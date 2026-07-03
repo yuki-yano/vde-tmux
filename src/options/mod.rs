@@ -1,6 +1,8 @@
 //! @vde_* option バスの契約。キー名の定義と読み書き API はこのモジュールに集約する。
 //! writer 原則(設計書 §3.1): キーごとに writer は 1 箇所。daemon は option を書かない。
 
+pub mod snapshot;
+
 use anyhow::Result;
 
 use crate::tmux::TmuxRunner;
