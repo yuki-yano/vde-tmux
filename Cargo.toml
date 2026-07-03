@@ -1,0 +1,25 @@
+[package]
+name = "vde-tmux"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Yuki Yano"]
+repository = "https://github.com/yuki-yano/vde-tmux"
+description = "tmux state & UI manager: session/category, statusline, agent sidebar"
+
+[[bin]]
+name = "vt"
+path = "src/bin/vt.rs"
+
+[[bin]]
+name = "vde-tmux"
+path = "src/bin/vde-tmux.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+serde_yaml_ng = "0.10"
