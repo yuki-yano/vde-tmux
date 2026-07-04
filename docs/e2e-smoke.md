@@ -166,6 +166,22 @@ M6 runtime smoke ok
 - Chat 行で `Space` を押し、`status:` と `session:` の Detail 行が出ることを確認する。
 - `p` または Detail 行クリックで preview が floating pane として開くことを確認する。
 
+## Session Manager popup
+
+本番 tmux server は使わず、scratch server だけを使う。
+`vt session-manager --popup` は `display-popup` 固定。
+
+```bash
+rtk cargo build
+name="vde-session-manager-popup-$(date +%s)"
+tmux -L "$name" -f /dev/null new-session -d -s main -n work -c /tmp
+trap 'tmux -L "$name" kill-server >/dev/null 2>&1 || true' EXIT
+
+VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt session-manager --popup
+```
+
+期待値: `display-popup -E -w 80% -h 70%` 経路で session picker が開く。
+
 ## 2026-07-04 実行記録
 
 M5 sidebar smoke は pass。
@@ -267,6 +283,14 @@ window=@0
 sidebar=%4
 checked=header repo/all, view cycle category, attn filter, Chat Detail status/session, preview floating pane path
 result=sidebar ui parity smoke ok
+```
+
+Session Manager popup は `display-popup` 固定に戻した。
+
+```text
+executed_at=2026-07-04 23:36:45 JST
+checked=unit test popup_uses_display_popup_directly / popup_does_not_probe_tmux_version
+result=session manager popup fixed to display-popup
 ```
 
 Sidebar preview floating pane の中央配置と Codex alt-screen capture も pass。

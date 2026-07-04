@@ -15,6 +15,11 @@ pub fn open_tree(runner: &dyn TmuxRunner) -> Result<()> {
 }
 
 pub fn open_popup(runner: &dyn TmuxRunner) -> Result<()> {
+    open_display_popup(runner)?;
+    Ok(())
+}
+
+fn open_display_popup(runner: &dyn TmuxRunner) -> Result<()> {
     let command = popup_shell_command();
     runner.run(&["display-popup", "-E", "-w", "80%", "-h", "70%", &command])?;
     Ok(())
@@ -44,14 +49,41 @@ mod tests {
     }
 
     #[test]
-    fn popup_uses_display_popup() {
+    fn popup_uses_display_popup_directly() {
         let mock = MockTmuxRunner::new();
         let command = popup_shell_command();
         mock.stub(
             &["display-popup", "-E", "-w", "80%", "-h", "70%", &command],
             "",
         );
+
         open_popup(&mock).unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            vec![vec![
+                "display-popup".to_string(),
+                "-E".to_string(),
+                "-w".to_string(),
+                "80%".to_string(),
+                "-h".to_string(),
+                "70%".to_string(),
+                command,
+            ]]
+        );
+    }
+
+    #[test]
+    fn popup_does_not_probe_tmux_version() {
+        let mock = MockTmuxRunner::new();
+        let command = popup_shell_command();
+        mock.stub(
+            &["display-popup", "-E", "-w", "80%", "-h", "70%", &command],
+            "",
+        );
+
+        open_popup(&mock).unwrap();
+
         assert_eq!(mock.calls().len(), 1);
     }
 
