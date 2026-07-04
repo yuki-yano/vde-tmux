@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -42,6 +43,49 @@ pub fn state_path(env: &BTreeMap<String, String>) -> PathBuf {
         return PathBuf::from(home).join(".local/state/vde/tmux/state.json");
     }
     PathBuf::from("/tmp/vde-tmux-state.json")
+}
+
+#[derive(Debug)]
+pub struct DebounceWriter {
+    path: PathBuf,
+    delay: Duration,
+    pending: Option<SidebarState>,
+    deadline: Option<Instant>,
+}
+
+impl DebounceWriter {
+    pub fn new(path: PathBuf, delay: Duration) -> Self {
+        Self {
+            path,
+            delay,
+            pending: None,
+            deadline: None,
+        }
+    }
+
+    pub fn mark_dirty(&mut self, state: SidebarState, now: Instant) {
+        self.pending = Some(state);
+        self.deadline = Some(now + self.delay);
+    }
+
+    pub fn flush_if_due(&mut self, now: Instant) -> Result<bool> {
+        let Some(deadline) = self.deadline else {
+            return Ok(false);
+        };
+        if now < deadline {
+            return Ok(false);
+        }
+        self.flush()
+    }
+
+    pub fn flush(&mut self) -> Result<bool> {
+        let Some(state) = self.pending.take() else {
+            return Ok(false);
+        };
+        self.deadline = None;
+        save_state(&self.path, &state)?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -116,5 +160,41 @@ mod tests {
         let loaded = load_state(&path).unwrap();
 
         assert_eq!(loaded, SidebarState::default());
+    }
+
+    #[test]
+    fn debounce_writer_writes_only_latest_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "vde-tmux-debounce-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("state.json");
+        let mut writer = DebounceWriter::new(path.clone(), std::time::Duration::from_millis(100));
+        let now = std::time::Instant::now();
+        let first = SidebarState {
+            version: 1,
+            selection: Some("pane::%1".to_string()),
+            ..SidebarState::default()
+        };
+        let latest = SidebarState {
+            version: 2,
+            selection: Some("pane::%2".to_string()),
+            ..SidebarState::default()
+        };
+
+        writer.mark_dirty(first, now);
+        writer.mark_dirty(latest, now + std::time::Duration::from_millis(10));
+        assert!(!path.exists());
+        writer
+            .flush_if_due(now + std::time::Duration::from_millis(200))
+            .unwrap();
+
+        let loaded = load_state(&path).unwrap();
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.selection.as_deref(), Some("pane::%2"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

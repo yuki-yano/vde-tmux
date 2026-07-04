@@ -37,6 +37,7 @@ struct AgentPane {
     agent: String,
     rollup: RollupLevel,
     repo_path: String,
+    attention: bool,
 }
 
 pub fn build_rows(
@@ -71,10 +72,11 @@ pub fn build_rows_with_git(
                 agent: pane.agent.clone(),
                 rollup,
                 repo_path: pane.current_path.clone(),
+                attention: pane.attention == "1",
             });
     }
     for panes in groups.values_mut() {
-        panes.sort_by(|left, right| left.pane_id.cmp(&right.pane_id));
+        panes.sort_by(compare_agent_panes);
     }
 
     match state.view_mode {
@@ -205,6 +207,14 @@ fn chat_row(pane: &AgentPane, depth: usize) -> SidebarRow {
         pane_id: Some(pane.pane_id.clone()),
         git: None,
     }
+}
+
+fn compare_agent_panes(left: &AgentPane, right: &AgentPane) -> std::cmp::Ordering {
+    right
+        .attention
+        .cmp(&left.attention)
+        .then_with(|| left.rollup.cmp(&right.rollup))
+        .then_with(|| left.pane_id.cmp(&right.pane_id))
 }
 
 fn repo_id(category: &str, repo: &str) -> String {
@@ -549,5 +559,22 @@ mod tests {
         );
 
         assert!(rows[0].git.is_none());
+    }
+
+    #[test]
+    fn attention_panes_sort_before_background_panes() {
+        let mut quiet = pane("main", "%1", "/tmp/app", "codex", "idle");
+        quiet.attention = "0".to_string();
+        let mut attention = pane("main", "%2", "/tmp/app", "claude", "idle");
+        attention.attention = "1".to_string();
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows(&Config::default(), &[quiet, attention], &state);
+
+        assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
+        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
     }
 }
