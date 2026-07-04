@@ -92,3 +92,51 @@ fn dispatch_config_schema_prints_json_schema() {
     );
     assert!(schema["properties"].get("sidebar").is_some());
 }
+
+#[test]
+fn config_warning_is_written_to_stderr_without_polluting_statusline_stdout() {
+    let config_home = std::env::temp_dir().join(format!(
+        "vde-tmux-broken-config-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = config_home.join("vde").join("tmux");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.yml"),
+        "daemon:\n  poll_ms: [broken\n",
+    )
+    .unwrap();
+
+    let env = BTreeMap::from([(
+        "XDG_CONFIG_HOME".to_string(),
+        config_home.display().to_string(),
+    )]);
+    let mock = MockTmuxRunner::new();
+    let format = crate::session::session_list_format();
+    mock.stub(
+        &["list-sessions", "-F", &format],
+        "main\u{1f}1\u{1f}100\u{1f}misc\u{1f}\u{1f}\u{1f}\n",
+    );
+    mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+
+    let mut stderr = Vec::new();
+    let output = run_with_input_at_writing_warnings(
+        ["vt", "statusline-category"],
+        "",
+        &mock,
+        &env,
+        0,
+        &mut stderr,
+    )
+    .unwrap()
+    .unwrap();
+
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert!(stderr.contains("vde-tmux config warning: invalid config"));
+    assert!(output.contains("misc"));
+    assert!(!output.contains("invalid config"));
+    std::fs::remove_dir_all(config_home).unwrap();
+}

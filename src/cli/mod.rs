@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -204,8 +204,26 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    let mut stderr = std::io::stderr();
+    run_with_input_at_writing_warnings(args, input, runner, env, now_epoch, &mut stderr)
+}
+
+pub(crate) fn run_with_input_at_writing_warnings<I, T, W>(
+    args: I,
+    input: &str,
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    now_epoch: i64,
+    warning_writer: &mut W,
+) -> Result<Option<String>>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+    W: Write,
+{
     let cli = Cli::try_parse_from(args)?;
     let loaded = load_config(env);
+    emit_config_warnings(&loaded.warnings, warning_writer)?;
     let config = loaded.config;
     match cli.command {
         Command::StatuslineCategory { command } => match command {
@@ -327,6 +345,13 @@ where
             Ok(None)
         }
     }
+}
+
+fn emit_config_warnings<W: Write>(warnings: &[String], writer: &mut W) -> Result<()> {
+    for warning in warnings {
+        writeln!(writer, "vde-tmux config warning: {warning}")?;
+    }
+    Ok(())
 }
 
 fn cli_index(index: usize) -> usize {
