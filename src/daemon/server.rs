@@ -38,6 +38,13 @@ pub fn handle_stream(runner: &dyn TmuxRunner, mut stream: UnixStream) -> Result<
 }
 
 pub fn run_daemon_server(runner: &dyn TmuxRunner, socket_path: &Path) -> Result<()> {
+    if let Some(parent) = socket_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
     if socket_path.exists() {
         fs::remove_file(socket_path)
             .with_context(|| format!("failed to remove {}", socket_path.display()))?;

@@ -3,12 +3,20 @@
 pub mod protocol;
 pub mod server;
 
-use anyhow::Result;
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::daemon::protocol::{ClientMessage, ServerMessage};
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
 use crate::options::snapshot::{PaneSnapshot, read_all_panes};
 use crate::tmux::TmuxRunner;
+
+const ENV_DAEMON_SOCKET: &str = "VDE_DAEMON_SOCKET";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentPaneSummary {
@@ -67,6 +75,49 @@ pub fn statusline_agent_badge_fallback(runner: &dyn TmuxRunner) -> Result<String
     Ok(render_agent_badge(&build_snapshot(&panes)))
 }
 
+pub fn statusline_agent_badge(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<String> {
+    let socket_path = daemon_socket_path(env, None);
+    if socket_path.exists()
+        && let Ok(value) = query_statusline_agent_badge(&socket_path)
+    {
+        return Ok(value);
+    }
+    statusline_agent_badge_fallback(runner)
+}
+
+pub fn daemon_socket_path(env: &BTreeMap<String, String>, explicit: Option<&str>) -> PathBuf {
+    if let Some(path) = explicit.filter(|path| !path.trim().is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = env
+        .get(ENV_DAEMON_SOCKET)
+        .filter(|path| !path.trim().is_empty())
+    {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(format!("/tmp/vde-tmux-{}/daemon.sock", unsafe {
+        libc::geteuid()
+    }))
+}
+
+pub fn query_statusline_agent_badge(socket_path: &Path) -> Result<String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect {}", socket_path.display()))?;
+    serde_json::to_writer(&mut stream, &ClientMessage::StatuslineAgentBadge)?;
+    stream.write_all(b"\n")?;
+
+    let mut line = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut line)?;
+    match serde_json::from_str::<ServerMessage>(line.trim())? {
+        ServerMessage::StatuslineAgentBadge { value } => Ok(value),
+        ServerMessage::Error { message } => bail!(message),
+    }
+}
+
 fn parse_agent_status(raw: &str) -> Option<AgentStatus> {
     match raw {
         "running" => Some(AgentStatus::Running),
@@ -91,7 +142,12 @@ fn rollup_label(level: RollupLevel) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::protocol::{ClientMessage, ServerMessage};
     use crate::options::snapshot::PaneSnapshot;
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn pane(agent: &str, status: &str, wait_reason: &str) -> PaneSnapshot {
         PaneSnapshot {
@@ -133,5 +189,52 @@ mod tests {
     fn render_agent_badge_includes_rollup_and_count() {
         let snapshot = build_snapshot(&[pane("codex", "running", "")]);
         assert_eq!(render_agent_badge(&snapshot), "running:1");
+    }
+
+    #[test]
+    fn daemon_socket_path_prefers_explicit_then_env() {
+        let env = BTreeMap::from([(ENV_DAEMON_SOCKET.to_string(), "/tmp/env.sock".to_string())]);
+        assert_eq!(
+            daemon_socket_path(&env, Some("/tmp/explicit.sock")),
+            PathBuf::from("/tmp/explicit.sock")
+        );
+        assert_eq!(
+            daemon_socket_path(&env, None),
+            PathBuf::from("/tmp/env.sock")
+        );
+    }
+
+    #[test]
+    fn query_statusline_agent_badge_reads_server_response() {
+        let socket_path = unique_socket_path();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream).read_line(&mut request).unwrap();
+            let message: ClientMessage = serde_json::from_str(request.trim()).unwrap();
+            assert_eq!(message, ClientMessage::StatuslineAgentBadge);
+            serde_json::to_writer(
+                &mut stream,
+                &ServerMessage::StatuslineAgentBadge {
+                    value: "running:1".to_string(),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+
+        let value = query_statusline_agent_badge(&socket_path).unwrap();
+        handle.join().unwrap();
+        fs::remove_file(socket_path).unwrap();
+        assert_eq!(value, "running:1");
+    }
+
+    fn unique_socket_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        PathBuf::from(format!("/tmp/vt-test-{nanos}.sock"))
     }
 }

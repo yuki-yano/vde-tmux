@@ -35,10 +35,16 @@ enum Command {
         #[command(subcommand)]
         command: Option<StatuslineCategoryCommand>,
     },
+    #[command(name = "statusline-agent-badge")]
+    StatuslineAgentBadge,
     #[command(name = "statusline-sessions")]
     StatuslineSessions {
         #[command(subcommand)]
         command: Option<StatuslineSessionsCommand>,
+    },
+    Daemon {
+        #[arg(long)]
+        socket: Option<String>,
     },
     Category {
         #[command(subcommand)]
@@ -242,6 +248,14 @@ where
                 runner, &config,
             )?)),
         },
+        Command::StatuslineAgentBadge => {
+            Ok(Some(crate::daemon::statusline_agent_badge(runner, env)?))
+        }
+        Command::Daemon { socket } => {
+            let socket_path = crate::daemon::daemon_socket_path(env, socket.as_deref());
+            crate::daemon::server::run_daemon_server(runner, &socket_path)?;
+            Ok(None)
+        }
         Command::Category { command } => {
             match command {
                 CategoryCommand::Next => {
@@ -841,5 +855,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mock.calls().len(), 2);
+    }
+
+    #[test]
+    fn dispatch_statusline_agent_badge_falls_back_to_tmux_snapshot() {
+        let mock = MockTmuxRunner::new();
+        let format = crate::options::snapshot::snapshot_format();
+        let line = [
+            "main", "@1", "%1", "/tmp", "zsh", "", "codex", "running", "", "", "", "", "", "", "",
+            "",
+        ]
+        .join("\u{1f}");
+        mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
+        let output = run_with(["vt", "statusline-agent-badge"], &mock, &env()).unwrap();
+        assert_eq!(output, Some("running:1".to_string()));
     }
 }
