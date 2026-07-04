@@ -1,6 +1,7 @@
 pub mod category;
 pub mod cli;
 pub mod config;
+pub mod hook;
 pub mod options;
 pub mod project;
 pub mod session;
