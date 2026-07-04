@@ -4,10 +4,12 @@ use std::panic;
 use std::path::Path;
 use std::sync::Once;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -20,8 +22,10 @@ use ratatui::widgets::{Block, Borders, List, ListItem};
 
 use crate::config::Config;
 use crate::daemon::DaemonSnapshot;
-use crate::sidebar::client::{send_sidebar_key, socket_path, subscribe};
+use crate::sidebar::client::{send_sidebar_jump, send_sidebar_key, socket_path, subscribe};
 use crate::sidebar::render::render_rows;
+
+const DOUBLE_CLICK_MAX: Duration = Duration::from_millis(500);
 
 static PANIC_RESTORE_HOOK: Once = Once::new();
 
@@ -33,12 +37,16 @@ pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<O
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_loop(&mut terminal, &socket, &rx);
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     result?;
     let _ = config;
@@ -58,7 +66,7 @@ fn install_panic_restore_hook() {
 
 fn restore_terminal_after_panic<W: Write>(writer: &mut W) -> Result<()> {
     let _ = disable_raw_mode();
-    execute!(writer, LeaveAlternateScreen)?;
+    execute!(writer, DisableMouseCapture, LeaveAlternateScreen)?;
     Ok(())
 }
 
@@ -68,6 +76,7 @@ pub fn run_loop<B: Backend>(
     rx: &mpsc::Receiver<DaemonSnapshot>,
 ) -> Result<()> {
     let mut current: Option<DaemonSnapshot> = None;
+    let mut clicks = ClickTracker::default();
     loop {
         while let Ok(snapshot) = rx.try_recv() {
             current = Some(snapshot);
@@ -75,21 +84,58 @@ pub fn run_loop<B: Backend>(
         if let Some(snapshot) = &current {
             draw_snapshot(terminal, snapshot)?;
         }
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => break,
-                KeyCode::Char(' ') => send_sidebar_key(socket, "space")?,
-                KeyCode::Char(ch) => send_sidebar_key(socket, &ch.to_string())?,
-                KeyCode::Down => send_sidebar_key(socket, "down")?,
-                KeyCode::Up => send_sidebar_key(socket, "up")?,
-                KeyCode::Enter => send_sidebar_key(socket, "enter")?,
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key) => match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => break,
+                    KeyCode::Char(' ') => send_sidebar_key(socket, "space")?,
+                    KeyCode::Char(ch) => send_sidebar_key(socket, &ch.to_string())?,
+                    KeyCode::Down => send_sidebar_key(socket, "down")?,
+                    KeyCode::Up => send_sidebar_key(socket, "up")?,
+                    KeyCode::Enter => send_sidebar_key(socket, "enter")?,
+                    _ => {}
+                },
+                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    if clicks.register_left_click(mouse.row, Instant::now())
+                        && let Some(snapshot) = &current
+                        && let Some(pane_id) = pane_for_click(snapshot, mouse.row)
+                    {
+                        send_sidebar_jump(socket, &pane_id)?;
+                    }
+                }
                 _ => {}
             }
         }
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct ClickTracker {
+    last: Option<(u16, Instant)>,
+}
+
+impl ClickTracker {
+    fn register_left_click(&mut self, row: u16, now: Instant) -> bool {
+        let double_clicked = self
+            .last
+            .map(|(last_row, last_at)| {
+                last_row == row && now.duration_since(last_at) <= DOUBLE_CLICK_MAX
+            })
+            .unwrap_or(false);
+        self.last = Some((row, now));
+        double_clicked
+    }
+}
+
+fn pane_for_click(snapshot: &DaemonSnapshot, row: u16) -> Option<String> {
+    snapshot
+        .sidebar
+        .as_ref()?
+        .rows
+        .get(usize::from(row))?
+        .pane_id
+        .clone()
 }
 
 pub fn draw_snapshot<B: Backend>(
@@ -177,5 +223,77 @@ mod tests {
 
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("\u{1b}[?1049l"));
+    }
+
+    #[test]
+    fn pane_for_click_returns_agent_row_pane_id() {
+        let snapshot = DaemonSnapshot {
+            agent_count: 1,
+            rollup: RollupLevel::Running,
+            panes: Vec::new(),
+            sidebar: Some(SidebarFrame {
+                state: SidebarState::default(),
+                rows: vec![
+                    SidebarRow {
+                        id: "repo::misc::app".to_string(),
+                        kind: SidebarRowKind::Repo,
+                        depth: 0,
+                        label: "app".to_string(),
+                        chat_count: 1,
+                        rollup: RollupLevel::Running,
+                        expanded: true,
+                        pane_id: None,
+                        git: None,
+                    },
+                    row(),
+                ],
+            }),
+        };
+
+        assert_eq!(pane_for_click(&snapshot, 1).as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn pane_for_click_ignores_non_agent_rows() {
+        let snapshot = DaemonSnapshot {
+            agent_count: 1,
+            rollup: RollupLevel::Running,
+            panes: Vec::new(),
+            sidebar: Some(SidebarFrame {
+                state: SidebarState::default(),
+                rows: vec![SidebarRow {
+                    id: "repo::misc::app".to_string(),
+                    kind: SidebarRowKind::Repo,
+                    depth: 0,
+                    label: "app".to_string(),
+                    chat_count: 1,
+                    rollup: RollupLevel::Running,
+                    expanded: true,
+                    pane_id: None,
+                    git: None,
+                }],
+            }),
+        };
+
+        assert_eq!(pane_for_click(&snapshot, 0), None);
+    }
+
+    #[test]
+    fn click_tracker_detects_double_click_on_same_row() {
+        let mut tracker = ClickTracker::default();
+        let now = std::time::Instant::now();
+
+        assert!(!tracker.register_left_click(2, now));
+        assert!(tracker.register_left_click(2, now + Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn click_tracker_ignores_slow_or_different_row_clicks() {
+        let mut tracker = ClickTracker::default();
+        let now = std::time::Instant::now();
+
+        assert!(!tracker.register_left_click(2, now));
+        assert!(!tracker.register_left_click(3, now + Duration::from_millis(100)));
+        assert!(!tracker.register_left_click(3, now + Duration::from_millis(700)));
     }
 }
