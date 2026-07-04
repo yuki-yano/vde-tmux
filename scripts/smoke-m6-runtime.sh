@@ -17,6 +17,7 @@ cleanup() {
     wait "$DAEMON_PID" 2>/dev/null
   fi
   tmux -L "$TMUX_SOCKET" kill-server 2>/dev/null
+  rm -f "/private/tmp/tmux-501/$TMUX_SOCKET"
   rm -rf "$RUNTIME_DIR"
 }
 trap cleanup EXIT

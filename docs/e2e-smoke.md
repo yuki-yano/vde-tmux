@@ -188,3 +188,16 @@ input redraw state ok
 query response ok
 M6 runtime smoke ok
 ```
+
+M6 runtime smoke cleanup 修正後の再実行も pass。
+
+```text
+executed_at=2026-07-04 17:40:50 JST
+script=scripts/smoke-m6-runtime.sh
+subscribe snapshot ok
+capture detect ok
+input redraw state ok
+query response ok
+M6 runtime smoke ok
+scratch tmux socket residual=0
+```
