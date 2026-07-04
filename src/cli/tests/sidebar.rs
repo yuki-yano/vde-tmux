@@ -242,52 +242,125 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
 }
 
 #[test]
-fn dispatch_sidebar_jump_switches_to_pane() {
+fn dispatch_sidebar_jump_forwards_to_daemon_when_socket_exists() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let socket = unique_socket_path("vde-tmux-sidebar-jump");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut line = String::new();
+                    BufReader::new(&mut stream).read_line(&mut line).unwrap();
+                    let message: crate::daemon::protocol::ClientMessage =
+                        serde_json::from_str(line.trim()).unwrap();
+                    tx.send(message).unwrap();
+                    serde_json::to_writer(
+                        &mut stream,
+                        &crate::daemon::protocol::ServerMessage::Ack,
+                    )
+                    .unwrap();
+                    stream.write_all(b"\n").unwrap();
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    let env = BTreeMap::from([(
+        "VDE_DAEMON_SOCKET".to_string(),
+        socket.display().to_string(),
+    )]);
     let mock = MockTmuxRunner::new();
-    let format = crate::options::snapshot::snapshot_format();
-    let line = [
-        "main", "@1", "%1", "/tmp/app", "zsh", "", "codex", "running", "", "", "", "", "", "", "",
-        "",
-    ]
-    .join("\u{1f}");
-    mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
-    mock.stub(&["switch-client", "-t", "main"], "");
-    mock.stub(&["select-window", "-t", "@1"], "");
-    mock.stub(&["select-pane", "-t", "%1"], "");
 
-    run_with(["vt", "sidebar", "jump", "%1"], &mock, &env()).unwrap();
+    run_with(["vt", "sidebar", "jump", "%1"], &mock, &env).unwrap();
 
-    assert_eq!(mock.calls().len(), 4);
+    let message = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        message,
+        crate::daemon::protocol::ClientMessage::SidebarEvent {
+            proto: 1,
+            event: crate::daemon::protocol::SidebarClientEvent::JumpPane {
+                pane: "%1".to_string()
+            }
+        }
+    );
+    handle.join().unwrap();
+    std::fs::remove_file(socket).unwrap();
 }
 
 #[test]
-fn dispatch_sidebar_input_moves_selection_and_saves_state() {
-    let state_home = std::env::temp_dir().join(format!(
-        "vde-tmux-sidebar-input-cli-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+fn dispatch_sidebar_input_forwards_to_daemon_when_socket_exists() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let socket = unique_socket_path("vde-tmux-sidebar-input");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut line = String::new();
+                    BufReader::new(&mut stream).read_line(&mut line).unwrap();
+                    let message: crate::daemon::protocol::ClientMessage =
+                        serde_json::from_str(line.trim()).unwrap();
+                    tx.send(message).unwrap();
+                    serde_json::to_writer(
+                        &mut stream,
+                        &crate::daemon::protocol::ServerMessage::Ack,
+                    )
+                    .unwrap();
+                    stream.write_all(b"\n").unwrap();
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    });
     let env = BTreeMap::from([(
-        "XDG_STATE_HOME".to_string(),
-        state_home.display().to_string(),
+        "VDE_DAEMON_SOCKET".to_string(),
+        socket.display().to_string(),
     )]);
     let mock = MockTmuxRunner::new();
-    let format = crate::options::snapshot::snapshot_format();
-    let line = [
-        "main", "@1", "%1", "/tmp/app", "zsh", "", "codex", "running", "", "", "", "", "", "", "",
-        "",
-    ]
-    .join("\u{1f}");
-    mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
 
     run_with(["vt", "sidebar", "input", "j"], &mock, &env).unwrap();
 
-    let state =
-        crate::sidebar::store::load_state(&crate::sidebar::store::state_path(&env)).unwrap();
-    assert_eq!(state.selection.as_deref(), Some("repo::misc::app"));
-    std::fs::remove_dir_all(state_home).unwrap();
+    let message = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        message,
+        crate::daemon::protocol::ClientMessage::SidebarEvent {
+            proto: 1,
+            event: crate::daemon::protocol::SidebarClientEvent::Key {
+                key: "j".to_string()
+            }
+        }
+    );
+    handle.join().unwrap();
+    std::fs::remove_file(socket).unwrap();
 }
 
 #[test]
@@ -381,4 +454,14 @@ fn shell_quote_for_test(value: &str) -> String {
     }
     quoted.push('\'');
     quoted
+}
+
+fn unique_socket_path(label: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "{label}-{}.sock",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
 }

@@ -80,19 +80,16 @@ where
         SidebarCommand::Attach { once } => {
             ensure_daemon(env)?;
             crate::sidebar::layout::attach(runner, env)?;
-            let rendered = render_sidebar_once(runner, env, config)?;
             if once {
-                return Ok(Some(rendered));
+                return crate::sidebar::once::render_once(runner, env, config).map(Some);
             }
-            if !rendered.is_empty() {
-                println!("{rendered}");
-            }
-            loop {
-                std::thread::sleep(Duration::from_secs(3600));
-            }
+            crate::sidebar::tui::run_live_tui(env, config)
         }
         SidebarCommand::Input { key } => {
-            handle_sidebar_input_key(runner, env, config, &key)?;
+            crate::sidebar::client::send_sidebar_key(
+                &crate::sidebar::client::socket_path(env),
+                &key,
+            )?;
             Ok(None)
         }
         SidebarCommand::Open {
@@ -162,7 +159,10 @@ where
             Ok(None)
         }
         SidebarCommand::Jump { pane } => {
-            crate::sidebar::layout::jump_to_pane(runner, &pane)?;
+            crate::sidebar::client::send_sidebar_jump(
+                &crate::sidebar::client::socket_path(env),
+                &pane,
+            )?;
             Ok(None)
         }
     }
@@ -170,76 +170,6 @@ where
 
 fn ensure_sidebar_daemon_started(env: &BTreeMap<String, String>) -> Result<()> {
     crate::daemon::lifecycle::ensure_daemon_started(env, None)
-}
-
-fn render_sidebar_once(
-    runner: &dyn TmuxRunner,
-    env: &BTreeMap<String, String>,
-    config: &crate::config::Config,
-) -> Result<String> {
-    let panes = crate::options::snapshot::read_all_panes(runner)?;
-    let state_path = crate::sidebar::store::state_path(env);
-    let state = crate::sidebar::store::load_state(&state_path)?;
-    let git = crate::git::collect_git_badges(&crate::git::SystemGitRunner::default(), &panes);
-    let rows = crate::sidebar::tree::build_rows_with_git(config, &panes, &state, &git);
-    Ok(crate::sidebar::render::render_rows(
-        &rows,
-        &state,
-        config.sidebar.width as usize,
-    ))
-}
-
-fn handle_sidebar_input_key(
-    runner: &dyn TmuxRunner,
-    env: &BTreeMap<String, String>,
-    config: &crate::config::Config,
-    key: &str,
-) -> Result<()> {
-    let Some(action) = crate::sidebar::input::parse_key(key) else {
-        return Ok(());
-    };
-    let state_path = crate::sidebar::store::state_path(env);
-    let mut state = crate::sidebar::store::load_state(&state_path)?;
-    let panes = crate::options::snapshot::read_all_panes(runner)?;
-    let rows = crate::sidebar::tree::build_rows(config, &panes, &state);
-    let row_refs = crate::sidebar::tree::row_refs(&rows);
-    let changed = match action {
-        crate::sidebar::input::SidebarInputAction::MoveNext => {
-            state.apply(crate::sidebar::state::SidebarAction::MoveNext, &row_refs)
-        }
-        crate::sidebar::input::SidebarInputAction::MovePrevious => state.apply(
-            crate::sidebar::state::SidebarAction::MovePrevious,
-            &row_refs,
-        ),
-        crate::sidebar::input::SidebarInputAction::ToggleExpand => state.apply(
-            crate::sidebar::state::SidebarAction::ToggleExpand,
-            &row_refs,
-        ),
-        crate::sidebar::input::SidebarInputAction::SetViewMode(view_mode) => state.apply(
-            crate::sidebar::state::SidebarAction::SetViewMode(view_mode),
-            &row_refs,
-        ),
-        crate::sidebar::input::SidebarInputAction::Activate => {
-            match crate::sidebar::input::activate_selected(state.selection.as_deref(), &rows) {
-                Some(crate::sidebar::input::SidebarCommand::JumpPane(pane_id)) => {
-                    crate::sidebar::layout::jump_to_pane(runner, &pane_id)?;
-                    false
-                }
-                Some(crate::sidebar::input::SidebarCommand::ToggleExpand(row_id)) => {
-                    state.selection = Some(row_id);
-                    state.apply(
-                        crate::sidebar::state::SidebarAction::ToggleExpand,
-                        &row_refs,
-                    )
-                }
-                None => false,
-            }
-        }
-    };
-    if changed {
-        crate::sidebar::store::save_state(&state_path, &state)?;
-    }
-    Ok(())
 }
 
 fn resolve_window_target(runner: &dyn TmuxRunner, window: Option<String>) -> Result<String> {
