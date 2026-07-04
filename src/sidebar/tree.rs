@@ -301,14 +301,54 @@ mod tests {
         }
     }
 
+    fn category_rule(category: &str, pattern: &str) -> CategoryRule {
+        CategoryRule {
+            category: category.to_string(),
+            ghq_patterns: vec![pattern.to_string()],
+        }
+    }
+
+    #[test]
+    fn empty_panes_render_no_rows() {
+        let rows = build_rows(
+            &Config::default(),
+            &[],
+            &SidebarState {
+                view_mode: ViewMode::ByCategory,
+                ..SidebarState::default()
+            },
+        );
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn build_rows_excludes_sidebar_and_non_agent_panes() {
+        let mut sidebar = pane("main", "%9", "/tmp/sidebar", "codex", "running");
+        sidebar.is_sidebar = true;
+        let rows = build_rows(
+            &Config::default(),
+            &[
+                sidebar,
+                pane("shell", "%2", "/tmp/shell", "", ""),
+                pane("main", "%1", "/tmp/app", "codex", "running"),
+            ],
+            &SidebarState::default(),
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "app");
+        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
+    }
+
     #[test]
     fn build_rows_groups_agent_panes_by_category_and_repo() {
         let mut config = Config::default();
         config.categories.default_category = Some("misc".to_string());
-        config.categories.rules.push(CategoryRule {
-            category: "work".to_string(),
-            ghq_patterns: vec!["github.com/acme/*".to_string()],
-        });
+        config
+            .categories
+            .rules
+            .push(category_rule("work", "github.com/acme/*"));
         let state = SidebarState {
             view_mode: ViewMode::ByCategory,
             ..SidebarState::default()
@@ -342,6 +382,96 @@ mod tests {
     }
 
     #[test]
+    fn by_category_rows_keep_same_repo_name_in_distinct_categories() {
+        let mut config = Config::default();
+        config
+            .categories
+            .rules
+            .push(category_rule("alpha", "github.com/acme/*"));
+        config
+            .categories
+            .rules
+            .push(category_rule("beta", "github.com/other/*"));
+        let state = SidebarState {
+            view_mode: ViewMode::ByCategory,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows(
+            &config,
+            &[
+                pane("a", "%1", "/ghq/github.com/acme/app", "codex", "running"),
+                pane("b", "%2", "/ghq/github.com/other/app", "claude", "idle"),
+            ],
+            &state,
+        );
+
+        let repo_rows = rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Repo)
+            .collect::<Vec<_>>();
+        assert_eq!(repo_rows.len(), 2);
+        assert!(repo_rows.iter().all(|row| row.label == "app"));
+        assert_eq!(repo_rows[0].id, "repo::alpha::app");
+        assert_eq!(repo_rows[1].id, "repo::beta::app");
+    }
+
+    #[test]
+    fn by_repo_rows_are_sorted_by_category_then_repo() {
+        let mut config = Config::default();
+        config
+            .categories
+            .rules
+            .push(category_rule("work", "github.com/work/*"));
+        config
+            .categories
+            .rules
+            .push(category_rule("oss", "github.com/oss/*"));
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows(
+            &config,
+            &[
+                pane("work", "%2", "/ghq/github.com/work/zeta", "codex", "idle"),
+                pane("oss", "%1", "/ghq/github.com/oss/alpha", "codex", "idle"),
+            ],
+            &state,
+        );
+
+        let repo_labels = rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Repo)
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(repo_labels, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn flat_view_contains_only_chat_rows() {
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows(
+            &Config::default(),
+            &[
+                pane("main", "%1", "/tmp/app", "codex", "running"),
+                pane("main", "%2", "/tmp/app", "claude", "idle"),
+            ],
+            &state,
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.kind == SidebarRowKind::Chat));
+        assert_eq!(rows[0].pane_id.as_deref(), Some("%1"));
+        assert_eq!(rows[1].pane_id.as_deref(), Some("%2"));
+    }
+
+    #[test]
     fn collapsed_repo_hides_chat_rows() {
         let mut state = SidebarState::default();
         state.collapsed.insert("repo::misc::app".to_string());
@@ -354,6 +484,36 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, SidebarRowKind::Repo);
         assert_eq!(rows[0].chat_count, 1);
+    }
+
+    #[test]
+    fn collapsed_category_hides_repo_rows() {
+        let mut state = SidebarState {
+            view_mode: ViewMode::ByCategory,
+            ..SidebarState::default()
+        };
+        state.collapsed.insert("category::misc".to_string());
+
+        let rows = build_rows(
+            &Config::default(),
+            &[pane("main", "%1", "/tmp/app", "codex", "running")],
+            &state,
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, SidebarRowKind::Category);
+        assert_eq!(rows[0].chat_count, 1);
+    }
+
+    #[test]
+    fn unknown_status_rolls_up_to_background() {
+        let rows = build_rows(
+            &Config::default(),
+            &[pane("main", "%1", "/tmp/app", "codex", "unknown")],
+            &SidebarState::default(),
+        );
+
+        assert_eq!(rows[0].rollup, RollupLevel::Background);
     }
 
     #[test]
@@ -375,5 +535,17 @@ mod tests {
         );
 
         assert_eq!(rows[0].git.as_ref().unwrap().branch, "main");
+    }
+
+    #[test]
+    fn repo_row_has_no_git_badge_when_path_is_absent_from_cache() {
+        let rows = build_rows_with_git(
+            &Config::default(),
+            &[pane("main", "%1", "/tmp/app", "codex", "running")],
+            &SidebarState::default(),
+            &std::collections::BTreeMap::new(),
+        );
+
+        assert!(rows[0].git.is_none());
     }
 }
