@@ -7,12 +7,26 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use super::protocol::{ClientMessage, ServerMessage};
-use crate::daemon::statusline_agent_badge_fallback;
+use super::protocol::{ClientMessage, QueryTarget, ServerMessage};
+use crate::daemon::{build_snapshot, statusline_agent_badge_fallback};
+use crate::options::snapshot::read_all_panes;
 use crate::tmux::TmuxRunner;
 
 pub fn handle_message(runner: &dyn TmuxRunner, message: ClientMessage) -> Result<ServerMessage> {
     match message {
+        ClientMessage::Query {
+            proto: _,
+            what: QueryTarget::Statusline,
+        } => {
+            let agent_badge = statusline_agent_badge_fallback(runner)?;
+            Ok(ServerMessage::Statusline { agent_badge })
+        }
+        ClientMessage::Subscribe { proto: _ } => {
+            let panes = read_all_panes(runner)?;
+            Ok(ServerMessage::Snapshot {
+                snapshot: build_snapshot(&panes),
+            })
+        }
         ClientMessage::StatuslineAgentBadge => {
             let value = statusline_agent_badge_fallback(runner)?;
             Ok(ServerMessage::StatuslineAgentBadge { value })
@@ -42,8 +56,7 @@ pub fn run_daemon_server(runner: &dyn TmuxRunner, socket_path: &Path) -> Result<
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+        crate::daemon::lifecycle::ensure_secure_socket_dir(parent)?;
     }
     if socket_path.exists() {
         fs::remove_file(socket_path)
@@ -106,5 +119,44 @@ mod tests {
                 value: "running:1".to_string()
             }
         );
+    }
+
+    #[test]
+    fn handle_query_returns_statusline_payload() {
+        let mock = MockTmuxRunner::new();
+        let format = snapshot_format();
+        mock.stub(
+            &["list-panes", "-a", "-F", &format],
+            &format!("{}\n", pane_line("codex", "running", "")),
+        );
+        let response = handle_message(
+            &mock,
+            ClientMessage::Query {
+                proto: 1,
+                what: crate::daemon::protocol::QueryTarget::Statusline,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            response,
+            ServerMessage::Statusline {
+                agent_badge: "running:1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn handle_subscribe_returns_snapshot() {
+        let mock = MockTmuxRunner::new();
+        let format = snapshot_format();
+        mock.stub(
+            &["list-panes", "-a", "-F", &format],
+            &format!("{}\n", pane_line("codex", "running", "")),
+        );
+        let response = handle_message(&mock, ClientMessage::Subscribe { proto: 1 }).unwrap();
+        let ServerMessage::Snapshot { snapshot } = response else {
+            panic!("expected snapshot response");
+        };
+        assert_eq!(snapshot.agent_count, 1);
     }
 }

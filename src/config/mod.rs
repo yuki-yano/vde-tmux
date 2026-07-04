@@ -2,6 +2,7 @@
 //! すべてのフィールドに default を持たせ、部分的な config でも常に動く。
 
 pub mod load;
+pub mod schema;
 
 use std::collections::BTreeMap;
 

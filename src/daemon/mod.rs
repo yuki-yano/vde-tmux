@@ -1,5 +1,6 @@
 //! daemon の snapshot 集約と statusline badge。
 
+pub mod lifecycle;
 pub mod protocol;
 pub mod server;
 
@@ -98,6 +99,12 @@ pub fn daemon_socket_path(env: &BTreeMap<String, String>, explicit: Option<&str>
     {
         return PathBuf::from(path);
     }
+    if let Some(runtime_dir) = env
+        .get("XDG_RUNTIME_DIR")
+        .filter(|path| !path.trim().is_empty())
+    {
+        return PathBuf::from(runtime_dir).join("vde-tmux/daemon.sock");
+    }
     PathBuf::from(format!("/tmp/vde-tmux-{}/daemon.sock", unsafe {
         libc::geteuid()
     }))
@@ -106,15 +113,23 @@ pub fn daemon_socket_path(env: &BTreeMap<String, String>, explicit: Option<&str>
 pub fn query_statusline_agent_badge(socket_path: &Path) -> Result<String> {
     let mut stream = UnixStream::connect(socket_path)
         .with_context(|| format!("failed to connect {}", socket_path.display()))?;
-    serde_json::to_writer(&mut stream, &ClientMessage::StatuslineAgentBadge)?;
+    serde_json::to_writer(
+        &mut stream,
+        &ClientMessage::Query {
+            proto: 1,
+            what: crate::daemon::protocol::QueryTarget::Statusline,
+        },
+    )?;
     stream.write_all(b"\n")?;
 
     let mut line = String::new();
     let mut reader = BufReader::new(stream);
     reader.read_line(&mut line)?;
     match serde_json::from_str::<ServerMessage>(line.trim())? {
+        ServerMessage::Statusline { agent_badge } => Ok(agent_badge),
         ServerMessage::StatuslineAgentBadge { value } => Ok(value),
         ServerMessage::Error { message } => bail!(message),
+        ServerMessage::Snapshot { .. } => bail!("unexpected daemon snapshot response"),
     }
 }
 
@@ -205,6 +220,16 @@ mod tests {
     }
 
     #[test]
+    fn daemon_socket_path_uses_xdg_runtime_dir_before_tmp_fallback() {
+        let env = BTreeMap::from([("XDG_RUNTIME_DIR".to_string(), "/run/user/501".to_string())]);
+
+        assert_eq!(
+            daemon_socket_path(&env, None),
+            PathBuf::from("/run/user/501/vde-tmux/daemon.sock")
+        );
+    }
+
+    #[test]
     fn query_statusline_agent_badge_reads_server_response() {
         let socket_path = unique_socket_path();
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -213,11 +238,17 @@ mod tests {
             let mut request = String::new();
             BufReader::new(&mut stream).read_line(&mut request).unwrap();
             let message: ClientMessage = serde_json::from_str(request.trim()).unwrap();
-            assert_eq!(message, ClientMessage::StatuslineAgentBadge);
+            assert_eq!(
+                message,
+                ClientMessage::Query {
+                    proto: 1,
+                    what: crate::daemon::protocol::QueryTarget::Statusline
+                }
+            );
             serde_json::to_writer(
                 &mut stream,
-                &ServerMessage::StatuslineAgentBadge {
-                    value: "running:1".to_string(),
+                &ServerMessage::Statusline {
+                    agent_badge: "running:1".to_string(),
                 },
             )
             .unwrap();
