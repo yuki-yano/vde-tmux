@@ -48,6 +48,7 @@ pub struct StatuslineConfig {
     pub sessions: StatuslineSessionsConfig,
     pub category: StatuslineCategoryConfig,
     pub agent_badge: AgentBadgeConfig,
+    pub session_badge: SessionBadgeConfig,
 }
 
 // show_index=false / SegmentStyle::default() は derive の Default と一致するため
@@ -126,6 +127,46 @@ pub struct AgentBadgeConfig {
 impl Default for AgentBadgeConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SessionBadgeConfig {
+    pub enabled: bool,
+    /// グリフ直後に付ける区切り文字列。絵文字は表示幅が広いので
+    /// デフォルトで半角スペース 1 個を挟む(バッジ値自体に含める)。
+    pub suffix: String,
+    pub glyphs: SessionBadgeGlyphs,
+}
+
+impl Default for SessionBadgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            suffix: " ".to_string(),
+            glyphs: SessionBadgeGlyphs::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SessionBadgeGlyphs {
+    pub blocked: String,
+    pub working: String,
+    pub done: String,
+    pub idle: String,
+}
+
+impl Default for SessionBadgeGlyphs {
+    fn default() -> Self {
+        Self {
+            blocked: "🔴".to_string(),
+            working: "🟡".to_string(),
+            done: "🔵".to_string(),
+            idle: "🟢".to_string(),
+        }
     }
 }
 
@@ -244,5 +285,16 @@ categories:
             config.categories.session_name_rules[0].patterns,
             vec!["dotfiles"]
         );
+    }
+
+    #[test]
+    fn session_badge_defaults_to_emoji_glyphs_with_space_suffix() {
+        let config = SessionBadgeConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.suffix, " ");
+        assert_eq!(config.glyphs.blocked, "🔴");
+        assert_eq!(config.glyphs.working, "🟡");
+        assert_eq!(config.glyphs.done, "🔵");
+        assert_eq!(config.glyphs.idle, "🟢");
     }
 }

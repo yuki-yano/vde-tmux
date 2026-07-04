@@ -141,4 +141,21 @@ mod tests {
         assert_eq!(loaded.config, Config::default());
         assert!(loaded.warnings.is_empty());
     }
+
+    #[test]
+    fn parse_config_accepts_session_badge_overrides() {
+        let yaml = r#"
+statusline:
+  session_badge:
+    suffix: ""
+    glyphs:
+      blocked: "!"
+"#;
+        let loaded = parse_config(yaml);
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(loaded.config.statusline.session_badge.suffix, "");
+        assert_eq!(loaded.config.statusline.session_badge.glyphs.blocked, "!");
+        assert_eq!(loaded.config.statusline.session_badge.glyphs.working, "🟡");
+        assert!(loaded.config.statusline.session_badge.enabled);
+    }
 }

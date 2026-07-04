@@ -19,7 +19,30 @@ pub fn config_schema() -> Value {
                     "session_name_rules": { "type": "array" }
                 }
             },
-            "statusline": { "type": "object", "additionalProperties": true },
+            "statusline": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                    "session_badge": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "enabled": { "type": "boolean" },
+                            "suffix": { "type": "string" },
+                            "glyphs": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "blocked": { "type": "string" },
+                                    "working": { "type": "string" },
+                                    "done": { "type": "string" },
+                                    "idle": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             "sidebar": {
                 "type": "object",
                 "additionalProperties": true,
