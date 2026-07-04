@@ -82,9 +82,7 @@ pub fn config_schema() -> Value {
                             "background": { "type": "string" },
                             "waiting": { "type": "string" },
                             "idle": { "type": "string" },
-                            "attention": { "type": "string" },
                             "selection_bg": { "type": "string" },
-                            "selection_active_bg": { "type": "string" },
                             "header_active_bg": { "type": "string" },
                             "header_active_fg": { "type": "string" }
                         }
@@ -166,6 +164,8 @@ mod tests {
 
         assert_eq!(colors["header_active_bg"]["type"], "string");
         assert_eq!(colors["selection_bg"]["type"], "string");
+        assert!(colors.get("attention").is_none());
+        assert!(colors.get("selection_active_bg").is_none());
     }
 
     #[test]

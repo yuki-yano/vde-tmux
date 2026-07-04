@@ -45,6 +45,7 @@ struct AgentPane {
     wait_reason: String,
     started_at: String,
     tasks: String,
+    subagents: String,
     rollup: RollupLevel,
     badge_state: BadgeState,
     repo_path: String,
@@ -135,6 +136,7 @@ pub fn build_rows_at_with_git_and_unread(
                 wait_reason: pane.wait_reason.clone(),
                 started_at: pane.started_at.clone(),
                 tasks: pane.tasks.clone(),
+                subagents: pane.subagents.clone(),
                 rollup,
                 badge_state: badge_state(rollup, unread),
                 repo_path: pane.current_path.clone(),
@@ -346,6 +348,22 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, now: i64, rows: &mut Ve
         "session",
         format!("session: {} / pane: {}", pane.session, pane.pane_id),
     ));
+    let subagents = decode_subagents(&pane.subagents);
+    if let Some(last_index) = subagents.len().checked_sub(1) {
+        for (index, (agent_id, agent_type)) in subagents.iter().enumerate() {
+            let connector = if index == last_index {
+                "\u{2514}"
+            } else {
+                "\u{251c}"
+            };
+            rows.push(detail_row(
+                pane,
+                depth,
+                &format!("subagent::{index}"),
+                format!("{connector} {agent_type}{}", subagent_id_suffix(agent_id)),
+            ));
+        }
+    }
     rows.push(SidebarRow {
         id: format!("jump::{}", pane.pane_id),
         kind: SidebarRowKind::Jump,
@@ -358,6 +376,26 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, now: i64, rows: &mut Ve
         pane_id: Some(pane.pane_id.clone()),
         git: None,
     });
+}
+
+fn decode_subagents(raw: &str) -> Vec<(String, String)> {
+    raw.split('|')
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            entry
+                .split_once(':')
+                .map(|(id, agent_type)| (id.to_string(), agent_type.to_string()))
+        })
+        .collect()
+}
+
+fn subagent_id_suffix(agent_id: &str) -> String {
+    let prefix = agent_id.chars().take(4).collect::<String>();
+    if prefix.is_empty() {
+        String::new()
+    } else {
+        format!(" #{prefix}")
+    }
 }
 
 fn chat_label(pane: &AgentPane) -> String {
@@ -860,6 +898,49 @@ mod tests {
             row.kind == SidebarRowKind::Detail && row.label == "session: main / pane: %5"
         }));
         assert_eq!(rows.last().unwrap().kind, SidebarRowKind::Jump);
+    }
+
+    #[test]
+    fn chat_detail_rows_include_running_subagents_with_tree_connectors() {
+        let mut agent = pane("main", "%5", "/tmp/app", "claude", "running");
+        agent.subagents = "sub12345:Explore|ab120000:general-purpose".to_string();
+        let mut state = SidebarState::default();
+        state.toggle_expanded("chat::%5");
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
+        let labels = rows
+            .iter()
+            .filter(|row| {
+                row.kind == SidebarRowKind::Detail
+                    && (row.label.starts_with('\u{251c}') || row.label.starts_with('\u{2514}'))
+            })
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec!["\u{251c} Explore #sub1", "\u{2514} general-purpose #ab12"]
+        );
+    }
+
+    #[test]
+    fn chat_detail_subagent_rows_appear_before_jump_row() {
+        let mut agent = pane("main", "%5", "/tmp/app", "claude", "running");
+        agent.subagents = "sub12345:Explore".to_string();
+        let mut state = SidebarState::default();
+        state.toggle_expanded("chat::%5");
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
+        let subagent_index = rows
+            .iter()
+            .position(|row| row.label == "\u{2514} Explore #sub1")
+            .expect("subagent row should exist");
+        let jump_index = rows
+            .iter()
+            .position(|row| row.kind == SidebarRowKind::Jump)
+            .expect("jump row should exist");
+
+        assert!(subagent_index < jump_index);
     }
 
     #[test]

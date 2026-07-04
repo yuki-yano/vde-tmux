@@ -100,6 +100,7 @@ daemon:
 `~/.config/vde/tmux/config.yml` に残っている場合は、M7 切替前に消す。
 `categories.rules[].ghq_patterns` は `path_patterns` へリネームする。
 `statusline.session_badge.glyphs` は `badge.glyphs` へ移動する。
+`sidebar.colors.attention` / `selection_active_bg` は未使用のため削除する。
 
 ## Pane Option Bus
 

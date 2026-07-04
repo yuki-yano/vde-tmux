@@ -14,7 +14,6 @@ pub struct SidebarRenderTheme {
     pub waiting: Color,
     pub idle: Color,
     pub selection_bg: Color,
-    pub selection_active_bg: Color,
     pub header_active_bg: Option<Color>,
     pub header_active_fg: Option<Color>,
     pub header_active_bold: bool,
@@ -35,7 +34,6 @@ impl Default for SidebarRenderTheme {
             waiting: Color::Yellow,
             idle: Color::Reset,
             selection_bg: Color::Indexed(237),
-            selection_active_bg: Color::Indexed(24),
             header_active_bg: None,
             header_active_fg: None,
             header_active_bold: false,
@@ -60,8 +58,6 @@ impl SidebarRenderTheme {
             idle: parse_color(config.idle.as_deref()).unwrap_or(default.idle),
             selection_bg: parse_color(config.selection_bg.as_deref())
                 .unwrap_or(default.selection_bg),
-            selection_active_bg: parse_color(config.selection_active_bg.as_deref())
-                .unwrap_or(default.selection_active_bg),
             header_active_bg: parse_color(config.header_active_bg.as_deref()),
             header_active_fg: parse_color(config.header_active_fg.as_deref()),
             header_active_bold: default.header_active_bold,

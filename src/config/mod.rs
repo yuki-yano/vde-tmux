@@ -220,7 +220,7 @@ impl Default for SidebarPreviewConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SidebarColorsConfig {
     pub error: Option<String>,
     pub running: Option<String>,
@@ -228,9 +228,7 @@ pub struct SidebarColorsConfig {
     pub background: Option<String>,
     pub waiting: Option<String>,
     pub idle: Option<String>,
-    pub attention: Option<String>,
     pub selection_bg: Option<String>,
-    pub selection_active_bg: Option<String>,
     pub header_active_bg: Option<String>,
     pub header_active_fg: Option<String>,
 }
@@ -416,6 +414,20 @@ mod tests {
             config.sidebar.colors.header_active_bg.as_deref(),
             Some("24")
         );
+    }
+
+    #[test]
+    fn sidebar_colors_reject_dead_keys() {
+        let attention =
+            serde_yaml_ng::from_str::<Config>("sidebar:\n  colors:\n    attention: yellow\n")
+                .unwrap_err();
+        assert!(attention.to_string().contains("attention"));
+
+        let active_bg = serde_yaml_ng::from_str::<Config>(
+            "sidebar:\n  colors:\n    selection_active_bg: \"24\"\n",
+        )
+        .unwrap_err();
+        assert!(active_bg.to_string().contains("selection_active_bg"));
     }
 
     #[test]
