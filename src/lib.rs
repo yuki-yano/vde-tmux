@@ -8,5 +8,6 @@ pub mod options;
 pub mod project;
 pub mod session;
 pub mod session_manager;
+pub mod sidebar;
 pub mod statusline;
 pub mod tmux;
