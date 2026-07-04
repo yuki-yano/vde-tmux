@@ -175,6 +175,8 @@ impl Default for SessionBadgeGlyphs {
 pub struct SidebarConfig {
     pub width: SidebarWidth,
     pub min_width: u16,
+    pub colors: SidebarColorsConfig,
+    pub header: SidebarHeaderConfig,
 }
 
 impl Default for SidebarConfig {
@@ -182,6 +184,48 @@ impl Default for SidebarConfig {
         Self {
             width: SidebarWidth::default(),
             min_width: 40,
+            colors: SidebarColorsConfig::default(),
+            header: SidebarHeaderConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct SidebarColorsConfig {
+    pub error: Option<String>,
+    pub running: Option<String>,
+    pub permission: Option<String>,
+    pub background: Option<String>,
+    pub waiting: Option<String>,
+    pub idle: Option<String>,
+    pub attention: Option<String>,
+    pub selection_bg: Option<String>,
+    pub selection_active_bg: Option<String>,
+    pub header_active_bg: Option<String>,
+    pub header_active_fg: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SidebarHeaderConfig {
+    pub format: String,
+    pub prefix: String,
+    pub suffix: String,
+    pub separator: String,
+    pub bold: bool,
+    pub colors: SegmentColors,
+}
+
+impl Default for SidebarHeaderConfig {
+    fn default() -> Self {
+        Self {
+            format: "{label} ".to_string(),
+            prefix: String::new(),
+            suffix: String::new(),
+            separator: String::new(),
+            bold: false,
+            colors: SegmentColors::default(),
         }
     }
 }
@@ -317,6 +361,48 @@ mod tests {
                 .unwrap();
         assert_eq!(config.sidebar.width, SidebarWidth::Percent(10));
         assert_eq!(config.sidebar.min_width, 48);
+    }
+
+    #[test]
+    fn sidebar_colors_accept_old_sidebar_color_keys() {
+        let config = serde_yaml_ng::from_str::<Config>(
+            "sidebar:\n  colors:\n    running: green\n    selection_bg: \"237\"\n    header_active_bg: \"24\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.sidebar.colors.running.as_deref(), Some("green"));
+        assert_eq!(config.sidebar.colors.selection_bg.as_deref(), Some("237"));
+        assert_eq!(
+            config.sidebar.colors.header_active_bg.as_deref(),
+            Some("24")
+        );
+    }
+
+    #[test]
+    fn sidebar_header_style_can_be_configured() {
+        let config = serde_yaml_ng::from_str::<Config>(
+            r##"
+sidebar:
+  header:
+    prefix: "["
+    suffix: "]"
+    format: " {label} "
+    separator: " "
+    bold: true
+    colors:
+      fg: white
+      bg: "24"
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(config.sidebar.header.prefix, "[");
+        assert_eq!(config.sidebar.header.suffix, "]");
+        assert_eq!(config.sidebar.header.format, " {label} ");
+        assert_eq!(config.sidebar.header.separator, " ");
+        assert!(config.sidebar.header.bold);
+        assert_eq!(config.sidebar.header.colors.fg.as_deref(), Some("white"));
+        assert_eq!(config.sidebar.header.colors.bg.as_deref(), Some("24"));
     }
 
     #[test]

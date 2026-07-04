@@ -35,6 +35,26 @@ statusline:
 sidebar:
   width: "10%"
   min_width: 40
+  header:
+    format: "{label} "
+    separator: ""
+    # pill 風にしたい場合:
+    # prefix: "["
+    # suffix: "]"
+    # format: " {label} "
+    # separator: " "
+    # bold: true
+    # colors:
+    #   fg: white
+    #   bg: "24"
+  colors:
+    running: green
+    waiting: yellow
+    permission: light_red
+    error: red
+    background: dark_gray
+    idle: reset
+    selection_bg: "237"
 daemon:
   poll_ms: 1000
 ```

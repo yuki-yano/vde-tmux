@@ -7,13 +7,15 @@ use crate::config::Config;
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
 use crate::options::snapshot::PaneSnapshot;
 use crate::session::SessionInfo;
-use crate::sidebar::state::{SidebarRowRef, SidebarState, ViewMode};
+use crate::sidebar::state::{SidebarRowRef, SidebarState, StatusFilter, ViewMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SidebarRowKind {
     Category,
     Repo,
     Chat,
+    Detail,
+    Jump,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,10 +33,16 @@ pub struct SidebarRow {
 
 #[derive(Debug, Clone)]
 struct AgentPane {
+    session: String,
     pane_id: String,
     repo: String,
     category: String,
     agent: String,
+    status: String,
+    prompt: String,
+    wait_reason: String,
+    started_at: String,
+    tasks: String,
     rollup: RollupLevel,
     repo_path: String,
     attention: bool,
@@ -54,6 +62,25 @@ pub fn build_rows_with_git(
     state: &SidebarState,
     git: &BTreeMap<String, crate::git::GitBadge>,
 ) -> Vec<SidebarRow> {
+    build_rows_at_with_git(config, panes, state, git, now_epoch_secs())
+}
+
+pub fn build_rows_at(
+    config: &Config,
+    panes: &[PaneSnapshot],
+    state: &SidebarState,
+    now: i64,
+) -> Vec<SidebarRow> {
+    build_rows_at_with_git(config, panes, state, &BTreeMap::new(), now)
+}
+
+pub fn build_rows_at_with_git(
+    config: &Config,
+    panes: &[PaneSnapshot],
+    state: &SidebarState,
+    git: &BTreeMap<String, crate::git::GitBadge>,
+    now: i64,
+) -> Vec<SidebarRow> {
     let mut groups: BTreeMap<(String, String), Vec<AgentPane>> = BTreeMap::new();
     for pane in panes {
         if pane.is_sidebar || pane.agent.trim().is_empty() {
@@ -66,10 +93,16 @@ pub fn build_rows_with_git(
             .entry((category.clone(), repo.clone()))
             .or_default()
             .push(AgentPane {
+                session: pane.session.clone(),
                 pane_id: pane.pane_id.clone(),
                 repo,
                 category,
                 agent: pane.agent.clone(),
+                status: pane.status.clone(),
+                prompt: pane.prompt.clone(),
+                wait_reason: pane.wait_reason.clone(),
+                started_at: pane.started_at.clone(),
+                tasks: pane.tasks.clone(),
                 rollup,
                 repo_path: pane.current_path.clone(),
                 attention: pane.attention == "1",
@@ -78,16 +111,21 @@ pub fn build_rows_with_git(
     for panes in groups.values_mut() {
         panes.sort_by(compare_agent_panes);
     }
+    for panes in groups.values_mut() {
+        panes.retain(|pane| pane_matches_filter(pane, state.filter));
+    }
+    groups.retain(|_, panes| !panes.is_empty());
 
     match state.view_mode {
-        ViewMode::Flat => flat_rows(groups),
-        ViewMode::ByRepo => repo_rows(groups, state, 0, git),
-        ViewMode::ByCategory => category_rows(groups, state, git),
+        ViewMode::Flat => flat_rows(groups, state, now),
+        ViewMode::ByRepo => repo_rows(groups, state, 0, git, now),
+        ViewMode::ByCategory => category_rows(groups, state, git, now),
     }
 }
 
 pub fn row_refs(rows: &[SidebarRow]) -> Vec<SidebarRowRef> {
     rows.iter()
+        .filter(|row| row.kind != SidebarRowKind::Detail)
         .map(|row| SidebarRowRef::new(row.id.clone()))
         .collect()
 }
@@ -96,6 +134,7 @@ fn category_rows(
     groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
     git: &BTreeMap<String, crate::git::GitBadge>,
+    now: i64,
 ) -> Vec<SidebarRow> {
     let mut by_category: BTreeMap<String, BTreeMap<String, Vec<AgentPane>>> = BTreeMap::new();
     for ((category, repo), panes) in groups {
@@ -119,7 +158,7 @@ fn category_rows(
             git: None,
         });
         if expanded {
-            rows.extend(repo_rows_from_map(repos, state, 1, git));
+            rows.extend(repo_rows_from_map(repos, state, 1, git, now));
         }
     }
     rows
@@ -130,12 +169,13 @@ fn repo_rows(
     state: &SidebarState,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
+    now: i64,
 ) -> Vec<SidebarRow> {
     let mut repos = BTreeMap::new();
     for ((category, repo), panes) in groups {
         repos.insert(format!("{category}\u{1f}{repo}"), panes);
     }
-    repo_rows_from_keyed_map(repos, state, depth, git)
+    repo_rows_from_keyed_map(repos, state, depth, git, now)
 }
 
 fn repo_rows_from_map(
@@ -143,6 +183,7 @@ fn repo_rows_from_map(
     state: &SidebarState,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
+    now: i64,
 ) -> Vec<SidebarRow> {
     let keyed = repos
         .into_iter()
@@ -154,7 +195,7 @@ fn repo_rows_from_map(
             (format!("{category}\u{1f}{repo}"), panes)
         })
         .collect();
-    repo_rows_from_keyed_map(keyed, state, depth, git)
+    repo_rows_from_keyed_map(keyed, state, depth, git, now)
 }
 
 fn repo_rows_from_keyed_map(
@@ -162,9 +203,12 @@ fn repo_rows_from_keyed_map(
     state: &SidebarState,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
+    now: i64,
 ) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
-    for (_key, panes) in repos {
+    let mut groups = repos.into_values().collect::<Vec<_>>();
+    order_repo_groups(&mut groups, state);
+    for panes in groups {
         let Some(first) = panes.first() else {
             continue;
         };
@@ -182,31 +226,169 @@ fn repo_rows_from_keyed_map(
             git: git.get(&first.repo_path).cloned(),
         });
         if expanded {
-            rows.extend(panes.iter().map(|pane| chat_row(pane, depth + 1)));
+            for pane in &panes {
+                push_chat_row(pane, depth + 1, state, now, &mut rows);
+            }
         }
     }
     rows
 }
 
-fn flat_rows(groups: BTreeMap<(String, String), Vec<AgentPane>>) -> Vec<SidebarRow> {
-    groups
-        .values()
-        .flat_map(|panes| panes.iter().map(|pane| chat_row(pane, 0)))
-        .collect()
+fn flat_rows(
+    groups: BTreeMap<(String, String), Vec<AgentPane>>,
+    state: &SidebarState,
+    now: i64,
+) -> Vec<SidebarRow> {
+    let mut rows = Vec::new();
+    for pane in groups.values().flat_map(|panes| panes.iter()) {
+        push_chat_row(pane, 0, state, now, &mut rows);
+    }
+    rows
 }
 
-fn chat_row(pane: &AgentPane, depth: usize) -> SidebarRow {
-    SidebarRow {
-        id: format!("pane::{}", pane.pane_id),
+fn push_chat_row(
+    pane: &AgentPane,
+    depth: usize,
+    state: &SidebarState,
+    now: i64,
+    rows: &mut Vec<SidebarRow>,
+) {
+    let id = format!("chat::{}", pane.pane_id);
+    let expanded = state.is_expanded_with_default(&id, false);
+    rows.push(SidebarRow {
+        id,
         kind: SidebarRowKind::Chat,
         depth,
-        label: format!("{} {}", pane.agent, pane.pane_id),
+        label: chat_label(pane),
         chat_count: 1,
+        rollup: pane.rollup,
+        expanded,
+        pane_id: Some(pane.pane_id.clone()),
+        git: None,
+    });
+    if expanded {
+        push_chat_detail_rows(pane, depth + 1, now, rows);
+    }
+}
+
+fn detail_row(pane: &AgentPane, depth: usize, suffix: &str, label: String) -> SidebarRow {
+    SidebarRow {
+        id: format!("detail::{}::{suffix}", pane.pane_id),
+        kind: SidebarRowKind::Detail,
+        depth,
+        label,
+        chat_count: 0,
         rollup: pane.rollup,
         expanded: true,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
     }
+}
+
+fn push_chat_detail_rows(pane: &AgentPane, depth: usize, now: i64, rows: &mut Vec<SidebarRow>) {
+    if let Some(prompt) = non_empty(&pane.prompt) {
+        rows.push(detail_row(pane, depth, "prompt", prompt.to_string()));
+    }
+    let mut status = format!("status: {}", status_label(&pane.status));
+    if let Some(wait_reason) = non_empty(&pane.wait_reason) {
+        status.push_str(&format!(" ({wait_reason})"));
+    }
+    rows.push(detail_row(pane, depth, "status", status));
+    if let Ok(started_at) = pane.started_at.parse::<i64>() {
+        let elapsed = (now - started_at).max(0);
+        rows.push(detail_row(
+            pane,
+            depth,
+            "elapsed",
+            format!("elapsed: {}m{:02}s", elapsed / 60, elapsed % 60),
+        ));
+    }
+    rows.push(detail_row(
+        pane,
+        depth,
+        "session",
+        format!("session: {} / pane: {}", pane.session, pane.pane_id),
+    ));
+    rows.push(SidebarRow {
+        id: format!("jump::{}", pane.pane_id),
+        kind: SidebarRowKind::Jump,
+        depth,
+        label: "jump".to_string(),
+        chat_count: 0,
+        rollup: pane.rollup,
+        expanded: true,
+        pane_id: Some(pane.pane_id.clone()),
+        git: None,
+    });
+}
+
+fn chat_label(pane: &AgentPane) -> String {
+    let base = if let Some(prompt) = non_empty(&pane.prompt) {
+        format!("{}: {prompt}", pane.agent)
+    } else {
+        format!("{} ({})", pane.agent, pane.pane_id)
+    };
+    if let Some((done, total)) = parse_tasks(&pane.tasks) {
+        format!("{base} {done}/{total}")
+    } else {
+        base
+    }
+}
+
+fn parse_tasks(raw: &str) -> Option<(i64, i64)> {
+    let (done, total) = raw.split_once('/')?;
+    Some((done.trim().parse().ok()?, total.trim().parse().ok()?))
+}
+
+fn status_label(raw: &str) -> &'static str {
+    match raw {
+        "running" => "running",
+        "waiting" => "waiting",
+        "idle" => "idle",
+        "error" => "error",
+        _ => "unknown",
+    }
+}
+
+fn pane_matches_filter(pane: &AgentPane, filter: StatusFilter) -> bool {
+    match filter {
+        StatusFilter::All => true,
+        StatusFilter::AttentionOnly => {
+            pane.attention
+                || matches!(
+                    pane.rollup,
+                    RollupLevel::Error | RollupLevel::Running | RollupLevel::Permission
+                )
+        }
+    }
+}
+
+fn order_repo_groups(groups: &mut [Vec<AgentPane>], state: &SidebarState) {
+    let position = |panes: &Vec<AgentPane>| -> usize {
+        let Some(first) = panes.first() else {
+            return usize::MAX;
+        };
+        state
+            .manual_order
+            .iter()
+            .position(|repo| repo.category == first.category && repo.repo == first.repo)
+            .unwrap_or(usize::MAX)
+    };
+    groups.sort_by(|left, right| {
+        position(left).cmp(&position(right)).then_with(|| {
+            let left = left.first();
+            let right = right.first();
+            left.map(|pane| (&pane.category, &pane.repo))
+                .cmp(&right.map(|pane| (&pane.category, &pane.repo)))
+        })
+    });
+}
+
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn compare_agent_panes(left: &AgentPane, right: &AgentPane) -> std::cmp::Ordering {
@@ -576,5 +758,97 @@ mod tests {
 
         assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
         assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn chat_detail_rows_are_hidden_by_default_and_shown_when_toggled_open() {
+        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
+        agent.prompt = "fix the bug".to_string();
+        agent.started_at = "1000".to_string();
+
+        let rows = build_rows_at(
+            &Config::default(),
+            &[agent.clone()],
+            &SidebarState::default(),
+            1075,
+        );
+
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Detail)
+                .count(),
+            0
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|row| row.id == "chat::%5")
+                .unwrap()
+                .expanded
+        );
+
+        let mut state = SidebarState::default();
+        state.toggle_expanded("chat::%5");
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
+
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == SidebarRowKind::Detail && row.label == "fix the bug")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == SidebarRowKind::Detail && row.label == "status: running")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == SidebarRowKind::Detail && row.label == "elapsed: 1m15s")
+        );
+        assert!(rows.iter().any(|row| {
+            row.kind == SidebarRowKind::Detail && row.label == "session: main / pane: %5"
+        }));
+        assert_eq!(rows.last().unwrap().kind, SidebarRowKind::Jump);
+    }
+
+    #[test]
+    fn attention_only_filter_drops_calm_panes_and_empty_groups() {
+        let mut calm = pane("main", "%1", "/tmp/calm", "codex", "idle");
+        calm.attention = "0".to_string();
+        let active = pane("main", "%2", "/tmp/active", "codex", "running");
+        let state = SidebarState {
+            filter: crate::sidebar::state::StatusFilter::AttentionOnly,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows(&Config::default(), &[calm, active], &state);
+
+        assert!(rows.iter().all(|row| !row.id.contains("%1")));
+        assert!(rows.iter().any(|row| row.id.contains("%2")));
+    }
+
+    #[test]
+    fn manual_order_reorders_repo_rows() {
+        let state = SidebarState {
+            manual_order: vec![
+                crate::sidebar::state::RepoId::new("misc", "zeta"),
+                crate::sidebar::state::RepoId::new("misc", "alpha"),
+            ],
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows(
+            &Config::default(),
+            &[
+                pane("main", "%1", "/tmp/alpha", "codex", "idle"),
+                pane("main", "%2", "/tmp/zeta", "codex", "idle"),
+            ],
+            &state,
+        );
+
+        let repo_labels = rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Repo)
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(repo_labels, vec!["zeta", "alpha"]);
     }
 }

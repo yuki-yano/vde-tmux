@@ -52,7 +52,44 @@ pub fn config_schema() -> Value {
                             { "type": "string", "pattern": "^(100|[1-9][0-9]?)%$" }
                         ]
                     },
-                    "min_width": { "type": "integer", "minimum": 1 }
+                    "min_width": { "type": "integer", "minimum": 1 },
+                    "colors": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "error": { "type": "string" },
+                            "running": { "type": "string" },
+                            "permission": { "type": "string" },
+                            "background": { "type": "string" },
+                            "waiting": { "type": "string" },
+                            "idle": { "type": "string" },
+                            "attention": { "type": "string" },
+                            "selection_bg": { "type": "string" },
+                            "selection_active_bg": { "type": "string" },
+                            "header_active_bg": { "type": "string" },
+                            "header_active_fg": { "type": "string" }
+                        }
+                    },
+                    "header": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "format": { "type": "string" },
+                            "prefix": { "type": "string" },
+                            "suffix": { "type": "string" },
+                            "separator": { "type": "string" },
+                            "bold": { "type": "boolean" },
+                            "colors": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "fg": { "type": "string" },
+                                    "bg": { "type": "string" },
+                                    "outer_bg": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
                 }
             },
             "daemon": {
@@ -94,5 +131,27 @@ mod tests {
         let sidebar = &schema["properties"]["sidebar"]["properties"];
         assert!(sidebar["width"]["oneOf"].is_array());
         assert_eq!(sidebar["min_width"]["type"], "integer");
+    }
+
+    #[test]
+    fn schema_contains_sidebar_colors() {
+        let schema = config_schema();
+        let colors = &schema["properties"]["sidebar"]["properties"]["colors"]["properties"];
+
+        assert_eq!(colors["header_active_bg"]["type"], "string");
+        assert_eq!(colors["selection_bg"]["type"], "string");
+    }
+
+    #[test]
+    fn schema_contains_sidebar_header_style() {
+        let schema = config_schema();
+        let header = &schema["properties"]["sidebar"]["properties"]["header"]["properties"];
+
+        assert_eq!(header["format"]["type"], "string");
+        assert_eq!(header["prefix"]["type"], "string");
+        assert_eq!(header["suffix"]["type"], "string");
+        assert_eq!(header["separator"]["type"], "string");
+        assert_eq!(header["bold"]["type"], "boolean");
+        assert_eq!(header["colors"]["type"], "object");
     }
 }

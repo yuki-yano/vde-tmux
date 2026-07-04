@@ -11,8 +11,8 @@ use crate::daemon::{
 use crate::git::GitBadge;
 use crate::options::snapshot::PaneSnapshot;
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
-use crate::sidebar::state::{SidebarAction, SidebarState};
-use crate::sidebar::tree::{SidebarRow, build_rows_with_git, row_refs};
+use crate::sidebar::state::{RepoId, SidebarAction, SidebarState};
+use crate::sidebar::tree::{SidebarRow, SidebarRowKind, build_rows_with_git, row_refs};
 
 const STATE_DEBOUNCE: Duration = Duration::from_millis(200);
 
@@ -269,7 +269,13 @@ impl RuntimeState {
     fn apply_client_event(&mut self, event: SidebarClientEvent) -> Vec<RuntimeEffect> {
         match event {
             SidebarClientEvent::Key { key } => self.apply_key(&key),
-            SidebarClientEvent::JumpPane { pane } => vec![RuntimeEffect::JumpPane(pane)],
+            SidebarClientEvent::JumpPane { pane } => {
+                self.ui_state.selection = Some(format!("chat::{pane}"));
+                self.mark_state_dirty(Instant::now());
+                self.rebuild_snapshot();
+                self.broadcast_if_needed();
+                vec![RuntimeEffect::JumpPane(pane)]
+            }
         }
     }
 
@@ -286,9 +292,24 @@ impl RuntimeState {
             SidebarInputAction::ToggleExpand => {
                 self.ui_state.apply(SidebarAction::ToggleExpand, &row_refs)
             }
+            SidebarInputAction::Expand => self.ui_state.apply(SidebarAction::Expand, &row_refs),
+            SidebarInputAction::Collapse => self.ui_state.apply(SidebarAction::Collapse, &row_refs),
             SidebarInputAction::SetViewMode(view_mode) => self
                 .ui_state
                 .apply(SidebarAction::SetViewMode(view_mode), &row_refs),
+            SidebarInputAction::CycleViewMode => {
+                self.ui_state.apply(SidebarAction::CycleViewMode, &row_refs)
+            }
+            SidebarInputAction::SetFilter(filter) => self.ui_state.set_filter(filter),
+            SidebarInputAction::ToggleFilter => {
+                self.ui_state.apply(SidebarAction::ToggleFilter, &row_refs)
+            }
+            SidebarInputAction::ToggleRow(row_id) => {
+                self.ui_state.selection = Some(row_id.clone());
+                self.ui_state.toggle_expanded(&row_id)
+            }
+            SidebarInputAction::ReorderUp => self.apply_reorder(true),
+            SidebarInputAction::ReorderDown => self.apply_reorder(false),
             SidebarInputAction::Activate => {
                 match activate_selected(self.ui_state.selection.as_deref(), &self.rows) {
                     Some(SidebarCommand::JumpPane(pane_id)) => {
@@ -298,6 +319,7 @@ impl RuntimeState {
                         self.ui_state.selection = Some(row_id);
                         self.ui_state.apply(SidebarAction::ToggleExpand, &row_refs)
                     }
+                    Some(SidebarCommand::PreviewPane(_)) => false,
                     None => false,
                 }
             }
@@ -308,6 +330,45 @@ impl RuntimeState {
             self.broadcast_if_needed();
         }
         Vec::new()
+    }
+
+    fn apply_reorder(&mut self, up: bool) -> bool {
+        let Some(repo) = self.selected_repo_id() else {
+            return false;
+        };
+        self.seed_manual_order_from_rows();
+        if up {
+            self.ui_state.apply(SidebarAction::ReorderUp(repo), &[])
+        } else {
+            self.ui_state.apply(SidebarAction::ReorderDown(repo), &[])
+        }
+    }
+
+    fn selected_repo_id(&self) -> Option<RepoId> {
+        let selection = self.ui_state.selection.as_deref()?;
+        let row = self.rows.iter().find(|row| row.id == selection)?;
+        (row.kind == SidebarRowKind::Repo)
+            .then(|| RepoId::from_row_id(&row.id))
+            .flatten()
+    }
+
+    fn seed_manual_order_from_rows(&mut self) {
+        let mut changed = false;
+        for row in self
+            .rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Repo)
+        {
+            if let Some(repo) = RepoId::from_row_id(&row.id)
+                && !self.ui_state.manual_order.contains(&repo)
+            {
+                self.ui_state.manual_order.push(repo);
+                changed = true;
+            }
+        }
+        if changed {
+            self.ui_state.version += 1;
+        }
     }
 
     fn flush_state_if_due(&mut self, now: Instant) -> Vec<RuntimeEffect> {
@@ -523,6 +584,86 @@ mod tests {
 
         assert_eq!(state.ui_state.selection.as_deref(), Some("repo::misc::app"));
         assert!(state.state_dirty_since().is_some());
+    }
+
+    #[test]
+    fn client_move_selection_skips_detail_rows_and_can_select_jump_row() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut agent = pane("%1", "/tmp/app", "codex", "running");
+        agent.prompt = "prompt".to_string();
+        state.ui_state.toggle_expanded("chat::%1");
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent]));
+
+        for _ in 0..3 {
+            state.apply_event(DaemonEvent::Client {
+                client_id: ClientId(1),
+                event: SidebarClientEvent::Key {
+                    key: "j".to_string(),
+                },
+            });
+        }
+
+        assert_eq!(state.ui_state.selection.as_deref(), Some("jump::%1"));
+    }
+
+    #[test]
+    fn client_encoded_toggle_key_toggles_clicked_row_without_prior_selection() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![pane(
+            "%1", "/tmp/app", "codex", "running",
+        )]));
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "toggle:chat::%1".to_string(),
+            },
+        });
+
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
+        assert!(state.ui_state.is_expanded_with_default("chat::%1", false));
+    }
+
+    #[test]
+    fn client_filter_key_rebuilds_rows_to_attention_only() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![
+            pane("%1", "/tmp/calm", "codex", "idle"),
+            pane("%2", "/tmp/active", "codex", "running"),
+        ]));
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "tab".to_string(),
+            },
+        });
+
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        assert!(rows.iter().all(|row| !row.id.contains("%1")));
+        assert!(rows.iter().any(|row| row.id.contains("%2")));
+    }
+
+    #[test]
+    fn client_reorder_key_seeds_and_moves_manual_order() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![
+            pane("%1", "/tmp/alpha", "codex", "idle"),
+            pane("%2", "/tmp/zeta", "codex", "idle"),
+        ]));
+        state.ui_state.selection = Some("repo::misc::zeta".to_string());
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "K".to_string(),
+            },
+        });
+
+        assert_eq!(
+            state.ui_state.manual_order,
+            vec![RepoId::new("misc", "zeta"), RepoId::new("misc", "alpha")]
+        );
     }
 
     #[test]

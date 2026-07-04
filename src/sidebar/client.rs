@@ -38,6 +38,10 @@ pub fn send_sidebar_jump(socket: &Path, pane: &str) -> Result<()> {
     )
 }
 
+pub fn send_sidebar_toggle(socket: &Path, row_id: &str) -> Result<()> {
+    send_sidebar_key(socket, &format!("toggle:{row_id}"))
+}
+
 pub fn subscribe(socket: &Path, tx: Sender<DaemonSnapshot>) -> Result<()> {
     let mut stream = UnixStream::connect(socket)?;
     serde_json::to_writer(&mut stream, &ClientMessage::Subscribe { proto: 1 })?;

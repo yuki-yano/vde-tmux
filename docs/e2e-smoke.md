@@ -150,6 +150,20 @@ session badge cleanup ok
 M6 runtime smoke ok
 ```
 
+## Sidebar UI parity
+
+本番 tmux server は使わず、scratch server と隔離 daemon だけで確認する。
+`VDE_DAEMON_SOCKET`、`XDG_STATE_HOME`、`XDG_CONFIG_HOME` は scratch directory に向ける。
+
+確認項目:
+
+- `vt hook emit` で running / waiting+permission / idle / attention の pane を作る。
+- `vt sidebar open` で daemon subscribe TUI を開き、header の現在値表示(`repo all`)を確認する。
+- `v` で `category` に切り替わることを確認する。
+- `Tab` で `attn` filter に切り替わり、attention 不要な idle pane が消えることを確認する。
+- Chat 行で `Space` を押し、`status:` と `session:` の Detail 行が出ることを確認する。
+- `p` または Detail 行クリックで preview が floating pane として開くことを確認する。
+
 ## 2026-07-04 実行記録
 
 M5 sidebar smoke は pass。
@@ -240,4 +254,34 @@ session badge cleanup ok
 M6 runtime smoke ok
 scratch tmux socket residual=0
 /tmp runtime residual=0
+```
+
+Sidebar UI parity smoke も pass。
+
+```text
+executed_at=2026-07-04 22:51:05 JST
+scratch=vde-ui-parity-1783173039
+window=@0
+sidebar=%4
+checked=header repo/all, view cycle category, attn filter, Chat Detail status/session, preview floating pane path
+result=sidebar ui parity smoke ok
+```
+
+Sidebar preview floating pane の中央配置と Codex alt-screen capture も pass。
+
+```text
+executed_at=2026-07-04 23:36:45 JST
+position=left=10 top=4 width=80 height=32 floating=1 on 100x40 scratch window
+capture=alt-screen text codex-alt-screen captured via capture-pane -a fallback
+result=sidebar preview centered floating pane and codex capture ok
+```
+
+Sidebar header の statusline category 風 default / pill 設定と preview repeat も pass。
+
+```text
+executed_at=2026-07-04 23:54:32 JST
+header_default=repo/all rendered as statusline-like fixed segments without bg
+header_config=pill style via sidebar.header prefix/suffix/format/separator/bold/colors
+preview_repeat=3 runs all left=10 top=4 width=80 height=32 floating=1 on 100x40 scratch window
+result=sidebar header style and preview stable center ok
 ```

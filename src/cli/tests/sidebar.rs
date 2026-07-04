@@ -32,7 +32,7 @@ fn dispatch_sidebar_attach_once_marks_and_renders() {
     )
     .unwrap();
 
-    assert!(output.unwrap().contains("codex %1"));
+    assert!(output.unwrap().contains("codex (%1)"));
 }
 
 #[test]
