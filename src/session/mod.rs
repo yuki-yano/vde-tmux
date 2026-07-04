@@ -1,8 +1,12 @@
 //! tmux session と client の読み取り、切替、per-client 記憶を扱う。
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 
-use crate::options::{set_global_option, show_global_option};
+use crate::category::{adjacent_category, resolve_category_for_session, sessions_in_category};
+use crate::config::Config;
+use crate::options::{
+    KEY_CATEGORY, KEY_CATEGORY_OVERRIDE, set_global_option, set_session_option, show_global_option,
+};
 use crate::tmux::TmuxRunner;
 
 const FIELD_SEP: char = '\u{1f}';
@@ -120,6 +124,119 @@ pub fn remembered_session_for_client(
     show_global_option(runner, &client_memory_key(client_name, category))
 }
 
+pub fn find_session<'a>(sessions: &'a [SessionInfo], name: &str) -> Option<&'a SessionInfo> {
+    sessions.iter().find(|session| session.name == name)
+}
+
+pub fn remember_client_session_for_session(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    client_name: &str,
+    session_name: &str,
+) -> Result<()> {
+    let sessions = list_sessions(runner)?;
+    let session = find_session(&sessions, session_name)
+        .ok_or_else(|| anyhow!("session not found: {session_name}"))?;
+    let category = resolve_category_for_session(config, session);
+    remember_session_for_client(runner, client_name, &category, session_name)
+}
+
+pub fn remember_current_client_session(runner: &dyn TmuxRunner, config: &Config) -> Result<()> {
+    let client = current_client_name(runner)?;
+    let current = current_session_name(runner)?;
+    remember_client_session_for_session(runner, config, &client, &current)
+}
+
+pub fn set_session_category_override(
+    runner: &dyn TmuxRunner,
+    session_name: &str,
+    category: &str,
+) -> Result<()> {
+    set_session_option(runner, session_name, KEY_CATEGORY_OVERRIDE, category)?;
+    set_session_option(runner, session_name, KEY_CATEGORY, category)
+}
+
+pub fn refresh_session_categories(runner: &dyn TmuxRunner, config: &Config) -> Result<()> {
+    for session in list_sessions(runner)? {
+        let category = resolve_category_for_session(config, &session);
+        set_session_option(runner, &session.name, KEY_CATEGORY, &category)?;
+    }
+    Ok(())
+}
+
+pub fn use_category(runner: &dyn TmuxRunner, config: &Config, category: &str) -> Result<()> {
+    let client = current_client_name(runner)?;
+    let sessions = list_sessions(runner)?;
+    if let Some(remembered) = remembered_session_for_client(runner, &client, category)?
+        && find_session(&sessions, &remembered).is_some()
+    {
+        switch_client(runner, &remembered)?;
+        return remember_session_for_client(runner, &client, category, &remembered);
+    }
+
+    let Some(session) = sessions_in_category(config, &sessions, category)
+        .first()
+        .copied()
+    else {
+        bail!("no session in category: {category}");
+    };
+    switch_client(runner, &session.name)?;
+    remember_session_for_client(runner, &client, category, &session.name)
+}
+
+pub fn use_adjacent_category(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    direction: Direction,
+) -> Result<()> {
+    let current = current_session_name(runner)?;
+    let sessions = list_sessions(runner)?;
+    let session = find_session(&sessions, &current)
+        .ok_or_else(|| anyhow!("current session not found: {current}"))?;
+    let current_category = resolve_category_for_session(config, session);
+    let next_category = adjacent_category(config, &sessions, &current_category, direction)
+        .ok_or_else(|| anyhow!("no categories available"))?;
+    use_category(runner, config, &next_category)
+}
+
+pub fn cycle_session(runner: &dyn TmuxRunner, config: &Config, direction: Direction) -> Result<()> {
+    let client = current_client_name(runner)?;
+    let current = current_session_name(runner)?;
+    let sessions = list_sessions(runner)?;
+    let session = find_session(&sessions, &current)
+        .ok_or_else(|| anyhow!("current session not found: {current}"))?;
+    let category = resolve_category_for_session(config, session);
+    let category_sessions = sessions_in_category(config, &sessions, &category);
+    if category_sessions.is_empty() {
+        bail!("no session in current category: {category}");
+    }
+    let index = category_sessions
+        .iter()
+        .position(|session| session.name == current)
+        .unwrap_or(0);
+    let next = match direction {
+        Direction::Next => (index + 1) % category_sessions.len(),
+        Direction::Previous => (index + category_sessions.len() - 1) % category_sessions.len(),
+    };
+    let next_name = category_sessions[next].name.clone();
+    switch_client(runner, &next_name)?;
+    remember_session_for_client(runner, &client, &category, &next_name)
+}
+
+pub fn on_client_session_changed(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    client_name: Option<&str>,
+    session_name: Option<&str>,
+) -> Result<()> {
+    match (client_name, session_name) {
+        (Some(client_name), Some(session_name)) => {
+            remember_client_session_for_session(runner, config, client_name, session_name)
+        }
+        _ => remember_current_client_session(runner, config),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +283,120 @@ mod tests {
             client_memory_key("a/b", "work/private"),
             "@vde_client_612f62_work_private"
         );
+    }
+
+    #[test]
+    fn remember_current_client_session_uses_effective_category() {
+        let mock = MockTmuxRunner::new();
+        let format = session_list_format();
+        mock.stub(&["display-message", "-p", "#{client_name}"], "abc\n");
+        mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\n",
+        );
+        mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
+        remember_current_client_session(&mock, &crate::config::Config::default()).unwrap();
+        assert_eq!(mock.calls().len(), 4);
+    }
+
+    #[test]
+    fn set_session_category_override_sets_override_and_category() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "main",
+                crate::options::KEY_CATEGORY_OVERRIDE,
+                "private",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "main",
+                crate::options::KEY_CATEGORY,
+                "private",
+            ],
+            "",
+        );
+        set_session_category_override(&mock, "main", "private").unwrap();
+        assert_eq!(mock.calls().len(), 2);
+    }
+
+    #[test]
+    fn cycle_session_switches_next_in_current_category() {
+        let mock = MockTmuxRunner::new();
+        let format = session_list_format();
+        mock.stub(&["display-message", "-p", "#{client_name}"], "abc\n");
+        mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\nsub\u{1f}0\u{1f}101\u{1f}work\u{1f}\u{1f}\nother\u{1f}0\u{1f}102\u{1f}private\u{1f}\u{1f}\n",
+        );
+        mock.stub(&["switch-client", "-t", "sub"], "");
+        mock.stub(&["set-option", "-g", "@vde_client_616263_work", "sub"], "");
+        cycle_session(&mock, &crate::config::Config::default(), Direction::Next).unwrap();
+        assert_eq!(mock.calls().len(), 5);
+    }
+
+    #[test]
+    fn use_category_prefers_remembered_session() {
+        let mock = MockTmuxRunner::new();
+        let format = session_list_format();
+        mock.stub(&["display-message", "-p", "#{client_name}"], "abc\n");
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\nsub\u{1f}0\u{1f}101\u{1f}work\u{1f}\u{1f}\n",
+        );
+        mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "sub\n");
+        mock.stub(&["switch-client", "-t", "sub"], "");
+        mock.stub(&["set-option", "-g", "@vde_client_616263_work", "sub"], "");
+        use_category(&mock, &crate::config::Config::default(), "work").unwrap();
+        assert_eq!(mock.calls().len(), 5);
+    }
+
+    #[test]
+    fn hook_with_args_remembers_given_client_session() {
+        let mock = MockTmuxRunner::new();
+        let format = session_list_format();
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\n",
+        );
+        mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
+        on_client_session_changed(
+            &mock,
+            &crate::config::Config::default(),
+            Some("abc"),
+            Some("main"),
+        )
+        .unwrap();
+        assert_eq!(mock.calls().len(), 2);
+    }
+
+    #[test]
+    fn refresh_session_categories_sets_effective_categories() {
+        let mock = MockTmuxRunner::new();
+        let format = session_list_format();
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}private\n",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "main",
+                crate::options::KEY_CATEGORY,
+                "private",
+            ],
+            "",
+        );
+        refresh_session_categories(&mock, &crate::config::Config::default()).unwrap();
+        assert_eq!(mock.calls().len(), 2);
     }
 }
