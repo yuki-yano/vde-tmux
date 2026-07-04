@@ -457,11 +457,19 @@ fn shell_quote_for_test(value: &str) -> String {
 }
 
 fn unique_socket_path(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "{label}-{}.sock",
+    std::path::PathBuf::from(format!(
+        "/tmp/{label}-{}.sock",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
     ))
+}
+
+#[test]
+fn unique_socket_path_uses_short_tmp_path() {
+    let path = unique_socket_path("vde-tmux-sidebar-input");
+
+    assert!(path.starts_with("/tmp"));
+    assert!(path.display().to_string().len() < 104);
 }
