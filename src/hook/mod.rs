@@ -1,6 +1,7 @@
 //! hook 入力を @vde_* pane option 書き込みへ変換する。
 
 pub mod adapter;
+pub mod writer;
 
 use serde::{Deserialize, Serialize};
 
@@ -94,7 +95,7 @@ impl PaneOptionWrite {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TaskProgress {
     pub done: i64,
     pub total: i64,
