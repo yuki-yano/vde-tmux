@@ -4,5 +4,6 @@ pub mod config;
 pub mod options;
 pub mod project;
 pub mod session;
+pub mod session_manager;
 pub mod statusline;
 pub mod tmux;
