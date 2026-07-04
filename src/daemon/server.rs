@@ -336,7 +336,22 @@ fn handle_runtime_effects(
                     crate::sidebar::store::save_state(path, &state)?;
                 }
             }
-            RuntimeEffect::SetSessionBadge { .. } | RuntimeEffect::ClearSessionBadge { .. } => {}
+            RuntimeEffect::SetSessionBadge { session, value } => {
+                if let Err(error) = worker_io.set_session_option(
+                    &session,
+                    crate::options::KEY_SESSION_STATUS,
+                    &value,
+                ) {
+                    eprintln!("[vde-tmux] session badge set failed: {error:#}");
+                }
+            }
+            RuntimeEffect::ClearSessionBadge { session } => {
+                if let Err(error) =
+                    worker_io.unset_session_option(&session, crate::options::KEY_SESSION_STATUS)
+                {
+                    eprintln!("[vde-tmux] session badge clear failed: {error:#}");
+                }
+            }
         }
     }
     Ok(())
@@ -474,6 +489,7 @@ mod tests {
     #[derive(Default)]
     struct LoopWorkerIo {
         jumps: std::sync::Mutex<Vec<String>>,
+        session_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
         fail_jump: bool,
     }
 
@@ -492,6 +508,40 @@ mod tests {
             }
             self.jumps.lock().unwrap().push(pane_id.to_string());
             Ok(())
+        }
+
+        fn set_session_option(&self, session: &str, key: &str, value: &str) -> anyhow::Result<()> {
+            self.session_options.lock().unwrap().push((
+                session.to_string(),
+                key.to_string(),
+                Some(value.to_string()),
+            ));
+            Ok(())
+        }
+
+        fn unset_session_option(&self, session: &str, key: &str) -> anyhow::Result<()> {
+            self.session_options
+                .lock()
+                .unwrap()
+                .push((session.to_string(), key.to_string(), None));
+            Ok(())
+        }
+    }
+
+    fn test_agent_pane(
+        session: &str,
+        pane_id: &str,
+        status: &str,
+    ) -> crate::options::snapshot::PaneSnapshot {
+        crate::options::snapshot::PaneSnapshot {
+            session: session.to_string(),
+            window_id: "@1".to_string(),
+            pane_id: pane_id.to_string(),
+            current_path: "/tmp/app".to_string(),
+            current_command: "zsh".to_string(),
+            agent: "codex".to_string(),
+            status: status.to_string(),
+            ..crate::options::snapshot::PaneSnapshot::default()
         }
     }
 
@@ -632,5 +682,40 @@ mod tests {
         let saved = crate::sidebar::store::load_state(&state_path).unwrap();
         assert_eq!(saved.selection.as_deref(), Some("repo::misc::app"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn runtime_loop_executes_session_badge_effects() {
+        use crate::daemon::runtime::{DaemonEvent, RuntimeState};
+        use crate::sidebar::state::SidebarState;
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+
+        let io = Arc::new(LoopWorkerIo::default());
+        let (tx, rx) = mpsc::channel();
+        let state = RuntimeState::new(crate::config::Config::default(), SidebarState::default());
+        let handle = {
+            let io = io.clone();
+            thread::spawn(move || run_runtime_loop(state, rx, None, io))
+        };
+        tx.send(DaemonEvent::PanesUpdated(vec![test_agent_pane(
+            "main", "%1", "running",
+        )]))
+        .unwrap();
+        tx.send(DaemonEvent::Shutdown).unwrap();
+        handle.join().unwrap().unwrap();
+
+        let calls = io.session_options.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "main".to_string(),
+                    "@vde_session_status".to_string(),
+                    Some("🟡 ".to_string()),
+                ),
+                ("main".to_string(), "@vde_session_status".to_string(), None),
+            ]
+        );
     }
 }

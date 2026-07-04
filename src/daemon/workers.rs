@@ -16,6 +16,8 @@ pub trait WorkerIo: Send + Sync + 'static {
     fn read_panes(&self) -> Result<Vec<PaneSnapshot>>;
     fn capture_tail(&self, pane_id: &str) -> Result<String>;
     fn jump_to_pane(&self, pane_id: &str) -> Result<()>;
+    fn set_session_option(&self, session: &str, key: &str, value: &str) -> Result<()>;
+    fn unset_session_option(&self, session: &str, key: &str) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +43,14 @@ impl WorkerIo for SystemWorkerIo {
 
     fn jump_to_pane(&self, pane_id: &str) -> Result<()> {
         jump_to_pane(&self.runner, pane_id)
+    }
+
+    fn set_session_option(&self, session: &str, key: &str, value: &str) -> Result<()> {
+        crate::options::set_session_option(&self.runner, session, key, value)
+    }
+
+    fn unset_session_option(&self, session: &str, key: &str) -> Result<()> {
+        crate::options::unset_session_option(&self.runner, session, key)
     }
 }
 
@@ -220,6 +230,19 @@ mod tests {
 
         fn jump_to_pane(&self, pane_id: &str) -> anyhow::Result<()> {
             self.jumps.lock().unwrap().push(pane_id.to_string());
+            Ok(())
+        }
+
+        fn set_session_option(
+            &self,
+            _session: &str,
+            _key: &str,
+            _value: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn unset_session_option(&self, _session: &str, _key: &str) -> anyhow::Result<()> {
             Ok(())
         }
     }
