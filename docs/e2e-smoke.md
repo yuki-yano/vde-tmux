@@ -311,3 +311,33 @@ header_config=pill style via sidebar.header prefix/suffix/format/separator/bold/
 preview_repeat=3 runs all left=10 top=4 width=80 height=32 floating=1 on 100x40 scratch window
 result=sidebar header style and preview stable center ok
 ```
+
+Plan 12 後の M6 runtime smoke 再実行も pass。
+
+```text
+executed_at=2026-07-05 01:11:13 JST
+script=scripts/smoke-m6-runtime.sh
+subscribe snapshot ok
+capture detect ok
+session badge blocked ok
+session badge done ok
+statusline badge render ok
+input redraw state ok
+query response ok
+session badge cleanup ok
+M6 runtime smoke ok
+```
+
+Plan 12 固有の scratch runtime smoke も pass。
+
+```text
+executed_at=2026-07-05 01:11:13 JST
+scratch=vde-m12-runtime-<timestamp>
+checked=stale agent exclusion with zsh pane retaining @vde_agent
+checked=badge glyphs 🔴/🟡/🔵/🟢 and unread -> viewed transition via control-mode attach
+checked=path_patterns with ${WORK_OWNER} expansion resolves category work
+checked=preview floating pane width matches target pane, centered by pane_left, q/Esc close
+checked=preview source capture includes scrollback via capture-pane -S -2000
+checked=double-click dispatch covered by sidebar::tui pseudo-time tests in quality gate
+result=Plan 12 scratch smoke ok
+```

@@ -10,6 +10,7 @@ DAEMON_SOCKET="$RUNTIME_DIR/daemon.sock"
 STATE_HOME="$RUNTIME_DIR/state"
 CONFIG_HOME="$RUNTIME_DIR/config"
 LOG="$RUNTIME_DIR/daemon.log"
+AGENT_BIN="$RUNTIME_DIR/codex"
 
 cleanup() {
   set +e
@@ -28,12 +29,35 @@ chmod 700 "$RUNTIME_DIR"
 
 cargo build
 
-tmux -L "$TMUX_SOCKET" -f /dev/null new-session -d -s main -n work -c "$ROOT" "/bin/sh"
+cat >"$RUNTIME_DIR/codex.c" <<'C'
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+  char line[256];
+  signal(SIGINT, SIG_IGN);
+  printf("? Allow command to run?\n  y) yes\n  n) no\n");
+  fflush(stdout);
+  while (fgets(line, sizeof(line), stdin) != NULL) {
+    if (strncmp(line, "clear", 5) == 0) {
+      printf("\033[2J\033[Hidle\n");
+      fflush(stdout);
+    }
+  }
+  for (;;) {
+    pause();
+  }
+}
+C
+cc -o "$AGENT_BIN" "$RUNTIME_DIR/codex.c"
+
+tmux -L "$TMUX_SOCKET" -f /dev/null new-session -d -s main -n work -c "$ROOT" "$AGENT_BIN"
 PANE_ID="$(tmux -L "$TMUX_SOCKET" list-panes -a -F '#{pane_id}' | head -n 1)"
 
 tmux -L "$TMUX_SOCKET" set-option -p -t "$PANE_ID" @vde_agent codex
 tmux -L "$TMUX_SOCKET" set-option -p -t "$PANE_ID" @vde_status running
-tmux -L "$TMUX_SOCKET" send-keys -t "$PANE_ID" "printf '? Allow command to run?\n  y) yes\n  n) no\n'; sleep 600" C-m
 
 VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET" \
 VDE_DAEMON_SOCKET="$DAEMON_SOCKET" \
