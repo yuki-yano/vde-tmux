@@ -1,21 +1,26 @@
 //! daemon server と request handler。
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use super::protocol::{ClientMessage, QueryTarget, ServerMessage};
 use super::runtime::{ClientId, DaemonEvent, LatestSlot, RuntimeEffect, RuntimeState};
 use crate::daemon::{build_snapshot, statusline_agent_badge_fallback};
 use crate::options::snapshot::read_all_panes;
 use crate::tmux::TmuxRunner;
+
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+static SHUTDOWN_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
 pub fn handle_message(runner: &dyn TmuxRunner, message: ClientMessage) -> Result<ServerMessage> {
     match message {
@@ -31,10 +36,6 @@ pub fn handle_message(runner: &dyn TmuxRunner, message: ClientMessage) -> Result
             Ok(ServerMessage::Snapshot {
                 snapshot: build_snapshot(&panes),
             })
-        }
-        ClientMessage::StatuslineAgentBadge => {
-            let value = statusline_agent_badge_fallback(runner)?;
-            Ok(ServerMessage::StatuslineAgentBadge { value })
         }
         ClientMessage::SidebarEvent { .. } => Ok(ServerMessage::Error {
             message: "sidebar events require runtime daemon".to_string(),
@@ -86,8 +87,7 @@ pub fn handle_stream_with_runtime(
         ClientMessage::Query {
             proto: _,
             what: QueryTarget::Statusline,
-        }
-        | ClientMessage::StatuslineAgentBadge => {
+        } => {
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(DaemonEvent::QueryStatusline { reply: reply_tx })?;
             let response = reply_rx
@@ -107,6 +107,11 @@ fn spawn_client_writer(
     slot: Arc<LatestSlot<ServerMessage>>,
     tx: Sender<DaemonEvent>,
 ) {
+    if let Err(error) = configure_client_writer_stream(&stream) {
+        eprintln!("[vde-tmux] daemon client writer setup error: {error:#}");
+        let _ = tx.send(DaemonEvent::Disconnect { client_id });
+        return;
+    }
     thread::spawn(move || {
         while let Some(message) = slot.wait_for_update() {
             if let Err(error) = write_server_message(&mut stream, &message) {
@@ -116,6 +121,11 @@ fn spawn_client_writer(
             }
         }
     });
+}
+
+fn configure_client_writer_stream(stream: &UnixStream) -> Result<()> {
+    stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
+    Ok(())
 }
 
 fn write_server_message(stream: &mut UnixStream, message: &ServerMessage) -> Result<()> {
@@ -170,6 +180,7 @@ pub fn run_runtime_daemon_server(
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
 
     let (tx, rx) = mpsc::channel();
+    install_shutdown_signal_handler(tx.clone())?;
     let latest_panes = Arc::new(crate::daemon::workers::LatestPanes::default());
     let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
     let worker_io = Arc::new(crate::daemon::workers::SystemWorkerIo::new(runner));
@@ -219,6 +230,67 @@ pub fn run_runtime_daemon_server(
         Some(state_path),
         worker_io,
     )
+}
+
+pub fn install_shutdown_signal_handler(tx: Sender<DaemonEvent>) -> Result<()> {
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` writes two valid file descriptors into `fds` on success.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        bail!(
+            "failed to create shutdown signal pipe: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    SHUTDOWN_SIGNAL_WRITE_FD.store(fds[1], Ordering::SeqCst);
+    install_shutdown_signal(libc::SIGTERM)?;
+    install_shutdown_signal(libc::SIGINT)?;
+    // SAFETY: `fds[0]` is a fresh read end returned by `pipe` and is now owned by `File`.
+    let reader = unsafe { fs::File::from_raw_fd(fds[0]) };
+    spawn_shutdown_forwarder(reader, tx);
+    Ok(())
+}
+
+fn install_shutdown_signal(signum: libc::c_int) -> Result<()> {
+    // SAFETY: zeroed `sigaction` is immediately initialized with a handler, empty mask, and flags.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = shutdown_signal_handler as *const () as usize;
+    action.sa_flags = 0;
+    // SAFETY: `action.sa_mask` is a valid signal set field to initialize.
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+    }
+    // SAFETY: `sigaction` installs a plain async-signal-safe handler for the given signal.
+    if unsafe { libc::sigaction(signum, &action, std::ptr::null_mut()) } != 0 {
+        bail!(
+            "failed to install signal handler for {signum}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+extern "C" fn shutdown_signal_handler(_signum: libc::c_int) {
+    let fd = SHUTDOWN_SIGNAL_WRITE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let byte = [1_u8];
+    // SAFETY: `write` is async-signal-safe; fd is the stored pipe write end.
+    unsafe {
+        let _ = libc::write(fd, byte.as_ptr().cast(), byte.len());
+    }
+}
+
+fn spawn_shutdown_forwarder<R>(mut reader: R, tx: Sender<DaemonEvent>)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut byte = [0_u8; 1];
+        if reader.read(&mut byte).is_ok() {
+            let _ = tx.send(DaemonEvent::Shutdown);
+        }
+    });
 }
 
 pub fn run_runtime_loop(
@@ -299,23 +371,6 @@ mod tests {
     }
 
     #[test]
-    fn handle_message_returns_statusline_badge() {
-        let mock = MockTmuxRunner::new();
-        let format = snapshot_format();
-        mock.stub(
-            &["list-panes", "-a", "-F", &format],
-            &format!("{}\n", pane_line("codex", "running", "")),
-        );
-        let response = handle_message(&mock, ClientMessage::StatuslineAgentBadge).unwrap();
-        assert_eq!(
-            response,
-            ServerMessage::StatuslineAgentBadge {
-                value: "running:1".to_string()
-            }
-        );
-    }
-
-    #[test]
     fn handle_query_returns_statusline_payload() {
         let mock = MockTmuxRunner::new();
         let format = snapshot_format();
@@ -376,6 +431,41 @@ mod tests {
         let mut line = String::new();
         BufReader::new(client).read_line(&mut line).unwrap();
         assert_eq!(line.trim(), r#"{"type":"ack"}"#);
+    }
+
+    #[test]
+    fn client_writer_stream_has_write_timeout() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let (_client, server) = UnixStream::pair().unwrap();
+
+        configure_client_writer_stream(&server).unwrap();
+
+        assert_eq!(
+            server.write_timeout().unwrap(),
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn shutdown_forwarder_sends_shutdown_event() {
+        use crate::daemon::runtime::DaemonEvent;
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (mut signal_writer, signal_reader) = UnixStream::pair().unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_shutdown_forwarder(signal_reader, tx);
+
+        signal_writer.write_all(b"x").unwrap();
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DaemonEvent::Shutdown
+        ));
     }
 
     #[derive(Default)]
@@ -489,5 +579,55 @@ mod tests {
                 agent_badge: String::new()
             }
         );
+    }
+
+    #[test]
+    fn runtime_loop_flushes_dirty_state_on_shutdown() {
+        use crate::daemon::protocol::SidebarClientEvent;
+        use crate::daemon::runtime::{ClientId, DaemonEvent, RuntimeState};
+        use crate::options::snapshot::PaneSnapshot;
+        use crate::sidebar::state::SidebarState;
+        use std::sync::{Arc, mpsc};
+
+        let dir = std::env::temp_dir().join(format!(
+            "vde-runtime-shutdown-flush-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state_path = dir.join("state.json");
+        let io = Arc::new(LoopWorkerIo::default());
+        let (tx, rx) = mpsc::channel();
+        tx.send(DaemonEvent::PanesUpdated(vec![PaneSnapshot {
+            session: "main".to_string(),
+            window_id: "@1".to_string(),
+            pane_id: "%1".to_string(),
+            current_path: "/tmp/app".to_string(),
+            agent: "codex".to_string(),
+            status: "running".to_string(),
+            ..PaneSnapshot::default()
+        }]))
+        .unwrap();
+        tx.send(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "j".to_string(),
+            },
+        })
+        .unwrap();
+        tx.send(DaemonEvent::Shutdown).unwrap();
+
+        run_runtime_loop(
+            RuntimeState::new(crate::config::Config::default(), SidebarState::default()),
+            rx,
+            Some(state_path.clone()),
+            io,
+        )
+        .unwrap();
+
+        let saved = crate::sidebar::store::load_state(&state_path).unwrap();
+        assert_eq!(saved.selection.as_deref(), Some("repo::misc::app"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -18,7 +18,6 @@ pub enum ClientMessage {
         proto: u16,
         event: SidebarClientEvent,
     },
-    StatuslineAgentBadge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +38,6 @@ pub enum QueryTarget {
 pub enum ServerMessage {
     Statusline { agent_badge: String },
     Snapshot { snapshot: DaemonSnapshot },
-    StatuslineAgentBadge { value: String },
     Ack,
     Error { message: String },
 }
@@ -47,28 +45,6 @@ pub enum ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn client_message_roundtrips_statusline_agent_badge() {
-        let json = serde_json::to_string(&ClientMessage::StatuslineAgentBadge).unwrap();
-        assert_eq!(json, r#"{"op":"statusline_agent_badge"}"#);
-        let message: ClientMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(message, ClientMessage::StatuslineAgentBadge);
-    }
-
-    #[test]
-    fn server_message_roundtrips_badge() {
-        let message = ServerMessage::StatuslineAgentBadge {
-            value: "running:1".to_string(),
-        };
-        let json = serde_json::to_string(&message).unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"statusline_agent_badge","value":"running:1"}"#
-        );
-        let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, message);
-    }
 
     #[test]
     fn query_statusline_uses_role_declaration_shape() {

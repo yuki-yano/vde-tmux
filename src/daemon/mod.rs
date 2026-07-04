@@ -147,7 +147,6 @@ pub fn query_statusline_agent_badge(socket_path: &Path) -> Result<String> {
     reader.read_line(&mut line)?;
     match serde_json::from_str::<ServerMessage>(line.trim())? {
         ServerMessage::Statusline { agent_badge } => Ok(agent_badge),
-        ServerMessage::StatuslineAgentBadge { value } => Ok(value),
         ServerMessage::Ack => bail!("unexpected daemon ack response"),
         ServerMessage::Error { message } => bail!(message),
         ServerMessage::Snapshot { .. } => bail!("unexpected daemon snapshot response"),
