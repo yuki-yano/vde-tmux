@@ -17,6 +17,12 @@ pub struct SessionInfo {
     pub category_override: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Next,
+    Previous,
+}
+
 pub fn session_list_format() -> String {
     [
         "#{session_name}",
