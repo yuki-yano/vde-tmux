@@ -77,6 +77,7 @@ mod tests {
             label: id.to_string(),
             chat_count: 1,
             rollup: crate::hook::RollupLevel::Idle,
+            badge_state: None,
             expanded: true,
             pane_id: pane_id.map(ToOwned::to_owned),
             git: None,

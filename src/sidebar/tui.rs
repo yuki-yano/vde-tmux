@@ -52,7 +52,7 @@ pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<O
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let runner = SystemTmuxRunner::from_env(Duration::from_secs(1));
-    let theme = SidebarRenderTheme::from_sidebar_config(&config.sidebar);
+    let theme = SidebarRenderTheme::from_app_config(config);
     let result = run_loop(&mut terminal, &socket, &rx, &runner, env, &theme);
     disable_raw_mode()?;
     execute!(
@@ -512,6 +512,7 @@ mod tests {
             label: "codex (%1)".to_string(),
             chat_count: 1,
             rollup: RollupLevel::Running,
+            badge_state: None,
             expanded: true,
             pane_id: Some("%1".to_string()),
             git: None,
@@ -621,6 +622,7 @@ mod tests {
                         label: "app".to_string(),
                         chat_count: 1,
                         rollup: RollupLevel::Running,
+                        badge_state: None,
                         expanded: true,
                         pane_id: None,
                         git: None,
@@ -648,6 +650,7 @@ mod tests {
                     label: "app".to_string(),
                     chat_count: 1,
                     rollup: RollupLevel::Running,
+                    badge_state: None,
                     expanded: true,
                     pane_id: None,
                     git: None,
@@ -674,6 +677,7 @@ mod tests {
                         label: "app".to_string(),
                         chat_count: 1,
                         rollup: RollupLevel::Running,
+                        badge_state: None,
                         expanded: true,
                         pane_id: None,
                         git: None,

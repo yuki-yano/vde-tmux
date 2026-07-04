@@ -1,4 +1,5 @@
 use crate::hook::RollupLevel;
+use crate::daemon::session_badge::{BadgeState, glyph_for_state};
 use crate::sidebar::state::{SidebarState, StatusFilter, ViewMode};
 use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 use ratatui::style::{Color, Modifier, Style};
@@ -21,6 +22,7 @@ pub struct SidebarRenderTheme {
     pub header_prefix: String,
     pub header_suffix: String,
     pub header_separator: String,
+    pub badge_glyphs: crate::config::BadgeGlyphs,
 }
 
 impl Default for SidebarRenderTheme {
@@ -41,6 +43,7 @@ impl Default for SidebarRenderTheme {
             header_prefix: String::new(),
             header_suffix: String::new(),
             header_separator: String::new(),
+            badge_glyphs: crate::config::BadgeGlyphs::default(),
         }
     }
 }
@@ -66,6 +69,7 @@ impl SidebarRenderTheme {
             header_prefix: default.header_prefix,
             header_suffix: default.header_suffix,
             header_separator: default.header_separator,
+            badge_glyphs: default.badge_glyphs,
         }
     }
 
@@ -83,6 +87,12 @@ impl SidebarRenderTheme {
         theme
     }
 
+    pub fn from_app_config(config: &crate::config::Config) -> Self {
+        let mut theme = Self::from_sidebar_config(&config.sidebar);
+        theme.badge_glyphs = config.badge.glyphs.clone();
+        theme
+    }
+
     fn rollup_color(&self, level: RollupLevel) -> Color {
         match level {
             RollupLevel::Error => self.error,
@@ -92,6 +102,10 @@ impl SidebarRenderTheme {
             RollupLevel::Waiting => self.waiting,
             RollupLevel::Idle => self.idle,
         }
+    }
+
+    fn badge_glyph(&self, state: BadgeState) -> &str {
+        glyph_for_state(state, &self.badge_glyphs)
     }
 }
 
@@ -265,7 +279,7 @@ fn render_row_line(
     if selected {
         style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
     }
-    let text = render_row_text(row, state, width);
+    let text = render_row_text(row, state, width, theme);
     if row.kind == SidebarRowKind::Repo
         && let Some(git) = &row.git
     {
@@ -274,18 +288,27 @@ fn render_row_line(
     Line::from(Span::styled(text, style))
 }
 
-fn render_row_text(row: &SidebarRow, state: &SidebarState, width: usize) -> String {
+fn render_row_text(
+    row: &SidebarRow,
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> String {
     let selected = if state.selection.as_deref() == Some(row.id.as_str()) {
         "> "
     } else {
         "  "
     };
     let indent = "  ".repeat(row.depth);
+    let badge = row
+        .badge_state
+        .map(|state| format!("{} ", theme.badge_glyph(state)))
+        .unwrap_or_default();
     let line = match row.kind {
         SidebarRowKind::Category | SidebarRowKind::Repo => {
             let marker = if row.expanded { "v" } else { ">" };
             format!(
-                "{selected}{indent}{marker} {} [{}:{}]",
+                "{selected}{indent}{marker} {badge}{} [{}:{}]",
                 row.label,
                 rollup_label(row.rollup),
                 row.chat_count
@@ -293,11 +316,7 @@ fn render_row_text(row: &SidebarRow, state: &SidebarState, width: usize) -> Stri
         }
         SidebarRowKind::Chat => {
             let marker = if row.expanded { "v" } else { ">" };
-            format!(
-                "{selected}{indent}{marker} {} [{}]",
-                row.label,
-                rollup_label(row.rollup)
-            )
+            format!("{selected}{indent}{marker} {badge}{}", row.label)
         }
         SidebarRowKind::Detail => {
             format!("{selected}{indent}{}", row.label)
@@ -364,7 +383,11 @@ fn render_rail_lines(
             if state.selection.as_deref() == Some(row.id.as_str()) {
                 style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
             }
-            Line::from(Span::styled(rollup_glyph(row.rollup).to_string(), style))
+            let glyph = row
+                .badge_state
+                .map(|state| theme.badge_glyph(state).to_string())
+                .unwrap_or_else(|| rollup_glyph(row.rollup).to_string());
+            Line::from(Span::styled(glyph, style))
         })
         .collect()
 }
@@ -505,6 +528,7 @@ mod tests {
             label: label.to_string(),
             chat_count: 1,
             rollup,
+            badge_state: None,
             expanded: true,
             pane_id: None,
             git: None,
@@ -537,7 +561,7 @@ mod tests {
         let rendered = render_rows(&rows, &state, 32);
 
         assert!(rendered.contains("v app [running:1]"));
-        assert!(rendered.contains(">   v codex %1 [running]"));
+        assert!(rendered.contains(">   v codex %1"));
     }
 
     #[test]
@@ -741,7 +765,40 @@ sidebar:
             lines[0].spans[0]
                 .style
                 .add_modifier
-                .contains(Modifier::BOLD)
+            .contains(Modifier::BOLD)
         );
+    }
+
+    #[test]
+    fn chat_rows_render_badge_glyph_and_omit_trailing_status_text() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex (%1)",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
+
+        let rendered = render_rows(&[chat], &SidebarState::default(), 80);
+
+        assert!(rendered.contains("🟡 codex (%1)"), "{rendered}");
+        assert!(!rendered.contains("[running]"), "{rendered}");
+    }
+
+    #[test]
+    fn rail_uses_badge_glyphs() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex",
+            RollupLevel::Idle,
+        );
+        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Done);
+
+        let rendered = render_rows(&[chat], &SidebarState::default(), 2);
+
+        assert_eq!(rendered, "🔵");
     }
 }

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::category::resolve_category_for_session;
 use crate::config::Config;
+use crate::daemon::session_badge::{BadgeState, badge_state};
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
 use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane};
 use crate::session::SessionInfo;
@@ -26,6 +27,7 @@ pub struct SidebarRow {
     pub label: String,
     pub chat_count: usize,
     pub rollup: RollupLevel,
+    pub badge_state: Option<BadgeState>,
     pub expanded: bool,
     pub pane_id: Option<String>,
     pub git: Option<crate::git::GitBadge>,
@@ -44,6 +46,7 @@ struct AgentPane {
     started_at: String,
     tasks: String,
     rollup: RollupLevel,
+    badge_state: BadgeState,
     repo_path: String,
     attention: bool,
 }
@@ -62,7 +65,17 @@ pub fn build_rows_with_git(
     state: &SidebarState,
     git: &BTreeMap<String, crate::git::GitBadge>,
 ) -> Vec<SidebarRow> {
-    build_rows_at_with_git(config, panes, state, git, now_epoch_secs())
+    build_rows_with_git_and_unread(config, panes, state, git, &BTreeMap::new())
+}
+
+pub fn build_rows_with_git_and_unread(
+    config: &Config,
+    panes: &[PaneSnapshot],
+    state: &SidebarState,
+    git: &BTreeMap<String, crate::git::GitBadge>,
+    unread: &BTreeMap<String, bool>,
+) -> Vec<SidebarRow> {
+    build_rows_at_with_git_and_unread(config, panes, state, git, unread, now_epoch_secs())
 }
 
 pub fn build_rows_at(
@@ -71,7 +84,7 @@ pub fn build_rows_at(
     state: &SidebarState,
     now: i64,
 ) -> Vec<SidebarRow> {
-    build_rows_at_with_git(config, panes, state, &BTreeMap::new(), now)
+    build_rows_at_with_git_and_unread(config, panes, state, &BTreeMap::new(), &BTreeMap::new(), now)
 }
 
 pub fn build_rows_at_with_git(
@@ -79,6 +92,17 @@ pub fn build_rows_at_with_git(
     panes: &[PaneSnapshot],
     state: &SidebarState,
     git: &BTreeMap<String, crate::git::GitBadge>,
+    now: i64,
+) -> Vec<SidebarRow> {
+    build_rows_at_with_git_and_unread(config, panes, state, git, &BTreeMap::new(), now)
+}
+
+pub fn build_rows_at_with_git_and_unread(
+    config: &Config,
+    panes: &[PaneSnapshot],
+    state: &SidebarState,
+    git: &BTreeMap<String, crate::git::GitBadge>,
+    unread: &BTreeMap<String, bool>,
     now: i64,
 ) -> Vec<SidebarRow> {
     let mut groups: BTreeMap<(String, String), Vec<AgentPane>> = BTreeMap::new();
@@ -89,6 +113,7 @@ pub fn build_rows_at_with_git(
         let repo = repo_label(pane);
         let category = category_for_pane(config, pane, &repo);
         let rollup = rollup_for_pane(pane);
+        let unread = unread.get(&pane.pane_id).copied().unwrap_or(false);
         groups
             .entry((category.clone(), repo.clone()))
             .or_default()
@@ -104,6 +129,7 @@ pub fn build_rows_at_with_git(
                 started_at: pane.started_at.clone(),
                 tasks: pane.tasks.clone(),
                 rollup,
+                badge_state: badge_state(rollup, unread),
                 repo_path: pane.current_path.clone(),
                 attention: pane.attention == "1",
             });
@@ -153,6 +179,7 @@ fn category_rows(
             label: category,
             chat_count: all_panes.len(),
             rollup: rollup(&all_panes),
+            badge_state: badge_rollup(&all_panes),
             expanded,
             pane_id: None,
             git: None,
@@ -221,6 +248,7 @@ fn repo_rows_from_keyed_map(
             label: first.repo.clone(),
             chat_count: panes.len(),
             rollup: rollup(&panes),
+            badge_state: badge_rollup(&panes),
             expanded,
             pane_id: None,
             git: git.get(&first.repo_path).cloned(),
@@ -262,6 +290,7 @@ fn push_chat_row(
         label: chat_label(pane),
         chat_count: 1,
         rollup: pane.rollup,
+        badge_state: Some(pane.badge_state),
         expanded,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
@@ -279,6 +308,7 @@ fn detail_row(pane: &AgentPane, depth: usize, suffix: &str, label: String) -> Si
         label,
         chat_count: 0,
         rollup: pane.rollup,
+        badge_state: Some(pane.badge_state),
         expanded: true,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
@@ -316,6 +346,7 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, now: i64, rows: &mut Ve
         label: "jump".to_string(),
         chat_count: 0,
         rollup: pane.rollup,
+        badge_state: Some(pane.badge_state),
         expanded: true,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
@@ -409,6 +440,10 @@ fn rollup(panes: &[AgentPane]) -> RollupLevel {
         .map(|pane| pane.rollup)
         .min()
         .unwrap_or(RollupLevel::Idle)
+}
+
+fn badge_rollup(panes: &[AgentPane]) -> Option<BadgeState> {
+    panes.iter().map(|pane| pane.badge_state).min()
 }
 
 fn category_for_pane(config: &Config, pane: &PaneSnapshot, repo: &str) -> String {
@@ -834,6 +869,34 @@ mod tests {
 
         assert!(rows.iter().all(|row| !row.id.contains("%1")));
         assert!(rows.iter().any(|row| row.id.contains("%2")));
+    }
+
+    #[test]
+    fn repo_row_badge_state_is_minimum_of_children() {
+        let mut done = pane("main", "%1", "/tmp/app", "codex", "idle");
+        done.window_active = false;
+        done.session_attached = false;
+        let mut blocked = pane("main", "%2", "/tmp/app", "codex", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        let unread = BTreeMap::from([("%1".to_string(), true)]);
+
+        let rows = build_rows_at_with_git_and_unread(
+            &Config::default(),
+            &[done, blocked],
+            &SidebarState::default(),
+            &BTreeMap::new(),
+            &unread,
+            1000,
+        );
+
+        let repo = rows
+            .iter()
+            .find(|row| row.kind == SidebarRowKind::Repo)
+            .unwrap();
+        assert_eq!(
+            repo.badge_state,
+            Some(crate::daemon::session_badge::BadgeState::Blocked)
+        );
     }
 
     #[test]

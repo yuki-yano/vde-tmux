@@ -149,7 +149,7 @@ impl Default for SessionBadgeConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct BadgeConfig {
     pub glyphs: BadgeGlyphs,
@@ -163,7 +163,7 @@ impl Default for BadgeConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct BadgeGlyphs {
     pub blocked: String,
