@@ -85,6 +85,23 @@ pub fn unset_session_option(runner: &dyn TmuxRunner, session: &str, key: &str) -
     Ok(())
 }
 
+pub fn set_global_option(runner: &dyn TmuxRunner, key: &str, value: &str) -> Result<()> {
+    runner.run(&["set-option", "-g", key, value])?;
+    Ok(())
+}
+
+pub fn show_global_option(runner: &dyn TmuxRunner, key: &str) -> Result<Option<String>> {
+    let value = runner
+        .run(&["show-option", "-gqv", key])?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +150,32 @@ mod tests {
         );
         unset_session_option(&mock, "main", KEY_CATEGORY_OVERRIDE).unwrap();
         assert_eq!(mock.calls().len(), 1);
+    }
+
+    #[test]
+    fn set_global_option_issues_global_set() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
+        set_global_option(&mock, "@vde_client_616263_work", "main").unwrap();
+        assert_eq!(mock.calls().len(), 1);
+    }
+
+    #[test]
+    fn show_global_option_reads_quiet_value() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["show-option", "-gqv", "@vde_client_616263_work"],
+            "main\n",
+        );
+        let value = show_global_option(&mock, "@vde_client_616263_work").unwrap();
+        assert_eq!(value, Some("main".to_string()));
+    }
+
+    #[test]
+    fn show_global_option_maps_empty_to_none() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "\n");
+        let value = show_global_option(&mock, "@vde_client_616263_work").unwrap();
+        assert_eq!(value, None);
     }
 }
