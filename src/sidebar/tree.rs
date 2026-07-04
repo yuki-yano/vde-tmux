@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::category::resolve_category_for_session;
 use crate::config::Config;
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
@@ -7,14 +9,14 @@ use crate::options::snapshot::PaneSnapshot;
 use crate::session::SessionInfo;
 use crate::sidebar::state::{SidebarRowRef, SidebarState, ViewMode};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SidebarRowKind {
     Category,
     Repo,
     Chat,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidebarRow {
     pub id: String,
     pub kind: SidebarRowKind,

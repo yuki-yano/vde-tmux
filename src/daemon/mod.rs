@@ -2,6 +2,7 @@
 
 pub mod lifecycle;
 pub mod protocol;
+pub mod runtime;
 pub mod server;
 
 use std::collections::BTreeMap;
@@ -15,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::daemon::protocol::{ClientMessage, ServerMessage};
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
 use crate::options::snapshot::{PaneSnapshot, read_all_panes};
+use crate::sidebar::state::SidebarState;
+use crate::sidebar::tree::SidebarRow;
 use crate::tmux::TmuxRunner;
 
 const ENV_DAEMON_SOCKET: &str = "VDE_DAEMON_SOCKET";
@@ -33,9 +36,24 @@ pub struct DaemonSnapshot {
     pub agent_count: usize,
     pub rollup: RollupLevel,
     pub panes: Vec<AgentPaneSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar: Option<SidebarFrame>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarFrame {
+    pub state: SidebarState,
+    pub rows: Vec<SidebarRow>,
 }
 
 pub fn build_snapshot(panes: &[PaneSnapshot]) -> DaemonSnapshot {
+    build_snapshot_with_sidebar(panes, None)
+}
+
+pub fn build_snapshot_with_sidebar(
+    panes: &[PaneSnapshot],
+    sidebar: Option<SidebarFrame>,
+) -> DaemonSnapshot {
     let panes = panes
         .iter()
         .filter(|pane| !pane.agent.is_empty())
@@ -61,6 +79,7 @@ pub fn build_snapshot(panes: &[PaneSnapshot]) -> DaemonSnapshot {
         agent_count: panes.len(),
         rollup,
         panes,
+        sidebar,
     }
 }
 
@@ -128,6 +147,7 @@ pub fn query_statusline_agent_badge(socket_path: &Path) -> Result<String> {
     match serde_json::from_str::<ServerMessage>(line.trim())? {
         ServerMessage::Statusline { agent_badge } => Ok(agent_badge),
         ServerMessage::StatuslineAgentBadge { value } => Ok(value),
+        ServerMessage::Ack => bail!("unexpected daemon ack response"),
         ServerMessage::Error { message } => bail!(message),
         ServerMessage::Snapshot { .. } => bail!("unexpected daemon snapshot response"),
     }

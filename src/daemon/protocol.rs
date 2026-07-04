@@ -7,9 +7,25 @@ use super::DaemonSnapshot;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ClientMessage {
-    Query { proto: u16, what: QueryTarget },
-    Subscribe { proto: u16 },
+    Query {
+        proto: u16,
+        what: QueryTarget,
+    },
+    Subscribe {
+        proto: u16,
+    },
+    SidebarEvent {
+        proto: u16,
+        event: SidebarClientEvent,
+    },
     StatuslineAgentBadge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SidebarClientEvent {
+    Key { key: String },
+    JumpPane { pane: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +40,7 @@ pub enum ServerMessage {
     Statusline { agent_badge: String },
     Snapshot { snapshot: DaemonSnapshot },
     StatuslineAgentBadge { value: String },
+    Ack,
     Error { message: String },
 }
 
@@ -72,5 +89,30 @@ mod tests {
         assert_eq!(json, r#"{"op":"subscribe","proto":1}"#);
         let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn sidebar_event_roundtrips_key() {
+        let message = ClientMessage::SidebarEvent {
+            proto: 1,
+            event: SidebarClientEvent::Key {
+                key: "j".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            json,
+            r#"{"op":"sidebar_event","proto":1,"event":{"type":"key","key":"j"}}"#
+        );
+        let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn ack_roundtrips() {
+        let json = serde_json::to_string(&ServerMessage::Ack).unwrap();
+        assert_eq!(json, r#"{"type":"ack"}"#);
+        let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, ServerMessage::Ack);
     }
 }

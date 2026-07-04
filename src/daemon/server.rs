@@ -31,6 +31,9 @@ pub fn handle_message(runner: &dyn TmuxRunner, message: ClientMessage) -> Result
             let value = statusline_agent_badge_fallback(runner)?;
             Ok(ServerMessage::StatuslineAgentBadge { value })
         }
+        ClientMessage::SidebarEvent { .. } => Ok(ServerMessage::Error {
+            message: "sidebar events require runtime daemon".to_string(),
+        }),
     }
 }
 
