@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Write};
+use std::panic;
 use std::path::Path;
+use std::sync::Once;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -21,7 +23,10 @@ use crate::daemon::DaemonSnapshot;
 use crate::sidebar::client::{send_sidebar_key, socket_path, subscribe};
 use crate::sidebar::render::render_rows;
 
+static PANIC_RESTORE_HOOK: Once = Once::new();
+
 pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<Option<String>> {
+    install_panic_restore_hook();
     let socket = socket_path(env);
     let (tx, rx) = mpsc::channel();
     subscribe(&socket, tx)?;
@@ -38,6 +43,23 @@ pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<O
     result?;
     let _ = config;
     Ok(None)
+}
+
+fn install_panic_restore_hook() {
+    PANIC_RESTORE_HOOK.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let mut stderr = io::stderr();
+            let _ = restore_terminal_after_panic(&mut stderr);
+            previous(info);
+        }));
+    });
+}
+
+fn restore_terminal_after_panic<W: Write>(writer: &mut W) -> Result<()> {
+    let _ = disable_raw_mode();
+    execute!(writer, LeaveAlternateScreen)?;
+    Ok(())
 }
 
 pub fn run_loop<B: Backend>(
@@ -145,5 +167,15 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("codex %1"));
+    }
+
+    #[test]
+    fn restore_terminal_after_panic_leaves_alternate_screen() {
+        let mut output = Vec::new();
+
+        restore_terminal_after_panic(&mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\u{1b}[?1049l"));
     }
 }
