@@ -102,6 +102,44 @@ else:
     raise AssertionError(last)
 PY
 
+# --- session badge ---
+badge_wait() {
+  local expect="$1"
+  local got=""
+  for _ in $(seq 1 50); do
+    got="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_session_status 2>/dev/null || true)"
+    [[ "$got" == "$expect" ]] && return 0
+    sleep 0.1
+  done
+  echo "session badge mismatch: expected [$expect] got [$got]" >&2
+  return 1
+}
+
+badge_wait "🔴 "
+echo "session badge blocked ok"
+
+tmux -L "$TMUX_SOCKET" send-keys -t "$PANE_ID" C-c
+sleep 0.3
+tmux -L "$TMUX_SOCKET" send-keys -t "$PANE_ID" "clear" C-m
+sleep 0.1
+tmux -L "$TMUX_SOCKET" clear-history -t "$PANE_ID"
+tmux -L "$TMUX_SOCKET" set-option -p -t "$PANE_ID" @vde_status idle
+tmux -L "$TMUX_SOCKET" set-option -p -t "$PANE_ID" -u @vde_wait_reason 2>/dev/null || true
+badge_wait "🔵 "
+echo "session badge done ok"
+
+SESSIONS_OUT="$(VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET" \
+  VDE_DAEMON_SOCKET="$DAEMON_SOCKET" \
+  XDG_STATE_HOME="$STATE_HOME" \
+  "$BIN" statusline-sessions 2>/dev/null || true)"
+case "$SESSIONS_OUT" in
+  *"🔵 "*) echo "statusline badge render ok" ;;
+  *)
+    echo "statusline output missing badge: [$SESSIONS_OUT]" >&2
+    exit 1
+    ;;
+esac
+
 VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET" \
 VDE_DAEMON_SOCKET="$DAEMON_SOCKET" \
 XDG_STATE_HOME="$STATE_HOME" \
@@ -146,5 +184,12 @@ msg = json.loads(line)
 assert msg["type"] == "statusline", msg
 print("query response ok")
 PY
+
+kill "$DAEMON_PID"
+wait "$DAEMON_PID" 2>/dev/null || true
+DAEMON_PID=""
+BADGE_AFTER="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_session_status 2>/dev/null || true)"
+[[ -z "$BADGE_AFTER" ]]
+echo "session badge cleanup ok"
 
 echo "M6 runtime smoke ok"

@@ -130,7 +130,7 @@ VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt sidebar toggle \
 
 `vt sidebar input <key>` と `vt sidebar jump <pane>` は M6 runtime daemon への
 client event として送る。
-次の script で subscribe/input/jump/query/detect をまとめて確認する。
+次の script で subscribe/input/jump/query/detect/session badge をまとめて確認する。
 
 ```bash
 scripts/smoke-m6-runtime.sh
@@ -141,8 +141,12 @@ scripts/smoke-m6-runtime.sh
 ```text
 subscribe snapshot ok
 capture detect ok
+session badge blocked ok
+session badge done ok
+statusline badge render ok
 input redraw state ok
 query response ok
+session badge cleanup ok
 M6 runtime smoke ok
 ```
 
@@ -200,4 +204,22 @@ input redraw state ok
 query response ok
 M6 runtime smoke ok
 scratch tmux socket residual=0
+```
+
+M6 runtime smoke session badge 追加後の再実行も pass。
+
+```text
+executed_at=2026-07-04 21:42:06 JST
+script=scripts/smoke-m6-runtime.sh
+subscribe snapshot ok
+capture detect ok
+session badge blocked ok
+session badge done ok
+statusline badge render ok
+input redraw state ok
+query response ok
+session badge cleanup ok
+M6 runtime smoke ok
+scratch tmux socket residual=0
+/tmp runtime residual=0
 ```

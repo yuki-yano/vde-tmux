@@ -65,7 +65,17 @@ fn dispatch_statusline_agent_badge_falls_back_to_tmux_snapshot() {
     ]
     .join("\u{1f}");
     mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
-    let output = run_with(["vt", "statusline-agent-badge"], &mock, &env()).unwrap();
+    let env = BTreeMap::from([(
+        "VDE_DAEMON_SOCKET".to_string(),
+        format!(
+            "/tmp/vde-tmux-test-missing-{}.sock",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ),
+    )]);
+    let output = run_with(["vt", "statusline-agent-badge"], &mock, &env).unwrap();
     assert_eq!(output, Some("running:1".to_string()));
 }
 
