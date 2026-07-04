@@ -262,7 +262,7 @@ fn repo_label(pane: &PaneSnapshot) -> String {
     }
 }
 
-fn rollup_for_pane(pane: &PaneSnapshot) -> RollupLevel {
+pub(crate) fn rollup_for_pane(pane: &PaneSnapshot) -> RollupLevel {
     pane_rollup_level(parse_status(&pane.status), non_empty(&pane.wait_reason))
 }
 

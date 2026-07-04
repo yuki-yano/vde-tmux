@@ -4,6 +4,7 @@ pub mod lifecycle;
 pub mod protocol;
 pub mod runtime;
 pub mod server;
+pub mod session_badge;
 pub mod workers;
 
 use std::collections::BTreeMap;
