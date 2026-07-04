@@ -45,6 +45,8 @@ badge:
 sidebar:
   width: "10%"
   min_width: 40
+  preview:
+    history_lines: 2000
   header:
     format: "{label} "
     separator: ""

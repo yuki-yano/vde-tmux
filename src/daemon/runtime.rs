@@ -44,6 +44,7 @@ pub enum DaemonEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEffect {
     JumpPane(String),
+    PreviewPane { pane_id: String, history_lines: u32 },
     SaveState(SidebarState),
     SetSessionBadge { session: String, value: String },
     ClearSessionBadge { session: String },
@@ -324,7 +325,12 @@ impl RuntimeState {
                         self.ui_state.selection = Some(row_id);
                         self.ui_state.apply(SidebarAction::ToggleExpand, &row_refs)
                     }
-                    Some(SidebarCommand::PreviewPane(_)) => false,
+                    Some(SidebarCommand::PreviewPane(pane_id)) => {
+                        return vec![RuntimeEffect::PreviewPane {
+                            pane_id,
+                            history_lines: self.config.sidebar.preview.history_lines,
+                        }];
+                    }
                     None => false,
                 }
             }
@@ -389,11 +395,7 @@ impl RuntimeState {
     fn update_unread(&mut self) {
         let mut next_was_idle = BTreeMap::new();
         let mut next_unread = BTreeMap::new();
-        for pane in self
-            .panes
-            .iter()
-            .filter(|pane| is_live_agent_pane(pane))
-        {
+        for pane in self.panes.iter().filter(|pane| is_live_agent_pane(pane)) {
             let level = crate::sidebar::tree::rollup_for_pane(pane);
             let is_idle = level == crate::hook::RollupLevel::Idle;
             let was_idle = self.pane_was_idle.get(&pane.pane_id).copied();
@@ -424,11 +426,7 @@ impl RuntimeState {
         let mut desired = BTreeMap::new();
         if badge_config.enabled {
             let mut states: BTreeMap<String, Vec<BadgeState>> = BTreeMap::new();
-            for pane in self
-                .panes
-                .iter()
-                .filter(|pane| is_live_agent_pane(pane))
-            {
+            for pane in self.panes.iter().filter(|pane| is_live_agent_pane(pane)) {
                 let level = crate::sidebar::tree::rollup_for_pane(pane);
                 let unread = self.unread.get(&pane.pane_id).copied().unwrap_or(false);
                 states
@@ -437,9 +435,7 @@ impl RuntimeState {
                     .push(badge_state(level, unread));
             }
             for (session, list) in states {
-                if let Some(value) =
-                    session_badge_value(list, badge_glyphs, &badge_config.suffix)
-                {
+                if let Some(value) = session_badge_value(list, badge_glyphs, &badge_config.suffix) {
                     desired.insert(session, value);
                 }
             }
@@ -613,6 +609,29 @@ mod tests {
         }
 
         assert_eq!(state.ui_state.selection.as_deref(), Some("jump::%1"));
+    }
+
+    #[test]
+    fn enter_on_detail_returns_preview_effect() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut agent = pane("%1", "/tmp/app", "codex", "running");
+        agent.prompt = "prompt".to_string();
+        state.ui_state.toggle_expanded("chat::%1");
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent]));
+        state.ui_state.selection = Some("detail::%1::status".to_string());
+
+        let effects = state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "enter".to_string(),
+            },
+        });
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::PreviewPane { pane_id, history_lines }
+                if pane_id == "%1" && *history_lines == 2000
+        )));
     }
 
     #[test]

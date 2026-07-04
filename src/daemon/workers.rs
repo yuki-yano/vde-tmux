@@ -16,6 +16,7 @@ pub trait WorkerIo: Send + Sync + 'static {
     fn read_panes(&self) -> Result<Vec<PaneSnapshot>>;
     fn capture_tail(&self, pane_id: &str) -> Result<String>;
     fn jump_to_pane(&self, pane_id: &str) -> Result<()>;
+    fn preview_pane(&self, pane_id: &str, history_lines: u32) -> Result<()>;
     fn set_session_option(&self, session: &str, key: &str, value: &str) -> Result<()>;
     fn unset_session_option(&self, session: &str, key: &str) -> Result<()>;
 }
@@ -43,6 +44,16 @@ impl WorkerIo for SystemWorkerIo {
 
     fn jump_to_pane(&self, pane_id: &str) -> Result<()> {
         jump_to_pane(&self.runner, pane_id)
+    }
+
+    fn preview_pane(&self, pane_id: &str, history_lines: u32) -> Result<()> {
+        let env = std::env::vars().collect();
+        crate::sidebar::preview::open_preview_floating_pane(
+            &self.runner,
+            &env,
+            pane_id,
+            history_lines,
+        )
     }
 
     fn set_session_option(&self, session: &str, key: &str, value: &str) -> Result<()> {
@@ -230,6 +241,10 @@ mod tests {
 
         fn jump_to_pane(&self, pane_id: &str) -> anyhow::Result<()> {
             self.jumps.lock().unwrap().push(pane_id.to_string());
+            Ok(())
+        }
+
+        fn preview_pane(&self, _pane_id: &str, _history_lines: u32) -> anyhow::Result<()> {
             Ok(())
         }
 

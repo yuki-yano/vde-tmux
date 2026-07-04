@@ -108,6 +108,13 @@ pub fn config_schema() -> Value {
                                 }
                             }
                         }
+                    },
+                    "preview": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "history_lines": { "type": "integer", "minimum": 0 }
+                        }
                     }
                 }
             },
@@ -172,6 +179,15 @@ mod tests {
         assert_eq!(header["separator"]["type"], "string");
         assert_eq!(header["bold"]["type"], "boolean");
         assert_eq!(header["colors"]["type"], "object");
+    }
+
+    #[test]
+    fn schema_contains_sidebar_preview_history_lines() {
+        let schema = config_schema();
+        let preview = &schema["properties"]["sidebar"]["properties"]["preview"]["properties"];
+
+        assert_eq!(preview["history_lines"]["type"], "integer");
+        assert_eq!(preview["history_lines"]["minimum"], 0);
     }
 
     #[test]

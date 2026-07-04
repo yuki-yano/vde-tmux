@@ -27,6 +27,7 @@ use crate::daemon::DaemonSnapshot;
 use crate::sidebar::client::{
     send_sidebar_jump, send_sidebar_key, send_sidebar_toggle, socket_path, subscribe,
 };
+use crate::sidebar::preview::open_preview_floating_pane;
 use crate::sidebar::render::{
     HeaderAction, SidebarRenderTheme, build_header_layout_with_theme, header_hit_test,
     render_header_lines, render_lines,
@@ -53,7 +54,15 @@ pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<O
     let mut terminal = Terminal::new(backend)?;
     let runner = SystemTmuxRunner::from_env(Duration::from_secs(1));
     let theme = SidebarRenderTheme::from_app_config(config);
-    let result = run_loop(&mut terminal, &socket, &rx, &runner, env, &theme);
+    let result = run_loop(
+        &mut terminal,
+        &socket,
+        &rx,
+        &runner,
+        env,
+        &theme,
+        config.sidebar.preview.history_lines,
+    );
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -97,6 +106,7 @@ pub fn run_loop<B: Backend>(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
     theme: &SidebarRenderTheme,
+    preview_history_lines: u32,
 ) -> Result<TuiExit> {
     let mut current: Option<DaemonSnapshot> = None;
     let mut clicks = ClickTracker::default();
@@ -109,6 +119,7 @@ pub fn run_loop<B: Backend>(
             runner,
             env,
             theme,
+            preview_history_lines,
         };
         if let Some(action) = clicks.flush_due(Instant::now()) {
             dispatch_click_action(&context, action);
@@ -126,7 +137,7 @@ pub fn run_loop<B: Backend>(
                         if let Some(snapshot) = &current
                             && let Some(pane_id) = preview_pane_for_selection(snapshot)
                         {
-                            spawn_preview(runner, env, &pane_id);
+                            spawn_preview(runner, env, &pane_id, preview_history_lines);
                         }
                     }
                     KeyCode::Char(' ') => send_sidebar_key(socket, "space")?,
@@ -375,6 +386,7 @@ struct ClickContext<'a> {
     runner: &'a dyn TmuxRunner,
     env: &'a BTreeMap<String, String>,
     theme: &'a SidebarRenderTheme,
+    preview_history_lines: u32,
 }
 
 fn handle_left_click(
@@ -420,7 +432,12 @@ fn dispatch_click_action(context: &ClickContext<'_>, action: ClickAction) {
             send_sidebar_request(send_sidebar_toggle(context.socket, &row_id));
         }
         ClickAction::PreviewPane(pane_id) => {
-            spawn_preview(context.runner, context.env, &pane_id);
+            spawn_preview(
+                context.runner,
+                context.env,
+                &pane_id,
+                context.preview_history_lines,
+            );
         }
         ClickAction::JumpPane(pane_id) => {
             send_sidebar_request(send_sidebar_jump(context.socket, &pane_id));
@@ -444,103 +461,15 @@ fn preview_pane_for_selection(snapshot: &DaemonSnapshot) -> Option<String> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PreviewCommand {
-    args: Vec<String>,
-}
-
-fn build_preview_command(pane_id: &str, window_id: &str) -> PreviewCommand {
-    let target = shell_quote(pane_id);
-    PreviewCommand {
-        args: vec![
-            "new-pane".to_string(),
-            "-P".to_string(),
-            "-F".to_string(),
-            "#{pane_id}".to_string(),
-            "-x".to_string(),
-            "80%".to_string(),
-            "-y".to_string(),
-            "80%".to_string(),
-            "-X".to_string(),
-            "10%".to_string(),
-            "-Y".to_string(),
-            "10%".to_string(),
-            "-t".to_string(),
-            window_id.to_string(),
-            format!(
-                "{{ tmux capture-pane -a -p -e -t {target} 2>/dev/null || tmux capture-pane -p -e -t {target}; }} | less -R"
-            ),
-        ],
-    }
-}
-
-fn spawn_preview(runner: &dyn TmuxRunner, _env: &BTreeMap<String, String>, pane_id: &str) {
-    if let Err(error) = open_preview_floating_pane(runner, _env, pane_id) {
-        eprintln!("[vde-tmux] sidebar preview failed: {error:#}");
-    }
-}
-
-fn open_preview_floating_pane(
+fn spawn_preview(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
     pane_id: &str,
-) -> Result<()> {
-    let window_id = resolve_current_window_id(runner, env)?;
-    kill_existing_preview_panes(runner, &window_id)?;
-    runner.run(&["set-option", "-s", "focus-events", "on"])?;
-    let command = build_preview_command(pane_id, &window_id);
-    let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
-    let pane = runner.run(&args)?.trim().to_string();
-    if pane.is_empty() {
-        anyhow::bail!("new-pane did not return pane_id");
+    history_lines: u32,
+) {
+    if let Err(error) = open_preview_floating_pane(runner, env, pane_id, history_lines) {
+        eprintln!("[vde-tmux] sidebar preview failed: {error:#}");
     }
-    if let Err(error) = configure_preview_floating_pane(runner, &pane) {
-        let _ = runner.run(&["kill-pane", "-t", &pane]);
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn configure_preview_floating_pane(runner: &dyn TmuxRunner, pane: &str) -> Result<()> {
-    runner.run(&["set-option", "-p", "-t", pane, "@vde_preview", "1"])?;
-    runner.run(&["set-option", "-p", "-t", pane, "pane-border-status", "off"])?;
-    let hook = format!("kill-pane -t '{}'", pane);
-    runner.run(&["set-hook", "-p", "-t", pane, "pane-focus-out", &hook])?;
-    Ok(())
-}
-
-fn kill_existing_preview_panes(runner: &dyn TmuxRunner, window_id: &str) -> Result<()> {
-    let output = runner.run(&[
-        "list-panes",
-        "-t",
-        window_id,
-        "-F",
-        "#{pane_id} #{@vde_preview}",
-    ])?;
-    for line in output.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(pane_id) = fields.next() else {
-            continue;
-        };
-        if fields.next() == Some("1") {
-            runner.run(&["kill-pane", "-t", pane_id])?;
-        }
-    }
-    Ok(())
-}
-
-fn shell_quote(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\\''");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -785,129 +714,6 @@ mod tests {
             Some("chat::%1")
         );
         assert_eq!(row_for_click(&snapshot, 0, 1), None);
-    }
-
-    #[test]
-    fn preview_command_uses_floating_pane() {
-        let command = build_preview_command("%26", "@1");
-
-        assert_eq!(
-            command.args,
-            vec![
-                "new-pane",
-                "-P",
-                "-F",
-                "#{pane_id}",
-                "-x",
-                "80%",
-                "-y",
-                "80%",
-                "-X",
-                "10%",
-                "-Y",
-                "10%",
-                "-t",
-                "@1",
-                "{ tmux capture-pane -a -p -e -t '%26' 2>/dev/null || tmux capture-pane -p -e -t '%26'; } | less -R"
-            ]
-        );
-    }
-
-    #[test]
-    fn spawn_preview_configures_floating_pane() {
-        let mock = crate::tmux::mock::MockTmuxRunner::new();
-        mock.stub(
-            &["display-message", "-p", "-t", "%10", "-F", "#{window_id}"],
-            "@1\n",
-        );
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", "#{pane_id} #{@vde_preview}"],
-            "%77 1\n%10 \n",
-        );
-        mock.stub(&["kill-pane", "-t", "%77"], "");
-        mock.stub(&["set-option", "-s", "focus-events", "on"], "");
-        mock.stub(
-            &[
-                "new-pane",
-                "-P",
-                "-F",
-                "#{pane_id}",
-                "-x",
-                "80%",
-                "-y",
-                "80%",
-                "-X",
-                "10%",
-                "-Y",
-                "10%",
-                "-t",
-                "@1",
-                "{ tmux capture-pane -a -p -e -t '%26' 2>/dev/null || tmux capture-pane -p -e -t '%26'; } | less -R",
-            ],
-            "%99\n",
-        );
-        mock.stub(&["set-option", "-p", "-t", "%99", "@vde_preview", "1"], "");
-        mock.stub(
-            &["set-option", "-p", "-t", "%99", "pane-border-status", "off"],
-            "",
-        );
-        mock.stub(
-            &[
-                "set-hook",
-                "-p",
-                "-t",
-                "%99",
-                "pane-focus-out",
-                "kill-pane -t '%99'",
-            ],
-            "",
-        );
-
-        spawn_preview(
-            &mock,
-            &BTreeMap::from([("TMUX_PANE".to_string(), "%10".to_string())]),
-            "%26",
-        );
-
-        assert_eq!(
-            mock.calls(),
-            vec![
-                vec!["display-message", "-p", "-t", "%10", "-F", "#{window_id}"],
-                vec!["list-panes", "-t", "@1", "-F", "#{pane_id} #{@vde_preview}"],
-                vec!["kill-pane", "-t", "%77"],
-                vec!["set-option", "-s", "focus-events", "on"],
-                vec![
-                    "new-pane",
-                    "-P",
-                    "-F",
-                    "#{pane_id}",
-                    "-x",
-                    "80%",
-                    "-y",
-                    "80%",
-                    "-X",
-                    "10%",
-                    "-Y",
-                    "10%",
-                    "-t",
-                    "@1",
-                    "{ tmux capture-pane -a -p -e -t '%26' 2>/dev/null || tmux capture-pane -p -e -t '%26'; } | less -R"
-                ],
-                vec!["set-option", "-p", "-t", "%99", "@vde_preview", "1"],
-                vec!["set-option", "-p", "-t", "%99", "pane-border-status", "off"],
-                vec![
-                    "set-hook",
-                    "-p",
-                    "-t",
-                    "%99",
-                    "pane-focus-out",
-                    "kill-pane -t '%99'"
-                ],
-            ]
-            .into_iter()
-            .map(|items| items.into_iter().map(str::to_string).collect::<Vec<_>>())
-            .collect::<Vec<_>>()
-        );
     }
 
     #[test]

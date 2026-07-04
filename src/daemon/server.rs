@@ -338,6 +338,14 @@ fn handle_runtime_effects(
                     eprintln!("[vde-tmux] daemon jump error: {error:#}");
                 }
             }
+            RuntimeEffect::PreviewPane {
+                pane_id,
+                history_lines,
+            } => {
+                if let Err(error) = worker_io.preview_pane(&pane_id, history_lines) {
+                    eprintln!("[vde-tmux] daemon preview error: {error:#}");
+                }
+            }
             RuntimeEffect::SaveState(state) => {
                 if let Some(path) = state_path {
                     crate::sidebar::store::save_state(path, &state)?;
@@ -521,6 +529,7 @@ mod tests {
     #[derive(Default)]
     struct LoopWorkerIo {
         jumps: std::sync::Mutex<Vec<String>>,
+        previews: std::sync::Mutex<Vec<(String, u32)>>,
         session_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
         fail_jump: bool,
     }
@@ -539,6 +548,14 @@ mod tests {
                 anyhow::bail!("jump failed");
             }
             self.jumps.lock().unwrap().push(pane_id.to_string());
+            Ok(())
+        }
+
+        fn preview_pane(&self, pane_id: &str, history_lines: u32) -> anyhow::Result<()> {
+            self.previews
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), history_lines));
             Ok(())
         }
 

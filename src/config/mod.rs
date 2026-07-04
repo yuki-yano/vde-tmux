@@ -190,6 +190,7 @@ pub struct SidebarConfig {
     pub min_width: u16,
     pub colors: SidebarColorsConfig,
     pub header: SidebarHeaderConfig,
+    pub preview: SidebarPreviewConfig,
 }
 
 impl Default for SidebarConfig {
@@ -199,6 +200,21 @@ impl Default for SidebarConfig {
             min_width: 40,
             colors: SidebarColorsConfig::default(),
             header: SidebarHeaderConfig::default(),
+            preview: SidebarPreviewConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SidebarPreviewConfig {
+    pub history_lines: u32,
+}
+
+impl Default for SidebarPreviewConfig {
+    fn default() -> Self {
+        Self {
+            history_lines: 2000,
         }
     }
 }
@@ -374,6 +390,17 @@ mod tests {
                 .unwrap();
         assert_eq!(config.sidebar.width, SidebarWidth::Percent(10));
         assert_eq!(config.sidebar.min_width, 48);
+    }
+
+    #[test]
+    fn sidebar_preview_history_lines_defaults_to_2000() {
+        let config = Config::default();
+        assert_eq!(config.sidebar.preview.history_lines, 2000);
+
+        let config =
+            serde_yaml_ng::from_str::<Config>("sidebar:\n  preview:\n    history_lines: 5000\n")
+                .unwrap();
+        assert_eq!(config.sidebar.preview.history_lines, 5000);
     }
 
     #[test]

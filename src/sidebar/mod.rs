@@ -4,6 +4,7 @@ pub mod client;
 pub mod input;
 pub mod layout;
 pub mod once;
+pub mod preview;
 pub mod render;
 pub mod state;
 pub mod store;

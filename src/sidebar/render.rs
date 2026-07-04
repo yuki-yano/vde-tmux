@@ -1,5 +1,5 @@
-use crate::hook::RollupLevel;
 use crate::daemon::session_badge::{BadgeState, glyph_for_state};
+use crate::hook::RollupLevel;
 use crate::sidebar::state::{SidebarState, StatusFilter, ViewMode};
 use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 use ratatui::style::{Color, Modifier, Style};
@@ -765,7 +765,7 @@ sidebar:
             lines[0].spans[0]
                 .style
                 .add_modifier
-            .contains(Modifier::BOLD)
+                .contains(Modifier::BOLD)
         );
     }
 

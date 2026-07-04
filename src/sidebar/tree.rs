@@ -84,7 +84,14 @@ pub fn build_rows_at(
     state: &SidebarState,
     now: i64,
 ) -> Vec<SidebarRow> {
-    build_rows_at_with_git_and_unread(config, panes, state, &BTreeMap::new(), &BTreeMap::new(), now)
+    build_rows_at_with_git_and_unread(
+        config,
+        panes,
+        state,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        now,
+    )
 }
 
 pub fn build_rows_at_with_git(

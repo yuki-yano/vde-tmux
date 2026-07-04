@@ -768,7 +768,7 @@ fn preview_command_captures_scrollback_and_starts_less_at_bottom() {
     );
     let inner = command.args.last().unwrap();
     assert!(inner.contains("capture-pane -a -p -e -S -2000 -t '%26'"));
-    assert!(inner.contains("LESSKEYIN=/tmp/preview.lesskey less -R +G"));
+    assert!(inner.contains("LESSKEYIN='/tmp/preview.lesskey' less -R +G"));
 }
 
 #[test]
@@ -783,7 +783,11 @@ fn enter_on_detail_returns_preview_effect() {
         client_id: ClientId(1),
         event: SidebarClientEvent::Key { key: "enter".to_string() },
     });
-    assert!(effects.iter().any(|effect| matches!(effect, RuntimeEffect::PreviewPane(pane) if pane == "%1")));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        RuntimeEffect::PreviewPane { pane_id, history_lines }
+            if pane_id == "%1" && *history_lines == 2000
+    )));
 }
 ```
 
@@ -874,14 +878,20 @@ runtime / server は preview effect を扱う。
 ```rust
 pub enum RuntimeEffect {
     JumpPane(String),
-    PreviewPane(String),
+    PreviewPane {
+        pane_id: String,
+        history_lines: u32,
+    },
     SaveState(SidebarState),
     SetSessionBadge { session: String, value: String },
     ClearSessionBadge { session: String },
 }
 
 Some(SidebarCommand::PreviewPane(pane_id)) => {
-    return vec![RuntimeEffect::PreviewPane(pane_id)];
+    return vec![RuntimeEffect::PreviewPane {
+        pane_id,
+        history_lines: self.config.sidebar.preview.history_lines,
+    }];
 }
 ```
 
