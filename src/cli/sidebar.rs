@@ -63,8 +63,22 @@ pub(crate) fn run_sidebar_command(
     env: &BTreeMap<String, String>,
     config: &crate::config::Config,
 ) -> Result<Option<String>> {
+    run_sidebar_command_with_ensure(command, runner, env, config, ensure_sidebar_daemon_started)
+}
+
+pub(crate) fn run_sidebar_command_with_ensure<F>(
+    command: SidebarCommand,
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    config: &crate::config::Config,
+    ensure_daemon: F,
+) -> Result<Option<String>>
+where
+    F: Fn(&BTreeMap<String, String>) -> Result<()>,
+{
     match command {
         SidebarCommand::Attach { once } => {
+            ensure_daemon(env)?;
             crate::sidebar::layout::attach(runner, env)?;
             let rendered = render_sidebar_once(runner, env, config)?;
             if once {
@@ -86,6 +100,7 @@ pub(crate) fn run_sidebar_command(
             width,
             delay_ms,
         } => {
+            ensure_daemon(env)?;
             if let Some(delay_ms) = delay_ms.filter(|value| *value > 0) {
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
@@ -99,6 +114,7 @@ pub(crate) fn run_sidebar_command(
             Ok(None)
         }
         SidebarCommand::Toggle { all, window, width } => {
+            ensure_daemon(env)?;
             if all && window.is_some() {
                 bail!("--all and --window cannot be used together");
             }
@@ -135,6 +151,7 @@ pub(crate) fn run_sidebar_command(
             Ok(None)
         }
         SidebarCommand::LayoutApplied { window, width } => {
+            ensure_daemon(env)?;
             let target = resolve_window_target(runner, window)?;
             crate::sidebar::layout::layout_applied(
                 runner,
@@ -149,6 +166,10 @@ pub(crate) fn run_sidebar_command(
             Ok(None)
         }
     }
+}
+
+fn ensure_sidebar_daemon_started(env: &BTreeMap<String, String>) -> Result<()> {
+    crate::daemon::lifecycle::ensure_daemon_started(env, None)
 }
 
 fn render_sidebar_once(

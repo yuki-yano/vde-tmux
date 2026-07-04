@@ -12,12 +12,16 @@ pub(crate) fn statusline_agent_badge(
 }
 
 pub(crate) fn run_daemon(
-    runner: &dyn TmuxRunner,
+    _runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
     socket: Option<&str>,
 ) -> Result<Option<String>> {
     let socket_path = crate::daemon::daemon_socket_path(env, socket);
-    crate::daemon::server::run_daemon_server(runner, &socket_path)?;
+    let loaded = crate::config::load::load_config(env);
+    for warning in loaded.warnings {
+        eprintln!("{warning}");
+    }
+    crate::daemon::server::run_runtime_daemon_server(loaded.config, &socket_path, env)?;
     Ok(None)
 }
 

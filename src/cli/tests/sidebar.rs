@@ -23,7 +23,14 @@ fn dispatch_sidebar_attach_once_marks_and_renders() {
     .join("\u{1f}");
     mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
 
-    let output = run_with(["vt", "sidebar", "attach", "--once"], &mock, &env).unwrap();
+    let output = crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Attach { once: true },
+        &mock,
+        &env,
+        &crate::config::Config::default(),
+        |_| Ok(()),
+    )
+    .unwrap();
 
     assert!(output.unwrap().contains("codex %1"));
 }
@@ -72,7 +79,14 @@ fn dispatch_sidebar_attach_once_restores_persisted_state() {
     .join("\u{1f}");
     mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
 
-    let output = run_with(["vt", "sidebar", "attach", "--once"], &mock, &env).unwrap();
+    let output = crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Attach { once: true },
+        &mock,
+        &env,
+        &crate::config::Config::default(),
+        |_| Ok(()),
+    )
+    .unwrap();
     let output = output.unwrap();
 
     assert!(output.contains("> > app"));
@@ -137,20 +151,16 @@ fn dispatch_sidebar_open_uses_layout_operations() {
         "",
     );
 
-    run_with(
-        [
-            "vt",
-            "sidebar",
-            "open",
-            "--window",
-            "@1",
-            "--width",
-            "40",
-            "--delay-ms",
-            "0",
-        ],
+    crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Open {
+            window: Some("@1".to_string()),
+            width: Some(40),
+            delay_ms: Some(0),
+        },
         &mock,
         &env(),
+        &crate::config::Config::default(),
+        |_| Ok(()),
     )
     .unwrap();
 
@@ -215,10 +225,16 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
         "",
     );
 
-    run_with(
-        ["vt", "sidebar", "toggle", "--all", "--width", "40"],
+    crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Toggle {
+            all: true,
+            window: None,
+            width: Some(40),
+        },
         &mock,
         &env(),
+        &crate::config::Config::default(),
+        |_| Ok(()),
     )
     .unwrap();
 
@@ -272,6 +288,85 @@ fn dispatch_sidebar_input_moves_selection_and_saves_state() {
         crate::sidebar::store::load_state(&crate::sidebar::store::state_path(&env)).unwrap();
     assert_eq!(state.selection.as_deref(), Some("repo::misc::app"));
     std::fs::remove_dir_all(state_home).unwrap();
+}
+
+#[test]
+fn sidebar_layout_applied_ensures_daemon_started() {
+    use std::cell::Cell;
+
+    let mock = MockTmuxRunner::new();
+    let exe = std::env::current_exe().unwrap();
+    let command = format!(
+        "{} sidebar attach",
+        shell_quote_for_test(&exe.display().to_string())
+    );
+    mock.stub(&["display-message", "-p", "#{window_id}"], "@1\n");
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@1",
+            "-F",
+            crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+        ],
+        "%1\t\t80\n",
+    );
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "@1",
+            "-F",
+            "#{window_layout}",
+        ],
+        "layout-before\n",
+    );
+    mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
+    mock.stub(
+        &[
+            "set-option",
+            "-w",
+            "-t",
+            "@1",
+            crate::options::KEY_LAYOUT_BASELINE,
+            "layout-before",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-w",
+            "-t",
+            "@1",
+            crate::options::KEY_LAYOUT_PANES,
+            "%1",
+        ],
+        "",
+    );
+    mock.stub(
+        &["split-window", "-t", "@1", "-hbf", "-l", "40", &command],
+        "",
+    );
+    let called = Cell::new(false);
+
+    crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::LayoutApplied {
+            window: Some("@1".to_string()),
+            width: Some(40),
+        },
+        &mock,
+        &env(),
+        &crate::config::Config::default(),
+        |_| {
+            called.set(true);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert!(called.get());
 }
 
 fn shell_quote_for_test(value: &str) -> String {
