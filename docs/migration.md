@@ -36,7 +36,6 @@ JSON Schema は `vt config schema` で確認する。
 主な対応は次のとおり。
 
 ```yaml
-ghq_root: ~/repos
 categories:
   display_names:
     work: W
@@ -57,13 +56,17 @@ statusline:
   agent_badge:
     enabled: true
 sidebar:
-  width: 40
+  width: "10%"
+  min_width: 40
 daemon:
   poll_ms: 1000
   git:
     timeout_ms: 500
     poll_interval_ms: 10000
 ```
+
+`ghq_root` は新実装では使わないため削除する。
+`~/.config/vde/tmux/config.yml` に残っている場合は、M7 切替前に消す。
 
 ## Pane Option Bus
 

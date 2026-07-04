@@ -8,6 +8,7 @@ TMUX_SOCKET="vde-m6-runtime-$STAMP"
 RUNTIME_DIR="/tmp/vde-m6-runtime-$STAMP"
 DAEMON_SOCKET="$RUNTIME_DIR/daemon.sock"
 STATE_HOME="$RUNTIME_DIR/state"
+CONFIG_HOME="$RUNTIME_DIR/config"
 LOG="$RUNTIME_DIR/daemon.log"
 
 cleanup() {
@@ -22,7 +23,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$RUNTIME_DIR" "$STATE_HOME"
+mkdir -p "$RUNTIME_DIR" "$STATE_HOME" "$CONFIG_HOME"
 chmod 700 "$RUNTIME_DIR"
 
 cargo build
@@ -37,6 +38,7 @@ tmux -L "$TMUX_SOCKET" send-keys -t "$PANE_ID" "printf '? Allow command to run?\
 VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET" \
 VDE_DAEMON_SOCKET="$DAEMON_SOCKET" \
 XDG_STATE_HOME="$STATE_HOME" \
+XDG_CONFIG_HOME="$CONFIG_HOME" \
 "$BIN" daemon --socket "$DAEMON_SOCKET" >"$LOG" 2>&1 &
 DAEMON_PID="$!"
 
@@ -131,6 +133,7 @@ echo "session badge done ok"
 SESSIONS_OUT="$(VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET" \
   VDE_DAEMON_SOCKET="$DAEMON_SOCKET" \
   XDG_STATE_HOME="$STATE_HOME" \
+  XDG_CONFIG_HOME="$CONFIG_HOME" \
   "$BIN" statusline-sessions 2>/dev/null || true)"
 case "$SESSIONS_OUT" in
   *"🔵 "*) echo "statusline badge render ok" ;;
@@ -143,6 +146,7 @@ esac
 VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET" \
 VDE_DAEMON_SOCKET="$DAEMON_SOCKET" \
 XDG_STATE_HOME="$STATE_HOME" \
+XDG_CONFIG_HOME="$CONFIG_HOME" \
 "$BIN" sidebar input j
 
 python3 - "$DAEMON_SOCKET" <<'PY'
@@ -166,6 +170,7 @@ PY
 VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET" \
 VDE_DAEMON_SOCKET="$DAEMON_SOCKET" \
 XDG_STATE_HOME="$STATE_HOME" \
+XDG_CONFIG_HOME="$CONFIG_HOME" \
 "$BIN" sidebar jump "$PANE_ID"
 
 python3 - "$DAEMON_SOCKET" <<'PY'

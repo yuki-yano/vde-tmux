@@ -223,3 +223,21 @@ M6 runtime smoke ok
 scratch tmux socket residual=0
 /tmp runtime residual=0
 ```
+
+Plan 10 で smoke 用 `XDG_CONFIG_HOME` を隔離した後の再実行も pass。
+
+```text
+executed_at=2026-07-04 22:08:22 JST
+script=scripts/smoke-m6-runtime.sh
+subscribe snapshot ok
+capture detect ok
+session badge blocked ok
+session badge done ok
+statusline badge render ok
+input redraw state ok
+query response ok
+session badge cleanup ok
+M6 runtime smoke ok
+scratch tmux socket residual=0
+/tmp runtime residual=0
+```
