@@ -135,7 +135,7 @@ pub struct HeaderSegment {
 }
 
 const VIEW_MODE_BADGE_WIDTH: usize = "category".len();
-const FILTER_BADGE_WIDTH: usize = "attn".len();
+const FILTER_BADGE_WIDTH: usize = "attention".len();
 
 pub fn build_header_layout(state: &SidebarState, width: u16) -> HeaderLayout {
     build_header_layout_with_theme(state, width, &SidebarRenderTheme::default())
@@ -469,7 +469,7 @@ fn view_mode_label(view_mode: ViewMode) -> &'static str {
 fn filter_label(filter: StatusFilter) -> &'static str {
     match filter {
         StatusFilter::All => "all",
-        StatusFilter::AttentionOnly => "attn",
+        StatusFilter::AttentionOnly => "attention",
     }
 }
 
@@ -668,13 +668,13 @@ mod tests {
 
         let header = build_header_layout(&state, 80);
 
-        assert_eq!(header.lines[0].text, "category attn ");
+        assert_eq!(header.lines[0].text, "category attention ");
         assert_eq!(
             header_hit_test(&header, 0, 1),
             Some(HeaderAction::CycleViewMode)
         );
         assert_eq!(
-            header_hit_test(&header, 0, 9),
+            header_hit_test(&header, 0, 10),
             Some(HeaderAction::ToggleFilter)
         );
     }
@@ -690,15 +690,15 @@ mod tests {
         let header = build_header_layout(&state, 80);
         let lines = render_header_lines(&header, &SidebarRenderTheme::default());
 
-        assert_eq!(header.lines[0].text, "repo     all  ");
+        assert_eq!(header.lines[0].text, "repo     all       ");
         assert_eq!(header.lines[0].segments[0].range, 0..9);
-        assert_eq!(header.lines[0].segments[1].range, 9..14);
+        assert_eq!(header.lines[0].segments[1].range, 9..19);
         assert_eq!(
             header_hit_test(&header, 0, 8),
             Some(HeaderAction::CycleViewMode)
         );
         assert_eq!(
-            header_hit_test(&header, 0, 13),
+            header_hit_test(&header, 0, 18),
             Some(HeaderAction::ToggleFilter)
         );
         assert_eq!(lines[0].spans[0].content.as_ref(), "repo     ");
@@ -709,7 +709,7 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::BOLD)
         );
-        assert_eq!(lines[0].spans[1].content.as_ref(), "all  ");
+        assert_eq!(lines[0].spans[1].content.as_ref(), "all       ");
         assert_eq!(lines[0].spans[1].style.bg, None);
     }
 
@@ -740,9 +740,9 @@ sidebar:
         let header = build_header_layout_with_theme(&state, 80, &theme);
         let lines = render_header_lines(&header, &theme);
 
-        assert_eq!(header.lines[0].text, "[ repo     ] [ all  ]");
+        assert_eq!(header.lines[0].text, "[ repo     ] [ all       ]");
         assert_eq!(header.lines[0].segments[0].range, 0..12);
-        assert_eq!(header.lines[0].segments[1].range, 13..21);
+        assert_eq!(header.lines[0].segments[1].range, 13..26);
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::White));
         assert_eq!(lines[0].spans[0].style.bg, Some(Color::Indexed(24)));
         assert!(

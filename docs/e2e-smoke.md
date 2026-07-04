@@ -162,7 +162,7 @@ M6 runtime smoke ok
 - `vt hook emit` で running / waiting+permission / idle / attention の pane を作る。
 - `vt sidebar open` で daemon subscribe TUI を開き、header の現在値表示(`repo all`)を確認する。
 - `v` で `category` に切り替わることを確認する。
-- `Tab` で `attn` filter に切り替わり、attention 不要な idle pane が消えることを確認する。
+- `Tab` で `attention` filter に切り替わり、attention 不要な idle pane が消えることを確認する。
 - Chat 行で `Space` を押し、`status:` と `session:` の Detail 行が出ることを確認する。
 - `p` または Detail 行クリックで preview が floating pane として開くことを確認する。
 
@@ -281,7 +281,7 @@ executed_at=2026-07-04 22:51:05 JST
 scratch=vde-ui-parity-1783173039
 window=@0
 sidebar=%4
-checked=header repo/all, view cycle category, attn filter, Chat Detail status/session, preview floating pane path
+checked=header repo/all, view cycle category, attention filter, Chat Detail status/session, preview floating pane path
 result=sidebar ui parity smoke ok
 ```
 
