@@ -1,5 +1,8 @@
 //! daemon の snapshot 集約と statusline badge。
 
+pub mod protocol;
+pub mod server;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
