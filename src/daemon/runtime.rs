@@ -415,6 +415,7 @@ impl RuntimeState {
         use crate::daemon::session_badge::{BadgeState, badge_state, session_badge_value};
 
         let badge_config = &self.config.statusline.session_badge;
+        let badge_glyphs = &self.config.badge.glyphs;
         let mut desired = BTreeMap::new();
         if badge_config.enabled {
             let mut states: BTreeMap<String, Vec<BadgeState>> = BTreeMap::new();
@@ -431,7 +432,9 @@ impl RuntimeState {
                     .push(badge_state(level, unread));
             }
             for (session, list) in states {
-                if let Some(value) = session_badge_value(list, badge_config) {
+                if let Some(value) =
+                    session_badge_value(list, badge_glyphs, &badge_config.suffix)
+                {
                     desired.insert(session, value);
                 }
             }

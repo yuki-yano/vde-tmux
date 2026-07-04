@@ -1,4 +1,4 @@
-use crate::config::SessionBadgeConfig;
+use crate::config::BadgeGlyphs;
 use crate::hook::RollupLevel;
 
 /// statusline sessions の表示 4 状態。
@@ -30,22 +30,26 @@ pub fn badge_state(level: RollupLevel, unread: bool) -> BadgeState {
 /// agent pane が 1 つも無ければ None(バッジを消す)。
 pub fn session_badge_value(
     states: impl IntoIterator<Item = BadgeState>,
-    config: &SessionBadgeConfig,
+    glyphs: &BadgeGlyphs,
+    suffix: &str,
 ) -> Option<String> {
     let state = states.into_iter().min()?;
-    let glyph = match state {
-        BadgeState::Blocked => &config.glyphs.blocked,
-        BadgeState::Working => &config.glyphs.working,
-        BadgeState::Done => &config.glyphs.done,
-        BadgeState::Idle => &config.glyphs.idle,
-    };
-    Some(format!("{glyph}{}", config.suffix))
+    Some(format!("{}{suffix}", glyph_for_state(state, glyphs)))
+}
+
+pub fn glyph_for_state<'a>(state: BadgeState, glyphs: &'a BadgeGlyphs) -> &'a str {
+    match state {
+        BadgeState::Blocked => &glyphs.blocked,
+        BadgeState::Working => &glyphs.working,
+        BadgeState::Done => &glyphs.done,
+        BadgeState::Idle => &glyphs.idle,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{SessionBadgeConfig, SessionBadgeGlyphs};
+    use crate::config::{BadgeGlyphs, SessionBadgeConfig};
     use crate::hook::RollupLevel;
 
     #[test]
@@ -81,9 +85,11 @@ mod tests {
     #[test]
     fn session_rollup_picks_most_urgent_state() {
         let config = SessionBadgeConfig::default();
+        let glyphs = BadgeGlyphs::default();
         let value = session_badge_value(
             [BadgeState::Idle, BadgeState::Blocked, BadgeState::Working],
-            &config,
+            &glyphs,
+            &config.suffix,
         );
         assert_eq!(value.as_deref(), Some("🔴 "));
     }
@@ -92,19 +98,34 @@ mod tests {
     fn session_badge_value_appends_suffix_and_respects_custom_glyphs() {
         let config = SessionBadgeConfig {
             suffix: "|".to_string(),
-            glyphs: SessionBadgeGlyphs {
-                done: "D".to_string(),
-                ..SessionBadgeGlyphs::default()
-            },
             ..SessionBadgeConfig::default()
         };
-        let value = session_badge_value([BadgeState::Done], &config);
+        let glyphs = BadgeGlyphs {
+            done: "D".to_string(),
+            ..BadgeGlyphs::default()
+        };
+        let value = session_badge_value([BadgeState::Done], &glyphs, &config.suffix);
         assert_eq!(value.as_deref(), Some("D|"));
     }
 
     #[test]
     fn session_badge_value_is_none_for_no_agents() {
         let config = SessionBadgeConfig::default();
-        assert_eq!(session_badge_value([], &config), None);
+        assert_eq!(
+            session_badge_value([], &BadgeGlyphs::default(), &config.suffix),
+            None
+        );
+    }
+
+    #[test]
+    fn session_badge_value_uses_top_level_badge_glyphs_and_statusline_suffix() {
+        let glyphs = crate::config::BadgeGlyphs {
+            working: "W".to_string(),
+            ..crate::config::BadgeGlyphs::default()
+        };
+
+        let value = session_badge_value([BadgeState::Working], &glyphs, "|");
+
+        assert_eq!(value.as_deref(), Some("W|"));
     }
 }

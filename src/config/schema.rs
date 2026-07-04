@@ -14,8 +14,37 @@ pub fn config_schema() -> Value {
                     "display_names": { "type": "object", "additionalProperties": { "type": "string" } },
                     "order": { "type": "object", "additionalProperties": { "type": "integer" } },
                     "default_category": { "type": ["string", "null"] },
-                    "rules": { "type": "array" },
+                    "rules": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "category": { "type": "string" },
+                                "path_patterns": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                }
+                            }
+                        }
+                    },
                     "session_name_rules": { "type": "array" }
+                }
+            },
+            "badge": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                    "glyphs": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "blocked": { "type": "string" },
+                            "working": { "type": "string" },
+                            "done": { "type": "string" },
+                            "idle": { "type": "string" }
+                        }
+                    }
                 }
             },
             "statusline": {
@@ -27,17 +56,7 @@ pub fn config_schema() -> Value {
                         "additionalProperties": true,
                         "properties": {
                             "enabled": { "type": "boolean" },
-                            "suffix": { "type": "string" },
-                            "glyphs": {
-                                "type": "object",
-                                "additionalProperties": true,
-                                "properties": {
-                                    "blocked": { "type": "string" },
-                                    "working": { "type": "string" },
-                                    "done": { "type": "string" },
-                                    "idle": { "type": "string" }
-                                }
-                            }
+                            "suffix": { "type": "string" }
                         }
                     }
                 }
@@ -116,7 +135,7 @@ mod tests {
             .and_then(|value| value.as_object())
             .unwrap();
 
-        for key in ["categories", "statusline", "sidebar", "daemon"] {
+        for key in ["categories", "statusline", "sidebar", "daemon", "badge"] {
             assert!(
                 properties.contains_key(key),
                 "missing schema property {key}"
@@ -153,5 +172,24 @@ mod tests {
         assert_eq!(header["separator"]["type"], "string");
         assert_eq!(header["bold"]["type"], "boolean");
         assert_eq!(header["colors"]["type"], "object");
+    }
+
+    #[test]
+    fn schema_contains_path_patterns_and_top_level_badge_glyphs() {
+        let schema = config_schema();
+        let rule = &schema["properties"]["categories"]["properties"]["rules"]["items"];
+        assert_eq!(
+            rule["properties"]["path_patterns"]["items"]["type"],
+            "string"
+        );
+        assert!(rule["properties"].get("ghq_patterns").is_none());
+
+        let badge = &schema["properties"]["badge"]["properties"]["glyphs"]["properties"];
+        assert_eq!(badge["working"]["type"], "string");
+        assert!(
+            schema["properties"]["statusline"]["properties"]["session_badge"]["properties"]
+                .get("glyphs")
+                .is_none()
+        );
     }
 }

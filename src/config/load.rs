@@ -60,11 +60,11 @@ fn expand_config_patterns(
     env: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     for (rule_index, rule) in config.categories.rules.iter_mut().enumerate() {
-        for (pattern_index, pattern) in rule.ghq_patterns.iter_mut().enumerate() {
+        for (pattern_index, pattern) in rule.path_patterns.iter_mut().enumerate() {
             *pattern = expand_pattern(
                 pattern,
                 env,
-                &format!("categories.rules.{rule_index}.ghq_patterns.{pattern_index}"),
+                &format!("categories.rules.{rule_index}.path_patterns.{pattern_index}"),
             )?;
         }
     }
@@ -220,13 +220,13 @@ mod tests {
     }
 
     #[test]
-    fn config_pattern_env_expands_ghq_and_session_patterns() {
+    fn config_pattern_env_expands_path_and_session_patterns() {
         let loaded = parse_config_with_env(
             r#"
 categories:
   rules:
     - category: work
-      ghq_patterns:
+      path_patterns:
         - github.com/${WORK_GHQ_OWNER}/*
   session_name_rules:
     - category: work
@@ -237,7 +237,7 @@ categories:
         );
         assert!(loaded.warnings.is_empty());
         assert_eq!(
-            loaded.config.categories.rules[0].ghq_patterns[0],
+            loaded.config.categories.rules[0].path_patterns[0],
             "github.com/acme/*"
         );
         assert_eq!(
@@ -249,7 +249,7 @@ categories:
     #[test]
     fn config_pattern_env_missing_var_returns_default_with_warning() {
         let loaded = parse_config_with_env(
-            "categories:\n  rules:\n    - category: work\n      ghq_patterns:\n        - github.com/${WORK_GHQ_OWNER}/*\n",
+            "categories:\n  rules:\n    - category: work\n      path_patterns:\n        - github.com/${WORK_GHQ_OWNER}/*\n",
             &env(&[]),
         );
         assert_eq!(loaded.config, Config::default());
@@ -263,14 +263,35 @@ categories:
 statusline:
   session_badge:
     suffix: ""
-    glyphs:
-      blocked: "!"
+badge:
+  glyphs:
+    blocked: "!"
 "#;
         let loaded = parse_config(yaml);
         assert!(loaded.warnings.is_empty());
         assert_eq!(loaded.config.statusline.session_badge.suffix, "");
-        assert_eq!(loaded.config.statusline.session_badge.glyphs.blocked, "!");
-        assert_eq!(loaded.config.statusline.session_badge.glyphs.working, "🟡");
+        assert_eq!(loaded.config.badge.glyphs.blocked, "!");
+        assert_eq!(loaded.config.badge.glyphs.working, "🟡");
         assert!(loaded.config.statusline.session_badge.enabled);
+    }
+
+    #[test]
+    fn config_pattern_env_expands_path_patterns() {
+        let loaded = parse_config_with_env(
+            r#"
+categories:
+  rules:
+    - category: work
+      path_patterns:
+        - github.com/${WORK_OWNER}/*
+"#,
+            &env(&[("WORK_OWNER", "acme")]),
+        );
+
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(
+            loaded.config.categories.rules[0].path_patterns[0],
+            "github.com/acme/*"
+        );
     }
 }

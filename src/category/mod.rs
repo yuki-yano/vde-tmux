@@ -11,7 +11,7 @@ pub fn resolve_category_for_session(config: &Config, session: &SessionInfo) -> S
     }
     for rule in &config.categories.rules {
         if rule
-            .ghq_patterns
+            .path_patterns
             .iter()
             .any(|pattern| matches_path_pattern(pattern, &session.project_path))
         {
@@ -173,7 +173,7 @@ mod tests {
         let mut config = Config::default();
         config.categories.rules.push(CategoryRule {
             category: "project".to_string(),
-            ghq_patterns: vec!["github.com/acme/*".to_string()],
+            path_patterns: vec!["github.com/acme/*".to_string()],
         });
         let actual = resolve_category_for_session(
             &config,
@@ -187,11 +187,25 @@ mod tests {
         let mut config = Config::default();
         config.categories.rules.push(CategoryRule {
             category: "work".to_string(),
-            ghq_patterns: vec!["github.com/acme/*".to_string()],
+            path_patterns: vec!["github.com/acme/*".to_string()],
         });
         let actual = resolve_category_for_session(
             &config,
             &session("app", "/Users/me/ghq/github.com/acme/app", "", ""),
+        );
+        assert_eq!(actual, "work");
+    }
+
+    #[test]
+    fn project_rule_matches_path_patterns_suffix_with_star() {
+        let mut config = Config::default();
+        config.categories.rules.push(CategoryRule {
+            category: "work".to_string(),
+            path_patterns: vec!["github.com/acme/*".to_string()],
+        });
+        let actual = resolve_category_for_session(
+            &config,
+            &session("app", "/Users/me/src/github.com/acme/app", "", ""),
         );
         assert_eq!(actual, "work");
     }

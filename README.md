@@ -26,12 +26,22 @@ JSON Schema は `vt config schema` で出力できる。
 ```yaml
 categories:
   default_category: misc
+  rules:
+    - category: work
+      path_patterns:
+        - github.com/acme/*
 statusline:
   agent_badge:
     enabled: true
   session_badge:
     enabled: true
     suffix: " "
+badge:
+  glyphs:
+    blocked: "🔴"
+    working: "🟡"
+    done: "🔵"
+    idle: "🟢"
 sidebar:
   width: "10%"
   min_width: 40

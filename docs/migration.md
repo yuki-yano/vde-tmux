@@ -44,7 +44,7 @@ categories:
   default_category: misc
   rules:
     - category: work
-      ghq_patterns:
+      path_patterns:
         - github.com/acme/*
   session_name_rules:
     - category: misc
@@ -55,6 +55,15 @@ statusline:
     show_index: true
   agent_badge:
     enabled: true
+  session_badge:
+    enabled: true
+    suffix: " "
+badge:
+  glyphs:
+    blocked: "🔴"
+    working: "🟡"
+    done: "🔵"
+    idle: "🟢"
 sidebar:
   width: "10%"
   min_width: 40
@@ -87,6 +96,8 @@ daemon:
 
 `ghq_root` は新実装では使わないため削除する。
 `~/.config/vde/tmux/config.yml` に残っている場合は、M7 切替前に消す。
+`categories.rules[].ghq_patterns` は `path_patterns` へリネームする。
+`statusline.session_badge.glyphs` は `badge.glyphs` へ移動する。
 
 ## Pane Option Bus
 

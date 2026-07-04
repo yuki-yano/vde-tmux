@@ -498,7 +498,7 @@ mod tests {
     fn category_rule(category: &str, pattern: &str) -> CategoryRule {
         CategoryRule {
             category: category.to_string(),
-            ghq_patterns: vec![pattern.to_string()],
+            path_patterns: vec![pattern.to_string()],
         }
     }
 

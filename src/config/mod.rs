@@ -16,6 +16,7 @@ pub struct Config {
     pub statusline: StatuslineConfig,
     pub sidebar: SidebarConfig,
     pub daemon: DaemonConfig,
+    pub badge: BadgeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -29,10 +30,10 @@ pub struct CategoriesConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CategoryRule {
     pub category: String,
-    pub ghq_patterns: Vec<String>,
+    pub path_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -131,13 +132,12 @@ impl Default for AgentBadgeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SessionBadgeConfig {
     pub enabled: bool,
     /// グリフ直後に付ける区切り文字列。絵文字は表示幅が広いので
     /// デフォルトで半角スペース 1 個を挟む(バッジ値自体に含める)。
     pub suffix: String,
-    pub glyphs: SessionBadgeGlyphs,
 }
 
 impl Default for SessionBadgeConfig {
@@ -145,21 +145,34 @@ impl Default for SessionBadgeConfig {
         Self {
             enabled: true,
             suffix: " ".to_string(),
-            glyphs: SessionBadgeGlyphs::default(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
-pub struct SessionBadgeGlyphs {
+pub struct BadgeConfig {
+    pub glyphs: BadgeGlyphs,
+}
+
+impl Default for BadgeConfig {
+    fn default() -> Self {
+        Self {
+            glyphs: BadgeGlyphs::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct BadgeGlyphs {
     pub blocked: String,
     pub working: String,
     pub done: String,
     pub idle: String,
 }
 
-impl Default for SessionBadgeGlyphs {
+impl Default for BadgeGlyphs {
     fn default() -> Self {
         Self {
             blocked: "🔴".to_string(),
@@ -447,7 +460,7 @@ categories:
   default_category: public
   rules:
     - category: private
-      ghq_patterns:
+      path_patterns:
         - github.com/example/project-a
         - github.com/${WORK_GHQ_OWNER}/*
   session_name_rules:
@@ -464,7 +477,7 @@ categories:
         );
         assert_eq!(config.categories.rules.len(), 1);
         assert_eq!(
-            config.categories.rules[0].ghq_patterns[1],
+            config.categories.rules[0].path_patterns[1],
             "github.com/${WORK_GHQ_OWNER}/*"
         );
         assert_eq!(
@@ -475,12 +488,51 @@ categories:
 
     #[test]
     fn session_badge_defaults_to_emoji_glyphs_with_space_suffix() {
+        let badge = BadgeConfig::default();
         let config = SessionBadgeConfig::default();
         assert!(config.enabled);
         assert_eq!(config.suffix, " ");
-        assert_eq!(config.glyphs.blocked, "🔴");
-        assert_eq!(config.glyphs.working, "🟡");
-        assert_eq!(config.glyphs.done, "🔵");
-        assert_eq!(config.glyphs.idle, "🟢");
+        assert_eq!(badge.glyphs.blocked, "🔴");
+        assert_eq!(badge.glyphs.working, "🟡");
+        assert_eq!(badge.glyphs.done, "🔵");
+        assert_eq!(badge.glyphs.idle, "🟢");
+    }
+
+    #[test]
+    fn categories_section_parses_path_patterns_only() {
+        let yaml = r#"
+categories:
+  rules:
+    - category: work
+      path_patterns:
+        - github.com/${WORK_OWNER}/*
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            config.categories.rules[0].path_patterns[0],
+            "github.com/${WORK_OWNER}/*"
+        );
+
+        let err = serde_yaml_ng::from_str::<Config>(
+            "categories:\n  rules:\n    - category: work\n      ghq_patterns:\n        - github.com/acme/*\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ghq_patterns"));
+    }
+
+    #[test]
+    fn badge_glyphs_are_top_level_config() {
+        let config: Config = serde_yaml_ng::from_str(
+            "badge:\n  glyphs:\n    working: W\nstatusline:\n  session_badge:\n    suffix: \"\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.badge.glyphs.working, "W");
+        assert_eq!(config.statusline.session_badge.suffix, "");
+
+        let err = serde_yaml_ng::from_str::<Config>(
+            "statusline:\n  session_badge:\n    glyphs:\n      working: W\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("glyphs"));
     }
 }
