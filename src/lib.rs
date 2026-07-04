@@ -2,6 +2,7 @@ pub mod category;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod git;
 pub mod hook;
 pub mod options;
 pub mod project;
