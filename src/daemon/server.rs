@@ -67,7 +67,9 @@ pub fn run_daemon_server(runner: &dyn TmuxRunner, socket_path: &Path) -> Result<
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let _ = handle_stream(runner, stream);
+                if let Err(error) = handle_stream(runner, stream) {
+                    eprintln!("[vde-tmux] daemon connection error: {error:#}");
+                }
             }
             Err(error) => return Err(error.into()),
         }

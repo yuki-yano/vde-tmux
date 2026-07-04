@@ -5,6 +5,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+/// Ensure the daemon socket directory is private and owned by the current user.
+///
+/// This rejects symlinks and loose permissions, but it is still a best-effort
+/// TOCTOU check around normal filesystem operations.
 pub fn ensure_secure_socket_dir(path: &Path) -> Result<()> {
     if !path.exists() {
         std::fs::create_dir_all(path)

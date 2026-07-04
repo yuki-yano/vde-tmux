@@ -154,10 +154,10 @@ remaining_panes=1
 EXIT=0
 ```
 
-Plan 07 追加 smoke も pass。
+M6 追加 smoke も pass。
 
 ```text
-scratch=vde-m7-1783132904
+scratch=vde-m6-1783132904
 window=@0
 main_pane=%0
 sessions= 1:main
