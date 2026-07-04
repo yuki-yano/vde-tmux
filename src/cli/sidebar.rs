@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use clap::Subcommand;
 
+use crate::config::SidebarWidth;
 use crate::tmux::TmuxRunner;
 
 #[derive(Debug, Subcommand)]
@@ -18,8 +19,8 @@ pub(crate) enum SidebarCommand {
     Open {
         #[arg(long)]
         window: Option<String>,
-        #[arg(long)]
-        width: Option<u16>,
+        #[arg(long, value_parser = parse_sidebar_width)]
+        width: Option<SidebarWidth>,
         #[arg(long = "delay-ms")]
         delay_ms: Option<u64>,
     },
@@ -28,8 +29,8 @@ pub(crate) enum SidebarCommand {
         all: bool,
         #[arg(long)]
         window: Option<String>,
-        #[arg(long)]
-        width: Option<u16>,
+        #[arg(long, value_parser = parse_sidebar_width)]
+        width: Option<SidebarWidth>,
     },
     Close {
         #[arg(long)]
@@ -38,8 +39,8 @@ pub(crate) enum SidebarCommand {
     Rail {
         #[arg(long)]
         window: Option<String>,
-        #[arg(long)]
-        width: Option<u16>,
+        #[arg(long, value_parser = parse_sidebar_width)]
+        width: Option<SidebarWidth>,
     },
     Rebaseline {
         #[arg(long)]
@@ -49,8 +50,8 @@ pub(crate) enum SidebarCommand {
     LayoutApplied {
         #[arg(long)]
         window: Option<String>,
-        #[arg(long)]
-        width: Option<u16>,
+        #[arg(long, value_parser = parse_sidebar_width)]
+        width: Option<SidebarWidth>,
     },
     Jump {
         pane: String,
@@ -107,6 +108,7 @@ where
                 &target,
                 &std::env::current_exe()?,
                 width.unwrap_or(config.sidebar.width),
+                config.sidebar.min_width,
             )?;
             Ok(None)
         }
@@ -120,6 +122,7 @@ where
                     runner,
                     &std::env::current_exe()?,
                     width.unwrap_or(config.sidebar.width),
+                    config.sidebar.min_width,
                 )?;
             } else {
                 let target = resolve_window_target(runner, window)?;
@@ -128,6 +131,7 @@ where
                     &target,
                     &std::env::current_exe()?,
                     width.unwrap_or(config.sidebar.width),
+                    config.sidebar.min_width,
                 )?;
             }
             Ok(None)
@@ -139,7 +143,12 @@ where
         }
         SidebarCommand::Rail { window, width } => {
             let target = resolve_window_target(runner, window)?;
-            crate::sidebar::layout::rail(runner, &target, width.unwrap_or(config.sidebar.width))?;
+            crate::sidebar::layout::rail(
+                runner,
+                &target,
+                width.unwrap_or(config.sidebar.width),
+                config.sidebar.min_width,
+            )?;
             Ok(None)
         }
         SidebarCommand::Rebaseline { window } => {
@@ -155,6 +164,7 @@ where
                 &target,
                 &std::env::current_exe()?,
                 width.unwrap_or(config.sidebar.width),
+                config.sidebar.min_width,
             )?;
             Ok(None)
         }
@@ -170,6 +180,10 @@ where
 
 fn ensure_sidebar_daemon_started(env: &BTreeMap<String, String>) -> Result<()> {
     crate::daemon::lifecycle::ensure_daemon_started(env, None)
+}
+
+fn parse_sidebar_width(value: &str) -> std::result::Result<SidebarWidth, String> {
+    value.parse()
 }
 
 fn resolve_window_target(runner: &dyn TmuxRunner, window: Option<String>) -> Result<String> {

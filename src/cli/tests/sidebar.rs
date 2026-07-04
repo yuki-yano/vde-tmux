@@ -154,7 +154,7 @@ fn dispatch_sidebar_open_uses_layout_operations() {
     crate::cli::sidebar::run_sidebar_command_with_ensure(
         crate::cli::sidebar::SidebarCommand::Open {
             window: Some("@1".to_string()),
-            width: Some(40),
+            width: Some(crate::config::SidebarWidth::Columns(40)),
             delay_ms: Some(0),
         },
         &mock,
@@ -165,6 +165,77 @@ fn dispatch_sidebar_open_uses_layout_operations() {
     .unwrap();
 
     assert_eq!(mock.calls().len(), 6);
+}
+
+#[test]
+fn dispatch_sidebar_open_accepts_percent_width() {
+    let mock = MockTmuxRunner::new();
+    let exe = std::env::current_exe().unwrap();
+    let command = format!(
+        "{} sidebar attach",
+        shell_quote_for_test(&exe.display().to_string())
+    );
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@1",
+            "-F",
+            crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+        ],
+        "%1\t\t640\n",
+    );
+    mock.stub(
+        &["display-message", "-p", "-t", "@1", "-F", "#{window_width}"],
+        "640\n",
+    );
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "@1",
+            "-F",
+            "#{window_layout}",
+        ],
+        "layout-before\n",
+    );
+    mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
+    mock.stub(
+        &[
+            "set-option",
+            "-w",
+            "-t",
+            "@1",
+            crate::options::KEY_LAYOUT_BASELINE,
+            "layout-before",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-w",
+            "-t",
+            "@1",
+            crate::options::KEY_LAYOUT_PANES,
+            "%1",
+        ],
+        "",
+    );
+    mock.stub(
+        &["split-window", "-t", "@1", "-hbf", "-l", "64", &command],
+        "",
+    );
+
+    crate::cli::run_with(
+        ["vt", "sidebar", "open", "--window", "@1", "--width", "10%"],
+        &mock,
+        &env(),
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 7);
 }
 
 #[test]
@@ -229,7 +300,7 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
         crate::cli::sidebar::SidebarCommand::Toggle {
             all: true,
             window: None,
-            width: Some(40),
+            width: Some(crate::config::SidebarWidth::Columns(40)),
         },
         &mock,
         &env(),
@@ -427,7 +498,7 @@ fn sidebar_layout_applied_ensures_daemon_started() {
     crate::cli::sidebar::run_sidebar_command_with_ensure(
         crate::cli::sidebar::SidebarCommand::LayoutApplied {
             window: Some("@1".to_string()),
-            width: Some(40),
+            width: Some(crate::config::SidebarWidth::Columns(40)),
         },
         &mock,
         &env(),

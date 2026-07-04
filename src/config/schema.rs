@@ -47,7 +47,13 @@ pub fn config_schema() -> Value {
                 "type": "object",
                 "additionalProperties": true,
                 "properties": {
-                    "width": { "type": "integer", "minimum": 1 }
+                    "width": {
+                        "oneOf": [
+                            { "type": "integer", "minimum": 1 },
+                            { "type": "string", "pattern": "^(100|[1-9][0-9]?)%$" }
+                        ]
+                    },
+                    "min_width": { "type": "integer", "minimum": 1 }
                 }
             },
             "daemon": {
@@ -80,5 +86,13 @@ mod tests {
                 "missing schema property {key}"
             );
         }
+    }
+
+    #[test]
+    fn schema_sidebar_width_accepts_integer_or_percent_string() {
+        let schema = config_schema();
+        let sidebar = &schema["properties"]["sidebar"]["properties"];
+        assert!(sidebar["width"]["oneOf"].is_array());
+        assert_eq!(sidebar["min_width"]["type"], "integer");
     }
 }

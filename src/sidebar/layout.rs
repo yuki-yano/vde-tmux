@@ -3,6 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+use crate::config::SidebarWidth;
 use crate::options::{KEY_LAYOUT_BASELINE, KEY_LAYOUT_PANES, KEY_SIDEBAR_MARKER};
 use crate::tmux::TmuxRunner;
 
@@ -25,11 +26,17 @@ pub fn attach(runner: &dyn TmuxRunner, env: &BTreeMap<String, String>) -> Result
     Ok(())
 }
 
-pub fn open(runner: &dyn TmuxRunner, target: &str, self_exe: &Path, width: u16) -> Result<()> {
+pub fn open(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    self_exe: &Path,
+    width: SidebarWidth,
+    min_width: u16,
+) -> Result<()> {
     if find_sidebar_pane(runner, target)?.is_some() {
         return Ok(());
     }
-    open_unchecked(runner, target, self_exe, width)
+    open_unchecked(runner, target, self_exe, width, min_width)
 }
 
 pub fn close(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
@@ -56,27 +63,43 @@ fn close_sidebar_pane(runner: &dyn TmuxRunner, target: &str, sidebar: &SidebarPa
     Ok(())
 }
 
-pub fn toggle(runner: &dyn TmuxRunner, target: &str, self_exe: &Path, width: u16) -> Result<()> {
+pub fn toggle(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    self_exe: &Path,
+    width: SidebarWidth,
+    min_width: u16,
+) -> Result<()> {
     if let Some(sidebar) = find_sidebar_pane(runner, target)? {
         close_sidebar_pane(runner, target, &sidebar)
     } else {
-        open_unchecked(runner, target, self_exe, width)
+        open_unchecked(runner, target, self_exe, width, min_width)
     }
 }
 
-pub fn toggle_all(runner: &dyn TmuxRunner, self_exe: &Path, width: u16) -> Result<()> {
+pub fn toggle_all(
+    runner: &dyn TmuxRunner,
+    self_exe: &Path,
+    width: SidebarWidth,
+    min_width: u16,
+) -> Result<()> {
     for window in list_window_ids(runner)? {
-        toggle(runner, &window, self_exe, width)?;
+        toggle(runner, &window, self_exe, width, min_width)?;
     }
     Ok(())
 }
 
-pub fn rail(runner: &dyn TmuxRunner, target: &str, normal_width: u16) -> Result<()> {
+pub fn rail(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    normal_width: SidebarWidth,
+    min_width: u16,
+) -> Result<()> {
     let Some(sidebar) = find_sidebar_pane(runner, target)? else {
         return Ok(());
     };
     let next_width = if sidebar.width <= RAIL_WIDTH {
-        normal_width
+        resolve_width(runner, target, normal_width, min_width)?
     } else {
         RAIL_WIDTH
     };
@@ -117,7 +140,8 @@ pub fn layout_applied(
     runner: &dyn TmuxRunner,
     target: &str,
     self_exe: &Path,
-    width: u16,
+    width: SidebarWidth,
+    min_width: u16,
 ) -> Result<()> {
     if !window_exists(runner, target)? {
         return Ok(());
@@ -125,18 +149,20 @@ pub fn layout_applied(
     if find_sidebar_pane(runner, target)?.is_some() {
         return rebaseline(runner, target);
     }
-    open_unchecked(runner, target, self_exe, width)
+    open_unchecked(runner, target, self_exe, width, min_width)
 }
 
 fn open_unchecked(
     runner: &dyn TmuxRunner,
     target: &str,
     self_exe: &Path,
-    width: u16,
+    width: SidebarWidth,
+    min_width: u16,
 ) -> Result<()> {
     let layout = capture_window_layout(runner, target)?;
     let panes = capture_pane_ids(runner, target)?;
     save_baseline(runner, target, &layout, &panes)?;
+    let width = resolve_width(runner, target, width, min_width)?;
     let socket_name = std::env::var("VDE_TMUX_SOCKET_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -151,6 +177,33 @@ fn open_unchecked(
         &command,
     ])?;
     Ok(())
+}
+
+fn resolve_width(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    width: SidebarWidth,
+    min_width: u16,
+) -> Result<u16> {
+    match width {
+        SidebarWidth::Columns(columns) => Ok(columns),
+        SidebarWidth::Percent(percent) => {
+            let output = runner.run(&[
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "-F",
+                "#{window_width}",
+            ])?;
+            let window_width = output
+                .trim()
+                .parse::<u32>()
+                .with_context(|| format!("failed to parse window width for {target}"))?;
+            let resolved = window_width.saturating_mul(percent as u32) / 100;
+            Ok((resolved as u16).max(min_width))
+        }
+    }
 }
 
 fn find_sidebar_pane(runner: &dyn TmuxRunner, target: &str) -> Result<Option<SidebarPane>> {
@@ -383,9 +436,96 @@ mod tests {
             "",
         );
 
-        open(&mock, "@1", &exe(), 40).unwrap();
+        open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
         assert_eq!(mock.calls().len(), 6);
+    }
+
+    #[test]
+    fn open_resolves_percent_width_from_window_width() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t640\n",
+        );
+        mock.stub(
+            &["display-message", "-p", "-t", "@1", "-F", "#{window_width}"],
+            "640\n",
+        );
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-before\n",
+        );
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@1",
+                KEY_LAYOUT_BASELINE,
+                "layout-before",
+            ],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-t", "@1", KEY_LAYOUT_PANES, "%1"],
+            "",
+        );
+        mock.stub(
+            &[
+                "split-window",
+                "-t",
+                "@1",
+                "-hbf",
+                "-l",
+                "64",
+                "'/tmp/vt' sidebar attach",
+            ],
+            "",
+        );
+
+        open(
+            &mock,
+            "@1",
+            &exe(),
+            crate::config::SidebarWidth::Percent(10),
+            40,
+        )
+        .unwrap();
+
+        assert_eq!(mock.calls().len(), 7);
+    }
+
+    #[test]
+    fn percent_width_is_clamped_to_min_width() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["display-message", "-p", "-t", "@1", "-F", "#{window_width}"],
+            "320\n",
+        );
+
+        assert_eq!(
+            resolve_width(&mock, "@1", crate::config::SidebarWidth::Percent(10), 40).unwrap(),
+            40
+        );
+    }
+
+    #[test]
+    fn fixed_width_is_not_clamped_to_min_width() {
+        let mock = MockTmuxRunner::new();
+
+        assert_eq!(
+            resolve_width(&mock, "@1", crate::config::SidebarWidth::Columns(20), 40).unwrap(),
+            20
+        );
     }
 
     #[test]
@@ -425,9 +565,27 @@ mod tests {
         );
         mock.stub(&["resize-pane", "-t", "%9", "-x", "2"], "");
 
-        rail(&mock, "@1", 40).unwrap();
+        rail(&mock, "@1", SidebarWidth::Columns(40), 40).unwrap();
 
         assert_eq!(mock.calls().len(), 2);
+    }
+
+    #[test]
+    fn rail_resolves_percent_width_when_restoring_normal_width() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%9\t1\t2\n",
+        );
+        mock.stub(
+            &["display-message", "-p", "-t", "@1", "-F", "#{window_width}"],
+            "640\n",
+        );
+        mock.stub(&["resize-pane", "-t", "%9", "-x", "64"], "");
+
+        rail(&mock, "@1", SidebarWidth::Percent(10), 40).unwrap();
+
+        assert_eq!(mock.calls().len(), 3);
     }
 
     #[test]
@@ -494,7 +652,7 @@ mod tests {
             "",
         );
 
-        toggle_all(&mock, &exe(), 40).unwrap();
+        toggle_all(&mock, &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
         assert_eq!(mock.calls().len(), 13);
     }
@@ -546,7 +704,7 @@ mod tests {
             "",
         );
 
-        layout_applied(&mock, "@1", &exe(), 32).unwrap();
+        layout_applied(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
 
         assert_eq!(mock.calls().len(), 7);
     }
@@ -570,7 +728,7 @@ mod tests {
             "",
         );
 
-        toggle(&mock, "@1", &exe(), 32).unwrap();
+        toggle(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
 
         assert_eq!(mock.calls().len(), 6);
     }

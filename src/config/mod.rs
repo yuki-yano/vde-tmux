@@ -5,8 +5,9 @@ pub mod load;
 pub mod schema;
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default)]
@@ -173,12 +174,81 @@ impl Default for SessionBadgeGlyphs {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct SidebarConfig {
-    pub width: u16,
+    pub width: SidebarWidth,
+    pub min_width: u16,
 }
 
 impl Default for SidebarConfig {
     fn default() -> Self {
-        Self { width: 40 }
+        Self {
+            width: SidebarWidth::default(),
+            min_width: 40,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarWidth {
+    Columns(u16),
+    Percent(u16),
+}
+
+impl Default for SidebarWidth {
+    fn default() -> Self {
+        Self::Columns(40)
+    }
+}
+
+impl FromStr for SidebarWidth {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if let Some(percent) = value.strip_suffix('%') {
+            let percent = percent
+                .parse::<u16>()
+                .map_err(|_| format!("expected percentage width like \"10%\", got {value:?}"))?;
+            if !(1..=100).contains(&percent) {
+                return Err(format!(
+                    "expected percentage width from 1% to 100%, got {value:?}"
+                ));
+            }
+            return Ok(Self::Percent(percent));
+        }
+        let columns = value
+            .parse::<u16>()
+            .map_err(|_| format!("expected sidebar width like 64 or \"10%\", got {value:?}"))?;
+        if columns == 0 {
+            return Err("sidebar width must be greater than 0".to_string());
+        }
+        Ok(Self::Columns(columns))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawSidebarWidth {
+    Columns(u16),
+    Percent(String),
+}
+
+impl<'de> Deserialize<'de> for SidebarWidth {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match RawSidebarWidth::deserialize(deserializer)? {
+            RawSidebarWidth::Columns(columns) if columns > 0 => Ok(Self::Columns(columns)),
+            RawSidebarWidth::Columns(_) => {
+                Err(de::Error::custom("sidebar width must be greater than 0"))
+            }
+            RawSidebarWidth::Percent(value) if value.trim().ends_with('%') => {
+                value.parse().map_err(de::Error::custom)
+            }
+            RawSidebarWidth::Percent(value) => Err(de::Error::custom(format!(
+                "expected percentage width like \"10%\", got {value:?}"
+            ))),
+        }
     }
 }
 
@@ -225,8 +295,35 @@ mod tests {
         assert!(config.statusline.agent_badge.enabled);
         assert_eq!(config.daemon.poll_ms, 1000);
         assert_eq!(config.daemon.git.timeout_ms, 500);
-        assert_eq!(config.sidebar.width, 40);
+        assert_eq!(config.sidebar.width, SidebarWidth::Columns(40));
+        assert_eq!(config.sidebar.min_width, 40);
         assert_eq!(config.statusline.category.mode, "list");
+    }
+
+    #[test]
+    fn sidebar_width_accepts_columns_and_percent() {
+        let columns = serde_yaml_ng::from_str::<Config>("sidebar:\n  width: 64\n").unwrap();
+        assert_eq!(columns.sidebar.width, SidebarWidth::Columns(64));
+        assert_eq!(columns.sidebar.min_width, 40);
+
+        let percent = serde_yaml_ng::from_str::<Config>("sidebar:\n  width: \"10%\"\n").unwrap();
+        assert_eq!(percent.sidebar.width, SidebarWidth::Percent(10));
+        assert_eq!(percent.sidebar.min_width, 40);
+    }
+
+    #[test]
+    fn sidebar_min_width_can_be_overridden() {
+        let config =
+            serde_yaml_ng::from_str::<Config>("sidebar:\n  width: \"10%\"\n  min_width: 48\n")
+                .unwrap();
+        assert_eq!(config.sidebar.width, SidebarWidth::Percent(10));
+        assert_eq!(config.sidebar.min_width, 48);
+    }
+
+    #[test]
+    fn sidebar_width_rejects_invalid_percent() {
+        let err = serde_yaml_ng::from_str::<Config>("sidebar:\n  width: \"%\"\n").unwrap_err();
+        assert!(err.to_string().contains("expected percentage width"));
     }
 
     #[test]
