@@ -7,7 +7,6 @@ pub fn config_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "ghq_root": { "type": ["string", "null"] },
             "categories": {
                 "type": "object",
                 "additionalProperties": true,
@@ -80,12 +79,13 @@ mod tests {
             .and_then(|value| value.as_object())
             .unwrap();
 
-        for key in ["ghq_root", "categories", "statusline", "sidebar", "daemon"] {
+        for key in ["categories", "statusline", "sidebar", "daemon"] {
             assert!(
                 properties.contains_key(key),
                 "missing schema property {key}"
             );
         }
+        assert!(!properties.contains_key("ghq_root"));
     }
 
     #[test]

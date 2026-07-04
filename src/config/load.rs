@@ -26,6 +26,10 @@ pub struct LoadedConfig {
 /// YAML 文字列から Config を得る。空文字列は default。
 /// パース失敗時は default + 位置情報付き警告(serde_path_to_error)。
 pub fn parse_config(yaml: &str) -> LoadedConfig {
+    parse_config_with_env(yaml, &BTreeMap::new())
+}
+
+pub fn parse_config_with_env(yaml: &str, env: &BTreeMap<String, String>) -> LoadedConfig {
     if yaml.trim().is_empty() {
         return LoadedConfig {
             config: Config::default(),
@@ -34,15 +38,88 @@ pub fn parse_config(yaml: &str) -> LoadedConfig {
     }
     let deserializer = serde_yaml_ng::Deserializer::from_str(yaml);
     match serde_path_to_error::deserialize::<_, Config>(deserializer) {
-        Ok(config) => LoadedConfig {
-            config,
-            warnings: Vec::new(),
+        Ok(mut config) => match expand_config_patterns(&mut config, env) {
+            Ok(()) => LoadedConfig {
+                config,
+                warnings: Vec::new(),
+            },
+            Err(warning) => LoadedConfig {
+                config: Config::default(),
+                warnings: vec![warning],
+            },
         },
         Err(error) => LoadedConfig {
             config: Config::default(),
             warnings: vec![format!("invalid config (path: {}): {error}", error.path())],
         },
     }
+}
+
+fn expand_config_patterns(
+    config: &mut Config,
+    env: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    for (rule_index, rule) in config.categories.rules.iter_mut().enumerate() {
+        for (pattern_index, pattern) in rule.ghq_patterns.iter_mut().enumerate() {
+            *pattern = expand_pattern(
+                pattern,
+                env,
+                &format!("categories.rules.{rule_index}.ghq_patterns.{pattern_index}"),
+            )?;
+        }
+    }
+    for (rule_index, rule) in config.categories.session_name_rules.iter_mut().enumerate() {
+        for (pattern_index, pattern) in rule.patterns.iter_mut().enumerate() {
+            *pattern = expand_pattern(
+                pattern,
+                env,
+                &format!("categories.session_name_rules.{rule_index}.patterns.{pattern_index}"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn expand_pattern(
+    value: &str,
+    env: &BTreeMap<String, String>,
+    path: &str,
+) -> Result<String, String> {
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find('}') else {
+            output.push_str(&rest[start..]);
+            return Ok(output);
+        };
+        let name = &after_start[..end];
+        let token_len = 2 + end + 1;
+        if !is_env_name(name) {
+            output.push_str(&rest[start..start + token_len]);
+            rest = &after_start[end + 1..];
+            continue;
+        }
+        let Some(replacement) = env.get(name) else {
+            return Err(format!(
+                "invalid config (path: {path}): environment variable {name} is not defined"
+            ));
+        };
+        output.push_str(replacement);
+        rest = &after_start[end + 1..];
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
+fn is_env_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 /// ファイルから読み込む。ファイル不在は警告なしの default(初回利用で騒がない)。
@@ -55,7 +132,7 @@ pub fn load_config(env: &BTreeMap<String, String>) -> LoadedConfig {
         };
     };
     match std::fs::read_to_string(&path) {
-        Ok(content) => parse_config(&content),
+        Ok(content) => parse_config_with_env(&content, env),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => LoadedConfig {
             config: Config::default(),
             warnings: Vec::new(),
@@ -140,6 +217,44 @@ mod tests {
         let loaded = load_config(&env(&[("HOME", "/nonexistent-home-for-vde-tmux-test")]));
         assert_eq!(loaded.config, Config::default());
         assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn config_pattern_env_expands_ghq_and_session_patterns() {
+        let loaded = parse_config_with_env(
+            r#"
+categories:
+  rules:
+    - category: work
+      ghq_patterns:
+        - github.com/${WORK_GHQ_OWNER}/*
+  session_name_rules:
+    - category: work
+      patterns:
+        - ${WORK_PREFIX}-*
+"#,
+            &env(&[("WORK_GHQ_OWNER", "acme"), ("WORK_PREFIX", "corp")]),
+        );
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(
+            loaded.config.categories.rules[0].ghq_patterns[0],
+            "github.com/acme/*"
+        );
+        assert_eq!(
+            loaded.config.categories.session_name_rules[0].patterns[0],
+            "corp-*"
+        );
+    }
+
+    #[test]
+    fn config_pattern_env_missing_var_returns_default_with_warning() {
+        let loaded = parse_config_with_env(
+            "categories:\n  rules:\n    - category: work\n      ghq_patterns:\n        - github.com/${WORK_GHQ_OWNER}/*\n",
+            &env(&[]),
+        );
+        assert_eq!(loaded.config, Config::default());
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(loaded.warnings[0].contains("WORK_GHQ_OWNER"));
     }
 
     #[test]

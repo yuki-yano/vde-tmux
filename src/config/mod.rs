@@ -10,9 +10,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, de};
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
-    pub ghq_root: Option<String>,
     pub categories: CategoriesConfig,
     pub statusline: StatuslineConfig,
     pub sidebar: SidebarConfig,
@@ -327,9 +326,14 @@ mod tests {
     }
 
     #[test]
+    fn ghq_root_is_no_longer_accepted_as_top_level_config() {
+        let err = serde_yaml_ng::from_str::<Config>("ghq_root: ~/repos\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
     fn partial_yaml_overrides_only_given_keys() {
         let yaml = r#"
-ghq_root: "~/repos"
 statusline:
   sessions:
     show_index: true
@@ -337,7 +341,6 @@ daemon:
   poll_ms: 250
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.ghq_root.as_deref(), Some("~/repos"));
         assert!(config.statusline.sessions.show_index);
         assert_eq!(config.daemon.poll_ms, 250);
         // 触っていないキーは default のまま
