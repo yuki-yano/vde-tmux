@@ -8,7 +8,7 @@ use crate::daemon::runtime::DaemonEvent;
 use crate::detect::{demote_stale_running, detect_codex_wait_reason};
 use crate::git::{GitRunner, SystemGitRunner, collect_git_badges};
 use crate::hook::AgentStatus;
-use crate::options::snapshot::{PaneSnapshot, read_all_panes};
+use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane, read_all_panes};
 use crate::sidebar::layout::jump_to_pane;
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
@@ -153,7 +153,7 @@ pub fn apply_capture_detection(
     now_epoch: i64,
     stale_threshold_seconds: i64,
 ) -> PaneSnapshot {
-    if pane.agent.trim().is_empty() || pane.is_sidebar {
+    if !is_live_agent_pane(&pane) {
         return pane;
     }
     let should_capture = pane.wait_reason.trim().is_empty() || pane.status == "running";
@@ -270,6 +270,7 @@ mod tests {
             window_id: "@1".to_string(),
             pane_id: pane_id.to_string(),
             current_path: "/tmp/app".to_string(),
+            current_command: agent.to_string(),
             agent: agent.to_string(),
             status: status.to_string(),
             ..PaneSnapshot::default()

@@ -92,6 +92,29 @@ pub fn read_all_panes(runner: &dyn TmuxRunner) -> Result<Vec<PaneSnapshot>> {
     Ok(parse_snapshot_lines(&output))
 }
 
+pub fn detect_agent_from_command(command: &str) -> Option<&'static str> {
+    let leaf = command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match leaf.as_str() {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "opencode" => Some("opencode"),
+        _ => None,
+    }
+}
+
+pub fn is_live_agent_pane(pane: &PaneSnapshot) -> bool {
+    !pane.is_sidebar
+        && !pane.agent.trim().is_empty()
+        && detect_agent_from_command(&pane.current_command).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +239,17 @@ mod tests {
         let panes = read_all_panes(&mock).unwrap();
         assert!(panes.is_empty());
         assert_eq!(mock.calls().len(), 1);
+    }
+
+    #[test]
+    fn detects_agent_process_from_current_command_only_for_real_agent_binary() {
+        assert_eq!(detect_agent_from_command("codex"), Some("codex"));
+        assert_eq!(
+            detect_agent_from_command("/opt/homebrew/bin/claude --danger"),
+            Some("claude")
+        );
+        assert_eq!(detect_agent_from_command("opencode"), Some("opencode"));
+        assert_eq!(detect_agent_from_command("node"), None);
+        assert_eq!(detect_agent_from_command("zsh"), None);
     }
 }

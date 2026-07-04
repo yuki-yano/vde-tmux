@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::daemon::protocol::{ClientMessage, ServerMessage};
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
-use crate::options::snapshot::{PaneSnapshot, read_all_panes};
+use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane, read_all_panes};
 use crate::sidebar::state::SidebarState;
 use crate::sidebar::tree::SidebarRow;
 use crate::tmux::TmuxRunner;
@@ -58,7 +58,7 @@ pub fn build_snapshot_with_sidebar(
 ) -> DaemonSnapshot {
     let panes = panes
         .iter()
-        .filter(|pane| !pane.agent.is_empty())
+        .filter(|pane| is_live_agent_pane(pane))
         .map(|pane| {
             let status = parse_agent_status(&pane.status);
             let wait_reason = (!pane.wait_reason.is_empty()).then(|| pane.wait_reason.clone());
@@ -188,6 +188,7 @@ mod tests {
     fn pane(agent: &str, status: &str, wait_reason: &str) -> PaneSnapshot {
         PaneSnapshot {
             pane_id: "%1".to_string(),
+            current_command: agent.to_string(),
             agent: agent.to_string(),
             status: status.to_string(),
             wait_reason: wait_reason.to_string(),
@@ -204,6 +205,17 @@ mod tests {
         ]);
         assert_eq!(snapshot.agent_count, 2);
         assert_eq!(snapshot.rollup, crate::hook::RollupLevel::Running);
+    }
+
+    #[test]
+    fn build_snapshot_ignores_stale_agent_option_when_command_is_not_agent() {
+        let mut stale = pane("codex", "running", "");
+        stale.current_command = "zsh".to_string();
+
+        let snapshot = build_snapshot(&[stale]);
+
+        assert_eq!(snapshot.agent_count, 0);
+        assert_eq!(render_agent_badge(&snapshot), "");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::category::resolve_category_for_session;
 use crate::config::Config;
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
-use crate::options::snapshot::PaneSnapshot;
+use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane};
 use crate::session::SessionInfo;
 use crate::sidebar::state::{SidebarRowRef, SidebarState, StatusFilter, ViewMode};
 
@@ -83,7 +83,7 @@ pub fn build_rows_at_with_git(
 ) -> Vec<SidebarRow> {
     let mut groups: BTreeMap<(String, String), Vec<AgentPane>> = BTreeMap::new();
     for pane in panes {
-        if pane.is_sidebar || pane.agent.trim().is_empty() {
+        if !is_live_agent_pane(pane) {
             continue;
         }
         let repo = repo_label(pane);
@@ -489,6 +489,7 @@ mod tests {
             session: session.to_string(),
             pane_id: pane_id.to_string(),
             current_path: path.to_string(),
+            current_command: agent.to_string(),
             agent: agent.to_string(),
             status: status.to_string(),
             ..PaneSnapshot::default()
@@ -533,6 +534,16 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].label, "app");
         assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn build_rows_excludes_stale_agent_option_when_command_is_not_agent() {
+        let mut stale = pane("main", "%1", "/tmp/app", "codex", "running");
+        stale.current_command = "node".to_string();
+
+        let rows = build_rows(&Config::default(), &[stale], &SidebarState::default());
+
+        assert!(rows.is_empty());
     }
 
     #[test]

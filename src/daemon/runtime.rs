@@ -9,7 +9,7 @@ use crate::daemon::{
     DaemonSnapshot, SidebarFrame, build_snapshot_with_sidebar, render_agent_badge,
 };
 use crate::git::GitBadge;
-use crate::options::snapshot::PaneSnapshot;
+use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane};
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
 use crate::sidebar::state::{RepoId, SidebarAction, SidebarState};
 use crate::sidebar::tree::{SidebarRow, SidebarRowKind, build_rows_with_git, row_refs};
@@ -387,7 +387,7 @@ impl RuntimeState {
         for pane in self
             .panes
             .iter()
-            .filter(|pane| !pane.is_sidebar && !pane.agent.is_empty())
+            .filter(|pane| is_live_agent_pane(pane))
         {
             let level = crate::sidebar::tree::rollup_for_pane(pane);
             let is_idle = level == crate::hook::RollupLevel::Idle;
@@ -422,7 +422,7 @@ impl RuntimeState {
             for pane in self
                 .panes
                 .iter()
-                .filter(|pane| !pane.is_sidebar && !pane.agent.is_empty())
+                .filter(|pane| is_live_agent_pane(pane))
             {
                 let level = crate::sidebar::tree::rollup_for_pane(pane);
                 let unread = self.unread.get(&pane.pane_id).copied().unwrap_or(false);
@@ -492,6 +492,7 @@ mod tests {
             window_id: "@1".to_string(),
             pane_id: pane_id.to_string(),
             current_path: path.to_string(),
+            current_command: agent.to_string(),
             agent: agent.to_string(),
             status: status.to_string(),
             ..PaneSnapshot::default()
@@ -504,7 +505,7 @@ mod tests {
             window_id: "@1".to_string(),
             pane_id: pane_id.to_string(),
             current_path: "/tmp".to_string(),
-            current_command: "zsh".to_string(),
+            current_command: "codex".to_string(),
             window_active: false,
             session_attached: false,
             is_sidebar: false,
@@ -715,6 +716,23 @@ mod tests {
                 value: "🟡 ".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn stale_agent_option_clears_session_badge() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let mut stale = agent_pane("main", "%1", "running");
+        stale.current_command = "zsh".to_string();
+
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![stale]));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::ClearSessionBadge { session } if session == "main"
+        )));
     }
 
     #[test]

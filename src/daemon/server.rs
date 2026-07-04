@@ -377,7 +377,7 @@ mod tests {
             "@1",
             "%1",
             "/tmp",
-            "zsh",
+            agent,
             "0",
             "0",
             "",
@@ -570,7 +570,7 @@ mod tests {
             window_id: "@1".to_string(),
             pane_id: pane_id.to_string(),
             current_path: "/tmp/app".to_string(),
-            current_command: "zsh".to_string(),
+            current_command: "codex".to_string(),
             agent: "codex".to_string(),
             status: status.to_string(),
             ..crate::options::snapshot::PaneSnapshot::default()
@@ -592,6 +592,7 @@ mod tests {
             window_id: "@1".to_string(),
             pane_id: "%1".to_string(),
             current_path: "/tmp/app".to_string(),
+            current_command: "codex".to_string(),
             agent: "codex".to_string(),
             status: "running".to_string(),
             ..PaneSnapshot::default()
@@ -689,6 +690,7 @@ mod tests {
             window_id: "@1".to_string(),
             pane_id: "%1".to_string(),
             current_path: "/tmp/app".to_string(),
+            current_command: "codex".to_string(),
             agent: "codex".to_string(),
             status: "running".to_string(),
             ..PaneSnapshot::default()

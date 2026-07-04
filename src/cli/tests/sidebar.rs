@@ -17,8 +17,8 @@ fn dispatch_sidebar_attach_once_marks_and_renders() {
     );
     let format = crate::options::snapshot::snapshot_format();
     let line = [
-        "main", "@1", "%1", "/tmp/app", "zsh", "0", "0", "", "codex", "running", "", "", "", "",
-        "", "", "", "",
+        "main", "@1", "%1", "/tmp/app", "codex", "0", "0", "", "codex", "running", "", "", "",
+        "", "", "", "", "",
     ]
     .join("\u{1f}");
     mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
@@ -73,8 +73,8 @@ fn dispatch_sidebar_attach_once_restores_persisted_state() {
     );
     let format = crate::options::snapshot::snapshot_format();
     let line = [
-        "main", "@1", "%1", "/tmp/app", "zsh", "0", "0", "", "codex", "running", "", "", "", "",
-        "", "", "", "",
+        "main", "@1", "%1", "/tmp/app", "codex", "0", "0", "", "codex", "running", "", "", "",
+        "", "", "", "", "",
     ]
     .join("\u{1f}");
     mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
