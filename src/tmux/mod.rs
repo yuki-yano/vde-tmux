@@ -67,9 +67,10 @@ pub fn run_command(program: &str, args: &[&str], timeout: Option<Duration>) -> R
 
 /// 実 tmux を呼ぶ Runner。timeout は経路ごとに選ぶ:
 /// hook 経路はエージェントをブロックしないため必ず Some を指定する。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SystemTmuxRunner {
     timeout: Option<Duration>,
+    socket_name: Option<String>,
 }
 
 impl SystemTmuxRunner {
@@ -80,14 +81,43 @@ impl SystemTmuxRunner {
     pub fn with_timeout(timeout: Duration) -> Self {
         Self {
             timeout: Some(timeout),
+            socket_name: None,
+        }
+    }
+
+    pub fn with_socket_name(socket_name: impl Into<String>, timeout: Option<Duration>) -> Self {
+        Self {
+            timeout,
+            socket_name: Some(socket_name.into()),
+        }
+    }
+
+    pub fn from_env(timeout: Duration) -> Self {
+        match std::env::var("VDE_TMUX_SOCKET_NAME") {
+            Ok(socket_name) if !socket_name.trim().is_empty() => {
+                Self::with_socket_name(socket_name, Some(timeout))
+            }
+            _ => Self::with_timeout(timeout),
         }
     }
 }
 
 impl TmuxRunner for SystemTmuxRunner {
     fn run(&self, args: &[&str]) -> Result<String> {
-        run_command("tmux", args, self.timeout)
+        let owned_args = tmux_args(self.socket_name.as_deref(), args);
+        let refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+        run_command("tmux", &refs, self.timeout)
     }
+}
+
+pub fn tmux_args(socket_name: Option<&str>, args: &[&str]) -> Vec<String> {
+    let mut tmux_args = Vec::new();
+    if let Some(socket_name) = socket_name.filter(|name| !name.trim().is_empty()) {
+        tmux_args.push("-L".to_string());
+        tmux_args.push(socket_name.to_string());
+    }
+    tmux_args.extend(args.iter().map(|arg| (*arg).to_string()));
+    tmux_args
 }
 
 #[cfg(test)]
@@ -123,5 +153,25 @@ mod tests {
             "kill されずに待ち続けていないこと"
         );
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn tmux_args_prefixes_socket_name_when_present() {
+        assert_eq!(
+            tmux_args(Some("scratch"), &["list-sessions"]),
+            vec![
+                "-L".to_string(),
+                "scratch".to_string(),
+                "list-sessions".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn tmux_args_without_socket_name_is_plain() {
+        assert_eq!(
+            tmux_args(None, &["list-sessions"]),
+            vec!["list-sessions".to_string()]
+        );
     }
 }
