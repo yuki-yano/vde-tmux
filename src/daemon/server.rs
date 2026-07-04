@@ -40,6 +40,9 @@ pub fn handle_message(runner: &dyn TmuxRunner, message: ClientMessage) -> Result
         ClientMessage::SidebarEvent { .. } => Ok(ServerMessage::Error {
             message: "sidebar events require runtime daemon".to_string(),
         }),
+        ClientMessage::Shutdown { .. } => Ok(ServerMessage::Error {
+            message: "shutdown requires runtime daemon".to_string(),
+        }),
     }
 }
 
@@ -82,6 +85,10 @@ pub fn handle_stream_with_runtime(
         }
         ClientMessage::SidebarEvent { proto: _, event } => {
             tx.send(DaemonEvent::Client { client_id, event })?;
+            write_server_message(&mut stream, &ServerMessage::Ack)?;
+        }
+        ClientMessage::Shutdown { proto: _ } => {
+            tx.send(DaemonEvent::Shutdown)?;
             write_server_message(&mut stream, &ServerMessage::Ack)?;
         }
         ClientMessage::Query {
@@ -484,6 +491,31 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             DaemonEvent::Shutdown
         ));
+    }
+
+    #[test]
+    fn handle_runtime_shutdown_sends_shutdown_event_and_ack() {
+        use crate::daemon::runtime::{ClientId, DaemonEvent};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        serde_json::to_writer(&mut client, &ClientMessage::Shutdown { proto: 1 }).unwrap();
+        client.write_all(b"\n").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        handle_stream_with_runtime(tx, ClientId(1), server).unwrap();
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DaemonEvent::Shutdown
+        ));
+
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), r#"{"type":"ack"}"#);
     }
 
     #[derive(Default)]

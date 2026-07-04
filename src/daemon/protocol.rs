@@ -14,6 +14,9 @@ pub enum ClientMessage {
     Subscribe {
         proto: u16,
     },
+    Shutdown {
+        proto: u16,
+    },
     SidebarEvent {
         proto: u16,
         event: SidebarClientEvent,
@@ -63,6 +66,15 @@ mod tests {
         let message = ClientMessage::Subscribe { proto: 1 };
         let json = serde_json::to_string(&message).unwrap();
         assert_eq!(json, r#"{"op":"subscribe","proto":1}"#);
+        let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn shutdown_uses_proto_field() {
+        let message = ClientMessage::Shutdown { proto: 1 };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(json, r#"{"op":"shutdown","proto":1}"#);
         let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, message);
     }

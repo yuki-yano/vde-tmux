@@ -42,6 +42,8 @@ enum Command {
     Daemon {
         #[arg(long)]
         socket: Option<String>,
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
     },
     Config {
         #[command(subcommand)]
@@ -102,6 +104,14 @@ enum StatuslineSessionsCommand {
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
     Schema,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    Stop {
+        #[arg(long)]
+        socket: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -254,7 +264,12 @@ where
             }
         },
         Command::StatuslineAgentBadge => Ok(Some(daemon::statusline_agent_badge(runner, env)?)),
-        Command::Daemon { socket } => daemon::run_daemon(runner, env, socket.as_deref()),
+        Command::Daemon { socket, command } => match command {
+            Some(DaemonCommand::Stop {
+                socket: stop_socket,
+            }) => daemon::stop_daemon(env, stop_socket.as_deref().or(socket.as_deref())),
+            None => daemon::run_daemon(runner, env, socket.as_deref()),
+        },
         Command::Config { command } => match command {
             ConfigCommand::Schema => daemon::config_schema(),
         },

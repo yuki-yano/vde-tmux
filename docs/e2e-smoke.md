@@ -35,9 +35,11 @@ VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt statusline-sessions --show-index
 daemon 経由も確認する。
 
 ```bash
-sock="/tmp/${name}.sock"
+sock_dir="/private/tmp/${name}-daemon"
+mkdir -p "$sock_dir"
+chmod 700 "$sock_dir"
+sock="$sock_dir/daemon.sock"
 VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt daemon --socket "$sock" &
-daemon_pid=$!
 
 for _ in $(seq 1 50); do
   [ -S "$sock" ] && break
@@ -47,8 +49,8 @@ done
 VDE_TMUX_SOCKET_NAME="$name" VDE_DAEMON_SOCKET="$sock" \
   ./target/debug/vt statusline-agent-badge
 
-kill "$daemon_pid"
-rm -f "$sock"
+VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt daemon stop --socket "$sock"
+rm -rf "$sock_dir"
 ```
 
 期待値: `running:1`。
