@@ -45,6 +45,8 @@ pub enum DaemonEvent {
 pub enum RuntimeEffect {
     JumpPane(String),
     SaveState(SidebarState),
+    SetSessionBadge { session: String, value: String },
+    ClearSessionBadge { session: String },
 }
 
 #[derive(Debug)]
@@ -126,6 +128,9 @@ pub struct RuntimeState {
     last_pushed: Option<PushFingerprint>,
     running: bool,
     dirty_state_since: Option<Instant>,
+    pane_was_idle: BTreeMap<String, bool>,
+    unread: BTreeMap<String, bool>,
+    written_badges: BTreeMap<String, String>,
 }
 
 impl RuntimeState {
@@ -141,6 +146,9 @@ impl RuntimeState {
             last_pushed: None,
             running: true,
             dirty_state_since: None,
+            pane_was_idle: BTreeMap::new(),
+            unread: BTreeMap::new(),
+            written_badges: BTreeMap::new(),
         }
     }
 
@@ -162,9 +170,10 @@ impl RuntimeState {
             DaemonEvent::Client { event, .. } => self.apply_client_event(event),
             DaemonEvent::PanesUpdated(panes) => {
                 self.panes = panes;
+                self.update_unread();
                 self.rebuild_snapshot();
                 self.broadcast_if_needed();
-                Vec::new()
+                self.sync_session_badges()
             }
             DaemonEvent::GitStatusUpdated(git_badges) => {
                 self.git_badges = git_badges;
@@ -185,7 +194,15 @@ impl RuntimeState {
             DaemonEvent::Shutdown => {
                 self.running = false;
                 self.clients.values().for_each(|slot| slot.close());
-                Vec::new()
+                let effects = self
+                    .written_badges
+                    .keys()
+                    .map(|session| RuntimeEffect::ClearSessionBadge {
+                        session: session.clone(),
+                    })
+                    .collect();
+                self.written_badges.clear();
+                effects
             }
         }
     }
@@ -303,6 +320,82 @@ impl RuntimeState {
         Vec::new()
     }
 
+    fn update_unread(&mut self) {
+        let mut next_was_idle = BTreeMap::new();
+        let mut next_unread = BTreeMap::new();
+        for pane in self
+            .panes
+            .iter()
+            .filter(|pane| !pane.is_sidebar && !pane.agent.is_empty())
+        {
+            let level = crate::sidebar::tree::rollup_for_pane(pane);
+            let is_idle = level == crate::hook::RollupLevel::Idle;
+            let was_idle = self.pane_was_idle.get(&pane.pane_id).copied();
+            let mut unread = self.unread.get(&pane.pane_id).copied().unwrap_or(false);
+            match was_idle {
+                None => unread = false,
+                Some(false) if is_idle => unread = true,
+                _ => {}
+            }
+            if !is_idle {
+                unread = false;
+            }
+            if pane.window_active && pane.session_attached {
+                unread = false;
+            }
+            next_was_idle.insert(pane.pane_id.clone(), is_idle);
+            next_unread.insert(pane.pane_id.clone(), unread);
+        }
+        self.pane_was_idle = next_was_idle;
+        self.unread = next_unread;
+    }
+
+    fn sync_session_badges(&mut self) -> Vec<RuntimeEffect> {
+        use crate::daemon::session_badge::{BadgeState, badge_state, session_badge_value};
+
+        let badge_config = &self.config.statusline.session_badge;
+        let mut desired = BTreeMap::new();
+        if badge_config.enabled {
+            let mut states: BTreeMap<String, Vec<BadgeState>> = BTreeMap::new();
+            for pane in self
+                .panes
+                .iter()
+                .filter(|pane| !pane.is_sidebar && !pane.agent.is_empty())
+            {
+                let level = crate::sidebar::tree::rollup_for_pane(pane);
+                let unread = self.unread.get(&pane.pane_id).copied().unwrap_or(false);
+                states
+                    .entry(pane.session.clone())
+                    .or_default()
+                    .push(badge_state(level, unread));
+            }
+            for (session, list) in states {
+                if let Some(value) = session_badge_value(list, badge_config) {
+                    desired.insert(session, value);
+                }
+            }
+        }
+
+        let mut effects = Vec::new();
+        for (session, value) in &desired {
+            if self.written_badges.get(session) != Some(value) {
+                effects.push(RuntimeEffect::SetSessionBadge {
+                    session: session.clone(),
+                    value: value.clone(),
+                });
+            }
+        }
+        for session in self.written_badges.keys() {
+            if !desired.contains_key(session) {
+                effects.push(RuntimeEffect::ClearSessionBadge {
+                    session: session.clone(),
+                });
+            }
+        }
+        self.written_badges = desired;
+        effects
+    }
+
     fn broadcast_if_needed(&mut self) {
         if !self.should_push() {
             return;
@@ -338,6 +431,29 @@ mod tests {
             agent: agent.to_string(),
             status: status.to_string(),
             ..PaneSnapshot::default()
+        }
+    }
+
+    fn agent_pane(session: &str, pane_id: &str, status: &str) -> PaneSnapshot {
+        PaneSnapshot {
+            session: session.to_string(),
+            window_id: "@1".to_string(),
+            pane_id: pane_id.to_string(),
+            current_path: "/tmp".to_string(),
+            current_command: "zsh".to_string(),
+            window_active: false,
+            session_attached: false,
+            is_sidebar: false,
+            agent: "codex".to_string(),
+            status: status.to_string(),
+            prompt: String::new(),
+            prompt_source: String::new(),
+            wait_reason: String::new(),
+            attention: String::new(),
+            started_at: String::new(),
+            completed_at: String::new(),
+            tasks: String::new(),
+            subagents: String::new(),
         }
     }
 
@@ -440,5 +556,170 @@ mod tests {
         let pushed = slot.wait_for_update();
 
         assert!(matches!(pushed, Some(ServerMessage::Snapshot { .. })));
+    }
+
+    #[test]
+    fn panes_updated_emits_set_session_badge_effect() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        assert_eq!(
+            effects,
+            vec![RuntimeEffect::SetSessionBadge {
+                session: "main".to_string(),
+                value: "🟡 ".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unchanged_badge_emits_no_effect() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn running_to_idle_becomes_done_until_window_viewed() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "idle",
+        )]));
+        assert_eq!(
+            effects,
+            vec![RuntimeEffect::SetSessionBadge {
+                session: "main".to_string(),
+                value: "🔵 ".to_string(),
+            }]
+        );
+
+        let mut viewed = agent_pane("main", "%1", "idle");
+        viewed.window_active = true;
+        viewed.session_attached = true;
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![viewed]));
+        assert_eq!(
+            effects,
+            vec![RuntimeEffect::SetSessionBadge {
+                session: "main".to_string(),
+                value: "🟢 ".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn first_seen_idle_pane_is_not_unread() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "idle",
+        )]));
+        assert_eq!(
+            effects,
+            vec![RuntimeEffect::SetSessionBadge {
+                session: "main".to_string(),
+                value: "🟢 ".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn session_rollup_prefers_blocked_over_working() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut blocked = agent_pane("main", "%2", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![
+            agent_pane("main", "%1", "running"),
+            blocked,
+        ]));
+        assert_eq!(
+            effects,
+            vec![RuntimeEffect::SetSessionBadge {
+                session: "main".to_string(),
+                value: "🔴 ".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn sessions_get_independent_badges() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![
+            agent_pane("alpha", "%1", "running"),
+            agent_pane("beta", "%2", "idle"),
+        ]));
+        assert_eq!(
+            effects,
+            vec![
+                RuntimeEffect::SetSessionBadge {
+                    session: "alpha".to_string(),
+                    value: "🟡 ".to_string(),
+                },
+                RuntimeEffect::SetSessionBadge {
+                    session: "beta".to_string(),
+                    value: "🟢 ".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn vanished_session_emits_clear_effect() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![]));
+        assert_eq!(
+            effects,
+            vec![RuntimeEffect::ClearSessionBadge {
+                session: "main".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn shutdown_clears_all_written_badges() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let effects = state.apply_event(DaemonEvent::Shutdown);
+        assert_eq!(
+            effects,
+            vec![RuntimeEffect::ClearSessionBadge {
+                session: "main".to_string(),
+            }]
+        );
+        assert!(!state.is_running());
+    }
+
+    #[test]
+    fn disabled_config_writes_no_badges() {
+        let mut config = Config::default();
+        config.statusline.session_badge.enabled = false;
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn sidebar_and_agentless_panes_are_ignored() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut sidebar = agent_pane("main", "%9", "running");
+        sidebar.is_sidebar = true;
+        let mut plain = agent_pane("main", "%8", "");
+        plain.agent = String::new();
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![sidebar, plain]));
+        assert!(effects.is_empty());
     }
 }

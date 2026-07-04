@@ -336,6 +336,7 @@ fn handle_runtime_effects(
                     crate::sidebar::store::save_state(path, &state)?;
                 }
             }
+            RuntimeEffect::SetSessionBadge { .. } | RuntimeEffect::ClearSessionBadge { .. } => {}
         }
     }
     Ok(())
