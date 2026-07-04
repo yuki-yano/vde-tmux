@@ -105,7 +105,7 @@ tmux -L "$name" list-panes -t "$window" -F '#{pane_id} #{@vde_sidebar}'
 - `rebaseline` 後の `@vde_layout_panes` に sidebar pane ID が含まれない。
 - `close` 後に `@vde_sidebar = 1` の pane が残らない。
 
-toggle / input / schema も確認する。
+toggle / schema も確認する。
 
 ```bash
 VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt sidebar toggle \
@@ -120,23 +120,31 @@ VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt sidebar toggle \
 VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt sidebar toggle \
   --all --width 30
 
-state_home="/tmp/${name}-state"
-XDG_STATE_HOME="$state_home" VDE_TMUX_SOCKET_NAME="$name" \
-  ./target/debug/vt sidebar input j
-
-grep -o 'repo::misc::tmp' "$state_home/vde/tmux/state.json"
-
 ./target/debug/vt config schema | grep 'https://json-schema.org/draft/2020-12/schema'
 ```
 
 期待値:
 
 - window 指定の `toggle` と `toggle --all` が sidebar pane を開閉する。
-- `sidebar input j` 後に state の selection が `repo::misc::tmp` になる。
 - `config schema` が JSON Schema draft 2020-12 を出力する。
 
-`vt sidebar jump <pane>` は attached client が必要なため、unit test では
-`switch-client` → `select-window` → `select-pane` の発行順を MockRunner で検証する。
+`vt sidebar input <key>` と `vt sidebar jump <pane>` は M6 runtime daemon への
+client event として送る。
+次の script で subscribe/input/jump/query/detect をまとめて確認する。
+
+```bash
+scripts/smoke-m6-runtime.sh
+```
+
+期待値:
+
+```text
+subscribe snapshot ok
+capture detect ok
+input redraw state ok
+query response ok
+M6 runtime smoke ok
+```
 
 ## 2026-07-04 実行記録
 
@@ -167,4 +175,16 @@ all_sidebar_count=1
 remaining_sidebar_count=0
 selection=repo::misc::tmp
 schema_ok=https://json-schema.org/draft/2020-12/schema
+```
+
+M6 runtime smoke も pass。
+
+```text
+scratch=vde-m6-runtime-<timestamp>
+socket=/tmp/vde-m6-runtime-<timestamp>/daemon.sock
+subscribe snapshot ok
+capture detect ok
+input redraw state ok
+query response ok
+M6 runtime smoke ok
 ```

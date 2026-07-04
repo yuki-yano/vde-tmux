@@ -254,7 +254,11 @@ fn handle_runtime_effects(
 ) -> Result<()> {
     for effect in effects {
         match effect {
-            RuntimeEffect::JumpPane(pane_id) => worker_io.jump_to_pane(&pane_id)?,
+            RuntimeEffect::JumpPane(pane_id) => {
+                if let Err(error) = worker_io.jump_to_pane(&pane_id) {
+                    eprintln!("[vde-tmux] daemon jump error: {error:#}");
+                }
+            }
             RuntimeEffect::SaveState(state) => {
                 if let Some(path) = state_path {
                     crate::sidebar::store::save_state(path, &state)?;
@@ -377,6 +381,7 @@ mod tests {
     #[derive(Default)]
     struct LoopWorkerIo {
         jumps: std::sync::Mutex<Vec<String>>,
+        fail_jump: bool,
     }
 
     impl crate::daemon::workers::WorkerIo for LoopWorkerIo {
@@ -389,6 +394,9 @@ mod tests {
         }
 
         fn jump_to_pane(&self, pane_id: &str) -> anyhow::Result<()> {
+            if self.fail_jump {
+                anyhow::bail!("jump failed");
+            }
             self.jumps.lock().unwrap().push(pane_id.to_string());
             Ok(())
         }
@@ -441,5 +449,45 @@ mod tests {
             }
         );
         assert_eq!(io.jumps.lock().unwrap().as_slice(), ["%1"]);
+    }
+
+    #[test]
+    fn runtime_loop_keeps_running_when_jump_effect_fails() {
+        use crate::daemon::protocol::SidebarClientEvent;
+        use crate::daemon::runtime::{ClientId, DaemonEvent, RuntimeState};
+        use crate::sidebar::state::SidebarState;
+        use std::sync::{Arc, mpsc};
+
+        let io = Arc::new(LoopWorkerIo {
+            fail_jump: true,
+            ..LoopWorkerIo::default()
+        });
+        let (tx, rx) = mpsc::channel();
+        tx.send(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::JumpPane {
+                pane: "%1".to_string(),
+            },
+        })
+        .unwrap();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(DaemonEvent::QueryStatusline { reply: reply_tx })
+            .unwrap();
+        drop(tx);
+
+        run_runtime_loop(
+            RuntimeState::new(crate::config::Config::default(), SidebarState::default()),
+            rx,
+            None,
+            io,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reply_rx.recv().unwrap(),
+            ServerMessage::Statusline {
+                agent_badge: String::new()
+            }
+        );
     }
 }
