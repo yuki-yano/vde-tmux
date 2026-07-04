@@ -39,12 +39,22 @@ enum Command {
     StatuslineAgentBadge,
     #[command(name = "statusline-sessions")]
     StatuslineSessions {
+        #[arg(long = "show-index")]
+        show_index: bool,
         #[command(subcommand)]
         command: Option<StatuslineSessionsCommand>,
     },
     Daemon {
         #[arg(long)]
         socket: Option<String>,
+    },
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    Sidebar {
+        #[command(subcommand)]
+        command: SidebarCommand,
     },
     Category {
         #[command(subcommand)]
@@ -95,6 +105,11 @@ enum StatuslineSessionsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    Schema,
+}
+
+#[derive(Debug, Subcommand)]
 enum CategoryCommand {
     Next,
     Prev,
@@ -139,6 +154,57 @@ enum SessionManagerCommand {
     KillWindow { target: String },
     #[command(name = "kill-pane")]
     KillPane { target: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum SidebarCommand {
+    Attach {
+        #[arg(long, hide = true)]
+        once: bool,
+    },
+    Input {
+        key: String,
+    },
+    Open {
+        #[arg(long)]
+        window: Option<String>,
+        #[arg(long)]
+        width: Option<u16>,
+        #[arg(long = "delay-ms")]
+        delay_ms: Option<u64>,
+    },
+    Toggle {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        window: Option<String>,
+        #[arg(long)]
+        width: Option<u16>,
+    },
+    Close {
+        #[arg(long)]
+        window: Option<String>,
+    },
+    Rail {
+        #[arg(long)]
+        window: Option<String>,
+        #[arg(long)]
+        width: Option<u16>,
+    },
+    Rebaseline {
+        #[arg(long)]
+        window: Option<String>,
+    },
+    #[command(name = "layout-applied")]
+    LayoutApplied {
+        #[arg(long)]
+        window: Option<String>,
+        #[arg(long)]
+        width: Option<u16>,
+    },
+    Jump {
+        pane: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -239,14 +305,23 @@ where
                 runner, &config,
             )?)),
         },
-        Command::StatuslineSessions { command } => match command {
+        Command::StatuslineSessions {
+            show_index,
+            command,
+        } => match command {
             Some(StatuslineSessionsCommand::Switch { index }) => {
                 crate::statusline::switch_statusline_session(runner, &config, cli_index(index))?;
                 Ok(None)
             }
-            None => Ok(Some(crate::statusline::statusline_sessions(
-                runner, &config,
-            )?)),
+            None => {
+                let mut config = config.clone();
+                if show_index {
+                    config.statusline.sessions.show_index = true;
+                }
+                Ok(Some(crate::statusline::statusline_sessions(
+                    runner, &config,
+                )?))
+            }
         },
         Command::StatuslineAgentBadge => {
             Ok(Some(crate::daemon::statusline_agent_badge(runner, env)?))
@@ -256,6 +331,12 @@ where
             crate::daemon::server::run_daemon_server(runner, &socket_path)?;
             Ok(None)
         }
+        Command::Config { command } => match command {
+            ConfigCommand::Schema => Ok(Some(serde_json::to_string_pretty(
+                &crate::config::schema::config_schema(),
+            )?)),
+        },
+        Command::Sidebar { command } => run_sidebar_command(command, runner, env, &config),
         Command::Category { command } => {
             match command {
                 CategoryCommand::Next => {
@@ -346,6 +427,184 @@ where
 
 fn cli_index(index: usize) -> usize {
     index.saturating_sub(1)
+}
+
+fn run_sidebar_command(
+    command: SidebarCommand,
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    config: &crate::config::Config,
+) -> Result<Option<String>> {
+    match command {
+        SidebarCommand::Attach { once } => {
+            crate::sidebar::layout::attach(runner, env)?;
+            let rendered = render_sidebar_once(runner, env, config)?;
+            if once {
+                return Ok(Some(rendered));
+            }
+            if !rendered.is_empty() {
+                println!("{rendered}");
+            }
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
+        SidebarCommand::Input { key } => {
+            handle_sidebar_input_key(runner, env, config, &key)?;
+            Ok(None)
+        }
+        SidebarCommand::Open {
+            window,
+            width,
+            delay_ms,
+        } => {
+            if let Some(delay_ms) = delay_ms.filter(|value| *value > 0) {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            let target = resolve_window_target(runner, window)?;
+            crate::sidebar::layout::open(
+                runner,
+                &target,
+                &std::env::current_exe()?,
+                width.unwrap_or(config.sidebar.width),
+            )?;
+            Ok(None)
+        }
+        SidebarCommand::Toggle { all, window, width } => {
+            if all && window.is_some() {
+                bail!("--all and --window cannot be used together");
+            }
+            if all {
+                crate::sidebar::layout::toggle_all(
+                    runner,
+                    &std::env::current_exe()?,
+                    width.unwrap_or(config.sidebar.width),
+                )?;
+            } else {
+                let target = resolve_window_target(runner, window)?;
+                crate::sidebar::layout::toggle(
+                    runner,
+                    &target,
+                    &std::env::current_exe()?,
+                    width.unwrap_or(config.sidebar.width),
+                )?;
+            }
+            Ok(None)
+        }
+        SidebarCommand::Close { window } => {
+            let target = resolve_window_target(runner, window)?;
+            crate::sidebar::layout::close(runner, &target)?;
+            Ok(None)
+        }
+        SidebarCommand::Rail { window, width } => {
+            let target = resolve_window_target(runner, window)?;
+            crate::sidebar::layout::rail(runner, &target, width.unwrap_or(config.sidebar.width))?;
+            Ok(None)
+        }
+        SidebarCommand::Rebaseline { window } => {
+            let target = resolve_window_target(runner, window)?;
+            crate::sidebar::layout::rebaseline(runner, &target)?;
+            Ok(None)
+        }
+        SidebarCommand::LayoutApplied { window, width } => {
+            let target = resolve_window_target(runner, window)?;
+            crate::sidebar::layout::layout_applied(
+                runner,
+                &target,
+                &std::env::current_exe()?,
+                width.unwrap_or(config.sidebar.width),
+            )?;
+            Ok(None)
+        }
+        SidebarCommand::Jump { pane } => {
+            crate::sidebar::layout::jump_to_pane(runner, &pane)?;
+            Ok(None)
+        }
+    }
+}
+
+fn render_sidebar_once(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    config: &crate::config::Config,
+) -> Result<String> {
+    let panes = crate::options::snapshot::read_all_panes(runner)?;
+    let state_path = crate::sidebar::store::state_path(env);
+    let state = crate::sidebar::store::load_state(&state_path)?;
+    let git = crate::git::collect_git_badges(&crate::git::SystemGitRunner::default(), &panes);
+    let rows = crate::sidebar::tree::build_rows_with_git(config, &panes, &state, &git);
+    Ok(crate::sidebar::render::render_rows(
+        &rows,
+        &state,
+        config.sidebar.width as usize,
+    ))
+}
+
+fn handle_sidebar_input_key(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    config: &crate::config::Config,
+    key: &str,
+) -> Result<()> {
+    let Some(action) = crate::sidebar::input::parse_key(key) else {
+        return Ok(());
+    };
+    let state_path = crate::sidebar::store::state_path(env);
+    let mut state = crate::sidebar::store::load_state(&state_path)?;
+    let panes = crate::options::snapshot::read_all_panes(runner)?;
+    let rows = crate::sidebar::tree::build_rows(config, &panes, &state);
+    let row_refs = crate::sidebar::tree::row_refs(&rows);
+    let changed = match action {
+        crate::sidebar::input::SidebarInputAction::MoveNext => {
+            state.apply(crate::sidebar::state::SidebarAction::MoveNext, &row_refs)
+        }
+        crate::sidebar::input::SidebarInputAction::MovePrevious => state.apply(
+            crate::sidebar::state::SidebarAction::MovePrevious,
+            &row_refs,
+        ),
+        crate::sidebar::input::SidebarInputAction::ToggleExpand => state.apply(
+            crate::sidebar::state::SidebarAction::ToggleExpand,
+            &row_refs,
+        ),
+        crate::sidebar::input::SidebarInputAction::SetViewMode(view_mode) => state.apply(
+            crate::sidebar::state::SidebarAction::SetViewMode(view_mode),
+            &row_refs,
+        ),
+        crate::sidebar::input::SidebarInputAction::Activate => {
+            match crate::sidebar::input::activate_selected(state.selection.as_deref(), &rows) {
+                Some(crate::sidebar::input::SidebarCommand::JumpPane(pane_id)) => {
+                    crate::sidebar::layout::jump_to_pane(runner, &pane_id)?;
+                    false
+                }
+                Some(crate::sidebar::input::SidebarCommand::ToggleExpand(row_id)) => {
+                    state.selection = Some(row_id);
+                    state.apply(
+                        crate::sidebar::state::SidebarAction::ToggleExpand,
+                        &row_refs,
+                    )
+                }
+                None => false,
+            }
+        }
+    };
+    if changed {
+        crate::sidebar::store::save_state(&state_path, &state)?;
+    }
+    Ok(())
+}
+
+fn resolve_window_target(runner: &dyn TmuxRunner, window: Option<String>) -> Result<String> {
+    if let Some(window) = window.filter(|value| !value.trim().is_empty()) {
+        return Ok(window);
+    }
+    let output = runner
+        .run(&["display-message", "-p", "#{window_id}"])?
+        .trim()
+        .to_string();
+    if output.is_empty() {
+        bail!("failed to resolve current window");
+    }
+    Ok(output)
 }
 
 fn run_hook_command(
@@ -529,6 +788,23 @@ mod tests {
         mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
         let output = run_with(["vt", "statusline-sessions"], &mock, &env()).unwrap();
         assert!(output.unwrap().contains("main"));
+    }
+
+    #[test]
+    fn dispatch_statusline_sessions_show_index_overrides_config() {
+        let mock = MockTmuxRunner::new();
+        let format = crate::session::session_list_format();
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\n",
+        );
+        mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+
+        let output = run_with(["vt", "statusline-sessions", "--show-index"], &mock, &env())
+            .unwrap()
+            .unwrap();
+
+        assert!(output.contains("1:main"));
     }
 
     #[test]
@@ -869,5 +1145,307 @@ mod tests {
         mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
         let output = run_with(["vt", "statusline-agent-badge"], &mock, &env()).unwrap();
         assert_eq!(output, Some("running:1".to_string()));
+    }
+
+    #[test]
+    fn dispatch_config_schema_prints_json_schema() {
+        let mock = MockTmuxRunner::new();
+
+        let output = run_with(["vt", "config", "schema"], &mock, &env()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&output.unwrap()).unwrap();
+
+        assert_eq!(
+            schema.get("$schema").and_then(|value| value.as_str()),
+            Some("https://json-schema.org/draft/2020-12/schema")
+        );
+        assert!(schema["properties"].get("sidebar").is_some());
+    }
+
+    #[test]
+    fn dispatch_sidebar_attach_once_marks_and_renders() {
+        let mock = MockTmuxRunner::new();
+        let env = BTreeMap::from([("TMUX_PANE".to_string(), "%9".to_string())]);
+        mock.stub(
+            &[
+                "set-option",
+                "-p",
+                "-t",
+                "%9",
+                crate::options::KEY_SIDEBAR_MARKER,
+                "1",
+            ],
+            "",
+        );
+        let format = crate::options::snapshot::snapshot_format();
+        let line = [
+            "main", "@1", "%1", "/tmp/app", "zsh", "", "codex", "running", "", "", "", "", "", "",
+            "", "",
+        ]
+        .join("\u{1f}");
+        mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
+
+        let output = run_with(["vt", "sidebar", "attach", "--once"], &mock, &env).unwrap();
+
+        assert!(output.unwrap().contains("codex %1"));
+    }
+
+    #[test]
+    fn dispatch_sidebar_attach_once_restores_persisted_state() {
+        let state_home = std::env::temp_dir().join(format!(
+            "vde-tmux-sidebar-state-cli-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let env = BTreeMap::from([
+            ("TMUX_PANE".to_string(), "%9".to_string()),
+            (
+                "XDG_STATE_HOME".to_string(),
+                state_home.display().to_string(),
+            ),
+        ]);
+        let state_path = crate::sidebar::store::state_path(&env);
+        let mut state = crate::sidebar::state::SidebarState {
+            selection: Some("repo::misc::app".to_string()),
+            ..crate::sidebar::state::SidebarState::default()
+        };
+        state.collapsed.insert("repo::misc::app".to_string());
+        crate::sidebar::store::save_state(&state_path, &state).unwrap();
+
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &[
+                "set-option",
+                "-p",
+                "-t",
+                "%9",
+                crate::options::KEY_SIDEBAR_MARKER,
+                "1",
+            ],
+            "",
+        );
+        let format = crate::options::snapshot::snapshot_format();
+        let line = [
+            "main", "@1", "%1", "/tmp/app", "zsh", "", "codex", "running", "", "", "", "", "", "",
+            "", "",
+        ]
+        .join("\u{1f}");
+        mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
+
+        let output = run_with(["vt", "sidebar", "attach", "--once"], &mock, &env).unwrap();
+        let output = output.unwrap();
+
+        assert!(output.contains("> > app"));
+        assert!(!output.contains("codex %1"));
+        std::fs::remove_dir_all(state_home).unwrap();
+    }
+
+    #[test]
+    fn dispatch_sidebar_open_uses_layout_operations() {
+        let mock = MockTmuxRunner::new();
+        let exe = std::env::current_exe().unwrap();
+        let command = format!(
+            "{} sidebar attach",
+            shell_quote_for_test(&exe.display().to_string())
+        );
+        mock.stub(
+            &[
+                "list-panes",
+                "-t",
+                "@1",
+                "-F",
+                crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+            ],
+            "%1\t\t80\n",
+        );
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-before\n",
+        );
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@1",
+                crate::options::KEY_LAYOUT_BASELINE,
+                "layout-before",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@1",
+                crate::options::KEY_LAYOUT_PANES,
+                "%1",
+            ],
+            "",
+        );
+        mock.stub(
+            &["split-window", "-t", "@1", "-hbf", "-l", "40", &command],
+            "",
+        );
+
+        run_with(
+            [
+                "vt",
+                "sidebar",
+                "open",
+                "--window",
+                "@1",
+                "--width",
+                "40",
+                "--delay-ms",
+                "0",
+            ],
+            &mock,
+            &env(),
+        )
+        .unwrap();
+
+        assert_eq!(mock.calls().len(), 6);
+    }
+
+    #[test]
+    fn dispatch_sidebar_toggle_all_uses_all_windows() {
+        let mock = MockTmuxRunner::new();
+        let exe = std::env::current_exe().unwrap();
+        let command = format!(
+            "{} sidebar attach",
+            shell_quote_for_test(&exe.display().to_string())
+        );
+        mock.stub(&["list-windows", "-a", "-F", "#{window_id}"], "@1\n");
+        mock.stub(
+            &[
+                "list-panes",
+                "-t",
+                "@1",
+                "-F",
+                crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+            ],
+            "%1\t\t80\n",
+        );
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-before\n",
+        );
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@1",
+                crate::options::KEY_LAYOUT_BASELINE,
+                "layout-before",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@1",
+                crate::options::KEY_LAYOUT_PANES,
+                "%1",
+            ],
+            "",
+        );
+        mock.stub(
+            &["split-window", "-t", "@1", "-hbf", "-l", "40", &command],
+            "",
+        );
+
+        run_with(
+            ["vt", "sidebar", "toggle", "--all", "--width", "40"],
+            &mock,
+            &env(),
+        )
+        .unwrap();
+
+        assert_eq!(mock.calls().len(), 7);
+    }
+
+    #[test]
+    fn dispatch_sidebar_jump_switches_to_pane() {
+        let mock = MockTmuxRunner::new();
+        let format = crate::options::snapshot::snapshot_format();
+        let line = [
+            "main", "@1", "%1", "/tmp/app", "zsh", "", "codex", "running", "", "", "", "", "", "",
+            "", "",
+        ]
+        .join("\u{1f}");
+        mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
+        mock.stub(&["switch-client", "-t", "main"], "");
+        mock.stub(&["select-window", "-t", "@1"], "");
+        mock.stub(&["select-pane", "-t", "%1"], "");
+
+        run_with(["vt", "sidebar", "jump", "%1"], &mock, &env()).unwrap();
+
+        assert_eq!(mock.calls().len(), 4);
+    }
+
+    #[test]
+    fn dispatch_sidebar_input_moves_selection_and_saves_state() {
+        let state_home = std::env::temp_dir().join(format!(
+            "vde-tmux-sidebar-input-cli-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let env = BTreeMap::from([(
+            "XDG_STATE_HOME".to_string(),
+            state_home.display().to_string(),
+        )]);
+        let mock = MockTmuxRunner::new();
+        let format = crate::options::snapshot::snapshot_format();
+        let line = [
+            "main", "@1", "%1", "/tmp/app", "zsh", "", "codex", "running", "", "", "", "", "", "",
+            "", "",
+        ]
+        .join("\u{1f}");
+        mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
+
+        run_with(["vt", "sidebar", "input", "j"], &mock, &env).unwrap();
+
+        let state =
+            crate::sidebar::store::load_state(&crate::sidebar::store::state_path(&env)).unwrap();
+        assert_eq!(state.selection.as_deref(), Some("repo::misc::app"));
+        std::fs::remove_dir_all(state_home).unwrap();
+    }
+
+    fn shell_quote_for_test(value: &str) -> String {
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('\'');
+        for ch in value.chars() {
+            if ch == '\'' {
+                quoted.push_str("'\\''");
+            } else {
+                quoted.push(ch);
+            }
+        }
+        quoted.push('\'');
+        quoted
     }
 }
