@@ -944,6 +944,20 @@ mod tests {
     }
 
     #[test]
+    fn chat_detail_omits_subagent_section_when_no_subagents_running() {
+        let agent = pane("main", "%5", "/tmp/app", "claude", "running");
+        let mut state = SidebarState::default();
+        state.toggle_expanded("chat::%5");
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
+
+        assert!(!rows.iter().any(|row| {
+            row.kind == SidebarRowKind::Detail
+                && (row.label.starts_with('\u{251c}') || row.label.starts_with('\u{2514}'))
+        }));
+    }
+
+    #[test]
     fn attention_only_filter_drops_calm_panes_and_empty_groups() {
         let mut calm = pane("main", "%1", "/tmp/calm", "codex", "idle");
         calm.attention = "0".to_string();

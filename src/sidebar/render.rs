@@ -379,11 +379,8 @@ fn render_rail_lines(
             if state.selection.as_deref() == Some(row.id.as_str()) {
                 style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
             }
-            let glyph = row
-                .badge_state
-                .map(|state| theme.badge_glyph(state).to_string())
-                .unwrap_or_else(|| rollup_glyph(row.rollup).to_string());
-            Line::from(Span::styled(glyph, style))
+            let glyph = row.badge_state.expect("rail rows must carry badge_state");
+            Line::from(Span::styled(theme.badge_glyph(glyph).to_string(), style))
         })
         .collect()
 }
@@ -396,17 +393,6 @@ fn rollup_label(level: RollupLevel) -> &'static str {
         RollupLevel::Background => "background",
         RollupLevel::Waiting => "waiting",
         RollupLevel::Idle => "idle",
-    }
-}
-
-fn rollup_glyph(level: RollupLevel) -> char {
-    match level {
-        RollupLevel::Error => 'E',
-        RollupLevel::Running => 'R',
-        RollupLevel::Permission => 'P',
-        RollupLevel::Background => 'B',
-        RollupLevel::Waiting => 'W',
-        RollupLevel::Idle => 'I',
     }
 }
 
@@ -562,15 +548,17 @@ mod tests {
 
     #[test]
     fn render_rows_uses_rail_for_narrow_width() {
-        let rows = vec![row(
+        let mut chat = row(
             "chat::%1",
             SidebarRowKind::Chat,
             0,
             "codex %1",
             RollupLevel::Permission,
-        )];
+        );
+        chat.badge_state = Some(BadgeState::Blocked);
+        let rows = vec![chat];
         let rendered = render_rows(&rows, &SidebarState::default(), 2);
-        assert_eq!(rendered, "P");
+        assert_eq!(rendered, "🔴");
     }
 
     #[test]

@@ -240,8 +240,8 @@ impl RuntimeState {
                 .iter()
                 .map(|row| {
                     format!(
-                        "{}:{}:{}:{:?}:{:?}",
-                        row.id, row.label, row.chat_count, row.rollup, row.git
+                        "{}:{}:{}:{:?}:{:?}:{:?}",
+                        row.id, row.label, row.chat_count, row.rollup, row.badge_state, row.git
                     )
                 })
                 .collect(),
@@ -556,6 +556,28 @@ mod tests {
     }
 
     #[test]
+    fn should_push_when_unread_badge_state_changes_without_rollup_change() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "idle",
+        )]));
+        let first = state.current_fingerprint();
+        state.mark_pushed(first);
+
+        let mut viewed = agent_pane("main", "%1", "idle");
+        viewed.window_active = true;
+        viewed.session_attached = true;
+        state.panes = vec![viewed];
+        state.update_unread();
+        state.rebuild_snapshot();
+
+        assert!(state.should_push());
+    }
+
+    #[test]
     fn client_error_does_not_stop_runtime() {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
         let slot = std::sync::Arc::new(LatestSlot::new());
@@ -596,6 +618,26 @@ mod tests {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
         let mut agent = pane("%1", "/tmp/app", "codex", "running");
         agent.prompt = "prompt".to_string();
+        state.ui_state.toggle_expanded("chat::%1");
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent]));
+
+        for _ in 0..3 {
+            state.apply_event(DaemonEvent::Client {
+                client_id: ClientId(1),
+                event: SidebarClientEvent::Key {
+                    key: "j".to_string(),
+                },
+            });
+        }
+
+        assert_eq!(state.ui_state.selection.as_deref(), Some("jump::%1"));
+    }
+
+    #[test]
+    fn client_move_selection_skips_subagent_detail_rows_and_can_select_jump_row() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut agent = pane("%1", "/tmp/app", "codex", "running");
+        agent.subagents = "sub12345:Explore|ab120000:general-purpose".to_string();
         state.ui_state.toggle_expanded("chat::%1");
         state.apply_event(DaemonEvent::PanesUpdated(vec![agent]));
 

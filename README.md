@@ -79,6 +79,11 @@ daemon socket は `VDE_DAEMON_SOCKET` 明示指定を優先し、次に
 `$XDG_RUNTIME_DIR/vde-tmux/daemon.sock`、最後に `/tmp/vde-tmux-<uid>/daemon.sock` を使う。
 socket directory は 0700 の通常ディレクトリであることを検証する。
 
+## Known Limits
+
+- Agent pane の生存判定は `pane_current_command` が `claude`、`codex`、`opencode` のいずれかであることを見る。node ラッパー起動などで別コマンド名を返す環境では、hooks が `@vde_agent` を残していても agent として表示しない。
+- Sidebar preview の Esc 終了は `less` の `LESSKEYIN` 対応を使う。現行の手元環境では Esc/q で閉じられることを scratch tmux で確認済みで、古い `less` 向けの追加フォールバックは持たない。
+
 ## Option Bus
 
 新実装は `@vde_*` の個別 pane/window/session option を使う。
