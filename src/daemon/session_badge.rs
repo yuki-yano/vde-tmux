@@ -39,7 +39,7 @@ pub fn session_badge_value(
     Some(format!("{}{suffix}", glyph_for_state(state, glyphs)))
 }
 
-pub fn glyph_for_state<'a>(state: BadgeState, glyphs: &'a BadgeGlyphs) -> &'a str {
+pub fn glyph_for_state(state: BadgeState, glyphs: &BadgeGlyphs) -> &str {
     match state {
         BadgeState::Blocked => &glyphs.blocked,
         BadgeState::Working => &glyphs.working,

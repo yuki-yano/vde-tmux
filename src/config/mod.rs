@@ -149,18 +149,10 @@ impl Default for SessionBadgeConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default)]
 pub struct BadgeConfig {
     pub glyphs: BadgeGlyphs,
-}
-
-impl Default for BadgeConfig {
-    fn default() -> Self {
-        Self {
-            glyphs: BadgeGlyphs::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
