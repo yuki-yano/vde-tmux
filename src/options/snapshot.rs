@@ -16,6 +16,10 @@ pub struct PaneSnapshot {
     pub pane_id: String,
     pub current_path: String,
     pub current_command: String,
+    /// この pane の window がセッションのカレント window か(#{window_active})。
+    pub window_active: bool,
+    /// セッションにクライアントがアタッチされているか(#{session_attached} > 0)。
+    pub session_attached: bool,
     pub is_sidebar: bool,
     pub agent: String,
     pub status: String,
@@ -30,7 +34,7 @@ pub struct PaneSnapshot {
 }
 
 /// list-panes -a に渡す -F フォーマット文字列を組み立てる。
-/// 固定 5 フィールド + @vde_sidebar + PANE_STATE_KEYS の順。
+/// 固定 7 フィールド + @vde_sidebar + PANE_STATE_KEYS の順。
 pub fn snapshot_format() -> String {
     let mut fields: Vec<String> = vec![
         "#{session_name}".into(),
@@ -38,6 +42,8 @@ pub fn snapshot_format() -> String {
         "#{pane_id}".into(),
         "#{pane_current_path}".into(),
         "#{pane_current_command}".into(),
+        "#{window_active}".into(),
+        "#{session_attached}".into(),
         format!("#{{{key}}}", key = super::KEY_SIDEBAR_MARKER),
     ];
     fields.extend(PANE_STATE_KEYS.iter().map(|key| format!("#{{{key}}}")));
@@ -47,7 +53,7 @@ pub fn snapshot_format() -> String {
 /// list-panes -a の出力(snapshot_format 準拠)をパースする。
 /// フィールド数が合わない行はスキップして残りを返す(壊れた 1 行で全体を落とさない)。
 pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
-    let expected = 6 + PANE_STATE_KEYS.len();
+    let expected = 8 + PANE_STATE_KEYS.len();
     output
         .lines()
         .filter_map(|line| {
@@ -61,17 +67,19 @@ pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
                 pane_id: fields[2].to_string(),
                 current_path: fields[3].to_string(),
                 current_command: fields[4].to_string(),
-                is_sidebar: fields[5] == "1",
-                agent: fields[6].to_string(),
-                status: fields[7].to_string(),
-                prompt: fields[8].to_string(),
-                prompt_source: fields[9].to_string(),
-                wait_reason: fields[10].to_string(),
-                attention: fields[11].to_string(),
-                started_at: fields[12].to_string(),
-                completed_at: fields[13].to_string(),
-                tasks: fields[14].to_string(),
-                subagents: fields[15].to_string(),
+                window_active: fields[5] == "1",
+                session_attached: !fields[6].is_empty() && fields[6] != "0",
+                is_sidebar: fields[7] == "1",
+                agent: fields[8].to_string(),
+                status: fields[9].to_string(),
+                prompt: fields[10].to_string(),
+                prompt_source: fields[11].to_string(),
+                wait_reason: fields[12].to_string(),
+                attention: fields[13].to_string(),
+                started_at: fields[14].to_string(),
+                completed_at: fields[15].to_string(),
+                tasks: fields[16].to_string(),
+                subagents: fields[17].to_string(),
             })
         })
         .collect()
@@ -98,8 +106,35 @@ mod tests {
     fn format_field_count_matches_parser_expectation() {
         assert_eq!(
             snapshot_format().matches('\u{1f}').count(),
-            6 + PANE_STATE_KEYS.len() - 1
+            8 + PANE_STATE_KEYS.len() - 1
         );
+    }
+
+    #[test]
+    fn snapshot_format_includes_window_active_and_session_attached() {
+        let format = snapshot_format();
+        assert!(format.contains("#{window_active}"));
+        assert!(format.contains("#{session_attached}"));
+    }
+
+    #[test]
+    fn parse_snapshot_lines_reads_activity_fields() {
+        let raw = line(&[
+            "main", "@1", "%1", "/tmp", "zsh", "1", "2", "", "codex", "running", "", "", "", "",
+            "", "", "", "",
+        ]);
+        let panes = parse_snapshot_lines(&raw);
+        assert_eq!(panes.len(), 1);
+        assert!(panes[0].window_active);
+        assert!(panes[0].session_attached);
+
+        let detached = line(&[
+            "main", "@1", "%1", "/tmp", "zsh", "0", "0", "", "codex", "running", "", "", "", "",
+            "", "", "", "",
+        ]);
+        let panes = parse_snapshot_lines(&detached);
+        assert!(!panes[0].window_active);
+        assert!(!panes[0].session_attached);
     }
 
     #[test]
@@ -110,6 +145,8 @@ mod tests {
             "%3",
             "/Users/me/repo",
             "node",
+            "0",
+            "0",
             "",
             "claude",
             "running",
@@ -141,6 +178,8 @@ mod tests {
             "%9",
             "/Users/me",
             "vt",
+            "0",
+            "0",
             "1",
             "",
             "",
@@ -162,7 +201,7 @@ mod tests {
     #[test]
     fn malformed_line_is_skipped_not_fatal() {
         let good = line(&[
-            "main", "@1", "%3", "/p", "zsh", "", "", "", "", "", "", "", "", "", "", "",
+            "main", "@1", "%3", "/p", "zsh", "0", "0", "", "", "", "", "", "", "", "", "", "", "",
         ]);
         let raw = format!("broken-line\n{good}\n");
         let panes = parse_snapshot_lines(&raw);

@@ -578,9 +578,19 @@ mod tests {
     #[test]
     fn jump_to_pane_switches_session_window_and_pane() {
         let mock = MockTmuxRunner::new();
+        let line = [
+            "main", "@1", "%1", "/tmp", "zsh", "0", "0", "", "codex", "running", "", "", "", "",
+            "", "", "", "",
+        ]
+        .join("\u{1f}");
         mock.stub(
-            &["list-panes", "-a", "-F", crate::options::snapshot::snapshot_format().as_str()],
-            "main\u{1f}@1\u{1f}%1\u{1f}/tmp\u{1f}zsh\u{1f}\u{1f}codex\u{1f}running\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
+            &[
+                "list-panes",
+                "-a",
+                "-F",
+                crate::options::snapshot::snapshot_format().as_str(),
+            ],
+            &format!("{line}\n"),
         );
         mock.stub(&["switch-client", "-t", "main"], "");
         mock.stub(&["select-window", "-t", "@1"], "");

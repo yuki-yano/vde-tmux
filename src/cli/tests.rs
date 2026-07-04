@@ -60,7 +60,8 @@ fn dispatch_statusline_agent_badge_falls_back_to_tmux_snapshot() {
     let mock = MockTmuxRunner::new();
     let format = crate::options::snapshot::snapshot_format();
     let line = [
-        "main", "@1", "%1", "/tmp", "zsh", "", "codex", "running", "", "", "", "", "", "", "", "",
+        "main", "@1", "%1", "/tmp", "zsh", "0", "0", "", "codex", "running", "", "", "", "", "",
+        "", "", "",
     ]
     .join("\u{1f}");
     mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));

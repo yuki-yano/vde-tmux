@@ -355,6 +355,8 @@ mod tests {
             "%1",
             "/tmp",
             "zsh",
+            "0",
+            "0",
             "",
             agent,
             status,
