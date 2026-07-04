@@ -41,7 +41,7 @@ pub fn open(
 
 pub fn close(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
     let Some(sidebar) = find_sidebar_pane(runner, target)? else {
-        return Ok(());
+        return restore_or_clear_stale_baseline(runner, target);
     };
     close_sidebar_pane(runner, target, &sidebar)
 }
@@ -159,6 +159,7 @@ fn open_unchecked(
     width: SidebarWidth,
     min_width: u16,
 ) -> Result<()> {
+    prepare_baseline_for_open(runner, target)?;
     let layout = capture_window_layout(runner, target)?;
     let panes = capture_pane_ids(runner, target)?;
     save_baseline(runner, target, &layout, &panes)?;
@@ -177,6 +178,51 @@ fn open_unchecked(
         &command,
     ])?;
     Ok(())
+}
+
+fn prepare_baseline_for_open(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
+    let options = runner.run(&["show-options", "-w", "-t", target])?;
+    let (saved_layout, saved_panes) = parse_saved_baseline(&options);
+    if saved_layout.is_none() && saved_panes.is_none() {
+        return Ok(());
+    }
+
+    restore_or_clear_saved_baseline(
+        runner,
+        target,
+        saved_layout.as_deref(),
+        saved_panes.as_ref(),
+    )
+}
+
+fn restore_or_clear_stale_baseline(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
+    let options = runner.run(&["show-options", "-w", "-t", target])?;
+    let (saved_layout, saved_panes) = parse_saved_baseline(&options);
+    if saved_layout.is_none() && saved_panes.is_none() {
+        return Ok(());
+    }
+    restore_or_clear_saved_baseline(
+        runner,
+        target,
+        saved_layout.as_deref(),
+        saved_panes.as_ref(),
+    )
+}
+
+fn restore_or_clear_saved_baseline(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    saved_layout: Option<&str>,
+    saved_panes: Option<&BTreeSet<String>>,
+) -> Result<()> {
+    let current_panes = capture_pane_ids(runner, target)?;
+    match (saved_layout, saved_panes) {
+        (Some(layout), Some(saved_panes)) if saved_panes == &current_panes => {
+            runner.run(&["select-layout", "-t", target, layout])?;
+            clear_baseline(runner, target)
+        }
+        _ => clear_baseline(runner, target),
+    }
 }
 
 fn resolve_width(
@@ -396,6 +442,7 @@ mod tests {
             &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
             "%1\t\t80\n",
         );
+        mock.stub(&["show-options", "-w", "-t", "@1"], "");
         mock.stub(
             &[
                 "display-message",
@@ -438,7 +485,7 @@ mod tests {
 
         open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
-        assert_eq!(mock.calls().len(), 6);
+        assert_eq!(mock.calls().len(), 7);
     }
 
     #[test]
@@ -448,6 +495,7 @@ mod tests {
             &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
             "%1\t\t640\n",
         );
+        mock.stub(&["show-options", "-w", "-t", "@1"], "");
         mock.stub(
             &["display-message", "-p", "-t", "@1", "-F", "#{window_width}"],
             "640\n",
@@ -501,7 +549,173 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(mock.calls().len(), 7);
+        assert_eq!(mock.calls().len(), 8);
+    }
+
+    #[test]
+    fn open_restores_matching_stale_baseline_before_saving_new_baseline() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t80\n%2\t\t80\n",
+        );
+        mock.stub(
+            &["show-options", "-w", "-t", "@1"],
+            "@vde_layout_baseline \"layout-before\"\n@vde_layout_panes \"%1,%2\"\n",
+        );
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n%2\n");
+        mock.stub(&["select-layout", "-t", "@1", "layout-before"], "");
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_BASELINE],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_PANES],
+            "",
+        );
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-restored\n",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@1",
+                KEY_LAYOUT_BASELINE,
+                "layout-restored",
+            ],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-t", "@1", KEY_LAYOUT_PANES, "%1,%2"],
+            "",
+        );
+        mock.stub(
+            &[
+                "split-window",
+                "-t",
+                "@1",
+                "-hbf",
+                "-l",
+                "40",
+                "'/tmp/vt' sidebar attach",
+            ],
+            "",
+        );
+
+        open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        let calls = mock.calls();
+        assert!(calls.contains(&vec![
+            "select-layout".to_string(),
+            "-t".to_string(),
+            "@1".to_string(),
+            "layout-before".to_string(),
+        ]));
+        let select_index = calls
+            .iter()
+            .position(|call| call.first().map(String::as_str) == Some("select-layout"))
+            .unwrap();
+        let save_index = calls
+            .iter()
+            .position(|call| {
+                call == &vec![
+                    "set-option".to_string(),
+                    "-w".to_string(),
+                    "-t".to_string(),
+                    "@1".to_string(),
+                    KEY_LAYOUT_BASELINE.to_string(),
+                    "layout-restored".to_string(),
+                ]
+            })
+            .unwrap();
+        assert!(select_index < save_index);
+    }
+
+    #[test]
+    fn open_clears_mismatched_stale_baseline_before_saving_current_layout() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t80\n%2\t\t80\n",
+        );
+        mock.stub(
+            &["show-options", "-w", "-t", "@1"],
+            "@vde_layout_baseline \"layout-before\"\n@vde_layout_panes \"%1\"\n",
+        );
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n%2\n");
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_BASELINE],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_PANES],
+            "",
+        );
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-current\n",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@1",
+                KEY_LAYOUT_BASELINE,
+                "layout-current",
+            ],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-t", "@1", KEY_LAYOUT_PANES, "%1,%2"],
+            "",
+        );
+        mock.stub(
+            &[
+                "split-window",
+                "-t",
+                "@1",
+                "-hbf",
+                "-l",
+                "40",
+                "'/tmp/vt' sidebar attach",
+            ],
+            "",
+        );
+
+        open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        let calls = mock.calls();
+        assert!(calls.contains(&vec![
+            "set-option".to_string(),
+            "-w".to_string(),
+            "-u".to_string(),
+            "-t".to_string(),
+            "@1".to_string(),
+            KEY_LAYOUT_BASELINE.to_string(),
+        ]));
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.first().map(String::as_str) == Some("select-layout"))
+        );
     }
 
     #[test]
@@ -557,6 +771,33 @@ mod tests {
     }
 
     #[test]
+    fn close_restores_stale_baseline_when_sidebar_pane_already_gone() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t80\n%2\t\t80\n",
+        );
+        mock.stub(
+            &["show-options", "-w", "-t", "@1"],
+            "@vde_layout_baseline \"layout-before\"\n@vde_layout_panes \"%1,%2\"\n",
+        );
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n%2\n");
+        mock.stub(&["select-layout", "-t", "@1", "layout-before"], "");
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_BASELINE],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_PANES],
+            "",
+        );
+
+        close(&mock, "@1").unwrap();
+
+        assert_eq!(mock.calls().len(), 6);
+    }
+
+    #[test]
     fn rail_toggles_sidebar_width() {
         let mock = MockTmuxRunner::new();
         mock.stub(
@@ -596,6 +837,7 @@ mod tests {
             &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
             "%1\t\t80\n",
         );
+        mock.stub(&["show-options", "-w", "-t", "@1"], "");
         mock.stub(
             &[
                 "display-message",
@@ -654,7 +896,7 @@ mod tests {
 
         toggle_all(&mock, &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
-        assert_eq!(mock.calls().len(), 13);
+        assert_eq!(mock.calls().len(), 14);
     }
 
     #[test]
@@ -665,6 +907,7 @@ mod tests {
             &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
             "%1\t\t80\n",
         );
+        mock.stub(&["show-options", "-w", "-t", "@1"], "");
         mock.stub(
             &[
                 "display-message",
@@ -706,7 +949,7 @@ mod tests {
 
         layout_applied(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
 
-        assert_eq!(mock.calls().len(), 7);
+        assert_eq!(mock.calls().len(), 8);
     }
 
     #[test]

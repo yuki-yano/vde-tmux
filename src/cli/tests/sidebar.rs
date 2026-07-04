@@ -112,6 +112,7 @@ fn dispatch_sidebar_open_uses_layout_operations() {
         ],
         "%1\t\t80\n",
     );
+    mock.stub(&["show-options", "-w", "-t", "@1"], "");
     mock.stub(
         &[
             "display-message",
@@ -164,7 +165,7 @@ fn dispatch_sidebar_open_uses_layout_operations() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 6);
+    assert_eq!(mock.calls().len(), 7);
 }
 
 #[test]
@@ -185,6 +186,7 @@ fn dispatch_sidebar_open_accepts_percent_width() {
         ],
         "%1\t\t640\n",
     );
+    mock.stub(&["show-options", "-w", "-t", "@1"], "");
     mock.stub(
         &["display-message", "-p", "-t", "@1", "-F", "#{window_width}"],
         "640\n",
@@ -235,7 +237,7 @@ fn dispatch_sidebar_open_accepts_percent_width() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 7);
+    assert_eq!(mock.calls().len(), 8);
 }
 
 #[test]
@@ -257,6 +259,7 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
         ],
         "%1\t\t80\n",
     );
+    mock.stub(&["show-options", "-w", "-t", "@1"], "");
     mock.stub(
         &[
             "display-message",
@@ -309,7 +312,7 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 7);
+    assert_eq!(mock.calls().len(), 8);
 }
 
 #[test]
@@ -455,6 +458,7 @@ fn sidebar_layout_applied_ensures_daemon_started() {
         ],
         "%1\t\t80\n",
     );
+    mock.stub(&["show-options", "-w", "-t", "@1"], "");
     mock.stub(
         &[
             "display-message",
@@ -511,6 +515,7 @@ fn sidebar_layout_applied_ensures_daemon_started() {
     .unwrap();
 
     assert!(called.get());
+    assert_eq!(mock.calls().len(), 8);
 }
 
 fn shell_quote_for_test(value: &str) -> String {

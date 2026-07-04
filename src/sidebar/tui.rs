@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::os::unix::process::CommandExt;
 use std::panic;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Once;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
 };
@@ -24,6 +26,7 @@ use crate::config::Config;
 use crate::daemon::DaemonSnapshot;
 use crate::sidebar::client::{send_sidebar_jump, send_sidebar_key, socket_path, subscribe};
 use crate::sidebar::render::render_rows;
+use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
 const DOUBLE_CLICK_MAX: Duration = Duration::from_millis(500);
 
@@ -31,6 +34,8 @@ static PANIC_RESTORE_HOOK: Once = Once::new();
 
 pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<Option<String>> {
     install_panic_restore_hook();
+    let close_window =
+        resolve_current_window_id(&SystemTmuxRunner::from_env(Duration::from_secs(1)), env)?;
     let socket = socket_path(env);
     let (tx, rx) = mpsc::channel();
     subscribe(&socket, tx)?;
@@ -48,7 +53,9 @@ pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<O
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
-    result?;
+    if result? == TuiExit::Quit {
+        spawn_detached_sidebar_close(&std::env::current_exe()?, &close_window)?;
+    }
     let _ = config;
     Ok(None)
 }
@@ -70,11 +77,16 @@ fn restore_terminal_after_panic<W: Write>(writer: &mut W) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiExit {
+    Quit,
+}
+
 pub fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     socket: &Path,
     rx: &mpsc::Receiver<DaemonSnapshot>,
-) -> Result<()> {
+) -> Result<TuiExit> {
     let mut current: Option<DaemonSnapshot> = None;
     let mut clicks = ClickTracker::default();
     loop {
@@ -83,11 +95,13 @@ pub fn run_loop<B: Backend>(
         }
         if let Some(snapshot) = &current {
             draw_snapshot(terminal, snapshot)?;
+        } else {
+            draw_connecting(terminal)?;
         }
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => break,
+                    KeyCode::Esc | KeyCode::Char('q') => return Ok(TuiExit::Quit),
                     KeyCode::Char(' ') => send_sidebar_key(socket, "space")?,
                     KeyCode::Char(ch) => send_sidebar_key(socket, &ch.to_string())?,
                     KeyCode::Down => send_sidebar_key(socket, "down")?,
@@ -107,7 +121,26 @@ pub fn run_loop<B: Backend>(
             }
         }
     }
-    Ok(())
+}
+
+fn resolve_current_window_id(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<String> {
+    let mut args = vec!["display-message", "-p"];
+    if let Some(pane) = env
+        .get("TMUX_PANE")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        args.extend(["-t", pane]);
+    }
+    args.extend(["-F", "#{window_id}"]);
+    let window = runner.run(&args)?.trim().to_string();
+    if window.is_empty() {
+        anyhow::bail!("failed to resolve current sidebar window");
+    }
+    Ok(window)
 }
 
 #[derive(Default)]
@@ -149,11 +182,21 @@ pub fn draw_snapshot<B: Backend>(
     Ok(())
 }
 
+pub fn draw_connecting<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
+    terminal.draw(|frame| {
+        let area = frame.area();
+        draw_placeholder(frame, area, "connecting to daemon...");
+    })?;
+    Ok(())
+}
+
 fn draw_snapshot_in_area(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &DaemonSnapshot) {
     let Some(sidebar) = &snapshot.sidebar else {
-        let list = List::new(vec![ListItem::new(Line::from("no sidebar data"))])
-            .block(Block::default().borders(Borders::NONE));
-        frame.render_widget(list, area);
+        draw_placeholder(frame, area, "no sidebar data");
+        return;
+    };
+    if sidebar.rows.is_empty() {
+        draw_placeholder(frame, area, "no agents");
         return;
     };
     let rendered = render_rows(&sidebar.rows, &sidebar.state, area.width as usize);
@@ -163,6 +206,52 @@ fn draw_snapshot_in_area(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &
         .collect::<Vec<_>>();
     let list = List::new(items).block(Block::default().borders(Borders::NONE));
     frame.render_widget(list, area);
+}
+
+fn draw_placeholder(frame: &mut ratatui::Frame<'_>, area: Rect, message: &str) {
+    let list = List::new(vec![ListItem::new(Line::from(message.to_string()))])
+        .block(Block::default().borders(Borders::NONE));
+    frame.render_widget(list, area);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarCloseCommand {
+    program: PathBuf,
+    args: Vec<String>,
+}
+
+fn sidebar_close_command(exe: &Path, window: &str) -> SidebarCloseCommand {
+    SidebarCloseCommand {
+        program: exe.to_path_buf(),
+        args: vec![
+            "sidebar".to_string(),
+            "close".to_string(),
+            "--window".to_string(),
+            window.to_string(),
+        ],
+    }
+}
+
+fn spawn_detached_sidebar_close(exe: &Path, window: &str) -> Result<()> {
+    let command_spec = sidebar_close_command(exe, window);
+    let mut command = Command::new(&command_spec.program);
+    command
+        .args(&command_spec.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+        .spawn()
+        .with_context(|| format!("failed to spawn sidebar close for window {window}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -213,6 +302,57 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("codex %1"));
+    }
+
+    #[test]
+    fn renders_connecting_placeholder_before_first_snapshot() {
+        let backend = TestBackend::new(40, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        draw_connecting(&mut terminal).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("connecting to daemon..."));
+    }
+
+    #[test]
+    fn renders_no_agents_placeholder_for_empty_sidebar_rows() {
+        let snapshot = DaemonSnapshot {
+            agent_count: 0,
+            rollup: RollupLevel::Idle,
+            panes: Vec::new(),
+            sidebar: Some(SidebarFrame {
+                state: SidebarState::default(),
+                rows: Vec::new(),
+            }),
+        };
+        let backend = TestBackend::new(40, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        draw_snapshot(&mut terminal, &snapshot).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("no agents"));
+    }
+
+    #[test]
+    fn sidebar_close_command_targets_window() {
+        let command = sidebar_close_command(std::path::Path::new("/tmp/vt"), "@1");
+
+        assert_eq!(command.program, std::path::PathBuf::from("/tmp/vt"));
+        assert_eq!(command.args, vec!["sidebar", "close", "--window", "@1"]);
     }
 
     #[test]
