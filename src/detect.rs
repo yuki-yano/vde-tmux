@@ -1,11 +1,46 @@
 use crate::hook::AgentStatus;
 
 pub fn detect_codex_wait_reason(screen_tail: &str) -> Option<&'static str> {
-    let lower = screen_tail.to_ascii_lowercase();
-    let asks_permission = lower.contains("allow")
-        && (lower.contains("command") || lower.contains("edit") || lower.contains("write"));
-    let has_choices = lower.contains("yes") || lower.contains("y)");
-    (asks_permission && has_choices).then_some("permission_prompt")
+    let lines = screen_tail
+        .lines()
+        .map(|line| line.trim().to_ascii_lowercase())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    for (index, line) in lines.iter().enumerate() {
+        if !looks_like_permission_question(line) {
+            continue;
+        }
+        if lines
+            .iter()
+            .skip(index + 1)
+            .take(3)
+            .any(|candidate| looks_like_yes_choice(candidate))
+        {
+            return Some("permission_prompt");
+        }
+    }
+    None
+}
+
+fn looks_like_permission_question(line: &str) -> bool {
+    (line.contains("allow") || line.contains("approve"))
+        && (line.contains("command")
+            || line.contains("edit")
+            || line.contains("write")
+            || line.contains("tool"))
+        && line.contains('?')
+}
+
+fn looks_like_yes_choice(line: &str) -> bool {
+    let normalized = line
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '-' || ch == '*' || ch == '>')
+        .trim();
+    normalized == "yes"
+        || normalized.starts_with("yes ")
+        || normalized.starts_with("y) yes")
+        || normalized.starts_with("y - yes")
+        || normalized.starts_with("[y] yes")
 }
 
 pub fn demote_stale_running(
@@ -32,6 +67,18 @@ mod tests {
     #[test]
     fn detects_codex_permission_prompt_from_screen_tail() {
         let text = "some output\n? Allow command to run?\n  y) yes\n  n) no\n";
+        assert_eq!(detect_codex_wait_reason(text), Some("permission_prompt"));
+    }
+
+    #[test]
+    fn does_not_detect_yes_when_permission_question_is_not_adjacent() {
+        let text = "Allow command to run?\nnoise\nmore noise\nunrelated summary: yes\n";
+        assert_eq!(detect_codex_wait_reason(text), None);
+    }
+
+    #[test]
+    fn detects_codex_permission_prompt_with_adjacent_choice() {
+        let text = "? Allow command to run?\n  y) yes\n  n) no\n";
         assert_eq!(detect_codex_wait_reason(text), Some("permission_prompt"));
     }
 

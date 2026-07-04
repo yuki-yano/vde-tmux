@@ -13,7 +13,7 @@ pub struct GitBadge {
     pub behind: u32,
 }
 
-pub trait GitRunner {
+pub trait GitRunner: Send + Sync {
     fn run(&self, cwd: &str, args: &[&str]) -> Result<String>;
 }
 

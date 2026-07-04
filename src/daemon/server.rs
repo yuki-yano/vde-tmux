@@ -4,10 +4,15 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use super::protocol::{ClientMessage, QueryTarget, ServerMessage};
+use super::runtime::{ClientId, DaemonEvent, LatestSlot};
 use crate::daemon::{build_snapshot, statusline_agent_badge_fallback};
 use crate::options::snapshot::read_all_panes;
 use crate::tmux::TmuxRunner;
@@ -51,6 +56,72 @@ pub fn handle_stream(runner: &dyn TmuxRunner, mut stream: UnixStream) -> Result<
     };
     serde_json::to_writer(&mut stream, &response)?;
     stream.write_all(b"\n")?;
+    Ok(())
+}
+
+pub fn handle_stream_with_runtime(
+    tx: Sender<DaemonEvent>,
+    client_id: ClientId,
+    mut stream: UnixStream,
+) -> Result<()> {
+    let mut line = String::new();
+    {
+        let mut reader = BufReader::new(&mut stream);
+        reader.read_line(&mut line)?;
+    }
+    let message = serde_json::from_str::<ClientMessage>(line.trim())?;
+    match message {
+        ClientMessage::Subscribe { proto: _ } => {
+            let slot = Arc::new(LatestSlot::new());
+            tx.send(DaemonEvent::Connect {
+                client_id,
+                slot: slot.clone(),
+            })?;
+            spawn_client_writer(client_id, stream, slot, tx);
+        }
+        ClientMessage::SidebarEvent { proto: _, event } => {
+            tx.send(DaemonEvent::Client { client_id, event })?;
+            write_server_message(&mut stream, &ServerMessage::Ack)?;
+        }
+        ClientMessage::Query {
+            proto: _,
+            what: QueryTarget::Statusline,
+        }
+        | ClientMessage::StatuslineAgentBadge => {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            tx.send(DaemonEvent::QueryStatusline { reply: reply_tx })?;
+            let response = reply_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_else(|error| ServerMessage::Error {
+                    message: error.to_string(),
+                });
+            write_server_message(&mut stream, &response)?;
+        }
+    }
+    Ok(())
+}
+
+fn spawn_client_writer(
+    client_id: ClientId,
+    mut stream: UnixStream,
+    slot: Arc<LatestSlot<ServerMessage>>,
+    tx: Sender<DaemonEvent>,
+) {
+    thread::spawn(move || {
+        while let Some(message) = slot.wait_for_update() {
+            if let Err(error) = write_server_message(&mut stream, &message) {
+                eprintln!("[vde-tmux] daemon client writer error: {error:#}");
+                let _ = tx.send(DaemonEvent::Disconnect { client_id });
+                break;
+            }
+        }
+    });
+}
+
+fn write_server_message(stream: &mut UnixStream, message: &ServerMessage) -> Result<()> {
+    serde_json::to_writer(&mut *stream, message)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
     Ok(())
 }
 
@@ -163,5 +234,29 @@ mod tests {
             panic!("expected snapshot response");
         };
         assert_eq!(snapshot.agent_count, 1);
+    }
+
+    #[test]
+    fn handle_subscribe_keeps_connection_and_pushes_snapshot() {
+        use crate::daemon::protocol::ServerMessage;
+        use crate::daemon::runtime::{ClientId, DaemonEvent};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        serde_json::to_writer(&mut client, &ClientMessage::Subscribe { proto: 1 }).unwrap();
+        client.write_all(b"\n").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        handle_stream_with_runtime(tx, ClientId(1), server).unwrap();
+        let DaemonEvent::Connect { slot, .. } = rx.recv().unwrap() else {
+            panic!("expected connect event");
+        };
+        slot.publish(ServerMessage::Ack);
+
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), r#"{"type":"ack"}"#);
     }
 }

@@ -4,6 +4,7 @@ pub mod lifecycle;
 pub mod protocol;
 pub mod runtime;
 pub mod server;
+pub mod workers;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};

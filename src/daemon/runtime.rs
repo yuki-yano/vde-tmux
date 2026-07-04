@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::daemon::protocol::{ServerMessage, SidebarClientEvent};
-use crate::daemon::{DaemonSnapshot, SidebarFrame, build_snapshot_with_sidebar};
+use crate::daemon::{
+    DaemonSnapshot, SidebarFrame, build_snapshot_with_sidebar, render_agent_badge,
+};
 use crate::git::GitBadge;
 use crate::options::snapshot::PaneSnapshot;
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
@@ -31,6 +34,9 @@ pub enum DaemonEvent {
     },
     PanesUpdated(Vec<PaneSnapshot>),
     GitStatusUpdated(BTreeMap<String, GitBadge>),
+    QueryStatusline {
+        reply: Sender<ServerMessage>,
+    },
     DebounceCheck(Instant),
     Shutdown,
 }
@@ -164,6 +170,15 @@ impl RuntimeState {
                 self.git_badges = git_badges;
                 self.rebuild_snapshot();
                 self.broadcast_if_needed();
+                Vec::new()
+            }
+            DaemonEvent::QueryStatusline { reply } => {
+                let agent_badge = self
+                    .snapshot
+                    .as_ref()
+                    .map(render_agent_badge)
+                    .unwrap_or_default();
+                let _ = reply.send(ServerMessage::Statusline { agent_badge });
                 Vec::new()
             }
             DaemonEvent::DebounceCheck(now) => self.flush_state_if_due(now),
