@@ -15,7 +15,7 @@ fn dispatch_statusline_sessions_prints_output() {
     let format = crate::session::session_list_format();
     mock.stub(
         &["list-sessions", "-F", &format],
-        "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\n",
+        "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}\n",
     );
     mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
     let output = run_with(["vt", "statusline-sessions"], &mock, &env()).unwrap();
@@ -28,7 +28,7 @@ fn dispatch_statusline_sessions_show_index_overrides_config() {
     let format = crate::session::session_list_format();
     mock.stub(
         &["list-sessions", "-F", &format],
-        "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\n",
+        "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}\n",
     );
     mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
 
@@ -46,7 +46,7 @@ fn dispatch_category_use_switches_category() {
     mock.stub(&["display-message", "-p", "#{client_name}"], "abc\n");
     mock.stub(
         &["list-sessions", "-F", &format],
-        "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\n",
+        "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\n",
     );
     mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "");
     mock.stub(&["switch-client", "-t", "main"], "");

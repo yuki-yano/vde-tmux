@@ -19,6 +19,7 @@ pub struct SessionInfo {
     pub category: String,
     pub project_path: String,
     pub category_override: String,
+    pub badge: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,7 @@ pub fn session_list_format() -> String {
         "#{@vde_category}",
         "#{@vde_project_path}",
         "#{@vde_category_override}",
+        "#{@vde_session_status}",
     ]
     .join(&FIELD_SEP.to_string())
 }
@@ -44,7 +46,7 @@ pub fn parse_sessions(output: &str) -> Vec<SessionInfo> {
         .lines()
         .filter_map(|line| {
             let fields = line.split(FIELD_SEP).collect::<Vec<_>>();
-            if fields.len() != 6 {
+            if fields.len() != 7 {
                 return None;
             }
             Some(SessionInfo {
@@ -54,6 +56,7 @@ pub fn parse_sessions(output: &str) -> Vec<SessionInfo> {
                 category: fields[3].to_string(),
                 project_path: fields[4].to_string(),
                 category_override: fields[5].to_string(),
+                badge: fields[6].to_string(),
             })
         })
         .collect()
@@ -244,7 +247,7 @@ mod tests {
 
     #[test]
     fn parse_sessions_reads_vde_options() {
-        let raw = "main\u{1f}1\u{1f}100\u{1f}work\u{1f}/repo\u{1f}\nsub\u{1f}0\u{1f}90\u{1f}\u{1f}\u{1f}private\n";
+        let raw = "main\u{1f}1\u{1f}100\u{1f}work\u{1f}/repo\u{1f}\u{1f}\nsub\u{1f}0\u{1f}90\u{1f}\u{1f}\u{1f}private\u{1f}\n";
         let sessions = parse_sessions(raw);
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].name, "main");
@@ -255,12 +258,26 @@ mod tests {
     }
 
     #[test]
+    fn session_list_format_includes_session_status() {
+        assert!(session_list_format().contains("#{@vde_session_status}"));
+    }
+
+    #[test]
+    fn parse_sessions_reads_badge_field() {
+        let sep = '\u{1f}';
+        let line = ["main", "1", "1700000000", "misc", "/tmp", "", "🔴 "].join(&sep.to_string());
+        let sessions = parse_sessions(&line);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].badge, "🔴 ");
+    }
+
+    #[test]
     fn list_sessions_uses_single_tmux_call() {
         let mock = MockTmuxRunner::new();
         let format = session_list_format();
         mock.stub(
             &["list-sessions", "-F", &format],
-            "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\n",
+            "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}\n",
         );
         let sessions = list_sessions(&mock).unwrap();
         assert_eq!(sessions[0].name, "main");
@@ -293,7 +310,7 @@ mod tests {
         mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
         mock.stub(
             &["list-sessions", "-F", &format],
-            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\n",
+            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\n",
         );
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
         remember_current_client_session(&mock, &crate::config::Config::default()).unwrap();
@@ -335,7 +352,7 @@ mod tests {
         mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
         mock.stub(
             &["list-sessions", "-F", &format],
-            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\nsub\u{1f}0\u{1f}101\u{1f}work\u{1f}\u{1f}\nother\u{1f}0\u{1f}102\u{1f}private\u{1f}\u{1f}\n",
+            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\nsub\u{1f}0\u{1f}101\u{1f}work\u{1f}\u{1f}\u{1f}\nother\u{1f}0\u{1f}102\u{1f}private\u{1f}\u{1f}\u{1f}\n",
         );
         mock.stub(&["switch-client", "-t", "sub"], "");
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "sub"], "");
@@ -350,7 +367,7 @@ mod tests {
         mock.stub(&["display-message", "-p", "#{client_name}"], "abc\n");
         mock.stub(
             &["list-sessions", "-F", &format],
-            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\nsub\u{1f}0\u{1f}101\u{1f}work\u{1f}\u{1f}\n",
+            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\nsub\u{1f}0\u{1f}101\u{1f}work\u{1f}\u{1f}\u{1f}\n",
         );
         mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "sub\n");
         mock.stub(&["switch-client", "-t", "sub"], "");
@@ -365,7 +382,7 @@ mod tests {
         let format = session_list_format();
         mock.stub(
             &["list-sessions", "-F", &format],
-            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\n",
+            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\n",
         );
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
         on_client_session_changed(
@@ -384,7 +401,7 @@ mod tests {
         let format = session_list_format();
         mock.stub(
             &["list-sessions", "-F", &format],
-            "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}private\n",
+            "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}private\u{1f}\n",
         );
         mock.stub(
             &[

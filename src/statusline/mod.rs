@@ -77,6 +77,7 @@ pub fn render_statusline_sessions(
             };
             render_session_segment(
                 style,
+                &session.badge,
                 &session.name,
                 index,
                 config.statusline.sessions.show_index,
@@ -132,6 +133,7 @@ fn current_category(config: &Config, sessions: &[SessionInfo], current_session: 
 
 fn render_session_segment(
     style: &SegmentStyle,
+    badge: &str,
     session_name: &str,
     index: usize,
     show_index: bool,
@@ -141,6 +143,7 @@ fn render_session_segment(
     } else {
         session_name.to_string()
     };
+    let label = format!("{badge}{label}");
     let body = style
         .format
         .replace("{session}", &label)
@@ -215,6 +218,18 @@ mod tests {
             "work",
         );
         assert!(rendered.contains("main"));
+        assert!(rendered.contains("sub"));
+    }
+
+    #[test]
+    fn render_statusline_sessions_prefixes_badge_to_label() {
+        let config = Config::default();
+        let mut main = session("main", "work");
+        main.badge = "🔴 ".to_string();
+        let rendered =
+            render_statusline_sessions(&config, &[main, session("sub", "work")], "main", "work");
+
+        assert!(rendered.contains("🔴 main"));
         assert!(rendered.contains("sub"));
     }
 
