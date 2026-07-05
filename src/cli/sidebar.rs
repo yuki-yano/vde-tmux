@@ -56,6 +56,10 @@ pub(crate) enum SidebarCommand {
     Jump {
         pane: String,
     },
+    Focus {
+        #[arg(long)]
+        window: Option<String>,
+    },
 }
 
 pub(crate) fn run_sidebar_command(
@@ -173,6 +177,11 @@ where
                 &crate::sidebar::client::socket_path(env),
                 &pane,
             )?;
+            Ok(None)
+        }
+        SidebarCommand::Focus { window } => {
+            let target = resolve_window_target(runner, window)?;
+            crate::sidebar::layout::focus(runner, &target)?;
             Ok(None)
         }
     }

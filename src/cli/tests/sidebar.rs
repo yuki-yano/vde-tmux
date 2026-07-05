@@ -169,6 +169,69 @@ fn dispatch_sidebar_open_uses_layout_operations() {
 }
 
 #[test]
+fn dispatch_sidebar_focus_selects_sidebar_pane() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(&["display-message", "-p", "#{window_id}"], "@1\n");
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@1",
+            "-F",
+            crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+        ],
+        "%9\t1\t40\n%1\t\t80\n",
+    );
+    mock.stub(&["select-pane", "-t", "%9"], "");
+
+    crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Focus { window: None },
+        &mock,
+        &env(),
+        &crate::config::Config::default(),
+        |_| Ok(()),
+    )
+    .unwrap();
+
+    assert!(mock.calls().contains(&vec![
+        "select-pane".to_string(),
+        "-t".to_string(),
+        "%9".to_string(),
+    ]));
+}
+
+#[test]
+fn dispatch_sidebar_focus_without_sidebar_is_noop() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(&["display-message", "-p", "#{window_id}"], "@1\n");
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@1",
+            "-F",
+            crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+        ],
+        "%1\t\t80\n",
+    );
+
+    let output = crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Focus { window: None },
+        &mock,
+        &env(),
+        &crate::config::Config::default(),
+        |_| Ok(()),
+    )
+    .unwrap();
+
+    assert_eq!(output, None);
+    assert!(!mock
+        .calls()
+        .iter()
+        .any(|call| call.first().map(String::as_str) == Some("select-pane")));
+}
+
+#[test]
 fn dispatch_sidebar_open_accepts_percent_width() {
     let mock = MockTmuxRunner::new();
     let exe = std::env::current_exe().unwrap();

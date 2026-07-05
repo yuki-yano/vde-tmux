@@ -125,6 +125,14 @@ pub fn jump_to_pane(runner: &dyn TmuxRunner, pane_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn focus(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
+    let Some(sidebar) = find_sidebar_pane(runner, target)? else {
+        return Ok(());
+    };
+    runner.run(&["select-pane", "-t", &sidebar.pane_id])?;
+    Ok(())
+}
+
 pub fn rebaseline(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
     let Some(sidebar) = find_sidebar_pane(runner, target)? else {
         return Ok(());
