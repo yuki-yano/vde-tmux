@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -17,6 +17,7 @@ use crate::sidebar::tree::{
 };
 
 const STATE_DEBOUNCE: Duration = Duration::from_millis(200);
+const TRIAGE_LEAVE_POLLS: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClientId(pub u64);
@@ -133,6 +134,8 @@ pub struct RuntimeState {
     dirty_state_since: Option<Instant>,
     pane_was_idle: BTreeMap<String, bool>,
     unread: BTreeMap<String, bool>,
+    triage: BTreeSet<String>,
+    calm_streak: BTreeMap<String, u8>,
     written_badges: BTreeMap<String, String>,
 }
 
@@ -151,6 +154,8 @@ impl RuntimeState {
             dirty_state_since: None,
             pane_was_idle: BTreeMap::new(),
             unread: BTreeMap::new(),
+            triage: BTreeSet::new(),
+            calm_streak: BTreeMap::new(),
             written_badges: BTreeMap::new(),
         }
     }
@@ -174,6 +179,7 @@ impl RuntimeState {
             DaemonEvent::PanesUpdated(panes) => {
                 self.panes = panes;
                 self.update_unread();
+                self.update_triage();
                 self.rebuild_snapshot();
                 self.broadcast_if_needed();
                 self.sync_session_badges()
@@ -218,7 +224,7 @@ impl RuntimeState {
             &RowBuildContext {
                 git: self.git_badges.clone(),
                 unread: self.unread.clone(),
-                triage: Default::default(),
+                triage: self.triage.clone(),
                 now: now_epoch_secs(),
             },
         );
@@ -468,6 +474,30 @@ impl RuntimeState {
         }
         self.pane_was_idle = next_was_idle;
         self.unread = next_unread;
+    }
+
+    fn update_triage(&mut self) {
+        use crate::daemon::session_badge::{BadgeState, badge_state};
+
+        let mut next_triage = BTreeSet::new();
+        let mut next_streak = BTreeMap::new();
+        for pane in self.panes.iter().filter(|pane| is_live_agent_pane(pane)) {
+            let level = crate::sidebar::tree::rollup_for_pane(pane);
+            let unread = self.unread.get(&pane.pane_id).copied().unwrap_or(false);
+            let blocked = badge_state(level, unread) == BadgeState::Blocked;
+            if blocked {
+                next_triage.insert(pane.pane_id.clone());
+                next_streak.insert(pane.pane_id.clone(), 0);
+            } else if self.triage.contains(&pane.pane_id) {
+                let streak = self.calm_streak.get(&pane.pane_id).copied().unwrap_or(0) + 1;
+                if streak < TRIAGE_LEAVE_POLLS {
+                    next_triage.insert(pane.pane_id.clone());
+                    next_streak.insert(pane.pane_id.clone(), streak);
+                }
+            }
+        }
+        self.triage = next_triage;
+        self.calm_streak = next_streak;
     }
 
     fn sync_session_badges(&mut self) -> Vec<RuntimeEffect> {
@@ -823,6 +853,35 @@ mod tests {
         let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
         assert!(rows.iter().all(|row| !row.id.contains("%1")));
         assert!(rows.iter().any(|row| row.id.contains("%2")));
+    }
+
+    #[test]
+    fn blocked_pane_enters_triage_immediately() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut blocked = agent_pane("main", "%1", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+
+        state.apply_event(DaemonEvent::PanesUpdated(vec![blocked]));
+
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        assert_eq!(rows[0].id, "zone::triage");
+    }
+
+    #[test]
+    fn pane_leaves_triage_after_two_calm_polls() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut blocked = agent_pane("main", "%1", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        state.apply_event(DaemonEvent::PanesUpdated(vec![blocked]));
+
+        let calm = || agent_pane("main", "%1", "running");
+        state.apply_event(DaemonEvent::PanesUpdated(vec![calm()]));
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        assert_eq!(rows[0].id, "zone::triage");
+
+        state.apply_event(DaemonEvent::PanesUpdated(vec![calm()]));
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        assert!(rows.iter().all(|row| row.id != "zone::triage"));
     }
 
     #[test]
