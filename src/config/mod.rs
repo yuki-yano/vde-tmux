@@ -143,8 +143,7 @@ impl Default for AgentBadgeConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SessionBadgeConfig {
     pub enabled: bool,
-    /// グリフ直後に付ける区切り文字列。絵文字は表示幅が広いので
-    /// デフォルトで半角スペース 1 個を挟む(バッジ値自体に含める)。
+    /// グリフ直後に付ける区切り文字列。
     pub suffix: String,
 }
 
@@ -152,7 +151,7 @@ impl Default for SessionBadgeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            suffix: " ".to_string(),
+            suffix: String::new(),
         }
     }
 }
@@ -566,11 +565,11 @@ categories:
     }
 
     #[test]
-    fn session_badge_defaults_to_single_width_glyphs_with_space_suffix() {
+    fn session_badge_defaults_to_single_width_glyphs_with_empty_suffix() {
         let badge = BadgeConfig::default();
         let config = SessionBadgeConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.suffix, " ");
+        assert_eq!(config.suffix, "");
         assert_eq!(badge.glyphs.blocked, "▲");
         assert_eq!(badge.glyphs.working, "●");
         assert_eq!(badge.glyphs.done, "✓");

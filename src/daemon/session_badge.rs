@@ -93,7 +93,7 @@ mod tests {
             &glyphs,
             &config.suffix,
         );
-        assert_eq!(value.as_deref(), Some("▲ "));
+        assert_eq!(value.as_deref(), Some("▲"));
     }
 
     #[test]
