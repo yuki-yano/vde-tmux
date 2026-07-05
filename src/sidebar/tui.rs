@@ -70,8 +70,15 @@ pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<O
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
-    if result? == TuiExit::Quit {
-        spawn_detached_sidebar_close(&std::env::current_exe()?, &close_window)?;
+    match result? {
+        TuiExit::Quit => {
+            spawn_detached_sidebar_close(&std::env::current_exe()?, &close_window)?;
+        }
+        TuiExit::Disconnected => {
+            eprintln!(
+                "[vde-tmux] daemon への接続が終了しました。daemon を再起動して attach し直してください。"
+            );
+        }
     }
     let _ = config;
     Ok(None)
@@ -97,6 +104,7 @@ fn restore_terminal_after_panic<W: Write>(writer: &mut W) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiExit {
     Quit,
+    Disconnected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -150,8 +158,8 @@ pub fn run_loop<B: Backend>(
         ..LiveState::default()
     };
     loop {
-        while let Ok(snapshot) = rx.try_recv() {
-            current = Some(snapshot);
+        if let Err(exit) = drain_snapshot_updates(rx, &mut current) {
+            return Ok(exit);
         }
         let context = ClickContext {
             socket,
@@ -247,6 +255,19 @@ pub fn run_loop<B: Backend>(
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+fn drain_snapshot_updates(
+    rx: &mpsc::Receiver<DaemonSnapshot>,
+    current: &mut Option<DaemonSnapshot>,
+) -> std::result::Result<(), TuiExit> {
+    loop {
+        match rx.try_recv() {
+            Ok(snapshot) => *current = Some(snapshot),
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => return Err(TuiExit::Disconnected),
         }
     }
 }
@@ -1289,6 +1310,18 @@ mod tests {
                 now
             ),
             ClickDecision::Immediate(ClickAction::ToggleRow("repo::misc::app".to_string()))
+        );
+    }
+
+    #[test]
+    fn drain_snapshot_updates_reports_disconnect() {
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        let mut current = None;
+
+        assert_eq!(
+            drain_snapshot_updates(&rx, &mut current),
+            Err(TuiExit::Disconnected)
         );
     }
 }
