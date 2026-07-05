@@ -110,6 +110,7 @@ pub fn run_loop<B: Backend>(
 ) -> Result<TuiExit> {
     let mut current: Option<DaemonSnapshot> = None;
     let mut clicks = ClickTracker::default();
+    let mut scroll: usize = 0;
     loop {
         while let Ok(snapshot) = rx.try_recv() {
             current = Some(snapshot);
@@ -125,7 +126,24 @@ pub fn run_loop<B: Backend>(
             dispatch_click_action(&context, action);
         }
         if let Some(snapshot) = &current {
-            draw_snapshot_with_theme(terminal, snapshot, theme)?;
+            let size = terminal.size()?;
+            let area = Rect::new(0, 0, size.width, size.height);
+            if let Some(sidebar) = &snapshot.sidebar {
+                let header = build_header_layout_with_theme(&sidebar.state, area.width, theme);
+                let areas = compute_areas(area, &header);
+                let selection_index = sidebar.state.selection.as_deref().and_then(|selection| {
+                    sidebar.rows.iter().position(|row| row.id == selection)
+                });
+                scroll = resolve_scroll(
+                    scroll,
+                    selection_index,
+                    sidebar.rows.len(),
+                    areas.rows_height as usize,
+                );
+            } else {
+                scroll = 0;
+            }
+            draw_snapshot_with_theme_and_scroll(terminal, snapshot, theme, scroll)?;
         } else {
             draw_connecting(terminal)?;
         }
@@ -157,6 +175,7 @@ pub fn run_loop<B: Backend>(
                             snapshot,
                             mouse.row,
                             mouse.column,
+                            scroll,
                             &mut clicks,
                         )?;
                     }
@@ -300,10 +319,15 @@ fn single_click_action(row: &ClickedRow) -> Option<ClickAction> {
 
 #[cfg(test)]
 fn pane_for_click(snapshot: &DaemonSnapshot, row: u16) -> Option<String> {
-    row_for_click(snapshot, row, 0)?.pane_id.clone()
+    row_for_click(snapshot, row, 0, 0)?.pane_id.clone()
 }
 
-fn row_for_click(snapshot: &DaemonSnapshot, row: u16, header_rows: u16) -> Option<&SidebarRow> {
+fn row_for_click(
+    snapshot: &DaemonSnapshot,
+    row: u16,
+    header_rows: u16,
+    scroll: usize,
+) -> Option<&SidebarRow> {
     if row < header_rows {
         return None;
     }
@@ -311,7 +335,7 @@ fn row_for_click(snapshot: &DaemonSnapshot, row: u16, header_rows: u16) -> Optio
         .sidebar
         .as_ref()?
         .rows
-        .get(usize::from(row - header_rows))
+        .get(usize::from(row - header_rows) + scroll)
 }
 
 pub fn draw_snapshot<B: Backend>(
@@ -326,9 +350,18 @@ pub fn draw_snapshot_with_theme<B: Backend>(
     snapshot: &DaemonSnapshot,
     theme: &SidebarRenderTheme,
 ) -> Result<()> {
+    draw_snapshot_with_theme_and_scroll(terminal, snapshot, theme, 0)
+}
+
+fn draw_snapshot_with_theme_and_scroll<B: Backend>(
+    terminal: &mut Terminal<B>,
+    snapshot: &DaemonSnapshot,
+    theme: &SidebarRenderTheme,
+    scroll: usize,
+) -> Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
-        draw_snapshot_in_area(frame, area, snapshot, theme);
+        draw_snapshot_in_area(frame, area, snapshot, theme, scroll);
     })?;
     Ok(())
 }
@@ -346,6 +379,7 @@ fn draw_snapshot_in_area(
     area: Rect,
     snapshot: &DaemonSnapshot,
     theme: &SidebarRenderTheme,
+    scroll: usize,
 ) {
     let Some(sidebar) = &snapshot.sidebar else {
         draw_placeholder(frame, area, "no sidebar data");
@@ -374,6 +408,8 @@ fn draw_snapshot_in_area(
     };
     let items = render_lines(&sidebar.rows, &sidebar.state, area.width as usize, theme)
         .into_iter()
+        .skip(scroll)
+        .take(areas.rows_height as usize)
         .map(ListItem::new)
         .collect::<Vec<_>>();
     let list = List::new(items).block(Block::default().borders(Borders::NONE));
@@ -418,6 +454,27 @@ pub(crate) fn compute_areas(area: Rect, header: &HeaderLayout) -> SidebarAreas {
     }
 }
 
+pub(crate) fn resolve_scroll(
+    prev: usize,
+    selection_index: Option<usize>,
+    rows_len: usize,
+    viewport: usize,
+) -> usize {
+    if viewport == 0 || rows_len <= viewport {
+        return 0;
+    }
+    let max_scroll = rows_len - viewport;
+    let mut scroll = prev.min(max_scroll);
+    if let Some(index) = selection_index {
+        if index < scroll {
+            scroll = index;
+        } else if index >= scroll + viewport {
+            scroll = index + 1 - viewport;
+        }
+    }
+    scroll.min(max_scroll)
+}
+
 struct ClickContext<'a> {
     socket: &'a Path,
     runner: &'a dyn TmuxRunner,
@@ -431,6 +488,7 @@ fn handle_left_click(
     snapshot: &DaemonSnapshot,
     row: u16,
     column: u16,
+    scroll: usize,
     clicks: &mut ClickTracker,
 ) -> Result<()> {
     let Some(sidebar) = &snapshot.sidebar else {
@@ -454,7 +512,7 @@ fn handle_left_click(
     if row >= areas.header_rows + areas.rows_height {
         return Ok(());
     }
-    let Some(clicked) = row_for_click(snapshot, row, header.row_count()) else {
+    let Some(clicked) = row_for_click(snapshot, row, header.row_count(), scroll) else {
         return Ok(());
     };
     if let ClickDecision::Immediate(action) =
@@ -576,6 +634,40 @@ mod tests {
             git: None,
             meta: None,
         }
+    }
+
+    #[test]
+    fn scroll_follows_selection() {
+        assert_eq!(resolve_scroll(0, Some(5), 30, 10), 0);
+        assert_eq!(resolve_scroll(0, Some(15), 30, 10), 6);
+        assert_eq!(resolve_scroll(6, Some(2), 30, 10), 2);
+        assert_eq!(resolve_scroll(25, Some(29), 30, 10), 20);
+        assert_eq!(resolve_scroll(9, None, 5, 10), 0);
+    }
+
+    #[test]
+    fn click_maps_through_scroll_offset() {
+        let rows = (0..30)
+            .map(|index| SidebarRow {
+                id: format!("chat::%{index}"),
+                pane_id: Some(format!("%{index}")),
+                ..row()
+            })
+            .collect();
+        let snapshot = DaemonSnapshot {
+            agent_count: 30,
+            rollup: RollupLevel::Running,
+            panes: Vec::new(),
+            sidebar: Some(SidebarFrame {
+                state: SidebarState::default(),
+                rows,
+            }),
+        };
+
+        assert_eq!(
+            row_for_click(&snapshot, 2, 1, 6).map(|row| row.id.as_str()),
+            Some("chat::%7")
+        );
     }
 
     #[test]
@@ -820,14 +912,14 @@ mod tests {
         };
 
         assert_eq!(
-            row_for_click(&snapshot, 1, 1).map(|row| row.id.as_str()),
+            row_for_click(&snapshot, 1, 1, 0).map(|row| row.id.as_str()),
             Some("repo::misc::app")
         );
         assert_eq!(
-            row_for_click(&snapshot, 2, 1).map(|row| row.id.as_str()),
+            row_for_click(&snapshot, 2, 1, 0).map(|row| row.id.as_str()),
             Some("chat::%1")
         );
-        assert_eq!(row_for_click(&snapshot, 0, 1), None);
+        assert_eq!(row_for_click(&snapshot, 0, 1, 0), None);
     }
 
     #[test]
