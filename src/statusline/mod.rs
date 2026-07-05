@@ -3,7 +3,7 @@
 use anyhow::{Result, anyhow};
 
 use crate::category::{resolve_category_for_session, sessions_in_category, sorted_categories};
-use crate::config::{Config, SegmentStyle, StatuslineCategoryConfig};
+use crate::config::{BadgeStyle, Config, SegmentStyle, StatuslineCategoryConfig};
 use crate::session::{
     SessionInfo, current_session_name, find_session, list_sessions, switch_client, use_category,
 };
@@ -78,9 +78,11 @@ pub fn render_statusline_sessions(
             render_session_segment(
                 style,
                 &session.badge,
+                &session.state,
                 &session.name,
                 index,
                 config.statusline.sessions.show_index,
+                config.statusline.sessions.badge_style,
             )
         })
         .collect::<Vec<_>>()
@@ -134,21 +136,53 @@ fn current_category(config: &Config, sessions: &[SessionInfo], current_session: 
 fn render_session_segment(
     style: &SegmentStyle,
     badge: &str,
+    state: &str,
     session_name: &str,
     index: usize,
     show_index: bool,
+    badge_style: BadgeStyle,
 ) -> String {
     let label = if show_index {
         format!("{}:{session_name}", index + 1)
     } else {
         session_name.to_string()
     };
-    let label = format!("{badge}{label}");
+    let label = format!(
+        "{}{label}",
+        badge_fragment(badge, state, style, badge_style)
+    );
     let body = style
         .format
         .replace("{session}", &label)
         .replace("{index}", &(index + 1).to_string());
     tmux_style_segment(style, &body)
+}
+
+fn badge_fragment(
+    badge: &str,
+    state: &str,
+    style: &SegmentStyle,
+    badge_style: BadgeStyle,
+) -> String {
+    if badge.is_empty() {
+        return String::new();
+    }
+    if badge_style == BadgeStyle::Plain {
+        return badge.to_string();
+    }
+    let color = match state {
+        "blocked" => Some("red"),
+        "working" => Some("green"),
+        "done" => Some("cyan"),
+        _ => None,
+    };
+    match color {
+        Some(color) => {
+            let restore = style.colors.fg.as_deref().unwrap_or("default");
+            format!("#[fg={color}]{badge}#[fg={restore}]")
+        }
+        None => badge.to_string(),
+    }
 }
 
 fn tmux_style_segment(style: &SegmentStyle, body: &str) -> String {
@@ -197,7 +231,7 @@ fn tmux_style_category(config: &StatuslineCategoryConfig, body: &str, active: bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{BadgeStyle, Config};
     use crate::session::SessionInfo;
 
     fn session(name: &str, category: &str) -> SessionInfo {
@@ -245,6 +279,45 @@ mod tests {
 
         assert!(rendered.contains("🔴 main"));
         assert!(rendered.contains("sub"));
+    }
+
+    #[test]
+    fn inline_badge_uses_state_color_and_restores_segment_fg() {
+        let config = Config::default();
+        let mut main = session("main", "work");
+        main.badge = "▲".to_string();
+        main.state = "blocked".to_string();
+        let rendered = render_statusline_sessions(&config, &[main], "main", "work");
+        assert!(
+            rendered.contains("#[fg=red]▲#[fg=default]main"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn inline_badge_restores_configured_segment_fg() {
+        let mut config = Config::default();
+        config.statusline.sessions.other.colors.fg = Some("white".to_string());
+        let mut sub = session("sub", "work");
+        sub.badge = "●".to_string();
+        sub.state = "working".to_string();
+        let rendered = render_statusline_sessions(&config, &[sub], "main", "work");
+        assert!(
+            rendered.contains("#[fg=green]●#[fg=white]sub"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn plain_badge_style_keeps_legacy_concatenation() {
+        let mut config = Config::default();
+        config.statusline.sessions.badge_style = BadgeStyle::Plain;
+        let mut main = session("main", "work");
+        main.badge = "▲".to_string();
+        main.state = "blocked".to_string();
+        let rendered = render_statusline_sessions(&config, &[main], "main", "work");
+        assert!(rendered.contains("▲main"), "{rendered}");
+        assert!(!rendered.contains("#[fg=red]"), "{rendered}");
     }
 
     #[test]

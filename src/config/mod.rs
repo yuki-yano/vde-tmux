@@ -67,6 +67,7 @@ pub struct StatuslineSessionsConfig {
     pub show_index: bool,
     pub current: SegmentStyle,
     pub other: SegmentStyle,
+    pub badge_style: BadgeStyle,
 }
 
 impl Default for StatuslineSessionsConfig {
@@ -78,8 +79,17 @@ impl Default for StatuslineSessionsConfig {
                 ..SegmentStyle::default()
             },
             other: SegmentStyle::default(),
+            badge_style: BadgeStyle::Inline,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BadgeStyle {
+    #[default]
+    Inline,
+    Plain,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

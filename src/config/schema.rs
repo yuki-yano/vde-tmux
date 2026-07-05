@@ -58,6 +58,16 @@ pub fn config_schema() -> Value {
                             "enabled": { "type": "boolean" }
                         }
                     },
+                    "sessions": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "badge_style": {
+                                "type": "string",
+                                "enum": ["inline", "plain"]
+                            }
+                        }
+                    },
                     "session_badge": {
                         "type": "object",
                         "additionalProperties": true,
@@ -260,6 +270,11 @@ mod tests {
         assert_eq!(
             schema["properties"]["statusline"]["properties"]["summary"]["properties"]["enabled"]["type"],
             "boolean"
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["badge_style"]
+                ["enum"][0],
+            "inline"
         );
     }
 }
