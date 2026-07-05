@@ -1023,7 +1023,12 @@ mod tests {
             view_mode: ViewMode::Flat,
             ..SidebarState::default()
         };
-        let rows = build_rows_at(&Config::default(), std::slice::from_ref(&agent), &state, 1000);
+        let rows = build_rows_at(
+            &Config::default(),
+            std::slice::from_ref(&agent),
+            &state,
+            1000,
+        );
         assert!(!rows.iter().any(|row| row.id == "meta::%1"));
 
         let mut expanded = SidebarState {

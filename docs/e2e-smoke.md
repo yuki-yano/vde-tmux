@@ -354,3 +354,17 @@ checked=daemon restarted on scratch socket and snapshot RowMeta attention_count
 checked=header/footer height threshold covered by sidebar::tui TestBackend tests in quality gate
 result=Plan 13 sidebar smoke ok
 ```
+
+Plan 14 sidebar UI Phase 2 smoke も pass。
+daemon は scratch socket で新 binary を起動し直して確認した。
+
+```text
+executed_at=2026-07-05 18:37:04 JST
+scratch=vde-p14-<timestamp>
+checked=selected chat row shows inline meta: 13m · task 2/5 · sub 2
+checked=Space full detail expansion suppresses inline meta row
+checked=n/N cycles between two permission blocked chat rows
+checked=jump from done(✓) pane immediately clears unread to idle(○)
+checked=vt sidebar focus selects current window sidebar pane
+result=Plan 14 sidebar smoke ok
+```

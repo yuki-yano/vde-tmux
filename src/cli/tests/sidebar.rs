@@ -225,10 +225,12 @@ fn dispatch_sidebar_focus_without_sidebar_is_noop() {
     .unwrap();
 
     assert_eq!(output, None);
-    assert!(!mock
-        .calls()
-        .iter()
-        .any(|call| call.first().map(String::as_str) == Some("select-pane")));
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|call| call.first().map(String::as_str) == Some("select-pane"))
+    );
 }
 
 #[test]
@@ -394,6 +396,7 @@ fn dispatch_sidebar_jump_forwards_to_daemon_when_socket_exists() {
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
                     let mut line = String::new();
                     BufReader::new(&mut stream).read_line(&mut line).unwrap();
                     let message: crate::daemon::protocol::ClientMessage =
@@ -455,6 +458,7 @@ fn dispatch_sidebar_input_forwards_to_daemon_when_socket_exists() {
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
                     let mut line = String::new();
                     BufReader::new(&mut stream).read_line(&mut line).unwrap();
                     let message: crate::daemon::protocol::ClientMessage =
