@@ -240,8 +240,14 @@ impl RuntimeState {
                 .iter()
                 .map(|row| {
                     format!(
-                        "{}:{}:{}:{:?}:{:?}:{:?}",
-                        row.id, row.label, row.chat_count, row.rollup, row.badge_state, row.git
+                        "{}:{}:{}:{:?}:{:?}:{:?}:{:?}",
+                        row.id,
+                        row.label,
+                        row.chat_count,
+                        row.rollup,
+                        row.badge_state,
+                        row.git,
+                        row.meta
                     )
                 })
                 .collect(),

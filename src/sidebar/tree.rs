@@ -31,6 +31,21 @@ pub struct SidebarRow {
     pub expanded: bool,
     pub pane_id: Option<String>,
     pub git: Option<crate::git::GitBadge>,
+    #[serde(default)]
+    pub meta: Option<RowMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RowMeta {
+    pub agent: Option<String>,
+    pub prompt: Option<String>,
+    pub wait_reason: Option<String>,
+    pub elapsed_secs: Option<i64>,
+    pub tasks_done: Option<i64>,
+    pub tasks_total: Option<i64>,
+    pub subagent_count: Option<usize>,
+    pub attention_count: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +207,7 @@ fn category_rows(
             expanded,
             pane_id: None,
             git: None,
+            meta: Some(group_meta(&all_panes)),
         });
         if expanded {
             rows.extend(repo_rows_from_map(repos, state, 1, git, now));
@@ -261,6 +277,7 @@ fn repo_rows_from_keyed_map(
             expanded,
             pane_id: None,
             git: git.get(&first.repo_path).cloned(),
+            meta: Some(group_meta(&panes)),
         });
         if expanded {
             for pane in &panes {
@@ -303,6 +320,7 @@ fn push_chat_row(
         expanded,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
+        meta: Some(chat_meta(pane, now)),
     });
     if expanded {
         push_chat_detail_rows(pane, depth + 1, now, rows);
@@ -321,6 +339,7 @@ fn detail_row(pane: &AgentPane, depth: usize, suffix: &str, label: String) -> Si
         expanded: true,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
+        meta: None,
     }
 }
 
@@ -375,7 +394,38 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, now: i64, rows: &mut Ve
         expanded: true,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
+        meta: None,
     });
+}
+
+fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
+    let tasks = parse_tasks(&pane.tasks);
+    RowMeta {
+        agent: Some(pane.agent.clone()),
+        prompt: non_empty(&pane.prompt).map(str::to_string),
+        wait_reason: non_empty(&pane.wait_reason).map(str::to_string),
+        elapsed_secs: pane
+            .started_at
+            .parse::<i64>()
+            .ok()
+            .map(|started_at| (now - started_at).max(0)),
+        tasks_done: tasks.map(|(done, _)| done),
+        tasks_total: tasks.map(|(_, total)| total),
+        subagent_count: Some(decode_subagents(&pane.subagents).len()),
+        attention_count: None,
+    }
+}
+
+fn group_meta(panes: &[AgentPane]) -> RowMeta {
+    RowMeta {
+        attention_count: Some(
+            panes
+                .iter()
+                .filter(|pane| pane.badge_state == BadgeState::Blocked)
+                .count(),
+        ),
+        ..RowMeta::default()
+    }
 }
 
 fn decode_subagents(raw: &str) -> Vec<(String, String)> {
@@ -998,6 +1048,55 @@ mod tests {
         assert_eq!(
             repo.badge_state,
             Some(crate::daemon::session_badge::BadgeState::Blocked)
+        );
+    }
+
+    #[test]
+    fn chat_rows_carry_row_meta() {
+        let mut agent = pane("main", "%1", "/tmp/app", "codex", "running");
+        agent.prompt = "fix bug".to_string();
+        agent.started_at = "925".to_string();
+        agent.tasks = "2/5".to_string();
+        agent.subagents = "sub1:Explore|ab12:general-purpose".to_string();
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
+
+        let chat = rows
+            .iter()
+            .find(|row| row.kind == SidebarRowKind::Chat)
+            .expect("chat row");
+        let meta = chat.meta.as_ref().expect("chat meta");
+        assert_eq!(meta.agent.as_deref(), Some("codex"));
+        assert_eq!(meta.prompt.as_deref(), Some("fix bug"));
+        assert_eq!(meta.elapsed_secs, Some(75));
+        assert_eq!(meta.tasks_done, Some(2));
+        assert_eq!(meta.tasks_total, Some(5));
+        assert_eq!(meta.subagent_count, Some(2));
+    }
+
+    #[test]
+    fn repo_rows_carry_blocked_count_in_meta() {
+        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        let running = pane("main", "%2", "/tmp/app", "claude", "running");
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows_at(&Config::default(), &[blocked, running], &state, 1000);
+
+        let repo = rows
+            .iter()
+            .find(|row| row.kind == SidebarRowKind::Repo)
+            .expect("repo row");
+        assert_eq!(
+            repo.meta.as_ref().and_then(|meta| meta.attention_count),
+            Some(1)
         );
     }
 

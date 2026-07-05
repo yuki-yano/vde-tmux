@@ -534,6 +534,7 @@ mod tests {
             expanded: true,
             pane_id: Some("%1".to_string()),
             git: None,
+            meta: None,
         }
     }
 
@@ -644,6 +645,7 @@ mod tests {
                         expanded: true,
                         pane_id: None,
                         git: None,
+                        meta: None,
                     },
                     row(),
                 ],
@@ -672,6 +674,7 @@ mod tests {
                     expanded: true,
                     pane_id: None,
                     git: None,
+                    meta: None,
                 }],
             }),
         };
@@ -699,6 +702,7 @@ mod tests {
                         expanded: true,
                         pane_id: None,
                         git: None,
+                        meta: None,
                     },
                     row(),
                 ],

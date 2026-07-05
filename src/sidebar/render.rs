@@ -567,6 +567,7 @@ mod tests {
             expanded: true,
             pane_id: None,
             git: None,
+            meta: None,
         }
     }
 
