@@ -198,7 +198,7 @@ pub fn build_rows_ctx(
     }
     let group_metas = groups
         .iter()
-        .map(|(key, panes)| (key.clone(), group_meta(panes)))
+        .map(|(key, panes)| (key.clone(), group_meta(panes, &ctx.triage)))
         .collect::<BTreeMap<_, _>>();
     let mut triage_panes = Vec::new();
     for panes in groups.values_mut() {
@@ -350,7 +350,7 @@ fn repo_rows_from_keyed_map(
                 metas
                     .get(&(first.category.clone(), first.repo.clone()))
                     .cloned()
-                    .unwrap_or_else(|| group_meta(&panes)),
+                    .unwrap_or_else(|| group_meta(&panes, &BTreeSet::new())),
             ),
         });
         if expanded {
@@ -585,12 +585,14 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
     }
 }
 
-fn group_meta(panes: &[AgentPane]) -> RowMeta {
+fn group_meta(panes: &[AgentPane], triage: &BTreeSet<String>) -> RowMeta {
     RowMeta {
         attention_count: Some(
             panes
                 .iter()
-                .filter(|pane| pane.badge_state == BadgeState::Blocked)
+                .filter(|pane| {
+                    pane.badge_state == BadgeState::Blocked || triage.contains(&pane.pane_id)
+                })
                 .count(),
         ),
         ..RowMeta::default()
@@ -1521,6 +1523,32 @@ mod tests {
         };
 
         let rows = build_rows_ctx(&Config::default(), &[blocked, running], &state, &ctx);
+        let repo = rows
+            .iter()
+            .find(|row| row.kind == SidebarRowKind::Repo)
+            .expect("repo row");
+
+        assert_eq!(
+            repo.meta.as_ref().and_then(|meta| meta.attention_count),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn repo_attention_count_keeps_triaged_pane_during_debounce() {
+        let calm = pane("main", "%1", "/tmp/app", "codex", "running");
+        let running = pane("main", "%2", "/tmp/app", "claude", "running");
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            ..SidebarState::default()
+        };
+        let ctx = RowBuildContext {
+            triage: BTreeSet::from(["%1".to_string()]),
+            now: 1000,
+            ..RowBuildContext::default()
+        };
+
+        let rows = build_rows_ctx(&Config::default(), &[calm, running], &state, &ctx);
         let repo = rows
             .iter()
             .find(|row| row.kind == SidebarRowKind::Repo)
