@@ -18,6 +18,13 @@ pub(crate) fn statusline_summary(
     crate::daemon::statusline_summary(runner, env, config)
 }
 
+pub(crate) fn statusline_attention(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<String> {
+    crate::daemon::statusline_attention(runner, env)
+}
+
 pub(crate) fn run_daemon(
     _runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,

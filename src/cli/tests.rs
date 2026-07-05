@@ -80,6 +80,50 @@ fn dispatch_statusline_summary_falls_back_to_tmux_snapshot() {
 }
 
 #[test]
+fn dispatch_statusline_attention_falls_back_to_tmux_snapshot() {
+    let mock = MockTmuxRunner::new();
+    let format = crate::options::snapshot::snapshot_format();
+    let started = crate::sidebar::tree::now_epoch_secs() - 120;
+    let line = [
+        "proxy",
+        "@1",
+        "%1",
+        "/tmp",
+        "codex",
+        "0",
+        "0",
+        "",
+        "codex",
+        "waiting",
+        "",
+        "",
+        "permission_prompt",
+        "",
+        &started.to_string(),
+        "",
+        "",
+        "",
+    ]
+    .join("\u{1f}");
+    mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
+    let env = BTreeMap::from([(
+        "VDE_DAEMON_SOCKET".to_string(),
+        format!(
+            "/tmp/vde-tmux-test-missing-{}.sock",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ),
+    )]);
+
+    let output = run_with(["vt", "statusline-attention"], &mock, &env).unwrap();
+
+    let text = output.unwrap();
+    assert!(text.contains("▲ proxy · perm"), "{text}");
+}
+
+#[test]
 fn dispatch_statusline_summary_is_empty_when_disabled() {
     let config_home = std::env::temp_dir().join(format!(
         "vde-tmux-summary-disabled-{}",

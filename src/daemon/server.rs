@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 
 use super::protocol::{ClientMessage, QueryTarget, ServerMessage};
 use super::runtime::{ClientId, DaemonEvent, LatestSlot, RuntimeEffect, RuntimeState};
-use crate::daemon::{build_snapshot, statusline_summary_fallback};
+use crate::daemon::{build_snapshot, statusline_attention_fallback, statusline_summary_fallback};
 use crate::options::snapshot::read_all_panes;
 use crate::tmux::TmuxRunner;
 
@@ -34,9 +34,10 @@ pub fn handle_message(runner: &dyn TmuxRunner, message: ClientMessage) -> Result
         ClientMessage::Query {
             proto: _,
             what: QueryTarget::Attention,
-        } => Ok(ServerMessage::Attention {
-            text: String::new(),
-        }),
+        } => {
+            let text = statusline_attention_fallback(runner)?;
+            Ok(ServerMessage::Attention { text })
+        }
         ClientMessage::Subscribe { proto: _ } => {
             let panes = read_all_panes(runner)?;
             Ok(ServerMessage::Snapshot {

@@ -32,6 +32,8 @@ enum Command {
     },
     #[command(name = "statusline-summary")]
     StatuslineSummary,
+    #[command(name = "statusline-attention")]
+    StatuslineAttention,
     #[command(name = "statusline-sessions")]
     StatuslineSessions {
         #[arg(long = "show-index")]
@@ -264,6 +266,7 @@ where
             }
         },
         Command::StatuslineSummary => Ok(Some(daemon::statusline_summary(runner, env, &config)?)),
+        Command::StatuslineAttention => Ok(Some(daemon::statusline_attention(runner, env)?)),
         Command::Daemon { socket, command } => match command {
             Some(DaemonCommand::Stop {
                 socket: stop_socket,

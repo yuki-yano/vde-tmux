@@ -20,7 +20,7 @@ use crate::daemon::session_badge::{BadgeState, badge_state, glyph_for_state};
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
 use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane, read_all_panes};
 use crate::sidebar::state::SidebarState;
-use crate::sidebar::tree::SidebarRow;
+use crate::sidebar::tree::{SidebarRow, now_epoch_secs};
 use crate::tmux::TmuxRunner;
 
 const ENV_DAEMON_SOCKET: &str = "VDE_DAEMON_SOCKET";
@@ -178,6 +178,40 @@ pub fn statusline_summary(
     statusline_summary_fallback(runner, config)
 }
 
+pub fn statusline_attention_fallback(runner: &dyn TmuxRunner) -> Result<String> {
+    let panes = read_all_panes(runner)?;
+    let now = now_epoch_secs();
+    let entries = panes
+        .iter()
+        .filter(|pane| is_live_agent_pane(pane))
+        .filter(|pane| !(pane.window_active && pane.session_attached))
+        .filter_map(|pane| {
+            let status = parse_agent_status(&pane.status);
+            let wait_reason = (!pane.wait_reason.is_empty()).then_some(pane.wait_reason.as_str());
+            let rollup = pane_rollup_level(status, wait_reason);
+            if badge_state(rollup, false) != BadgeState::Blocked {
+                return None;
+            }
+            let started = pane.started_at.parse::<i64>().unwrap_or(now);
+            Some((pane.session.clone(), rollup, (now - started).max(0)))
+        })
+        .collect::<Vec<_>>();
+    Ok(format_attention(&entries))
+}
+
+pub fn statusline_attention(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<String> {
+    let socket_path = daemon_socket_path(env, None);
+    if socket_path.exists()
+        && let Ok(value) = query_statusline_attention(&socket_path)
+    {
+        return Ok(value);
+    }
+    statusline_attention_fallback(runner)
+}
+
 pub fn daemon_socket_path(env: &BTreeMap<String, String>, explicit: Option<&str>) -> PathBuf {
     if let Some(path) = explicit.filter(|path| !path.trim().is_empty()) {
         return PathBuf::from(path);
@@ -217,6 +251,30 @@ pub fn query_statusline_summary(socket_path: &Path) -> Result<String> {
     match serde_json::from_str::<ServerMessage>(line.trim())? {
         ServerMessage::Summary { text } => Ok(text),
         ServerMessage::Attention { .. } => bail!("unexpected daemon attention response"),
+        ServerMessage::Ack => bail!("unexpected daemon ack response"),
+        ServerMessage::Error { message } => bail!(message),
+        ServerMessage::Snapshot { .. } => bail!("unexpected daemon snapshot response"),
+    }
+}
+
+pub fn query_statusline_attention(socket_path: &Path) -> Result<String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect {}", socket_path.display()))?;
+    serde_json::to_writer(
+        &mut stream,
+        &ClientMessage::Query {
+            proto: 1,
+            what: crate::daemon::protocol::QueryTarget::Attention,
+        },
+    )?;
+    stream.write_all(b"\n")?;
+
+    let mut line = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut line)?;
+    match serde_json::from_str::<ServerMessage>(line.trim())? {
+        ServerMessage::Attention { text } => Ok(text),
+        ServerMessage::Summary { .. } => bail!("unexpected daemon summary response"),
         ServerMessage::Ack => bail!("unexpected daemon ack response"),
         ServerMessage::Error { message } => bail!(message),
         ServerMessage::Snapshot { .. } => bail!("unexpected daemon snapshot response"),
