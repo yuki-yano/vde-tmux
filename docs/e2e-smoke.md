@@ -160,7 +160,7 @@ M6 runtime smoke ok
 確認項目:
 
 - `vt hook emit` で running / waiting+permission / idle / attention の pane を作る。
-- `vt sidebar open` で daemon subscribe TUI を開き、header の現在値表示(`repo all`)を確認する。
+- `vt sidebar open` で daemon subscribe TUI を開き、header の現在値表示(` repo · all`)を確認する。
 - `v` で `category` に切り替わることを確認する。
 - `Tab` で `attention` filter に切り替わり、attention 不要な idle pane が消えることを確認する。
 - Chat 行で `Space` を押し、`status:` と `session:` の Detail 行が出ることを確認する。
@@ -340,4 +340,17 @@ checked=preview floating pane width matches target pane, centered by pane_left, 
 checked=preview source capture includes scrollback via capture-pane -S -2000
 checked=double-click dispatch covered by sidebar::tui pseudo-time tests in quality gate
 result=Plan 12 scratch smoke ok
+```
+
+Plan 13 sidebar UI Phase 1 smoke も pass。
+daemon は scratch socket で新 binary を起動し直して確認した。
+
+```text
+executed_at=2026-07-05 18:26:37 JST
+scratch=vde-p13-once-<timestamp>
+checked=attach --once width40 padding/right-column/no [running:N]
+checked=attach --once width2 rail glyph
+checked=daemon restarted on scratch socket and snapshot RowMeta attention_count
+checked=header/footer height threshold covered by sidebar::tui TestBackend tests in quality gate
+result=Plan 13 sidebar smoke ok
 ```
