@@ -22,6 +22,10 @@ pub struct SidebarRenderTheme {
     pub header_suffix: String,
     pub header_separator: String,
     pub badge_glyphs: crate::config::BadgeGlyphs,
+    pub badge_blocked: Color,
+    pub badge_working: Color,
+    pub badge_done: Color,
+    pub badge_idle: Color,
 }
 
 impl Default for SidebarRenderTheme {
@@ -42,6 +46,10 @@ impl Default for SidebarRenderTheme {
             header_suffix: String::new(),
             header_separator: String::new(),
             badge_glyphs: crate::config::BadgeGlyphs::default(),
+            badge_blocked: Color::Red,
+            badge_working: Color::Green,
+            badge_done: Color::Cyan,
+            badge_idle: Color::DarkGray,
         }
     }
 }
@@ -66,6 +74,12 @@ impl SidebarRenderTheme {
             header_suffix: default.header_suffix,
             header_separator: default.header_separator,
             badge_glyphs: default.badge_glyphs,
+            badge_blocked: parse_color(config.badge_blocked.as_deref())
+                .unwrap_or(default.badge_blocked),
+            badge_working: parse_color(config.badge_working.as_deref())
+                .unwrap_or(default.badge_working),
+            badge_done: parse_color(config.badge_done.as_deref()).unwrap_or(default.badge_done),
+            badge_idle: parse_color(config.badge_idle.as_deref()).unwrap_or(default.badge_idle),
         }
     }
 
@@ -102,6 +116,15 @@ impl SidebarRenderTheme {
 
     fn badge_glyph(&self, state: BadgeState) -> &str {
         glyph_for_state(state, &self.badge_glyphs)
+    }
+
+    pub(crate) fn badge_color(&self, state: BadgeState) -> Color {
+        match state {
+            BadgeState::Blocked => self.badge_blocked,
+            BadgeState::Working => self.badge_working,
+            BadgeState::Done => self.badge_done,
+            BadgeState::Idle => self.badge_idle,
+        }
     }
 }
 
@@ -588,7 +611,7 @@ mod tests {
         chat.badge_state = Some(BadgeState::Blocked);
         let rows = vec![chat];
         let rendered = render_rows(&rows, &SidebarState::default(), 2);
-        assert_eq!(rendered, "🔴");
+        assert_eq!(rendered, "▲");
     }
 
     #[test]
@@ -796,7 +819,7 @@ sidebar:
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 80);
 
-        assert!(rendered.contains("🟡 codex (%1)"), "{rendered}");
+        assert!(rendered.contains("● codex (%1)"), "{rendered}");
         assert!(!rendered.contains("[running]"), "{rendered}");
     }
 
@@ -813,7 +836,7 @@ sidebar:
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 2);
 
-        assert_eq!(rendered, "🔵");
+        assert_eq!(rendered, "✓");
     }
 
     #[test]
@@ -829,5 +852,29 @@ sidebar:
         assert_eq!(truncate_display("hello world", 8), "hello w…");
         assert_eq!(truncate_display("あいうえお", 7), "あいう…");
         assert_eq!(truncate_display("abc", 0), "");
+    }
+
+    #[test]
+    fn theme_maps_badge_states_to_default_colors() {
+        let theme = SidebarRenderTheme::default();
+        assert_eq!(theme.badge_color(BadgeState::Blocked), Color::Red);
+        assert_eq!(theme.badge_color(BadgeState::Working), Color::Green);
+        assert_eq!(theme.badge_color(BadgeState::Done), Color::Cyan);
+        assert_eq!(theme.badge_color(BadgeState::Idle), Color::DarkGray);
+    }
+
+    #[test]
+    fn badge_colors_are_configurable() {
+        let config = serde_yaml_ng::from_str::<crate::config::Config>(
+            r##"
+sidebar:
+  colors:
+    badge_working: yellow
+"##,
+        )
+        .unwrap();
+        let theme = SidebarRenderTheme::from_sidebar_config(&config.sidebar);
+        assert_eq!(theme.badge_color(BadgeState::Working), Color::Yellow);
+        assert_eq!(theme.badge_color(BadgeState::Blocked), Color::Red);
     }
 }

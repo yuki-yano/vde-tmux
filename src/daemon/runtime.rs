@@ -779,7 +779,7 @@ mod tests {
             effects,
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
-                value: "🟡 ".to_string(),
+                value: "● ".to_string(),
             }]
         );
     }
@@ -826,7 +826,7 @@ mod tests {
             effects,
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
-                value: "🔵 ".to_string(),
+                value: "✓ ".to_string(),
             }]
         );
 
@@ -838,7 +838,7 @@ mod tests {
             effects,
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
-                value: "🟢 ".to_string(),
+                value: "○ ".to_string(),
             }]
         );
     }
@@ -853,7 +853,7 @@ mod tests {
             effects,
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
-                value: "🟢 ".to_string(),
+                value: "○ ".to_string(),
             }]
         );
     }
@@ -871,7 +871,7 @@ mod tests {
             effects,
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
-                value: "🔴 ".to_string(),
+                value: "▲ ".to_string(),
             }]
         );
     }
@@ -888,11 +888,11 @@ mod tests {
             vec![
                 RuntimeEffect::SetSessionBadge {
                     session: "alpha".to_string(),
-                    value: "🟡 ".to_string(),
+                    value: "● ".to_string(),
                 },
                 RuntimeEffect::SetSessionBadge {
                     session: "beta".to_string(),
-                    value: "🟢 ".to_string(),
+                    value: "○ ".to_string(),
                 },
             ]
         );

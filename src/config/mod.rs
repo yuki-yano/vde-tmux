@@ -167,10 +167,10 @@ pub struct BadgeGlyphs {
 impl Default for BadgeGlyphs {
     fn default() -> Self {
         Self {
-            blocked: "🔴".to_string(),
-            working: "🟡".to_string(),
-            done: "🔵".to_string(),
-            idle: "🟢".to_string(),
+            blocked: "▲".to_string(),
+            working: "●".to_string(),
+            done: "✓".to_string(),
+            idle: "○".to_string(),
         }
     }
 }
@@ -223,6 +223,10 @@ pub struct SidebarColorsConfig {
     pub selection_bg: Option<String>,
     pub header_active_bg: Option<String>,
     pub header_active_fg: Option<String>,
+    pub badge_blocked: Option<String>,
+    pub badge_working: Option<String>,
+    pub badge_done: Option<String>,
+    pub badge_idle: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -518,15 +522,15 @@ categories:
     }
 
     #[test]
-    fn session_badge_defaults_to_emoji_glyphs_with_space_suffix() {
+    fn session_badge_defaults_to_single_width_glyphs_with_space_suffix() {
         let badge = BadgeConfig::default();
         let config = SessionBadgeConfig::default();
         assert!(config.enabled);
         assert_eq!(config.suffix, " ");
-        assert_eq!(badge.glyphs.blocked, "🔴");
-        assert_eq!(badge.glyphs.working, "🟡");
-        assert_eq!(badge.glyphs.done, "🔵");
-        assert_eq!(badge.glyphs.idle, "🟢");
+        assert_eq!(badge.glyphs.blocked, "▲");
+        assert_eq!(badge.glyphs.working, "●");
+        assert_eq!(badge.glyphs.done, "✓");
+        assert_eq!(badge.glyphs.idle, "○");
     }
 
     #[test]

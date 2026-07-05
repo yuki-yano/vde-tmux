@@ -763,7 +763,7 @@ mod tests {
                 (
                     "main".to_string(),
                     "@vde_session_status".to_string(),
-                    Some("🟡 ".to_string()),
+                    Some("● ".to_string()),
                 ),
                 ("main".to_string(), "@vde_session_status".to_string(), None),
             ]

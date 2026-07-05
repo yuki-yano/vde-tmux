@@ -271,7 +271,7 @@ badge:
         assert!(loaded.warnings.is_empty());
         assert_eq!(loaded.config.statusline.session_badge.suffix, "");
         assert_eq!(loaded.config.badge.glyphs.blocked, "!");
-        assert_eq!(loaded.config.badge.glyphs.working, "🟡");
+        assert_eq!(loaded.config.badge.glyphs.working, "●");
         assert!(loaded.config.statusline.session_badge.enabled);
     }
 
