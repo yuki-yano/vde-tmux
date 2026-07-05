@@ -48,6 +48,7 @@ pub struct RowMeta {
     pub subagent_count: Option<usize>,
     pub attention_count: Option<usize>,
     pub origin: Option<String>,
+    pub pinned: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -376,9 +377,13 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
     for pane in panes {
         let id = format!("chat::{}", pane.pane_id);
         let selected = state.selection.as_deref() == Some(id.as_str());
+        let pinned = state.pinned.contains(&id);
+        let manual = state.is_expanded_with_default(&id, false);
+        let expanded = selected || manual;
         let origin = format!("{}/{}", pane.category, pane.repo);
         let mut meta = chat_meta(pane, now);
         meta.origin = Some(origin.clone());
+        meta.pinned = Some(pinned);
         rows.push(SidebarRow {
             id,
             kind: SidebarRowKind::Chat,
@@ -387,25 +392,15 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
             chat_count: 1,
             rollup: pane.rollup,
             badge_state: Some(pane.badge_state),
-            expanded: false,
+            expanded,
             pane_id: Some(pane.pane_id.clone()),
             git: None,
             meta: Some(meta),
         });
-        if selected {
-            rows.push(SidebarRow {
-                id: format!("meta::{}", pane.pane_id),
-                kind: SidebarRowKind::Detail,
-                depth: 2,
-                label: format!("{origin} · {}", meta_label(pane, now)),
-                chat_count: 0,
-                rollup: pane.rollup,
-                badge_state: Some(pane.badge_state),
-                expanded: true,
-                pane_id: Some(pane.pane_id.clone()),
-                git: None,
-                meta: None,
-            });
+        if expanded {
+            push_chat_detail_rows(pane, 2, now, &mut rows);
+        } else if pinned {
+            push_meta_row(pane, 2, now, Some(&origin), &mut rows);
         }
     }
     rows
@@ -431,8 +426,12 @@ fn push_chat_row(
     rows: &mut Vec<SidebarRow>,
 ) {
     let id = format!("chat::{}", pane.pane_id);
-    let expanded = state.is_expanded_with_default(&id, false);
-    let show_meta = !expanded && state.selection.as_deref() == Some(id.as_str());
+    let selected = state.selection.as_deref() == Some(id.as_str());
+    let pinned = state.pinned.contains(&id);
+    let manual = state.is_expanded_with_default(&id, false);
+    let expanded = selected || manual;
+    let mut meta = chat_meta(pane, now);
+    meta.pinned = Some(pinned);
     rows.push(SidebarRow {
         id,
         kind: SidebarRowKind::Chat,
@@ -444,25 +443,40 @@ fn push_chat_row(
         expanded,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
-        meta: Some(chat_meta(pane, now)),
+        meta: Some(meta),
     });
     if expanded {
         push_chat_detail_rows(pane, depth + 1, now, rows);
-    } else if show_meta {
-        rows.push(SidebarRow {
-            id: format!("meta::{}", pane.pane_id),
-            kind: SidebarRowKind::Detail,
-            depth: depth + 1,
-            label: meta_label(pane, now),
-            chat_count: 0,
-            rollup: pane.rollup,
-            badge_state: Some(pane.badge_state),
-            expanded: true,
-            pane_id: Some(pane.pane_id.clone()),
-            git: None,
-            meta: None,
-        });
+    } else if pinned {
+        push_meta_row(pane, depth + 1, now, None, rows);
     }
+}
+
+fn push_meta_row(
+    pane: &AgentPane,
+    depth: usize,
+    now: i64,
+    origin: Option<&str>,
+    rows: &mut Vec<SidebarRow>,
+) {
+    let label = if let Some(origin) = origin {
+        format!("{origin} · {}", meta_label(pane, now))
+    } else {
+        meta_label(pane, now)
+    };
+    rows.push(SidebarRow {
+        id: format!("meta::{}", pane.pane_id),
+        kind: SidebarRowKind::Detail,
+        depth,
+        label,
+        chat_count: 0,
+        rollup: pane.rollup,
+        badge_state: Some(pane.badge_state),
+        expanded: true,
+        pane_id: Some(pane.pane_id.clone()),
+        git: None,
+        meta: None,
+    });
 }
 
 fn detail_row(pane: &AgentPane, depth: usize, suffix: &str, label: String) -> SidebarRow {
@@ -552,6 +566,7 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
         subagent_count: Some(decode_subagents(&pane.subagents).len()),
         attention_count: None,
         origin: None,
+        pinned: None,
     }
 }
 
@@ -1147,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_chat_row_gets_inline_meta_row() {
+    fn selected_chat_row_expands_full_detail_rows() {
         let mut agent = pane("main", "%1", "/tmp/app", "codex", "running");
         agent.prompt = "fix bug".to_string();
         agent.started_at = "185".to_string();
@@ -1161,13 +1176,10 @@ mod tests {
 
         let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
 
-        let meta = rows
-            .iter()
-            .find(|row| row.id == "meta::%1")
-            .expect("meta row");
-        assert_eq!(meta.kind, SidebarRowKind::Detail);
-        assert_eq!(meta.label, "13m · task 2/5 · sub 2");
-        assert_eq!(meta.pane_id.as_deref(), Some("%1"));
+        assert!(!rows.iter().any(|row| row.id == "meta::%1"));
+        assert!(rows.iter().any(|row| row.id == "detail::%1::prompt"));
+        assert!(rows.iter().any(|row| row.id == "detail::%1::status"));
+        assert!(rows.iter().any(|row| row.id == "jump::%1"));
     }
 
     #[test]
@@ -1201,7 +1213,7 @@ mod tests {
         let agent = pane("main", "%1", "/tmp/app", "codex", "running");
         let state = SidebarState {
             view_mode: ViewMode::Flat,
-            selection: Some("chat::%1".to_string()),
+            pinned: BTreeSet::from(["chat::%1".to_string()]),
             ..SidebarState::default()
         };
 
@@ -1471,7 +1483,7 @@ mod tests {
         blocked.started_at = "940".to_string();
         let state = SidebarState {
             view_mode: ViewMode::ByRepo,
-            selection: Some("chat::%1".to_string()),
+            pinned: BTreeSet::from(["chat::%1".to_string()]),
             ..SidebarState::default()
         };
         let ctx = RowBuildContext {
@@ -1490,6 +1502,51 @@ mod tests {
 
         assert_eq!(meta.origin.as_deref(), Some("misc/app"));
         assert!(inline_meta.label.contains("misc/app"), "{inline_meta:?}");
+    }
+
+    #[test]
+    fn selected_chat_expands_full_pinned_expands_medium_others_single() {
+        let selected = pane("main", "%1", "/tmp/app", "codex", "running");
+        let pinned = pane("main", "%2", "/tmp/app", "claude", "running");
+        let other = pane("main", "%3", "/tmp/app", "opencode", "running");
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            selection: Some("chat::%1".to_string()),
+            pinned: BTreeSet::from(["chat::%2".to_string()]),
+            ..SidebarState::default()
+        };
+        let ctx = RowBuildContext {
+            now: 1000,
+            ..RowBuildContext::default()
+        };
+
+        let rows = build_rows_ctx(&Config::default(), &[selected, pinned, other], &state, &ctx);
+
+        assert!(rows.iter().any(|row| row.id == "detail::%1::status"));
+        assert!(rows.iter().any(|row| row.id == "jump::%1"));
+        assert!(rows.iter().any(|row| row.id == "meta::%2"));
+        assert!(!rows.iter().any(|row| row.id == "detail::%2::status"));
+        assert!(!rows.iter().any(|row| row.id == "meta::%3"));
+        assert!(!rows.iter().any(|row| row.id == "detail::%3::status"));
+    }
+
+    #[test]
+    fn pinned_rows_carry_pin_meta() {
+        let agent = pane("main", "%1", "/tmp/app", "codex", "running");
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            pinned: BTreeSet::from(["chat::%1".to_string()]),
+            ..SidebarState::default()
+        };
+        let ctx = RowBuildContext {
+            now: 1000,
+            ..RowBuildContext::default()
+        };
+
+        let rows = build_rows_ctx(&Config::default(), &[agent], &state, &ctx);
+        let chat = rows.iter().find(|row| row.id == "chat::%1").expect("chat");
+
+        assert_eq!(chat.meta.as_ref().and_then(|meta| meta.pinned), Some(true));
     }
 
     #[test]

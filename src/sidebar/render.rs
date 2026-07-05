@@ -316,9 +316,23 @@ fn render_row_line(
 
     let indent = "  ".repeat(row.depth);
     let head = match row.kind {
-        SidebarRowKind::Category | SidebarRowKind::Repo | SidebarRowKind::Chat => {
+        SidebarRowKind::Category | SidebarRowKind::Repo => {
             let marker = if row.expanded { "▾" } else { "▸" };
             format!("{indent}{marker} ")
+        }
+        SidebarRowKind::Chat => {
+            let marker = if row.expanded { "▾" } else { "▸" };
+            let pin = if row
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.pinned)
+                .unwrap_or(false)
+            {
+                "·"
+            } else {
+                " "
+            };
+            format!("{indent}{pin}{marker} ")
         }
         SidebarRowKind::Detail => indent.clone(),
         SidebarRowKind::Jump => format!("{indent}-> "),
@@ -654,6 +668,27 @@ mod tests {
             }),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn pinned_chat_renders_pin_marker() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex",
+            RollupLevel::Running,
+        );
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            pinned: Some(true),
+            ..Default::default()
+        });
+        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
+        chat.expanded = false;
+
+        let rendered = render_rows(&[chat], &SidebarState::default(), 40);
+
+        assert!(rendered.starts_with(" ·▸ "), "{rendered:?}");
     }
 
     #[test]
