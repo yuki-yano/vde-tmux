@@ -7,7 +7,8 @@ use crate::config::Config;
 use crate::daemon::protocol::{ServerMessage, SidebarClientEvent};
 use crate::daemon::session_badge::{BadgeState, badge_state};
 use crate::daemon::{
-    DaemonSnapshot, SidebarFrame, TransitionEvent, build_snapshot_with_sidebar, render_summary,
+    DaemonSnapshot, SidebarFrame, TransitionEvent, build_snapshot_with_sidebar, format_attention,
+    render_summary,
 };
 use crate::git::GitBadge;
 use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane};
@@ -41,6 +42,9 @@ pub enum DaemonEvent {
     PanesUpdated(Vec<PaneSnapshot>),
     GitStatusUpdated(BTreeMap<String, GitBadge>),
     QuerySummary {
+        reply: Sender<ServerMessage>,
+    },
+    QueryAttention {
         reply: Sender<ServerMessage>,
     },
     DebounceCheck(Instant),
@@ -220,6 +224,11 @@ impl RuntimeState {
             DaemonEvent::QuerySummary { reply } => {
                 let text = self.render_summary_text();
                 let _ = reply.send(ServerMessage::Summary { text });
+                Vec::new()
+            }
+            DaemonEvent::QueryAttention { reply } => {
+                let text = self.render_attention_text();
+                let _ = reply.send(ServerMessage::Attention { text });
                 Vec::new()
             }
             DaemonEvent::DebounceCheck(now) => self.flush_state_if_due(now),
@@ -690,6 +699,26 @@ impl RuntimeState {
             ],
             &self.config.badge.glyphs,
         )
+    }
+
+    fn render_attention_text(&self) -> String {
+        let now = now_epoch_secs();
+        let entries = self
+            .panes
+            .iter()
+            .filter(|pane| is_live_agent_pane(pane))
+            .filter(|pane| self.triage.contains(&pane.pane_id))
+            .filter(|pane| !(pane.window_active && pane.session_attached))
+            .map(|pane| {
+                let started = pane.started_at.parse::<i64>().unwrap_or(now);
+                (
+                    pane.session.clone(),
+                    crate::sidebar::tree::rollup_for_pane(pane),
+                    (now - started).max(0),
+                )
+            })
+            .collect::<Vec<_>>();
+        format_attention(&entries)
     }
 
     fn broadcast_if_needed(&mut self) {
@@ -1613,6 +1642,56 @@ mod tests {
         assert_eq!(
             receiver.recv().unwrap(),
             ServerMessage::Summary {
+                text: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn attention_names_oldest_hidden_blocked_session() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let now = crate::sidebar::tree::now_epoch_secs();
+        let mut blocked_old = agent_pane("proxy", "%1", "waiting");
+        blocked_old.wait_reason = "permission_prompt".to_string();
+        blocked_old.started_at = (now - 120).to_string();
+        let mut blocked_new = agent_pane("etl", "%2", "waiting");
+        blocked_new.wait_reason = "permission_prompt".to_string();
+        blocked_new.started_at = (now - 30).to_string();
+        let mut visible = agent_pane("main", "%3", "waiting");
+        visible.wait_reason = "permission_prompt".to_string();
+        visible.window_active = true;
+        visible.session_attached = true;
+        state.apply_event(DaemonEvent::PanesUpdated(vec![
+            blocked_old,
+            blocked_new,
+            visible,
+        ]));
+
+        let (reply, receiver) = std::sync::mpsc::channel();
+        state.apply_event(DaemonEvent::QueryAttention { reply });
+        let ServerMessage::Attention { text } = receiver.recv().unwrap() else {
+            panic!("expected attention");
+        };
+        assert!(text.contains("▲ proxy · perm 2m"), "{text}");
+        assert!(text.contains("+1"), "{text}");
+        assert!(!text.contains("main"), "{text}");
+    }
+
+    #[test]
+    fn attention_is_empty_without_hidden_blocked() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut visible = agent_pane("main", "%1", "waiting");
+        visible.wait_reason = "permission_prompt".to_string();
+        visible.window_active = true;
+        visible.session_attached = true;
+        state.apply_event(DaemonEvent::PanesUpdated(vec![visible]));
+
+        let (reply, receiver) = std::sync::mpsc::channel();
+        state.apply_event(DaemonEvent::QueryAttention { reply });
+
+        assert_eq!(
+            receiver.recv().unwrap(),
+            ServerMessage::Attention {
                 text: String::new()
             }
         );

@@ -31,6 +31,12 @@ pub fn handle_message(runner: &dyn TmuxRunner, message: ClientMessage) -> Result
             let text = statusline_summary_fallback(runner, &crate::config::Config::default())?;
             Ok(ServerMessage::Summary { text })
         }
+        ClientMessage::Query {
+            proto: _,
+            what: QueryTarget::Attention,
+        } => Ok(ServerMessage::Attention {
+            text: String::new(),
+        }),
         ClientMessage::Subscribe { proto: _ } => {
             let panes = read_all_panes(runner)?;
             Ok(ServerMessage::Snapshot {
@@ -97,6 +103,19 @@ pub fn handle_stream_with_runtime(
         } => {
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(DaemonEvent::QuerySummary { reply: reply_tx })?;
+            let response = reply_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_else(|error| ServerMessage::Error {
+                    message: error.to_string(),
+                });
+            write_server_message(&mut stream, &response)?;
+        }
+        ClientMessage::Query {
+            proto: _,
+            what: QueryTarget::Attention,
+        } => {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            tx.send(DaemonEvent::QueryAttention { reply: reply_tx })?;
             let response = reply_rx
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap_or_else(|error| ServerMessage::Error {

@@ -83,6 +83,7 @@ fn request_shutdown(socket_path: &Path) -> Result<()> {
         ServerMessage::Ack => Ok(()),
         ServerMessage::Error { message } => bail!(message),
         ServerMessage::Summary { .. } => bail!("unexpected daemon summary response"),
+        ServerMessage::Attention { .. } => bail!("unexpected daemon attention response"),
         ServerMessage::Snapshot { .. } => bail!("unexpected daemon snapshot response"),
     }
 }

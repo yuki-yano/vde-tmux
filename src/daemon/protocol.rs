@@ -34,12 +34,14 @@ pub enum SidebarClientEvent {
 #[serde(rename_all = "snake_case")]
 pub enum QueryTarget {
     Summary,
+    Attention,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     Summary { text: String },
+    Attention { text: String },
     Snapshot { snapshot: DaemonSnapshot },
     Ack,
     Error { message: String },
@@ -59,6 +61,20 @@ mod tests {
         assert_eq!(json, r#"{"op":"query","proto":1,"what":"summary"}"#);
         let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn attention_query_roundtrips() {
+        let message = ClientMessage::Query {
+            proto: 1,
+            what: QueryTarget::Attention,
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(json, r#"{"op":"query","proto":1,"what":"attention"}"#);
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).unwrap(),
+            message
+        );
     }
 
     #[test]

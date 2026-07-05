@@ -122,6 +122,31 @@ pub fn render_summary(
         .join(" ")
 }
 
+pub fn format_attention(entries: &[(String, RollupLevel, i64)]) -> String {
+    let mut entries = entries.to_vec();
+    entries.sort_by(|left, right| right.2.cmp(&left.2));
+    let Some((session, level, elapsed)) = entries.first() else {
+        return String::new();
+    };
+    let reason = match level {
+        RollupLevel::Error => "err",
+        RollupLevel::Permission => "perm",
+        _ => "wait",
+    };
+    let elapsed = if *elapsed < 60 {
+        format!("{elapsed}s")
+    } else {
+        format!("{}m", elapsed / 60)
+    };
+    let more = entries.len().saturating_sub(1);
+    let suffix = if more > 0 {
+        format!(" +{more}")
+    } else {
+        String::new()
+    };
+    format!("#[fg=red]▲ {session} · {reason} {elapsed}{suffix}#[default]")
+}
+
 pub fn statusline_summary_fallback(
     runner: &dyn TmuxRunner,
     config: &crate::config::Config,
@@ -191,6 +216,7 @@ pub fn query_statusline_summary(socket_path: &Path) -> Result<String> {
     reader.read_line(&mut line)?;
     match serde_json::from_str::<ServerMessage>(line.trim())? {
         ServerMessage::Summary { text } => Ok(text),
+        ServerMessage::Attention { .. } => bail!("unexpected daemon attention response"),
         ServerMessage::Ack => bail!("unexpected daemon ack response"),
         ServerMessage::Error { message } => bail!(message),
         ServerMessage::Snapshot { .. } => bail!("unexpected daemon snapshot response"),
