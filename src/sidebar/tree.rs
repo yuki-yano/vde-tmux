@@ -47,6 +47,7 @@ pub struct RowMeta {
     pub tasks_total: Option<i64>,
     pub subagent_count: Option<usize>,
     pub attention_count: Option<usize>,
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,16 +190,35 @@ pub fn build_rows_ctx(
     for panes in groups.values_mut() {
         panes.sort_by(compare_agent_panes);
     }
+    let group_metas = groups
+        .iter()
+        .map(|(key, panes)| (key.clone(), group_meta(panes)))
+        .collect::<BTreeMap<_, _>>();
+    let mut triage_panes = Vec::new();
+    for panes in groups.values_mut() {
+        let mut index = 0;
+        while index < panes.len() {
+            if ctx.triage.contains(&panes[index].pane_id) {
+                triage_panes.push(panes.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+    }
+    triage_panes.sort_by(compare_agent_panes);
     for panes in groups.values_mut() {
         panes.retain(|pane| pane_matches_filter(pane, state.filter));
     }
     groups.retain(|_, panes| !panes.is_empty());
 
-    match state.view_mode {
+    let mut rows = triage_zone_rows(&triage_panes, state, ctx.now);
+    let mut fleet_rows = match state.view_mode {
         ViewMode::Flat => flat_rows(groups, state, ctx.now),
-        ViewMode::ByRepo => repo_rows(groups, state, 0, &ctx.git, ctx.now),
-        ViewMode::ByCategory => category_rows(groups, state, &ctx.git, ctx.now),
-    }
+        ViewMode::ByRepo => repo_rows(groups, state, 0, &ctx.git, ctx.now, &group_metas),
+        ViewMode::ByCategory => category_rows(groups, state, &ctx.git, ctx.now, &group_metas),
+    };
+    rows.append(&mut fleet_rows);
+    rows
 }
 
 pub fn row_refs(rows: &[SidebarRow]) -> Vec<SidebarRowRef> {
@@ -213,6 +233,7 @@ fn category_rows(
     state: &SidebarState,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
+    metas: &BTreeMap<(String, String), RowMeta>,
 ) -> Vec<SidebarRow> {
     let mut by_category: BTreeMap<String, BTreeMap<String, Vec<AgentPane>>> = BTreeMap::new();
     for ((category, repo), panes) in groups {
@@ -223,6 +244,14 @@ fn category_rows(
     for (category, repos) in by_category {
         let category_id = format!("category::{category}");
         let all_panes = repos.values().flatten().cloned().collect::<Vec<_>>();
+        let attention_count = repos
+            .keys()
+            .filter_map(|repo| {
+                metas
+                    .get(&(category.clone(), repo.clone()))
+                    .and_then(|meta| meta.attention_count)
+            })
+            .sum();
         let expanded = state.is_expanded(&category_id);
         rows.push(SidebarRow {
             id: category_id,
@@ -235,10 +264,13 @@ fn category_rows(
             expanded,
             pane_id: None,
             git: None,
-            meta: Some(group_meta(&all_panes)),
+            meta: Some(RowMeta {
+                attention_count: Some(attention_count),
+                ..RowMeta::default()
+            }),
         });
         if expanded {
-            rows.extend(repo_rows_from_map(repos, state, 1, git, now));
+            rows.extend(repo_rows_from_map(repos, state, 1, git, now, metas));
         }
     }
     rows
@@ -250,12 +282,13 @@ fn repo_rows(
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
+    metas: &BTreeMap<(String, String), RowMeta>,
 ) -> Vec<SidebarRow> {
     let mut repos = BTreeMap::new();
     for ((category, repo), panes) in groups {
-        repos.insert(format!("{category}\u{1f}{repo}"), panes);
+        repos.insert((category, repo), panes);
     }
-    repo_rows_from_keyed_map(repos, state, depth, git, now)
+    repo_rows_from_keyed_map(repos, state, depth, git, now, metas)
 }
 
 fn repo_rows_from_map(
@@ -264,6 +297,7 @@ fn repo_rows_from_map(
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
+    metas: &BTreeMap<(String, String), RowMeta>,
 ) -> Vec<SidebarRow> {
     let keyed = repos
         .into_iter()
@@ -272,18 +306,19 @@ fn repo_rows_from_map(
                 .first()
                 .map(|pane| pane.category.clone())
                 .unwrap_or_else(|| "misc".to_string());
-            (format!("{category}\u{1f}{repo}"), panes)
+            ((category, repo), panes)
         })
         .collect();
-    repo_rows_from_keyed_map(keyed, state, depth, git, now)
+    repo_rows_from_keyed_map(keyed, state, depth, git, now, metas)
 }
 
 fn repo_rows_from_keyed_map(
-    repos: BTreeMap<String, Vec<AgentPane>>,
+    repos: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
+    metas: &BTreeMap<(String, String), RowMeta>,
 ) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
     let mut groups = repos.into_values().collect::<Vec<_>>();
@@ -305,12 +340,72 @@ fn repo_rows_from_keyed_map(
             expanded,
             pane_id: None,
             git: git.get(&first.repo_path).cloned(),
-            meta: Some(group_meta(&panes)),
+            meta: Some(
+                metas
+                    .get(&(first.category.clone(), first.repo.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| group_meta(&panes)),
+            ),
         });
         if expanded {
             for pane in &panes {
                 push_chat_row(pane, depth + 1, state, now, &mut rows);
             }
+        }
+    }
+    rows
+}
+
+fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<SidebarRow> {
+    if panes.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = vec![SidebarRow {
+        id: "zone::triage".to_string(),
+        kind: SidebarRowKind::Zone,
+        depth: 0,
+        label: "TRIAGE".to_string(),
+        chat_count: panes.len(),
+        rollup: rollup(panes),
+        badge_state: badge_rollup(panes),
+        expanded: true,
+        pane_id: None,
+        git: None,
+        meta: None,
+    }];
+    for pane in panes {
+        let id = format!("chat::{}", pane.pane_id);
+        let selected = state.selection.as_deref() == Some(id.as_str());
+        let origin = format!("{}/{}", pane.category, pane.repo);
+        let mut meta = chat_meta(pane, now);
+        meta.origin = Some(origin.clone());
+        rows.push(SidebarRow {
+            id,
+            kind: SidebarRowKind::Chat,
+            depth: 1,
+            label: format!("{} · {}", pane.agent, pane.repo),
+            chat_count: 1,
+            rollup: pane.rollup,
+            badge_state: Some(pane.badge_state),
+            expanded: false,
+            pane_id: Some(pane.pane_id.clone()),
+            git: None,
+            meta: Some(meta),
+        });
+        if selected {
+            rows.push(SidebarRow {
+                id: format!("meta::{}", pane.pane_id),
+                kind: SidebarRowKind::Detail,
+                depth: 2,
+                label: format!("{origin} · {}", meta_label(pane, now)),
+                chat_count: 0,
+                rollup: pane.rollup,
+                badge_state: Some(pane.badge_state),
+                expanded: true,
+                pane_id: Some(pane.pane_id.clone()),
+                git: None,
+                meta: None,
+            });
         }
     }
     rows
@@ -456,6 +551,7 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
         tasks_total: tasks.map(|(_, total)| total),
         subagent_count: Some(decode_subagents(&pane.subagents).len()),
         attention_count: None,
+        origin: None,
     }
 }
 
@@ -549,13 +645,7 @@ fn status_label(raw: &str) -> &'static str {
 fn pane_matches_filter(pane: &AgentPane, filter: StatusFilter) -> bool {
     match filter {
         StatusFilter::All => true,
-        StatusFilter::AttentionOnly => {
-            pane.attention
-                || matches!(
-                    pane.rollup,
-                    RollupLevel::Error | RollupLevel::Running | RollupLevel::Permission
-                )
-        }
+        StatusFilter::AttentionOnly => pane.attention || pane.rollup == RollupLevel::Running,
     }
 }
 
@@ -1272,6 +1362,134 @@ mod tests {
             repo.meta.as_ref().and_then(|meta| meta.attention_count),
             Some(1)
         );
+    }
+
+    #[test]
+    fn blocked_panes_move_to_triage_zone_on_top() {
+        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        let running = pane("main", "%2", "/tmp/app", "claude", "running");
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            ..SidebarState::default()
+        };
+        let ctx = RowBuildContext {
+            triage: BTreeSet::from(["%1".to_string()]),
+            now: 1000,
+            ..RowBuildContext::default()
+        };
+
+        let rows = build_rows_ctx(&Config::default(), &[blocked, running], &state, &ctx);
+
+        assert_eq!(rows[0].id, "zone::triage");
+        assert_eq!(rows[0].chat_count, 1);
+        assert_eq!(rows[1].id, "chat::%1");
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[1].label, "codex · app");
+        assert!(!rows[2..].iter().any(|row| row.id == "chat::%1"));
+    }
+
+    #[test]
+    fn triage_zone_is_absent_when_empty() {
+        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows_ctx(
+            &Config::default(),
+            &[blocked],
+            &state,
+            &RowBuildContext {
+                now: 1000,
+                ..RowBuildContext::default()
+            },
+        );
+
+        assert!(rows.iter().all(|row| row.kind != SidebarRowKind::Zone));
+    }
+
+    #[test]
+    fn triage_ignores_attention_filter() {
+        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        let idle = pane("main", "%2", "/tmp/app", "claude", "idle");
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            filter: crate::sidebar::state::StatusFilter::AttentionOnly,
+            ..SidebarState::default()
+        };
+        let ctx = RowBuildContext {
+            triage: BTreeSet::from(["%1".to_string()]),
+            now: 1000,
+            ..RowBuildContext::default()
+        };
+
+        let rows = build_rows_ctx(&Config::default(), &[blocked, idle], &state, &ctx);
+
+        assert!(rows.iter().any(|row| row.id == "chat::%1"));
+        assert!(rows.iter().all(|row| row.id != "chat::%2"));
+        assert_eq!(
+            rows.first().map(|row| row.id.as_str()),
+            Some("zone::triage")
+        );
+    }
+
+    #[test]
+    fn repo_attention_count_includes_triaged_panes() {
+        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        let running = pane("main", "%2", "/tmp/app", "claude", "running");
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            ..SidebarState::default()
+        };
+        let ctx = RowBuildContext {
+            triage: BTreeSet::from(["%1".to_string()]),
+            now: 1000,
+            ..RowBuildContext::default()
+        };
+
+        let rows = build_rows_ctx(&Config::default(), &[blocked, running], &state, &ctx);
+        let repo = rows
+            .iter()
+            .find(|row| row.kind == SidebarRowKind::Repo)
+            .expect("repo row");
+
+        assert_eq!(
+            repo.meta.as_ref().and_then(|meta| meta.attention_count),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn triage_rows_carry_origin_in_meta() {
+        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        blocked.started_at = "940".to_string();
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            selection: Some("chat::%1".to_string()),
+            ..SidebarState::default()
+        };
+        let ctx = RowBuildContext {
+            triage: BTreeSet::from(["%1".to_string()]),
+            now: 1000,
+            ..RowBuildContext::default()
+        };
+
+        let rows = build_rows_ctx(&Config::default(), &[blocked], &state, &ctx);
+        let chat = rows.iter().find(|row| row.id == "chat::%1").expect("chat");
+        let meta = chat.meta.as_ref().expect("chat meta");
+        let inline_meta = rows
+            .iter()
+            .find(|row| row.id == "meta::%1")
+            .expect("inline meta");
+
+        assert_eq!(meta.origin.as_deref(), Some("misc/app"));
+        assert!(inline_meta.label.contains("misc/app"), "{inline_meta:?}");
     }
 
     #[test]
