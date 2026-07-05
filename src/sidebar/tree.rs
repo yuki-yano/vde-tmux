@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +67,14 @@ struct AgentPane {
     attention: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RowBuildContext {
+    pub git: BTreeMap<String, crate::git::GitBadge>,
+    pub unread: BTreeMap<String, bool>,
+    pub triage: BTreeSet<String>,
+    pub now: i64,
+}
+
 pub fn build_rows(
     config: &Config,
     panes: &[PaneSnapshot],
@@ -128,6 +136,25 @@ pub fn build_rows_at_with_git_and_unread(
     unread: &BTreeMap<String, bool>,
     now: i64,
 ) -> Vec<SidebarRow> {
+    build_rows_ctx(
+        config,
+        panes,
+        state,
+        &RowBuildContext {
+            git: git.clone(),
+            unread: unread.clone(),
+            triage: BTreeSet::new(),
+            now,
+        },
+    )
+}
+
+pub fn build_rows_ctx(
+    config: &Config,
+    panes: &[PaneSnapshot],
+    state: &SidebarState,
+    ctx: &RowBuildContext,
+) -> Vec<SidebarRow> {
     let mut groups: BTreeMap<(String, String), Vec<AgentPane>> = BTreeMap::new();
     for pane in panes {
         if !is_live_agent_pane(pane) {
@@ -136,7 +163,7 @@ pub fn build_rows_at_with_git_and_unread(
         let repo = repo_label(pane);
         let category = category_for_pane(config, pane, &repo);
         let rollup = rollup_for_pane(pane);
-        let unread = unread.get(&pane.pane_id).copied().unwrap_or(false);
+        let unread = ctx.unread.get(&pane.pane_id).copied().unwrap_or(false);
         groups
             .entry((category.clone(), repo.clone()))
             .or_default()
@@ -167,9 +194,9 @@ pub fn build_rows_at_with_git_and_unread(
     groups.retain(|_, panes| !panes.is_empty());
 
     match state.view_mode {
-        ViewMode::Flat => flat_rows(groups, state, now),
-        ViewMode::ByRepo => repo_rows(groups, state, 0, git, now),
-        ViewMode::ByCategory => category_rows(groups, state, git, now),
+        ViewMode::Flat => flat_rows(groups, state, ctx.now),
+        ViewMode::ByRepo => repo_rows(groups, state, 0, &ctx.git, ctx.now),
+        ViewMode::ByCategory => category_rows(groups, state, &ctx.git, ctx.now),
     }
 }
 
@@ -552,7 +579,7 @@ fn order_repo_groups(groups: &mut [Vec<AgentPane>], state: &SidebarState) {
     });
 }
 
-fn now_epoch_secs() -> i64 {
+pub(crate) fn now_epoch_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)

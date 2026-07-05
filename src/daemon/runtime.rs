@@ -12,7 +12,9 @@ use crate::git::GitBadge;
 use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane};
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
 use crate::sidebar::state::{RepoId, SidebarAction, SidebarState};
-use crate::sidebar::tree::{SidebarRow, SidebarRowKind, build_rows_with_git_and_unread, row_refs};
+use crate::sidebar::tree::{
+    RowBuildContext, SidebarRow, SidebarRowKind, build_rows_ctx, now_epoch_secs, row_refs,
+};
 
 const STATE_DEBOUNCE: Duration = Duration::from_millis(200);
 
@@ -209,12 +211,16 @@ impl RuntimeState {
     }
 
     pub fn rebuild_snapshot(&mut self) {
-        self.rows = build_rows_with_git_and_unread(
+        self.rows = build_rows_ctx(
             &self.config,
             &self.panes,
             &self.ui_state,
-            &self.git_badges,
-            &self.unread,
+            &RowBuildContext {
+                git: self.git_badges.clone(),
+                unread: self.unread.clone(),
+                triage: Default::default(),
+                now: now_epoch_secs(),
+            },
         );
         let sidebar = SidebarFrame {
             state: self.ui_state.clone(),
