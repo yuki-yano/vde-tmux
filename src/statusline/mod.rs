@@ -112,11 +112,13 @@ pub fn render_statusline_category(
                 .get(category)
                 .map(String::as_str)
                 .unwrap_or(category);
+            let count = sessions_in_category(config, sessions, category).len();
             let body = config
                 .statusline
                 .category
                 .format
-                .replace("{category}", label);
+                .replace("{category}", label)
+                .replace("{count}", &count.to_string());
             tmux_style_category(
                 &config.statusline.category,
                 &body,
@@ -367,5 +369,22 @@ mod tests {
         );
         assert!(rendered.contains("W"));
         assert!(!rendered.contains("P"));
+    }
+
+    #[test]
+    fn category_format_supports_count_placeholder() {
+        let mut config = Config::default();
+        config.statusline.category.format = "{category} {count} ".to_string();
+        let rendered = render_statusline_category(
+            &config,
+            &[
+                session("a", "work"),
+                session("b", "work"),
+                session("c", "private"),
+            ],
+            "work",
+        );
+        assert!(rendered.contains("work 2"), "{rendered}");
+        assert!(rendered.contains("private 1"), "{rendered}");
     }
 }
