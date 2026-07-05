@@ -385,3 +385,18 @@ checked=after blocked clears, first calm poll keeps TRIAGE and second calm poll 
 checked=blocked again re-enters TRIAGE without flicker
 result=Plan 15 TRIAGE snapshot smoke ok
 ```
+
+Plan 16 sidebar UI Phase 4 smoke も pass。
+daemon は scratch socket で新 binary を起動し直して確認した。
+TUI の `capture-pane -a` は alt-screen が空になるため、fisheye/pin/state は daemon subscribe snapshot、幅ティアは `attach --once`、scroll offset は unit test で確認した。
+
+```text
+executed_at=2026-07-05 19:18:09 JST
+scratch=vde-p16-smoke
+checked=selected chat row expands to full detail rows and jump row
+checked=Space pins selected chat; after selection moves away, pinned row keeps one meta row and no full detail rows
+checked=12 agent panes are present; selection movement path exercised, scroll offset covered by sidebar::tui::tests::scroll_follows_selection
+checked=state.json contains pinned and daemon restart keeps pinned medium row
+checked=sidebar width 30 renders dense, width 20 renders micro, width 2 renders rail count + separator + glyph rows via attach --once
+result=Plan 16 fisheye width-tier snapshot smoke ok
+```
