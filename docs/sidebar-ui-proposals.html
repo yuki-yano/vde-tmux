@@ -1,0 +1,984 @@
+<title>vde-tmux sidebar 表示案</title>
+<style>
+:root {
+  --bg: #f6f7f5;
+  --fg: #1c2420;
+  --muted: #5c6b63;
+  --card: #ffffff;
+  --border: #dde3de;
+  --accent: #0e8a63;
+  --accent-soft: #e2f2ea;
+  --code-bg: #eef1ee;
+  /* terminal mock — 単一ダークで固定(端末世界の再現) */
+  --t-bg: #0d1117;
+  --t-fg: #c9d1d9;
+  --t-dim: #58636e;
+  --t-red: #f47067;
+  --t-green: #57ab5a;
+  --t-yellow: #c69026;
+  --t-blue: #539bf5;
+  --t-cyan: #39c5cf;
+  --t-magenta: #b083f0;
+  --t-sel: #2d333b;
+  --t-border: #30363d;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131715;
+    --fg: #e2e8e4;
+    --muted: #8fa098;
+    --card: #1a201d;
+    --border: #2a332e;
+    --accent: #41c493;
+    --accent-soft: #1c322a;
+    --code-bg: #212824;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #f6f7f5; --fg: #1c2420; --muted: #5c6b63; --card: #ffffff;
+  --border: #dde3de; --accent: #0e8a63; --accent-soft: #e2f2ea; --code-bg: #eef1ee;
+}
+:root[data-theme="dark"] {
+  --bg: #131715; --fg: #e2e8e4; --muted: #8fa098; --card: #1a201d;
+  --border: #2a332e; --accent: #41c493; --accent-soft: #1c322a; --code-bg: #212824;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+  line-height: 1.75;
+  font-size: 15px;
+}
+.wrap { max-width: 1060px; margin: 0 auto; padding: 0 24px 96px; }
+
+.mono, pre, code, .term { font-family: ui-monospace, "SF Mono", Menlo, "Cascadia Code", monospace; }
+
+/* ---------- header ---------- */
+header.page { padding: 56px 0 8px; }
+.eyebrow {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--accent); margin: 0 0 12px;
+}
+h1 {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: clamp(26px, 4vw, 38px); line-height: 1.25;
+  letter-spacing: -0.01em; margin: 0 0 12px; text-wrap: balance;
+}
+.lede { color: var(--muted); max-width: 42em; margin: 0; }
+
+/* ---------- nav ---------- */
+nav.toc {
+  position: sticky; top: 0; z-index: 10;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+  margin: 32px -24px 0; padding: 10px 24px;
+  display: flex; gap: 4px; overflow-x: auto; white-space: nowrap;
+}
+nav.toc a {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12.5px; color: var(--muted); text-decoration: none;
+  padding: 4px 10px; border-radius: 4px;
+}
+nav.toc a:hover, nav.toc a:focus-visible { color: var(--accent); background: var(--accent-soft); outline: none; }
+
+/* ---------- sections ---------- */
+section { margin-top: 64px; }
+h2 {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 21px; letter-spacing: -0.01em; margin: 0 0 6px;
+  scroll-margin-top: 64px;
+}
+h2 .idx { color: var(--accent); margin-right: 10px; }
+h3 { font-size: 16px; margin: 28px 0 8px; }
+.sub { color: var(--muted); margin: 0 0 24px; max-width: 46em; }
+p { max-width: 46em; }
+ul { max-width: 46em; padding-left: 1.4em; }
+li { margin: 4px 0; }
+li::marker { color: var(--accent); }
+strong { font-weight: 600; }
+code {
+  background: var(--code-bg); border-radius: 4px;
+  padding: 0.1em 0.4em; font-size: 0.88em;
+}
+
+/* ---------- terminal mock ---------- */
+.term {
+  background: var(--t-bg); color: var(--t-fg);
+  border: 1px solid var(--t-border); border-radius: 8px;
+  padding: 0; overflow: hidden;
+  font-size: 13px; line-height: 1.5;
+  flex-shrink: 0;
+}
+.term .bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 12px; border-bottom: 1px solid var(--t-border);
+  color: var(--t-dim); font-size: 11px;
+}
+.term .bar .dots { display: flex; gap: 5px; }
+.term .bar .dots i { width: 9px; height: 9px; border-radius: 50%; background: var(--t-border); }
+.term pre {
+  margin: 0; padding: 10px 0 12px; overflow-x: auto;
+  font-size: inherit; line-height: inherit;
+}
+.term pre span { display: inline; }
+.r { color: var(--t-red); }
+.g { color: var(--t-green); }
+.y { color: var(--t-yellow); }
+.b { color: var(--t-blue); }
+.c { color: var(--t-cyan); }
+.m { color: var(--t-magenta); }
+.d { color: var(--t-dim); }
+.w { color: #e6edf3; font-weight: 600; }
+.sel { background: var(--t-sel); font-weight: 600; display: inline-block; width: 100%; }
+.hl { background: color-mix(in srgb, var(--t-yellow) 18%, transparent); display: inline-block; width: 100%; }
+
+.termgrid { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; margin: 20px 0; }
+.termcol { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.termcol .cap {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px; color: var(--muted);
+}
+
+/* ---------- overview rail ---------- */
+.overview {
+  display: flex; gap: 18px; overflow-x: auto;
+  padding: 8px 2px 18px; margin: 20px -2px 0;
+}
+.overview .card-mock {
+  flex: 0 0 auto; display: flex; flex-direction: column; gap: 10px;
+  text-decoration: none; color: inherit;
+}
+.overview .card-mock .name {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px; font-weight: 600;
+}
+.overview .card-mock .name em { color: var(--accent); font-style: normal; margin-right: 8px; }
+.overview .card-mock .tag { font-size: 12px; color: var(--muted); }
+.overview .term { font-size: 11.5px; }
+.overview .card-mock:hover .term { border-color: var(--accent); }
+
+/* ---------- proposal cards ---------- */
+.proposal {
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--card); padding: 28px; margin-top: 28px;
+  scroll-margin-top: 64px;
+}
+.proposal h2 { margin-bottom: 2px; }
+.proposal .fit {
+  font-size: 13px; color: var(--muted); margin: 0 0 20px;
+}
+.split { display: flex; gap: 32px; flex-wrap: wrap; align-items: flex-start; }
+.split .mockside { flex: 0 0 auto; display: flex; flex-direction: column; gap: 14px; }
+.split .proseside { flex: 1 1 340px; min-width: 0; }
+.split .proseside > :first-child { margin-top: 0; }
+
+.pros-cons { display: flex; gap: 20px; flex-wrap: wrap; margin: 16px 0; }
+.pros-cons > div { flex: 1 1 220px; }
+.pros-cons h4 {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase;
+  margin: 0 0 6px; color: var(--muted);
+}
+.pros-cons ul { margin: 0; padding-left: 1.3em; font-size: 13.5px; }
+.pros h4 { color: var(--accent); }
+.cons li::marker { color: var(--muted); }
+
+.impl {
+  font-size: 13px; color: var(--muted);
+  border-top: 1px dashed var(--border); margin-top: 18px; padding-top: 12px;
+}
+.impl code { font-size: 0.92em; }
+
+/* ---------- tables ---------- */
+.tablewrap { overflow-x: auto; margin: 20px 0; }
+table {
+  border-collapse: collapse; font-size: 13.5px; min-width: 640px;
+  font-variant-numeric: tabular-nums;
+}
+th, td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted); font-weight: 600;
+}
+td.good { color: var(--accent); font-weight: 600; }
+td.mid { color: var(--fg); }
+td.bad { color: var(--muted); }
+tr.reco td { background: var(--accent-soft); }
+
+/* ---------- glyph legend ---------- */
+.glyphs { display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0; }
+.glyph {
+  display: flex; align-items: center; gap: 10px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--card); padding: 10px 14px; font-size: 13px;
+}
+.glyph .g-mark {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 16px; width: 40px; text-align: center;
+  background: var(--t-bg); border-radius: 6px; padding: 6px 0;
+}
+.glyph .g-label b { display: block; font-size: 13px; }
+.glyph .g-label span { color: var(--muted); font-size: 12px; }
+
+.note {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  padding: 12px 16px; border-radius: 0 8px 8px 0;
+  font-size: 13.5px; max-width: 46em; margin: 20px 0;
+}
+.note p { margin: 0; }
+
+footer.page {
+  margin-top: 80px; padding-top: 20px; border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 12.5px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+</style>
+
+<div class="wrap">
+
+<header class="page">
+  <p class="eyebrow">design proposal · 2026-07</p>
+  <h1>vde-tmux sidebar<br>表示形式の再設計 4案</h1>
+  <p class="lede">現行実装(f7587a3)の調査に基づき、サイドバーの情報設計・レイアウト・余白・状態表現を見直す5案を提示する。herdr の2段サイドバーと hiroppy/tmux-agent-sidebar のリッチカード表示を先行事例として分析し、それぞれ異なる思想を持つ案として比較できるようにした。モックはすべて幅40列(現行デフォルト)で描いている。</p>
+</header>
+
+<nav class="toc">
+  <a href="#current">現状</a>
+  <a href="#refs">先行事例</a>
+  <a href="#overview">一覧比較</a>
+  <a href="#matrix">比較表</a>
+  <a href="#plan-a">案A ツリー改良</a>
+  <a href="#plan-b">案B 2段デッキ</a>
+  <a href="#plan-c">案C インボックス</a>
+  <a href="#plan-d">案D モニター</a>
+  <a href="#plan-e">案E リッチカード</a>
+  <a href="#guide">デザイン指針</a>
+  <a href="#features">機能案</a>
+  <a href="#reco">推奨</a>
+  <a href="#ideal">理想形</a>
+</nav>
+
+<!-- ================================================== 現状 -->
+<section id="current">
+  <h2><span class="idx">00</span>現状の表示と課題</h2>
+  <p class="sub">ByRepo モード・filter all・幅40列での現行レンダリング(render.rs の実装を忠実に再現)。上の Chat 行を選択し Detail 展開した状態。</p>
+
+  <div class="termgrid">
+    <div class="termcol">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>現状 · width 40 · ByRepo</div><pre>
+<span class="d">repo     all       </span>
+  v <span class="b">vde-tmux</span> <span class="c">main</span> <span class="g">+2</span> <span class="d">[running:3]</span>
+<span class="sel">&gt;   v 🟡 <span class="g">claude: fix sidebar flicker 2</span></span>
+      <span class="d">fix the flicker when an agent f</span>
+      <span class="d">status: running</span>
+      <span class="d">elapsed: 13m36s</span>
+      <span class="d">session: dev / pane: %12</span>
+      <span class="d">├ Explore #a1b2</span>
+      <span class="d">└ general-purpose #c3d4</span>
+      <span class="c">-&gt; jump</span>
+    🔴 <span class="r">codex: review PR #42</span>
+    🟢 claude (%15)
+  v <span class="b">obsidian-sync</span> <span class="c">main</span> <span class="d">[waiting:2]</span>
+    🔴 <span class="y">codex: sync vault</span>
+    🔵 claude: update readme
+</pre></div>
+      <div class="cap">現行:ヘッダー1行 + ツリー + Detail 9行展開</div>
+    </div>
+    <div class="termcol">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>現状 rail · width 2</div><pre>
+🟡
+🔴
+🟢
+🔴
+🔵
+</pre></div>
+      <div class="cap">rail モード:バッジ絵文字のみ</div>
+    </div>
+  </div>
+
+  <h3>構造は良い、視覚設計に伸びしろがある</h3>
+  <p>daemon push によるリアルタイム更新、rollup の min() 集約、attention フィルタ、rail モードなど、データ設計は既に強い。課題は「文字列の並べ方」に集中している。</p>
+  <ul>
+    <li><strong>余白ゼロ</strong> — 全行が左端に密着し、pane の境界と文字が接触する。右端も同様。</li>
+    <li><strong>絵文字バッジの幅問題</strong> — 🔴🟡は端末・フォントにより1〜2セル幅が揺れ、列が崩れる。彩度も高くノイズになる。</li>
+    <li><strong>右端が揃わない</strong> — <code>[running:2]</code> や <code>2/5</code> がラベル直後に付き、視線の第2軸(状態・数値)が作れていない。</li>
+    <li><strong>truncate がぶつ切り</strong> — <code>truncate_width</code> は省略記号なしで chars を切るため、切れたことすら分からない。</li>
+    <li><strong>Detail 展開が重い</strong> — 1 agent の詳細に9行消費し、40列 × 実用高さでは他が見えなくなる。</li>
+    <li><strong>ヘッダーが状態表示のみ</strong> — <code>repo     all</code> は固定幅パディングの残骸が見え、クリック可能であることが伝わらない。</li>
+    <li><strong>フッターなし</strong> — j/k/Tab/v/p などのキーが発見できない。</li>
+  </ul>
+</section>
+
+<!-- ================================================== 先行事例 -->
+<section id="refs">
+  <h2><span class="idx">01</span>先行事例 — herdr と tmux-agent-sidebar</h2>
+  <p class="sub">同じ問題(複数 AI エージェントの tmux 監視)に対する2つの対照的な回答。herdr は「浅く・少なく・一目で」、tmux-agent-sidebar は「深く・多く・行内に全部」。vde-tmux の現行は両者の中間にいる。</p>
+
+  <div class="termgrid">
+    <div class="termcol">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>herdr — 2段(spaces / agents)</div><pre>
+ <span class="d">spaces</span>
+ <span class="w">herdr</span>      <span class="d">master</span>
+ <span class="w">llm-proxy</span>  <span class="d">master</span>
+ <span class="w">qmp</span>        <span class="d">autoresearch/qmp-ra…</span>
+ <span class="d">agents</span>                    <span class="d">all</span>
+ <span class="w">herdr</span>      <span class="d">working · claude</span>  <span class="g">◉</span>
+ <span class="w">explore</span>    <span class="d">idle · opencode</span>   <span class="d">✓</span>
+ <span class="w">llm-proxy</span>  <span class="d">blocked · claude</span>  <span class="r">●</span>
+ <span class="w">qmp</span>        <span class="d">done · codex</span>
+</pre></div>
+      <div class="cap">状態4値(blocked/working/done/idle)。1 agent = 1行に徹する</div>
+    </div>
+    <div class="termcol">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>tmux-agent-sidebar — リッチカード</div><pre>
+ <span class="d">≡6</span> <span class="g">●1</span> <span class="m">◎1</span> <span class="y">◐2</span> <span class="d">○2</span> <span class="r">✕0</span>
+ <span class="d">repo ▾ —</span>
+ <span class="d">──────────────────────────────</span>
+ <span class="g">●</span> <span class="w">claude</span>  <span class="c">main</span> <span class="d">+</span>        <span class="d">13m</span>
+   <span class="d">❯ fix sidebar flicker</span>
+   <span class="d">▷ Found it. The rollup rec…</span>
+   <span class="g">✔✔</span><span class="y">◼</span><span class="d">◻◻ 2/5</span>
+   <span class="d">├ Explore #a1b2</span>
+   <span class="d">└ Bash    #dead</span>
+ <span class="y">◐</span> <span class="w">codex</span>   <span class="c">main</span>  <span class="y">permission</span>
+   <span class="d">❯ review PR #42</span>
+</pre></div>
+      <div class="cap">状態5値 + 優先順位解決。1 agent = 2〜7行の可変カード</div>
+    </div>
+  </div>
+
+  <h3>herdr から学べること</h3>
+  <ul>
+    <li><strong>2段分離</strong>:「どこで(spaces)」と「誰が何を(agents)」を別セクションにし、ツリーの折りたたみ操作を消している。→ 案B の骨格。</li>
+    <li><strong>状態は4値に畳む</strong>:blocked / working / done / idle。人間の次の行動(対応する・待つ・確認する・無視する)に1:1対応する粒度。vde-tmux の BadgeState と同型。</li>
+    <li>行は名前+<code>状態 · agent種別</code>のみ。prompt すら出さない潔さで密度を確保。</li>
+  </ul>
+
+  <h3>tmux-agent-sidebar から学べること</h3>
+  <ul>
+    <li><strong>フィルタバー = 状態サマリ</strong>:最上部に <code>≡6 ●1 ◎1 ◐2 ○2 ✕0</code> と「アイコン+ライブ件数」を並べ、それ自体がクリック/h/l/Tab で切り替わるフィルタになっている。表示と操作の統合として秀逸。その下に repo セレクタ <code>▾</code>(r キー)。</li>
+    <li><strong>単幅グリフ5種</strong>:<code>●</code> running / <code>◎</code> background / <code>◐</code> waiting / <code>○</code> idle / <code>✕</code> error。形状差があり色に依存しない。競合時は <code>running &gt; permission &gt; background &gt; waiting &gt; idle</code> の優先順位で1つに解決 — vde-tmux の RollupLevel min() と同じ発想。</li>
+    <li><strong>task 進捗のグリフ化</strong>:<code>✔✔◼◻◻ 2/5</code>。数字だけより進行の形が見える。vde-tmux は <code>parse_tasks</code> 済みなので移植が容易。</li>
+    <li><strong>▷ レスポンスプレビュー</strong>:agent の最後の発言1行を行内に出す。「jump する価値があるか」の判断材料として prompt より強いことが多い。</li>
+    <li><strong>worktree 統合</strong>:sidebar から worktree+agent を spawn、1キーで window/worktree/branch を teardown。vde-tmux には vde-worktree があるので同じ統合が狙える。</li>
+    <li><strong>デスクトップ通知</strong>:完了・permission・エラー時にネイティブ通知。サイドバーが見えていない時間をカバーする。</li>
+  </ul>
+</section>
+
+<!-- ================================================== 状態グリフ -->
+<section id="glyphs">
+  <h2><span class="idx">02</span>前提:状態グリフの共通刷新</h2>
+  <p class="sub">4案すべてに共通する前提として、絵文字バッジを「単幅グリフ + ANSI色」に置き換える。色だけでなく形も変えることで、色覚特性やモノクロ端末でも判別できる。BadgeState 4値との対応:</p>
+
+  <div class="glyphs">
+    <div class="glyph"><span class="g-mark r">▲</span><div class="g-label"><b>blocked</b><span>🔴 ← permission / error / waiting</span></div></div>
+    <div class="glyph"><span class="g-mark g">●</span><div class="g-label"><b>working</b><span>🟡 ← running / background</span></div></div>
+    <div class="glyph"><span class="g-mark c">✓</span><div class="g-label"><b>done</b><span>🔵 ← idle + unread</span></div></div>
+    <div class="glyph"><span class="g-mark d">○</span><div class="g-label"><b>idle</b><span>🟢 ← idle(既読)</span></div></div>
+  </div>
+
+  <p><strong>意味論の変更提案:</strong>現行は working=🟡黄・idle=🟢緑だが、「進行中=緑(健全)」「要対応=赤」「完了未読=シアン」「静止=無彩色」に再割り当てする。緊急度と彩度が一致し、視線が自然に blocked → working の順に流れる。現行の黄=working を維持したい場合は <code>BadgeGlyphs</code> 設定で色だけ差し替え可能な構造は既にあるので、既定値の変更として提案する。</p>
+  <p>working の <code>●</code> は daemon push のタイミングでスピナー(<code>◐◓◑◒</code>)にすると「生きている」ことが伝わるが、更新頻度依存なのでオプション扱いが妥当。</p>
+  <p><strong>代替案(tas 型5値直接表示):</strong>tmux-agent-sidebar のように BadgeState への畳み込みをやめ、RollupLevel 寄りの5グリフ(<code>✕</code> error / <code>●</code> running / <code>◐</code> waiting·permission / <code>◎</code> background / <code>○</code> idle)を直接出す手もある。情報は増えるが、「blocked をまとめて赤1色で叩きつける」畳み込みの強さは失う。attention 駆動の運用なら4値、状態の内訳まで常時見たいなら5値。どちらでも <code>BadgeGlyphs</code> 設定の拡張で吸収できる。</p>
+</section>
+
+<!-- ================================================== 一覧 -->
+<section id="overview">
+  <h2><span class="idx">03</span>5案の一覧比較</h2>
+  <p class="sub">同じデータ(2リポジトリ・6エージェント)を5案で描いたもの。横スクロールで並べて比較できる。クリックで各案の詳細へ。</p>
+
+  <div class="overview">
+
+    <a class="card-mock" href="#plan-a">
+      <span class="name"><em>A</em>Refined Tree</span>
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>40 cols</div><pre>
+ <span class="w">repo</span> <span class="d">· all</span>                <span class="r">▲2</span> <span class="g">●1</span> <span class="d">○2</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">▾</span> <span class="b">vde-tmux</span> <span class="d">·</span> <span class="c">main</span> <span class="g">↑2</span>            <span class="r">▲1</span>
+<span class="sel">   <span class="g">●</span> claude  fix sidebar flicker…   </span>
+     <span class="d">13m · task 2/5 · sub 2   <span class="c">⏎jump</span></span>
+   <span class="r">▲</span> <span class="r">codex   review PR #42      perm</span>
+   <span class="d">○ claude  —                       </span>
+ <span class="d">▸</span> <span class="b">obsidian-sync</span> <span class="d">·</span> <span class="c">main</span>           <span class="r">▲1</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">j/k移動 ⏎jump ␣開閉 ⇥attention</span>
+</pre></div>
+      <span class="tag">現行ツリーの視覚刷新。構造はそのまま。</span>
+    </a>
+
+    <a class="card-mock" href="#plan-b">
+      <span class="name"><em>B</em>Two-Deck(herdr型)</span>
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>40 cols</div><pre>
+ <span class="d">SPACES</span>                             <span class="d">3</span>
+<span class="sel"> <span class="b">vde-tmux</span>       <span class="c">main</span> <span class="g">↑2</span>          <span class="r">▲</span> </span>
+ <span class="b">obsidian-sync</span>  <span class="c">main</span>             <span class="r">▲</span>
+ <span class="b">dotfiles</span>       <span class="c">main</span>             <span class="d">·</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">AGENTS · vde-tmux</span>              <span class="d">all</span>
+ <span class="g">●</span> <span class="w">claude</span>   <span class="g">working · 13m</span>
+   <span class="d">└ fix sidebar flicker      2/5</span>
+ <span class="r">▲</span> <span class="w">codex</span>    <span class="r">permission</span>
+   <span class="d">└ review PR #42</span>
+ <span class="d">○ claude   idle · %15</span>
+</pre></div>
+      <span class="tag">上段=リポジトリ、下段=エージェント。</span>
+    </a>
+
+    <a class="card-mock" href="#plan-c">
+      <span class="name"><em>C</em>Attention Inbox</span>
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>40 cols</div><pre>
+ <span class="d">inbox</span>                     <span class="d">6 agents</span>
+ <span class="r">▍ATTENTION</span> <span class="r">2</span>
+<span class="sel"> <span class="r">▲</span> codex  review PR #42        <span class="r">perm</span> </span>
+   <span class="d">vde-tmux · 2m</span>
+ <span class="r">▲</span> codex  sync vault           <span class="y">wait</span>
+   <span class="d">obsidian-sync · 8m</span>
+ <span class="g">▍RUNNING</span> <span class="g">1</span>
+ <span class="g">●</span> claude fix sidebar flicker…  <span class="d">13m</span>
+   <span class="d">vde-tmux · task 2/5</span>
+ <span class="d">▍QUIET</span> <span class="d">3</span>
+ <span class="c">✓</span> claude update readme    <span class="d">obsidian</span>
+ <span class="d">○ claude —                    vde</span>
+</pre></div>
+      <span class="tag">状態バケツで再グルーピング。triage 特化。</span>
+    </a>
+
+    <a class="card-mock" href="#plan-d">
+      <span class="name"><em>D</em>Dense Monitor</span>
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>40 cols</div><pre>
+ <span class="d">agents 6</span>  <span class="r">▲2</span> <span class="g">●1</span> <span class="c">✓1</span> <span class="d">○2</span>     <span class="d">[all]</span>
+ <span class="r">▲</span> codex   <span class="d">vde</span> review PR #42  <span class="r">perm</span>
+ <span class="r">▲</span> codex   <span class="d">obs</span> sync vault     <span class="y">wait</span>
+<span class="sel"> <span class="g">●</span> claude  <span class="d">vde</span> fix sidebar f… <span class="d">13m</span> </span>
+ <span class="c">✓</span> claude  <span class="d">obs</span> update readme    <span class="c">✓</span>
+ <span class="d">○ claude  vde —                ·</span>
+ <span class="d">○ claude  dot —                ·</span>
+</pre></div>
+      <span class="tag">1 agent = 1行。最大密度・緊急度ソート。</span>
+    </a>
+
+    <a class="card-mock" href="#plan-e">
+      <span class="name"><em>E</em>Rich Card(tas型)</span>
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>40 cols</div><pre>
+ <span class="d">≡6</span> <span class="r">▲2</span> <span class="g">●1</span> <span class="c">✓1</span> <span class="d">○2</span>       <span class="d">repo ▾ —</span>
+ <span class="d">────────────────────────────────────</span>
+<span class="sel"> <span class="g">●</span> <span class="w">claude</span>  <span class="c">main</span> <span class="d">+</span>             <span class="d">13m</span> </span>
+   <span class="d">❯ fix sidebar flicker</span>
+   <span class="d">▷ Found it. The rollup recompu…</span>
+   <span class="g">✔✔</span><span class="y">◼</span><span class="d">◻◻ 2/5</span> <span class="d">· ├Explore └general</span>
+ <span class="r">▲</span> <span class="w">codex</span>   <span class="c">main</span>       <span class="r">permission</span>
+   <span class="d">❯ review PR #42</span>
+ <span class="d">○ claude  main</span>
+</pre></div>
+      <span class="tag">フィルタバー + 可変高カード。情報量最大。</span>
+    </a>
+
+  </div>
+</section>
+
+<!-- ================================================== 比較表 -->
+<section id="matrix">
+  <h2><span class="idx">04</span>比較表</h2>
+  <div class="tablewrap">
+  <table>
+    <thead><tr>
+      <th>観点</th><th>現状</th><th>A ツリー改良</th><th>B 2段デッキ</th><th>C インボックス</th><th>D モニター</th><th>E リッチカード</th>
+    </tr></thead>
+    <tbody>
+      <tr><td>1画面のagent数(高さ24行)</td><td class="mid">〜10</td><td class="mid">〜12</td><td class="mid">〜7(下段)</td><td class="mid">〜8</td><td class="good">〜20</td><td class="bad">〜5</td></tr>
+      <tr><td>attention の発見速度</td><td class="bad">ソート依存</td><td class="mid">バッジ+ソート</td><td class="mid">上段ロールアップ</td><td class="good">構造そのもの</td><td class="good">最上部固定</td><td class="mid">フィルタバー件数</td></tr>
+      <tr><td>repo の文脈把握</td><td class="good">ツリーで明確</td><td class="good">ツリーで明確</td><td class="good">上段が専任</td><td class="bad">行内ラベルのみ</td><td class="bad">3字略号のみ</td><td class="mid">branch+セレクタ</td></tr>
+      <tr><td>詳細情報への到達</td><td class="bad">9行展開</td><td class="good">選択行に1行inline</td><td class="mid">2行目+preview</td><td class="mid">2行目固定</td><td class="bad">preview頼み</td><td class="good">常時行内(▷含む)</td></tr>
+      <tr><td>狭幅(30列)耐性</td><td class="bad">崩れる</td><td class="mid">meta省略で可</td><td class="mid">下段のみ可</td><td class="mid">2行目省略で可</td><td class="good">最適</td><td class="bad">低い</td></tr>
+      <tr><td>実装コスト</td><td class="mid">—</td><td class="good">小(render中心)</td><td class="bad">大(state/tree/入力)</td><td class="mid">中(tree差替)</td><td class="mid">中(Flat拡張)</td><td class="bad">大(daemon拡張要)</td></tr>
+      <tr><td>現行stateとの互換</td><td class="mid">—</td><td class="good">全互換</td><td class="bad">選択モデル変更</td><td class="mid">ViewMode追加</td><td class="good">Flat拡張</td><td class="mid">データ源の追加</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ================================================== 案A -->
+<section class="proposal" id="plan-a">
+  <h2><span class="idx">A</span>Refined Tree — 現行構造の視覚刷新</h2>
+  <p class="fit">向くケース:現行の Repo→Chat ツリーに慣れている / 改修を段階的に進めたい / リポジトリ単位の把握が主目的</p>
+
+  <div class="split">
+    <div class="mockside">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>案A · 40 cols</div><pre>
+ <span class="w">repo</span> <span class="d">· all</span>                <span class="r">▲2</span> <span class="g">●1</span> <span class="d">○2</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">▾</span> <span class="b">vde-tmux</span> <span class="d">·</span> <span class="c">main</span> <span class="g">↑2</span>            <span class="r">▲1</span>
+<span class="sel">   <span class="g">●</span> claude  fix sidebar flicker…   </span>
+     <span class="d">13m · task 2/5 · sub 2   <span class="c">⏎jump</span></span>
+   <span class="r">▲</span> <span class="r">codex   review PR #42      perm</span>
+   <span class="d">○ claude  —                   idle</span>
+ <span class="d">▸</span> <span class="b">obsidian-sync</span> <span class="d">·</span> <span class="c">main</span>           <span class="r">▲1</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">j/k移動 ⏎jump ␣開閉 ⇥attention</span>
+</pre></div>
+      <div class="cap">選択行(●claude)の直下にだけ meta 行が inline 展開される</div>
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>案A · filter: attention</div><pre>
+ <span class="w">repo</span> <span class="d">·</span> <span class="r">attention</span>              <span class="r">▲2</span> <span class="g">●1</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">▾</span> <span class="b">vde-tmux</span> <span class="d">·</span> <span class="c">main</span> <span class="g">↑2</span>            <span class="r">▲1</span>
+<span class="sel">   <span class="r">▲</span> <span class="r">codex   review PR #42      perm</span> </span>
+     <span class="d">2m · waiting approval    <span class="c">⏎jump</span></span>
+   <span class="g">●</span> claude  fix sidebar flicker…
+ <span class="d">▾</span> <span class="b">obsidian-sync</span> <span class="d">·</span> <span class="c">main</span>           <span class="r">▲1</span>
+   <span class="r">▲</span> <span class="y">codex   sync vault         wait</span>
+</pre></div>
+    </div>
+
+    <div class="proseside">
+      <h3>変更点</h3>
+      <ul>
+        <li><strong>全行に左右1列の padding</strong>。行頭の選択マーカー <code>"&gt; "</code> は廃止し、選択は背景色バーのみで表現(現行も bg は付くので二重表現を解消)。</li>
+        <li><strong>右端整列カラム</strong>を導入。Repo 行は右端に attention 件数(<code>▲1</code>)、Chat 行は右端に状態略語(<code>perm</code>/<code>wait</code>)または経過時間。<code>[running:2]</code> 形式は廃止。</li>
+        <li><strong>Detail 9行 → 選択行の inline meta 1行</strong>。選択中の Chat 行の直下にだけ <code>13m · task 2/5 · sub 2  ⏎jump</code> を自動表示。Space の明示展開は「フル詳細(現行 Detail)」として残す。</li>
+        <li><strong>ヘッダーを2ゾーン化</strong>:左=モード・フィルタ(クリック可能)、右=状態サマリ(<code>▲2 ●1 ○2</code>)。固定幅パディングをやめ、<code>·</code> 区切りに。</li>
+        <li><strong>フッター1行</strong>にキーヒント。高さが閾値未満なら自動で消す。</li>
+        <li>truncate は <code>…</code> 付き(<code>unicode-width</code> ベースで表示幅を計測)。</li>
+        <li>展開マーカーを <code>v/&gt;</code> → <code>▾/▸</code> に。ASCII fallback は設定で。</li>
+      </ul>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>state / tree / daemon に一切手を入れず render.rs 中心で完結</li>
+          <li>現行ユーザーの操作モデルが崩れない</li>
+          <li>inline meta により Enter 前に必要十分な情報が得られる</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>repo が増えるとツリーの折りたたみ操作が必要な点は変わらない</li>
+          <li>attention は依然「各 repo の中」に散る(ソートとバッジで緩和)</li>
+        </ul></div>
+      </div>
+      <div class="impl">実装メモ:<code>render.rs</code> の <code>render_row_text</code>/<code>build_header_layout</code> の書き換え + <code>truncate_width</code> の unicode-width 化 + フッター行追加(<code>tui.rs</code> の layout 分割を3分割に)。既存テストの期待文字列更新が主作業。規模感 小。</div>
+    </div>
+  </div>
+</section>
+
+<!-- ================================================== 案B -->
+<section class="proposal" id="plan-b">
+  <h2><span class="idx">B</span>Two-Deck — herdr 型の2段サイドバー</h2>
+  <p class="fit">向くケース:リポジトリ(space)を跨いだ作業が常態 / 「どの repo にいるか」と「agent の状態」を別のレイヤーとして扱いたい</p>
+
+  <div class="split">
+    <div class="mockside">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>案B · 40 cols</div><pre>
+ <span class="d">SPACES</span>                             <span class="d">3</span>
+<span class="sel"> <span class="b">vde-tmux</span>       <span class="c">main</span> <span class="g">↑2</span>          <span class="r">▲</span> </span>
+ <span class="b">obsidian-sync</span>  <span class="c">main</span>             <span class="r">▲</span>
+ <span class="b">dotfiles</span>       <span class="c">main</span>             <span class="d">·</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">AGENTS · vde-tmux</span>              <span class="d">all</span>
+ <span class="g">●</span> <span class="w">claude</span>   <span class="g">working · 13m</span>
+   <span class="d">└ fix sidebar flicker      2/5</span>
+ <span class="r">▲</span> <span class="w">codex</span>    <span class="r">permission</span>
+   <span class="d">└ review PR #42</span>
+ <span class="d">○ claude   idle · %15</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">⇥デッキ切替 ⏎jump a:全repo表示</span>
+</pre></div>
+      <div class="cap">上段で repo を選ぶと下段がその repo の agent に絞られる</div>
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>案B · AGENTS デッキで all 表示</div><pre>
+ <span class="d">SPACES</span>                             <span class="d">3</span>
+ <span class="b">vde-tmux</span>       <span class="c">main</span> <span class="g">↑2</span>          <span class="r">▲</span>
+ <span class="b">obsidian-sync</span>  <span class="c">main</span>             <span class="r">▲</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">AGENTS · all</span>             <span class="r">attention</span>
+<span class="sel"> <span class="r">▲</span> <span class="w">codex</span>    <span class="r">permission</span>     <span class="d">vde-tmux</span> </span>
+   <span class="d">└ review PR #42</span>
+ <span class="r">▲</span> <span class="w">codex</span>    <span class="y">waiting</span>   <span class="d">obsidian-sync</span>
+   <span class="d">└ sync vault</span>
+ <span class="g">●</span> <span class="w">claude</span>   <span class="g">working · 13m</span> <span class="d">vde-tmux</span>
+   <span class="d">└ fix sidebar flicker      2/5</span>
+</pre></div>
+    </div>
+
+    <div class="proseside">
+      <h3>構成</h3>
+      <ul>
+        <li><strong>上段 SPACES</strong>:repo 一覧。各行は「名前 / branch ↑↓ / 状態ロールアップ(最悪値1グリフ)」。高さは repo 数 + ヘッダー(最大でウィンドウの1/3、超えたらスクロール)。</li>
+        <li><strong>下段 AGENTS</strong>:選択 repo の agent をフラット表示。各 agent は2行(1行目=名前+状態+経過、2行目=prompt+タスク進捗)。<code>a</code> で全 repo 横断表示に切り替え、その場合は右端に repo 名を表示。</li>
+        <li><strong>Tab でデッキ間フォーカス移動</strong>(現行の Tab=フィルタは <code>f</code> へ移設、またはヘッダークリック)。j/k は現在のデッキ内で動く。</li>
+        <li>区切りは罫線1本。デッキ見出しは <code>SPACES</code>/<code>AGENTS</code> の小文字ラベルを dim で。</li>
+      </ul>
+      <h3>herdr との差分</h3>
+      <p>herdr は spaces=サーバー上のワークスペースだが、vde-tmux では既にある <code>(category, repo)</code> グルーピングを上段に写像するだけでよい。カテゴリを使う場合は上段を category、下段を repo+agent にする変形も可能。</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>「repo の選択」と「agent の監視」が別ゾーンになり、折りたたみ操作が消える</li>
+          <li>上段が常時見えるダッシュボードとして機能(全 repo の最悪状態が一望)</li>
+          <li>ネスト深度が最大1になり、40列に対してインデント消費が最小</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>2フォーカスモデルの導入で state / 入力 / クリック処理の改修が最大</li>
+          <li>repo が1〜2個の場合、上段が空間の無駄になる(repo 1個なら上段自動非表示で緩和)</li>
+          <li>下段2行/agent なので一覧密度は案Dに劣る</li>
+        </ul></div>
+      </div>
+      <div class="impl">実装メモ:<code>SidebarState</code> に <code>focused_deck</code> と <code>selected_space</code> を追加、<code>tree.rs</code> は2つの行リストを返す形に分割、<code>tui.rs</code> の描画を3レイアウト(上段/罫線/下段)に。クリックのデッキ判定も必要。規模感 大。</div>
+    </div>
+  </div>
+</section>
+
+<!-- ================================================== 案C -->
+<section class="proposal" id="plan-c">
+  <h2><span class="idx">C</span>Attention Inbox — 状態バケツでの再グルーピング</h2>
+  <p class="fit">向くケース:agent 数が多く「次に自分が触るべきもの」の判断が主目的 / attention フィルタを常用している</p>
+
+  <div class="split">
+    <div class="mockside">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>案C · 40 cols</div><pre>
+ <span class="d">inbox</span>                     <span class="d">6 agents</span>
+ <span class="r">▍ATTENTION</span> <span class="r">2</span>
+<span class="sel"> <span class="r">▲</span> codex  review PR #42        <span class="r">perm</span> </span>
+   <span class="d">vde-tmux · 2m</span>
+ <span class="r">▲</span> codex  sync vault           <span class="y">wait</span>
+   <span class="d">obsidian-sync · 8m</span>
+ <span class="g">▍RUNNING</span> <span class="g">1</span>
+ <span class="g">●</span> claude fix sidebar flicker…  <span class="d">13m</span>
+   <span class="d">vde-tmux · task 2/5 · sub 2</span>
+ <span class="d">▍QUIET</span> <span class="d">3</span>
+ <span class="c">✓</span> claude update readme    <span class="d">obsidian</span>
+ <span class="d">○ claude —                    vde</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">⏎jump n:次のattention ␣QUIET開閉</span>
+</pre></div>
+      <div class="cap">ATTENTION が常に最上部。QUIET はデフォルト折りたたみも可</div>
+    </div>
+
+    <div class="proseside">
+      <h3>構成</h3>
+      <ul>
+        <li>ツリーの第一軸を repo から <strong>状態バケツ</strong>に変える:<code>ATTENTION</code>(blocked)→ <code>RUNNING</code>(working)→ <code>QUIET</code>(done+idle)。BadgeState の Ord がそのままセクション順になる。</li>
+        <li>各 agent は2行:1行目=グリフ+agent+prompt+状態略語(右端)、2行目=repo・経過・進捗を dim で。</li>
+        <li>セクション見出しは左端の色付き縦線 <code>▍</code> + ラベル + 件数。件数が0のセクションは見出しごと非表示。</li>
+        <li><code>QUIET</code> はデフォルト折りたたみ(1行のサマリだけ)にすると、実質「attention フィルタが構造に昇格した」状態になる。</li>
+        <li>repo 情報は2行目に降格。repo で絞りたいときは既存の ByRepo モードに <code>v</code> で切り替えればよい —— <strong>この案は ViewMode の4つ目(ByStatus)として追加する</strong>のが自然。</li>
+      </ul>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>「今すぐ対応すべきもの」が構造的に最上部へ集まり、フィルタ切り替え自体が不要になる</li>
+          <li>状態変化で行が上下に動くため、変化への気づきが生まれる</li>
+          <li>ViewMode 追加として実装でき、既存モードと共存(1/2/3/4 で直接切替)</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>repo の文脈が弱く、同名 agent が並ぶと2行目を読む必要がある</li>
+          <li>状態変化のたびに行が移動するので、選択追従(id ベースの selection は既にあるので致命的ではない)と視線の安定性に配慮が要る</li>
+        </ul></div>
+      </div>
+      <div class="impl">実装メモ:<code>tree.rs</code> に <code>build_rows_by_status</code> を追加し、<code>ViewMode::ByStatus</code> を <code>state.rs</code> に追加。セクション見出しは <code>SidebarRowKind::Category</code> を流用可能。render は案Aの刷新に乗る。規模感 中。</div>
+    </div>
+  </div>
+</section>
+
+<!-- ================================================== 案D -->
+<section class="proposal" id="plan-d">
+  <h2><span class="idx">D</span>Dense Monitor — 1行1エージェントの高密度表示</h2>
+  <p class="fit">向くケース:agent 10体以上を並走させる / サイドバー幅を30列以下に切り詰めたい / rail と通常表示の中間が欲しい</p>
+
+  <div class="split">
+    <div class="mockside">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>案D · 40 cols</div><pre>
+ <span class="d">agents 6</span>  <span class="r">▲2</span> <span class="g">●1</span> <span class="c">✓1</span> <span class="d">○2</span>     <span class="d">[all]</span>
+ <span class="r">▲</span> codex   <span class="d">vde</span> review PR #42  <span class="r">perm</span>
+ <span class="r">▲</span> codex   <span class="d">obs</span> sync vault     <span class="y">wait</span>
+<span class="sel"> <span class="g">●</span> claude  <span class="d">vde</span> fix sidebar f… <span class="d">13m</span> </span>
+ <span class="c">✓</span> claude  <span class="d">obs</span> update readme    <span class="c">✓</span>
+ <span class="d">○ claude  vde —                ·</span>
+ <span class="d">○ claude  dot —                ·</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="g">●</span> <span class="d">claude · vde-tmux · %12 · 13m36s</span>
+ <span class="d">task 2/5 · sub: Explore, general…</span>
+</pre></div>
+      <div class="cap">下部2行はステータスペイン:選択行の詳細が常時ここに出る</div>
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>案D · width 24(狭幅でも成立)</div><pre>
+ <span class="d">6</span> <span class="r">▲2</span> <span class="g">●1</span> <span class="c">✓1</span> <span class="d">○2</span>
+ <span class="r">▲</span> codex  <span class="d">vde</span> <span class="r">perm</span>
+ <span class="r">▲</span> codex  <span class="d">obs</span> <span class="y">wait</span>
+<span class="sel"> <span class="g">●</span> claude <span class="d">vde</span> <span class="d">13m</span> </span>
+ <span class="c">✓</span> claude <span class="d">obs</span>   <span class="c">✓</span>
+ <span class="d">○ claude vde   ·</span>
+</pre></div>
+    </div>
+
+    <div class="proseside">
+      <h3>構成</h3>
+      <ul>
+        <li>グルーピングを完全に捨て、<strong>緊急度ソートの1行リスト</strong>にする(現行 Flat モードの強化版)。ソートは既存の <code>compare_agent_panes</code>(attention → rollup → pane_id)がそのまま使える。</li>
+        <li>各行は固定カラム:<code>グリフ · agent名(7字) · repo略号(3字) · prompt(可変・…) · 右端状態</code>。列が揃うことで表として走査できる。</li>
+        <li>repo 略号は repo 名の頭3字(衝突時は4字)。dim 表示で主張させない。</li>
+        <li><strong>詳細はツリー展開ではなく下部ステータスペイン(2行固定)</strong>に常時表示。選択を動かすだけで詳細が流れる —— Detail 行・Space 開閉が不要になる。</li>
+        <li>ヘッダーは件数サマリ(<code>▲2 ●1 ✓1 ○2</code>)。これは rail モードの表示(後述)と同じ語彙。</li>
+      </ul>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>密度最大:高さ24行で約20 agent。並走数が多いほど効く</li>
+          <li>幅24列まで自然に縮退でき、rail(2列)との中間形態になる</li>
+          <li>展開・折りたたみの概念が消え、操作が j/k/Enter だけになる</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>repo の文脈が3字略号だけになり、repo 数が多いと苦しい</li>
+          <li>prompt の表示幅が最も狭い(40列で約14字)</li>
+          <li>ステータスペイン分の高さ(2〜3行)を常時消費</li>
+        </ul></div>
+      </div>
+      <div class="impl">実装メモ:<code>ViewMode::Flat</code> の render を専用パスに分岐し、固定カラム整形関数を追加。ステータスペインは <code>tui.rs</code> のレイアウトを List+Paragraph の2段にする。規模感 中。</div>
+    </div>
+  </div>
+</section>
+
+<!-- ================================================== 案E -->
+<section class="proposal" id="plan-e">
+  <h2><span class="idx">E</span>Rich Card — tmux-agent-sidebar 型の情報最大化</h2>
+  <p class="fit">向くケース:agent 数は少数(〜5体)で1体ずつ深く監視したい / jump せずにサイドバーだけで作業の進行を追いたい / サイドバー幅を50列以上取れる</p>
+
+  <div class="split">
+    <div class="mockside">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>案E · 40 cols</div><pre>
+ <span class="d">≡6</span> <span class="r">▲2</span> <span class="g">●1</span> <span class="c">✓1</span> <span class="d">○2</span>       <span class="d">repo ▾ —</span>
+ <span class="d">────────────────────────────────────</span>
+<span class="sel"> <span class="g">●</span> <span class="w">claude</span>  <span class="c">main</span> <span class="d">+</span>             <span class="d">13m</span> </span>
+   <span class="d">❯ fix sidebar flicker</span>
+   <span class="d">▷ Found it. The rollup recompu…</span>
+   <span class="g">✔✔</span><span class="y">◼</span><span class="d">◻◻ 2/5</span>
+   <span class="d">├ Explore #a1b2</span>
+   <span class="d">└ general-purpose #c3d4</span>
+ <span class="r">▲</span> <span class="w">codex</span>   <span class="c">main</span>       <span class="r">permission</span>
+   <span class="d">❯ review PR #42</span>
+ <span class="r">▲</span> <span class="w">codex</span>   <span class="c">main</span> <span class="d">+</span>         <span class="y">waiting</span>
+   <span class="d">❯ sync vault</span>
+ <span class="d">○ claude  main</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">⏎jump w:worktree生成 x:破棄</span>
+</pre></div>
+      <div class="cap">最上部がフィルタバー(アイコン+件数、クリック/h/l で切替)</div>
+    </div>
+
+    <div class="proseside">
+      <h3>構成</h3>
+      <ul>
+        <li><strong>フィルタバー</strong>:<code>≡6 ▲2 ●1 ✓1 ○2</code> のアイコン+ライブ件数を最上部に。クリック or <code>h/l</code> で状態フィルタを直接選択(現行の all/attention 2値 Tab トグルを多値化)。右端に repo セレクタ <code>▾</code>。</li>
+        <li><strong>可変高カード</strong>:各 agent は状態行(グリフ・agent・branch・worktree マーカー <code>+</code>・右端に経過/状態)+ <code>❯</code> prompt 行 + <code>▷</code> 最新レスポンス1行 + task グリフ列 + subagent tree。idle は状態行1行に縮退。</li>
+        <li><strong>worktree 統合</strong>:カードから <code>w</code> で新規 worktree+agent を spawn、sidebar 発の worktree は <code>x</code> で window/worktree/branch を一括破棄(vde-worktree 連携)。</li>
+        <li>グルーピングはしない(repo セレクタで絞る)。ソートは緊急度順。</li>
+      </ul>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>jump しなくても「今どこまで進んだか」(▷ と task グリフ)が分かる唯一の案</li>
+          <li>フィルタバーがサマリ表示とフィルタ操作を兼ね、ヘッダーの情報効率が最高</li>
+          <li>worktree 運用(vw)との統合の受け皿になる</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>密度最低:24行で5体前後。並走数が多い運用には向かない</li>
+          <li>40列では ▷ プレビューが十数字で切れ、価値が半減(50列以上推奨)</li>
+          <li>▷ に出す「最新レスポンス」を取る仕組みが現行 daemon にない(hook 拡張 or capture-pane 定期取得が必要)で、実装コストが最大級</li>
+        </ul></div>
+      </div>
+      <div class="impl">実装メモ:task グリフ(<code>parse_tasks</code> 済み)と worktree マーカーは小改修。フィルタバー多値化は <code>StatusFilter</code> の enum 拡張。▷ レスポンスプレビューだけが大物で、<code>@vde_last_response</code> 的な pane option を hook 側で書く設計が必要。規模感 大(段階導入可)。</div>
+    </div>
+  </div>
+</section>
+
+<!-- ================================================== ガイド -->
+<section id="guide">
+  <h2><span class="idx">05</span>横断デザイン指針 — 余白・整列・truncate・rail</h2>
+  <p class="sub">どの案を選んでも適用すべき、40列のテキスト UI としての設計原則。</p>
+
+  <h3>余白(margin / padding)</h3>
+  <ul>
+    <li><strong>左右1列ずつの padding を全行に</strong>。tmux の pane border と文字が接触しないだけで別物に見える。幅40列なら実効38列。rail(2列)時のみ padding なし。</li>
+    <li><strong>選択ハイライトは padding 込みのフル幅</strong>で塗る。行頭 <code>"&gt; "</code> マーカーとの二重表現はやめ、bg + bold に一本化。マーカーを残すなら bg を消す(どちらか一方)。</li>
+    <li><strong>セクション間は罫線より空行を優先</strong>。罫線(─)は「デッキ境界」など構造的に強い境界だけに使い、repo 間のような弱い境界は空行または見出し色で分ける。線が多いと40列では柵に見える。</li>
+    <li><strong>ヘッダー・フッターは本文と1行分の呼吸</strong>(空行 or 罫線)を挟む。高さが20行未満のときはフッター→ヘッダーサマリの順に自動で畳む。</li>
+    <li><strong>インデントは2スペース、ネストは最大2段まで</strong>。40列でインデント3段(6列)は prompt 表示幅を15%奪う。案B/C/D がネストを浅くしているのはこのため。</li>
+  </ul>
+
+  <h3>整列 — 右端カラムという第2の読み軸</h3>
+  <p>左端の「グリフ列」と右端の「状態・数値列」を固定カラムにすると、中央の可変テキストを読まずに縦スキャンだけで全体を把握できる。<code>[running:2]</code> のようにラベル直後へ付ける現行方式は、この縦の軸を壊している。経過時間・件数などの数値は右端揃え + tabular に。</p>
+
+  <h3>truncate</h3>
+  <ul>
+    <li>省略記号 <code>…</code> を必ず付ける(1文字分を確保して切る)。</li>
+    <li><code>chars().count()</code> ではなく <strong>表示幅(unicode-width)</strong>で計測する。CJK・絵文字を含む prompt で右端カラムが崩れる現行の潜在バグもこれで直る。</li>
+    <li>切る位置は「中央の可変テキストのみ」。右端カラムとグリフは絶対に切らない。</li>
+  </ul>
+
+  <h3>rail モードの強化</h3>
+  <div class="termgrid">
+    <div class="termcol">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>現状 rail(2列)</div><pre>
+🟡
+🔴
+🟢
+🔴
+🔵
+</pre></div>
+    </div>
+    <div class="termcol">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>提案 rail(4列)</div><pre>
+ <span class="r">▲2</span>
+ <span class="g">●1</span>
+ <span class="c">✓1</span>
+ <span class="d">○2</span>
+ <span class="d">──</span>
+ <span class="r">▲</span><span class="d">v</span>
+ <span class="r">▲</span><span class="d">o</span>
+ <span class="g">●</span><span class="d">v</span>
+</pre></div>
+      <div class="cap">上=状態別カウント、下=agent 個別(グリフ+repo頭文字)</div>
+    </div>
+    <div class="termcol">
+      <p style="max-width:22em; font-size:13.5px; margin:0;">rail を「agent の数だけグリフが並ぶ」から「<strong>集計 + 個別</strong>」の2部構成にする。幅を2→4列にすると状態別カウントが置け、畳んだままでも「▲が増えた」ことに気づける。attention 発生時に rail 側で該当グリフを点滅(reverse video)させると、畳んだ状態が常用に耐える。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================================================== 機能 -->
+<section id="features">
+  <h2><span class="idx">06</span>サイドバーを使いやすくする機能案</h2>
+  <p class="sub">表示形式と独立に導入できるもの。優先度順。「由来」は先行事例で実証済みであることを示す。</p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>優先</th><th>機能</th><th>内容</th><th>実装の足場</th></tr></thead>
+    <tbody>
+      <tr><td>高</td><td>フィルタバーの icon+count 化 <span style="color:var(--muted)">(tas由来)</span></td><td>ヘッダーを <code>≡6 ▲2 ●1 ✓1 ○2</code> にし、状態サマリ表示とフィルタ操作を統合。all/attention の2値 Tab トグルを多値選択に拡張。</td><td><code>StatusFilter</code> enum 拡張 + ヘッダー hit test は既にある</td></tr>
+      <tr><td>高</td><td><code>n</code> / <code>N</code> 次の attention へ</td><td>フィルタを切り替えずに blocked な agent 間を直接巡回。jump までを1キーに短絡する <code>g</code> 系も検討。</td><td><code>SidebarAction</code> 追加のみ。rows は緊急度ソート済み</td></tr>
+      <tr><td>高</td><td>unread の既読管理</td><td>done(🔵/✓)は jump した時点で idle 表示へ落とす。「見たのに残る」通知は信頼を失う。</td><td><code>unread</code> フラグは daemon に既にある。jump 時に clear</td></tr>
+      <tr><td>高</td><td>状態変化フラッシュ</td><td>rollup が変化した行を1〜2秒 reverse video でハイライト。視界の端で変化に気づける。</td><td>daemon push 契機で <code>changed_at</code> を frame に載せる</td></tr>
+      <tr><td>中</td><td>task 進捗のグリフ化 <span style="color:var(--muted)">(tas由来)</span></td><td><code>2/5</code> を <code>✔✔◼◻◻ 2/5</code> にする。進行の「形」が見え、停滞にも気づける。</td><td><code>parse_tasks</code> 済み。ただし現行 tasks は done/total のみなので per-task 状態の hook 拡張が必要</td></tr>
+      <tr><td>中</td><td><code>/</code> インクリメンタル絞り込み</td><td>agent 名・prompt・repo 名を対象に部分一致で rows を絞る。agent が10体を超えると必須になる。</td><td><code>StatusFilter</code> と直交する <code>query: Option&lt;String&gt;</code></td></tr>
+      <tr><td>中</td><td>フッターのコンテキストヒント</td><td>選択行の種類でヒントを変える(Chat 行なら <code>⏎jump ␣詳細 p:preview</code>、Repo 行なら <code>⏎開閉 J/K並替</code>)。</td><td><code>SidebarRowKind</code> で分岐するだけ</td></tr>
+      <tr><td>中</td><td>経過時間の live 更新</td><td><code>13m</code> 表示を daemon push がなくても毎分更新。「動いているのか死んでいるのか」の不安を消す。</td><td><code>tui.rs</code> の event loop に tick を追加</td></tr>
+      <tr><td>中</td><td>worktree 連携 <span style="color:var(--muted)">(tas由来)</span></td><td>サイドバーから worktree+agent を spawn(<code>w</code>)、sidebar 発 worktree を1キーで一括破棄(<code>x</code>)。worktree 内の pane には <code>+</code> マーカー。</td><td>vde-worktree(vw)が既にあるので、コマンド発行の接続のみ</td></tr>
+      <tr><td>低</td><td><code>▷</code> レスポンスプレビュー <span style="color:var(--muted)">(tas由来)</span></td><td>agent の最後の発言1行を行内またはステータスペインに表示。「jump する価値」の判断材料として prompt より強い。</td><td>hook で <code>@vde_last_response</code> を書く拡張が必要。<code>capture-pane</code> 定期取得(preview.rs)でも代替可</td></tr>
+      <tr><td>低</td><td>デスクトップ通知 <span style="color:var(--muted)">(tas/herdr由来)</span></td><td>blocked / error / done への遷移時にネイティブ通知。サイドバーが見えていない時間をカバー。</td><td>daemon の状態遷移検知に <code>osascript</code> / <code>terminal-notifier</code> を接続</td></tr>
+      <tr><td>低</td><td>pin(先頭固定)</td><td>manual order(J/K)は repo 単位のみ。agent 単位の pin があると「監視したい1体」を固定できる。</td><td><code>manual_order</code> の agent 版</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ================================================== 推奨 -->
+<section id="reco">
+  <h2><span class="idx">07</span>推奨と進め方</h2>
+  <div class="note"><p><strong>推奨:案A を基盤として先行実装し、tas 由来のフィルタバー(icon+count)を取り込み、案C(ByStatus)を4つ目の ViewMode として重ねる。</strong>案B(2段デッキ)は state・入力系の改修が最大、案E(リッチカード)は密度と実装コストの点で全面採用は見送り、それぞれ「次段の選択肢」「要素の取り込み元」として扱う。</p></div>
+  <ul>
+    <li><strong>Phase 1(案Aの土台)</strong>:グリフ刷新・左右 padding・右端カラム・truncate 改善・フッター、そして<strong>フィルタバーの icon+count 化</strong>。<code>render.rs</code> 中心、既存テストの期待値更新が主作業。ここまでで見た目の課題は8割解消する。</li>
+    <li><strong>Phase 2(inline meta + 機能)</strong>:選択行 inline meta、<code>n</code> ジャンプ、既読管理、状態変化フラッシュ、task グリフ(hook 拡張が許すなら)。</li>
+    <li><strong>Phase 3(案C)</strong>:<code>ViewMode::ByStatus</code> を追加し <code>4</code> キーに割当。attention 運用が主なら既定モードにする。</li>
+    <li><strong>Phase 4(worktree 連携)</strong>:vde-worktree との接続(spawn / teardown / <code>+</code> マーカー)。tas が実証した「サイドバー = agent の起点」への拡張。</li>
+    <li><strong>Phase 5(必要なら案B/D/E)</strong>:並走 agent 数が10体超なら案D の密度、repo 横断が常態なら案B の2段化、深い監視が主なら案E の ▷ プレビュー(daemon 拡張)を再評価する。</li>
+  </ul>
+  <p>いずれの Phase も <code>BadgeGlyphs</code> / <code>SidebarColorsConfig</code> の既存カスタマイズ機構を壊さない範囲で「既定値の変更」として実装できるため、絵文字バッジ派のユーザーは設定で現行表示に戻せる。</p>
+</section>
+
+<!-- ================================================== 理想形 -->
+<section class="proposal" id="ideal">
+  <h2><span class="idx">F</span>理想形 — Command Center(実装コスト度外視)</h2>
+  <p class="fit">5案の統合ではなく、「コストが理由で捨てていた発想」を全部入れた場合の構成。設計原理は3つ:<strong>①モードをなくして幅と状況に自動適応する ②選択だけがリッチになる(fisheye) ③jump しなくても応答できる</strong>。</p>
+
+  <div class="split">
+    <div class="mockside">
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>理想形 · 40 cols · 4ゾーン構成</div><pre>
+ <span class="d">≡6</span> <span class="r">▲2</span> <span class="g">●1</span> <span class="c">✓1</span> <span class="d">○2</span>       <span class="d">repo ▾ —</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="r">▍TRIAGE</span> <span class="r">2</span>
+<span class="sel"> <span class="r">▲</span> <span class="w">codex</span> <span class="d">· vde-tmux</span>       <span class="r">perm</span> <span class="d">2m</span> </span>
+   <span class="d">$ cargo sqlx migrate run</span>
+   <span class="c">[y]許可 [n]拒否 [d]diff [⏎]jump</span>
+ <span class="r">▲</span> <span class="w">codex</span> <span class="d">· obsidian-sync</span>   <span class="y">wait</span> <span class="d">8m</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">▾</span> <span class="b">vde-tmux</span> <span class="d">·</span> <span class="c">main</span> <span class="g">↑2</span>
+ <span class="g">●</span> claude  fix sidebar flicker…  <span class="d">13m</span>
+ <span class="d">│ ▷ Found it. The rollup recompu…</span>
+ <span class="d">│ <span class="g">✔✔</span><span class="y">◼</span>◻◻ 2/5 · ├Explore └general…</span>
+ <span class="d">○ claude  —                       ·</span>
+ <span class="d">▾</span> <span class="b">obsidian-sync</span> <span class="d">·</span> <span class="c">main</span>
+ <span class="c">✓</span> claude  update readme            <span class="c">✓</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">LIVE · codex %14</span>
+ <span class="d">│ Apply pending database migratio</span>
+ <span class="d">│ ❯ 1. Yes  2. No, and tell Claud</span>
+ <span class="d">────────────────────────────────────</span>
+ <span class="d">y:許可 n:次▲ /検索 w:worktree ?:keys</span>
+</pre></div>
+      <div class="cap">①フィルタバー ②TRIAGE(要対応が構造的に最上部・行内アクション付き) ③FLEET(repo別、選択行だけ fisheye 展開) ④LIVE(選択 agent の画面末尾を実況)</div>
+
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>幅による自動変形(モード切替キーなし)</div><pre>
+ <span class="d">width ≥56   rich    全行カード(案E相当)</span>
+ <span class="d">36–55       standard 上のモック(理想形標準)</span>
+ <span class="d">24–35       dense   1行/agent(案D相当)</span>
+ <span class="d">7–23        micro   グリフ+repo頭字+分数</span>
+ <span class="d">≤6          rail    集計+個別グリフ</span>
+</pre></div>
+      <div class="term"><div class="bar"><span class="dots"><i></i><i></i><i></i></span>同 · width 28(dense に自動縮退)</div><pre>
+ <span class="d">6</span> <span class="r">▲2</span> <span class="g">●1</span> <span class="c">✓1</span> <span class="d">○2</span>
+ <span class="r">▍TRIAGE</span>
+<span class="sel"> <span class="r">▲</span> codex <span class="d">vde</span>  <span class="r">perm</span> <span class="d">2m</span> </span>
+ <span class="r">▲</span> codex <span class="d">obs</span>  <span class="y">wait</span> <span class="d">8m</span>
+ <span class="d">▍FLEET</span>
+ <span class="g">●</span> claude <span class="d">vde</span>      <span class="d">13m</span>
+ <span class="c">✓</span> claude <span class="d">obs</span>        <span class="c">✓</span>
+ <span class="d">○ claude vde        ·</span>
+</pre></div>
+    </div>
+
+    <div class="proseside">
+      <h3>原理① モードの廃止 — 状況が表示を決める</h3>
+      <p>Flat/ByRepo/ByCategory や rail の切替キーをなくし、<strong>幅・高さ・agent 数・attention 有無から表示密度を導出する</strong>。幅を広げれば勝手にリッチに、狭めれば勝手に密になる(左表)。TRIAGE ゾーンは attention が0なら消滅し、FLEET が全域を使う。repo が1つなら repo 見出しも消える。「ユーザーが表示を管理する」仕事自体を削除するのが最大の UX 改善で、5案を「選ぶ」必要もなくなる — 全部が同一 UI の断面になる。</p>
+      <p><strong>スコープ:素の状態は全 category・全 session 横断</strong>(現行 daemon の収集範囲と同じ)。絞り込みはフィルタバー右端の <code>scope ▾</code>(category → repo の2段選択)で行い、<code>—</code> なら全横断。ただし <strong>TRIAGE だけはスコープを貫通して常にグローバル</strong> — 絞り込み中に permission 待ちを見落とすのが最悪ケースなので、スコープ外の attention も行内に <code>codex · work/vde-tmux</code> と出所付きで表示する。category 見出しも自動適応の対象で、category が1つなら非表示、複数あるときだけ repo 見出しに dim で前置(<code>▾ work/vde-tmux · main</code>)し、ネストは深くしない。</p>
+
+      <h3>原理② Fisheye — 選択だけがリッチ、ただし pin は残す</h3>
+      <p>密度(案D)と情報量(案E)のトレードオフは、全行を同じ高さにする前提から生じる。選択行だけを2〜4行(▷レスポンス・task グリフ・subagent)に展開し、非選択行は1行に保てば、<strong>一覧性と詳細性が同時に成立する</strong>。j/k で舐めるだけで各 agent の詳細が流れていく。ratatui は毎フレーム全再描画なので行高の動的変化に技術的障害はない。</p>
+      <p><strong>手動の開閉(Space)は廃止せず「pin」に意味を変えて残す。</strong>選択は一時的な視線、開閉は持続的な関心であり、別物だからだ。「この2体の進捗を見張りながら選択は別の agent を触る」が fisheye 単独では成立しない。行高は3段階:</p>
+      <ul>
+        <li><strong>選択行</strong> — フル展開(▷・task・subagent、2〜4行)。選択が離れたら自動で畳まる。</li>
+        <li><strong>pin 行(Space でトグル、左端に <code>·</code> 等の pin 印)</strong> — 中展開(task グリフ+▷ の2行)を選択がどこにあっても維持。</li>
+        <li><strong>その他</strong> — 常に1行。</li>
+      </ul>
+      <p>pin をフル展開にしないのは密度防衛のため。pin だらけにすると fisheye の前提が崩れるので、中展開に制限した上で、高さが不足したら「最後に触った pin から順に1行へ縮退」する(pin 自体は保持し、余裕が戻れば再展開)。フル詳細が2体以上で常時必要なら、それはもう LIVE ペインの分割か preview の仕事と割り切る。なお repo 見出しの開閉(グループの折りたたみ)は現行どおり残る — こちらは関心の管理そのものなので fisheye と競合しない。</p>
+
+      <h3>原理③ サイドバーから出ない — 行内アクションと LIVE ペイン</h3>
+      <ul>
+        <li><strong>permission への行内応答</strong>:TRIAGE の permission 行で <code>y</code>/<code>n</code> を押すと、対象 pane へ send-keys で応答を送る。何を許可するかはコマンド行(<code>$ cargo sqlx migrate run</code>)と <code>d</code>(diff/コンテキストを floating preview)で確認できる。<em>jump → 応答 → 戻る</em>という往復が1キーになる。サイドバーの利用時間の大半は permission 対応なので、これが理想形の中核。</li>
+        <li><strong>LIVE ペイン</strong>:選択 agent の pane 末尾2〜3行を capture-pane で常時ストリーム表示。「jump する価値があるか」を prompt(過去)でも ▷(要約)でもなく<strong>現在の画面そのもの</strong>で判断できる。</li>
+        <li><strong>worktree spawn/teardown</strong>(<code>w</code>/<code>x</code>)と <code>/</code> 検索、<code>n/N</code> attention 巡回で、agent のライフサイクル全体がサイドバーで完結する。</li>
+      </ul>
+
+      <h3>時間軸の補完</h3>
+      <ul>
+        <li><strong>状態遷移フラッシュ</strong>:変化行を1.5秒 reverse video。</li>
+        <li><strong>イベントログ(<code>e</code> でトグル)</strong>:LIVE ペインを「<code>2m前 codex → permission</code>」の遷移フィードに切替。離席中に何が起きたかを取り戻せる。</li>
+        <li><strong>デスクトップ通知 + rail 点滅</strong>:サイドバーが見えていない/畳んでいる時間をカバー。</li>
+        <li>経過時間は毎分 tick で live 更新、working グリフはスピナー。</li>
+      </ul>
+
+      <div class="pros-cons">
+        <div class="pros"><h4>成立させるための代償</h4><ul>
+          <li>daemon 拡張:▷用の last_response hook、capture-pane ストリーム、遷移イベントバッファ</li>
+          <li>send-keys 応答の安全装置(対象 pane の状態を再確認してから送る)</li>
+          <li>自動変形の境界値はユーザー調整可能にしないと「勝手に変わる」不快感が出る</li>
+        </ul></div>
+        <div class="cons"><h4>それでも残る限界</h4><ul>
+          <li>行高が動く fisheye は視線の安定性と引き換え(選択移動で下が押し流れる)→ 展開は viewport 内に収める scroll 制御が必須</li>
+          <li>permission の行内応答は「読まずに y を叩く」誘惑を生む。コマンド行の常時表示は外せない</li>
+        </ul></div>
+      </div>
+      <div class="impl">段階導入との関係:この理想形は案A(視覚基盤)→ フィルタバー → TRIAGE 分離(案C)→ LIVE ペイン(案D の発展)→ fisheye → 行内応答、の順に積み上げると全段が中間状態として運用可能。つまり Phase 計画の最終到達点をここに置き直せる。</div>
+    </div>
+  </div>
+</section>
+
+<footer class="page">
+  vde-tmux sidebar design proposal · based on f7587a3 · refs: herdr.dev, hiroppy/tmux-agent-sidebar · mocks are 40-column renderings
+</footer>
+
+</div>

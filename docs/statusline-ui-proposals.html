@@ -1,0 +1,516 @@
+<title>vde-tmux statusline 表示案</title>
+<style>
+:root {
+  --bg: #f6f7f5;
+  --fg: #1c2420;
+  --muted: #5c6b63;
+  --card: #ffffff;
+  --border: #dde3de;
+  --accent: #0e8a63;
+  --accent-soft: #e2f2ea;
+  --code-bg: #eef1ee;
+  --t-bg: #0d1117;
+  --t-fg: #c9d1d9;
+  --t-dim: #58636e;
+  --t-red: #f47067;
+  --t-green: #57ab5a;
+  --t-yellow: #c69026;
+  --t-blue: #539bf5;
+  --t-cyan: #39c5cf;
+  --t-magenta: #b083f0;
+  --t-sel: #2d333b;
+  --t-border: #30363d;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131715; --fg: #e2e8e4; --muted: #8fa098; --card: #1a201d;
+    --border: #2a332e; --accent: #41c493; --accent-soft: #1c322a; --code-bg: #212824;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #f6f7f5; --fg: #1c2420; --muted: #5c6b63; --card: #ffffff;
+  --border: #dde3de; --accent: #0e8a63; --accent-soft: #e2f2ea; --code-bg: #eef1ee;
+}
+:root[data-theme="dark"] {
+  --bg: #131715; --fg: #e2e8e4; --muted: #8fa098; --card: #1a201d;
+  --border: #2a332e; --accent: #41c493; --accent-soft: #1c322a; --code-bg: #212824;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+  line-height: 1.75; font-size: 15px;
+}
+.wrap { max-width: 1060px; margin: 0 auto; padding: 0 24px 96px; }
+.mono, pre, code, .sbar { font-family: ui-monospace, "SF Mono", Menlo, "Cascadia Code", monospace; }
+
+header.page { padding: 56px 0 8px; }
+.eyebrow {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--accent); margin: 0 0 12px;
+}
+h1 {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: clamp(26px, 4vw, 38px); line-height: 1.25;
+  letter-spacing: -0.01em; margin: 0 0 12px; text-wrap: balance;
+}
+.lede { color: var(--muted); max-width: 42em; margin: 0; }
+
+nav.toc {
+  position: sticky; top: 0; z-index: 10;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+  margin: 32px -24px 0; padding: 10px 24px;
+  display: flex; gap: 4px; overflow-x: auto; white-space: nowrap;
+}
+nav.toc a {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12.5px; color: var(--muted); text-decoration: none;
+  padding: 4px 10px; border-radius: 4px;
+}
+nav.toc a:hover, nav.toc a:focus-visible { color: var(--accent); background: var(--accent-soft); outline: none; }
+
+section { margin-top: 64px; }
+h2 {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 21px; letter-spacing: -0.01em; margin: 0 0 6px;
+  scroll-margin-top: 64px;
+}
+h2 .idx { color: var(--accent); margin-right: 10px; }
+h3 { font-size: 16px; margin: 28px 0 8px; }
+.sub { color: var(--muted); margin: 0 0 24px; max-width: 46em; }
+p { max-width: 46em; }
+ul { max-width: 46em; padding-left: 1.4em; }
+li { margin: 4px 0; }
+li::marker { color: var(--accent); }
+code { background: var(--code-bg); border-radius: 4px; padding: 0.1em 0.4em; font-size: 0.88em; }
+
+/* ---------- status bar mock ---------- */
+.barwrap { margin: 14px 0 6px; }
+.barwrap .cap {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px; color: var(--muted); margin-top: 6px;
+}
+.sbar {
+  background: var(--t-bg); color: var(--t-fg);
+  border: 1px solid var(--t-border); border-radius: 6px;
+  padding: 6px 10px; font-size: 13px; line-height: 1.6;
+  display: flex; align-items: center; gap: 12px;
+  overflow-x: auto; white-space: nowrap;
+}
+.sbar .mid { flex: 1 1 auto; text-align: center; color: var(--t-dim); min-width: 60px; }
+.sbar .left, .sbar .right { flex: 0 0 auto; }
+.r { color: var(--t-red); }
+.g { color: var(--t-green); }
+.y { color: var(--t-yellow); }
+.b { color: var(--t-blue); }
+.c { color: var(--t-cyan); }
+.m { color: var(--t-magenta); }
+.d { color: var(--t-dim); }
+.w { color: #e6edf3; font-weight: 600; }
+.rev { background: var(--t-sel); padding: 0 4px; border-radius: 3px; font-weight: 600; }
+.pill { background: #1c2733; padding: 0 6px; border-radius: 8px; }
+/* 実運用の pill ビジュアル(vde-tmux-manager 由来) */
+.p { display: inline-block; padding: 0 9px; border-radius: 10px; background: #21262d; color: var(--t-fg); }
+.p-cur { background: #b8b3e8; color: #1c1a2e; font-weight: 700; }
+.p-cat { background: #21262d; }
+.p-cat-a { background: #d9a15c; color: #241a0d; font-weight: 600; }
+.p-win { background: #e6e2d8; color: #232019; font-weight: 600; }
+.p-red { background: #6e2a28; color: #ffd9d6; font-weight: 700; }
+.p-green { background: #1f4d2b; color: #c9f0d0; }
+.p-cyan { background: #124a52; color: #c5eef2; }
+.p-dim { background: #1a1f26; color: var(--t-dim); }
+/* 分割コンパートメント pill: 左=状態色の小区画、右=本体 */
+.pc { display: inline-block; padding: 0 6px; border-radius: 10px 0 0 10px; font-weight: 700; }
+.pc-red { background: #a83a34; color: #fff1f0; }
+.pc-green { background: #2e7d3f; color: #eefaf0; }
+.pc-cyan { background: #1d7a86; color: #ecfbfd; }
+.pb { display: inline-block; padding: 0 9px 0 7px; border-radius: 0 10px 10px 0; }
+.pb-cur { background: #b8b3e8; color: #1c1a2e; font-weight: 700; }
+.pb-cat { background: #21262d; }
+.pb-cat-a { background: #d9a15c; color: #241a0d; font-weight: 600; }
+/* 内側配置(色バリアント): 明るい pill 上の濃色グリフ */
+.in-red { color: #7c1d18; font-weight: 800; }
+
+.proposal {
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--card); padding: 28px; margin-top: 28px;
+  scroll-margin-top: 64px;
+}
+.proposal h2 { margin-bottom: 2px; }
+.proposal .fit { font-size: 13px; color: var(--muted); margin: 0 0 14px; }
+
+.pros-cons { display: flex; gap: 20px; flex-wrap: wrap; margin: 16px 0 0; }
+.pros-cons > div { flex: 1 1 220px; }
+.pros-cons h4 {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase;
+  margin: 0 0 6px; color: var(--muted);
+}
+.pros-cons ul { margin: 0; padding-left: 1.3em; font-size: 13.5px; }
+.pros h4 { color: var(--accent); }
+.cons li::marker { color: var(--muted); }
+.impl {
+  font-size: 13px; color: var(--muted);
+  border-top: 1px dashed var(--border); margin-top: 18px; padding-top: 12px;
+}
+
+.tablewrap { overflow-x: auto; margin: 20px 0; }
+table {
+  border-collapse: collapse; font-size: 13.5px; min-width: 640px;
+  font-variant-numeric: tabular-nums;
+}
+th, td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted); font-weight: 600;
+}
+td.good { color: var(--accent); font-weight: 600; }
+td.bad { color: var(--muted); }
+
+.note {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  padding: 12px 16px; border-radius: 0 8px 8px 0;
+  font-size: 13.5px; max-width: 46em; margin: 20px 0;
+}
+.note p { margin: 0; }
+
+footer.page {
+  margin-top: 80px; padding-top: 20px; border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 12.5px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+</style>
+
+<div class="wrap">
+
+<header class="page">
+  <p class="eyebrow">design proposal · 2026-07</p>
+  <h1>vde-tmux statusline<br>表示形式の再設計 4案</h1>
+  <p class="lede">現行実装(statusline-sessions / statusline-category / statusline-agent-badge の3コマンド構成)の調査と、<strong>実運用スクリーンショット(vde-tmux-manager ベースの pill スタイル)</strong>に基づき、tmux ステータスバーの役割定義から表示・運用・アーキテクチャまでを見直す。全案が「アイコン pill のカテゴリ + index 付きセッション + current pill」という現行のビジュアル言語を継承し、その上にサイドバー再設計(Plan 13〜17)と共有する状態語彙(▲●✓○)を重ねる。</p>
+</header>
+
+<nav class="toc">
+  <a href="#role">役割定義</a>
+  <a href="#current">現状と課題</a>
+  <a href="#premise">共通前提</a>
+  <a href="#plan-a">案A グリフ注入</a>
+  <a href="#plan-b">案B 状態pill</a>
+  <a href="#plan-c">案C 例外チャネル</a>
+  <a href="#plan-d">案D カテゴリ集約</a>
+  <a href="#arch">アーキテクチャ</a>
+  <a href="#fixes">修正・機能表</a>
+  <a href="#reco">推奨</a>
+</nav>
+
+<!-- ================================================== 役割 -->
+<section id="role">
+  <h2><span class="idx">00</span>ステータスバーはどうあるべきか</h2>
+  <p>サイドバー再設計後の世界では、両者の役割分担を先に決めないと表示項目が決められない。結論から言うと:</p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th></th><th>サイドバー(Plan 13〜17)</th><th>ステータスバー</th></tr></thead>
+    <tbody>
+      <tr><td>性格</td><td>triage と操作の場。開いているときだけ存在</td><td><strong>常時視界にある1行</strong>。閉じられない・操作は最小</td></tr>
+      <tr><td>答える問い</td><td>「どれから対応するか」「今どこまで進んだか」</td><td>「<strong>今いる場所はどこか</strong>」「<strong>視界の外で何かが自分を待っていないか</strong>」</td></tr>
+      <tr><td>情報の深さ</td><td>agent 単位、prompt・進捗・LIVE まで</td><td>集約値と例外のみ。詳細はサイドバー/jump に委譲</td></tr>
+      <tr><td>面積</td><td>幅40列 × 全高</td><td>数十セル。1セルが貴重</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>つまりステータスバーの本質は「<strong>現在地の表示</strong>」と「<strong>不在検知の安全網</strong>(サイドバーを閉じている・別 session にいるときに attention を取りこぼさない)」の2つで、それ以外は全部ノイズ候補。現行の3コマンドをこの物差しで評価し直すのが本提案の軸になる。</p>
+</section>
+
+<!-- ================================================== 現状 -->
+<section id="current">
+  <h2><span class="idx">01</span>現状の表示と課題</h2>
+  <p class="sub">実運用(vde-tmux-manager + dotfiles)のスクリーンショットを再現したもの。カテゴリは <code>display_names</code> でアイコン化された pill(アクティブ = オレンジ)、続いて現 category のセッションが index 付きで並び、current session がラベンダーの pill。右端に window pill。</p>
+
+  <div class="barwrap">
+    <div class="sbar">
+      <span class="left"><span class="p p-cat">🏠</span> <span class="p p-cat-a">🌐</span>  <span class="d">1</span> duel-logger  <span class="d">2</span> opener-rate  <span class="d">3</span> vde-monitor  <span class="p p-cur">4 vde-tmux</span></span>
+      <span class="mid"></span>
+      <span class="right"><span class="p p-win">1 node</span></span>
+    </div>
+    <div class="cap">現行の実運用。pill の見た目は dotfiles 側の prefix/suffix/colors 設定 + display_names(アイコン)で実現されている</div>
+  </div>
+  <div class="barwrap">
+    <div class="sbar">
+      <span class="left"> 🔴 1:main  2:sub </span>
+      <span class="mid">1:nvim  2:zsh*</span>
+      <span class="right"><span class="d">private work</span>  running:2</span>
+    </div>
+    <div class="cap">参考: vde-tmux(新実装)を素の config で使った場合の出力。pill も色も付かない</div>
+  </div>
+
+  <p>つまり「見た目の骨格」は既に dotfiles 側で完成しており、vde-tmux 新実装はそれを <code>#()</code> の呼び先差し替えで再現できる状態にある(migration.md の M7)。<strong>本提案の主眼は pill の骨格を壊さずに「agent の状態」をこのバーに正しく載せること</strong>になる。</p>
+
+  <h3>調査で確認した課題</h3>
+  <ul>
+    <li><strong>情報の重複</strong> — session badge(🔴 = blocked あり)と <code>running:2</code>(agent-badge)は同じ「agent の状態」を別の粒度・別の記法で二重表示している。しかも後者は英語ラベルで語彙が揃っていない。</li>
+    <li><strong>category に件数がない</strong> — <code>private work</code> と名前を列挙するだけで、「そこに何があるか」を何も伝えない。現在地表示としても弱い(active 色も既定では付かない)。</li>
+    <li><strong>current session が既定で無区別</strong> — <code>current</code>/<code>other</code> のスタイル既定が同一。バッジ以外にカレントを示すものがない。</li>
+    <li><strong>絵文字幅問題</strong> — 🔴🟡 の幅揺れを <code>suffix: " "</code> で帳尻合わせしている(plan-09 に対症療法と明記あり)。サイドバー(Plan 13)は ▲●✓○ に移行するため、放置すると語彙が分裂する。</li>
+    <li><strong>dead config</strong> — <code>statusline.agent_badge.enabled</code> はどこからも読まれていない(README には設定例として載っている)。<code>SegmentColors.outer_bg</code> も定義のみで未配線。</li>
+    <li><strong>stale バッジ</strong> — daemon がクラッシュすると <code>@vde_session_status</code> に最後の値が残り続け、「生きているように見える」偽表示になる。</li>
+    <li><strong>更新遅延が暗黙前提</strong> — 反映は daemon poll(1s)+ tmux status-interval の合成。status-interval の推奨値がどこにも書かれていない。</li>
+    <li><strong>クリック非対応</strong> — <code>switch &lt;n&gt;</code> サブコマンドはあるが <code>#[range=...]</code> を生成しないため、クリック切替は利用者の自作頼み。</li>
+  </ul>
+</section>
+
+<!-- ================================================== 前提 -->
+<section id="premise">
+  <h2><span class="idx">02</span>共通前提 — 現行ビジュアルの継承とサイドバーとの語彙統一</h2>
+  <p class="sub">4案すべてに共通する前提。個別の案を選ぶ前に、これだけは確定させるべきもの。</p>
+  <ul>
+    <li><strong>pill の骨格は壊さない</strong>: 「カテゴリ = アイコン pill」「セッション = index + 名前」「current = 塗り pill」「window = 右端 pill」という現行の文法は維持する。提案が加えるのは状態(▲●✓○)のレイヤーだけ。pill 装飾は引き続き dotfiles(prefix/suffix/colors)の管轄とし、vde-tmux 側は素材(プレースホルダと状態値)を供給する。</li>
+    <li><strong>グリフと色の統一</strong>: ▲(blocked・赤)/ ●(working・緑)/ ✓(done・シアン)/ ○(idle・無彩)。<code>badge.glyphs</code> は sidebar と共有の top-level 設定なので、<strong>Plan 13 の既定値変更で自動的に単幅グリフ化されるのは session badge のみ</strong>。agent-badge(<code>running:N</code>)の summary 置換と <code>suffix: " "</code> の既定変更は明示作業として必要。</li>
+    <li><strong>件数表記の統一</strong>: サイドバーのフィルタバー(Plan 17)・rail と同じ <code>▲2 ●1</code> 形式。<code>running:2</code> 表記は廃止。</li>
+    <li><strong>agent-badge コマンドの再定義</strong>: 現行 <code>vt statusline-agent-badge</code>(<code>running:2</code>)を、状態別カウント <code>▲2 ●1</code>(0件は省略、tmux 色マークアップ付き)を出す <code>vt statusline summary</code> に置き換える。dead config の <code>agent_badge.enabled</code> はこのタイミングで整理。</li>
+    <li><strong>current session の既定スタイル</strong>: config 未設定でも bold + 色が付く既定に変える(現行は「設定しなければ全部同じ見た目」)。</li>
+  </ul>
+
+  <h3>サイドバーとの併用整合 — pill とフラットは共存できる</h3>
+  <p>ステータスバーは「クローム」(常設の装飾面)、サイドバーは「コンテンツペイン」(密度優先の作業面)であり、質感が違うこと自体は正しい(VS Code のアクティビティバーとエクスプローラの関係と同じ)。両者を繋ぐのは見た目の統一ではなく語彙の統一で、次の4ルールを守れば違和感は出ない:</p>
+  <ul>
+    <li><strong>状態4色(赤・緑・シアン・無彩)は状態専用に予約</strong>。装飾 pill はラベンダー・オレンジ・クリーム等、状態色と被らない色相に留める(現行配色は既に満たしている)。</li>
+    <li><strong>塗り背景の意味は「現在地/選択」と「警報(赤のみ)」の2つに限定</strong>。バーの current pill ↔ サイドバーの選択行 bg、案Cの赤 pill ↔ TRIAGE の赤見出しが、それぞれ同じ文法として対応する。</li>
+    <li><strong>グリフは両面で同一セット・同一色</strong>(<code>badge.glyphs</code> 共有で自動担保)。</li>
+    <li><strong>状態グリフは pill と一体化させ、浮かせない</strong>。裸のグリフを pill の外に置くと所属が曖昧になり pill 列のリズムから浮く。かといって状態色をそのまま装飾背景に直置きするとコントラストが崩れる。解は2つ:
+      <br>(a) <strong>内側 + 色バリアント(推奨・既定)</strong> — pill 内にグリフを置き、背景の明度に応じた濃色/明色バリアントを使う(<span class="mono"><span class="p p-cur"><span class="in-red">▲</span> 4 vde-tmux</span></span>)。pill の一体感を保ち、実装も最軽量
+      <br>(b) <strong>分割コンパートメント(opt-in)</strong> — pill 左端にバッジ専用の状態色区画を融合(<span class="mono"><span class="pc pc-red">▲</span><span class="pb pb-cur">4 vde-tmux</span></span>)。powerline 的でより主張が強い
+      <br>非 pill 要素(通常セッションの <code>●2 opener-rate</code>)は従来どおり裸のグリフ前置でよい — 地の上なら浮かない。</li>
+  </ul>
+  <p>この観点で唯一要注意なのが案B(State Pills): pill の塗りを状態色にするため「塗り=現在地」の文法が崩れ、装飾 pill と意味が衝突する。案Bを opt-in に留める理由はここにある。</p>
+</section>
+
+<!-- ================================================== 案A -->
+<section class="proposal" id="plan-a">
+  <h2><span class="idx">A</span>Glyph Injection — 現行 pill に状態グリフを注入</h2>
+  <p class="fit">向くケース:今の見た目をほぼ変えたくない / まず最小の手数で agent 状態をバーに載せたい</p>
+
+  <div class="barwrap">
+    <div class="sbar">
+      <span class="left"><span class="p p-cat">🏠</span> <span class="p p-cat-a"><span class="in-red">▲</span> 🌐</span>  <span class="d">○</span><span class="d">1</span> duel-logger  <span class="g">●</span><span class="d">2</span> opener-rate  <span class="c">✓</span><span class="d">3</span> vde-monitor  <span class="p p-cur"><span class="in-red">▲</span> 4 vde-tmux</span></span>
+      <span class="mid"></span>
+      <span class="right"><span class="r">▲1</span> <span class="g">●1</span> <span class="c">✓1</span> <span class="d">○1</span>  <span class="p p-win">1 node</span></span>
+    </div>
+    <div class="cap">推奨配置(内側 + 色バリアント): グリフは pill 内、明るい pill には濃色バリアント。非 pill のセッションは裸のグリフ前置のまま</div>
+  </div>
+  <div class="barwrap">
+    <div class="sbar">
+      <span class="left"><span class="p p-cat">🏠</span> <span class="pc pc-red">▲</span><span class="pb pb-cat-a">🌐</span>  <span class="d">○</span><span class="d">1</span> duel-logger  <span class="g">●</span><span class="d">2</span> opener-rate  <span class="c">✓</span><span class="d">3</span> vde-monitor  <span class="pc pc-red">▲</span><span class="pb pb-cur">4 vde-tmux</span></span>
+      <span class="mid"></span>
+      <span class="right"><span class="r">▲1</span> <span class="g">●1</span> <span class="c">✓1</span> <span class="d">○1</span>  <span class="p p-win">1 node</span></span>
+    </div>
+    <div class="cap">代替配置(分割コンパートメント): pill 左端に状態色の小区画を融合。より主張が強い opt-in</div>
+  </div>
+  <div class="barwrap">
+    <div class="sbar">
+      <span class="left"><span class="p p-cat">🏠</span> <span class="r">▲</span><span class="p p-cat-a">🌐</span>  <span class="d">1</span> duel-logger  <span class="d">…</span>  <span class="r">▲</span><span class="p p-cur">4 vde-tmux</span></span>
+      <span class="mid"></span>
+      <span class="right"><span class="d">(参考・不採用)</span></span>
+    </div>
+    <div class="cap">不採用(外側の裸グリフ): 所属が曖昧で pill 列から浮く</div>
+  </div>
+
+  <ul>
+    <li><strong>セッションへのグリフ前置は実は実装済み</strong>(session badge の前置、`{badge}{label}`)。Plan 13 の <code>badge.glyphs</code> 既定変更で 🔴→▲ になり、単幅化で幅ズレも消える。<strong>idle(○)も既定で表示する</strong> — これにより無印の意味が「agent なし」だけに純化され、「idle の agent が居る」と「agent が居ない」が一目で区別できる(agent の居ない session は現実装でも daemon がバッジを書かないため無印)。静かにしたい人向けに <code>hide_idle_badge: true</code> オプションを用意(既定 false)。</li>
+    <li><strong>pill 付き要素(current session・カテゴリ)のバッジは内側配置</strong>: グリフを pill 内に置き、pill 背景の明度に応じた状態色バリアント(ラベンダー上は深紅等)を使う(併用整合ルール4)。renderer が badge 部分に個別 fg(<code>#[fg=&lt;state_variant&gt;]▲#[fg=&lt;label_fg&gt;]</code>、bg は pill のまま)を出す <code>badge_style: inline | compartment | plain</code> の新設が必要(既定 inline)。compartment(左端の状態色区画)はより主張の強い opt-in。</li>
+    <li><strong>カテゴリの最悪状態グリフ</strong>: category format に <code>{badge}</code> プレースホルダを追加し、そのカテゴリ所属 session の badge の min(最悪値)を注入(新実装)。非アクティブカテゴリ(🏠)にも ▲ が付けば「別カテゴリで待たれている」が icon レベルで分かる。</li>
+    <li>右端に summary(<code>▲1 ●1</code>、0件省略)。<code>running:2</code> は廃止。</li>
+  </ul>
+  <div class="pros-cons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>dotfiles の pill 設定を1文字も変えずに移行できる(グリフは既存プレースホルダに乗る)</li>
+      <li>カテゴリ icon への状態伝播で「視界の外」がカテゴリ粒度まで見える</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>「どの session が待っているか」は現 category 外だと分からない(カテゴリ粒度止まり)</li>
+      <li>グリフの分だけ左側が最大4〜5セル伸びる</li>
+    </ul></div>
+  </div>
+  <div class="impl">実装: badge_style(inline)+ hide_idle_badge + summary コマンド + dead config 配線で規模感 中。category への <code>{badge}</code> はグリフ→BadgeState の逆引きか構造化経路が必要(中〜大)なため確定計画では Step 5 送り(§05 参照)。</div>
+</section>
+
+<!-- ================================================== 案B -->
+<section class="proposal" id="plan-b">
+  <h2><span class="idx">B</span>State Pills — pill の色そのものが状態を語る</h2>
+  <p class="fit">向くケース:グリフの文字を増やしたくない / pill の色彩をもう一段活用したい / 一瞥での判別速度を最優先</p>
+
+  <div class="barwrap">
+    <div class="sbar">
+      <span class="left"><span class="p p-cat">🏠</span> <span class="p p-cat-a">🌐</span>  <span class="p p-dim">1 duel-logger</span> <span class="p p-green">2 opener-rate</span> <span class="p p-cyan">3 vde-monitor</span> <span class="p p-red">4 vde-tmux</span></span>
+      <span class="mid"></span>
+      <span class="right"><span class="p p-win">1 node</span></span>
+    </div>
+    <div class="cap">全セッションを pill 化し、背景色 = 状態(赤=blocked / 緑=working / シアン=done / 暗=idle)。current は太字+明度で区別</div>
+  </div>
+
+  <ul>
+    <li>セッションを全て pill にし、<strong>pill の背景色を badge 状態に連動</strong>させる: blocked=赤 / working=緑 / done=シアン / idle=暗色。current session は同色系の高明度 + 太字。</li>
+    <li>グリフ文字を足さないため幅の増加はゼロ。色だけで「どの session が待っているか」が icon 的に分かる。</li>
+    <li>実現には vde-tmux 側に <strong>状態別カラーセット</strong>(<code>sessions.state_colors.{blocked,working,done,idle}</code> で fg/bg を指定し、`{session}` セグメントのスタイル解決時に badge 状態で切り替える)の新設が必要。pill の丸め(prefix/suffix)は従来どおり dotfiles。</li>
+  </ul>
+  <div class="pros-cons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>判別速度が最速(色面 > グリフ > テキスト)。幅コストゼロ</li>
+      <li>「バーの中に rail がある」状態になり、サイドバー rail と完全に同じ語彙</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>色覚特性・配色テーマとの相性問題をグリフなしで受けることになる(A のグリフ併用で緩和可能)</li>
+      <li>state_colors の新設 + スタイル解決の条件分岐で、4案中では statusline 側の改修が最大</li>
+      <li>current の区別が「明度差」になり、赤 pill(blocked)と赤系 current の衝突に配色設計が要る</li>
+    </ul></div>
+  </div>
+  <div class="impl">実装: SegmentStyle の状態別解決(state_colors)+ current との合成規則。規模感 中。</div>
+</section>
+
+<!-- ================================================== 案C -->
+<section class="proposal" id="plan-c">
+  <h2><span class="idx">C</span>Exception Channel — 右端に「よそで待たれているもの」だけ</h2>
+  <p class="fit">向くケース:サイドバー(TRIAGE)主力で、status bar は不在検知の安全網に徹させたい / 左側は現行のまま一切触りたくない</p>
+
+  <div class="barwrap">
+    <div class="sbar">
+      <span class="left"><span class="p p-cat">🏠</span> <span class="p p-cat-a">🌐</span>  <span class="d">1</span> duel-logger  <span class="d">2</span> opener-rate  <span class="d">3</span> vde-monitor  <span class="p p-cur">4 vde-tmux</span></span>
+      <span class="mid"></span>
+      <span class="right"><span class="p p-red">▲ llm-proxy · perm 2m</span> <span class="g">●2</span>  <span class="p p-win">1 node</span></span>
+    </div>
+    <div class="cap">左は現行のまま。右に「現在 attach していない session の blocked」を赤 pill で名指し + 残りは集約</div>
+  </div>
+  <div class="barwrap">
+    <div class="sbar">
+      <span class="left"><span class="p p-cat">🏠</span> <span class="p p-cat-a">🌐</span>  <span class="d">1</span> duel-logger  <span class="d">2</span> opener-rate  <span class="d">3</span> vde-monitor  <span class="p p-cur">4 vde-tmux</span></span>
+      <span class="mid"></span>
+      <span class="right"><span class="g">●3</span> <span class="c">✓1</span>  <span class="p p-win">1 node</span></span>
+    </div>
+    <div class="cap">例外が無いとき: 右は静かな集約だけに縮む</div>
+  </div>
+
+  <ul>
+    <li>左側(カテゴリ pill + セッション列挙)は現行のまま。<strong>右端に <code>vt statusline attention</code> を追加するだけ</strong>の増築案。</li>
+    <li>出力は「現在 attach していない session の blocked」を <code>▲ {session} · {reason} {経過}</code> で名指し(最も古い1件 + <code>+N</code>)、それ以外は集約値(<code>●2 ✓1</code>)。blocked が無ければ集約のみ。</li>
+    <li>「見えている場所の問題は報せない。見えていない場所の問題だけ報せる」— サイドバーの TRIAGE(スコープ貫通)と対になる通知設計。</li>
+    <li>データは daemon Query(wait_reason・経過は daemon が持つ)+ agent-badge と同じ list-panes フォールバックの2段構え。</li>
+  </ul>
+  <div class="pros-cons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>平常時は最小、異常時だけ具体的 — 注意資源の使い方が最も正しい</li>
+      <li>左側の運用(index 切替・pill 装飾)に一切触れない純増築</li>
+      <li>Plan 15(TRIAGE)完了後なら daemon 側に blocked 集合が既にあり実装が薄い</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>右端の幅が動的に変わり、window pill の位置がガタつく(固定幅確保オプションで緩和)</li>
+      <li>daemon 停止時は例外チャネルが沈黙する(heartbeat での stale 表示が前提)</li>
+    </ul></div>
+  </div>
+  <div class="impl">実装: <code>vt statusline attention</code> 新設のみ。規模感 小〜中(daemon Query 拡張含む)。</div>
+</section>
+
+<!-- ================================================== 案D -->
+<section class="proposal" id="plan-d">
+  <h2><span class="idx">D</span>Category Dashboard — アイコン pill を集約器にする</h2>
+  <p class="fit">向くケース:session 数が増えて列挙が window リストを圧迫し始めた / カテゴリ単位の把握が主で session 名は current だけ見えればよい</p>
+
+  <div class="barwrap">
+    <div class="sbar">
+      <span class="left"><span class="p p-cat">🏠 <span class="d">2</span></span> <span class="p p-cat-a"><span class="in-red">▲</span> 🌐 <span class="d">4</span></span>  <span class="p p-cur"><span class="in-red">▲</span> 4 vde-tmux</span></span>
+      <span class="mid">1:nvim  2:zsh*  3:codex</span>
+      <span class="right"><span class="r">▲1</span> <span class="g">●2</span>  <span class="p p-win">1 node</span></span>
+    </div>
+    <div class="cap">カテゴリ pill = 内側バッジ(最悪状態)+ アイコン + session 数。セッション列挙をやめ current pill だけ残す</div>
+  </div>
+
+  <ul>
+    <li>セッション列挙を畳み、<strong>カテゴリ pill を「内側バッジ(最悪状態)+ アイコン + 件数」のダッシュボード</strong>に昇格させる: <code>[▲ 🌐 4]</code> = 「web カテゴリに4 session、うち blocked あり」。</li>
+    <li>current session は pill 1つだけ残す(現在地表示)。session 単位の把握と切替は session-manager popup / サイドバーに委譲。</li>
+    <li>index 切替は「カテゴリ切替(<code>statusline-category switch</code>)+ popup」の2段になる。<strong>index 直打ち切替の運用を手放せるかがこの案の分水嶺</strong>。</li>
+  </ul>
+  <div class="pros-cons">
+    <div class="pros"><h4>Pros</h4><ul>
+      <li>session 数に対して幅が一定(カテゴリ数にしか比例しない)。window リストに最大面積</li>
+      <li>カテゴリ横断の状態が icon 列で一望でき、B/C の要素(色・例外)とも併用可能</li>
+    </ul></div>
+    <div class="cons"><h4>Cons</h4><ul>
+      <li>index 即切替の筋肉記憶を壊す(最大の代償)</li>
+      <li>「どの session か」の解決に必ず1ホップ要る</li>
+    </ul></div>
+  </div>
+  <div class="impl">実装: category format への <code>{count}</code>/<code>{badge}</code> 追加(案Aと共通)+ sessions の current-only モード。規模感 小〜中。</div>
+</section>
+
+<!-- ================================================== アーキテクチャ -->
+<section id="arch">
+  <h2><span class="idx">03</span>運用アーキテクチャ — #() 継続か option bus か</h2>
+  <p class="sub">表示案と独立に決められる、更新の仕組みの選択。</p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th></th><th>現行: <code>#(vt ...)</code> コマンド置換</th><th>提案: option bus 配信</th></tr></thead>
+    <tbody>
+      <tr><td>仕組み</td><td>status-interval ごとに tmux が vt を fork して stdout を埋め込む</td><td>daemon が描画済み文字列を <code>@vde_statusline_left/right</code> に書き、tmux.conf は <code>#{E:@vde_statusline_left}</code> を参照</td></tr>
+      <tr><td>更新コスト</td><td>interval ごとにプロセス起動 ×コマンド数(sessions + category + summary で3 fork/interval)</td><td class="good">daemon の poll 内で差分時のみ set-option。fork ゼロ</td></tr>
+      <tr><td>反映遅延</td><td>poll_ms + status-interval</td><td class="good">poll_ms + status-interval(同じだが fork 分の揺らぎがない)</td></tr>
+      <tr><td>daemon 停止時</td><td>sessions/category は素で動く(badge のみ stale)</td><td class="bad">文字列全体が stale — <strong>heartbeat が必須</strong>(下記)</td></tr>
+      <tr><td>実装の場所</td><td>CLI(現行のまま)</td><td>daemon の effect に <code>SetStatusline</code> を追加。session badge と同じ経路(<code>@vde_session_status</code> の前例あり)</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><strong>stale 対策(どちらの構成でも入れるべき)</strong>: daemon が poll ごとに <code>@vde_heartbeat</code>(epoch)を書き、描画側は heartbeat が5秒より古ければバッジ・サマリを dim の <code>?</code> に落とす。「daemon が死んでいるのに元気そうに見える」現行の偽表示を潰す。加えて shutdown 時の全消去(既存)はそのまま。</p>
+  <p>推奨は「<strong>当面 #() を維持し、Plan 17 完了後に option bus へ移行</strong>」。理由: option bus は daemon への一極化を進める設計で、statusline の daemon 依存を高める。sessions/category が daemon 無しで動く現行の頑健さは、daemon 自体の安定運用が実証されるまで保険として残す価値がある。status-interval は <code>1</code> 推奨を README に明記する(現状どこにも書かれていない)。</p>
+</section>
+
+<!-- ================================================== 修正表 -->
+<section id="fixes">
+  <h2><span class="idx">04</span>表示案と独立に行うべき修正・機能</h2>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>優先</th><th>項目</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>高</td><td>グリフ語彙の統一</td><td>Plan 13 の <code>badge.glyphs</code> 既定変更で自動反映されるのは session badge のみ。<code>suffix</code> 既定の <code>" "</code> → <code>""</code> 変更は明示作業(Step 1)</td></tr>
+      <tr><td>高</td><td>dead config の整理</td><td><code>agent_badge.enabled</code> を実際に配線する(summary コマンドのゲートに)。<code>SegmentColors.outer_bg</code> は<strong>削除に傾く</strong> — <code>SegmentColors</code> に <code>deny_unknown_fields</code> は無く、削除しても既存 config はエラーにならない。pill 接続機能の予定が立たない限り dead field は消す</td></tr>
+      <tr><td>高</td><td>current の既定スタイル</td><td><code>current</code> 既定を bold + reverse 相当に。「設定しないと区別できない」既定をやめる</td></tr>
+      <tr><td>中</td><td>category 件数</td><td><code>{count}</code> プレースホルダ追加(案A採用時は必須)</td></tr>
+      <tr><td>中</td><td>heartbeat / stale 表示</td><td><code>@vde_heartbeat</code> + 5秒閾値で dim <code>?</code> 化</td></tr>
+      <tr><td>中</td><td>status-interval 推奨の文書化</td><td>README に <code>set -g status-interval 1</code> と遅延の説明を記載</td></tr>
+      <tr><td>低</td><td>クリック対応</td><td><code>--click</code> フラグで <code>#[range=user|vde:switch:N]...#[norange]</code> を生成し、bind 例を README に。tmux 3.x の range マークアップ前提</td></tr>
+      <tr><td>低</td><td>window-status バッジ</td><td>plan-09 で non-goal とされた window 単位表示。サイドバーが pane 単位を担うため、引き続き見送りを推奨</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ================================================== 推奨 -->
+<section id="reco">
+  <h2><span class="idx">05</span>推奨と進め方</h2>
+  <div class="note"><p><strong>推奨: 案A(グリフ注入)+ 案C(例外チャネル)の組み合わせを既定とし、案B(state pill)は <code>state_colors</code> の opt-in 機能として提供する。</strong>A は現行の pill 骨格・index 切替・dotfiles 設定を一切壊さず、Plan 13 のグリフ統一にほぼ相乗りできる。C は左側に触れない純増築で、サイドバー TRIAGE の対になる。B は判別速度で最強だが改修が最大なので、A+C 運用後に「グリフでは物足りない」と感じた場合の強化として位置づける。D(カテゴリ集約)は session 数が列挙に耐えなくなったときの縮退先として config で選べるようにしておく。</p></div>
+
+  <div class="barwrap">
+    <div class="sbar">
+      <span class="left"><span class="p p-cat">🏠</span> <span class="p p-cat-a"><span class="in-red">▲</span> 🌐</span>  <span class="d">○</span><span class="d">1</span> duel-logger  <span class="g">●</span><span class="d">2</span> opener-rate  <span class="c">✓</span><span class="d">3</span> vde-monitor  <span class="p p-cur"><span class="in-red">▲</span> 4 vde-tmux</span></span>
+      <span class="mid"></span>
+      <span class="right"><span class="p p-red">▲ llm-proxy · perm 2m</span> <span class="g">●2</span>  <span class="p p-win">1 node</span></span>
+    </div>
+    <div class="cap">推奨形(A+C): pill 付き要素は内側バッジ(色バリアント)、非 pill はグリフ前置。右によそ見用の例外チャネル</div>
+  </div>
+
+  <ul>
+    <li><strong>Step 1(Plan 13 完了後)</strong>: session badge 単幅化の確認、<code>suffix</code> 既定を空へ、<code>hide_idle_badge</code>(既定 false = ○ 表示)、current session の既定スタイル。</li>
+    <li><strong>Step 2(summary 置換)</strong>: <code>vt statusline summary</code>(<code>▲2 ●1</code> 形式・色付き)で agent-badge を置換し、<code>agent_badge.enabled</code> をここで配線。</li>
+    <li><strong>Step 3(案A-lite)</strong>: <code>badge_style: inline | plain</code>(既定 inline)と category <code>{count}</code>。</li>
+    <li><strong>Step 4(Plan 15 完了後)</strong>: <code>vt statusline attention</code>(fallback でも wait_reason/経過は表示可、unread のみ daemon 限定)+ heartbeat(閾値 <code>max(5s, poll_ms×3)</code>)/ stale 表示 + <code>status-interval 1</code> の文書化。</li>
+    <li><strong>Step 5(再評価ゲート)</strong>: category <code>{badge}</code>(attention チャネルの下位互換になるため不要判定が濃厚)、案B <code>state_colors</code>、案D current-only、option bus、<code>outer_bg</code> 削除、クリック対応。</li>
+  </ul>
+  <p>この Step 構成は Codex セカンドオピニオン評価(2026-07-05)を反映した確定版(詳細な反映記録と DoD は <code>docs/statusline-ui-proposals.md</code> §7)。Step 4 は Plan 15 の成果物(runtime の triage 集合)に相乗りできるため、sidebar ロードマップの後に Plan 18 として実装計画化する。dotfiles 側(M7 の `vtm`→`vt` 切替)とはプレースホルダ互換を保つため、既存の pill 装飾はそのまま移行できる。</p>
+</section>
+
+<footer class="page">
+  vde-tmux statusline design proposal · based on f7587a3 · aligned with sidebar redesign (Plan 13–17)
+</footer>
+
+</div>
