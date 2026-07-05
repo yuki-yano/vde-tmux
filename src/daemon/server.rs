@@ -411,6 +411,18 @@ fn handle_runtime_effects(
                     eprintln!("[vde-tmux] session state clear failed: {error:#}");
                 }
             }
+            RuntimeEffect::Heartbeat(epoch) => {
+                if let Err(error) =
+                    worker_io.set_global_option(crate::options::KEY_HEARTBEAT, &epoch.to_string())
+                {
+                    eprintln!("[vde-tmux] heartbeat set failed: {error:#}");
+                }
+            }
+            RuntimeEffect::ClearHeartbeat => {
+                if let Err(error) = worker_io.unset_global_option(crate::options::KEY_HEARTBEAT) {
+                    eprintln!("[vde-tmux] heartbeat clear failed: {error:#}");
+                }
+            }
             RuntimeEffect::Notify {
                 pane_id,
                 agent,
@@ -587,6 +599,7 @@ mod tests {
         jumps: std::sync::Mutex<Vec<String>>,
         previews: std::sync::Mutex<Vec<(String, u32)>>,
         session_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
+        global_options: std::sync::Mutex<Vec<(String, Option<String>)>>,
         notify_calls: std::sync::Mutex<Vec<(String, String, String, String)>>,
         fail_jump: bool,
     }
@@ -630,6 +643,22 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((session.to_string(), key.to_string(), None));
+            Ok(())
+        }
+
+        fn set_global_option(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.global_options
+                .lock()
+                .unwrap()
+                .push((key.to_string(), Some(value.to_string())));
+            Ok(())
+        }
+
+        fn unset_global_option(&self, key: &str) -> anyhow::Result<()> {
+            self.global_options
+                .lock()
+                .unwrap()
+                .push((key.to_string(), None));
             Ok(())
         }
 

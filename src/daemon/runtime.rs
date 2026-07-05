@@ -67,6 +67,8 @@ pub enum RuntimeEffect {
     ClearSessionBadge {
         session: String,
     },
+    Heartbeat(i64),
+    ClearHeartbeat,
     Notify {
         pane_id: String,
         agent: String,
@@ -161,6 +163,7 @@ pub struct RuntimeState {
     events: VecDeque<TransitionEvent>,
     flash: BTreeMap<String, u8>,
     written_badges: BTreeMap<String, (String, String)>,
+    last_heartbeat: i64,
 }
 
 impl RuntimeState {
@@ -184,6 +187,7 @@ impl RuntimeState {
             events: VecDeque::new(),
             flash: BTreeMap::new(),
             written_badges: BTreeMap::new(),
+            last_heartbeat: 0,
         }
     }
 
@@ -213,6 +217,7 @@ impl RuntimeState {
                 self.broadcast_if_needed();
                 let mut effects = transition_effects;
                 effects.extend(self.sync_session_badges());
+                effects.extend(self.sync_heartbeat());
                 effects
             }
             DaemonEvent::GitStatusUpdated(git_badges) => {
@@ -235,13 +240,14 @@ impl RuntimeState {
             DaemonEvent::Shutdown => {
                 self.running = false;
                 self.clients.values().for_each(|slot| slot.close());
-                let effects = self
+                let mut effects = self
                     .written_badges
                     .keys()
                     .map(|session| RuntimeEffect::ClearSessionBadge {
                         session: session.clone(),
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                effects.push(RuntimeEffect::ClearHeartbeat);
                 self.written_badges.clear();
                 effects
             }
@@ -721,6 +727,15 @@ impl RuntimeState {
         format_attention(&entries)
     }
 
+    fn sync_heartbeat(&mut self) -> Vec<RuntimeEffect> {
+        let now = now_epoch_secs();
+        if now == self.last_heartbeat {
+            return Vec::new();
+        }
+        self.last_heartbeat = now;
+        vec![RuntimeEffect::Heartbeat(now)]
+    }
+
     fn broadcast_if_needed(&mut self) {
         if !self.should_push() {
             return;
@@ -781,6 +796,14 @@ mod tests {
             tasks: String::new(),
             subagents: String::new(),
         }
+    }
+
+    fn without_heartbeat(effects: &[RuntimeEffect]) -> Vec<RuntimeEffect> {
+        effects
+            .iter()
+            .filter(|effect| !matches!(effect, RuntimeEffect::Heartbeat(_)))
+            .cloned()
+            .collect()
     }
 
     fn chat_flash(state: &RuntimeState, pane_id: &str) -> bool {
@@ -1369,7 +1392,7 @@ mod tests {
             "main", "%1", "running",
         )]));
         assert_eq!(
-            effects,
+            without_heartbeat(&effects),
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
                 value: "●".to_string(),
@@ -1417,7 +1440,7 @@ mod tests {
         let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
             "main", "%1", "running",
         )]));
-        assert!(effects.is_empty());
+        assert!(without_heartbeat(&effects).is_empty());
     }
 
     #[test]
@@ -1430,7 +1453,7 @@ mod tests {
             "main", "%1", "idle",
         )]));
         assert_eq!(
-            effects,
+            without_heartbeat(&effects),
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
                 value: "✓".to_string(),
@@ -1443,7 +1466,7 @@ mod tests {
         viewed.session_attached = true;
         let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![viewed]));
         assert_eq!(
-            effects,
+            without_heartbeat(&effects),
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
                 value: "○".to_string(),
@@ -1485,7 +1508,7 @@ mod tests {
             "main", "%1", "idle",
         )]));
         assert_eq!(
-            effects,
+            without_heartbeat(&effects),
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
                 value: "○".to_string(),
@@ -1503,7 +1526,7 @@ mod tests {
             "main", "%1", "idle",
         )]));
         assert!(
-            !effects
+            !without_heartbeat(&effects)
                 .iter()
                 .any(|effect| matches!(effect, RuntimeEffect::SetSessionBadge { .. }))
         );
@@ -1519,7 +1542,7 @@ mod tests {
             blocked,
         ]));
         assert_eq!(
-            effects,
+            without_heartbeat(&effects),
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
                 value: "▲".to_string(),
@@ -1536,7 +1559,7 @@ mod tests {
             agent_pane("beta", "%2", "idle"),
         ]));
         assert_eq!(
-            effects,
+            without_heartbeat(&effects),
             vec![
                 RuntimeEffect::SetSessionBadge {
                     session: "alpha".to_string(),
@@ -1560,7 +1583,7 @@ mod tests {
         )]));
         let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![]));
         assert_eq!(
-            effects,
+            without_heartbeat(&effects),
             vec![RuntimeEffect::ClearSessionBadge {
                 session: "main".to_string(),
             }]
@@ -1576,9 +1599,12 @@ mod tests {
         let effects = state.apply_event(DaemonEvent::Shutdown);
         assert_eq!(
             effects,
-            vec![RuntimeEffect::ClearSessionBadge {
-                session: "main".to_string(),
-            }]
+            vec![
+                RuntimeEffect::ClearSessionBadge {
+                    session: "main".to_string(),
+                },
+                RuntimeEffect::ClearHeartbeat
+            ]
         );
         assert!(!state.is_running());
     }
@@ -1591,7 +1617,7 @@ mod tests {
         let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
             "main", "%1", "running",
         )]));
-        assert!(effects.is_empty());
+        assert!(without_heartbeat(&effects).is_empty());
     }
 
     #[test]
@@ -1602,7 +1628,7 @@ mod tests {
         let mut plain = agent_pane("main", "%8", "");
         plain.agent = String::new();
         let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![sidebar, plain]));
-        assert!(effects.is_empty());
+        assert!(without_heartbeat(&effects).is_empty());
     }
 
     #[test]
@@ -1695,5 +1721,16 @@ mod tests {
                 text: String::new()
             }
         );
+    }
+
+    #[test]
+    fn panes_updated_emits_heartbeat_effect() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![]));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::Heartbeat(epoch) if *epoch > 0
+        )));
     }
 }

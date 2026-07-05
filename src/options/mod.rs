@@ -35,6 +35,9 @@ pub const KEY_PROJECT_PATH: &str = "@vde_project_path";
 pub const KEY_SESSION_STATUS: &str = "@vde_session_status";
 pub const KEY_SESSION_STATE: &str = "@vde_session_state";
 
+// --- global スコープ(writer: daemon) ---
+pub const KEY_HEARTBEAT: &str = "@vde_heartbeat";
+
 /// hook CLI が書く pane キーの全列挙(snapshot reader と writer の網羅テストに使う)。
 pub const PANE_STATE_KEYS: &[&str] = &[
     KEY_AGENT,
@@ -94,6 +97,11 @@ pub fn set_global_option(runner: &dyn TmuxRunner, key: &str, value: &str) -> Res
     Ok(())
 }
 
+pub fn unset_global_option(runner: &dyn TmuxRunner, key: &str) -> Result<()> {
+    runner.run(&["set-option", "-gu", key])?;
+    Ok(())
+}
+
 pub fn show_global_option(runner: &dyn TmuxRunner, key: &str) -> Result<Option<String>> {
     let value = runner
         .run(&["show-option", "-gqv", key])?
@@ -123,6 +131,7 @@ mod tests {
             KEY_PROJECT_PATH,
             KEY_SESSION_STATUS,
             KEY_SESSION_STATE,
+            KEY_HEARTBEAT,
         ]);
         for key in keys {
             assert!(key.starts_with("@vde_"), "{key} が @vde_ 名前空間でない");

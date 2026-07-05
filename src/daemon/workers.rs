@@ -19,6 +19,8 @@ pub trait WorkerIo: Send + Sync + 'static {
     fn preview_pane(&self, pane_id: &str, history_lines: u32) -> Result<()>;
     fn set_session_option(&self, session: &str, key: &str, value: &str) -> Result<()>;
     fn unset_session_option(&self, session: &str, key: &str) -> Result<()>;
+    fn set_global_option(&self, key: &str, value: &str) -> Result<()>;
+    fn unset_global_option(&self, key: &str) -> Result<()>;
     fn run_notify(&self, command: &str, pane_id: &str, agent: &str, state: &str) -> Result<()>;
 }
 
@@ -63,6 +65,14 @@ impl WorkerIo for SystemWorkerIo {
 
     fn unset_session_option(&self, session: &str, key: &str) -> Result<()> {
         crate::options::unset_session_option(&self.runner, session, key)
+    }
+
+    fn set_global_option(&self, key: &str, value: &str) -> Result<()> {
+        crate::options::set_global_option(&self.runner, key, value)
+    }
+
+    fn unset_global_option(&self, key: &str) -> Result<()> {
+        crate::options::unset_global_option(&self.runner, key)
     }
 
     fn run_notify(&self, command: &str, pane_id: &str, agent: &str, state: &str) -> Result<()> {
@@ -273,6 +283,14 @@ mod tests {
         }
 
         fn unset_session_option(&self, _session: &str, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_global_option(&self, _key: &str, _value: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn unset_global_option(&self, _key: &str) -> anyhow::Result<()> {
             Ok(())
         }
 

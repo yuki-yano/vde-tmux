@@ -18,6 +18,7 @@ fn dispatch_statusline_sessions_prints_output() {
         "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
     );
     mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+    mock.stub(&["show-option", "-gqv", "@vde_heartbeat"], "");
     let output = run_with(["vt", "statusline-sessions"], &mock, &env()).unwrap();
     assert!(output.unwrap().contains("main"));
 }
@@ -31,6 +32,7 @@ fn dispatch_statusline_sessions_show_index_overrides_config() {
         "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
     );
     mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+    mock.stub(&["show-option", "-gqv", "@vde_heartbeat"], "");
 
     let output = run_with(["vt", "statusline-sessions", "--show-index"], &mock, &env())
         .unwrap()
