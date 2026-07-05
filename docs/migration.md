@@ -57,7 +57,9 @@ statusline:
     enabled: true
   session_badge:
     enabled: true
+    # 既定は空文字。旧表示のようにバッジとラベルの間に空白を残す場合だけ指定する。
     suffix: " "
+    hide_idle: false
 badge:
   glyphs:
     blocked: "🔴"
@@ -100,6 +102,9 @@ daemon:
 `~/.config/vde/tmux/config.yml` に残っている場合は、M7 切替前に消す。
 `categories.rules[].ghq_patterns` は `path_patterns` へリネームする。
 `statusline.session_badge.glyphs` は `badge.glyphs` へ移動する。
+`statusline.session_badge.suffix` の既定は空文字になる。
+旧表示のようにバッジとラベルの間の空白を維持したい場合は、`statusline.session_badge.suffix: " "` を明示する。
+`statusline.session_badge.hide_idle: true` を指定すると idle(○)バッジを非表示にできる。
 `sidebar.colors.attention` / `selection_active_bg` は未使用のため削除する。
 
 ## Pane Option Bus

@@ -60,14 +60,26 @@ pub struct StatuslineConfig {
     pub session_badge: SessionBadgeConfig,
 }
 
-// show_index=false / SegmentStyle::default() は derive の Default と一致するため
-// 手書き impl にしない(clippy::derivable_impls が -D warnings でエラーになる)。
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+// current session の既定だけ bold にするため手書き default にする。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct StatuslineSessionsConfig {
     pub show_index: bool,
     pub current: SegmentStyle,
     pub other: SegmentStyle,
+}
+
+impl Default for StatuslineSessionsConfig {
+    fn default() -> Self {
+        Self {
+            show_index: false,
+            current: SegmentStyle {
+                bold: true,
+                ..SegmentStyle::default()
+            },
+            other: SegmentStyle::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

@@ -1428,10 +1428,11 @@ mod tests {
         let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
             "main", "%1", "idle",
         )]));
-        assert!(!effects.iter().any(|effect| matches!(
-            effect,
-            RuntimeEffect::SetSessionBadge { .. }
-        )));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RuntimeEffect::SetSessionBadge { .. }))
+        );
     }
 
     #[test]

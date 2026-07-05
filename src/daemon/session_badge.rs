@@ -118,7 +118,10 @@ mod tests {
     #[test]
     fn hide_idle_suppresses_idle_badge_only() {
         let glyphs = BadgeGlyphs::default();
-        assert_eq!(session_badge_value([BadgeState::Idle], &glyphs, "", true), None);
+        assert_eq!(
+            session_badge_value([BadgeState::Idle], &glyphs, "", true),
+            None
+        );
         assert_eq!(
             session_badge_value([BadgeState::Done], &glyphs, "", true).as_deref(),
             Some("✓")

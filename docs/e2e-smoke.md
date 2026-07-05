@@ -30,7 +30,7 @@ VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt statusline-agent-badge
 VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt statusline-sessions --show-index
 ```
 
-期待値: agent badge は `running:1`、sessions は `1:main` を含む。
+期待値: agent badge は `running:1`、sessions は `1:main` を含む。session badge がある場合、バッジとラベルは suffix なしで `○1:main` のように連結される。
 
 daemon 経由も確認する。
 
@@ -54,6 +54,16 @@ rm -rf "$sock_dir"
 ```
 
 期待値: `running:1`。
+
+### Plan 19 statusline smoke (2026-07-05)
+
+scratch tmux server `vde-plan19-smoke-1783256207` で確認。
+daemon は default config で起動後、`hide_idle: true` を設定して再起動した。
+
+- idle agent の session option: `@vde_session_status=○`
+- default `statusline-sessions`: `#[bold] ○main #[default]`
+- `hide_idle: true` 後の session option: 空
+- pill 設定(`current.prefix/suffix` + `bg=24`)の `statusline-sessions`: `[#[bg=24] main #[default]]`
 
 ## Session / Category / Project
 

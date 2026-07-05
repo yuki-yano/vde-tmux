@@ -56,7 +56,8 @@ pub fn config_schema() -> Value {
                         "additionalProperties": true,
                         "properties": {
                             "enabled": { "type": "boolean" },
-                            "suffix": { "type": "string" }
+                            "suffix": { "type": "string" },
+                            "hide_idle": { "type": "boolean" }
                         }
                     }
                 }
@@ -243,6 +244,11 @@ mod tests {
             schema["properties"]["statusline"]["properties"]["session_badge"]["properties"]
                 .get("glyphs")
                 .is_none()
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["session_badge"]["properties"]["hide_idle"]
+                ["type"],
+            "boolean"
         );
     }
 }

@@ -222,6 +222,20 @@ mod tests {
     }
 
     #[test]
+    fn current_session_is_bold_by_default() {
+        let config = Config::default();
+        let rendered = render_statusline_sessions(
+            &config,
+            &[session("main", "work"), session("sub", "work")],
+            "main",
+            "work",
+        );
+        assert!(rendered.contains("#[bold] main #[default]"), "{rendered}");
+        assert!(rendered.contains(" sub "), "{rendered}");
+        assert!(!rendered.contains("#[bold] sub"), "{rendered}");
+    }
+
+    #[test]
     fn render_statusline_sessions_prefixes_badge_to_label() {
         let config = Config::default();
         let mut main = session("main", "work");
