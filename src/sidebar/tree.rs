@@ -309,6 +309,7 @@ fn push_chat_row(
 ) {
     let id = format!("chat::{}", pane.pane_id);
     let expanded = state.is_expanded_with_default(&id, false);
+    let show_meta = !expanded && state.selection.as_deref() == Some(id.as_str());
     rows.push(SidebarRow {
         id,
         kind: SidebarRowKind::Chat,
@@ -324,6 +325,20 @@ fn push_chat_row(
     });
     if expanded {
         push_chat_detail_rows(pane, depth + 1, now, rows);
+    } else if show_meta {
+        rows.push(SidebarRow {
+            id: format!("meta::{}", pane.pane_id),
+            kind: SidebarRowKind::Detail,
+            depth: depth + 1,
+            label: meta_label(pane, now),
+            chat_count: 0,
+            rollup: pane.rollup,
+            badge_state: Some(pane.badge_state),
+            expanded: true,
+            pane_id: Some(pane.pane_id.clone()),
+            git: None,
+            meta: None,
+        });
     }
 }
 
@@ -425,6 +440,33 @@ fn group_meta(panes: &[AgentPane]) -> RowMeta {
                 .count(),
         ),
         ..RowMeta::default()
+    }
+}
+
+fn meta_label(pane: &AgentPane, now: i64) -> String {
+    let mut parts = Vec::new();
+    if let Ok(started_at) = pane.started_at.parse::<i64>() {
+        let elapsed = (now - started_at).max(0);
+        if elapsed < 60 {
+            parts.push(format!("{elapsed}s"));
+        } else {
+            parts.push(format!("{}m", elapsed / 60));
+        }
+    }
+    if let Some((done, total)) = parse_tasks(&pane.tasks) {
+        parts.push(format!("task {done}/{total}"));
+    }
+    let subagents = decode_subagents(&pane.subagents).len();
+    if subagents > 0 {
+        parts.push(format!("sub {subagents}"));
+    }
+    if let Some(wait_reason) = non_empty(&pane.wait_reason) {
+        parts.push(wait_reason.to_string());
+    }
+    if parts.is_empty() {
+        format!("{} / {}", pane.session, pane.pane_id)
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -948,6 +990,69 @@ mod tests {
             row.kind == SidebarRowKind::Detail && row.label == "session: main / pane: %5"
         }));
         assert_eq!(rows.last().unwrap().kind, SidebarRowKind::Jump);
+    }
+
+    #[test]
+    fn selected_chat_row_gets_inline_meta_row() {
+        let mut agent = pane("main", "%1", "/tmp/app", "codex", "running");
+        agent.prompt = "fix bug".to_string();
+        agent.started_at = "185".to_string();
+        agent.tasks = "2/5".to_string();
+        agent.subagents = "sub1:Explore|ab12:general-purpose".to_string();
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            selection: Some("chat::%1".to_string()),
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
+
+        let meta = rows
+            .iter()
+            .find(|row| row.id == "meta::%1")
+            .expect("meta row");
+        assert_eq!(meta.kind, SidebarRowKind::Detail);
+        assert_eq!(meta.label, "13m · task 2/5 · sub 2");
+        assert_eq!(meta.pane_id.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn unselected_or_expanded_chat_rows_have_no_meta_row() {
+        let agent = pane("main", "%1", "/tmp/app", "codex", "running");
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            ..SidebarState::default()
+        };
+        let rows = build_rows_at(&Config::default(), std::slice::from_ref(&agent), &state, 1000);
+        assert!(!rows.iter().any(|row| row.id == "meta::%1"));
+
+        let mut expanded = SidebarState {
+            view_mode: ViewMode::Flat,
+            selection: Some("chat::%1".to_string()),
+            ..SidebarState::default()
+        };
+        expanded.toggle_expanded("chat::%1");
+        let rows = build_rows_at(&Config::default(), &[agent], &expanded, 1000);
+        assert!(!rows.iter().any(|row| row.id == "meta::%1"));
+        assert!(rows.iter().any(|row| row.id == "jump::%1"));
+    }
+
+    #[test]
+    fn meta_row_falls_back_to_session_and_pane() {
+        let agent = pane("main", "%1", "/tmp/app", "codex", "running");
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            selection: Some("chat::%1".to_string()),
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
+
+        let meta = rows
+            .iter()
+            .find(|row| row.id == "meta::%1")
+            .expect("meta row");
+        assert_eq!(meta.label, "main / %1");
     }
 
     #[test]
