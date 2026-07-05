@@ -177,7 +177,7 @@ pub fn build_header_layout_with_theme(
     let mode_badge = format_header_segment(mode, VIEW_MODE_BADGE_WIDTH, theme);
     let filter_badge = format_header_segment(filter, FILTER_BADGE_WIDTH, theme);
     let full_text = format!("{}{}{}", mode_badge, theme.header_separator, filter_badge);
-    let text = truncate_width(&full_text, width as usize);
+    let text = truncate_display(&full_text, width as usize);
     let mut segments = Vec::new();
     let mode_len = mode_badge.chars().count();
     let separator_len = theme.header_separator.chars().count();
@@ -294,84 +294,89 @@ fn render_row_line(
     theme: &SidebarRenderTheme,
 ) -> Line<'static> {
     let selected = state.selection.as_deref() == Some(row.id.as_str());
-    let mut style = row_style(row, theme);
-    if selected {
-        style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
-    }
-    let text = render_row_text(row, state, width, theme);
-    if row.kind == SidebarRowKind::Repo
-        && let Some(git) = &row.git
-    {
-        return render_repo_line_with_git(row, &text, git, style, width);
-    }
-    Line::from(Span::styled(text, style))
-}
+    let style = row_style(row, theme);
+    let content_width = width.saturating_sub(2);
 
-fn render_row_text(
-    row: &SidebarRow,
-    state: &SidebarState,
-    width: usize,
-    theme: &SidebarRenderTheme,
-) -> String {
-    let selected = if state.selection.as_deref() == Some(row.id.as_str()) {
-        "> "
-    } else {
-        "  "
-    };
     let indent = "  ".repeat(row.depth);
-    let badge = row
-        .badge_state
-        .map(|state| format!("{} ", theme.badge_glyph(state)))
-        .unwrap_or_default();
-    let line = match row.kind {
-        SidebarRowKind::Category | SidebarRowKind::Repo => {
-            let marker = if row.expanded { "v" } else { ">" };
-            format!(
-                "{selected}{indent}{marker} {badge}{} [{}:{}]",
-                row.label,
-                rollup_label(row.rollup),
-                row.chat_count
-            )
+    let head = match row.kind {
+        SidebarRowKind::Category | SidebarRowKind::Repo | SidebarRowKind::Chat => {
+            let marker = if row.expanded { "▾" } else { "▸" };
+            format!("{indent}{marker} ")
         }
-        SidebarRowKind::Chat => {
-            let marker = if row.expanded { "v" } else { ">" };
-            format!("{selected}{indent}{marker} {badge}{}", row.label)
-        }
-        SidebarRowKind::Detail => {
-            format!("{selected}{indent}{}", row.label)
-        }
-        SidebarRowKind::Jump => {
-            format!("{selected}{indent}-> {}", row.label)
-        }
+        SidebarRowKind::Detail => indent.clone(),
+        SidebarRowKind::Jump => format!("{indent}-> "),
     };
-    truncate_width(&line, width)
-}
+    let badge = if row.kind == SidebarRowKind::Chat {
+        row.badge_state.map(|state| {
+            (
+                format!("{} ", theme.badge_glyph(state)),
+                theme.badge_color(state),
+            )
+        })
+    } else {
+        None
+    };
+    let git = if row.kind == SidebarRowKind::Repo {
+        row.git
+            .as_ref()
+            .map(format_git_badge_parts)
+            .filter(|git| !git.branch.is_empty())
+    } else {
+        None
+    };
+    let right = right_label(row);
 
-fn render_repo_line_with_git(
-    row: &SidebarRow,
-    text: &str,
-    badge: &crate::git::GitBadge,
-    style: Style,
-    width: usize,
-) -> Line<'static> {
-    let mut spans = vec![Span::styled(text.to_string(), style)];
-    let used = text.chars().count();
-    if used >= width {
-        return Line::from(spans);
+    let badge_width = badge
+        .as_ref()
+        .map(|(text, _)| display_width(text))
+        .unwrap_or(0);
+    let git_width = git.as_ref().map(git_badge_width).unwrap_or(0);
+    let right_width = right.as_deref().map(display_width).unwrap_or(0);
+    let right_reserved = if right_width > 0 { right_width + 1 } else { 0 };
+    let label_budget = content_width
+        .saturating_sub(display_width(&head))
+        .saturating_sub(badge_width)
+        .saturating_sub(git_width)
+        .saturating_sub(right_reserved);
+    let label = truncate_display(&row.label, label_budget);
+
+    let mut spans = vec![Span::styled(format!(" {head}"), style)];
+    if let Some((glyph, color)) = badge {
+        spans.push(Span::styled(glyph, Style::default().fg(color)));
     }
-    let git = format_git_badge_parts(badge);
-    if git.branch.is_empty() {
-        return Line::from(spans);
+    spans.push(Span::styled(label, style));
+    if let Some(git) = &git {
+        spans.push(Span::styled(format!(" {}", git.branch), style));
+        if let Some(ahead) = &git.ahead {
+            spans.push(Span::styled(format!(" {ahead}"), style.fg(Color::Green)));
+        }
+        if let Some(behind) = &git.behind {
+            spans.push(Span::styled(format!(" {behind}"), style.fg(Color::Red)));
+        }
     }
-    spans.push(Span::styled(format!(" {}", git.branch), style));
-    if let Some(ahead) = git.ahead {
-        spans.push(Span::styled(format!(" {ahead}"), style.fg(Color::Green)));
+    let used: usize = spans
+        .iter()
+        .map(|span| display_width(&span.content))
+        .sum();
+    let filler = width
+        .saturating_sub(1)
+        .saturating_sub(used)
+        .saturating_sub(right_width);
+    spans.push(Span::raw(" ".repeat(filler)));
+    if let Some(right) = right {
+        spans.push(Span::styled(right, right_style(row, theme)));
     }
-    if let Some(behind) = git.behind {
-        spans.push(Span::styled(format!(" {behind}"), style.fg(Color::Red)));
+    spans.push(Span::raw(" "));
+
+    let mut line = Line::from(spans);
+    if selected {
+        line = line.style(
+            Style::default()
+                .bg(theme.selection_bg)
+                .add_modifier(Modifier::BOLD),
+        );
     }
-    let _ = row;
-    Line::from(spans)
+    line
 }
 
 struct GitBadgeText {
@@ -408,24 +413,6 @@ fn render_rail_lines(
         .collect()
 }
 
-fn rollup_label(level: RollupLevel) -> &'static str {
-    match level {
-        RollupLevel::Error => "error",
-        RollupLevel::Running => "running",
-        RollupLevel::Permission => "permission",
-        RollupLevel::Background => "background",
-        RollupLevel::Waiting => "waiting",
-        RollupLevel::Idle => "idle",
-    }
-}
-
-fn truncate_width(line: &str, width: usize) -> String {
-    if line.chars().count() <= width {
-        return line.to_string();
-    }
-    line.chars().take(width).collect()
-}
-
 pub(crate) fn display_width(text: &str) -> usize {
     use unicode_width::UnicodeWidthChar;
     text.chars()
@@ -454,6 +441,58 @@ pub(crate) fn truncate_display(text: &str, max_width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+fn right_label(row: &SidebarRow) -> Option<String> {
+    match row.kind {
+        SidebarRowKind::Category | SidebarRowKind::Repo => {
+            let count = row.meta.as_ref()?.attention_count?;
+            (count > 0).then(|| format!("▲{count}"))
+        }
+        SidebarRowKind::Chat => match row.rollup {
+            RollupLevel::Error => Some("err".to_string()),
+            RollupLevel::Permission => Some("perm".to_string()),
+            RollupLevel::Waiting => Some("wait".to_string()),
+            RollupLevel::Background => Some("bg".to_string()),
+            RollupLevel::Running => row
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.elapsed_secs)
+                .map(elapsed_label),
+            RollupLevel::Idle => None,
+        },
+        SidebarRowKind::Detail | SidebarRowKind::Jump => None,
+    }
+}
+
+fn elapsed_label(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m", secs / 60)
+    }
+}
+
+fn right_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
+    match row.kind {
+        SidebarRowKind::Category | SidebarRowKind::Repo => {
+            Style::default().fg(theme.badge_color(BadgeState::Blocked))
+        }
+        _ => Style::default()
+            .fg(theme.rollup_color(row.rollup))
+            .add_modifier(Modifier::DIM),
+    }
+}
+
+fn git_badge_width(git: &GitBadgeText) -> usize {
+    let mut width = 1 + display_width(&git.branch);
+    if let Some(ahead) = &git.ahead {
+        width += 1 + display_width(ahead);
+    }
+    if let Some(behind) = &git.behind {
+        width += 1 + display_width(behind);
+    }
+    width
 }
 
 fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
@@ -596,8 +635,9 @@ mod tests {
 
         let rendered = render_rows(&rows, &state, 32);
 
-        assert!(rendered.contains("v app [running:1]"));
-        assert!(rendered.contains(">   v codex %1"));
+        assert!(rendered.contains(" ▾ app"));
+        assert!(rendered.contains("   ▾ codex %1"));
+        assert!(!rendered.contains("> "));
     }
 
     #[test]
@@ -652,7 +692,7 @@ mod tests {
 
         let rendered = render_rows(&[repo], &SidebarState::default(), 80);
 
-        assert!(rendered.contains("v app [idle:1] main"));
+        assert!(rendered.contains("▾ app main"));
         assert!(!rendered.contains("+0"));
         assert!(!rendered.contains("-0"));
     }
@@ -697,7 +737,7 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::BOLD)
         );
-        assert_eq!(lines[1].spans[0].style.bg, Some(Color::Indexed(237)));
+        assert_eq!(lines[1].style.bg, Some(Color::Indexed(237)));
         assert!(
             lines[1]
                 .spans
@@ -877,5 +917,116 @@ sidebar:
         let theme = SidebarRenderTheme::from_sidebar_config(&config.sidebar);
         assert_eq!(theme.badge_color(BadgeState::Working), Color::Yellow);
         assert_eq!(theme.badge_color(BadgeState::Blocked), Color::Red);
+    }
+
+    #[test]
+    fn rows_have_horizontal_padding_and_no_selection_marker() {
+        let rows = vec![row(
+            "repo::misc::app",
+            SidebarRowKind::Repo,
+            0,
+            "app",
+            RollupLevel::Running,
+        )];
+        let state = SidebarState {
+            selection: Some("repo::misc::app".to_string()),
+            ..SidebarState::default()
+        };
+        let rendered = render_rows(&rows, &state, 20);
+        assert!(rendered.starts_with(" ▾ app"), "{rendered:?}");
+        assert!(!rendered.contains("> "), "{rendered:?}");
+        assert_eq!(display_width(&rendered), 20, "{rendered:?}");
+    }
+
+    #[test]
+    fn repo_row_right_aligns_attention_count() {
+        let mut repo = row(
+            "repo::misc::app",
+            SidebarRowKind::Repo,
+            0,
+            "app",
+            RollupLevel::Permission,
+        );
+        repo.meta = Some(crate::sidebar::tree::RowMeta {
+            attention_count: Some(2),
+            ..Default::default()
+        });
+        let rendered = render_rows(&[repo], &SidebarState::default(), 20);
+        assert!(rendered.ends_with("▲2 "), "{rendered:?}");
+        assert!(!rendered.contains("[permission:"), "{rendered:?}");
+    }
+
+    #[test]
+    fn chat_row_right_aligns_status_short_label() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: review PR",
+            RollupLevel::Permission,
+        );
+        chat.badge_state = Some(BadgeState::Blocked);
+        let rendered = render_rows(&[chat], &SidebarState::default(), 30);
+        assert!(rendered.ends_with("perm "), "{rendered:?}");
+        assert!(rendered.contains("▲ codex: review PR"), "{rendered:?}");
+    }
+
+    #[test]
+    fn chat_row_shows_elapsed_when_running() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: fix",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(BadgeState::Working);
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            elapsed_secs: Some(815),
+            ..Default::default()
+        });
+        let rendered = render_rows(&[chat], &SidebarState::default(), 30);
+        assert!(rendered.ends_with("13m "), "{rendered:?}");
+    }
+
+    #[test]
+    fn long_cjk_label_is_truncated_with_ellipsis_keeping_right_column() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: 日本語のとても長いプロンプトを表示する",
+            RollupLevel::Permission,
+        );
+        chat.badge_state = Some(BadgeState::Blocked);
+        let rendered = render_rows(&[chat], &SidebarState::default(), 24);
+        assert!(rendered.contains('…'), "{rendered:?}");
+        assert!(rendered.ends_with("perm "), "{rendered:?}");
+        assert_eq!(display_width(&rendered), 24, "{rendered:?}");
+    }
+
+    #[test]
+    fn badge_glyph_is_rendered_in_badge_color_span() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(BadgeState::Working);
+        let lines = render_lines(
+            &[chat],
+            &SidebarState::default(),
+            30,
+            &SidebarRenderTheme::default(),
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.contains('●') && span.style.fg == Some(Color::Green)),
+            "{lines:?}"
+        );
     }
 }

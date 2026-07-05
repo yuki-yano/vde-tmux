@@ -89,7 +89,7 @@ fn dispatch_sidebar_attach_once_restores_persisted_state() {
     .unwrap();
     let output = output.unwrap();
 
-    assert!(output.contains("> > ● app"));
+    assert!(output.contains(" ▸ app"));
     assert!(!output.contains("codex %1"));
     std::fs::remove_dir_all(state_home).unwrap();
 }
