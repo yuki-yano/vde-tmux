@@ -132,6 +132,32 @@ impl SidebarRenderTheme {
 pub enum HeaderAction {
     CycleViewMode,
     ToggleFilter,
+    SetFilter(StatusFilter),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BadgeCounts {
+    pub total: usize,
+    pub blocked: usize,
+    pub working: usize,
+    pub done: usize,
+    pub idle: usize,
+}
+
+impl BadgeCounts {
+    pub fn from_rows(rows: &[SidebarRow]) -> Self {
+        let mut counts = Self::default();
+        for row in rows.iter().filter(|row| row.kind == SidebarRowKind::Chat) {
+            counts.total += 1;
+            match row.badge_state {
+                Some(BadgeState::Blocked) => counts.blocked += 1,
+                Some(BadgeState::Working) => counts.working += 1,
+                Some(BadgeState::Done) => counts.done += 1,
+                Some(BadgeState::Idle) | None => counts.idle += 1,
+            }
+        }
+        counts
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +206,7 @@ pub struct HeaderLine {
 pub struct HeaderSegment {
     pub range: std::ops::Range<u16>,
     pub action: HeaderAction,
+    pub style: Option<Style>,
 }
 
 pub fn build_header_layout(state: &SidebarState, width: u16) -> HeaderLayout {
@@ -191,17 +218,62 @@ pub fn build_header_layout_with_theme(
     width: u16,
     theme: &SidebarRenderTheme,
 ) -> HeaderLayout {
+    build_header_layout_with_counts(state, width, theme, BadgeCounts::default())
+}
+
+pub fn build_header_layout_with_counts(
+    state: &SidebarState,
+    width: u16,
+    theme: &SidebarRenderTheme,
+    counts: BadgeCounts,
+) -> HeaderLayout {
     if width <= 2 {
         return HeaderLayout::default();
     }
     let mode_badge = format_header_segment(view_mode_label(state.view_mode), theme);
-    let filter_badge = format_header_segment(filter_label(state.filter), theme);
     let separator = if theme.header_separator.is_empty() {
         " · ".to_string()
     } else {
         theme.header_separator.clone()
     };
-    let full_text = format!(" {mode_badge}{separator}{filter_badge}");
+    let filter_items = [
+        (
+            format_header_segment(&format!("≡{}", counts.total), theme),
+            HeaderAction::SetFilter(StatusFilter::All),
+            StatusFilter::All,
+            None,
+        ),
+        (
+            format_header_segment(&format!("▲{}", counts.blocked), theme),
+            HeaderAction::SetFilter(StatusFilter::AttentionOnly),
+            StatusFilter::AttentionOnly,
+            Some(BadgeState::Blocked),
+        ),
+        (
+            format_header_segment(&format!("●{}", counts.working), theme),
+            HeaderAction::SetFilter(StatusFilter::WorkingOnly),
+            StatusFilter::WorkingOnly,
+            Some(BadgeState::Working),
+        ),
+        (
+            format_header_segment(&format!("✓{}", counts.done), theme),
+            HeaderAction::SetFilter(StatusFilter::DoneOnly),
+            StatusFilter::DoneOnly,
+            Some(BadgeState::Done),
+        ),
+        (
+            format_header_segment(&format!("○{}", counts.idle), theme),
+            HeaderAction::SetFilter(StatusFilter::IdleOnly),
+            StatusFilter::IdleOnly,
+            Some(BadgeState::Idle),
+        ),
+    ];
+    let filter_badges = filter_items
+        .iter()
+        .map(|(label, _, _, _)| label.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let full_text = format!(" {mode_badge}{separator}{filter_badges}");
     let text = truncate_display(&full_text, width as usize);
     let mut segments = Vec::new();
     let mode_len = mode_badge.chars().count();
@@ -210,17 +282,26 @@ pub fn build_header_layout_with_theme(
         segments.push(HeaderSegment {
             range,
             action: HeaderAction::CycleViewMode,
+            style: None,
         });
     }
-    if let Some(range) = visible_segment_range(
-        &text,
-        1 + mode_len + separator_len,
-        filter_badge.chars().count(),
-    ) {
-        segments.push(HeaderSegment {
-            range,
-            action: HeaderAction::ToggleFilter,
-        });
+    let mut start = 1 + mode_len + separator_len;
+    for (label, action, filter, badge_state) in filter_items {
+        if let Some(range) = visible_segment_range(&text, start, label.chars().count()) {
+            let style = if state.filter == filter {
+                header_segment_style(theme)
+            } else if let Some(badge_state) = badge_state {
+                Style::default().fg(theme.badge_color(badge_state))
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            segments.push(HeaderSegment {
+                range,
+                action,
+                style: Some(style),
+            });
+        }
+        start += label.chars().count() + 1;
     }
     HeaderLayout {
         lines: vec![HeaderLine { text, segments }],
@@ -262,7 +343,7 @@ pub fn render_header_lines(
                 }
                 spans.push(Span::styled(
                     slice_chars(&line.text, segment.range.start, segment.range.end),
-                    header_segment_style(theme),
+                    segment.style.unwrap_or_else(|| header_segment_style(theme)),
                 ));
                 cursor = segment.range.end;
             }
@@ -1155,15 +1236,97 @@ mod tests {
 
         let header = build_header_layout(&state, 80);
 
-        assert_eq!(header.lines[0].text, " category · attention");
+        assert_eq!(header.lines[0].text, " category · ≡0 ▲0 ●0 ✓0 ○0");
         assert_eq!(
             header_hit_test(&header, 0, 2),
             Some(HeaderAction::CycleViewMode)
         );
         assert_eq!(
-            header_hit_test(&header, 0, 13),
-            Some(HeaderAction::ToggleFilter)
+            header_hit_test(&header, 0, 15),
+            Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
         );
+    }
+
+    #[test]
+    fn header_shows_badge_counts_as_filter_segments() {
+        let mut blocked = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex",
+            RollupLevel::Permission,
+        );
+        blocked.badge_state = Some(BadgeState::Blocked);
+        let mut working = row(
+            "chat::%2",
+            SidebarRowKind::Chat,
+            0,
+            "claude",
+            RollupLevel::Running,
+        );
+        working.badge_state = Some(BadgeState::Working);
+        let mut done = row(
+            "chat::%3",
+            SidebarRowKind::Chat,
+            0,
+            "opencode",
+            RollupLevel::Idle,
+        );
+        done.badge_state = Some(BadgeState::Done);
+        let idle = row(
+            "chat::%4",
+            SidebarRowKind::Chat,
+            0,
+            "cursor",
+            RollupLevel::Idle,
+        );
+        let repo = row(
+            "repo::misc::app",
+            SidebarRowKind::Repo,
+            0,
+            "app",
+            RollupLevel::Running,
+        );
+        let counts = BadgeCounts::from_rows(&[blocked, working, done, idle, repo]);
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            filter: StatusFilter::IdleOnly,
+            ..SidebarState::default()
+        };
+
+        let header = build_header_layout_with_counts(
+            &state,
+            80,
+            &SidebarRenderTheme::default(),
+            counts,
+        );
+
+        assert_eq!(header.lines[0].text, " repo · ≡4 ▲1 ●1 ✓1 ○1");
+        assert_eq!(
+            header_hit_test(&header, 0, 2),
+            Some(HeaderAction::CycleViewMode)
+        );
+        assert_eq!(
+            header_hit_test(&header, 0, 8),
+            Some(HeaderAction::SetFilter(StatusFilter::All))
+        );
+        assert_eq!(
+            header_hit_test(&header, 0, 11),
+            Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
+        );
+        assert_eq!(
+            header_hit_test(&header, 0, 14),
+            Some(HeaderAction::SetFilter(StatusFilter::WorkingOnly))
+        );
+        assert_eq!(
+            header_hit_test(&header, 0, 17),
+            Some(HeaderAction::SetFilter(StatusFilter::DoneOnly))
+        );
+        assert_eq!(
+            header_hit_test(&header, 0, 20),
+            Some(HeaderAction::SetFilter(StatusFilter::IdleOnly))
+        );
+        assert!(header.lines[0].segments[5].style.is_some());
     }
 
     #[test]
@@ -1176,16 +1339,16 @@ mod tests {
 
         let header = build_header_layout(&state, 80);
 
-        assert_eq!(header.lines[0].text, " repo · all");
+        assert_eq!(header.lines[0].text, " repo · ≡0 ▲0 ●0 ✓0 ○0");
         assert_eq!(header.lines[0].segments[0].range, 1..5);
-        assert_eq!(header.lines[0].segments[1].range, 8..11);
+        assert_eq!(header.lines[0].segments[1].range, 8..10);
         assert_eq!(
             header_hit_test(&header, 0, 2),
             Some(HeaderAction::CycleViewMode)
         );
         assert_eq!(
             header_hit_test(&header, 0, 9),
-            Some(HeaderAction::ToggleFilter)
+            Some(HeaderAction::SetFilter(StatusFilter::All))
         );
         assert_eq!(header_hit_test(&header, 0, 6), None);
     }
@@ -1217,9 +1380,12 @@ sidebar:
         let header = build_header_layout_with_theme(&state, 80, &theme);
         let lines = render_header_lines(&header, &theme);
 
-        assert_eq!(header.lines[0].text, " [ repo ] [ all ]");
+        assert_eq!(
+            header.lines[0].text,
+            " [ repo ] [ ≡0 ] [ ▲0 ] [ ●0 ] [ ✓0 ] [ ○0 ]"
+        );
         assert_eq!(header.lines[0].segments[0].range, 1..9);
-        assert_eq!(header.lines[0].segments[1].range, 10..17);
+        assert_eq!(header.lines[0].segments[1].range, 10..16);
         assert_eq!(lines[0].spans[1].style.fg, Some(Color::White));
         assert_eq!(lines[0].spans[1].style.bg, Some(Color::Indexed(24)));
         assert!(

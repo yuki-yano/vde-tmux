@@ -29,10 +29,11 @@ use crate::sidebar::client::{
 };
 use crate::sidebar::preview::open_preview_floating_pane;
 use crate::sidebar::render::{
-    HeaderAction, HeaderLayout, SidebarRenderTheme, build_footer_line,
-    build_header_layout_with_theme, header_hit_test, render_header_lines,
+    BadgeCounts, HeaderAction, HeaderLayout, SidebarRenderTheme, build_footer_line,
+    build_header_layout_with_counts, header_hit_test, render_header_lines,
     render_lines_with_indices,
 };
+use crate::sidebar::state::StatusFilter;
 use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
@@ -130,7 +131,12 @@ pub fn run_loop<B: Backend>(
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
             if let Some(sidebar) = &snapshot.sidebar {
-                let header = build_header_layout_with_theme(&sidebar.state, area.width, theme);
+                let header = build_header_layout_with_counts(
+                    &sidebar.state,
+                    area.width,
+                    theme,
+                    BadgeCounts::from_rows(&sidebar.rows),
+                );
                 let areas = compute_areas(area, &header);
                 let rendered = render_lines_with_indices(
                     &sidebar.rows,
@@ -414,7 +420,12 @@ fn draw_snapshot_in_area(
         draw_placeholder(frame, area, "no agents");
         return;
     };
-    let header = build_header_layout_with_theme(&sidebar.state, area.width, theme);
+    let header = build_header_layout_with_counts(
+        &sidebar.state,
+        area.width,
+        theme,
+        BadgeCounts::from_rows(&sidebar.rows),
+    );
     let areas = compute_areas(area, &header);
     if areas.header_rows > 0 {
         let header_area = Rect {
@@ -523,7 +534,12 @@ fn handle_left_click(
         return Ok(());
     };
     let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-    let header = build_header_layout_with_theme(&sidebar.state, width, context.theme);
+    let header = build_header_layout_with_counts(
+        &sidebar.state,
+        width,
+        context.theme,
+        BadgeCounts::from_rows(&sidebar.rows),
+    );
     if row < header.row_count() {
         match header_hit_test(&header, row, column) {
             Some(HeaderAction::CycleViewMode) => {
@@ -531,6 +547,9 @@ fn handle_left_click(
             }
             Some(HeaderAction::ToggleFilter) => {
                 send_sidebar_request(send_sidebar_key(context.socket, "tab"));
+            }
+            Some(HeaderAction::SetFilter(filter)) => {
+                send_sidebar_request(send_sidebar_key(context.socket, filter_key(filter)));
             }
             None => {}
         }
@@ -575,6 +594,16 @@ fn dispatch_click_action(context: &ClickContext<'_>, action: ClickAction) {
         ClickAction::JumpPane(pane_id) => {
             send_sidebar_request(send_sidebar_jump(context.socket, &pane_id));
         }
+    }
+}
+
+fn filter_key(filter: StatusFilter) -> &'static str {
+    match filter {
+        StatusFilter::All => "all",
+        StatusFilter::AttentionOnly => "attn",
+        StatusFilter::WorkingOnly => "working",
+        StatusFilter::DoneOnly => "done",
+        StatusFilter::IdleOnly => "idle",
     }
 }
 
