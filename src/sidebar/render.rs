@@ -403,6 +403,36 @@ fn truncate_width(line: &str, width: usize) -> String {
     line.chars().take(width).collect()
 }
 
+pub(crate) fn display_width(text: &str) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    text.chars()
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
+}
+
+pub(crate) fn truncate_display(text: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if max_width == 0 {
+        return String::new();
+    }
+    if display_width(text) <= max_width {
+        return text.to_string();
+    }
+    let budget = max_width - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push('…');
+    out
+}
+
 fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
     let style = Style::default().fg(match row.kind {
         SidebarRowKind::Category => Color::Blue,
@@ -784,5 +814,20 @@ sidebar:
         let rendered = render_rows(&[chat], &SidebarState::default(), 2);
 
         assert_eq!(rendered, "🔵");
+    }
+
+    #[test]
+    fn display_width_counts_cjk_as_two_cells() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("あいう"), 6);
+        assert_eq!(display_width("a…"), 2);
+    }
+
+    #[test]
+    fn truncate_display_appends_ellipsis_within_width() {
+        assert_eq!(truncate_display("hello", 10), "hello");
+        assert_eq!(truncate_display("hello world", 8), "hello w…");
+        assert_eq!(truncate_display("あいうえお", 7), "あいう…");
+        assert_eq!(truncate_display("abc", 0), "");
     }
 }
