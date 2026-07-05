@@ -332,9 +332,7 @@ impl RuntimeState {
             .map(|pane| format!("chat::{}", pane.pane_id))
             .collect::<BTreeSet<_>>();
         let before = self.ui_state.pinned.len();
-        self.ui_state
-            .pinned
-            .retain(|id| live_chat_ids.contains(id));
+        self.ui_state.pinned.retain(|id| live_chat_ids.contains(id));
         if self.ui_state.pinned.len() != before {
             self.ui_state.version += 1;
             self.mark_state_dirty(Instant::now());

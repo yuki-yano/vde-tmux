@@ -57,10 +57,15 @@ pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<O
     let mut terminal = Terminal::new(backend)?;
     let runner = SystemTmuxRunner::from_env(Duration::from_secs(1));
     let theme = SidebarRenderTheme::from_app_config(config);
+    let (live_request_tx, live_request_rx) = mpsc::channel();
+    let (live_result_tx, live_result_rx) = mpsc::channel();
+    spawn_live_capture_worker(live_request_rx, live_result_tx);
     let runtime_config = RunLoopConfig {
         theme: &theme,
         preview_history_lines: config.sidebar.preview.history_lines,
         live: &config.sidebar.live,
+        live_capture_tx: &live_request_tx,
+        live_capture_rx: &live_result_rx,
     };
     let result = run_loop(&mut terminal, &socket, &rx, &runner, env, runtime_config);
     disable_raw_mode()?;
@@ -121,6 +126,7 @@ struct LiveState {
     lines: Vec<String>,
     last_capture: Option<Instant>,
     requested_lines: u16,
+    capture_in_flight: bool,
 }
 
 impl LiveState {
@@ -137,6 +143,8 @@ pub struct RunLoopConfig<'a> {
     pub theme: &'a SidebarRenderTheme,
     pub preview_history_lines: u32,
     pub live: &'a SidebarLiveConfig,
+    pub live_capture_tx: &'a mpsc::Sender<String>,
+    pub live_capture_rx: &'a mpsc::Receiver<(String, String)>,
 }
 
 pub fn run_loop<B: Backend>(
@@ -173,7 +181,13 @@ pub fn run_loop<B: Backend>(
             dispatch_click_action(&context, action);
         }
         if let Some(snapshot) = &current {
-            update_live_state(snapshot, runner, live_config, &mut live);
+            update_live_state(
+                snapshot,
+                live_config,
+                &mut live,
+                config.live_capture_tx,
+                config.live_capture_rx,
+            );
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
             if let Some(sidebar) = &snapshot.sidebar {
@@ -278,15 +292,20 @@ fn live_rows_requested(config: &SidebarLiveConfig) -> u16 {
 
 fn update_live_state(
     snapshot: &DaemonSnapshot,
-    runner: &dyn TmuxRunner,
     config: &SidebarLiveConfig,
     live: &mut LiveState,
+    request_tx: &mpsc::Sender<String>,
+    result_rx: &mpsc::Receiver<(String, String)>,
 ) {
+    while let Ok((pane_id, output)) = result_rx.try_recv() {
+        apply_live_capture_result(live, &pane_id, &output);
+    }
     live.requested_lines = live_rows_requested(config);
     if live.requested_lines == 0 {
         live.pane_id = None;
         live.lines.clear();
         live.last_capture = None;
+        live.capture_in_flight = false;
         return;
     }
     let selected = preview_pane_for_selection(snapshot);
@@ -294,6 +313,7 @@ fn update_live_state(
         live.pane_id = selected;
         live.last_capture = None;
         live.lines.clear();
+        live.capture_in_flight = false;
     }
     let Some(pane_id) = live.pane_id.clone() else {
         return;
@@ -307,10 +327,38 @@ fn update_live_state(
     if !due {
         return;
     }
-    if let Ok(output) = runner.run(&["capture-pane", "-p", "-t", &pane_id]) {
-        live.lines = extract_tail(&output, live.requested_lines as usize);
+    if live.capture_in_flight {
+        return;
     }
-    live.last_capture = Some(now);
+    if request_tx.send(pane_id).is_ok() {
+        live.capture_in_flight = true;
+        live.last_capture = Some(now);
+    }
+}
+
+fn apply_live_capture_result(live: &mut LiveState, pane_id: &str, output: &str) {
+    if live.pane_id.as_deref() != Some(pane_id) {
+        return;
+    }
+    live.lines = extract_tail(output, live.requested_lines as usize);
+    live.capture_in_flight = false;
+}
+
+fn spawn_live_capture_worker(
+    request_rx: mpsc::Receiver<String>,
+    result_tx: mpsc::Sender<(String, String)>,
+) {
+    std::thread::spawn(move || {
+        let runner = SystemTmuxRunner::from_env(Duration::from_millis(500));
+        while let Ok(pane_id) = request_rx.recv() {
+            let output = runner
+                .run(&["capture-pane", "-p", "-t", &pane_id])
+                .unwrap_or_default();
+            if result_tx.send((pane_id, output)).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 fn resolve_current_window_id(
@@ -1323,5 +1371,25 @@ mod tests {
             drain_snapshot_updates(&rx, &mut current),
             Err(TuiExit::Disconnected)
         );
+    }
+
+    #[test]
+    fn live_capture_result_updates_only_current_pane() {
+        let mut live = LiveState {
+            pane_id: Some("%1".to_string()),
+            requested_lines: 2,
+            capture_in_flight: true,
+            ..LiveState::default()
+        };
+
+        apply_live_capture_result(&mut live, "%2", "stale\noutput\n");
+
+        assert!(live.lines.is_empty());
+        assert!(live.capture_in_flight);
+
+        apply_live_capture_result(&mut live, "%1", "one\ntwo\nthree\n");
+
+        assert_eq!(live.lines, vec!["two".to_string(), "three".to_string()]);
+        assert!(!live.capture_in_flight);
     }
 }

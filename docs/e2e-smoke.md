@@ -432,5 +432,8 @@ checked=rail double-count regression covered by sidebar::render::tests::rail_doe
 checked=event log format covered by sidebar::tui::tests::event_tail_formats_ago_agent_and_glyphs
 checked=expanded chat j/k teleport regression covered by daemon::runtime::tests::moving_through_expanded_chat_does_not_teleport_selection
 checked=TRIAGE/FLEET selection follow regression covered by daemon::runtime::tests::selection_follows_pane_across_triage_and_fleet
+checked=Task 11 live capture worker smoke at 2026-07-05 21:06:42 JST: scratch=vde-p18-live-1783253186, LIVE source pane capture contains live-a/live-b/live-c
+checked=Task 11 daemon disconnect after sidebar TUI launch completed without hang; message was not captured because tmux alt-screen capture remains unreliable
+checked=Task 11 non-blocking result path covered by sidebar::tui::tests::live_capture_result_updates_only_current_pane
 result=Plan 18 smoke ok
 ```

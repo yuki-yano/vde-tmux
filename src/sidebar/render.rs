@@ -1449,8 +1449,7 @@ sidebar:
         let theme = SidebarRenderTheme::from_app_config(&config);
         let state = SidebarState::default();
 
-        let layout =
-            build_header_layout_with_counts(&state, 60, &theme, BadgeCounts::default());
+        let layout = build_header_layout_with_counts(&state, 60, &theme, BadgeCounts::default());
         let line = &layout.lines[0];
         let mode = &line.segments[0];
         let mode_text = format_header_segment(view_mode_label(state.view_mode), &theme);
@@ -1461,10 +1460,7 @@ sidebar:
         );
         let lines = render_header_lines(&layout, &theme);
         assert!(
-            lines[0]
-                .spans
-                .iter()
-                .any(|span| span.content == mode_text),
+            lines[0].spans.iter().any(|span| span.content == mode_text),
             "{lines:?}"
         );
     }
