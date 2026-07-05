@@ -315,7 +315,13 @@ impl RuntimeState {
                 self.ui_state.apply(SidebarAction::MovePrevious, &row_refs)
             }
             SidebarInputAction::ToggleExpand => {
-                self.ui_state.apply(SidebarAction::ToggleExpand, &row_refs)
+                if let Some(id) = self.ui_state.selection.clone()
+                    && id.starts_with("chat::")
+                {
+                    self.ui_state.toggle_pinned(&id)
+                } else {
+                    self.ui_state.apply(SidebarAction::ToggleExpand, &row_refs)
+                }
             }
             SidebarInputAction::Expand => self.ui_state.apply(SidebarAction::Expand, &row_refs),
             SidebarInputAction::Collapse => self.ui_state.apply(SidebarAction::Collapse, &row_refs),
@@ -331,7 +337,11 @@ impl RuntimeState {
             }
             SidebarInputAction::ToggleRow(row_id) => {
                 self.ui_state.selection = Some(row_id.clone());
-                self.ui_state.toggle_expanded(&row_id)
+                if row_id.starts_with("chat::") {
+                    self.ui_state.toggle_pinned(&row_id)
+                } else {
+                    self.ui_state.toggle_expanded(&row_id)
+                }
             }
             SidebarInputAction::FocusNextAttention => self.focus_attention(true),
             SidebarInputAction::FocusPreviousAttention => self.focus_attention(false),
@@ -818,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn client_encoded_toggle_key_toggles_clicked_row_without_prior_selection() {
+    fn client_encoded_toggle_key_pins_clicked_chat_without_prior_selection() {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
         state.apply_event(DaemonEvent::PanesUpdated(vec![pane(
             "%1", "/tmp/app", "codex", "running",
@@ -832,7 +842,8 @@ mod tests {
         });
 
         assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
-        assert!(state.ui_state.is_expanded_with_default("chat::%1", false));
+        assert!(state.ui_state.pinned.contains("chat::%1"));
+        assert!(!state.ui_state.is_expanded_with_default("chat::%1", false));
     }
 
     #[test]
@@ -853,6 +864,43 @@ mod tests {
         let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
         assert!(rows.iter().all(|row| !row.id.contains("%1")));
         assert!(rows.iter().any(|row| row.id.contains("%2")));
+    }
+
+    #[test]
+    fn space_on_chat_row_toggles_pin_instead_of_expand() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        state.ui_state.selection = Some("chat::%1".to_string());
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "space".to_string(),
+            },
+        });
+
+        assert!(state.ui_state.pinned.contains("chat::%1"));
+        assert!(!state.ui_state.is_expanded_with_default("chat::%1", false));
+    }
+
+    #[test]
+    fn space_on_repo_row_still_toggles_collapse() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![pane(
+            "%1", "/tmp/app", "codex", "running",
+        )]));
+        state.ui_state.selection = Some("repo::misc::app".to_string());
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "space".to_string(),
+            },
+        });
+
+        assert!(!state.ui_state.is_expanded("repo::misc::app"));
     }
 
     #[test]

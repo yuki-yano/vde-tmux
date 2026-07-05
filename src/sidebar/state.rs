@@ -52,6 +52,8 @@ pub struct SidebarState {
     #[serde(default)]
     pub collapsed: BTreeSet<String>,
     #[serde(default)]
+    pub pinned: BTreeSet<String>,
+    #[serde(default)]
     pub manual_order: Vec<RepoId>,
 }
 
@@ -137,6 +139,14 @@ impl SidebarState {
     pub fn toggle_expanded(&mut self, id: &str) -> bool {
         if !self.collapsed.insert(id.to_string()) {
             self.collapsed.remove(id);
+        }
+        self.bump();
+        true
+    }
+
+    pub fn toggle_pinned(&mut self, id: &str) -> bool {
+        if !self.pinned.insert(id.to_string()) {
+            self.pinned.remove(id);
         }
         self.bump();
         true
@@ -295,6 +305,25 @@ mod tests {
 
         assert!(json.contains(r#""filter":"attention_only""#));
         assert!(json.contains(r#""manual_order""#));
+    }
+
+    #[test]
+    fn pinned_set_toggles_and_persists() {
+        let mut state = SidebarState::default();
+        assert!(state.toggle_pinned("chat::%1"));
+        assert!(state.pinned.contains("chat::%1"));
+        assert!(state.toggle_pinned("chat::%1"));
+        assert!(!state.pinned.contains("chat::%1"));
+
+        let json = serde_json::to_string(&SidebarState {
+            pinned: std::iter::once("chat::%1".to_string()).collect(),
+            ..SidebarState::default()
+        })
+        .unwrap();
+        assert!(json.contains(r#""pinned""#));
+
+        let old: SidebarState = serde_json::from_str(r#"{"version":3}"#).unwrap();
+        assert!(old.pinned.is_empty());
     }
 
     #[test]
