@@ -55,6 +55,11 @@ pub enum RuntimeEffect {
     SaveState(SidebarState),
     SetSessionBadge { session: String, value: String },
     ClearSessionBadge { session: String },
+    Notify {
+        pane_id: String,
+        agent: String,
+        state: BadgeState,
+    },
 }
 
 #[derive(Debug)]
@@ -306,6 +311,11 @@ impl RuntimeState {
         self.snapshot.as_ref()
     }
 
+    pub fn notify_command(&self) -> Option<&str> {
+        (self.config.notify.enabled && !self.config.notify.command.trim().is_empty())
+            .then_some(self.config.notify.command.as_str())
+    }
+
     fn apply_client_event(&mut self, event: SidebarClientEvent) -> Vec<RuntimeEffect> {
         match event {
             SidebarClientEvent::Key { key } => self.apply_key(&key),
@@ -528,6 +538,8 @@ impl RuntimeState {
         self.decay_flash();
         let badges = self.current_badges();
         let at_epoch = now_epoch_secs();
+        let notify_enabled = self.notify_command().is_some();
+        let mut effects = Vec::new();
         for (pane_id, (agent, to)) in &badges {
             let from = self.prev_badges.get(pane_id).copied();
             if from != Some(*to) {
@@ -539,6 +551,13 @@ impl RuntimeState {
                     at_epoch,
                 });
                 self.flash.insert(pane_id.clone(), FLASH_POLLS);
+                if notify_enabled && *to == BadgeState::Blocked {
+                    effects.push(RuntimeEffect::Notify {
+                        pane_id: pane_id.clone(),
+                        agent: agent.clone(),
+                        state: *to,
+                    });
+                }
             }
         }
         while self.events.len() > EVENT_CAP {
@@ -548,7 +567,7 @@ impl RuntimeState {
             .into_iter()
             .map(|(pane_id, (_, badge))| (pane_id, badge))
             .collect();
-        Vec::new()
+        effects
     }
 
     fn decay_flash(&mut self) {
@@ -829,6 +848,45 @@ mod tests {
             "main", "%1", "running",
         )]));
         assert!(!chat_flash(&state, "%1"));
+    }
+
+    #[test]
+    fn blocked_transition_returns_notify_effect_when_enabled() {
+        let mut config = Config::default();
+        config.notify.enabled = true;
+        config.notify.command = "printf blocked".to_string();
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let mut blocked = agent_pane("main", "%1", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![blocked]));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::Notify { pane_id, agent, state }
+                if pane_id == "%1"
+                    && agent == "codex"
+                    && *state == crate::daemon::session_badge::BadgeState::Blocked
+        )));
+    }
+
+    #[test]
+    fn blocked_transition_is_silent_by_default() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let mut blocked = agent_pane("main", "%1", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![blocked]));
+
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::Notify { .. })));
     }
 
     #[test]

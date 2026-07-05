@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -306,6 +307,7 @@ pub fn run_runtime_loop(
     state_path: Option<std::path::PathBuf>,
     worker_io: Arc<dyn crate::daemon::workers::WorkerIo>,
 ) -> Result<()> {
+    let notify_command = state.notify_command().map(str::to_string);
     while state.is_running() {
         let effects = match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(event) => state.apply_event(event),
@@ -314,7 +316,12 @@ pub fn run_runtime_loop(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        handle_runtime_effects(effects, state_path.as_deref(), worker_io.as_ref())?;
+        handle_runtime_effects(
+            effects,
+            state_path.as_deref(),
+            worker_io.as_ref(),
+            notify_command.as_deref(),
+        )?;
     }
     handle_runtime_effects(
         state.apply_event(DaemonEvent::DebounceCheck(
@@ -322,6 +329,7 @@ pub fn run_runtime_loop(
         )),
         state_path.as_deref(),
         worker_io.as_ref(),
+        notify_command.as_deref(),
     )?;
     Ok(())
 }
@@ -330,6 +338,7 @@ fn handle_runtime_effects(
     effects: Vec<RuntimeEffect>,
     state_path: Option<&Path>,
     worker_io: &dyn crate::daemon::workers::WorkerIo,
+    notify_command: Option<&str>,
 ) -> Result<()> {
     for effect in effects {
         match effect {
@@ -365,6 +374,23 @@ fn handle_runtime_effects(
                     worker_io.unset_session_option(&session, crate::options::KEY_SESSION_STATUS)
                 {
                     eprintln!("[vde-tmux] session badge clear failed: {error:#}");
+                }
+            }
+            RuntimeEffect::Notify {
+                pane_id,
+                agent,
+                state,
+            } => {
+                if let Some(command) = notify_command
+                    && let Err(error) = Command::new("sh")
+                        .arg("-c")
+                        .arg(command)
+                        .env("VDE_PANE_ID", pane_id)
+                        .env("VDE_AGENT", agent)
+                        .env("VDE_BADGE_STATE", format!("{state:?}"))
+                        .spawn()
+                {
+                    eprintln!("[vde-tmux] notify command failed: {error:#}");
                 }
             }
         }

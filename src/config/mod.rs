@@ -17,6 +17,14 @@ pub struct Config {
     pub sidebar: SidebarConfig,
     pub daemon: DaemonConfig,
     pub badge: BadgeConfig,
+    pub notify: NotifyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    pub enabled: bool,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -605,5 +613,19 @@ categories:
         )
         .unwrap_err();
         assert!(err.to_string().contains("glyphs"));
+    }
+
+    #[test]
+    fn notify_config_defaults_to_disabled_and_parses_top_level() {
+        let config = Config::default();
+        assert!(!config.notify.enabled);
+        assert_eq!(config.notify.command, "");
+
+        let config = serde_yaml_ng::from_str::<Config>(
+            "notify:\n  enabled: true\n  command: \"printf blocked\"\n",
+        )
+        .unwrap();
+        assert!(config.notify.enabled);
+        assert_eq!(config.notify.command, "printf blocked");
     }
 }
