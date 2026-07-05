@@ -31,6 +31,10 @@ categories:
       path_patterns:
         - github.com/acme/*
 statusline:
+  category:
+    format: "{category} {count} "
+  sessions:
+    badge_style: inline
   summary:
     enabled: true
   session_badge:

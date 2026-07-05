@@ -54,6 +54,9 @@ categories:
 statusline:
   sessions:
     show_index: true
+    badge_style: inline
+  category:
+    format: "{category} {count} "
   summary:
     enabled: true
   session_badge:
@@ -108,6 +111,8 @@ daemon:
 `statusline.session_badge.hide_idle: true` を指定すると idle(○)バッジを非表示にできる。
 `statusline.agent_badge` は `statusline.summary` へ置き換える。
 tmux.conf の `#(vtm statusline-agent-badge)` / `#(vt statusline-agent-badge)` 相当は `#(vt statusline-summary)` へ書き換える。
+`statusline.sessions.badge_style` は `inline`(既定)または `plain` を指定できる。
+`statusline.category.format` では `{count}` を使える。
 `sidebar.colors.attention` / `selection_active_bg` は未使用のため削除する。
 
 ## Pane Option Bus
