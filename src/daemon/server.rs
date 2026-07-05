@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 
 use super::protocol::{ClientMessage, QueryTarget, ServerMessage};
 use super::runtime::{ClientId, DaemonEvent, LatestSlot, RuntimeEffect, RuntimeState};
+use crate::config::Config;
 use crate::daemon::{build_snapshot, statusline_attention_fallback, statusline_summary_fallback};
 use crate::options::snapshot::read_all_panes;
 use crate::tmux::TmuxRunner;
@@ -22,13 +23,17 @@ use crate::tmux::TmuxRunner;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 static SHUTDOWN_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
-pub fn handle_message(runner: &dyn TmuxRunner, message: ClientMessage) -> Result<ServerMessage> {
+pub fn handle_message(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    message: ClientMessage,
+) -> Result<ServerMessage> {
     match message {
         ClientMessage::Query {
             proto: _,
             what: QueryTarget::Summary,
         } => {
-            let text = statusline_summary_fallback(runner, &crate::config::Config::default())?;
+            let text = statusline_summary_fallback(runner, config)?;
             Ok(ServerMessage::Summary { text })
         }
         ClientMessage::Query {
@@ -53,14 +58,18 @@ pub fn handle_message(runner: &dyn TmuxRunner, message: ClientMessage) -> Result
     }
 }
 
-pub fn handle_stream(runner: &dyn TmuxRunner, mut stream: UnixStream) -> Result<()> {
+pub fn handle_stream(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    mut stream: UnixStream,
+) -> Result<()> {
     let mut line = String::new();
     {
         let mut reader = BufReader::new(&mut stream);
         reader.read_line(&mut line)?;
     }
     let response = match serde_json::from_str::<ClientMessage>(line.trim()) {
-        Ok(message) => handle_message(runner, message)?,
+        Ok(message) => handle_message(runner, config, message)?,
         Err(error) => ServerMessage::Error {
             message: error.to_string(),
         },
@@ -162,7 +171,11 @@ fn write_server_message(stream: &mut UnixStream, message: &ServerMessage) -> Res
     Ok(())
 }
 
-pub fn run_daemon_server(runner: &dyn TmuxRunner, socket_path: &Path) -> Result<()> {
+pub fn run_daemon_server(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    socket_path: &Path,
+) -> Result<()> {
     if let Some(parent) = socket_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -178,7 +191,7 @@ pub fn run_daemon_server(runner: &dyn TmuxRunner, socket_path: &Path) -> Result<
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle_stream(runner, stream) {
+                if let Err(error) = handle_stream(runner, config, stream) {
                     eprintln!("[vde-tmux] daemon connection error: {error:#}");
                 }
             }
@@ -481,6 +494,7 @@ mod tests {
         );
         let response = handle_message(
             &mock,
+            &Config::default(),
             ClientMessage::Query {
                 proto: 1,
                 what: crate::daemon::protocol::QueryTarget::Summary,
@@ -496,6 +510,35 @@ mod tests {
     }
 
     #[test]
+    fn handle_query_summary_uses_supplied_config() {
+        let mock = MockTmuxRunner::new();
+        let format = snapshot_format();
+        mock.stub(
+            &["list-panes", "-a", "-F", &format],
+            &format!("{}\n", pane_line("codex", "running", "")),
+        );
+        let mut config = crate::config::Config::default();
+        config.statusline.summary.enabled = false;
+
+        let response = handle_message(
+            &mock,
+            &config,
+            ClientMessage::Query {
+                proto: 1,
+                what: crate::daemon::protocol::QueryTarget::Summary,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            response,
+            ServerMessage::Summary {
+                text: String::new()
+            }
+        );
+    }
+
+    #[test]
     fn handle_subscribe_returns_snapshot() {
         let mock = MockTmuxRunner::new();
         let format = snapshot_format();
@@ -503,7 +546,12 @@ mod tests {
             &["list-panes", "-a", "-F", &format],
             &format!("{}\n", pane_line("codex", "running", "")),
         );
-        let response = handle_message(&mock, ClientMessage::Subscribe { proto: 1 }).unwrap();
+        let response = handle_message(
+            &mock,
+            &Config::default(),
+            ClientMessage::Subscribe { proto: 1 },
+        )
+        .unwrap();
         let ServerMessage::Snapshot { snapshot } = response else {
             panic!("expected snapshot response");
         };
