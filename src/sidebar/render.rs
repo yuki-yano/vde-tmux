@@ -703,7 +703,7 @@ fn render_rail_lines(
     let chat_rows = rows
         .iter()
         .enumerate()
-        .filter(|(_, row)| matches!(row.kind, SidebarRowKind::Chat | SidebarRowKind::Jump))
+        .filter(|(_, row)| matches!(row.kind, SidebarRowKind::Chat))
         .collect::<Vec<_>>();
     let mut lines = Vec::new();
     let mut row_indices = Vec::new();
@@ -1094,6 +1094,33 @@ mod tests {
         let rendered = render_rows(&[blocked1, blocked2, working], &SidebarState::default(), 2);
 
         assert_eq!(rendered, "▲2\n●1\n──\n▲\n▲\n●");
+    }
+
+    #[test]
+    fn rail_does_not_double_count_expanded_chat() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            1,
+            "codex",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(BadgeState::Working);
+        chat.expanded = true;
+        chat.pane_id = Some("%1".to_string());
+        let mut jump = row(
+            "jump::%1",
+            SidebarRowKind::Jump,
+            2,
+            "jump",
+            RollupLevel::Running,
+        );
+        jump.badge_state = Some(BadgeState::Working);
+        jump.pane_id = Some("%1".to_string());
+
+        let text = render_rows(&[chat, jump], &SidebarState::default(), 2);
+
+        assert_eq!(text, "●1\n──\n●");
     }
 
     #[test]
