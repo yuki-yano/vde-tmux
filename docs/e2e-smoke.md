@@ -368,3 +368,20 @@ checked=jump from done(✓) pane immediately clears unread to idle(○)
 checked=vt sidebar focus selects current window sidebar pane
 result=Plan 14 sidebar smoke ok
 ```
+
+Plan 15 sidebar UI Phase 3 smoke も pass。
+daemon は scratch socket で新 binary を起動し直して確認した。
+TUI の `capture-pane -a` は alt-screen が空になるため、daemon subscribe snapshot の rows で表示状態を確認した。
+
+```text
+executed_at=2026-07-05 18:56:30 JST
+scratch=vde-p15-smoke-direct
+checked=permission pane appears as top zone: zone::triage / TRIAGE 1 / chat label codex · app / rollup permission
+checked=FLEET repo row keeps meta.attention_count=1 while blocked pane is triaged
+checked=attention filter keeps TRIAGE visible
+checked=n selects triaged chat and inline meta contains origin misc/app
+checked=Enter on selected TRIAGE chat is accepted by daemon input path
+checked=after blocked clears, first calm poll keeps TRIAGE and second calm poll removes it back to FLEET
+checked=blocked again re-enters TRIAGE without flicker
+result=Plan 15 TRIAGE snapshot smoke ok
+```
