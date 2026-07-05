@@ -108,7 +108,9 @@ daemon:
 `categories.rules[].ghq_patterns` は `path_patterns` へリネームする。
 `statusline.session_badge.glyphs` は `badge.glyphs` へ移動する。
 `statusline.session_badge.suffix` の既定は空文字になる。
-旧表示のようにバッジとラベルの間の空白を維持したい場合は、`statusline.session_badge.suffix: " "` を明示する。
+これにより `▲main` のようにバッジとラベルが密着し、グリフ直後の余分な空白を持たない表示になる。
+一方で badge あり/なしの session が混在すると、label の開始位置が 1 セルずれる。
+旧表示のようにバッジとラベルの間の空白を維持し、開始位置のずれを避けたい場合は、`statusline.session_badge.suffix: " "` を明示する。
 `statusline.session_badge.hide_idle: true` を指定すると idle(○)バッジを非表示にできる。
 `statusline.agent_badge` は `statusline.summary` へ置き換える。
 tmux.conf の `#(vtm statusline-agent-badge)` / `#(vt statusline-agent-badge)` 相当は `#(vt statusline-summary)` へ書き換える。
