@@ -57,16 +57,12 @@ pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<O
     let mut terminal = Terminal::new(backend)?;
     let runner = SystemTmuxRunner::from_env(Duration::from_secs(1));
     let theme = SidebarRenderTheme::from_app_config(config);
-    let result = run_loop(
-        &mut terminal,
-        &socket,
-        &rx,
-        &runner,
-        env,
-        &theme,
-        config.sidebar.preview.history_lines,
-        &config.sidebar.live,
-    );
+    let runtime_config = RunLoopConfig {
+        theme: &theme,
+        preview_history_lines: config.sidebar.preview.history_lines,
+        live: &config.sidebar.live,
+    };
+    let result = run_loop(&mut terminal, &socket, &rx, &runner, env, runtime_config);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -128,16 +124,24 @@ impl LiveState {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RunLoopConfig<'a> {
+    pub theme: &'a SidebarRenderTheme,
+    pub preview_history_lines: u32,
+    pub live: &'a SidebarLiveConfig,
+}
+
 pub fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     socket: &Path,
     rx: &mpsc::Receiver<DaemonSnapshot>,
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
-    theme: &SidebarRenderTheme,
-    preview_history_lines: u32,
-    live_config: &SidebarLiveConfig,
+    config: RunLoopConfig<'_>,
 ) -> Result<TuiExit> {
+    let theme = config.theme;
+    let preview_history_lines = config.preview_history_lines;
+    let live_config = config.live;
     let mut current: Option<DaemonSnapshot> = None;
     let mut clicks = ClickTracker::default();
     let mut scroll: usize = 0;
@@ -197,7 +201,13 @@ pub fn run_loop<B: Backend>(
             } else {
                 scroll = 0;
             }
-            draw_snapshot_with_theme_and_scroll_live(terminal, snapshot, theme, scroll, Some(&live))?;
+            draw_snapshot_with_theme_and_scroll_live(
+                terminal,
+                snapshot,
+                theme,
+                scroll,
+                Some(&live),
+            )?;
         } else {
             draw_connecting(terminal)?;
         }
@@ -726,11 +736,7 @@ fn handle_left_click(
         }
         return Ok(());
     }
-    let areas = compute_areas(
-        Rect::new(0, 0, width, height),
-        &header,
-        context.live_lines,
-    );
+    let areas = compute_areas(Rect::new(0, 0, width, height), &header, context.live_lines);
     if row >= areas.header_rows + areas.rows_height {
         return Ok(());
     }

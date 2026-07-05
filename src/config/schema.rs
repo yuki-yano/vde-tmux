@@ -113,6 +113,15 @@ pub fn config_schema() -> Value {
                         "properties": {
                             "history_lines": { "type": "integer", "minimum": 0 }
                         }
+                    },
+                    "live": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "enabled": { "type": "boolean" },
+                            "lines": { "type": "integer", "minimum": 0 },
+                            "interval_ms": { "type": "integer", "minimum": 1 }
+                        }
                     }
                 }
             },
@@ -122,6 +131,14 @@ pub fn config_schema() -> Value {
                 "properties": {
                     "poll_ms": { "type": "integer", "minimum": 1 },
                     "git": { "type": "object", "additionalProperties": true }
+                }
+            },
+            "notify": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                    "enabled": { "type": "boolean" },
+                    "command": { "type": "string" }
                 }
             }
         }
@@ -140,7 +157,14 @@ mod tests {
             .and_then(|value| value.as_object())
             .unwrap();
 
-        for key in ["categories", "statusline", "sidebar", "daemon", "badge"] {
+        for key in [
+            "categories",
+            "statusline",
+            "sidebar",
+            "daemon",
+            "badge",
+            "notify",
+        ] {
             assert!(
                 properties.contains_key(key),
                 "missing schema property {key}"
@@ -188,6 +212,19 @@ mod tests {
 
         assert_eq!(preview["history_lines"]["type"], "integer");
         assert_eq!(preview["history_lines"]["minimum"], 0);
+    }
+
+    #[test]
+    fn schema_contains_sidebar_live_and_notify() {
+        let schema = config_schema();
+        let live = &schema["properties"]["sidebar"]["properties"]["live"]["properties"];
+        let notify = &schema["properties"]["notify"]["properties"];
+
+        assert_eq!(live["enabled"]["type"], "boolean");
+        assert_eq!(live["lines"]["type"], "integer");
+        assert_eq!(live["interval_ms"]["type"], "integer");
+        assert_eq!(notify["enabled"]["type"], "boolean");
+        assert_eq!(notify["command"]["type"], "string");
     }
 
     #[test]

@@ -400,3 +400,19 @@ checked=state.json contains pinned and daemon restart keeps pinned medium row
 checked=sidebar width 30 renders dense, width 20 renders micro, width 2 renders rail count + separator + glyph rows via attach --once
 result=Plan 16 fisheye width-tier snapshot smoke ok
 ```
+
+Plan 17 sidebar UI Phase 5 smoke も pass。
+daemon は scratch socket で新 binary を起動し直して確認した。
+TUI の `capture-pane -a` はこれまで同様に alt-screen が空になるため、filter/events/flash/notify/elapsed は daemon subscribe snapshot、LIVE tail の source は scratch pane の `capture-pane -p`、LIVE area/tail は unit test で確認した。
+
+```text
+executed_at=2026-07-05 19:45:38 JST
+scratch=vde-p17-smoke-1783248338
+checked=badge counts include Blocked/Working/Done/Idle and transition events include %0 -> Blocked
+checked=Tab cycles filters attention_only -> working_only -> done_only -> idle_only -> all
+checked=blocked transition sets row meta.flash, then flash clears after subsequent polls
+checked=notify.enabled command ran with VDE_PANE_ID/VDE_AGENT/VDE_BADGE_STATE: %0 codex Blocked
+checked=running elapsed_secs advanced via daemon snapshot
+checked=LIVE source pane capture contains live-a/live-b; LIVE area/tail behavior covered by sidebar::tui tests
+result=Plan 17 snapshot smoke ok
+```

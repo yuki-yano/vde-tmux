@@ -5,11 +5,10 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::daemon::protocol::{ServerMessage, SidebarClientEvent};
-use crate::daemon::{
-    DaemonSnapshot, SidebarFrame, TransitionEvent, build_snapshot_with_sidebar,
-    render_agent_badge,
-};
 use crate::daemon::session_badge::{BadgeState, badge_state};
+use crate::daemon::{
+    DaemonSnapshot, SidebarFrame, TransitionEvent, build_snapshot_with_sidebar, render_agent_badge,
+};
 use crate::git::GitBadge;
 use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane};
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
@@ -51,10 +50,18 @@ pub enum DaemonEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEffect {
     JumpPane(String),
-    PreviewPane { pane_id: String, history_lines: u32 },
+    PreviewPane {
+        pane_id: String,
+        history_lines: u32,
+    },
     SaveState(SidebarState),
-    SetSessionBadge { session: String, value: String },
-    ClearSessionBadge { session: String },
+    SetSessionBadge {
+        session: String,
+        value: String,
+    },
+    ClearSessionBadge {
+        session: String,
+    },
     Notify {
         pane_id: String,
         agent: String,
@@ -884,9 +891,11 @@ mod tests {
 
         let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![blocked]));
 
-        assert!(!effects
-            .iter()
-            .any(|effect| matches!(effect, RuntimeEffect::Notify { .. })));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RuntimeEffect::Notify { .. }))
+        );
     }
 
     #[test]

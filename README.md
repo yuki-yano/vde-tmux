@@ -47,6 +47,10 @@ sidebar:
   min_width: 40
   preview:
     history_lines: 2000
+  live:
+    enabled: true
+    lines: 3
+    interval_ms: 2000
   header:
     format: "{label} "
     separator: ""
@@ -69,6 +73,10 @@ sidebar:
     selection_bg: "237"
 daemon:
   poll_ms: 1000
+notify:
+  enabled: false
+  # blocked 遷移時だけ実行する。環境変数 VDE_PANE_ID / VDE_AGENT / VDE_BADGE_STATE を渡す。
+  command: "terminal-notifier -title vde-tmux -message \"$VDE_AGENT $VDE_BADGE_STATE\""
 ```
 
 ## State / Socket

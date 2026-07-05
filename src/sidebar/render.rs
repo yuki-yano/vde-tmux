@@ -920,16 +920,6 @@ fn view_mode_label(view_mode: ViewMode) -> &'static str {
     }
 }
 
-fn filter_label(filter: StatusFilter) -> &'static str {
-    match filter {
-        StatusFilter::All => "all",
-        StatusFilter::AttentionOnly => "attention",
-        StatusFilter::WorkingOnly => "working",
-        StatusFilter::DoneOnly => "done",
-        StatusFilter::IdleOnly => "idle",
-    }
-}
-
 fn visible_segment_range(text: &str, start: usize, len: usize) -> Option<std::ops::Range<u16>> {
     let visible_len = text.chars().count();
     if start >= visible_len {
@@ -1316,12 +1306,8 @@ mod tests {
             ..SidebarState::default()
         };
 
-        let header = build_header_layout_with_counts(
-            &state,
-            80,
-            &SidebarRenderTheme::default(),
-            counts,
-        );
+        let header =
+            build_header_layout_with_counts(&state, 80, &SidebarRenderTheme::default(), counts);
 
         assert_eq!(header.lines[0].text, " repo · ≡4 ▲1 ●1 ✓1 ○1");
         assert_eq!(
