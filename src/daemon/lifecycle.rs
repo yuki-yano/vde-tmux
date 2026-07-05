@@ -126,7 +126,7 @@ fn daemon_socket_responds(socket: &Path) -> bool {
         &mut stream,
         &crate::daemon::protocol::ClientMessage::Query {
             proto: 1,
-            what: crate::daemon::protocol::QueryTarget::Statusline,
+            what: crate::daemon::protocol::QueryTarget::Summary,
         },
     )
     .is_err()

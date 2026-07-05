@@ -56,7 +56,7 @@ fn dispatch_category_use_switches_category() {
 }
 
 #[test]
-fn dispatch_statusline_agent_badge_falls_back_to_tmux_snapshot() {
+fn dispatch_statusline_summary_falls_back_to_tmux_snapshot() {
     let mock = MockTmuxRunner::new();
     let format = crate::options::snapshot::snapshot_format();
     let line = [
@@ -75,8 +75,36 @@ fn dispatch_statusline_agent_badge_falls_back_to_tmux_snapshot() {
                 .as_nanos()
         ),
     )]);
-    let output = run_with(["vt", "statusline-agent-badge"], &mock, &env).unwrap();
-    assert_eq!(output, Some("running:1".to_string()));
+    let output = run_with(["vt", "statusline-summary"], &mock, &env).unwrap();
+    assert_eq!(output, Some("#[fg=green]●1#[default]".to_string()));
+}
+
+#[test]
+fn dispatch_statusline_summary_is_empty_when_disabled() {
+    let config_home = std::env::temp_dir().join(format!(
+        "vde-tmux-summary-disabled-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = config_home.join("vde").join("tmux");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.yml"),
+        "statusline:\n  summary:\n    enabled: false\n",
+    )
+    .unwrap();
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([(
+        "XDG_CONFIG_HOME".to_string(),
+        config_home.display().to_string(),
+    )]);
+
+    let output = run_with(["vt", "statusline-summary"], &mock, &env).unwrap();
+
+    assert_eq!(output, Some(String::new()));
+    std::fs::remove_dir_all(config_home).unwrap();
 }
 
 #[test]

@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::daemon::protocol::{ServerMessage, SidebarClientEvent};
 use crate::daemon::session_badge::{BadgeState, badge_state};
 use crate::daemon::{
-    DaemonSnapshot, SidebarFrame, TransitionEvent, build_snapshot_with_sidebar, render_agent_badge,
+    DaemonSnapshot, SidebarFrame, TransitionEvent, build_snapshot_with_sidebar, render_summary,
 };
 use crate::git::GitBadge;
 use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane};
@@ -40,7 +40,7 @@ pub enum DaemonEvent {
     },
     PanesUpdated(Vec<PaneSnapshot>),
     GitStatusUpdated(BTreeMap<String, GitBadge>),
-    QueryStatusline {
+    QuerySummary {
         reply: Sender<ServerMessage>,
     },
     DebounceCheck(Instant),
@@ -216,13 +216,9 @@ impl RuntimeState {
                 self.broadcast_if_needed();
                 Vec::new()
             }
-            DaemonEvent::QueryStatusline { reply } => {
-                let agent_badge = self
-                    .snapshot
-                    .as_ref()
-                    .map(render_agent_badge)
-                    .unwrap_or_default();
-                let _ = reply.send(ServerMessage::Statusline { agent_badge });
+            DaemonEvent::QuerySummary { reply } => {
+                let text = self.render_summary_text();
+                let _ = reply.send(ServerMessage::Summary { text });
                 Vec::new()
             }
             DaemonEvent::DebounceCheck(now) => self.flush_state_if_due(now),
@@ -662,6 +658,35 @@ impl RuntimeState {
         }
         self.written_badges = desired;
         effects
+    }
+
+    fn render_summary_text(&self) -> String {
+        if !self.config.statusline.summary.enabled {
+            return String::new();
+        }
+        let mut blocked = 0usize;
+        let mut working = 0usize;
+        let mut done = 0usize;
+        let mut idle = 0usize;
+        for pane in self.panes.iter().filter(|pane| is_live_agent_pane(pane)) {
+            let level = crate::sidebar::tree::rollup_for_pane(pane);
+            let unread = self.unread.get(&pane.pane_id).copied().unwrap_or(false);
+            match badge_state(level, unread) {
+                BadgeState::Blocked => blocked += 1,
+                BadgeState::Working => working += 1,
+                BadgeState::Done => done += 1,
+                BadgeState::Idle => idle += 1,
+            }
+        }
+        render_summary(
+            &[
+                (BadgeState::Blocked, blocked),
+                (BadgeState::Working, working),
+                (BadgeState::Done, done),
+                (BadgeState::Idle, idle),
+            ],
+            &self.config.badge.glyphs,
+        )
     }
 
     fn broadcast_if_needed(&mut self) {
@@ -1526,5 +1551,47 @@ mod tests {
         plain.agent = String::new();
         let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![sidebar, plain]));
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn summary_query_counts_unread_as_done() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![
+            agent_pane("main", "%1", "idle"),
+            agent_pane("main", "%2", "running"),
+        ]));
+
+        let (reply, receiver) = std::sync::mpsc::channel();
+        state.apply_event(DaemonEvent::QuerySummary { reply });
+        let message = receiver.recv().unwrap();
+        assert_eq!(
+            message,
+            ServerMessage::Summary {
+                text: "#[fg=green]●1#[default] #[fg=cyan]✓1#[default]".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn summary_query_returns_empty_when_disabled() {
+        let mut config = Config::default();
+        config.statusline.summary.enabled = false;
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+
+        let (reply, receiver) = std::sync::mpsc::channel();
+        state.apply_event(DaemonEvent::QuerySummary { reply });
+
+        assert_eq!(
+            receiver.recv().unwrap(),
+            ServerMessage::Summary {
+                text: String::new()
+            }
+        );
     }
 }

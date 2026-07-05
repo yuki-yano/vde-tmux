@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 
 use super::protocol::{ClientMessage, QueryTarget, ServerMessage};
 use super::runtime::{ClientId, DaemonEvent, LatestSlot, RuntimeEffect, RuntimeState};
-use crate::daemon::{build_snapshot, statusline_agent_badge_fallback};
+use crate::daemon::{build_snapshot, statusline_summary_fallback};
 use crate::options::snapshot::read_all_panes;
 use crate::tmux::TmuxRunner;
 
@@ -26,10 +26,10 @@ pub fn handle_message(runner: &dyn TmuxRunner, message: ClientMessage) -> Result
     match message {
         ClientMessage::Query {
             proto: _,
-            what: QueryTarget::Statusline,
+            what: QueryTarget::Summary,
         } => {
-            let agent_badge = statusline_agent_badge_fallback(runner)?;
-            Ok(ServerMessage::Statusline { agent_badge })
+            let text = statusline_summary_fallback(runner, &crate::config::Config::default())?;
+            Ok(ServerMessage::Summary { text })
         }
         ClientMessage::Subscribe { proto: _ } => {
             let panes = read_all_panes(runner)?;
@@ -93,10 +93,10 @@ pub fn handle_stream_with_runtime(
         }
         ClientMessage::Query {
             proto: _,
-            what: QueryTarget::Statusline,
+            what: QueryTarget::Summary,
         } => {
             let (reply_tx, reply_rx) = mpsc::channel();
-            tx.send(DaemonEvent::QueryStatusline { reply: reply_tx })?;
+            tx.send(DaemonEvent::QuerySummary { reply: reply_tx })?;
             let response = reply_rx
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap_or_else(|error| ServerMessage::Error {
@@ -424,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_query_returns_statusline_payload() {
+    fn handle_query_returns_summary_payload() {
         let mock = MockTmuxRunner::new();
         let format = snapshot_format();
         mock.stub(
@@ -435,14 +435,14 @@ mod tests {
             &mock,
             ClientMessage::Query {
                 proto: 1,
-                what: crate::daemon::protocol::QueryTarget::Statusline,
+                what: crate::daemon::protocol::QueryTarget::Summary,
             },
         )
         .unwrap();
         assert_eq!(
             response,
-            ServerMessage::Statusline {
-                agent_badge: "running:1".to_string()
+            ServerMessage::Summary {
+                text: "#[fg=green]●1#[default]".to_string()
             }
         );
     }
@@ -653,7 +653,7 @@ mod tests {
         }]))
         .unwrap();
         let (reply_tx, reply_rx) = mpsc::channel();
-        tx.send(DaemonEvent::QueryStatusline { reply: reply_tx })
+        tx.send(DaemonEvent::QuerySummary { reply: reply_tx })
             .unwrap();
         tx.send(DaemonEvent::Client {
             client_id: ClientId(1),
@@ -674,8 +674,8 @@ mod tests {
 
         assert_eq!(
             reply_rx.recv().unwrap(),
-            ServerMessage::Statusline {
-                agent_badge: "running:1".to_string()
+            ServerMessage::Summary {
+                text: "#[fg=green]●1#[default]".to_string()
             }
         );
         assert_eq!(io.jumps.lock().unwrap().as_slice(), ["%1"]);
@@ -701,7 +701,7 @@ mod tests {
         })
         .unwrap();
         let (reply_tx, reply_rx) = mpsc::channel();
-        tx.send(DaemonEvent::QueryStatusline { reply: reply_tx })
+        tx.send(DaemonEvent::QuerySummary { reply: reply_tx })
             .unwrap();
         drop(tx);
 
@@ -715,8 +715,8 @@ mod tests {
 
         assert_eq!(
             reply_rx.recv().unwrap(),
-            ServerMessage::Statusline {
-                agent_badge: String::new()
+            ServerMessage::Summary {
+                text: String::new()
             }
         );
     }

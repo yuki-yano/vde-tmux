@@ -30,8 +30,8 @@ enum Command {
         #[command(subcommand)]
         command: Option<StatuslineCategoryCommand>,
     },
-    #[command(name = "statusline-agent-badge")]
-    StatuslineAgentBadge,
+    #[command(name = "statusline-summary")]
+    StatuslineSummary,
     #[command(name = "statusline-sessions")]
     StatuslineSessions {
         #[arg(long = "show-index")]
@@ -263,7 +263,7 @@ where
                 )?))
             }
         },
-        Command::StatuslineAgentBadge => Ok(Some(daemon::statusline_agent_badge(runner, env)?)),
+        Command::StatuslineSummary => Ok(Some(daemon::statusline_summary(runner, env, &config)?)),
         Command::Daemon { socket, command } => match command {
             Some(DaemonCommand::Stop {
                 socket: stop_socket,

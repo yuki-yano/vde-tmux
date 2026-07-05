@@ -33,13 +33,13 @@ pub enum SidebarClientEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryTarget {
-    Statusline,
+    Summary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    Statusline { agent_badge: String },
+    Summary { text: String },
     Snapshot { snapshot: DaemonSnapshot },
     Ack,
     Error { message: String },
@@ -50,13 +50,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn query_statusline_uses_role_declaration_shape() {
+    fn summary_query_uses_role_declaration_shape() {
         let message = ClientMessage::Query {
             proto: 1,
-            what: QueryTarget::Statusline,
+            what: QueryTarget::Summary,
         };
         let json = serde_json::to_string(&message).unwrap();
-        assert_eq!(json, r#"{"op":"query","proto":1,"what":"statusline"}"#);
+        assert_eq!(json, r#"{"op":"query","proto":1,"what":"summary"}"#);
         let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, message);
     }

@@ -51,6 +51,13 @@ pub fn config_schema() -> Value {
                 "type": "object",
                 "additionalProperties": true,
                 "properties": {
+                    "summary": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "enabled": { "type": "boolean" }
+                        }
+                    },
                     "session_badge": {
                         "type": "object",
                         "additionalProperties": true,
@@ -248,6 +255,10 @@ mod tests {
         assert_eq!(
             schema["properties"]["statusline"]["properties"]["session_badge"]["properties"]["hide_idle"]
                 ["type"],
+            "boolean"
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["summary"]["properties"]["enabled"]["type"],
             "boolean"
         );
     }

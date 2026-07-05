@@ -10,11 +10,12 @@ use anyhow::{Context, Result, bail};
 use crate::daemon::protocol::{ClientMessage, ServerMessage};
 use crate::tmux::TmuxRunner;
 
-pub(crate) fn statusline_agent_badge(
+pub(crate) fn statusline_summary(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
+    config: &crate::config::Config,
 ) -> Result<String> {
-    crate::daemon::statusline_agent_badge(runner, env)
+    crate::daemon::statusline_summary(runner, env, config)
 }
 
 pub(crate) fn run_daemon(
@@ -81,7 +82,7 @@ fn request_shutdown(socket_path: &Path) -> Result<()> {
     match serde_json::from_str::<ServerMessage>(line.trim())? {
         ServerMessage::Ack => Ok(()),
         ServerMessage::Error { message } => bail!(message),
-        ServerMessage::Statusline { .. } => bail!("unexpected daemon statusline response"),
+        ServerMessage::Summary { .. } => bail!("unexpected daemon summary response"),
         ServerMessage::Snapshot { .. } => bail!("unexpected daemon snapshot response"),
     }
 }

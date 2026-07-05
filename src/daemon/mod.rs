@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::protocol::{ClientMessage, ServerMessage};
-use crate::daemon::session_badge::{BadgeState, glyph_for_state};
+use crate::daemon::session_badge::{BadgeState, badge_state, glyph_for_state};
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
 use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane, read_all_panes};
 use crate::sidebar::state::SidebarState;
@@ -98,13 +98,6 @@ pub fn build_snapshot_with_sidebar(
     }
 }
 
-pub fn render_agent_badge(snapshot: &DaemonSnapshot) -> String {
-    if snapshot.agent_count == 0 {
-        return String::new();
-    }
-    format!("{}:{}", rollup_label(snapshot.rollup), snapshot.agent_count)
-}
-
 pub fn render_summary(
     counts: &[(BadgeState, usize)],
     glyphs: &crate::config::BadgeGlyphs,
@@ -129,22 +122,35 @@ pub fn render_summary(
         .join(" ")
 }
 
-pub fn statusline_agent_badge_fallback(runner: &dyn TmuxRunner) -> Result<String> {
+pub fn statusline_summary_fallback(
+    runner: &dyn TmuxRunner,
+    config: &crate::config::Config,
+) -> Result<String> {
+    if !config.statusline.summary.enabled {
+        return Ok(String::new());
+    }
     let panes = read_all_panes(runner)?;
-    Ok(render_agent_badge(&build_snapshot(&panes)))
+    Ok(render_summary(
+        &summary_counts_for_panes(&panes),
+        &config.badge.glyphs,
+    ))
 }
 
-pub fn statusline_agent_badge(
+pub fn statusline_summary(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
+    config: &crate::config::Config,
 ) -> Result<String> {
+    if !config.statusline.summary.enabled {
+        return Ok(String::new());
+    }
     let socket_path = daemon_socket_path(env, None);
     if socket_path.exists()
-        && let Ok(value) = query_statusline_agent_badge(&socket_path)
+        && let Ok(value) = query_statusline_summary(&socket_path)
     {
         return Ok(value);
     }
-    statusline_agent_badge_fallback(runner)
+    statusline_summary_fallback(runner, config)
 }
 
 pub fn daemon_socket_path(env: &BTreeMap<String, String>, explicit: Option<&str>) -> PathBuf {
@@ -168,14 +174,14 @@ pub fn daemon_socket_path(env: &BTreeMap<String, String>, explicit: Option<&str>
     }))
 }
 
-pub fn query_statusline_agent_badge(socket_path: &Path) -> Result<String> {
+pub fn query_statusline_summary(socket_path: &Path) -> Result<String> {
     let mut stream = UnixStream::connect(socket_path)
         .with_context(|| format!("failed to connect {}", socket_path.display()))?;
     serde_json::to_writer(
         &mut stream,
         &ClientMessage::Query {
             proto: 1,
-            what: crate::daemon::protocol::QueryTarget::Statusline,
+            what: crate::daemon::protocol::QueryTarget::Summary,
         },
     )?;
     stream.write_all(b"\n")?;
@@ -184,11 +190,34 @@ pub fn query_statusline_agent_badge(socket_path: &Path) -> Result<String> {
     let mut reader = BufReader::new(stream);
     reader.read_line(&mut line)?;
     match serde_json::from_str::<ServerMessage>(line.trim())? {
-        ServerMessage::Statusline { agent_badge } => Ok(agent_badge),
+        ServerMessage::Summary { text } => Ok(text),
         ServerMessage::Ack => bail!("unexpected daemon ack response"),
         ServerMessage::Error { message } => bail!(message),
         ServerMessage::Snapshot { .. } => bail!("unexpected daemon snapshot response"),
     }
+}
+
+fn summary_counts_for_panes(panes: &[PaneSnapshot]) -> [(BadgeState, usize); 4] {
+    let mut blocked = 0usize;
+    let mut working = 0usize;
+    let mut done = 0usize;
+    let mut idle = 0usize;
+    for pane in panes.iter().filter(|pane| is_live_agent_pane(pane)) {
+        let status = parse_agent_status(&pane.status);
+        let wait_reason = (!pane.wait_reason.is_empty()).then_some(pane.wait_reason.as_str());
+        match badge_state(pane_rollup_level(status, wait_reason), false) {
+            BadgeState::Blocked => blocked += 1,
+            BadgeState::Working => working += 1,
+            BadgeState::Done => done += 1,
+            BadgeState::Idle => idle += 1,
+        }
+    }
+    [
+        (BadgeState::Blocked, blocked),
+        (BadgeState::Working, working),
+        (BadgeState::Done, done),
+        (BadgeState::Idle, idle),
+    ]
 }
 
 fn parse_agent_status(raw: &str) -> Option<AgentStatus> {
@@ -198,17 +227,6 @@ fn parse_agent_status(raw: &str) -> Option<AgentStatus> {
         "idle" => Some(AgentStatus::Idle),
         "error" => Some(AgentStatus::Error),
         _ => None,
-    }
-}
-
-fn rollup_label(level: RollupLevel) -> &'static str {
-    match level {
-        RollupLevel::Error => "error",
-        RollupLevel::Running => "running",
-        RollupLevel::Permission => "permission",
-        RollupLevel::Background => "background",
-        RollupLevel::Waiting => "waiting",
-        RollupLevel::Idle => "idle",
     }
 }
 
@@ -252,7 +270,6 @@ mod tests {
         let snapshot = build_snapshot(&[stale]);
 
         assert_eq!(snapshot.agent_count, 0);
-        assert_eq!(render_agent_badge(&snapshot), "");
     }
 
     #[test]
@@ -262,18 +279,6 @@ mod tests {
             pane("codex", "waiting", "permission_prompt"),
         ]);
         assert_eq!(snapshot.rollup, crate::hook::RollupLevel::Permission);
-    }
-
-    #[test]
-    fn render_agent_badge_is_empty_without_agents() {
-        let snapshot = build_snapshot(&[pane("", "", "")]);
-        assert_eq!(render_agent_badge(&snapshot), "");
-    }
-
-    #[test]
-    fn render_agent_badge_includes_rollup_and_count() {
-        let snapshot = build_snapshot(&[pane("codex", "running", "")]);
-        assert_eq!(render_agent_badge(&snapshot), "running:1");
     }
 
     #[test]
@@ -323,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn query_statusline_agent_badge_reads_server_response() {
+    fn query_statusline_summary_reads_server_response() {
         let socket_path = unique_socket_path();
         let listener = UnixListener::bind(&socket_path).unwrap();
         let handle = thread::spawn(move || {
@@ -335,23 +340,23 @@ mod tests {
                 message,
                 ClientMessage::Query {
                     proto: 1,
-                    what: crate::daemon::protocol::QueryTarget::Statusline
+                    what: crate::daemon::protocol::QueryTarget::Summary
                 }
             );
             serde_json::to_writer(
                 &mut stream,
-                &ServerMessage::Statusline {
-                    agent_badge: "running:1".to_string(),
+                &ServerMessage::Summary {
+                    text: "#[fg=green]●1#[default]".to_string(),
                 },
             )
             .unwrap();
             stream.write_all(b"\n").unwrap();
         });
 
-        let value = query_statusline_agent_badge(&socket_path).unwrap();
+        let value = query_statusline_summary(&socket_path).unwrap();
         handle.join().unwrap();
         fs::remove_file(socket_path).unwrap();
-        assert_eq!(value, "running:1");
+        assert_eq!(value, "#[fg=green]●1#[default]");
     }
 
     fn unique_socket_path() -> PathBuf {
