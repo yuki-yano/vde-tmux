@@ -282,6 +282,7 @@ impl RuntimeState {
         match event {
             SidebarClientEvent::Key { key } => self.apply_key(&key),
             SidebarClientEvent::JumpPane { pane } => {
+                self.unread.insert(pane.clone(), false);
                 self.ui_state.selection = Some(format!("chat::{pane}"));
                 self.mark_state_dirty(Instant::now());
                 self.rebuild_snapshot();
@@ -327,6 +328,9 @@ impl RuntimeState {
             SidebarInputAction::Activate => {
                 match activate_selected(self.ui_state.selection.as_deref(), &self.rows) {
                     Some(SidebarCommand::JumpPane(pane_id)) => {
+                        self.unread.insert(pane_id.clone(), false);
+                        self.rebuild_snapshot();
+                        self.broadcast_if_needed();
                         return vec![RuntimeEffect::JumpPane(pane_id)];
                     }
                     Some(SidebarCommand::ToggleExpand(row_id)) => {
@@ -941,6 +945,32 @@ mod tests {
                 session: "main".to_string(),
                 value: "○ ".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn jump_clears_unread_immediately() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "idle",
+        )]));
+
+        let effects = state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::JumpPane {
+                pane: "%1".to_string(),
+            },
+        });
+
+        assert!(effects.contains(&RuntimeEffect::JumpPane("%1".to_string())));
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        let chat = rows.iter().find(|row| row.id == "chat::%1").unwrap();
+        assert_eq!(
+            chat.badge_state,
+            Some(crate::daemon::session_badge::BadgeState::Idle)
         );
     }
 
