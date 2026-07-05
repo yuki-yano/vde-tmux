@@ -560,7 +560,13 @@ fn draw_snapshot_in_area(
             ..area
         };
         frame.render_widget(
-            Paragraph::new(render_live_lines(snapshot, live, areas.live_rows)),
+            Paragraph::new(render_live_lines(
+                snapshot,
+                live,
+                areas.live_rows,
+                crate::sidebar::tree::now_epoch_secs(),
+                theme,
+            )),
             live_area,
         );
     }
@@ -587,6 +593,8 @@ fn render_live_lines(
     snapshot: &DaemonSnapshot,
     live: &LiveState,
     live_rows: u16,
+    now: i64,
+    theme: &SidebarRenderTheme,
 ) -> Vec<Line<'static>> {
     let body_limit = live_rows.saturating_sub(1) as usize;
     let title = match live.mode {
@@ -603,7 +611,7 @@ fn render_live_lines(
     ))];
     let body = match live.mode {
         LiveMode::Tail => live.lines.clone(),
-        LiveMode::Events => event_tail(snapshot, body_limit),
+        LiveMode::Events => event_tail(snapshot, body_limit, now, theme),
     };
     lines.extend(
         body.into_iter()
@@ -625,18 +633,34 @@ pub(crate) fn extract_tail(raw: &str, limit: usize) -> Vec<String> {
     lines
 }
 
-fn event_tail(snapshot: &DaemonSnapshot, limit: usize) -> Vec<String> {
+fn event_tail(
+    snapshot: &DaemonSnapshot,
+    limit: usize,
+    now: i64,
+    theme: &SidebarRenderTheme,
+) -> Vec<String> {
     let mut events = snapshot
         .events
         .iter()
         .rev()
         .take(limit)
         .map(|event| {
+            let elapsed = (now - event.at_epoch).max(0);
+            let ago = if elapsed >= 60 {
+                format!("{}m前", elapsed / 60)
+            } else {
+                format!("{elapsed}s前")
+            };
             let from = event
                 .from
-                .map(|state| format!("{state:?}"))
-                .unwrap_or_else(|| "New".to_string());
-            format!("{} {} -> {:?}", event.pane_id, from, event.to)
+                .map(|state| theme.badge_glyph(state).to_string())
+                .unwrap_or_else(|| "·".to_string());
+            format!(
+                "{ago} {} {} → {}",
+                event.agent,
+                from,
+                theme.badge_glyph(event.to)
+            )
         })
         .collect::<Vec<_>>();
     events.reverse();
@@ -1040,6 +1064,23 @@ mod tests {
     fn live_tail_keeps_last_nonempty_lines() {
         assert_eq!(extract_tail("a\nb\n\nc\n\n\n", 3), vec!["a", "b", "c"]);
         assert_eq!(extract_tail("a\nb\nc\nd\n", 2), vec!["c", "d"]);
+    }
+
+    #[test]
+    fn event_tail_formats_ago_agent_and_glyphs() {
+        let mut snapshot = crate::daemon::build_snapshot_with_sidebar(&[], None);
+        snapshot.events.push(crate::daemon::TransitionEvent {
+            pane_id: "%1".to_string(),
+            agent: "codex".to_string(),
+            from: Some(crate::daemon::session_badge::BadgeState::Working),
+            to: crate::daemon::session_badge::BadgeState::Blocked,
+            at_epoch: 880,
+        });
+        let theme = SidebarRenderTheme::from_app_config(&crate::config::Config::default());
+
+        let lines = event_tail(&snapshot, 3, 1000, &theme);
+
+        assert_eq!(lines, vec!["2m前 codex ● → ▲".to_string()]);
     }
 
     #[test]

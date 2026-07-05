@@ -114,7 +114,7 @@ impl SidebarRenderTheme {
         }
     }
 
-    fn badge_glyph(&self, state: BadgeState) -> &str {
+    pub(crate) fn badge_glyph(&self, state: BadgeState) -> &str {
         glyph_for_state(state, &self.badge_glyphs)
     }
 
