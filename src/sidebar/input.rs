@@ -64,6 +64,7 @@ pub fn activate_selected(selection: Option<&str>, rows: &[SidebarRow]) -> Option
             Some(SidebarCommand::ToggleExpand(row.id.clone()))
         }
         SidebarRowKind::Detail => row.pane_id.clone().map(SidebarCommand::PreviewPane),
+        SidebarRowKind::Zone => None,
     }
 }
 

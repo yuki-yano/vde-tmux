@@ -268,6 +268,10 @@ impl ClickTracker {
                 });
                 ClickDecision::Pending
             }
+            SidebarRowKind::Zone => {
+                self.pending = None;
+                ClickDecision::None
+            }
         }
     }
 
@@ -290,6 +294,7 @@ fn single_click_action(row: &ClickedRow) -> Option<ClickAction> {
         }
         SidebarRowKind::Jump => row.pane_id.clone().map(ClickAction::JumpPane),
         SidebarRowKind::Detail => row.pane_id.clone().map(ClickAction::PreviewPane),
+        SidebarRowKind::Zone => None,
     }
 }
 
@@ -491,7 +496,7 @@ fn preview_pane_for_selection(snapshot: &DaemonSnapshot) -> Option<String> {
     let row = sidebar.rows.iter().find(|row| row.id == selection)?;
     match row.kind {
         SidebarRowKind::Chat | SidebarRowKind::Jump | SidebarRowKind::Detail => row.pane_id.clone(),
-        SidebarRowKind::Category | SidebarRowKind::Repo => None,
+        SidebarRowKind::Category | SidebarRowKind::Repo | SidebarRowKind::Zone => None,
     }
 }
 

@@ -12,6 +12,7 @@ use crate::sidebar::state::{SidebarRowRef, SidebarState, StatusFilter, ViewMode}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SidebarRowKind {
+    Zone,
     Category,
     Repo,
     Chat,
@@ -202,7 +203,7 @@ pub fn build_rows_ctx(
 
 pub fn row_refs(rows: &[SidebarRow]) -> Vec<SidebarRowRef> {
     rows.iter()
-        .filter(|row| row.kind != SidebarRowKind::Detail)
+        .filter(|row| !matches!(row.kind, SidebarRowKind::Detail | SidebarRowKind::Zone))
         .map(|row| SidebarRowRef::new(row.id.clone()))
         .collect()
 }
@@ -700,6 +701,42 @@ mod tests {
             category: category.to_string(),
             path_patterns: vec![pattern.to_string()],
         }
+    }
+
+    #[test]
+    fn row_refs_exclude_zone_rows() {
+        let rows = vec![
+            SidebarRow {
+                id: "zone::triage".to_string(),
+                kind: SidebarRowKind::Zone,
+                depth: 0,
+                label: "TRIAGE".to_string(),
+                chat_count: 1,
+                rollup: RollupLevel::Permission,
+                badge_state: None,
+                expanded: true,
+                pane_id: None,
+                git: None,
+                meta: None,
+            },
+            SidebarRow {
+                id: "repo::misc::app".to_string(),
+                kind: SidebarRowKind::Repo,
+                depth: 0,
+                label: "app".to_string(),
+                chat_count: 1,
+                rollup: RollupLevel::Running,
+                badge_state: None,
+                expanded: true,
+                pane_id: None,
+                git: None,
+                meta: None,
+            },
+        ];
+
+        let refs = row_refs(&rows);
+
+        assert_eq!(refs, vec![SidebarRowRef::new("repo::misc::app")]);
     }
 
     #[test]

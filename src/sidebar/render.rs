@@ -301,6 +301,16 @@ fn render_row_line(
     theme: &SidebarRenderTheme,
 ) -> Line<'static> {
     let selected = state.selection.as_deref() == Some(row.id.as_str());
+    if row.kind == SidebarRowKind::Zone {
+        let text = truncate_display(
+            &format!(" ▍{} {}", row.label, row.chat_count),
+            width.saturating_sub(1),
+        );
+        let style = Style::default()
+            .fg(theme.badge_color(BadgeState::Blocked))
+            .add_modifier(Modifier::BOLD);
+        return Line::from(Span::styled(text, style));
+    }
     let style = row_style(row, theme);
     let content_width = width.saturating_sub(2);
 
@@ -312,6 +322,7 @@ fn render_row_line(
         }
         SidebarRowKind::Detail => indent.clone(),
         SidebarRowKind::Jump => format!("{indent}-> "),
+        SidebarRowKind::Zone => unreachable!("zone rows return before generic rendering"),
     };
     let badge = if row.kind == SidebarRowKind::Chat {
         row.badge_state.map(|state| {
@@ -465,7 +476,7 @@ fn right_label(row: &SidebarRow) -> Option<String> {
                 .map(elapsed_label),
             RollupLevel::Idle => None,
         },
-        SidebarRowKind::Detail | SidebarRowKind::Jump => None,
+        SidebarRowKind::Detail | SidebarRowKind::Jump | SidebarRowKind::Zone => None,
     }
 }
 
@@ -501,6 +512,7 @@ fn git_badge_width(git: &GitBadgeText) -> usize {
 
 fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
     let style = Style::default().fg(match row.kind {
+        SidebarRowKind::Zone => Color::Reset,
         SidebarRowKind::Category => Color::Blue,
         SidebarRowKind::Repo
         | SidebarRowKind::Chat
@@ -512,6 +524,7 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
         SidebarRowKind::Detail => style.add_modifier(Modifier::DIM),
         SidebarRowKind::Jump => style.fg(Color::Cyan),
         SidebarRowKind::Chat => style,
+        SidebarRowKind::Zone => style,
     }
 }
 
@@ -612,6 +625,35 @@ mod tests {
             git: None,
             meta: None,
         }
+    }
+
+    #[test]
+    fn zone_row_renders_as_colored_heading() {
+        let mut zone = row(
+            "zone::triage",
+            SidebarRowKind::Zone,
+            0,
+            "TRIAGE",
+            RollupLevel::Permission,
+        );
+        zone.chat_count = 2;
+
+        let lines = render_lines(
+            &[zone],
+            &SidebarState::default(),
+            30,
+            &SidebarRenderTheme::default(),
+        );
+        let text = line_to_string(lines[0].clone());
+
+        assert!(text.starts_with(" ▍TRIAGE 2"), "{text:?}");
+        assert!(
+            lines[0].spans.iter().any(|span| {
+                span.style.fg == Some(Color::Red)
+                    && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "{lines:?}"
+        );
     }
 
     #[test]
