@@ -276,8 +276,8 @@ pub fn build_header_layout_with_counts(
     let full_text = format!(" {mode_badge}{separator}{filter_badges}");
     let text = truncate_display(&full_text, width as usize);
     let mut segments = Vec::new();
-    let mode_len = mode_badge.chars().count();
-    let separator_len = separator.chars().count();
+    let mode_len = display_width(&mode_badge);
+    let separator_len = display_width(&separator);
     if let Some(range) = visible_segment_range(&text, 1, mode_len) {
         segments.push(HeaderSegment {
             range,
@@ -287,7 +287,8 @@ pub fn build_header_layout_with_counts(
     }
     let mut start = 1 + mode_len + separator_len;
     for (label, action, filter, badge_state) in filter_items {
-        if let Some(range) = visible_segment_range(&text, start, label.chars().count()) {
+        let label_len = display_width(&label);
+        if let Some(range) = visible_segment_range(&text, start, label_len) {
             let style = if state.filter == filter {
                 header_segment_style(theme)
             } else if let Some(badge_state) = badge_state {
@@ -301,7 +302,7 @@ pub fn build_header_layout_with_counts(
                 style: Some(style),
             });
         }
-        start += label.chars().count() + 1;
+        start += label_len + 1;
     }
     HeaderLayout {
         lines: vec![HeaderLine { text, segments }],
@@ -335,21 +336,21 @@ pub fn render_header_lines(
             let mut cursor = 0_u16;
             for segment in &line.segments {
                 if cursor < segment.range.start {
-                    spans.push(Span::raw(slice_chars(
+                    spans.push(Span::raw(slice_display(
                         &line.text,
                         cursor,
                         segment.range.start,
                     )));
                 }
                 spans.push(Span::styled(
-                    slice_chars(&line.text, segment.range.start, segment.range.end),
+                    slice_display(&line.text, segment.range.start, segment.range.end),
                     segment.style.unwrap_or_else(|| header_segment_style(theme)),
                 ));
                 cursor = segment.range.end;
             }
-            let text_len = line.text.chars().count() as u16;
+            let text_len = display_width(&line.text) as u16;
             if cursor < text_len {
-                spans.push(Span::raw(slice_chars(&line.text, cursor, text_len)));
+                spans.push(Span::raw(slice_display(&line.text, cursor, text_len)));
             }
             Line::from(spans)
         })
@@ -921,7 +922,7 @@ fn view_mode_label(view_mode: ViewMode) -> &'static str {
 }
 
 fn visible_segment_range(text: &str, start: usize, len: usize) -> Option<std::ops::Range<u16>> {
-    let visible_len = text.chars().count();
+    let visible_len = display_width(text);
     if start >= visible_len {
         return None;
     }
@@ -929,11 +930,20 @@ fn visible_segment_range(text: &str, start: usize, len: usize) -> Option<std::op
     Some(start as u16..end as u16)
 }
 
-fn slice_chars(text: &str, start: u16, end: u16) -> String {
-    text.chars()
-        .skip(start as usize)
-        .take((end - start) as usize)
-        .collect()
+fn slice_display(text: &str, start: u16, end: u16) -> String {
+    let mut cell = 0_u16;
+    let mut out = String::new();
+    for ch in text.chars() {
+        let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+        if cell >= end {
+            break;
+        }
+        if cell >= start && cell + width <= end {
+            out.push(ch);
+        }
+        cell = cell.saturating_add(width);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1428,6 +1438,34 @@ sidebar:
                 .style
                 .add_modifier
                 .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn header_segments_use_display_cells_with_cjk_prefix() {
+        let mut config = crate::config::Config::default();
+        config.sidebar.header.prefix = "「".to_string();
+        config.sidebar.header.suffix = "」".to_string();
+        let theme = SidebarRenderTheme::from_app_config(&config);
+        let state = SidebarState::default();
+
+        let layout =
+            build_header_layout_with_counts(&state, 60, &theme, BadgeCounts::default());
+        let line = &layout.lines[0];
+        let mode = &line.segments[0];
+        let mode_text = format_header_segment(view_mode_label(state.view_mode), &theme);
+
+        assert_eq!(
+            (mode.range.end - mode.range.start) as usize,
+            display_width(&mode_text)
+        );
+        let lines = render_header_lines(&layout, &theme);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content == mode_text),
+            "{lines:?}"
         );
     }
 
