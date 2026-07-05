@@ -975,6 +975,74 @@ mod tests {
     }
 
     #[test]
+    fn moving_through_expanded_chat_does_not_teleport_selection() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                view_mode: crate::sidebar::state::ViewMode::Flat,
+                ..SidebarState::default()
+            },
+        );
+        state.apply_event(DaemonEvent::PanesUpdated(vec![
+            agent_pane("main", "%1", "running"),
+            agent_pane("main", "%2", "running"),
+        ]));
+        let key = |state: &mut RuntimeState, key: &str| {
+            state.apply_event(DaemonEvent::Client {
+                client_id: ClientId(1),
+                event: SidebarClientEvent::Key {
+                    key: key.to_string(),
+                },
+            });
+        };
+
+        key(&mut state, "j");
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
+        key(&mut state, "j");
+        assert_eq!(state.ui_state.selection.as_deref(), Some("jump::%1"));
+        assert!(state.rows.iter().any(|row| row.id == "jump::%1"));
+        key(&mut state, "j");
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%2"));
+    }
+
+    #[test]
+    fn selection_follows_pane_across_triage_and_fleet() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                view_mode: crate::sidebar::state::ViewMode::Flat,
+                ..SidebarState::default()
+            },
+        );
+        let mut blocked = agent_pane("main", "%1", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        state.apply_event(DaemonEvent::PanesUpdated(vec![
+            blocked,
+            agent_pane("main", "%2", "running"),
+        ]));
+        let key = |state: &mut RuntimeState, key: &str| {
+            state.apply_event(DaemonEvent::Client {
+                client_id: ClientId(1),
+                event: SidebarClientEvent::Key {
+                    key: key.to_string(),
+                },
+            });
+        };
+
+        key(&mut state, "n");
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
+        for _ in 0..2 {
+            state.apply_event(DaemonEvent::PanesUpdated(vec![
+                agent_pane("main", "%1", "running"),
+                agent_pane("main", "%2", "running"),
+            ]));
+        }
+
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
+        assert!(state.rows.iter().any(|row| row.id == "chat::%1"));
+    }
+
+    #[test]
     fn client_move_selection_skips_detail_rows_and_can_select_jump_row() {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
         let mut agent = pane("%1", "/tmp/app", "codex", "running");

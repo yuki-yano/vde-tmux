@@ -381,7 +381,7 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
     }];
     for pane in panes {
         let id = format!("chat::{}", pane.pane_id);
-        let selected = state.selection.as_deref() == Some(id.as_str());
+        let selected = selection_pane_id(state.selection.as_deref()) == Some(pane.pane_id.as_str());
         let pinned = state.pinned.contains(&id);
         let manual = state.is_expanded_with_default(&id, false);
         let expanded = selected || manual;
@@ -431,7 +431,7 @@ fn push_chat_row(
     rows: &mut Vec<SidebarRow>,
 ) {
     let id = format!("chat::{}", pane.pane_id);
-    let selected = state.selection.as_deref() == Some(id.as_str());
+    let selected = selection_pane_id(state.selection.as_deref()) == Some(pane.pane_id.as_str());
     let pinned = state.pinned.contains(&id);
     let manual = state.is_expanded_with_default(&id, false);
     let expanded = selected || manual;
@@ -455,6 +455,15 @@ fn push_chat_row(
     } else if pinned {
         push_meta_row(pane, depth + 1, now, None, rows);
     }
+}
+
+fn selection_pane_id(selection: Option<&str>) -> Option<&str> {
+    let selection = selection?;
+    let rest = selection
+        .strip_prefix("chat::")
+        .or_else(|| selection.strip_prefix("jump::"))
+        .or_else(|| selection.strip_prefix("detail::"))?;
+    Some(rest.split("::").next().unwrap_or(rest))
 }
 
 fn push_meta_row(
@@ -1575,6 +1584,25 @@ mod tests {
         assert!(!rows.iter().any(|row| row.id == "detail::%2::status"));
         assert!(!rows.iter().any(|row| row.id == "meta::%3"));
         assert!(!rows.iter().any(|row| row.id == "detail::%3::status"));
+    }
+
+    #[test]
+    fn selection_on_child_row_keeps_chat_expanded() {
+        let p = pane("main", "%1", "/tmp/app", "codex", "running");
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            selection: Some("jump::%1".to_string()),
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows_ctx(
+            &Config::default(),
+            &[p],
+            &state,
+            &RowBuildContext::default(),
+        );
+
+        assert!(rows.iter().any(|row| row.id == "jump::%1"));
     }
 
     #[test]
