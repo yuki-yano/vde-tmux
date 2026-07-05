@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::protocol::{ClientMessage, ServerMessage};
+use crate::daemon::session_badge::BadgeState;
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
 use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane, read_all_panes};
 use crate::sidebar::state::SidebarState;
@@ -40,6 +41,17 @@ pub struct DaemonSnapshot {
     pub panes: Vec<AgentPaneSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar: Option<SidebarFrame>,
+    #[serde(default)]
+    pub events: Vec<TransitionEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitionEvent {
+    pub pane_id: String,
+    pub agent: String,
+    pub from: Option<BadgeState>,
+    pub to: BadgeState,
+    pub at_epoch: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +94,7 @@ pub fn build_snapshot_with_sidebar(
         rollup,
         panes,
         sidebar,
+        events: Vec::new(),
     }
 }
 

@@ -49,6 +49,7 @@ pub struct RowMeta {
     pub attention_count: Option<usize>,
     pub origin: Option<String>,
     pub pinned: Option<bool>,
+    pub flash: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +69,7 @@ struct AgentPane {
     badge_state: BadgeState,
     repo_path: String,
     attention: bool,
+    flash: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -75,6 +77,7 @@ pub struct RowBuildContext {
     pub git: BTreeMap<String, crate::git::GitBadge>,
     pub unread: BTreeMap<String, bool>,
     pub triage: BTreeSet<String>,
+    pub flash: BTreeSet<String>,
     pub now: i64,
 }
 
@@ -147,6 +150,7 @@ pub fn build_rows_at_with_git_and_unread(
             git: git.clone(),
             unread: unread.clone(),
             triage: BTreeSet::new(),
+            flash: BTreeSet::new(),
             now,
         },
     )
@@ -186,6 +190,7 @@ pub fn build_rows_ctx(
                 badge_state: badge_state(rollup, unread),
                 repo_path: pane.current_path.clone(),
                 attention: pane.attention == "1",
+                flash: ctx.flash.contains(&pane.pane_id),
             });
     }
     for panes in groups.values_mut() {
@@ -567,6 +572,7 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
         attention_count: None,
         origin: None,
         pinned: None,
+        flash: pane.flash.then_some(true),
     }
 }
 

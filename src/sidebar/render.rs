@@ -495,7 +495,7 @@ fn render_row_line(
 
     let mut spans = vec![Span::styled(format!(" {head}"), style)];
     if let Some((glyph, color)) = badge {
-        spans.push(Span::styled(glyph, Style::default().fg(color)));
+        spans.push(Span::styled(glyph, badge_style(color, row)));
     }
     spans.push(Span::styled(label, style));
     if let Some(git) = &git {
@@ -643,7 +643,11 @@ fn render_chat_dense_line(
     text.push_str(&" ".repeat(filler));
     text.push_str(&right);
     text.push(' ');
-    let mut line = Line::from(Span::styled(text, row_style(row, theme)));
+    let mut style = row_style(row, theme);
+    if row_flash(row) {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    let mut line = Line::from(Span::styled(text, style));
     if state.selection.as_deref() == Some(row.id.as_str()) {
         line = line.style(
             Style::default()
@@ -676,7 +680,7 @@ fn render_micro_lines(
         };
         let mut line = Line::from(Span::styled(
             pad_to_width(truncate_display(&text, width), width),
-            Style::default().fg(theme.badge_color(badge_state)),
+            badge_style(theme.badge_color(badge_state), row),
         ));
         if state.selection.as_deref() == Some(row.id.as_str()) {
             line = line.style(
@@ -730,6 +734,9 @@ fn render_rail_lines(
     }
     for (index, row) in chat_rows {
         let mut style = Style::default().fg(theme.rollup_color(row.rollup));
+        if row_flash(row) {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
         if state.selection.as_deref() == Some(row.id.as_str()) {
             style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
         }
@@ -741,6 +748,21 @@ fn render_rail_lines(
         row_indices.push(Some(index));
     }
     RenderedLines { lines, row_indices }
+}
+
+fn badge_style(color: Color, row: &SidebarRow) -> Style {
+    let mut style = Style::default().fg(color);
+    if row_flash(row) {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
+}
+
+fn row_flash(row: &SidebarRow) -> bool {
+    row.meta
+        .as_ref()
+        .and_then(|meta| meta.flash)
+        .unwrap_or(false)
 }
 
 pub(crate) fn display_width(text: &str) -> usize {

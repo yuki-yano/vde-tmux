@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::daemon::protocol::{ServerMessage, SidebarClientEvent};
 use crate::daemon::{
-    DaemonSnapshot, SidebarFrame, build_snapshot_with_sidebar, render_agent_badge,
+    DaemonSnapshot, SidebarFrame, TransitionEvent, build_snapshot_with_sidebar,
+    render_agent_badge,
 };
+use crate::daemon::session_badge::{BadgeState, badge_state};
 use crate::git::GitBadge;
 use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane};
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
@@ -18,6 +20,8 @@ use crate::sidebar::tree::{
 
 const STATE_DEBOUNCE: Duration = Duration::from_millis(200);
 const TRIAGE_LEAVE_POLLS: u8 = 2;
+const FLASH_POLLS: u8 = 2;
+const EVENT_CAP: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClientId(pub u64);
@@ -136,6 +140,9 @@ pub struct RuntimeState {
     unread: BTreeMap<String, bool>,
     triage: BTreeSet<String>,
     calm_streak: BTreeMap<String, u8>,
+    prev_badges: BTreeMap<String, BadgeState>,
+    events: VecDeque<TransitionEvent>,
+    flash: BTreeMap<String, u8>,
     written_badges: BTreeMap<String, String>,
 }
 
@@ -156,6 +163,9 @@ impl RuntimeState {
             unread: BTreeMap::new(),
             triage: BTreeSet::new(),
             calm_streak: BTreeMap::new(),
+            prev_badges: BTreeMap::new(),
+            events: VecDeque::new(),
+            flash: BTreeMap::new(),
             written_badges: BTreeMap::new(),
         }
     }
@@ -180,9 +190,12 @@ impl RuntimeState {
                 self.panes = panes;
                 self.update_unread();
                 self.update_triage();
+                let transition_effects = self.update_transitions();
                 self.rebuild_snapshot();
                 self.broadcast_if_needed();
-                self.sync_session_badges()
+                let mut effects = transition_effects;
+                effects.extend(self.sync_session_badges());
+                effects
             }
             DaemonEvent::GitStatusUpdated(git_badges) => {
                 self.git_badges = git_badges;
@@ -225,6 +238,7 @@ impl RuntimeState {
                 git: self.git_badges.clone(),
                 unread: self.unread.clone(),
                 triage: self.triage.clone(),
+                flash: self.flash.keys().cloned().collect(),
                 now: now_epoch_secs(),
             },
         );
@@ -232,7 +246,9 @@ impl RuntimeState {
             state: self.ui_state.clone(),
             rows: self.rows.clone(),
         };
-        self.snapshot = Some(build_snapshot_with_sidebar(&self.panes, Some(sidebar)));
+        let mut snapshot = build_snapshot_with_sidebar(&self.panes, Some(sidebar));
+        snapshot.events = self.events.iter().cloned().collect();
+        self.snapshot = Some(snapshot);
     }
 
     pub fn should_push(&self) -> bool {
@@ -487,8 +503,6 @@ impl RuntimeState {
     }
 
     fn update_triage(&mut self) {
-        use crate::daemon::session_badge::{BadgeState, badge_state};
-
         let mut next_triage = BTreeSet::new();
         let mut next_streak = BTreeMap::new();
         for pane in self.panes.iter().filter(|pane| is_live_agent_pane(pane)) {
@@ -510,8 +524,58 @@ impl RuntimeState {
         self.calm_streak = next_streak;
     }
 
+    fn update_transitions(&mut self) -> Vec<RuntimeEffect> {
+        self.decay_flash();
+        let badges = self.current_badges();
+        let at_epoch = now_epoch_secs();
+        for (pane_id, (agent, to)) in &badges {
+            let from = self.prev_badges.get(pane_id).copied();
+            if from != Some(*to) {
+                self.events.push_back(TransitionEvent {
+                    pane_id: pane_id.clone(),
+                    agent: agent.clone(),
+                    from,
+                    to: *to,
+                    at_epoch,
+                });
+                self.flash.insert(pane_id.clone(), FLASH_POLLS);
+            }
+        }
+        while self.events.len() > EVENT_CAP {
+            self.events.pop_front();
+        }
+        self.prev_badges = badges
+            .into_iter()
+            .map(|(pane_id, (_, badge))| (pane_id, badge))
+            .collect();
+        Vec::new()
+    }
+
+    fn decay_flash(&mut self) {
+        let mut next = BTreeMap::new();
+        for (pane_id, remaining) in &self.flash {
+            if *remaining > 1 {
+                next.insert(pane_id.clone(), remaining - 1);
+            }
+        }
+        self.flash = next;
+    }
+
+    fn current_badges(&self) -> BTreeMap<String, (String, BadgeState)> {
+        let mut badges = BTreeMap::new();
+        for pane in self.panes.iter().filter(|pane| is_live_agent_pane(pane)) {
+            let level = crate::sidebar::tree::rollup_for_pane(pane);
+            let unread = self.unread.get(&pane.pane_id).copied().unwrap_or(false);
+            badges.insert(
+                pane.pane_id.clone(),
+                (pane.agent.clone(), badge_state(level, unread)),
+            );
+        }
+        badges
+    }
+
     fn sync_session_badges(&mut self) -> Vec<RuntimeEffect> {
-        use crate::daemon::session_badge::{BadgeState, badge_state, session_badge_value};
+        use crate::daemon::session_badge::session_badge_value;
 
         let badge_config = &self.config.statusline.session_badge;
         let badge_glyphs = &self.config.badge.glyphs;
@@ -615,6 +679,21 @@ mod tests {
         }
     }
 
+    fn chat_flash(state: &RuntimeState, pane_id: &str) -> bool {
+        state
+            .snapshot()
+            .and_then(|snapshot| snapshot.sidebar.as_ref())
+            .and_then(|sidebar| {
+                sidebar
+                    .rows
+                    .iter()
+                    .find(|row| row.id == format!("chat::{pane_id}"))
+            })
+            .and_then(|row| row.meta.as_ref())
+            .and_then(|meta| meta.flash)
+            .unwrap_or(false)
+    }
+
     #[test]
     fn latest_slot_coalesces_slow_client_writes() {
         let slot = LatestSlot::new();
@@ -686,6 +765,70 @@ mod tests {
 
         assert!(state.is_running());
         assert_eq!(state.clients_len(), 0);
+    }
+
+    #[test]
+    fn badge_transitions_are_recorded_as_events() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "idle",
+        )]));
+
+        let snapshot = state.snapshot().expect("snapshot");
+
+        assert_eq!(snapshot.events.len(), 2);
+        assert_eq!(snapshot.events[0].from, None);
+        assert_eq!(
+            snapshot.events[0].to,
+            crate::daemon::session_badge::BadgeState::Working
+        );
+        assert_eq!(
+            snapshot.events[1].from,
+            Some(crate::daemon::session_badge::BadgeState::Working)
+        );
+        assert_eq!(
+            snapshot.events[1].to,
+            crate::daemon::session_badge::BadgeState::Done
+        );
+    }
+
+    #[test]
+    fn events_are_capped_at_20() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+
+        for index in 0..25 {
+            let status = if index % 2 == 0 { "running" } else { "idle" };
+            state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+                "main", "%1", status,
+            )]));
+        }
+
+        let snapshot = state.snapshot().expect("snapshot");
+
+        assert_eq!(snapshot.events.len(), 20);
+    }
+
+    #[test]
+    fn changed_rows_flash_for_two_polls() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        assert!(chat_flash(&state, "%1"));
+
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        assert!(chat_flash(&state, "%1"));
+
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        assert!(!chat_flash(&state, "%1"));
     }
 
     #[test]

@@ -727,6 +727,7 @@ mod tests {
                 state: SidebarState::default(),
                 rows,
             }),
+            events: Vec::new(),
         };
 
         assert_eq!(
@@ -745,6 +746,7 @@ mod tests {
                 state: SidebarState::default(),
                 rows: vec![row()],
             }),
+            events: Vec::new(),
         };
         let backend = TestBackend::new(40, 4);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -771,6 +773,7 @@ mod tests {
                 state: SidebarState::default(),
                 rows: vec![row()],
             }),
+            events: Vec::new(),
         };
         let backend = TestBackend::new(40, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -797,6 +800,7 @@ mod tests {
                 state: SidebarState::default(),
                 rows: vec![row()],
             }),
+            events: Vec::new(),
         };
         let backend = TestBackend::new(40, 8);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -858,6 +862,7 @@ mod tests {
                 state: SidebarState::default(),
                 rows: Vec::new(),
             }),
+            events: Vec::new(),
         };
         let backend = TestBackend::new(40, 2);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -917,6 +922,7 @@ mod tests {
                     row(),
                 ],
             }),
+            events: Vec::new(),
         };
 
         assert_eq!(pane_for_click(&snapshot, 1).as_deref(), Some("%1"));
@@ -944,6 +950,7 @@ mod tests {
                     meta: None,
                 }],
             }),
+            events: Vec::new(),
         };
 
         assert_eq!(pane_for_click(&snapshot, 0), None);
@@ -974,6 +981,7 @@ mod tests {
                     row(),
                 ],
             }),
+            events: Vec::new(),
         };
 
         assert_eq!(
