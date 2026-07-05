@@ -633,7 +633,12 @@ impl RuntimeState {
                     .push(badge_state(level, unread));
             }
             for (session, list) in states {
-                if let Some(value) = session_badge_value(list, badge_glyphs, &badge_config.suffix) {
+                if let Some(value) = session_badge_value(
+                    list,
+                    badge_glyphs,
+                    &badge_config.suffix,
+                    badge_config.hide_idle,
+                ) {
                     desired.insert(session, value);
                 }
             }
@@ -1413,6 +1418,20 @@ mod tests {
                 value: "○".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn hide_idle_config_clears_idle_session_badge() {
+        let mut config = Config::default();
+        config.statusline.session_badge.hide_idle = true;
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "idle",
+        )]));
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::SetSessionBadge { .. }
+        )));
     }
 
     #[test]

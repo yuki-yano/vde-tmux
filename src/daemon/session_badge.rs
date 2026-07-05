@@ -34,8 +34,12 @@ pub fn session_badge_value(
     states: impl IntoIterator<Item = BadgeState>,
     glyphs: &BadgeGlyphs,
     suffix: &str,
+    hide_idle: bool,
 ) -> Option<String> {
     let state = states.into_iter().min()?;
+    if hide_idle && state == BadgeState::Idle {
+        return None;
+    }
     Some(format!("{}{suffix}", glyph_for_state(state, glyphs)))
 }
 
@@ -92,6 +96,7 @@ mod tests {
             [BadgeState::Idle, BadgeState::Blocked, BadgeState::Working],
             &glyphs,
             &config.suffix,
+            false,
         );
         assert_eq!(value.as_deref(), Some("▲"));
     }
@@ -106,15 +111,29 @@ mod tests {
             done: "D".to_string(),
             ..BadgeGlyphs::default()
         };
-        let value = session_badge_value([BadgeState::Done], &glyphs, &config.suffix);
+        let value = session_badge_value([BadgeState::Done], &glyphs, &config.suffix, false);
         assert_eq!(value.as_deref(), Some("D|"));
+    }
+
+    #[test]
+    fn hide_idle_suppresses_idle_badge_only() {
+        let glyphs = BadgeGlyphs::default();
+        assert_eq!(session_badge_value([BadgeState::Idle], &glyphs, "", true), None);
+        assert_eq!(
+            session_badge_value([BadgeState::Done], &glyphs, "", true).as_deref(),
+            Some("✓")
+        );
+        assert_eq!(
+            session_badge_value([BadgeState::Idle], &glyphs, "", false).as_deref(),
+            Some("○")
+        );
     }
 
     #[test]
     fn session_badge_value_is_none_for_no_agents() {
         let config = SessionBadgeConfig::default();
         assert_eq!(
-            session_badge_value([], &BadgeGlyphs::default(), &config.suffix),
+            session_badge_value([], &BadgeGlyphs::default(), &config.suffix, false),
             None
         );
     }
@@ -126,7 +145,7 @@ mod tests {
             ..crate::config::BadgeGlyphs::default()
         };
 
-        let value = session_badge_value([BadgeState::Working], &glyphs, "|");
+        let value = session_badge_value([BadgeState::Working], &glyphs, "|", false);
 
         assert_eq!(value.as_deref(), Some("W|"));
     }

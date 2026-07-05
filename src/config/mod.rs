@@ -145,6 +145,7 @@ pub struct SessionBadgeConfig {
     pub enabled: bool,
     /// グリフ直後に付ける区切り文字列。
     pub suffix: String,
+    pub hide_idle: bool,
 }
 
 impl Default for SessionBadgeConfig {
@@ -152,6 +153,7 @@ impl Default for SessionBadgeConfig {
         Self {
             enabled: true,
             suffix: String::new(),
+            hide_idle: false,
         }
     }
 }
@@ -570,6 +572,7 @@ categories:
         let config = SessionBadgeConfig::default();
         assert!(config.enabled);
         assert_eq!(config.suffix, "");
+        assert!(!config.hide_idle);
         assert_eq!(badge.glyphs.blocked, "▲");
         assert_eq!(badge.glyphs.working, "●");
         assert_eq!(badge.glyphs.done, "✓");
