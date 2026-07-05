@@ -14,29 +14,29 @@
 
 ### 機能完了条件
 
-- [ ] 既定バッジが `▲`(blocked・赤)/ `●`(working・緑)/ `✓`(done・シアン)/ `○`(idle・DarkGray)の単幅グリフ + 色付き span で表示される
-- [ ] `badge.glyphs` 設定で絵文字(🔴🟡🔵🟢)に戻せる。`sidebar.colors.badge_*` でバッジ色を上書きできる
-- [ ] 全行に左右1列の padding が入り、選択行は行頭 `"> "` マーカーなしで背景色 + BOLD がフル幅に塗られる
-- [ ] Repo/Category 行の `[running:2]` 形式が消え、右端に `▲N`(blocked 件数、0件なら非表示)が右寄せされる
-- [ ] Chat 行の右端に状態略語(`err`/`perm`/`wait`/`bg`)または running 時の経過時間(`13m`/`45s`)が右寄せされる
-- [ ] truncate が表示幅(unicode-width)基準で行われ、`…` が付く。CJK を含む prompt で右端カラムが崩れない
-- [ ] ヘッダーが `" repo · all"` 形式(固定幅パディング廃止)になり、mode/filter のクリック hit-test が機能する
-- [ ] 高さ12行以上のときフッター1行(キーヒント、DIM)が表示され、12行未満では自動で消える
-- [ ] rail(幅≤2)が新グリフで従来どおり動作する
-- [ ] 幅40列・高さ24行、幅30列、rail で表示崩れがない
+- [x] 既定バッジが `▲`(blocked・赤)/ `●`(working・緑)/ `✓`(done・シアン)/ `○`(idle・DarkGray)の単幅グリフ + 色付き span で表示される
+- [x] `badge.glyphs` 設定で絵文字(🔴🟡🔵🟢)に戻せる。`sidebar.colors.badge_*` でバッジ色を上書きできる
+- [x] 全行に左右1列の padding が入り、選択行は行頭 `"> "` マーカーなしで背景色 + BOLD がフル幅に塗られる
+- [x] Repo/Category 行の `[running:2]` 形式が消え、右端に `▲N`(blocked 件数、0件なら非表示)が右寄せされる
+- [x] Chat 行の右端に状態略語(`err`/`perm`/`wait`/`bg`)または running 時の経過時間(`13m`/`45s`)が右寄せされる
+- [x] truncate が表示幅(unicode-width)基準で行われ、`…` が付く。CJK を含む prompt で右端カラムが崩れない
+- [x] ヘッダーが `" repo · all"` 形式(固定幅パディング廃止)になり、mode/filter のクリック hit-test が機能する(既定 ASCII 設定で機能。CJK 設定は Plan 18 Task 7 で対応)
+- [x] 高さ12行以上のときフッター1行(キーヒント、DIM)が表示され、12行未満では自動で消える
+- [x] rail(幅≤2)が新グリフで従来どおり動作する
+- [x] 幅40列・高さ24行、幅30列、rail で表示崩れがない
 
 ### テスト完了条件
 
-- [ ] `rtk cargo test` 全通過(既存期待文字列の更新を含む)
-- [ ] 新規テスト: truncate の CJK 境界、右端カラムの整列、RowMeta 構築、フッターの高さ閾値、選択行のフル幅背景
-- [ ] `rtk cargo clippy --all-targets` 警告ゼロ
-- [ ] `rtk cargo fmt --check` 通過
+- [x] `rtk cargo test` 全通過(既存期待文字列の更新を含む)
+- [x] 新規テスト: truncate の CJK 境界、右端カラムの整列、RowMeta 構築、フッターの高さ閾値、選択行のフル幅背景
+- [x] `rtk cargo clippy --all-targets` 警告ゼロ
+- [x] `rtk cargo fmt --check` 通過
 
 ### 運用反映条件
 
-- [ ] `docs/e2e-smoke.md` の表示期待(絵文字バッジ・`[running:N]` 表記)を新表示に更新し、scratch tmux で smoke を実施して結果を記録
-- [ ] `docs/sidebar-ui-proposals.md` §9.2 Phase 1 にチェックを付け、実装中の判断変更があれば追記
-- [ ] daemon 再起動が必要な旨を commit message または smoke 記録に明記
+- [x] `docs/e2e-smoke.md` の表示期待(絵文字バッジ・`[running:N]` 表記)を新表示に更新し、scratch tmux で smoke を実施して結果を記録
+- [x] `docs/sidebar-ui-proposals.md` §9.2 Phase 1 にチェックを付け、実装中の判断変更があれば追記
+- [x] daemon 再起動が必要な旨を commit message または smoke 記録に明記
 
 ---
 

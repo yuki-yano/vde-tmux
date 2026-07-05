@@ -12,25 +12,25 @@
 
 ### 機能完了条件
 
-- [ ] サイドバー下部(フッターの上)に `LIVE · {pane_id}` 見出し + 選択 agent pane の末尾3行が表示され、選択変更・2秒間隔で更新される。`sidebar.live.enabled: false` で無効化できる
-- [ ] `e` で LIVE がイベントログ(`2m前 codex ● → ▲` 形式の遷移フィード)に切り替わる(トグル)
-- [ ] ヘッダーが `" {mode} · ≡6 ▲2 ●1 ✓1 ○2"` になり、各状態セグメントのクリックでそのフィルタに直接切り替わる。`Tab` は all → blocked → working → done → idle → all の巡回になる
-- [ ] フィルタは FLEET にのみ作用し、TRIAGE は常に貫通(Plan 15 の性質を維持)
-- [ ] badge が変化した行が2ポーリング(約2秒)の間 REVERSED でフラッシュする
-- [ ] `notify.enabled: true` かつ `notify.command` 設定時、blocked / error への遷移で外部コマンドが1回実行される(既定は無効)
-- [ ] 経過時間表示が毎秒更新される(Plan 13 の fingerprint 変更により daemon push で実現済みであることの確認)
+- [x] サイドバー下部(フッターの上)に `LIVE · {pane_id}` 見出し + 選択 agent pane の末尾3行が表示され、選択変更・2秒間隔で更新される。`sidebar.live.enabled: false` で無効化できる
+- [x] `e` で LIVE がイベントログ(`2m前 codex ● → ▲` 形式の遷移フィード)に切り替わる(トグル)
+- [x] ヘッダーが `" {mode} · ≡6 ▲2 ●1 ✓1 ○2"` になり、各状態セグメントのクリックでそのフィルタに直接切り替わる。`Tab` は all → blocked → working → done → idle → all の巡回になる
+- [x] フィルタは FLEET にのみ作用し、TRIAGE は常に貫通(Plan 15 の性質を維持)
+- [x] badge が変化した行が2ポーリング(約2秒)の間 REVERSED でフラッシュする
+- [x] `notify.enabled: true` かつ `notify.command` 設定時、blocked / error への遷移で外部コマンドが1回実行される(既定は無効)
+- [x] 経過時間表示が毎秒更新される(Plan 13 の fingerprint 変更により daemon push で実現済みであることの確認)
 
 ### テスト完了条件
 
-- [ ] `rtk cargo test` 全通過
-- [ ] 新規テスト: StatusFilter 拡張のフィルタ挙動と巡回、ヘッダー counts とセグメント hit-test、遷移イベントの記録と上限、flash の付与と消滅、通知 effect の発火条件、LIVE 領域のレイアウト
-- [ ] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
+- [x] `rtk cargo test` 全通過
+- [x] 新規テスト: StatusFilter 拡張のフィルタ挙動と巡回、ヘッダー counts とセグメント hit-test、遷移イベントの記録と上限、flash の付与と消滅、通知 effect の発火条件、LIVE 領域のレイアウト
+- [x] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
 
 ### 運用反映条件
 
-- [ ] `docs/e2e-smoke.md` に LIVE・イベントログ・フィルタバー・フラッシュの確認手順を追記し、smoke 実施を記録
-- [ ] README に `sidebar.live` / `notify` 設定例を追記
-- [ ] `docs/sidebar-ui-proposals.md` §9.2 Phase 5 にチェック
+- [x] `docs/e2e-smoke.md` に LIVE・イベントログ・フィルタバー・フラッシュの確認手順を追記し、smoke 実施を記録
+- [x] README に `sidebar.live` / `notify` 設定例を追記
+- [x] `docs/sidebar-ui-proposals.md` §9.2 Phase 5 にチェック
 
 ---
 
@@ -625,3 +625,5 @@ rtk git commit -m "Plan 17 の smoke 結果と docs を更新する"
 - `RuntimeEffect::Notify.state` は文字列ではなく `BadgeState` のまま保持し、server 側で `VDE_BADGE_STATE` に `Debug` 表記(`Blocked` など)として渡す実装にした。runtime 内の型安全性を保ち、wire format には載せない transient effect のため。
 - notify command の環境変数名は実装側で既存 prefix に合わせて `VDE_PANE_ID` / `VDE_AGENT` / `VDE_BADGE_STATE` とした。
 - TUI の `capture-pane -a` は Plan 15/16 と同様に alt-screen 内容を安定取得できないため、Plan 17 smoke では daemon subscribe snapshot と scratch pane の `capture-pane -p`、および `sidebar::tui` unit test で LIVE / event / flash / filter の確認を分担した。
+- event log 形式は Plan 18 Task 5 で仕様形式(`2m前 codex ● → ▲`)に修正した。
+- running pane が存在する間は fingerprint が毎秒変化し、全クライアントへ毎秒 push される。これは経過時間表示の毎秒更新を満たすための意図的設計である。

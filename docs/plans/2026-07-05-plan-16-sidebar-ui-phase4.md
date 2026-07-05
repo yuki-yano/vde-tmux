@@ -12,26 +12,26 @@
 
 ### 機能完了条件
 
-- [ ] 選択中の Chat 行はフル展開(status/elapsed/session/subagents/jump の Detail 行群)が自動表示され、選択が離れると畳まれる
-- [ ] Space で Chat 行を pin できる(トグル)。pin 行は選択がどこにあっても中展開(meta 1行)を維持し、行頭に pin 印(`·`)が付く
-- [ ] Repo/Category 行の Space(グループ折りたたみ)は従来どおり
-- [ ] 行数が viewport を超えたとき、j/k・n/N での選択移動に追従してスクロールし、選択行が常に表示される
-- [ ] スクロール中のクリックが正しい行に届く(オフセット補正)
-- [ ] 幅 24〜35 列で dense 表示(1行/agent、`{glyph} {agent} {repo略} {right}`)に自動縮退する
-- [ ] 幅 3〜23 列で micro 表示(`{glyph} {right}` 相当の最小形)に縮退する
-- [ ] rail(幅≤2)が「状態別カウント + 罫線 + 個別グリフ」の2部構成になる
-- [ ] state.json に pinned が永続化され、旧 state.json の読み込みが壊れない
+- [x] 選択中の Chat 行はフル展開(status/elapsed/session/subagents/jump の Detail 行群)が自動表示され、選択が離れると畳まれる
+- [x] Space で Chat 行を pin できる(トグル)。pin 行は選択がどこにあっても中展開(meta 1行)を維持し、行頭に pin 印(`·`)が付く
+- [x] Repo/Category 行の Space(グループ折りたたみ)は従来どおり
+- [x] 行数が viewport を超えたとき、j/k・n/N での選択移動に追従してスクロールし、選択行が常に表示される
+- [x] スクロール中のクリックが正しい行に届く(オフセット補正)
+- [x] 幅 24〜35 列で dense 表示(1行/agent、`{glyph} {agent} {repo略} {right}`)に自動縮退する
+- [x] 幅 3〜23 列で micro 表示(`{glyph} {right}` 相当の最小形)に縮退する
+- [x] rail(幅≤2)が「状態別カウント + 罫線 + 個別グリフ」の2部構成になる
+- [x] state.json に pinned が永続化され、旧 state.json の読み込みが壊れない
 
 ### テスト完了条件
 
-- [ ] `rtk cargo test` 全通過
-- [ ] 新規テスト: pin トグルと永続化、選択フル展開/pin 中展開/その他1行の共存、scroll 追従、オフセット込みクリック対応、各幅ティアの出力、rail 2部構成
-- [ ] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
+- [x] `rtk cargo test` 全通過
+- [x] 新規テスト: pin トグルと永続化、選択フル展開/pin 中展開/その他1行の共存、scroll 追従、オフセット込みクリック対応、各幅ティアの出力、rail 2部構成
+- [x] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
 
 ### 運用反映条件
 
-- [ ] `docs/e2e-smoke.md` に fisheye(選択で開く・pin で留まる)、幅を変えての縮退確認、スクロール確認を追記し、smoke 実施を記録
-- [ ] `docs/sidebar-ui-proposals.md` §9.2 Phase 4 にチェック
+- [x] `docs/e2e-smoke.md` に fisheye(選択で開く・pin で留まる)、幅を変えての縮退確認、スクロール確認を追記し、smoke 実施を記録
+- [x] `docs/sidebar-ui-proposals.md` §9.2 Phase 4 にチェック
 
 ---
 
@@ -470,3 +470,4 @@ rtk git commit -m "Plan 16 の smoke 結果と docs を更新する"
 - `capture-pane -a` は Plan 15 と同様に TUI alt-screen が空になるため、fisheye / pin / state 永続化は scratch daemon の subscribe snapshot で検証した。
 - dense / micro / rail は client render の幅ティアなので、scratch tmux 上の pane option と state.json を使い、`sidebar attach --once` の幅30/20/2出力で検証した。
 - scroll の実画面追従は capture できないため、`resolve_scroll` と scroll offset 付き click mapping の unit test を smoke 記録上の証跡とした。
+- 選択展開は pane 系列判定に修正した(Plan 18 Task 1)。`jump::` / `detail::` に選択が移っても親 chat のフル展開を維持する。

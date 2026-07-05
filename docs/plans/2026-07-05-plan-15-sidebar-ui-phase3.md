@@ -12,25 +12,25 @@
 
 ### 機能完了条件
 
-- [ ] blocked な agent が repo ツリーから抜けて最上部の TRIAGE ゾーンに `▲ {agent} · {repo}` + 右端 `perm/wait/err` 形式で表示される
-- [ ] TRIAGE ゾーン見出しが `▍TRIAGE {N}`(badge_blocked 色・BOLD)で表示され、0件では見出しごと消える
-- [ ] TRIAGE は StatusFilter(all/attention)の影響を受けない
-- [ ] FLEET 側の repo 行の右端 `▲N` は TRIAGE に移動した agent も数え続ける(出所の手がかり)
-- [ ] TRIAGE 行を選択すると inline meta 行(Plan 14)に出所(`category/repo`)が含まれる
-- [ ] blocked 解除後、2回連続の非 blocked ポーリングを経てから FLEET に戻る(退出デバウンス)。blocked への遷移は即時
-- [ ] ViewMode(flat/repo/category)・折りたたみ・J/K 並べ替えは FLEET 部分で従来どおり動作する
-- [ ] `n`/`N`(Plan 14)が折りたたみ状態に関わらず全 blocked を巡回できる(TRIAGE に常時表示されるため)
+- [x] blocked な agent が repo ツリーから抜けて最上部の TRIAGE ゾーンに `▲ {agent} · {repo}` + 右端 `perm/wait/err` 形式で表示される
+- [x] TRIAGE ゾーン見出しが `▍TRIAGE {N}`(badge_blocked 色・BOLD)で表示され、0件では見出しごと消える
+- [x] TRIAGE は StatusFilter(all/attention)の影響を受けない
+- [x] FLEET 側の repo 行の右端 `▲N` は TRIAGE に移動した agent も数え続ける(出所の手がかり)
+- [x] TRIAGE 行を選択すると inline meta 行(Plan 14)に出所(`category/repo`)が含まれる
+- [x] blocked 解除後、2回連続の非 blocked ポーリングを経てから FLEET に戻る(退出デバウンス)。blocked への遷移は即時
+- [x] ViewMode(flat/repo/category)・折りたたみ・J/K 並べ替えは FLEET 部分で従来どおり動作する
+- [x] `n`/`N`(Plan 14)が折りたたみ状態に関わらず全 blocked を巡回できる(TRIAGE に常時表示されるため)
 
 ### テスト完了条件
 
-- [ ] `rtk cargo test` 全通過
-- [ ] 新規テスト: TRIAGE 分離と0件消滅、フィルタ貫通、repo ▲N の維持、退出デバウンス、ゾーン跨ぎ選択移動
-- [ ] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
+- [x] `rtk cargo test` 全通過
+- [x] 新規テスト: TRIAGE 分離と0件消滅、フィルタ貫通、repo ▲N の維持、退出デバウンス、ゾーン跨ぎ選択移動
+- [x] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
 
 ### 運用反映条件
 
-- [ ] `docs/e2e-smoke.md` に TRIAGE の確認手順(permission 発生→最上部に出現→承認→2秒後に FLEET へ戻る)を追記し、smoke 実施を記録
-- [ ] `docs/sidebar-ui-proposals.md` §9.2 Phase 3 にチェック
+- [x] `docs/e2e-smoke.md` に TRIAGE の確認手順(permission 発生→最上部に出現→承認→2秒後に FLEET へ戻る)を追記し、smoke 実施を記録
+- [x] `docs/sidebar-ui-proposals.md` §9.2 Phase 3 にチェック
 
 ---
 
@@ -492,3 +492,5 @@ rtk git commit -m "Plan 15 の smoke 結果と docs を更新する"
 
 - TUI の `capture-pane -a` は Plan 13 と同様に alt-screen が空になるため、Plan 15 の smoke は scratch tmux 上で新 daemon を起動し直し、NDJSON subscribe snapshot の `SidebarFrame.rows` を検証した。
 - `SidebarRowKind` / `BadgeState` は JSON wire 上では `Zone` / `Blocked` の PascalCase で出るため、smoke の snapshot assertion は wire 表現に合わせた。
+- Plan 18 Task 3・4 で、TRIAGE 保持中の pane を repo/category の `▲N` に含め続け、TRIAGE 選択時に出所 detail 行を表示するよう修正した。
+- ゾーン跨ぎ選択移動は Plan 18 Task 1 の `selection_follows_pane_across_triage_and_fleet` で回帰テストを追加した。
