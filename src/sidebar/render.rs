@@ -41,7 +41,7 @@ impl Default for SidebarRenderTheme {
             header_active_bg: None,
             header_active_fg: None,
             header_active_bold: false,
-            header_format: "{label} ".to_string(),
+            header_format: "{label}".to_string(),
             header_prefix: String::new(),
             header_suffix: String::new(),
             header_separator: String::new(),
@@ -157,9 +157,6 @@ pub struct HeaderSegment {
     pub action: HeaderAction,
 }
 
-const VIEW_MODE_BADGE_WIDTH: usize = "category".len();
-const FILTER_BADGE_WIDTH: usize = "attention".len();
-
 pub fn build_header_layout(state: &SidebarState, width: u16) -> HeaderLayout {
     build_header_layout_with_theme(state, width, &SidebarRenderTheme::default())
 }
@@ -172,16 +169,19 @@ pub fn build_header_layout_with_theme(
     if width <= 2 {
         return HeaderLayout::default();
     }
-    let mode = view_mode_label(state.view_mode);
-    let filter = filter_label(state.filter);
-    let mode_badge = format_header_segment(mode, VIEW_MODE_BADGE_WIDTH, theme);
-    let filter_badge = format_header_segment(filter, FILTER_BADGE_WIDTH, theme);
-    let full_text = format!("{}{}{}", mode_badge, theme.header_separator, filter_badge);
+    let mode_badge = format_header_segment(view_mode_label(state.view_mode), theme);
+    let filter_badge = format_header_segment(filter_label(state.filter), theme);
+    let separator = if theme.header_separator.is_empty() {
+        " · ".to_string()
+    } else {
+        theme.header_separator.clone()
+    };
+    let full_text = format!(" {mode_badge}{separator}{filter_badge}");
     let text = truncate_display(&full_text, width as usize);
     let mut segments = Vec::new();
     let mode_len = mode_badge.chars().count();
-    let separator_len = theme.header_separator.chars().count();
-    if let Some(range) = visible_segment_range(&text, 0, mode_len) {
+    let separator_len = separator.chars().count();
+    if let Some(range) = visible_segment_range(&text, 1, mode_len) {
         segments.push(HeaderSegment {
             range,
             action: HeaderAction::CycleViewMode,
@@ -189,7 +189,7 @@ pub fn build_header_layout_with_theme(
     }
     if let Some(range) = visible_segment_range(
         &text,
-        mode_len + separator_len,
+        1 + mode_len + separator_len,
         filter_badge.chars().count(),
     ) {
         segments.push(HeaderSegment {
@@ -202,8 +202,7 @@ pub fn build_header_layout_with_theme(
     }
 }
 
-fn format_header_segment(label: &str, width: usize, theme: &SidebarRenderTheme) -> String {
-    let label = format!("{label:<width$}");
+fn format_header_segment(label: &str, theme: &SidebarRenderTheme) -> String {
     let body = theme.header_format.replace("{label}", &label);
     format!("{}{}{}", theme.header_prefix, body, theme.header_suffix)
 }
@@ -762,19 +761,19 @@ mod tests {
 
         let header = build_header_layout(&state, 80);
 
-        assert_eq!(header.lines[0].text, "category attention ");
+        assert_eq!(header.lines[0].text, " category · attention");
         assert_eq!(
-            header_hit_test(&header, 0, 1),
+            header_hit_test(&header, 0, 2),
             Some(HeaderAction::CycleViewMode)
         );
         assert_eq!(
-            header_hit_test(&header, 0, 10),
+            header_hit_test(&header, 0, 13),
             Some(HeaderAction::ToggleFilter)
         );
     }
 
     #[test]
-    fn header_layout_defaults_to_statusline_category_like_segments() {
+    fn header_layout_defaults_to_compact_dot_separated_segments() {
         let state = SidebarState {
             view_mode: ViewMode::ByRepo,
             filter: StatusFilter::All,
@@ -782,29 +781,19 @@ mod tests {
         };
 
         let header = build_header_layout(&state, 80);
-        let lines = render_header_lines(&header, &SidebarRenderTheme::default());
 
-        assert_eq!(header.lines[0].text, "repo     all       ");
-        assert_eq!(header.lines[0].segments[0].range, 0..9);
-        assert_eq!(header.lines[0].segments[1].range, 9..19);
+        assert_eq!(header.lines[0].text, " repo · all");
+        assert_eq!(header.lines[0].segments[0].range, 1..5);
+        assert_eq!(header.lines[0].segments[1].range, 8..11);
         assert_eq!(
-            header_hit_test(&header, 0, 8),
+            header_hit_test(&header, 0, 2),
             Some(HeaderAction::CycleViewMode)
         );
         assert_eq!(
-            header_hit_test(&header, 0, 18),
+            header_hit_test(&header, 0, 9),
             Some(HeaderAction::ToggleFilter)
         );
-        assert_eq!(lines[0].spans[0].content.as_ref(), "repo     ");
-        assert_eq!(lines[0].spans[0].style.bg, None);
-        assert!(
-            !lines[0].spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::BOLD)
-        );
-        assert_eq!(lines[0].spans[1].content.as_ref(), "all       ");
-        assert_eq!(lines[0].spans[1].style.bg, None);
+        assert_eq!(header_hit_test(&header, 0, 6), None);
     }
 
     #[test]
@@ -834,13 +823,13 @@ sidebar:
         let header = build_header_layout_with_theme(&state, 80, &theme);
         let lines = render_header_lines(&header, &theme);
 
-        assert_eq!(header.lines[0].text, "[ repo     ] [ all       ]");
-        assert_eq!(header.lines[0].segments[0].range, 0..12);
-        assert_eq!(header.lines[0].segments[1].range, 13..26);
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::White));
-        assert_eq!(lines[0].spans[0].style.bg, Some(Color::Indexed(24)));
+        assert_eq!(header.lines[0].text, " [ repo ] [ all ]");
+        assert_eq!(header.lines[0].segments[0].range, 1..9);
+        assert_eq!(header.lines[0].segments[1].range, 10..17);
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::White));
+        assert_eq!(lines[0].spans[1].style.bg, Some(Color::Indexed(24)));
         assert!(
-            lines[0].spans[0]
+            lines[0].spans[1]
                 .style
                 .add_modifier
                 .contains(Modifier::BOLD)

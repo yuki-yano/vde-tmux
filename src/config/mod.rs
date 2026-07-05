@@ -243,7 +243,7 @@ pub struct SidebarHeaderConfig {
 impl Default for SidebarHeaderConfig {
     fn default() -> Self {
         Self {
-            format: "{label} ".to_string(),
+            format: "{label}".to_string(),
             prefix: String::new(),
             suffix: String::new(),
             separator: String::new(),
