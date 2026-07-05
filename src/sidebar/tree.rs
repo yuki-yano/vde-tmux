@@ -403,6 +403,7 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
             meta: Some(meta),
         });
         if expanded {
+            rows.push(detail_row(pane, 2, "origin", format!("origin: {origin}")));
             push_chat_detail_rows(pane, 2, now, &mut rows);
         } else if pinned {
             push_meta_row(pane, 2, now, Some(&origin), &mut rows);
@@ -1586,6 +1587,29 @@ mod tests {
 
         assert_eq!(meta.origin.as_deref(), Some("misc/app"));
         assert!(inline_meta.label.contains("misc/app"), "{inline_meta:?}");
+    }
+
+    #[test]
+    fn selected_triage_row_shows_origin_detail() {
+        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        let state = SidebarState {
+            selection: Some("chat::%1".to_string()),
+            ..SidebarState::default()
+        };
+        let ctx = RowBuildContext {
+            triage: BTreeSet::from(["%1".to_string()]),
+            now: 1000,
+            ..RowBuildContext::default()
+        };
+
+        let rows = build_rows_ctx(&Config::default(), &[blocked], &state, &ctx);
+        let origin_row = rows
+            .iter()
+            .find(|row| row.id == "detail::%1::origin")
+            .expect("origin detail row");
+
+        assert!(origin_row.label.contains("misc/app"));
     }
 
     #[test]
