@@ -26,11 +26,11 @@ tmux -L "$name" show-hooks -g | rg '^after-new-window\[' || true
 VDE_TMUX_SOCKET_NAME="$name" TMUX_PANE="$pane" \
   ./target/debug/vt hook emit --agent codex --status running --prompt smoke
 
-VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt statusline-agent-badge
+VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt statusline-summary
 VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt statusline-sessions --show-index
 ```
 
-期待値: agent badge は `running:1`、sessions は `1:main` を含む。session badge がある場合、バッジとラベルは suffix なしで `○1:main` のように連結される。
+期待値: summary は `#[fg=green]●1#[default]`、sessions は `1:main` を含む。session badge がある場合、バッジとラベルは suffix なしで `○1:main` のように連結される。
 
 daemon 経由も確認する。
 
@@ -47,13 +47,13 @@ for _ in $(seq 1 50); do
 done
 
 VDE_TMUX_SOCKET_NAME="$name" VDE_DAEMON_SOCKET="$sock" \
-  ./target/debug/vt statusline-agent-badge
+  ./target/debug/vt statusline-summary
 
 VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt daemon stop --socket "$sock"
 rm -rf "$sock_dir"
 ```
 
-期待値: `running:1`。
+期待値: `#[fg=green]●1#[default]`。
 
 ### Plan 19 statusline smoke (2026-07-05)
 
@@ -64,6 +64,14 @@ daemon は default config で起動後、`hide_idle: true` を設定して再起
 - default `statusline-sessions`: `#[bold] ○main #[default]`
 - `hide_idle: true` 後の session option: 空
 - pill 設定(`current.prefix/suffix` + `bg=24`)の `statusline-sessions`: `[#[bg=24] main #[default]]`
+
+### Plan 20 statusline summary smoke (2026-07-05)
+
+scratch tmux server `vde-plan20-smoke-1783256800` で確認。
+daemon 起動後に summary を確認し、daemon 停止後に fallback も確認した。
+
+- daemon 経由 `statusline-summary`: `#[fg=green]●1#[default]`
+- fallback `statusline-summary`: `#[fg=green]●1#[default]`
 
 ## Session / Category / Project
 

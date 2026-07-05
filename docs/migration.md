@@ -8,6 +8,7 @@ M7 の一括切替で使う作業メモ。
 | 旧コマンド | 新コマンド |
 |---|---|
 | `vtm statusline-category` | `vt statusline-category` |
+| `vtm statusline-agent-badge` | `vt statusline-summary` |
 | `vtm statusline-sessions` | `vt statusline-sessions` |
 | `vtm statusline-sessions --show-index` | `vt statusline-sessions --show-index` |
 | `vtm statusline-sessions switch <n>` | `vt statusline-sessions switch <n>` |
@@ -53,7 +54,7 @@ categories:
 statusline:
   sessions:
     show_index: true
-  agent_badge:
+  summary:
     enabled: true
   session_badge:
     enabled: true
@@ -105,6 +106,8 @@ daemon:
 `statusline.session_badge.suffix` の既定は空文字になる。
 旧表示のようにバッジとラベルの間の空白を維持したい場合は、`statusline.session_badge.suffix: " "` を明示する。
 `statusline.session_badge.hide_idle: true` を指定すると idle(○)バッジを非表示にできる。
+`statusline.agent_badge` は `statusline.summary` へ置き換える。
+tmux.conf の `#(vtm statusline-agent-badge)` / `#(vt statusline-agent-badge)` 相当は `#(vt statusline-summary)` へ書き換える。
 `sidebar.colors.attention` / `selection_active_bg` は未使用のため削除する。
 
 ## Pane Option Bus
