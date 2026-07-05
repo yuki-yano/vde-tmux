@@ -134,6 +134,31 @@ pub enum HeaderAction {
     ToggleFilter,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WidthTier {
+    Rail,
+    Micro,
+    Dense,
+    Standard,
+}
+
+impl WidthTier {
+    pub fn from_width(width: usize) -> Self {
+        match width {
+            0..=2 => Self::Rail,
+            3..=23 => Self::Micro,
+            24..=35 => Self::Dense,
+            _ => Self::Standard,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedLines {
+    pub lines: Vec<Line<'static>>,
+    pub row_indices: Vec<Option<usize>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HeaderLayout {
     pub lines: Vec<HeaderLine>,
@@ -286,12 +311,27 @@ pub fn render_lines(
     width: usize,
     theme: &SidebarRenderTheme,
 ) -> Vec<Line<'static>> {
-    if width <= 2 {
-        return render_rail_lines(rows, state, theme);
+    render_lines_with_indices(rows, state, width, theme).lines
+}
+
+pub fn render_lines_with_indices(
+    rows: &[SidebarRow],
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> RenderedLines {
+    match WidthTier::from_width(width) {
+        WidthTier::Rail => render_rail_lines(rows, state, theme),
+        WidthTier::Micro => render_micro_lines(rows, state, width, theme),
+        WidthTier::Dense => render_dense_lines(rows, state, width, theme),
+        WidthTier::Standard => RenderedLines {
+            lines: rows
+                .iter()
+                .map(|row| render_row_line(row, state, width, theme))
+                .collect(),
+            row_indices: (0..rows.len()).map(Some).collect(),
+        },
     }
-    rows.iter()
-        .map(|row| render_row_line(row, state, width, theme))
-        .collect()
 }
 
 fn render_row_line(
@@ -424,22 +464,202 @@ fn format_git_badge_parts(badge: &crate::git::GitBadge) -> GitBadgeText {
     }
 }
 
+fn render_dense_lines(
+    rows: &[SidebarRow],
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> RenderedLines {
+    let mut lines = Vec::new();
+    let mut row_indices = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let line = match row.kind {
+            SidebarRowKind::Detail | SidebarRowKind::Jump => None,
+            SidebarRowKind::Zone => Some(render_zone_dense_line(row, width, theme)),
+            SidebarRowKind::Category | SidebarRowKind::Repo => {
+                Some(render_group_dense_line(row, state, width, theme))
+            }
+            SidebarRowKind::Chat => Some(render_chat_dense_line(row, state, width, theme)),
+        };
+        if let Some(line) = line {
+            lines.push(line);
+            row_indices.push(Some(index));
+        }
+    }
+    RenderedLines { lines, row_indices }
+}
+
+fn render_zone_dense_line(
+    row: &SidebarRow,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> Line<'static> {
+    let text = truncate_display(&format!(" ▍{} {}", row.label, row.chat_count), width);
+    Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(theme.badge_color(BadgeState::Blocked))
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn render_group_dense_line(
+    row: &SidebarRow,
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> Line<'static> {
+    let marker = if row.expanded { "▾" } else { "▸" };
+    let text = truncate_display(&format!(" {marker} {}", row.label), width);
+    let mut style = row_style(row, theme);
+    if state.selection.as_deref() == Some(row.id.as_str()) {
+        style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
+    }
+    Line::from(Span::styled(pad_to_width(text, width), style))
+}
+
+fn render_chat_dense_line(
+    row: &SidebarRow,
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> Line<'static> {
+    let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
+    let glyph = theme.badge_glyph(badge_state);
+    let agent = row
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.agent.as_deref())
+        .unwrap_or_else(|| row.label.split(':').next().unwrap_or(row.label.as_str()));
+    let agent = truncate_display(agent, 7);
+    let origin = row
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.origin.as_deref())
+        .and_then(|origin| origin.rsplit('/').next())
+        .unwrap_or("");
+    let origin = origin.chars().take(3).collect::<String>();
+    let right = right_label(row).unwrap_or_default();
+    let body = row
+        .label
+        .split_once(':')
+        .map(|(_, body)| body.trim())
+        .unwrap_or(row.label.as_str());
+    let prefix = format!(" {glyph} {agent:<7} {origin:<3} ");
+    let right_width = display_width(&right);
+    let right_reserved = if right_width > 0 { right_width + 1 } else { 0 };
+    let label_budget = width
+        .saturating_sub(display_width(&prefix))
+        .saturating_sub(right_reserved)
+        .saturating_sub(1);
+    let label = truncate_display(body, label_budget);
+    let mut text = format!("{prefix}{label}");
+    let used = display_width(&text);
+    let filler = width
+        .saturating_sub(1)
+        .saturating_sub(used)
+        .saturating_sub(right_width);
+    text.push_str(&" ".repeat(filler));
+    text.push_str(&right);
+    text.push(' ');
+    let mut line = Line::from(Span::styled(text, row_style(row, theme)));
+    if state.selection.as_deref() == Some(row.id.as_str()) {
+        line = line.style(
+            Style::default()
+                .bg(theme.selection_bg)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    line
+}
+
+fn render_micro_lines(
+    rows: &[SidebarRow],
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> RenderedLines {
+    let mut lines = Vec::new();
+    let mut row_indices = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        if row.kind != SidebarRowKind::Chat {
+            continue;
+        }
+        let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
+        let glyph = theme.badge_glyph(badge_state);
+        let right = right_label(row).unwrap_or_default();
+        let text = if right.is_empty() {
+            format!(" {glyph}")
+        } else {
+            format!(" {glyph} {right}")
+        };
+        let mut line = Line::from(Span::styled(
+            pad_to_width(truncate_display(&text, width), width),
+            Style::default().fg(theme.badge_color(badge_state)),
+        ));
+        if state.selection.as_deref() == Some(row.id.as_str()) {
+            line = line.style(
+                Style::default()
+                    .bg(theme.selection_bg)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+        lines.push(line);
+        row_indices.push(Some(index));
+    }
+    RenderedLines { lines, row_indices }
+}
+
 fn render_rail_lines(
     rows: &[SidebarRow],
     state: &SidebarState,
     theme: &SidebarRenderTheme,
-) -> Vec<Line<'static>> {
-    rows.iter()
-        .filter(|row| matches!(row.kind, SidebarRowKind::Chat | SidebarRowKind::Jump))
-        .map(|row| {
-            let mut style = Style::default().fg(theme.rollup_color(row.rollup));
-            if state.selection.as_deref() == Some(row.id.as_str()) {
-                style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
-            }
-            let glyph = row.badge_state.expect("rail rows must carry badge_state");
-            Line::from(Span::styled(theme.badge_glyph(glyph).to_string(), style))
-        })
-        .collect()
+) -> RenderedLines {
+    let chat_rows = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| matches!(row.kind, SidebarRowKind::Chat | SidebarRowKind::Jump))
+        .collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    let mut row_indices = Vec::new();
+    for state in [
+        BadgeState::Blocked,
+        BadgeState::Working,
+        BadgeState::Done,
+        BadgeState::Idle,
+    ] {
+        let count = chat_rows
+            .iter()
+            .filter(|(_, row)| row.badge_state == Some(state))
+            .count();
+        if count > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("{}{}", theme.badge_glyph(state), count),
+                Style::default().fg(theme.badge_color(state)),
+            )));
+            row_indices.push(None);
+        }
+    }
+    if !lines.is_empty() && !chat_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "──",
+            Style::default().fg(Color::DarkGray),
+        )));
+        row_indices.push(None);
+    }
+    for (index, row) in chat_rows {
+        let mut style = Style::default().fg(theme.rollup_color(row.rollup));
+        if state.selection.as_deref() == Some(row.id.as_str()) {
+            style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
+        }
+        let glyph = row.badge_state.expect("rail rows must carry badge_state");
+        lines.push(Line::from(Span::styled(
+            theme.badge_glyph(glyph).to_string(),
+            style,
+        )));
+        row_indices.push(Some(index));
+    }
+    RenderedLines { lines, row_indices }
 }
 
 pub(crate) fn display_width(text: &str) -> usize {
@@ -470,6 +690,14 @@ pub(crate) fn truncate_display(text: &str, max_width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+fn pad_to_width(mut text: String, width: usize) -> String {
+    let used = display_width(&text);
+    if used < width {
+        text.push_str(&" ".repeat(width - used));
+    }
+    text
 }
 
 fn right_label(row: &SidebarRow) -> Option<String> {
@@ -692,6 +920,87 @@ mod tests {
     }
 
     #[test]
+    fn width_tier_boundaries() {
+        assert_eq!(WidthTier::from_width(2), WidthTier::Rail);
+        assert_eq!(WidthTier::from_width(3), WidthTier::Micro);
+        assert_eq!(WidthTier::from_width(23), WidthTier::Micro);
+        assert_eq!(WidthTier::from_width(24), WidthTier::Dense);
+        assert_eq!(WidthTier::from_width(35), WidthTier::Dense);
+        assert_eq!(WidthTier::from_width(36), WidthTier::Standard);
+    }
+
+    #[test]
+    fn dense_tier_renders_one_line_per_chat_with_origin_abbrev() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "claude: fix the bug",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("claude".to_string()),
+            elapsed_secs: Some(780),
+            origin: Some("misc/vde-tmux".to_string()),
+            ..Default::default()
+        });
+
+        let rendered = render_rows(&[chat], &SidebarState::default(), 30);
+
+        assert!(rendered.contains("● claude  vde"), "{rendered:?}");
+        assert!(rendered.ends_with("13m "), "{rendered:?}");
+    }
+
+    #[test]
+    fn micro_tier_renders_glyph_and_status_only() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex",
+            RollupLevel::Permission,
+        );
+        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Blocked);
+
+        let rendered = render_rows(&[chat], &SidebarState::default(), 8);
+
+        assert_eq!(rendered, " ▲ perm ");
+    }
+
+    #[test]
+    fn rail_renders_counts_then_rows() {
+        let mut blocked1 = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex",
+            RollupLevel::Permission,
+        );
+        blocked1.badge_state = Some(crate::daemon::session_badge::BadgeState::Blocked);
+        let mut blocked2 = row(
+            "chat::%2",
+            SidebarRowKind::Chat,
+            0,
+            "claude",
+            RollupLevel::Permission,
+        );
+        blocked2.badge_state = Some(crate::daemon::session_badge::BadgeState::Blocked);
+        let mut working = row(
+            "chat::%3",
+            SidebarRowKind::Chat,
+            0,
+            "opencode",
+            RollupLevel::Running,
+        );
+        working.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
+
+        let rendered = render_rows(&[blocked1, blocked2, working], &SidebarState::default(), 2);
+
+        assert_eq!(rendered, "▲2\n●1\n──\n▲\n▲\n●");
+    }
+
+    #[test]
     fn render_rows_includes_selection_indentation_and_rollup() {
         let rows = vec![
             row(
@@ -714,7 +1023,7 @@ mod tests {
             ..SidebarState::default()
         };
 
-        let rendered = render_rows(&rows, &state, 32);
+        let rendered = render_rows(&rows, &state, 40);
 
         assert!(rendered.contains(" ▾ app"));
         assert!(rendered.contains("   ▾ codex %1"));
@@ -733,7 +1042,7 @@ mod tests {
         chat.badge_state = Some(BadgeState::Blocked);
         let rows = vec![chat];
         let rendered = render_rows(&rows, &SidebarState::default(), 2);
-        assert_eq!(rendered, "▲");
+        assert_eq!(rendered, "▲1\n──\n▲");
     }
 
     #[test]
@@ -948,7 +1257,7 @@ sidebar:
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 2);
 
-        assert_eq!(rendered, "✓");
+        assert_eq!(rendered, "✓1\n──\n✓");
     }
 
     #[test]
@@ -1003,10 +1312,10 @@ sidebar:
             selection: Some("repo::misc::app".to_string()),
             ..SidebarState::default()
         };
-        let rendered = render_rows(&rows, &state, 20);
+        let rendered = render_rows(&rows, &state, 40);
         assert!(rendered.starts_with(" ▾ app"), "{rendered:?}");
         assert!(!rendered.contains("> "), "{rendered:?}");
-        assert_eq!(display_width(&rendered), 20, "{rendered:?}");
+        assert_eq!(display_width(&rendered), 40, "{rendered:?}");
     }
 
     #[test]
@@ -1022,7 +1331,7 @@ sidebar:
             attention_count: Some(2),
             ..Default::default()
         });
-        let rendered = render_rows(&[repo], &SidebarState::default(), 20);
+        let rendered = render_rows(&[repo], &SidebarState::default(), 40);
         assert!(rendered.ends_with("▲2 "), "{rendered:?}");
         assert!(!rendered.contains("[permission:"), "{rendered:?}");
     }
@@ -1037,7 +1346,7 @@ sidebar:
             RollupLevel::Permission,
         );
         chat.badge_state = Some(BadgeState::Blocked);
-        let rendered = render_rows(&[chat], &SidebarState::default(), 30);
+        let rendered = render_rows(&[chat], &SidebarState::default(), 40);
         assert!(rendered.ends_with("perm "), "{rendered:?}");
         assert!(rendered.contains("▲ codex: review PR"), "{rendered:?}");
     }
@@ -1089,7 +1398,7 @@ sidebar:
         let lines = render_lines(
             &[chat],
             &SidebarState::default(),
-            30,
+            40,
             &SidebarRenderTheme::default(),
         );
         assert!(

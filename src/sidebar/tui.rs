@@ -30,7 +30,8 @@ use crate::sidebar::client::{
 use crate::sidebar::preview::open_preview_floating_pane;
 use crate::sidebar::render::{
     HeaderAction, HeaderLayout, SidebarRenderTheme, build_footer_line,
-    build_header_layout_with_theme, header_hit_test, render_header_lines, render_lines,
+    build_header_layout_with_theme, header_hit_test, render_header_lines,
+    render_lines_with_indices,
 };
 use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
@@ -131,13 +132,26 @@ pub fn run_loop<B: Backend>(
             if let Some(sidebar) = &snapshot.sidebar {
                 let header = build_header_layout_with_theme(&sidebar.state, area.width, theme);
                 let areas = compute_areas(area, &header);
-                let selection_index = sidebar.state.selection.as_deref().and_then(|selection| {
-                    sidebar.rows.iter().position(|row| row.id == selection)
+                let rendered = render_lines_with_indices(
+                    &sidebar.rows,
+                    &sidebar.state,
+                    area.width as usize,
+                    theme,
+                );
+                let selected_row_index =
+                    sidebar.state.selection.as_deref().and_then(|selection| {
+                        sidebar.rows.iter().position(|row| row.id == selection)
+                    });
+                let selection_index = selected_row_index.and_then(|row_index| {
+                    rendered
+                        .row_indices
+                        .iter()
+                        .position(|mapped| *mapped == Some(row_index))
                 });
                 scroll = resolve_scroll(
                     scroll,
                     selection_index,
-                    sidebar.rows.len(),
+                    rendered.lines.len(),
                     areas.rows_height as usize,
                 );
             } else {
@@ -322,20 +336,31 @@ fn pane_for_click(snapshot: &DaemonSnapshot, row: u16) -> Option<String> {
     row_for_click(snapshot, row, 0, 0)?.pane_id.clone()
 }
 
+#[cfg(test)]
 fn row_for_click(
     snapshot: &DaemonSnapshot,
     row: u16,
     header_rows: u16,
     scroll: usize,
 ) -> Option<&SidebarRow> {
+    let rows_len = snapshot.sidebar.as_ref()?.rows.len();
+    let row_indices = (0..rows_len).map(Some).collect::<Vec<_>>();
+    row_for_click_with_indices(snapshot, row, header_rows, scroll, &row_indices)
+}
+
+fn row_for_click_with_indices<'a>(
+    snapshot: &'a DaemonSnapshot,
+    row: u16,
+    header_rows: u16,
+    scroll: usize,
+    row_indices: &[Option<usize>],
+) -> Option<&'a SidebarRow> {
     if row < header_rows {
         return None;
     }
-    snapshot
-        .sidebar
-        .as_ref()?
-        .rows
-        .get(usize::from(row - header_rows) + scroll)
+    let display_index = usize::from(row - header_rows) + scroll;
+    let row_index = row_indices.get(display_index).and_then(|index| *index)?;
+    snapshot.sidebar.as_ref()?.rows.get(row_index)
 }
 
 pub fn draw_snapshot<B: Backend>(
@@ -406,7 +431,10 @@ fn draw_snapshot_in_area(
         height: areas.rows_height,
         ..area
     };
-    let items = render_lines(&sidebar.rows, &sidebar.state, area.width as usize, theme)
+    let rendered =
+        render_lines_with_indices(&sidebar.rows, &sidebar.state, area.width as usize, theme);
+    let items = rendered
+        .lines
         .into_iter()
         .skip(scroll)
         .take(areas.rows_height as usize)
@@ -512,7 +540,15 @@ fn handle_left_click(
     if row >= areas.header_rows + areas.rows_height {
         return Ok(());
     }
-    let Some(clicked) = row_for_click(snapshot, row, header.row_count(), scroll) else {
+    let rendered =
+        render_lines_with_indices(&sidebar.rows, &sidebar.state, width as usize, context.theme);
+    let Some(clicked) = row_for_click_with_indices(
+        snapshot,
+        row,
+        header.row_count(),
+        scroll,
+        &rendered.row_indices,
+    ) else {
         return Ok(());
     };
     if let ClickDecision::Immediate(action) =
