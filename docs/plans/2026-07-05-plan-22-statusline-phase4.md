@@ -27,7 +27,7 @@
 
 ### 運用反映条件
 
-- [ ] `docs/e2e-smoke.md` に attention(permission 発生 → 別 session から見える → 承認で消える)と stale(daemon kill → バッジが `?`)の手順を追記し、smoke 実施を記録
+- [x] `docs/e2e-smoke.md` に attention(permission 発生 → 別 session から見える → 承認で消える)と stale(daemon kill → バッジが `?`)の手順を追記し、smoke 実施を記録
 - [x] README / migration.md 更新(status-interval・設定例・M7 手順への追記)
 - [x] `docs/statusline-ui-proposals.md` §7.2 Step 4 にチェック
 

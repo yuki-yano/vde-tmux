@@ -21,28 +21,28 @@ tmux ステータスライン再設計(背景と設計判断は `docs/statusline
 
 ## 各 Plan 共通のゲート(次の Plan に進む条件)
 
-- [ ] その Plan の DoD(機能/テスト/運用)が全項目チェック済み
-- [ ] `rtk cargo fmt --check` / `rtk cargo clippy --all-targets` / `rtk cargo test` が全通過
-- [ ] scratch tmux での smoke 実施と `docs/e2e-smoke.md` への記録(daemon 再起動を含む)
-- [ ] `docs/statusline-ui-proposals.md` §7.2 の該当 Step にチェック
-- [ ] コミット済み(Task 単位)。ワーキングツリーがクリーン
-- [ ] 最終 Task では、該当 Plan の DoD チェックボックス更新までを完了範囲に含める
+- [x] その Plan の DoD(機能/テスト/運用)が全項目チェック済み
+- [x] `rtk cargo fmt --check` / `rtk cargo clippy --all-targets` / `rtk cargo test` が全通過
+- [x] scratch tmux での smoke 実施と `docs/e2e-smoke.md` への記録(daemon 再起動を含む)
+- [x] `docs/statusline-ui-proposals.md` §7.2 の該当 Step にチェック
+- [x] コミット済み(Task 単位)。ワーキングツリーがクリーン
+- [x] 最終 Task では、該当 Plan の DoD チェックボックス更新までを完了範囲に含める
 
 ## 全体 DoD(ロードマップ完了条件)
 
 ### 機能完了条件
 
-- [ ] Plan 19〜22 の DoD がすべて満たされている
-- [ ] 実運用相当の tmux.conf(pill 装飾 + `#()` 呼び出し)で: グリフ付きセッション列挙 / current 強調 / summary / attention / stale 表示が同時に成立する
-- [ ] daemon 停止時に sessions/category は継続動作し、バッジは `?` に落ち、summary/attention はフォールバックで動く
+- [x] Plan 19〜22 の DoD がすべて満たされている
+- [x] 実運用相当の tmux.conf(pill 装飾 + `#()` 呼び出し)で: グリフ付きセッション列挙 / current 強調 / summary / attention / stale 表示が同時に成立する
+- [x] daemon 停止時に sessions/category は継続動作し、バッジは `?` に落ち、summary/attention はフォールバックで動く
 
 ### テスト完了条件
 
-- [ ] `rtk cargo test` / `rtk cargo clippy --all-targets` / `rtk cargo fmt --check` 全通過
+- [x] `rtk cargo test` / `rtk cargo clippy --all-targets` / `rtk cargo fmt --check` 全通過
 
 ### 運用反映条件
 
-- [ ] `docs/e2e-smoke.md` が最終仕様に対応し、全 Plan の smoke 記録が残っている
+- [x] `docs/e2e-smoke.md` が最終仕様に対応し、全 Plan の smoke 記録が残っている
 - [x] README に status-interval 推奨・status-left/right 設定例・新 config(badge_style / hide_idle / {count} / summary / attention)が記載されている
 - [x] `docs/migration.md` の M7(dotfiles 切替)手順に `statusline-agent-badge` → `statusline-summary` と suffix 既定変更が反映されている
 
