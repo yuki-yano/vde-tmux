@@ -56,7 +56,7 @@ pub struct SessionNameRule {
 pub struct StatuslineConfig {
     pub sessions: StatuslineSessionsConfig,
     pub category: StatuslineCategoryConfig,
-    pub agent_badge: AgentBadgeConfig,
+    pub summary: SummaryConfig,
     pub session_badge: SessionBadgeConfig,
 }
 
@@ -141,11 +141,11 @@ impl Default for StatuslineCategoryConfig {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
-pub struct AgentBadgeConfig {
+pub struct SummaryConfig {
     pub enabled: bool,
 }
 
-impl Default for AgentBadgeConfig {
+impl Default for SummaryConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
@@ -399,7 +399,7 @@ mod tests {
     fn empty_yaml_yields_full_defaults() {
         let config: Config = serde_yaml_ng::from_str("").unwrap_or_default();
         assert_eq!(config, Config::default());
-        assert!(config.statusline.agent_badge.enabled);
+        assert!(config.statusline.summary.enabled);
         assert_eq!(config.daemon.poll_ms, 1000);
         assert_eq!(config.daemon.git.timeout_ms, 500);
         assert_eq!(config.sidebar.width, SidebarWidth::Columns(40));

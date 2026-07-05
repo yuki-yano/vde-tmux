@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::protocol::{ClientMessage, ServerMessage};
-use crate::daemon::session_badge::BadgeState;
+use crate::daemon::session_badge::{BadgeState, glyph_for_state};
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
 use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane, read_all_panes};
 use crate::sidebar::state::SidebarState;
@@ -103,6 +103,30 @@ pub fn render_agent_badge(snapshot: &DaemonSnapshot) -> String {
         return String::new();
     }
     format!("{}:{}", rollup_label(snapshot.rollup), snapshot.agent_count)
+}
+
+pub fn render_summary(
+    counts: &[(BadgeState, usize)],
+    glyphs: &crate::config::BadgeGlyphs,
+) -> String {
+    let color = |state: BadgeState| match state {
+        BadgeState::Blocked => Some("red"),
+        BadgeState::Working => Some("green"),
+        BadgeState::Done => Some("cyan"),
+        BadgeState::Idle => None,
+    };
+    counts
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(state, count)| {
+            let glyph = glyph_for_state(*state, glyphs);
+            match color(*state) {
+                Some(color) => format!("#[fg={color}]{glyph}{count}#[default]"),
+                None => format!("{glyph}{count}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn statusline_agent_badge_fallback(runner: &dyn TmuxRunner) -> Result<String> {
@@ -250,6 +274,29 @@ mod tests {
     fn render_agent_badge_includes_rollup_and_count() {
         let snapshot = build_snapshot(&[pane("codex", "running", "")]);
         assert_eq!(render_agent_badge(&snapshot), "running:1");
+    }
+
+    #[test]
+    fn render_summary_counts_states_with_markup_and_omits_zero() {
+        use crate::daemon::session_badge::BadgeState;
+        let glyphs = crate::config::BadgeGlyphs::default();
+        let counts = [
+            (BadgeState::Blocked, 2),
+            (BadgeState::Working, 1),
+            (BadgeState::Done, 0),
+            (BadgeState::Idle, 3),
+        ];
+        assert_eq!(
+            render_summary(&counts, &glyphs),
+            "#[fg=red]▲2#[default] #[fg=green]●1#[default] ○3"
+        );
+    }
+
+    #[test]
+    fn render_summary_is_empty_without_agents() {
+        let glyphs = crate::config::BadgeGlyphs::default();
+        let counts = [];
+        assert_eq!(render_summary(&counts, &glyphs), "");
     }
 
     #[test]
