@@ -29,8 +29,8 @@ use crate::sidebar::client::{
 };
 use crate::sidebar::preview::open_preview_floating_pane;
 use crate::sidebar::render::{
-    HeaderAction, SidebarRenderTheme, build_header_layout_with_theme, header_hit_test,
-    render_header_lines, render_lines,
+    HeaderAction, HeaderLayout, SidebarRenderTheme, build_footer_line,
+    build_header_layout_with_theme, header_hit_test, render_header_lines, render_lines,
 };
 use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
@@ -351,10 +351,10 @@ fn draw_snapshot_in_area(
         return;
     };
     let header = build_header_layout_with_theme(&sidebar.state, area.width, theme);
-    let header_rows = header.row_count().min(area.height);
-    if header_rows > 0 {
+    let areas = compute_areas(area, &header);
+    if areas.header_rows > 0 {
         let header_area = Rect {
-            height: header_rows,
+            height: areas.header_rows,
             ..area
         };
         frame.render_widget(
@@ -363,8 +363,8 @@ fn draw_snapshot_in_area(
         );
     }
     let rows_area = Rect {
-        y: area.y + header_rows,
-        height: area.height.saturating_sub(header_rows),
+        y: area.y + areas.header_rows,
+        height: areas.rows_height,
         ..area
     };
     let items = render_lines(&sidebar.rows, &sidebar.state, area.width as usize, theme)
@@ -373,12 +373,44 @@ fn draw_snapshot_in_area(
         .collect::<Vec<_>>();
     let list = List::new(items).block(Block::default().borders(Borders::NONE));
     frame.render_widget(list, rows_area);
+    if areas.footer_rows > 0 {
+        let footer_area = Rect {
+            y: area.y + areas.header_rows + areas.rows_height,
+            height: areas.footer_rows,
+            ..area
+        };
+        frame.render_widget(
+            Paragraph::new(build_footer_line(area.width as usize)),
+            footer_area,
+        );
+    }
 }
 
 fn draw_placeholder(frame: &mut ratatui::Frame<'_>, area: Rect, message: &str) {
     let list = List::new(vec![ListItem::new(Line::from(message.to_string()))])
         .block(Block::default().borders(Borders::NONE));
     frame.render_widget(list, area);
+}
+
+pub(crate) struct SidebarAreas {
+    pub(crate) header_rows: u16,
+    pub(crate) rows_height: u16,
+    pub(crate) footer_rows: u16,
+}
+
+pub(crate) fn compute_areas(area: Rect, header: &HeaderLayout) -> SidebarAreas {
+    let header_rows = header.row_count().min(area.height);
+    let remaining = area.height.saturating_sub(header_rows);
+    let footer_rows = if area.width > 2 && area.height >= 12 && remaining > 1 {
+        1
+    } else {
+        0
+    };
+    SidebarAreas {
+        header_rows,
+        rows_height: remaining.saturating_sub(footer_rows),
+        footer_rows,
+    }
 }
 
 struct ClickContext<'a> {
@@ -399,9 +431,7 @@ fn handle_left_click(
     let Some(sidebar) = &snapshot.sidebar else {
         return Ok(());
     };
-    let width = crossterm::terminal::size()
-        .map(|(width, _)| width)
-        .unwrap_or(80);
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
     let header = build_header_layout_with_theme(&sidebar.state, width, context.theme);
     if row < header.row_count() {
         match header_hit_test(&header, row, column) {
@@ -413,6 +443,10 @@ fn handle_left_click(
             }
             None => {}
         }
+        return Ok(());
+    }
+    let areas = compute_areas(Rect::new(0, 0, width, height), &header);
+    if row >= areas.header_rows + areas.rows_height {
         return Ok(());
     }
     let Some(clicked) = row_for_click(snapshot, row, header.row_count()) else {
@@ -517,6 +551,7 @@ mod tests {
     use super::*;
     use crate::daemon::{DaemonSnapshot, SidebarFrame};
     use crate::hook::RollupLevel;
+    use crate::sidebar::render::{HeaderLayout, HeaderLine};
     use crate::sidebar::state::SidebarState;
     use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
     use ratatui::Terminal;
@@ -562,6 +597,76 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("codex (%1)"));
+    }
+
+    #[test]
+    fn footer_is_rendered_when_height_is_sufficient() {
+        let snapshot = DaemonSnapshot {
+            agent_count: 1,
+            rollup: RollupLevel::Running,
+            panes: Vec::new(),
+            sidebar: Some(SidebarFrame {
+                state: SidebarState::default(),
+                rows: vec![row()],
+            }),
+        };
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        draw_snapshot(&mut terminal, &snapshot).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("j/k move"), "{rendered}");
+    }
+
+    #[test]
+    fn footer_is_hidden_when_height_is_small() {
+        let snapshot = DaemonSnapshot {
+            agent_count: 1,
+            rollup: RollupLevel::Running,
+            panes: Vec::new(),
+            sidebar: Some(SidebarFrame {
+                state: SidebarState::default(),
+                rows: vec![row()],
+            }),
+        };
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        draw_snapshot(&mut terminal, &snapshot).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("j/k move"), "{rendered}");
+    }
+
+    #[test]
+    fn clicks_below_visible_rows_are_ignored() {
+        let header = HeaderLayout {
+            lines: vec![HeaderLine {
+                text: " repo · all".to_string(),
+                segments: Vec::new(),
+            }],
+        };
+        let areas = compute_areas(Rect::new(0, 0, 40, 24), &header);
+        assert_eq!(areas.header_rows, 1);
+        assert_eq!(areas.footer_rows, 1);
+        assert_eq!(areas.rows_height, 22);
+
+        let small = compute_areas(Rect::new(0, 0, 40, 8), &header);
+        assert_eq!(small.footer_rows, 0);
+        assert_eq!(small.rows_height, 7);
     }
 
     #[test]

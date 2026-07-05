@@ -203,7 +203,7 @@ pub fn build_header_layout_with_theme(
 }
 
 fn format_header_segment(label: &str, theme: &SidebarRenderTheme) -> String {
-    let body = theme.header_format.replace("{label}", &label);
+    let body = theme.header_format.replace("{label}", label);
     format!("{}{}{}", theme.header_prefix, body, theme.header_suffix)
 }
 
@@ -248,6 +248,14 @@ pub fn render_header_lines(
             Line::from(spans)
         })
         .collect()
+}
+
+pub fn build_footer_line(width: usize) -> Line<'static> {
+    let text = truncate_display(" j/k move  enter jump  tab filter", width);
+    Line::from(Span::styled(
+        text,
+        Style::default().add_modifier(Modifier::DIM),
+    ))
 }
 
 fn header_segment_style(theme: &SidebarRenderTheme) -> Style {
@@ -353,10 +361,7 @@ fn render_row_line(
             spans.push(Span::styled(format!(" {behind}"), style.fg(Color::Red)));
         }
     }
-    let used: usize = spans
-        .iter()
-        .map(|span| display_width(&span.content))
-        .sum();
+    let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
     let filler = width
         .saturating_sub(1)
         .saturating_sub(used)
