@@ -359,7 +359,11 @@ fn handle_runtime_effects(
                     crate::sidebar::store::save_state(path, &state)?;
                 }
             }
-            RuntimeEffect::SetSessionBadge { session, value } => {
+            RuntimeEffect::SetSessionBadge {
+                session,
+                value,
+                state,
+            } => {
                 if let Err(error) = worker_io.set_session_option(
                     &session,
                     crate::options::KEY_SESSION_STATUS,
@@ -367,12 +371,24 @@ fn handle_runtime_effects(
                 ) {
                     eprintln!("[vde-tmux] session badge set failed: {error:#}");
                 }
+                if let Err(error) = worker_io.set_session_option(
+                    &session,
+                    crate::options::KEY_SESSION_STATE,
+                    &state,
+                ) {
+                    eprintln!("[vde-tmux] session state set failed: {error:#}");
+                }
             }
             RuntimeEffect::ClearSessionBadge { session } => {
                 if let Err(error) =
                     worker_io.unset_session_option(&session, crate::options::KEY_SESSION_STATUS)
                 {
                     eprintln!("[vde-tmux] session badge clear failed: {error:#}");
+                }
+                if let Err(error) =
+                    worker_io.unset_session_option(&session, crate::options::KEY_SESSION_STATE)
+                {
+                    eprintln!("[vde-tmux] session state clear failed: {error:#}");
                 }
             }
             RuntimeEffect::Notify {
@@ -802,7 +818,13 @@ mod tests {
                     "@vde_session_status".to_string(),
                     Some("●".to_string()),
                 ),
+                (
+                    "main".to_string(),
+                    "@vde_session_state".to_string(),
+                    Some("working".to_string()),
+                ),
                 ("main".to_string(), "@vde_session_status".to_string(), None),
+                ("main".to_string(), "@vde_session_state".to_string(), None),
             ]
         );
     }

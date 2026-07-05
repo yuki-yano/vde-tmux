@@ -58,6 +58,7 @@ pub enum RuntimeEffect {
     SetSessionBadge {
         session: String,
         value: String,
+        state: String,
     },
     ClearSessionBadge {
         session: String,
@@ -155,7 +156,7 @@ pub struct RuntimeState {
     prev_badges: BTreeMap<String, BadgeState>,
     events: VecDeque<TransitionEvent>,
     flash: BTreeMap<String, u8>,
-    written_badges: BTreeMap<String, String>,
+    written_badges: BTreeMap<String, (String, String)>,
 }
 
 impl RuntimeState {
@@ -629,23 +630,25 @@ impl RuntimeState {
                     .push(badge_state(level, unread));
             }
             for (session, list) in states {
+                let state = list.iter().copied().min().unwrap_or(BadgeState::Idle);
                 if let Some(value) = session_badge_value(
                     list,
                     badge_glyphs,
                     &badge_config.suffix,
                     badge_config.hide_idle,
                 ) {
-                    desired.insert(session, value);
+                    desired.insert(session, (value, state.as_str().to_string()));
                 }
             }
         }
 
         let mut effects = Vec::new();
-        for (session, value) in &desired {
-            if self.written_badges.get(session) != Some(value) {
+        for (session, (value, state)) in &desired {
+            if self.written_badges.get(session) != Some(&(value.clone(), state.clone())) {
                 effects.push(RuntimeEffect::SetSessionBadge {
                     session: session.clone(),
                     value: value.clone(),
+                    state: state.clone(),
                 });
             }
         }
@@ -1341,8 +1344,22 @@ mod tests {
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
                 value: "●".to_string(),
+                state: "working".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn session_badge_effect_carries_structured_state() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::SetSessionBadge { session, value, state }
+                if session == "main" && value.starts_with('●') && state == "working"
+        )));
     }
 
     #[test]
@@ -1388,6 +1405,7 @@ mod tests {
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
                 value: "✓".to_string(),
+                state: "done".to_string(),
             }]
         );
 
@@ -1400,6 +1418,7 @@ mod tests {
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
                 value: "○".to_string(),
+                state: "idle".to_string(),
             }]
         );
     }
@@ -1441,6 +1460,7 @@ mod tests {
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
                 value: "○".to_string(),
+                state: "idle".to_string(),
             }]
         );
     }
@@ -1474,6 +1494,7 @@ mod tests {
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
                 value: "▲".to_string(),
+                state: "blocked".to_string(),
             }]
         );
     }
@@ -1491,10 +1512,12 @@ mod tests {
                 RuntimeEffect::SetSessionBadge {
                     session: "alpha".to_string(),
                     value: "●".to_string(),
+                    state: "working".to_string(),
                 },
                 RuntimeEffect::SetSessionBadge {
                     session: "beta".to_string(),
                     value: "○".to_string(),
+                    state: "idle".to_string(),
                 },
             ]
         );

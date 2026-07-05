@@ -13,6 +13,17 @@ pub enum BadgeState {
     Idle,
 }
 
+impl BadgeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BadgeState::Blocked => "blocked",
+            BadgeState::Working => "working",
+            BadgeState::Done => "done",
+            BadgeState::Idle => "idle",
+        }
+    }
+}
+
 /// RollupLevel(6 値)を未読フラグ込みで 4 状態へ畳む。
 pub fn badge_state(level: RollupLevel, unread: bool) -> BadgeState {
     match level {

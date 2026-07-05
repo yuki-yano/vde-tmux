@@ -33,6 +33,7 @@ pub const KEY_PROJECT_PATH: &str = "@vde_project_path";
 
 // --- session スコープ(writer: daemon) ---
 pub const KEY_SESSION_STATUS: &str = "@vde_session_status";
+pub const KEY_SESSION_STATE: &str = "@vde_session_state";
 
 /// hook CLI が書く pane キーの全列挙(snapshot reader と writer の網羅テストに使う)。
 pub const PANE_STATE_KEYS: &[&str] = &[
@@ -121,6 +122,7 @@ mod tests {
             KEY_CATEGORY_OVERRIDE,
             KEY_PROJECT_PATH,
             KEY_SESSION_STATUS,
+            KEY_SESSION_STATE,
         ]);
         for key in keys {
             assert!(key.starts_with("@vde_"), "{key} が @vde_ 名前空間でない");
