@@ -19,10 +19,11 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
-use crate::config::Config;
+use crate::config::{Config, SidebarLiveConfig};
 use crate::daemon::DaemonSnapshot;
 use crate::sidebar::client::{
     send_sidebar_jump, send_sidebar_key, send_sidebar_toggle, socket_path, subscribe,
@@ -64,6 +65,7 @@ pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<O
         env,
         &theme,
         config.sidebar.preview.history_lines,
+        &config.sidebar.live,
     );
     disable_raw_mode()?;
     execute!(
@@ -101,6 +103,31 @@ pub enum TuiExit {
     Quit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LiveMode {
+    #[default]
+    Tail,
+    Events,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LiveState {
+    mode: LiveMode,
+    pane_id: Option<String>,
+    lines: Vec<String>,
+    last_capture: Option<Instant>,
+    requested_lines: u16,
+}
+
+impl LiveState {
+    fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            LiveMode::Tail => LiveMode::Events,
+            LiveMode::Events => LiveMode::Tail,
+        };
+    }
+}
+
 pub fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     socket: &Path,
@@ -109,10 +136,15 @@ pub fn run_loop<B: Backend>(
     env: &BTreeMap<String, String>,
     theme: &SidebarRenderTheme,
     preview_history_lines: u32,
+    live_config: &SidebarLiveConfig,
 ) -> Result<TuiExit> {
     let mut current: Option<DaemonSnapshot> = None;
     let mut clicks = ClickTracker::default();
     let mut scroll: usize = 0;
+    let mut live = LiveState {
+        requested_lines: live_rows_requested(live_config),
+        ..LiveState::default()
+    };
     loop {
         while let Ok(snapshot) = rx.try_recv() {
             current = Some(snapshot);
@@ -123,11 +155,13 @@ pub fn run_loop<B: Backend>(
             env,
             theme,
             preview_history_lines,
+            live_lines: live.requested_lines,
         };
         if let Some(action) = clicks.flush_due(Instant::now()) {
             dispatch_click_action(&context, action);
         }
         if let Some(snapshot) = &current {
+            update_live_state(snapshot, runner, live_config, &mut live);
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
             if let Some(sidebar) = &snapshot.sidebar {
@@ -137,7 +171,7 @@ pub fn run_loop<B: Backend>(
                     theme,
                     BadgeCounts::from_rows(&sidebar.rows),
                 );
-                let areas = compute_areas(area, &header);
+                let areas = compute_areas(area, &header, live.requested_lines);
                 let rendered = render_lines_with_indices(
                     &sidebar.rows,
                     &sidebar.state,
@@ -163,7 +197,7 @@ pub fn run_loop<B: Backend>(
             } else {
                 scroll = 0;
             }
-            draw_snapshot_with_theme_and_scroll(terminal, snapshot, theme, scroll)?;
+            draw_snapshot_with_theme_and_scroll_live(terminal, snapshot, theme, scroll, Some(&live))?;
         } else {
             draw_connecting(terminal)?;
         }
@@ -178,6 +212,7 @@ pub fn run_loop<B: Backend>(
                             spawn_preview(runner, env, &pane_id, preview_history_lines);
                         }
                     }
+                    KeyCode::Char('e') => live.toggle_mode(),
                     KeyCode::Char(' ') => send_sidebar_key(socket, "space")?,
                     KeyCode::Char(ch) => send_sidebar_key(socket, &ch.to_string())?,
                     KeyCode::Down => send_sidebar_key(socket, "down")?,
@@ -204,6 +239,47 @@ pub fn run_loop<B: Backend>(
             }
         }
     }
+}
+
+fn live_rows_requested(config: &SidebarLiveConfig) -> u16 {
+    if config.enabled { config.lines } else { 0 }
+}
+
+fn update_live_state(
+    snapshot: &DaemonSnapshot,
+    runner: &dyn TmuxRunner,
+    config: &SidebarLiveConfig,
+    live: &mut LiveState,
+) {
+    live.requested_lines = live_rows_requested(config);
+    if live.requested_lines == 0 {
+        live.pane_id = None;
+        live.lines.clear();
+        live.last_capture = None;
+        return;
+    }
+    let selected = preview_pane_for_selection(snapshot);
+    if live.pane_id != selected {
+        live.pane_id = selected;
+        live.last_capture = None;
+        live.lines.clear();
+    }
+    let Some(pane_id) = live.pane_id.clone() else {
+        return;
+    };
+    let now = Instant::now();
+    let interval = Duration::from_millis(config.interval_ms);
+    let due = live
+        .last_capture
+        .map(|last| now.duration_since(last) >= interval)
+        .unwrap_or(true);
+    if !due {
+        return;
+    }
+    if let Ok(output) = runner.run(&["capture-pane", "-p", "-t", &pane_id]) {
+        live.lines = extract_tail(&output, live.requested_lines as usize);
+    }
+    live.last_capture = Some(now);
 }
 
 fn resolve_current_window_id(
@@ -390,9 +466,19 @@ fn draw_snapshot_with_theme_and_scroll<B: Backend>(
     theme: &SidebarRenderTheme,
     scroll: usize,
 ) -> Result<()> {
+    draw_snapshot_with_theme_and_scroll_live(terminal, snapshot, theme, scroll, None)
+}
+
+fn draw_snapshot_with_theme_and_scroll_live<B: Backend>(
+    terminal: &mut Terminal<B>,
+    snapshot: &DaemonSnapshot,
+    theme: &SidebarRenderTheme,
+    scroll: usize,
+    live: Option<&LiveState>,
+) -> Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
-        draw_snapshot_in_area(frame, area, snapshot, theme, scroll);
+        draw_snapshot_in_area(frame, area, snapshot, theme, scroll, live);
     })?;
     Ok(())
 }
@@ -411,6 +497,7 @@ fn draw_snapshot_in_area(
     snapshot: &DaemonSnapshot,
     theme: &SidebarRenderTheme,
     scroll: usize,
+    live: Option<&LiveState>,
 ) {
     let Some(sidebar) = &snapshot.sidebar else {
         draw_placeholder(frame, area, "no sidebar data");
@@ -426,7 +513,8 @@ fn draw_snapshot_in_area(
         theme,
         BadgeCounts::from_rows(&sidebar.rows),
     );
-    let areas = compute_areas(area, &header);
+    let live_lines = live.map(|live| live.requested_lines).unwrap_or(0);
+    let areas = compute_areas(area, &header, live_lines);
     if areas.header_rows > 0 {
         let header_area = Rect {
             height: areas.header_rows,
@@ -453,9 +541,22 @@ fn draw_snapshot_in_area(
         .collect::<Vec<_>>();
     let list = List::new(items).block(Block::default().borders(Borders::NONE));
     frame.render_widget(list, rows_area);
+    if areas.live_rows > 0
+        && let Some(live) = live
+    {
+        let live_area = Rect {
+            y: area.y + areas.header_rows + areas.rows_height,
+            height: areas.live_rows,
+            ..area
+        };
+        frame.render_widget(
+            Paragraph::new(render_live_lines(snapshot, live, areas.live_rows)),
+            live_area,
+        );
+    }
     if areas.footer_rows > 0 {
         let footer_area = Rect {
-            y: area.y + areas.header_rows + areas.rows_height,
+            y: area.y + areas.header_rows + areas.rows_height + areas.live_rows,
             height: areas.footer_rows,
             ..area
         };
@@ -472,13 +573,74 @@ fn draw_placeholder(frame: &mut ratatui::Frame<'_>, area: Rect, message: &str) {
     frame.render_widget(list, area);
 }
 
+fn render_live_lines(
+    snapshot: &DaemonSnapshot,
+    live: &LiveState,
+    live_rows: u16,
+) -> Vec<Line<'static>> {
+    let body_limit = live_rows.saturating_sub(1) as usize;
+    let title = match live.mode {
+        LiveMode::Tail => live
+            .pane_id
+            .as_deref()
+            .map(|pane| format!(" LIVE · {pane}"))
+            .unwrap_or_else(|| " LIVE".to_string()),
+        LiveMode::Events => " EVENTS".to_string(),
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        title,
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    let body = match live.mode {
+        LiveMode::Tail => live.lines.clone(),
+        LiveMode::Events => event_tail(snapshot, body_limit),
+    };
+    lines.extend(
+        body.into_iter()
+            .take(body_limit)
+            .map(|line| Line::from(Span::styled(format!(" {line}"), Style::default()))),
+    );
+    lines
+}
+
+pub(crate) fn extract_tail(raw: &str, limit: usize) -> Vec<String> {
+    let mut lines = raw
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(limit);
+    lines.drain(0..start);
+    lines
+}
+
+fn event_tail(snapshot: &DaemonSnapshot, limit: usize) -> Vec<String> {
+    let mut events = snapshot
+        .events
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|event| {
+            let from = event
+                .from
+                .map(|state| format!("{state:?}"))
+                .unwrap_or_else(|| "New".to_string());
+            format!("{} {} -> {:?}", event.pane_id, from, event.to)
+        })
+        .collect::<Vec<_>>();
+    events.reverse();
+    events
+}
+
 pub(crate) struct SidebarAreas {
     pub(crate) header_rows: u16,
     pub(crate) rows_height: u16,
+    pub(crate) live_rows: u16,
     pub(crate) footer_rows: u16,
 }
 
-pub(crate) fn compute_areas(area: Rect, header: &HeaderLayout) -> SidebarAreas {
+pub(crate) fn compute_areas(area: Rect, header: &HeaderLayout, live_lines: u16) -> SidebarAreas {
     let header_rows = header.row_count().min(area.height);
     let remaining = area.height.saturating_sub(header_rows);
     let footer_rows = if area.width > 2 && area.height >= 12 && remaining > 1 {
@@ -486,9 +648,17 @@ pub(crate) fn compute_areas(area: Rect, header: &HeaderLayout) -> SidebarAreas {
     } else {
         0
     };
+    let live_rows = if live_lines > 0 && area.width > 2 && area.height >= 14 {
+        (live_lines + 1).min(remaining.saturating_sub(footer_rows))
+    } else {
+        0
+    };
     SidebarAreas {
         header_rows,
-        rows_height: remaining.saturating_sub(footer_rows),
+        rows_height: remaining
+            .saturating_sub(live_rows)
+            .saturating_sub(footer_rows),
+        live_rows,
         footer_rows,
     }
 }
@@ -520,6 +690,7 @@ struct ClickContext<'a> {
     env: &'a BTreeMap<String, String>,
     theme: &'a SidebarRenderTheme,
     preview_history_lines: u32,
+    live_lines: u16,
 }
 
 fn handle_left_click(
@@ -555,7 +726,11 @@ fn handle_left_click(
         }
         return Ok(());
     }
-    let areas = compute_areas(Rect::new(0, 0, width, height), &header);
+    let areas = compute_areas(
+        Rect::new(0, 0, width, height),
+        &header,
+        context.live_lines,
+    );
     if row >= areas.header_rows + areas.rows_height {
         return Ok(());
     }
@@ -825,14 +1000,40 @@ mod tests {
                 segments: Vec::new(),
             }],
         };
-        let areas = compute_areas(Rect::new(0, 0, 40, 24), &header);
+        let areas = compute_areas(Rect::new(0, 0, 40, 24), &header, 0);
         assert_eq!(areas.header_rows, 1);
         assert_eq!(areas.footer_rows, 1);
         assert_eq!(areas.rows_height, 22);
 
-        let small = compute_areas(Rect::new(0, 0, 40, 8), &header);
+        let small = compute_areas(Rect::new(0, 0, 40, 8), &header, 0);
         assert_eq!(small.footer_rows, 0);
         assert_eq!(small.rows_height, 7);
+    }
+
+    #[test]
+    fn compute_areas_reserves_live_rows_when_enabled() {
+        let header = HeaderLayout {
+            lines: vec![HeaderLine {
+                text: " repo · all".to_string(),
+                segments: Vec::new(),
+            }],
+        };
+
+        let areas = compute_areas(Rect::new(0, 0, 40, 24), &header, 3);
+
+        assert_eq!(areas.header_rows, 1);
+        assert_eq!(areas.rows_height, 18);
+        assert_eq!(areas.live_rows, 4);
+        assert_eq!(areas.footer_rows, 1);
+
+        let small = compute_areas(Rect::new(0, 0, 40, 13), &header, 3);
+        assert_eq!(small.live_rows, 0);
+    }
+
+    #[test]
+    fn live_tail_keeps_last_nonempty_lines() {
+        assert_eq!(extract_tail("a\nb\n\nc\n\n\n", 3), vec!["a", "b", "c"]);
+        assert_eq!(extract_tail("a\nb\nc\nd\n", 2), vec!["c", "d"]);
     }
 
     #[test]

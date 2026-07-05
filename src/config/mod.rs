@@ -183,6 +183,7 @@ pub struct SidebarConfig {
     pub colors: SidebarColorsConfig,
     pub header: SidebarHeaderConfig,
     pub preview: SidebarPreviewConfig,
+    pub live: SidebarLiveConfig,
 }
 
 impl Default for SidebarConfig {
@@ -193,6 +194,25 @@ impl Default for SidebarConfig {
             colors: SidebarColorsConfig::default(),
             header: SidebarHeaderConfig::default(),
             preview: SidebarPreviewConfig::default(),
+            live: SidebarLiveConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SidebarLiveConfig {
+    pub enabled: bool,
+    pub lines: u16,
+    pub interval_ms: u64,
+}
+
+impl Default for SidebarLiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lines: 3,
+            interval_ms: 2000,
         }
     }
 }
@@ -395,6 +415,22 @@ mod tests {
             serde_yaml_ng::from_str::<Config>("sidebar:\n  preview:\n    history_lines: 5000\n")
                 .unwrap();
         assert_eq!(config.sidebar.preview.history_lines, 5000);
+    }
+
+    #[test]
+    fn sidebar_live_config_defaults_and_overrides() {
+        let config = Config::default();
+        assert!(config.sidebar.live.enabled);
+        assert_eq!(config.sidebar.live.lines, 3);
+        assert_eq!(config.sidebar.live.interval_ms, 2000);
+
+        let config = serde_yaml_ng::from_str::<Config>(
+            "sidebar:\n  live:\n    enabled: false\n    lines: 5\n    interval_ms: 750\n",
+        )
+        .unwrap();
+        assert!(!config.sidebar.live.enabled);
+        assert_eq!(config.sidebar.live.lines, 5);
+        assert_eq!(config.sidebar.live.interval_ms, 750);
     }
 
     #[test]
