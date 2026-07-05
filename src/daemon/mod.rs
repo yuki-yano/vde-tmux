@@ -7,6 +7,7 @@ pub mod server;
 pub mod session_badge;
 pub mod workers;
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -124,7 +125,7 @@ pub fn render_summary(
 
 pub fn format_attention(entries: &[(String, RollupLevel, i64)]) -> String {
     let mut entries = entries.to_vec();
-    entries.sort_by(|left, right| right.2.cmp(&left.2));
+    entries.sort_by_key(|entry| Reverse(entry.2));
     let Some((session, level, elapsed)) = entries.first() else {
         return String::new();
     };

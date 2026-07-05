@@ -85,6 +85,19 @@ daemon 起動後に `@vde_session_state`、inline 表示、daemon stop 後の cl
 - `badge_style: plain` の `statusline-sessions`: ` ●main #[bold] sub #[default]`
 - `format: "{category} {count} "` の `statusline-category`: `work 2 `
 
+### Plan 22 statusline attention/heartbeat smoke (2026-07-05)
+
+scratch tmux server `vde-plan22-smoke-1783258255` で確認。
+daemon 起動後の attention、`kill -9` 後の stale、daemon 再起動後の復帰、graceful stop 後の heartbeat clear を確認した。
+
+- heartbeat: `1783258255`
+- `statusline-attention`: `#[fg=red]▲ proxy · perm 2m#[default]`
+- fresh `statusline-sessions`: ` #[fg=green]●#[fg=default]main #[bold] #[fg=red]▲#[fg=default]proxy #[default]`
+- daemon 強制終了後 stale: ` ?main #[bold] ?proxy #[default]`
+- daemon 再起動後: ` #[fg=green]●#[fg=default]main #[bold] #[fg=red]▲#[fg=default]proxy #[default]`
+- graceful stop 後 heartbeat: 空
+- graceful stop 後 `statusline-sessions`: ` main #[bold] proxy #[default]`
+
 ## Session / Category / Project
 
 ```bash
