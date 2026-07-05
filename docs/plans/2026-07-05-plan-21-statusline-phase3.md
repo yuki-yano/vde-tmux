@@ -12,23 +12,23 @@
 
 ### 機能完了条件
 
-- [ ] daemon が session ごとに `@vde_session_state` を書き、badge クリア時は両キーとも消える
-- [ ] `badge_style: inline`(既定)で、バッジグリフがセグメント内で状態色(blocked=red / working=green / done=cyan / idle=色なし)の fg で描かれ、直後にセグメントの fg(未設定なら default)へ復帰する。bold / bg は維持される
-- [ ] `badge_style: plain` で従来どおり無色のグリフ連結になる
-- [ ] category の `format` で `{count}`(そのカテゴリの session 数)が使える
-- [ ] 既存の pill 運用(prefix/suffix/colors)が inline でも壊れない
+- [x] daemon が session ごとに `@vde_session_state` を書き、badge クリア時は両キーとも消える
+- [x] `badge_style: inline`(既定)で、バッジグリフがセグメント内で状態色(blocked=red / working=green / done=cyan / idle=色なし)の fg で描かれ、直後にセグメントの fg(未設定なら default)へ復帰する。bold / bg は維持される
+- [x] `badge_style: plain` で従来どおり無色のグリフ連結になる
+- [x] category の `format` で `{count}`(そのカテゴリの session 数)が使える
+- [x] 既存の pill 運用(prefix/suffix/colors)が inline でも壊れない
 
 ### テスト完了条件
 
-- [ ] `rtk cargo test` 全通過
-- [ ] 新規テスト: state option の書き込み/クリア、SessionInfo.state のパース、inline のマークアップ(fg あり/なしセグメント両方)、plain の従来出力、{count} 置換
-- [ ] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
+- [x] `rtk cargo test` 全通過
+- [x] 新規テスト: state option の書き込み/クリア、SessionInfo.state のパース、inline のマークアップ(fg あり/なしセグメント両方)、plain の従来出力、{count} 置換
+- [x] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
 
 ### 運用反映条件
 
-- [ ] `docs/e2e-smoke.md` に inline バッジと {count} の確認を追記し、smoke 実施を記録
-- [ ] README(または migration.md)に `badge_style` と `{count}` の設定例を追記
-- [ ] `docs/statusline-ui-proposals.md` §7.2 Step 3 にチェック
+- [x] `docs/e2e-smoke.md` に inline バッジと {count} の確認を追記し、smoke 実施を記録
+- [x] README(または migration.md)に `badge_style` と `{count}` の設定例を追記
+- [x] `docs/statusline-ui-proposals.md` §7.2 Step 3 にチェック
 
 ---
 
@@ -40,7 +40,7 @@
 - Modify: `src/daemon/server.rs`(effect 処理で両キー書き込み/クリア)
 - Modify: `src/session/mod.rs`(session_list_format / parse_sessions / SessionInfo.state)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/daemon/runtime.rs` tests(既存の `panes_updated_emits_set_session_badge_effect` を拡張):
 
@@ -69,7 +69,7 @@ fn parse_sessions_reads_state_field() {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認 → 実装**
+- [x] **Step 2: テストが失敗することを確認 → 実装**
 
 `src/options/mod.rs`: `KEY_SESSION_STATUS` の隣に追加:
 
@@ -103,7 +103,7 @@ pub const KEY_SESSION_STATE: &str = "@vde_session_state";
 
 既存 runtime テストの `RuntimeEffect::SetSessionBadge { .. }` パターンマッチはフィールド追加でコンパイルエラーになるため全箇所更新する。
 
-- [ ] **Step 3: テスト通過を確認してコミット**
+- [x] **Step 3: テスト通過を確認してコミット**
 
 Run: `rtk cargo test`
 
@@ -120,7 +120,7 @@ rtk git commit -m "session badge と並行して構造化状態 option を配信
 - Modify: `src/config/mod.rs`(StatuslineSessionsConfig.badge_style)
 - Modify: `src/statusline/mod.rs`(render_session_segment / tmux_style_segment)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/statusline/mod.rs` tests:
 
@@ -166,7 +166,7 @@ fn plain_badge_style_keeps_legacy_concatenation() {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認 → 実装**
+- [x] **Step 2: テストが失敗することを確認 → 実装**
 
 `src/config/mod.rs`:
 
@@ -213,7 +213,7 @@ fn badge_fragment(badge: &str, state: &str, style: &SegmentStyle, badge_style: B
 
 **設計注意**: fg のみを切り替え、`#[default]` は使わない(セグメントの bold/bg を巻き添えでリセットしないため)。外側の `tmux_style_segment` が最後に `#[default]` で全体を閉じる構造は不変。
 
-- [ ] **Step 3: テスト通過を確認してコミット**
+- [x] **Step 3: テスト通過を確認してコミット**
 
 Run: `rtk cargo test`
 
@@ -229,7 +229,7 @@ rtk git commit -m "badge_style inline で状態色付きバッジを描画する
 **Files:**
 - Modify: `src/statusline/mod.rs`(render_statusline_category)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/statusline/mod.rs` tests:
 
@@ -252,7 +252,7 @@ fn category_format_supports_count_placeholder() {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認 → 実装**
+- [x] **Step 2: テストが失敗することを確認 → 実装**
 
 `render_statusline_category`(90-126行)の body 構築に `{count}` 置換を追加:
 
@@ -268,7 +268,7 @@ fn category_format_supports_count_placeholder() {
 
 既定 format(`"{category} "`)は `{count}` を含まないため挙動不変。
 
-- [ ] **Step 3: テスト通過を確認してコミット**
+- [x] **Step 3: テスト通過を確認してコミット**
 
 Run: `rtk cargo test`
 
@@ -281,11 +281,11 @@ rtk git commit -m "category format に {count} プレースホルダを追加す
 
 ## Task 3: smoke・ドキュメント・品質ゲート
 
-- [ ] **Step 1: 品質ゲート**
+- [x] **Step 1: 品質ゲート**
 
 Run: `rtk cargo fmt --check && rtk cargo clippy --all-targets && rtk cargo test`
 
-- [ ] **Step 2: smoke**
+- [x] **Step 2: smoke**
 
 scratch tmux で確認(daemon 再起動込み):
 - `@vde_session_state` が書かれ、badge クリアで両キー消える(`rtk proxy tmux show-options -t <session>` で確認)
@@ -295,7 +295,7 @@ scratch tmux で確認(daemon 再起動込み):
 
 結果を `docs/e2e-smoke.md` に追記。
 
-- [ ] **Step 3: docs 更新とコミット**
+- [x] **Step 3: docs 更新とコミット**
 
 README(または migration.md)に badge_style / {count} の設定例。`docs/statusline-ui-proposals.md` §7.2 Step 3 にチェック。
 
@@ -303,3 +303,8 @@ README(または migration.md)に badge_style / {count} の設定例。`docs/sta
 rtk git add -A
 rtk git commit -m "Plan 21 の smoke 結果と docs を更新する"
 ```
+
+## 実装ノート
+
+- 計画からの逸脱なし。
+- `badge_style: inline` は fg のみを状態色へ切り替え、直後にセグメント fg へ復帰する。`#[default]` はセグメント末尾の既存リセットに任せ、bold/bg を途中で壊さない。

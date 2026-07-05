@@ -12,22 +12,22 @@
 
 ### 機能完了条件
 
-- [ ] session badge の既定 suffix が `""` になり、`▲main` のようにグリフとラベルが `{badge}{label}` で自然に連結される(format 側の空白で調整可能)
-- [ ] idle(○)バッジが既定で表示される。`statusline.session_badge.hide_idle: true` で非表示にできる(無印 = agent なし、に純化)
-- [ ] 既定 config で current session セグメントが bold で描画され、other と視覚的に区別できる
-- [ ] 既存の pill 運用(dotfiles の prefix/suffix/colors)が無変更で動く
+- [x] session badge の既定 suffix が `""` になり、`▲main` のようにグリフとラベルが `{badge}{label}` で自然に連結される(format 側の空白で調整可能)
+- [x] idle(○)バッジが既定で表示される。`statusline.session_badge.hide_idle: true` で非表示にできる(無印 = agent なし、に純化)
+- [x] 既定 config で current session セグメントが bold で描画され、other と視覚的に区別できる
+- [x] 既存の pill 運用(dotfiles の prefix/suffix/colors)が無変更で動く
 
 ### テスト完了条件
 
-- [ ] `rtk cargo test` 全通過(suffix 既定変更に伴う期待値更新を含む)
-- [ ] 新規テスト: hide_idle の true/false、current 既定 bold の出力
-- [ ] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
+- [x] `rtk cargo test` 全通過(suffix 既定変更に伴う期待値更新を含む)
+- [x] 新規テスト: hide_idle の true/false、current 既定 bold の出力
+- [x] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
 
 ### 運用反映条件
 
-- [ ] `docs/e2e-smoke.md` の statusline 期待値(バッジ + suffix)を更新し、scratch tmux で smoke を実施して記録
-- [ ] `docs/migration.md` に suffix 既定変更の注意(空白を維持したい場合は `session_badge.suffix: " "` を明示)を追記
-- [ ] `docs/statusline-ui-proposals.md` §7.2 Step 1 にチェック
+- [x] `docs/e2e-smoke.md` の statusline 期待値(バッジ + suffix)を更新し、scratch tmux で smoke を実施して記録
+- [x] `docs/migration.md` に suffix 既定変更の注意(空白を維持したい場合は `session_badge.suffix: " "` を明示)を追記
+- [x] `docs/statusline-ui-proposals.md` §7.2 Step 1 にチェック
 
 ---
 
@@ -37,7 +37,7 @@
 - Modify: `src/config/mod.rs`(SessionBadgeConfig::default)
 - Modify: `src/daemon/session_badge.rs` / `src/daemon/runtime.rs` の期待値テスト
 
-- [ ] **Step 1: 失敗するテストを書く(既存テストの期待値を先に更新する)**
+- [x] **Step 1: 失敗するテストを書く(既存テストの期待値を先に更新する)**
 
 `src/daemon/session_badge.rs` の `session_rollup_picks_most_urgent_state`(88-97行):
 
@@ -49,12 +49,12 @@
 
 `src/daemon/runtime.rs` の session badge 期待値(`running_to_idle_becomes_done_until_window_viewed` 等、`"● "` / `"✓ "` / `"○ "` / `"▲ "` を期待しているテストすべて)を suffix なしに更新する。
 
-- [ ] **Step 2: テストが失敗することを確認**
+- [x] **Step 2: テストが失敗することを確認**
 
 Run: `rtk cargo test --lib daemon::session_badge`
 Expected: FAIL(現行 suffix は `" "`)
 
-- [ ] **Step 3: 実装**
+- [x] **Step 3: 実装**
 
 `src/config/mod.rs` の `SessionBadgeConfig::default`(143-150行付近)を変更:
 
@@ -73,7 +73,7 @@ impl Default for SessionBadgeConfig {
 
 **注意**: `render_session_segment`(statusline/mod.rs:146)は badge が空文字なら `{label}` のみになる。suffix を空にすると「badge あり」と「badge なし」で label 開始位置が1セルずれる。これを嫌う場合の逃げ道が `suffix: " "` 復活であることも migration.md に明記。
 
-- [ ] **Step 4: テスト通過を確認してコミット**
+- [x] **Step 4: テスト通過を確認してコミット**
 
 Run: `rtk cargo test`
 
@@ -91,7 +91,7 @@ rtk git commit -m "session badge の suffix 既定を空にする"
 - Modify: `src/daemon/session_badge.rs`(session_badge_value)
 - Modify: `src/daemon/runtime.rs`(sync_session_badges の呼び出し)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/daemon/session_badge.rs` tests:
 
@@ -136,12 +136,12 @@ fn hide_idle_config_clears_idle_session_badge() {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認**
+- [x] **Step 2: テストが失敗することを確認**
 
 Run: `rtk cargo test --lib daemon::session_badge::tests::hide_idle_suppresses_idle_badge_only`
 Expected: コンパイルエラー(引数が3つ)
 
-- [ ] **Step 3: 実装**
+- [x] **Step 3: 実装**
 
 `src/config/mod.rs` の `SessionBadgeConfig` に追加(`#[serde(default)]` 構造体なので追加は非破壊):
 
@@ -174,7 +174,7 @@ pub fn session_badge_value(
 
 呼び出し側(`src/daemon/runtime.rs` の `sync_session_badges`、`session_badge_value(list, badge_glyphs, &badge_config.suffix)` の箇所)に `badge_config.hide_idle` を渡す。既存テストの呼び出しにも第4引数 `false` を追加(コンパイルエラーで全箇所検出される)。
 
-- [ ] **Step 4: テスト通過を確認してコミット**
+- [x] **Step 4: テスト通過を確認してコミット**
 
 Run: `rtk cargo test`
 
@@ -192,7 +192,7 @@ rtk git commit -m "session badge に hide_idle オプションを追加する"
 - Modify: `src/statusline/mod.rs` tests
 - Modify: `docs/migration.md` / `docs/e2e-smoke.md`
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/statusline/mod.rs` tests:
 
@@ -213,12 +213,12 @@ fn current_session_is_bold_by_default() {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認**
+- [x] **Step 2: テストが失敗することを確認**
 
 Run: `rtk cargo test --lib statusline::tests::current_session_is_bold_by_default`
 Expected: FAIL(現行は current/other とも無スタイル)
 
-- [ ] **Step 3: 実装**
+- [x] **Step 3: 実装**
 
 `src/config/mod.rs` の `StatuslineSessionsConfig`(65-71行)から `Default` derive を外し、手書き impl にする(63-64行の clippy 対策コメントは「current 既定が derive と一致しなくなったため手書きに戻した」旨へ書き換え):
 
@@ -247,18 +247,18 @@ impl Default for StatuslineSessionsConfig {
 
 **設計判断(§7 からの明確化)**: §7.2 は「bold + 色」としているが、既定の色付けは状態4色(赤緑シアン)や装飾 pill との衝突リスクがあるため **既定は bold のみ**とする。色は `sessions.current.colors.fg` で従来どおり設定可能。pill 運用者は dotfiles 側で current pill を塗っているため実害なし。この判断を実装ノートとして本ファイル末尾に記録する。
 
-- [ ] **Step 4: docs 更新**
+- [x] **Step 4: docs 更新**
 
 - `docs/migration.md`: suffix 既定変更の注意(旧挙動維持は `session_badge.suffix: " "`)、hide_idle の紹介
 - `docs/e2e-smoke.md`: statusline 期待値を新表示(`▲1:main` 形式・suffix なし)に更新
 
-- [ ] **Step 5: テスト・品質ゲート・smoke**
+- [x] **Step 5: テスト・品質ゲート・smoke**
 
 Run: `rtk cargo fmt --check && rtk cargo clippy --all-targets && rtk cargo test`
 
 scratch tmux で: idle session に ○ が付く / `hide_idle: true` で消える / current が bold / 既存 pill 設定が壊れない、を確認して e2e-smoke.md に記録。
 
-- [ ] **Step 6: コミット**
+- [x] **Step 6: コミット**
 
 ```bash
 rtk git add -A

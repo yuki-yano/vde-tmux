@@ -4,9 +4,9 @@ tmux ステータスライン再設計(背景と設計判断は `docs/statusline
 
 ## 前提条件(着手前に確認)
 
-- [ ] sidebar Plan 13〜17 が実装済み(単幅グリフ ▲●✓○、runtime の triage 集合・unread 管理が存在する)
-- [ ] **Plan 18(sidebar レビュー指摘の修正)が完了している**。未完了なら本ロードマップに着手しない
-- [ ] `rtk cargo test` が green の状態から始める
+- [x] sidebar Plan 13〜17 が実装済み(単幅グリフ ▲●✓○、runtime の triage 集合・unread 管理が存在する)
+- [x] **Plan 18(sidebar レビュー指摘の修正)が完了している**。未完了なら本ロードマップに着手しない
+- [x] `rtk cargo test` が green の状態から始める
 
 ## 実行順序と依存
 
@@ -26,6 +26,7 @@ tmux ステータスライン再設計(背景と設計判断は `docs/statusline
 - [ ] scratch tmux での smoke 実施と `docs/e2e-smoke.md` への記録(daemon 再起動を含む)
 - [ ] `docs/statusline-ui-proposals.md` §7.2 の該当 Step にチェック
 - [ ] コミット済み(Task 単位)。ワーキングツリーがクリーン
+- [ ] 最終 Task では、該当 Plan の DoD チェックボックス更新までを完了範囲に含める
 
 ## 全体 DoD(ロードマップ完了条件)
 
@@ -42,8 +43,8 @@ tmux ステータスライン再設計(背景と設計判断は `docs/statusline
 ### 運用反映条件
 
 - [ ] `docs/e2e-smoke.md` が最終仕様に対応し、全 Plan の smoke 記録が残っている
-- [ ] README に status-interval 推奨・status-left/right 設定例・新 config(badge_style / hide_idle / {count} / summary / attention)が記載されている
-- [ ] `docs/migration.md` の M7(dotfiles 切替)手順に `statusline-agent-badge` → `statusline-summary` と suffix 既定変更が反映されている
+- [x] README に status-interval 推奨・status-left/right 設定例・新 config(badge_style / hide_idle / {count} / summary / attention)が記載されている
+- [x] `docs/migration.md` の M7(dotfiles 切替)手順に `statusline-agent-badge` → `statusline-summary` と suffix 既定変更が反映されている
 
 ## 実装中の判断ルール
 

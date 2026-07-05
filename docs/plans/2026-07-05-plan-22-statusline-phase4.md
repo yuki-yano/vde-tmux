@@ -12,24 +12,24 @@
 
 ### 機能完了条件
 
-- [ ] `vt statusline-attention` が、attach されていない(または window 非アクティブな)session の blocked agent を `#[fg=red]▲ {session} · {reason} {elapsed}#[default]` 形式で最も古い1件 + `+N`(2件以上時)出力する。該当なしなら空文字列
-- [ ] reason は `perm` / `wait` / `err` の略語(rollup: Permission → perm、Waiting → wait、Error → err)
-- [ ] daemon 停止時は list-panes フォールバックで動作する(unread 相当の情報のみ欠落。wait_reason / 経過は出る)
-- [ ] daemon が毎ポーリングで `@vde_heartbeat` に epoch 秒を書き、graceful shutdown で消す
-- [ ] heartbeat が `max(5秒, poll_ms×3)` より古い(または存在するのに古い)とき、`statusline-sessions` のバッジが `?` に置き換わる。heartbeat option が存在しなければ従来どおり(daemon 未使用運用を壊さない)
-- [ ] README に `set -g status-interval 1` 推奨、summary / attention / heartbeat の説明と設定例が載る
+- [x] `vt statusline-attention` が、attach されていない(または window 非アクティブな)session の blocked agent を `#[fg=red]▲ {session} · {reason} {elapsed}#[default]` 形式で最も古い1件 + `+N`(2件以上時)出力する。該当なしなら空文字列
+- [x] reason は `perm` / `wait` / `err` の略語(rollup: Permission → perm、Waiting → wait、Error → err)
+- [x] daemon 停止時は list-panes フォールバックで動作する(unread 相当の情報のみ欠落。wait_reason / 経過は出る)
+- [x] daemon が毎ポーリングで `@vde_heartbeat` に epoch 秒を書き、graceful shutdown で消す
+- [x] heartbeat が `max(5秒, poll_ms×3)` より古い(または存在するのに古い)とき、`statusline-sessions` のバッジが `?` に置き換わる。heartbeat option が存在しなければ従来どおり(daemon 未使用運用を壊さない)
+- [x] README に `set -g status-interval 1` 推奨、summary / attention / heartbeat の説明と設定例が載る
 
 ### テスト完了条件
 
-- [ ] `rtk cargo test` 全通過
-- [ ] 新規テスト: attention の対象選別(可視 session 除外・最古選択・+N)、空出力、reason 略語、フォールバック経路、heartbeat effect の発行、stale 判定(閾値・option 不在)
-- [ ] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
+- [x] `rtk cargo test` 全通過
+- [x] 新規テスト: attention の対象選別(可視 session 除外・最古選択・+N)、空出力、reason 略語、フォールバック経路、heartbeat effect の発行、stale 判定(閾値・option 不在)
+- [x] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
 
 ### 運用反映条件
 
 - [ ] `docs/e2e-smoke.md` に attention(permission 発生 → 別 session から見える → 承認で消える)と stale(daemon kill → バッジが `?`)の手順を追記し、smoke 実施を記録
-- [ ] README / migration.md 更新(status-interval・設定例・M7 手順への追記)
-- [ ] `docs/statusline-ui-proposals.md` §7.2 Step 4 にチェック
+- [x] README / migration.md 更新(status-interval・設定例・M7 手順への追記)
+- [x] `docs/statusline-ui-proposals.md` §7.2 Step 4 にチェック
 
 ---
 
@@ -40,7 +40,7 @@
 - Modify: `src/daemon/runtime.rs`(QueryAttention ハンドラ)
 - Modify: `src/daemon/server.rs`(dispatch)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/daemon/runtime.rs` tests:
 
@@ -82,7 +82,7 @@ fn attention_is_empty_without_hidden_blocked() {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認 → 実装**
+- [x] **Step 2: テストが失敗することを確認 → 実装**
 
 `src/daemon/protocol.rs`: `QueryTarget` に `Attention`、`ServerMessage` に `Attention { text: String }` を追加(roundtrip テストも)。
 
@@ -131,7 +131,7 @@ fn attention_is_empty_without_hidden_blocked() {
 
 `src/daemon/server.rs`: Query dispatch に Attention を追加。
 
-- [ ] **Step 3: テスト通過を確認してコミット**
+- [x] **Step 3: テスト通過を確認してコミット**
 
 ```bash
 rtk git add -A
@@ -146,7 +146,7 @@ rtk git commit -m "daemon に attention クエリを追加する"
 - Modify: `src/daemon/mod.rs`(query_statusline_attention / statusline_attention / fallback)
 - Modify: `src/cli/mod.rs`(`statusline-attention` サブコマンド)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/cli/tests.rs`(summary のフォールバックテストと同じ流儀):
 
@@ -159,7 +159,7 @@ fn dispatch_statusline_attention_falls_back_to_tmux_snapshot() {
 }
 ```
 
-- [ ] **Step 2: 実装**
+- [x] **Step 2: 実装**
 
 `src/daemon/mod.rs`:
 - `query_statusline_attention(socket_path)`: `QueryTarget::Attention` → `ServerMessage::Attention { text }`
@@ -168,7 +168,7 @@ fn dispatch_statusline_attention_falls_back_to_tmux_snapshot() {
 
 `src/cli/mod.rs`: `StatuslineAttention`(コマンド名 `statusline-attention`)を追加し、dispatch する。
 
-- [ ] **Step 3: テスト通過を確認してコミット**
+- [x] **Step 3: テスト通過を確認してコミット**
 
 ```bash
 rtk git add -A
@@ -184,7 +184,7 @@ rtk git commit -m "vt statusline-attention を追加する"
 - Modify: `src/daemon/runtime.rs`(Heartbeat effect)/ `src/daemon/server.rs`(書き込み・shutdown 時クリア)
 - Modify: `src/statusline/mod.rs`(stale 判定とバッジ置換)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/daemon/runtime.rs` tests:
 
@@ -212,7 +212,7 @@ fn stale_heartbeat_replaces_badges_with_question_mark() {
 
 (`is_heartbeat_stale(heartbeat_age_secs, ...)` の正確なシグネチャは実装時に determine。検証意図: 閾値 = `max(5, poll_ms * 3 / 1000)` 秒。)
 
-- [ ] **Step 2: 実装**
+- [x] **Step 2: 実装**
 
 `src/options/mod.rs`:
 
@@ -232,7 +232,7 @@ pub const KEY_HEARTBEAT: &str = "@vde_heartbeat";
 - `statusline_sessions` で heartbeat を1回読む(`runner.run(&["show-options", "-gqv", "@vde_heartbeat"])`)。値が存在し、`now - heartbeat > max(5, poll_ms*3/1000)` なら、各 session の badge を `?`(状態不明)に置換して描画する。option が空(daemon 未起動 or graceful shutdown 済み)なら従来どおり(badge は書かれていないので自然に無印)
 - 判定は純関数 `is_heartbeat_stale(...)` に切り出してテスト可能にする。`poll_ms` は `config.daemon.poll_ms`
 
-- [ ] **Step 3: テスト通過を確認してコミット**
+- [x] **Step 3: テスト通過を確認してコミット**
 
 ```bash
 rtk git add -A
@@ -243,7 +243,7 @@ rtk git commit -m "daemon heartbeat と stale バッジ表示を追加する"
 
 ## Task 3: README・smoke・品質ゲート
 
-- [ ] **Step 1: README 更新**
+- [x] **Step 1: README 更新**
 
 statusline 節を新設(または更新)し、以下を記載:
 - `set -g status-interval 1` 推奨と、反映遅延が `daemon.poll_ms + status-interval` の合成である説明
@@ -257,7 +257,7 @@ set -g status-right '#(vt statusline-attention) #(vt statusline-summary)'
 
 - `badge_style` / `hide_idle` / `{count}` / summary / attention の config 例
 
-- [ ] **Step 2: 品質ゲート**
+- [x] **Step 2: 品質ゲート**
 
 Run: `rtk cargo fmt --check && rtk cargo clippy --all-targets && rtk cargo test`
 
@@ -271,9 +271,15 @@ scratch tmux で(daemon 再起動込み):
 
 結果を `docs/e2e-smoke.md` に追記。
 
-- [ ] **Step 4: コミット**
+- [x] **Step 4: コミット**
 
 ```bash
 rtk git add -A
 rtk git commit -m "Plan 22 の smoke 結果と statusline docs を更新する"
 ```
+
+## 実装ノート
+
+- 計画からの逸脱なし。
+- attention の「最古」と elapsed は `started_at`(最終プロンプト送信時刻)基準である。blocked 遷移時刻基準への変更は、実運用を見て Step 5 の再評価ゲートで判断する。
+- headless scratch tmux では `session_attached=true` の可視 session を安定再現できなかったため、可視除外は unit test(`attention_names_oldest_hidden_blocked_session` / `attention_is_empty_without_hidden_blocked`)で担保し、smoke 記録では未実施として扱う。
