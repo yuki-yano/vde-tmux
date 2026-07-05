@@ -200,6 +200,7 @@ impl RuntimeState {
             DaemonEvent::Client { event, .. } => self.apply_client_event(event),
             DaemonEvent::PanesUpdated(panes) => {
                 self.panes = panes;
+                self.prune_missing_pins();
                 self.update_unread();
                 self.update_triage();
                 let transition_effects = self.update_transitions();
@@ -321,6 +322,23 @@ impl RuntimeState {
     pub fn notify_command(&self) -> Option<&str> {
         (self.config.notify.enabled && !self.config.notify.command.trim().is_empty())
             .then_some(self.config.notify.command.as_str())
+    }
+
+    fn prune_missing_pins(&mut self) {
+        let live_chat_ids = self
+            .panes
+            .iter()
+            .filter(|pane| is_live_agent_pane(pane))
+            .map(|pane| format!("chat::{}", pane.pane_id))
+            .collect::<BTreeSet<_>>();
+        let before = self.ui_state.pinned.len();
+        self.ui_state
+            .pinned
+            .retain(|id| live_chat_ids.contains(id));
+        if self.ui_state.pinned.len() != before {
+            self.ui_state.version += 1;
+            self.mark_state_dirty(Instant::now());
+        }
     }
 
     fn apply_client_event(&mut self, event: SidebarClientEvent) -> Vec<RuntimeEffect> {
@@ -791,6 +809,25 @@ mod tests {
 
         assert!(state.is_running());
         assert_eq!(state.clients_len(), 0);
+    }
+
+    #[test]
+    fn pinned_entries_for_missing_panes_are_pruned() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        state.ui_state.pinned.insert("chat::%9".to_string());
+
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+
+        assert!(!state.ui_state.pinned.contains("chat::%9"));
+        state.ui_state.pinned.insert("chat::%1".to_string());
+
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+
+        assert!(state.ui_state.pinned.contains("chat::%1"));
     }
 
     #[test]
