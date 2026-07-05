@@ -660,7 +660,14 @@ fn status_label(raw: &str) -> &'static str {
 fn pane_matches_filter(pane: &AgentPane, filter: StatusFilter) -> bool {
     match filter {
         StatusFilter::All => true,
-        StatusFilter::AttentionOnly => pane.attention || pane.rollup == RollupLevel::Running,
+        StatusFilter::AttentionOnly => {
+            pane.attention
+                || pane.badge_state == BadgeState::Blocked
+                || pane.badge_state == BadgeState::Working
+        }
+        StatusFilter::WorkingOnly => pane.badge_state == BadgeState::Working,
+        StatusFilter::DoneOnly => pane.badge_state == BadgeState::Done,
+        StatusFilter::IdleOnly => pane.badge_state == BadgeState::Idle,
     }
 }
 
@@ -1297,6 +1304,40 @@ mod tests {
 
         assert!(rows.iter().all(|row| !row.id.contains("%1")));
         assert!(rows.iter().any(|row| row.id.contains("%2")));
+    }
+
+    #[test]
+    fn working_done_idle_filters_partition_fleet_panes() {
+        let working = pane("main", "%1", "/tmp/app", "codex", "running");
+        let mut done = pane("main", "%2", "/tmp/app", "claude", "idle");
+        done.window_active = false;
+        done.session_attached = false;
+        let idle = pane("main", "%3", "/tmp/app", "opencode", "idle");
+
+        for (filter, expected) in [
+            (crate::sidebar::state::StatusFilter::WorkingOnly, "%1"),
+            (crate::sidebar::state::StatusFilter::DoneOnly, "%2"),
+            (crate::sidebar::state::StatusFilter::IdleOnly, "%3"),
+        ] {
+            let state = SidebarState {
+                view_mode: ViewMode::Flat,
+                filter,
+                ..SidebarState::default()
+            };
+
+            let rows = build_rows_ctx(
+                &Config::default(),
+                &[working.clone(), done.clone(), idle.clone()],
+                &state,
+                &RowBuildContext {
+                    unread: BTreeMap::from([("%2".to_string(), true)]),
+                    ..RowBuildContext::default()
+                },
+            );
+
+            assert_eq!(rows.len(), 1, "{filter:?}");
+            assert_eq!(rows[0].pane_id.as_deref(), Some(expected), "{filter:?}");
+        }
     }
 
     #[test]

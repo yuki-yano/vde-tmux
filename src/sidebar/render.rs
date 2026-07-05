@@ -821,6 +821,9 @@ fn filter_label(filter: StatusFilter) -> &'static str {
     match filter {
         StatusFilter::All => "all",
         StatusFilter::AttentionOnly => "attention",
+        StatusFilter::WorkingOnly => "working",
+        StatusFilter::DoneOnly => "done",
+        StatusFilter::IdleOnly => "idle",
     }
 }
 

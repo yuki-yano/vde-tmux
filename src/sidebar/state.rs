@@ -38,6 +38,9 @@ pub enum StatusFilter {
     #[default]
     All,
     AttentionOnly,
+    WorkingOnly,
+    DoneOnly,
+    IdleOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -249,7 +252,10 @@ impl StatusFilter {
     pub fn next(self) -> Self {
         match self {
             StatusFilter::All => StatusFilter::AttentionOnly,
-            StatusFilter::AttentionOnly => StatusFilter::All,
+            StatusFilter::AttentionOnly => StatusFilter::WorkingOnly,
+            StatusFilter::WorkingOnly => StatusFilter::DoneOnly,
+            StatusFilter::DoneOnly => StatusFilter::IdleOnly,
+            StatusFilter::IdleOnly => StatusFilter::All,
         }
     }
 }
@@ -308,6 +314,15 @@ mod tests {
     }
 
     #[test]
+    fn old_state_json_filter_value_still_loads() {
+        let state: SidebarState =
+            serde_json::from_str(r#"{"version":7,"filter":"attention_only"}"#).unwrap();
+
+        assert_eq!(state.filter, StatusFilter::AttentionOnly);
+        assert_eq!(state.version, 7);
+    }
+
+    #[test]
     fn pinned_set_toggles_and_persists() {
         let mut state = SidebarState::default();
         assert!(state.toggle_pinned("chat::%1"));
@@ -343,7 +358,36 @@ mod tests {
         assert!(state.apply(SidebarAction::ToggleFilter, &[]));
         assert_eq!(state.filter, StatusFilter::AttentionOnly);
         assert!(state.apply(SidebarAction::ToggleFilter, &[]));
+        assert_eq!(state.filter, StatusFilter::WorkingOnly);
+        assert!(state.apply(SidebarAction::ToggleFilter, &[]));
+        assert_eq!(state.filter, StatusFilter::DoneOnly);
+        assert!(state.apply(SidebarAction::ToggleFilter, &[]));
+        assert_eq!(state.filter, StatusFilter::IdleOnly);
+        assert!(state.apply(SidebarAction::ToggleFilter, &[]));
         assert_eq!(state.filter, StatusFilter::All);
+    }
+
+    #[test]
+    fn filter_cycles_through_all_states() {
+        let mut filter = StatusFilter::All;
+        let mut seen = Vec::new();
+
+        for _ in 0..6 {
+            seen.push(filter);
+            filter = filter.next();
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                StatusFilter::All,
+                StatusFilter::AttentionOnly,
+                StatusFilter::WorkingOnly,
+                StatusFilter::DoneOnly,
+                StatusFilter::IdleOnly,
+                StatusFilter::All,
+            ]
+        );
     }
 
     #[test]
