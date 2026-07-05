@@ -416,3 +416,21 @@ checked=running elapsed_secs advanced via daemon snapshot
 checked=LIVE source pane capture contains live-a/live-b; LIVE area/tail behavior covered by sidebar::tui tests
 result=Plan 17 snapshot smoke ok
 ```
+
+Plan 18 sidebar review fixes smoke も pass。
+`cargo build` で `target/debug/vt` を最新化し、scratch socket で daemon を新規起動し直して確認した。
+TUI の alt-screen capture はこれまで同様に安定しないため、scratch daemon subscribe snapshot と Plan 18 の回帰 unit test で確認を分担した。
+
+```text
+executed_at=2026-07-05 20:55:22 JST
+scratch=vde-p18-smoke-1783252512
+checked=daemon restarted with rebuilt target/debug/vt on scratch socket
+checked=permission pane appears in TRIAGE and FLEET repo row keeps meta.attention_count=1
+checked=n selects triaged chat and selected TRIAGE row shows origin detail
+checked=after approval, first calm/debounce snapshot keeps TRIAGE row and repo attention_count=1
+checked=rail double-count regression covered by sidebar::render::tests::rail_does_not_double_count_expanded_chat
+checked=event log format covered by sidebar::tui::tests::event_tail_formats_ago_agent_and_glyphs
+checked=expanded chat j/k teleport regression covered by daemon::runtime::tests::moving_through_expanded_chat_does_not_teleport_selection
+checked=TRIAGE/FLEET selection follow regression covered by daemon::runtime::tests::selection_follows_pane_across_triage_and_fleet
+result=Plan 18 smoke ok
+```
