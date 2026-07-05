@@ -320,6 +320,8 @@ impl RuntimeState {
                 self.ui_state.selection = Some(row_id.clone());
                 self.ui_state.toggle_expanded(&row_id)
             }
+            SidebarInputAction::FocusNextAttention => self.focus_attention(true),
+            SidebarInputAction::FocusPreviousAttention => self.focus_attention(false),
             SidebarInputAction::ReorderUp => self.apply_reorder(true),
             SidebarInputAction::ReorderDown => self.apply_reorder(false),
             SidebarInputAction::Activate => {
@@ -347,6 +349,40 @@ impl RuntimeState {
             self.broadcast_if_needed();
         }
         Vec::new()
+    }
+
+    fn focus_attention(&mut self, forward: bool) -> bool {
+        use crate::daemon::session_badge::BadgeState;
+
+        let blocked: Vec<&str> = self
+            .rows
+            .iter()
+            .filter(|row| {
+                row.kind == SidebarRowKind::Chat && row.badge_state == Some(BadgeState::Blocked)
+            })
+            .map(|row| row.id.as_str())
+            .collect();
+        if blocked.is_empty() {
+            return false;
+        }
+        let current = self
+            .ui_state
+            .selection
+            .as_deref()
+            .and_then(|id| blocked.iter().position(|blocked_id| *blocked_id == id));
+        let next = match (current, forward) {
+            (None, true) => 0,
+            (None, false) => blocked.len() - 1,
+            (Some(index), true) => (index + 1) % blocked.len(),
+            (Some(index), false) => (index + blocked.len() - 1) % blocked.len(),
+        };
+        let next_id = blocked[next].to_string();
+        if self.ui_state.selection.as_deref() == Some(next_id.as_str()) {
+            return false;
+        }
+        self.ui_state.selection = Some(next_id);
+        self.ui_state.version += 1;
+        true
     }
 
     fn apply_reorder(&mut self, up: bool) -> bool {
@@ -617,6 +653,65 @@ mod tests {
 
         assert_eq!(state.ui_state.selection.as_deref(), Some("repo::misc::app"));
         assert!(state.state_dirty_since().is_some());
+    }
+
+    #[test]
+    fn attention_navigation_cycles_blocked_chat_rows() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                view_mode: crate::sidebar::state::ViewMode::Flat,
+                ..SidebarState::default()
+            },
+        );
+        let mut blocked_a = agent_pane("main", "%1", "waiting");
+        blocked_a.wait_reason = "permission_prompt".to_string();
+        let mut blocked_b = agent_pane("main", "%3", "waiting");
+        blocked_b.wait_reason = "permission_prompt".to_string();
+        state.apply_event(DaemonEvent::PanesUpdated(vec![
+            blocked_a,
+            agent_pane("main", "%2", "running"),
+            blocked_b,
+        ]));
+
+        let key = |state: &mut RuntimeState, key: &str| {
+            state.apply_event(DaemonEvent::Client {
+                client_id: ClientId(1),
+                event: SidebarClientEvent::Key {
+                    key: key.to_string(),
+                },
+            });
+        };
+
+        key(&mut state, "n");
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
+        key(&mut state, "n");
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%3"));
+        key(&mut state, "n");
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
+        key(&mut state, "N");
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%3"));
+    }
+
+    #[test]
+    fn attention_navigation_is_noop_without_blocked_rows() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                view_mode: crate::sidebar::state::ViewMode::Flat,
+                ..SidebarState::default()
+            },
+        );
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "n".to_string(),
+            },
+        });
+        assert_eq!(state.ui_state.selection, None);
     }
 
     #[test]

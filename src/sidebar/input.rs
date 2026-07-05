@@ -14,6 +14,8 @@ pub enum SidebarInputAction {
     SetFilter(StatusFilter),
     ToggleFilter,
     ToggleRow(String),
+    FocusNextAttention,
+    FocusPreviousAttention,
     ReorderUp,
     ReorderDown,
 }
@@ -38,6 +40,8 @@ pub fn parse_key(key: &str) -> Option<SidebarInputAction> {
         "h" | "left" => Some(SidebarInputAction::Collapse),
         "v" => Some(SidebarInputAction::CycleViewMode),
         "tab" => Some(SidebarInputAction::ToggleFilter),
+        "n" => Some(SidebarInputAction::FocusNextAttention),
+        "N" => Some(SidebarInputAction::FocusPreviousAttention),
         "J" => Some(SidebarInputAction::ReorderDown),
         "K" => Some(SidebarInputAction::ReorderUp),
         "1" => Some(SidebarInputAction::SetViewMode(ViewMode::Flat)),
@@ -105,6 +109,15 @@ mod tests {
             Some(SidebarInputAction::SetViewMode(ViewMode::ByCategory))
         );
         assert_eq!(parse_key("unknown"), None);
+    }
+
+    #[test]
+    fn parse_key_maps_attention_navigation() {
+        assert_eq!(parse_key("n"), Some(SidebarInputAction::FocusNextAttention));
+        assert_eq!(
+            parse_key("N"),
+            Some(SidebarInputAction::FocusPreviousAttention)
+        );
     }
 
     #[test]
