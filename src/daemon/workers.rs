@@ -19,6 +19,7 @@ pub trait WorkerIo: Send + Sync + 'static {
     fn preview_pane(&self, pane_id: &str, history_lines: u32) -> Result<()>;
     fn set_session_option(&self, session: &str, key: &str, value: &str) -> Result<()>;
     fn unset_session_option(&self, session: &str, key: &str) -> Result<()>;
+    fn run_notify(&self, command: &str, pane_id: &str, agent: &str, state: &str) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +63,20 @@ impl WorkerIo for SystemWorkerIo {
 
     fn unset_session_option(&self, session: &str, key: &str) -> Result<()> {
         crate::options::unset_session_option(&self.runner, session, key)
+    }
+
+    fn run_notify(&self, command: &str, pane_id: &str, agent: &str, state: &str) -> Result<()> {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("VDE_PANE_ID", pane_id)
+            .env("VDE_AGENT", agent)
+            .env("VDE_BADGE_STATE", state)
+            .spawn()?;
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
     }
 }
 
@@ -258,6 +273,16 @@ mod tests {
         }
 
         fn unset_session_option(&self, _session: &str, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn run_notify(
+            &self,
+            _command: &str,
+            _pane_id: &str,
+            _agent: &str,
+            _state: &str,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }

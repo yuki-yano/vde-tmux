@@ -5,7 +5,6 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -382,13 +381,8 @@ fn handle_runtime_effects(
                 state,
             } => {
                 if let Some(command) = notify_command
-                    && let Err(error) = Command::new("sh")
-                        .arg("-c")
-                        .arg(command)
-                        .env("VDE_PANE_ID", pane_id)
-                        .env("VDE_AGENT", agent)
-                        .env("VDE_BADGE_STATE", format!("{state:?}"))
-                        .spawn()
+                    && let Err(error) =
+                        worker_io.run_notify(command, &pane_id, &agent, &format!("{state:?}"))
                 {
                     eprintln!("[vde-tmux] notify command failed: {error:#}");
                 }
@@ -557,6 +551,7 @@ mod tests {
         jumps: std::sync::Mutex<Vec<String>>,
         previews: std::sync::Mutex<Vec<(String, u32)>>,
         session_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
+        notify_calls: std::sync::Mutex<Vec<(String, String, String, String)>>,
         fail_jump: bool,
     }
 
@@ -599,6 +594,22 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((session.to_string(), key.to_string(), None));
+            Ok(())
+        }
+
+        fn run_notify(
+            &self,
+            command: &str,
+            pane_id: &str,
+            agent: &str,
+            state: &str,
+        ) -> anyhow::Result<()> {
+            self.notify_calls.lock().unwrap().push((
+                command.to_string(),
+                pane_id.to_string(),
+                agent.to_string(),
+                state.to_string(),
+            ));
             Ok(())
         }
     }
@@ -793,6 +804,34 @@ mod tests {
                 ),
                 ("main".to_string(), "@vde_session_status".to_string(), None),
             ]
+        );
+    }
+
+    #[test]
+    fn notify_effect_runs_command_via_worker_io() {
+        let io = LoopWorkerIo::default();
+
+        handle_runtime_effects(
+            vec![RuntimeEffect::Notify {
+                pane_id: "%1".to_string(),
+                agent: "codex".to_string(),
+                state: crate::daemon::session_badge::BadgeState::Blocked,
+            }],
+            None,
+            &io,
+            Some("true"),
+        )
+        .unwrap();
+
+        let calls = io.notify_calls.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            &[(
+                "true".to_string(),
+                "%1".to_string(),
+                "codex".to_string(),
+                "Blocked".to_string()
+            )]
         );
     }
 }
