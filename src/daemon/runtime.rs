@@ -1733,4 +1733,25 @@ mod tests {
             RuntimeEffect::Heartbeat(epoch) if *epoch > 0
         )));
     }
+
+    #[test]
+    fn panes_updated_deduplicates_heartbeat_within_same_epoch() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let first = state.apply_event(DaemonEvent::PanesUpdated(vec![]));
+        let second = state.apply_event(DaemonEvent::PanesUpdated(vec![]));
+
+        assert_eq!(
+            first
+                .iter()
+                .filter(|effect| matches!(effect, RuntimeEffect::Heartbeat(_)))
+                .count(),
+            1
+        );
+        assert!(
+            !second
+                .iter()
+                .any(|effect| matches!(effect, RuntimeEffect::Heartbeat(_))),
+            "{second:?}"
+        );
+    }
 }

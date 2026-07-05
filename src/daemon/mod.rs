@@ -319,7 +319,8 @@ fn parse_agent_status(raw: &str) -> Option<AgentStatus> {
 mod tests {
     use super::*;
     use crate::daemon::protocol::{ClientMessage, ServerMessage};
-    use crate::options::snapshot::PaneSnapshot;
+    use crate::options::snapshot::{PaneSnapshot, snapshot_format};
+    use crate::tmux::mock::MockTmuxRunner;
     use std::fs;
     use std::os::unix::net::UnixListener;
     use std::thread;
@@ -334,6 +335,56 @@ mod tests {
             wait_reason: wait_reason.to_string(),
             ..PaneSnapshot::default()
         }
+    }
+
+    fn pane_in_session(
+        session: &str,
+        pane_id: &str,
+        status: &str,
+        wait_reason: &str,
+        started_at: &str,
+        window_active: bool,
+        session_attached: bool,
+    ) -> PaneSnapshot {
+        PaneSnapshot {
+            session: session.to_string(),
+            window_id: "@1".to_string(),
+            pane_id: pane_id.to_string(),
+            current_path: "/tmp".to_string(),
+            current_command: "codex".to_string(),
+            window_active,
+            session_attached,
+            is_sidebar: false,
+            agent: "codex".to_string(),
+            status: status.to_string(),
+            wait_reason: wait_reason.to_string(),
+            started_at: started_at.to_string(),
+            ..PaneSnapshot::default()
+        }
+    }
+
+    fn snapshot_line(pane: &PaneSnapshot) -> String {
+        [
+            pane.session.as_str(),
+            pane.window_id.as_str(),
+            pane.pane_id.as_str(),
+            pane.current_path.as_str(),
+            pane.current_command.as_str(),
+            if pane.window_active { "1" } else { "0" },
+            if pane.session_attached { "1" } else { "0" },
+            if pane.is_sidebar { "1" } else { "0" },
+            pane.agent.as_str(),
+            pane.status.as_str(),
+            pane.prompt.as_str(),
+            pane.prompt_source.as_str(),
+            pane.wait_reason.as_str(),
+            pane.attention.as_str(),
+            pane.started_at.as_str(),
+            pane.completed_at.as_str(),
+            pane.tasks.as_str(),
+            pane.subagents.as_str(),
+        ]
+        .join("\u{1f}")
     }
 
     #[test]
@@ -387,6 +438,76 @@ mod tests {
         let glyphs = crate::config::BadgeGlyphs::default();
         let counts = [];
         assert_eq!(render_summary(&counts, &glyphs), "");
+    }
+
+    #[test]
+    fn fallback_summary_counts_idle_as_idle_not_done() {
+        let counts = summary_counts_for_panes(&[pane_in_session(
+            "main", "%1", "idle", "", "", false, false,
+        )]);
+
+        assert_eq!(
+            render_summary(&counts, &crate::config::BadgeGlyphs::default()),
+            "○1"
+        );
+    }
+
+    #[test]
+    fn format_attention_abbreviates_wait_and_error_without_more_suffix() {
+        assert_eq!(
+            format_attention(&[("etl".to_string(), crate::hook::RollupLevel::Waiting, 59)]),
+            "#[fg=red]▲ etl · wait 59s#[default]"
+        );
+        assert_eq!(
+            format_attention(&[("proxy".to_string(), crate::hook::RollupLevel::Error, 60)]),
+            "#[fg=red]▲ proxy · err 1m#[default]"
+        );
+    }
+
+    #[test]
+    fn attention_fallback_excludes_visible_session_and_adds_more_count() {
+        let mock = MockTmuxRunner::new();
+        let hidden_old = pane_in_session(
+            "proxy",
+            "%1",
+            "waiting",
+            "permission_prompt",
+            "100",
+            false,
+            false,
+        );
+        let hidden_new = pane_in_session(
+            "etl",
+            "%2",
+            "waiting",
+            "permission_prompt",
+            "200",
+            false,
+            false,
+        );
+        let visible = pane_in_session(
+            "main",
+            "%3",
+            "waiting",
+            "permission_prompt",
+            "50",
+            true,
+            true,
+        );
+        let output = [
+            snapshot_line(&hidden_old),
+            snapshot_line(&hidden_new),
+            snapshot_line(&visible),
+        ]
+        .join("\n");
+        let format = snapshot_format();
+        mock.stub(&["list-panes", "-a", "-F", &format], &output);
+
+        let text = statusline_attention_fallback(&mock).unwrap();
+
+        assert!(text.contains("▲ proxy · perm"), "{text}");
+        assert!(text.contains("+1"), "{text}");
+        assert!(!text.contains("main"), "{text}");
     }
 
     #[test]

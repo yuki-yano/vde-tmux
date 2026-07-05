@@ -349,6 +349,17 @@ mod tests {
     }
 
     #[test]
+    fn inline_badge_segment_renders_exact_markup() {
+        let config = Config::default();
+        let mut main = session("main", "work");
+        main.badge = "▲".to_string();
+        main.state = "blocked".to_string();
+        let rendered = render_statusline_sessions(&config, &[main], "main", "work");
+
+        assert_eq!(rendered, "#[bold] #[fg=red]▲#[fg=default]main #[default]");
+    }
+
+    #[test]
     fn plain_badge_style_keeps_legacy_concatenation() {
         let mut config = Config::default();
         config.statusline.sessions.badge_style = BadgeStyle::Plain;
@@ -440,5 +451,13 @@ mod tests {
             render_statusline_sessions_with_stale(&config, &[main], "main", "work", true);
         assert!(rendered.contains("?main"), "{rendered}");
         assert!(!rendered.contains("▲main"), "{rendered}");
+    }
+
+    #[test]
+    fn heartbeat_stale_boundary_is_strictly_greater_than_threshold() {
+        assert!(!is_heartbeat_stale(Some(995), 1000, 1000));
+        assert!(is_heartbeat_stale(Some(994), 1000, 1000));
+        assert!(!is_heartbeat_stale(Some(988), 1000, 4000));
+        assert!(is_heartbeat_stale(Some(987), 1000, 4000));
     }
 }
