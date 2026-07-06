@@ -729,26 +729,27 @@ fn truncate_spans_to_width(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<
     if width == 0 {
         return Vec::new();
     }
-    let target = width.saturating_sub(1);
+    let target = width.saturating_sub(1); // 末尾の「…」1桁を確保
     let mut used = 0usize;
     let mut out = Vec::new();
     let mut ellipsis_style = Style::default();
-    'spans: for span in spans {
+    for span in spans {
+        ellipsis_style = span.style;
         let mut content = String::new();
+        let mut truncated = false;
         for ch in span.content.chars() {
             let ch_width = display_width(&ch.to_string());
             if used + ch_width > target {
-                ellipsis_style = span.style;
-                break 'spans;
+                truncated = true;
+                break;
             }
             content.push(ch);
             used += ch_width;
         }
-        ellipsis_style = span.style;
         if !content.is_empty() {
             out.push(Span::styled(content, span.style));
         }
-        if used >= target {
+        if truncated || used >= target {
             break;
         }
     }
@@ -769,18 +770,26 @@ pub(crate) fn extract_tail(raw: &str, limit: usize, cut_markers: &[String]) -> V
     lines
 }
 
+/// 入力欄/フッター UI は画面最下部の帯にしか現れないため、
+/// マーカー探索は末尾 CUT_SCAN_TAIL 行に限定する。本文中に偶然
+/// マーカー文字(`❯` や `╭` など)が写り込んでも、帯の外なら
+/// LIVE の本文が丸ごと切り落とされることはない。
+const CUT_SCAN_TAIL: usize = 15;
+
 /// Codex / Claude Code の入力欄・フッター以下を落とすための切断位置。
-/// 各マーカーの「最後の出現行」を求め、その最小 index で切る
+/// 末尾帯の中で各マーカーの「最後の出現行」を求め、その最小 index で切る
 /// (Claude Code は入力ボックス上辺 `╭`、Codex は入力プロンプト等が
 ///  常に最下部 UI 帯にあるため、最後の出現 = 入力欄になる)。
 fn cut_index(lines: &[&str], markers: &[String]) -> Option<usize> {
+    let scan_start = lines.len().saturating_sub(CUT_SCAN_TAIL);
     markers
         .iter()
         .filter(|marker| !marker.is_empty())
         .filter_map(|marker| {
-            lines
+            lines[scan_start..]
                 .iter()
                 .rposition(|line| strip_ansi(line).contains(marker.as_str()))
+                .map(|pos| scan_start + pos)
         })
         .min()
 }
@@ -1328,13 +1337,19 @@ mod tests {
         let lines = render_live_lines(&snapshot(), &live, 3, 24, 0, &SidebarRenderTheme::default());
         let body = &lines[1];
 
+        // 色付き span が残ること(省略記号だけが色付きでも通ってしまわないよう、
+        // 本文テキスト自体が残っていることまで確認する)
         assert!(
             body.spans
                 .iter()
-                .any(|span| span.style.fg == Some(Color::Red)),
+                .any(|span| span.style.fg == Some(Color::Red)
+                    && span.content.starts_with("red-highlight")),
             "{body:?}"
         );
-        assert_eq!(crate::sidebar::render::display_width(&line_text(body)), 24);
+        let text = line_text(body);
+        assert!(text.contains("red-highlight"), "{text:?}");
+        assert!(text.contains('…'), "{text:?}");
+        assert_eq!(crate::sidebar::render::display_width(&text), 24);
     }
 
     #[test]
@@ -1378,6 +1393,27 @@ mod tests {
         // マーカーが無い出力はそのまま
         let raw = "plain 1\nplain 2\n";
         assert_eq!(extract_tail(raw, 5, &markers), vec!["plain 1", "plain 2"]);
+    }
+
+    #[test]
+    fn stray_marker_outside_bottom_band_does_not_cut_live_tail() {
+        let markers = crate::config::SidebarLiveConfig::default().cut_markers;
+        // 本文中(末尾帯 CUT_SCAN_TAIL 行の外)に ❯ が写り込んでも切断しない
+        let mut lines = vec!["❯ quoted shell prompt".to_string()];
+        lines.extend((0..20).map(|i| format!("body {i}")));
+        let raw = lines.join("\n");
+        assert_eq!(
+            extract_tail(&raw, 3, &markers),
+            vec!["body 17", "body 18", "body 19"]
+        );
+        // 末尾帯の中のマーカーは従来どおり切断する
+        let mut lines = (0..20).map(|i| format!("body {i}")).collect::<Vec<_>>();
+        lines.push("❯\u{a0}".to_string());
+        let raw = lines.join("\n");
+        assert_eq!(
+            extract_tail(&raw, 3, &markers),
+            vec!["body 17", "body 18", "body 19"]
+        );
     }
 
     #[test]
