@@ -844,28 +844,49 @@ fn render_chat_dense_line(
         .split_once(':')
         .map(|(_, body)| body.trim())
         .unwrap_or(row.label.as_str());
-    let prefix = format!(" {glyph} {agent:<7} {origin:<3} ");
+    let prefix_after_glyph = format!(" {agent:<7} {origin:<3} ");
     let right_width = display_width(&right);
     let right_reserved = if right_width > 0 { right_width + 1 } else { 0 };
     let label_budget = width
-        .saturating_sub(display_width(&prefix))
+        .saturating_sub(1)
+        .saturating_sub(display_width(glyph))
+        .saturating_sub(display_width(&prefix_after_glyph))
         .saturating_sub(right_reserved)
         .saturating_sub(1);
     let label = truncate_display(body, label_budget);
-    let mut text = format!("{prefix}{label}");
-    let used = display_width(&text);
+    let used =
+        1 + display_width(glyph) + display_width(&prefix_after_glyph) + display_width(&label);
     let filler = width
         .saturating_sub(1)
         .saturating_sub(used)
         .saturating_sub(right_width);
-    text.push_str(&" ".repeat(filler));
-    text.push_str(&right);
-    text.push(' ');
     let mut style = row_style(row, theme);
     if row_flash(row) {
         style = style.add_modifier(Modifier::REVERSED);
     }
-    let mut line = active_bar_line(row, theme, text, style);
+    let mut right_status_style = right_style(row, theme);
+    if row_flash(row) {
+        right_status_style = right_status_style.add_modifier(Modifier::REVERSED);
+    }
+    let mut line = Line::from(vec![
+        Span::styled(
+            if row.active { "▎" } else { " " }.to_string(),
+            if row.active {
+                Style::default().fg(theme.active_bar)
+            } else {
+                style
+            },
+        ),
+        Span::styled(
+            glyph.to_string(),
+            badge_style(theme.badge_color(badge_state), row),
+        ),
+        Span::styled(prefix_after_glyph, style),
+        Span::styled(label, style),
+        Span::raw(" ".repeat(filler)),
+        Span::styled(right, right_status_style),
+        Span::raw(" ".to_string()),
+    ]);
     if state.selection.as_deref() == Some(row.id.as_str()) {
         line = line.style(
             Style::default()
@@ -1107,8 +1128,8 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
 const JUMP_ROW_LABEL: &str = "[↗ jump] [⌕ preview]";
 /// jump グリフの淡シアン(branch の明るい Cyan と彩度で差別化する)
 const ACTION_JUMP_GLYPH: Color = Color::Indexed(73);
-/// preview グリフの淡ラベンダー(pin の 147 より一段落とす)
-const ACTION_PREVIEW_GLYPH: Color = Color::Indexed(103);
+/// preview グリフは jump と同じ操作アクセント色に揃える。
+const ACTION_PREVIEW_GLYPH: Color = ACTION_JUMP_GLYPH;
 
 /// Jump 行の [↗ jump] [⌕ preview] チップ。ブラケットは marker、
 /// ラベルは detail で detail ゾーンに馴染ませ、グリフ1文字だけ
@@ -1441,6 +1462,35 @@ mod tests {
 
         assert!(rendered.contains("● claude  vde"), "{rendered:?}");
         assert!(rendered.ends_with("13m "), "{rendered:?}");
+    }
+
+    #[test]
+    fn dense_tier_renders_badge_glyph_in_status_color() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "claude: fix the bug",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
+        chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("claude".to_string()),
+            elapsed_secs: Some(780),
+            origin: Some("misc/vde-tmux".to_string()),
+            ..Default::default()
+        });
+        let theme = SidebarRenderTheme::default();
+
+        let lines = render_lines(&[chat], &SidebarState::default(), 30, &theme);
+
+        let glyph = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "●")
+            .unwrap_or_else(|| panic!("badge glyph span not found: {:?}", lines[0]));
+        assert_eq!(glyph.style.fg, Some(theme.badge_color(BadgeState::Working)));
     }
 
     #[test]
@@ -1862,7 +1912,7 @@ mod tests {
                 .style
         };
         assert_eq!(style_of("↗").fg, Some(Color::Indexed(73)));
-        assert_eq!(style_of("⌕").fg, Some(Color::Indexed(103)));
+        assert_eq!(style_of("⌕").fg, Some(Color::Indexed(73)));
         assert_eq!(style_of(" jump").fg, Some(theme.detail));
         assert_eq!(style_of(" preview").fg, Some(theme.detail));
         assert_eq!(style_of("[").fg, Some(theme.marker));
@@ -1881,7 +1931,7 @@ mod tests {
         };
 
         assert_eq!(style_of("↗").fg, Some(Color::Indexed(73)));
-        assert_eq!(style_of("⌕").fg, Some(Color::Indexed(103)));
+        assert_eq!(style_of("⌕").fg, Some(Color::Indexed(73)));
     }
 
     #[test]
