@@ -495,3 +495,20 @@ checked=Task 11 daemon disconnect after sidebar TUI launch completed without han
 checked=Task 11 non-blocking result path covered by sidebar::tui::tests::live_capture_result_updates_only_current_pane
 result=Plan 18 smoke ok
 ```
+
+Plan 23 sidebar polish smoke も pass。
+`cargo install --path . --force` で `vt` / `vde-tmux` を反映し、TUI の alt-screen capture は既存計画同様に安定しないため、表示・クリック仕様は対応する render/tui/runtime/tree の回帰テストで確認した。
+
+```text
+executed_at=2026-07-06 13:59:35 JST
+scratch=plan23-installed-binary
+checked=rtk cargo fmt --check && rtk cargo clippy --all-targets && rtk cargo test passed
+checked=rtk cargo install --path . --force replaced vt and vde-tmux
+checked=pin marker ✦ and colors.pin covered by sidebar::render::tests::pinned_chat_row_shows_pin_glyph / pin_color_is_configurable
+checked=header ≣ mode, spaced badges (≡ 0 etc.), category ◆ peach, repo blue covered by sidebar::render header/color tests
+checked=ByCategory category rule filler covered by sidebar::render::tests::category_row_fills_remaining_width_with_rule
+checked=LIVE rounded card wide/narrow and compute_areas chrome rows covered by sidebar::tui live_card tests
+checked=jump/preview action row hit-test, immediate click dispatch, detail toggle covered by sidebar::render::tests::jump_row_hit_test_maps_columns_to_actions, sidebar::tui::tests::detail_click_toggles_row_immediately, daemon::runtime::tests::toggle_on_detail_row_toggles_manual_expand_of_parent_chat
+checked=active lineage derivation and left bar/chat bg covered by sidebar::tree::tests::active_pane_marks_chat_row_and_ancestors and sidebar::render::tests::active_rows_render_left_bar_and_chat_bg
+result=Plan 23 sidebar polish smoke ok
+```

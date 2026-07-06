@@ -76,6 +76,11 @@ sidebar:
     background: dark_gray
     idle: reset
     selection_bg: "237"
+    pin: "147"
+    category: "215"
+    header_mode: "147"
+    active_bg: "235"
+    active_bar: "147"
 daemon:
   poll_ms: 1000
 notify:
