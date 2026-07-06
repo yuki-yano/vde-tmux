@@ -1,0 +1,1238 @@
+<title>vde-tmux ステータスライン配色比較</title>
+<style>
+  :root {
+    --bg: #f5f4f8;
+    --surface: #ffffff;
+    --surface2: #eceaf3;
+    --border: #dcd9e8;
+    --text: #232130;
+    --muted: #6b6880;
+    --accent: #5049c0;
+    --accent-soft: #e6e4fa;
+    --pass: #1e7e4b;
+    --pass-bg: #ddf2e5;
+    --warn: #92650f;
+    --warn-bg: #f7ecd2;
+    --fail: #b23434;
+    --fail-bg: #f9e0e0;
+    --good: #1e7e4b;
+    --mid: #92650f;
+    --weak: #b23434;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14131c;
+      --surface: #1c1b27;
+      --surface2: #232230;
+      --border: #2e2c40;
+      --text: #e8e6f2;
+      --muted: #9a96b0;
+      --accent: #8b84f0;
+      --accent-soft: #2a2749;
+      --pass: #5fce8f;
+      --pass-bg: #17301f;
+      --warn: #d9b45c;
+      --warn-bg: #322a14;
+      --fail: #e57676;
+      --fail-bg: #3a1d1d;
+      --good: #5fce8f;
+      --mid: #d9b45c;
+      --weak: #e57676;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f4f8; --surface: #ffffff; --surface2: #eceaf3; --border: #dcd9e8;
+    --text: #232130; --muted: #6b6880; --accent: #5049c0; --accent-soft: #e6e4fa;
+    --pass: #1e7e4b; --pass-bg: #ddf2e5; --warn: #92650f; --warn-bg: #f7ecd2;
+    --fail: #b23434; --fail-bg: #f9e0e0; --good: #1e7e4b; --mid: #92650f; --weak: #b23434;
+  }
+  :root[data-theme="dark"] {
+    --bg: #14131c; --surface: #1c1b27; --surface2: #232230; --border: #2e2c40;
+    --text: #e8e6f2; --muted: #9a96b0; --accent: #8b84f0; --accent-soft: #2a2749;
+    --pass: #5fce8f; --pass-bg: #17301f; --warn: #d9b45c; --warn-bg: #322a14;
+    --fail: #e57676; --fail-bg: #3a1d1d; --good: #5fce8f; --mid: #d9b45c; --weak: #e57676;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.85;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 48px 24px 96px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 10px;
+  }
+  h1 {
+    font-size: 27px;
+    line-height: 1.45;
+    margin: 0 0 12px;
+    letter-spacing: 0.01em;
+    text-wrap: balance;
+  }
+  .lead { color: var(--muted); margin: 0; max-width: 42em; }
+
+  nav.toc {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    margin: 24px 0 0;
+  }
+  nav.toc a {
+    font-family: var(--mono); font-size: 12px;
+    color: var(--muted); text-decoration: none;
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 12px; background: var(--surface);
+  }
+  nav.toc a:hover, nav.toc a:focus-visible { color: var(--accent); border-color: var(--accent); outline: none; }
+
+  h2 {
+    font-size: 19px; margin: 64px 0 8px;
+    letter-spacing: 0.01em; text-wrap: balance;
+  }
+  h2 .hash { color: var(--accent); font-family: var(--mono); margin-right: 8px; font-weight: 600; }
+  .sec-note { color: var(--muted); font-size: 13.5px; margin: 0 0 20px; }
+
+  /* ---- verdict ---- */
+  .verdict {
+    margin-top: 40px;
+    border: 1px solid var(--accent);
+    border-radius: 12px;
+    background: var(--surface);
+    overflow: hidden;
+  }
+  .verdict .vhead {
+    background: var(--accent-soft);
+    padding: 10px 20px;
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.14em;
+    color: var(--accent); font-weight: 700;
+  }
+  .verdict .vbody { padding: 18px 20px; }
+  .verdict .vbody p { margin: 0 0 10px; }
+  .verdict .vbody p:last-child { margin-bottom: 0; }
+  .verdict strong { color: var(--accent); }
+
+  .principle {
+    margin: 20px 0 0;
+    border-left: 3px solid var(--accent);
+    background: var(--surface);
+    border-radius: 0 10px 10px 0;
+    padding: 14px 18px;
+    font-size: 14.5px;
+  }
+  .principle b { display: block; font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em; color: var(--accent); margin-bottom: 4px; }
+
+  /* ---- legend ---- */
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 10px 22px;
+    margin: 16px 0 0;
+    padding: 14px 18px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 13.5px;
+  }
+  .legend .g { font-family: var(--mono); display: flex; align-items: center; gap: 8px; }
+  .legend .sw {
+    display: inline-block; width: 22px; height: 22px; border-radius: 6px;
+    background: #1a1926; text-align: center; line-height: 22px; font-size: 12px;
+    border: 1px solid var(--border);
+  }
+
+  /* ---- option cards ---- */
+  .option {
+    margin-top: 28px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: var(--surface);
+    overflow: hidden;
+    scroll-margin-top: 24px;
+  }
+  .option.reco { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .ohead {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 16px 20px 0;
+  }
+  .otag {
+    font-family: var(--mono); font-weight: 700; font-size: 13px;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 6px; padding: 2px 10px;
+  }
+  .ohead h3 { font-size: 16.5px; margin: 0; }
+  .obadge {
+    font-size: 11.5px; font-family: var(--mono); border-radius: 999px; padding: 2px 10px;
+    margin-left: auto;
+  }
+  .obadge.reco { background: var(--pass-bg); color: var(--pass); font-weight: 700; }
+  .obadge.cond { background: var(--warn-bg); color: var(--warn); }
+  .obadge.out  { background: var(--fail-bg); color: var(--fail); }
+  .osub { padding: 4px 20px 0; color: var(--muted); font-size: 13.5px; margin: 0; }
+
+  .term {
+    margin: 14px 20px 0;
+    background: #0b0a11;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 14px;
+    overflow-x: auto;
+  }
+  .term + .term { margin-top: 10px; }
+  .termlabel {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.14em;
+    color: #6f6b85; margin: 0 0 8px 2px; text-transform: uppercase;
+  }
+  .bar {
+    display: flex; align-items: center; gap: 22px;
+    min-width: 880px;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1;
+    padding: 7px 12px;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .bar .grp { display: flex; align-items: center; gap: 10px; }
+  .bar .mid { margin: 0 auto; }
+  .pill { border-radius: 999px; padding: 3px 10px; }
+  .chip { border-radius: 4px; padding: 3px 8px; }
+  .rect { border-radius: 0; padding: 3px 8px; }
+  .u { text-decoration: underline; text-underline-offset: 3px; }
+  .b { font-weight: 700; }
+  .crumb {
+    display: flex; align-items: center; gap: 8px;
+    min-width: 880px;
+    margin-top: 5px;
+    font-family: var(--mono); font-size: 12px; line-height: 1;
+    padding: 6px 12px;
+    border-radius: 4px;
+  }
+  .mk {
+    font-family: var(--mono); font-size: 10px; vertical-align: super;
+    color: #ffcf6e; font-weight: 700; margin-left: 2px;
+  }
+  .caps {
+    padding: 6px 20px 0; margin: 0;
+    color: var(--muted); font-size: 13px;
+    list-style: none;
+  }
+  .caps li { margin: 2px 0; }
+  .caps .mk { vertical-align: baseline; margin-right: 6px; color: var(--warn); }
+
+  .crrow { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 20px 0; }
+  .cr {
+    font-family: var(--mono); font-size: 11.5px;
+    border-radius: 6px; padding: 3px 9px;
+    font-variant-numeric: tabular-nums;
+  }
+  .cr.pass { background: var(--pass-bg); color: var(--pass); }
+  .cr.warn { background: var(--warn-bg); color: var(--warn); }
+  .cr.fail { background: var(--fail-bg); color: var(--fail); }
+
+  .procon {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px;
+    padding: 12px 20px 20px;
+  }
+  .procon ul { margin: 6px 0 0; padding-left: 1.3em; font-size: 13.5px; }
+  .procon li { margin: 3px 0; }
+  .procon .h { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; }
+  .procon .pro .h { color: var(--pass); }
+  .procon .con .h { color: var(--fail); }
+  @media (max-width: 640px) { .procon { grid-template-columns: 1fr; gap: 12px; } }
+
+  .swrow { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 10px 20px 0; }
+  .swatch {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+  }
+  .swatch i {
+    width: 14px; height: 14px; border-radius: 4px; display: inline-block;
+    border: 1px solid rgba(128,128,128,0.35);
+  }
+
+  /* ---- score matrix ---- */
+  .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+  table.score { border-collapse: collapse; width: 100%; min-width: 720px; font-size: 13.5px; }
+  table.score th, table.score td { padding: 10px 14px; text-align: center; border-bottom: 1px solid var(--border); }
+  table.score tr:last-child td { border-bottom: none; }
+  table.score th {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.06em;
+    background: var(--surface2);
+  }
+  table.score td.axis { text-align: left; font-weight: 600; white-space: nowrap; }
+  table.score td .why { display: block; font-weight: 400; font-size: 11.5px; color: var(--muted); }
+  .s { font-family: var(--mono); font-weight: 700; font-size: 15px; }
+  .s.good { color: var(--good); }
+  .s.mid  { color: var(--mid); }
+  .s.weak { color: var(--weak); }
+  table.score th.reco-col, table.score td.reco-col { background: var(--accent-soft); }
+
+  /* ---- issues / impl ---- */
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 720px) { .cards { grid-template-columns: 1fr; } }
+  .card {
+    border: 1px solid var(--border); border-radius: 12px;
+    background: var(--surface); padding: 16px 18px;
+  }
+  .card h4 { margin: 0 0 6px; font-size: 14.5px; }
+  .card h4 .n { font-family: var(--mono); color: var(--accent); margin-right: 8px; }
+  .card p { margin: 0; font-size: 13.5px; color: var(--muted); }
+  .card p b, .card p code { color: var(--text); }
+
+  ol.impl { padding-left: 1.4em; margin: 0; }
+  ol.impl li { margin: 10px 0; }
+  ol.impl li b { display: inline; }
+  ol.impl li p { margin: 2px 0 0; font-size: 13.5px; color: var(--muted); }
+
+  code {
+    font-family: var(--mono); font-size: 0.86em;
+    background: var(--surface2);
+    border-radius: 5px; padding: 1px 6px;
+  }
+  pre {
+    background: #0b0a11; color: #cdc9e0;
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; overflow-x: auto;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.7;
+  }
+  pre code { background: none; padding: 0; }
+
+  .foot {
+    margin-top: 64px; padding-top: 20px;
+    border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 12.5px;
+  }
+  .foot p { margin: 4px 0; }
+  a { color: var(--accent); }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">vde-tmux / tmux statusline color review</p>
+  <h1>ステータスライン配色 — 5案＋改良案の視覚比較</h1>
+  <p class="lead">別セッションで作成された配色改善5案（D3 / D1 / B / A / C）の独立レビュー。全コントラスト比（CR）は WCAG 2.x 相対輝度で再実測済み。モックアップは実密度（4 session・4 window）で各案を再現している。</p>
+
+  <nav class="toc">
+    <a href="#current">現状</a>
+    <a href="#d3">D3</a>
+    <a href="#d3tune">D3グリフ調整4案</a>
+    <a href="#d3x">D3改（推奨）</a>
+    <a href="#d1">D1</a>
+    <a href="#b">B</a>
+    <a href="#a">A</a>
+    <a href="#c">C</a>
+    <a href="#score">採点</a>
+    <a href="#issues">論点</a>
+    <a href="#impl">実装懸念</a>
+  </nav>
+
+  <!-- ================= verdict ================= -->
+  <div class="verdict">
+    <div class="vhead">結論 — VERDICT</div>
+    <div class="vbody">
+      <p><strong>D3 の方向性に同意するが、そのままでは採用しない。</strong>実測で D3 に「カレント塗りの上の blocked グリフが CR 3.08:1」という設計思想と矛盾する穴が見つかった。最重要信号の blocked が、ユーザーが最も注視する場所（カレント session）でだけ最弱になる。</p>
+      <p>推奨は <strong>D3改：カレントのグリフを塗りの外（バー地の上）に出す</strong>。これで全状態グリフが例外なくバー地上に載り、D3 が掲げた「全所で単一パレット」がむしろ完全達成される。tmux フォーマット上は単なる順序の入れ替えで済む。</p>
+    </div>
+  </div>
+
+  <div class="principle">
+    <b>ゼロベースで導いた構造原則</b>
+    暗いバー上で「状態色の全所一貫」と「アクティブの強調」を両立する構造は一つしかない — <strong>信号グリフは常に暗い地の上に置き、塗り（明るい面）には信号を載せない</strong>。明るい pill と単一状態色は輝度的に両立不可能（現行の CR 1.20 はその帰結）。D3 系はこの原則に沿うが、塗り上グリフの1点で自らの原則を破っている。
+  </div>
+
+  <!-- ================= legend ================= -->
+  <h2><span class="hash">§</span>状態グリフの意味と信号パレット</h2>
+  <p class="sec-note">グリフ形状（▲●✓○）が色と冗長に状態を符号化しており、色覚多様性への耐性はこの形状差が担っている。信号色は D3 系の値。</p>
+  <div class="legend">
+    <span class="g"><span class="sw" style="color:#ff6b6b">▲</span>blocked <span style="color:var(--muted)">#ff6b6b</span></span>
+    <span class="g"><span class="sw" style="color:#4fd08a">●</span>working <span style="color:var(--muted)">#4fd08a</span></span>
+    <span class="g"><span class="sw" style="color:#45cbe6">✓</span>done <span style="color:var(--muted)">#45cbe6</span></span>
+    <span class="g"><span class="sw" style="color:#6f6b85">○</span>idle <span style="color:var(--muted)">#6f6b85</span></span>
+  </div>
+
+  <!-- ================= current ================= -->
+  <h2 id="current"><span class="hash">00</span>現状 — 痛点の確認</h2>
+  <p class="sec-note">バー地 #232332。痛点は2つ：① category アクティブ pill の濁った暖色（ピーチ #eab78d）、② 明るい pill 上の状態グリフがテーマの淡い ANSI 色で CR 1.20 とほぼ不可視。</p>
+
+  <section class="option" id="cur-card">
+    <div class="ohead">
+      <span class="otag">現状</span>
+      <h3>明るいパステル pill ＋ ANSI 名前色グリフ</h3>
+      <span class="obadge out">要改善</span>
+    </div>
+    <div class="term">
+      <p class="termlabel">status bar</p>
+      <div class="bar" style="background:#232332">
+        <span class="grp">
+          <span class="pill" style="background:#eab78d;color:#232332">🏠</span><span class="mk">①</span>
+          <span class="pill" style="background:#696288;color:#232332">🌐</span>
+          <span class="pill" style="background:#696288;color:#232332">🪪</span>
+        </span>
+        <span class="grp">
+          <span class="pill" style="background:#98b2f6;color:#232332"><span style="color:#c76a66">▲</span>2 proxy</span>
+          <span class="pill" style="background:#b8befa;color:#232332"><span style="color:#b6e0a5">●</span>3 vde</span><span class="mk">②</span>
+          <span class="pill" style="background:#98b2f6;color:#232332"><span style="color:#7fb2ba">✓</span>1 docs</span>
+          <span class="pill" style="background:#98b2f6;color:#232332"><span style="color:#8a86a0">○</span>1 misc</span>
+        </span>
+        <span class="grp mid">
+          <span style="color:#6e6a86">1:nvim</span>
+          <span class="b" style="color:#b8befa">2:zsh</span>
+          <span style="color:#6e6a86">3:log<span style="color:#eab78d">!</span></span>
+          <span style="color:#6e6a86">4:ssh</span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ea9a97">▲</span><span style="color:#c6c3dd">1</span> <span style="color:#b6e0a5">●</span><span style="color:#c6c3dd">1</span> <span style="color:#9ccfd8">✓</span><span style="color:#c6c3dd">1</span> <span style="color:#6e6a86">○</span><span style="color:#c6c3dd">1</span></span>
+          <span style="color:#ea9a97">▲ proxy · perm 2m</span>
+        </span>
+      </div>
+      <div class="crumb" style="background:#181824;color:#8994cd">
+        <span>1.5</span><span style="color:#4a4766">⟩</span><span>~/repos/vde-tmux</span><span style="color:#4a4766">⟩</span><span>node</span>
+      </div>
+    </div>
+    <ul class="caps">
+      <li><span class="mk">①</span>ピーチ #eab78d — 実測 CR は 8.58 と高く、主訴の「濁り」はコントラストではなく色相・彩度の不快感。</li>
+      <li><span class="mk">②</span>カレント pill 上の working グリフ — テーマ ANSI のパステル緑 #b6e0a5 on #b8befa で <b>CR 1.20、ほぼ不可視</b>。</li>
+    </ul>
+    <div class="crrow">
+      <span class="cr fail">グリフ on pill 1.20</span>
+      <span class="cr pass">ピーチ vs 地 8.58</span>
+      <span class="cr pass">pill vs 地 8.68</span>
+    </div>
+    <div class="procon">
+      <div class="con" style="grid-column: 1 / -1">
+        <span class="h">根本原因</span>
+        <ul>
+          <li>グリフ色は <code>src/statusline/mod.rs</code> が <code>"green"</code> 等の ANSI 名前色を出力し、ターミナルテーマのパステルパレットに写像されている。どの案でも hex 直書きか設定化が必須の共通作業。</li>
+          <li>明るい pill と「全所で同じ状態色」は輝度的に両立不可能。構造の選択（塗りをやめるか、二重パレットを受け入れるか）が必要。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= D3 ================= -->
+  <h2 id="d3"><span class="hash">01</span>案D3 — Signal + accent-active（作成者の推奨）</h2>
+  <p class="sec-note">非アクティブは全てフラットな色付きテキスト。塗り（インディゴ chip）はアクティブ category・カレント session・アクティブ window のみ。方向性は正しいが、塗りの上にグリフを載せる1点で自己矛盾している。</p>
+
+  <section class="option">
+    <div class="ohead">
+      <span class="otag">D3</span>
+      <h3>焦点1点塗り — ただし塗り上グリフに穴</h3>
+      <span class="obadge cond">条件付き（修正すれば可）</span>
+    </div>
+    <div class="term">
+      <p class="termlabel">status bar — 通常時（カレント = working）</p>
+      <div class="bar" style="background:#1a1926">
+        <span class="grp">
+          <span class="chip" style="background:#453f9e;color:#ecebff">🏠 home</span>
+          <span>🌐</span>
+          <span>🪪</span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#9591ad">2 proxy</span></span>
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#4fd08a">●</span>3 vde</span><span class="mk">①</span>
+          <span><span style="color:#45cbe6">✓</span><span style="color:#9591ad">1 docs</span></span>
+          <span><span style="color:#6f6b85">○</span><span style="color:#9591ad">1 misc</span></span>
+        </span>
+        <span class="grp mid">
+          <span style="color:#9591ad">1:nvim</span>
+          <span class="chip" style="background:#453f9e;color:#ecebff">2:zsh</span>
+          <span style="color:#9591ad">3:log<span style="color:#ff6b6b">!</span></span>
+          <span style="color:#9591ad">4:ssh</span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#c6c3dd">1</span> <span style="color:#4fd08a">●</span><span style="color:#c6c3dd">1</span> <span style="color:#45cbe6">✓</span><span style="color:#c6c3dd">1</span> <span style="color:#6f6b85">○</span><span style="color:#c6c3dd">1</span></span>
+          <span style="color:#ff6b6b">▲ proxy · perm 2m</span>
+        </span>
+      </div>
+      <div class="crumb" style="background:#181824;color:#8994cd">
+        <span>1.5</span><span style="color:#4a4766">⟩</span><span>~/repos/vde-tmux</span><span style="color:#4a4766">⟩</span><span>node</span><span class="mk">②</span>
+      </div>
+    </div>
+    <div class="term">
+      <p class="termlabel">最悪ケース — カレント session が blocked のとき</p>
+      <div class="bar" style="background:#1a1926">
+        <span class="grp">
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#ff6b6b">▲</span>2 proxy</span><span class="mk">③</span>
+          <span><span style="color:#4fd08a">●</span><span style="color:#9591ad">3 vde</span></span>
+          <span><span style="color:#45cbe6">✓</span><span style="color:#9591ad">1 docs</span></span>
+          <span><span style="color:#6f6b85">○</span><span style="color:#9591ad">1 misc</span></span>
+        </span>
+        <span class="grp mid" style="color:#6f6b85">…</span>
+        <span class="grp">
+          <span style="color:#ff6b6b">▲ proxy · perm 2m</span>
+        </span>
+      </div>
+    </div>
+    <ul class="caps">
+      <li><span class="mk">①</span>working on 塗り = CR 4.36。ぎりぎり読めるが 4.5 未満。</li>
+      <li><span class="mk">②</span>バー地 #1a1926 と breadcrumb 地 #181824 がほぼ同輝度になり、現在成立している面の区別が消える（後述の論点1）。</li>
+      <li><span class="mk">③</span><b>blocked on 塗り = CR 3.08</b>。最重要信号が最注視点でだけ最弱になる設計欠陥。idle on 塗りは 1.68 でほぼ消失。</li>
+    </ul>
+    <div class="crrow">
+      <span class="cr pass">▲ on 地 6.25</span>
+      <span class="cr pass">● on 地 8.85</span>
+      <span class="cr pass">✓ on 地 9.03</span>
+      <span class="cr warn">○ on 地 3.40</span>
+      <span class="cr pass">文字 on 塗り 7.28</span>
+      <span class="cr warn">● on 塗り 4.36</span>
+      <span class="cr fail">▲ on 塗り 3.08</span>
+      <span class="cr fail">○ on 塗り 1.68</span>
+    </div>
+    <div class="procon">
+      <div class="pro">
+        <span class="h">強み</span>
+        <ul>
+          <li>塗り色で category を区別しない → 濁り問題自体が消滅</li>
+          <li>唯一の塗り＝圧倒的な焦点。多密度でも視線が1点に収束</li>
+          <li>fg 中心＋焦点のみ塗りは tmux/lualine の定石で TUI ネイティブ</li>
+        </ul>
+      </div>
+      <div class="con">
+        <span class="h">弱み</span>
+        <ul>
+          <li>塗り上グリフ（▲3.08 / ○1.68）が「単一パレット」の看板と自己矛盾</li>
+          <li>塗り #453f9e vs 地 = 2.03 で chip の縁が柔らかい（文字 7.28 が主役なので許容範囲）</li>
+          <li>ラベル展開・underline 属性などコード変更量は5案中最大級</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= D3 glyph tuning ================= -->
+  <h2 id="d3tune"><span class="hash">01b</span>D3 をそのまま採用する場合 — 塗り上グリフ色の調整4案</h2>
+  <p class="sec-note">D3（グリフを塗りの内側に置く）を採用するなら、問題は blocked 3.08 と idle 1.68。working 4.36 / done 4.45 はぎりぎり可。構造的制約：単一色で塗り #453f9e（明るめ）とバー地 #1a1926（暗）の両方に効かせるには明度を上げるしかなく、上げるとバー上で騒がしくなる。以下の4案はこのトレードオフの切り方の違い。各ストリップは「カレント chip が各状態だったら」を並べたもの。</p>
+
+  <section class="option">
+    <div class="ohead">
+      <span class="otag">E1</span>
+      <h3>全体明度アップ — 単一パレットを守る</h3>
+      <span class="obadge cond">可・ただし静けさを失う</span>
+    </div>
+    <div class="term">
+      <p class="termlabel">カレント chip ×4状態 ＋ summary（バー地）— 全所同色</p>
+      <div class="bar" style="background:#1a1926">
+        <span class="grp">
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#ffa8a8">▲</span>2 proxy</span>
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#5fdd99">●</span>3 vde</span>
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#5cd8ef">✓</span>1 docs</span>
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#9d99bb">○</span>1 misc</span><span class="mk">①</span>
+        </span>
+        <span class="grp mid">
+          <span><span style="color:#ffa8a8">▲</span><span style="color:#9591ad">2 proxy</span></span>
+          <span><span style="color:#5cd8ef">✓</span><span style="color:#9591ad">1 docs</span></span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ffa8a8">▲</span><span style="color:#c6c3dd">1</span> <span style="color:#5fdd99">●</span><span style="color:#c6c3dd">1</span> <span style="color:#5cd8ef">✓</span><span style="color:#c6c3dd">1</span> <span style="color:#9d99bb">○</span><span style="color:#c6c3dd">1</span></span><span class="mk">②</span>
+        </span>
+      </div>
+    </div>
+    <ul class="caps">
+      <li><span class="mk">①</span>idle #9d99bb は塗り上 3.14 で非テキスト下限をクリアするが、バー上では 6.36 になり非アクティブ session 名 #9591ad（5.72）より目立つ — 「idle は静か」という階層が反転する。</li>
+      <li><span class="mk">②</span>blocked #ffa8a8 はパステル寄りになり、警報としての彩度感が #ff6b6b より弱まる。summary 全体も一段明るく（騒がしく）なる。</li>
+    </ul>
+    <div class="crrow">
+      <span class="cr pass">▲#ffa8a8 塗り4.65 / 地9.43</span>
+      <span class="cr pass">●#5fdd99 塗り5.00 / 地10.15</span>
+      <span class="cr pass">✓#5cd8ef 塗り5.10 / 地10.34</span>
+      <span class="cr warn">○#9d99bb 塗り3.14 / 地6.36</span>
+    </div>
+    <div class="procon">
+      <div class="pro">
+        <span class="h">強み</span>
+        <ul>
+          <li>単一パレット維持 — config は <code>badge.colors</code> 4値のまま、実装追加ゼロ</li>
+          <li>塗り上の全状態が非テキスト 3:1 を満たし、idle 以外は 4.5+ </li>
+        </ul>
+      </div>
+      <div class="con">
+        <span class="h">弱み</span>
+        <ul>
+          <li>idle がバー上で session 名より明るくなり、静的な階層が壊れる</li>
+          <li>blocked の緊急感が薄まる（パステル化）</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="option reco">
+    <div class="ohead">
+      <span class="otag">E2</span>
+      <h3>塗り上専用ティント — 文脈2つ限定の二重パレット</h3>
+      <span class="obadge reco">★ D3 採用時の推奨</span>
+    </div>
+    <div class="term">
+      <p class="termlabel">カレント chip ×4状態（塗り上ティント）＋ summary（バーパレットは D3 のまま）</p>
+      <div class="bar" style="background:#1a1926">
+        <span class="grp">
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#ffbcbc">▲</span>2 proxy</span>
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#8ce8b5">●</span>3 vde</span>
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#8ce4f4">✓</span>1 docs</span>
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#c3bfe4">○</span>1 misc</span><span class="mk">①</span>
+        </span>
+        <span class="grp mid">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#9591ad">2 proxy</span></span>
+          <span><span style="color:#45cbe6">✓</span><span style="color:#9591ad">1 docs</span></span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#c6c3dd">1</span> <span style="color:#4fd08a">●</span><span style="color:#c6c3dd">1</span> <span style="color:#45cbe6">✓</span><span style="color:#c6c3dd">1</span> <span style="color:#6f6b85">○</span><span style="color:#c6c3dd">1</span></span><span class="mk">②</span>
+        </span>
+      </div>
+    </div>
+    <ul class="caps">
+      <li><span class="mk">①</span>塗り上は同色相の明ティントに切り替え。全状態が 4.8 前後以上で、色相が同じため「同じ信号の明るい版」として知覚される。</li>
+      <li><span class="mk">②</span>バー上（非カレント・summary・attention）は D3 の元パレットを一切変えない — バーの階層と静けさが無傷。</li>
+    </ul>
+    <div class="crrow">
+      <span class="cr pass">▲#ffbcbc on 塗り 5.36</span>
+      <span class="cr pass">●#8ce8b5 on 塗り 5.83</span>
+      <span class="cr pass">✓#8ce4f4 on 塗り 5.91</span>
+      <span class="cr pass">○#c3bfe4 on 塗り 4.84</span>
+      <span class="cr pass">バー側は D3 のまま（6.25〜9.03 / idle 3.40）</span>
+    </div>
+    <div class="procon">
+      <div class="pro">
+        <span class="h">強み</span>
+        <ul>
+          <li>全所 4.5+ を達成しつつ、バーの視覚設計に一切触れない</li>
+          <li>二重パレットだが文脈は「バー地」「塗り」の2つだけで、色相が同一 — 案A で批判した不一致（別色相・明暗逆転）とは質が違う</li>
+        </ul>
+      </div>
+      <div class="con">
+        <span class="h">弱み</span>
+        <ul>
+          <li>config・実装が状態×文脈のマトリクスになる（<code>badge.colors</code> に加えて <code>badge.colors_on_fill</code> 相当が必要）</li>
+          <li>「全所で単一色」という D3 の看板は名目上失われる</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="option">
+    <div class="ohead">
+      <span class="otag">E3</span>
+      <h3>塗りを暗くする — 単独では不成立</h3>
+      <span class="obadge out">部分修正に留まる</span>
+    </div>
+    <div class="term">
+      <p class="termlabel">塗りを #2f2b66 に落とした場合（グリフは D3 元パレット）</p>
+      <div class="bar" style="background:#1a1926">
+        <span class="grp">
+          <span class="chip" style="background:#2f2b66;color:#ecebff"><span style="color:#ff6b6b">▲</span>2 proxy</span>
+          <span class="chip" style="background:#2f2b66;color:#ecebff"><span style="color:#4fd08a">●</span>3 vde</span>
+          <span class="chip" style="background:#2f2b66;color:#ecebff"><span style="color:#45cbe6">✓</span>1 docs</span>
+          <span class="chip" style="background:#2f2b66;color:#ecebff"><span style="color:#6f6b85">○</span>1 misc</span><span class="mk">①</span>
+        </span>
+        <span class="grp mid">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#9591ad">2 proxy</span></span>
+          <span><span style="color:#45cbe6">✓</span><span style="color:#9591ad">1 docs</span></span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#c6c3dd">1</span> <span style="color:#4fd08a">●</span><span style="color:#c6c3dd">1</span> <span style="color:#45cbe6">✓</span><span style="color:#c6c3dd">1</span> <span style="color:#6f6b85">○</span><span style="color:#c6c3dd">1</span></span>
+        </span>
+      </div>
+    </div>
+    <ul class="caps">
+      <li><span class="mk">①</span>blocked は 4.56 まで回復するが、<b>idle は 2.48 で依然 3:1 未達</b>。idle も直すには #9d99bb 等への変更が必要になり、そうすると E1 と同じ「バー上で idle が騒がしい」問題を引き継ぐ。さらに塗り vs バーが 1.37 まで落ち、「唯一の塗り＝焦点」の効きが弱まる。</li>
+    </ul>
+    <div class="crrow">
+      <span class="cr pass">▲ on 塗り 4.56</span>
+      <span class="cr pass">● on 塗り 6.47</span>
+      <span class="cr pass">✓ on 塗り 6.60</span>
+      <span class="cr fail">○ on 塗り 2.48</span>
+      <span class="cr fail">塗り vs 地 1.37</span>
+      <span class="cr pass">文字 on 塗り 10.79</span>
+    </div>
+    <div class="procon">
+      <div class="pro">
+        <span class="h">強み</span>
+        <ul>
+          <li>グリフパレット・config を一切変えずに blocked/working/done が改善</li>
+        </ul>
+      </div>
+      <div class="con">
+        <span class="h">弱み</span>
+        <ul>
+          <li>idle が直らない — 結局 idle 色の変更（＝E1 の問題）を併用することになる</li>
+          <li>塗りの焦点性が犠牲になる（1.37 はエッジがほぼ知覚できない）</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="option">
+    <div class="ohead">
+      <span class="otag">E4</span>
+      <h3>状態連動塗り — blocked のカレントは chip ごと赤に</h3>
+      <span class="obadge cond">大胆な代替・意味論は最強</span>
+    </div>
+    <div class="term">
+      <p class="termlabel">カレント chip の塗り自体を状態で切り替える（グリフ・バーパレットは D3 のまま）</p>
+      <div class="bar" style="background:#1a1926">
+        <span class="grp">
+          <span class="chip" style="background:#6e2a28;color:#ffd9d6"><span style="color:#ffd9d6">▲</span>2 proxy</span><span class="mk">①</span>
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#4fd08a">●</span>3 vde</span><span class="mk">②</span>
+          <span class="chip" style="background:#453f9e;color:#ecebff"><span style="color:#45cbe6">✓</span>1 docs</span>
+          <span class="chip" style="background:#34304f;color:#c6c3dd"><span style="color:#a5a1c2">○</span>1 misc</span><span class="mk">③</span>
+        </span>
+        <span class="grp mid">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#9591ad">2 proxy</span></span>
+          <span><span style="color:#45cbe6">✓</span><span style="color:#9591ad">1 docs</span></span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#c6c3dd">1</span> <span style="color:#4fd08a">●</span><span style="color:#c6c3dd">1</span> <span style="color:#45cbe6">✓</span><span style="color:#c6c3dd">1</span> <span style="color:#6f6b85">○</span><span style="color:#c6c3dd">1</span></span>
+        </span>
+      </div>
+    </div>
+    <ul class="caps">
+      <li><span class="mk">①</span>blocked のカレントは塗りごと赤系 #6e2a28＋#ffd9d6 に。この配色は<b>既存の attention pill（#FFD9D6 on #6E2A28、テスト実装済み）と同一系統</b>で、プロダクト内の「警告面」の語彙と揃う。グリフ単体の 3.08 問題は消滅（7.98）。</li>
+      <li><span class="mk">②</span>working / done はインディゴのまま（4.36 / 4.45 — D3 の「ぎりぎり可」を受容）。</li>
+      <li><span class="mk">③</span>idle のカレントは減彩した #34304f に沈める。グリフ 5.04 で読め、かつ「アイドルだから静か」という意味と塗りの明度が一致する。</li>
+    </ul>
+    <div class="crrow">
+      <span class="cr pass">▲#ffd9d6 on #6e2a28 7.98</span>
+      <span class="cr warn">● on 塗り 4.36（D3のまま）</span>
+      <span class="cr warn">✓ on 塗り 4.45（D3のまま）</span>
+      <span class="cr pass">○#a5a1c2 on #34304f 5.04</span>
+      <span class="cr pass">idle文字 #c6c3dd 7.29</span>
+    </div>
+    <div class="procon">
+      <div class="pro">
+        <span class="h">強み</span>
+        <ul>
+          <li>「カレントが blocked」という最重要事象が chip 全体の色で伝わる — 信号強度は4案中最強</li>
+          <li>attention pill と同色系で警告語彙が統一される</li>
+          <li>バーパレット・summary は無変更</li>
+        </ul>
+      </div>
+      <div class="con">
+        <span class="h">弱み</span>
+        <ul>
+          <li>塗り色が「フォーカス」と「状態」の二重符号化になる — D3 の「塗り＝焦点のみ」という規律を崩す</li>
+          <li>実装はカレント塗りの状態分岐が必要（config は state 別 SegmentColors）</li>
+          <li>blocked カレント時、window のインディゴ塗りと赤塗りが同時に並ぶ</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <div class="principle">
+    <b>D3 採用時の判定</b>
+    <strong>E2（塗り上ティント）を推奨</strong>。全状態 4.8 前後を確保しつつバーの視覚設計が無傷で、二重パレットの弊害は「同色相・文脈2つ」に封じ込められる。意味論の強さを取るなら E4 が対抗（attention pill と語彙が揃う点も良い）。E1 は config 最小だが idle の階層反転が痛い。E3 は単独では idle が直らず不成立。なお、この4案が必要になること自体が「グリフを塗りに載せる」コストであり、D3改（外置き）ならこの問題系は丸ごと消える。
+  </div>
+
+  <!-- ================= D3kai ================= -->
+  <h2 id="d3x"><span class="hash">02</span>案D3改 — グリフを塗りの外に出す（本レビューの推奨）</h2>
+  <p class="sec-note">D3 との差分：カレント session／アクティブ window のグリフを塗りセグメントの直前、バー地の上に置く。「グリフ＝バー地、名前＝塗り」という規則が全要素で機械的に統一される。塗りの形状は <b>pill（キャップ付きカプセル）ではなくフラットな矩形</b>を採用する — 理由は下の形状比較を参照。</p>
+
+  <section class="option reco">
+    <div class="ohead">
+      <span class="otag">D3改</span>
+      <h3>信号は常に暗い地の上 — 原則の完全達成</h3>
+      <span class="obadge reco">★ 推奨</span>
+    </div>
+    <div class="term">
+      <p class="termlabel">status bar — 通常時（カレント = working）</p>
+      <div class="bar" style="background:#1a1926">
+        <span class="grp">
+          <span class="rect" style="background:#453f9e;color:#ecebff">🏠 home</span>
+          <span>🌐</span>
+          <span>🪪</span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#9591ad">2 proxy</span></span>
+          <span><span style="color:#4fd08a">●</span><span class="rect" style="background:#453f9e;color:#ecebff;margin-left:4px">3 vde</span></span><span class="mk">①</span>
+          <span><span style="color:#45cbe6">✓</span><span style="color:#9591ad">1 docs</span></span>
+          <span><span style="color:#6f6b85">○</span><span style="color:#9591ad">1 misc</span></span>
+        </span>
+        <span class="grp mid">
+          <span style="color:#9591ad">1:nvim</span>
+          <span class="rect" style="background:#453f9e;color:#ecebff">2:zsh</span>
+          <span style="color:#9591ad">3:log<span style="color:#ff6b6b">!</span></span>
+          <span style="color:#9591ad">4:ssh</span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#c6c3dd">1</span> <span style="color:#4fd08a">●</span><span style="color:#c6c3dd">1</span> <span style="color:#45cbe6">✓</span><span style="color:#c6c3dd">1</span> <span style="color:#6f6b85">○</span><span style="color:#c6c3dd">1</span></span>
+          <span style="color:#ff6b6b">▲ proxy · perm 2m</span>
+        </span>
+      </div>
+      <div class="crumb" style="background:#121218;color:#8994cd">
+        <span>1.5</span><span style="color:#44415e">⟩</span><span>~/repos/vde-tmux</span><span style="color:#44415e">⟩</span><span>node</span><span class="mk">②</span>
+      </div>
+    </div>
+    <div class="term">
+      <p class="termlabel">最悪ケース — カレント session が blocked でも信号は地の上</p>
+      <div class="bar" style="background:#1a1926">
+        <span class="grp">
+          <span><span style="color:#ff6b6b">▲</span><span class="rect" style="background:#453f9e;color:#ecebff;margin-left:4px">2 proxy</span></span><span class="mk">③</span>
+          <span><span style="color:#4fd08a">●</span><span style="color:#9591ad">3 vde</span></span>
+          <span><span style="color:#45cbe6">✓</span><span style="color:#9591ad">1 docs</span></span>
+          <span><span style="color:#6f6b85">○</span><span style="color:#9591ad">1 misc</span></span>
+        </span>
+        <span class="grp mid" style="color:#6f6b85">…</span>
+        <span class="grp">
+          <span style="color:#ff6b6b">▲ proxy · perm 2m</span>
+        </span>
+      </div>
+    </div>
+    <div class="term">
+      <p class="termlabel">形状比較 — 外グリフと組むのは pill か矩形か</p>
+      <div class="bar" style="background:#1a1926;min-width:0;gap:36px">
+        <span class="grp">
+          <span style="color:#6f6b85;font-size:11px">a. pill＋外グリフ</span>
+          <span><span style="color:#4fd08a">●</span><span class="pill" style="background:#453f9e;color:#ecebff;margin-left:4px">3 vde</span></span>
+          <span class="mk">④</span>
+        </span>
+        <span class="grp">
+          <span style="color:#6f6b85;font-size:11px">b. 矩形＋外グリフ（推奨）</span>
+          <span><span style="color:#4fd08a">●</span><span class="rect" style="background:#453f9e;color:#ecebff;margin-left:4px">3 vde</span></span>
+          <span class="mk">⑤</span>
+        </span>
+        <span class="grp">
+          <span style="color:#6f6b85;font-size:11px">c. 参考: pill＋内グリフ（D3）</span>
+          <span class="pill" style="background:#453f9e;color:#ecebff"><span style="color:#4fd08a">●</span>3 vde</span>
+          <span class="mk">⑥</span>
+        </span>
+      </div>
+    </div>
+    <ul class="caps">
+      <li><span class="mk">④</span>キャップの丸みが「閉じたカプセル」の輪郭を作り、外のグリフを群から弾いて孤立させる — 違和感の正体。</li>
+      <li><span class="mk">⑤</span>直線エッジは閉合が弱く、1スペースの近接だけでグリフと名前が同一群として読める。tmux の素の bg 塗り（<code>window-status-current-style</code>）と同じ描画で、キャップ glyph も不要。</li>
+      <li><span class="mk">⑥</span>グリフを中に戻すと塗り上 CR 問題（▲3.08 / ○1.68）に逆戻り。</li>
+      <li><span class="mk">①</span>グリフは塗りの外＝バー地上。pill 内・summary・category の全所で文字どおり単一パレットになる。</li>
+      <li><span class="mk">②</span>随伴修正：breadcrumb 地をさらに一段暗く（例 #121218）して面の区別を回復する。</li>
+      <li><span class="mk">③</span>blocked がカレントでも CR 6.25 を維持。D3 の 3.08 と直接比較されたい。</li>
+    </ul>
+    <div class="crrow">
+      <span class="cr pass">▲ on 地 6.25</span>
+      <span class="cr pass">● on 地 8.85</span>
+      <span class="cr pass">✓ on 地 9.03</span>
+      <span class="cr warn">○ on 地 3.40（非テキスト 3:1 は充足・idle は静かでよい）</span>
+      <span class="cr pass">文字 on 塗り 7.28</span>
+    </div>
+    <div class="procon">
+      <div class="pro">
+        <span class="h">強み</span>
+        <ul>
+          <li>全グリフの最悪値が 3.40（idle）に改善。blocked/working/done は 6.25〜9.03</li>
+          <li>D3 の設計目標「全所で単一パレット」が例外なしに成立</li>
+          <li>tmux フォーマット上は順序の入れ替えだけ。D3 比の追加コストほぼゼロ</li>
+        </ul>
+      </div>
+      <div class="con">
+        <span class="h">弱み・条件</span>
+        <ul>
+          <li>塗りは pill でなく矩形にする（外グリフとカプセル閉合が衝突するため — 上の形状比較）。キャップ glyph 処理は丸ごと不要になる</li>
+          <li>D3 と同じく underline 属性・ラベル展開・地色変更の実装が必要</li>
+          <li>breadcrumb 地の再調整が必須の随伴作業</li>
+        </ul>
+      </div>
+    </div>
+    <pre><code># tmux フォーマット（概念）— グリフはバー地、名前だけ矩形塗り。キャップ glyph なし
+#[fg=#4fd08a,bg=#1a1926]● #[fg=#ecebff,bg=#453f9e] 3 vde #[default]</code></pre>
+  </section>
+
+  <!-- ================= D1 ================= -->
+  <h2 id="d1"><span class="hash">03</span>案D1 — Flat</h2>
+  <p class="sec-note">塗りを一切使わない。全所フラットな色付きテキスト＋区切り │。カレントは bold＋underline のみ。</p>
+
+  <section class="option">
+    <div class="ohead">
+      <span class="otag">D1</span>
+      <h3>最もTUIネイティブ — だがカレントが埋もれる</h3>
+      <span class="obadge cond">次点</span>
+    </div>
+    <div class="term">
+      <p class="termlabel">status bar</p>
+      <div class="bar" style="background:#1a1926">
+        <span class="grp">
+          <span class="u">🏠 <span style="color:#ecebff">home</span></span>
+          <span>🌐</span>
+          <span>🪪</span>
+          <span style="color:#3a374f">│</span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#9591ad">2 proxy</span></span>
+          <span class="b u"><span style="color:#4fd08a">●</span><span style="color:#ecebff">3 vde</span></span><span class="mk">①</span>
+          <span><span style="color:#45cbe6">✓</span><span style="color:#9591ad">1 docs</span></span>
+          <span><span style="color:#6f6b85">○</span><span style="color:#9591ad">1 misc</span></span>
+        </span>
+        <span class="grp mid">
+          <span style="color:#9591ad">1:nvim</span>
+          <span class="b u" style="color:#ecebff">2:zsh</span>
+          <span style="color:#9591ad">3:log<span style="color:#ff6b6b">!</span></span>
+          <span style="color:#9591ad">4:ssh</span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#c6c3dd">1</span> <span style="color:#4fd08a">●</span><span style="color:#c6c3dd">1</span> <span style="color:#45cbe6">✓</span><span style="color:#c6c3dd">1</span> <span style="color:#6f6b85">○</span><span style="color:#c6c3dd">1</span></span>
+          <span style="color:#ff6b6b">▲ proxy · perm 2m</span>
+        </span>
+      </div>
+      <div class="crumb" style="background:#181824;color:#8994cd">
+        <span>1.5</span><span style="color:#4a4766">⟩</span><span>~/repos/vde-tmux</span><span style="color:#4a4766">⟩</span><span>node</span>
+      </div>
+    </div>
+    <ul class="caps">
+      <li><span class="mk">①</span>カレントの手掛かりが bold＋underline のみ。4 session 程度でもスキャン速度が落ち、多 window では焦点探索になる。</li>
+    </ul>
+    <div class="crrow">
+      <span class="cr pass">▲ on 地 6.25</span>
+      <span class="cr pass">● on 地 8.85</span>
+      <span class="cr pass">✓ on 地 9.03</span>
+      <span class="cr warn">○ on 地 3.40</span>
+      <span class="cr pass">カレント文字 #ecebff 高CR</span>
+    </div>
+    <div class="procon">
+      <div class="pro">
+        <span class="h">強み</span>
+        <ul>
+          <li>グリフは全所バー地上で完全単一パレット（この軸では◎）</li>
+          <li>最も TUI ネイティブで媒体と喧嘩しない</li>
+        </ul>
+      </div>
+      <div class="con">
+        <span class="h">弱み</span>
+        <ul>
+          <li>カレント／アクティブの視認性が最弱。密度が上がるほど悪化</li>
+          <li>「色だけの案」に見えるが underline 対応・ラベル展開・塗り除去分岐が必要で、変更量は D3 とほぼ同等。<b>変更が小さいから D1、という選び方は成立しない</b></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= B ================= -->
+  <h2 id="b"><span class="hash">04</span>案B — Uniform dark chips</h2>
+  <p class="sec-note">全要素を同系の暗い chip に統一。アクティブは少し明るい地色＋bold＋underline。</p>
+
+  <section class="option">
+    <div class="ohead">
+      <span class="otag">B</span>
+      <h3>看板と実体の乖離 — chip が地に溶けて消える</h3>
+      <span class="obadge out">落選推奨</span>
+    </div>
+    <div class="term">
+      <p class="termlabel">status bar</p>
+      <div class="bar" style="background:#1e1d29">
+        <span class="grp">
+          <span class="chip b u" style="background:#3a3352;color:#eecb8a">🏠 home</span><span class="mk">①</span>
+          <span class="chip" style="background:#24233a;color:#8580a0">🌐</span>
+          <span class="chip" style="background:#24233a;color:#8580a0">🪪</span>
+        </span>
+        <span class="grp">
+          <span class="chip" style="background:#24233a;color:#8580a0"><span style="color:#ff6b6b">▲</span>2 proxy</span>
+          <span class="chip b u" style="background:#332f4d;color:#d3cfff"><span style="color:#5ad19a">●</span>3 vde</span>
+          <span class="chip" style="background:#24233a;color:#8580a0"><span style="color:#4dd4e8">✓</span>1 docs</span>
+          <span class="chip" style="background:#24233a;color:#8580a0"><span style="color:#8580a0">○</span>1 misc</span><span class="mk">②</span>
+        </span>
+        <span class="grp mid">
+          <span class="chip" style="background:#24233a;color:#8580a0">1:nvim</span>
+          <span class="chip b u" style="background:#3a3352;color:#d3cfff">2:zsh</span>
+          <span class="chip" style="background:#24233a;color:#8580a0">3:log<span style="color:#ff6b6b">!</span></span>
+          <span class="chip" style="background:#24233a;color:#8580a0">4:ssh</span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ff6b6b">▲</span><span style="color:#c6c3dd">1</span> <span style="color:#5ad19a">●</span><span style="color:#c6c3dd">1</span> <span style="color:#4dd4e8">✓</span><span style="color:#c6c3dd">1</span> <span style="color:#8580a0">○</span><span style="color:#c6c3dd">1</span></span>
+          <span style="color:#ff6b6b">▲ proxy · perm 2m</span>
+        </span>
+      </div>
+      <div class="crumb" style="background:#181824;color:#8994cd">
+        <span>1.5</span><span style="color:#4a4766">⟩</span><span>~/repos/vde-tmux</span><span style="color:#4a4766">⟩</span><span>node</span>
+      </div>
+    </div>
+    <ul class="caps">
+      <li><span class="mk">①</span>アクティブ chip #3a3352 vs 地 = 1.41、カレント chip 1.31、other 1.09。<b>chip 構造が視覚上ほぼ消え、実質 D1 にキャップのノイズと幅コストを足したものに退化する</b>。</li>
+      <li><span class="mk">②</span>idle #8580a0 on chip = 4.06 で、提案書の主張値 4.5 をやや割る。</li>
+    </ul>
+    <div class="crrow">
+      <span class="cr fail">active chip vs 地 1.41</span>
+      <span class="cr fail">current chip vs 地 1.31</span>
+      <span class="cr fail">other chip vs 地 1.09</span>
+      <span class="cr pass">● on chip 6.21〜8.01</span>
+      <span class="cr warn">○ on chip 4.06</span>
+      <span class="cr pass">文字 7.63 / 8.55</span>
+    </div>
+    <div class="procon">
+      <div class="pro">
+        <span class="h">強み</span>
+        <ul>
+          <li>chip が暗いのでグリフ単一パレットに近い（CR 4.1〜8.0）</li>
+          <li>構造は現状に近く変更は色中心</li>
+        </ul>
+      </div>
+      <div class="con">
+        <span class="h">弱み</span>
+        <ul>
+          <li>存在意義の「uniform chips」が CR 1.09〜1.41 で不可視。5案中で最も看板と実体が乖離</li>
+          <li>truecolor が効かない環境では微妙な暗色差が完全に潰れる</li>
+          <li>ラベル #eecb8a に暖色が残る</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= A ================= -->
+  <h2 id="a"><span class="hash">05</span>案A — Refined pastel（現状に近い）</h2>
+  <p class="sec-note">明るいパステル pill を維持し、ピーチをコーラル #f0b0a8 に置換。信号グリフは pill 内でだけ暗色化する。</p>
+
+  <section class="option">
+    <div class="ohead">
+      <span class="otag">A</span>
+      <h3>色相だけ動かす賭け — 二重パレットの恒久化</h3>
+      <span class="obadge out">非推奨</span>
+    </div>
+    <div class="term">
+      <p class="termlabel">status bar</p>
+      <div class="bar" style="background:#232332">
+        <span class="grp">
+          <span class="pill" style="background:#f0b0a8;color:#3a1f1a">🏠</span><span class="mk">①</span>
+          <span class="pill" style="background:#696288;color:#232332">🌐</span>
+          <span class="pill" style="background:#696288;color:#232332">🪪</span>
+        </span>
+        <span class="grp">
+          <span class="pill" style="background:#aec4f7;color:#232332"><span style="color:#991b1b">▲</span>2 proxy</span>
+          <span class="pill" style="background:#c9c6f7;color:#232332"><span style="color:#166534">●</span>3 vde</span><span class="mk">②</span>
+          <span class="pill" style="background:#aec4f7;color:#232332"><span style="color:#155e75">✓</span>1 docs</span>
+          <span class="pill" style="background:#aec4f7;color:#232332"><span style="color:#4b5563">○</span>1 misc</span>
+        </span>
+        <span class="grp mid">
+          <span style="color:#6e6a86">1:nvim</span>
+          <span class="b" style="color:#c9c6f7">2:zsh</span>
+          <span style="color:#6e6a86">3:log<span style="color:#f0b0a8">!</span></span>
+          <span style="color:#6e6a86">4:ssh</span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ea9a97">▲</span><span style="color:#c6c3dd">1</span> <span style="color:#b6e0a5">●</span><span style="color:#c6c3dd">1</span><span class="mk">③</span> <span style="color:#9ccfd8">✓</span><span style="color:#c6c3dd">1</span> <span style="color:#6e6a86">○</span><span style="color:#c6c3dd">1</span></span>
+          <span style="color:#ea9a97">▲ proxy · perm 2m</span>
+        </span>
+      </div>
+      <div class="crumb" style="background:#181824;color:#8994cd">
+        <span>1.5</span><span style="color:#4a4766">⟩</span><span>~/repos/vde-tmux</span><span style="color:#4a4766">⟩</span><span>node</span>
+      </div>
+    </div>
+    <ul class="caps">
+      <li><span class="mk">①</span>コーラルは色相調整に過ぎず、「明るい暖色 pill が不快」という主訴が再発するリスクが5案中最も高い。現行ピーチは CR 8.58 と高く、問題はコントラストではないため。</li>
+      <li><span class="mk">②</span>pill 内は暗緑 #166534（CR 4.38、4.5 未達）。</li>
+      <li><span class="mk">③</span>summary は明るい緑 — <b>同じ working 状態が場所によって別の色になる不一致</b>が仕様として固定される。</li>
+    </ul>
+    <div class="crrow">
+      <span class="cr pass">コーラル vs 地 8.45</span>
+      <span class="cr warn">暗緑 on pill 4.38</span>
+      <span class="cr fail">暗緑 on 地 2.17（流用不可）</span>
+    </div>
+    <div class="procon">
+      <div class="pro">
+        <span class="h">強み</span>
+        <ul>
+          <li>変更量が最小（ほぼ色置換のみ）</li>
+          <li>現状の見た目からの心理的乖離が小さい</li>
+        </ul>
+      </div>
+      <div class="con">
+        <span class="h">弱み</span>
+        <ul>
+          <li>二重パレット（pill 内暗色／summary 明色）を恒久化し、実装も状態×文脈の色分岐が必要に</li>
+          <li>明るいパステル pill は GUI 的で、多 session 密度で騒がしい</li>
+          <li>主訴①の解決確度が低い</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= C ================= -->
+  <h2 id="c"><span class="hash">06</span>案C — Mid solid</h2>
+  <p class="sec-note">中明度ソリッド pill に白文字。暖色を外し category をティール #3f9488 に、session current を #5b57b0 に。</p>
+
+  <section class="option">
+    <div class="ohead">
+      <span class="otag">C</span>
+      <h3>濁りは消えるが、彩度ブロックが騒がしい</h3>
+      <span class="obadge out">非推奨</span>
+    </div>
+    <div class="term">
+      <p class="termlabel">status bar</p>
+      <div class="bar" style="background:#232332">
+        <span class="grp">
+          <span class="pill" style="background:#3f9488;color:#ffffff">🏠</span><span class="mk">①</span>
+          <span class="pill" style="background:#4c4a80;color:#d5d3ea">🌐</span>
+          <span class="pill" style="background:#4c4a80;color:#d5d3ea">🪪</span>
+        </span>
+        <span class="grp">
+          <span class="pill" style="background:#4c4a80;color:#ffffff"><span style="color:#ff8f8a">▲</span>2 proxy</span>
+          <span class="pill" style="background:#5b57b0;color:#ffffff"><span style="color:#7fe0b0">●</span>3 vde</span>
+          <span class="pill" style="background:#4c4a80;color:#ffffff"><span style="color:#74dcef">✓</span>1 docs</span>
+          <span class="pill" style="background:#4c4a80;color:#ffffff"><span style="color:#a5a1c2">○</span>1 misc</span>
+        </span>
+        <span class="grp mid">
+          <span style="color:#8a86a0">1:nvim</span>
+          <span class="pill" style="background:#5b57b0;color:#ffffff">2:zsh</span>
+          <span style="color:#8a86a0">3:log<span style="color:#ff8f8a">!</span></span>
+          <span style="color:#8a86a0">4:ssh</span>
+        </span>
+        <span class="grp">
+          <span><span style="color:#ff8f8a">▲</span><span style="color:#c6c3dd">1</span> <span style="color:#7fe0b0">●</span><span style="color:#c6c3dd">1</span> <span style="color:#74dcef">✓</span><span style="color:#c6c3dd">1</span> <span style="color:#8a86a0">○</span><span style="color:#c6c3dd">1</span></span>
+          <span style="color:#ff8f8a">▲ proxy · perm 2m</span>
+        </span>
+      </div>
+      <div class="crumb" style="background:#181824;color:#8994cd">
+        <span>1.5</span><span style="color:#4a4766">⟩</span><span>~/repos/vde-tmux</span><span style="color:#4a4766">⟩</span><span>node</span>
+      </div>
+    </div>
+    <ul class="caps">
+      <li><span class="mk">①</span>白文字 on ティール = CR 3.62 でテキスト下限 4.5 未達。中明度地は「上に載せる色」の選択肢が構造的に狭い。</li>
+    </ul>
+    <div class="crrow">
+      <span class="cr pass">ティール vs 地 4.27</span>
+      <span class="cr warn">白 on ティール 3.62</span>
+      <span class="cr pass">白 on #5b57b0 6.11</span>
+    </div>
+    <div class="procon">
+      <div class="pro">
+        <span class="h">強み</span>
+        <ul>
+          <li>暖色を排除して濁り問題を確実に解消</li>
+          <li>変更は色置換中心で構造の変更が少ない</li>
+        </ul>
+      </div>
+      <div class="con">
+        <span class="h">弱み</span>
+        <ul>
+          <li>彩度ブロック多数で密度時に騒がしい（提案書も自認）</li>
+          <li>全部塗りのためカレントの相対的な強調が色相差頼みになり埋もれ気味</li>
+          <li>中明度地の上ではグリフの明ティントも輝度差を稼げない</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= score ================= -->
+  <h2 id="score"><span class="hash">§</span>採点マトリクス — 6評価軸</h2>
+  <p class="sec-note">◎ = 良、○ = 可、△ = 弱。根拠は各カードの実測値を参照。</p>
+  <div class="tablewrap">
+    <table class="score">
+      <thead>
+        <tr>
+          <th style="text-align:left">評価軸</th>
+          <th>D3</th>
+          <th class="reco-col">D3改</th>
+          <th>D1</th>
+          <th>B</th>
+          <th>A</th>
+          <th>C</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="axis">1. グリフ視認性・一貫性<span class="why">pill 内と summary で同じ色が使えるか</span></td>
+          <td><span class="s mid">○</span></td>
+          <td class="reco-col"><span class="s good">◎</span></td>
+          <td><span class="s good">◎</span></td>
+          <td><span class="s mid">○</span></td>
+          <td><span class="s weak">△</span></td>
+          <td><span class="s weak">△</span></td>
+        </tr>
+        <tr>
+          <td class="axis">2. category の濁り回避</td>
+          <td><span class="s good">◎</span></td>
+          <td class="reco-col"><span class="s good">◎</span></td>
+          <td><span class="s good">◎</span></td>
+          <td><span class="s mid">○</span></td>
+          <td><span class="s weak">△</span></td>
+          <td><span class="s good">◎</span></td>
+        </tr>
+        <tr>
+          <td class="axis">3. アクティブ/カレントの視認性</td>
+          <td><span class="s good">◎</span></td>
+          <td class="reco-col"><span class="s good">◎</span></td>
+          <td><span class="s weak">△</span></td>
+          <td><span class="s weak">△</span></td>
+          <td><span class="s mid">○</span></td>
+          <td><span class="s mid">○</span></td>
+        </tr>
+        <tr>
+          <td class="axis">4. 多密度での整理しやすさ</td>
+          <td><span class="s good">◎</span></td>
+          <td class="reco-col"><span class="s good">◎</span></td>
+          <td><span class="s mid">○</span></td>
+          <td><span class="s weak">△</span></td>
+          <td><span class="s weak">△</span></td>
+          <td><span class="s weak">△</span></td>
+        </tr>
+        <tr>
+          <td class="axis">5. TUI ネイティブ度</td>
+          <td><span class="s good">◎</span></td>
+          <td class="reco-col"><span class="s good">◎</span></td>
+          <td><span class="s good">◎</span></td>
+          <td><span class="s mid">○</span></td>
+          <td><span class="s weak">△</span></td>
+          <td><span class="s mid">○</span></td>
+        </tr>
+        <tr>
+          <td class="axis">6. 変更量（小さいほど良）</td>
+          <td><span class="s weak">△</span></td>
+          <td class="reco-col"><span class="s weak">△</span></td>
+          <td><span class="s weak">△</span></td>
+          <td><span class="s mid">○</span></td>
+          <td><span class="s good">◎</span></td>
+          <td><span class="s mid">○</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ================= issues ================= -->
+  <h2 id="issues"><span class="hash">§</span>5案とも見落としている論点</h2>
+  <div class="cards">
+    <div class="card">
+      <h4><span class="n">1</span>breadcrumb との輝度衝突</h4>
+      <p>バー地を #232332 → #1a1926 に落とすと breadcrumb 地 #181824 とほぼ同輝度になり、現在成立している「breadcrumb は一段暗い面」という区別が消える。D3 / D3改 / D1 採用時は breadcrumb 地の再調整（例 <b>#121218</b>）が必須の随伴作業。</p>
+    </div>
+    <div class="card">
+      <h4><span class="n">2</span>色覚多様性は形状が救っている</h4>
+      <p>blocked(赤) / working(緑) は deuteranopia で最悪の組だが、<b>▲●✓○ の形状冗長性</b>が既に耐性を担保している。将来グリフ形状を変える変更でこの冗長性を壊さないよう、設計制約として明文化すべき。</p>
+    </div>
+    <div class="card">
+      <h4><span class="n">3</span>痛点②の根本原因は ANSI 名前色</h4>
+      <p>グリフが淡いのは <code>mod.rs</code> が <code>"green"</code> 等を出力し、ターミナルテーマのパステル ANSI パレットに写像されるため。<b>どの案でも hex 直書きか設定化が必須の共通作業</b>。ただし現行の明 pill 上では暗色 hex が要り二重パレット化するので単体適用は不可。</p>
+    </div>
+    <div class="card">
+      <h4><span class="n">4</span>truecolor 前提の明文化</h4>
+      <p>hex 指定は <code>terminal-overrides</code> で Tc/RGB が有効でないと 256 色近似に落ち、微妙な暗色差（案B の chip 群など）は全滅する。採用案の前提条件としてドキュメント化が必要。</p>
+    </div>
+  </div>
+
+  <!-- ================= impl ================= -->
+  <h2 id="impl"><span class="hash">§</span>実装観点の懸念 — src/statusline/mod.rs</h2>
+  <ol class="impl">
+    <li>
+      <b>グリフ色は設定化すべき。</b>
+      <p><code>badge_fragment</code> / <code>category_badge_fragment</code>（mod.rs:216-221, 321-326）に色がハードコードされているが、pill 色は既に config 化されており非対称。hex を再ハードコードするより <code>badge.colors.{blocked,working,done,idle}</code>（既定値 = D3 の hex）として <code>badge.glyphs</code> と対に置くのが一貫する。</p>
+    </li>
+    <li>
+      <b>restore 機構が D3改と干渉する。</b>
+      <p><code>badge_fragment</code> はグリフ後に <code>#[fg={style.colors.fg}]</code> で復元する（mod.rs:329-330）が、グリフをセグメント外＝バー地に出す D3改では「グリフはバーの bg/fg → 矩形塗り」という並びになり、グリフとラベルが同一スタイル内という前提が崩れる。<code>render_session_segment</code> の <code>{badge}</code> トークン処理を「セグメント外プレフィックス」に昇格させる改修が要る。矩形採用でキャップ glyph の描画処理自体は不要になるため、改修の正味量はむしろ減る。</p>
+    </li>
+    <li>
+      <b>underline 属性が未実装。</b>
+      <p><code>tmux_style_segment</code> は bold のみ対応に見える。D1/D3 系のカレント表現に使うなら、tmux では <code>#[underscore]</code>（<code>underline</code> ではない）の属性追加が config・レンダラ双方に必要。</p>
+    </li>
+    <li>
+      <b>ラベル展開による幅ジッタ。</b>
+      <p>アクティブ category のラベル展開は status-left の幅を動的に変え、category 切替のたびに window list の開始位置が揺れる。<code>status-left-length</code> の余裕確保と展開幅の上限（truncate）を決めておかないと、多 session 時に window list が押し出される。</p>
+    </li>
+    <li>
+      <b>D1 の隠れコスト。</b>
+      <p>D1 は「色だけの案」に見えるが、underline 対応・ラベル展開・塗り描画の除去分岐が必要で変更量は D3 とほぼ同等。変更量最小を優先するなら A だが、主訴解決の確度が低い。</p>
+    </li>
+  </ol>
+
+  <div class="foot">
+    <p>・コントラスト比は WCAG 2.x 相対輝度による実測（追試済み）。テキストの推奨下限 4.5:1、非テキスト要素の下限 3:1。</p>
+    <p>・モックアップの pill の丸みは border-radius による近似。実装では powerline キャップ glyph（ 等）で描画される。</p>
+    <p>・元となったモックアップ：<a href="https://claude.ai/code/artifact/b208ff83-efb9-4508-9e53-aea3e82dff48">配色改善案（作成者版）</a></p>
+  </div>
+</div>

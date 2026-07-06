@@ -106,6 +106,62 @@ set -g status-right '#(vt statusline-attention) #(vt statusline-summary)'
 `statusline-attention` は見えていない session の blocked agent を `▲ session · perm 2m` 形式で表示する。
 daemon heartbeat が stale になると、`statusline-sessions` の既存バッジは `?` に置き換わる。
 
+### D3改配色（推奨プリセット）
+
+設計根拠と全案比較は `docs/statusline-color-proposals.html` を参照。
+状態グリフは常にバー地の上に置き、塗りはカレント要素の名前だけに使う。
+
+```yaml
+# ~/.config/vde/tmux/config.yml
+statusline:
+  category:
+    mode: list
+    format: "{category} {name} "
+    inactive_format: "{category} "
+    colors:
+      fg: "#ecebff"
+      bg: "#453f9e"
+    inactive_colors:
+      fg: "#9591ad"
+
+  sessions:
+    badge_style: outer
+    current:
+      format: " {session} "
+      bold: true
+      colors:
+        fg: "#ecebff"
+        bg: "#453f9e"
+    other:
+      format: " {session} "
+      colors:
+        fg: "#9591ad"
+
+# badge.colors は既定で D3改の hex（変更する場合のみ記述）
+# badge:
+#   colors:
+#     blocked: "#ff6b6b"
+#     working: "#4fd08a"
+#     done: "#45cbe6"
+#     idle: "#6f6b85"
+```
+
+```tmux
+# ~/.tmux.conf
+set -ga terminal-overrides ',*:Tc'
+set -g status-style 'bg=#1a1926,fg=#9591ad'
+set -g status-left-length 60
+set -g window-status-format '#[fg=#9591ad] #I:#W '
+set -g window-status-current-format '#[fg=#ecebff,bg=#453f9e] #I:#W '
+set -g window-status-bell-style 'fg=#ff6b6b'
+set -g window-status-activity-style 'fg=#ff6b6b'
+```
+
+塗りは矩形で使う。
+powerline キャップを `prefix` / `suffix` に設定すると、外置きグリフとカプセル形状が視覚的に衝突する。
+breadcrumb 等でバーの下に別の面を重ねている場合、その地色を `#121218` 目安まで一段暗くしないとバー地 `#1a1926` と同化する。
+hex 色をそのまま使うには tmux の truecolor 設定が必要になる。
+
 ## Sidebar Detail View
 
 sidebar の Standard 幅で chat 行を展開すると、chat 行自体は agent 名のみを表示し、右ラベルは出さない。prompt は展開内の先頭 detail 行に集約する。

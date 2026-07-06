@@ -724,7 +724,7 @@ impl RuntimeState {
                 (BadgeState::Done, done),
                 (BadgeState::Idle, idle),
             ],
-            &self.config.badge.glyphs,
+            &self.config.badge,
         )
     }
 
@@ -1727,7 +1727,7 @@ mod tests {
         let ServerMessage::Summary { text } = receiver.recv().unwrap() else {
             panic!("expected summary");
         };
-        assert_eq!(text, "#[fg=green]●1#[default]");
+        assert_eq!(text, "#[fg=#4fd08a]●1#[default]");
     }
 
     #[test]
@@ -1747,7 +1747,7 @@ mod tests {
         assert_eq!(
             message,
             ServerMessage::Summary {
-                text: "#[fg=green]●1#[default] #[fg=cyan]✓1#[default]".to_string()
+                text: "#[fg=#4fd08a]●1#[default] #[fg=#45cbe6]✓1#[default]".to_string()
             }
         );
     }

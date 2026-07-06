@@ -506,7 +506,7 @@ mod tests {
         assert_eq!(
             response,
             ServerMessage::Summary {
-                text: "#[fg=green]●1#[default]".to_string()
+                text: "#[fg=#4fd08a]●1#[default]".to_string()
             }
         );
     }
@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(
             reply_rx.recv().unwrap(),
             ServerMessage::Summary {
-                text: "#[fg=green]●1#[default]".to_string()
+                text: "#[fg=#4fd08a]●1#[default]".to_string()
             }
         );
         assert_eq!(io.jumps.lock().unwrap().as_slice(), ["%1"]);

@@ -302,7 +302,7 @@ fn dispatch_statusline_summary_falls_back_to_tmux_snapshot() {
         ),
     )]);
     let output = run_with(["vt", "statusline-summary"], &mock, &env).unwrap();
-    assert_eq!(output, Some("#[fg=green]●1#[default]".to_string()));
+    assert_eq!(output, Some("#[fg=#4fd08a]●1#[default]".to_string()));
 }
 
 #[test]

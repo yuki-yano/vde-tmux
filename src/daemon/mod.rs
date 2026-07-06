@@ -101,23 +101,20 @@ pub fn build_snapshot_with_sidebar(
 
 pub fn render_summary(
     counts: &[(BadgeState, usize)],
-    glyphs: &crate::config::BadgeGlyphs,
+    badge: &crate::config::BadgeConfig,
 ) -> String {
-    let color = |state: BadgeState| match state {
-        BadgeState::Blocked => Some("red"),
-        BadgeState::Working => Some("green"),
-        BadgeState::Done => Some("cyan"),
-        BadgeState::Idle => None,
-    };
     counts
         .iter()
         .filter(|(_, count)| *count > 0)
         .map(|(state, count)| {
-            let glyph = glyph_for_state(*state, glyphs);
-            match color(*state) {
-                Some(color) => format!("#[fg={color}]{glyph}{count}#[default]"),
-                None => format!("{glyph}{count}"),
-            }
+            let glyph = glyph_for_state(*state, &badge.glyphs);
+            let color = match state {
+                BadgeState::Blocked => &badge.colors.blocked,
+                BadgeState::Working => &badge.colors.working,
+                BadgeState::Done => &badge.colors.done,
+                BadgeState::Idle => &badge.colors.idle,
+            };
+            format!("#[fg={color}]{glyph}{count}#[default]")
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -161,7 +158,7 @@ pub fn statusline_summary_fallback(
     if config.statusline.summary.hide_idle {
         counts[3].1 = 0;
     }
-    Ok(render_summary(&counts, &config.badge.glyphs))
+    Ok(render_summary(&counts, &config.badge))
 }
 
 pub fn statusline_summary(
@@ -436,7 +433,7 @@ mod tests {
     #[test]
     fn render_summary_counts_states_with_markup_and_omits_zero() {
         use crate::daemon::session_badge::BadgeState;
-        let glyphs = crate::config::BadgeGlyphs::default();
+        let badge = crate::config::BadgeConfig::default();
         let counts = [
             (BadgeState::Blocked, 2),
             (BadgeState::Working, 1),
@@ -444,16 +441,16 @@ mod tests {
             (BadgeState::Idle, 3),
         ];
         assert_eq!(
-            render_summary(&counts, &glyphs),
-            "#[fg=red]▲2#[default] #[fg=green]●1#[default] ○3"
+            render_summary(&counts, &badge),
+            "#[fg=#ff6b6b]▲2#[default] #[fg=#4fd08a]●1#[default] #[fg=#6f6b85]○3#[default]"
         );
     }
 
     #[test]
     fn render_summary_is_empty_without_agents() {
-        let glyphs = crate::config::BadgeGlyphs::default();
+        let badge = crate::config::BadgeConfig::default();
         let counts = [];
-        assert_eq!(render_summary(&counts, &glyphs), "");
+        assert_eq!(render_summary(&counts, &badge), "");
     }
 
     #[test]
@@ -463,8 +460,8 @@ mod tests {
         )]);
 
         assert_eq!(
-            render_summary(&counts, &crate::config::BadgeGlyphs::default()),
-            "○1"
+            render_summary(&counts, &crate::config::BadgeConfig::default()),
+            "#[fg=#6f6b85]○1#[default]"
         );
     }
 

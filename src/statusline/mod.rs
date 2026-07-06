@@ -105,14 +105,19 @@ pub fn render_statusline_sessions_with_stale(
                 &session.badge
             };
             let state = if stale { "" } else { &session.state };
+            let label = if config.statusline.sessions.show_index {
+                format!("{} {}", index + 1, session.name)
+            } else {
+                session.name.clone()
+            };
             let segment = render_session_segment(
                 style,
                 badge,
                 state,
-                &session.name,
+                &label,
                 index,
-                config.statusline.sessions.show_index,
                 config.statusline.sessions.badge_style,
+                &config.badge.colors,
             );
             // クリックで switch-client できるよう tmux の session range で包む
             // (.tmux.conf 側の MouseDown1Status バインドが `-t =` で拾う)
@@ -166,11 +171,14 @@ pub fn render_statusline_category(
                 &config.statusline.category.inactive_colors
             };
             let badge = category_badge_fragment(config, &category_sessions, colors);
-            let body = config
-                .statusline
-                .category
-                .format
+            let format = if active {
+                &config.statusline.category.format
+            } else {
+                &config.statusline.category.inactive_format
+            };
+            let body = format
                 .replace("{category}", label)
+                .replace("{name}", category)
                 .replace("{count}", &category_sessions.len().to_string())
                 .replace("{badge}", &badge);
             let segment = tmux_style_category(&config.statusline.category, &body, active);
@@ -213,13 +221,7 @@ fn category_badge_fragment(
         "done" => &glyphs.done,
         _ => &glyphs.idle,
     };
-    let color = match state {
-        "blocked" => Some("red"),
-        "working" => Some("green"),
-        "done" => Some("cyan"),
-        _ => None,
-    };
-    match color {
+    match config.badge.colors.for_state(state) {
         Some(color) => {
             let restore = colors.fg.as_deref().unwrap_or("default");
             format!("#[fg={color}]{glyph}#[fg={restore}]")
@@ -275,17 +277,28 @@ fn render_session_segment(
     style: &SegmentStyle,
     badge: &str,
     state: &str,
-    session_name: &str,
+    label: &str,
     index: usize,
-    show_index: bool,
     badge_style: BadgeStyle,
+    colors: &crate::config::BadgeColors,
 ) -> String {
-    let label = if show_index {
-        format!("{} {session_name}", index + 1)
-    } else {
-        session_name.to_string()
-    };
-    let fragment = badge_fragment(badge, state, style, badge_style);
+    if badge_style == BadgeStyle::Outer {
+        let body = style
+            .format
+            .replace("{badge}", "")
+            .replace("{session}", label)
+            .replace("{index}", &(index + 1).to_string());
+        let segment = tmux_style_segment(style, &body);
+        if badge.is_empty() {
+            return segment;
+        }
+        let glyph = match colors.for_state(state) {
+            Some(color) => format!("#[fg={color}]{badge}#[default]"),
+            None => badge.to_string(),
+        };
+        return format!("{glyph} {segment}");
+    }
+    let fragment = badge_fragment(badge, state, style, badge_style, colors);
     // format に {badge} があればそこへ(存在時のみ末尾スペース付き)、
     // 無ければ従来どおりラベル直前へ密着連結する。
     let (badge_token, label) = if style.format.contains("{badge}") {
@@ -294,7 +307,7 @@ fn render_session_segment(
         } else {
             format!("{fragment} ")
         };
-        (token, label)
+        (token, label.to_string())
     } else {
         (String::new(), format!("{fragment}{label}"))
     };
@@ -311,6 +324,7 @@ fn badge_fragment(
     state: &str,
     style: &SegmentStyle,
     badge_style: BadgeStyle,
+    colors: &crate::config::BadgeColors,
 ) -> String {
     if badge.is_empty() {
         return String::new();
@@ -318,13 +332,7 @@ fn badge_fragment(
     if badge_style == BadgeStyle::Plain {
         return badge.to_string();
     }
-    let color = match state {
-        "blocked" => Some("red"),
-        "working" => Some("green"),
-        "done" => Some("cyan"),
-        _ => None,
-    };
-    match color {
+    match colors.for_state(state) {
         Some(color) => {
             let restore = style.colors.fg.as_deref().unwrap_or("default");
             format!("#[fg={color}]{badge}#[fg={restore}]")
@@ -397,6 +405,13 @@ mod tests {
         }
     }
 
+    fn session_with_badge(name: &str, category: &str, badge: &str, state: &str) -> SessionInfo {
+        let mut session = session(name, category);
+        session.badge = badge.to_string();
+        session.state = state.to_string();
+        session
+    }
+
     #[test]
     fn renders_sessions_with_current_marker() {
         let config = Config::default();
@@ -444,7 +459,7 @@ mod tests {
         main.state = "blocked".to_string();
         let rendered = render_statusline_sessions(&config, &[main], "main", "work");
         assert!(
-            rendered.contains("#[fg=red]▲#[fg=default]main"),
+            rendered.contains("#[fg=#ff6b6b]▲#[fg=default]main"),
             "{rendered}"
         );
     }
@@ -452,13 +467,14 @@ mod tests {
     #[test]
     fn inline_badge_restores_configured_segment_fg() {
         let mut config = Config::default();
+        config.badge.colors.working = "#00ff00".to_string();
         config.statusline.sessions.other.colors.fg = Some("white".to_string());
         let mut sub = session("sub", "work");
         sub.badge = "●".to_string();
         sub.state = "working".to_string();
         let rendered = render_statusline_sessions(&config, &[sub], "main", "work");
         assert!(
-            rendered.contains("#[fg=green]●#[fg=white]sub"),
+            rendered.contains("#[fg=#00ff00]●#[fg=white]sub"),
             "{rendered}"
         );
     }
@@ -471,7 +487,10 @@ mod tests {
         main.state = "blocked".to_string();
         let rendered = render_statusline_sessions(&config, &[main], "main", "work");
 
-        assert_eq!(rendered, "#[bold] #[fg=red]▲#[fg=default]main #[default]");
+        assert_eq!(
+            rendered,
+            "#[bold] #[fg=#ff6b6b]▲#[fg=default]main #[default]"
+        );
     }
 
     #[test]
@@ -483,7 +502,32 @@ mod tests {
         main.state = "blocked".to_string();
         let rendered = render_statusline_sessions(&config, &[main], "main", "work");
         assert!(rendered.contains("▲main"), "{rendered}");
-        assert!(!rendered.contains("#[fg=red]"), "{rendered}");
+        assert!(!rendered.contains("#[fg=#ff6b6b]"), "{rendered}");
+    }
+
+    #[test]
+    fn outer_badge_places_glyph_on_bar_before_segment() {
+        let mut config = Config::default();
+        config.statusline.sessions.badge_style = BadgeStyle::Outer;
+        config.statusline.sessions.current.colors.fg = Some("#ecebff".to_string());
+        config.statusline.sessions.current.colors.bg = Some("#453f9e".to_string());
+        let sessions = vec![session_with_badge("main", "work", "●", "working")];
+        let rendered = render_statusline_sessions(&config, &sessions, "main", "work");
+        assert!(
+            rendered
+                .contains("#[fg=#4fd08a]●#[default] #[bold,fg=#ecebff,bg=#453f9e] main #[default]"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn outer_badge_without_badge_renders_segment_only() {
+        let mut config = Config::default();
+        config.statusline.sessions.badge_style = BadgeStyle::Outer;
+        let sessions = vec![session("main", "work")];
+        let rendered = render_statusline_sessions(&config, &sessions, "main", "work");
+        assert!(!rendered.contains("#[default] #[bold]"), "{rendered}");
+        assert!(rendered.contains("#[bold] main #[default]"), "{rendered}");
     }
 
     #[test]
@@ -536,6 +580,29 @@ mod tests {
     }
 
     #[test]
+    fn active_category_can_expand_name_while_inactive_uses_inactive_format() {
+        let mut config = Config::default();
+        config.statusline.category.format = "{category} {name} ".to_string();
+        config.statusline.category.inactive_format = "{category} ".to_string();
+        config
+            .categories
+            .display_names
+            .insert("work".into(), "W".into());
+        config
+            .categories
+            .display_names
+            .insert("private".into(), "P".into());
+        let rendered = render_statusline_category(
+            &config,
+            &[session("a", "work"), session("b", "private")],
+            "work",
+        );
+        assert!(rendered.contains("W work "), "{rendered}");
+        assert!(rendered.contains("P "), "{rendered}");
+        assert!(!rendered.contains("P private"), "{rendered}");
+    }
+
+    #[test]
     fn show_index_uses_space_separator() {
         let mut config = Config::default();
         config.statusline.sessions.show_index = true;
@@ -563,7 +630,7 @@ mod tests {
             render_statusline_sessions(&config, &[main, session("sub", "work")], "main", "work");
         // badge あり: グリフの後にスペース1つ → "▲ 1 main"
         assert!(
-            rendered.contains("#[fg=red]▲#[fg=default] 1 main"),
+            rendered.contains("#[fg=#ff6b6b]▲#[fg=default] 1 main"),
             "{rendered}"
         );
         // badge なし: 余分なスペースが残らない → " 2 sub "
@@ -587,6 +654,7 @@ mod tests {
         let mut config = Config::default();
         config.statusline.category.format = "{badge}{category} ".to_string();
         config.statusline.category.show_badge = true;
+        config.badge.colors.blocked = "#aa0000".to_string();
         config.statusline.category.colors.fg = Some("#1C1C1C".to_string());
         let mut blocked = session("a", "work");
         blocked.state = "blocked".to_string();
@@ -594,13 +662,13 @@ mod tests {
         working.state = "working".to_string();
         let rendered = render_statusline_category(&config, &[blocked, working], "work");
         assert!(
-            rendered.contains("#[fg=red]▲#[fg=#1C1C1C]work"),
+            rendered.contains("#[fg=#aa0000]▲#[fg=#1C1C1C]work"),
             "{rendered}"
         );
     }
 
     #[test]
-    fn category_badge_is_empty_without_agent_state_and_idle_is_plain() {
+    fn category_badge_is_empty_without_agent_state_and_idle_is_colored() {
         let mut config = Config::default();
         config.statusline.category.format = "{badge}{category} ".to_string();
         config.statusline.category.show_badge = true;
@@ -611,19 +679,21 @@ mod tests {
             !rendered.contains("▲") && !rendered.contains("○"),
             "{rendered}"
         );
-        // idle のみ → 無彩の ○
+        // idle のみ → 色付きの ○
         let mut idle = session("a", "work");
         idle.state = "idle".to_string();
         let rendered = render_statusline_category(&config, &[idle], "work");
-        assert!(rendered.contains("○work"), "{rendered}");
-        assert!(!rendered.contains("#[fg=red]"), "{rendered}");
+        assert!(
+            rendered.contains("#[fg=#6f6b85]○#[fg=default]work"),
+            "{rendered}"
+        );
     }
 
     #[test]
     fn attention_segment_defaults_to_red_text() {
         let config = Config::default();
         let rendered = render_attention_segment(&config.statusline.attention, "▲ proxy · perm 2m");
-        assert_eq!(rendered, "#[fg=red]▲ proxy · perm 2m#[default]");
+        assert_eq!(rendered, "#[fg=#ff6b6b]▲ proxy · perm 2m#[default]");
     }
 
     #[test]
@@ -707,6 +777,7 @@ mod tests {
     fn category_format_supports_count_placeholder() {
         let mut config = Config::default();
         config.statusline.category.format = "{category} {count} ".to_string();
+        config.statusline.category.inactive_format = "{category} {count} ".to_string();
         let rendered = render_statusline_category(
             &config,
             &[

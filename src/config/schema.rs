@@ -44,6 +44,16 @@ pub fn config_schema() -> Value {
                             "done": { "type": "string" },
                             "idle": { "type": "string" }
                         }
+                    },
+                    "colors": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "blocked": { "type": "string" },
+                            "working": { "type": "string" },
+                            "done": { "type": "string" },
+                            "idle": { "type": "string" }
+                        }
                     }
                 }
             },
@@ -72,8 +82,18 @@ pub fn config_schema() -> Value {
                         "properties": {
                             "badge_style": {
                                 "type": "string",
-                                "enum": ["inline", "plain"]
+                                "enum": ["inline", "plain", "outer"]
                             }
+                        }
+                    },
+                    "category": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "mode": { "type": "string" },
+                            "format": { "type": "string" },
+                            "inactive_format": { "type": "string" },
+                            "show_badge": { "type": "boolean" }
                         }
                     },
                     "session_badge": {
@@ -275,6 +295,8 @@ mod tests {
 
         let badge = &schema["properties"]["badge"]["properties"]["glyphs"]["properties"];
         assert_eq!(badge["working"]["type"], "string");
+        let badge_colors = &schema["properties"]["badge"]["properties"]["colors"]["properties"];
+        assert_eq!(badge_colors["working"]["type"], "string");
         assert!(
             schema["properties"]["statusline"]["properties"]["session_badge"]["properties"]
                 .get("glyphs")
@@ -290,9 +312,19 @@ mod tests {
             "boolean"
         );
         assert_eq!(
+            schema["properties"]["statusline"]["properties"]["category"]["properties"]["inactive_format"]
+                ["type"],
+            "string"
+        );
+        assert_eq!(
             schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["badge_style"]
                 ["enum"][0],
             "inline"
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["badge_style"]
+                ["enum"][2],
+            "outer"
         );
     }
 }

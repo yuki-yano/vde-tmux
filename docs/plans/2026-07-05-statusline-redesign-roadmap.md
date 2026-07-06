@@ -17,6 +17,8 @@ tmux ステータスライン再設計(背景と設計判断は `docs/statusline
 | 3 | `2026-07-05-plan-21-statusline-phase3.md` | 案A-lite(`@vde_session_state` 配信・badge_style inline・category {count}) | Plan 19, 20 |
 | 4 | `2026-07-05-plan-22-statusline-phase4.md` | `statusline-attention`・heartbeat / stale・README 文書化 | Plan 19〜21 + sidebar Plan 15 |
 
+- Plan 25: D3改配色（signal fg ＋ 矩形 accent-active） — `docs/plans/2026-07-06-plan-25-statusline-d3x-colors.md`
+
 **必ずこの順で、1 Plan ずつ完了させる。** 各 Plan 内も Task 順(TDD: 失敗テスト → 実装 → 全テスト → コミット)を守る。Plan を跨いだ先取り実装はしない。
 
 ## 各 Plan 共通のゲート(次の Plan に進む条件)

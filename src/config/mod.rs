@@ -108,6 +108,7 @@ pub enum BadgeStyle {
     #[default]
     Inline,
     Plain,
+    Outer,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -146,6 +147,7 @@ pub struct StatuslineCategoryConfig {
     /// "list"(全カテゴリ列挙)または "current"(現在のみ)。
     pub mode: String,
     pub format: String,
+    pub inactive_format: String,
     pub prefix: String,
     pub suffix: String,
     /// 非アクティブ category 用の prefix/suffix。未設定(空)なら prefix/suffix を共用する。
@@ -164,6 +166,7 @@ impl Default for StatuslineCategoryConfig {
         Self {
             mode: "list".to_string(),
             format: "{category} ".to_string(),
+            inactive_format: "{category} ".to_string(),
             prefix: String::new(),
             suffix: String::new(),
             inactive_prefix: String::new(),
@@ -213,7 +216,7 @@ impl Default for AttentionConfig {
             suffix: String::new(),
             bold: false,
             colors: SegmentColors {
-                fg: Some("red".to_string()),
+                fg: Some("#ff6b6b".to_string()),
                 bg: None,
                 outer_bg: None,
             },
@@ -244,6 +247,7 @@ impl Default for SessionBadgeConfig {
 #[serde(default)]
 pub struct BadgeConfig {
     pub glyphs: BadgeGlyphs,
+    pub colors: BadgeColors,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -262,6 +266,38 @@ impl Default for BadgeGlyphs {
             working: "●".to_string(),
             done: "✓".to_string(),
             idle: "○".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct BadgeColors {
+    pub blocked: String,
+    pub working: String,
+    pub done: String,
+    pub idle: String,
+}
+
+impl Default for BadgeColors {
+    fn default() -> Self {
+        Self {
+            blocked: "#ff6b6b".to_string(),
+            working: "#4fd08a".to_string(),
+            done: "#45cbe6".to_string(),
+            idle: "#6f6b85".to_string(),
+        }
+    }
+}
+
+impl BadgeColors {
+    pub fn for_state(&self, state: &str) -> Option<&str> {
+        match state {
+            "blocked" => Some(self.blocked.as_str()),
+            "working" => Some(self.working.as_str()),
+            "done" => Some(self.done.as_str()),
+            "idle" => Some(self.idle.as_str()),
+            _ => None,
         }
     }
 }
@@ -703,6 +739,10 @@ categories:
         assert_eq!(badge.glyphs.working, "●");
         assert_eq!(badge.glyphs.done, "✓");
         assert_eq!(badge.glyphs.idle, "○");
+        assert_eq!(badge.colors.blocked, "#ff6b6b");
+        assert_eq!(badge.colors.working, "#4fd08a");
+        assert_eq!(badge.colors.done, "#45cbe6");
+        assert_eq!(badge.colors.idle, "#6f6b85");
     }
 
     #[test]
@@ -741,6 +781,20 @@ categories:
         )
         .unwrap_err();
         assert!(err.to_string().contains("glyphs"));
+    }
+
+    #[test]
+    fn badge_colors_can_be_overridden_in_yaml() {
+        let config = serde_yaml_ng::from_str::<Config>(
+            r##"
+badge:
+  colors:
+    working: "#00ff00"
+"##,
+        )
+        .unwrap();
+        assert_eq!(config.badge.colors.working, "#00ff00");
+        assert_eq!(config.badge.colors.blocked, "#ff6b6b");
     }
 
     #[test]
