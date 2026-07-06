@@ -1457,8 +1457,26 @@ mod tests {
     fn jump_to_pane_switches_session_window_and_pane() {
         let mock = MockTmuxRunner::new();
         let line = [
-            "main", "@1", "%1", "/tmp", "zsh", "0", "0", "", "codex", "running", "", "", "", "",
-            "", "", "", "",
+            "main",
+            "@1",
+            "%1",
+            "/tmp",
+            "zsh",
+            "/dev/ttys001",
+            "123",
+            "0",
+            "0",
+            "",
+            "codex",
+            "running",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
         ]
         .join("\u{1f}");
         mock.stub(

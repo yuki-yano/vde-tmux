@@ -1,6 +1,9 @@
 //! 全 pane の @vde_* 状態を list-panes 1 コールで取得する一括 reader。
 //! daemon の tmux worker と statusline フォールバックの両方がこれを使う。
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::process::Command;
+
 use anyhow::Result;
 
 use super::PANE_STATE_KEYS;
@@ -16,6 +19,8 @@ pub struct PaneSnapshot {
     pub pane_id: String,
     pub current_path: String,
     pub current_command: String,
+    pub pane_tty: String,
+    pub pane_pid: String,
     /// この pane の window がセッションのカレント window か(#{window_active})。
     pub window_active: bool,
     /// セッションにクライアントがアタッチされているか(#{session_attached} > 0)。
@@ -34,7 +39,7 @@ pub struct PaneSnapshot {
 }
 
 /// list-panes -a に渡す -F フォーマット文字列を組み立てる。
-/// 固定 7 フィールド + @vde_sidebar + PANE_STATE_KEYS の順。
+/// 固定 9 フィールド + @vde_sidebar + PANE_STATE_KEYS の順。
 pub fn snapshot_format() -> String {
     let mut fields: Vec<String> = vec![
         "#{session_name}".into(),
@@ -42,6 +47,8 @@ pub fn snapshot_format() -> String {
         "#{pane_id}".into(),
         "#{pane_current_path}".into(),
         "#{pane_current_command}".into(),
+        "#{pane_tty}".into(),
+        "#{pane_pid}".into(),
         "#{window_active}".into(),
         "#{session_attached}".into(),
         format!("#{{{key}}}", key = super::KEY_SIDEBAR_MARKER),
@@ -53,7 +60,7 @@ pub fn snapshot_format() -> String {
 /// list-panes -a の出力(snapshot_format 準拠)をパースする。
 /// フィールド数が合わない行はスキップして残りを返す(壊れた 1 行で全体を落とさない)。
 pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
-    let expected = 8 + PANE_STATE_KEYS.len();
+    let expected = 10 + PANE_STATE_KEYS.len();
     output
         .lines()
         .filter_map(|line| {
@@ -67,19 +74,21 @@ pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
                 pane_id: fields[2].to_string(),
                 current_path: fields[3].to_string(),
                 current_command: fields[4].to_string(),
-                window_active: fields[5] == "1",
-                session_attached: !fields[6].is_empty() && fields[6] != "0",
-                is_sidebar: fields[7] == "1",
-                agent: fields[8].to_string(),
-                status: fields[9].to_string(),
-                prompt: fields[10].to_string(),
-                prompt_source: fields[11].to_string(),
-                wait_reason: fields[12].to_string(),
-                attention: fields[13].to_string(),
-                started_at: fields[14].to_string(),
-                completed_at: fields[15].to_string(),
-                tasks: fields[16].to_string(),
-                subagents: fields[17].to_string(),
+                pane_tty: fields[5].to_string(),
+                pane_pid: fields[6].to_string(),
+                window_active: fields[7] == "1",
+                session_attached: !fields[8].is_empty() && fields[8] != "0",
+                is_sidebar: fields[9] == "1",
+                agent: fields[10].to_string(),
+                status: fields[11].to_string(),
+                prompt: fields[12].to_string(),
+                prompt_source: fields[13].to_string(),
+                wait_reason: fields[14].to_string(),
+                attention: fields[15].to_string(),
+                started_at: fields[16].to_string(),
+                completed_at: fields[17].to_string(),
+                tasks: fields[18].to_string(),
+                subagents: fields[19].to_string(),
             })
         })
         .collect()
@@ -89,7 +98,9 @@ pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
 pub fn read_all_panes(runner: &dyn TmuxRunner) -> Result<Vec<PaneSnapshot>> {
     let format = snapshot_format();
     let output = runner.run(&["list-panes", "-a", "-F", &format])?;
-    Ok(parse_snapshot_lines(&output))
+    let mut panes = parse_snapshot_lines(&output);
+    enrich_agents_from_processes(&mut panes);
+    Ok(panes)
 }
 
 pub fn detect_agent_from_command(command: &str) -> Option<&'static str> {
@@ -107,6 +118,165 @@ pub fn detect_agent_from_command(command: &str) -> Option<&'static str> {
         "opencode" => Some("opencode"),
         _ => None,
     }
+}
+
+fn detect_agent_from_hint(hint: &str) -> Option<&'static str> {
+    let lower = hint.to_ascii_lowercase();
+    if lower.contains("codex") {
+        Some("codex")
+    } else if lower.contains("claude") {
+        Some("claude")
+    } else if lower.contains("opencode") {
+        Some("opencode")
+    } else {
+        None
+    }
+}
+
+fn detect_agent_from_tty_commands(commands: &str) -> Option<&'static str> {
+    detect_agent_from_hint(commands)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessEntry {
+    command: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ProcessSnapshot {
+    by_pid: BTreeMap<i64, ProcessEntry>,
+    children: BTreeMap<i64, Vec<i64>>,
+}
+
+impl ProcessSnapshot {
+    fn parse(output: &str) -> Self {
+        let mut snapshot = Self::default();
+        for line in output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let mut fields = line.splitn(3, char::is_whitespace);
+            let Some(pid) = fields.next().and_then(|value| value.parse::<i64>().ok()) else {
+                continue;
+            };
+            let Some(ppid) = fields
+                .next()
+                .and_then(|value| value.trim().parse::<i64>().ok())
+            else {
+                continue;
+            };
+            let command = fields.next().unwrap_or("").trim().to_string();
+            snapshot.by_pid.insert(pid, ProcessEntry { command });
+            snapshot.children.entry(ppid).or_default().push(pid);
+        }
+        snapshot
+    }
+
+    fn find_agent_from_pid_tree(&self, root_pid: i64) -> Option<&'static str> {
+        let mut stack = vec![root_pid];
+        let mut visited = BTreeSet::new();
+        while let Some(pid) = stack.pop() {
+            if !visited.insert(pid) {
+                continue;
+            }
+            if let Some(entry) = self.by_pid.get(&pid)
+                && let Some(agent) = detect_agent_from_hint(&entry.command)
+            {
+                return Some(agent);
+            }
+            if let Some(children) = self.children.get(&pid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        None
+    }
+}
+
+fn enrich_agents_from_processes(panes: &mut [PaneSnapshot]) {
+    if !panes.iter().any(needs_process_agent_detection) {
+        return;
+    }
+    let Some(processes) = read_process_snapshot() else {
+        enrich_agents_from_ttys(panes);
+        return;
+    };
+    for pane in panes.iter_mut().filter(|pane| {
+        pane.agent.trim().is_empty() && detect_agent_from_command(&pane.current_command).is_none()
+    }) {
+        let Some(pid) = pane.pane_pid.trim().parse::<i64>().ok() else {
+            continue;
+        };
+        if let Some(agent) = processes.find_agent_from_pid_tree(pid) {
+            pane.agent = agent.to_string();
+        }
+    }
+    enrich_agents_from_ttys(panes);
+}
+
+fn needs_process_agent_detection(pane: &PaneSnapshot) -> bool {
+    pane.agent.trim().is_empty() && detect_agent_from_command(&pane.current_command).is_none()
+}
+
+fn read_process_snapshot() -> Option<ProcessSnapshot> {
+    let output = Command::new("ps")
+        .args(["-ax", "-o", "pid=,ppid=,command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(ProcessSnapshot::parse(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn enrich_agents_from_ttys(panes: &mut [PaneSnapshot]) {
+    let mut tty_agents = BTreeMap::new();
+    let ttys = panes
+        .iter()
+        .filter(|pane| needs_process_agent_detection(pane))
+        .filter_map(|pane| normalize_tty(&pane.pane_tty))
+        .collect::<BTreeSet<_>>();
+
+    for tty in ttys {
+        if let Some(commands) = read_tty_commands(&tty)
+            && let Some(agent) = detect_agent_from_tty_commands(&commands)
+        {
+            tty_agents.insert(tty, agent);
+        }
+    }
+
+    for pane in panes
+        .iter_mut()
+        .filter(|pane| needs_process_agent_detection(pane))
+    {
+        let Some(tty) = normalize_tty(&pane.pane_tty) else {
+            continue;
+        };
+        if let Some(agent) = tty_agents.get(&tty) {
+            pane.agent = (*agent).to_string();
+        }
+    }
+}
+
+fn normalize_tty(tty: &str) -> Option<String> {
+    let tty = tty.trim();
+    if tty.is_empty() || tty == "?" {
+        return None;
+    }
+    Some(tty.strip_prefix("/dev/").unwrap_or(tty).to_string())
+}
+
+fn read_tty_commands(tty: &str) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-o", "command=", "-t", tty])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 pub fn effective_agent(pane: &PaneSnapshot) -> Option<&str> {
@@ -135,7 +305,7 @@ mod tests {
     fn format_field_count_matches_parser_expectation() {
         assert_eq!(
             snapshot_format().matches('\u{1f}').count(),
-            8 + PANE_STATE_KEYS.len() - 1
+            10 + PANE_STATE_KEYS.len() - 1
         );
     }
 
@@ -149,8 +319,26 @@ mod tests {
     #[test]
     fn parse_snapshot_lines_reads_activity_fields() {
         let raw = line(&[
-            "main", "@1", "%1", "/tmp", "zsh", "1", "2", "", "codex", "running", "", "", "", "",
-            "", "", "", "",
+            "main",
+            "@1",
+            "%1",
+            "/tmp",
+            "zsh",
+            "/dev/ttys001",
+            "123",
+            "1",
+            "2",
+            "",
+            "codex",
+            "running",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
         ]);
         let panes = parse_snapshot_lines(&raw);
         assert_eq!(panes.len(), 1);
@@ -158,8 +346,26 @@ mod tests {
         assert!(panes[0].session_attached);
 
         let detached = line(&[
-            "main", "@1", "%1", "/tmp", "zsh", "0", "0", "", "codex", "running", "", "", "", "",
-            "", "", "", "",
+            "main",
+            "@1",
+            "%1",
+            "/tmp",
+            "zsh",
+            "/dev/ttys001",
+            "123",
+            "0",
+            "0",
+            "",
+            "codex",
+            "running",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
         ]);
         let panes = parse_snapshot_lines(&detached);
         assert!(!panes[0].window_active);
@@ -174,6 +380,8 @@ mod tests {
             "%3",
             "/Users/me/repo",
             "node",
+            "/dev/ttys001",
+            "123",
             "0",
             "0",
             "",
@@ -207,6 +415,8 @@ mod tests {
             "%9",
             "/Users/me",
             "vt",
+            "/dev/ttys001",
+            "123",
             "0",
             "0",
             "1",
@@ -230,7 +440,26 @@ mod tests {
     #[test]
     fn malformed_line_is_skipped_not_fatal() {
         let good = line(&[
-            "main", "@1", "%3", "/p", "zsh", "0", "0", "", "", "", "", "", "", "", "", "", "", "",
+            "main",
+            "@1",
+            "%3",
+            "/p",
+            "zsh",
+            "/dev/ttys001",
+            "123",
+            "0",
+            "0",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
         ]);
         let raw = format!("broken-line\n{good}\n");
         let panes = parse_snapshot_lines(&raw);
@@ -280,5 +509,57 @@ mod tests {
 
         assert!(is_live_agent_pane(&pane));
         assert_eq!(effective_agent(&pane), Some("claude"));
+    }
+
+    #[test]
+    fn parse_snapshot_lines_reads_pid_and_tty_fields() {
+        let raw = line(&[
+            "main",
+            "@1",
+            "%3",
+            "/Users/me/repo",
+            "node",
+            "/dev/ttys061",
+            "74605",
+            "0",
+            "0",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]);
+
+        let panes = parse_snapshot_lines(&raw);
+
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_tty, "/dev/ttys061");
+        assert_eq!(panes[0].pane_pid, "74605");
+    }
+
+    #[test]
+    fn detects_agent_from_process_tree_under_pane_pid() {
+        let processes = ProcessSnapshot::parse(
+            r#"
+74605 1 -zsh
+89779 74605 node /Users/me/.npm/bin/codex --yolo
+89780 89779 /opt/homebrew/bin/codex --yolo
+"#,
+        );
+
+        assert_eq!(processes.find_agent_from_pid_tree(74605), Some("codex"));
+    }
+
+    #[test]
+    fn detects_agent_from_tty_command_output() {
+        let commands = "-zsh\nnode /Users/me/.npm/bin/claude --dangerously-skip-permissions\n";
+
+        assert_eq!(detect_agent_from_tty_commands(commands), Some("claude"));
     }
 }

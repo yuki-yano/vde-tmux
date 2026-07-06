@@ -372,6 +372,8 @@ mod tests {
             pane.pane_id.as_str(),
             pane.current_path.as_str(),
             pane.current_command.as_str(),
+            pane.pane_tty.as_str(),
+            pane.pane_pid.as_str(),
             if pane.window_active { "1" } else { "0" },
             if pane.session_attached { "1" } else { "0" },
             if pane.is_sidebar { "1" } else { "0" },

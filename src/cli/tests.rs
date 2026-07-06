@@ -248,8 +248,26 @@ fn dispatch_statusline_summary_falls_back_to_tmux_snapshot() {
     let mock = MockTmuxRunner::new();
     let format = crate::options::snapshot::snapshot_format();
     let line = [
-        "main", "@1", "%1", "/tmp", "codex", "0", "0", "", "codex", "running", "", "", "", "", "",
-        "", "", "",
+        "main",
+        "@1",
+        "%1",
+        "/tmp",
+        "codex",
+        "/dev/ttys001",
+        "123",
+        "0",
+        "0",
+        "",
+        "codex",
+        "running",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
     ]
     .join("\u{1f}");
     mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
@@ -278,6 +296,8 @@ fn dispatch_statusline_attention_falls_back_to_tmux_snapshot() {
         "%1",
         "/tmp",
         "codex",
+        "/dev/ttys001",
+        "123",
         "0",
         "0",
         "",

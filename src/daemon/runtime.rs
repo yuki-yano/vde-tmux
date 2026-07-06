@@ -800,6 +800,8 @@ mod tests {
             pane_id: pane_id.to_string(),
             current_path: "/tmp".to_string(),
             current_command: "codex".to_string(),
+            pane_tty: String::new(),
+            pane_pid: String::new(),
             window_active: false,
             session_attached: false,
             is_sidebar: false,

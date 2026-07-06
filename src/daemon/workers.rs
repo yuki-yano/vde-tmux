@@ -197,19 +197,21 @@ pub fn apply_capture_detection(
     {
         pane.agent = agent.to_string();
     }
+    let mut observed_activity_epoch = None;
     let should_capture = pane.wait_reason.trim().is_empty() || pane.status == "running";
     if should_capture && let Ok(tail) = io.capture_tail(&pane.pane_id) {
         if let Some(wait_reason) = detect_codex_wait_reason(&tail) {
             pane.status = "waiting".to_string();
             pane.wait_reason = wait_reason.to_string();
-        } else if pane.status.trim().is_empty() && !tail.trim().is_empty() {
-            pane.status = "running".to_string();
+        } else if !tail.trim().is_empty() {
+            observed_activity_epoch = Some(now_epoch);
+            if pane.status.trim().is_empty() {
+                pane.status = "running".to_string();
+            }
         }
     }
-    let last_activity = pane
-        .completed_at
-        .parse::<i64>()
-        .ok()
+    let last_activity = observed_activity_epoch
+        .or_else(|| pane.completed_at.parse::<i64>().ok())
         .or_else(|| pane.started_at.parse::<i64>().ok())
         .unwrap_or(now_epoch);
     let status = parse_status(&pane.status);
@@ -456,5 +458,20 @@ mod tests {
             panic!("expected panes updated");
         };
         assert_eq!(panes[0].status, "idle");
+    }
+
+    #[test]
+    fn running_pane_with_captured_activity_is_not_demoted_to_idle() {
+        let io = MockWorkerIo::default();
+        let mut active = pane("%1", "claude", "running");
+        active.started_at = "100".to_string();
+        io.captures
+            .lock()
+            .unwrap()
+            .insert("%1".to_string(), "Claude is still working\n".to_string());
+
+        let pane = apply_capture_detection(&io, active, 1_000, 30);
+
+        assert_eq!(pane.status, "running");
     }
 }
