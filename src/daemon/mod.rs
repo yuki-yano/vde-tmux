@@ -403,14 +403,14 @@ mod tests {
     }
 
     #[test]
-    fn build_snapshot_trusts_hook_agent_even_when_command_is_shell() {
+    fn build_snapshot_ignores_stale_hook_agent_when_command_is_shell() {
         let mut hook_marked = pane("codex", "running", "");
         hook_marked.current_command = "zsh".to_string();
 
         let snapshot = build_snapshot(&[hook_marked]);
 
-        assert_eq!(snapshot.agent_count, 1);
-        assert_eq!(snapshot.panes[0].agent, "codex");
+        assert_eq!(snapshot.agent_count, 0);
+        assert!(snapshot.panes.is_empty());
     }
 
     #[test]

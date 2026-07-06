@@ -1012,17 +1012,13 @@ mod tests {
     }
 
     #[test]
-    fn build_rows_trusts_hook_agent_when_command_is_not_agent() {
+    fn build_rows_ignores_stale_hook_agent_when_command_is_not_agent() {
         let mut hook_marked = pane("main", "%1", "/tmp/app", "codex", "running");
         hook_marked.current_command = "node".to_string();
 
         let rows = build_rows(&Config::default(), &[hook_marked], &SidebarState::default());
 
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[1].meta.as_ref().and_then(|meta| meta.agent.as_deref()),
-            Some("codex")
-        );
+        assert!(rows.is_empty());
     }
 
     #[test]

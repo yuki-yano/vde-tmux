@@ -11,7 +11,7 @@ use crate::daemon::{
     render_summary,
 };
 use crate::git::GitBadge;
-use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane};
+use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane};
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
 use crate::sidebar::state::{RepoId, SidebarAction, SidebarState};
 use crate::sidebar::tree::{
@@ -637,7 +637,10 @@ impl RuntimeState {
             let unread = self.unread.get(&pane.pane_id).copied().unwrap_or(false);
             badges.insert(
                 pane.pane_id.clone(),
-                (pane.agent.clone(), badge_state(level, unread)),
+                (
+                    effective_agent(pane).unwrap_or_default().to_string(),
+                    badge_state(level, unread),
+                ),
             );
         }
         badges
@@ -815,6 +818,7 @@ mod tests {
             completed_at: String::new(),
             tasks: String::new(),
             subagents: String::new(),
+            agent_observed: true,
         }
     }
 
@@ -931,6 +935,26 @@ mod tests {
         )]));
 
         assert!(state.ui_state.pinned.contains("chat::%1"));
+    }
+
+    #[test]
+    fn stale_hook_agent_clears_session_badge() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let mut stale = agent_pane("main", "%1", "running");
+        stale.current_command = "zsh".to_string();
+        stale.agent_observed = false;
+
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![stale]));
+
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, RuntimeEffect::ClearSessionBadge { session } if session == "main")
+            ),
+            "{effects:?}"
+        );
     }
 
     #[test]

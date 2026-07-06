@@ -36,6 +36,8 @@ pub struct PaneSnapshot {
     pub completed_at: String,
     pub tasks: String,
     pub subagents: String,
+    /// `pane_current_command`、process tree、TTY のいずれかで現在 agent を観測できたか。
+    pub agent_observed: bool,
 }
 
 /// list-panes -a に渡す -F フォーマット文字列を組み立てる。
@@ -68,12 +70,14 @@ pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
             if fields.len() != expected {
                 return None;
             }
+            let current_command = fields[4].to_string();
+            let agent_observed = detect_agent_from_command(&current_command).is_some();
             Some(PaneSnapshot {
                 session: fields[0].to_string(),
                 window_id: fields[1].to_string(),
                 pane_id: fields[2].to_string(),
                 current_path: fields[3].to_string(),
-                current_command: fields[4].to_string(),
+                current_command,
                 pane_tty: fields[5].to_string(),
                 pane_pid: fields[6].to_string(),
                 window_active: fields[7] == "1",
@@ -89,6 +93,7 @@ pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
                 completed_at: fields[17].to_string(),
                 tasks: fields[18].to_string(),
                 subagents: fields[19].to_string(),
+                agent_observed,
             })
         })
         .collect()
@@ -194,28 +199,34 @@ impl ProcessSnapshot {
 }
 
 fn enrich_agents_from_processes(panes: &mut [PaneSnapshot]) {
-    if !panes.iter().any(needs_process_agent_detection) {
+    if !panes.iter().any(needs_runtime_agent_detection) {
         return;
     }
     let Some(processes) = read_process_snapshot() else {
         enrich_agents_from_ttys(panes);
         return;
     };
-    for pane in panes.iter_mut().filter(|pane| {
-        pane.agent.trim().is_empty() && detect_agent_from_command(&pane.current_command).is_none()
-    }) {
+    enrich_agents_from_process_snapshot(panes, &processes);
+    enrich_agents_from_ttys(panes);
+}
+
+fn enrich_agents_from_process_snapshot(panes: &mut [PaneSnapshot], processes: &ProcessSnapshot) {
+    for pane in panes
+        .iter_mut()
+        .filter(|pane| needs_runtime_agent_detection(pane))
+    {
         let Some(pid) = pane.pane_pid.trim().parse::<i64>().ok() else {
             continue;
         };
         if let Some(agent) = processes.find_agent_from_pid_tree(pid) {
             pane.agent = agent.to_string();
+            pane.agent_observed = true;
         }
     }
-    enrich_agents_from_ttys(panes);
 }
 
-fn needs_process_agent_detection(pane: &PaneSnapshot) -> bool {
-    pane.agent.trim().is_empty() && detect_agent_from_command(&pane.current_command).is_none()
+fn needs_runtime_agent_detection(pane: &PaneSnapshot) -> bool {
+    !pane.agent_observed && detect_agent_from_command(&pane.current_command).is_none()
 }
 
 fn read_process_snapshot() -> Option<ProcessSnapshot> {
@@ -235,7 +246,7 @@ fn enrich_agents_from_ttys(panes: &mut [PaneSnapshot]) {
     let mut tty_agents = BTreeMap::new();
     let ttys = panes
         .iter()
-        .filter(|pane| needs_process_agent_detection(pane))
+        .filter(|pane| needs_runtime_agent_detection(pane))
         .filter_map(|pane| normalize_tty(&pane.pane_tty))
         .collect::<BTreeSet<_>>();
 
@@ -249,13 +260,14 @@ fn enrich_agents_from_ttys(panes: &mut [PaneSnapshot]) {
 
     for pane in panes
         .iter_mut()
-        .filter(|pane| needs_process_agent_detection(pane))
+        .filter(|pane| needs_runtime_agent_detection(pane))
     {
         let Some(tty) = normalize_tty(&pane.pane_tty) else {
             continue;
         };
         if let Some(agent) = tty_agents.get(&tty) {
             pane.agent = (*agent).to_string();
+            pane.agent_observed = true;
         }
     }
 }
@@ -280,11 +292,14 @@ fn read_tty_commands(tty: &str) -> Option<String> {
 }
 
 pub fn effective_agent(pane: &PaneSnapshot) -> Option<&str> {
-    let agent = pane.agent.trim();
-    if !agent.is_empty() {
+    if let Some(agent) = detect_agent_from_command(&pane.current_command) {
         return Some(agent);
     }
-    detect_agent_from_command(&pane.current_command)
+    let agent = pane.agent.trim();
+    if pane.agent_observed && !agent.is_empty() {
+        return Some(agent);
+    }
+    None
 }
 
 pub fn is_live_agent_pane(pane: &PaneSnapshot) -> bool {
@@ -489,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_marked_agent_pane_is_live_even_when_command_is_shell() {
+    fn stale_hook_marked_agent_pane_is_not_live_when_command_is_shell() {
         let pane = PaneSnapshot {
             current_command: "zsh".to_string(),
             agent: "codex".to_string(),
@@ -497,7 +512,7 @@ mod tests {
             ..PaneSnapshot::default()
         };
 
-        assert!(is_live_agent_pane(&pane));
+        assert!(!is_live_agent_pane(&pane));
     }
 
     #[test]
@@ -554,6 +569,26 @@ mod tests {
         );
 
         assert_eq!(processes.find_agent_from_pid_tree(74605), Some("codex"));
+    }
+
+    #[test]
+    fn process_detected_agent_pane_is_live_without_hook_options() {
+        let processes = ProcessSnapshot::parse(
+            r#"
+74605 1 -zsh
+89779 74605 node /Users/me/.npm/bin/codex --yolo
+"#,
+        );
+        let mut panes = vec![PaneSnapshot {
+            current_command: "node".to_string(),
+            pane_pid: "74605".to_string(),
+            ..PaneSnapshot::default()
+        }];
+
+        enrich_agents_from_process_snapshot(&mut panes, &processes);
+
+        assert_eq!(effective_agent(&panes[0]), Some("codex"));
+        assert!(is_live_agent_pane(&panes[0]));
     }
 
     #[test]
