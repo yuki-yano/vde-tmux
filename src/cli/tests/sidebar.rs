@@ -151,6 +151,23 @@ fn dispatch_sidebar_open_uses_layout_operations() {
         &["split-window", "-t", "@1", "-hbf", "-l", "40", &command],
         "",
     );
+    mock.stub(
+        &[
+            "set-hook",
+            "-g",
+            "after-new-window[90]",
+            &format!(
+                "run-shell {}",
+                shell_quote_for_test(&format!(
+                    "{} sidebar layout-applied --window {} --width {}",
+                    shell_quote_for_test(&exe.display().to_string()),
+                    shell_quote_for_test("#{window_id}"),
+                    shell_quote_for_test("40")
+                ))
+            ),
+        ],
+        "",
+    );
 
     crate::cli::sidebar::run_sidebar_command_with_ensure(
         crate::cli::sidebar::SidebarCommand::Open {
@@ -363,6 +380,23 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
         &["split-window", "-t", "@1", "-hbf", "-l", "40", &command],
         "",
     );
+    mock.stub(
+        &[
+            "set-hook",
+            "-g",
+            "after-new-window[90]",
+            &format!(
+                "run-shell {}",
+                shell_quote_for_test(&format!(
+                    "{} sidebar layout-applied --window {} --width {}",
+                    shell_quote_for_test(&exe.display().to_string()),
+                    shell_quote_for_test("#{window_id}"),
+                    shell_quote_for_test("40")
+                ))
+            ),
+        ],
+        "",
+    );
 
     crate::cli::sidebar::run_sidebar_command_with_ensure(
         crate::cli::sidebar::SidebarCommand::Toggle {
@@ -377,7 +411,7 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 8);
+    assert_eq!(mock.calls().len(), 9);
 }
 
 #[test]

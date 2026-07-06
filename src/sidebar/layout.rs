@@ -9,6 +9,7 @@ use crate::tmux::TmuxRunner;
 
 pub const SIDEBAR_PANE_FORMAT: &str = "#{pane_id}\t#{@vde_sidebar}\t#{pane_width}";
 const RAIL_WIDTH: u16 = 2;
+const AFTER_NEW_WINDOW_HOOK: &str = "after-new-window[90]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SidebarPane {
@@ -83,8 +84,25 @@ pub fn toggle_all(
     width: SidebarWidth,
     min_width: u16,
 ) -> Result<()> {
-    for window in list_window_ids(runner)? {
-        toggle(runner, &window, self_exe, width, min_width)?;
+    let windows = list_window_ids(runner)?;
+    let sidebars = windows
+        .iter()
+        .map(|window| Ok((window.clone(), find_sidebar_pane(runner, window)?)))
+        .collect::<Result<Vec<_>>>()?;
+    if !sidebars.is_empty() && sidebars.iter().all(|(_, sidebar)| sidebar.is_some()) {
+        for (window, sidebar) in sidebars {
+            if let Some(sidebar) = sidebar {
+                close_sidebar_pane(runner, &window, &sidebar)?;
+            }
+        }
+        uninstall_after_new_window_hook(runner)?;
+    } else {
+        for (window, sidebar) in sidebars {
+            if sidebar.is_none() {
+                open_unchecked(runner, &window, self_exe, width, min_width)?;
+            }
+        }
+        install_after_new_window_hook(runner, self_exe, width)?;
     }
     Ok(())
 }
@@ -144,7 +162,8 @@ pub fn jump_to_pane(runner: &dyn TmuxRunner, pane_id: &str) -> Result<()> {
         .iter()
         .find(|pane| pane.pane_id == pane_id)
         .with_context(|| format!("pane not found: {pane_id}"))?;
-    runner.run(&["switch-client", "-t", &pane.session])?;
+    let target = crate::session::exact_session_target(&pane.session);
+    runner.run(&["switch-client", "-t", &target])?;
     runner.run(&["select-window", "-t", &pane.window_id])?;
     runner.run(&["select-pane", "-t", &pane.pane_id])?;
     Ok(())
@@ -419,6 +438,21 @@ fn list_window_ids(runner: &dyn TmuxRunner) -> Result<Vec<String>> {
         .collect())
 }
 
+fn install_after_new_window_hook(
+    runner: &dyn TmuxRunner,
+    self_exe: &Path,
+    width: SidebarWidth,
+) -> Result<()> {
+    let command = new_window_hook_command(self_exe, width);
+    runner.run(&["set-hook", "-g", AFTER_NEW_WINDOW_HOOK, &command])?;
+    Ok(())
+}
+
+fn uninstall_after_new_window_hook(runner: &dyn TmuxRunner) -> Result<()> {
+    runner.run(&["set-hook", "-gu", AFTER_NEW_WINDOW_HOOK])?;
+    Ok(())
+}
+
 fn shell_quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('\'');
@@ -447,6 +481,34 @@ fn attach_shell_command(self_exe: &Path, socket_name: Option<&str>) -> String {
     }
 }
 
+fn new_window_hook_command(self_exe: &Path, width: SidebarWidth) -> String {
+    let width = sidebar_width_arg(width);
+    let command = format!(
+        "{} sidebar layout-applied --window {} --width {}",
+        shell_quote(&self_exe.display().to_string()),
+        shell_quote("#{window_id}"),
+        shell_quote(&width),
+    );
+    let command = match std::env::var("VDE_TMUX_SOCKET_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(socket_name) => format!(
+            "VDE_TMUX_SOCKET_NAME={} {command}",
+            shell_quote(&socket_name)
+        ),
+        None => command,
+    };
+    format!("run-shell {}", shell_quote(&command))
+}
+
+fn sidebar_width_arg(width: SidebarWidth) -> String {
+    match width {
+        SidebarWidth::Columns(columns) => columns.to_string(),
+        SidebarWidth::Percent(percent) => format!("{percent}%"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +530,14 @@ mod tests {
         assert_eq!(
             attach_shell_command(&exe(), None),
             "'/tmp/vt' sidebar attach"
+        );
+    }
+
+    #[test]
+    fn new_window_hook_command_runs_layout_applied_for_created_window() {
+        assert_eq!(
+            new_window_hook_command(&exe(), SidebarWidth::Percent(10)),
+            "run-shell ''\\''/tmp/vt'\\'' sidebar layout-applied --window '\\''#{window_id}'\\'' --width '\\''10%'\\'''"
         );
     }
 
@@ -992,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn toggle_all_applies_to_each_window() {
+    fn toggle_all_opens_all_windows_when_none_are_open() {
         let mock = MockTmuxRunner::new();
         mock.stub(&["list-windows", "-a", "-F", "#{window_id}"], "@1\n@2\n");
         mock.stub(
@@ -1042,23 +1112,180 @@ mod tests {
 
         mock.stub(
             &["list-panes", "-t", "@2", "-F", SIDEBAR_PANE_FORMAT],
-            "%9\t1\t40\n%2\t\t80\n",
+            "%2\t\t80\n",
         );
         mock.stub(&["show-options", "-w", "-t", "@2"], "");
-        mock.stub(&["kill-pane", "-t", "%9"], "");
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@2",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-two\n",
+        );
         mock.stub(&["list-panes", "-t", "@2", "-F", "#{pane_id}"], "%2\n");
         mock.stub(
-            &["set-option", "-w", "-u", "-t", "@2", KEY_LAYOUT_BASELINE],
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@2",
+                KEY_LAYOUT_BASELINE,
+                "layout-two",
+            ],
             "",
         );
         mock.stub(
-            &["set-option", "-w", "-u", "-t", "@2", KEY_LAYOUT_PANES],
+            &["set-option", "-w", "-t", "@2", KEY_LAYOUT_PANES, "%2"],
+            "",
+        );
+        mock.stub(
+            &[
+                "split-window",
+                "-t",
+                "@2",
+                "-hbf",
+                "-l",
+                "40",
+                "'/tmp/vt' sidebar attach",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-hook",
+                "-g",
+                AFTER_NEW_WINDOW_HOOK,
+                &new_window_hook_command(&exe(), SidebarWidth::Columns(40)),
+            ],
             "",
         );
 
         toggle_all(&mock, &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
-        assert_eq!(mock.calls().len(), 14);
+        assert_eq!(mock.calls().len(), 16);
+    }
+
+    #[test]
+    fn toggle_all_opens_missing_windows_without_closing_existing_sidebars() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(&["list-windows", "-a", "-F", "#{window_id}"], "@1\n@2\n");
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t80\n",
+        );
+        mock.stub(&["show-options", "-w", "-t", "@1"], "");
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-one\n",
+        );
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@1",
+                KEY_LAYOUT_BASELINE,
+                "layout-one",
+            ],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-t", "@1", KEY_LAYOUT_PANES, "%1"],
+            "",
+        );
+        mock.stub(
+            &[
+                "split-window",
+                "-t",
+                "@1",
+                "-hbf",
+                "-l",
+                "40",
+                "'/tmp/vt' sidebar attach",
+            ],
+            "",
+        );
+        mock.stub(
+            &["list-panes", "-t", "@2", "-F", SIDEBAR_PANE_FORMAT],
+            "%9\t1\t40\n%2\t\t80\n",
+        );
+        mock.stub(
+            &[
+                "set-hook",
+                "-g",
+                AFTER_NEW_WINDOW_HOOK,
+                &new_window_hook_command(&exe(), SidebarWidth::Columns(40)),
+            ],
+            "",
+        );
+
+        toggle_all(&mock, &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        let calls = mock.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.first().map(String::as_str) == Some("kill-pane"))
+        );
+        assert!(calls.iter().any(|call| {
+            call.first().map(String::as_str) == Some("set-hook")
+                && call.get(2).map(String::as_str) == Some(AFTER_NEW_WINDOW_HOOK)
+        }));
+    }
+
+    #[test]
+    fn toggle_all_closes_all_sidebars_and_disables_new_window_hook_when_all_windows_are_open() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(&["list-windows", "-a", "-F", "#{window_id}"], "@1\n@2\n");
+        for (window, sidebar, pane) in [("@1", "%9", "%1"), ("@2", "%8", "%2")] {
+            mock.stub(
+                &["list-panes", "-t", window, "-F", SIDEBAR_PANE_FORMAT],
+                &format!("{sidebar}\t1\t40\n{pane}\t\t80\n"),
+            );
+            mock.stub(&["show-options", "-w", "-t", window], "");
+            mock.stub(&["kill-pane", "-t", sidebar], "");
+            mock.stub(
+                &["list-panes", "-t", window, "-F", "#{pane_id}"],
+                &format!("{pane}\n"),
+            );
+            mock.stub(
+                &["set-option", "-w", "-u", "-t", window, KEY_LAYOUT_BASELINE],
+                "",
+            );
+            mock.stub(
+                &["set-option", "-w", "-u", "-t", window, KEY_LAYOUT_PANES],
+                "",
+            );
+        }
+        mock.stub(&["set-hook", "-gu", AFTER_NEW_WINDOW_HOOK], "");
+
+        toggle_all(&mock, &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().map(String::as_str) == Some("kill-pane"))
+                .count(),
+            2
+        );
+        assert!(calls.contains(&vec![
+            "set-hook".to_string(),
+            "-gu".to_string(),
+            "after-new-window[90]".to_string(),
+        ]));
     }
 
     #[test]
@@ -1243,7 +1470,7 @@ mod tests {
             ],
             &format!("{line}\n"),
         );
-        mock.stub(&["switch-client", "-t", "main"], "");
+        mock.stub(&["switch-client", "-t", "=main:"], "");
         mock.stub(&["select-window", "-t", "@1"], "");
         mock.stub(&["select-pane", "-t", "%1"], "");
 
