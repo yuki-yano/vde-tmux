@@ -294,9 +294,12 @@ impl Default for SidebarLiveConfig {
                 "? for shortcuts",
                 // Codex: 入力プロンプト / プレースホルダ / フッター
                 "› ",
+                "❯",
                 "Ask Codex",
                 "⏎ send",
                 "context left",
+                "new task?",
+                "bypass permissions",
             ]
             .map(String::from)
             .to_vec(),

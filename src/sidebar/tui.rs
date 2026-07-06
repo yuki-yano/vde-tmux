@@ -704,8 +704,13 @@ fn live_card_body_line(
         .map(|span| display_width(&span.content))
         .sum();
     if content_used > content_width {
-        content = plain();
-    } else if content_used < content_width {
+        content = truncate_spans_to_width(content, content_width);
+    }
+    let content_used: usize = content
+        .iter()
+        .map(|span| display_width(&span.content))
+        .sum();
+    if content_used < content_width {
         content.push(Span::raw(" ".repeat(content_width - content_used)));
     }
     let mut spans = vec![Span::styled(
@@ -718,6 +723,37 @@ fn live_card_body_line(
         Style::default().fg(theme.marker),
     ));
     Line::from(spans)
+}
+
+fn truncate_spans_to_width(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let target = width.saturating_sub(1);
+    let mut used = 0usize;
+    let mut out = Vec::new();
+    let mut ellipsis_style = Style::default();
+    'spans: for span in spans {
+        let mut content = String::new();
+        for ch in span.content.chars() {
+            let ch_width = display_width(&ch.to_string());
+            if used + ch_width > target {
+                ellipsis_style = span.style;
+                break 'spans;
+            }
+            content.push(ch);
+            used += ch_width;
+        }
+        ellipsis_style = span.style;
+        if !content.is_empty() {
+            out.push(Span::styled(content, span.style));
+        }
+        if used >= target {
+            break;
+        }
+    }
+    out.push(Span::styled("…".to_string(), ellipsis_style));
+    out
 }
 
 pub(crate) fn extract_tail(raw: &str, limit: usize, cut_markers: &[String]) -> Vec<String> {
@@ -1063,6 +1099,7 @@ mod tests {
     use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     fn row() -> SidebarRow {
         SidebarRow {
@@ -1278,6 +1315,29 @@ mod tests {
     }
 
     #[test]
+    fn live_card_preserves_ansi_styles_when_truncating_long_lines() {
+        let live = LiveState {
+            pane_id: Some("%1".to_string()),
+            lines: vec![
+                "\u{1b}[31mred-highlight-that-is-too-long-for-card\u{1b}[0m tail".to_string(),
+            ],
+            requested_lines: 1,
+            ..Default::default()
+        };
+
+        let lines = render_live_lines(&snapshot(), &live, 3, 24, 0, &SidebarRenderTheme::default());
+        let body = &lines[1];
+
+        assert!(
+            body.spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::Red)),
+            "{body:?}"
+        );
+        assert_eq!(crate::sidebar::render::display_width(&line_text(body)), 24);
+    }
+
+    #[test]
     fn live_card_falls_back_to_plain_when_narrow() {
         let live = LiveState {
             pane_id: Some("%1".to_string()),
@@ -1308,6 +1368,13 @@ mod tests {
         // Codex 風: 入力プロンプトとフッター
         let raw = "thinking...\ndone!\n› type here\n⏎ send  95% context left\n";
         assert_eq!(extract_tail(raw, 5, &markers), vec!["thinking...", "done!"]);
+        // Claude/Codex の新しいプロンプト/ステータス行。ここが残ると LIVE の
+        // 限られた行数が footer で埋まり、本文が押し出される。
+        let raw = "important 1\nimportant 2\n❯\u{a0}\nnew task? /clear to save tokens\nbypass permissions on\n";
+        assert_eq!(
+            extract_tail(raw, 5, &markers),
+            vec!["important 1", "important 2"]
+        );
         // マーカーが無い出力はそのまま
         let raw = "plain 1\nplain 2\n";
         assert_eq!(extract_tail(raw, 5, &markers), vec!["plain 1", "plain 2"]);
