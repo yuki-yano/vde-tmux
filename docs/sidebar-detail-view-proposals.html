@@ -1,0 +1,468 @@
+<title>サイドバー展開ビュー改善 比較提案</title>
+<style>
+  :root {
+    --ground: #F4F3F7; --surface: #FFFFFF; --ink: #23263A; --ink-soft: #5A5E74;
+    --line: #DDDCE6; --accent: #5157C9; --accent-soft: #EAEAF9;
+    --c-blocked: #C0403A; --c-working: #2E8B4F;
+    --reco-bg: #EEF7F0; --reco-line: #2E8B4F;
+    --mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #13151D; --surface: #1B1E2A; --ink: #DCE0EE; --ink-soft: #9A9FB5;
+      --line: #2B2F40; --accent: #AEB6FF; --accent-soft: #262A45;
+      --c-blocked: #F07A72; --c-working: #7FD08F;
+      --reco-bg: #1E2A22; --reco-line: #7FD08F;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #13151D; --surface: #1B1E2A; --ink: #DCE0EE; --ink-soft: #9A9FB5;
+    --line: #2B2F40; --accent: #AEB6FF; --accent-soft: #262A45;
+    --c-blocked: #F07A72; --c-working: #7FD08F;
+    --reco-bg: #1E2A22; --reco-line: #7FD08F;
+  }
+  :root[data-theme="light"] {
+    --ground: #F4F3F7; --surface: #FFFFFF; --ink: #23263A; --ink-soft: #5A5E74;
+    --line: #DDDCE6; --accent: #5157C9; --accent-soft: #EAEAF9;
+    --c-blocked: #C0403A; --c-working: #2E8B4F;
+    --reco-bg: #EEF7F0; --reco-line: #2E8B4F;
+  }
+
+  html { background: var(--ground); }
+  body {
+    font-family: var(--sans); color: var(--ink); line-height: 1.8;
+    margin: 0; padding: 3.5rem 1.25rem 5rem; font-size: 15px;
+  }
+  main { max-width: 60rem; margin: 0 auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin: .4rem 0 .6rem; text-wrap: balance; }
+  .lede { color: var(--ink-soft); margin: 0 0 1.6rem; max-width: 44rem; }
+  .eyebrow {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--accent); margin: 0;
+  }
+  section { margin-top: 3.2rem; }
+  h2 { font-size: 1.25rem; margin: .25rem 0 .4rem; text-wrap: balance; }
+  .problem { color: var(--ink-soft); margin: 0 0 1.2rem; max-width: 46rem; }
+  p { margin: .6rem 0; }
+  ul { padding-left: 1.25rem; margin: .5rem 0; }
+  li { margin: .25rem 0; }
+  code {
+    font-family: var(--mono); font-size: .85em;
+    background: var(--accent-soft); border-radius: 4px; padding: .1em .35em;
+  }
+
+  nav.toc { display: flex; flex-wrap: wrap; gap: .5rem; margin: 0 0 .5rem; }
+  nav.toc a {
+    font-family: var(--mono); font-size: .78rem; text-decoration: none;
+    color: var(--ink-soft); border: 1px solid var(--line); background: var(--surface);
+    border-radius: 999px; padding: .18rem .7rem;
+  }
+  nav.toc a:hover { color: var(--accent); border-color: var(--accent); }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .options { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: 1rem; }
+  .opt {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 12px; padding: 1rem 1.1rem 1.1rem;
+    display: flex; flex-direction: column; gap: .4rem;
+  }
+  .opt.reco { box-shadow: inset 0 0 0 1px var(--reco-line); border-color: var(--reco-line); }
+  .opt .tag {
+    font-family: var(--mono); font-size: .68rem; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--ink-soft);
+  }
+  .opt.reco .tag::after { content: " · 推奨"; color: var(--reco-line); font-weight: 700; }
+  .opt ul { font-size: .88rem; }
+  .pro::marker { color: var(--c-working); }
+  .con::marker { color: var(--c-blocked); }
+
+  .verdict {
+    border-left: 3px solid var(--reco-line); background: var(--reco-bg);
+    border-radius: 0 10px 10px 0; padding: .7rem 1rem; margin: 1.2rem 0 0;
+    font-size: .93rem;
+  }
+  .verdict p { margin: .3rem 0; }
+  .impl {
+    font-size: .85rem; color: var(--ink-soft);
+    border-top: 1px dashed var(--line); margin-top: 1rem; padding-top: .7rem;
+  }
+
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { text-align: left; padding: .55rem .85rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  th {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-soft); font-weight: 600;
+  }
+
+  .term {
+    background: #12141C; border: 1px solid #2A2E40; border-radius: 10px;
+    padding: .7rem .9rem; margin: .3rem 0 .5rem; overflow-x: auto;
+  }
+  .term pre {
+    font-family: var(--mono); font-size: .78rem; line-height: 1.75;
+    color: #C7CCDE; margin: 0;
+  }
+  .t-red { color: #F07A72; }
+  .t-yellow { color: #E5C07B; }
+  .t-green { color: #7FD08F; }
+  .t-cyan { color: #79D2DE; }
+  .t-cyan-dim { color: #5FA8A8; }
+  .t-gray { color: #6A6F86; }
+  .t-blue { color: #86A7F5; font-weight: 700; }
+  .t-peach { color: #F5B98A; font-weight: 700; }
+  .t-lav { color: #AEB6FF; }
+  .t-lav-dim { color: #8B8FC7; }
+  .t-dim { color: #9BA0B5; }
+  .t-dim2 { color: #7C8199; }
+  .t-bold { font-weight: 700; }
+  .bad { color: #F07A72; font-weight: 700; }
+
+  footer {
+    margin-top: 4rem; padding-top: 1rem; border-top: 1px solid var(--line);
+    color: var(--ink-soft); font-size: .8rem; font-family: var(--mono);
+  }
+</style>
+
+<main>
+  <p class="eyebrow">vde-tmux sidebar — detail view</p>
+  <h1>展開ビューの改善提案</h1>
+  <p class="lede">
+    実スクリーンショット(2026-07-06)の表示状態をもとに、fisheye 展開時の情報構成を再検討する。
+    指摘の2点(status 行の状態色/chat 行と展開行の情報重複)に加え、時間表記とメタ行の冗長さも対象にする。
+  </p>
+
+  <nav class="toc">
+    <a href="#current">現状の問題</a>
+    <a href="#dup">1 重複解消</a>
+    <a href="#status">2 status の状態色</a>
+    <a href="#meta">3 メタ行の圧縮と時間表記</a>
+    <a href="#extra">4 追加すると有用な情報</a>
+    <a href="#palette">5 色システム全体の再検討</a>
+    <a href="#combined">推奨案の合成</a>
+  </nav>
+
+  <section id="current">
+    <p class="eyebrow">Current</p>
+    <h2>現状の表示と問題点</h2>
+    <div class="term"><pre> <span class="t-gray">▾</span> <span class="t-blue">vde-tmux</span>  <span class="t-cyan">main</span>
+   <span class="t-gray">▾ ○</span> <span class="t-bold">claude</span>: M-Eは対応させなくて良いから、M-eのmapだけ差…  <span class="bad">←①</span>
+     <span class="t-dim">M-Eは対応させなくて良いから、M-eのmapだけ差し替えといて</span>  <span class="bad">←①´ 全文と二重</span>
+     <span class="t-dim">status: idle</span>                       <span class="bad">←② 状態なのに無彩色</span>
+     <span class="t-dim">elapsed: 2279m04s</span>                  <span class="bad">←③ 読めない単位</span>
+     <span class="t-dim">session: vde-tmux / pane: %55</span>      <span class="bad">←④ repo 行とほぼ重複</span>
+     <span class="t-gray">[</span><span class="t-cyan-dim">↗</span> <span class="t-dim">jump</span><span class="t-gray">]</span> <span class="t-gray">[</span><span class="t-lav-dim">⌕</span> <span class="t-dim">preview</span><span class="t-gray">]</span></pre></div>
+    <ul>
+      <li><strong>① prompt の二重表示</strong> — chat 行のラベル(truncate 済)と展開1行目(全文)が同じ内容。展開中は 2 行を prompt に使っているのに情報は 1 つ</li>
+      <li><strong>② status 行が無彩色</strong> — 状態は本来このサイドバーの主役なのに、展開の中では色の文法(▲赤/●緑/✓シアン/○灰)が途切れる</li>
+      <li><strong>③ 分単位の生値</strong> — <code>991m26s</code> や <code>2279m04s</code> は換算しないと読めない。未展開行の右ラベル(<code>976m</code>)も同様</li>
+      <li><strong>④ session 行の冗長</strong> — session 名は多くの場合 repo 行と同じ。pane id はジャンプがボタン化された今、日常では使わない</li>
+      <li>また、idle の agent に「起動からの経過(elapsed)」を出しても行動に繋がらない。idle で知りたいのは「<strong>いつ終わったか</strong>」</li>
+    </ul>
+  </section>
+
+  <!-- ============ 1 ============ -->
+  <section id="dup">
+    <p class="eyebrow">Item 1</p>
+    <h2>chat 行と展開行の重複解消</h2>
+    <p class="problem">展開中の chat 行のラベル(truncate された prompt)と、展開1行目の prompt 全文が重複している。</p>
+
+    <div class="options">
+      <div class="opt reco">
+        <p class="tag">案 A — 展開中は chat 行を agent 名だけに縮約</p>
+        <div class="term"><pre>   <span class="t-gray">▾ ○</span> <span class="t-bold">claude</span>
+     <span class="t-dim">M-Eは対応させなくて良いから、M-eのmapだけ差し替えといて</span>
+     …
+   <span class="t-gray">▸ ○</span> <span class="t-bold">claude</span>: plan-12レビュー結果を確認し…  <span class="t-dim2">38h</span></pre></div>
+        <ul>
+          <li class="pro">重複が消え、prompt は展開1行目(全文)が唯一の置き場になる</li>
+          <li class="pro">chat 行の右ラベル(経過時間)も展開中は非表示にでき、メタ行(Item 3)と役割が分離する</li>
+          <li class="pro">折りたたみ時は従来どおり(truncate prompt + 右ラベル)なので一覧性は落ちない</li>
+          <li class="con">展開/折りたたみで行の見た目が変わる(識別は agent 名とバッジで保たれる)</li>
+        </ul>
+      </div>
+
+      <div class="opt">
+        <p class="tag">案 B — 展開1行目の prompt 行を廃止</p>
+        <div class="term"><pre>   <span class="t-gray">▾ ○</span> <span class="t-bold">claude</span>: M-Eは対応させなくて良いから、M-eのma…
+     <span class="t-dim">status: idle …</span></pre></div>
+        <ul>
+          <li class="pro">展開の行数が 1 行減る</li>
+          <li class="con">truncate の続き(prompt 全文)をサイドバー内で読む手段が無くなり、preview 頼みになる</li>
+          <li class="con">長い prompt ほど情報が失われる、逆方向の割り切り</li>
+        </ul>
+      </div>
+
+      <div class="opt">
+        <p class="tag">案 C — chat 行を維持し prompt 行は続きだけ</p>
+        <div class="term"><pre>   <span class="t-gray">▾ ○</span> <span class="t-bold">claude</span>: M-Eは対応させなくて良いから、M-eのma…
+     <span class="t-dim">…pだけ差し替えといて</span></pre></div>
+        <ul>
+          <li class="pro">重複ゼロで全文も読める</li>
+          <li class="con">truncate 位置が幅依存なので「続き」の切り出しが脆く、折り返し表示に近い複雑さになる</li>
+          <li class="con">2 行に分かれた文はどのみち読みにくい</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="verdict">
+      <p><strong>推奨: 案 A。</strong>「折りたたみ = ダイジェスト 1 行、展開 = 全文+詳細」という fisheye の意味論に一番素直。
+      展開中の右ラベル非表示までセットで入れると、経過時間の置き場も Item 3 のメタ行に一本化される。</p>
+      <p class="impl">実装影響: <code>tree.rs push_chat_row</code> で <code>expanded</code> のとき label を agent 名のみにする。<code>render.rs right_label</code> は <code>row.expanded && kind==Chat</code> で None。</p>
+    </div>
+  </section>
+
+  <!-- ============ 2 ============ -->
+  <section id="status">
+    <p class="eyebrow">Item 2</p>
+    <h2>status 行の状態色</h2>
+    <p class="problem">status の値は 4 値バッジと同じ語彙なのに、展開の中では無彩色のテキストになっている。</p>
+
+    <div class="options">
+      <div class="opt reco">
+        <p class="tag">案 A — グリフ+値だけ状態色</p>
+        <div class="term"><pre>     <span class="t-green">● running</span> <span class="t-dim2">· 12m</span>
+     <span class="t-red">▲ permission</span> <span class="t-dim2">(approve request?)</span>
+     <span class="t-gray">○ idle</span></pre></div>
+        <ul>
+          <li class="pro">バッジと同じグリフ+色で「状態の語彙」が展開内でも一貫する</li>
+          <li class="pro"><code>status:</code> ラベル自体を省ける(グリフがあれば状態行だと自明)</li>
+          <li class="pro">wait_reason は括弧のまま detail 色で従属情報に留める</li>
+          <li class="con">ラベル省略に伴い、既存の「status: 」表記に慣れた目には一瞬新しい</li>
+        </ul>
+      </div>
+
+      <div class="opt">
+        <p class="tag">案 B — ラベル維持、値のみ色付け</p>
+        <div class="term"><pre>     <span class="t-dim">status:</span> <span class="t-gray">○ idle</span>
+     <span class="t-dim">status:</span> <span class="t-green">● running</span></pre></div>
+        <ul>
+          <li class="pro">最小差分で指摘に応える保守的な形</li>
+          <li class="con"><code>status:</code> の 8 桁が毎回先頭に居座り、幅 40 では値の余白を圧迫する</li>
+        </ul>
+      </div>
+
+      <div class="opt">
+        <p class="tag">案 C — 行全体を状態色で塗る</p>
+        <div class="term"><pre>     <span class="t-green">status: running (build 実行中)</span></pre></div>
+        <ul>
+          <li class="pro">最も目立つ</li>
+          <li class="con">「状態色はバッジと右ラベルだけ、本文は通常色」という多トーン方針(理想形で確定済み)を壊す</li>
+          <li class="con">展開が多いと画面が色で騒がしくなる</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="verdict">
+      <p><strong>推奨: 案 A。</strong>色はグリフ+状態語だけに載せ、補足(wait_reason)は detail 色に残す。
+      確定済みの多トーン方針と整合し、Item 3 の統合メタ行にそのまま組み込める。</p>
+      <p class="impl">実装影響: detail 行は既に <code>rollup</code> / <code>badge_state</code> を保持しているため、<code>render.rs</code> で id が <code>detail::…::status</code> の行だけ「グリフ+状態語 span を状態色、残りを detail 色」に分ければよい(daemon 変更不要)。</p>
+    </div>
+  </section>
+
+  <!-- ============ 3 ============ -->
+  <section id="meta">
+    <p class="eyebrow">Item 3</p>
+    <h2>メタ行の圧縮と時間表記</h2>
+    <p class="problem">
+      status / elapsed / session の 3 行はラベルが冗長で、時間は分単位の生値。
+      さらに idle では「起動からの経過」より「いつ完了したか」の方が有用。
+    </p>
+
+    <div class="options">
+      <div class="opt reco">
+        <p class="tag">案 A — 状態行+場所行の 2 行に統合</p>
+        <div class="term"><pre>  <span class="t-dim2">running の場合</span>
+     <span class="t-green">● running</span> <span class="t-dim2">·</span> <span class="t-dim">12m</span>
+     <span class="t-dim">vde-tmux · %51</span>
+  <span class="t-dim2">idle の場合(completed_at ベース)</span>
+     <span class="t-gray">○ idle</span> <span class="t-dim2">·</span> <span class="t-dim">done 38h ago</span>
+     <span class="t-dim">vde-tmux · %55</span></pre></div>
+        <ul>
+          <li class="pro">3 行 → 2 行。ラベル(status:/elapsed:/session:)を全廃し値だけにする</li>
+          <li class="pro">時間の意味を状態に合わせて切替: running=経過、idle/done=完了からの時間、blocked=待ち時間。idle の「2279m04s」問題が本質から消える</li>
+          <li class="pro">時間は humanize(<code>45s / 12m / 1h30m / 38h / 2d</code>)。未展開行の右ラベルにも同じ関数を使う</li>
+          <li class="con">completed_at を RowMeta に載せる daemon 側変更が必要</li>
+        </ul>
+      </div>
+
+      <div class="opt">
+        <p class="tag">案 B — 3 行維持、値だけ改善</p>
+        <div class="term"><pre>     <span class="t-dim">status:</span> <span class="t-gray">○ idle</span>
+     <span class="t-dim">elapsed:</span> <span class="t-dim">38h00m</span>
+     <span class="t-dim">session:</span> <span class="t-dim">vde-tmux / pane: %55</span></pre></div>
+        <ul>
+          <li class="pro">構造を変えないので実装が最小(humanize + 色のみ)</li>
+          <li class="con">縦 3 行の消費と session 行の冗長さは残る</li>
+          <li class="con">idle の elapsed が「起動からの経過」のままで、値の有用性が低い</li>
+        </ul>
+      </div>
+
+      <div class="opt">
+        <p class="tag">案 C — 1 行に全部凝縮</p>
+        <div class="term"><pre>     <span class="t-gray">○ idle</span> <span class="t-dim2">·</span> <span class="t-dim">done 38h ago · vde-tmux · %55</span></pre></div>
+        <ul>
+          <li class="pro">展開が最小 3 行(prompt+メタ+アクション)になり、多数展開時に強い</li>
+          <li class="con">幅 40 で truncate されやすく、後半(場所情報)が欠けがち</li>
+          <li class="con">pin 時の要約 1 行(meta 行)と見た目が紛らわしい</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="verdict">
+      <p><strong>推奨: 案 A。</strong>「状態の行(色付き)」と「場所の行(灰色)」の 2 行構成は、Item 2 の色付けと自然に合成できる。
+      session 名が repo 行と同じ場合は場所行を <code>%55</code> だけに省略する最適化も入れられる(初期実装では常時表示でよい)。</p>
+      <p class="impl">実装影響: <code>tree.rs push_chat_detail_rows</code> の再構成(status/elapsed/session の 3 detail 行 → state 行+place 行)、<code>PaneSnapshot.completed_at</code>(既存)を <code>AgentPane</code>/<code>RowMeta</code> に配線、<code>elapsed_label</code> の humanize 化(右ラベル・TRIAGE・meta 行と共通化)。</p>
+    </div>
+  </section>
+
+  <!-- ============ 4 ============ -->
+  <section id="extra">
+    <p class="eyebrow">Item 4</p>
+    <h2>追加すると有用な情報</h2>
+    <p class="problem">既に daemon が持っているのに展開ビューへ出していないデータがいくつかある。</p>
+    <div class="table-wrap"><table>
+      <tr><th>情報</th><th>表示イメージ</th><th>価値 / コスト</th><th>判定</th></tr>
+      <tr>
+        <td>タスク進捗(tasks_done/total)</td>
+        <td><code>● running · 12m · 3/5 tasks</code></td>
+        <td>running 中の「あとどれくらいか」が分かる。データは <code>RowMeta</code> に既存で表示だけ</td>
+        <td><strong>推奨</strong>(状態行の末尾に、running 時のみ)</td>
+      </tr>
+      <tr>
+        <td>完了からの経過(completed_at)</td>
+        <td><code>○ idle · done 38h ago</code></td>
+        <td>Item 3 案 A の中核。「放置していた完了」の発見に直結</td>
+        <td><strong>推奨</strong>(Item 3 に含む)</td>
+      </tr>
+      <tr>
+        <td>wait_reason の露出強化</td>
+        <td><code>▲ permission (approve request?)</code></td>
+        <td>blocked 時の一次情報。現在も status 行にあるが、色付け(Item 2)で視認性が上がる</td>
+        <td><strong>推奨</strong>(Item 2 に含む)</td>
+      </tr>
+      <tr>
+        <td>最新レスポンス 1 行(▷)</td>
+        <td><code>▷ 393 tests passed…</code></td>
+        <td>有用だが LIVE ペインと役割が全く同じ。選択中は LIVE が見えている</td>
+        <td>見送り(Phase 6 の判断のまま)</td>
+      </tr>
+      <tr>
+        <td>subagent 一覧</td>
+        <td><code>├ Explore …</code></td>
+        <td>既に展開ビューに表示済み</td>
+        <td>現状維持</td>
+      </tr>
+    </table></div>
+  </section>
+
+  <!-- ============ 5 palette ============ -->
+  <section id="palette">
+    <p class="eyebrow">Item 5</p>
+    <h2>色システム全体の再検討</h2>
+    <p class="problem">機能追加のたびに色が増えてきたので、現状の色マップを棚卸しして役割を再定義する。</p>
+
+    <h2 style="font-size:1rem; border:none; margin:1.4rem 0 .4rem;">現状の色マップ(監査)</h2>
+    <div class="table-wrap"><table>
+      <tr><th>色</th><th>使用箇所</th><th>評価</th></tr>
+      <tr><td><span class="t-red">■</span> 赤</td><td>▲ blocked、err/perm/wait、TRIAGE 見出し、git -behind</td><td>OK — 「人の対応が要る」で一貫</td></tr>
+      <tr><td><span class="t-green">■</span> 緑</td><td>● working、経過時間ラベル、git +ahead</td><td>OK — 「進行/前進」で近縁</td></tr>
+      <tr><td><span class="t-cyan">■</span> シアン(明)</td><td>✓ done、<strong>git branch 名</strong></td><td><strong>衝突</strong> — 同じ色が「状態」と「構造情報」の 2 役。branch の main が ✓ と同じ強さで光る</td></tr>
+      <tr><td><span class="t-gray">■</span> 灰(暗)/<span class="t-dim">■</span> 灰(中)</td><td>暗: ○ idle・▾▸・0件ヘッダー・チップ括弧 / 中(246): detail 文・prompt</td><td>OK — ただし「記号=暗 / 補足文=中 / 本文=通常色」の 3 階調を規約として明文化したい</td></tr>
+      <tr><td><span class="t-blue">■</span> 青太字 / <span class="t-peach">■</span> ピーチ太字</td><td>repo 見出し / ◆ category 見出し(statusline のピルと同系)</td><td>OK — 構造見出しの 2 色。tmux バーとの一貫性が取れている</td></tr>
+      <tr><td><span class="t-lav">■</span> ラベンダー(147/103)</td><td>✦ pin、≣ mode、active バー+薄背景、⌕ preview</td><td>OK — 「vde の操作・現在地」族として自然に集まってきた。これを正式な文法にする</td></tr>
+      <tr><td><span class="t-cyan-dim">■</span> 淡シアン(73)</td><td>↗ jump グリフ</td><td>OK — 「移動」の色。branch がここに合流できる(下記 案 A)</td></tr>
+      <tr><td>マゼンタ</td><td>LIVE / EVENTS 見出しラベルのみ</td><td>要判断 — 孤立した 1 色。実況チャネルの目印としての孤立は意図的とも言える</td></tr>
+    </table></div>
+
+    <div class="options" style="margin-top:1.2rem;">
+      <div class="opt reco">
+        <p class="tag">案 A — 5 族の文法を明文化+衝突だけ解消</p>
+        <div class="term"><pre>  <span class="t-dim2">状態族</span>   <span class="t-red">▲</span> <span class="t-green">●</span> <span class="t-cyan">✓</span> <span class="t-gray">○</span>  <span class="t-dim2">(バッジ・右ラベル・状態行・ヘッダー)</span>
+  <span class="t-dim2">構造族</span>   <span class="t-blue">repo</span> <span class="t-peach">◆ category</span> <span class="t-cyan-dim">main</span><span class="t-green">+2</span>  <span class="t-dim2">(branch は 73 へ降格)</span>
+  <span class="t-dim2">操作族</span>   <span class="t-lav">✦ ≣ ▎ ⌕</span>  <span class="t-dim2">(pin / mode / active / preview = ラベンダー)</span>
+  <span class="t-dim2">本文族</span>   本文=通常色 / <span class="t-dim">補足=246</span> / <span class="t-gray">記号=暗灰</span>
+  <span class="t-dim2">実況</span>     <span class="t-mag" style="color:#D9A7F0;font-weight:700;">LIVE</span>  <span class="t-dim2">(マゼンタは LIVE 専用の孤立色として維持)</span></pre></div>
+        <ul>
+          <li class="pro">変更は実質 branch の既定色を明シアン → 淡シアン(73)へ落とすだけ。✓ done がシアンの唯一の「強い」使い手になり、branch は jump と同じ「場所・移動」族に収まる</li>
+          <li class="pro">既にできている秩序(状態 4 色/構造 2 色/操作ラベンダー)を規約として README・theme コメントに固定し、今後の機能追加で色が増殖するのを防ぐ</li>
+          <li class="pro">全キーが config 化済みなので、既定値の変更のみで互換の心配がない</li>
+          <li class="con">branch の視認性は今より一段下がる(構造情報としては適正、という判断)</li>
+        </ul>
+      </div>
+
+      <div class="opt">
+        <p class="tag">案 B — 構造情報をモノトーン化(状態だけが色)</p>
+        <div class="term"><pre>  <span class="t-bold">◆ public</span> <span class="t-dim2">──────────</span>
+    <span class="t-bold">vde-tmux</span>  <span class="t-dim">main</span> <span class="t-green">+2</span>
+      <span class="t-gray">▸ ○</span> <span class="t-bold">claude</span>: plan-12…  <span class="t-dim2">38h</span></pre></div>
+        <ul>
+          <li class="pro">色=状態、と意味が一対一になり、「赤いものだけ見ればいい」が極まる</li>
+          <li class="con">category / repo の視覚的区別(Item 2 で入れたばかりの 3 役 3 色)を放棄することになる</li>
+          <li class="con">statusline のピーチピルとの一貫性が崩れ、ツール全体では逆に不揃いになる</li>
+        </ul>
+      </div>
+
+      <div class="opt">
+        <p class="tag">案 C — アクセントをラベンダー 1 系統に統合</p>
+        <div class="term"><pre>  <span class="t-lav t-bold">◆ public</span>
+    <span class="t-lav-dim t-bold">vde-tmux</span>  <span class="t-dim">main</span>
+      <span style="color:#AEB6FF;font-weight:700;">LIVE</span> <span class="t-dim">tail · %51</span></pre></div>
+        <ul>
+          <li class="pro">状態 4 色+ラベンダー濃淡だけの 2 系統になり、画面全体の彩度が下がって落ち着く</li>
+          <li class="con">repo と category の区別が濃淡頼みになり、Item 2 の解決を半分巻き戻す</li>
+          <li class="con">「ラベンダー=操作・現在地」の意味が薄まる(構造にも実況にも使うため)</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="verdict">
+      <p><strong>推奨: 案 A。</strong>現状は偶発的にせよ族がほぼ成立しており、壊れているのは「✓ とbranch のシアン衝突」1 点だけ。
+      branch を 73 に落とし、5 族(状態/構造/操作/本文/実況)を規約として明文化するのが最小コストで最大の整合。
+      LIVE のマゼンタは「画面内で唯一の実況」という特異性の表現として孤立を許容する。</p>
+      <p class="impl">実装影響: <code>SidebarRenderTheme::default().branch</code> を <code>Color::Cyan</code> → <code>Color::Indexed(73)</code> に変更(config `colors.branch` で従来色に戻せる)。加えて theme 構造体コメントと README に 5 族の規約を記載。</p>
+    </div>
+  </section>
+
+  <!-- ============ combined ============ -->
+  <section id="combined">
+    <p class="eyebrow">Combined</p>
+    <h2>推奨案(1A + 2A + 3A + tasks + 5A)を合成した姿</h2>
+    <div class="term"><pre> <span class="t-gray">▾</span> <span class="t-peach">◆ public</span> <span class="t-dim2">──────────────────────────</span>
+   <span class="t-gray">▾</span> <span class="t-blue">vde-tmux</span>  <span class="t-cyan-dim">main</span>
+     <span class="t-gray">▾ ○</span> <span class="t-bold">claude</span>
+       <span class="t-dim">M-Eは対応させなくて良いから、M-eのmapだけ差し替えといて</span>
+       <span class="t-gray">○ idle</span> <span class="t-dim2">·</span> <span class="t-dim">done 12m ago</span>
+       <span class="t-dim">vde-tmux · %51</span>
+       <span class="t-gray">[</span><span class="t-cyan-dim">↗</span> <span class="t-dim">jump</span><span class="t-gray">]</span> <span class="t-gray">[</span><span class="t-lav-dim">⌕</span> <span class="t-dim">preview</span><span class="t-gray">]</span>
+     <span class="t-gray">▸ ○</span> <span class="t-bold">claude</span>: plan-12レビュー結果を確認し、自分…  <span class="t-dim2">38h</span>
+   <span class="t-gray">▾</span> <span class="t-blue">api</span>  <span class="t-cyan-dim">main</span> <span class="t-green">+2</span>
+     <span class="t-gray">▾ ●</span> <span class="t-bold">codex</span>
+       <span class="t-dim">migration スクリプトの動作確認とテスト追加</span>
+       <span class="t-green">● running</span> <span class="t-dim2">·</span> <span class="t-dim">12m · 3/5 tasks</span>
+       <span class="t-dim">api · %62</span>
+       <span class="t-gray">[</span><span class="t-cyan-dim">↗</span> <span class="t-dim">jump</span><span class="t-gray">]</span> <span class="t-gray">[</span><span class="t-lav-dim">⌕</span> <span class="t-dim">preview</span><span class="t-gray">]</span></pre></div>
+    <ul>
+      <li>展開 5 行(現状 6 行)で情報量は増加: prompt 全文 / 状態(色付き)+状態依存の時間+進捗 / 場所 / アクション</li>
+      <li>重複ゼロ: prompt は展開1行目のみ、経過時間はメタ行のみ(展開中の chat 行右ラベルは非表示)</li>
+      <li>状態色の文法(▲●✓○)がバッジ → ヘッダー → TRIAGE → 展開メタまで一気通貫する</li>
+    </ul>
+
+    <div class="table-wrap" style="margin-top:1rem;"><table>
+      <tr><th>#</th><th>変更</th><th>主な実装箇所</th><th>重さ</th></tr>
+      <tr><td>1A</td><td>展開中 chat 行 = agent 名のみ+右ラベル非表示</td><td>tree.rs push_chat_row / render.rs right_label</td><td>小</td></tr>
+      <tr><td>2A</td><td>状態行の色付け(グリフ+状態語のみ)</td><td>render.rs(detail::…::status の span 分割)</td><td>小</td></tr>
+      <tr><td>3A</td><td>メタ 3 行 → 状態行+場所行、completed_at 配線、humanize 共通化</td><td>tree.rs / options snapshot 配線 / elapsed_label</td><td><strong>中</strong></td></tr>
+      <tr><td>4</td><td>running 時の tasks 進捗を状態行末尾に表示</td><td>tree.rs(RowMeta 既存データ)</td><td>極小</td></tr>
+      <tr><td>5A</td><td>branch 既定色を 73 へ、5 族の色規約を明文化</td><td>render.rs default / README</td><td>極小</td></tr>
+    </table></div>
+    <p>
+      依存関係: 2A と 3A は同じ行を触るため同時に実装するのが安全(3A が 2A を内包する形)。1A・4・5A は独立。
+      実装順の想定は <strong>5A → 1A → 3A(2A 込み)→ 4</strong>。
+    </p>
+  </section>
+
+  <footer>vde-tmux sidebar detail-view proposals — スクリーンショット 2026-07-06 15:43 時点の表示に基づく</footer>
+</main>
