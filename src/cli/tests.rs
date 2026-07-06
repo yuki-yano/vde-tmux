@@ -6,6 +6,10 @@ fn env() -> BTreeMap<String, String> {
     BTreeMap::new()
 }
 
+fn tmux_env() -> BTreeMap<String, String> {
+    BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())])
+}
+
 mod hook;
 mod sidebar;
 
@@ -110,9 +114,22 @@ fn dispatch_session_manager_opens_popup() {
         "",
     );
 
-    run_with(["vt", "session-manager"], &mock, &env()).unwrap();
+    run_with(["vt", "session-manager"], &mock, &tmux_env()).unwrap();
 
     assert_eq!(mock.calls().len(), 2);
+}
+
+#[test]
+fn session_manager_popup_wrap_is_used_only_inside_tmux() {
+    assert!(!should_wrap_session_manager_in_popup(&env()));
+    assert!(should_wrap_session_manager_in_popup(&BTreeMap::from([(
+        "TMUX".to_string(),
+        "/tmp/tmux-501/default,1,0".to_string(),
+    )])));
+    assert!(should_wrap_session_manager_in_popup(&BTreeMap::from([(
+        "TMUX_PANE".to_string(),
+        "%1".to_string(),
+    )])));
 }
 
 #[test]
@@ -131,10 +148,13 @@ fn dispatch_popups_use_configured_size() {
         "popup:\n  width: \"72%\"\n  height: \"60%\"\n",
     )
     .unwrap();
-    let env = BTreeMap::from([(
-        "XDG_CONFIG_HOME".to_string(),
-        config_home.display().to_string(),
-    )]);
+    let env = BTreeMap::from([
+        (
+            "XDG_CONFIG_HOME".to_string(),
+            config_home.display().to_string(),
+        ),
+        ("TMUX_PANE".to_string(), "%1".to_string()),
+    ]);
     let exe = std::env::current_exe().unwrap().display().to_string();
 
     let session_mock = MockTmuxRunner::new();

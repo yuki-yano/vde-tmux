@@ -397,11 +397,17 @@ where
                 (true, Some(SessionManagerCommand::KillPane { target })) => {
                     crate::session_manager::kill_pane(runner, &target)?;
                 }
-                (false, None) => crate::session_manager::open_popup(
-                    runner,
-                    &config.popup,
-                    &std::env::current_exe()?.display().to_string(),
-                )?,
+                (false, None) => {
+                    if should_wrap_session_manager_in_popup(env) {
+                        crate::session_manager::open_popup(
+                            runner,
+                            &config.popup,
+                            &std::env::current_exe()?.display().to_string(),
+                        )?;
+                    } else {
+                        crate::session_manager::run_interactive_outside_tmux(runner, env)?;
+                    }
+                }
             }
             Ok(None)
         }
@@ -410,6 +416,13 @@ where
             Ok(None)
         }
     }
+}
+
+fn should_wrap_session_manager_in_popup(env: &BTreeMap<String, String>) -> bool {
+    env.get("TMUX")
+        .or_else(|| env.get("TMUX_PANE"))
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn emit_config_warnings<W: Write>(warnings: &[String], writer: &mut W) -> Result<()> {

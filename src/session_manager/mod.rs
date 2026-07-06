@@ -10,7 +10,7 @@ use crate::session::{
     current_client_name, current_session_name, exact_session_target, list_sessions,
     switch_client_for_client,
 };
-use crate::tmux::TmuxRunner;
+use crate::tmux::{TmuxRunner, tmux_args};
 use anyhow::{Context, Result};
 use unicode_width::UnicodeWidthStr;
 
@@ -41,7 +41,25 @@ pub trait SessionManagerIo {
     fn choose(&mut self, rows: &[String]) -> Result<Option<String>>;
 }
 
+trait SessionAttachIo {
+    fn attach_session(&mut self, target: &str) -> Result<()>;
+}
+
 pub struct SystemSessionManagerIo;
+struct SystemSessionAttachIo {
+    socket_name: Option<String>,
+}
+
+impl SystemSessionAttachIo {
+    fn from_env(env: &BTreeMap<String, String>) -> Self {
+        Self {
+            socket_name: env
+                .get("VDE_TMUX_SOCKET_NAME")
+                .filter(|value| !value.trim().is_empty())
+                .cloned(),
+        }
+    }
+}
 
 impl SessionManagerIo for SystemSessionManagerIo {
     fn choose(&mut self, rows: &[String]) -> Result<Option<String>> {
@@ -96,6 +114,26 @@ impl SessionManagerIo for SystemSessionManagerIo {
     }
 }
 
+impl SessionAttachIo for SystemSessionAttachIo {
+    fn attach_session(&mut self, target: &str) -> Result<()> {
+        let owned_args = tmux_args(
+            self.socket_name.as_deref(),
+            &["attach-session", "-t", target],
+        );
+        let status = Command::new("tmux")
+            .args(&owned_args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("failed to attach tmux session")?;
+        if !status.success() {
+            anyhow::bail!("tmux attach-session failed with exit {status:?}");
+        }
+        Ok(())
+    }
+}
+
 pub fn open_popup(runner: &dyn TmuxRunner, popup: &PopupConfig, exe: &str) -> Result<()> {
     let pane_path = runner
         .run(&["display-message", "-p", "#{pane_current_path}"])?
@@ -122,6 +160,15 @@ pub fn run_interactive(runner: &dyn TmuxRunner) -> Result<()> {
     run_interactive_with_io(runner, &mut io)
 }
 
+pub fn run_interactive_outside_tmux(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<()> {
+    let mut io = SystemSessionManagerIo;
+    let mut attach = SystemSessionAttachIo::from_env(env);
+    run_interactive_outside_tmux_with_io(runner, &mut io, &mut attach)
+}
+
 pub fn run_interactive_with_io(
     runner: &dyn TmuxRunner,
     io: &mut dyn SessionManagerIo,
@@ -132,6 +179,19 @@ pub fn run_interactive_with_io(
         return Ok(());
     };
     run_selection(runner, &selected)
+}
+
+fn run_interactive_outside_tmux_with_io(
+    runner: &dyn TmuxRunner,
+    io: &mut dyn SessionManagerIo,
+    attach: &mut dyn SessionAttachIo,
+) -> Result<()> {
+    let entries = build_entries(runner)?;
+    let rows = entries.iter().map(render_entry).collect::<Vec<_>>();
+    let Some(selected) = io.choose(&rows)? else {
+        return Ok(());
+    };
+    run_selection_outside_tmux(runner, &selected, attach)
 }
 
 fn build_entries(runner: &dyn TmuxRunner) -> Result<Vec<ManagerEntry>> {
@@ -387,6 +447,32 @@ fn run_selection(runner: &dyn TmuxRunner, selected: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_selection_outside_tmux(
+    runner: &dyn TmuxRunner,
+    selected: &str,
+    attach: &mut dyn SessionAttachIo,
+) -> Result<()> {
+    let (key, entries) = parse_selection_output(selected);
+    match key.as_str() {
+        "ctrl-q" => return kill_selection(runner, &entries),
+        "ctrl-t" => return create_and_attach_session(runner, attach),
+        "ctrl-r" => return rename_selection(runner, entries.first()),
+        _ => {}
+    }
+    let Some(entry) = entries.first() else {
+        return Ok(());
+    };
+    let session = if entry.session.is_empty() {
+        &entry.name
+    } else {
+        &entry.session
+    };
+    if entry.action == "window" && !entry.target.is_empty() {
+        runner.run(&["select-window", "-t", &entry.target])?;
+    }
+    attach.attach_session(&exact_session_target(session))
+}
+
 fn parse_selection_output(output: &str) -> (String, Vec<ManagerEntry>) {
     let mut lines = output.lines().filter(|line| !line.trim().is_empty());
     let Some(first) = lines.next() else {
@@ -462,6 +548,20 @@ fn create_and_switch_session(runner: &dyn TmuxRunner) -> Result<()> {
     }
     let client = current_client_name(runner)?;
     switch_client_for_client(runner, &client, &session)
+}
+
+fn create_and_attach_session(
+    runner: &dyn TmuxRunner,
+    attach: &mut dyn SessionAttachIo,
+) -> Result<()> {
+    let session = runner
+        .run(&["new-session", "-d", "-P", "-F", "#{session_name}"])?
+        .trim()
+        .to_string();
+    if session.is_empty() {
+        return Ok(());
+    }
+    attach.attach_session(&exact_session_target(&session))
 }
 
 fn rename_selection(runner: &dyn TmuxRunner, entry: Option<&ManagerEntry>) -> Result<()> {
@@ -1036,10 +1136,22 @@ mod tests {
         seen_rows: Vec<String>,
     }
 
+    #[derive(Default)]
+    struct MockSessionAttachIo {
+        targets: Vec<String>,
+    }
+
     impl SessionManagerIo for MockSessionManagerIo {
         fn choose(&mut self, rows: &[String]) -> Result<Option<String>> {
             self.seen_rows = rows.to_vec();
             Ok(self.selection.clone())
+        }
+    }
+
+    impl SessionAttachIo for MockSessionAttachIo {
+        fn attach_session(&mut self, target: &str) -> Result<()> {
+            self.targets.push(target.to_string());
+            Ok(())
         }
     }
 
@@ -1137,6 +1249,72 @@ mod tests {
         run_interactive_with_io(&mock, &mut io).unwrap();
 
         assert!(io.seen_rows.iter().any(|row| row.contains("ni.zsh")));
+    }
+
+    #[test]
+    fn outside_tmux_session_manager_attaches_selected_session() {
+        let mock = MockTmuxRunner::new();
+        let session_format = crate::session::session_list_format();
+        let window_format = [
+            "#{session_name}",
+            "#{window_index}",
+            "#{window_id}",
+            "#{window_name}",
+            "#{window_panes}",
+            "#{window_active}",
+            "#{pane_current_command}",
+        ]
+        .join(&FIELD_SEP.to_string());
+        mock.stub(
+            &["list-sessions", "-F", &session_format],
+            "main\u{1f}0\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\nni.zsh\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
+        );
+        mock.stub(
+            &["list-windows", "-a", "-F", &window_format],
+            "main\t1\t@1\tzsh\t1\t1\tzsh\nni.zsh\t1\t@2\tzsh\t1\t1\tzsh\n",
+        );
+        let selected = render_entry(&ManagerEntry {
+            action: "session".to_string(),
+            name: "ni.zsh".to_string(),
+            session: "ni.zsh".to_string(),
+            target: String::new(),
+            display: "· ni.zsh  [public]".to_string(),
+        });
+        let mut io = MockSessionManagerIo {
+            selection: Some(selected),
+            seen_rows: Vec::new(),
+        };
+        let mut attach = MockSessionAttachIo::default();
+
+        run_interactive_outside_tmux_with_io(&mock, &mut io, &mut attach).unwrap();
+
+        assert!(io.seen_rows.iter().any(|row| row.contains("ni.zsh")));
+        assert_eq!(attach.targets, vec!["=ni.zsh:"]);
+        assert!(
+            !mock
+                .calls()
+                .iter()
+                .any(|call| call.first().map(String::as_str) == Some("switch-client"))
+        );
+    }
+
+    #[test]
+    fn outside_tmux_session_manager_selects_window_before_attaching() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(&["select-window", "-t", "@9"], "");
+        let selected = render_entry(&ManagerEntry {
+            action: "window".to_string(),
+            name: "@9".to_string(),
+            session: "ni.zsh".to_string(),
+            target: "@9".to_string(),
+            display: "  └─ ni.zsh:2 editor".to_string(),
+        });
+        let mut attach = MockSessionAttachIo::default();
+
+        run_selection_outside_tmux(&mock, &selected, &mut attach).unwrap();
+
+        assert_eq!(mock.calls(), vec![vec!["select-window", "-t", "@9"]]);
+        assert_eq!(attach.targets, vec!["=ni.zsh:"]);
     }
 
     #[test]
