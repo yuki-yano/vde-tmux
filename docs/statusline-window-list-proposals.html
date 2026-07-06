@@ -1,0 +1,452 @@
+<title>vde-tmux 上部バー ウィンドウ一覧 視認性改善</title>
+<style>
+  :root {
+    --bg: #f5f4f8; --surface: #ffffff; --surface2: #eceaf3; --border: #dcd9e8;
+    --text: #232130; --muted: #6b6880; --accent: #5049c0; --accent-soft: #e6e4fa;
+    --pass: #1e7e4b; --pass-bg: #ddf2e5; --warn: #92650f; --warn-bg: #f7ecd2;
+    --fail: #b23434; --fail-bg: #f9e0e0;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14131c; --surface: #1c1b27; --surface2: #232230; --border: #2e2c40;
+      --text: #e8e6f2; --muted: #9a96b0; --accent: #8b84f0; --accent-soft: #2a2749;
+      --pass: #5fce8f; --pass-bg: #17301f; --warn: #d9b45c; --warn-bg: #322a14;
+      --fail: #e57676; --fail-bg: #3a1d1d;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f4f8; --surface: #ffffff; --surface2: #eceaf3; --border: #dcd9e8;
+    --text: #232130; --muted: #6b6880; --accent: #5049c0; --accent-soft: #e6e4fa;
+    --pass: #1e7e4b; --pass-bg: #ddf2e5; --warn: #92650f; --warn-bg: #f7ecd2;
+    --fail: #b23434; --fail-bg: #f9e0e0;
+  }
+  :root[data-theme="dark"] {
+    --bg: #14131c; --surface: #1c1b27; --surface2: #232230; --border: #2e2c40;
+    --text: #e8e6f2; --muted: #9a96b0; --accent: #8b84f0; --accent-soft: #2a2749;
+    --pass: #5fce8f; --pass-bg: #17301f; --warn: #d9b45c; --warn-bg: #322a14;
+    --fail: #e57676; --fail-bg: #3a1d1d;
+  }
+
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 15px; line-height: 1.85; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 48px 24px 96px; }
+
+  .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .18em; text-transform: uppercase; color: var(--accent); margin: 0 0 10px; }
+  h1 { font-size: 27px; line-height: 1.45; margin: 0 0 12px; text-wrap: balance; }
+  .lead { color: var(--muted); margin: 0; max-width: 44em; }
+
+  nav.toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 24px 0 0; }
+  nav.toc a { font-family: var(--mono); font-size: 12px; color: var(--muted); text-decoration: none; border: 1px solid var(--border); border-radius: 999px; padding: 3px 12px; background: var(--surface); }
+  nav.toc a:hover, nav.toc a:focus-visible { color: var(--accent); border-color: var(--accent); outline: none; }
+
+  h2 { font-size: 19px; margin: 60px 0 8px; text-wrap: balance; }
+  h2 .hash { color: var(--accent); font-family: var(--mono); margin-right: 8px; font-weight: 600; }
+  .sec-note { color: var(--muted); font-size: 13.5px; margin: 0 0 18px; }
+
+  .principle { margin: 20px 0 0; border-left: 3px solid var(--accent); background: var(--surface); border-radius: 0 10px 10px 0; padding: 14px 18px; font-size: 14.5px; }
+  .principle b { display: block; font-family: var(--mono); font-size: 11px; letter-spacing: .14em; color: var(--accent); margin-bottom: 4px; }
+
+  /* ---- terminal bar mock (stays dark in both themes) ---- */
+  .term { margin: 14px 0 0; background: #0b0a11; border: 1px solid var(--border); border-radius: 10px; padding: 16px 14px; overflow-x: auto; }
+  .termlabel { font-family: var(--mono); font-size: 10.5px; letter-spacing: .14em; color: #6f6b85; margin: 0 0 8px 2px; text-transform: uppercase; }
+  .bar { display: flex; align-items: center; min-width: 720px; font-family: var(--mono); font-size: 13px; line-height: 1; padding: 8px 10px; border-radius: 4px; white-space: nowrap; background: #232332; }
+  .seg { padding: 3px 8px; display: inline-flex; align-items: center; gap: 6px; }
+  .pill { border-radius: 999px; }
+  .chip { border-radius: 5px; }
+  .g { display: inline-flex; align-items: center; gap: 6px; }
+  .div { color: #4a4860; padding: 0 2px; }
+  .gap { width: 14px; display: inline-block; }
+  .name { color: #cdc9e0; }
+  .name.dim { color: #8f8ba8; }
+  .b { font-weight: 700; }
+  /* state dot colors */
+  .work { color: #4fd08a; } .done { color: #45cbe6; } .block { color: #ff6b6b; } .idle { color: #6f6b85; }
+  /* widened palette */
+  .work2 { color: #57d98a; } .done2 { color: #5aa6ff; } .block2 { color: #ff7a7a; } .idle2 { color: #8b86a3; }
+  .win { color: #8f8ba8; }
+  .pl { font-size: 13px; } /* powerline caps */
+
+  .crrow { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 0; }
+  .cr { font-family: var(--mono); font-size: 11.5px; border-radius: 6px; padding: 3px 9px; font-variant-numeric: tabular-nums; }
+  .cr.pass { background: var(--pass-bg); color: var(--pass); }
+  .cr.warn { background: var(--warn-bg); color: var(--warn); }
+  .cr.fail { background: var(--fail-bg); color: var(--fail); }
+
+  .option { margin-top: 26px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); overflow: hidden; }
+  .option.reco { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .ohead { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; padding: 16px 20px 0; }
+  .otag { font-family: var(--mono); font-weight: 700; font-size: 13px; color: var(--accent); background: var(--accent-soft); border-radius: 6px; padding: 2px 10px; }
+  .ohead h3 { font-size: 16px; margin: 0; }
+  .obadge { font-size: 11.5px; font-family: var(--mono); border-radius: 999px; padding: 2px 10px; margin-left: auto; }
+  .obadge.reco { background: var(--pass-bg); color: var(--pass); font-weight: 700; }
+  .obadge.cond { background: var(--warn-bg); color: var(--warn); }
+  .obadge.out { background: var(--fail-bg); color: var(--fail); }
+  .obody { padding: 6px 20px 4px; }
+  .procon { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; padding: 12px 20px 20px; }
+  .procon ul { margin: 6px 0 0; padding-left: 1.3em; font-size: 13.5px; }
+  .procon li { margin: 3px 0; }
+  .procon .h { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; }
+  .procon .pro .h { color: var(--pass); } .procon .con .h { color: var(--fail); }
+  @media (max-width: 640px) { .procon { grid-template-columns: 1fr; gap: 12px; } }
+
+  .verdict { margin-top: 22px; border: 1px solid var(--accent); border-radius: 12px; background: var(--surface); overflow: hidden; }
+  .verdict .vhead { background: var(--accent-soft); padding: 10px 20px; font-family: var(--mono); font-size: 12px; letter-spacing: .14em; color: var(--accent); font-weight: 700; }
+  .verdict .vbody { padding: 16px 20px; }
+  .verdict .vbody p { margin: 0 0 10px; } .verdict .vbody p:last-child { margin-bottom: 0; }
+  .verdict strong { color: var(--accent); }
+
+  .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); margin-top: 18px; }
+  table.score { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 13.5px; }
+  table.score th, table.score td { padding: 10px 14px; text-align: center; border-bottom: 1px solid var(--border); }
+  table.score tr:last-child td { border-bottom: none; }
+  table.score th { font-family: var(--mono); font-size: 12px; background: var(--surface2); }
+  table.score td.axis { text-align: left; font-weight: 600; white-space: nowrap; }
+  .s { font-family: var(--mono); font-weight: 700; }
+  .s.good { color: var(--pass); } .s.mid { color: var(--warn); } .s.weak { color: var(--fail); }
+
+  code { font-family: var(--mono); font-size: .86em; background: var(--surface2); border-radius: 5px; padding: 1px 6px; }
+  ol.impl { padding-left: 1.4em; margin: 8px 0 0; } ol.impl li { margin: 10px 0; }
+  ol.impl li p { margin: 2px 0 0; font-size: 13.5px; color: var(--muted); }
+  .foot { margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12.5px; }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">vde-tmux / top status bar — window list</p>
+  <h1>上部バー ウィンドウ一覧の視認性改善 — 複数案</h1>
+  <p class="lead">
+    tmux 上部バーの session/window 一覧について、指摘された 3 つの痛点
+    ①要素の境界が溶ける ②状態色が似ていて区別できない ③badge を塗りの中に置くか外に置くか
+    を分けて複数案を出します。バー地は実測の <code>#232332</code>。コントラスト比(CR)は WCAG 2.x 相対輝度で実算出。
+    緑枠が推奨案です。
+  </p>
+
+  <nav class="toc">
+    <a href="#now">現状の痛点</a>
+    <a href="#sep">① 境界を立てる</a>
+    <a href="#color">② 色を離す</a>
+    <a href="#fill">③ badge の塗り内/外</a>
+    <a href="#combo">推奨バー(統合)</a>
+    <a href="#impl">実装マッピング</a>
+  </nav>
+
+  <div class="principle">
+    <b>核となる原則</b>
+    信号グリフ(状態●▲✓○)は常に<strong>暗いバー地の上</strong>に置く。明るい塗り(面)は<strong>名前ラベル</strong>にだけ使う。
+    塗りとグリフを重ねると、明るい面の上でグリフの状態色が潰れる(実測 CR 1.1 前後)。この分担が 3 論点すべての土台になります。
+  </div>
+
+  <!-- ===== 現状 ===== -->
+  <h2 id="now"><span class="hash">00</span>現状 — 痛点の確認</h2>
+  <p class="sec-note">
+    <code>badge_style = inline</code> / <code>format = " {session} "</code> をセパレータなし(<code>""</code>)で連結。
+    グリフは状態色、名前は既定色、カレントのみ bold。
+  </p>
+  <div class="term">
+    <p class="termlabel">status bar — 現状</p>
+    <div class="bar">
+      <span class="seg"><span class="g"><span class="work">●</span><span class="name">public</span></span></span>
+      <span class="seg"><span class="g"><span class="done">✓</span><span class="name">miyauchidp.dev</span></span></span>
+      <span class="seg"><span class="g"><span class="work">●</span><span class="name">vde-monitor</span></span></span>
+      <span class="seg"><span class="g"><span class="block">▲</span><span class="name b">vde-tmux</span></span></span>
+      <span class="gap"></span><span class="win">1:node</span>
+    </div>
+  </div>
+  <div class="crrow">
+    <span class="cr fail">working ● vs done ✓ = 1.02 — ほぼ同色</span>
+    <span class="cr fail">セグメント境界 = なし</span>
+    <span class="cr warn">idle ○ on bar = 3.03</span>
+    <span class="cr pass">working/done on bar ≈ 8.0</span>
+  </div>
+  <p class="sec-note" style="margin-top:14px">
+    痛点は 3 つ。<b>(a)</b> 隣の session との間に区切りが無く、名前が長いと <code>miyauchidp.dev</code> と <code>vde-monitor</code> が地続きに見える。
+    <b>(b)</b> working の緑 <code>#4fd08a</code> と done の水色 <code>#45cbe6</code> は輝度がほぼ同じ(CR 1.02)で、色だけでは見分けられない。
+    <b>(c)</b> カレントに塗りを足したくても、塗りの上にグリフを載せると潰れる。
+  </p>
+
+  <!-- ===== ① 境界 ===== -->
+  <h2 id="sep"><span class="hash">01</span>① 要素の境界を立てる</h2>
+  <p class="sec-note">セグメント間に区切りを与える。幅コストと主張の強さでトレードオフ。</p>
+
+  <div class="option reco">
+    <div class="ohead"><span class="otag">A1</span><h3>細いディバイダ <code>│</code>(最小変更)</h3><span class="obadge reco">推奨</span></div>
+    <div class="obody">
+      <div class="term"><p class="termlabel">thin divider</p>
+        <div class="bar">
+          <span class="seg"><span class="work">●</span>&nbsp;<span class="name">public</span></span><span class="div">│</span>
+          <span class="seg"><span class="done">✓</span>&nbsp;<span class="name">miyauchidp.dev</span></span><span class="div">│</span>
+          <span class="seg"><span class="work">●</span>&nbsp;<span class="name">vde-monitor</span></span><span class="div">│</span>
+          <span class="seg"><span class="block">▲</span>&nbsp;<span class="name b">vde-tmux</span></span>
+          <span class="gap"></span><span class="win">1:node</span>
+        </div>
+      </div>
+    </div>
+    <div class="procon">
+      <div class="pro"><span class="h">PRO</span><ul><li>幅コスト実質ゼロ(区切り1文字)。狭いバーでも破綻しない</li><li>塗りを一切足さないので原則(グリフは暗地の上)を自然に守る</li><li>config だけで実現(セグメント連結に separator を挿入)</li></ul></div>
+      <div class="con"><span class="h">CON</span><ul><li>面での分離ではないので、bold カレント以外の強調は弱め</li><li>ディバイダ色を暗くしすぎるとバー地に沈む(<code>#4a4860</code> 程度が下限)</li></ul></div>
+    </div>
+  </div>
+
+  <div class="option">
+    <div class="ohead"><span class="otag">A2</span><h3>暗いチップで各セグメントを面分離</h3><span class="obadge cond">状況次第</span></div>
+    <div class="obody">
+      <div class="term"><p class="termlabel">dark chips (#2e3350)</p>
+        <div class="bar" style="gap:8px">
+          <span class="seg chip" style="background:#2e3350"><span class="work">●</span>&nbsp;<span class="name">public</span></span>
+          <span class="seg chip" style="background:#2e3350"><span class="done">✓</span>&nbsp;<span class="name">miyauchidp.dev</span></span>
+          <span class="seg chip" style="background:#2e3350"><span class="work">●</span>&nbsp;<span class="name">vde-monitor</span></span>
+          <span class="seg chip" style="background:#3a3550"><span class="block">▲</span>&nbsp;<span class="name b">vde-tmux</span></span>
+          <span class="gap"></span><span class="win">1:node</span>
+        </div>
+      </div>
+      <div class="crrow">
+        <span class="cr pass">glyph on chip ≈ 6.3</span>
+        <span class="cr pass">名前 on chip ≈ 7.5</span>
+        <span class="cr warn">idle ○ on chip = 2.4</span>
+      </div>
+    </div>
+    <div class="procon">
+      <div class="pro"><span class="h">PRO</span><ul><li>面で分離するので境界が最も明快。カレントは一段明るいチップで区別</li><li><b>暗い</b>チップなのでグリフ CR ≈ 6 を保てる(明るい pill と違い潰れない)</li></ul></div>
+      <div class="con"><span class="h">CON</span><ul><li>左右パディングで 1 session あたり +2 列。session が多いと右が溢れる</li><li>idle グリフだけは chip 上で 2.4 と弱い(idle 色を少し上げる必要)</li></ul></div>
+    </div>
+  </div>
+
+  <div class="option">
+    <div class="ohead"><span class="otag">A3</span><h3>powerline セグメント(交互塗り)</h3><span class="obadge out">非推奨</span></div>
+    <div class="obody">
+      <div class="term"><p class="termlabel">powerline</p>
+        <div class="bar" style="gap:0">
+          <span class="seg" style="background:#2e3350"><span class="work">●</span>&nbsp;<span class="name">public</span></span><span class="pl" style="color:#2e3350;background:#3a3550">&#xE0B0;</span>
+          <span class="seg" style="background:#3a3550"><span class="done">✓</span>&nbsp;<span class="name">miyauchidp.dev</span></span><span class="pl" style="color:#3a3550;background:#2e3350">&#xE0B0;</span>
+          <span class="seg" style="background:#2e3350"><span class="work">●</span>&nbsp;<span class="name">vde-monitor</span></span><span class="pl" style="color:#2e3350;background:#98b2f6">&#xE0B0;</span>
+          <span class="seg" style="background:#98b2f6;color:#232332"><span class="b">▲ vde-tmux</span></span><span class="pl" style="color:#98b2f6">&#xE0B0;</span>
+          <span class="gap"></span><span class="win">1:node</span>
+        </div>
+      </div>
+    </div>
+    <div class="procon">
+      <div class="pro"><span class="h">PRO</span><ul><li>境界の主張は最強。ターミナル UI として馴染みがある</li></ul></div>
+      <div class="con"><span class="h">CON</span><ul><li>キャップ文字が Nerd Font 必須。環境依存で崩れる</li><li>塗りが常時全面に入り、状態色(赤=詰まり)の視線誘導を殺す</li><li>カレント塗りの上にグリフが乗ると潰れる(③参照)。塗り前提の設計は原則に反する</li></ul></div>
+    </div>
+  </div>
+
+  <div class="verdict">
+    <div class="vhead">① の推奨</div>
+    <div class="vbody">
+      <p><strong>A1(細いディバイダ)を基本</strong>。幅を食わず、塗りを足さないので原則を崩さない。区切りは <code>│</code> を <code>#4a4860</code> 前後で。</p>
+      <p>より強い面分離が欲しい/session 数が少ない環境では <strong>A2(暗いチップ)</strong> を選択肢に。明るい pill ではなく<strong>暗い</strong>チップにするのがグリフを潰さない鍵。</p>
+    </div>
+  </div>
+
+  <!-- ===== ② 色 ===== -->
+  <h2 id="color"><span class="hash">02</span>② 状態色を離して区別できるようにする</h2>
+  <p class="sec-note">
+    現状 working(緑 <code>#4fd08a</code>)と done(水色 <code>#45cbe6</code>)は輝度差 CR 1.02。
+    形(<code>●</code>/<code>✓</code>)は違うが、遠目や小フォントでは色が同じに読める。色相と輝度の両方を離す。
+  </p>
+
+  <div class="option reco">
+    <div class="ohead"><span class="otag">B1</span><h3>パレットを色相ごと離す(緑→青へ)</h3><span class="obadge reco">推奨</span></div>
+    <div class="obody">
+      <div class="term"><p class="termlabel">before → after</p>
+        <div class="bar">
+          <span class="seg"><span class="work">●</span>&nbsp;<span class="name">working</span></span><span class="div">│</span>
+          <span class="seg"><span class="done">✓</span>&nbsp;<span class="name">done</span></span>
+          <span class="gap"></span><span class="win">現状: 緑と水色が近い</span>
+        </div>
+        <div class="bar" style="margin-top:8px">
+          <span class="seg"><span class="work2">●</span>&nbsp;<span class="name">working</span></span><span class="div">│</span>
+          <span class="seg"><span class="done2">✓</span>&nbsp;<span class="name">done</span></span>
+          <span class="gap"></span><span class="win">改良: 緑と青で明確に別</span>
+        </div>
+        <div class="bar" style="margin-top:8px">
+          <span class="seg"><span class="block2">▲</span>&nbsp;<span class="name">blocked</span></span><span class="div">│</span>
+          <span class="seg"><span class="work2">●</span>&nbsp;<span class="name">working</span></span><span class="div">│</span>
+          <span class="seg"><span class="done2">✓</span>&nbsp;<span class="name">done</span></span><span class="div">│</span>
+          <span class="seg"><span class="idle2">○</span>&nbsp;<span class="name">idle</span></span>
+        </div>
+      </div>
+      <div class="crrow">
+        <span class="cr fail">現状 working vs done = 1.02</span>
+        <span class="cr pass">改良 working vs done = 1.40 + 色相が緑↔青</span>
+        <span class="cr pass">改良 idle on bar = 4.45(現状 3.03 から改善)</span>
+      </div>
+      <p class="sec-note" style="margin-top:12px">
+        提案値: blocked <code>#ff7a7a</code> / working <code>#57d98a</code>(緑) / done <code>#5aa6ff</code>(青) / idle <code>#8b86a3</code>。
+        done を水色から<strong>青</strong>に振ることで working の緑と色相が分離し、輝度差もつく。
+      </p>
+    </div>
+    <div class="procon">
+      <div class="pro"><span class="h">PRO</span><ul><li>色相(緑↔青)と輝度の両方が離れ、小フォント・色覚特性下でも区別できる</li><li>グリフ形(<code>●✓▲○</code>)との二重符号化で色に依存しない</li><li><code>badge.colors.*</code> の値差し替えのみ。コード変更ゼロ</li></ul></div>
+      <div class="con"><span class="h">CON</span><ul><li>done の「青」が blocked 以外の青系 UI と混同されないか要確認(sidebar の repo 青との整合)</li></ul></div>
+    </div>
+  </div>
+
+  <div class="option">
+    <div class="ohead"><span class="otag">B2</span><h3>色は据え置き、グリフ形の差だけで分離</h3><span class="obadge cond">補助</span></div>
+    <div class="obody">
+      <div class="term"><p class="termlabel">shape-only</p>
+        <div class="bar">
+          <span class="seg"><span class="work">◐</span>&nbsp;<span class="name">working</span></span><span class="div">│</span>
+          <span class="seg"><span class="done">✔</span>&nbsp;<span class="name">done</span></span>
+          <span class="gap"></span><span class="win">形を強く差別化</span>
+        </div>
+      </div>
+    </div>
+    <div class="procon">
+      <div class="pro"><span class="h">PRO</span><ul><li>配色を一切変えないので既存テーマとの整合の心配がない</li></ul></div>
+      <div class="con"><span class="h">CON</span><ul><li>色が同じままなので「一瞥での区別」は改善が小さい</li><li>グリフ形はフォント依存で細部が潰れやすい</li></ul></div>
+    </div>
+  </div>
+
+  <div class="verdict">
+    <div class="vhead">② の推奨</div>
+    <div class="vbody">
+      <p><strong>B1(パレットを離す)</strong>。done を水色→青に振るのが決め手で、working の緑と色相・輝度の両方で分離する。値差し替えだけで済む。</p>
+      <p>B2 の「形も離す」は B1 と併用すると二重符号化になり、色覚特性への保険になる(必須ではない)。</p>
+    </div>
+  </div>
+
+  <!-- ===== ③ badge fill ===== -->
+  <h2 id="fill"><span class="hash">03</span>③ badge を塗りの「中」か「外」か</h2>
+  <p class="sec-note">
+    カレントを塗り(面)で強調したい場合、状態グリフをその塗りの中に入れるか、塗りの外(バー地)に出すか。実測で決着する論点。
+  </p>
+
+  <div class="option">
+    <div class="ohead"><span class="otag">C1</span><h3>塗りの「中」— 明るい pill にグリフを載せる</h3><span class="obadge out">非推奨</span></div>
+    <div class="obody">
+      <div class="term"><p class="termlabel">badge inside bright pill</p>
+        <div class="bar">
+          <span class="seg"><span class="work">●</span>&nbsp;<span class="name">public</span></span><span class="div">│</span>
+          <span class="seg pill" style="background:#98b2f6;color:#232332"><span class="block">▲</span>&nbsp;<span class="b">vde-tmux</span></span>
+          <span class="gap"></span><span class="win">▲ が塗りに溶ける</span>
+        </div>
+      </div>
+      <div class="crrow">
+        <span class="cr fail">blocked ▲ on pill = 1.33</span>
+        <span class="cr fail">working ● on pill = 1.07</span>
+        <span class="cr fail">done ✓ on pill = 1.09</span>
+      </div>
+    </div>
+    <div class="procon">
+      <div class="pro"><span class="h">PRO</span><ul><li>1 セグメントに全情報が収まって見た目はまとまる</li></ul></div>
+      <div class="con"><span class="h">CON</span><ul><li>明るい pill の上でグリフ状態色が CR 1.1 前後に潰れ、<b>状態が読めなくなる</b></li><li>いちばん重要な「詰まり=赤」の警告がカレントで消える本末転倒</li></ul></div>
+    </div>
+  </div>
+
+  <div class="option reco">
+    <div class="ohead"><span class="otag">C2</span><h3>塗りの「外」— グリフはバー地、塗りは名前だけ</h3><span class="obadge reco">推奨</span></div>
+    <div class="obody">
+      <div class="term"><p class="termlabel">badge outside pill (= badge_style: outer)</p>
+        <div class="bar">
+          <span class="seg"><span class="work">●</span>&nbsp;<span class="name">public</span></span><span class="div">│</span>
+          <span class="g"><span class="block">▲</span>&nbsp;<span class="seg pill" style="background:#98b2f6;color:#232332"><span class="b">vde-tmux</span></span></span>
+          <span class="gap"></span><span class="win">▲ は暗地の上で鮮明</span>
+        </div>
+      </div>
+      <div class="crrow">
+        <span class="cr pass">blocked ▲ on bar = 5.57</span>
+        <span class="cr pass">名前 on pill(暗字) = 7.39</span>
+        <span class="cr pass">pill vs バー地 = 7.39</span>
+      </div>
+    </div>
+    <div class="procon">
+      <div class="pro"><span class="h">PRO</span><ul><li>グリフは常に暗地の上 → 全状態色が鮮明(CR 5.5〜8)</li><li>塗りは名前ラベル専用にでき、暗字(<code>#232332</code>)で CR 7.4 の可読性</li><li><code>badge_style = "outer"</code> が<strong>既に実装済み</strong>。config 切替のみ</li></ul></div>
+      <div class="con"><span class="h">CON</span><ul><li>グリフが pill の左に一段はみ出すので、+1 列ぶん幅が要る</li></ul></div>
+    </div>
+  </div>
+
+  <div class="option">
+    <div class="ohead"><span class="otag">C3</span><h3>塗りを使わず bold + 暗チップ</h3><span class="obadge cond">代替</span></div>
+    <div class="obody">
+      <div class="term"><p class="termlabel">no bright fill</p>
+        <div class="bar">
+          <span class="seg"><span class="work">●</span>&nbsp;<span class="name">public</span></span><span class="div">│</span>
+          <span class="seg chip" style="background:#3a3550"><span class="block">▲</span>&nbsp;<span class="name b">vde-tmux</span></span>
+          <span class="gap"></span><span class="win">暗チップ内でも読める</span>
+        </div>
+      </div>
+      <div class="crrow"><span class="cr pass">glyph on 暗チップ ≈ 5〜6</span><span class="cr pass">名前(明字) ≈ 7.5</span></div>
+    </div>
+    <div class="procon">
+      <div class="pro"><span class="h">PRO</span><ul><li>明るい面を使わないのでグリフを塗りの中に入れても潰れない</li><li>A2(暗チップ境界)とそのまま両立する</li></ul></div>
+      <div class="con"><span class="h">CON</span><ul><li>カレントの主張は明るい pill(C2)より弱い</li></ul></div>
+    </div>
+  </div>
+
+  <div class="verdict">
+    <div class="vhead">③ の推奨</div>
+    <div class="vbody">
+      <p><strong>C2(塗りの外)</strong>。明るい pill を使うなら、グリフは必ずバー地に出す。これは既存の <code>badge_style = "outer"</code> で今すぐ切替可能。</p>
+      <p>明るい面自体を避けたいなら <strong>C3(暗チップ)</strong>。この場合はグリフを中に入れても潰れないので A2 とセットで使える。</p>
+    </div>
+  </div>
+
+  <!-- ===== 統合 ===== -->
+  <h2 id="combo"><span class="hash">04</span>推奨バー(3 論点の統合)</h2>
+  <p class="sec-note">①A1 + ②B1 + ③C2 を重ねた本命と、面分離を強めた ①A2 + ②B1 + ③C3 の代替を並べます。</p>
+
+  <div class="option reco">
+    <div class="ohead"><span class="otag">本命</span><h3>ディバイダ + 離したパレット + カレントは pill(グリフ外)</h3><span class="obadge reco">推奨</span></div>
+    <div class="obody">
+      <div class="term"><p class="termlabel">recommended</p>
+        <div class="bar">
+          <span class="seg"><span class="work2">●</span>&nbsp;<span class="name">public</span></span><span class="div">│</span>
+          <span class="seg"><span class="done2">✓</span>&nbsp;<span class="name">miyauchidp.dev</span></span><span class="div">│</span>
+          <span class="seg"><span class="work2">●</span>&nbsp;<span class="name">vde-monitor</span></span><span class="div">│</span>
+          <span class="g"><span class="block2">▲</span>&nbsp;<span class="seg pill" style="background:#98b2f6;color:#232332"><span class="b">vde-tmux</span></span></span>
+          <span class="gap"></span><span class="win">1:node</span>
+        </div>
+      </div>
+      <p class="sec-note" style="margin-top:12px">境界=ディバイダ、状態=緑/青で分離、カレント=明るい pill+グリフはバー地。3 論点が互いに干渉しない。</p>
+    </div>
+  </div>
+
+  <div class="option">
+    <div class="ohead"><span class="otag">代替</span><h3>暗チップで面分離 + 離したパレット(全面フラット)</h3><span class="obadge cond">濃いめ</span></div>
+    <div class="obody">
+      <div class="term"><p class="termlabel">alternative — dark chips</p>
+        <div class="bar" style="gap:8px">
+          <span class="seg chip" style="background:#2e3350"><span class="work2">●</span>&nbsp;<span class="name">public</span></span>
+          <span class="seg chip" style="background:#2e3350"><span class="done2">✓</span>&nbsp;<span class="name">miyauchidp.dev</span></span>
+          <span class="seg chip" style="background:#2e3350"><span class="work2">●</span>&nbsp;<span class="name">vde-monitor</span></span>
+          <span class="seg chip" style="background:#3a3550"><span class="block2">▲</span>&nbsp;<span class="name b">vde-tmux</span></span>
+          <span class="gap"></span><span class="win">1:node</span>
+        </div>
+      </div>
+      <p class="sec-note" style="margin-top:12px">全 session を暗チップで面分離。カレントは一段明るい暗チップ+bold。明るい pill を使わないのでグリフを中に置いても潰れない。</p>
+    </div>
+  </div>
+
+  <div class="tablewrap">
+    <table class="score">
+      <tr><th class="axis">評価軸</th><th>現状</th><th>本命<br>A1+B1+C2</th><th>代替<br>A2+B1+C3</th></tr>
+      <tr><td class="axis">境界の明快さ</td><td class="s weak">弱</td><td class="s good">良</td><td class="s good">最良</td></tr>
+      <tr><td class="axis">状態色の区別</td><td class="s weak">1.02</td><td class="s good">緑/青</td><td class="s good">緑/青</td></tr>
+      <tr><td class="axis">グリフ可読性</td><td class="s good">8.0</td><td class="s good">5.5〜8</td><td class="s good">5〜6</td></tr>
+      <tr><td class="axis">幅コスト</td><td class="s good">最小</td><td class="s good">+1列</td><td class="s mid">+2列/枠</td></tr>
+      <tr><td class="axis">実装コスト</td><td class="s good">—</td><td class="s good">config</td><td class="s good">config</td></tr>
+    </table>
+  </div>
+
+  <!-- ===== 実装 ===== -->
+  <h2 id="impl"><span class="hash">05</span>実装マッピング(ほぼ config)</h2>
+  <ol class="impl">
+    <li><b>③ グリフを塗りの外へ</b><p><code>statusline.sessions.badge_style = "outer"</code>(実装済み)。カレント塗りは <code>sessions.current.colors.bg = "#98b2f6"</code> / <code>fg = "#232332"</code>。</p></li>
+    <li><b>② パレットを離す</b><p><code>badge.colors</code> を blocked <code>#ff7a7a</code> / working <code>#57d98a</code> / done <code>#5aa6ff</code> / idle <code>#8b86a3</code> に差し替え。コード変更なし。</p></li>
+    <li><b>① 境界(A1 ディバイダ)</b><p>セグメント連結が現状 <code>join("")</code>。ここに区切り(例 <code>#[fg=#4a4860]│#[default]</code>)を挟む小改修が要る。<code>render_statusline_sessions_with_stale</code> の <code>join</code> を separator 付きに。あるいは <code>sessions.other.suffix</code> にディバイダを入れる暫定手もあるが、末尾に余分な区切りが残る点に注意。</p></li>
+    <li><b>① 境界(A2 暗チップ / 代替案)</b><p><code>sessions.other.colors.bg = "#2e3350"</code> + <code>format = " {session} "</code>。ディバイダ不要。カレントは <code>current.colors.bg = "#3a3550"</code> + bold。</p></li>
+    <li><b>idle の底上げ</b><p>idle が暗地/チップで沈むので <code>#6f6b85 → #8b86a3</code>(② に含む)。</p></li>
+  </ol>
+  <p class="sec-note" style="margin-top:14px">
+    ②③ と代替①(A2)は <b>config 差し替えのみ</b>で試せます。本命①(A1 ディバイダ)だけ <code>join</code> への separator 挿入という数行の改修が必要。
+    まず ②(色)③(outer)を config で入れて効果を確認し、境界を A1/A2 のどちらで固めるか実機で選ぶのが安全です。
+  </p>
+
+  <div class="foot">
+    <p>vde-tmux 上部バー ウィンドウ一覧 視認性改善 — 計画前の比較検討 / 2026-07-06</p>
+    <p>CR は WCAG 2.x 相対輝度で算出。バー地 <code>#232332</code>、カレント塗り <code>#98b2f6</code>、暗チップ <code>#2e3350</code> 基準。</p>
+  </div>
+</div>
