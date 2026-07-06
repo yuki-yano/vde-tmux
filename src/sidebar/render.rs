@@ -583,7 +583,7 @@ fn render_row_line(
         .saturating_sub(right_reserved);
     let label_source = match row.kind {
         SidebarRowKind::Category => format!("◆ {}", row.label),
-        SidebarRowKind::Jump => "↗ jump   ⌕ preview".to_string(),
+        SidebarRowKind::Jump => JUMP_ROW_LABEL.to_string(),
         _ => row.label.clone(),
     };
     let label = truncate_display(&label_source, label_budget);
@@ -617,7 +617,11 @@ fn render_row_line(
     if let Some((glyph, color)) = badge {
         spans.push(Span::styled(glyph, badge_style(color, row)));
     }
-    spans.extend(label_spans(label, row, style));
+    if row.kind == SidebarRowKind::Jump {
+        spans.extend(jump_action_spans(&label, theme));
+    } else {
+        spans.extend(label_spans(label, row, style));
+    }
     if let Some(git) = &git {
         spans.push(Span::styled(
             format!(" {}", git.branch),
@@ -1063,20 +1067,54 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
         SidebarRowKind::Repo => Style::default().fg(theme.repo).add_modifier(Modifier::BOLD),
         SidebarRowKind::Chat => Style::default().fg(Color::Reset),
         SidebarRowKind::Detail => Style::default().fg(theme.detail),
-        SidebarRowKind::Jump => Style::default().fg(Color::Cyan),
+        SidebarRowKind::Jump => Style::default().fg(theme.detail),
     }
 }
 
+/// Jump 行のアクションチップの全文(幅計算と truncate 判定に使う)。
+const JUMP_ROW_LABEL: &str = "[↗ jump] [⌕ preview]";
+/// jump グリフの淡シアン(branch の明るい Cyan と彩度で差別化する)
+const ACTION_JUMP_GLYPH: Color = Color::Indexed(73);
+/// preview グリフの淡ラベンダー(pin の 147 より一段落とす)
+const ACTION_PREVIEW_GLYPH: Color = Color::Indexed(103);
+
+/// Jump 行の [↗ jump] [⌕ preview] チップ。ブラケットは marker、
+/// ラベルは detail で detail ゾーンに馴染ませ、グリフ1文字だけ
+/// 淡色アクセントにして「押せる」ことを示す。
+fn jump_action_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'static>> {
+    if label != JUMP_ROW_LABEL {
+        // 幅不足で truncate された場合はプレーン表示に落とす
+        return vec![Span::styled(
+            label.to_string(),
+            Style::default().fg(theme.detail),
+        )];
+    }
+    let bracket = Style::default().fg(theme.marker);
+    let text = Style::default().fg(theme.detail);
+    vec![
+        Span::styled("[".to_string(), bracket),
+        Span::styled("↗".to_string(), Style::default().fg(ACTION_JUMP_GLYPH)),
+        Span::styled(" jump".to_string(), text),
+        Span::styled("]".to_string(), bracket),
+        Span::raw(" ".to_string()),
+        Span::styled("[".to_string(), bracket),
+        Span::styled("⌕".to_string(), Style::default().fg(ACTION_PREVIEW_GLYPH)),
+        Span::styled(" preview".to_string(), text),
+        Span::styled("]".to_string(), bracket),
+    ]
+}
+
 /// Jump 行のクリック列をアクションへ変換する。
-/// レイアウトは " " + indent(2*depth) + "↗ jump" + "   " + "⌕ preview"。
+/// レイアウトは " " + indent(2*depth) + "[↗ jump]"(8桁) + " " + "[⌕ preview]"(11桁)。
+/// クリック範囲はブラケット込み(見た目のチップと一致させる)。
 pub fn jump_row_action_at(row: &SidebarRow, column: u16) -> Option<JumpRowAction> {
     if row.kind != SidebarRowKind::Jump {
         return None;
     }
     let jump_start = 1 + 2 * row.depth;
-    let jump_end = jump_start + 6;
-    let preview_start = jump_end + 3;
-    let preview_end = preview_start + 9;
+    let jump_end = jump_start + 8;
+    let preview_start = jump_end + 1;
+    let preview_end = preview_start + 11;
     let column = column as usize;
     if (jump_start..jump_end).contains(&column) {
         Some(JumpRowAction::Jump)
@@ -1693,12 +1731,29 @@ mod tests {
             RollupLevel::Running,
         );
 
-        let rendered = render_rows(&[jump], &SidebarState::default(), 40);
+        let rendered = render_rows(std::slice::from_ref(&jump), &SidebarState::default(), 40);
 
         assert!(
-            rendered.starts_with("     ↗ jump   ⌕ preview"),
+            rendered.starts_with("     [↗ jump] [⌕ preview]"),
             "{rendered:?}"
         );
+
+        // グリフだけ淡色アクセント、ラベルは detail、ブラケットは marker
+        let theme = SidebarRenderTheme::default();
+        let lines = render_lines(&[jump], &SidebarState::default(), 40, &theme);
+        let style_of = |needle: &str| {
+            lines[0]
+                .spans
+                .iter()
+                .find(|span| span.content == needle)
+                .unwrap_or_else(|| panic!("span {needle:?} not found: {:?}", lines[0]))
+                .style
+        };
+        assert_eq!(style_of("↗").fg, Some(Color::Indexed(73)));
+        assert_eq!(style_of("⌕").fg, Some(Color::Indexed(103)));
+        assert_eq!(style_of(" jump").fg, Some(theme.detail));
+        assert_eq!(style_of(" preview").fg, Some(theme.detail));
+        assert_eq!(style_of("[").fg, Some(theme.marker));
     }
 
     #[test]
@@ -1711,12 +1766,14 @@ mod tests {
             RollupLevel::Running,
         );
 
+        // " " + indent(4) + "[↗ jump]"(5..13) + " "(13) + "[⌕ preview]"(14..25)
+        assert_eq!(jump_row_action_at(&jump, 4), None);
         assert_eq!(jump_row_action_at(&jump, 5), Some(JumpRowAction::Jump));
-        assert_eq!(jump_row_action_at(&jump, 10), Some(JumpRowAction::Jump));
-        assert_eq!(jump_row_action_at(&jump, 12), None);
+        assert_eq!(jump_row_action_at(&jump, 12), Some(JumpRowAction::Jump));
+        assert_eq!(jump_row_action_at(&jump, 13), None);
         assert_eq!(jump_row_action_at(&jump, 14), Some(JumpRowAction::Preview));
-        assert_eq!(jump_row_action_at(&jump, 22), Some(JumpRowAction::Preview));
-        assert_eq!(jump_row_action_at(&jump, 30), None);
+        assert_eq!(jump_row_action_at(&jump, 24), Some(JumpRowAction::Preview));
+        assert_eq!(jump_row_action_at(&jump, 25), None);
     }
 
     #[test]

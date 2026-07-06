@@ -1,0 +1,188 @@
+<title>jump / preview ボタンの配色 比較提案</title>
+<style>
+  :root {
+    --ground: #F4F3F7; --surface: #FFFFFF; --ink: #23263A; --ink-soft: #5A5E74;
+    --line: #DDDCE6; --accent: #5157C9; --accent-soft: #EAEAF9;
+    --c-blocked: #C0403A; --c-working: #2E8B4F;
+    --reco-bg: #EEF7F0; --reco-line: #2E8B4F;
+    --mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #13151D; --surface: #1B1E2A; --ink: #DCE0EE; --ink-soft: #9A9FB5;
+      --line: #2B2F40; --accent: #AEB6FF; --accent-soft: #262A45;
+      --c-blocked: #F07A72; --c-working: #7FD08F;
+      --reco-bg: #1E2A22; --reco-line: #7FD08F;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #13151D; --surface: #1B1E2A; --ink: #DCE0EE; --ink-soft: #9A9FB5;
+    --line: #2B2F40; --accent: #AEB6FF; --accent-soft: #262A45;
+    --c-blocked: #F07A72; --c-working: #7FD08F;
+    --reco-bg: #1E2A22; --reco-line: #7FD08F;
+  }
+  :root[data-theme="light"] {
+    --ground: #F4F3F7; --surface: #FFFFFF; --ink: #23263A; --ink-soft: #5A5E74;
+    --line: #DDDCE6; --accent: #5157C9; --accent-soft: #EAEAF9;
+    --c-blocked: #C0403A; --c-working: #2E8B4F;
+    --reco-bg: #EEF7F0; --reco-line: #2E8B4F;
+  }
+
+  html { background: var(--ground); }
+  body {
+    font-family: var(--sans); color: var(--ink); line-height: 1.8;
+    margin: 0; padding: 3.5rem 1.25rem 5rem; font-size: 15px;
+  }
+  main { max-width: 60rem; margin: 0 auto; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin: .4rem 0 .6rem; text-wrap: balance; }
+  .lede { color: var(--ink-soft); margin: 0 0 1.6rem; max-width: 44rem; }
+  .eyebrow {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--accent); margin: 0;
+  }
+  h2 { font-size: 1.2rem; margin: 2.6rem 0 .8rem; text-wrap: balance; }
+  p { margin: .6rem 0; }
+  ul { padding-left: 1.25rem; margin: .5rem 0; }
+  li { margin: .25rem 0; }
+  code {
+    font-family: var(--mono); font-size: .85em;
+    background: var(--accent-soft); border-radius: 4px; padding: .1em .35em;
+  }
+
+  .options { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: 1rem; }
+  .opt {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 12px; padding: 1rem 1.1rem 1.1rem;
+    display: flex; flex-direction: column; gap: .4rem;
+  }
+  .opt.reco { box-shadow: inset 0 0 0 1px var(--reco-line); border-color: var(--reco-line); }
+  .opt .tag {
+    font-family: var(--mono); font-size: .68rem; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--ink-soft);
+  }
+  .opt.reco .tag::after { content: " · 推奨"; color: var(--reco-line); font-weight: 700; }
+  .opt ul { font-size: .88rem; }
+  .pro::marker { color: var(--c-working); }
+  .con::marker { color: var(--c-blocked); }
+
+  .verdict {
+    border-left: 3px solid var(--reco-line); background: var(--reco-bg);
+    border-radius: 0 10px 10px 0; padding: .7rem 1rem; margin: 1.4rem 0 0;
+    font-size: .93rem;
+  }
+  .verdict p { margin: .3rem 0; }
+  .impl {
+    font-size: .85rem; color: var(--ink-soft);
+    border-top: 1px dashed var(--line); margin-top: 1rem; padding-top: .7rem;
+  }
+
+  .term {
+    background: #12141C; border: 1px solid #2A2E40; border-radius: 10px;
+    padding: .7rem .9rem; margin: .3rem 0 .5rem; overflow-x: auto;
+  }
+  .term pre {
+    font-family: var(--mono); font-size: .78rem; line-height: 1.75;
+    color: #C7CCDE; margin: 0;
+  }
+  .t-green { color: #7FD08F; }
+  .t-cyan { color: #79D2DE; }         /* branch / 現行 jump の明るいシアン */
+  .t-cyan-dim { color: #5FA8A8; }     /* Indexed(73) 相当の淡シアン */
+  .t-lav { color: #AEB6FF; }          /* 現行 preview(pin 色 147) */
+  .t-lav-dim { color: #8B8FC7; }      /* Indexed(103) 相当の淡ラベンダー */
+  .t-gray { color: #6A6F86; }
+  .t-blue { color: #86A7F5; font-weight: 700; }
+  .t-dim { color: #9BA0B5; }          /* detail 246 相当 */
+  .t-dim2 { color: #7C8199; }
+  .t-sel { background: #2E3247; font-weight: 700; }
+  .t-bold { font-weight: 700; }
+
+  footer {
+    margin-top: 4rem; padding-top: 1rem; border-top: 1px solid var(--line);
+    color: var(--ink-soft); font-size: .8rem; font-family: var(--mono);
+  }
+</style>
+
+<main>
+  <p class="eyebrow">vde-tmux sidebar — follow-up</p>
+  <h1>jump / preview ボタンの配色バランス</h1>
+  <p class="lede">
+    現状の <code>↗ jump</code> は branch と同じ明るいシアン(ハードコードの <code>Color::Cyan</code>)、
+    <code>⌕ preview</code> は pin と同じラベンダー(147)。detail ゾーンの控えめなグレーの中で
+    2 色のフルアクセントが並ぶため浮いて見える。周辺トーンと馴染ませる案を比較する。
+  </p>
+
+  <h2>現状(参考)</h2>
+  <div class="term"><pre> <span class="t-sel">  <span class="t-green">●</span> <span class="t-bold">claude</span>  sidebar polish       <span class="t-green">4m</span></span>
+ <span class="t-dim">    prompt: LIVE の色を理想形に…</span>
+ <span class="t-dim">    session: dotfiles / pane: %12</span>
+     <span class="t-cyan">↗ jump</span>   <span class="t-lav">⌕ preview</span>
+ <span class="t-gray">▾</span> <span class="t-blue">dotfiles</span>  <span class="t-cyan">main</span>   <span class="t-dim2">← branch と jump が同色で衝突</span></pre></div>
+
+  <h2>比較案</h2>
+  <div class="options">
+    <div class="opt reco">
+      <p class="tag">案 A — ラベルは灰、グリフだけ淡アクセント</p>
+      <div class="term"><pre> <span class="t-dim">    session: dotfiles / pane: %12</span>
+     <span class="t-cyan-dim">↗</span> <span class="t-dim">jump</span>   <span class="t-lav-dim">⌕</span> <span class="t-dim">preview</span>
+ <span class="t-gray">▾</span> <span class="t-blue">dotfiles</span>  <span class="t-cyan">main</span></pre></div>
+      <ul>
+        <li class="pro">ラベル文字を detail 色(246)にして detail ゾーンへ馴染ませ、グリフ 1 文字だけ淡色(jump=淡シアン 73 / preview=淡ラベンダー 103)で「押せる」を示す</li>
+        <li class="pro">branch の明るいシアンとは彩度差ではっきり区別でき、色相の文法(シアン系=移動、ラベンダー系=閲覧・操作)は維持される</li>
+        <li class="pro">カーソルが乗ると既存の選択ハイライト(bg 237 + BOLD)で自然に点灯するため、選択時の視認性は落ちない</li>
+        <li class="con">非選択時のボタンの発見性はいまより下がる(detail 行との差はグリフの色だけ)</li>
+      </ul>
+    </div>
+
+    <div class="opt">
+      <p class="tag">案 B — 選択時のみフル点灯</p>
+      <div class="term"><pre> <span class="t-dim">    session: dotfiles / pane: %12</span>
+ <span class="t-dim">    ↗ jump   ⌕ preview</span>   <span class="t-dim2">← 非選択時</span>
+
+ <span class="t-sel">    <span class="t-cyan">↗ jump</span>   <span class="t-lav">⌕ preview</span>       </span> <span class="t-dim2">← 選択時</span></pre></div>
+      <ul>
+        <li class="pro">非選択時は完全に detail 扱いなので浮きが一切ない。fisheye の「選択に情報が集まる」思想と一貫する</li>
+        <li class="pro">選択時は現行のフルアクセントが復活し、キーボード操作の直前に一番目立つ</li>
+        <li class="con">マウス派にはクリック可能であることが選択するまで分からない</li>
+        <li class="con">選択状態でスタイルが切り替わる実装(render に selected 分岐追加)が必要で、行の見た目が状態依存になる</li>
+      </ul>
+    </div>
+
+    <div class="opt">
+      <p class="tag">案 C — 操作色(ラベンダー)に統一</p>
+      <div class="term"><pre> <span class="t-dim">    session: dotfiles / pane: %12</span>
+     <span class="t-lav-dim t-bold">↗ jump</span>   <span class="t-lav-dim">⌕ preview</span>
+ <span class="t-gray">▾</span> <span class="t-blue">dotfiles</span>  <span class="t-cyan">main</span></pre></div>
+      <ul>
+        <li class="pro">jump / preview とも淡ラベンダー(103)にし、jump のみ BOLD で主アクションを示す。branch シアンとの衝突が構造的に消える</li>
+        <li class="pro">pin ✦・active バー・mode と合わせて「ラベンダー=vde の操作系」という色の文法が確立する</li>
+        <li class="con">jump と preview の区別が太さだけになり、2 ボタンの判別は案 A より弱い</li>
+        <li class="con">ラベンダーの出現箇所が増え、pin や active バーの希少性(=目立ち)が薄まる</li>
+      </ul>
+    </div>
+
+    <div class="opt">
+      <p class="tag">案 D — ブラケットで形にして色を抜く</p>
+      <div class="term"><pre> <span class="t-dim">    session: dotfiles / pane: %12</span>
+     <span class="t-gray">[</span><span class="t-cyan-dim">↗</span> <span class="t-dim">jump</span><span class="t-gray">]</span> <span class="t-gray">[</span><span class="t-lav-dim">⌕</span> <span class="t-dim">preview</span><span class="t-gray">]</span>
+ <span class="t-gray">▾</span> <span class="t-blue">dotfiles</span>  <span class="t-cyan">main</span></pre></div>
+      <ul>
+        <li class="pro">marker 色のブラケットが「ボタンである」ことを形で示すため、色をほぼ抜いても発見性が残る(案 A の弱点を補う)</li>
+        <li class="pro">クリック当たり判定の範囲がブラケット込みで視覚と一致する</li>
+        <li class="con">幅を 4 桁余分に使う(40 列では許容範囲だが detail ゾーンがややうるさくなる)</li>
+        <li class="con">サイドバー内に括弧の記法がここにしか無く、新しい視覚語彙が増える</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="verdict">
+    <p><strong>推奨: 案 A。</strong>detail ゾーンの中では「グリフ 1 文字の淡色」だけで十分ボタンとして読め、
+    選択が乗れば既存の選択ハイライトが点灯を肩代わりする(案 B の利点を実装追加なしで半分得られる)。
+    branch との衝突は色相ではなく彩度で解くため、「シアン系=移動先」の直感も壊さない。
+    発見性をさらに補いたくなったら案 D のブラケットを後付けできる(A と D は排他ではない)。</p>
+    <p class="impl">実装影響(案 A): `render.rs` の Jump 行描画のみ。4 span 化(`↗`=Indexed(73) / `jump`=theme.detail / `⌕`=Indexed(103) / `preview`=theme.detail)。
+    列 hit-test(`jump_row_action_at`)はレイアウト不変なので変更なし。config キーは追加せず既定値のみ(要望が出たら `colors.action_*` を検討)。</p>
+  </div>
+
+  <footer>vde-tmux sidebar action-row color proposals / 2026-07-06</footer>
+</main>
