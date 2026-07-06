@@ -90,9 +90,6 @@ pub fn codex_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Res
                 agent_event.prompt_source = Some(OptionUpdate::Set("user".to_string()));
             }
         }
-        "PreToolUse" | "PostToolUse" => {
-            agent_event.status = Some(AgentStatus::Running);
-        }
         _ => {
             agent_event.agent.clear();
         }
@@ -177,6 +174,14 @@ mod tests {
             event.wait_reason,
             Some(OptionUpdate::Set("permission_prompt".into()))
         );
+    }
+
+    #[test]
+    fn codex_tool_use_events_do_not_start_running_state() {
+        for hook in ["PreToolUse", "PostToolUse"] {
+            let event = codex_event_from_json(hook, "{}", 123).unwrap();
+            assert_eq!(event, AgentEvent::default());
+        }
     }
 
     #[test]

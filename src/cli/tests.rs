@@ -284,7 +284,7 @@ fn dispatch_statusline_summary_falls_back_to_tmux_snapshot() {
         "",
         "",
         "",
-        "",
+        "100",
         "",
         "",
         "",

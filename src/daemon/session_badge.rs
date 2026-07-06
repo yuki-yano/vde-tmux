@@ -28,8 +28,8 @@ impl BadgeState {
 pub fn badge_state(level: RollupLevel, unread: bool) -> BadgeState {
     match level {
         RollupLevel::Error | RollupLevel::Permission | RollupLevel::Waiting => BadgeState::Blocked,
-        RollupLevel::Running | RollupLevel::Background => BadgeState::Working,
-        RollupLevel::Idle => {
+        RollupLevel::Running => BadgeState::Working,
+        RollupLevel::Background | RollupLevel::Idle => {
             if unread {
                 BadgeState::Done
             } else {
@@ -82,15 +82,20 @@ mod tests {
     }
 
     #[test]
-    fn working_covers_running_and_background() {
+    fn working_covers_running_only() {
         assert_eq!(
             badge_state(RollupLevel::Running, false),
             BadgeState::Working
         );
+    }
+
+    #[test]
+    fn background_without_explicit_agent_status_is_idle() {
         assert_eq!(
-            badge_state(RollupLevel::Background, true),
-            BadgeState::Working
+            badge_state(RollupLevel::Background, false),
+            BadgeState::Idle
         );
+        assert_eq!(badge_state(RollupLevel::Background, true), BadgeState::Done);
     }
 
     #[test]

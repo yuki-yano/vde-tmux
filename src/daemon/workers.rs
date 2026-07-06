@@ -198,17 +198,20 @@ pub fn apply_capture_detection(
         pane.agent = agent.to_string();
     }
     let mut observed_activity_epoch = None;
+    let running_has_started_at =
+        pane.status == "running" && pane.started_at.trim().parse::<i64>().is_ok();
     let should_capture = pane.wait_reason.trim().is_empty() || pane.status == "running";
     if should_capture && let Ok(tail) = io.capture_tail(&pane.pane_id) {
         if let Some(wait_reason) = detect_codex_wait_reason(&tail) {
             pane.status = "waiting".to_string();
             pane.wait_reason = wait_reason.to_string();
-        } else if !tail.trim().is_empty() {
+        } else if running_has_started_at && !tail.trim().is_empty() {
             observed_activity_epoch = Some(now_epoch);
-            if pane.status.trim().is_empty() {
-                pane.status = "running".to_string();
-            }
         }
+    }
+    if pane.status == "running" && !running_has_started_at {
+        pane.status = "idle".to_string();
+        pane.wait_reason.clear();
     }
     let last_activity = observed_activity_epoch
         .or_else(|| pane.completed_at.parse::<i64>().ok())
@@ -401,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_worker_detects_agent_from_command_when_hook_options_are_missing() {
+    fn tmux_worker_does_not_infer_running_from_non_empty_tail_without_hook_status() {
         let io = Arc::new(MockWorkerIo::default());
         let mut pane = pane("%1", "", "");
         pane.current_command = "claude".to_string();
@@ -418,7 +421,7 @@ mod tests {
             panic!("expected panes updated");
         };
         assert_eq!(panes[0].agent, "claude");
-        assert_eq!(panes[0].status, "running");
+        assert_eq!(panes[0].status, "");
     }
 
     #[test]
@@ -473,5 +476,19 @@ mod tests {
         let pane = apply_capture_detection(&io, active, 1_000, 30);
 
         assert_eq!(pane.status, "running");
+    }
+
+    #[test]
+    fn running_without_started_at_is_demoted_even_with_non_empty_tail() {
+        let io = MockWorkerIo::default();
+        let active = pane("%1", "codex", "running");
+        io.captures
+            .lock()
+            .unwrap()
+            .insert("%1".to_string(), "Codex is ready for input\n".to_string());
+
+        let pane = apply_capture_detection(&io, active, 1_000, 30);
+
+        assert_eq!(pane.status, "idle");
     }
 }

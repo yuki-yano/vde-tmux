@@ -73,7 +73,7 @@ pub fn build_snapshot_with_sidebar(
         .iter()
         .filter(|pane| is_live_agent_pane(pane))
         .map(|pane| {
-            let status = parse_agent_status(&pane.status);
+            let status = parse_agent_status_for_pane(pane);
             let wait_reason = (!pane.wait_reason.is_empty()).then(|| pane.wait_reason.clone());
             let rollup = pane_rollup_level(status, wait_reason.as_deref());
             AgentPaneSummary {
@@ -186,7 +186,7 @@ pub fn statusline_attention_fallback(runner: &dyn TmuxRunner) -> Result<String> 
         .filter(|pane| is_live_agent_pane(pane))
         .filter(|pane| !(pane.window_active && pane.session_attached))
         .filter_map(|pane| {
-            let status = parse_agent_status(&pane.status);
+            let status = parse_agent_status_for_pane(pane);
             let wait_reason = (!pane.wait_reason.is_empty()).then_some(pane.wait_reason.as_str());
             let rollup = pane_rollup_level(status, wait_reason);
             if badge_state(rollup, false) != BadgeState::Blocked {
@@ -287,7 +287,7 @@ fn summary_counts_for_panes(panes: &[PaneSnapshot]) -> [(BadgeState, usize); 4] 
     let mut done = 0usize;
     let mut idle = 0usize;
     for pane in panes.iter().filter(|pane| is_live_agent_pane(pane)) {
-        let status = parse_agent_status(&pane.status);
+        let status = parse_agent_status_for_pane(pane);
         let wait_reason = (!pane.wait_reason.is_empty()).then_some(pane.wait_reason.as_str());
         match badge_state(pane_rollup_level(status, wait_reason), false) {
             BadgeState::Blocked => blocked += 1,
@@ -302,6 +302,15 @@ fn summary_counts_for_panes(panes: &[PaneSnapshot]) -> [(BadgeState, usize); 4] 
         (BadgeState::Done, done),
         (BadgeState::Idle, idle),
     ]
+}
+
+fn parse_agent_status_for_pane(pane: &PaneSnapshot) -> Option<AgentStatus> {
+    let status = parse_agent_status(&pane.status);
+    if status == Some(AgentStatus::Running) && pane.started_at.trim().parse::<i64>().is_err() {
+        None
+    } else {
+        status
+    }
 }
 
 fn parse_agent_status(raw: &str) -> Option<AgentStatus> {
@@ -332,6 +341,7 @@ mod tests {
             agent: agent.to_string(),
             status: status.to_string(),
             wait_reason: wait_reason.to_string(),
+            started_at: if status == "running" { "100" } else { "" }.to_string(),
             ..PaneSnapshot::default()
         }
     }
@@ -457,6 +467,18 @@ mod tests {
     fn fallback_summary_counts_idle_as_idle_not_done() {
         let counts = summary_counts_for_panes(&[pane_in_session(
             "main", "%1", "idle", "", "", false, false,
+        )]);
+
+        assert_eq!(
+            render_summary(&counts, &crate::config::BadgeConfig::default()),
+            "#[fg=#6f6b85]○1#[default]"
+        );
+    }
+
+    #[test]
+    fn fallback_summary_treats_running_without_started_at_as_idle() {
+        let counts = summary_counts_for_panes(&[pane_in_session(
+            "main", "%1", "running", "", "", false, false,
         )]);
 
         assert_eq!(

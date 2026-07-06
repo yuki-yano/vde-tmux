@@ -478,7 +478,7 @@ mod tests {
             "",
             wait_reason,
             "",
-            "",
+            if status == "running" { "100" } else { "" },
             "",
             "",
             "",

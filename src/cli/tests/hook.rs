@@ -339,6 +339,31 @@ fn dispatch_hook_codex_event_reads_stdin_json() {
 }
 
 #[test]
+fn dispatch_hook_codex_tool_use_does_not_write_running() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "PreToolUse"],
+        "{}",
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+    run_with_input_at(
+        ["vt", "hook", "codex", "PostToolUse"],
+        "{}",
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert!(mock.calls().is_empty());
+}
+
+#[test]
 fn dispatch_hook_codex_notify_reads_argv_json() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
