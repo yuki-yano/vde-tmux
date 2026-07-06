@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::daemon::protocol::{ClientMessage, ServerMessage};
 use crate::daemon::session_badge::{BadgeState, badge_state, glyph_for_state};
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
-use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane, read_all_panes};
+use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane, read_all_panes};
 use crate::sidebar::state::SidebarState;
 use crate::sidebar::tree::{SidebarRow, now_epoch_secs};
 use crate::tmux::TmuxRunner;
@@ -78,7 +78,7 @@ pub fn build_snapshot_with_sidebar(
             let rollup = pane_rollup_level(status, wait_reason.as_deref());
             AgentPaneSummary {
                 pane_id: pane.pane_id.clone(),
-                agent: pane.agent.clone(),
+                agent: effective_agent(pane).unwrap_or_default().to_string(),
                 status,
                 wait_reason,
                 rollup,
@@ -401,13 +401,25 @@ mod tests {
     }
 
     #[test]
-    fn build_snapshot_ignores_stale_agent_option_when_command_is_not_agent() {
-        let mut stale = pane("codex", "running", "");
-        stale.current_command = "zsh".to_string();
+    fn build_snapshot_trusts_hook_agent_even_when_command_is_shell() {
+        let mut hook_marked = pane("codex", "running", "");
+        hook_marked.current_command = "zsh".to_string();
 
-        let snapshot = build_snapshot(&[stale]);
+        let snapshot = build_snapshot(&[hook_marked]);
 
-        assert_eq!(snapshot.agent_count, 0);
+        assert_eq!(snapshot.agent_count, 1);
+        assert_eq!(snapshot.panes[0].agent, "codex");
+    }
+
+    #[test]
+    fn build_snapshot_uses_command_agent_when_hook_options_are_missing() {
+        let mut pane = pane("", "", "");
+        pane.current_command = "claude".to_string();
+
+        let snapshot = build_snapshot(&[pane]);
+
+        assert_eq!(snapshot.agent_count, 1);
+        assert_eq!(snapshot.panes[0].agent, "claude");
     }
 
     #[test]

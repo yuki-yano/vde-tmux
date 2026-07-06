@@ -37,6 +37,7 @@ pub fn claude_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Re
         "Stop" => {
             agent_event.status = Some(AgentStatus::Idle);
             agent_event.attention = Some(true);
+            agent_event.completed_at = Some(now_epoch);
             agent_event.subagents = Some(OptionUpdate::Unset);
         }
         "UserPromptSubmit" => {

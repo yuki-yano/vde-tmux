@@ -6,7 +6,7 @@ use crate::category::resolve_category_for_session;
 use crate::config::Config;
 use crate::daemon::session_badge::{BadgeState, badge_state};
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
-use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane};
+use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane};
 use crate::session::SessionInfo;
 use crate::sidebar::state::{SidebarRowRef, SidebarState, StatusFilter, ViewMode};
 
@@ -171,6 +171,7 @@ pub fn build_rows_ctx(
         if !is_live_agent_pane(pane) {
             continue;
         }
+        let agent = effective_agent(pane).unwrap_or_default().to_string();
         let repo = repo_label(pane);
         let category = category_for_pane(config, pane, &repo);
         let rollup = rollup_for_pane(pane);
@@ -183,7 +184,7 @@ pub fn build_rows_ctx(
                 pane_id: pane.pane_id.clone(),
                 repo,
                 category,
-                agent: pane.agent.clone(),
+                agent,
                 status: pane.status.clone(),
                 prompt: pane.prompt.clone(),
                 wait_reason: pane.wait_reason.clone(),
@@ -978,13 +979,35 @@ mod tests {
     }
 
     #[test]
-    fn build_rows_excludes_stale_agent_option_when_command_is_not_agent() {
-        let mut stale = pane("main", "%1", "/tmp/app", "codex", "running");
-        stale.current_command = "node".to_string();
+    fn build_rows_trusts_hook_agent_when_command_is_not_agent() {
+        let mut hook_marked = pane("main", "%1", "/tmp/app", "codex", "running");
+        hook_marked.current_command = "node".to_string();
 
-        let rows = build_rows(&Config::default(), &[stale], &SidebarState::default());
+        let rows = build_rows(&Config::default(), &[hook_marked], &SidebarState::default());
 
-        assert!(rows.is_empty());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1].meta.as_ref().and_then(|meta| meta.agent.as_deref()),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn build_rows_uses_command_agent_when_hook_options_are_missing() {
+        let mut command_agent = pane("main", "%1", "/tmp/app", "", "");
+        command_agent.current_command = "claude".to_string();
+
+        let rows = build_rows(
+            &Config::default(),
+            &[command_agent],
+            &SidebarState::default(),
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1].meta.as_ref().and_then(|meta| meta.agent.as_deref()),
+            Some("claude")
+        );
     }
 
     #[test]

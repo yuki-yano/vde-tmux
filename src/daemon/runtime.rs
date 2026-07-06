@@ -1471,17 +1471,17 @@ mod tests {
     }
 
     #[test]
-    fn stale_agent_option_clears_session_badge() {
+    fn hook_agent_option_keeps_session_badge_when_command_is_shell() {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
         let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
             "main", "%1", "running",
         )]));
-        let mut stale = agent_pane("main", "%1", "running");
-        stale.current_command = "zsh".to_string();
+        let mut hook_marked = agent_pane("main", "%1", "running");
+        hook_marked.current_command = "zsh".to_string();
 
-        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![stale]));
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![hook_marked]));
 
-        assert!(effects.iter().any(|effect| matches!(
+        assert!(!effects.iter().any(|effect| matches!(
             effect,
             RuntimeEffect::ClearSessionBadge { session } if session == "main"
         )));
@@ -1683,6 +1683,7 @@ mod tests {
         sidebar.is_sidebar = true;
         let mut plain = agent_pane("main", "%8", "");
         plain.agent = String::new();
+        plain.current_command = "zsh".to_string();
         let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![sidebar, plain]));
         assert!(without_heartbeat(&effects).is_empty());
     }

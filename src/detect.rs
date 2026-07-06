@@ -24,17 +24,26 @@ pub fn detect_codex_wait_reason(screen_tail: &str) -> Option<&'static str> {
 }
 
 fn looks_like_permission_question(line: &str) -> bool {
-    (line.contains("allow") || line.contains("approve"))
-        && (line.contains("command")
-            || line.contains("edit")
-            || line.contains("write")
-            || line.contains("tool"))
-        && line.contains('?')
+    let asks_for_permission =
+        line.contains("allow") || line.contains("approve") || line.contains("permission");
+    let mentions_action = line.contains("command")
+        || line.contains("edit")
+        || line.contains("write")
+        || line.contains("tool")
+        || line.contains("bash")
+        || line.contains("use")
+        || line.contains("run")
+        || line.contains("execute");
+    (asks_for_permission && mentions_action && line.contains('?'))
+        || line.contains("do you want to proceed?")
 }
 
 fn looks_like_yes_choice(line: &str) -> bool {
     let normalized = line
-        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '-' || ch == '*' || ch == '>')
+        .trim_start_matches(|ch: char| {
+            ch.is_whitespace() || ch == '-' || ch == '*' || ch == '>' || ch == '❯'
+        })
+        .trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.' || ch == ')' || ch == '-')
         .trim();
     normalized == "yes"
         || normalized.starts_with("yes ")
@@ -79,6 +88,12 @@ mod tests {
     #[test]
     fn detects_codex_permission_prompt_with_adjacent_choice() {
         let text = "? Allow command to run?\n  y) yes\n  n) no\n";
+        assert_eq!(detect_codex_wait_reason(text), Some("permission_prompt"));
+    }
+
+    #[test]
+    fn detects_claude_permission_prompt_with_numbered_yes_choice() {
+        let text = "Claude needs your permission to use Bash\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n";
         assert_eq!(detect_codex_wait_reason(text), Some("permission_prompt"));
     }
 

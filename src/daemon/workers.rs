@@ -8,7 +8,7 @@ use crate::daemon::runtime::DaemonEvent;
 use crate::detect::{demote_stale_running, detect_codex_wait_reason};
 use crate::git::{GitRunner, SystemGitRunner, collect_git_badges};
 use crate::hook::AgentStatus;
-use crate::options::snapshot::{PaneSnapshot, is_live_agent_pane, read_all_panes};
+use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane, read_all_panes};
 use crate::sidebar::layout::jump_to_pane;
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
@@ -192,13 +192,19 @@ pub fn apply_capture_detection(
     if !is_live_agent_pane(&pane) {
         return pane;
     }
-    let should_capture = pane.wait_reason.trim().is_empty() || pane.status == "running";
-    if should_capture
-        && let Ok(tail) = io.capture_tail(&pane.pane_id)
-        && let Some(wait_reason) = detect_codex_wait_reason(&tail)
+    if pane.agent.trim().is_empty()
+        && let Some(agent) = effective_agent(&pane)
     {
-        pane.status = "waiting".to_string();
-        pane.wait_reason = wait_reason.to_string();
+        pane.agent = agent.to_string();
+    }
+    let should_capture = pane.wait_reason.trim().is_empty() || pane.status == "running";
+    if should_capture && let Ok(tail) = io.capture_tail(&pane.pane_id) {
+        if let Some(wait_reason) = detect_codex_wait_reason(&tail) {
+            pane.status = "waiting".to_string();
+            pane.wait_reason = wait_reason.to_string();
+        } else if pane.status.trim().is_empty() && !tail.trim().is_empty() {
+            pane.status = "running".to_string();
+        }
     }
     let last_activity = pane
         .completed_at
@@ -388,6 +394,50 @@ mod tests {
         let DaemonEvent::PanesUpdated(panes) = rx.recv().unwrap() else {
             panic!("expected panes updated");
         };
+        assert_eq!(panes[0].status, "waiting");
+        assert_eq!(panes[0].wait_reason, "permission_prompt");
+    }
+
+    #[test]
+    fn tmux_worker_detects_agent_from_command_when_hook_options_are_missing() {
+        let io = Arc::new(MockWorkerIo::default());
+        let mut pane = pane("%1", "", "");
+        pane.current_command = "claude".to_string();
+        io.panes.lock().unwrap().push(pane);
+        io.captures
+            .lock()
+            .unwrap()
+            .insert("%1".to_string(), "Claude is working\n".to_string());
+        let (tx, rx) = mpsc::channel();
+
+        poll_tmux_once(io, tx, 100).unwrap();
+
+        let DaemonEvent::PanesUpdated(panes) = rx.recv().unwrap() else {
+            panic!("expected panes updated");
+        };
+        assert_eq!(panes[0].agent, "claude");
+        assert_eq!(panes[0].status, "running");
+    }
+
+    #[test]
+    fn tmux_worker_detects_claude_permission_prompt_without_hook_options() {
+        let io = Arc::new(MockWorkerIo::default());
+        let mut pane = pane("%1", "", "");
+        pane.current_command = "claude".to_string();
+        io.panes.lock().unwrap().push(pane);
+        io.captures.lock().unwrap().insert(
+            "%1".to_string(),
+            "Claude needs your permission to use Bash\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n"
+                .to_string(),
+        );
+        let (tx, rx) = mpsc::channel();
+
+        poll_tmux_once(io, tx, 100).unwrap();
+
+        let DaemonEvent::PanesUpdated(panes) = rx.recv().unwrap() else {
+            panic!("expected panes updated");
+        };
+        assert_eq!(panes[0].agent, "claude");
         assert_eq!(panes[0].status, "waiting");
         assert_eq!(panes[0].wait_reason, "permission_prompt");
     }

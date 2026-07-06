@@ -109,10 +109,16 @@ pub fn detect_agent_from_command(command: &str) -> Option<&'static str> {
     }
 }
 
+pub fn effective_agent(pane: &PaneSnapshot) -> Option<&str> {
+    let agent = pane.agent.trim();
+    if !agent.is_empty() {
+        return Some(agent);
+    }
+    detect_agent_from_command(&pane.current_command)
+}
+
 pub fn is_live_agent_pane(pane: &PaneSnapshot) -> bool {
-    !pane.is_sidebar
-        && !pane.agent.trim().is_empty()
-        && detect_agent_from_command(&pane.current_command).is_some()
+    !pane.is_sidebar && effective_agent(pane).is_some()
 }
 
 #[cfg(test)]
@@ -251,5 +257,28 @@ mod tests {
         assert_eq!(detect_agent_from_command("opencode"), Some("opencode"));
         assert_eq!(detect_agent_from_command("node"), None);
         assert_eq!(detect_agent_from_command("zsh"), None);
+    }
+
+    #[test]
+    fn hook_marked_agent_pane_is_live_even_when_command_is_shell() {
+        let pane = PaneSnapshot {
+            current_command: "zsh".to_string(),
+            agent: "codex".to_string(),
+            status: "running".to_string(),
+            ..PaneSnapshot::default()
+        };
+
+        assert!(is_live_agent_pane(&pane));
+    }
+
+    #[test]
+    fn command_marked_agent_pane_is_live_without_hook_options() {
+        let pane = PaneSnapshot {
+            current_command: "claude".to_string(),
+            ..PaneSnapshot::default()
+        };
+
+        assert!(is_live_agent_pane(&pane));
+        assert_eq!(effective_agent(&pane), Some("claude"));
     }
 }

@@ -132,7 +132,7 @@ bind-key b run-shell "vt sidebar focus"
 
 ## Known Limits
 
-- Agent pane の生存判定は `pane_current_command` が `claude`、`codex`、`opencode` のいずれかであることを見る。node ラッパー起動などで別コマンド名を返す環境では、hooks が `@vde_agent` を残していても agent として表示しない。
+- Agent pane の生存判定は hooks が書いた `@vde_agent` を優先し、未設定なら `pane_current_command` が `claude`、`codex`、`opencode` のいずれかであることを見る。hook が動いていない場合でも command から agent を補完し、capture-pane で permission 画面を検出できる範囲では blocked として表示する。
 - Sidebar preview の Esc 終了は `less` の `LESSKEYIN` 対応を使う。現行の手元環境では Esc/q で閉じられることを scratch tmux で確認済みで、古い `less` 向けの追加フォールバックは持たない。
 
 ## Option Bus
