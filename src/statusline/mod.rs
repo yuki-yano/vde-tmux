@@ -106,7 +106,8 @@ pub fn render_statusline_sessions_with_stale(
             };
             let state = if stale { "" } else { &session.state };
             let label = if config.statusline.sessions.show_index {
-                format!("{} {}", index + 1, session.name)
+                // `{num}: {session}` 形式。show_index=false で番号ごと省く。
+                format!("{}: {}", index + 1, session.name)
             } else {
                 session.name.clone()
             };
@@ -128,7 +129,7 @@ pub fn render_statusline_sessions_with_stale(
             }
         })
         .collect::<Vec<_>>()
-        .join("")
+        .join(&config.statusline.sessions.separator)
 }
 
 pub fn is_heartbeat_stale(heartbeat: Option<i64>, now: i64, poll_ms: u64) -> bool {
@@ -603,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn show_index_uses_space_separator() {
+    fn show_index_uses_colon_separator() {
         let mut config = Config::default();
         config.statusline.sessions.show_index = true;
         let rendered = render_statusline_sessions(
@@ -612,9 +613,10 @@ mod tests {
             "main",
             "work",
         );
-        assert!(rendered.contains("1 main"), "{rendered}");
-        assert!(rendered.contains("2 sub"), "{rendered}");
-        assert!(!rendered.contains("1:main"), "{rendered}");
+        // `{num}: {session}` 形式
+        assert!(rendered.contains("1: main"), "{rendered}");
+        assert!(rendered.contains("2: sub"), "{rendered}");
+        assert!(!rendered.contains("1 main"), "{rendered}");
     }
 
     #[test]
@@ -628,14 +630,14 @@ mod tests {
         main.state = "blocked".to_string();
         let rendered =
             render_statusline_sessions(&config, &[main, session("sub", "work")], "main", "work");
-        // badge あり: グリフの後にスペース1つ → "▲ 1 main"
+        // badge あり: グリフの後にスペース1つ → "▲ 1: main"
         assert!(
-            rendered.contains("#[fg=#ff6b6b]▲#[fg=default] 1 main"),
+            rendered.contains("#[fg=#ff6b6b]▲#[fg=default] 1: main"),
             "{rendered}"
         );
-        // badge なし: 余分なスペースが残らない → " 2 sub "
-        assert!(rendered.contains(" 2 sub "), "{rendered}");
-        assert!(!rendered.contains("  2 sub"), "{rendered}");
+        // badge なし: 余分なスペースが残らない → " 2: sub "
+        assert!(rendered.contains(" 2: sub "), "{rendered}");
+        assert!(!rendered.contains("  2: sub"), "{rendered}");
     }
 
     #[test]
@@ -714,6 +716,42 @@ mod tests {
             render_attention_segment(&config.statusline.attention, ""),
             ""
         );
+    }
+
+    #[test]
+    fn sessions_join_with_separator_between_segments_only() {
+        let mut config = Config::default();
+        config.statusline.sessions.separator = "#[fg=#4a4860]│#[default]".to_string();
+        let mut a = session("a", "work");
+        a.id = "$1".to_string();
+        let mut b = session("b", "work");
+        b.id = "$2".to_string();
+        let mut c = session("c", "work");
+        c.id = "$3".to_string();
+        let rendered = render_statusline_sessions(&config, &[a, b, c], "a", "work");
+        // 3 セグメント → 区切りは間の 2 箇所だけ
+        assert_eq!(rendered.matches('│').count(), 2, "{rendered}");
+        // 先頭・末尾には付かない
+        assert!(!rendered.starts_with("#[fg=#4a4860]│"), "{rendered}");
+        assert!(!rendered.ends_with("│#[default]"), "{rendered}");
+        // 区切りは range の外(#[norange] と次の #[range= の間)に入る
+        assert!(
+            rendered.contains("#[norange]#[fg=#4a4860]│#[default]#[range=session|$2]"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn sessions_without_separator_keep_tight_join() {
+        let config = Config::default();
+        let rendered = render_statusline_sessions(
+            &config,
+            &[session("a", "work"), session("b", "work")],
+            "a",
+            "work",
+        );
+        // 既定は区切りなし → 従来どおり密着連結
+        assert!(!rendered.contains('│'), "{rendered}");
     }
 
     #[test]

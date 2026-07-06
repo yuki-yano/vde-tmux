@@ -42,7 +42,7 @@ fn dispatch_statusline_sessions_show_index_overrides_config() {
         .unwrap()
         .unwrap();
 
-    assert!(output.contains("1 main"));
+    assert!(output.contains("1: main"));
 }
 
 #[test]

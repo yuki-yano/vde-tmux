@@ -83,7 +83,8 @@ pub fn config_schema() -> Value {
                             "badge_style": {
                                 "type": "string",
                                 "enum": ["inline", "plain", "outer"]
-                            }
+                            },
+                            "separator": { "type": "string" }
                         }
                     },
                     "category": {

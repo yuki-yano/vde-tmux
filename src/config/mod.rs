@@ -86,6 +86,10 @@ pub struct StatuslineSessionsConfig {
     pub current: SegmentStyle,
     pub other: SegmentStyle,
     pub badge_style: BadgeStyle,
+    /// 隣接セッションセグメントの「間」にだけ挿入する区切り(既定: 空=区切りなし)。
+    /// tmux markup を含められる(例: `#[fg=#4a4860]│#[default]`)。
+    /// 先頭/末尾には付かず、クリック用の session range の外に置かれる。
+    pub separator: String,
 }
 
 impl Default for StatuslineSessionsConfig {
@@ -98,6 +102,7 @@ impl Default for StatuslineSessionsConfig {
             },
             other: SegmentStyle::default(),
             badge_style: BadgeStyle::Inline,
+            separator: String::new(),
         }
     }
 }
