@@ -1020,18 +1020,23 @@ fn right_label(row: &SidebarRow) -> Option<String> {
             let count = row.meta.as_ref()?.attention_count?;
             (count > 0).then(|| format!("▲{count}"))
         }
-        SidebarRowKind::Chat => match row.rollup {
-            RollupLevel::Error => Some("err".to_string()),
-            RollupLevel::Permission => Some("perm".to_string()),
-            RollupLevel::Waiting => Some("wait".to_string()),
-            RollupLevel::Background => Some("bg".to_string()),
-            RollupLevel::Running => row
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.elapsed_secs)
-                .map(elapsed_label),
-            RollupLevel::Idle => None,
-        },
+        SidebarRowKind::Chat => {
+            if row.expanded {
+                return None;
+            }
+            match row.rollup {
+                RollupLevel::Error => Some("err".to_string()),
+                RollupLevel::Permission => Some("perm".to_string()),
+                RollupLevel::Waiting => Some("wait".to_string()),
+                RollupLevel::Background => Some("bg".to_string()),
+                RollupLevel::Running => row
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.elapsed_secs)
+                    .map(elapsed_label),
+                RollupLevel::Idle => None,
+            }
+        }
         SidebarRowKind::Detail | SidebarRowKind::Jump | SidebarRowKind::Zone => None,
     }
 }
@@ -1363,6 +1368,7 @@ mod tests {
             RollupLevel::Running,
         );
         chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
+        chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("claude".to_string()),
             elapsed_secs: Some(780),
@@ -1386,6 +1392,7 @@ mod tests {
             RollupLevel::Permission,
         );
         chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Blocked);
+        chat.expanded = false;
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 8);
 
@@ -2101,6 +2108,7 @@ sidebar:
             RollupLevel::Running,
         );
         chat.badge_state = Some(BadgeState::Working);
+        chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("claude".to_string()),
             elapsed_secs: Some(780),
@@ -2298,6 +2306,7 @@ sidebar:
             RollupLevel::Permission,
         );
         chat.badge_state = Some(BadgeState::Blocked);
+        chat.expanded = false;
         let rendered = render_rows(&[chat], &SidebarState::default(), 40);
         assert!(rendered.ends_with("perm "), "{rendered:?}");
         assert!(rendered.contains("▲ codex: review PR"), "{rendered:?}");
@@ -2313,12 +2322,36 @@ sidebar:
             RollupLevel::Running,
         );
         chat.badge_state = Some(BadgeState::Working);
+        chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             elapsed_secs: Some(815),
             ..Default::default()
         });
         let rendered = render_rows(&[chat], &SidebarState::default(), 30);
         assert!(rendered.ends_with("13m "), "{rendered:?}");
+    }
+
+    #[test]
+    fn expanded_chat_row_suppresses_right_label() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: fix",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(BadgeState::Working);
+        chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            elapsed_secs: Some(780),
+            ..Default::default()
+        });
+
+        assert_eq!(right_label(&chat).as_deref(), Some("13m"));
+
+        chat.expanded = true;
+
+        assert_eq!(right_label(&chat), None);
     }
 
     #[test]
@@ -2331,6 +2364,7 @@ sidebar:
             RollupLevel::Permission,
         );
         chat.badge_state = Some(BadgeState::Blocked);
+        chat.expanded = false;
         let rendered = render_rows(&[chat], &SidebarState::default(), 24);
         assert!(rendered.contains('…'), "{rendered:?}");
         assert!(rendered.ends_with("perm "), "{rendered:?}");

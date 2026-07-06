@@ -402,7 +402,11 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
             id,
             kind: SidebarRowKind::Chat,
             depth: 1,
-            label: format!("{} · {}", pane.agent, pane.repo),
+            label: if expanded {
+                pane.agent.clone()
+            } else {
+                format!("{} · {}", pane.agent, pane.repo)
+            },
             chat_count: 1,
             rollup: pane.rollup,
             badge_state: Some(pane.badge_state),
@@ -448,11 +452,16 @@ fn push_chat_row(
     let expanded = selected || manual;
     let mut meta = chat_meta(pane, now);
     meta.pinned = Some(pinned);
+    let label = if expanded {
+        pane.agent.clone()
+    } else {
+        chat_label(pane)
+    };
     rows.push(SidebarRow {
         id,
         kind: SidebarRowKind::Chat,
         depth,
-        label: chat_label(pane),
+        label,
         chat_count: 1,
         rollup: pane.rollup,
         badge_state: Some(pane.badge_state),
@@ -1305,6 +1314,49 @@ mod tests {
             row.kind == SidebarRowKind::Detail && row.label == "session: main / pane: %5"
         }));
         assert_eq!(rows.last().unwrap().kind, SidebarRowKind::Jump);
+    }
+
+    #[test]
+    fn expanded_chat_row_shows_agent_name_only() {
+        let mut agent = pane("main", "%1", "/tmp/app", "claude", "running");
+        agent.prompt = "review the long plan".to_string();
+        let collapsed_state = SidebarState {
+            view_mode: ViewMode::Flat,
+            ..SidebarState::default()
+        };
+        let collapsed = build_rows_at(&Config::default(), &[agent.clone()], &collapsed_state, 1000);
+        let collapsed_chat = collapsed
+            .iter()
+            .find(|row| row.id == "chat::%1")
+            .expect("collapsed chat row");
+
+        assert_eq!(collapsed_chat.label, "claude: review the long plan");
+
+        let expanded_state = SidebarState {
+            view_mode: ViewMode::Flat,
+            selection: Some("chat::%1".to_string()),
+            ..SidebarState::default()
+        };
+        let expanded = build_rows_at(&Config::default(), &[agent.clone()], &expanded_state, 1000);
+        let expanded_chat = expanded
+            .iter()
+            .find(|row| row.id == "chat::%1")
+            .expect("expanded chat row");
+
+        assert_eq!(expanded_chat.label, "claude");
+
+        let triage_ctx = RowBuildContext {
+            triage: BTreeSet::from(["%1".to_string()]),
+            now: 1000,
+            ..RowBuildContext::default()
+        };
+        let triage = build_rows_ctx(&Config::default(), &[agent], &expanded_state, &triage_ctx);
+        let triage_chat = triage
+            .iter()
+            .find(|row| row.id == "chat::%1")
+            .expect("triage chat row");
+
+        assert_eq!(triage_chat.label, "claude");
     }
 
     #[test]
