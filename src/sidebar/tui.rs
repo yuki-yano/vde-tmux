@@ -250,7 +250,16 @@ pub fn run_loop<B: Backend>(
                     KeyCode::Right => send_sidebar_key(socket, "right")?,
                     KeyCode::Left => send_sidebar_key(socket, "left")?,
                     KeyCode::Tab => send_sidebar_key(socket, "tab")?,
-                    KeyCode::Enter => send_sidebar_key(socket, "enter")?,
+                    KeyCode::Enter => {
+                        if let Some(snapshot) = &current
+                            && selection_is_detail_row(snapshot)
+                            && let Some(pane_id) = preview_pane_for_selection(snapshot)
+                        {
+                            spawn_preview(runner, env, &pane_id, preview_history_lines);
+                        } else {
+                            send_sidebar_key(socket, "enter")?;
+                        }
+                    }
                     _ => {}
                 },
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
@@ -1045,6 +1054,19 @@ fn preview_pane_for_selection(snapshot: &DaemonSnapshot) -> Option<String> {
         SidebarRowKind::Chat | SidebarRowKind::Jump | SidebarRowKind::Detail => row.pane_id.clone(),
         SidebarRowKind::Category | SidebarRowKind::Repo | SidebarRowKind::Zone => None,
     }
+}
+
+fn selection_is_detail_row(snapshot: &DaemonSnapshot) -> bool {
+    let Some(sidebar) = snapshot.sidebar.as_ref() else {
+        return false;
+    };
+    let Some(selection) = sidebar.state.selection.as_deref() else {
+        return false;
+    };
+    sidebar
+        .rows
+        .iter()
+        .any(|row| row.id == selection && row.kind == SidebarRowKind::Detail)
 }
 
 fn spawn_preview(

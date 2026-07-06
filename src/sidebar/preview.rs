@@ -44,7 +44,7 @@ pub fn open_preview_floating_pane(
     pane_id: &str,
     history_lines: u32,
 ) -> Result<()> {
-    let target = resolve_preview_target(runner, pane_id)?;
+    let target = resolve_preview_target(runner, env, pane_id)?;
     kill_existing_preview_panes(runner, &target.window_id)?;
     runner.run(&["set-option", "-s", "focus-events", "on"])?;
     let less_keyfile = write_less_escape_keyfile(env);
@@ -67,18 +67,49 @@ pub fn open_preview_floating_pane(
     Ok(())
 }
 
-fn resolve_preview_target(runner: &dyn TmuxRunner, pane_id: &str) -> Result<PreviewTarget> {
-    let format = "#{window_id}\u{1f}#{window_width}\u{1f}#{window_height}\u{1f}#{pane_width}";
-    let output = runner.run(&["display-message", "-p", "-t", pane_id, "-F", format])?;
-    let fields = output.trim().split('\u{1f}').collect::<Vec<_>>();
-    if fields.len() != 4 {
-        anyhow::bail!("failed to resolve preview target geometry for {pane_id}");
+fn resolve_preview_target(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    pane_id: &str,
+) -> Result<PreviewTarget> {
+    let source_pane = env
+        .get("TMUX_PANE")
+        .filter(|value| !value.trim().is_empty())
+        .map(String::as_str)
+        .unwrap_or(pane_id);
+    let source_format = "#{window_id}\u{1f}#{window_width}\u{1f}#{window_height}";
+    let source_output = runner.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        source_pane,
+        "-F",
+        source_format,
+    ])?;
+    let source_fields = source_output.trim().split('\u{1f}').collect::<Vec<_>>();
+    if source_fields.len() != 3 {
+        anyhow::bail!("failed to resolve preview source geometry for {source_pane}");
     }
-    let window_width = fields[1].parse::<u16>().context("invalid window_width")?;
-    let window_height = fields[2].parse::<u16>().context("invalid window_height")?;
-    let pane_width = fields[3].parse::<u16>().context("invalid pane_width")?;
+    let pane_width_output = runner.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        pane_id,
+        "-F",
+        "#{pane_width}",
+    ])?;
+    let pane_width = pane_width_output
+        .trim()
+        .parse::<u16>()
+        .context("invalid pane_width")?;
+    let window_width = source_fields[1]
+        .parse::<u16>()
+        .context("invalid window_width")?;
+    let window_height = source_fields[2]
+        .parse::<u16>()
+        .context("invalid window_height")?;
     Ok(PreviewTarget {
-        window_id: fields[0].to_string(),
+        window_id: source_fields[0].to_string(),
         geometry: PreviewGeometry::new(window_width, window_height, pane_width),
     })
 }
@@ -122,10 +153,10 @@ fn build_preview_inner_command(
     );
     match less_keyfile {
         Some(path) => format!(
-            "{capture} | LESSKEYIN={} less -R +G",
+            "{capture} | LESSCHARSET=utf-8 LESSKEYIN={} less -R +G",
             shell_quote(&path.display().to_string())
         ),
-        None => format!("{capture} | less -R +G"),
+        None => format!("{capture} | LESSCHARSET=utf-8 less -R +G"),
     }
 }
 
@@ -195,6 +226,7 @@ pub fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmux::mock::MockTmuxRunner;
 
     #[test]
     fn preview_geometry_uses_target_pane_width_centered_in_window() {
@@ -218,6 +250,62 @@ mod tests {
         let inner = command.args.last().unwrap();
 
         assert!(inner.contains("capture-pane -a -p -e -S -2000 -t '%26'"));
+        assert!(inner.contains("LESSCHARSET=utf-8"));
         assert!(inner.contains("LESSKEYIN='/tmp/preview.lesskey' less -R +G"));
+    }
+
+    #[test]
+    fn preview_floating_pane_opens_in_current_tmux_pane_window() {
+        let runner = MockTmuxRunner::new();
+        let mut env = BTreeMap::new();
+        env.insert("TMUX_PANE".to_string(), "%99".to_string());
+        let source_format = "#{window_id}\u{1f}#{window_width}\u{1f}#{window_height}";
+        runner.stub(
+            &["display-message", "-p", "-t", "%99", "-F", source_format],
+            "@1\u{1f}120\u{1f}40\n",
+        );
+        runner.stub(
+            &["display-message", "-p", "-t", "%42", "-F", "#{pane_width}"],
+            "72\n",
+        );
+        runner.stub(
+            &["list-panes", "-t", "@1", "-F", "#{pane_id} #{@vde_preview}"],
+            "",
+        );
+        runner.stub(&["set-option", "-s", "focus-events", "on"], "");
+        let command =
+            build_preview_command("%42", "@1", PreviewGeometry::new(120, 40, 72), 2000, None);
+        let command_args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
+        runner.stub(&command_args, "%77\n");
+        runner.stub(&["set-option", "-p", "-t", "%77", "@vde_preview", "1"], "");
+        runner.stub(
+            &["set-option", "-p", "-t", "%77", "pane-border-status", "off"],
+            "",
+        );
+        runner.stub(
+            &[
+                "set-hook",
+                "-p",
+                "-t",
+                "%77",
+                "pane-focus-out",
+                "kill-pane -t '%77'",
+            ],
+            "",
+        );
+
+        open_preview_floating_pane(&runner, &env, "%42", 2000).unwrap();
+
+        let calls = runner.calls();
+        let new_pane = calls
+            .iter()
+            .find(|call| call.first().map(String::as_str) == Some("new-pane"))
+            .expect("new-pane call");
+        assert!(new_pane.windows(2).any(|window| window == ["-t", "@1"]));
+        assert!(new_pane.windows(2).any(|window| window == ["-x", "72"]));
+        assert!(new_pane.windows(2).any(|window| window == ["-X", "24"]));
+        let inner = new_pane.last().unwrap();
+        assert!(inner.contains("capture-pane -a -p -e -S -2000 -t '%42'"));
+        assert!(inner.contains("LESSCHARSET=utf-8 less -R +G"));
     }
 }
