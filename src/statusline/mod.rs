@@ -105,7 +105,7 @@ pub fn render_statusline_sessions_with_stale(
                 &session.badge
             };
             let state = if stale { "" } else { &session.state };
-            render_session_segment(
+            let segment = render_session_segment(
                 style,
                 badge,
                 state,
@@ -113,7 +113,14 @@ pub fn render_statusline_sessions_with_stale(
                 index,
                 config.statusline.sessions.show_index,
                 config.statusline.sessions.badge_style,
-            )
+            );
+            // クリックで switch-client できるよう tmux の session range で包む
+            // (.tmux.conf 側の MouseDown1Status バインドが `-t =` で拾う)
+            if session.id.is_empty() {
+                segment
+            } else {
+                format!("#[range=session|{}]{segment}#[norange]", session.id)
+            }
         })
         .collect::<Vec<_>>()
         .join("")
@@ -143,28 +150,115 @@ pub fn render_statusline_category(
     };
     categories
         .iter()
-        .map(|category| {
+        .enumerate()
+        .map(|(index, category)| {
+            let active = category == current_category;
             let label = config
                 .categories
                 .display_names
                 .get(category)
                 .map(String::as_str)
                 .unwrap_or(category);
-            let count = sessions_in_category(config, sessions, category).len();
+            let category_sessions = sessions_in_category(config, sessions, category);
+            let colors = if active {
+                &config.statusline.category.colors
+            } else {
+                &config.statusline.category.inactive_colors
+            };
+            let badge = category_badge_fragment(config, &category_sessions, colors);
             let body = config
                 .statusline
                 .category
                 .format
                 .replace("{category}", label)
-                .replace("{count}", &count.to_string());
-            tmux_style_category(
-                &config.statusline.category,
-                &body,
-                category == current_category,
-            )
+                .replace("{count}", &category_sessions.len().to_string())
+                .replace("{badge}", &badge);
+            let segment = tmux_style_category(&config.statusline.category, &body, active);
+            // クリックで `vt statusline-category switch N` を発火させる user range
+            format!("#[range=user|{}]{segment}#[norange]", index + 1)
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// category 内の最悪 agent 状態(`@vde_session_state` 由来)を色付きグリフにする。
+/// 状態を持つ session が無ければ空文字列。
+fn category_badge_fragment(
+    config: &Config,
+    category_sessions: &[&SessionInfo],
+    colors: &crate::config::SegmentColors,
+) -> String {
+    let rank = |state: &str| match state {
+        "blocked" => Some(0_u8),
+        "working" => Some(1),
+        "done" => Some(2),
+        "idle" => Some(3),
+        _ => None,
+    };
+    let worst = category_sessions
+        .iter()
+        .filter_map(|session| rank(&session.state).map(|rank| (rank, session.state.as_str())))
+        .min_by_key(|(rank, _)| *rank);
+    let Some((_, state)) = worst else {
+        return String::new();
+    };
+    let glyphs = &config.badge.glyphs;
+    let glyph = match state {
+        "blocked" => &glyphs.blocked,
+        "working" => &glyphs.working,
+        "done" => &glyphs.done,
+        _ => &glyphs.idle,
+    };
+    let color = match state {
+        "blocked" => Some("red"),
+        "working" => Some("green"),
+        "done" => Some("cyan"),
+        _ => None,
+    };
+    match color {
+        Some(color) => {
+            let restore = colors.fg.as_deref().unwrap_or("default");
+            format!("#[fg={color}]{glyph}#[fg={restore}]")
+        }
+        None => glyph.to_string(),
+    }
+}
+
+/// `vt statusline-attention` の CLI エントリ。daemon(または fallback)の
+/// 素のテキストを config の装飾で包む。空なら装飾ごと出さない。
+pub fn statusline_attention(
+    runner: &dyn TmuxRunner,
+    env: &std::collections::BTreeMap<String, String>,
+    config: &Config,
+) -> Result<String> {
+    let inner = crate::daemon::statusline_attention(runner, env)?;
+    Ok(render_attention_segment(
+        &config.statusline.attention,
+        &inner,
+    ))
+}
+
+pub fn render_attention_segment(style: &crate::config::AttentionConfig, inner: &str) -> String {
+    if inner.is_empty() {
+        return String::new();
+    }
+    let body = style.format.replace("{attention}", inner);
+    let mut attrs = Vec::new();
+    if style.bold {
+        attrs.push("bold".to_string());
+    }
+    if let Some(fg) = &style.colors.fg {
+        attrs.push(format!("fg={fg}"));
+    }
+    if let Some(bg) = &style.colors.bg {
+        attrs.push(format!("bg={bg}"));
+    }
+    let styled = if attrs.is_empty() {
+        body
+    } else {
+        format!("#[{}]{}#[default]", attrs.join(","), body)
+    };
+    format!("{}{}{}", style.prefix, styled, style.suffix)
 }
 
 fn current_category(config: &Config, sessions: &[SessionInfo], current_session: &str) -> String {
@@ -183,16 +277,26 @@ fn render_session_segment(
     badge_style: BadgeStyle,
 ) -> String {
     let label = if show_index {
-        format!("{}:{session_name}", index + 1)
+        format!("{} {session_name}", index + 1)
     } else {
         session_name.to_string()
     };
-    let label = format!(
-        "{}{label}",
-        badge_fragment(badge, state, style, badge_style)
-    );
+    let fragment = badge_fragment(badge, state, style, badge_style);
+    // format に {badge} があればそこへ(存在時のみ末尾スペース付き)、
+    // 無ければ従来どおりラベル直前へ密着連結する。
+    let (badge_token, label) = if style.format.contains("{badge}") {
+        let token = if fragment.is_empty() {
+            String::new()
+        } else {
+            format!("{fragment} ")
+        };
+        (token, label)
+    } else {
+        (String::new(), format!("{fragment}{label}"))
+    };
     let body = style
         .format
+        .replace("{badge}", &badge_token)
         .replace("{session}", &label)
         .replace("{index}", &(index + 1).to_string());
     tmux_style_segment(style, &body)
@@ -265,7 +369,14 @@ fn tmux_style_category(config: &StatuslineCategoryConfig, body: &str, active: bo
     } else {
         format!("#[{}]{}#[default]", attrs.join(","), body)
     };
-    format!("{}{}{}", config.prefix, styled, config.suffix)
+    let use_inactive =
+        !active && (!config.inactive_prefix.is_empty() || !config.inactive_suffix.is_empty());
+    let (prefix, suffix) = if use_inactive {
+        (&config.inactive_prefix, &config.inactive_suffix)
+    } else {
+        (&config.prefix, &config.suffix)
+    };
+    format!("{prefix}{styled}{suffix}")
 }
 
 #[cfg(test)]
@@ -418,6 +529,161 @@ mod tests {
         );
         assert!(rendered.contains("W"));
         assert!(!rendered.contains("P"));
+    }
+
+    #[test]
+    fn show_index_uses_space_separator() {
+        let mut config = Config::default();
+        config.statusline.sessions.show_index = true;
+        let rendered = render_statusline_sessions(
+            &config,
+            &[session("main", "work"), session("sub", "work")],
+            "main",
+            "work",
+        );
+        assert!(rendered.contains("1 main"), "{rendered}");
+        assert!(rendered.contains("2 sub"), "{rendered}");
+        assert!(!rendered.contains("1:main"), "{rendered}");
+    }
+
+    #[test]
+    fn badge_placeholder_positions_badge_with_trailing_space_only_when_present() {
+        let mut config = Config::default();
+        config.statusline.sessions.show_index = true;
+        config.statusline.sessions.current.format = " {badge}{session} ".to_string();
+        config.statusline.sessions.other.format = " {badge}{session} ".to_string();
+        let mut main = session("main", "work");
+        main.badge = "▲".to_string();
+        main.state = "blocked".to_string();
+        let rendered =
+            render_statusline_sessions(&config, &[main, session("sub", "work")], "main", "work");
+        // badge あり: グリフの後にスペース1つ → "▲ 1 main"
+        assert!(
+            rendered.contains("#[fg=red]▲#[fg=default] 1 main"),
+            "{rendered}"
+        );
+        // badge なし: 余分なスペースが残らない → " 2 sub "
+        assert!(rendered.contains(" 2 sub "), "{rendered}");
+        assert!(!rendered.contains("  2 sub"), "{rendered}");
+    }
+
+    #[test]
+    fn category_badge_shows_worst_state_with_color_and_restore() {
+        let mut config = Config::default();
+        config.statusline.category.format = "{badge}{category} ".to_string();
+        config.statusline.category.colors.fg = Some("#1C1C1C".to_string());
+        let mut blocked = session("a", "work");
+        blocked.state = "blocked".to_string();
+        let mut working = session("b", "work");
+        working.state = "working".to_string();
+        let rendered = render_statusline_category(&config, &[blocked, working], "work");
+        assert!(
+            rendered.contains("#[fg=red]▲#[fg=#1C1C1C]work"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn category_badge_is_empty_without_agent_state_and_idle_is_plain() {
+        let mut config = Config::default();
+        config.statusline.category.format = "{badge}{category} ".to_string();
+        // 状態なし → バッジなし
+        let rendered = render_statusline_category(&config, &[session("a", "work")], "work");
+        assert!(rendered.contains("work "), "{rendered}");
+        assert!(
+            !rendered.contains("▲") && !rendered.contains("○"),
+            "{rendered}"
+        );
+        // idle のみ → 無彩の ○
+        let mut idle = session("a", "work");
+        idle.state = "idle".to_string();
+        let rendered = render_statusline_category(&config, &[idle], "work");
+        assert!(rendered.contains("○work"), "{rendered}");
+        assert!(!rendered.contains("#[fg=red]"), "{rendered}");
+    }
+
+    #[test]
+    fn attention_segment_defaults_to_red_text() {
+        let config = Config::default();
+        let rendered = render_attention_segment(&config.statusline.attention, "▲ proxy · perm 2m");
+        assert_eq!(rendered, "#[fg=red]▲ proxy · perm 2m#[default]");
+    }
+
+    #[test]
+    fn attention_segment_supports_pill_styling_and_empty_input() {
+        let mut config = Config::default();
+        config.statusline.attention.format = " {attention} ".to_string();
+        config.statusline.attention.prefix = "<".to_string();
+        config.statusline.attention.suffix = ">".to_string();
+        config.statusline.attention.colors.fg = Some("#FFD9D6".to_string());
+        config.statusline.attention.colors.bg = Some("#6E2A28".to_string());
+        let rendered = render_attention_segment(&config.statusline.attention, "▲ proxy · perm 2m");
+        assert_eq!(
+            rendered,
+            "<#[fg=#FFD9D6,bg=#6E2A28] ▲ proxy · perm 2m #[default]>"
+        );
+        // 空入力は装飾ごと出さない(pill の殻を残さない)
+        assert_eq!(
+            render_attention_segment(&config.statusline.attention, ""),
+            ""
+        );
+    }
+
+    #[test]
+    fn session_segments_are_wrapped_in_session_ranges() {
+        let config = Config::default();
+        let mut main = session("main", "work");
+        main.id = "$3".to_string();
+        let rendered = render_statusline_sessions(&config, &[main], "main", "work");
+        assert!(rendered.starts_with("#[range=session|$3]"), "{rendered}");
+        assert!(rendered.ends_with("#[norange]"), "{rendered}");
+        // id が空(テスト用フィクスチャ等)なら range を付けない
+        let rendered =
+            render_statusline_sessions(&config, &[session("sub", "work")], "main", "work");
+        assert!(!rendered.contains("#[range="), "{rendered}");
+    }
+
+    #[test]
+    fn category_segments_are_wrapped_in_user_ranges() {
+        let config = Config::default();
+        let rendered = render_statusline_category(
+            &config,
+            &[session("a", "private"), session("b", "work")],
+            "work",
+        );
+        assert!(rendered.contains("#[range=user|1]"), "{rendered}");
+        assert!(rendered.contains("#[range=user|2]"), "{rendered}");
+        assert!(rendered.contains("#[norange]"), "{rendered}");
+    }
+
+    #[test]
+    fn category_uses_inactive_prefix_suffix_when_configured() {
+        let mut config = Config::default();
+        config.statusline.category.prefix = "<A>".to_string();
+        config.statusline.category.suffix = "</A>".to_string();
+        config.statusline.category.inactive_prefix = "<I>".to_string();
+        config.statusline.category.inactive_suffix = "</I>".to_string();
+        let rendered = render_statusline_category(
+            &config,
+            &[session("a", "work"), session("b", "private")],
+            "work",
+        );
+        assert!(rendered.contains("<A>work </A>"), "{rendered}");
+        assert!(rendered.contains("<I>private </I>"), "{rendered}");
+    }
+
+    #[test]
+    fn category_falls_back_to_shared_prefix_suffix_when_inactive_unset() {
+        let mut config = Config::default();
+        config.statusline.category.prefix = "<P>".to_string();
+        config.statusline.category.suffix = "</P>".to_string();
+        let rendered = render_statusline_category(
+            &config,
+            &[session("a", "work"), session("b", "private")],
+            "work",
+        );
+        assert!(rendered.contains("<P>work </P>"), "{rendered}");
+        assert!(rendered.contains("<P>private </P>"), "{rendered}");
     }
 
     #[test]

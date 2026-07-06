@@ -127,6 +127,7 @@ struct LiveState {
     last_capture: Option<Instant>,
     requested_lines: u16,
     capture_in_flight: bool,
+    cut_markers: Vec<String>,
 }
 
 impl LiveState {
@@ -163,6 +164,7 @@ pub fn run_loop<B: Backend>(
     let mut scroll: usize = 0;
     let mut live = LiveState {
         requested_lines: live_rows_requested(live_config),
+        cut_markers: live_config.cut_markers.clone(),
         ..LiveState::default()
     };
     loop {
@@ -340,7 +342,7 @@ fn apply_live_capture_result(live: &mut LiveState, pane_id: &str, output: &str) 
     if live.pane_id.as_deref() != Some(pane_id) {
         return;
     }
-    live.lines = extract_tail(output, live.requested_lines as usize);
+    live.lines = extract_tail(output, live.requested_lines as usize, &live.cut_markers);
     live.capture_in_flight = false;
 }
 
@@ -352,7 +354,7 @@ fn spawn_live_capture_worker(
         let runner = SystemTmuxRunner::from_env(Duration::from_millis(500));
         while let Ok(pane_id) = request_rx.recv() {
             let output = runner
-                .run(&["capture-pane", "-p", "-t", &pane_id])
+                .run(&["capture-pane", "-p", "-e", "-t", &pane_id])
                 .unwrap_or_default();
             if result_tx.send((pane_id, output)).is_err() {
                 break;
@@ -665,41 +667,118 @@ fn render_live_lines(
     now: i64,
     theme: &SidebarRenderTheme,
 ) -> Vec<Line<'static>> {
+    use ansi_to_tui::IntoText;
+
     let body_limit = live_rows.saturating_sub(1) as usize;
-    let title = match live.mode {
-        LiveMode::Tail => live
-            .pane_id
-            .as_deref()
-            .map(|pane| format!(" LIVE · {pane}"))
-            .unwrap_or_else(|| " LIVE".to_string()),
-        LiveMode::Events => " EVENTS".to_string(),
+    let (label, title_rest) = match live.mode {
+        LiveMode::Tail => (
+            "LIVE",
+            live.pane_id
+                .as_deref()
+                .map(|pane| format!(" · {pane}"))
+                .unwrap_or_default(),
+        ),
+        LiveMode::Events => ("EVENTS", String::new()),
     };
-    let mut lines = vec![Line::from(Span::styled(
-        title,
-        Style::default().add_modifier(Modifier::BOLD),
-    ))];
+    let mut lines = vec![Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            label,
+            Style::default().fg(theme.live).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(title_rest, Style::default().fg(theme.detail)),
+    ])];
     let body = match live.mode {
         LiveMode::Tail => live.lines.clone(),
         LiveMode::Events => event_tail(snapshot, body_limit, now, theme),
     };
-    lines.extend(
-        body.into_iter()
-            .take(body_limit)
-            .map(|line| Line::from(Span::styled(format!(" {line}"), Style::default()))),
-    );
+    let ansi = matches!(live.mode, LiveMode::Tail);
+    lines.extend(body.into_iter().take(body_limit).map(|line| {
+        let plain = || {
+            Line::from(Span::styled(
+                format!(" {}", strip_ansi(&line)),
+                Style::default().fg(theme.detail),
+            ))
+        };
+        if !ansi {
+            return plain();
+        }
+        // capture-pane -e の ANSI を元の色のまま描画する。パース失敗時はプレーン
+        match format!(" {line}").into_text() {
+            Ok(text) => text.lines.into_iter().next().unwrap_or_else(plain),
+            Err(_) => plain(),
+        }
+    }));
     lines
 }
 
-pub(crate) fn extract_tail(raw: &str, limit: usize) -> Vec<String> {
-    let mut lines = raw
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .map(str::to_string)
+pub(crate) fn extract_tail(raw: &str, limit: usize, cut_markers: &[String]) -> Vec<String> {
+    let all = raw.lines().map(str::trim_end).collect::<Vec<_>>();
+    let cut = cut_index(&all, cut_markers).unwrap_or(all.len());
+    let mut lines = all[..cut]
+        .iter()
+        .filter(|line| !strip_ansi(line).trim().is_empty())
+        .map(|line| line.to_string())
         .collect::<Vec<_>>();
     let start = lines.len().saturating_sub(limit);
     lines.drain(0..start);
     lines
+}
+
+/// Codex / Claude Code の入力欄・フッター以下を落とすための切断位置。
+/// 各マーカーの「最後の出現行」を求め、その最小 index で切る
+/// (Claude Code は入力ボックス上辺 `╭`、Codex は入力プロンプト等が
+///  常に最下部 UI 帯にあるため、最後の出現 = 入力欄になる)。
+fn cut_index(lines: &[&str], markers: &[String]) -> Option<usize> {
+    markers
+        .iter()
+        .filter(|marker| !marker.is_empty())
+        .filter_map(|marker| {
+            lines
+                .iter()
+                .rposition(|line| strip_ansi(line).contains(marker.as_str()))
+        })
+        .min()
+}
+
+/// マーカー判定・空行判定用の簡易 ANSI エスケープ除去(CSI / OSC / 単独 ESC)。
+pub(crate) fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                // CSI: パラメータ/中間バイトを読み飛ばし、終端バイト(@-~)で終わる
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                // OSC: BEL または ESC \ で終わる
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {
+                chars.next();
+            }
+        }
+    }
+    out
 }
 
 fn event_tail(
@@ -1131,8 +1210,30 @@ mod tests {
 
     #[test]
     fn live_tail_keeps_last_nonempty_lines() {
-        assert_eq!(extract_tail("a\nb\n\nc\n\n\n", 3), vec!["a", "b", "c"]);
-        assert_eq!(extract_tail("a\nb\nc\nd\n", 2), vec!["c", "d"]);
+        assert_eq!(extract_tail("a\nb\n\nc\n\n\n", 3, &[]), vec!["a", "b", "c"]);
+        assert_eq!(extract_tail("a\nb\nc\nd\n", 2, &[]), vec!["c", "d"]);
+    }
+
+    #[test]
+    fn live_tail_cuts_below_agent_input_area() {
+        let markers = crate::config::SidebarLiveConfig::default().cut_markers;
+        // Claude Code 風: 入力ボックスとフッターが末尾に居る
+        let raw =
+            "output 1\noutput 2\n\n╭──────────╮\n│ >        │\n╰──────────╯\n? for shortcuts\n";
+        assert_eq!(extract_tail(raw, 5, &markers), vec!["output 1", "output 2"]);
+        // Codex 風: 入力プロンプトとフッター
+        let raw = "thinking...\ndone!\n› type here\n⏎ send  95% context left\n";
+        assert_eq!(extract_tail(raw, 5, &markers), vec!["thinking...", "done!"]);
+        // マーカーが無い出力はそのまま
+        let raw = "plain 1\nplain 2\n";
+        assert_eq!(extract_tail(raw, 5, &markers), vec!["plain 1", "plain 2"]);
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_and_osc_sequences() {
+        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m text"), "red text");
+        assert_eq!(strip_ansi("\u{1b}]0;title\u{7}body"), "body");
+        assert_eq!(strip_ansi("no escapes"), "no escapes");
     }
 
     #[test]

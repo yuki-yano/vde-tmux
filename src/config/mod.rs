@@ -57,6 +57,7 @@ pub struct StatuslineConfig {
     pub sessions: StatuslineSessionsConfig,
     pub category: StatuslineCategoryConfig,
     pub summary: SummaryConfig,
+    pub attention: AttentionConfig,
     pub session_badge: SessionBadgeConfig,
 }
 
@@ -130,6 +131,10 @@ pub struct StatuslineCategoryConfig {
     pub format: String,
     pub prefix: String,
     pub suffix: String,
+    /// 非アクティブ category 用の prefix/suffix。未設定(空)なら prefix/suffix を共用する。
+    /// pill 装飾のキャップ色を active/inactive で切り替えるために使う。
+    pub inactive_prefix: String,
+    pub inactive_suffix: String,
     pub bold: bool,
     pub colors: SegmentColors,
     pub inactive_colors: SegmentColors,
@@ -142,6 +147,8 @@ impl Default for StatuslineCategoryConfig {
             format: "{category} ".to_string(),
             prefix: String::new(),
             suffix: String::new(),
+            inactive_prefix: String::new(),
+            inactive_suffix: String::new(),
             bold: false,
             colors: SegmentColors::default(),
             inactive_colors: SegmentColors::default(),
@@ -153,11 +160,44 @@ impl Default for StatuslineCategoryConfig {
 #[serde(default)]
 pub struct SummaryConfig {
     pub enabled: bool,
+    /// true なら summary から idle(○)のカウントを省く。
+    pub hide_idle: bool,
 }
 
 impl Default for SummaryConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            hide_idle: false,
+        }
+    }
+}
+
+/// `vt statusline-attention` の出力装飾。空出力時は装飾ごと出さない。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct AttentionConfig {
+    /// `{attention}` プレースホルダに本文が入る。
+    pub format: String,
+    pub prefix: String,
+    pub suffix: String,
+    pub bold: bool,
+    pub colors: SegmentColors,
+}
+
+impl Default for AttentionConfig {
+    fn default() -> Self {
+        Self {
+            format: "{attention}".to_string(),
+            prefix: String::new(),
+            suffix: String::new(),
+            bold: false,
+            colors: SegmentColors {
+                fg: Some("red".to_string()),
+                bg: None,
+                outer_bg: None,
+            },
+        }
     }
 }
 
@@ -236,6 +276,9 @@ pub struct SidebarLiveConfig {
     pub enabled: bool,
     pub lines: u16,
     pub interval_ms: u64,
+    /// LIVE で「これを含む最後の行」以下を切り落とすマーカー
+    /// (Codex / Claude Code の入力欄・フッターを隠す)。空にすると無効。
+    pub cut_markers: Vec<String>,
 }
 
 impl Default for SidebarLiveConfig {
@@ -244,6 +287,19 @@ impl Default for SidebarLiveConfig {
             enabled: true,
             lines: 3,
             interval_ms: 2000,
+            cut_markers: [
+                // Claude Code: 入力ボックス上辺
+                "╭",
+                // Claude Code: フッター
+                "? for shortcuts",
+                // Codex: 入力プロンプト / プレースホルダ / フッター
+                "› ",
+                "Ask Codex",
+                "⏎ send",
+                "context left",
+            ]
+            .map(String::from)
+            .to_vec(),
         }
     }
 }
@@ -278,6 +334,11 @@ pub struct SidebarColorsConfig {
     pub badge_working: Option<String>,
     pub badge_done: Option<String>,
     pub badge_idle: Option<String>,
+    pub detail: Option<String>,
+    pub marker: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub live: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

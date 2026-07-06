@@ -16,6 +16,7 @@ name = "vde-tmux"
 path = "src/bin/vde-tmux.rs"
 
 [dependencies]
+ansi-to-tui = "7"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"

@@ -266,7 +266,9 @@ where
             }
         },
         Command::StatuslineSummary => Ok(Some(daemon::statusline_summary(runner, env, &config)?)),
-        Command::StatuslineAttention => Ok(Some(daemon::statusline_attention(runner, env)?)),
+        Command::StatuslineAttention => {
+            Ok(Some(daemon::statusline_attention(runner, env, &config)?))
+        }
         Command::Daemon { socket, command } => match command {
             Some(DaemonCommand::Stop {
                 socket: stop_socket,

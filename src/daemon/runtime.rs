@@ -696,6 +696,9 @@ impl RuntimeState {
                 BadgeState::Idle => idle += 1,
             }
         }
+        if self.config.statusline.summary.hide_idle {
+            idle = 0;
+        }
         render_summary(
             &[
                 (BadgeState::Blocked, blocked),
@@ -1629,6 +1632,23 @@ mod tests {
         plain.agent = String::new();
         let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![sidebar, plain]));
         assert!(without_heartbeat(&effects).is_empty());
+    }
+
+    #[test]
+    fn summary_query_hides_idle_when_configured() {
+        let mut config = Config::default();
+        config.statusline.summary.hide_idle = true;
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![
+            agent_pane("main", "%1", "idle"),
+            agent_pane("main", "%2", "running"),
+        ]));
+        let (reply, receiver) = std::sync::mpsc::channel();
+        state.apply_event(DaemonEvent::QuerySummary { reply });
+        let ServerMessage::Summary { text } = receiver.recv().unwrap() else {
+            panic!("expected summary");
+        };
+        assert_eq!(text, "#[fg=green]●1#[default]");
     }
 
     #[test]

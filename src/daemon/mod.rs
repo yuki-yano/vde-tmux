@@ -145,7 +145,8 @@ pub fn format_attention(entries: &[(String, RollupLevel, i64)]) -> String {
     } else {
         String::new()
     };
-    format!("#[fg=red]▲ {session} · {reason} {elapsed}{suffix}#[default]")
+    // 装飾(色・pill)は statusline::render_attention_segment 側で付ける
+    format!("▲ {session} · {reason} {elapsed}{suffix}")
 }
 
 pub fn statusline_summary_fallback(
@@ -156,10 +157,11 @@ pub fn statusline_summary_fallback(
         return Ok(String::new());
     }
     let panes = read_all_panes(runner)?;
-    Ok(render_summary(
-        &summary_counts_for_panes(&panes),
-        &config.badge.glyphs,
-    ))
+    let mut counts = summary_counts_for_panes(&panes);
+    if config.statusline.summary.hide_idle {
+        counts[3].1 = 0;
+    }
+    Ok(render_summary(&counts, &config.badge.glyphs))
 }
 
 pub fn statusline_summary(
@@ -456,11 +458,11 @@ mod tests {
     fn format_attention_abbreviates_wait_and_error_without_more_suffix() {
         assert_eq!(
             format_attention(&[("etl".to_string(), crate::hook::RollupLevel::Waiting, 59)]),
-            "#[fg=red]▲ etl · wait 59s#[default]"
+            "▲ etl · wait 59s"
         );
         assert_eq!(
             format_attention(&[("proxy".to_string(), crate::hook::RollupLevel::Error, 60)]),
-            "#[fg=red]▲ proxy · err 1m#[default]"
+            "▲ proxy · err 1m"
         );
     }
 

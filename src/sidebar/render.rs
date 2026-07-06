@@ -26,6 +26,16 @@ pub struct SidebarRenderTheme {
     pub badge_working: Color,
     pub badge_done: Color,
     pub badge_idle: Color,
+    /// Detail / meta 行の前景色(DIM は使わず読める中間グレーにする)
+    pub detail: Color,
+    /// 展開マーカー ▾/▸ と pin 印の色
+    pub marker: Color,
+    /// repo 名(および category 見出し)の色
+    pub repo: Color,
+    /// git branch 名の色
+    pub branch: Color,
+    /// LIVE / EVENTS 見出しラベルの色
+    pub live: Color,
 }
 
 impl Default for SidebarRenderTheme {
@@ -50,6 +60,11 @@ impl Default for SidebarRenderTheme {
             badge_working: Color::Green,
             badge_done: Color::Cyan,
             badge_idle: Color::DarkGray,
+            detail: Color::Indexed(246),
+            marker: Color::DarkGray,
+            repo: Color::Blue,
+            branch: Color::Cyan,
+            live: Color::Magenta,
         }
     }
 }
@@ -80,6 +95,11 @@ impl SidebarRenderTheme {
                 .unwrap_or(default.badge_working),
             badge_done: parse_color(config.badge_done.as_deref()).unwrap_or(default.badge_done),
             badge_idle: parse_color(config.badge_idle.as_deref()).unwrap_or(default.badge_idle),
+            detail: parse_color(config.detail.as_deref()).unwrap_or(default.detail),
+            marker: parse_color(config.marker.as_deref()).unwrap_or(default.marker),
+            repo: parse_color(config.repo.as_deref()).unwrap_or(default.repo),
+            branch: parse_color(config.branch.as_deref()).unwrap_or(default.branch),
+            live: parse_color(config.live.as_deref()).unwrap_or(default.live),
         }
     }
 
@@ -242,35 +262,40 @@ pub fn build_header_layout_with_counts(
             HeaderAction::SetFilter(StatusFilter::All),
             StatusFilter::All,
             None,
+            counts.total,
         ),
         (
             format_header_segment(&format!("▲{}", counts.blocked), theme),
             HeaderAction::SetFilter(StatusFilter::AttentionOnly),
             StatusFilter::AttentionOnly,
             Some(BadgeState::Blocked),
+            counts.blocked,
         ),
         (
             format_header_segment(&format!("●{}", counts.working), theme),
             HeaderAction::SetFilter(StatusFilter::WorkingOnly),
             StatusFilter::WorkingOnly,
             Some(BadgeState::Working),
+            counts.working,
         ),
         (
             format_header_segment(&format!("✓{}", counts.done), theme),
             HeaderAction::SetFilter(StatusFilter::DoneOnly),
             StatusFilter::DoneOnly,
             Some(BadgeState::Done),
+            counts.done,
         ),
         (
             format_header_segment(&format!("○{}", counts.idle), theme),
             HeaderAction::SetFilter(StatusFilter::IdleOnly),
             StatusFilter::IdleOnly,
             Some(BadgeState::Idle),
+            counts.idle,
         ),
     ];
     let filter_badges = filter_items
         .iter()
-        .map(|(label, _, _, _)| label.as_str())
+        .map(|(label, _, _, _, _)| label.as_str())
         .collect::<Vec<_>>()
         .join(" ");
     let full_text = format!(" {mode_badge}{separator}{filter_badges}");
@@ -282,19 +307,22 @@ pub fn build_header_layout_with_counts(
         segments.push(HeaderSegment {
             range,
             action: HeaderAction::CycleViewMode,
-            style: None,
+            style: Some(mode_segment_style(theme)),
         });
     }
     let mut start = 1 + mode_len + separator_len;
-    for (label, action, filter, badge_state) in filter_items {
+    for (label, action, filter, badge_state, count) in filter_items {
         let label_len = display_width(&label);
         if let Some(range) = visible_segment_range(&text, start, label_len) {
             let style = if state.filter == filter {
-                header_segment_style(theme)
+                active_filter_style(theme, badge_state)
+            } else if count == 0 {
+                // 0件は控えめに(状態色で塗らない)
+                Style::default().fg(theme.marker)
             } else if let Some(badge_state) = badge_state {
                 Style::default().fg(theme.badge_color(badge_state))
             } else {
-                Style::default().add_modifier(Modifier::DIM)
+                Style::default()
             };
             segments.push(HeaderSegment {
                 range,
@@ -363,6 +391,37 @@ pub fn build_footer_line(width: usize) -> Line<'static> {
         text,
         Style::default().add_modifier(Modifier::DIM),
     ))
+}
+
+/// ヘッダーの mode(view 切替)セグメントの色。
+/// `sidebar.header` で明示スタイルが設定されていればそれを優先し、
+/// 無指定なら repo 見出しと同じ色 + BOLD。
+fn mode_segment_style(theme: &SidebarRenderTheme) -> Style {
+    if header_style_configured(theme) {
+        header_segment_style(theme)
+    } else {
+        Style::default().fg(theme.repo).add_modifier(Modifier::BOLD)
+    }
+}
+
+/// 現在アクティブなフィルタセグメントの強調。
+/// 明示スタイルがあればそれを優先し、無指定なら
+/// 「状態色 + selection_bg + BOLD」でアクティブを示す。
+fn active_filter_style(theme: &SidebarRenderTheme, badge_state: Option<BadgeState>) -> Style {
+    if header_style_configured(theme) {
+        return header_segment_style(theme);
+    }
+    let mut style = Style::default()
+        .bg(theme.selection_bg)
+        .add_modifier(Modifier::BOLD);
+    if let Some(badge_state) = badge_state {
+        style = style.fg(theme.badge_color(badge_state));
+    }
+    style
+}
+
+fn header_style_configured(theme: &SidebarRenderTheme) -> bool {
+    theme.header_active_fg.is_some() || theme.header_active_bg.is_some() || theme.header_active_bold
 }
 
 fn header_segment_style(theme: &SidebarRenderTheme) -> Style {
@@ -494,18 +553,30 @@ fn render_row_line(
         .saturating_sub(right_reserved);
     let label = truncate_display(&row.label, label_budget);
 
-    let mut spans = vec![Span::styled(format!(" {head}"), style)];
+    let mut spans = vec![Span::styled(
+        format!(" {head}"),
+        Style::default().fg(theme.marker),
+    )];
     if let Some((glyph, color)) = badge {
         spans.push(Span::styled(glyph, badge_style(color, row)));
     }
-    spans.push(Span::styled(label, style));
+    spans.extend(label_spans(label, row, style));
     if let Some(git) = &git {
-        spans.push(Span::styled(format!(" {}", git.branch), style));
+        spans.push(Span::styled(
+            format!(" {}", git.branch),
+            Style::default().fg(theme.branch),
+        ));
         if let Some(ahead) = &git.ahead {
-            spans.push(Span::styled(format!(" {ahead}"), style.fg(Color::Green)));
+            spans.push(Span::styled(
+                format!(" {ahead}"),
+                Style::default().fg(Color::Green),
+            ));
         }
         if let Some(behind) = &git.behind {
-            spans.push(Span::styled(format!(" {behind}"), style.fg(Color::Red)));
+            spans.push(Span::styled(
+                format!(" {behind}"),
+                Style::default().fg(Color::Red),
+            ));
         }
     }
     let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
@@ -528,6 +599,26 @@ fn render_row_line(
         );
     }
     line
+}
+
+/// Chat 行のラベルを「agent 名(太字)+ 残り(通常)」に分ける。
+/// それ以外の行、および truncate で agent 名が欠けた場合は単一 span。
+fn label_spans(label: String, row: &SidebarRow, base: Style) -> Vec<Span<'static>> {
+    if row.kind == SidebarRowKind::Chat
+        && let Some(agent) = row
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.agent.as_deref())
+            .filter(|agent| !agent.is_empty())
+        && label.starts_with(agent)
+    {
+        let (agent_part, rest) = label.split_at(agent.len());
+        return vec![
+            Span::styled(agent_part.to_string(), base.add_modifier(Modifier::BOLD)),
+            Span::styled(rest.to_string(), base),
+        ];
+    }
+    vec![Span::styled(label, base)]
 }
 
 struct GitBadgeText {
@@ -839,9 +930,7 @@ fn right_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
         SidebarRowKind::Category | SidebarRowKind::Repo => {
             Style::default().fg(theme.badge_color(BadgeState::Blocked))
         }
-        _ => Style::default()
-            .fg(theme.rollup_color(row.rollup))
-            .add_modifier(Modifier::DIM),
+        _ => Style::default().fg(theme.rollup_color(row.rollup)),
     }
 }
 
@@ -857,20 +946,16 @@ fn git_badge_width(git: &GitBadgeText) -> usize {
 }
 
 fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
-    let style = Style::default().fg(match row.kind {
-        SidebarRowKind::Zone => Color::Reset,
-        SidebarRowKind::Category => Color::Blue,
-        SidebarRowKind::Repo
-        | SidebarRowKind::Chat
-        | SidebarRowKind::Detail
-        | SidebarRowKind::Jump => theme.rollup_color(row.rollup),
-    });
+    // 状態(rollup)の色はバッジグリフと右カラムだけに載せ、
+    // 本文テキストは通常色に保つ(理想形の多トーン構成)。
     match row.kind {
-        SidebarRowKind::Category | SidebarRowKind::Repo => style.add_modifier(Modifier::BOLD),
-        SidebarRowKind::Detail => style.add_modifier(Modifier::DIM),
-        SidebarRowKind::Jump => style.fg(Color::Cyan),
-        SidebarRowKind::Chat => style,
-        SidebarRowKind::Zone => style,
+        SidebarRowKind::Zone => Style::default().fg(Color::Reset),
+        SidebarRowKind::Category | SidebarRowKind::Repo => {
+            Style::default().fg(theme.repo).add_modifier(Modifier::BOLD)
+        }
+        SidebarRowKind::Chat => Style::default().fg(Color::Reset),
+        SidebarRowKind::Detail => Style::default().fg(theme.detail),
+        SidebarRowKind::Jump => Style::default().fg(Color::Cyan),
     }
 }
 
@@ -1253,12 +1338,18 @@ mod tests {
             &SidebarRenderTheme::default(),
         );
 
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Blue));
+        // 多トーン検証は colorize_follows_ideal_multi_tone_scheme も参照
+        // 先頭 span はマーカー(DarkGray)、ラベル span が Blue + BOLD
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::DarkGray));
         assert!(
-            lines[0].spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::BOLD)
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.trim() == "misc"
+                    && span.style.fg == Some(Color::Blue)
+                    && span.style.add_modifier.contains(Modifier::BOLD)),
+            "{:?}",
+            lines[0]
         );
         assert_eq!(lines[1].style.bg, Some(Color::Indexed(237)));
         assert!(
@@ -1480,6 +1571,147 @@ sidebar:
 
         assert!(rendered.contains("● codex (%1)"), "{rendered}");
         assert!(!rendered.contains("[running]"), "{rendered}");
+    }
+
+    #[test]
+    fn header_segments_are_colorized_by_default() {
+        let theme = SidebarRenderTheme::default();
+        let counts = BadgeCounts {
+            total: 4,
+            blocked: 0,
+            working: 1,
+            done: 0,
+            idle: 3,
+        };
+        let state = SidebarState::default(); // filter = All がアクティブ
+        let header = build_header_layout_with_counts(&state, 60, &theme, counts);
+        let segments = &header.lines[0].segments;
+        // mode: repo 色 + BOLD
+        assert_eq!(
+            segments[0].style,
+            Some(
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
+            )
+        );
+        // アクティブフィルタ(≡): selection_bg + BOLD で強調
+        let active = segments[1].style.unwrap();
+        assert_eq!(active.bg, Some(Color::Indexed(237)));
+        assert!(active.add_modifier.contains(Modifier::BOLD));
+        // 0件(▲0)は marker 色、非0(●1)は状態色
+        assert_eq!(
+            segments[2].style,
+            Some(Style::default().fg(Color::DarkGray))
+        );
+        assert_eq!(segments[3].style, Some(Style::default().fg(Color::Green)));
+    }
+
+    #[test]
+    fn colorize_follows_ideal_multi_tone_scheme() {
+        // running な chat 行でも本文は通常色、状態色はバッジと右カラムのみ。
+        // agent 名は太字、prompt は通常。Detail は DIM ではなく読める中間グレー。
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "claude: fix flicker",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(BadgeState::Working);
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("claude".to_string()),
+            elapsed_secs: Some(780),
+            ..Default::default()
+        });
+        let detail = row(
+            "detail::%1::status",
+            SidebarRowKind::Detail,
+            1,
+            "status: running",
+            RollupLevel::Running,
+        );
+        let lines = render_lines(
+            &[chat, detail],
+            &SidebarState::default(),
+            40,
+            &SidebarRenderTheme::default(),
+        );
+
+        let chat_spans = &lines[0].spans;
+        // agent 名: 通常色 + BOLD
+        assert!(
+            chat_spans
+                .iter()
+                .any(|span| span.content.as_ref() == "claude"
+                    && span.style.fg == Some(Color::Reset)
+                    && span.style.add_modifier.contains(Modifier::BOLD)),
+            "{chat_spans:?}"
+        );
+        // prompt 部分: 通常色・非 BOLD(running でも緑にしない)
+        assert!(
+            chat_spans
+                .iter()
+                .any(|span| span.content.as_ref().contains(": fix flicker")
+                    && span.style.fg == Some(Color::Reset)
+                    && !span.style.add_modifier.contains(Modifier::BOLD)),
+            "{chat_spans:?}"
+        );
+        // マーカーは marker 色(DarkGray)
+        assert_eq!(chat_spans[0].style.fg, Some(Color::DarkGray));
+        // 右カラム(経過)は rollup 色で DIM なし
+        assert!(
+            chat_spans.iter().any(|span| span.content.as_ref() == "13m"
+                && span.style.fg == Some(Color::Green)
+                && !span.style.add_modifier.contains(Modifier::DIM)),
+            "{chat_spans:?}"
+        );
+        // Detail 行: DIM なしの中間グレー
+        let detail_spans = &lines[1].spans;
+        assert!(
+            detail_spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("status: running")
+                    && span.style.fg == Some(Color::Indexed(246))
+                    && !span.style.add_modifier.contains(Modifier::DIM)),
+            "{detail_spans:?}"
+        );
+    }
+
+    #[test]
+    fn repo_branch_is_rendered_in_branch_color() {
+        let mut repo = row(
+            "repo::misc::app",
+            SidebarRowKind::Repo,
+            0,
+            "app",
+            RollupLevel::Running,
+        );
+        repo.git = Some(crate::git::GitBadge {
+            branch: "main".to_string(),
+            ahead: 0,
+            behind: 0,
+        });
+        let lines = render_lines(
+            &[repo],
+            &SidebarState::default(),
+            40,
+            &SidebarRenderTheme::default(),
+        );
+        let spans = &lines[0].spans;
+        // repo 名は repo 色 + BOLD、branch は branch 色(シアン)非 BOLD
+        assert!(
+            spans.iter().any(|span| span.content.as_ref() == "app"
+                && span.style.fg == Some(Color::Blue)
+                && span.style.add_modifier.contains(Modifier::BOLD)),
+            "{spans:?}"
+        );
+        assert!(
+            spans.iter().any(|span| span.content.trim() == "main"
+                && span.style.fg == Some(Color::Cyan)
+                && !span.style.add_modifier.contains(Modifier::BOLD)),
+            "{spans:?}"
+        );
     }
 
     #[test]

@@ -30,7 +30,7 @@ VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt statusline-summary
 VDE_TMUX_SOCKET_NAME="$name" ./target/debug/vt statusline-sessions --show-index
 ```
 
-期待値: summary は `#[fg=green]●1#[default]`、sessions は `1:main` を含む。session badge がある場合、バッジとラベルは suffix なしで `○1:main` のように連結される。
+期待値: summary は `#[fg=green]●1#[default]`、sessions は `1 main` を含む。session badge がある場合、バッジとラベルは suffix なしで `○1 main` のように連結される。
 
 daemon 経由も確認する。
 
@@ -262,7 +262,7 @@ M6 追加 smoke も pass。
 scratch=vde-m6-1783132904
 window=@0
 main_pane=%0
-sessions= 1:main
+sessions= 1 main
 sidebar_pane=%1
 open_width=30
 all_sidebar_count=1
