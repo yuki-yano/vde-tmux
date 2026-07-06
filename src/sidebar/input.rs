@@ -7,8 +7,6 @@ pub enum SidebarInputAction {
     MovePrevious,
     Activate,
     ToggleExpand,
-    Expand,
-    Collapse,
     SetViewMode(ViewMode),
     CycleViewMode,
     SetFilter(StatusFilter),
@@ -36,8 +34,6 @@ pub fn parse_key(key: &str) -> Option<SidebarInputAction> {
         "k" | "up" => Some(SidebarInputAction::MovePrevious),
         "enter" | "\n" => Some(SidebarInputAction::Activate),
         "space" => Some(SidebarInputAction::ToggleExpand),
-        "l" | "right" => Some(SidebarInputAction::Expand),
-        "h" | "left" => Some(SidebarInputAction::Collapse),
         "v" => Some(SidebarInputAction::CycleViewMode),
         "tab" => Some(SidebarInputAction::ToggleFilter),
         "n" => Some(SidebarInputAction::FocusNextAttention),
@@ -103,8 +99,10 @@ mod tests {
         assert_eq!(parse_key("tab"), Some(SidebarInputAction::ToggleFilter));
         assert_eq!(parse_key("J"), Some(SidebarInputAction::ReorderDown));
         assert_eq!(parse_key("K"), Some(SidebarInputAction::ReorderUp));
-        assert_eq!(parse_key("right"), Some(SidebarInputAction::Expand));
-        assert_eq!(parse_key("left"), Some(SidebarInputAction::Collapse));
+        assert_eq!(parse_key("h"), None);
+        assert_eq!(parse_key("l"), None);
+        assert_eq!(parse_key("right"), None);
+        assert_eq!(parse_key("left"), None);
         assert_eq!(
             parse_key("toggle:chat::%1"),
             Some(SidebarInputAction::ToggleRow("chat::%1".to_string()))

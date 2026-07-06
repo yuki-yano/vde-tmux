@@ -45,12 +45,12 @@ pub struct RowMeta {
     pub prompt: Option<String>,
     pub wait_reason: Option<String>,
     pub elapsed_secs: Option<i64>,
+    pub completed_age_secs: Option<i64>,
     pub tasks_done: Option<i64>,
     pub tasks_total: Option<i64>,
     pub subagent_count: Option<usize>,
     pub attention_count: Option<usize>,
     pub origin: Option<String>,
-    pub pinned: Option<bool>,
     pub flash: Option<bool>,
 }
 
@@ -398,14 +398,10 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
     }];
     for pane in panes {
         let id = format!("chat::{}", pane.pane_id);
-        let selected = selection_pane_id(state.selection.as_deref()) == Some(pane.pane_id.as_str());
-        let pinned = state.pinned.contains(&id);
-        let manual = state.is_expanded_with_default(&id, false);
-        let expanded = selected || manual;
+        let expanded = state.is_expanded_with_default(&id, false);
         let origin = format!("{}/{}", pane.category, pane.repo);
         let mut meta = chat_meta(pane, now);
         meta.origin = Some(origin.clone());
-        meta.pinned = Some(pinned);
         rows.push(SidebarRow {
             id,
             kind: SidebarRowKind::Chat,
@@ -427,8 +423,6 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
         if expanded {
             rows.push(detail_row(pane, 2, "origin", format!("origin: {origin}")));
             push_chat_detail_rows(pane, 2, now, &mut rows);
-        } else if pinned {
-            push_meta_row(pane, 2, now, Some(&origin), &mut rows);
         }
     }
     rows
@@ -454,12 +448,8 @@ fn push_chat_row(
     rows: &mut Vec<SidebarRow>,
 ) {
     let id = format!("chat::{}", pane.pane_id);
-    let selected = selection_pane_id(state.selection.as_deref()) == Some(pane.pane_id.as_str());
-    let pinned = state.pinned.contains(&id);
-    let manual = state.is_expanded_with_default(&id, false);
-    let expanded = selected || manual;
-    let mut meta = chat_meta(pane, now);
-    meta.pinned = Some(pinned);
+    let expanded = state.is_expanded_with_default(&id, false);
+    let meta = chat_meta(pane, now);
     let label = if expanded {
         pane.agent.clone()
     } else {
@@ -481,46 +471,7 @@ fn push_chat_row(
     });
     if expanded {
         push_chat_detail_rows(pane, depth + 1, now, rows);
-    } else if pinned {
-        push_meta_row(pane, depth + 1, now, None, rows);
     }
-}
-
-fn selection_pane_id(selection: Option<&str>) -> Option<&str> {
-    let selection = selection?;
-    let rest = selection
-        .strip_prefix("chat::")
-        .or_else(|| selection.strip_prefix("jump::"))
-        .or_else(|| selection.strip_prefix("detail::"))?;
-    Some(rest.split("::").next().unwrap_or(rest))
-}
-
-fn push_meta_row(
-    pane: &AgentPane,
-    depth: usize,
-    now: i64,
-    origin: Option<&str>,
-    rows: &mut Vec<SidebarRow>,
-) {
-    let label = if let Some(origin) = origin {
-        format!("{origin} · {}", meta_label(pane, now))
-    } else {
-        meta_label(pane, now)
-    };
-    rows.push(SidebarRow {
-        id: format!("meta::{}", pane.pane_id),
-        kind: SidebarRowKind::Detail,
-        depth,
-        label,
-        chat_count: 0,
-        rollup: pane.rollup,
-        badge_state: Some(pane.badge_state),
-        expanded: true,
-        pane_id: Some(pane.pane_id.clone()),
-        git: None,
-        active: pane.active,
-        meta: None,
-    });
 }
 
 fn detail_row(pane: &AgentPane, depth: usize, suffix: &str, label: String) -> SidebarRow {
@@ -601,7 +552,7 @@ fn state_time_label(pane: &AgentPane, now: i64) -> Option<String> {
     match pane.badge_state {
         BadgeState::Blocked | BadgeState::Working => {
             let started_at = pane.started_at.parse::<i64>().ok()?;
-            Some(humanize_secs(now - started_at))
+            Some(humanize_secs_full(now - started_at))
         }
         BadgeState::Done | BadgeState::Idle => {
             let completed_at = pane.completed_at.parse::<i64>().ok()?;
@@ -621,12 +572,16 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
             .parse::<i64>()
             .ok()
             .map(|started_at| (now - started_at).max(0)),
+        completed_age_secs: pane
+            .completed_at
+            .parse::<i64>()
+            .ok()
+            .map(|completed_at| (now - completed_at).max(0)),
         tasks_done: tasks.map(|(done, _)| done),
         tasks_total: tasks.map(|(_, total)| total),
         subagent_count: Some(decode_subagents(&pane.subagents).len()),
         attention_count: None,
         origin: None,
-        pinned: None,
         flash: pane.flash.then_some(true),
     }
 }
@@ -642,28 +597,6 @@ fn group_meta(panes: &[AgentPane], triage: &BTreeSet<String>) -> RowMeta {
                 .count(),
         ),
         ..RowMeta::default()
-    }
-}
-
-fn meta_label(pane: &AgentPane, now: i64) -> String {
-    let mut parts = Vec::new();
-    if let Ok(started_at) = pane.started_at.parse::<i64>() {
-        parts.push(humanize_secs(now - started_at));
-    }
-    if let Some((done, total)) = parse_tasks(&pane.tasks) {
-        parts.push(format!("task {done}/{total}"));
-    }
-    let subagents = decode_subagents(&pane.subagents).len();
-    if subagents > 0 {
-        parts.push(format!("sub {subagents}"));
-    }
-    if let Some(wait_reason) = non_empty(&pane.wait_reason) {
-        parts.push(wait_reason.to_string());
-    }
-    if parts.is_empty() {
-        format!("{} / {}", pane.session, pane.pane_id)
-    } else {
-        parts.join(" · ")
     }
 }
 
@@ -690,6 +623,20 @@ pub fn humanize_secs(secs: i64) -> String {
         return format!("{hours}h");
     }
     format!("{}d", hours / 24)
+}
+
+pub fn humanize_secs_full(secs: i64) -> String {
+    let secs = secs.max(0);
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn decode_subagents(raw: &str) -> Vec<(String, String)> {
@@ -1090,11 +1037,12 @@ mod tests {
             .categories
             .rules
             .push(category_rule("idle", "/tmp/idle/*"));
-        let state = SidebarState {
+        let mut state = SidebarState {
             view_mode: ViewMode::ByCategory,
             selection: Some("chat::%1".to_string()),
             ..SidebarState::default()
         };
+        state.toggle_expanded("chat::%1");
         let mut active = pane("main", "%1", "/tmp/active/app", "codex", "running");
         active.window_active = true;
         active.session_attached = true;
@@ -1372,7 +1320,7 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .any(|row| row.kind == SidebarRowKind::Detail && row.label == "running · 1m")
+                .any(|row| row.kind == SidebarRowKind::Detail && row.label == "running · 1m 15s")
         );
         assert!(
             rows.iter()
@@ -1397,11 +1345,12 @@ mod tests {
 
         assert_eq!(collapsed_chat.label, "claude: review the long plan");
 
-        let expanded_state = SidebarState {
+        let mut expanded_state = SidebarState {
             view_mode: ViewMode::Flat,
             selection: Some("chat::%1".to_string()),
             ..SidebarState::default()
         };
+        expanded_state.toggle_expanded("chat::%1");
         let expanded = build_rows_at(&Config::default(), &[agent.clone()], &expanded_state, 1000);
         let expanded_chat = expanded
             .iter()
@@ -1425,17 +1374,36 @@ mod tests {
     }
 
     #[test]
-    fn selected_chat_row_expands_full_detail_rows() {
+    fn selected_chat_row_does_not_auto_expand_full_detail_rows() {
         let mut agent = pane("main", "%1", "/tmp/app", "codex", "running");
         agent.prompt = "fix bug".to_string();
-        agent.started_at = "185".to_string();
-        agent.tasks = "2/5".to_string();
-        agent.subagents = "sub1:Explore|ab12:general-purpose".to_string();
         let state = SidebarState {
             view_mode: ViewMode::Flat,
             selection: Some("chat::%1".to_string()),
             ..SidebarState::default()
         };
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
+
+        let chat = rows.iter().find(|row| row.id == "chat::%1").unwrap();
+        assert!(!chat.expanded);
+        assert!(!rows.iter().any(|row| row.id == "detail::%1::prompt"));
+        assert!(!rows.iter().any(|row| row.id == "jump::%1"));
+    }
+
+    #[test]
+    fn manually_expanded_chat_row_expands_full_detail_rows() {
+        let mut agent = pane("main", "%1", "/tmp/app", "codex", "running");
+        agent.prompt = "fix bug".to_string();
+        agent.started_at = "185".to_string();
+        agent.tasks = "2/5".to_string();
+        agent.subagents = "sub1:Explore|ab12:general-purpose".to_string();
+        let mut state = SidebarState {
+            view_mode: ViewMode::Flat,
+            selection: Some("chat::%1".to_string()),
+            ..SidebarState::default()
+        };
+        state.toggle_expanded("chat::%1");
 
         let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
 
@@ -1451,11 +1419,12 @@ mod tests {
         let mut agent = pane("vde-tmux", "%1", "/tmp/app", "codex", "running");
         agent.prompt = "fix bug".to_string();
         agent.started_at = "280".to_string();
-        let state = SidebarState {
+        let mut state = SidebarState {
             view_mode: ViewMode::Flat,
             selection: Some("chat::%1".to_string()),
             ..SidebarState::default()
         };
+        state.toggle_expanded("chat::%1");
 
         let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
 
@@ -1463,7 +1432,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "detail::%1::state")
                 .map(|row| row.label.as_str()),
-            Some("running · 12m")
+            Some("running · 12m 00s")
         );
         assert_eq!(
             rows.iter()
@@ -1482,11 +1451,12 @@ mod tests {
         done.completed_at = (1000 - 38 * 3600).to_string();
         let mut missing = pane("main", "%2", "/tmp/app", "claude", "idle");
         missing.completed_at.clear();
-        let state = SidebarState {
+        let mut state = SidebarState {
             view_mode: ViewMode::Flat,
             selection: Some("chat::%1".to_string()),
             ..SidebarState::default()
         };
+        state.toggle_expanded("chat::%1");
 
         let rows = build_rows_at(&Config::default(), &[done], &state, 1000);
         assert_eq!(
@@ -1496,11 +1466,12 @@ mod tests {
             Some("idle · done 38h ago")
         );
 
-        let state = SidebarState {
+        let mut state = SidebarState {
             view_mode: ViewMode::Flat,
             selection: Some("chat::%2".to_string()),
             ..SidebarState::default()
         };
+        state.toggle_expanded("chat::%2");
         let rows = build_rows_at(&Config::default(), &[missing], &state, 1000);
         assert_eq!(
             rows.iter()
@@ -1515,11 +1486,12 @@ mod tests {
         let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
         blocked.wait_reason = "permission_prompt".to_string();
         blocked.started_at = "880".to_string();
-        let state = SidebarState {
+        let mut state = SidebarState {
             view_mode: ViewMode::Flat,
             selection: Some("chat::%1".to_string()),
             ..SidebarState::default()
         };
+        state.toggle_expanded("chat::%1");
 
         let rows = build_rows_at(&Config::default(), &[blocked], &state, 1000);
 
@@ -1527,7 +1499,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "detail::%1::state")
                 .map(|row| row.label.as_str()),
-            Some("waiting (permission_prompt) · 2m")
+            Some("waiting (permission_prompt) · 2m 00s")
         );
     }
 
@@ -1540,30 +1512,32 @@ mod tests {
         zero_total.started_at = "280".to_string();
         zero_total.tasks = "0/0".to_string();
 
-        let state = SidebarState {
+        let mut state = SidebarState {
             view_mode: ViewMode::Flat,
             selection: Some("chat::%1".to_string()),
             ..SidebarState::default()
         };
+        state.toggle_expanded("chat::%1");
         let rows = build_rows_at(&Config::default(), &[with_tasks], &state, 1000);
         assert_eq!(
             rows.iter()
                 .find(|row| row.id == "detail::%1::state")
                 .map(|row| row.label.as_str()),
-            Some("running · 12m · 3/5 tasks")
+            Some("running · 12m 00s · 3/5 tasks")
         );
 
-        let state = SidebarState {
+        let mut state = SidebarState {
             view_mode: ViewMode::Flat,
             selection: Some("chat::%2".to_string()),
             ..SidebarState::default()
         };
+        state.toggle_expanded("chat::%2");
         let rows = build_rows_at(&Config::default(), &[zero_total], &state, 1000);
         assert_eq!(
             rows.iter()
                 .find(|row| row.id == "detail::%2::state")
                 .map(|row| row.label.as_str()),
-            Some("running · 12m")
+            Some("running · 12m 00s")
         );
     }
 
@@ -1591,24 +1565,6 @@ mod tests {
         let rows = build_rows_at(&Config::default(), &[agent], &expanded, 1000);
         assert!(!rows.iter().any(|row| row.id == "meta::%1"));
         assert!(rows.iter().any(|row| row.id == "jump::%1"));
-    }
-
-    #[test]
-    fn meta_row_falls_back_to_session_and_pane() {
-        let agent = pane("main", "%1", "/tmp/app", "codex", "running");
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            pinned: BTreeSet::from(["chat::%1".to_string()]),
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
-
-        let meta = rows
-            .iter()
-            .find(|row| row.id == "meta::%1")
-            .expect("meta row");
-        assert_eq!(meta.label, "main / %1");
     }
 
     #[test]
@@ -1774,6 +1730,25 @@ mod tests {
     }
 
     #[test]
+    fn completed_chat_rows_carry_completed_age_meta() {
+        let mut agent = pane("main", "%1", "/tmp/app", "codex", "idle");
+        agent.completed_at = "925".to_string();
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
+
+        let chat = rows
+            .iter()
+            .find(|row| row.kind == SidebarRowKind::Chat)
+            .expect("chat row");
+        let meta = chat.meta.as_ref().expect("chat meta");
+        assert_eq!(meta.completed_age_secs, Some(75));
+    }
+
+    #[test]
     fn repo_rows_carry_blocked_count_in_meta() {
         let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
         blocked.wait_reason = "permission_prompt".to_string();
@@ -1928,7 +1903,6 @@ mod tests {
         blocked.started_at = "940".to_string();
         let state = SidebarState {
             view_mode: ViewMode::ByRepo,
-            pinned: BTreeSet::from(["chat::%1".to_string()]),
             ..SidebarState::default()
         };
         let ctx = RowBuildContext {
@@ -1940,23 +1914,19 @@ mod tests {
         let rows = build_rows_ctx(&Config::default(), &[blocked], &state, &ctx);
         let chat = rows.iter().find(|row| row.id == "chat::%1").expect("chat");
         let meta = chat.meta.as_ref().expect("chat meta");
-        let inline_meta = rows
-            .iter()
-            .find(|row| row.id == "meta::%1")
-            .expect("inline meta");
 
         assert_eq!(meta.origin.as_deref(), Some("misc/app"));
-        assert!(inline_meta.label.contains("misc/app"), "{inline_meta:?}");
     }
 
     #[test]
     fn selected_triage_row_shows_origin_detail() {
         let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
         blocked.wait_reason = "permission_prompt".to_string();
-        let state = SidebarState {
+        let mut state = SidebarState {
             selection: Some("chat::%1".to_string()),
             ..SidebarState::default()
         };
+        state.toggle_expanded("chat::%1");
         let ctx = RowBuildContext {
             triage: BTreeSet::from(["%1".to_string()]),
             now: 1000,
@@ -1973,26 +1943,25 @@ mod tests {
     }
 
     #[test]
-    fn selected_chat_expands_full_pinned_expands_medium_others_single() {
+    fn manual_chat_expands_full_and_others_stay_single() {
         let selected = pane("main", "%1", "/tmp/app", "codex", "running");
-        let pinned = pane("main", "%2", "/tmp/app", "claude", "running");
+        let second = pane("main", "%2", "/tmp/app", "claude", "running");
         let other = pane("main", "%3", "/tmp/app", "opencode", "running");
-        let state = SidebarState {
+        let mut state = SidebarState {
             view_mode: ViewMode::Flat,
             selection: Some("chat::%1".to_string()),
-            pinned: BTreeSet::from(["chat::%2".to_string()]),
             ..SidebarState::default()
         };
+        state.toggle_expanded("chat::%1");
         let ctx = RowBuildContext {
             now: 1000,
             ..RowBuildContext::default()
         };
 
-        let rows = build_rows_ctx(&Config::default(), &[selected, pinned, other], &state, &ctx);
+        let rows = build_rows_ctx(&Config::default(), &[selected, second, other], &state, &ctx);
 
         assert!(rows.iter().any(|row| row.id == "detail::%1::state"));
         assert!(rows.iter().any(|row| row.id == "jump::%1"));
-        assert!(rows.iter().any(|row| row.id == "meta::%2"));
         assert!(!rows.iter().any(|row| row.id == "detail::%2::state"));
         assert!(!rows.iter().any(|row| row.id == "meta::%3"));
         assert!(!rows.iter().any(|row| row.id == "detail::%3::state"));
@@ -2001,11 +1970,12 @@ mod tests {
     #[test]
     fn selection_on_child_row_keeps_chat_expanded() {
         let p = pane("main", "%1", "/tmp/app", "codex", "running");
-        let state = SidebarState {
+        let mut state = SidebarState {
             view_mode: ViewMode::Flat,
             selection: Some("jump::%1".to_string()),
             ..SidebarState::default()
         };
+        state.toggle_expanded("chat::%1");
 
         let rows = build_rows_ctx(
             &Config::default(),
@@ -2015,25 +1985,6 @@ mod tests {
         );
 
         assert!(rows.iter().any(|row| row.id == "jump::%1"));
-    }
-
-    #[test]
-    fn pinned_rows_carry_pin_meta() {
-        let agent = pane("main", "%1", "/tmp/app", "codex", "running");
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            pinned: BTreeSet::from(["chat::%1".to_string()]),
-            ..SidebarState::default()
-        };
-        let ctx = RowBuildContext {
-            now: 1000,
-            ..RowBuildContext::default()
-        };
-
-        let rows = build_rows_ctx(&Config::default(), &[agent], &state, &ctx);
-        let chat = rows.iter().find(|row| row.id == "chat::%1").expect("chat");
-
-        assert_eq!(chat.meta.as_ref().and_then(|meta| meta.pinned), Some(true));
     }
 
     #[test]

@@ -76,8 +76,6 @@ pub enum SidebarAction {
     MoveNext,
     MovePrevious,
     ToggleExpand,
-    Expand,
-    Collapse,
     SetViewMode(ViewMode),
     CycleViewMode,
     ToggleFilter,
@@ -95,18 +93,6 @@ impl SidebarState {
                     return false;
                 };
                 self.toggle_expanded(&id)
-            }
-            SidebarAction::Expand => {
-                let Some(id) = self.selection.clone() else {
-                    return false;
-                };
-                self.set_expanded(&id, true)
-            }
-            SidebarAction::Collapse => {
-                let Some(id) = self.selection.clone() else {
-                    return false;
-                };
-                self.set_expanded(&id, false)
             }
             SidebarAction::SetViewMode(view_mode) => {
                 if self.view_mode == view_mode {
@@ -142,14 +128,6 @@ impl SidebarState {
     pub fn toggle_expanded(&mut self, id: &str) -> bool {
         if !self.collapsed.insert(id.to_string()) {
             self.collapsed.remove(id);
-        }
-        self.bump();
-        true
-    }
-
-    pub fn toggle_pinned(&mut self, id: &str) -> bool {
-        if !self.pinned.insert(id.to_string()) {
-            self.pinned.remove(id);
         }
         self.bump();
         true
@@ -320,25 +298,6 @@ mod tests {
 
         assert_eq!(state.filter, StatusFilter::AttentionOnly);
         assert_eq!(state.version, 7);
-    }
-
-    #[test]
-    fn pinned_set_toggles_and_persists() {
-        let mut state = SidebarState::default();
-        assert!(state.toggle_pinned("chat::%1"));
-        assert!(state.pinned.contains("chat::%1"));
-        assert!(state.toggle_pinned("chat::%1"));
-        assert!(!state.pinned.contains("chat::%1"));
-
-        let json = serde_json::to_string(&SidebarState {
-            pinned: std::iter::once("chat::%1".to_string()).collect(),
-            ..SidebarState::default()
-        })
-        .unwrap();
-        assert!(json.contains(r#""pinned""#));
-
-        let old: SidebarState = serde_json::from_str(r#"{"version":3}"#).unwrap();
-        assert!(old.pinned.is_empty());
     }
 
     #[test]

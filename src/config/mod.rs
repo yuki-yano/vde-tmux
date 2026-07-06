@@ -400,7 +400,7 @@ pub struct SidebarColorsConfig {
     pub badge_idle: Option<String>,
     pub detail: Option<String>,
     pub marker: Option<String>,
-    pub pin: Option<String>,
+    pub toggle: Option<String>,
     pub category: Option<String>,
     pub header_mode: Option<String>,
     pub active_bg: Option<String>,

@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 /// サイドバーの配色。色は 5 族の規約で運用する:
 /// - 状態族: badge_* / rollup 色(▲赤 ●緑 ✓シアン ○灰)。状態を示す場所にだけ使う
 /// - 構造族: repo(青太字)/ category(ピーチ太字)/ branch(淡シアン 73)
-/// - 操作族: ラベンダー 147/103(pin ✦ / mode ≣ / active ▎ / preview ⌕)
+/// - 操作族: ラベンダー 147/103(mode ≣ / active ▎ / preview ⌕)
 /// - 本文族: 本文=通常色 / 補足=detail(246)/ 記号=marker(暗灰)
 /// - 実況: live(マゼンタ)は LIVE/EVENTS 見出し専用の孤立色
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,19 +585,9 @@ fn render_row_line(
         }
         SidebarRowKind::Chat => {
             let marker = if row.expanded { "▾" } else { "▸" };
-            let pin = if row
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.pinned)
-                .unwrap_or(false)
-            {
-                "✦"
-            } else {
-                " "
-            };
-            format!("{indent}{pin}{marker} ")
+            format!("{indent} {marker} ")
         }
-        SidebarRowKind::Detail if row.id.starts_with("meta::") => format!("{indent}✦ "),
+        SidebarRowKind::Detail if row.id.starts_with("meta::") => format!("{indent}  "),
         SidebarRowKind::Detail => indent.clone(),
         SidebarRowKind::Jump => indent.clone(),
         SidebarRowKind::Zone => unreachable!("zone rows return before generic rendering"),
@@ -645,25 +635,27 @@ fn render_row_line(
     let mut spans = Vec::new();
     if row.kind == SidebarRowKind::Chat {
         let marker = if row.expanded { "▾" } else { "▸" };
-        let pinned = row
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.pinned)
-            .unwrap_or(false);
         push_leading_marker_span(&mut spans, row, theme, &indent);
         spans.push(Span::styled(
-            if pinned { "✦" } else { " " }.to_string(),
-            Style::default().fg(theme.pin),
+            " ".to_string(),
+            Style::default().fg(theme.marker),
         ));
         spans.push(Span::styled(
             format!("{marker} "),
-            Style::default().fg(theme.marker),
+            toggle_marker_style(theme),
+        ));
+    } else if matches!(row.kind, SidebarRowKind::Category | SidebarRowKind::Repo) {
+        let marker = if row.expanded { "▾" } else { "▸" };
+        push_leading_marker_span(&mut spans, row, theme, &indent);
+        spans.push(Span::styled(
+            format!("{marker} "),
+            toggle_marker_style(theme),
         ));
     } else if row.kind == SidebarRowKind::Detail && row.id.starts_with("meta::") {
         push_leading_marker_span(&mut spans, row, theme, &indent);
         spans.push(Span::styled(
-            "✦ ".to_string(),
-            Style::default().fg(theme.pin),
+            "  ".to_string(),
+            Style::default().fg(theme.marker),
         ));
     } else {
         push_leading_marker_span(&mut spans, row, theme, &head);
@@ -790,6 +782,12 @@ fn state_detail_label_spans(
         spans.push(Span::styled(rest, Style::default().fg(theme.detail)));
     }
     spans
+}
+
+fn toggle_marker_style(theme: &SidebarRenderTheme) -> Style {
+    Style::default()
+        .fg(theme.toggle)
+        .add_modifier(Modifier::BOLD)
 }
 
 struct GitBadgeText {
@@ -1123,6 +1121,11 @@ fn right_label(row: &SidebarRow) -> Option<String> {
                     .as_ref()
                     .and_then(|meta| meta.elapsed_secs)
                     .map(elapsed_label),
+                RollupLevel::Idle if row.badge_state == Some(BadgeState::Done) => row
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.completed_age_secs)
+                    .map(|secs| format!("{} ago", elapsed_label(secs))),
                 RollupLevel::Idle => None,
             }
         }
@@ -1138,6 +1141,13 @@ fn right_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
     match row.kind {
         SidebarRowKind::Category | SidebarRowKind::Repo => {
             Style::default().fg(theme.badge_color(BadgeState::Blocked))
+        }
+        SidebarRowKind::Chat
+            if row.badge_state == Some(BadgeState::Done)
+                && !row.expanded
+                && right_label(row).is_some() =>
+        {
+            Style::default().fg(Color::White)
         }
         _ => Style::default().fg(theme.rollup_color(row.rollup)),
     }
@@ -1164,6 +1174,7 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
             .add_modifier(Modifier::BOLD),
         SidebarRowKind::Repo => Style::default().fg(theme.repo).add_modifier(Modifier::BOLD),
         SidebarRowKind::Chat => Style::default().fg(Color::Reset),
+        SidebarRowKind::Detail if row.id.ends_with("::prompt") => Style::default().fg(Color::Reset),
         SidebarRowKind::Detail => Style::default().fg(theme.detail),
         SidebarRowKind::Jump => Style::default().fg(theme.detail),
     }
@@ -1401,55 +1412,6 @@ mod tests {
             }),
             "{lines:?}"
         );
-    }
-
-    #[test]
-    fn pinned_chat_row_shows_pin_glyph() {
-        let mut chat = row(
-            "chat::%1",
-            SidebarRowKind::Chat,
-            0,
-            "codex",
-            RollupLevel::Running,
-        );
-        chat.meta = Some(crate::sidebar::tree::RowMeta {
-            pinned: Some(true),
-            ..Default::default()
-        });
-        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
-        chat.expanded = false;
-        let mut unpinned = row(
-            "chat::%2",
-            SidebarRowKind::Chat,
-            0,
-            "claude",
-            RollupLevel::Running,
-        );
-        unpinned.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
-        unpinned.expanded = false;
-
-        let rendered = render_rows(&[chat, unpinned], &SidebarState::default(), 40);
-
-        assert!(
-            rendered.lines().next().unwrap().starts_with(" ✦▸ "),
-            "{rendered:?}"
-        );
-        assert!(
-            rendered.lines().nth(1).unwrap().starts_with("  ▸ "),
-            "{rendered:?}"
-        );
-    }
-
-    #[test]
-    fn pin_color_is_configurable() {
-        let config = crate::config::SidebarColorsConfig {
-            pin: Some("magenta".to_string()),
-            ..Default::default()
-        };
-        let theme = SidebarRenderTheme::from_config(&config);
-
-        assert_eq!(theme.pin, Color::Magenta);
-        assert_eq!(SidebarRenderTheme::default().pin, Color::Indexed(147));
     }
 
     #[test]
@@ -1735,8 +1697,18 @@ mod tests {
         );
 
         // 多トーン検証は colorize_follows_ideal_multi_tone_scheme も参照
-        // 先頭 span はマーカー(DarkGray)、ラベル span が category 色 + BOLD
+        // 先頭 span は padding(DarkGray)、開閉 marker は操作色、ラベル span が category 色 + BOLD
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::DarkGray));
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref() == "▾ "
+                    && span.style.fg == Some(Color::Indexed(147))
+                    && span.style.add_modifier.contains(Modifier::BOLD)),
+            "{:?}",
+            lines[0]
+        );
         assert!(
             lines[0]
                 .spans
@@ -2302,8 +2274,15 @@ sidebar:
             "main · %1",
             RollupLevel::Running,
         );
+        let prompt_detail = row(
+            "detail::%1::prompt",
+            SidebarRowKind::Detail,
+            1,
+            "fix flicker",
+            RollupLevel::Running,
+        );
         let lines = render_lines(
-            &[chat, detail],
+            &[chat, detail, prompt_detail],
             &SidebarState::default(),
             40,
             &SidebarRenderTheme::default(),
@@ -2328,8 +2307,14 @@ sidebar:
                     && !span.style.add_modifier.contains(Modifier::BOLD)),
             "{chat_spans:?}"
         );
-        // マーカーは marker 色(DarkGray)
+        // padding は marker 色(DarkGray)、開閉 marker は操作色で強調
         assert_eq!(chat_spans[0].style.fg, Some(Color::DarkGray));
+        assert!(
+            chat_spans.iter().any(|span| span.content.as_ref() == "▸ "
+                && span.style.fg == Some(Color::Indexed(147))
+                && span.style.add_modifier.contains(Modifier::BOLD)),
+            "{chat_spans:?}"
+        );
         // 右カラム(経過)は rollup 色で DIM なし
         assert!(
             chat_spans.iter().any(|span| span.content.as_ref() == "13m"
@@ -2346,6 +2331,16 @@ sidebar:
                     && span.style.fg == Some(Color::Indexed(246))
                     && !span.style.add_modifier.contains(Modifier::DIM)),
             "{detail_spans:?}"
+        );
+        // prompt detail 行: 閉じた chat 行の prompt と同じ通常色
+        let prompt_detail_spans = &lines[2].spans;
+        assert!(
+            prompt_detail_spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("fix flicker")
+                    && span.style.fg == Some(Color::Reset)
+                    && !span.style.add_modifier.contains(Modifier::DIM)),
+            "{prompt_detail_spans:?}"
         );
     }
 
@@ -2572,6 +2567,37 @@ sidebar:
         });
         let rendered = render_rows(&[chat], &SidebarState::default(), 30);
         assert!(rendered.ends_with("13m "), "{rendered:?}");
+    }
+
+    #[test]
+    fn chat_row_shows_completed_age_when_done() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: fix",
+            RollupLevel::Idle,
+        );
+        chat.badge_state = Some(BadgeState::Done);
+        chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            completed_age_secs: Some(815),
+            ..Default::default()
+        });
+
+        assert_eq!(right_label(&chat).as_deref(), Some("13m ago"));
+        assert_eq!(
+            right_style(&chat, &SidebarRenderTheme::default()).fg,
+            Some(ratatui::style::Color::White)
+        );
+
+        let rendered = render_rows(&[chat], &SidebarState::default(), 30);
+        assert!(rendered.ends_with("13m ago "), "{rendered:?}");
+        assert_eq!(
+            display_width(rendered.lines().next().unwrap()),
+            30,
+            "{rendered:?}"
+        );
     }
 
     #[test]

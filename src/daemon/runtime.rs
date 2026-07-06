@@ -209,7 +209,6 @@ impl RuntimeState {
             DaemonEvent::Client { event, .. } => self.apply_client_event(event),
             DaemonEvent::PanesUpdated(panes) => {
                 self.panes = panes;
-                self.prune_missing_pins();
                 self.update_unread();
                 self.update_triage();
                 let transition_effects = self.update_transitions();
@@ -336,21 +335,6 @@ impl RuntimeState {
             .then_some(self.config.notify.command.as_str())
     }
 
-    fn prune_missing_pins(&mut self) {
-        let live_chat_ids = self
-            .panes
-            .iter()
-            .filter(|pane| is_live_agent_pane(pane))
-            .map(|pane| format!("chat::{}", pane.pane_id))
-            .collect::<BTreeSet<_>>();
-        let before = self.ui_state.pinned.len();
-        self.ui_state.pinned.retain(|id| live_chat_ids.contains(id));
-        if self.ui_state.pinned.len() != before {
-            self.ui_state.version += 1;
-            self.mark_state_dirty(Instant::now());
-        }
-    }
-
     fn apply_client_event(&mut self, event: SidebarClientEvent) -> Vec<RuntimeEffect> {
         match event {
             SidebarClientEvent::Key { key } => self.apply_key(&key),
@@ -376,16 +360,8 @@ impl RuntimeState {
                 self.ui_state.apply(SidebarAction::MovePrevious, &row_refs)
             }
             SidebarInputAction::ToggleExpand => {
-                if let Some(id) = self.ui_state.selection.clone()
-                    && id.starts_with("chat::")
-                {
-                    self.ui_state.toggle_pinned(&id)
-                } else {
-                    self.ui_state.apply(SidebarAction::ToggleExpand, &row_refs)
-                }
+                self.ui_state.apply(SidebarAction::ToggleExpand, &row_refs)
             }
-            SidebarInputAction::Expand => self.ui_state.apply(SidebarAction::Expand, &row_refs),
-            SidebarInputAction::Collapse => self.ui_state.apply(SidebarAction::Collapse, &row_refs),
             SidebarInputAction::SetViewMode(view_mode) => self
                 .ui_state
                 .apply(SidebarAction::SetViewMode(view_mode), &row_refs),
@@ -412,11 +388,7 @@ impl RuntimeState {
                     self.ui_state.toggle_expanded(&chat_id)
                 } else {
                     self.ui_state.selection = Some(row_id.clone());
-                    if row_id.starts_with("chat::") {
-                        self.ui_state.toggle_pinned(&row_id)
-                    } else {
-                        self.ui_state.toggle_expanded(&row_id)
-                    }
+                    self.ui_state.toggle_expanded(&row_id)
                 }
             }
             SidebarInputAction::FocusNextAttention => self.focus_attention(true),
@@ -919,25 +891,6 @@ mod tests {
     }
 
     #[test]
-    fn pinned_entries_for_missing_panes_are_pruned() {
-        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
-        state.ui_state.pinned.insert("chat::%9".to_string());
-
-        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
-            "main", "%1", "running",
-        )]));
-
-        assert!(!state.ui_state.pinned.contains("chat::%9"));
-        state.ui_state.pinned.insert("chat::%1".to_string());
-
-        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
-            "main", "%1", "running",
-        )]));
-
-        assert!(state.ui_state.pinned.contains("chat::%1"));
-    }
-
-    #[test]
     fn stale_hook_agent_clears_session_badge() {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
         let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
@@ -1269,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn client_encoded_toggle_key_pins_clicked_chat_without_prior_selection() {
+    fn client_encoded_toggle_key_toggles_clicked_chat_without_prior_selection() {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
         state.apply_event(DaemonEvent::PanesUpdated(vec![pane(
             "%1", "/tmp/app", "codex", "running",
@@ -1283,7 +1236,15 @@ mod tests {
         });
 
         assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
-        assert!(state.ui_state.pinned.contains("chat::%1"));
+        assert!(state.ui_state.is_expanded_with_default("chat::%1", false));
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "toggle:chat::%1".to_string(),
+            },
+        });
+
         assert!(!state.ui_state.is_expanded_with_default("chat::%1", false));
     }
 
@@ -1322,7 +1283,6 @@ mod tests {
 
         assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
         assert!(state.ui_state.is_expanded_with_default("chat::%1", false));
-        assert!(!state.ui_state.pinned.contains("chat::%1"));
     }
 
     #[test]
@@ -1346,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn space_on_chat_row_toggles_pin_instead_of_expand() {
+    fn space_on_chat_row_toggles_expand() {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
         state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
             "main", "%1", "running",
@@ -1360,7 +1320,15 @@ mod tests {
             },
         });
 
-        assert!(state.ui_state.pinned.contains("chat::%1"));
+        assert!(state.ui_state.is_expanded_with_default("chat::%1", false));
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "space".to_string(),
+            },
+        });
+
         assert!(!state.ui_state.is_expanded_with_default("chat::%1", false));
     }
 

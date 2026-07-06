@@ -247,8 +247,6 @@ pub fn run_loop<B: Backend>(
                     KeyCode::Char(ch) => send_sidebar_key(socket, &ch.to_string())?,
                     KeyCode::Down => send_sidebar_key(socket, "down")?,
                     KeyCode::Up => send_sidebar_key(socket, "up")?,
-                    KeyCode::Right => send_sidebar_key(socket, "right")?,
-                    KeyCode::Left => send_sidebar_key(socket, "left")?,
                     KeyCode::Tab => send_sidebar_key(socket, "tab")?,
                     KeyCode::Enter => {
                         if let Some(snapshot) = &current
