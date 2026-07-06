@@ -75,10 +75,28 @@ pub fn list_sessions(runner: &dyn TmuxRunner) -> Result<Vec<SessionInfo>> {
 }
 
 pub fn current_client_name(runner: &dyn TmuxRunner) -> Result<String> {
+    if let Ok(client) = runner.run(&["display-message", "-p", "#{client_name}\t#{client_tty}"]) {
+        let client = parse_client_target_line(client.trim());
+        if !client.is_empty() {
+            return Ok(client.to_string());
+        }
+    }
     Ok(runner
-        .run(&["display-message", "-p", "#{client_name}"])?
-        .trim()
+        .run(&["list-clients", "-F", "#{client_name}\t#{client_tty}"])?
+        .lines()
+        .map(parse_client_target_line)
+        .find(|client| !client.is_empty())
+        .unwrap_or_default()
         .to_string())
+}
+
+fn parse_client_target_line(line: &str) -> &str {
+    let (name, tty) = line.split_once('\t').unwrap_or((line, ""));
+    let name = name.trim();
+    if !name.is_empty() {
+        return name;
+    }
+    tty.trim()
 }
 
 pub fn current_session_name(runner: &dyn TmuxRunner) -> Result<String> {
@@ -89,7 +107,25 @@ pub fn current_session_name(runner: &dyn TmuxRunner) -> Result<String> {
 }
 
 pub fn switch_client(runner: &dyn TmuxRunner, session: &str) -> Result<()> {
-    runner.run(&["switch-client", "-t", session])?;
+    let target = exact_session_target(session);
+    runner.run(&["switch-client", "-t", &target])?;
+    Ok(())
+}
+
+pub fn exact_session_target(session: &str) -> String {
+    format!("={session}:")
+}
+
+pub fn switch_client_for_client(
+    runner: &dyn TmuxRunner,
+    client_name: &str,
+    session: &str,
+) -> Result<()> {
+    if client_name.trim().is_empty() {
+        return switch_client(runner, session);
+    }
+    let target = exact_session_target(session);
+    runner.run(&["switch-client", "-c", client_name, "-t", &target])?;
     Ok(())
 }
 
@@ -179,7 +215,7 @@ pub fn use_category(runner: &dyn TmuxRunner, config: &Config, category: &str) ->
     if let Some(remembered) = remembered_session_for_client(runner, &client, category)?
         && find_session(&sessions, &remembered).is_some()
     {
-        switch_client(runner, &remembered)?;
+        switch_client_for_client(runner, &client, &remembered)?;
         return remember_session_for_client(runner, &client, category, &remembered);
     }
 
@@ -189,7 +225,7 @@ pub fn use_category(runner: &dyn TmuxRunner, config: &Config, category: &str) ->
     else {
         bail!("no session in category: {category}");
     };
-    switch_client(runner, &session.name)?;
+    switch_client_for_client(runner, &client, &session.name)?;
     remember_session_for_client(runner, &client, category, &session.name)
 }
 
@@ -228,7 +264,7 @@ pub fn cycle_session(runner: &dyn TmuxRunner, config: &Config, direction: Direct
         Direction::Previous => (index + category_sessions.len() - 1) % category_sessions.len(),
     };
     let next_name = category_sessions[next].name.clone();
-    switch_client(runner, &next_name)?;
+    switch_client_for_client(runner, &client, &next_name)?;
     remember_session_for_client(runner, &client, &category, &next_name)
 }
 
@@ -329,10 +365,39 @@ mod tests {
     #[test]
     fn current_context_reads_client_and_session() {
         let mock = MockTmuxRunner::new();
-        mock.stub(&["display-message", "-p", "#{client_name}"], "client-1\n");
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "client-1\t/dev/ttys001\n",
+        );
         mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
         assert_eq!(current_client_name(&mock).unwrap(), "client-1");
         assert_eq!(current_session_name(&mock).unwrap(), "main");
+    }
+
+    #[test]
+    fn current_client_name_falls_back_to_list_clients_when_tmux_has_no_current_client() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "\t\n",
+        );
+        mock.stub(
+            &["list-clients", "-F", "#{client_name}\t#{client_tty}"],
+            "\t/dev/ttys001\n",
+        );
+
+        assert_eq!(current_client_name(&mock).unwrap(), "/dev/ttys001");
+    }
+
+    #[test]
+    fn current_client_name_falls_back_to_list_clients_when_display_message_fails() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["list-clients", "-F", "#{client_name}\t#{client_tty}"],
+            "abc\t/dev/ttys001\n",
+        );
+
+        assert_eq!(current_client_name(&mock).unwrap(), "abc");
     }
 
     #[test]
@@ -348,7 +413,10 @@ mod tests {
     fn remember_current_client_session_uses_effective_category() {
         let mock = MockTmuxRunner::new();
         let format = session_list_format();
-        mock.stub(&["display-message", "-p", "#{client_name}"], "abc\n");
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "abc\t/dev/ttys001\n",
+        );
         mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
         mock.stub(
             &["list-sessions", "-F", &format],
@@ -390,29 +458,57 @@ mod tests {
     fn cycle_session_switches_next_in_current_category() {
         let mock = MockTmuxRunner::new();
         let format = session_list_format();
-        mock.stub(&["display-message", "-p", "#{client_name}"], "abc\n");
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "abc\t/dev/ttys001\n",
+        );
         mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
         mock.stub(
             &["list-sessions", "-F", &format],
             "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\nsub\u{1f}0\u{1f}101\u{1f}work\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\nother\u{1f}0\u{1f}102\u{1f}private\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
         );
-        mock.stub(&["switch-client", "-t", "sub"], "");
+        mock.stub(&["switch-client", "-c", "abc", "-t", "=sub:"], "");
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "sub"], "");
         cycle_session(&mock, &crate::config::Config::default(), Direction::Next).unwrap();
         assert_eq!(mock.calls().len(), 5);
     }
 
     #[test]
+    fn use_adjacent_category_switches_with_explicit_client() {
+        let mock = MockTmuxRunner::new();
+        let format = session_list_format();
+        mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "main\u{1f}1\u{1f}100\u{1f}a\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\none\u{1f}0\u{1f}101\u{1f}b\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
+        );
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "abc\t/dev/ttys001\n",
+        );
+        mock.stub(&["show-option", "-gqv", "@vde_client_616263_b"], "");
+        mock.stub(&["switch-client", "-c", "abc", "-t", "=one:"], "");
+        mock.stub(&["set-option", "-g", "@vde_client_616263_b", "one"], "");
+
+        use_adjacent_category(&mock, &crate::config::Config::default(), Direction::Next).unwrap();
+
+        assert_eq!(mock.calls().len(), 7);
+    }
+
+    #[test]
     fn use_category_prefers_remembered_session() {
         let mock = MockTmuxRunner::new();
         let format = session_list_format();
-        mock.stub(&["display-message", "-p", "#{client_name}"], "abc\n");
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "abc\t/dev/ttys001\n",
+        );
         mock.stub(
             &["list-sessions", "-F", &format],
             "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\nsub\u{1f}0\u{1f}101\u{1f}work\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
         );
         mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "sub\n");
-        mock.stub(&["switch-client", "-t", "sub"], "");
+        mock.stub(&["switch-client", "-c", "abc", "-t", "=sub:"], "");
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "sub"], "");
         use_category(&mock, &crate::config::Config::default(), "work").unwrap();
         assert_eq!(mock.calls().len(), 5);

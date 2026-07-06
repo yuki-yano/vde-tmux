@@ -45,13 +45,16 @@ fn dispatch_statusline_sessions_show_index_overrides_config() {
 fn dispatch_category_use_switches_category() {
     let mock = MockTmuxRunner::new();
     let format = crate::session::session_list_format();
-    mock.stub(&["display-message", "-p", "#{client_name}"], "abc\n");
+    mock.stub(
+        &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+        "abc\t/dev/ttys001\n",
+    );
     mock.stub(
         &["list-sessions", "-F", &format],
         "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
     );
     mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "");
-    mock.stub(&["switch-client", "-t", "main"], "");
+    mock.stub(&["switch-client", "-c", "abc", "-t", "=main:"], "");
     mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
     run_with(["vt", "category", "use", "work"], &mock, &env()).unwrap();
     assert_eq!(mock.calls().len(), 5);

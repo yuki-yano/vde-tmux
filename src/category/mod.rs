@@ -89,7 +89,10 @@ pub fn adjacent_category(
     current_category: &str,
     direction: Direction,
 ) -> Option<String> {
-    let categories = sorted_categories(config, sessions);
+    let categories = sorted_categories(config, sessions)
+        .into_iter()
+        .filter(|category| !sessions_in_category(config, sessions, category).is_empty())
+        .collect::<Vec<_>>();
     if categories.is_empty() {
         return None;
     }
@@ -260,6 +263,32 @@ mod tests {
         assert_eq!(
             adjacent_category(&config, &sessions, "a", Direction::Previous),
             Some("b".to_string())
+        );
+        assert_eq!(
+            adjacent_category(&config, &sessions, "b", Direction::Next),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            adjacent_category(&config, &sessions, "b", Direction::Previous),
+            Some("a".to_string())
+        );
+    }
+
+    #[test]
+    fn adjacent_category_skips_empty_configured_categories() {
+        let mut config = Config::default();
+        config.categories.order.insert("a".into(), 10);
+        config.categories.order.insert("empty".into(), 20);
+        config.categories.order.insert("b".into(), 30);
+        let sessions = [session("one", "", "a", ""), session("two", "", "b", "")];
+
+        assert_eq!(
+            adjacent_category(&config, &sessions, "a", Direction::Next),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            adjacent_category(&config, &sessions, "b", Direction::Next),
+            Some("a".to_string())
         );
     }
 }

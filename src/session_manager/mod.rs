@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::tmux::TmuxRunner;
 
 pub fn popup_shell_command() -> String {
-    "tmux list-sessions -F '#{session_name}' | fzf --reverse | xargs -r tmux switch-client -t"
+    "tmux list-sessions -F '#{session_name}' | fzf --reverse | xargs -r -I{} tmux switch-client -t ={}:"
         .to_string()
 }
 
