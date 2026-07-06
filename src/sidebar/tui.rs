@@ -31,7 +31,7 @@ use crate::sidebar::client::{
 use crate::sidebar::preview::open_preview_floating_pane;
 use crate::sidebar::render::{
     BadgeCounts, HeaderAction, HeaderLayout, SidebarRenderTheme, build_footer_line,
-    build_header_layout_with_counts, header_hit_test, render_header_lines,
+    build_header_layout_with_counts, display_width, header_hit_test, render_header_lines,
     render_lines_with_indices,
 };
 use crate::sidebar::state::StatusFilter;
@@ -39,6 +39,7 @@ use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
 const DOUBLE_CLICK_MAX: Duration = Duration::from_millis(250);
+const LIVE_CARD_MIN_WIDTH: u16 = 24;
 
 static PANIC_RESTORE_HOOK: Once = Once::new();
 
@@ -635,6 +636,7 @@ fn draw_snapshot_in_area(
                 snapshot,
                 live,
                 areas.live_rows,
+                area.width,
                 crate::sidebar::tree::now_epoch_secs(),
                 theme,
             )),
@@ -664,12 +666,14 @@ fn render_live_lines(
     snapshot: &DaemonSnapshot,
     live: &LiveState,
     live_rows: u16,
+    width: u16,
     now: i64,
     theme: &SidebarRenderTheme,
 ) -> Vec<Line<'static>> {
     use ansi_to_tui::IntoText;
 
-    let body_limit = live_rows.saturating_sub(1) as usize;
+    let card = width >= LIVE_CARD_MIN_WIDTH;
+    let body_limit = live_rows.saturating_sub(if card { 2 } else { 1 }) as usize;
     let (label, title_rest) = match live.mode {
         LiveMode::Tail => (
             "LIVE",
@@ -680,6 +684,45 @@ fn render_live_lines(
         ),
         LiveMode::Events => ("EVENTS", String::new()),
     };
+    let body = match live.mode {
+        LiveMode::Tail => live.lines.clone(),
+        LiveMode::Events => event_tail(snapshot, body_limit, now, theme),
+    };
+    let ansi = matches!(live.mode, LiveMode::Tail);
+
+    if card {
+        let width = width as usize;
+        let title = format!("{label}{title_rest}");
+        let title_width = display_width(&title).min(width.saturating_sub(3));
+        let top_rule = width.saturating_sub(3).saturating_sub(title_width);
+        let mut lines = vec![Line::from(vec![
+            Span::styled("╭╴".to_string(), Style::default().fg(theme.marker)),
+            Span::styled(
+                label.to_string(),
+                Style::default().fg(theme.live).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(title_rest, Style::default().fg(theme.detail)),
+            Span::styled(
+                format!("{}╮", "─".repeat(top_rule)),
+                Style::default().fg(theme.marker),
+            ),
+        ])];
+        let mut body_lines = body
+            .into_iter()
+            .take(body_limit)
+            .map(|line| live_card_body_line(&line, ansi, width, theme))
+            .collect::<Vec<_>>();
+        while body_lines.len() < body_limit {
+            body_lines.push(live_card_body_line("", false, width, theme));
+        }
+        lines.extend(body_lines);
+        lines.push(Line::from(Span::styled(
+            format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
+            Style::default().fg(theme.marker),
+        )));
+        return lines;
+    }
+
     let mut lines = vec![Line::from(vec![
         Span::raw(" "),
         Span::styled(
@@ -688,11 +731,6 @@ fn render_live_lines(
         ),
         Span::styled(title_rest, Style::default().fg(theme.detail)),
     ])];
-    let body = match live.mode {
-        LiveMode::Tail => live.lines.clone(),
-        LiveMode::Events => event_tail(snapshot, body_limit, now, theme),
-    };
-    let ansi = matches!(live.mode, LiveMode::Tail);
     lines.extend(body.into_iter().take(body_limit).map(|line| {
         let plain = || {
             Line::from(Span::styled(
@@ -710,6 +748,56 @@ fn render_live_lines(
         }
     }));
     lines
+}
+
+fn live_card_body_line(
+    raw: &str,
+    ansi: bool,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> Line<'static> {
+    use ansi_to_tui::IntoText;
+
+    let content_width = width.saturating_sub(2);
+    let plain = || {
+        let mut text = crate::sidebar::render::truncate_display(
+            &format!(" {}", strip_ansi(raw)),
+            content_width,
+        );
+        let used = display_width(&text);
+        if used < content_width {
+            text.push_str(&" ".repeat(content_width - used));
+        }
+        vec![Span::styled(text, Style::default().fg(theme.detail))]
+    };
+    let mut content = if ansi {
+        match format!(" {raw}").into_text() {
+            Ok(text) => text.lines.into_iter().next().map(|line| line.spans),
+            Err(_) => None,
+        }
+        .unwrap_or_else(plain)
+    } else {
+        plain()
+    };
+    let content_used: usize = content
+        .iter()
+        .map(|span| display_width(&span.content))
+        .sum();
+    if content_used > content_width {
+        content = plain();
+    } else if content_used < content_width {
+        content.push(Span::raw(" ".repeat(content_width - content_used)));
+    }
+    let mut spans = vec![Span::styled(
+        "│".to_string(),
+        Style::default().fg(theme.marker),
+    )];
+    spans.extend(content);
+    spans.push(Span::styled(
+        "│".to_string(),
+        Style::default().fg(theme.marker),
+    ));
+    Line::from(spans)
 }
 
 pub(crate) fn extract_tail(raw: &str, limit: usize, cut_markers: &[String]) -> Vec<String> {
@@ -831,7 +919,12 @@ pub(crate) fn compute_areas(area: Rect, header: &HeaderLayout, live_lines: u16) 
         0
     };
     let live_rows = if live_lines > 0 && area.width > 2 && area.height >= 14 {
-        (live_lines + 1).min(remaining.saturating_sub(footer_rows))
+        let live_chrome = if area.width >= LIVE_CARD_MIN_WIDTH {
+            2
+        } else {
+            1
+        };
+        (live_lines + live_chrome).min(remaining.saturating_sub(footer_rows))
     } else {
         0
     };
@@ -1054,6 +1147,23 @@ mod tests {
         }
     }
 
+    fn snapshot() -> DaemonSnapshot {
+        DaemonSnapshot {
+            agent_count: 1,
+            rollup: RollupLevel::Running,
+            panes: Vec::new(),
+            sidebar: None,
+            events: Vec::new(),
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
     #[test]
     fn scroll_follows_selection() {
         assert_eq!(resolve_scroll(0, Some(5), 30, 10), 0);
@@ -1200,12 +1310,52 @@ mod tests {
         let areas = compute_areas(Rect::new(0, 0, 40, 24), &header, 3);
 
         assert_eq!(areas.header_rows, 1);
-        assert_eq!(areas.rows_height, 18);
-        assert_eq!(areas.live_rows, 4);
+        assert_eq!(areas.rows_height, 17);
+        assert_eq!(areas.live_rows, 5);
         assert_eq!(areas.footer_rows, 1);
+
+        let narrow = compute_areas(Rect::new(0, 0, 20, 24), &header, 3);
+        assert_eq!(narrow.header_rows, 1);
+        assert_eq!(narrow.rows_height, 18);
+        assert_eq!(narrow.live_rows, 4);
+        assert_eq!(narrow.footer_rows, 1);
 
         let small = compute_areas(Rect::new(0, 0, 40, 13), &header, 3);
         assert_eq!(small.live_rows, 0);
+    }
+
+    #[test]
+    fn live_card_has_rounded_border_when_wide() {
+        let live = LiveState {
+            pane_id: Some("%1".to_string()),
+            lines: vec!["one".to_string(), "two".to_string(), "three".to_string()],
+            requested_lines: 3,
+            ..Default::default()
+        };
+
+        let lines = render_live_lines(&snapshot(), &live, 5, 40, 0, &SidebarRenderTheme::default());
+
+        assert!(line_text(&lines[0]).starts_with("╭╴LIVE · %1"), "{lines:?}");
+        assert!(line_text(&lines[0]).ends_with('╮'), "{lines:?}");
+        assert!(line_text(&lines[1]).starts_with("│ "), "{lines:?}");
+        assert!(line_text(&lines[1]).ends_with('│'), "{lines:?}");
+        assert!(line_text(&lines[4]).starts_with('╰'), "{lines:?}");
+        assert!(line_text(&lines[4]).ends_with('╯'), "{lines:?}");
+    }
+
+    #[test]
+    fn live_card_falls_back_to_plain_when_narrow() {
+        let live = LiveState {
+            pane_id: Some("%1".to_string()),
+            lines: vec!["one".to_string(), "two".to_string(), "three".to_string()],
+            requested_lines: 3,
+            ..Default::default()
+        };
+
+        let lines = render_live_lines(&snapshot(), &live, 4, 20, 0, &SidebarRenderTheme::default());
+
+        assert_eq!(line_text(&lines[0]), " LIVE · %1");
+        assert_eq!(line_text(&lines[1]), " one");
     }
 
     #[test]
