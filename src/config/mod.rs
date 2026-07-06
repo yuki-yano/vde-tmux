@@ -255,6 +255,8 @@ pub struct SidebarConfig {
     pub header: SidebarHeaderConfig,
     pub preview: SidebarPreviewConfig,
     pub live: SidebarLiveConfig,
+    /// category 行の左に配下 worst 状態の badge を表示する(既定 false)
+    pub category_badge: bool,
 }
 
 impl Default for SidebarConfig {
@@ -266,6 +268,7 @@ impl Default for SidebarConfig {
             header: SidebarHeaderConfig::default(),
             preview: SidebarPreviewConfig::default(),
             live: SidebarLiveConfig::default(),
+            category_badge: false,
         }
     }
 }
@@ -515,6 +518,16 @@ mod tests {
             serde_yaml_ng::from_str::<Config>("sidebar:\n  preview:\n    history_lines: 5000\n")
                 .unwrap();
         assert_eq!(config.sidebar.preview.history_lines, 5000);
+    }
+
+    #[test]
+    fn sidebar_category_badge_defaults_off_and_parses() {
+        let config = Config::default();
+        assert!(!config.sidebar.category_badge);
+
+        let config =
+            serde_yaml_ng::from_str::<Config>("sidebar:\n  category_badge: true\n").unwrap();
+        assert!(config.sidebar.category_badge);
     }
 
     #[test]
