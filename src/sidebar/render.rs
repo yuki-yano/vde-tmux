@@ -5,6 +5,12 @@ use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+/// サイドバーの配色。色は 5 族の規約で運用する:
+/// - 状態族: badge_* / rollup 色(▲赤 ●緑 ✓シアン ○灰)。状態を示す場所にだけ使う
+/// - 構造族: repo(青太字)/ category(ピーチ太字)/ branch(淡シアン 73)
+/// - 操作族: ラベンダー 147/103(pin ✦ / mode ≣ / active ▎ / preview ⌕)
+/// - 本文族: 本文=通常色 / 補足=detail(246)/ 記号=marker(暗灰)
+/// - 実況: live(マゼンタ)は LIVE/EVENTS 見出し専用の孤立色
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRenderTheme {
     pub error: Color,
@@ -84,7 +90,7 @@ impl Default for SidebarRenderTheme {
             active_bg: Color::Indexed(235),
             active_bar: Color::Indexed(147),
             repo: Color::Blue,
-            branch: Color::Cyan,
+            branch: Color::Indexed(73),
             live: Color::Magenta,
         }
     }
@@ -1319,6 +1325,11 @@ mod tests {
     }
 
     #[test]
+    fn branch_defaults_to_muted_cyan() {
+        assert_eq!(SidebarRenderTheme::default().branch, Color::Indexed(73));
+    }
+
+    #[test]
     fn active_colors_are_configurable() {
         let config = crate::config::SidebarColorsConfig {
             active_bg: Some("235".to_string()),
@@ -2174,7 +2185,7 @@ sidebar:
             &SidebarRenderTheme::default(),
         );
         let spans = &lines[0].spans;
-        // repo 名は repo 色 + BOLD、branch は branch 色(シアン)非 BOLD
+        // repo 名は repo 色 + BOLD、branch は淡シアン(73)非 BOLD
         assert!(
             spans.iter().any(|span| span.content.as_ref() == "app"
                 && span.style.fg == Some(Color::Blue)
@@ -2183,7 +2194,7 @@ sidebar:
         );
         assert!(
             spans.iter().any(|span| span.content.trim() == "main"
-                && span.style.fg == Some(Color::Cyan)
+                && span.style.fg == Some(Color::Indexed(73))
                 && !span.style.add_modifier.contains(Modifier::BOLD)),
             "{spans:?}"
         );
