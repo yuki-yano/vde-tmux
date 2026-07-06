@@ -237,7 +237,12 @@ pub fn build_rows_ctx(
 
 pub fn row_refs(rows: &[SidebarRow]) -> Vec<SidebarRowRef> {
     rows.iter()
-        .filter(|row| !matches!(row.kind, SidebarRowKind::Detail | SidebarRowKind::Zone))
+        .filter(|row| {
+            !matches!(
+                row.kind,
+                SidebarRowKind::Detail | SidebarRowKind::Jump | SidebarRowKind::Zone
+            )
+        })
         .map(|row| SidebarRowRef::new(row.id.clone()))
         .collect()
 }
@@ -908,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn row_refs_exclude_zone_rows() {
+    fn row_refs_exclude_non_focusable_rows() {
         let rows = vec![
             SidebarRow {
                 id: "zone::triage".to_string(),
@@ -920,6 +925,34 @@ mod tests {
                 badge_state: None,
                 expanded: true,
                 pane_id: None,
+                git: None,
+                active: false,
+                meta: None,
+            },
+            SidebarRow {
+                id: "detail::%1::state".to_string(),
+                kind: SidebarRowKind::Detail,
+                depth: 1,
+                label: "running".to_string(),
+                chat_count: 0,
+                rollup: RollupLevel::Running,
+                badge_state: None,
+                expanded: true,
+                pane_id: Some("%1".to_string()),
+                git: None,
+                active: false,
+                meta: None,
+            },
+            SidebarRow {
+                id: "jump::%1".to_string(),
+                kind: SidebarRowKind::Jump,
+                depth: 1,
+                label: "jump".to_string(),
+                chat_count: 0,
+                rollup: RollupLevel::Running,
+                badge_state: None,
+                expanded: true,
+                pane_id: Some("%1".to_string()),
                 git: None,
                 active: false,
                 meta: None,

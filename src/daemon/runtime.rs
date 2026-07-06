@@ -1139,8 +1139,7 @@ mod tests {
         key(&mut state, "j");
         assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
         key(&mut state, "j");
-        assert_eq!(state.ui_state.selection.as_deref(), Some("jump::%1"));
-        assert!(state.rows.iter().any(|row| row.id == "jump::%1"));
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%2"));
         key(&mut state, "j");
         assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%2"));
     }
@@ -1183,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn client_move_selection_skips_detail_rows_and_can_select_jump_row() {
+    fn client_move_selection_skips_detail_and_jump_rows() {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
         let mut agent = pane("%1", "/tmp/app", "codex", "running");
         agent.prompt = "prompt".to_string();
@@ -1199,11 +1198,11 @@ mod tests {
             });
         }
 
-        assert_eq!(state.ui_state.selection.as_deref(), Some("jump::%1"));
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
     }
 
     #[test]
-    fn client_move_selection_skips_subagent_detail_rows_and_can_select_jump_row() {
+    fn client_move_selection_skips_subagent_detail_and_jump_rows() {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
         let mut agent = pane("%1", "/tmp/app", "codex", "running");
         agent.subagents = "sub12345:Explore|ab120000:general-purpose".to_string();
@@ -1219,7 +1218,7 @@ mod tests {
             });
         }
 
-        assert_eq!(state.ui_state.selection.as_deref(), Some("jump::%1"));
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
     }
 
     #[test]
