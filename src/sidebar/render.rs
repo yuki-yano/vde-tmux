@@ -32,6 +32,10 @@ pub struct SidebarRenderTheme {
     pub marker: Color,
     /// pin 中の chat / meta 印の色
     pub pin: Color,
+    /// category 見出しの色
+    pub category: Color,
+    /// ヘッダー mode セグメントの色
+    pub header_mode: Color,
     /// repo 名(および category 見出し)の色
     pub repo: Color,
     /// git branch 名の色
@@ -65,6 +69,8 @@ impl Default for SidebarRenderTheme {
             detail: Color::Indexed(246),
             marker: Color::DarkGray,
             pin: Color::Indexed(147),
+            category: Color::Indexed(215),
+            header_mode: Color::Indexed(147),
             repo: Color::Blue,
             branch: Color::Cyan,
             live: Color::Magenta,
@@ -101,6 +107,8 @@ impl SidebarRenderTheme {
             detail: parse_color(config.detail.as_deref()).unwrap_or(default.detail),
             marker: parse_color(config.marker.as_deref()).unwrap_or(default.marker),
             pin: parse_color(config.pin.as_deref()).unwrap_or(default.pin),
+            category: parse_color(config.category.as_deref()).unwrap_or(default.category),
+            header_mode: parse_color(config.header_mode.as_deref()).unwrap_or(default.header_mode),
             repo: parse_color(config.repo.as_deref()).unwrap_or(default.repo),
             branch: parse_color(config.branch.as_deref()).unwrap_or(default.branch),
             live: parse_color(config.live.as_deref()).unwrap_or(default.live),
@@ -254,7 +262,8 @@ pub fn build_header_layout_with_counts(
     if width <= 2 {
         return HeaderLayout::default();
     }
-    let mode_badge = format_header_segment(view_mode_label(state.view_mode), theme);
+    let mode_badge =
+        format_header_segment(&format!("≣ {}", view_mode_label(state.view_mode)), theme);
     let separator = if theme.header_separator.is_empty() {
         " · ".to_string()
     } else {
@@ -262,35 +271,35 @@ pub fn build_header_layout_with_counts(
     };
     let filter_items = [
         (
-            format_header_segment(&format!("≡{}", counts.total), theme),
+            format_header_segment(&format!("≡ {}", counts.total), theme),
             HeaderAction::SetFilter(StatusFilter::All),
             StatusFilter::All,
             None,
             counts.total,
         ),
         (
-            format_header_segment(&format!("▲{}", counts.blocked), theme),
+            format_header_segment(&format!("▲ {}", counts.blocked), theme),
             HeaderAction::SetFilter(StatusFilter::AttentionOnly),
             StatusFilter::AttentionOnly,
             Some(BadgeState::Blocked),
             counts.blocked,
         ),
         (
-            format_header_segment(&format!("●{}", counts.working), theme),
+            format_header_segment(&format!("● {}", counts.working), theme),
             HeaderAction::SetFilter(StatusFilter::WorkingOnly),
             StatusFilter::WorkingOnly,
             Some(BadgeState::Working),
             counts.working,
         ),
         (
-            format_header_segment(&format!("✓{}", counts.done), theme),
+            format_header_segment(&format!("✓ {}", counts.done), theme),
             HeaderAction::SetFilter(StatusFilter::DoneOnly),
             StatusFilter::DoneOnly,
             Some(BadgeState::Done),
             counts.done,
         ),
         (
-            format_header_segment(&format!("○{}", counts.idle), theme),
+            format_header_segment(&format!("○ {}", counts.idle), theme),
             HeaderAction::SetFilter(StatusFilter::IdleOnly),
             StatusFilter::IdleOnly,
             Some(BadgeState::Idle),
@@ -399,12 +408,14 @@ pub fn build_footer_line(width: usize) -> Line<'static> {
 
 /// ヘッダーの mode(view 切替)セグメントの色。
 /// `sidebar.header` で明示スタイルが設定されていればそれを優先し、
-/// 無指定なら repo 見出しと同じ色 + BOLD。
+/// 無指定なら header_mode 色 + BOLD。
 fn mode_segment_style(theme: &SidebarRenderTheme) -> Style {
     if header_style_configured(theme) {
         header_segment_style(theme)
     } else {
-        Style::default().fg(theme.repo).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme.header_mode)
+            .add_modifier(Modifier::BOLD)
     }
 }
 
@@ -556,7 +567,12 @@ fn render_row_line(
         .saturating_sub(badge_width)
         .saturating_sub(git_width)
         .saturating_sub(right_reserved);
-    let label = truncate_display(&row.label, label_budget);
+    let label_source = if row.kind == SidebarRowKind::Category {
+        format!("◆ {}", row.label)
+    } else {
+        row.label.clone()
+    };
+    let label = truncate_display(&label_source, label_budget);
 
     let mut spans = Vec::new();
     if row.kind == SidebarRowKind::Chat {
@@ -583,7 +599,10 @@ fn render_row_line(
             format!(" {indent}"),
             Style::default().fg(theme.marker),
         ));
-        spans.push(Span::styled("✦ ".to_string(), Style::default().fg(theme.pin)));
+        spans.push(Span::styled(
+            "✦ ".to_string(),
+            Style::default().fg(theme.pin),
+        ));
     } else {
         spans.push(Span::styled(
             format!(" {head}"),
@@ -983,9 +1002,10 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
     // 本文テキストは通常色に保つ(理想形の多トーン構成)。
     match row.kind {
         SidebarRowKind::Zone => Style::default().fg(Color::Reset),
-        SidebarRowKind::Category | SidebarRowKind::Repo => {
-            Style::default().fg(theme.repo).add_modifier(Modifier::BOLD)
-        }
+        SidebarRowKind::Category => Style::default()
+            .fg(theme.category)
+            .add_modifier(Modifier::BOLD),
+        SidebarRowKind::Repo => Style::default().fg(theme.repo).add_modifier(Modifier::BOLD),
         SidebarRowKind::Chat => Style::default().fg(Color::Reset),
         SidebarRowKind::Detail => Style::default().fg(theme.detail),
         SidebarRowKind::Jump => Style::default().fg(Color::Cyan),
@@ -1149,7 +1169,10 @@ mod tests {
 
         let rendered = render_rows(&[chat, unpinned], &SidebarState::default(), 40);
 
-        assert!(rendered.lines().next().unwrap().starts_with(" ✦▸ "), "{rendered:?}");
+        assert!(
+            rendered.lines().next().unwrap().starts_with(" ✦▸ "),
+            "{rendered:?}"
+        );
         assert!(
             rendered.lines().nth(1).unwrap().starts_with("  ▸ "),
             "{rendered:?}"
@@ -1397,14 +1420,14 @@ mod tests {
         );
 
         // 多トーン検証は colorize_follows_ideal_multi_tone_scheme も参照
-        // 先頭 span はマーカー(DarkGray)、ラベル span が Blue + BOLD
+        // 先頭 span はマーカー(DarkGray)、ラベル span が category 色 + BOLD
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::DarkGray));
         assert!(
             lines[0]
                 .spans
                 .iter()
-                .any(|span| span.content.trim() == "misc"
-                    && span.style.fg == Some(Color::Blue)
+                .any(|span| span.content.trim() == "◆ misc"
+                    && span.style.fg == Some(Color::Indexed(215))
                     && span.style.add_modifier.contains(Modifier::BOLD)),
             "{:?}",
             lines[0]
@@ -1425,6 +1448,64 @@ mod tests {
     }
 
     #[test]
+    fn category_and_repo_rows_use_distinct_colors() {
+        let theme = SidebarRenderTheme::default();
+        let category = row(
+            "category::misc",
+            SidebarRowKind::Category,
+            0,
+            "misc",
+            RollupLevel::Idle,
+        );
+        let repo = row(
+            "repo::misc::app",
+            SidebarRowKind::Repo,
+            0,
+            "app",
+            RollupLevel::Idle,
+        );
+
+        assert_eq!(row_style(&category, &theme).fg, Some(Color::Indexed(215)));
+        assert_eq!(row_style(&repo, &theme).fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn mode_segment_uses_header_mode_color_and_glyph() {
+        let theme = SidebarRenderTheme::default();
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            ..SidebarState::default()
+        };
+
+        assert_eq!(mode_segment_style(&theme).fg, Some(Color::Indexed(147)));
+        assert_eq!(
+            build_header_layout(&state, 80).lines[0].text,
+            " ≣ repo · ≡ 0 ▲ 0 ● 0 ✓ 0 ○ 0"
+        );
+    }
+
+    #[test]
+    fn category_row_label_has_diamond_prefix_in_standard_tier() {
+        let category = row(
+            "category::dev",
+            SidebarRowKind::Category,
+            0,
+            "dev",
+            RollupLevel::Idle,
+        );
+
+        let standard = render_rows(
+            std::slice::from_ref(&category),
+            &SidebarState::default(),
+            40,
+        );
+        let dense = render_rows(&[category], &SidebarState::default(), 30);
+
+        assert!(standard.contains("▾ ◆ dev"), "{standard:?}");
+        assert!(!dense.contains("◆"), "{dense:?}");
+    }
+
+    #[test]
     fn header_layout_shows_current_values_only_and_hit_tests_tokens() {
         let state = SidebarState {
             view_mode: ViewMode::ByCategory,
@@ -1434,13 +1515,13 @@ mod tests {
 
         let header = build_header_layout(&state, 80);
 
-        assert_eq!(header.lines[0].text, " category · ≡0 ▲0 ●0 ✓0 ○0");
+        assert_eq!(header.lines[0].text, " ≣ category · ≡ 0 ▲ 0 ● 0 ✓ 0 ○ 0");
         assert_eq!(
             header_hit_test(&header, 0, 2),
             Some(HeaderAction::CycleViewMode)
         );
         assert_eq!(
-            header_hit_test(&header, 0, 15),
+            header_hit_test(&header, 0, 19),
             Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
         );
     }
@@ -1495,29 +1576,29 @@ mod tests {
         let header =
             build_header_layout_with_counts(&state, 80, &SidebarRenderTheme::default(), counts);
 
-        assert_eq!(header.lines[0].text, " repo · ≡4 ▲1 ●1 ✓1 ○1");
+        assert_eq!(header.lines[0].text, " ≣ repo · ≡ 4 ▲ 1 ● 1 ✓ 1 ○ 1");
         assert_eq!(
             header_hit_test(&header, 0, 2),
             Some(HeaderAction::CycleViewMode)
         );
         assert_eq!(
-            header_hit_test(&header, 0, 8),
+            header_hit_test(&header, 0, 10),
             Some(HeaderAction::SetFilter(StatusFilter::All))
         );
         assert_eq!(
-            header_hit_test(&header, 0, 11),
+            header_hit_test(&header, 0, 15),
             Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
         );
         assert_eq!(
-            header_hit_test(&header, 0, 14),
+            header_hit_test(&header, 0, 19),
             Some(HeaderAction::SetFilter(StatusFilter::WorkingOnly))
         );
         assert_eq!(
-            header_hit_test(&header, 0, 17),
+            header_hit_test(&header, 0, 23),
             Some(HeaderAction::SetFilter(StatusFilter::DoneOnly))
         );
         assert_eq!(
-            header_hit_test(&header, 0, 20),
+            header_hit_test(&header, 0, 27),
             Some(HeaderAction::SetFilter(StatusFilter::IdleOnly))
         );
         assert!(header.lines[0].segments[5].style.is_some());
@@ -1533,18 +1614,18 @@ mod tests {
 
         let header = build_header_layout(&state, 80);
 
-        assert_eq!(header.lines[0].text, " repo · ≡0 ▲0 ●0 ✓0 ○0");
-        assert_eq!(header.lines[0].segments[0].range, 1..5);
-        assert_eq!(header.lines[0].segments[1].range, 8..10);
+        assert_eq!(header.lines[0].text, " ≣ repo · ≡ 0 ▲ 0 ● 0 ✓ 0 ○ 0");
+        assert_eq!(header.lines[0].segments[0].range, 1..7);
+        assert_eq!(header.lines[0].segments[1].range, 10..13);
         assert_eq!(
-            header_hit_test(&header, 0, 2),
+            header_hit_test(&header, 0, 3),
             Some(HeaderAction::CycleViewMode)
         );
         assert_eq!(
-            header_hit_test(&header, 0, 9),
+            header_hit_test(&header, 0, 11),
             Some(HeaderAction::SetFilter(StatusFilter::All))
         );
-        assert_eq!(header_hit_test(&header, 0, 6), None);
+        assert_eq!(header_hit_test(&header, 0, 8), None);
     }
 
     #[test]
@@ -1576,10 +1657,10 @@ sidebar:
 
         assert_eq!(
             header.lines[0].text,
-            " [ repo ] [ ≡0 ] [ ▲0 ] [ ●0 ] [ ✓0 ] [ ○0 ]"
+            " [ ≣ repo ] [ ≡ 0 ] [ ▲ 0 ] [ ● 0 ] [ ✓ 0 ] [ ○ 0 ]"
         );
-        assert_eq!(header.lines[0].segments[0].range, 1..9);
-        assert_eq!(header.lines[0].segments[1].range, 10..16);
+        assert_eq!(header.lines[0].segments[0].range, 1..11);
+        assert_eq!(header.lines[0].segments[1].range, 12..19);
         assert_eq!(lines[0].spans[1].style.fg, Some(Color::White));
         assert_eq!(lines[0].spans[1].style.bg, Some(Color::Indexed(24)));
         assert!(
@@ -1601,7 +1682,8 @@ sidebar:
         let layout = build_header_layout_with_counts(&state, 60, &theme, BadgeCounts::default());
         let line = &layout.lines[0];
         let mode = &line.segments[0];
-        let mode_text = format_header_segment(view_mode_label(state.view_mode), &theme);
+        let mode_text =
+            format_header_segment(&format!("≣ {}", view_mode_label(state.view_mode)), &theme);
 
         assert_eq!(
             (mode.range.end - mode.range.start) as usize,
@@ -1644,12 +1726,12 @@ sidebar:
         let state = SidebarState::default(); // filter = All がアクティブ
         let header = build_header_layout_with_counts(&state, 60, &theme, counts);
         let segments = &header.lines[0].segments;
-        // mode: repo 色 + BOLD
+        // mode: header_mode 色 + BOLD
         assert_eq!(
             segments[0].style,
             Some(
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(Color::Indexed(147))
                     .add_modifier(Modifier::BOLD)
             )
         );

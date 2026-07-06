@@ -337,6 +337,8 @@ pub struct SidebarColorsConfig {
     pub detail: Option<String>,
     pub marker: Option<String>,
     pub pin: Option<String>,
+    pub category: Option<String>,
+    pub header_mode: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub live: Option<String>,
