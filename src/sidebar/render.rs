@@ -636,7 +636,14 @@ fn render_row_line(
         .saturating_sub(1)
         .saturating_sub(used)
         .saturating_sub(right_width);
-    spans.push(Span::raw(" ".repeat(filler)));
+    if row.kind == SidebarRowKind::Category && filler > 2 {
+        spans.push(Span::styled(
+            format!(" {} ", "─".repeat(filler.saturating_sub(2))),
+            Style::default().fg(theme.marker),
+        ));
+    } else {
+        spans.push(Span::raw(" ".repeat(filler)));
+    }
     if let Some(right) = right {
         spans.push(Span::styled(right, right_style(row, theme)));
     }
@@ -1503,6 +1510,48 @@ mod tests {
 
         assert!(standard.contains("▾ ◆ dev"), "{standard:?}");
         assert!(!dense.contains("◆"), "{dense:?}");
+    }
+
+    #[test]
+    fn category_row_fills_remaining_width_with_rule() {
+        let mut category = row(
+            "category::dev",
+            SidebarRowKind::Category,
+            0,
+            "dev",
+            RollupLevel::Idle,
+        );
+        category.meta = Some(crate::sidebar::tree::RowMeta {
+            attention_count: Some(1),
+            ..Default::default()
+        });
+
+        let rendered = render_rows(&[category], &SidebarState::default(), 40);
+
+        assert!(rendered.contains("▾ ◆ dev ─"), "{rendered:?}");
+        assert!(rendered.contains("─ ▲1 "), "{rendered:?}");
+    }
+
+    #[test]
+    fn repo_and_chat_rows_keep_space_filler() {
+        let repo = row(
+            "repo::misc::app",
+            SidebarRowKind::Repo,
+            0,
+            "app",
+            RollupLevel::Idle,
+        );
+        let chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex",
+            RollupLevel::Idle,
+        );
+
+        let rendered = render_rows(&[repo, chat], &SidebarState::default(), 40);
+
+        assert!(!rendered.contains('─'), "{rendered:?}");
     }
 
     #[test]
