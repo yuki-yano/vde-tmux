@@ -182,12 +182,16 @@ pub fn render_statusline_category(
 }
 
 /// category 内の最悪 agent 状態(`@vde_session_state` 由来)を色付きグリフにする。
-/// 状態を持つ session が無ければ空文字列。
+/// `statusline.category.show_badge`(既定 false)が無効な場合と、
+/// 状態を持つ session が無い場合は空文字列。
 fn category_badge_fragment(
     config: &Config,
     category_sessions: &[&SessionInfo],
     colors: &crate::config::SegmentColors,
 ) -> String {
+    if !config.statusline.category.show_badge {
+        return String::new();
+    }
     let rank = |state: &str| match state {
         "blocked" => Some(0_u8),
         "working" => Some(1),
@@ -568,9 +572,21 @@ mod tests {
     }
 
     #[test]
+    fn category_badge_is_hidden_by_default_even_with_badge_placeholder() {
+        let mut config = Config::default();
+        config.statusline.category.format = "{badge}{category} ".to_string();
+        let mut blocked = session("a", "work");
+        blocked.state = "blocked".to_string();
+        let rendered = render_statusline_category(&config, &[blocked], "work");
+        assert!(rendered.contains("work "), "{rendered}");
+        assert!(!rendered.contains('▲'), "{rendered}");
+    }
+
+    #[test]
     fn category_badge_shows_worst_state_with_color_and_restore() {
         let mut config = Config::default();
         config.statusline.category.format = "{badge}{category} ".to_string();
+        config.statusline.category.show_badge = true;
         config.statusline.category.colors.fg = Some("#1C1C1C".to_string());
         let mut blocked = session("a", "work");
         blocked.state = "blocked".to_string();
@@ -587,6 +603,7 @@ mod tests {
     fn category_badge_is_empty_without_agent_state_and_idle_is_plain() {
         let mut config = Config::default();
         config.statusline.category.format = "{badge}{category} ".to_string();
+        config.statusline.category.show_badge = true;
         // 状態なし → バッジなし
         let rendered = render_statusline_category(&config, &[session("a", "work")], "work");
         assert!(rendered.contains("work "), "{rendered}");

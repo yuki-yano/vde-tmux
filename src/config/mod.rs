@@ -136,6 +136,8 @@ pub struct StatuslineCategoryConfig {
     pub inactive_prefix: String,
     pub inactive_suffix: String,
     pub bold: bool,
+    /// format 中の {badge}(カテゴリ内 worst 状態のグリフ)を描画するか(既定 false)。
+    pub show_badge: bool,
     pub colors: SegmentColors,
     pub inactive_colors: SegmentColors,
 }
@@ -150,6 +152,7 @@ impl Default for StatuslineCategoryConfig {
             inactive_prefix: String::new(),
             inactive_suffix: String::new(),
             bold: false,
+            show_badge: false,
             colors: SegmentColors::default(),
             inactive_colors: SegmentColors::default(),
         }
