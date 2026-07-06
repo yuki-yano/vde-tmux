@@ -557,7 +557,8 @@ fn render_row_line(
         SidebarRowKind::Jump => indent.clone(),
         SidebarRowKind::Zone => unreachable!("zone rows return before generic rendering"),
     };
-    let badge = if row.kind == SidebarRowKind::Chat {
+    let is_state_detail = row.kind == SidebarRowKind::Detail && row.id.ends_with("::state");
+    let badge = if row.kind == SidebarRowKind::Chat || is_state_detail {
         row.badge_state.map(|state| {
             (
                 format!("{} ", theme.badge_glyph(state)),
@@ -627,6 +628,8 @@ fn render_row_line(
     }
     if row.kind == SidebarRowKind::Jump {
         spans.extend(jump_action_spans(&label, theme));
+    } else if is_state_detail {
+        spans.extend(state_detail_label_spans(label, row, theme));
     } else {
         spans.extend(label_spans(label, row, style));
     }
@@ -722,6 +725,26 @@ fn label_spans(label: String, row: &SidebarRow, base: Style) -> Vec<Span<'static
         ];
     }
     vec![Span::styled(label, base)]
+}
+
+fn state_detail_label_spans(
+    label: String,
+    row: &SidebarRow,
+    theme: &SidebarRenderTheme,
+) -> Vec<Span<'static>> {
+    let color = row
+        .badge_state
+        .map(|state| theme.badge_color(state))
+        .unwrap_or(theme.detail);
+    let (word, rest) = match label.split_once(' ') {
+        Some((word, rest)) => (word.to_string(), format!(" {rest}")),
+        None => (label, String::new()),
+    };
+    let mut spans = vec![Span::styled(word, Style::default().fg(color))];
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest, Style::default().fg(theme.detail)));
+    }
+    spans
 }
 
 struct GitBadgeText {
@@ -2115,10 +2138,10 @@ sidebar:
             ..Default::default()
         });
         let detail = row(
-            "detail::%1::status",
+            "detail::%1::place",
             SidebarRowKind::Detail,
             1,
-            "status: running",
+            "main · %1",
             RollupLevel::Running,
         );
         let lines = render_lines(
@@ -2161,10 +2184,72 @@ sidebar:
         assert!(
             detail_spans
                 .iter()
-                .any(|span| span.content.as_ref().contains("status: running")
+                .any(|span| span.content.as_ref().contains("main · %1")
                     && span.style.fg == Some(Color::Indexed(246))
                     && !span.style.add_modifier.contains(Modifier::DIM)),
             "{detail_spans:?}"
+        );
+    }
+
+    #[test]
+    fn state_detail_row_colors_glyph_and_state_word() {
+        let mut state_row = row(
+            "detail::%1::state",
+            SidebarRowKind::Detail,
+            1,
+            "running · 12m",
+            RollupLevel::Running,
+        );
+        state_row.badge_state = Some(BadgeState::Working);
+        let mut place_row = row(
+            "detail::%1::place",
+            SidebarRowKind::Detail,
+            1,
+            "vde-tmux · %1",
+            RollupLevel::Running,
+        );
+        place_row.badge_state = Some(BadgeState::Working);
+        let theme = SidebarRenderTheme::default();
+        let lines = render_lines(
+            &[state_row, place_row],
+            &SidebarState::default(),
+            40,
+            &theme,
+        );
+        let state_spans = &lines[0].spans;
+
+        assert!(
+            state_spans
+                .iter()
+                .any(|span| span.content.as_ref() == "● "
+                    && span.style.fg == Some(theme.badge_working)),
+            "{state_spans:?}"
+        );
+        assert!(
+            state_spans
+                .iter()
+                .any(|span| span.content.as_ref() == "running"
+                    && span.style.fg == Some(theme.badge_working)),
+            "{state_spans:?}"
+        );
+        assert!(
+            state_spans.iter().any(
+                |span| span.content.as_ref() == " · 12m" && span.style.fg == Some(theme.detail)
+            ),
+            "{state_spans:?}"
+        );
+
+        let place_spans = &lines[1].spans;
+        assert!(
+            place_spans
+                .iter()
+                .any(|span| span.content.as_ref() == "vde-tmux · %1"
+                    && span.style.fg == Some(theme.detail)),
+            "{place_spans:?}"
+        );
+        assert!(
+            !place_spans.iter().any(|span| span.content.as_ref() == "● "),
+            "{place_spans:?}"
         );
     }
 

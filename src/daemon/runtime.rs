@@ -1227,7 +1227,7 @@ mod tests {
         agent.prompt = "prompt".to_string();
         state.ui_state.toggle_expanded("chat::%1");
         state.apply_event(DaemonEvent::PanesUpdated(vec![agent]));
-        state.ui_state.selection = Some("detail::%1::status".to_string());
+        state.ui_state.selection = Some("detail::%1::state".to_string());
 
         let effects = state.apply_event(DaemonEvent::Client {
             client_id: ClientId(1),
