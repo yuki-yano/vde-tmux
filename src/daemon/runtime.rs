@@ -397,11 +397,24 @@ impl RuntimeState {
                 self.ui_state.apply(SidebarAction::ToggleFilter, &row_refs)
             }
             SidebarInputAction::ToggleRow(row_id) => {
-                self.ui_state.selection = Some(row_id.clone());
-                if row_id.starts_with("chat::") {
-                    self.ui_state.toggle_pinned(&row_id)
+                if let Some(rest) = row_id
+                    .strip_prefix("detail::")
+                    .or_else(|| row_id.strip_prefix("meta::"))
+                {
+                    let pane_id = rest
+                        .split_once("::")
+                        .map(|(pane_id, _)| pane_id)
+                        .unwrap_or(rest);
+                    let chat_id = format!("chat::{pane_id}");
+                    self.ui_state.selection = Some(chat_id.clone());
+                    self.ui_state.toggle_expanded(&chat_id)
                 } else {
-                    self.ui_state.toggle_expanded(&row_id)
+                    self.ui_state.selection = Some(row_id.clone());
+                    if row_id.starts_with("chat::") {
+                        self.ui_state.toggle_pinned(&row_id)
+                    } else {
+                        self.ui_state.toggle_expanded(&row_id)
+                    }
                 }
             }
             SidebarInputAction::FocusNextAttention => self.focus_attention(true),
@@ -1245,6 +1258,44 @@ mod tests {
         assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
         assert!(state.ui_state.pinned.contains("chat::%1"));
         assert!(!state.ui_state.is_expanded_with_default("chat::%1", false));
+    }
+
+    #[test]
+    fn toggle_on_detail_row_toggles_manual_expand_of_parent_chat() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![pane(
+            "%1", "/tmp/app", "codex", "running",
+        )]));
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "toggle:detail::%1::prompt".to_string(),
+            },
+        });
+
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
+        assert!(state.ui_state.is_expanded_with_default("chat::%1", false));
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "toggle:detail::%1::prompt".to_string(),
+            },
+        });
+
+        assert!(!state.ui_state.is_expanded_with_default("chat::%1", false));
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "toggle:meta::%1".to_string(),
+            },
+        });
+
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
+        assert!(state.ui_state.is_expanded_with_default("chat::%1", false));
+        assert!(!state.ui_state.pinned.contains("chat::%1"));
     }
 
     #[test]

@@ -44,6 +44,12 @@ pub struct SidebarRenderTheme {
     pub live: Color,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JumpRowAction {
+    Jump,
+    Preview,
+}
+
 impl Default for SidebarRenderTheme {
     fn default() -> Self {
         Self {
@@ -532,7 +538,7 @@ fn render_row_line(
         }
         SidebarRowKind::Detail if row.id.starts_with("meta::") => format!("{indent}✦ "),
         SidebarRowKind::Detail => indent.clone(),
-        SidebarRowKind::Jump => format!("{indent}-> "),
+        SidebarRowKind::Jump => indent.clone(),
         SidebarRowKind::Zone => unreachable!("zone rows return before generic rendering"),
     };
     let badge = if row.kind == SidebarRowKind::Chat {
@@ -567,10 +573,10 @@ fn render_row_line(
         .saturating_sub(badge_width)
         .saturating_sub(git_width)
         .saturating_sub(right_reserved);
-    let label_source = if row.kind == SidebarRowKind::Category {
-        format!("◆ {}", row.label)
-    } else {
-        row.label.clone()
+    let label_source = match row.kind {
+        SidebarRowKind::Category => format!("◆ {}", row.label),
+        SidebarRowKind::Jump => "↗ jump   ⌕ preview".to_string(),
+        _ => row.label.clone(),
     };
     let label = truncate_display(&label_source, label_budget);
 
@@ -1016,6 +1022,26 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
         SidebarRowKind::Chat => Style::default().fg(Color::Reset),
         SidebarRowKind::Detail => Style::default().fg(theme.detail),
         SidebarRowKind::Jump => Style::default().fg(Color::Cyan),
+    }
+}
+
+/// Jump 行のクリック列をアクションへ変換する。
+/// レイアウトは " " + indent(2*depth) + "↗ jump" + "   " + "⌕ preview"。
+pub fn jump_row_action_at(row: &SidebarRow, column: u16) -> Option<JumpRowAction> {
+    if row.kind != SidebarRowKind::Jump {
+        return None;
+    }
+    let jump_start = 1 + 2 * row.depth;
+    let jump_end = jump_start + 6;
+    let preview_start = jump_end + 3;
+    let preview_end = preview_start + 9;
+    let column = column as usize;
+    if (jump_start..jump_end).contains(&column) {
+        Some(JumpRowAction::Jump)
+    } else if (preview_start..preview_end).contains(&column) {
+        Some(JumpRowAction::Preview)
+    } else {
+        None
     }
 }
 
@@ -1552,6 +1578,42 @@ mod tests {
         let rendered = render_rows(&[repo, chat], &SidebarState::default(), 40);
 
         assert!(!rendered.contains('─'), "{rendered:?}");
+    }
+
+    #[test]
+    fn jump_row_renders_two_action_buttons() {
+        let jump = row(
+            "jump::%1",
+            SidebarRowKind::Jump,
+            2,
+            "jump",
+            RollupLevel::Running,
+        );
+
+        let rendered = render_rows(&[jump], &SidebarState::default(), 40);
+
+        assert!(
+            rendered.starts_with("     ↗ jump   ⌕ preview"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn jump_row_hit_test_maps_columns_to_actions() {
+        let jump = row(
+            "jump::%1",
+            SidebarRowKind::Jump,
+            2,
+            "jump",
+            RollupLevel::Running,
+        );
+
+        assert_eq!(jump_row_action_at(&jump, 5), Some(JumpRowAction::Jump));
+        assert_eq!(jump_row_action_at(&jump, 10), Some(JumpRowAction::Jump));
+        assert_eq!(jump_row_action_at(&jump, 12), None);
+        assert_eq!(jump_row_action_at(&jump, 14), Some(JumpRowAction::Preview));
+        assert_eq!(jump_row_action_at(&jump, 22), Some(JumpRowAction::Preview));
+        assert_eq!(jump_row_action_at(&jump, 30), None);
     }
 
     #[test]

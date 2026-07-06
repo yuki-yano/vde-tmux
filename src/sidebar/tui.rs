@@ -30,15 +30,14 @@ use crate::sidebar::client::{
 };
 use crate::sidebar::preview::open_preview_floating_pane;
 use crate::sidebar::render::{
-    BadgeCounts, HeaderAction, HeaderLayout, SidebarRenderTheme, build_footer_line,
-    build_header_layout_with_counts, display_width, header_hit_test, render_header_lines,
-    render_lines_with_indices,
+    BadgeCounts, HeaderAction, HeaderLayout, JumpRowAction, SidebarRenderTheme, build_footer_line,
+    build_header_layout_with_counts, display_width, header_hit_test, jump_row_action_at,
+    render_header_lines, render_lines_with_indices,
 };
 use crate::sidebar::state::StatusFilter;
 use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
-const DOUBLE_CLICK_MAX: Duration = Duration::from_millis(250);
 const LIVE_CARD_MIN_WIDTH: u16 = 24;
 
 static PANIC_RESTORE_HOOK: Once = Once::new();
@@ -161,7 +160,6 @@ pub fn run_loop<B: Backend>(
     let preview_history_lines = config.preview_history_lines;
     let live_config = config.live;
     let mut current: Option<DaemonSnapshot> = None;
-    let mut clicks = ClickTracker::default();
     let mut scroll: usize = 0;
     let mut live = LiveState {
         requested_lines: live_rows_requested(live_config),
@@ -180,9 +178,6 @@ pub fn run_loop<B: Backend>(
             preview_history_lines,
             live_lines: live.requested_lines,
         };
-        if let Some(action) = clicks.flush_due(Instant::now()) {
-            dispatch_click_action(&context, action);
-        }
         if let Some(snapshot) = &current {
             update_live_state(
                 snapshot,
@@ -260,14 +255,7 @@ pub fn run_loop<B: Backend>(
                 },
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                     if let Some(snapshot) = &current {
-                        handle_left_click(
-                            &context,
-                            snapshot,
-                            mouse.row,
-                            mouse.column,
-                            scroll,
-                            &mut clicks,
-                        )?;
+                        handle_left_click(&context, snapshot, mouse.row, mouse.column, scroll)?;
                     }
                 }
                 _ => {}
@@ -417,81 +405,13 @@ enum ClickAction {
     JumpPane(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ClickDecision {
-    Immediate(ClickAction),
-    Pending,
-    None,
-}
-
-#[derive(Debug, Clone)]
-struct PendingClick {
-    row: ClickedRow,
-    action: ClickAction,
-    deadline: Instant,
-}
-
-#[derive(Default)]
-struct ClickTracker {
-    pending: Option<PendingClick>,
-}
-
-impl ClickTracker {
-    fn register_click(&mut self, row: ClickedRow, now: Instant) -> ClickDecision {
-        if let Some(pending) = &self.pending
-            && pending.row.id == row.id
-            && now <= pending.deadline
-            && let Some(pane_id) = &row.pane_id
-        {
-            self.pending = None;
-            return ClickDecision::Immediate(ClickAction::JumpPane(pane_id.clone()));
-        }
-
-        let Some(action) = single_click_action(&row) else {
-            self.pending = None;
-            return ClickDecision::None;
-        };
-
-        match row.kind {
-            SidebarRowKind::Category | SidebarRowKind::Repo | SidebarRowKind::Jump => {
-                self.pending = None;
-                ClickDecision::Immediate(action)
-            }
-            SidebarRowKind::Chat | SidebarRowKind::Detail => {
-                self.pending = Some(PendingClick {
-                    row,
-                    action,
-                    deadline: now + DOUBLE_CLICK_MAX,
-                });
-                ClickDecision::Pending
-            }
-            SidebarRowKind::Zone => {
-                self.pending = None;
-                ClickDecision::None
-            }
-        }
-    }
-
-    fn flush_due(&mut self, now: Instant) -> Option<ClickAction> {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| now >= pending.deadline)
-        {
-            return self.pending.take().map(|pending| pending.action);
-        }
-        None
-    }
-}
-
 fn single_click_action(row: &ClickedRow) -> Option<ClickAction> {
     match row.kind {
         SidebarRowKind::Category | SidebarRowKind::Repo | SidebarRowKind::Chat => {
             Some(ClickAction::ToggleRow(row.id.clone()))
         }
-        SidebarRowKind::Jump => row.pane_id.clone().map(ClickAction::JumpPane),
-        SidebarRowKind::Detail => row.pane_id.clone().map(ClickAction::PreviewPane),
-        SidebarRowKind::Zone => None,
+        SidebarRowKind::Detail => Some(ClickAction::ToggleRow(row.id.clone())),
+        SidebarRowKind::Jump | SidebarRowKind::Zone => None,
     }
 }
 
@@ -974,7 +894,6 @@ fn handle_left_click(
     row: u16,
     column: u16,
     scroll: usize,
-    clicks: &mut ClickTracker,
 ) -> Result<()> {
     let Some(sidebar) = &snapshot.sidebar else {
         return Ok(());
@@ -1016,9 +935,23 @@ fn handle_left_click(
     ) else {
         return Ok(());
     };
-    if let ClickDecision::Immediate(action) =
-        clicks.register_click(ClickedRow::from_row(clicked), Instant::now())
-    {
+    if clicked.kind == SidebarRowKind::Jump {
+        match jump_row_action_at(clicked, column) {
+            Some(JumpRowAction::Jump) => {
+                if let Some(pane_id) = clicked.pane_id.clone() {
+                    dispatch_click_action(context, ClickAction::JumpPane(pane_id));
+                }
+            }
+            Some(JumpRowAction::Preview) => {
+                if let Some(pane_id) = clicked.pane_id.clone() {
+                    dispatch_click_action(context, ClickAction::PreviewPane(pane_id));
+                }
+            }
+            None => {}
+        }
+        return Ok(());
+    }
+    if let Some(action) = single_click_action(&ClickedRow::from_row(clicked)) {
         dispatch_click_action(context, action);
     }
     Ok(())
@@ -1564,51 +1497,26 @@ mod tests {
     }
 
     #[test]
-    fn detail_single_click_is_preview_after_double_click_deadline() {
-        let mut tracker = ClickTracker::default();
-        let now = Instant::now();
-
-        assert_eq!(
-            tracker.register_click(
-                ClickedRow::new("detail::%1::status", SidebarRowKind::Detail, Some("%1")),
-                now
-            ),
-            ClickDecision::Pending
-        );
-        assert_eq!(
-            tracker.flush_due(now + Duration::from_millis(251)),
-            Some(ClickAction::PreviewPane("%1".to_string()))
-        );
-    }
-
-    #[test]
-    fn detail_double_click_jumps_without_preview() {
-        let mut tracker = ClickTracker::default();
-        let now = Instant::now();
-        let row = ClickedRow::new("detail::%1::status", SidebarRowKind::Detail, Some("%1"));
-
-        assert_eq!(
-            tracker.register_click(row.clone(), now),
-            ClickDecision::Pending
-        );
-        assert_eq!(
-            tracker.register_click(row, now + Duration::from_millis(120)),
-            ClickDecision::Immediate(ClickAction::JumpPane("%1".to_string()))
-        );
-        assert_eq!(tracker.flush_due(now + Duration::from_millis(251)), None);
-    }
-
-    #[test]
     fn repo_click_toggles_immediately() {
-        let mut tracker = ClickTracker::default();
-        let now = Instant::now();
-
         assert_eq!(
-            tracker.register_click(
-                ClickedRow::new("repo::misc::app", SidebarRowKind::Repo, None),
-                now
-            ),
-            ClickDecision::Immediate(ClickAction::ToggleRow("repo::misc::app".to_string()))
+            single_click_action(&ClickedRow::new(
+                "repo::misc::app",
+                SidebarRowKind::Repo,
+                None
+            )),
+            Some(ClickAction::ToggleRow("repo::misc::app".to_string()))
+        );
+    }
+
+    #[test]
+    fn detail_click_toggles_row_immediately() {
+        assert_eq!(
+            single_click_action(&ClickedRow::new(
+                "detail::%1::status",
+                SidebarRowKind::Detail,
+                Some("%1")
+            )),
+            Some(ClickAction::ToggleRow("detail::%1::status".to_string()))
         );
     }
 
