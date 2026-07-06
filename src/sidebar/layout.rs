@@ -89,6 +89,31 @@ pub fn toggle_all(
     Ok(())
 }
 
+/// 3状態トグル: 未表示なら開く、表示中でフォーカスが外れていれば
+/// サイドバーへフォーカスを移す、フォーカス中なら閉じる。
+pub fn focus_toggle(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    self_exe: &Path,
+    width: SidebarWidth,
+    min_width: u16,
+) -> Result<()> {
+    let Some(sidebar) = find_sidebar_pane(runner, target)? else {
+        return open_unchecked(runner, target, self_exe, width, min_width);
+    };
+    // window を target-pane に与えると、その window のアクティブ pane に解決される
+    let active = runner
+        .run(&["display-message", "-p", "-t", target, "#{pane_id}"])?
+        .trim()
+        .to_string();
+    if active == sidebar.pane_id {
+        close_sidebar_pane(runner, target, &sidebar)
+    } else {
+        runner.run(&["select-pane", "-t", &sidebar.pane_id])?;
+        Ok(())
+    }
+}
+
 pub fn rail(
     runner: &dyn TmuxRunner,
     target: &str,
@@ -575,6 +600,118 @@ mod tests {
         .unwrap();
 
         assert_eq!(mock.calls().len(), 8);
+    }
+
+    #[test]
+    fn focus_toggle_focuses_sidebar_when_not_active() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t80\n%2\t1\t40\n",
+        );
+        mock.stub(&["display-message", "-p", "-t", "@1", "#{pane_id}"], "%1\n");
+        mock.stub(&["select-pane", "-t", "%2"], "");
+
+        focus_toggle(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls[2],
+            vec![
+                "select-pane".to_string(),
+                "-t".to_string(),
+                "%2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn focus_toggle_closes_sidebar_when_active() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t80\n%2\t1\t40\n",
+        );
+        mock.stub(&["display-message", "-p", "-t", "@1", "#{pane_id}"], "%2\n");
+        mock.stub(&["show-options", "-w", "-t", "@1"], "");
+        mock.stub(&["kill-pane", "-t", "%2"], "");
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_BASELINE],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_PANES],
+            "",
+        );
+
+        focus_toggle(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        let calls = mock.calls();
+        assert!(calls.contains(&vec![
+            "kill-pane".to_string(),
+            "-t".to_string(),
+            "%2".to_string()
+        ]));
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.first().map(String::as_str) == Some("select-pane"))
+        );
+    }
+
+    #[test]
+    fn focus_toggle_opens_sidebar_when_missing() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t80\n",
+        );
+        mock.stub(&["show-options", "-w", "-t", "@1"], "");
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-before\n",
+        );
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n%2\n");
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@1",
+                KEY_LAYOUT_BASELINE,
+                "layout-before",
+            ],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-t", "@1", KEY_LAYOUT_PANES, "%1,%2"],
+            "",
+        );
+        mock.stub(
+            &[
+                "split-window",
+                "-t",
+                "@1",
+                "-hbf",
+                "-l",
+                "40",
+                "'/tmp/vt' sidebar attach",
+            ],
+            "",
+        );
+
+        focus_toggle(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        assert_eq!(mock.calls().len(), 7);
     }
 
     #[test]

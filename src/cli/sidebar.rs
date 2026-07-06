@@ -32,6 +32,14 @@ pub(crate) enum SidebarCommand {
         #[arg(long, value_parser = parse_sidebar_width)]
         width: Option<SidebarWidth>,
     },
+    /// 未表示なら開く / 非フォーカスならフォーカス / フォーカス中なら閉じる
+    #[command(name = "focus-toggle")]
+    FocusToggle {
+        #[arg(long)]
+        window: Option<String>,
+        #[arg(long, value_parser = parse_sidebar_width)]
+        width: Option<SidebarWidth>,
+    },
     Close {
         #[arg(long)]
         window: Option<String>,
@@ -138,6 +146,18 @@ where
                     config.sidebar.min_width,
                 )?;
             }
+            Ok(None)
+        }
+        SidebarCommand::FocusToggle { window, width } => {
+            ensure_daemon(env)?;
+            let target = resolve_window_target(runner, window)?;
+            crate::sidebar::layout::focus_toggle(
+                runner,
+                &target,
+                &std::env::current_exe()?,
+                width.unwrap_or(config.sidebar.width),
+                config.sidebar.min_width,
+            )?;
             Ok(None)
         }
         SidebarCommand::Close { window } => {
