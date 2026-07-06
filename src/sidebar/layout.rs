@@ -151,13 +151,26 @@ pub fn layout_applied(
     width: SidebarWidth,
     min_width: u16,
 ) -> Result<()> {
-    if !window_exists(runner, target)? {
+    let Some(panes) = capture_existing_pane_ids(runner, target)? else {
         return Ok(());
-    }
-    if find_sidebar_pane(runner, target)?.is_some() {
+    };
+    if let Some(sidebar) = find_sidebar_pane(runner, target)? {
+        if panes.len() == 1 && panes.contains(&sidebar.pane_id) {
+            return close_lonely_sidebar_pane(runner, target, &sidebar);
+        }
         return rebaseline(runner, target);
     }
     open_unchecked(runner, target, self_exe, width, min_width)
+}
+
+fn close_lonely_sidebar_pane(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    sidebar: &SidebarPane,
+) -> Result<()> {
+    clear_baseline(runner, target)?;
+    runner.run(&["kill-pane", "-t", &sidebar.pane_id])?;
+    Ok(())
 }
 
 fn open_unchecked(
@@ -360,10 +373,14 @@ fn parse_saved_baseline(output: &str) -> (Option<String>, Option<BTreeSet<String
     (layout, panes)
 }
 
-fn window_exists(runner: &dyn TmuxRunner, target: &str) -> Result<bool> {
-    match runner.run(&["list-panes", "-t", target, "-F", "#{pane_id}"]) {
-        Ok(output) => Ok(!output.trim().is_empty()),
-        Err(_) => Ok(false),
+fn capture_existing_pane_ids(
+    runner: &dyn TmuxRunner,
+    target: &str,
+) -> Result<Option<BTreeSet<String>>> {
+    match capture_pane_ids(runner, target) {
+        Ok(panes) if panes.is_empty() => Ok(None),
+        Ok(panes) => Ok(Some(panes)),
+        Err(_) => Ok(None),
     }
 }
 
@@ -958,6 +975,94 @@ mod tests {
         layout_applied(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
 
         assert_eq!(mock.calls().len(), 8);
+    }
+
+    #[test]
+    fn layout_applied_closes_window_when_only_sidebar_remains() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%9\n");
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%9\t1\t40\n",
+        );
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_BASELINE],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_PANES],
+            "",
+        );
+        mock.stub(&["kill-pane", "-t", "%9"], "");
+
+        layout_applied(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
+
+        let calls = mock.calls();
+        assert!(calls.contains(&vec![
+            "kill-pane".to_string(),
+            "-t".to_string(),
+            "%9".to_string()
+        ]));
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.first().map(String::as_str) == Some("display-message")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn layout_applied_rebaselines_when_non_sidebar_pane_remains() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n%9\n");
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t80\n%9\t1\t40\n",
+        );
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-with-sidebar\n",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@1",
+                KEY_LAYOUT_BASELINE,
+                "layout-with-sidebar",
+            ],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-t", "@1", KEY_LAYOUT_PANES, "%1"],
+            "",
+        );
+
+        layout_applied(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
+
+        let calls = mock.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.first().map(String::as_str) == Some("kill-pane")),
+            "{calls:?}"
+        );
+        assert!(calls.contains(&vec![
+            "set-option".to_string(),
+            "-w".to_string(),
+            "-t".to_string(),
+            "@1".to_string(),
+            KEY_LAYOUT_PANES.to_string(),
+            "%1".to_string(),
+        ]));
     }
 
     #[test]
