@@ -617,12 +617,7 @@ fn group_meta(panes: &[AgentPane], triage: &BTreeSet<String>) -> RowMeta {
 fn meta_label(pane: &AgentPane, now: i64) -> String {
     let mut parts = Vec::new();
     if let Ok(started_at) = pane.started_at.parse::<i64>() {
-        let elapsed = (now - started_at).max(0);
-        if elapsed < 60 {
-            parts.push(format!("{elapsed}s"));
-        } else {
-            parts.push(format!("{}m", elapsed / 60));
-        }
+        parts.push(humanize_secs(now - started_at));
     }
     if let Some((done, total)) = parse_tasks(&pane.tasks) {
         parts.push(format!("task {done}/{total}"));
@@ -639,6 +634,31 @@ fn meta_label(pane: &AgentPane, now: i64) -> String {
     } else {
         parts.join(" · ")
     }
+}
+
+/// 経過秒の人間可読表記。<60s は秒、<60m は分、<10h は時+分、
+/// <48h は時のみ、以上は日のみ(桁が大きいほど粒度を落とす)。
+pub fn humanize_secs(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let minutes = secs / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 10 {
+        let rest = minutes % 60;
+        if rest == 0 {
+            return format!("{hours}h");
+        }
+        return format!("{hours}h{rest:02}m");
+    }
+    if hours < 48 {
+        return format!("{hours}h");
+    }
+    format!("{}d", hours / 24)
 }
 
 fn decode_subagents(raw: &str) -> Vec<(String, String)> {
@@ -845,6 +865,20 @@ mod tests {
             category: category.to_string(),
             path_patterns: vec![pattern.to_string()],
         }
+    }
+
+    #[test]
+    fn humanize_secs_formats_by_magnitude() {
+        assert_eq!(humanize_secs(0), "0s");
+        assert_eq!(humanize_secs(45), "45s");
+        assert_eq!(humanize_secs(60), "1m");
+        assert_eq!(humanize_secs(12 * 60 + 30), "12m");
+        assert_eq!(humanize_secs(90 * 60), "1h30m");
+        assert_eq!(humanize_secs(10 * 3600), "10h");
+        assert_eq!(humanize_secs(38 * 3600 + 59 * 60), "38h");
+        assert_eq!(humanize_secs(48 * 3600), "2d");
+        assert_eq!(humanize_secs(100 * 3600), "4d");
+        assert_eq!(humanize_secs(-5), "0s");
     }
 
     #[test]

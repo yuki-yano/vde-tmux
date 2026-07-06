@@ -1037,11 +1037,7 @@ fn right_label(row: &SidebarRow) -> Option<String> {
 }
 
 fn elapsed_label(secs: i64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        format!("{}m", secs / 60)
-    }
+    crate::sidebar::tree::humanize_secs(secs)
 }
 
 fn right_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
