@@ -495,7 +495,7 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, now: i64, rows: &mut Ve
     if let Some(prompt) = non_empty(&pane.prompt) {
         rows.push(detail_row(pane, depth, "prompt", prompt.to_string()));
     }
-    let mut state = status_label(&pane.status).to_string();
+    let mut state = format!("state {}", status_label(&pane.status));
     if let Some(wait_reason) = non_empty(&pane.wait_reason) {
         state.push_str(&format!(" ({wait_reason})"));
     }
@@ -1336,7 +1336,8 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .any(|row| row.kind == SidebarRowKind::Detail && row.label == "running · 1m 15s")
+                .any(|row| row.kind == SidebarRowKind::Detail
+                    && row.label == "state running · 1m 15s")
         );
         assert!(
             rows.iter()
@@ -1448,7 +1449,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "detail::%1::state")
                 .map(|row| row.label.as_str()),
-            Some("running · 12m 00s")
+            Some("state running · 12m 00s")
         );
         assert_eq!(
             rows.iter()
@@ -1479,7 +1480,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "detail::%1::state")
                 .map(|row| row.label.as_str()),
-            Some("idle · done 38h ago")
+            Some("state idle · done 38h ago")
         );
 
         let mut state = SidebarState {
@@ -1493,7 +1494,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "detail::%2::state")
                 .map(|row| row.label.as_str()),
-            Some("idle")
+            Some("state idle")
         );
     }
 
@@ -1515,7 +1516,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "detail::%1::state")
                 .map(|row| row.label.as_str()),
-            Some("waiting (permission_prompt) · 2m 00s")
+            Some("state waiting (permission_prompt) · 2m 00s")
         );
     }
 
@@ -1539,7 +1540,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "detail::%1::state")
                 .map(|row| row.label.as_str()),
-            Some("running · 12m 00s · 3/5 tasks")
+            Some("state running · 12m 00s · 3/5 tasks")
         );
 
         let mut state = SidebarState {
@@ -1553,7 +1554,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "detail::%2::state")
                 .map(|row| row.label.as_str()),
-            Some("running · 12m 00s")
+            Some("state running · 12m 00s")
         );
     }
 

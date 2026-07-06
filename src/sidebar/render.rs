@@ -594,12 +594,11 @@ fn render_row_line(
             format!("{indent} {marker} ")
         }
         SidebarRowKind::Detail if row.id.starts_with("meta::") => format!("{indent}  "),
-        SidebarRowKind::Detail => indent.clone(),
-        SidebarRowKind::Jump => indent.clone(),
+        SidebarRowKind::Detail => format!("{indent}│ "),
+        SidebarRowKind::Jump => format!("{indent}└ "),
         SidebarRowKind::Zone => unreachable!("zone rows return before generic rendering"),
     };
-    let is_state_detail = row.kind == SidebarRowKind::Detail && row.id.ends_with("::state");
-    let badge = if row.kind == SidebarRowKind::Chat || is_state_detail {
+    let badge = if row.kind == SidebarRowKind::Chat {
         row.badge_state.map(|state| {
             (
                 format!("{} ", theme.badge_glyph(state)),
@@ -671,8 +670,6 @@ fn render_row_line(
     }
     if row.kind == SidebarRowKind::Jump {
         spans.extend(jump_action_spans(&label, theme));
-    } else if is_state_detail {
-        spans.extend(state_detail_label_spans(label, row, theme));
     } else {
         spans.extend(label_spans(label, row, style));
     }
@@ -768,26 +765,6 @@ fn label_spans(label: String, row: &SidebarRow, base: Style) -> Vec<Span<'static
         ];
     }
     vec![Span::styled(label, base)]
-}
-
-fn state_detail_label_spans(
-    label: String,
-    row: &SidebarRow,
-    theme: &SidebarRenderTheme,
-) -> Vec<Span<'static>> {
-    let color = row
-        .badge_state
-        .map(|state| theme.badge_color(state))
-        .unwrap_or(theme.detail);
-    let (word, rest) = match label.split_once(' ') {
-        Some((word, rest)) => (word.to_string(), format!(" {rest}")),
-        None => (label, String::new()),
-    };
-    let mut spans = vec![Span::styled(word, Style::default().fg(color))];
-    if !rest.is_empty() {
-        spans.push(Span::styled(rest, Style::default().fg(theme.detail)));
-    }
-    spans
 }
 
 fn toggle_marker_style(theme: &SidebarRenderTheme) -> Style {
@@ -1919,7 +1896,7 @@ mod tests {
         let rendered = render_rows(std::slice::from_ref(&jump), &SidebarState::default(), 40);
 
         assert!(
-            rendered.starts_with("     [↗ jump] [⌕ preview]"),
+            rendered.starts_with("     └ [↗ jump] [⌕ preview]"),
             "{rendered:?}"
         );
 
@@ -2351,12 +2328,12 @@ sidebar:
     }
 
     #[test]
-    fn state_detail_row_colors_glyph_and_state_word() {
+    fn state_detail_row_renders_as_detail_text_without_status_badge() {
         let mut state_row = row(
             "detail::%1::state",
             SidebarRowKind::Detail,
             1,
-            "running · 12m",
+            "state running · 12m",
             RollupLevel::Running,
         );
         state_row.badge_state = Some(BadgeState::Working);
@@ -2368,9 +2345,17 @@ sidebar:
             RollupLevel::Running,
         );
         place_row.badge_state = Some(BadgeState::Working);
+        let mut jump_row = row(
+            "jump::%1",
+            SidebarRowKind::Jump,
+            1,
+            "jump",
+            RollupLevel::Running,
+        );
+        jump_row.badge_state = Some(BadgeState::Working);
         let theme = SidebarRenderTheme::default();
         let lines = render_lines(
-            &[state_row, place_row],
+            &[state_row, place_row, jump_row],
             &SidebarState::default(),
             40,
             &theme,
@@ -2378,24 +2363,26 @@ sidebar:
         let state_spans = &lines[0].spans;
 
         assert!(
-            state_spans
+            !state_spans.iter().any(|span| span.content.as_ref() == "● "),
+            "{state_spans:?}"
+        );
+        assert!(
+            !state_spans
                 .iter()
-                .any(|span| span.content.as_ref() == "● "
-                    && span.style.fg == Some(theme.badge_working)),
+                .any(|span| span.style.fg == Some(theme.badge_working)),
             "{state_spans:?}"
         );
         assert!(
             state_spans
                 .iter()
-                .any(|span| span.content.as_ref() == "running"
-                    && span.style.fg == Some(theme.badge_working)),
+                .any(|span| span.content.as_ref() == "state running · 12m"
+                    && span.style.fg == Some(theme.detail)),
             "{state_spans:?}"
         );
         assert!(
-            state_spans.iter().any(
-                |span| span.content.as_ref() == " · 12m" && span.style.fg == Some(theme.detail)
-            ),
-            "{state_spans:?}"
+            line_to_string(lines[0].clone()).contains("│ state running · 12m"),
+            "{:?}",
+            line_to_string(lines[0].clone())
         );
 
         let place_spans = &lines[1].spans;
@@ -2409,6 +2396,11 @@ sidebar:
         assert!(
             !place_spans.iter().any(|span| span.content.as_ref() == "● "),
             "{place_spans:?}"
+        );
+        assert!(
+            line_to_string(lines[2].clone()).contains("└ [↗ jump] [⌕ preview]"),
+            "{:?}",
+            line_to_string(lines[2].clone())
         );
     }
 
