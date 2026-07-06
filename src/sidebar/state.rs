@@ -55,9 +55,9 @@ pub struct SidebarState {
     #[serde(default)]
     pub collapsed: BTreeSet<String>,
     #[serde(default)]
-    pub pinned: BTreeSet<String>,
-    #[serde(default)]
     pub manual_order: Vec<RepoId>,
+    #[serde(default)]
+    pub manual_chat_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +184,49 @@ impl SidebarState {
             return false;
         }
         self.manual_order.swap(index, index + 1);
+        self.bump();
+        true
+    }
+
+    pub fn manual_chat_insert(&mut self, pane_id: impl Into<String>, index: usize) -> bool {
+        let pane_id = pane_id.into();
+        if self.manual_chat_order.contains(&pane_id) {
+            return false;
+        }
+        let index = index.min(self.manual_chat_order.len());
+        self.manual_chat_order.insert(index, pane_id);
+        self.bump();
+        true
+    }
+
+    pub fn manual_chat_move_up(&mut self, pane_id: &str) -> bool {
+        let Some(index) = self
+            .manual_chat_order
+            .iter()
+            .position(|item| item == pane_id)
+        else {
+            return false;
+        };
+        if index == 0 {
+            return false;
+        }
+        self.manual_chat_order.swap(index, index - 1);
+        self.bump();
+        true
+    }
+
+    pub fn manual_chat_move_down(&mut self, pane_id: &str) -> bool {
+        let Some(index) = self
+            .manual_chat_order
+            .iter()
+            .position(|item| item == pane_id)
+        else {
+            return false;
+        };
+        if index + 1 >= self.manual_chat_order.len() {
+            return false;
+        }
+        self.manual_chat_order.swap(index, index + 1);
         self.bump();
         true
     }
@@ -364,5 +407,19 @@ mod tests {
         assert_eq!(state.version, version + 1);
         assert!(!state.manual_move_up(&RepoId::new("misc", "b")));
         assert!(!state.manual_move_down(&RepoId::new("misc", "missing")));
+    }
+
+    #[test]
+    fn manual_chat_reorder_moves_existing_chats_only() {
+        let mut state = SidebarState::default();
+        state.manual_chat_insert("%1", 0);
+        state.manual_chat_insert("%2", 1);
+        let version = state.version;
+
+        assert!(state.manual_chat_move_up("%2"));
+        assert_eq!(state.manual_chat_order, vec!["%2", "%1"]);
+        assert_eq!(state.version, version + 1);
+        assert!(!state.manual_chat_move_up("%2"));
+        assert!(!state.manual_chat_move_down("%9"));
     }
 }

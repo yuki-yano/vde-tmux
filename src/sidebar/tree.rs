@@ -202,7 +202,7 @@ pub fn build_rows_ctx(
             });
     }
     for panes in groups.values_mut() {
-        panes.sort_by(compare_agent_panes);
+        order_agent_panes(panes, state);
     }
     let group_metas = groups
         .iter()
@@ -219,7 +219,7 @@ pub fn build_rows_ctx(
             }
         }
     }
-    triage_panes.sort_by(compare_agent_panes);
+    order_agent_panes(&mut triage_panes, state);
     for panes in groups.values_mut() {
         panes.retain(|pane| pane_matches_filter(pane, state.filter));
     }
@@ -729,11 +729,27 @@ pub(crate) fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn compare_agent_panes(left: &AgentPane, right: &AgentPane) -> std::cmp::Ordering {
+fn order_agent_panes(panes: &mut [AgentPane], state: &SidebarState) {
+    panes.sort_by(|left, right| compare_agent_panes(left, right, state));
+}
+
+fn compare_agent_panes(
+    left: &AgentPane,
+    right: &AgentPane,
+    state: &SidebarState,
+) -> std::cmp::Ordering {
+    let manual_position = |pane: &AgentPane| {
+        state
+            .manual_chat_order
+            .iter()
+            .position(|pane_id| pane_id == &pane.pane_id)
+            .unwrap_or(usize::MAX)
+    };
     right
         .attention
         .cmp(&left.attention)
         .then_with(|| left.rollup.cmp(&right.rollup))
+        .then_with(|| manual_position(left).cmp(&manual_position(right)))
         .then_with(|| left.pane_id.cmp(&right.pane_id))
 }
 
@@ -2012,5 +2028,30 @@ mod tests {
             .map(|row| row.label.as_str())
             .collect::<Vec<_>>();
         assert_eq!(repo_labels, vec!["zeta", "alpha"]);
+    }
+
+    #[test]
+    fn manual_chat_order_reorders_chat_rows() {
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            manual_chat_order: vec!["%2".to_string(), "%1".to_string()],
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows(
+            &Config::default(),
+            &[
+                pane("main", "%1", "/tmp/app", "codex", "idle"),
+                pane("main", "%2", "/tmp/app", "claude", "idle"),
+            ],
+            &state,
+        );
+
+        let chat_ids = rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Chat)
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(chat_ids, vec!["chat::%2", "chat::%1"]);
     }
 }

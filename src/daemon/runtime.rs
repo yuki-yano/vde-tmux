@@ -460,6 +460,14 @@ impl RuntimeState {
     }
 
     fn apply_reorder(&mut self, up: bool) -> bool {
+        if let Some(pane_id) = self.selected_chat_pane_id() {
+            self.seed_manual_chat_order_from_rows();
+            return if up {
+                self.ui_state.manual_chat_move_up(&pane_id)
+            } else {
+                self.ui_state.manual_chat_move_down(&pane_id)
+            };
+        }
         let Some(repo) = self.selected_repo_id() else {
             return false;
         };
@@ -479,6 +487,14 @@ impl RuntimeState {
             .flatten()
     }
 
+    fn selected_chat_pane_id(&self) -> Option<String> {
+        let selection = self.ui_state.selection.as_deref()?;
+        let row = self.rows.iter().find(|row| row.id == selection)?;
+        (row.kind == SidebarRowKind::Chat)
+            .then(|| row.pane_id.clone())
+            .flatten()
+    }
+
     fn seed_manual_order_from_rows(&mut self) {
         let mut changed = false;
         for row in self
@@ -490,6 +506,29 @@ impl RuntimeState {
                 && !self.ui_state.manual_order.contains(&repo)
             {
                 self.ui_state.manual_order.push(repo);
+                changed = true;
+            }
+        }
+        if changed {
+            self.ui_state.version += 1;
+        }
+    }
+
+    fn seed_manual_chat_order_from_rows(&mut self) {
+        let mut changed = false;
+        for row in self
+            .rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Chat)
+        {
+            if let Some(pane_id) = row.pane_id.as_deref()
+                && !self
+                    .ui_state
+                    .manual_chat_order
+                    .iter()
+                    .any(|existing| existing == pane_id)
+            {
+                self.ui_state.manual_chat_order.push(pane_id.to_string());
                 changed = true;
             }
         }
@@ -1399,6 +1438,38 @@ mod tests {
             state.ui_state.manual_order,
             vec![RepoId::new("misc", "zeta"), RepoId::new("misc", "alpha")]
         );
+    }
+
+    #[test]
+    fn client_reorder_key_seeds_and_moves_manual_chat_order() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                view_mode: crate::sidebar::state::ViewMode::Flat,
+                ..SidebarState::default()
+            },
+        );
+        state.apply_event(DaemonEvent::PanesUpdated(vec![
+            pane("%1", "/tmp/app", "codex", "idle"),
+            pane("%2", "/tmp/app", "claude", "idle"),
+        ]));
+        state.ui_state.selection = Some("chat::%2".to_string());
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: "K".to_string(),
+            },
+        });
+
+        assert_eq!(state.ui_state.manual_chat_order, vec!["%2", "%1"]);
+        let chat_ids = state
+            .rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Chat)
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(chat_ids, vec!["chat::%2", "chat::%1"]);
     }
 
     #[test]
