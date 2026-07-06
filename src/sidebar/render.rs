@@ -276,8 +276,10 @@ pub fn build_header_layout_with_counts(
     if width <= 2 {
         return HeaderLayout::default();
     }
-    let mode_badge =
-        format_header_segment(&format!("≣ {}", view_mode_label(state.view_mode)), theme);
+    let mode_badge = format_header_segment(
+        &format!("≣ {}", view_mode_label_padded(state.view_mode)),
+        theme,
+    );
     let separator = if theme.header_separator.is_empty() {
         " · ".to_string()
     } else {
@@ -1172,6 +1174,17 @@ fn view_mode_label(view_mode: ViewMode) -> &'static str {
     }
 }
 
+/// mode ラベルを最長ラベル("category")に合わせて右空白で固定幅にする。
+/// mode 切替でヘッダー後続(フィルタ群)の表示位置がずれないようにするため。
+fn view_mode_label_padded(view_mode: ViewMode) -> String {
+    let width = [ViewMode::Flat, ViewMode::ByRepo, ViewMode::ByCategory]
+        .into_iter()
+        .map(|mode| view_mode_label(mode).len())
+        .max()
+        .unwrap_or(0);
+    format!("{:<width$}", view_mode_label(view_mode))
+}
+
 fn visible_segment_range(text: &str, start: usize, len: usize) -> Option<std::ops::Range<u16>> {
     let visible_len = display_width(text);
     if start >= visible_len {
@@ -1612,8 +1625,32 @@ mod tests {
         assert_eq!(mode_segment_style(&theme).fg, Some(Color::Indexed(147)));
         assert_eq!(
             build_header_layout(&state, 80).lines[0].text,
-            " ≣ repo · ≡ 0 ▲ 0 ● 0 ✓ 0 ○ 0"
+            " ≣ repo     · ≡ 0 ▲ 0 ● 0 ✓ 0 ○ 0"
         );
+    }
+
+    #[test]
+    fn header_filter_positions_are_stable_across_view_modes() {
+        let text_for = |view_mode: ViewMode| {
+            let state = SidebarState {
+                view_mode,
+                ..SidebarState::default()
+            };
+            build_header_layout(&state, 80).lines[0].text.clone()
+        };
+        let flat = text_for(ViewMode::Flat);
+        let repo = text_for(ViewMode::ByRepo);
+        let category = text_for(ViewMode::ByCategory);
+
+        // mode を切り替えてもフィルタ群の開始位置と全体幅が動かない
+        assert_eq!(flat.find('≡'), repo.find('≡'), "{flat:?} vs {repo:?}");
+        assert_eq!(
+            repo.find('≡'),
+            category.find('≡'),
+            "{repo:?} vs {category:?}"
+        );
+        assert_eq!(display_width(&flat), display_width(&repo));
+        assert_eq!(display_width(&repo), display_width(&category));
     }
 
     #[test]
@@ -1872,29 +1909,29 @@ mod tests {
         let header =
             build_header_layout_with_counts(&state, 80, &SidebarRenderTheme::default(), counts);
 
-        assert_eq!(header.lines[0].text, " ≣ repo · ≡ 4 ▲ 1 ● 1 ✓ 1 ○ 1");
+        assert_eq!(header.lines[0].text, " ≣ repo     · ≡ 4 ▲ 1 ● 1 ✓ 1 ○ 1");
         assert_eq!(
             header_hit_test(&header, 0, 2),
             Some(HeaderAction::CycleViewMode)
         );
         assert_eq!(
-            header_hit_test(&header, 0, 10),
+            header_hit_test(&header, 0, 14),
             Some(HeaderAction::SetFilter(StatusFilter::All))
         );
         assert_eq!(
-            header_hit_test(&header, 0, 15),
+            header_hit_test(&header, 0, 19),
             Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
         );
         assert_eq!(
-            header_hit_test(&header, 0, 19),
+            header_hit_test(&header, 0, 23),
             Some(HeaderAction::SetFilter(StatusFilter::WorkingOnly))
         );
         assert_eq!(
-            header_hit_test(&header, 0, 23),
+            header_hit_test(&header, 0, 27),
             Some(HeaderAction::SetFilter(StatusFilter::DoneOnly))
         );
         assert_eq!(
-            header_hit_test(&header, 0, 27),
+            header_hit_test(&header, 0, 31),
             Some(HeaderAction::SetFilter(StatusFilter::IdleOnly))
         );
         assert!(header.lines[0].segments[5].style.is_some());
@@ -1910,18 +1947,18 @@ mod tests {
 
         let header = build_header_layout(&state, 80);
 
-        assert_eq!(header.lines[0].text, " ≣ repo · ≡ 0 ▲ 0 ● 0 ✓ 0 ○ 0");
-        assert_eq!(header.lines[0].segments[0].range, 1..7);
-        assert_eq!(header.lines[0].segments[1].range, 10..13);
+        assert_eq!(header.lines[0].text, " ≣ repo     · ≡ 0 ▲ 0 ● 0 ✓ 0 ○ 0");
+        assert_eq!(header.lines[0].segments[0].range, 1..11);
+        assert_eq!(header.lines[0].segments[1].range, 14..17);
         assert_eq!(
             header_hit_test(&header, 0, 3),
             Some(HeaderAction::CycleViewMode)
         );
         assert_eq!(
-            header_hit_test(&header, 0, 11),
+            header_hit_test(&header, 0, 15),
             Some(HeaderAction::SetFilter(StatusFilter::All))
         );
-        assert_eq!(header_hit_test(&header, 0, 8), None);
+        assert_eq!(header_hit_test(&header, 0, 12), None);
     }
 
     #[test]
@@ -1953,10 +1990,10 @@ sidebar:
 
         assert_eq!(
             header.lines[0].text,
-            " [ ≣ repo ] [ ≡ 0 ] [ ▲ 0 ] [ ● 0 ] [ ✓ 0 ] [ ○ 0 ]"
+            " [ ≣ repo     ] [ ≡ 0 ] [ ▲ 0 ] [ ● 0 ] [ ✓ 0 ] [ ○ 0 ]"
         );
-        assert_eq!(header.lines[0].segments[0].range, 1..11);
-        assert_eq!(header.lines[0].segments[1].range, 12..19);
+        assert_eq!(header.lines[0].segments[0].range, 1..15);
+        assert_eq!(header.lines[0].segments[1].range, 16..23);
         assert_eq!(lines[0].spans[1].style.fg, Some(Color::White));
         assert_eq!(lines[0].spans[1].style.bg, Some(Color::Indexed(24)));
         assert!(
@@ -1978,8 +2015,10 @@ sidebar:
         let layout = build_header_layout_with_counts(&state, 60, &theme, BadgeCounts::default());
         let line = &layout.lines[0];
         let mode = &line.segments[0];
-        let mode_text =
-            format_header_segment(&format!("≣ {}", view_mode_label(state.view_mode)), &theme);
+        let mode_text = format_header_segment(
+            &format!("≣ {}", view_mode_label_padded(state.view_mode)),
+            &theme,
+        );
 
         assert_eq!(
             (mode.range.end - mode.range.start) as usize,
