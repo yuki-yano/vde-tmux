@@ -452,7 +452,7 @@ mod tests {
         ];
         assert_eq!(
             render_summary(&counts, &badge),
-            "#[fg=#ff6b6b]▲2#[default] #[fg=#4fd08a]●1#[default] #[fg=#6f6b85]○3#[default]"
+            "#[fg=#ff6b6b]▲2#[default] #[fg=#4fd08a]●1#[default] #[fg=#a8a8b2]○3#[default]"
         );
     }
 
@@ -471,7 +471,7 @@ mod tests {
 
         assert_eq!(
             render_summary(&counts, &crate::config::BadgeConfig::default()),
-            "#[fg=#6f6b85]○1#[default]"
+            "#[fg=#a8a8b2]○1#[default]"
         );
     }
 
@@ -483,7 +483,7 @@ mod tests {
 
         assert_eq!(
             render_summary(&counts, &crate::config::BadgeConfig::default()),
-            "#[fg=#6f6b85]○1#[default]"
+            "#[fg=#a8a8b2]○1#[default]"
         );
     }
 

@@ -34,10 +34,10 @@ pub struct SidebarRenderTheme {
     pub badge_idle: Color,
     /// Detail / meta 行の前景色(DIM は使わず読める中間グレーにする)
     pub detail: Color,
-    /// 展開マーカー ▾/▸ と pin 印の色
+    /// 展開マーカー ▾/▸ の色
     pub marker: Color,
-    /// pin 中の chat / meta 印の色
-    pub pin: Color,
+    /// 開閉操作の ▾/▸ を強調する色
+    pub toggle: Color,
     /// category 見出しの色
     pub category: Color,
     /// ヘッダー mode セグメントの色
@@ -81,10 +81,10 @@ impl Default for SidebarRenderTheme {
             badge_blocked: Color::Red,
             badge_working: Color::Green,
             badge_done: Color::Cyan,
-            badge_idle: Color::DarkGray,
+            badge_idle: Color::Indexed(248),
             detail: Color::Indexed(246),
             marker: Color::DarkGray,
-            pin: Color::Indexed(147),
+            toggle: Color::Indexed(147),
             category: Color::Indexed(215),
             header_mode: Color::Indexed(147),
             active_bg: Color::Indexed(235),
@@ -116,15 +116,15 @@ impl SidebarRenderTheme {
             header_suffix: default.header_suffix,
             header_separator: default.header_separator,
             badge_glyphs: default.badge_glyphs,
-            badge_blocked: parse_color(config.badge_blocked.as_deref())
-                .unwrap_or(default.badge_blocked),
-            badge_working: parse_color(config.badge_working.as_deref())
-                .unwrap_or(default.badge_working),
-            badge_done: parse_color(config.badge_done.as_deref()).unwrap_or(default.badge_done),
-            badge_idle: parse_color(config.badge_idle.as_deref()).unwrap_or(default.badge_idle),
+            // badge の色は from_app_config で共通の badge.colors から設定する。
+            // ここ(sidebar.colors 単体)では ANSI 既定のままにしておく。
+            badge_blocked: default.badge_blocked,
+            badge_working: default.badge_working,
+            badge_done: default.badge_done,
+            badge_idle: default.badge_idle,
             detail: parse_color(config.detail.as_deref()).unwrap_or(default.detail),
             marker: parse_color(config.marker.as_deref()).unwrap_or(default.marker),
-            pin: parse_color(config.pin.as_deref()).unwrap_or(default.pin),
+            toggle: parse_color(config.toggle.as_deref()).unwrap_or(default.toggle),
             category: parse_color(config.category.as_deref()).unwrap_or(default.category),
             header_mode: parse_color(config.header_mode.as_deref()).unwrap_or(default.header_mode),
             active_bg: parse_color(config.active_bg.as_deref()).unwrap_or(default.active_bg),
@@ -151,7 +151,13 @@ impl SidebarRenderTheme {
 
     pub fn from_app_config(config: &crate::config::Config) -> Self {
         let mut theme = Self::from_sidebar_config(&config.sidebar);
+        // badge の glyph / 色は statusline と共通の `badge.*` を単一ソースにする。
         theme.badge_glyphs = config.badge.glyphs.clone();
+        let badge = &config.badge.colors;
+        theme.badge_blocked = parse_color(Some(&badge.blocked)).unwrap_or(theme.badge_blocked);
+        theme.badge_working = parse_color(Some(&badge.working)).unwrap_or(theme.badge_working);
+        theme.badge_done = parse_color(Some(&badge.done)).unwrap_or(theme.badge_done);
+        theme.badge_idle = parse_color(Some(&badge.idle)).unwrap_or(theme.badge_idle);
         theme
     }
 
@@ -2479,22 +2485,39 @@ sidebar:
         assert_eq!(theme.badge_color(BadgeState::Blocked), Color::Red);
         assert_eq!(theme.badge_color(BadgeState::Working), Color::Green);
         assert_eq!(theme.badge_color(BadgeState::Done), Color::Cyan);
-        assert_eq!(theme.badge_color(BadgeState::Idle), Color::DarkGray);
+        assert_eq!(theme.badge_color(BadgeState::Idle), Color::Indexed(248));
     }
 
     #[test]
-    fn badge_colors_are_configurable() {
+    fn sidebar_badge_colors_use_shared_badge_colors() {
+        // badge.colors を statusline / sidebar 共通のソースとして使う。
         let config = serde_yaml_ng::from_str::<crate::config::Config>(
             r##"
-sidebar:
+badge:
   colors:
-    badge_working: yellow
+    working: "#57d98a"
+    done: "#5aa6ff"
 "##,
         )
         .unwrap();
-        let theme = SidebarRenderTheme::from_sidebar_config(&config.sidebar);
-        assert_eq!(theme.badge_color(BadgeState::Working), Color::Yellow);
-        assert_eq!(theme.badge_color(BadgeState::Blocked), Color::Red);
+        let theme = SidebarRenderTheme::from_app_config(&config);
+        assert_eq!(
+            theme.badge_color(BadgeState::Working),
+            Color::Rgb(0x57, 0xd9, 0x8a)
+        );
+        assert_eq!(
+            theme.badge_color(BadgeState::Done),
+            Color::Rgb(0x5a, 0xa6, 0xff)
+        );
+        // 未指定の状態は badge.colors の既定(hex)を使う。
+        assert_eq!(
+            theme.badge_color(BadgeState::Blocked),
+            Color::Rgb(0xff, 0x6b, 0x6b)
+        );
+        assert_eq!(
+            theme.badge_color(BadgeState::Idle),
+            Color::Rgb(0xa8, 0xa8, 0xb2)
+        );
     }
 
     #[test]

@@ -686,7 +686,7 @@ mod tests {
         idle.state = "idle".to_string();
         let rendered = render_statusline_category(&config, &[idle], "work");
         assert!(
-            rendered.contains("#[fg=#6f6b85]○#[fg=default]work"),
+            rendered.contains("#[fg=#a8a8b2]○#[fg=default]work"),
             "{rendered}"
         );
     }

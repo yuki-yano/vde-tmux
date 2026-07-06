@@ -290,7 +290,7 @@ impl Default for BadgeColors {
             blocked: "#ff6b6b".to_string(),
             working: "#4fd08a".to_string(),
             done: "#45cbe6".to_string(),
-            idle: "#6f6b85".to_string(),
+            idle: "#a8a8b2".to_string(),
         }
     }
 }
@@ -394,10 +394,8 @@ pub struct SidebarColorsConfig {
     pub selection_bg: Option<String>,
     pub header_active_bg: Option<String>,
     pub header_active_fg: Option<String>,
-    pub badge_blocked: Option<String>,
-    pub badge_working: Option<String>,
-    pub badge_done: Option<String>,
-    pub badge_idle: Option<String>,
+    // badge の色は statusline と共通の `badge.colors` を単一ソースにするため
+    // sidebar 個別の badge_* キーは持たない(from_app_config で badge.colors を適用)。
     pub detail: Option<String>,
     pub marker: Option<String>,
     pub toggle: Option<String>,
@@ -747,7 +745,7 @@ categories:
         assert_eq!(badge.colors.blocked, "#ff6b6b");
         assert_eq!(badge.colors.working, "#4fd08a");
         assert_eq!(badge.colors.done, "#45cbe6");
-        assert_eq!(badge.colors.idle, "#6f6b85");
+        assert_eq!(badge.colors.idle, "#a8a8b2");
     }
 
     #[test]

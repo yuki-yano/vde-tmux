@@ -143,7 +143,7 @@ statusline:
 #     blocked: "#ff6b6b"
 #     working: "#4fd08a"
 #     done: "#45cbe6"
-#     idle: "#6f6b85"
+#     idle: "#a8a8b2"
 ```
 
 ```tmux
