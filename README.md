@@ -106,6 +106,14 @@ set -g status-right '#(vt statusline-attention) #(vt statusline-summary)'
 `statusline-attention` は見えていない session の blocked agent を `▲ session · perm 2m` 形式で表示する。
 daemon heartbeat が stale になると、`statusline-sessions` の既存バッジは `?` に置き換わる。
 
+## Sidebar Detail View
+
+sidebar の Standard 幅で chat 行を展開すると、chat 行自体は agent 名のみを表示し、右ラベルは出さない。prompt は展開内の先頭 detail 行に集約する。
+
+展開メタは `状態行 + 場所行` の 2 行で表示する。状態行は `● running · 12m`、`○ idle · done 38h ago`、`▲ waiting (permission_prompt) · 2m` の形式で、グリフと状態語だけを状態色にする。場所行は `vde-tmux · %51` の形式で session と pane id を detail 色で表示する。
+
+時間表記は `45s` / `12m` / `1h30m` / `38h` / `2d` のように humanize する。running / blocked は `started_at` からの経過、idle / done は `completed_at` からの `done {t} ago` を表示し、`completed_at` が無い idle は時間部を省略する。running で tasks total がある場合だけ状態行末尾に `· 3/5 tasks` を追加する。
+
 ## State / Socket
 
 sidebar state は `$XDG_STATE_HOME/vde/tmux/state.json`、未設定なら

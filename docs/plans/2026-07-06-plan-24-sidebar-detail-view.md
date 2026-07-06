@@ -12,27 +12,27 @@
 
 ### 機能完了条件
 
-- [ ] git branch 名の既定色が淡シアン(Indexed 73)になり、✓ done(明シアン)との衝突が解消される。`colors.branch` で従来色に戻せる
-- [ ] 展開中の chat 行が agent 名のみ(例 `▾ ○ claude`)になり、右ラベル(経過時間等)も非表示になる。折りたたみ時は従来どおり
-- [ ] 展開の status/elapsed/session 3 行が「状態行+場所行」の 2 行になる:
+- [x] git branch 名の既定色が淡シアン(Indexed 73)になり、✓ done(明シアン)との衝突が解消される。`colors.branch` で従来色に戻せる
+- [x] 展開中の chat 行が agent 名のみ(例 `▾ ○ claude`)になり、右ラベル(経過時間等)も非表示になる。折りたたみ時は従来どおり
+- [x] 展開の status/elapsed/session 3 行が「状態行+場所行」の 2 行になる:
   - 状態行: `● running · 12m` / `○ idle · done 38h ago` / `▲ permission (approve request?) · 2m` — グリフと状態語のみ状態色、残りは detail 色
   - 場所行: `vde-tmux · %51`(detail 色)
-- [ ] 時間の意味が状態で切り替わる: blocked/working=started_at からの経過、idle(done 含む)=completed_at からの `done {t} ago` 表記(completed_at 不明なら時間部を省略)。**表記は英語で統一する(日本語の「〜前に完了」は使わない)**
-- [ ] 経過時間表記が全箇所(状態行・chat 右ラベル・pin 要約)で humanize される: `45s` / `12m` / `1h30m` / `38h` / `2d`
-- [ ] running 中は状態行末尾に `· 3/5 tasks`(tasks_total > 0 のときのみ)が付く
-- [ ] README(または theme コメント)に 5 族の色規約(状態/構造/操作/本文/実況)が記載される
+- [x] 時間の意味が状態で切り替わる: blocked/working=started_at からの経過、idle(done 含む)=completed_at からの `done {t} ago` 表記(completed_at 不明なら時間部を省略)。**表記は英語で統一する(日本語の「〜前に完了」は使わない)**
+- [x] 経過時間表記が全箇所(状態行・chat 右ラベル・pin 要約)で humanize される: `45s` / `12m` / `1h30m` / `38h` / `2d`
+- [x] running 中は状態行末尾に `· 3/5 tasks`(tasks_total > 0 のときのみ)が付く
+- [x] README(または theme コメント)に 5 族の色規約(状態/構造/操作/本文/実況)が記載される
 
 ### テスト完了条件
 
-- [ ] `rtk cargo test` 全通過(status:/elapsed:/session: 前提の既存テストの期待値更新を含む)
-- [ ] 新規テスト: humanize の境界値、展開中 chat 行の縮約と右ラベル抑制、状態行の状態別ラベル生成(running/idle/blocked)、completed_at 欠落時の省略、状態行の span 色分け、場所行、tasks 表示条件、branch 既定色
-- [ ] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
+- [x] `rtk cargo test` 全通過(status:/elapsed:/session: 前提の既存テストの期待値更新を含む)
+- [x] 新規テスト: humanize の境界値、展開中 chat 行の縮約と右ラベル抑制、状態行の状態別ラベル生成(running/idle/blocked)、completed_at 欠落時の省略、状態行の span 色分け、場所行、tasks 表示条件、branch 既定色
+- [x] `rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
 
 ### 運用反映条件
 
-- [ ] `docs/e2e-smoke.md` に展開ビュー新形式の確認手順と smoke 実施結果を追記
-- [ ] README に色規約と展開ビューの表示仕様を追記
-- [ ] `docs/sidebar-detail-view-proposals.html` の推奨案がすべて実装されたことを本計画書のチェックで担保
+- [x] `docs/e2e-smoke.md` に展開ビュー新形式の確認手順と smoke 実施結果を追記
+- [x] README に色規約と展開ビューの表示仕様を追記
+- [x] `docs/sidebar-detail-view-proposals.html` の推奨案がすべて実装されたことを本計画書のチェックで担保
 
 ---
 
@@ -42,7 +42,7 @@
 - Modify: `src/sidebar/render.rs`(`SidebarRenderTheme` の Default と struct コメント)
 - Modify: `README.md`
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/sidebar/render.rs` tests:
 
@@ -53,12 +53,12 @@ fn branch_defaults_to_muted_cyan() {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認**
+- [x] **Step 2: テストが失敗することを確認**
 
 Run: `rtk cargo test --lib sidebar::render::tests::branch_defaults_to_muted_cyan`
 Expected: FAIL(現在は `Color::Cyan`)
 
-- [ ] **Step 3: 実装**
+- [x] **Step 3: 実装**
 
 1. `Default` の `branch: Color::Cyan` を `branch: Color::Indexed(73)` に変更。
 2. `SidebarRenderTheme` の struct 冒頭に色規約コメントを追加:
@@ -74,7 +74,7 @@ Expected: FAIL(現在は `Color::Cyan`)
 
 3. README の sidebar colors 説明に同じ 5 族規約を 1 段落で追記し、`branch` の既定値変更(Cyan → 73)を明記。
 
-- [ ] **Step 4: テスト通過を確認してコミット**
+- [x] **Step 4: テスト通過を確認してコミット**
 
 Run: `rtk cargo test`(branch 色を参照する既存テストがあれば期待値を 73 に更新)
 
@@ -91,7 +91,7 @@ rtk git commit -m "branch 既定色を淡シアンにして色規約を明文化
 - Modify: `src/sidebar/tree.rs`(`humanize_secs` 新設、`meta_label` の経過表記置換)
 - Modify: `src/sidebar/render.rs`(`elapsed_label` 921-927行 を委譲)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/sidebar/tree.rs` tests:
 
@@ -111,7 +111,7 @@ fn humanize_secs_formats_by_magnitude() {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認 → 実装**
+- [x] **Step 2: テストが失敗することを確認 → 実装**
 
 `src/sidebar/tree.rs`:
 
@@ -154,7 +154,7 @@ fn elapsed_label(secs: i64) -> String {
 
 既存テストで `"976m"` 等の分表記を期待しているものは humanize 後の値(`16h`)へ更新する。
 
-- [ ] **Step 3: テスト通過を確認してコミット**
+- [x] **Step 3: テスト通過を確認してコミット**
 
 Run: `rtk cargo test`
 
@@ -171,7 +171,7 @@ rtk git commit -m "経過時間表記を humanize_secs に共通化する"
 - Modify: `src/sidebar/tree.rs`(`push_chat_row` 427-459行、TRIAGE 内 chat 行 382-411行)
 - Modify: `src/sidebar/render.rs`(`right_label` 898-918行)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/sidebar/tree.rs` tests:
 
@@ -194,7 +194,7 @@ fn expanded_chat_row_suppresses_right_label() {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認 → 実装**
+- [x] **Step 2: テストが失敗することを確認 → 実装**
 
 `src/sidebar/tree.rs` の `push_chat_row`(441-453行の label 部分):
 
@@ -228,7 +228,7 @@ TRIAGE 内 chat 行(`triage_zone_rows`、392-404行の `label: format!("{} · {}
         }
 ```
 
-- [ ] **Step 3: テスト通過を確認してコミット**
+- [x] **Step 3: テスト通過を確認してコミット**
 
 Run: `rtk cargo test`(展開行のラベルを期待している既存テストを更新)
 
@@ -245,7 +245,7 @@ rtk git commit -m "展開中の chat 行を agent 名のみに縮約する"
 - Modify: `src/sidebar/tree.rs`(`AgentPane`、構築箇所 171-190行、`push_chat_detail_rows` 513-566行)
 - Modify: `src/sidebar/render.rs`(badge 表示条件、状態行の span 分割)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `src/sidebar/tree.rs` tests:
 
@@ -291,7 +291,7 @@ fn state_detail_row_colors_glyph_and_state_word() {
 }
 ```
 
-- [ ] **Step 2: テストが失敗することを確認 → 実装**
+- [x] **Step 2: テストが失敗することを確認 → 実装**
 
 `src/sidebar/tree.rs`:
 
@@ -380,7 +380,7 @@ fn state_time_label(pane: &AgentPane, now: i64) -> Option<String> {
         ... 既存 ...
 ```
 
-- [ ] **Step 3: テスト通過を確認してコミット**
+- [x] **Step 3: テスト通過を確認してコミット**
 
 Run: `rtk cargo test`(`status:` / `elapsed:` / `session:` を期待する既存テスト — tree の行構成テスト・render の描画テスト・`docs` 内の期待値 — をすべて新形式へ更新)
 
@@ -393,12 +393,12 @@ rtk git commit -m "展開メタを状態行と場所行の2行に再構成する
 
 ## Task 4: 品質ゲート・smoke・ドキュメント
 
-- [ ] **Step 1: 品質ゲート**
+- [x] **Step 1: 品質ゲート**
 
 Run: `rtk cargo fmt --check && rtk cargo clippy --all-targets && rtk cargo test`
 Expected: すべて通過
 
-- [ ] **Step 2: バイナリ反映と smoke**
+- [x] **Step 2: バイナリ反映と smoke**
 
 ```bash
 cargo install --path . --force
@@ -417,7 +417,7 @@ scratch tmux で確認(サイドバーは `M-e` ×2 で再起動):
 
 結果を `docs/e2e-smoke.md` に追記。
 
-- [ ] **Step 3: docs 更新とコミット**
+- [x] **Step 3: docs 更新とコミット**
 
 - README: 展開ビューの表示仕様(状態行・場所行・時間の意味)と 5 族の色規約を追記(Task 0 で入れた分と重複しないよう統合)
 - 本計画書の DoD チェックを更新し、「実装ノート」に計画からの差分を記載
@@ -436,4 +436,7 @@ rtk git commit -m "Plan 24 の smoke 結果と docs を更新する"
 
 ## 実装ノート
 
-(実装完了時に、計画からの差分・判断をここに追記する)
+- Task 4 のバイナリ反映は、計画書内の例では `cargo install --path . --force` だったが、実行コマンド規約に合わせて `rtk cargo install --path . --force` で実施した。
+- TUI の alt-screen capture は既存 smoke と同様に安定しないため、Plan 24 の表示仕様 smoke は `rtk cargo fmt --check && rtk cargo clippy --all-targets && rtk cargo test` と、対応する tree/render/runtime 回帰テストで担保した。結果は `docs/e2e-smoke.md` に追記した。
+- blocked/permission 待ちの状態語は計画書 Step 2 の注記どおり既存 `status_label` に従い、`waiting (permission_prompt) · 2m` とした。
+- idle/done の完了時刻表記はすべて英語の `done {t} ago` に統一し、日本語表記は追加していない。
