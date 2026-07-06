@@ -1115,11 +1115,8 @@ const ACTION_PREVIEW_GLYPH: Color = Color::Indexed(103);
 /// 淡色アクセントにして「押せる」ことを示す。
 fn jump_action_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'static>> {
     if label != JUMP_ROW_LABEL {
-        // 幅不足で truncate された場合はプレーン表示に落とす
-        return vec![Span::styled(
-            label.to_string(),
-            Style::default().fg(theme.detail),
-        )];
+        // 幅不足で truncate された場合も、操作グリフだけは色を保持する。
+        return action_label_spans(label, theme);
     }
     let bracket = Style::default().fg(theme.marker);
     let text = Style::default().fg(theme.detail);
@@ -1134,6 +1131,47 @@ fn jump_action_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'stati
         Span::styled(" preview".to_string(), text),
         Span::styled("]".to_string(), bracket),
     ]
+}
+
+fn action_label_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut text = String::new();
+    let flush_text = |spans: &mut Vec<Span<'static>>, text: &mut String| {
+        if !text.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(text),
+                Style::default().fg(theme.detail),
+            ));
+        }
+    };
+    for ch in label.chars() {
+        match ch {
+            '↗' => {
+                flush_text(&mut spans, &mut text);
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(ACTION_JUMP_GLYPH),
+                ));
+            }
+            '⌕' => {
+                flush_text(&mut spans, &mut text);
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(ACTION_PREVIEW_GLYPH),
+                ));
+            }
+            '[' | ']' => {
+                flush_text(&mut spans, &mut text);
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(theme.marker),
+                ));
+            }
+            _ => text.push(ch),
+        }
+    }
+    flush_text(&mut spans, &mut text);
+    spans
 }
 
 /// Jump 行のクリック列をアクションへ変換する。
@@ -1828,6 +1866,22 @@ mod tests {
         assert_eq!(style_of(" jump").fg, Some(theme.detail));
         assert_eq!(style_of(" preview").fg, Some(theme.detail));
         assert_eq!(style_of("[").fg, Some(theme.marker));
+    }
+
+    #[test]
+    fn truncated_jump_row_keeps_preview_icon_color() {
+        let theme = SidebarRenderTheme::default();
+        let spans = jump_action_spans("[↗ jump] [⌕ pre…", &theme);
+        let style_of = |needle: &str| {
+            spans
+                .iter()
+                .find(|span| span.content == needle)
+                .unwrap_or_else(|| panic!("span {needle:?} not found: {spans:?}"))
+                .style
+        };
+
+        assert_eq!(style_of("↗").fg, Some(Color::Indexed(73)));
+        assert_eq!(style_of("⌕").fg, Some(Color::Indexed(103)));
     }
 
     #[test]
