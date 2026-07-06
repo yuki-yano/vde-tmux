@@ -20,6 +20,9 @@ pub fn detect_codex_wait_reason(screen_tail: &str) -> Option<&'static str> {
             return Some("permission_prompt");
         }
     }
+    if codex_question_prompt_active(&lines) {
+        return Some("codex_question_prompt");
+    }
     None
 }
 
@@ -50,6 +53,63 @@ fn looks_like_yes_choice(line: &str) -> bool {
         || normalized.starts_with("y) yes")
         || normalized.starts_with("y - yes")
         || normalized.starts_with("[y] yes")
+}
+
+fn codex_question_prompt_active(lines: &[String]) -> bool {
+    let mut latest_status = None;
+    for line in lines {
+        if looks_like_codex_question_unanswered(line) {
+            latest_status = Some(true);
+        } else if looks_like_codex_questions_answered(line) {
+            latest_status = Some(false);
+        }
+    }
+    latest_status == Some(true)
+}
+
+fn looks_like_codex_question_unanswered(line: &str) -> bool {
+    let line = normalize_question_status_line(line);
+    let Some(rest) = line.strip_prefix("question") else {
+        return false;
+    };
+    let Some(rest) = parse_question_index(rest) else {
+        return false;
+    };
+    let rest = rest.trim();
+    if !rest.starts_with('(') || !rest.ends_with(')') {
+        return false;
+    }
+    let inner = rest.trim_start_matches('(').trim_end_matches(')').trim();
+    let Some(rest) = consume_ascii_digits(inner) else {
+        return false;
+    };
+    rest.trim() == "unanswered"
+}
+
+fn looks_like_codex_questions_answered(line: &str) -> bool {
+    let line = normalize_question_status_line(line);
+    let Some(rest) = line.strip_prefix("questions") else {
+        return false;
+    };
+    parse_question_index(rest)
+        .map(str::trim)
+        .is_some_and(|rest| rest == "answered")
+}
+
+fn normalize_question_status_line(line: &str) -> &str {
+    line.trim_start_matches(|ch: char| ch == '•' || ch == '*' || ch == '-')
+        .trim()
+}
+
+fn parse_question_index(input: &str) -> Option<&str> {
+    let rest = consume_ascii_digits(input.trim_start())?;
+    let rest = rest.trim_start().strip_prefix('/')?;
+    consume_ascii_digits(rest.trim_start())
+}
+
+fn consume_ascii_digits(input: &str) -> Option<&str> {
+    let digit_count = input.bytes().take_while(u8::is_ascii_digit).count();
+    (digit_count > 0).then_some(&input[digit_count..])
 }
 
 pub fn demote_stale_running(
@@ -95,6 +155,21 @@ mod tests {
     fn detects_claude_permission_prompt_with_numbered_yes_choice() {
         let text = "Claude needs your permission to use Bash\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n";
         assert_eq!(detect_codex_wait_reason(text), Some("permission_prompt"));
+    }
+
+    #[test]
+    fn detects_codex_question_prompt_from_unanswered_status() {
+        let text = "Question 1/1 (1 unanswered)\nRun this commit plan?\n› 1. y (Recommended)\n  2. e\n  3. n\n  4. None of the above\n";
+        assert_eq!(
+            detect_codex_wait_reason(text),
+            Some("codex_question_prompt")
+        );
+    }
+
+    #[test]
+    fn does_not_detect_codex_question_prompt_after_answered_status() {
+        let text = "Question 1/1 (1 unanswered)\nRun this commit plan?\nQuestions 1/1 answered\n";
+        assert_eq!(detect_codex_wait_reason(text), None);
     }
 
     #[test]
