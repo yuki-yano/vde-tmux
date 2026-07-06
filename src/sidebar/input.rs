@@ -89,6 +89,7 @@ mod tests {
             expanded: true,
             pane_id: pane_id.map(ToOwned::to_owned),
             git: None,
+            active: false,
             meta: None,
         }
     }

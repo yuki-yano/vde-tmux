@@ -406,6 +406,8 @@ impl RuntimeState {
                         .map(|(pane_id, _)| pane_id)
                         .unwrap_or(rest);
                     let chat_id = format!("chat::{pane_id}");
+                    // fisheye は selected || manual で展開するため、detail/meta クリックは
+                    // 選択解除後も親 chat を展開維持するかの固定/解除として扱う。
                     self.ui_state.selection = Some(chat_id.clone());
                     self.ui_state.toggle_expanded(&chat_id)
                 } else {

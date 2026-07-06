@@ -33,6 +33,8 @@ pub struct SidebarRow {
     pub pane_id: Option<String>,
     pub git: Option<crate::git::GitBadge>,
     #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
     pub meta: Option<RowMeta>,
 }
 
@@ -70,6 +72,7 @@ struct AgentPane {
     repo_path: String,
     attention: bool,
     flash: bool,
+    active: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -191,6 +194,8 @@ pub fn build_rows_ctx(
                 repo_path: pane.current_path.clone(),
                 attention: pane.attention == "1",
                 flash: ctx.flash.contains(&pane.pane_id),
+                // 複数 client が別 window を見ている場合は、複数系譜を active として扱う。
+                active: pane.window_active && pane.session_attached,
             });
     }
     for panes in groups.values_mut() {
@@ -250,6 +255,7 @@ fn category_rows(
     for (category, repos) in by_category {
         let category_id = format!("category::{category}");
         let all_panes = repos.values().flatten().cloned().collect::<Vec<_>>();
+        let active = all_panes.iter().any(|pane| pane.active);
         let attention_count = repos
             .keys()
             .filter_map(|repo| {
@@ -270,6 +276,7 @@ fn category_rows(
             expanded,
             pane_id: None,
             git: None,
+            active,
             meta: Some(RowMeta {
                 attention_count: Some(attention_count),
                 ..RowMeta::default()
@@ -346,6 +353,7 @@ fn repo_rows_from_keyed_map(
             expanded,
             pane_id: None,
             git: git.get(&first.repo_path).cloned(),
+            active: panes.iter().any(|pane| pane.active),
             meta: Some(
                 metas
                     .get(&(first.category.clone(), first.repo.clone()))
@@ -377,6 +385,7 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
         expanded: true,
         pane_id: None,
         git: None,
+        active: false,
         meta: None,
     }];
     for pane in panes {
@@ -400,6 +409,7 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
             expanded,
             pane_id: Some(pane.pane_id.clone()),
             git: None,
+            active: pane.active,
             meta: Some(meta),
         });
         if expanded {
@@ -449,6 +459,7 @@ fn push_chat_row(
         expanded,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
+        active: pane.active,
         meta: Some(meta),
     });
     if expanded {
@@ -490,6 +501,7 @@ fn push_meta_row(
         expanded: true,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
+        active: pane.active,
         meta: None,
     });
 }
@@ -506,6 +518,7 @@ fn detail_row(pane: &AgentPane, depth: usize, suffix: &str, label: String) -> Si
         expanded: true,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
+        active: pane.active,
         meta: None,
     }
 }
@@ -561,6 +574,7 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, now: i64, rows: &mut Ve
         expanded: true,
         pane_id: Some(pane.pane_id.clone()),
         git: None,
+        active: pane.active,
         meta: None,
     });
 }
@@ -847,6 +861,7 @@ mod tests {
                 expanded: true,
                 pane_id: None,
                 git: None,
+                active: false,
                 meta: None,
             },
             SidebarRow {
@@ -860,6 +875,7 @@ mod tests {
                 expanded: true,
                 pane_id: None,
                 git: None,
+                active: false,
                 meta: None,
             },
         ];
@@ -950,6 +966,77 @@ mod tests {
         assert_eq!(rows[2].kind, SidebarRowKind::Chat);
         assert_eq!(rows[2].pane_id.as_deref(), Some("%1"));
         assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn active_pane_marks_chat_row_and_ancestors() {
+        let mut config = Config::default();
+        config
+            .categories
+            .rules
+            .push(category_rule("active", "/tmp/active/*"));
+        config
+            .categories
+            .rules
+            .push(category_rule("idle", "/tmp/idle/*"));
+        let state = SidebarState {
+            view_mode: ViewMode::ByCategory,
+            selection: Some("chat::%1".to_string()),
+            ..SidebarState::default()
+        };
+        let mut active = pane("main", "%1", "/tmp/active/app", "codex", "running");
+        active.window_active = true;
+        active.session_attached = true;
+        let inactive = pane("main", "%2", "/tmp/idle/other", "codex", "running");
+
+        let rows = build_rows(&config, &[active, inactive], &state);
+
+        assert!(
+            rows.iter()
+                .find(|row| row.id == "category::active")
+                .unwrap()
+                .active
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.id == "repo::active::app")
+                .unwrap()
+                .active
+        );
+        assert!(rows.iter().find(|row| row.id == "chat::%1").unwrap().active);
+        assert!(
+            rows.iter()
+                .find(|row| row.id == "detail::%1::status")
+                .unwrap()
+                .active
+        );
+        assert!(rows.iter().find(|row| row.id == "jump::%1").unwrap().active);
+        assert!(
+            !rows
+                .iter()
+                .find(|row| row.id == "category::idle")
+                .unwrap()
+                .active
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|row| row.id == "repo::idle::other")
+                .unwrap()
+                .active
+        );
+        assert!(!rows.iter().find(|row| row.id == "chat::%2").unwrap().active);
+    }
+
+    #[test]
+    fn detached_session_is_not_active() {
+        let mut pane = pane("main", "%1", "/tmp/app", "codex", "running");
+        pane.window_active = true;
+        pane.session_attached = false;
+
+        let rows = build_rows(&Config::default(), &[pane], &SidebarState::default());
+
+        assert!(!rows.iter().any(|row| row.active));
     }
 
     #[test]

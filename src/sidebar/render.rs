@@ -36,6 +36,10 @@ pub struct SidebarRenderTheme {
     pub category: Color,
     /// ヘッダー mode セグメントの色
     pub header_mode: Color,
+    /// active chat 行の薄背景色
+    pub active_bg: Color,
+    /// active 系譜の左端バー色
+    pub active_bar: Color,
     /// repo 名(および category 見出し)の色
     pub repo: Color,
     /// git branch 名の色
@@ -77,6 +81,8 @@ impl Default for SidebarRenderTheme {
             pin: Color::Indexed(147),
             category: Color::Indexed(215),
             header_mode: Color::Indexed(147),
+            active_bg: Color::Indexed(235),
+            active_bar: Color::Indexed(147),
             repo: Color::Blue,
             branch: Color::Cyan,
             live: Color::Magenta,
@@ -115,6 +121,8 @@ impl SidebarRenderTheme {
             pin: parse_color(config.pin.as_deref()).unwrap_or(default.pin),
             category: parse_color(config.category.as_deref()).unwrap_or(default.category),
             header_mode: parse_color(config.header_mode.as_deref()).unwrap_or(default.header_mode),
+            active_bg: parse_color(config.active_bg.as_deref()).unwrap_or(default.active_bg),
+            active_bar: parse_color(config.active_bar.as_deref()).unwrap_or(default.active_bar),
             repo: parse_color(config.repo.as_deref()).unwrap_or(default.repo),
             branch: parse_color(config.branch.as_deref()).unwrap_or(default.branch),
             live: parse_color(config.live.as_deref()).unwrap_or(default.live),
@@ -588,10 +596,7 @@ fn render_row_line(
             .as_ref()
             .and_then(|meta| meta.pinned)
             .unwrap_or(false);
-        spans.push(Span::styled(
-            format!(" {indent}"),
-            Style::default().fg(theme.marker),
-        ));
+        push_leading_marker_span(&mut spans, row, theme, &indent);
         spans.push(Span::styled(
             if pinned { "✦" } else { " " }.to_string(),
             Style::default().fg(theme.pin),
@@ -601,19 +606,13 @@ fn render_row_line(
             Style::default().fg(theme.marker),
         ));
     } else if row.kind == SidebarRowKind::Detail && row.id.starts_with("meta::") {
-        spans.push(Span::styled(
-            format!(" {indent}"),
-            Style::default().fg(theme.marker),
-        ));
+        push_leading_marker_span(&mut spans, row, theme, &indent);
         spans.push(Span::styled(
             "✦ ".to_string(),
             Style::default().fg(theme.pin),
         ));
     } else {
-        spans.push(Span::styled(
-            format!(" {head}"),
-            Style::default().fg(theme.marker),
-        ));
+        push_leading_marker_span(&mut spans, row, theme, &head);
     }
     if let Some((glyph, color)) = badge {
         spans.push(Span::styled(glyph, badge_style(color, row)));
@@ -662,8 +661,35 @@ fn render_row_line(
                 .bg(theme.selection_bg)
                 .add_modifier(Modifier::BOLD),
         );
+    } else if row.active && row.kind == SidebarRowKind::Chat {
+        line = line.style(Style::default().bg(theme.active_bg));
     }
     line
+}
+
+fn push_leading_marker_span(
+    spans: &mut Vec<Span<'static>>,
+    row: &SidebarRow,
+    theme: &SidebarRenderTheme,
+    tail: &str,
+) {
+    if row.active {
+        spans.push(Span::styled(
+            "▎".to_string(),
+            Style::default().fg(theme.active_bar),
+        ));
+        if !tail.is_empty() {
+            spans.push(Span::styled(
+                tail.to_string(),
+                Style::default().fg(theme.marker),
+            ));
+        }
+    } else {
+        spans.push(Span::styled(
+            format!(" {tail}"),
+            Style::default().fg(theme.marker),
+        ));
+    }
 }
 
 /// Chat 行のラベルを「agent 名(太字)+ 残り(通常)」に分ける。
@@ -753,7 +779,7 @@ fn render_group_dense_line(
     if state.selection.as_deref() == Some(row.id.as_str()) {
         style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
     }
-    Line::from(Span::styled(pad_to_width(text, width), style))
+    active_bar_line(row, theme, pad_to_width(text, width), style)
 }
 
 fn render_chat_dense_line(
@@ -804,7 +830,7 @@ fn render_chat_dense_line(
     if row_flash(row) {
         style = style.add_modifier(Modifier::REVERSED);
     }
-    let mut line = Line::from(Span::styled(text, style));
+    let mut line = active_bar_line(row, theme, text, style);
     if state.selection.as_deref() == Some(row.id.as_str()) {
         line = line.style(
             Style::default()
@@ -813,6 +839,22 @@ fn render_chat_dense_line(
         );
     }
     line
+}
+
+fn active_bar_line(
+    row: &SidebarRow,
+    theme: &SidebarRenderTheme,
+    text: String,
+    style: Style,
+) -> Line<'static> {
+    if !row.active {
+        return Line::from(Span::styled(text, style));
+    }
+    let rest = text.chars().skip(1).collect::<String>();
+    Line::from(vec![
+        Span::styled("▎".to_string(), Style::default().fg(theme.active_bar)),
+        Span::styled(rest, style),
+    ])
 }
 
 fn render_micro_lines(
@@ -1142,6 +1184,7 @@ mod tests {
             expanded: true,
             pane_id: None,
             git: None,
+            active: false,
             meta: None,
         }
     }
@@ -1222,6 +1265,24 @@ mod tests {
 
         assert_eq!(theme.pin, Color::Magenta);
         assert_eq!(SidebarRenderTheme::default().pin, Color::Indexed(147));
+    }
+
+    #[test]
+    fn active_colors_are_configurable() {
+        let config = crate::config::SidebarColorsConfig {
+            active_bg: Some("235".to_string()),
+            active_bar: Some("magenta".to_string()),
+            ..Default::default()
+        };
+        let theme = SidebarRenderTheme::from_config(&config);
+
+        assert_eq!(theme.active_bg, Color::Indexed(235));
+        assert_eq!(theme.active_bar, Color::Magenta);
+        assert_eq!(SidebarRenderTheme::default().active_bg, Color::Indexed(235));
+        assert_eq!(
+            SidebarRenderTheme::default().active_bar,
+            Color::Indexed(147)
+        );
     }
 
     #[test]
@@ -1578,6 +1639,48 @@ mod tests {
         let rendered = render_rows(&[repo, chat], &SidebarState::default(), 40);
 
         assert!(!rendered.contains('─'), "{rendered:?}");
+    }
+
+    #[test]
+    fn active_rows_render_left_bar_and_chat_bg() {
+        let mut category = row(
+            "category::dev",
+            SidebarRowKind::Category,
+            0,
+            "dev",
+            RollupLevel::Idle,
+        );
+        category.active = true;
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            1,
+            "codex",
+            RollupLevel::Running,
+        );
+        chat.active = true;
+        let theme = SidebarRenderTheme::default();
+
+        let lines = render_lines(
+            &[category.clone(), chat.clone()],
+            &SidebarState::default(),
+            40,
+            &theme,
+        );
+
+        assert_eq!(line_to_string(lines[0].clone()).chars().next(), Some('▎'));
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.active_bar));
+        assert_eq!(lines[0].style.bg, None);
+        assert_eq!(line_to_string(lines[1].clone()).chars().next(), Some('▎'));
+        assert_eq!(lines[1].spans[0].style.fg, Some(theme.active_bar));
+        assert_eq!(lines[1].style.bg, Some(theme.active_bg));
+
+        let selected = SidebarState {
+            selection: Some("chat::%1".to_string()),
+            ..SidebarState::default()
+        };
+        let selected_lines = render_lines(&[chat], &selected, 40, &theme);
+        assert_eq!(selected_lines[0].style.bg, Some(theme.selection_bg));
     }
 
     #[test]
