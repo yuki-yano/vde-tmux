@@ -336,6 +336,7 @@ pub struct SidebarColorsConfig {
     pub badge_idle: Option<String>,
     pub detail: Option<String>,
     pub marker: Option<String>,
+    pub pin: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub live: Option<String>,

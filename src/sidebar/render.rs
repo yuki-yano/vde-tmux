@@ -30,6 +30,8 @@ pub struct SidebarRenderTheme {
     pub detail: Color,
     /// 展開マーカー ▾/▸ と pin 印の色
     pub marker: Color,
+    /// pin 中の chat / meta 印の色
+    pub pin: Color,
     /// repo 名(および category 見出し)の色
     pub repo: Color,
     /// git branch 名の色
@@ -62,6 +64,7 @@ impl Default for SidebarRenderTheme {
             badge_idle: Color::DarkGray,
             detail: Color::Indexed(246),
             marker: Color::DarkGray,
+            pin: Color::Indexed(147),
             repo: Color::Blue,
             branch: Color::Cyan,
             live: Color::Magenta,
@@ -97,6 +100,7 @@ impl SidebarRenderTheme {
             badge_idle: parse_color(config.badge_idle.as_deref()).unwrap_or(default.badge_idle),
             detail: parse_color(config.detail.as_deref()).unwrap_or(default.detail),
             marker: parse_color(config.marker.as_deref()).unwrap_or(default.marker),
+            pin: parse_color(config.pin.as_deref()).unwrap_or(default.pin),
             repo: parse_color(config.repo.as_deref()).unwrap_or(default.repo),
             branch: parse_color(config.branch.as_deref()).unwrap_or(default.branch),
             live: parse_color(config.live.as_deref()).unwrap_or(default.live),
@@ -509,12 +513,13 @@ fn render_row_line(
                 .and_then(|meta| meta.pinned)
                 .unwrap_or(false)
             {
-                "·"
+                "✦"
             } else {
                 " "
             };
             format!("{indent}{pin}{marker} ")
         }
+        SidebarRowKind::Detail if row.id.starts_with("meta::") => format!("{indent}✦ "),
         SidebarRowKind::Detail => indent.clone(),
         SidebarRowKind::Jump => format!("{indent}-> "),
         SidebarRowKind::Zone => unreachable!("zone rows return before generic rendering"),
@@ -553,10 +558,38 @@ fn render_row_line(
         .saturating_sub(right_reserved);
     let label = truncate_display(&row.label, label_budget);
 
-    let mut spans = vec![Span::styled(
-        format!(" {head}"),
-        Style::default().fg(theme.marker),
-    )];
+    let mut spans = Vec::new();
+    if row.kind == SidebarRowKind::Chat {
+        let marker = if row.expanded { "▾" } else { "▸" };
+        let pinned = row
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.pinned)
+            .unwrap_or(false);
+        spans.push(Span::styled(
+            format!(" {indent}"),
+            Style::default().fg(theme.marker),
+        ));
+        spans.push(Span::styled(
+            if pinned { "✦" } else { " " }.to_string(),
+            Style::default().fg(theme.pin),
+        ));
+        spans.push(Span::styled(
+            format!("{marker} "),
+            Style::default().fg(theme.marker),
+        ));
+    } else if row.kind == SidebarRowKind::Detail && row.id.starts_with("meta::") {
+        spans.push(Span::styled(
+            format!(" {indent}"),
+            Style::default().fg(theme.marker),
+        ));
+        spans.push(Span::styled("✦ ".to_string(), Style::default().fg(theme.pin)));
+    } else {
+        spans.push(Span::styled(
+            format!(" {head}"),
+            Style::default().fg(theme.marker),
+        ));
+    }
     if let Some((glyph, color)) = badge {
         spans.push(Span::styled(glyph, badge_style(color, row)));
     }
@@ -1090,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_chat_renders_pin_marker() {
+    fn pinned_chat_row_shows_pin_glyph() {
         let mut chat = row(
             "chat::%1",
             SidebarRowKind::Chat,
@@ -1104,10 +1137,35 @@ mod tests {
         });
         chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
         chat.expanded = false;
+        let mut unpinned = row(
+            "chat::%2",
+            SidebarRowKind::Chat,
+            0,
+            "claude",
+            RollupLevel::Running,
+        );
+        unpinned.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
+        unpinned.expanded = false;
 
-        let rendered = render_rows(&[chat], &SidebarState::default(), 40);
+        let rendered = render_rows(&[chat, unpinned], &SidebarState::default(), 40);
 
-        assert!(rendered.starts_with(" ·▸ "), "{rendered:?}");
+        assert!(rendered.lines().next().unwrap().starts_with(" ✦▸ "), "{rendered:?}");
+        assert!(
+            rendered.lines().nth(1).unwrap().starts_with("  ▸ "),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn pin_color_is_configurable() {
+        let config = crate::config::SidebarColorsConfig {
+            pin: Some("magenta".to_string()),
+            ..Default::default()
+        };
+        let theme = SidebarRenderTheme::from_config(&config);
+
+        assert_eq!(theme.pin, Color::Magenta);
+        assert_eq!(SidebarRenderTheme::default().pin, Color::Indexed(147));
     }
 
     #[test]
