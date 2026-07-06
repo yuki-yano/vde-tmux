@@ -18,6 +18,23 @@ pub struct Config {
     pub daemon: DaemonConfig,
     pub badge: BadgeConfig,
     pub notify: NotifyConfig,
+    pub popup: PopupConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PopupConfig {
+    pub width: String,
+    pub height: String,
+}
+
+impl Default for PopupConfig {
+    fn default() -> Self {
+        Self {
+            width: "50%".to_string(),
+            height: "50%".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -486,7 +503,22 @@ mod tests {
         assert_eq!(config.daemon.git.timeout_ms, 500);
         assert_eq!(config.sidebar.width, SidebarWidth::Columns(40));
         assert_eq!(config.sidebar.min_width, 40);
+        assert_eq!(config.popup.width, "50%");
+        assert_eq!(config.popup.height, "50%");
         assert_eq!(config.statusline.category.mode, "list");
+    }
+
+    #[test]
+    fn popup_size_defaults_and_overrides() {
+        let config = Config::default();
+        assert_eq!(config.popup.width, "50%");
+        assert_eq!(config.popup.height, "50%");
+
+        let config =
+            serde_yaml_ng::from_str::<Config>("popup:\n  width: \"72%\"\n  height: \"60%\"\n")
+                .unwrap();
+        assert_eq!(config.popup.width, "72%");
+        assert_eq!(config.popup.height, "60%");
     }
 
     #[test]

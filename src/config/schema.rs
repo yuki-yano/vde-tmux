@@ -47,6 +47,14 @@ pub fn config_schema() -> Value {
                     }
                 }
             },
+            "popup": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "width": { "type": "string" },
+                    "height": { "type": "string" }
+                }
+            },
             "statusline": {
                 "type": "object",
                 "additionalProperties": true,
@@ -182,6 +190,7 @@ mod tests {
             "daemon",
             "badge",
             "notify",
+            "popup",
         ] {
             assert!(
                 properties.contains_key(key),
@@ -189,6 +198,15 @@ mod tests {
             );
         }
         assert!(!properties.contains_key("ghq_root"));
+    }
+
+    #[test]
+    fn schema_contains_popup_size() {
+        let schema = config_schema();
+        let popup = &schema["properties"]["popup"]["properties"];
+
+        assert_eq!(popup["width"]["type"], "string");
+        assert_eq!(popup["height"]["type"], "string");
     }
 
     #[test]

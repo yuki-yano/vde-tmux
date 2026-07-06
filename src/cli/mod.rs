@@ -84,6 +84,10 @@ enum Command {
     SessionManager {
         #[arg(long)]
         popup: bool,
+        #[arg(long, hide = true)]
+        render_preview: Option<String>,
+        #[arg(long, hide = true)]
+        preview_name: Option<String>,
         #[command(subcommand)]
         command: Option<SessionManagerCommand>,
     },
@@ -347,16 +351,40 @@ where
             }
             Ok(None)
         }
-        Command::SessionManager { popup, command } => {
+        Command::SessionManager {
+            popup,
+            render_preview,
+            preview_name,
+            command,
+        } => {
+            if render_preview.is_some() != preview_name.is_some() {
+                bail!("--render-preview and --preview-name must be provided together");
+            }
+            if let (Some(action), Some(name)) = (render_preview.as_deref(), preview_name.as_deref())
+            {
+                return Ok(Some(crate::session_manager::render_preview(
+                    runner, action, name, env,
+                )?));
+            }
             match (popup, command) {
-                (true, _) => crate::session_manager::open_popup(runner)?,
+                (true, None) => crate::session_manager::run_interactive(runner)?,
                 (false, Some(SessionManagerCommand::KillWindow { target })) => {
                     crate::session_manager::kill_window(runner, &target)?;
                 }
                 (false, Some(SessionManagerCommand::KillPane { target })) => {
                     crate::session_manager::kill_pane(runner, &target)?;
                 }
-                (false, None) => crate::session_manager::open_tree(runner)?,
+                (true, Some(SessionManagerCommand::KillWindow { target })) => {
+                    crate::session_manager::kill_window(runner, &target)?;
+                }
+                (true, Some(SessionManagerCommand::KillPane { target })) => {
+                    crate::session_manager::kill_pane(runner, &target)?;
+                }
+                (false, None) => crate::session_manager::open_popup(
+                    runner,
+                    &config.popup,
+                    &std::env::current_exe()?.display().to_string(),
+                )?,
             }
             Ok(None)
         }
