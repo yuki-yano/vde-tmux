@@ -34,8 +34,6 @@ pub struct SidebarRenderTheme {
     pub pin: Color,
     /// category 見出しの色
     pub category: Color,
-    /// category 行の左に配下 worst 状態の badge を表示する(既定 false)
-    pub category_badge: bool,
     /// ヘッダー mode セグメントの色
     pub header_mode: Color,
     /// active chat 行の薄背景色
@@ -82,7 +80,6 @@ impl Default for SidebarRenderTheme {
             marker: Color::DarkGray,
             pin: Color::Indexed(147),
             category: Color::Indexed(215),
-            category_badge: false,
             header_mode: Color::Indexed(147),
             active_bg: Color::Indexed(235),
             active_bar: Color::Indexed(147),
@@ -123,7 +120,6 @@ impl SidebarRenderTheme {
             marker: parse_color(config.marker.as_deref()).unwrap_or(default.marker),
             pin: parse_color(config.pin.as_deref()).unwrap_or(default.pin),
             category: parse_color(config.category.as_deref()).unwrap_or(default.category),
-            category_badge: default.category_badge,
             header_mode: parse_color(config.header_mode.as_deref()).unwrap_or(default.header_mode),
             active_bg: parse_color(config.active_bg.as_deref()).unwrap_or(default.active_bg),
             active_bar: parse_color(config.active_bar.as_deref()).unwrap_or(default.active_bar),
@@ -144,7 +140,6 @@ impl SidebarRenderTheme {
         theme.header_prefix = config.header.prefix.clone();
         theme.header_suffix = config.header.suffix.clone();
         theme.header_separator = config.header.separator.clone();
-        theme.category_badge = config.category_badge;
         theme
     }
 
@@ -554,9 +549,7 @@ fn render_row_line(
         SidebarRowKind::Jump => indent.clone(),
         SidebarRowKind::Zone => unreachable!("zone rows return before generic rendering"),
     };
-    let badge = if row.kind == SidebarRowKind::Chat
-        || (row.kind == SidebarRowKind::Category && theme.category_badge)
-    {
+    let badge = if row.kind == SidebarRowKind::Chat {
         row.badge_state.map(|state| {
             (
                 format!("{} ", theme.badge_glyph(state)),
@@ -1784,7 +1777,7 @@ mod tests {
     }
 
     #[test]
-    fn category_badge_is_hidden_by_default_and_shown_when_enabled() {
+    fn category_row_never_renders_badge_glyph() {
         let mut category = row(
             "category::dev",
             SidebarRowKind::Category,
@@ -1793,43 +1786,19 @@ mod tests {
             RollupLevel::Permission,
         );
         category.badge_state = Some(BadgeState::Blocked);
-        let text_of = |line: &Line<'_>| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        };
 
-        // 既定では category 行に badge は出ない
         let lines = render_lines(
             std::slice::from_ref(&category),
             &SidebarState::default(),
             40,
             &SidebarRenderTheme::default(),
         );
-        assert!(!text_of(&lines[0]).contains('▲'), "{:?}", lines[0]);
-
-        // sidebar.category_badge: true で worst 状態の badge がテキストの左に出る
-        let config = crate::config::SidebarConfig {
-            category_badge: true,
-            ..Default::default()
-        };
-        let theme = SidebarRenderTheme::from_sidebar_config(&config);
-        assert!(theme.category_badge);
-        let lines = render_lines(
-            std::slice::from_ref(&category),
-            &SidebarState::default(),
-            40,
-            &theme,
-        );
-        let text = text_of(&lines[0]);
-        assert!(text.contains("▲ ◆ dev"), "{text:?}");
-        let badge_span = lines[0]
+        let text = lines[0]
             .spans
             .iter()
-            .find(|span| span.content.starts_with('▲'))
-            .unwrap();
-        assert_eq!(badge_span.style.fg, Some(theme.badge_blocked));
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!text.contains('▲'), "{text:?}");
     }
 
     #[test]
