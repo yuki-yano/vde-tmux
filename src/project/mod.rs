@@ -1,17 +1,75 @@
 //! project path から tmux session を作成または切替する。
 
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::category::resolve_category_for_session;
-use crate::config::Config;
+use crate::config::{Config, PopupConfig};
 use crate::options::{KEY_CATEGORY, KEY_PROJECT_PATH, set_session_option};
 use crate::session::{
     SessionInfo, current_client_name, find_session, list_sessions, remember_session_for_client,
     switch_client_for_client,
 };
 use crate::tmux::TmuxRunner;
+
+pub trait ProjectSelectorIo {
+    fn list_projects(&mut self) -> Result<Vec<String>>;
+    fn choose_project(&mut self, choices: &[String]) -> Result<Option<String>>;
+}
+
+pub struct SystemProjectSelectorIo;
+
+impl ProjectSelectorIo for SystemProjectSelectorIo {
+    fn list_projects(&mut self) -> Result<Vec<String>> {
+        let output =
+            crate::tmux::run_command("ghq", &["list", "-p"], Some(Duration::from_secs(3)))?;
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect())
+    }
+
+    fn choose_project(&mut self, choices: &[String]) -> Result<Option<String>> {
+        if choices.is_empty() {
+            return Ok(None);
+        }
+        let preview = r#"path="$(eval echo {})"; if command -v bat >/dev/null 2>&1; then bat --color=always --paging=never --style=plain --theme="Catppuccin Mocha" "$path/README.md"; else cat "$path/README.md"; fi"#;
+        let mut child = Command::new("fzf")
+            .args([
+                "--prompt=Project> ",
+                "--preview",
+                preview,
+                "--bind",
+                "ctrl-d:preview-page-down,ctrl-u:preview-page-up",
+                "--no-separator",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("failed to spawn fzf")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            for choice in choices {
+                writeln!(stdin, "{choice}")?;
+            }
+        }
+        let output = child.wait_with_output().context("failed to wait fzf")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let selected = String::from_utf8(output.stdout)
+            .context("fzf output was not utf-8")?
+            .trim()
+            .to_string();
+        Ok((!selected.is_empty()).then_some(selected))
+    }
+}
 
 pub fn session_name_for_path(path: &str) -> String {
     let base = Path::new(path)
@@ -34,6 +92,82 @@ pub fn session_name_for_path(path: &str) -> String {
     } else {
         name
     }
+}
+
+pub fn display_project_path(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|home| !home.is_empty()) else {
+        return path.to_string();
+    };
+    if path == home {
+        return "~".to_string();
+    }
+    path.strip_prefix(&format!("{home}/"))
+        .map(|rest| format!("~/{rest}"))
+        .unwrap_or_else(|| path.to_string())
+}
+
+pub fn restore_project_selection(selection: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|home| !home.is_empty()) else {
+        return selection.to_string();
+    };
+    if selection == "~" {
+        return home.to_string();
+    }
+    selection
+        .strip_prefix("~/")
+        .map(|rest| format!("{home}/{rest}"))
+        .unwrap_or_else(|| selection.to_string())
+}
+
+pub fn project_selector_popup_command(exe: &str) -> String {
+    format!("{} project selector", shell_quote(exe))
+}
+
+pub fn open_project_selector_popup(
+    runner: &dyn TmuxRunner,
+    popup: &PopupConfig,
+    exe: &str,
+) -> Result<()> {
+    let command = project_selector_popup_command(exe);
+    runner.run(&[
+        "display-popup",
+        "-E",
+        "-w",
+        &popup.width,
+        "-h",
+        &popup.height,
+        "-d",
+        "#{pane_current_path}",
+        &command,
+    ])?;
+    Ok(())
+}
+
+pub fn run_project_selector(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let mut io = SystemProjectSelectorIo;
+    run_project_selector_with_io(runner, config, env.get("HOME").map(String::as_str), &mut io)
+}
+
+pub fn run_project_selector_with_io(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    home: Option<&str>,
+    io: &mut dyn ProjectSelectorIo,
+) -> Result<()> {
+    let projects = io.list_projects()?;
+    let choices = projects
+        .iter()
+        .map(|project| display_project_path(project, home))
+        .collect::<Vec<_>>();
+    let Some(selection) = io.choose_project(&choices)? else {
+        return Ok(());
+    };
+    let path = restore_project_selection(&selection, home);
+    switch_project(runner, config, &path)
 }
 
 pub fn switch_project(runner: &dyn TmuxRunner, config: &Config, path: &str) -> Result<()> {
@@ -64,14 +198,151 @@ pub fn switch_project(runner: &dyn TmuxRunner, config: &Config, path: &str) -> R
     remember_session_for_client(runner, &client, &category, &session_name)
 }
 
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tmux::mock::MockTmuxRunner;
 
+    struct MockProjectSelectorIo {
+        projects: Vec<String>,
+        selection: Option<String>,
+        seen_choices: Vec<String>,
+    }
+
+    impl ProjectSelectorIo for MockProjectSelectorIo {
+        fn list_projects(&mut self) -> Result<Vec<String>> {
+            Ok(self.projects.clone())
+        }
+
+        fn choose_project(&mut self, choices: &[String]) -> Result<Option<String>> {
+            self.seen_choices = choices.to_vec();
+            Ok(self.selection.clone())
+        }
+    }
+
     #[test]
     fn session_name_replaces_unsafe_chars() {
         assert_eq!(session_name_for_path("/tmp/my repo"), "my_repo");
+    }
+
+    #[test]
+    fn selector_displays_home_relative_path_and_restores_selection() {
+        let home = "/Users/me";
+
+        assert_eq!(
+            display_project_path("/Users/me/repos/github.com/acme/app", Some(home)),
+            "~/repos/github.com/acme/app"
+        );
+        assert_eq!(
+            restore_project_selection("~/repos/github.com/acme/app", Some(home)),
+            "/Users/me/repos/github.com/acme/app"
+        );
+    }
+
+    #[test]
+    fn selector_popup_uses_current_exe_command() {
+        let mock = MockTmuxRunner::new();
+        let command = project_selector_popup_command("/tmp/my vt");
+        mock.stub(
+            &[
+                "display-popup",
+                "-E",
+                "-w",
+                "50%",
+                "-h",
+                "50%",
+                "-d",
+                "#{pane_current_path}",
+                &command,
+            ],
+            "",
+        );
+
+        open_project_selector_popup(&mock, &crate::config::PopupConfig::default(), "/tmp/my vt")
+            .unwrap();
+
+        assert_eq!(command, "'/tmp/my vt' project selector");
+        assert_eq!(mock.calls().len(), 1);
+    }
+
+    #[test]
+    fn selector_switches_selected_project() {
+        let mock = MockTmuxRunner::new();
+        let format = crate::session::session_list_format();
+        let mut selector = MockProjectSelectorIo {
+            projects: vec!["/Users/me/repos/ni.zsh".to_string()],
+            selection: Some("~/repos/ni.zsh".to_string()),
+            seen_choices: Vec::new(),
+        };
+        let mut config = crate::config::Config::default();
+        config.categories.default_category = Some("public".to_string());
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "/dev/ttys001\t/dev/ttys001\n",
+        );
+        mock.stub(&["list-sessions", "-F", &format], "");
+        mock.stub(
+            &[
+                "new-session",
+                "-d",
+                "-s",
+                "ni.zsh",
+                "-c",
+                "/Users/me/repos/ni.zsh",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "ni.zsh",
+                crate::options::KEY_PROJECT_PATH,
+                "/Users/me/repos/ni.zsh",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "ni.zsh",
+                crate::options::KEY_CATEGORY,
+                "public",
+            ],
+            "",
+        );
+        mock.stub(
+            &["switch-client", "-c", "/dev/ttys001", "-t", "=ni.zsh:"],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-g",
+                "@vde_client_2f6465762f74747973303031_public",
+                "ni.zsh",
+            ],
+            "",
+        );
+
+        run_project_selector_with_io(&mock, &config, Some("/Users/me"), &mut selector).unwrap();
+
+        assert_eq!(selector.seen_choices, vec!["~/repos/ni.zsh"]);
     }
 
     #[test]

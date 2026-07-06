@@ -61,6 +61,189 @@ fn dispatch_category_use_switches_category() {
 }
 
 #[test]
+fn dispatch_project_selector_popup_opens_popup() {
+    let mock = MockTmuxRunner::new();
+    let exe = std::env::current_exe().unwrap().display().to_string();
+    let command = crate::project::project_selector_popup_command(&exe);
+    mock.stub(
+        &[
+            "display-popup",
+            "-E",
+            "-w",
+            "50%",
+            "-h",
+            "50%",
+            "-d",
+            "#{pane_current_path}",
+            &command,
+        ],
+        "",
+    );
+
+    run_with(["vt", "project", "selector", "--popup"], &mock, &env()).unwrap();
+
+    assert_eq!(mock.calls().len(), 1);
+}
+
+#[test]
+fn dispatch_session_manager_opens_popup() {
+    let mock = MockTmuxRunner::new();
+    let exe = std::env::current_exe().unwrap().display().to_string();
+    mock.stub(
+        &["display-message", "-p", "#{pane_current_path}"],
+        "/tmp/project\n",
+    );
+    mock.stub(
+        &[
+            "display-popup",
+            "-E",
+            "-w",
+            "50%",
+            "-h",
+            "50%",
+            "-d",
+            "/tmp/project",
+            &exe,
+            "session-manager",
+            "--popup",
+        ],
+        "",
+    );
+
+    run_with(["vt", "session-manager"], &mock, &env()).unwrap();
+
+    assert_eq!(mock.calls().len(), 2);
+}
+
+#[test]
+fn dispatch_popups_use_configured_size() {
+    let config_home = std::env::temp_dir().join(format!(
+        "vde-tmux-popup-size-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = config_home.join("vde").join("tmux");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.yml"),
+        "popup:\n  width: \"72%\"\n  height: \"60%\"\n",
+    )
+    .unwrap();
+    let env = BTreeMap::from([(
+        "XDG_CONFIG_HOME".to_string(),
+        config_home.display().to_string(),
+    )]);
+    let exe = std::env::current_exe().unwrap().display().to_string();
+
+    let session_mock = MockTmuxRunner::new();
+    session_mock.stub(
+        &["display-message", "-p", "#{pane_current_path}"],
+        "/tmp/project\n",
+    );
+    session_mock.stub(
+        &[
+            "display-popup",
+            "-E",
+            "-w",
+            "72%",
+            "-h",
+            "60%",
+            "-d",
+            "/tmp/project",
+            &exe,
+            "session-manager",
+            "--popup",
+        ],
+        "",
+    );
+    run_with(["vt", "session-manager"], &session_mock, &env).unwrap();
+
+    let project_mock = MockTmuxRunner::new();
+    let command = crate::project::project_selector_popup_command(&exe);
+    project_mock.stub(
+        &[
+            "display-popup",
+            "-E",
+            "-w",
+            "72%",
+            "-h",
+            "60%",
+            "-d",
+            "#{pane_current_path}",
+            &command,
+        ],
+        "",
+    );
+    run_with(
+        ["vt", "project", "selector", "--popup"],
+        &project_mock,
+        &env,
+    )
+    .unwrap();
+
+    std::fs::remove_dir_all(config_home).unwrap();
+}
+
+#[test]
+fn dispatch_session_manager_renders_preview() {
+    let mock = MockTmuxRunner::new();
+    let session_format = crate::session::session_list_format();
+    let window_format = [
+        "#{session_name}",
+        "#{window_index}",
+        "#{window_id}",
+        "#{window_name}",
+        "#{window_panes}",
+        "#{window_active}",
+        "#{pane_current_command}",
+    ]
+    .join("\t");
+    mock.stub(
+        &["list-sessions", "-F", &session_format],
+        "ni.zsh\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
+    );
+    mock.stub(
+        &["list-windows", "-t", "=ni.zsh:", "-F", &window_format],
+        "ni.zsh\t2\t@9\teditor\t2\t1\tnvim\n",
+    );
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "=ni.zsh:",
+            "#{pane_current_path}",
+        ],
+        "/tmp/project\n",
+    );
+    mock.stub(
+        &["capture-pane", "-epJ", "-t", "=ni.zsh:", "-S", "-30"],
+        "tail\n",
+    );
+
+    let output = run_with(
+        [
+            "vt",
+            "session-manager",
+            "--popup",
+            "--render-preview",
+            "session",
+            "--preview-name",
+            "ni.zsh",
+        ],
+        &mock,
+        &env(),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(output.contains("Session ni.zsh"));
+    assert!(output.contains("tail"));
+}
+
+#[test]
 fn dispatch_statusline_summary_falls_back_to_tmux_snapshot() {
     let mock = MockTmuxRunner::new();
     let format = crate::options::snapshot::snapshot_format();

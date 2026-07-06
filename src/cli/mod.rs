@@ -156,7 +156,13 @@ enum HooksCommand {
 
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
-    Switch { path: String },
+    Switch {
+        path: String,
+    },
+    Selector {
+        #[arg(long)]
+        popup: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -347,6 +353,17 @@ where
             match command {
                 ProjectCommand::Switch { path } => {
                     crate::project::switch_project(runner, &config, &path)?;
+                }
+                ProjectCommand::Selector { popup } => {
+                    if popup {
+                        crate::project::open_project_selector_popup(
+                            runner,
+                            &config.popup,
+                            &std::env::current_exe()?.display().to_string(),
+                        )?;
+                    } else {
+                        crate::project::run_project_selector(runner, &config, env)?;
+                    }
                 }
             }
             Ok(None)
