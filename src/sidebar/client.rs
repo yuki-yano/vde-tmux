@@ -53,24 +53,31 @@ pub fn subscribe(socket: &Path, tx: Sender<DaemonSnapshot>) -> Result<()> {
     thread::spawn(move || {
         let reader = BufReader::new(stream);
         for line in reader.lines() {
-            match line
-                .map_err(anyhow::Error::from)
-                .and_then(|raw| Ok(serde_json::from_str::<ServerMessage>(raw.trim())?))
-            {
-                Ok(ServerMessage::Snapshot { snapshot }) => {
-                    if tx.send(snapshot).is_err() {
-                        break;
-                    }
-                }
-                Ok(ServerMessage::Error { message }) => {
-                    eprintln!("[vde-tmux] daemon subscribe error: {message}");
-                    break;
-                }
-                Ok(_) => {}
+            let raw = match line {
+                Ok(raw) => raw,
                 Err(error) => {
                     eprintln!("[vde-tmux] daemon subscribe read error: {error:#}");
                     break;
                 }
+            };
+            let message = match serde_json::from_str::<ServerMessage>(raw.trim()) {
+                Ok(message) => message,
+                Err(error) => {
+                    eprintln!("[vde-tmux] daemon subscribe decode error: {error:#}");
+                    continue;
+                }
+            };
+            match message {
+                ServerMessage::Snapshot { snapshot } => {
+                    if tx.send(snapshot).is_err() {
+                        break;
+                    }
+                }
+                ServerMessage::Error { message } => {
+                    eprintln!("[vde-tmux] daemon subscribe error: {message}");
+                    break;
+                }
+                _ => {}
             }
         }
     });
@@ -136,6 +143,38 @@ mod tests {
         );
         handle.join().unwrap();
         std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn subscribe_skips_invalid_json_line_and_reads_next_snapshot() {
+        let socket = unique_socket_path("vt-sub-bad");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server_socket = socket.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream).read_line(&mut line).unwrap();
+            let message: ClientMessage = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(message, ClientMessage::Subscribe { proto: 1 });
+
+            stream.write_all(b"{not-json}\n").unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &ServerMessage::Snapshot {
+                    snapshot: crate::daemon::build_snapshot(&[]),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            std::fs::remove_file(server_socket).unwrap();
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        subscribe(&socket, tx).unwrap();
+
+        let snapshot = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(snapshot.agent_count, 0);
+        handle.join().unwrap();
     }
 
     fn unique_socket_path(label: &str) -> PathBuf {

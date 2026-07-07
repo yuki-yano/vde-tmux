@@ -132,4 +132,17 @@ mod tests {
         let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, ServerMessage::Ack);
     }
+
+    #[test]
+    fn snapshot_message_defaults_missing_sidebar_counts() {
+        let json = r#"{"type":"snapshot","snapshot":{"agent_count":0,"rollup":"idle","panes":[],"sidebar":{"state":{"version":0},"rows":[]},"events":[]}}"#;
+
+        let decoded: ServerMessage = serde_json::from_str(json).unwrap();
+
+        let ServerMessage::Snapshot { snapshot } = decoded else {
+            panic!("expected snapshot");
+        };
+        let sidebar = snapshot.sidebar.expect("sidebar frame");
+        assert_eq!(sidebar.counts, crate::sidebar::tree::BadgeCounts::default());
+    }
 }

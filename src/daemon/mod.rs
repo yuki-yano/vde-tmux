@@ -58,6 +58,7 @@ pub struct TransitionEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidebarFrame {
     pub state: SidebarState,
+    #[serde(default)]
     pub counts: BadgeCounts,
     pub rows: Vec<SidebarRow>,
 }
