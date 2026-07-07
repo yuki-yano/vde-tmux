@@ -306,6 +306,23 @@ pub fn is_live_agent_pane(pane: &PaneSnapshot) -> bool {
     !pane.is_sidebar && effective_agent(pane).is_some()
 }
 
+pub fn has_pane_state(pane: &PaneSnapshot) -> bool {
+    [
+        pane.agent.as_str(),
+        pane.status.as_str(),
+        pane.prompt.as_str(),
+        pane.prompt_source.as_str(),
+        pane.wait_reason.as_str(),
+        pane.attention.as_str(),
+        pane.started_at.as_str(),
+        pane.completed_at.as_str(),
+        pane.tasks.as_str(),
+        pane.subagents.as_str(),
+    ]
+    .iter()
+    .any(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

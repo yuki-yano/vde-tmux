@@ -460,6 +460,13 @@ fn handle_runtime_effects(
                     eprintln!("[vde-tmux] session state clear failed: {error:#}");
                 }
             }
+            RuntimeEffect::ClearPaneState { pane_id } => {
+                for key in crate::options::PANE_STATE_KEYS {
+                    if let Err(error) = worker_io.unset_pane_option(&pane_id, key) {
+                        eprintln!("[vde-tmux] pane state clear failed: {pane_id} {key}: {error:#}");
+                    }
+                }
+            }
             RuntimeEffect::Heartbeat(epoch) => {
                 if let Err(error) =
                     worker_io.set_global_option(crate::options::KEY_HEARTBEAT, &epoch.to_string())
@@ -685,6 +692,7 @@ mod tests {
         panes: std::sync::Mutex<Vec<crate::options::snapshot::PaneSnapshot>>,
         jumps: std::sync::Mutex<Vec<String>>,
         previews: std::sync::Mutex<Vec<(String, u32)>>,
+        pane_options: std::sync::Mutex<Vec<(String, String)>>,
         session_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
         global_options: std::sync::Mutex<Vec<(String, Option<String>)>>,
         notify_calls: std::sync::Mutex<Vec<(String, String, String, String)>>,
@@ -713,6 +721,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((pane_id.to_string(), history_lines));
+            Ok(())
+        }
+
+        fn unset_pane_option(&self, pane_id: &str, key: &str) -> anyhow::Result<()> {
+            self.pane_options
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), key.to_string()));
             Ok(())
         }
 
@@ -1027,5 +1043,27 @@ mod tests {
                 "Blocked".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn clear_pane_state_effect_unsets_all_pane_state_keys() {
+        let io = LoopWorkerIo::default();
+
+        handle_runtime_effects(
+            vec![RuntimeEffect::ClearPaneState {
+                pane_id: "%1".to_string(),
+            }],
+            None,
+            &io,
+            None,
+        )
+        .unwrap();
+
+        let calls = io.pane_options.lock().unwrap().clone();
+        let expected = crate::options::PANE_STATE_KEYS
+            .iter()
+            .map(|key| ("%1".to_string(), (*key).to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(calls, expected);
     }
 }

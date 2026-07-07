@@ -1,5 +1,6 @@
 //! @vde_* option バスの契約。キー名の定義と読み書き API はこのモジュールに集約する。
-//! writer 原則(設計書 §3.1): キーごとに writer は 1 箇所。daemon は option を書かない。
+//! writer 原則(設計書 §3.1): キーごとに通常 writer は 1 箇所。
+//! pane state は hook CLI が書き、daemon は stale state の GC として unset のみ行う。
 
 pub mod snapshot;
 

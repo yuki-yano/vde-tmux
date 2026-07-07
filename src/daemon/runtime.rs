@@ -11,7 +11,7 @@ use crate::daemon::{
     render_summary,
 };
 use crate::git::GitBadge;
-use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane};
+use crate::options::snapshot::{PaneSnapshot, effective_agent, has_pane_state, is_live_agent_pane};
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
 use crate::sidebar::state::{RepoId, SidebarAction, SidebarState};
 use crate::sidebar::tree::{
@@ -70,6 +70,9 @@ pub enum RuntimeEffect {
     },
     ClearSessionBadge {
         session: String,
+    },
+    ClearPaneState {
+        pane_id: String,
     },
     Heartbeat(i64),
     ClearHeartbeat,
@@ -216,12 +219,14 @@ impl RuntimeState {
             DaemonEvent::Client { event, .. } => self.apply_client_event(event),
             DaemonEvent::PanesUpdated(panes) => {
                 self.panes = panes;
+                let clear_pane_state_effects = self.clear_stale_pane_state_effects();
                 self.update_unread();
                 self.update_triage();
                 let transition_effects = self.update_transitions();
                 self.rebuild_snapshot();
                 self.broadcast_if_needed();
-                let mut effects = transition_effects;
+                let mut effects = clear_pane_state_effects;
+                effects.extend(transition_effects);
                 effects.extend(self.sync_session_badges());
                 effects.extend(self.sync_heartbeat());
                 effects
@@ -731,6 +736,18 @@ impl RuntimeState {
         effects
     }
 
+    fn clear_stale_pane_state_effects(&self) -> Vec<RuntimeEffect> {
+        self.panes
+            .iter()
+            .filter(|pane| !pane.is_sidebar)
+            .filter(|pane| !is_live_agent_pane(pane))
+            .filter(|pane| has_pane_state(pane))
+            .map(|pane| RuntimeEffect::ClearPaneState {
+                pane_id: pane.pane_id.clone(),
+            })
+            .collect()
+    }
+
     fn render_summary_text(&self) -> String {
         if !self.config.statusline.summary.enabled {
             return String::new();
@@ -990,6 +1007,42 @@ mod tests {
                 |effect| matches!(effect, RuntimeEffect::ClearSessionBadge { session } if session == "main")
             ),
             "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn stale_agent_pane_state_emits_clear_effect() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut stale = agent_pane("main", "%1", "running");
+        stale.current_command = "zsh".to_string();
+        stale.agent_observed = false;
+        stale.prompt = "old prompt".to_string();
+        stale.started_at = "1720000000".to_string();
+        stale.tasks = "1/2".to_string();
+
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![stale]));
+
+        assert!(effects.contains(&RuntimeEffect::ClearPaneState {
+            pane_id: "%1".to_string(),
+        }));
+    }
+
+    #[test]
+    fn plain_shell_pane_without_agent_state_does_not_emit_clear_effect() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![PaneSnapshot {
+            session: "main".to_string(),
+            window_id: "@1".to_string(),
+            pane_id: "%1".to_string(),
+            current_path: "/tmp/app".to_string(),
+            current_command: "zsh".to_string(),
+            ..PaneSnapshot::default()
+        }]));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RuntimeEffect::ClearPaneState { .. }))
         );
     }
 
