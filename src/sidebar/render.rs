@@ -300,52 +300,62 @@ pub fn build_header_layout_with_counts(
     let filter_items = [
         header_filter_item(
             state.filter,
-            StatusFilter::All,
-            "≡",
-            "all",
-            counts.total,
-            None,
-            HeaderAction::SetFilter(StatusFilter::All),
+            HeaderFilterSpec {
+                filter: StatusFilter::All,
+                glyph: "≡",
+                name: "all",
+                count: counts.total,
+                badge_state: None,
+                action: HeaderAction::SetFilter(StatusFilter::All),
+            },
             theme,
         ),
         header_filter_item(
             state.filter,
-            StatusFilter::AttentionOnly,
-            "▲",
-            "attn",
-            counts.blocked,
-            Some(BadgeState::Blocked),
-            HeaderAction::SetFilter(StatusFilter::AttentionOnly),
+            HeaderFilterSpec {
+                filter: StatusFilter::AttentionOnly,
+                glyph: "▲",
+                name: "attn",
+                count: counts.blocked,
+                badge_state: Some(BadgeState::Blocked),
+                action: HeaderAction::SetFilter(StatusFilter::AttentionOnly),
+            },
             theme,
         ),
         header_filter_item(
             state.filter,
-            StatusFilter::WorkingOnly,
-            "●",
-            "working",
-            counts.working,
-            Some(BadgeState::Working),
-            HeaderAction::SetFilter(StatusFilter::WorkingOnly),
+            HeaderFilterSpec {
+                filter: StatusFilter::WorkingOnly,
+                glyph: "●",
+                name: "working",
+                count: counts.working,
+                badge_state: Some(BadgeState::Working),
+                action: HeaderAction::SetFilter(StatusFilter::WorkingOnly),
+            },
             theme,
         ),
         header_filter_item(
             state.filter,
-            StatusFilter::DoneOnly,
-            "✓",
-            "done",
-            counts.done,
-            Some(BadgeState::Done),
-            HeaderAction::SetFilter(StatusFilter::DoneOnly),
+            HeaderFilterSpec {
+                filter: StatusFilter::DoneOnly,
+                glyph: "✓",
+                name: "done",
+                count: counts.done,
+                badge_state: Some(BadgeState::Done),
+                action: HeaderAction::SetFilter(StatusFilter::DoneOnly),
+            },
             theme,
         ),
         header_filter_item(
             state.filter,
-            StatusFilter::IdleOnly,
-            "○",
-            "idle",
-            counts.idle,
-            Some(BadgeState::Idle),
-            HeaderAction::SetFilter(StatusFilter::IdleOnly),
+            HeaderFilterSpec {
+                filter: StatusFilter::IdleOnly,
+                glyph: "○",
+                name: "idle",
+                count: counts.idle,
+                badge_state: Some(BadgeState::Idle),
+                action: HeaderAction::SetFilter(StatusFilter::IdleOnly),
+            },
             theme,
         ),
     ];
@@ -393,14 +403,18 @@ pub fn build_header_layout_with_counts(
     }
 }
 
-fn header_filter_item(
-    active_filter: StatusFilter,
+struct HeaderFilterSpec {
     filter: StatusFilter,
-    glyph: &str,
-    name: &str,
     count: usize,
+    glyph: &'static str,
+    name: &'static str,
     badge_state: Option<BadgeState>,
     action: HeaderAction,
+}
+
+fn header_filter_item(
+    active_filter: StatusFilter,
+    spec: HeaderFilterSpec,
     theme: &SidebarRenderTheme,
 ) -> (
     String,
@@ -409,17 +423,17 @@ fn header_filter_item(
     Option<BadgeState>,
     usize,
 ) {
-    let label = if active_filter == filter {
-        format!("{glyph} {name}:{count}")
+    let label = if active_filter == spec.filter {
+        format!("{} {}:{}", spec.glyph, spec.name, spec.count)
     } else {
-        format!("{glyph} {count}")
+        format!("{} {}", spec.glyph, spec.count)
     };
     (
         format_header_segment(&label, theme),
-        action,
-        filter,
-        badge_state,
-        count,
+        spec.action,
+        spec.filter,
+        spec.badge_state,
+        spec.count,
     )
 }
 

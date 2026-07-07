@@ -97,8 +97,7 @@ fn looks_like_codex_questions_answered(line: &str) -> bool {
 }
 
 fn normalize_question_status_line(line: &str) -> &str {
-    line.trim_start_matches(|ch: char| ch == '•' || ch == '*' || ch == '-')
-        .trim()
+    line.trim_start_matches(['•', '*', '-']).trim()
 }
 
 fn parse_question_index(input: &str) -> Option<&str> {
