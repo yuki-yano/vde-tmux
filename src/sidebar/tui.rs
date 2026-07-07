@@ -30,7 +30,7 @@ use crate::sidebar::client::{
 };
 use crate::sidebar::preview::open_preview_floating_pane;
 use crate::sidebar::render::{
-    BadgeCounts, HeaderAction, HeaderLayout, JumpRowAction, SidebarRenderTheme, build_footer_line,
+    HeaderAction, HeaderLayout, JumpRowAction, SidebarRenderTheme, build_footer_line,
     build_header_layout_with_counts, display_width, header_hit_test, jump_row_action_at,
     render_header_lines, render_lines_with_indices,
 };
@@ -193,7 +193,7 @@ pub fn run_loop<B: Backend>(
                     &sidebar.state,
                     area.width,
                     theme,
-                    BadgeCounts::from_rows(&sidebar.rows),
+                    sidebar.counts,
                 );
                 let areas = compute_areas(area, &header, live.requested_lines);
                 let rendered = render_lines_with_indices(
@@ -520,7 +520,7 @@ fn draw_snapshot_in_area(
         &sidebar.state,
         area.width,
         theme,
-        BadgeCounts::from_rows(&sidebar.rows),
+        sidebar.counts,
     );
     let live_lines = live.map(|live| live.requested_lines).unwrap_or(0);
     let areas = compute_areas(area, &header, live_lines);
@@ -955,7 +955,7 @@ fn handle_left_click(
         &sidebar.state,
         width,
         context.theme,
-        BadgeCounts::from_rows(&sidebar.rows),
+        sidebar.counts,
     );
     if row < header.row_count() {
         match header_hit_test(&header, row, column) {
@@ -1125,7 +1125,7 @@ mod tests {
     use crate::hook::RollupLevel;
     use crate::sidebar::render::{HeaderLayout, HeaderLine};
     use crate::sidebar::state::SidebarState;
-    use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
+    use crate::sidebar::tree::{BadgeCounts, SidebarRow, SidebarRowKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
@@ -1188,6 +1188,7 @@ mod tests {
             panes: Vec::new(),
             sidebar: Some(SidebarFrame {
                 state: SidebarState::default(),
+                counts: BadgeCounts::default(),
                 rows,
             }),
             events: Vec::new(),
@@ -1207,6 +1208,7 @@ mod tests {
             panes: Vec::new(),
             sidebar: Some(SidebarFrame {
                 state: SidebarState::default(),
+                counts: BadgeCounts::default(),
                 rows: vec![row()],
             }),
             events: Vec::new(),
@@ -1234,6 +1236,7 @@ mod tests {
             panes: Vec::new(),
             sidebar: Some(SidebarFrame {
                 state: SidebarState::default(),
+                counts: BadgeCounts::default(),
                 rows: vec![row()],
             }),
             events: Vec::new(),
@@ -1261,6 +1264,7 @@ mod tests {
             panes: Vec::new(),
             sidebar: Some(SidebarFrame {
                 state: SidebarState::default(),
+                counts: BadgeCounts::default(),
                 rows: vec![row()],
             }),
             events: Vec::new(),
@@ -1485,6 +1489,7 @@ mod tests {
             panes: Vec::new(),
             sidebar: Some(SidebarFrame {
                 state: SidebarState::default(),
+                counts: BadgeCounts::default(),
                 rows: Vec::new(),
             }),
             events: Vec::new(),
@@ -1530,6 +1535,7 @@ mod tests {
             panes: Vec::new(),
             sidebar: Some(SidebarFrame {
                 state: SidebarState::default(),
+                counts: BadgeCounts::default(),
                 rows: vec![
                     SidebarRow {
                         id: "repo::misc::app".to_string(),
@@ -1562,6 +1568,7 @@ mod tests {
             panes: Vec::new(),
             sidebar: Some(SidebarFrame {
                 state: SidebarState::default(),
+                counts: BadgeCounts::default(),
                 rows: vec![SidebarRow {
                     id: "repo::misc::app".to_string(),
                     kind: SidebarRowKind::Repo,
@@ -1591,6 +1598,7 @@ mod tests {
             panes: Vec::new(),
             sidebar: Some(SidebarFrame {
                 state: SidebarState::default(),
+                counts: BadgeCounts::default(),
                 rows: vec![
                     SidebarRow {
                         id: "repo::misc::app".to_string(),

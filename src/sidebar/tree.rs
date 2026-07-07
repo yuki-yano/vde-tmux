@@ -54,6 +54,31 @@ pub struct RowMeta {
     pub flash: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BadgeCounts {
+    pub total: usize,
+    pub blocked: usize,
+    pub working: usize,
+    pub done: usize,
+    pub idle: usize,
+}
+
+impl BadgeCounts {
+    pub fn from_rows(rows: &[SidebarRow]) -> Self {
+        let mut counts = Self::default();
+        for row in rows.iter().filter(|row| row.kind == SidebarRowKind::Chat) {
+            counts.total += 1;
+            match row.badge_state {
+                Some(BadgeState::Blocked) => counts.blocked += 1,
+                Some(BadgeState::Working) => counts.working += 1,
+                Some(BadgeState::Done) => counts.done += 1,
+                Some(BadgeState::Idle) | None => counts.idle += 1,
+            }
+        }
+        counts
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AgentPane {
     session: String,
@@ -158,6 +183,7 @@ pub fn build_rows_at_with_git_and_unread(
             now,
         },
     )
+    .0
 }
 
 pub fn build_rows_ctx(
@@ -165,7 +191,7 @@ pub fn build_rows_ctx(
     panes: &[PaneSnapshot],
     state: &SidebarState,
     ctx: &RowBuildContext,
-) -> Vec<SidebarRow> {
+) -> (Vec<SidebarRow>, BadgeCounts) {
     let mut groups: BTreeMap<(String, String), Vec<AgentPane>> = BTreeMap::new();
     for pane in panes {
         if !is_live_agent_pane(pane) {
@@ -220,6 +246,12 @@ pub fn build_rows_ctx(
         }
     }
     order_agent_panes(&mut triage_panes, state);
+    let counts = badge_counts_from_agent_panes(
+        groups
+            .values()
+            .flat_map(|panes| panes.iter())
+            .chain(triage_panes.iter()),
+    );
     for panes in groups.values_mut() {
         panes.retain(|pane| pane_matches_filter(pane, state.filter));
     }
@@ -232,7 +264,23 @@ pub fn build_rows_ctx(
         ViewMode::ByCategory => category_rows(groups, state, &ctx.git, ctx.now, &group_metas),
     };
     rows.append(&mut fleet_rows);
-    rows
+    (rows, counts)
+}
+
+fn badge_counts_from_agent_panes<'a>(
+    panes: impl IntoIterator<Item = &'a AgentPane>,
+) -> BadgeCounts {
+    let mut counts = BadgeCounts::default();
+    for pane in panes {
+        counts.total += 1;
+        match pane.badge_state {
+            BadgeState::Blocked => counts.blocked += 1,
+            BadgeState::Working => counts.working += 1,
+            BadgeState::Done => counts.done += 1,
+            BadgeState::Idle => counts.idle += 1,
+        }
+    }
+    counts
 }
 
 pub fn row_refs(rows: &[SidebarRow]) -> Vec<SidebarRowRef> {
@@ -1381,7 +1429,7 @@ mod tests {
             now: 1000,
             ..RowBuildContext::default()
         };
-        let triage = build_rows_ctx(&Config::default(), &[agent], &expanded_state, &triage_ctx);
+        let triage = build_rows_ctx(&Config::default(), &[agent], &expanded_state, &triage_ctx).0;
         let triage_chat = triage
             .iter()
             .find(|row| row.id == "chat::%1")
@@ -1684,7 +1732,8 @@ mod tests {
                     unread: BTreeMap::from([("%2".to_string(), true)]),
                     ..RowBuildContext::default()
                 },
-            );
+            )
+            .0;
 
             assert_eq!(rows.len(), 1, "{filter:?}");
             assert_eq!(rows[0].pane_id.as_deref(), Some(expected), "{filter:?}");
@@ -1802,7 +1851,7 @@ mod tests {
             ..RowBuildContext::default()
         };
 
-        let rows = build_rows_ctx(&Config::default(), &[blocked, running], &state, &ctx);
+        let rows = build_rows_ctx(&Config::default(), &[blocked, running], &state, &ctx).0;
 
         assert_eq!(rows[0].id, "zone::triage");
         assert_eq!(rows[0].chat_count, 1);
@@ -1829,7 +1878,8 @@ mod tests {
                 now: 1000,
                 ..RowBuildContext::default()
             },
-        );
+        )
+        .0;
 
         assert!(rows.iter().all(|row| row.kind != SidebarRowKind::Zone));
     }
@@ -1850,7 +1900,7 @@ mod tests {
             ..RowBuildContext::default()
         };
 
-        let rows = build_rows_ctx(&Config::default(), &[blocked, idle], &state, &ctx);
+        let rows = build_rows_ctx(&Config::default(), &[blocked, idle], &state, &ctx).0;
 
         assert!(rows.iter().any(|row| row.id == "chat::%1"));
         assert!(rows.iter().all(|row| row.id != "chat::%2"));
@@ -1858,6 +1908,42 @@ mod tests {
             rows.first().map(|row| row.id.as_str()),
             Some("zone::triage")
         );
+    }
+
+    #[test]
+    fn counts_are_computed_before_filter_and_include_triage() {
+        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        let working = pane("main", "%2", "/tmp/app", "claude", "running");
+        let idle_a = pane("main", "%3", "/tmp/app", "opencode", "idle");
+        let idle_b = pane("main", "%4", "/tmp/app", "claude", "idle");
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            filter: crate::sidebar::state::StatusFilter::AttentionOnly,
+            ..SidebarState::default()
+        };
+        let ctx = RowBuildContext {
+            triage: BTreeSet::from(["%1".to_string()]),
+            now: 1000,
+            ..RowBuildContext::default()
+        };
+
+        let (rows, counts) = build_rows_ctx(
+            &Config::default(),
+            &[blocked, working, idle_a, idle_b],
+            &state,
+            &ctx,
+        );
+
+        assert!(rows.iter().any(|row| row.id == "chat::%1"));
+        assert!(rows.iter().any(|row| row.id == "chat::%2"));
+        assert!(rows.iter().all(|row| row.id != "chat::%3"));
+        assert!(rows.iter().all(|row| row.id != "chat::%4"));
+        assert_eq!(counts.total, 4);
+        assert_eq!(counts.blocked, 1);
+        assert_eq!(counts.working, 1);
+        assert_eq!(counts.done, 0);
+        assert_eq!(counts.idle, 2);
     }
 
     #[test]
@@ -1875,7 +1961,7 @@ mod tests {
             ..RowBuildContext::default()
         };
 
-        let rows = build_rows_ctx(&Config::default(), &[blocked, running], &state, &ctx);
+        let rows = build_rows_ctx(&Config::default(), &[blocked, running], &state, &ctx).0;
         let repo = rows
             .iter()
             .find(|row| row.kind == SidebarRowKind::Repo)
@@ -1901,7 +1987,7 @@ mod tests {
             ..RowBuildContext::default()
         };
 
-        let rows = build_rows_ctx(&Config::default(), &[calm, running], &state, &ctx);
+        let rows = build_rows_ctx(&Config::default(), &[calm, running], &state, &ctx).0;
         let repo = rows
             .iter()
             .find(|row| row.kind == SidebarRowKind::Repo)
@@ -1928,7 +2014,7 @@ mod tests {
             ..RowBuildContext::default()
         };
 
-        let rows = build_rows_ctx(&Config::default(), &[blocked], &state, &ctx);
+        let rows = build_rows_ctx(&Config::default(), &[blocked], &state, &ctx).0;
         let chat = rows.iter().find(|row| row.id == "chat::%1").expect("chat");
         let meta = chat.meta.as_ref().expect("chat meta");
 
@@ -1950,7 +2036,7 @@ mod tests {
             ..RowBuildContext::default()
         };
 
-        let rows = build_rows_ctx(&Config::default(), &[blocked], &state, &ctx);
+        let rows = build_rows_ctx(&Config::default(), &[blocked], &state, &ctx).0;
         let origin_row = rows
             .iter()
             .find(|row| row.id == "detail::%1::origin")
@@ -1975,7 +2061,7 @@ mod tests {
             ..RowBuildContext::default()
         };
 
-        let rows = build_rows_ctx(&Config::default(), &[selected, second, other], &state, &ctx);
+        let rows = build_rows_ctx(&Config::default(), &[selected, second, other], &state, &ctx).0;
 
         assert!(rows.iter().any(|row| row.id == "detail::%1::state"));
         assert!(rows.iter().any(|row| row.id == "jump::%1"));
@@ -1999,7 +2085,8 @@ mod tests {
             &[p],
             &state,
             &RowBuildContext::default(),
-        );
+        )
+        .0;
 
         assert!(rows.iter().any(|row| row.id == "jump::%1"));
     }

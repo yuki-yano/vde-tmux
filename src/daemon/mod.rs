@@ -21,7 +21,7 @@ use crate::daemon::session_badge::{BadgeState, badge_state, glyph_for_state};
 use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
 use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane, read_all_panes};
 use crate::sidebar::state::SidebarState;
-use crate::sidebar::tree::{SidebarRow, now_epoch_secs};
+use crate::sidebar::tree::{BadgeCounts, SidebarRow, now_epoch_secs};
 use crate::tmux::TmuxRunner;
 
 const ENV_DAEMON_SOCKET: &str = "VDE_DAEMON_SOCKET";
@@ -58,6 +58,7 @@ pub struct TransitionEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidebarFrame {
     pub state: SidebarState,
+    pub counts: BadgeCounts,
     pub rows: Vec<SidebarRow>,
 }
 

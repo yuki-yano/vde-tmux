@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sidebar Header 実装仕様(案E採用)</title>
+<style>
+  :root {
+    --bg: #f6f5fa;
+    --text: #2a2733;
+    --muted: #6b6580;
+    --accent: #6f66d6;
+    --card-border: #e3e0ee;
+    --card-bg: #ffffff;
+    --code-bg: #edebf5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131118;
+      --text: #e4e1f0;
+      --muted: #9a94ad;
+      --accent: #a9a4f2;
+      --card-border: #2a2740;
+      --card-bg: #1a1723;
+      --code-bg: #241f33;
+    }
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    line-height: 1.75;
+    margin: 0;
+    padding: 3rem 1.25rem 5rem;
+  }
+  main { max-width: 46rem; margin: 0 auto; display: flex; flex-direction: column; gap: 2.5rem; }
+
+  h1, h2, .eyebrow, code, .term {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "JetBrains Mono", monospace;
+  }
+  .eyebrow {
+    color: var(--accent);
+    font-size: 0.75rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    margin: 0 0 0.5rem;
+  }
+  h1 { font-size: 1.5rem; margin: 0 0 0.75rem; text-wrap: balance; }
+  h2 { font-size: 1.05rem; margin: 0; }
+  .lead { color: var(--muted); margin: 0; font-size: 0.95rem; }
+  code {
+    background: var(--code-bg);
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+    font-size: 0.85em;
+  }
+
+  .card {
+    border: 1px solid var(--card-border);
+    border-radius: 10px;
+    background: var(--card-bg);
+    padding: 1.5rem 1.5rem 1.25rem;
+  }
+  .card-head { display: flex; align-items: baseline; gap: 0.75rem; margin-bottom: 0.35rem; }
+  .tag {
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    padding: 0.05rem 0.6rem;
+    white-space: nowrap;
+  }
+  .concept { color: var(--muted); font-size: 0.9rem; margin: 0 0 1rem; }
+  .notes { margin: 1rem 0 0; padding-left: 1.2rem; font-size: 0.875rem; color: var(--muted); }
+  .notes li { margin: 0.2rem 0; }
+  .notes strong { color: var(--text); font-weight: 600; }
+  .rules { margin: 0.5rem 0 0; padding-left: 1.2rem; font-size: 0.9rem; }
+  .rules li { margin: 0.35rem 0; }
+
+  /* ---- terminal mockup (実機のダーク配色で固定) ---- */
+  .term {
+    background: #191627;
+    color: #dcd9ec;
+    border: 1px solid #2c2842;
+    border-radius: 8px;
+    padding: 0.7rem 0;
+    font-size: 13px;
+    line-height: 1.5;
+    overflow-x: auto;
+  }
+  .t { white-space: pre; padding: 0 0.75rem; min-width: max-content; }
+
+  /* ANSI 相当 */
+  .lav  { color: #aca7f4; }  /* Indexed(147) header_mode */
+  .pch  { color: #ffaf5f; }  /* Indexed(215) category */
+  .red  { color: #f0716f; }  /* badge_blocked */
+  .grn  { color: #79c986; }  /* badge_working */
+  .cyn  { color: #6fd3d6; }  /* badge_done */
+  .brn  { color: #7aa9b8; }  /* Indexed(73) branch */
+  .gry  { color: #a5a1b5; }  /* Indexed(248) badge_idle */
+  .dim  { color: #5a5670; }  /* marker (darkgray) */
+  .det  { color: #918da3; }  /* Indexed(246) detail */
+  .b    { font-weight: 700; }
+
+  /* powerline セグメント: 実機は bg 塗り + nerd font  (U+E0B0) */
+  .seg  { background: #aca7f4; color: #191627; font-weight: 700; }
+  .seg2 { background: #2b2740; color: #918da3; }
+  .arr {
+    display: inline-block;
+    width: 0; height: 0;
+    border-top: 0.62em solid transparent;
+    border-bottom: 0.62em solid transparent;
+    border-left: 0.62ch solid #aca7f4;
+    vertical-align: -0.28em;
+  }
+  .arr-into-seg2 { border-left-color: #aca7f4; background: #2b2740; height: auto; border-top-width: 0.62em; border-bottom-width: 0.62em; }
+  .arr2 { border-left-color: #2b2740; }
+
+  /* チップ: 実機は前後1スペースの矩形 bg 塗り(角丸は HTML 上の演出) */
+  .chip { background: #2b2740; border-radius: 5px; padding: 0 0.5ch; }
+  .chip-active-all { background: #aca7f4; color: #191627; font-weight: 700; border-radius: 5px; padding: 0 0.5ch; }
+  .chip-active-red { background: #f0716f; color: #191627; font-weight: 700; border-radius: 5px; padding: 0 0.5ch; }
+  .chip-zero { color: #5a5670; padding: 0 0.5ch; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">vde-tmux / sidebar / plan-26</p>
+    <h1>Sidebar Header 実装仕様(案E採用)</h1>
+    <p class="lead">
+      検討した5案(powerline バッジ / タブ+罫線 / タイトルバンド / 分布メーター / バッジ+チップ)のうち
+      「案E: powerline バッジ + フィルタチップの2段構成」を採用。
+      さらに「0件フィルタは適用不可」「適用中に0件になってもヘッダーを維持」の2ルールを組み合わせる。
+      ターミナル部分は実機のダーク配色・ratatui で表現可能な範囲(セル単位の fg/bg・bold・Unicode グリフ)で描いている。
+    </p>
+  </header>
+
+  <!-- ============ ルール ============ -->
+  <section class="card">
+    <div class="card-head"><span class="tag">RULES</span><h2>インタラクションルール</h2></div>
+    <ol class="rules">
+      <li><strong>カウントは常にフィルタ適用前の全体から算出する。</strong>フィルタ中でも他状態の件数が正しく見える(現状はフィルタ後 rows から算出しているため壊れている)。</li>
+      <li><strong>0件のフィルタは適用できない。</strong>0件チップは dim 表示・クリック無効。<code>tab</code> サイクルも0件状態をスキップする。<code>all</code> は常に適用可。</li>
+      <li><strong>適用中に0件になっても自動解除しない。</strong>アクティブチップは状態色反転のまま <code>▲ 0</code> と表示し、リスト領域にフィルタ文脈付きの空状態を出す。</li>
+    </ol>
+  </section>
+
+  <!-- ============ 状態1 ============ -->
+  <section class="card">
+    <div class="card-head"><span class="tag">状態 1</span><h2>通常(all フィルタ)</h2></div>
+    <p class="concept">1行目: モードバッジ(bg 147)+ 総数セグメント(bg 235 系)の powerline 2連。2行目: フィルタチップ。アクティブな all チップは lavender 反転、0件の ✓ チップは dim・非活性。</p>
+    <div class="term">
+      <div class="t"><span class="seg"> ≣ category </span><span class="arr arr-into-seg2"></span><span class="seg2"> 7 tasks </span><span class="arr arr2"></span></div>
+      <div class="t"> <span class="chip-active-all">≡ all 7</span> <span class="chip"><span class="red">▲ 1</span></span> <span class="chip"><span class="grn">● 1</span></span> <span class="chip-zero">✓ 0</span> <span class="chip"><span class="gry">○ 5</span></span></div>
+      <div class="t"> <span class="pch b">TRIAGE</span> <span class="dim">1</span></div>
+      <div class="t"> <span class="red">▌▲</span> vde-tmux <span class="dim">·</span> <span class="brn">fix/sidebar-header</span></div>
+      <div class="t"> <span class="pch b">CODING</span> <span class="dim">1</span></div>
+      <div class="t">  <span class="grn">●</span> obsidian-sync <span class="dim">·</span> <span class="brn">feat/daily-sync</span></div>
+    </div>
+    <ul class="notes">
+      <li>モードバッジ: クリックで view mode サイクル(既存 <code>CycleViewMode</code>)。ラベルは <code>view_mode_label_padded</code> の固定幅を維持し、切替時にチップ位置がずれないようにする。</li>
+      <li>総数セグメント: 非インタラクティブ。fg は detail(246)相当。</li>
+      <li>チップ: クリックで <code>SetFilter</code>(既存挙動)。0件チップはヒットテスト対象外。</li>
+    </ul>
+  </section>
+
+  <!-- ============ 状態2 ============ -->
+  <section class="card">
+    <div class="card-head"><span class="tag">状態 2</span><h2>▲ attn フィルタ適用中</h2></div>
+    <p class="concept">アクティブチップは状態色(赤)で反転。他チップの件数はフィルタ前の全体カウントのまま(ルール1)。リストは blocked のみ + TRIAGE ゾーン(フィルタ対象外)。</p>
+    <div class="term">
+      <div class="t"><span class="seg"> ≣ category </span><span class="arr arr-into-seg2"></span><span class="seg2"> 7 tasks </span><span class="arr arr2"></span></div>
+      <div class="t"> <span class="chip">≡ all 7</span> <span class="chip-active-red">▲ 1</span> <span class="chip"><span class="grn">● 1</span></span> <span class="chip-zero">✓ 0</span> <span class="chip"><span class="gry">○ 5</span></span></div>
+      <div class="t"> <span class="pch b">CODING</span> <span class="dim">1</span></div>
+      <div class="t"> <span class="red">▌▲</span> vde-tmux <span class="dim">·</span> <span class="brn">fix/sidebar-header</span></div>
+    </div>
+    <ul class="notes">
+      <li>アクティブチップの表記は <code>▲ 1</code>(グリフ+件数)のまま。反転で十分区別できるため名前表記への切替はしない。</li>
+      <li>TRIAGE ゾーンは現行実装どおりフィルタの対象外(tree.rs で retain 前に抽出される)。</li>
+    </ul>
+  </section>
+
+  <!-- ============ 状態3 ============ -->
+  <section class="card">
+    <div class="card-head"><span class="tag">状態 3</span><h2>適用中に0件化(空状態)</h2></div>
+    <p class="concept">blocked だった 1 件が working に遷移して attn が0件になった状態。ヘッダーは維持され、アクティブチップは <code>▲ 0</code> のまま反転表示。リスト領域にフィルタ文脈と復帰手段を示す(現状は "no agents" だけ表示されヘッダーごと消える)。</p>
+    <div class="term">
+      <div class="t"><span class="seg"> ≣ category </span><span class="arr arr-into-seg2"></span><span class="seg2"> 7 tasks </span><span class="arr arr2"></span></div>
+      <div class="t"> <span class="chip">≡ all 7</span> <span class="chip-active-red">▲ 0</span> <span class="chip"><span class="grn">● 2</span></span> <span class="chip-zero">✓ 0</span> <span class="chip"><span class="gry">○ 5</span></span></div>
+      <div class="t"></div>
+      <div class="t">   <span class="det">no attn agents</span></div>
+      <div class="t">   <span class="dim">tab: next filter · click ≡ all to reset</span></div>
+    </div>
+    <ul class="notes">
+      <li>rows が空でもヘッダーのチップはクリック可能なので、<code>≡ all</code> クリックが最短の復帰手段になる。</li>
+      <li><code>all</code> フィルタで本当にエージェントが0件のときは従来どおり <code>no agents</code> のみ(フィルタ文脈の行は出さない)。</li>
+    </ul>
+  </section>
+
+  <!-- ============ 実装ノート ============ -->
+  <section class="card">
+    <div class="card-head"><span class="tag">NOTES</span><h2>実装上の制約と表現</h2></div>
+    <ul class="notes">
+      <li><strong>powerline 矢印</strong>: nerd font の <code></code>(U+E0B0)。fg=直前セグメント bg、bg=直後セグメント bg(行末は default bg)。</li>
+      <li><strong>チップ</strong>: 前後1スペースの矩形 bg 塗り。HTML 上の角丸は演出であり実機は矩形でよい。丸めたい場合のみ <code></code>/<code></code>(U+E0B6/U+E0B4)を使う(初期実装ではやらない)。</li>
+      <li><strong>アクティブチップの fg</strong>: 端末背景色に近い暗色(bg との反転)。theme に反転用 fg を追加する。</li>
+      <li><strong>0件チップ</strong>: bg なし・marker 色(darkgray)。枠線は端末では表現しないので dim テキストのみ。</li>
+      <li><strong>幅フォールバック</strong>: 幅が足りない場合は 1行目の総数セグメント(<code> 7 tasks </code>)から省略する。チップははみ出し時に既存の <code>truncate_display</code> で切る。</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

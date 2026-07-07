@@ -1,7 +1,7 @@
 use crate::daemon::session_badge::{BadgeState, glyph_for_state};
 use crate::hook::RollupLevel;
 use crate::sidebar::state::{SidebarState, StatusFilter, ViewMode};
-use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
+use crate::sidebar::tree::{BadgeCounts, SidebarRow, SidebarRowKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -191,31 +191,6 @@ pub enum HeaderAction {
     CycleViewMode,
     ToggleFilter,
     SetFilter(StatusFilter),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BadgeCounts {
-    pub total: usize,
-    pub blocked: usize,
-    pub working: usize,
-    pub done: usize,
-    pub idle: usize,
-}
-
-impl BadgeCounts {
-    pub fn from_rows(rows: &[SidebarRow]) -> Self {
-        let mut counts = Self::default();
-        for row in rows.iter().filter(|row| row.kind == SidebarRowKind::Chat) {
-            counts.total += 1;
-            match row.badge_state {
-                Some(BadgeState::Blocked) => counts.blocked += 1,
-                Some(BadgeState::Working) => counts.working += 1,
-                Some(BadgeState::Done) => counts.done += 1,
-                Some(BadgeState::Idle) | None => counts.idle += 1,
-            }
-        }
-        counts
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

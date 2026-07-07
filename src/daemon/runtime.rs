@@ -15,7 +15,8 @@ use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
 use crate::sidebar::state::{RepoId, SidebarAction, SidebarState};
 use crate::sidebar::tree::{
-    RowBuildContext, SidebarRow, SidebarRowKind, build_rows_ctx, now_epoch_secs, row_refs,
+    BadgeCounts, RowBuildContext, SidebarRow, SidebarRowKind, build_rows_ctx, now_epoch_secs,
+    row_refs,
 };
 
 const STATE_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -140,6 +141,7 @@ impl<T> LatestSlot<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushFingerprint {
     state_version: u64,
+    counts: BadgeCounts,
     rows: Vec<String>,
 }
 
@@ -150,6 +152,7 @@ pub struct RuntimeState {
     pub panes: Vec<PaneSnapshot>,
     git_badges: BTreeMap<String, GitBadge>,
     rows: Vec<SidebarRow>,
+    counts: BadgeCounts,
     snapshot: Option<DaemonSnapshot>,
     clients: BTreeMap<ClientId, Arc<LatestSlot<ServerMessage>>>,
     last_pushed: Option<PushFingerprint>,
@@ -174,6 +177,7 @@ impl RuntimeState {
             panes: Vec::new(),
             git_badges: BTreeMap::new(),
             rows: Vec::new(),
+            counts: BadgeCounts::default(),
             snapshot: None,
             clients: BTreeMap::new(),
             last_pushed: None,
@@ -254,7 +258,7 @@ impl RuntimeState {
     }
 
     pub fn rebuild_snapshot(&mut self) {
-        self.rows = build_rows_ctx(
+        let (rows, counts) = build_rows_ctx(
             &self.config,
             &self.panes,
             &self.ui_state,
@@ -266,8 +270,11 @@ impl RuntimeState {
                 now: now_epoch_secs(),
             },
         );
+        self.rows = rows;
+        self.counts = counts;
         let sidebar = SidebarFrame {
             state: self.ui_state.clone(),
+            counts: self.counts,
             rows: self.rows.clone(),
         };
         let mut snapshot = build_snapshot_with_sidebar(&self.panes, Some(sidebar));
@@ -287,6 +294,7 @@ impl RuntimeState {
     pub fn current_fingerprint(&self) -> PushFingerprint {
         PushFingerprint {
             state_version: self.ui_state.version,
+            counts: self.counts,
             rows: self
                 .rows
                 .iter()
