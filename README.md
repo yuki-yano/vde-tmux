@@ -1,31 +1,161 @@
 # vde-tmux
 
-tmux 上の state と UI の管理ツール(セッション/カテゴリ管理、statusline、エージェントサイドバー)。
+**English** | [日本語](./README.ja.md)
 
-[vde-tmux-manager](https://github.com/yuki-yano/vde-tmux-manager) と
-[vde-tmux-sidebar](https://github.com/yuki-yano/vde-tmux-sidebar) を参考実装として
-スクラッチで書き直し中。バイナリは `vt`(常用)と `vde-tmux`(正式名)の 2 つで、同一 CLI を提供する。
+A tmux state & UI manager for AI coding agents.
+vde-tmux tracks every Claude Code / Codex / opencode pane on your tmux server and surfaces their status through the tmux status line and a dedicated sidebar, together with category-based session management and fzf-powered session/project switching.
 
-設計・進捗はローカルの設計書(`2026-07-04-vde-tmux-rewrite-design.md`)を参照。
+![vde-tmux sidebar](https://github.com/user-attachments/assets/e912448f-b657-49d9-b175-39a0cbad04f2)
 
-## 機能
+## Why
 
-- session/category: `statusline-sessions`、`statusline-sessions --show-index`、`statusline-category`、category 切替、session cycle、project switch、session-manager。
-- hook: `vt hook claude`、`vt hook codex`、`vt hook emit` で agent 状態を `@vde_*` pane option に書く。`SessionStart` では stale state を clear し、resume 時は transcript から直近 user prompt を復元する。
-- daemon/statusline: `vt daemon`、`vt daemon stop`、`vt statusline-summary`、`vt statusline-attention`。daemon が使えない場合は tmux option snapshot を直接読む。
-- session badge: daemon が session ごとの agent 状態を 4 状態(▲ Blocked、● Working、✓ Done 未読、○ Idle 既読)に集約し、`statusline-sessions` の session ラベルへ前置する。
-- sidebar: `vt sidebar open`、`toggle`、`toggle --all`、`close`、`rail`、`rebaseline`、`layout-applied`、`attach`、`input`、`jump`、`focus`。
-- git badge: sidebar の repo 行に branch と ahead/behind を表示する。upstream が無い場合は branch のみを表示する。
+Running several AI coding agents in parallel across tmux sessions quickly becomes a monitoring problem: one agent is waiting for your permission, another finished minutes ago, a third is still working, and none of that is visible unless you visit each pane.
+vde-tmux watches all agent panes and answers one question at a glance: **which pane needs me right now?**
 
-sidebar の配色は 5 族の規約で運用する。状態族は `badge.colors` 由来の ▲ blocked・● working・✓ done・○ idle、構造族は repo 青太字・category ピーチ太字・branch 淡シアン(Indexed 73)、操作族は toggle/mode/active/preview のラベンダー系、本文族は通常本文・detail(246)・marker 暗灰、実況族は LIVE/EVENTS 見出し専用のマゼンタ。branch の既定色は ✓ done の明シアンとの衝突を避けるため、従来の Cyan から Indexed 73 に変更した。`sidebar.colors.branch` を設定すれば従来色にも戻せる。
+## Features
 
-## Config
+- **Agent status tracking** — every agent pane is classified into four states: `▲` Blocked (waiting for your input), `●` Working, `✓` Done (finished, unread), `○` Idle.
+- **Status line segments** — a session list with per-session agent badges, state summary counts (`▲2 ●1`), and an attention indicator for blocked agents in sessions you are not currently looking at (`▲ session · perm 2m`).
+- **Agent sidebar** — a TUI pane that lists all agent panes with their state, latest prompt, and elapsed time. Jump to a pane, preview its scrollback, or watch a live tail of its output.
+- **Session categories** — group sessions into categories (e.g. `work` / `private`) with path or session-name rules, then cycle between categories and between the sessions inside one.
+- **Session & project switching** — an fzf-based session manager and a ghq-based project selector, both usable as tmux popups.
+- **Notifications** — optionally run any command (e.g. `terminal-notifier`) the moment an agent becomes blocked.
 
-設定ファイルは `~/.config/vde/tmux/config.yml`。
-旧 vtm/sidebar config からの自動移行はしない。
-JSON Schema は `schemas/config.schema.json` に配置する。
-YAML LSP では config の先頭に `# yaml-language-server: $schema=/path/to/vde-tmux/schemas/config.schema.json` を置く。
-同じ schema は `vt config schema` でも出力できる。
+## Requirements
+
+- **tmux** 3.2+ (popups are used for the session manager, project selector, and sidebar preview)
+- **Rust toolchain** (edition 2024; Rust 1.85 or later) to build from source
+- **fzf** — required by the session manager and project selector
+- **ghq** — required by the project selector
+- **git** — used for repository/branch badges in the sidebar
+- **less** — used by the sidebar preview pager
+
+## Installation
+
+```bash
+git clone https://github.com/yuki-yano/vde-tmux
+cd vde-tmux
+cargo install --path .
+```
+
+This installs two binaries that provide the identical CLI:
+
+- `vt` — short alias for everyday use
+- `vde-tmux` — full name
+
+The examples below use `vt`.
+
+## Getting started
+
+### 1. Add the status line segments
+
+In `~/.tmux.conf`:
+
+```tmux
+set -g status-interval 1
+set -g status-left '#(vt statusline-category)#(vt statusline-sessions --show-index)'
+set -g status-right '#(vt statusline-attention) #(vt statusline-summary)'
+```
+
+- `statusline-category` — the current category (and the other categories, depending on config)
+- `statusline-sessions` — sessions in the current category, each prefixed with an agent state badge
+- `statusline-summary` — state counts across all agents, e.g. `▲2 ●1`
+- `statusline-attention` — blocked agents you cannot currently see, e.g. `▲ session · perm 2m`
+
+Status updates appear within roughly `daemon.poll_ms + status-interval` (about 2 seconds with the defaults).
+The background daemon that collects agent state is started automatically; you never need to launch it yourself (`vt daemon` / `vt daemon stop` exist for manual control).
+
+### 2. Hook up your agents
+
+Agents are detected even without hooks (from the pane's running command), but hooks give you accurate state transitions, prompts, and timing.
+
+**Claude Code** — add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "vt hook claude SessionStart" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "vt hook claude UserPromptSubmit" }] }],
+    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "vt hook claude PreToolUse" }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "vt hook claude PostToolUse" }] }],
+    "Notification": [{ "hooks": [{ "type": "command", "command": "vt hook claude Notification" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "vt hook claude Stop" }] }]
+  }
+}
+```
+
+**Codex** — add to `~/.codex/config.toml`:
+
+```toml
+notify = ["vt", "hook", "codex"]
+```
+
+**Other agents** — anything can report its state through the generic low-level command:
+
+```bash
+vt hook emit --agent myagent --status running --prompt "fix the build"
+```
+
+### 3. Open the sidebar
+
+```bash
+vt sidebar toggle
+```
+
+Convenient tmux bindings:
+
+```tmux
+bind-key e run-shell "vt sidebar focus-toggle"   # open → focus → close
+bind-key b run-shell "vt sidebar focus"          # return to the sidebar after jumping to a pane
+bind-key s run-shell "vt session-manager --popup"
+bind-key g run-shell "vt project selector --popup"
+```
+
+## Agent states
+
+| Badge | State | Meaning |
+| --- | --- | --- |
+| `▲` | Blocked | The agent is waiting for you (permission prompt, question) |
+| `●` | Working | The agent is running |
+| `✓` | Done | The agent finished and you have not looked at it yet |
+| `○` | Idle | Nothing to do, or already acknowledged |
+
+Glyphs and colors are configurable via `badge.glyphs` and `badge.colors`.
+
+## Sidebar
+
+The sidebar is a TUI pane inside the current tmux window.
+It lists agent panes grouped flat, by repository, or by category, and shows each agent's state, latest prompt, and elapsed time (`45s`, `12m`, `1h30m`, ...).
+Expanding a row reveals the full prompt and the pane's location, and the sidebar auto-follows window layout changes.
+
+### Key bindings
+
+| Key | Action |
+| --- | --- |
+| `j` / `k`, `↓` / `↑` | Move down / up |
+| `Enter` | Jump to the selected agent pane |
+| `Space` | Expand / collapse the selected row |
+| `v`, `1` / `2` / `3` | Cycle / set view mode (Flat / ByRepo / ByCategory) |
+| `Tab` | Cycle filter (all → attn → working → done → idle; empty filters are skipped) |
+| `n` / `N` | Focus next / previous row that needs attention |
+| `J` / `K` | Reorder pinned rows |
+| `p` | Preview the pane's scrollback in a floating pane (`less`) |
+| `e` | Toggle the live-output mode |
+| `q` / `Esc` | Close the sidebar TUI |
+
+### Sidebar commands
+
+```bash
+vt sidebar open [--width 40|20%]   # open in the current window
+vt sidebar toggle [--all]          # toggle (optionally in all windows)
+vt sidebar focus-toggle            # open if hidden, focus if unfocused, close if focused
+vt sidebar rail                    # collapse to a minimal rail
+vt sidebar close
+```
+
+## Sessions, categories, and projects
+
+Sessions are grouped into **categories** (e.g. `work`, `private`) using rules on the project path or the session name:
 
 ```yaml
 categories:
@@ -34,81 +164,68 @@ categories:
     - category: work
       path_patterns:
         - github.com/acme/*
+```
+
+- `vt category next` / `vt category prev` / `vt category use <name>` — switch category; vde-tmux remembers the last session you used in each category and returns to it
+- `vt session-cycle next` / `vt session-cycle prev` — cycle through the sessions of the current category
+- `vt session set-category <session> <category>` — manually override a session's category
+- `vt session-manager --popup` — fzf UI to switch or kill sessions, windows, and panes
+- `vt project switch <path>` / `vt project selector --popup` — create or switch to a session for a ghq-managed project
+
+## Configuration
+
+The config file lives at `~/.config/vde/tmux/config.yml` (respects `$XDG_CONFIG_HOME`).
+Everything has sensible defaults; a missing config file is fine.
+
+A JSON Schema ships at `schemas/config.schema.json` and is also printed by `vt config schema`.
+For YAML language servers, put this at the top of your config:
+
+```yaml
+# yaml-language-server: $schema=/path/to/vde-tmux/schemas/config.schema.json
+```
+
+A typical starting point:
+
+```yaml
+categories:
+  default_category: misc
+  rules:
+    - category: work
+      path_patterns:
+        - github.com/acme/*
+
 statusline:
-  category:
-    format: "{category} {count} "
   sessions:
-    badge_style: inline
+    badge_style: inline   # inline | plain | outer
   summary:
     enabled: true
-  session_badge:
+
+sidebar:
+  width: "20%"            # columns or percentage
+  min_width: 40
+  live:
     enabled: true
-    suffix: ""
-    hide_idle: false
+    lines: 3
+
 badge:
   glyphs:
     blocked: "▲"
     working: "●"
     done: "✓"
     idle: "○"
-sidebar:
-  width: "10%"
-  min_width: 40
-  preview:
-    history_lines: 2000
-  live:
-    enabled: true
-    lines: 3
-    interval_ms: 2000
-  header:
-    format: " {label} "
-    prefix: ""
-    suffix: ""
-    bold: true
-    colors:
-      fg: "16"
-      bg: "147"
-      outer_bg: "235"
-  colors:
-    selection_bg: "237"
-    toggle: "147"
-    category: "215"
-    header_mode: "147"
-    # active filter chip の文字色。未指定なら header.colors.fg と同じ解決順
-    header_chip_fg: ""
-    # "N tasks" チップの背景色。未指定なら active_bg
-    header_total_bg: ""
-    # "N tasks" チップの "tasks" ラベル文字色。未指定なら detail
-    header_total_fg: ""
-    active_bg: "235"
-    active_bar: "147"
-daemon:
-  poll_ms: 1000
+
 notify:
-  enabled: false
-  # blocked 遷移時だけ実行する。環境変数 VDE_PANE_ID / VDE_AGENT / VDE_BADGE_STATE を渡す。
-  command: "terminal-notifier -title vde-tmux -message \"$VDE_AGENT $VDE_BADGE_STATE\""
+  enabled: true
+  # Runs only when an agent transitions to blocked.
+  # Receives VDE_PANE_ID / VDE_AGENT / VDE_BADGE_STATE as environment variables.
+  command: 'terminal-notifier -title vde-tmux -message "$VDE_AGENT $VDE_BADGE_STATE"'
 ```
 
-## Statusline
+`${ENV_VAR}` expansion is available inside `path_patterns` and session-name `patterns`.
 
-tmux 側は `status-interval 1` を推奨する。
-実際の反映遅延は、おおむね `daemon.poll_ms + status-interval` になる。
+### Recommended status line colors
 
-```tmux
-set -g status-interval 1
-set -g status-left '#(vt statusline-category)#(vt statusline-sessions --show-index)'
-set -g status-right '#(vt statusline-attention) #(vt statusline-summary)'
-```
-
-`statusline-summary` は状態別カウントを `▲2 ●1` 形式で表示する。
-`statusline-attention` は見えていない session の blocked agent を `▲ session · perm 2m` 形式で表示する。
-daemon heartbeat が stale になると、`statusline-sessions` の既存バッジは `?` に置き換わる。
-
-### D3改配色（推奨プリセット）
-
-設計根拠と全案比較は `docs/statusline-color-proposals.html` を参照。
-状態グリフは常にバー地の上に置き、塗りはカレント要素の名前だけに使う。
+A truecolor preset that keeps state glyphs readable on the bar and uses fills only for the current element:
 
 ```yaml
 # ~/.config/vde/tmux/config.yml
@@ -122,7 +239,6 @@ statusline:
       bg: "#453f9e"
     inactive_colors:
       fg: "#9591ad"
-
   sessions:
     badge_style: outer
     current:
@@ -135,14 +251,6 @@ statusline:
       format: " {session} "
       colors:
         fg: "#9591ad"
-
-# badge.colors は既定で D3改の hex（変更する場合のみ記述）
-# badge:
-#   colors:
-#     blocked: "#ff6b6b"
-#     working: "#4fd08a"
-#     done: "#45cbe6"
-#     idle: "#a8a8b2"
 ```
 
 ```tmux
@@ -156,76 +264,19 @@ set -g window-status-bell-style 'fg=#ff6b6b'
 set -g window-status-activity-style 'fg=#ff6b6b'
 ```
 
-塗りは矩形で使う。
-breadcrumb 等でバーの下に別の面を重ねている場合、その地色を `#121218` 目安まで一段暗くしないとバー地 `#1a1926` と同化する。
-hex 色をそのまま使うには tmux の truecolor 設定が必要になる。
+Hex colors require tmux truecolor support (the `terminal-overrides` line above).
 
-## Sidebar Header
+## Files and runtime paths
 
-sidebar header は 2 行構成で表示する。
-1 行目は `≣ repo      7 tasks ` のような mode badge と総数セグメント、2 行目は `≡ all 7  ▲ 1  ● 1  ✓ 0  ○ 5` の filter chip 列。
+- Config: `~/.config/vde/tmux/config.yml`
+- State: `$XDG_STATE_HOME/vde/tmux/state.json` (falls back to `~/.local/state/vde/tmux/state.json`)
+- Daemon socket: `$VDE_DAEMON_SOCKET` if set, else `$XDG_RUNTIME_DIR/vde-tmux/daemon.sock`, else `/tmp/vde-tmux-<uid>/daemon.sock`
 
-chip は状態に応じて表示を分ける。
-状態 chip の glyph は `badge.glyphs` に従い、`≡ all` の glyph だけは固定。
-アクティブ chip は状態色 bg + 暗色 fg + bold で反転し、適用中に 0 件になっても `▲ 0` の反転表示を維持する。
-非アクティブかつ非 0 件の chip は `active_bg` bg + 状態色 fg、0 件 chip は marker 色の dim 表示でクリック対象外。
-`all` は常に適用でき、`tab` filter cycle は 0 件状態をスキップする。
+## Known limitations
 
-件数は filter 適用前の全 agent pane から算出するため、filter 中も他状態の件数は変わらない。
-`▲` は blocked 専用件数ではなく、attn ビューに表示される agent pane 数を示す。
-このため explicit attention・blocked・working の pane が `▲` 件数と `tab` cycle の対象になる。
-filter 適用中に rows が空になっても header は残り、rows 領域に `no attn agents` と `tab: next filter · click ≡ all to reset` を表示する。
-`all` filter で本当に 0 件のときは `no agents` のみ表示する。
+- Agent detection prefers hook-provided state; without hooks it falls back to the pane's running command (`claude`, `codex`, `opencode`) and can mark a pane as blocked only when a permission prompt is recognizable in the visible pane content.
+- Closing the sidebar preview with `Esc` relies on `less` supporting `LESSKEYIN`; very old `less` versions may need `q` instead.
 
-`sidebar.header` は statusline の segment と同じ考え方で、`format` / `prefix` / `suffix` / `bold` / `colors` を設定できる。
-`format` の `{label}` は `≣ repo` などの固定幅 mode label に置換される。
-既定の `suffix: ""` は mode badge と総数セグメントを powerline 表示にし、`suffix: ""` にすると矢印なしの矩形塗りになる。
-`suffix` が非空なら mode badge 後と総数セグメント後の両方に同じ glyph を描画する。
-`colors.bg` は mode badge とアクティブな `all` chip の背景色に使い、`colors.outer_bg` は suffix の遷移先背景色として使う。
-filter chip の前後キャップは `chip_prefix` / `chip_suffix` で指定でき、空文字ならキャップなしの矩形表示になる。
-`sidebar.header.powerline` と `separator` は受け付けない。
+## License
 
-## Sidebar Detail View
-
-sidebar の Standard 幅で chat 行を展開すると、左側は `${agent}`、右端は `${state} ${time}` を表示する。prompt は展開内の先頭 detail 行に集約する。
-
-展開メタは `prompt 行 + 場所行` を表示し、state 情報は親 chat 行の右端に集約する。右端の state と時間は状態色で表示する。場所行は `vde-tmux · %51` の形式で session と pane id を detail 色で表示する。
-
-時間表記は `45s` / `12m` / `1h30m` / `38h` / `2d` のように humanize する。running / blocked は `started_at` からの経過、idle / done は `completed_at` からの `done {t} ago` を表示し、`completed_at` が無い idle は時間部を省略する。
-
-## State / Socket
-
-sidebar state は `$XDG_STATE_HOME/vde/tmux/state.json`、未設定なら
-`~/.local/state/vde/tmux/state.json` を使う。
-daemon socket は `VDE_DAEMON_SOCKET` 明示指定を優先し、次に
-`$XDG_RUNTIME_DIR/vde-tmux/daemon.sock`、最後に `/tmp/vde-tmux-<uid>/daemon.sock` を使う。
-socket directory は 0700 の通常ディレクトリであることを検証する。
-
-## Sidebar jump & return
-
-サイドバーから Enter で agent pane に jump した後、tmux バインドで sidebar に戻れる。
-
-```tmux
-bind-key b run-shell "vt sidebar focus"
-```
-
-## Known Limits
-
-- Agent pane の生存判定は hooks が書いた `@vde_agent` を優先し、未設定なら `pane_current_command` が `claude`、`codex`、`opencode` のいずれかであることを見る。hook が動いていない場合でも command から agent を補完し、capture-pane で permission 画面を検出できる範囲では blocked として表示する。
-- Sidebar preview の Esc 終了は `less` の `LESSKEYIN` 対応を使う。現行の手元環境では Esc/q で閉じられることを scratch tmux で確認済みで、古い `less` 向けの追加フォールバックは持たない。
-
-## Option Bus
-
-新実装は `@vde_*` の個別 pane/window/session option を使う。
-旧 `@pane_*` は書かない。
-
-- pane: `@vde_agent`、`@vde_status`、`@vde_prompt`、`@vde_wait_reason`、`@vde_attention`、`@vde_sidebar`
-- window: `@vde_layout_baseline`、`@vde_layout_panes`
-- session: `@vde_category`、`@vde_category_override`、`@vde_project_path`、`@vde_session_status`
-  - `@vde_session_status` の writer は daemon のみ。graceful shutdown 時に daemon が削除する。
-
-## Docs
-
-- [E2E smoke](docs/e2e-smoke.md)
-- [Migration](docs/migration.md)
-- [vde-monitor compatibility](docs/vde-monitor-compat.md)
+[MIT](./LICENSE)
