@@ -52,6 +52,9 @@ pub fn handle_message(
         ClientMessage::SidebarEvent { .. } => Ok(ServerMessage::Error {
             message: "sidebar events require runtime daemon".to_string(),
         }),
+        ClientMessage::RefreshPanes { .. } => Ok(ServerMessage::Error {
+            message: "refresh_panes requires runtime daemon".to_string(),
+        }),
         ClientMessage::Shutdown { .. } => Ok(ServerMessage::Error {
             message: "shutdown requires runtime daemon".to_string(),
         }),
@@ -102,6 +105,16 @@ pub fn handle_stream_with_runtime(
         ClientMessage::SidebarEvent { proto: _, event } => {
             tx.send(DaemonEvent::Client { client_id, event })?;
             write_server_message(&mut stream, &ServerMessage::Ack)?;
+        }
+        ClientMessage::RefreshPanes { proto: _ } => {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            tx.send(DaemonEvent::RefreshPanes { reply: reply_tx })?;
+            let response = reply_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_else(|error| ServerMessage::Error {
+                    message: error.to_string(),
+                });
+            write_server_message(&mut stream, &response)?;
         }
         ClientMessage::Shutdown { proto: _ } => {
             tx.send(DaemonEvent::Shutdown)?;
@@ -342,6 +355,9 @@ pub fn run_runtime_loop(
     let notify_command = state.notify_command().map(str::to_string);
     while state.is_running() {
         let effects = match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(DaemonEvent::RefreshPanes { reply }) => {
+                refresh_panes_once(&mut state, worker_io.as_ref(), reply)
+            }
             Ok(event) => state.apply_event(event),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 state.apply_event(DaemonEvent::DebounceCheck(std::time::Instant::now()))
@@ -364,6 +380,26 @@ pub fn run_runtime_loop(
         notify_command.as_deref(),
     )?;
     Ok(())
+}
+
+fn refresh_panes_once(
+    state: &mut RuntimeState,
+    worker_io: &dyn crate::daemon::workers::WorkerIo,
+    reply: Sender<ServerMessage>,
+) -> Vec<RuntimeEffect> {
+    match crate::daemon::workers::read_panes_with_detection(worker_io, 300) {
+        Ok(panes) => {
+            let effects = state.apply_event(DaemonEvent::PanesUpdated(panes));
+            let _ = reply.send(ServerMessage::Ack);
+            effects
+        }
+        Err(error) => {
+            let _ = reply.send(ServerMessage::Error {
+                message: error.to_string(),
+            });
+            Vec::new()
+        }
+    }
 }
 
 fn handle_runtime_effects(
@@ -646,6 +682,7 @@ mod tests {
 
     #[derive(Default)]
     struct LoopWorkerIo {
+        panes: std::sync::Mutex<Vec<crate::options::snapshot::PaneSnapshot>>,
         jumps: std::sync::Mutex<Vec<String>>,
         previews: std::sync::Mutex<Vec<(String, u32)>>,
         session_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
@@ -656,7 +693,7 @@ mod tests {
 
     impl crate::daemon::workers::WorkerIo for LoopWorkerIo {
         fn read_panes(&self) -> anyhow::Result<Vec<crate::options::snapshot::PaneSnapshot>> {
-            Ok(Vec::new())
+            Ok(self.panes.lock().unwrap().clone())
         }
 
         fn capture_tail(&self, _pane_id: &str) -> anyhow::Result<String> {
@@ -794,6 +831,42 @@ mod tests {
             }
         );
         assert_eq!(io.jumps.lock().unwrap().as_slice(), ["%1"]);
+    }
+
+    #[test]
+    fn runtime_loop_refresh_panes_reads_tmux_and_updates_snapshot() {
+        use crate::daemon::runtime::{DaemonEvent, RuntimeState};
+        use crate::sidebar::state::SidebarState;
+        use std::sync::{Arc, mpsc};
+
+        let io = Arc::new(LoopWorkerIo::default());
+        let mut pane = test_agent_pane("main", "%1", "waiting");
+        pane.wait_reason = "permission_prompt".to_string();
+        io.panes.lock().unwrap().push(pane);
+        let (tx, rx) = mpsc::channel();
+        let (refresh_tx, refresh_rx) = mpsc::channel();
+        tx.send(DaemonEvent::RefreshPanes { reply: refresh_tx })
+            .unwrap();
+        let (summary_tx, summary_rx) = mpsc::channel();
+        tx.send(DaemonEvent::QuerySummary { reply: summary_tx })
+            .unwrap();
+        drop(tx);
+
+        run_runtime_loop(
+            RuntimeState::new(crate::config::Config::default(), SidebarState::default()),
+            rx,
+            None,
+            io,
+        )
+        .unwrap();
+
+        assert_eq!(refresh_rx.recv().unwrap(), ServerMessage::Ack);
+        assert_eq!(
+            summary_rx.recv().unwrap(),
+            ServerMessage::Summary {
+                text: "#[fg=#ff6b6b]▲1#[default]".to_string()
+            }
+        );
     }
 
     #[test]

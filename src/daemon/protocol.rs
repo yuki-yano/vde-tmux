@@ -14,6 +14,9 @@ pub enum ClientMessage {
     Subscribe {
         proto: u16,
     },
+    RefreshPanes {
+        proto: u16,
+    },
     Shutdown {
         proto: u16,
     },
@@ -109,6 +112,15 @@ mod tests {
             json,
             r#"{"op":"sidebar_event","proto":1,"event":{"type":"key","key":"j"}}"#
         );
+        let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn refresh_panes_roundtrips() {
+        let message = ClientMessage::RefreshPanes { proto: 1 };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(json, r#"{"op":"refresh_panes","proto":1}"#);
         let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, message);
     }

@@ -180,11 +180,11 @@ filter 適用中に rows が空になっても header は残り、rows 領域に
 
 ## Sidebar Detail View
 
-sidebar の Standard 幅で chat 行を展開すると、chat 行自体は状態 badge と agent 名のみを表示し、右ラベルは出さない。prompt は展開内の先頭 detail 行に集約する。
+sidebar の Standard 幅で chat 行を展開すると、chat 行自体は `${agent}: ${state} · ${time}` を表示し、右ラベルは出さない。prompt は展開内の先頭 detail 行に集約する。
 
-展開メタは `状態行 + 場所行` の 2 行で表示する。状態行は `state running · 12m`、`state idle · done 38h ago`、`state waiting (permission_prompt) · 2m` の形式で detail 色の説明行として表示し、状態色は親 chat 行の badge に集約する。場所行は `vde-tmux · %51` の形式で session と pane id を detail 色で表示する。
+展開メタは `prompt 行 + 場所行` を表示し、state 情報は親 chat 行に集約する。状態部分は状態色、wait reason や時間は detail 色で表示する。場所行は `vde-tmux · %51` の形式で session と pane id を detail 色で表示する。
 
-時間表記は `45s` / `12m` / `1h30m` / `38h` / `2d` のように humanize する。running / blocked は `started_at` からの経過、idle / done は `completed_at` からの `done {t} ago` を表示し、`completed_at` が無い idle は時間部を省略する。running で tasks total がある場合だけ状態行末尾に `· 3/5 tasks` を追加する。
+時間表記は `45s` / `12m` / `1h30m` / `38h` / `2d` のように humanize する。running / blocked は `started_at` からの経過、idle / done は `completed_at` からの `done {t} ago` を表示し、`completed_at` が無い idle は時間部を省略する。
 
 ## State / Socket
 

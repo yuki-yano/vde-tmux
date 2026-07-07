@@ -345,6 +345,9 @@ where
                         client_name.as_deref(),
                         session_name.as_deref(),
                     )?;
+                    let _ = crate::sidebar::client::request_pane_refresh(
+                        &crate::sidebar::client::socket_path(env),
+                    );
                 }
             }
             Ok(None)

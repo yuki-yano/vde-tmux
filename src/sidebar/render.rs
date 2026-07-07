@@ -769,7 +769,7 @@ fn render_row_line(
     if row.kind == SidebarRowKind::Jump {
         spans.extend(jump_action_spans(&label, theme));
     } else {
-        spans.extend(label_spans(label, row, style));
+        spans.extend(label_spans(label, row, style, theme));
     }
     if let Some(git) = &git {
         spans.push(Span::styled(
@@ -847,7 +847,12 @@ fn push_leading_marker_span(
 
 /// Chat 行のラベルを「agent 名(太字)+ 残り(通常)」に分ける。
 /// それ以外の行、および truncate で agent 名が欠けた場合は単一 span。
-fn label_spans(label: String, row: &SidebarRow, base: Style) -> Vec<Span<'static>> {
+fn label_spans(
+    label: String,
+    row: &SidebarRow,
+    base: Style,
+    theme: &SidebarRenderTheme,
+) -> Vec<Span<'static>> {
     if row.kind == SidebarRowKind::Chat
         && let Some(agent) = row
             .meta
@@ -857,12 +862,47 @@ fn label_spans(label: String, row: &SidebarRow, base: Style) -> Vec<Span<'static
         && label.starts_with(agent)
     {
         let (agent_part, rest) = label.split_at(agent.len());
+        if row.expanded
+            && let Some(state_context) = rest.strip_prefix(": ")
+        {
+            let mut spans = vec![
+                Span::styled(agent_part.to_string(), base.add_modifier(Modifier::BOLD)),
+                Span::styled(": ".to_string(), base),
+            ];
+            spans.extend(state_context_spans(state_context, row, theme));
+            return spans;
+        }
         return vec![
             Span::styled(agent_part.to_string(), base.add_modifier(Modifier::BOLD)),
             Span::styled(rest.to_string(), base),
         ];
     }
     vec![Span::styled(label, base)]
+}
+
+fn state_context_spans(
+    state_context: &str,
+    row: &SidebarRow,
+    theme: &SidebarRenderTheme,
+) -> Vec<Span<'static>> {
+    if state_context.is_empty() {
+        return Vec::new();
+    }
+    let state_len = state_context
+        .find(|ch: char| ch.is_whitespace() || ch == '(')
+        .unwrap_or(state_context.len());
+    let (state, context) = state_context.split_at(state_len);
+    let mut spans = vec![Span::styled(
+        state.to_string(),
+        Style::default().fg(theme.rollup_color(row.rollup)),
+    )];
+    if !context.is_empty() {
+        spans.push(Span::styled(
+            context.to_string(),
+            Style::default().fg(theme.detail),
+        ));
+    }
+    spans
 }
 
 fn toggle_marker_style(theme: &SidebarRenderTheme) -> Style {
@@ -1202,12 +1242,11 @@ fn right_label(row: &SidebarRow) -> Option<String> {
                     .as_ref()
                     .and_then(|meta| meta.elapsed_secs)
                     .map(elapsed_label),
-                RollupLevel::Idle if row.badge_state == Some(BadgeState::Done) => row
+                RollupLevel::Idle => row
                     .meta
                     .as_ref()
                     .and_then(|meta| meta.completed_age_secs)
                     .map(|secs| format!("{} ago", elapsed_label(secs))),
-                RollupLevel::Idle => None,
             }
         }
         SidebarRowKind::Detail | SidebarRowKind::Jump | SidebarRowKind::Zone => None,
@@ -1229,6 +1268,11 @@ fn right_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
                 && right_label(row).is_some() =>
         {
             Style::default().fg(Color::White)
+        }
+        SidebarRowKind::Chat
+            if row.rollup == RollupLevel::Idle && !row.expanded && right_label(row).is_some() =>
+        {
+            Style::default().fg(theme.detail)
         }
         _ => Style::default().fg(theme.rollup_color(row.rollup)),
     }
@@ -1464,6 +1508,15 @@ mod tests {
             active: false,
             meta: None,
         }
+    }
+
+    fn assert_span_fg(spans: &[Span<'_>], content: &str, color: Color) {
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content.as_ref() == content && span.style.fg == Some(color)),
+            "span {content:?} with fg {color:?} not found in {spans:?}"
+        );
     }
 
     #[test]
@@ -2468,80 +2521,60 @@ sidebar:
     }
 
     #[test]
-    fn state_detail_row_renders_as_detail_text_without_status_badge() {
-        let mut state_row = row(
-            "detail::%1::state",
-            SidebarRowKind::Detail,
-            1,
-            "state running · 12m",
+    fn expanded_chat_row_colors_status_and_context_in_label() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: running · 12m",
             RollupLevel::Running,
         );
-        state_row.badge_state = Some(BadgeState::Working);
-        let mut place_row = row(
-            "detail::%1::place",
-            SidebarRowKind::Detail,
-            1,
-            "vde-tmux · %1",
-            RollupLevel::Running,
-        );
-        place_row.badge_state = Some(BadgeState::Working);
-        let mut jump_row = row(
-            "jump::%1",
-            SidebarRowKind::Jump,
-            1,
-            "jump",
-            RollupLevel::Running,
-        );
-        jump_row.badge_state = Some(BadgeState::Working);
+        chat.badge_state = Some(BadgeState::Working);
+        chat.expanded = true;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            ..Default::default()
+        });
         let theme = SidebarRenderTheme::default();
-        let lines = render_lines(
-            &[state_row, place_row, jump_row],
-            &SidebarState::default(),
-            40,
-            &theme,
-        );
-        let state_spans = &lines[0].spans;
+
+        let lines = render_lines(&[chat], &SidebarState::default(), 40, &theme);
+        let chat_spans = &lines[0].spans;
 
         assert!(
-            !state_spans.iter().any(|span| span.content.as_ref() == "● "),
-            "{state_spans:?}"
-        );
-        assert!(
-            !state_spans
+            chat_spans
                 .iter()
-                .any(|span| span.style.fg == Some(theme.badge_working)),
-            "{state_spans:?}"
+                .any(|span| span.content.as_ref() == "codex"
+                    && span.style.add_modifier.contains(Modifier::BOLD)
+                    && span.style.fg == Some(Color::Reset)),
+            "{chat_spans:?}"
         );
-        assert!(
-            state_spans
-                .iter()
-                .any(|span| span.content.as_ref() == "state running · 12m"
-                    && span.style.fg == Some(theme.detail)),
-            "{state_spans:?}"
-        );
-        assert!(
-            line_to_string(lines[0].clone()).contains("│ state running · 12m"),
-            "{:?}",
-            line_to_string(lines[0].clone())
-        );
+        assert_span_fg(chat_spans, ": ", Color::Reset);
+        assert_span_fg(chat_spans, "running", theme.running);
+        assert_span_fg(chat_spans, " · 12m", theme.detail);
+    }
 
-        let place_spans = &lines[1].spans;
-        assert!(
-            place_spans
-                .iter()
-                .any(|span| span.content.as_ref() == "vde-tmux · %1"
-                    && span.style.fg == Some(theme.detail)),
-            "{place_spans:?}"
+    #[test]
+    fn expanded_chat_row_keeps_wait_reason_context_muted() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: waiting (permission_prompt) · 2m 00s",
+            RollupLevel::Permission,
         );
-        assert!(
-            !place_spans.iter().any(|span| span.content.as_ref() == "● "),
-            "{place_spans:?}"
-        );
-        assert!(
-            line_to_string(lines[2].clone()).contains("└ [↗ jump] [⌕ preview]"),
-            "{:?}",
-            line_to_string(lines[2].clone())
-        );
+        chat.badge_state = Some(BadgeState::Blocked);
+        chat.expanded = true;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            ..Default::default()
+        });
+        let theme = SidebarRenderTheme::default();
+
+        let lines = render_lines(&[chat], &SidebarState::default(), 60, &theme);
+        let chat_spans = &lines[0].spans;
+
+        assert_span_fg(chat_spans, "waiting", theme.permission);
+        assert_span_fg(chat_spans, " (permission_prompt) · 2m 00s", theme.detail);
     }
 
     #[test]
@@ -2753,6 +2786,32 @@ badge:
             30,
             "{rendered:?}"
         );
+    }
+
+    #[test]
+    fn chat_row_shows_completed_age_when_idle() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: fix",
+            RollupLevel::Idle,
+        );
+        chat.badge_state = Some(BadgeState::Idle);
+        chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            completed_age_secs: Some(815),
+            ..Default::default()
+        });
+
+        assert_eq!(right_label(&chat).as_deref(), Some("13m ago"));
+        assert_eq!(
+            right_style(&chat, &SidebarRenderTheme::default()).fg,
+            Some(SidebarRenderTheme::default().detail)
+        );
+
+        let rendered = render_rows(&[chat], &SidebarState::default(), 30);
+        assert!(rendered.ends_with("13m ago "), "{rendered:?}");
     }
 
     #[test]

@@ -142,15 +142,22 @@ fn poll_tmux_once_with_latest(
     tx: Sender<DaemonEvent>,
     stale_threshold_seconds: i64,
 ) -> Result<()> {
-    let now = now_epoch();
-    let panes = io
-        .read_panes()?
-        .into_iter()
-        .map(|pane| apply_capture_detection(io.as_ref(), pane, now, stale_threshold_seconds))
-        .collect::<Vec<_>>();
+    let panes = read_panes_with_detection(io.as_ref(), stale_threshold_seconds)?;
     latest_panes.store(panes.clone());
     tx.send(DaemonEvent::PanesUpdated(panes))?;
     Ok(())
+}
+
+pub fn read_panes_with_detection(
+    io: &dyn WorkerIo,
+    stale_threshold_seconds: i64,
+) -> Result<Vec<PaneSnapshot>> {
+    let now = now_epoch();
+    Ok(io
+        .read_panes()?
+        .into_iter()
+        .map(|pane| apply_capture_detection(io, pane, now, stale_threshold_seconds))
+        .collect())
 }
 
 pub fn start_git_worker(

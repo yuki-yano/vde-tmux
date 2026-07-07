@@ -352,6 +352,73 @@ fn dispatch_statusline_attention_falls_back_to_tmux_snapshot() {
 }
 
 #[test]
+fn dispatch_hooks_on_client_session_changed_requests_pane_refresh() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let socket = unique_socket_path("vde-tmux-session-hook-refresh");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(&mut stream).read_line(&mut line).unwrap();
+                    let message: crate::daemon::protocol::ClientMessage =
+                        serde_json::from_str(line.trim()).unwrap();
+                    tx.send(message).unwrap();
+                    serde_json::to_writer(
+                        &mut stream,
+                        &crate::daemon::protocol::ServerMessage::Ack,
+                    )
+                    .unwrap();
+                    stream.write_all(b"\n").unwrap();
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    let env = BTreeMap::from([(
+        "VDE_DAEMON_SOCKET".to_string(),
+        socket.display().to_string(),
+    )]);
+    let mock = MockTmuxRunner::new();
+    let format = crate::session::session_list_format();
+    mock.stub(
+        &["list-sessions", "-F", &format],
+        "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
+    );
+    mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
+
+    run_with(
+        ["vt", "hooks", "on-client-session-changed", "abc", "main"],
+        &mock,
+        &env,
+    )
+    .unwrap();
+
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        crate::daemon::protocol::ClientMessage::RefreshPanes { proto: 1 }
+    );
+    handle.join().unwrap();
+    std::fs::remove_file(socket).unwrap();
+}
+
+#[test]
 fn dispatch_statusline_summary_is_empty_when_disabled() {
     let config_home = std::env::temp_dir().join(format!(
         "vde-tmux-summary-disabled-{}",
@@ -439,4 +506,14 @@ fn config_warning_is_written_to_stderr_without_polluting_statusline_stdout() {
     assert!(output.contains("misc"));
     assert!(!output.contains("invalid config"));
     std::fs::remove_dir_all(config_home).unwrap();
+}
+
+fn unique_socket_path(label: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!(
+        "/tmp/{label}-{}.sock",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
 }

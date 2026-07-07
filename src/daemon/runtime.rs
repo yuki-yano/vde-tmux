@@ -48,6 +48,9 @@ pub enum DaemonEvent {
     QueryAttention {
         reply: Sender<ServerMessage>,
     },
+    RefreshPanes {
+        reply: Sender<ServerMessage>,
+    },
     DebounceCheck(Instant),
     Shutdown,
 }
@@ -237,6 +240,12 @@ impl RuntimeState {
             DaemonEvent::QueryAttention { reply } => {
                 let text = self.render_attention_text();
                 let _ = reply.send(ServerMessage::Attention { text });
+                Vec::new()
+            }
+            DaemonEvent::RefreshPanes { reply } => {
+                let _ = reply.send(ServerMessage::Error {
+                    message: "refresh_panes requires runtime loop".to_string(),
+                });
                 Vec::new()
             }
             DaemonEvent::DebounceCheck(now) => self.flush_state_if_due(now),
@@ -1283,7 +1292,7 @@ mod tests {
         agent.prompt = "prompt".to_string();
         state.ui_state.toggle_expanded("chat::%1");
         state.apply_event(DaemonEvent::PanesUpdated(vec![agent]));
-        state.ui_state.selection = Some("detail::%1::state".to_string());
+        state.ui_state.selection = Some("detail::%1::prompt".to_string());
 
         let effects = state.apply_event(DaemonEvent::Client {
             client_id: ClientId(1),
