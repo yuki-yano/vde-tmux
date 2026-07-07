@@ -1,7 +1,11 @@
 //! Claude/Codex hook payload を AgentEvent に変換する。
 
+use std::io::BufRead;
+use std::path::Path;
+
 use anyhow::Result;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::hook::{AgentEvent, AgentStatus, OptionUpdate};
 
@@ -9,11 +13,15 @@ use crate::hook::{AgentEvent, AgentStatus, OptionUpdate};
 struct ClaudeHookPayload {
     notification_type: Option<String>,
     prompt: Option<String>,
+    source: Option<String>,
+    transcript_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct CodexHookPayload {
     prompt: Option<String>,
+    source: Option<String>,
+    transcript_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -56,6 +64,9 @@ pub fn claude_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Re
         "PreToolUse" | "PostToolUse" => {
             agent_event.status = Some(AgentStatus::Running);
         }
+        "SessionStart" => {
+            apply_session_start(&mut agent_event, payload.source, payload.transcript_path);
+        }
         _ => {
             agent_event.agent.clear();
         }
@@ -89,6 +100,9 @@ pub fn codex_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Res
                 agent_event.prompt = Some(OptionUpdate::Set(prompt));
                 agent_event.prompt_source = Some(OptionUpdate::Set("user".to_string()));
             }
+        }
+        "SessionStart" => {
+            apply_session_start(&mut agent_event, payload.source, payload.transcript_path);
         }
         _ => {
             agent_event.agent.clear();
@@ -126,6 +140,74 @@ pub fn build_prompt_preview(raw: &str) -> Option<String> {
         None
     } else {
         Some(preview)
+    }
+}
+
+fn apply_session_start(
+    agent_event: &mut AgentEvent,
+    source: Option<String>,
+    transcript_path: Option<String>,
+) {
+    match source.as_deref() {
+        Some("startup" | "resume" | "clear") => {
+            agent_event.clear_state = true;
+            agent_event.status = Some(AgentStatus::Idle);
+            agent_event.attention = Some(false);
+            if source.as_deref() == Some("resume")
+                && let Some(prompt) = transcript_path
+                    .as_deref()
+                    .and_then(latest_user_prompt_from_transcript)
+            {
+                agent_event.prompt = Some(OptionUpdate::Set(prompt));
+                agent_event.prompt_source = Some(OptionUpdate::Set("resume".to_string()));
+            }
+        }
+        _ => {
+            agent_event.agent.clear();
+        }
+    }
+}
+
+fn latest_user_prompt_from_transcript(path: &str) -> Option<String> {
+    let file = std::fs::File::open(Path::new(path)).ok()?;
+    let reader = std::io::BufReader::new(file);
+    reader
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .filter_map(|value| user_prompt_from_transcript_value(&value))
+        .filter_map(|prompt| build_prompt_preview(&prompt))
+        .last()
+}
+
+fn user_prompt_from_transcript_value(value: &Value) -> Option<String> {
+    let payload = value.get("payload").unwrap_or(value);
+    if role_of(payload) == Some("user") {
+        return text_from_content(payload.get("content")?);
+    }
+    let message = payload.get("message").or_else(|| value.get("message"))?;
+    if role_of(message) == Some("user") {
+        return text_from_content(message.get("content")?);
+    }
+    None
+}
+
+fn role_of(value: &Value) -> Option<&str> {
+    value.get("role").and_then(Value::as_str)
+}
+
+fn text_from_content(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then_some(text)
+        }
+        _ => None,
     }
 }
 
@@ -191,5 +273,75 @@ mod tests {
         assert_eq!(event.status, Some(AgentStatus::Idle));
         assert_eq!(event.completed_at, Some(456));
         assert_eq!(event.attention, Some(true));
+    }
+
+    #[test]
+    fn codex_session_start_resume_clears_state_and_reads_latest_prompt_from_transcript() {
+        let path = write_temp_transcript(
+            "codex-session-start",
+            &[
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"old prompt"}]}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"latest\nprompt"}]}}"#,
+            ],
+        );
+        let raw = format!(
+            r#"{{"source":"resume","transcript_path":{}}}"#,
+            serde_json::to_string(path.to_str().unwrap()).unwrap()
+        );
+
+        let event = codex_event_from_json("SessionStart", &raw, 123).unwrap();
+
+        assert!(event.clear_state);
+        assert_eq!(event.agent, "codex");
+        assert_eq!(event.status, Some(AgentStatus::Idle));
+        assert_eq!(event.attention, Some(false));
+        assert_eq!(
+            event.prompt,
+            Some(OptionUpdate::Set("latest prompt".to_string()))
+        );
+        assert_eq!(
+            event.prompt_source,
+            Some(OptionUpdate::Set("resume".to_string()))
+        );
+    }
+
+    #[test]
+    fn claude_session_start_resume_reads_message_content_from_transcript() {
+        let path = write_temp_transcript(
+            "claude-session-start",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"claude prompt"}]}}"#,
+            ],
+        );
+        let raw = format!(
+            r#"{{"source":"resume","transcript_path":{}}}"#,
+            serde_json::to_string(path.to_str().unwrap()).unwrap()
+        );
+
+        let event = claude_event_from_json("SessionStart", &raw, 123).unwrap();
+
+        assert!(event.clear_state);
+        assert_eq!(event.agent, "claude");
+        assert_eq!(
+            event.prompt,
+            Some(OptionUpdate::Set("claude prompt".to_string()))
+        );
+        assert_eq!(
+            event.prompt_source,
+            Some(OptionUpdate::Set("resume".to_string()))
+        );
+    }
+
+    fn write_temp_transcript(name: &str, lines: &[&str]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "vde-tmux-{name}-{}.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        path
     }
 }

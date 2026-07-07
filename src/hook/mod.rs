@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::options::{
     KEY_AGENT, KEY_ATTENTION, KEY_COMPLETED_AT, KEY_PROMPT, KEY_PROMPT_SOURCE, KEY_STARTED_AT,
-    KEY_STATUS, KEY_SUBAGENTS, KEY_TASKS, KEY_WAIT_REASON,
+    KEY_STATUS, KEY_SUBAGENTS, KEY_TASKS, KEY_WAIT_REASON, PANE_STATE_KEYS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +115,7 @@ pub struct SubagentEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AgentEvent {
+    pub clear_state: bool,
     pub agent: String,
     pub status: Option<AgentStatus>,
     pub prompt: Option<OptionUpdate<String>>,
@@ -129,9 +130,18 @@ pub struct AgentEvent {
 
 pub fn derive_event_writes(event: &AgentEvent) -> Vec<PaneOptionWrite> {
     let mut writes = Vec::new();
+    if event.clear_state {
+        writes.extend(
+            PANE_STATE_KEYS
+                .iter()
+                .map(|key| PaneOptionWrite::unset(key)),
+        );
+    }
     if let Some(status) = event.status {
         writes.push(PaneOptionWrite::set(KEY_STATUS, status.as_str()));
-        if matches!(status, AgentStatus::Running | AgentStatus::Idle) && event.wait_reason.is_none()
+        if !event.clear_state
+            && matches!(status, AgentStatus::Running | AgentStatus::Idle)
+            && event.wait_reason.is_none()
         {
             writes.push(PaneOptionWrite::unset(KEY_WAIT_REASON));
         }
@@ -294,5 +304,28 @@ mod tests {
                 PaneOptionWrite::set(KEY_SUBAGENTS, "abc:Explore"),
             ]
         );
+    }
+
+    #[test]
+    fn derive_event_writes_clears_existing_pane_state_before_session_start_values() {
+        let event = AgentEvent {
+            clear_state: true,
+            agent: "codex".to_string(),
+            status: Some(AgentStatus::Idle),
+            attention: Some(false),
+            prompt: Some(OptionUpdate::Set("latest prompt".to_string())),
+            prompt_source: Some(OptionUpdate::Set("resume".to_string())),
+            ..AgentEvent::default()
+        };
+
+        let writes = derive_event_writes(&event);
+
+        for key in crate::options::PANE_STATE_KEYS {
+            assert!(writes.contains(&PaneOptionWrite::unset(key)), "{key}");
+        }
+        assert!(writes.contains(&PaneOptionWrite::set(KEY_STATUS, "idle")));
+        assert!(writes.contains(&PaneOptionWrite::set(KEY_AGENT, "codex")));
+        assert!(writes.contains(&PaneOptionWrite::set(KEY_PROMPT, "latest prompt")));
+        assert!(writes.contains(&PaneOptionWrite::set(KEY_PROMPT_SOURCE, "resume")));
     }
 }

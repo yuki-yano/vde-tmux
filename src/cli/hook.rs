@@ -67,6 +67,7 @@ pub(crate) fn run_hook_command(
             subagents,
         } => {
             let event = AgentEvent {
+                clear_state: false,
                 agent,
                 status: status.as_deref().map(parse_agent_status).transpose()?,
                 prompt: prompt.map(OptionUpdate::Set),
