@@ -71,6 +71,7 @@ fn close_sidebar_pane(runner: &dyn TmuxRunner, target: &str, sidebar: &SidebarPa
     if let (Some(layout), Some(saved_panes)) = (saved_layout.as_deref(), saved_panes.as_ref())
         && saved_panes == &current_panes
         && layout_matches_panes(layout, &current_panes)
+        && layout_matches_current_window_size(runner, target, layout)?
     {
         runner.run(&["select-layout", "-t", target, layout])?;
     }
@@ -153,7 +154,8 @@ pub fn rail(
         return Ok(());
     };
     let next_width = if sidebar.width <= RAIL_WIDTH {
-        resolve_width(runner, target, normal_width, min_width)?
+        let layout = capture_window_layout(runner, target)?;
+        resolve_width(&layout, normal_width, min_width)?
     } else {
         RAIL_WIDTH
     };
@@ -258,7 +260,7 @@ fn open_unchecked(
     let layout = capture_window_layout(runner, target)?;
     let panes = capture_pane_ids(runner, target)?;
     save_baseline(runner, target, &layout, &panes)?;
-    let width = resolve_width(runner, target, width, min_width)?;
+    let width = resolve_width(&layout, width, min_width)?;
     let socket_name = std::env::var("VDE_TMUX_SOCKET_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -314,7 +316,9 @@ fn restore_or_clear_saved_baseline(
     let current_panes = capture_pane_ids(runner, target)?;
     match (saved_layout, saved_panes) {
         (Some(layout), Some(saved_panes))
-            if saved_panes == &current_panes && layout_matches_panes(layout, &current_panes) =>
+            if saved_panes == &current_panes
+                && layout_matches_panes(layout, &current_panes)
+                && layout_matches_current_window_size(runner, target, layout)? =>
         {
             runner.run(&["select-layout", "-t", target, layout])?;
             clear_baseline(runner, target)
@@ -323,31 +327,54 @@ fn restore_or_clear_saved_baseline(
     }
 }
 
-fn resolve_width(
-    runner: &dyn TmuxRunner,
-    target: &str,
-    width: SidebarWidth,
-    min_width: u16,
-) -> Result<u16> {
+fn resolve_width(layout: &str, width: SidebarWidth, min_width: u16) -> Result<u16> {
     match width {
         SidebarWidth::Columns(columns) => Ok(columns),
         SidebarWidth::Percent(percent) => {
-            let output = runner.run(&[
-                "display-message",
-                "-p",
-                "-t",
-                target,
-                "-F",
-                "#{window_width}",
-            ])?;
-            let window_width = output
-                .trim()
-                .parse::<u32>()
-                .with_context(|| format!("failed to parse window width for {target}"))?;
+            let (window_width, _) = parse_layout_root_size(layout)
+                .with_context(|| format!("failed to parse window layout size from {layout:?}"))?;
             let resolved = window_width.saturating_mul(percent as u32) / 100;
-            Ok((resolved as u16).max(min_width))
+            u16::try_from(resolved.max(min_width as u32))
+                .context("resolved sidebar width exceeds tmux pane width limit")
         }
     }
+}
+
+fn layout_matches_current_window_size(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    layout: &str,
+) -> Result<bool> {
+    let Some(layout_size) = parse_layout_root_size(layout) else {
+        return Ok(false);
+    };
+    let output = runner.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "-F",
+        "#{window_width}x#{window_height}",
+    ])?;
+    let current_size = parse_size(output.trim())
+        .with_context(|| format!("failed to parse current window size for {target}"))?;
+    Ok(layout_size == current_size)
+}
+
+fn parse_layout_root_size(layout: &str) -> Option<(u32, u32)> {
+    let (_, rest) = layout.split_once(',')?;
+    parse_size(rest)
+}
+
+fn parse_size(value: &str) -> Option<(u32, u32)> {
+    let (width, rest) = value.split_once('x')?;
+    let height_end = rest
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if height_end == 0 {
+        return None;
+    }
+    Some((width.parse().ok()?, rest[..height_end].parse().ok()?))
 }
 
 fn find_sidebar_pane(runner: &dyn TmuxRunner, target: &str) -> Result<Option<SidebarPane>> {
@@ -820,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn open_resolves_percent_width_from_window_width() {
+    fn open_resolves_percent_width_from_layout_width() {
         let mock = MockTmuxRunner::new();
         mock.stub(
             &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
@@ -828,8 +855,15 @@ mod tests {
         );
         mock.stub(&["show-options", "-w", "-t", "@1"], "");
         mock.stub(
-            &["display-message", "-p", "-t", "@1", "-F", "#{window_width}"],
-            "640\n",
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_layout}",
+            ],
+            "abcd,640x132,0,0,9\n",
         );
         mock.stub(
             &[
@@ -840,7 +874,7 @@ mod tests {
                 "-F",
                 "#{window_layout}",
             ],
-            "layout-before\n",
+            "5969,80x24,0,0,1\n",
         );
         mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
         mock.stub(
@@ -850,7 +884,7 @@ mod tests {
                 "-t",
                 "@1",
                 KEY_LAYOUT_BASELINE,
-                "layout-before",
+                "5969,80x24,0,0,1",
             ],
             "",
         );
@@ -871,6 +905,19 @@ mod tests {
             ],
             "",
         );
+        mock.stub(
+            &[
+                "split-window",
+                "-d",
+                "-t",
+                "@1",
+                "-hbf",
+                "-l",
+                "40",
+                "'/tmp/vt' sidebar attach",
+            ],
+            "",
+        );
 
         open(
             &mock,
@@ -881,7 +928,27 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(mock.calls().len(), 8);
+        let calls = mock.calls();
+        assert!(calls.contains(&vec![
+            "split-window".to_string(),
+            "-d".to_string(),
+            "-t".to_string(),
+            "@1".to_string(),
+            "-hbf".to_string(),
+            "-l".to_string(),
+            "40".to_string(),
+            "'/tmp/vt' sidebar attach".to_string(),
+        ]));
+        assert!(!calls.contains(&vec![
+            "split-window".to_string(),
+            "-d".to_string(),
+            "-t".to_string(),
+            "@1".to_string(),
+            "-hbf".to_string(),
+            "-l".to_string(),
+            "64".to_string(),
+            "'/tmp/vt' sidebar attach".to_string(),
+        ]));
     }
 
     #[test]
@@ -1000,16 +1067,29 @@ mod tests {
     #[test]
     fn open_restores_matching_stale_baseline_before_saving_new_baseline() {
         let mock = MockTmuxRunner::new();
+        let layout_before = "abcd,120x40,0,0[60x40,0,0,1,59x40,61,0,2]";
+        let layout_restored = "efgh,120x40,0,0[60x40,0,0,1,59x40,61,0,2]";
         mock.stub(
             &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
             "%1\t\t80\n%2\t\t80\n",
         );
         mock.stub(
             &["show-options", "-w", "-t", "@1"],
-            "@vde_layout_baseline \"layout-before\"\n@vde_layout_panes \"%1,%2\"\n",
+            &format!("{KEY_LAYOUT_BASELINE} \"{layout_before}\"\n{KEY_LAYOUT_PANES} \"%1,%2\"\n"),
         );
         mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n%2\n");
-        mock.stub(&["select-layout", "-t", "@1", "layout-before"], "");
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_width}x#{window_height}",
+            ],
+            "120x40\n",
+        );
+        mock.stub(&["select-layout", "-t", "@1", layout_before], "");
         mock.stub(
             &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_BASELINE],
             "",
@@ -1027,7 +1107,7 @@ mod tests {
                 "-F",
                 "#{window_layout}",
             ],
-            "layout-restored\n",
+            &format!("{layout_restored}\n"),
         );
         mock.stub(
             &[
@@ -1036,7 +1116,7 @@ mod tests {
                 "-t",
                 "@1",
                 KEY_LAYOUT_BASELINE,
-                "layout-restored",
+                layout_restored,
             ],
             "",
         );
@@ -1065,7 +1145,7 @@ mod tests {
             "select-layout".to_string(),
             "-t".to_string(),
             "@1".to_string(),
-            "layout-before".to_string(),
+            layout_before.to_string(),
         ]));
         let select_index = calls
             .iter()
@@ -1080,7 +1160,7 @@ mod tests {
                     "-t".to_string(),
                     "@1".to_string(),
                     KEY_LAYOUT_BASELINE.to_string(),
-                    "layout-restored".to_string(),
+                    layout_restored.to_string(),
                 ]
             })
             .unwrap();
@@ -1167,24 +1247,26 @@ mod tests {
 
     #[test]
     fn percent_width_is_clamped_to_min_width() {
-        let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["display-message", "-p", "-t", "@1", "-F", "#{window_width}"],
-            "320\n",
-        );
-
         assert_eq!(
-            resolve_width(&mock, "@1", crate::config::SidebarWidth::Percent(10), 40).unwrap(),
+            resolve_width(
+                "abcd,320x80,0,0,1",
+                crate::config::SidebarWidth::Percent(10),
+                40
+            )
+            .unwrap(),
             40
         );
     }
 
     #[test]
     fn fixed_width_is_not_clamped_to_min_width() {
-        let mock = MockTmuxRunner::new();
-
         assert_eq!(
-            resolve_width(&mock, "@1", crate::config::SidebarWidth::Columns(20), 40).unwrap(),
+            resolve_width(
+                "abcd,320x80,0,0,1",
+                crate::config::SidebarWidth::Columns(20),
+                40
+            )
+            .unwrap(),
             20
         );
     }
@@ -1192,17 +1274,114 @@ mod tests {
     #[test]
     fn close_restores_saved_layout_when_panes_match() {
         let mock = MockTmuxRunner::new();
+        let layout = "abcd,120x40,0,0[60x40,0,0,1,59x40,61,0,2]";
         mock.stub(
             &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
             "%9\t1\t40\n%1\t\t80\n%2\t\t80\n",
         );
         mock.stub(
             &["show-options", "-w", "-t", "@1"],
-            "@vde_layout_baseline \"layout-before\"\n@vde_layout_panes \"%1,%2\"\n",
+            &format!("{KEY_LAYOUT_BASELINE} \"{layout}\"\n{KEY_LAYOUT_PANES} \"%1,%2\"\n"),
         );
         mock.stub(&["kill-pane", "-t", "%9"], "");
         mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n%2\n");
-        mock.stub(&["select-layout", "-t", "@1", "layout-before"], "");
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_width}x#{window_height}",
+            ],
+            "120x40\n",
+        );
+        mock.stub(&["select-layout", "-t", "@1", layout], "");
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_BASELINE],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_PANES],
+            "",
+        );
+
+        close(&mock, "@1").unwrap();
+
+        assert_eq!(mock.calls().len(), 8);
+    }
+
+    #[test]
+    fn close_skips_saved_layout_when_size_differs_from_current_window() {
+        let mock = MockTmuxRunner::new();
+        let layout = "abcd,80x24,0,0,1";
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%9\t1\t40\n%1\t\t80\n",
+        );
+        mock.stub(
+            &["show-options", "-w", "-t", "@1"],
+            &format!("{KEY_LAYOUT_BASELINE} \"{layout}\"\n{KEY_LAYOUT_PANES} \"%1\"\n"),
+        );
+        mock.stub(&["kill-pane", "-t", "%9"], "");
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_width}x#{window_height}",
+            ],
+            "640x132\n",
+        );
+        mock.stub(&["select-layout", "-t", "@1", layout], "");
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_BASELINE],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_PANES],
+            "",
+        );
+
+        close(&mock, "@1").unwrap();
+
+        let calls = mock.calls();
+        assert!(!calls.contains(&vec![
+            "select-layout".to_string(),
+            "-t".to_string(),
+            "@1".to_string(),
+            layout.to_string(),
+        ]));
+    }
+
+    #[test]
+    fn close_restores_stale_baseline_when_sidebar_pane_already_gone() {
+        let mock = MockTmuxRunner::new();
+        let layout = "abcd,120x40,0,0[60x40,0,0,1,59x40,61,0,2]";
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t80\n%2\t\t80\n",
+        );
+        mock.stub(
+            &["show-options", "-w", "-t", "@1"],
+            &format!("{KEY_LAYOUT_BASELINE} \"{layout}\"\n{KEY_LAYOUT_PANES} \"%1,%2\"\n"),
+        );
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n%2\n");
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_width}x#{window_height}",
+            ],
+            "120x40\n",
+        );
+        mock.stub(&["select-layout", "-t", "@1", layout], "");
         mock.stub(
             &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_BASELINE],
             "",
@@ -1215,33 +1394,6 @@ mod tests {
         close(&mock, "@1").unwrap();
 
         assert_eq!(mock.calls().len(), 7);
-    }
-
-    #[test]
-    fn close_restores_stale_baseline_when_sidebar_pane_already_gone() {
-        let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n%2\t\t80\n",
-        );
-        mock.stub(
-            &["show-options", "-w", "-t", "@1"],
-            "@vde_layout_baseline \"layout-before\"\n@vde_layout_panes \"%1,%2\"\n",
-        );
-        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n%2\n");
-        mock.stub(&["select-layout", "-t", "@1", "layout-before"], "");
-        mock.stub(
-            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_BASELINE],
-            "",
-        );
-        mock.stub(
-            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_PANES],
-            "",
-        );
-
-        close(&mock, "@1").unwrap();
-
-        assert_eq!(mock.calls().len(), 6);
     }
 
     #[test]
@@ -1301,8 +1453,15 @@ mod tests {
             "%9\t1\t2\n",
         );
         mock.stub(
-            &["display-message", "-p", "-t", "@1", "-F", "#{window_width}"],
-            "640\n",
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_layout}",
+            ],
+            "abcd,640x132,0,0,9\n",
         );
         mock.stub(&["resize-pane", "-t", "%9", "-x", "64"], "");
 

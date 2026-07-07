@@ -317,6 +317,7 @@ fn dispatch_sidebar_open_accepts_percent_width() {
         &["display-message", "-p", "-t", "@1", "-F", "#{window_width}"],
         "640\n",
     );
+    let layout = "abcd,640x132,0,0,1";
     mock.stub(
         &[
             "display-message",
@@ -326,7 +327,7 @@ fn dispatch_sidebar_open_accepts_percent_width() {
             "-F",
             "#{window_layout}",
         ],
-        "layout-before\n",
+        &format!("{layout}\n"),
     );
     mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
     mock.stub(
@@ -336,7 +337,7 @@ fn dispatch_sidebar_open_accepts_percent_width() {
             "-t",
             "@1",
             crate::options::KEY_LAYOUT_BASELINE,
-            "layout-before",
+            layout,
         ],
         "",
     );
@@ -372,7 +373,7 @@ fn dispatch_sidebar_open_accepts_percent_width() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 8);
+    assert_eq!(mock.calls().len(), 7);
 }
 
 #[test]

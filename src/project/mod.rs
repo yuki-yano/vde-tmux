@@ -205,6 +205,7 @@ pub fn switch_project(runner: &dyn TmuxRunner, config: &Config, path: &str) -> R
         set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
         (category, Some(created_window))
     };
+    switch_client_for_client(runner, &client, &session_name)?;
     if let Some(window) = created_window
         .as_deref()
         .filter(|window| !window.is_empty())
@@ -217,7 +218,6 @@ pub fn switch_project(runner: &dyn TmuxRunner, config: &Config, path: &str) -> R
             config.sidebar.min_width,
         )?;
     }
-    switch_client_for_client(runner, &client, &session_name)?;
     remember_session_for_client(runner, &client, &category, &session_name)
 }
 
@@ -566,6 +566,19 @@ mod tests {
                 && call.get(2).map(String::as_str) == Some("-t")
                 && call.get(3).map(String::as_str) == Some("@9")
         }));
+        let calls = mock.calls();
+        let switch_index = calls
+            .iter()
+            .position(|call| call.first().map(String::as_str) == Some("switch-client"))
+            .unwrap();
+        let split_index = calls
+            .iter()
+            .position(|call| call.first().map(String::as_str) == Some("split-window"))
+            .unwrap();
+        assert!(
+            switch_index < split_index,
+            "sidebar should open after the created session is attached"
+        );
     }
 
     #[test]
