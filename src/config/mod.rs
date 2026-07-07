@@ -416,6 +416,9 @@ pub struct SidebarHeaderConfig {
     pub suffix: String,
     pub bold: bool,
     pub colors: SegmentColors,
+    /// filter chip の前後キャップ(例: "\u{e0b6}" / "\u{e0b4}" で pill 形)。空なら矩形塗り。
+    pub chip_prefix: String,
+    pub chip_suffix: String,
 }
 
 impl Default for SidebarHeaderConfig {
@@ -430,6 +433,8 @@ impl Default for SidebarHeaderConfig {
                 bg: Some("147".to_string()),
                 outer_bg: Some("235".to_string()),
             },
+            chip_prefix: String::new(),
+            chip_suffix: String::new(),
         }
     }
 }

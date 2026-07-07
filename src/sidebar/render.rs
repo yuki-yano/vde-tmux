@@ -28,6 +28,9 @@ pub struct SidebarRenderTheme {
     pub header_prefix: String,
     pub header_suffix: String,
     pub header_outer_bg: Option<Color>,
+    /// filter chip の前後キャップ(例: nerd font 半円  / )。空なら矩形塗り。
+    pub header_chip_prefix: String,
+    pub header_chip_suffix: String,
     pub badge_glyphs: crate::config::BadgeGlyphs,
     pub badge_blocked: Color,
     pub badge_working: Color,
@@ -79,6 +82,8 @@ impl Default for SidebarRenderTheme {
             header_prefix: String::new(),
             header_suffix: POWERLINE_ARROW.to_string(),
             header_outer_bg: Some(Color::Indexed(235)),
+            header_chip_prefix: String::new(),
+            header_chip_suffix: String::new(),
             badge_glyphs: crate::config::BadgeGlyphs::default(),
             badge_blocked: Color::Red,
             badge_working: Color::Green,
@@ -118,6 +123,8 @@ impl SidebarRenderTheme {
             header_prefix: default.header_prefix,
             header_suffix: default.header_suffix,
             header_outer_bg: default.header_outer_bg,
+            header_chip_prefix: default.header_chip_prefix,
+            header_chip_suffix: default.header_chip_suffix,
             badge_glyphs: default.badge_glyphs,
             // badge の色は from_app_config で共通の badge.colors から設定する。
             // ここ(sidebar.colors 単体)では ANSI 既定のままにしておく。
@@ -150,6 +157,8 @@ impl SidebarRenderTheme {
         theme.header_format = config.header.format.clone();
         theme.header_prefix = config.header.prefix.clone();
         theme.header_suffix = config.header.suffix.clone();
+        theme.header_chip_prefix = config.header.chip_prefix.clone();
+        theme.header_chip_suffix = config.header.chip_suffix.clone();
         theme
     }
 
@@ -415,30 +424,72 @@ fn build_header_chip_line(
         },
     ];
 
-    let labels = specs.map(chip_label);
-    let full_text = labels.join("");
+    // (text片, style, action)。style が None の片(チップ間の空白)は segment を作らない。
+    let caps_enabled = !theme.header_chip_prefix.is_empty() || !theme.header_chip_suffix.is_empty();
+    let mut pieces: Vec<(String, Option<Style>, Option<HeaderAction>)> = Vec::new();
+    for (index, spec) in specs.into_iter().enumerate() {
+        let active = state.filter == spec.filter;
+        let action = if spec.filter == StatusFilter::All || active || spec.count > 0 {
+            Some(HeaderAction::SetFilter(spec.filter))
+        } else {
+            None
+        };
+        let style = chip_style(theme, active, spec.badge_state, spec.count);
+        if caps_enabled && index > 0 {
+            pieces.push((" ".to_string(), None, None));
+        }
+        // bg 塗りのあるチップだけキャップで pill にする(0件チップは dim テキストのみ)。
+        let bg = chip_bg(theme, active, spec.count, spec.badge_state);
+        match bg {
+            Some(bg) if caps_enabled => {
+                let cap = Style::default().fg(bg);
+                if !theme.header_chip_prefix.is_empty() {
+                    pieces.push((theme.header_chip_prefix.clone(), Some(cap), action));
+                }
+                pieces.push((chip_label(spec), Some(style), action));
+                if !theme.header_chip_suffix.is_empty() {
+                    pieces.push((theme.header_chip_suffix.clone(), Some(cap), action));
+                }
+            }
+            _ => pieces.push((chip_label(spec), Some(style), action)),
+        }
+    }
+
+    let full_text: String = pieces.iter().map(|(text, _, _)| text.as_str()).collect();
     let text = truncate_display(&full_text, width);
     let mut segments = Vec::new();
     let mut start = 0;
-    for (spec, label) in specs.into_iter().zip(labels) {
-        let len = display_width(&label);
-        if let Some(range) = visible_segment_range(&text, start, len) {
-            let active = state.filter == spec.filter;
-            let action = if spec.filter == StatusFilter::All || active || spec.count > 0 {
-                Some(HeaderAction::SetFilter(spec.filter))
-            } else {
-                None
-            };
+    for (piece, style, action) in pieces {
+        let len = display_width(&piece);
+        if let Some(style) = style
+            && let Some(range) = visible_segment_range(&text, start, len)
+        {
             segments.push(HeaderSegment {
                 range,
                 action,
-                style: Some(chip_style(theme, active, spec.badge_state, spec.count)),
+                style: Some(style),
             });
         }
         start += len;
     }
 
     HeaderLine { text, segments }
+}
+
+/// チップの背景色。アクティブは状態色、非アクティブ非0件は active_bg、0件は塗りなし。
+fn chip_bg(
+    theme: &SidebarRenderTheme,
+    active: bool,
+    count: usize,
+    badge_state: Option<BadgeState>,
+) -> Option<Color> {
+    if active {
+        Some(chip_color(theme, badge_state))
+    } else if count > 0 {
+        Some(theme.active_bg)
+    } else {
+        None
+    }
 }
 
 fn chip_label(spec: HeaderChipSpec) -> String {
@@ -2140,6 +2191,43 @@ mod tests {
         assert_eq!(active.bg, Some(theme.badge_blocked));
         // 明示スタイル設定時は bold も header_active_bold(既定 false)に従う。
         assert!(!active.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn chip_caps_render_as_pill_and_skip_zero_chips() {
+        let theme = SidebarRenderTheme {
+            header_chip_prefix: "\u{e0b6}".to_string(),
+            header_chip_suffix: "\u{e0b4}".to_string(),
+            ..SidebarRenderTheme::default()
+        };
+        let counts = BadgeCounts {
+            total: 3,
+            blocked: 1,
+            working: 0,
+            done: 0,
+            idle: 2,
+        };
+        let state = SidebarState::default();
+
+        let header = build_header_layout_with_counts(&state, 80, &theme, counts);
+        let line = &header.lines[1];
+
+        // bg 塗りのあるチップ(all/attn/idle)だけキャップで囲まれる。
+        assert_eq!(
+            line.text,
+            "\u{e0b6} ≡ all 3 \u{e0b4} \u{e0b6} ▲ 1 \u{e0b4}  ● 0   ✓ 0  \u{e0b6} ○ 2 \u{e0b4}"
+        );
+        // キャップの fg はチップ bg と一致し、クリックも同じ action になる。
+        let cap = style_for_segment(&header, 1, "\u{e0b6}");
+        assert_eq!(cap.fg, Some(theme.header_mode));
+        assert_eq!(
+            header_hit_test(&header, 1, 0),
+            Some(HeaderAction::SetFilter(StatusFilter::All))
+        );
+        // 0件チップはキャップなし・クリック不可のまま。
+        let zero = style_for_segment(&header, 1, "● 0");
+        assert_eq!(zero.fg, Some(theme.marker));
+        assert_eq!(zero.bg, None);
     }
 
     #[test]

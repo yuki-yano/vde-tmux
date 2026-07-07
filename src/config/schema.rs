@@ -141,6 +141,8 @@ pub fn config_schema() -> Value {
                             "format": { "type": "string" },
                             "prefix": { "type": "string" },
                             "suffix": { "type": "string" },
+                            "chip_prefix": { "type": "string" },
+                            "chip_suffix": { "type": "string" },
                             "bold": { "type": "boolean" },
                             "colors": {
                                 "type": "object",
@@ -259,6 +261,8 @@ mod tests {
         assert!(header.get("powerline").is_none());
         assert!(header.get("separator").is_none());
         assert_eq!(header["bold"]["type"], "boolean");
+        assert_eq!(header["chip_prefix"]["type"], "string");
+        assert_eq!(header["chip_suffix"]["type"], "string");
         assert_eq!(header["colors"]["type"], "object");
     }
 
