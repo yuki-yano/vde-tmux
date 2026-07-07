@@ -171,15 +171,17 @@ fn claude_progress_event_from_input(
 ) -> Result<Option<ClaudeProgressEvent>> {
     #[derive(serde::Deserialize, Default)]
     struct Payload {
+        hook_event_name: Option<String>,
         agent_id: Option<String>,
         agent_type: Option<String>,
     }
 
+    let payload: Payload = serde_json::from_str(input.trim()).unwrap_or_default();
+    let event = payload.hook_event_name.as_deref().unwrap_or(event);
     let progress = match event {
         "TaskCreated" => ClaudeProgressEvent::TaskCreated,
         "TaskCompleted" => ClaudeProgressEvent::TaskCompleted,
         "SubagentStart" => {
-            let payload: Payload = serde_json::from_str(input.trim()).unwrap_or_default();
             let Some(agent_id) = payload.agent_id else {
                 return Ok(None);
             };
@@ -189,7 +191,6 @@ fn claude_progress_event_from_input(
             })
         }
         "SubagentStop" => {
-            let payload: Payload = serde_json::from_str(input.trim()).unwrap_or_default();
             let Some(agent_id) = payload.agent_id else {
                 return Ok(None);
             };

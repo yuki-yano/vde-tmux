@@ -9,6 +9,7 @@ use crate::hook::{AgentEvent, AgentStatus, OptionUpdate};
 
 #[derive(Debug, Deserialize, Default)]
 struct ClaudeHookPayload {
+    hook_event_name: Option<String>,
     notification_type: Option<String>,
     prompt: Option<String>,
     source: Option<String>,
@@ -30,6 +31,7 @@ struct CodexNotifyPayload {
 
 pub fn claude_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Result<AgentEvent> {
     let payload: ClaudeHookPayload = serde_json::from_str(raw_json.trim()).unwrap_or_default();
+    let event = payload.hook_event_name.as_deref().unwrap_or(event);
     let mut agent_event = AgentEvent {
         agent: "claude".to_string(),
         ..AgentEvent::default()

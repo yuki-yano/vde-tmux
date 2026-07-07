@@ -459,3 +459,53 @@ fn dispatch_hook_claude_task_created_updates_progress() {
     .unwrap();
     assert_eq!(mock.calls().len(), 2);
 }
+
+#[test]
+fn dispatch_hook_claude_stop_payload_subagent_stop_updates_subagents_without_done() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_subagents \"a:Explore|b:Plan\"\n",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_SUBAGENTS,
+            "b:Plan",
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "claude", "Stop"],
+        r#"{"hook_event_name":"SubagentStop","agent_id":"a","agent_type":"Explore"}"#,
+        &mock,
+        &env,
+        456,
+    )
+    .unwrap();
+
+    assert_eq!(
+        mock.calls(),
+        vec![
+            vec![
+                "show-options".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                "%1".to_string(),
+            ],
+            vec![
+                "set-option".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                "%1".to_string(),
+                crate::options::KEY_SUBAGENTS.to_string(),
+                "b:Plan".to_string(),
+            ],
+        ]
+    );
+}
