@@ -38,14 +38,14 @@ impl Default for PopupConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NotifyConfig {
     pub enabled: bool,
     pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CategoriesConfig {
     pub display_names: BTreeMap<String, String>,
     pub order: BTreeMap<String, i64>,
@@ -62,14 +62,14 @@ pub struct CategoryRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SessionNameRule {
     pub category: String,
     pub patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StatuslineConfig {
     pub sessions: StatuslineSessionsConfig,
     pub category: StatuslineCategoryConfig,
@@ -80,7 +80,7 @@ pub struct StatuslineConfig {
 
 // current session の既定だけ bold にするため手書き default にする。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StatuslineSessionsConfig {
     pub show_index: bool,
     pub current: SegmentStyle,
@@ -117,7 +117,7 @@ pub enum BadgeStyle {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SegmentStyle {
     pub format: String,
     pub prefix: String,
@@ -139,7 +139,7 @@ impl Default for SegmentStyle {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SegmentColors {
     pub fg: Option<String>,
     pub bg: Option<String>,
@@ -147,7 +147,7 @@ pub struct SegmentColors {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StatuslineCategoryConfig {
     /// "list"(全カテゴリ列挙)または "current"(現在のみ)。
     pub mode: String,
@@ -185,7 +185,7 @@ impl Default for StatuslineCategoryConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SummaryConfig {
     pub enabled: bool,
     /// true なら summary から idle(○)のカウントを省く。
@@ -203,7 +203,7 @@ impl Default for SummaryConfig {
 
 /// `vt statusline-attention` の出力装飾。空出力時は装飾ごと出さない。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AttentionConfig {
     /// `{attention}` プレースホルダに本文が入る。
     pub format: String,
@@ -249,14 +249,14 @@ impl Default for SessionBadgeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BadgeConfig {
     pub glyphs: BadgeGlyphs,
     pub colors: BadgeColors,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BadgeGlyphs {
     pub blocked: String,
     pub working: String,
@@ -276,7 +276,7 @@ impl Default for BadgeGlyphs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BadgeColors {
     pub blocked: String,
     pub working: String,
@@ -308,7 +308,7 @@ impl BadgeColors {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SidebarConfig {
     pub width: SidebarWidth,
     pub min_width: u16,
@@ -332,7 +332,7 @@ impl Default for SidebarConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SidebarLiveConfig {
     pub enabled: bool,
     pub lines: u16,
@@ -369,7 +369,7 @@ impl Default for SidebarLiveConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SidebarPreviewConfig {
     pub history_lines: u32,
 }
@@ -409,7 +409,7 @@ pub struct SidebarColorsConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SidebarHeaderConfig {
     pub format: String,
     pub prefix: String,
@@ -498,7 +498,7 @@ impl<'de> Deserialize<'de> for SidebarWidth {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
     pub poll_ms: u64,
     pub git: GitConfig,
@@ -514,7 +514,7 @@ impl Default for DaemonConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GitConfig {
     pub timeout_ms: u64,
     pub poll_interval_ms: u64,

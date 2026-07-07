@@ -206,6 +206,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_unknown_nested_field_returns_default_with_warning() {
+        let loaded = parse_config("sidebar:\n  preview:\n    history_line: 2000\n");
+
+        assert_eq!(loaded.config, Config::default());
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(
+            loaded.warnings[0].contains("sidebar.preview.history_line"),
+            "{}",
+            loaded.warnings[0]
+        );
+    }
+
+    #[test]
     fn parse_empty_is_default_silent() {
         let loaded = parse_config("   \n");
         assert_eq!(loaded.config, Config::default());
