@@ -279,6 +279,16 @@ impl StatusFilter {
             StatusFilter::IdleOnly => StatusFilter::All,
         }
     }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            StatusFilter::All => "all",
+            StatusFilter::AttentionOnly => "attn",
+            StatusFilter::WorkingOnly => "working",
+            StatusFilter::DoneOnly => "done",
+            StatusFilter::IdleOnly => "idle",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,6 +400,15 @@ mod tests {
                 StatusFilter::All,
             ]
         );
+    }
+
+    #[test]
+    fn status_filter_key_is_shared_by_filter_ui() {
+        assert_eq!(StatusFilter::All.key(), "all");
+        assert_eq!(StatusFilter::AttentionOnly.key(), "attn");
+        assert_eq!(StatusFilter::WorkingOnly.key(), "working");
+        assert_eq!(StatusFilter::DoneOnly.key(), "done");
+        assert_eq!(StatusFilter::IdleOnly.key(), "idle");
     }
 
     #[test]

@@ -596,7 +596,7 @@ fn empty_rows_placeholder_lines(
     }
     vec![
         Line::from(Span::styled(
-            format!("no {} agents", filter_name(filter)),
+            format!("no {} agents", filter.key()),
             Style::default().fg(theme.detail),
         )),
         Line::from(Span::styled(
@@ -606,16 +606,6 @@ fn empty_rows_placeholder_lines(
                 .add_modifier(Modifier::DIM),
         )),
     ]
-}
-
-fn filter_name(filter: StatusFilter) -> &'static str {
-    match filter {
-        StatusFilter::All => "all",
-        StatusFilter::AttentionOnly => "attn",
-        StatusFilter::WorkingOnly => "working",
-        StatusFilter::DoneOnly => "done",
-        StatusFilter::IdleOnly => "idle",
-    }
 }
 
 fn render_live_lines(
@@ -991,7 +981,7 @@ fn handle_left_click(
                 send_sidebar_request(send_sidebar_key(context.socket, "tab"));
             }
             Some(HeaderAction::SetFilter(filter)) => {
-                send_sidebar_request(send_sidebar_key(context.socket, filter_key(filter)));
+                send_sidebar_request(send_sidebar_key(context.socket, filter.key()));
             }
             None => {}
         }
@@ -1050,16 +1040,6 @@ fn dispatch_click_action(context: &ClickContext<'_>, action: ClickAction) {
         ClickAction::JumpPane(pane_id) => {
             send_sidebar_request(send_sidebar_jump(context.socket, &pane_id));
         }
-    }
-}
-
-fn filter_key(filter: StatusFilter) -> &'static str {
-    match filter {
-        StatusFilter::All => "all",
-        StatusFilter::AttentionOnly => "attn",
-        StatusFilter::WorkingOnly => "working",
-        StatusFilter::DoneOnly => "done",
-        StatusFilter::IdleOnly => "idle",
     }
 }
 

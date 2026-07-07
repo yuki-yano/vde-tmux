@@ -68,11 +68,10 @@ pub fn subscribe(socket: &Path, tx: Sender<DaemonSnapshot>) -> Result<()> {
                 }
             };
             match message {
-                ServerMessage::Snapshot { snapshot } => {
-                    if tx.send(snapshot).is_err() {
-                        break;
-                    }
-                }
+                ServerMessage::Snapshot { snapshot } => match tx.send(snapshot) {
+                    Ok(()) => {}
+                    Err(_) => break,
+                },
                 ServerMessage::Error { message } => {
                     eprintln!("[vde-tmux] daemon subscribe error: {message}");
                     break;

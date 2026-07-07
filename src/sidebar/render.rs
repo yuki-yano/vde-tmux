@@ -288,81 +288,68 @@ fn build_header_title_line(
     let mode_body = format_header_mode_body(state.view_mode, theme);
     let mode_text = format!("{}{}", theme.header_prefix, mode_body);
     let mode_suffix = theme.header_suffix.as_str();
-    let total_text = format!(" {} tasks ", counts.total);
+    let count_text = format!(" {}", counts.total);
+    let task_label = if counts.total == 1 { "task" } else { "tasks" };
+    let total_label_text = format!(" {task_label} ");
     let total_suffix = header_total_suffix(theme);
-    let full_text = format!("{mode_text}{mode_suffix}{total_text}{total_suffix}");
+    let full_text = format!("{mode_text}{mode_suffix}{count_text}{total_label_text}{total_suffix}");
     let include_total = display_width(&full_text) <= width;
     let text = if include_total {
-        full_text.clone()
-    } else if display_width(&mode_text) <= width {
-        mode_text.clone()
+        full_text
     } else {
         truncate_display(&mode_text, width)
     };
 
-    let mut segments = Vec::new();
-    let mode_len = display_width(&mode_text);
-    if let Some(range) = visible_segment_range(&text, 0, mode_len) {
-        segments.push(HeaderSegment {
-            range,
-            action: Some(HeaderAction::CycleViewMode),
-            style: Some(mode_segment_style(theme)),
-        });
+    let total_bg = theme.header_total_bg.unwrap_or(theme.active_bg);
+    let mut pieces = vec![(
+        mode_text,
+        mode_segment_style(theme),
+        Some(HeaderAction::CycleViewMode),
+    )];
+    if include_total {
+        if !mode_suffix.is_empty() {
+            pieces.push((
+                mode_suffix.to_string(),
+                Style::default().fg(mode_bg(theme)).bg(total_bg),
+                None,
+            ));
+        }
+        pieces.push((
+            count_text,
+            Style::default()
+                .fg(Color::Reset)
+                .bg(total_bg)
+                .add_modifier(Modifier::BOLD),
+            None,
+        ));
+        pieces.push((
+            total_label_text,
+            Style::default()
+                .fg(theme.header_total_fg.unwrap_or(theme.detail))
+                .bg(total_bg),
+            None,
+        ));
+        if !total_suffix.is_empty() {
+            pieces.push((
+                total_suffix.to_string(),
+                Style::default().fg(total_bg),
+                None,
+            ));
+        }
     }
 
-    let total_bg = theme.header_total_bg.unwrap_or(theme.active_bg);
-    let mut start = mode_len;
-    if include_total && !mode_suffix.is_empty() {
-        let suffix_len = display_width(mode_suffix);
-        if let Some(range) = visible_segment_range(&text, start, suffix_len) {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (piece, style, action) in pieces {
+        let len = display_width(&piece);
+        if let Some(range) = visible_segment_range(&text, start, len) {
             segments.push(HeaderSegment {
                 range,
-                action: None,
-                style: Some(Style::default().fg(mode_bg(theme)).bg(total_bg)),
+                action,
+                style: Some(style),
             });
         }
-        start += suffix_len;
-    }
-    if include_total {
-        // 数字(情報)は通常文字色 + bold で立たせ、"tasks" ラベルは detail に落とす。
-        let count_len = display_width(&format!(" {}", counts.total));
-        let total_len = display_width(&total_text);
-        if let Some(range) = visible_segment_range(&text, start, count_len) {
-            segments.push(HeaderSegment {
-                range,
-                action: None,
-                style: Some(
-                    Style::default()
-                        .fg(Color::Reset)
-                        .bg(total_bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            });
-        }
-        if let Some(range) =
-            visible_segment_range(&text, start + count_len, total_len - count_len)
-        {
-            segments.push(HeaderSegment {
-                range,
-                action: None,
-                style: Some(
-                    Style::default()
-                        .fg(theme.header_total_fg.unwrap_or(theme.detail))
-                        .bg(total_bg),
-                ),
-            });
-        }
-        start += total_len;
-    }
-    if include_total
-        && !total_suffix.is_empty()
-        && let Some(range) = visible_segment_range(&text, start, display_width(total_suffix))
-    {
-        segments.push(HeaderSegment {
-            range,
-            action: None,
-            style: Some(Style::default().fg(total_bg)),
-        });
+        start += len;
     }
 
     HeaderLine { text, segments }
@@ -429,7 +416,7 @@ fn build_header_chip_line(
     let mut pieces: Vec<(String, Option<Style>, Option<HeaderAction>)> = Vec::new();
     for (index, spec) in specs.into_iter().enumerate() {
         let active = state.filter == spec.filter;
-        let action = if spec.filter == StatusFilter::All || active || spec.count > 0 {
+        let action = if active || counts.filter_is_available(spec.filter) {
             Some(HeaderAction::SetFilter(spec.filter))
         } else {
             None
@@ -517,7 +504,7 @@ fn chip_style(
         let mut style = Style::default()
             .fg(theme.header_chip_fg.unwrap_or_else(|| mode_fg(theme)))
             .bg(chip_color(theme, badge_state));
-        if !header_style_configured(theme) || theme.header_active_bold {
+        if header_bold(theme) {
             style = style.add_modifier(Modifier::BOLD);
         }
         return style;
@@ -549,7 +536,7 @@ pub fn header_hit_test(layout: &HeaderLayout, row: u16, column: u16) -> Option<H
 
 pub fn render_header_lines(
     layout: &HeaderLayout,
-    theme: &SidebarRenderTheme,
+    _theme: &SidebarRenderTheme,
 ) -> Vec<Line<'static>> {
     layout
         .lines
@@ -567,7 +554,7 @@ pub fn render_header_lines(
                 }
                 spans.push(Span::styled(
                     slice_display(&line.text, segment.range.start, segment.range.end),
-                    segment.style.unwrap_or_else(|| header_segment_style(theme)),
+                    segment.style.expect("header segment style"),
                 ));
                 cursor = segment.range.end;
             }
@@ -593,7 +580,7 @@ pub fn build_footer_line(width: usize) -> Line<'static> {
 /// 無指定なら header_mode 色 + BOLD。
 fn mode_segment_style(theme: &SidebarRenderTheme) -> Style {
     let mut style = Style::default().fg(mode_fg(theme)).bg(mode_bg(theme));
-    if !header_style_configured(theme) || theme.header_active_bold {
+    if header_bold(theme) {
         style = style.add_modifier(Modifier::BOLD);
     }
     style
@@ -603,26 +590,16 @@ fn header_style_configured(theme: &SidebarRenderTheme) -> bool {
     theme.header_active_fg.is_some() || theme.header_active_bg.is_some() || theme.header_active_bold
 }
 
+fn header_bold(theme: &SidebarRenderTheme) -> bool {
+    !header_style_configured(theme) || theme.header_active_bold
+}
+
 fn mode_fg(theme: &SidebarRenderTheme) -> Color {
     theme.header_active_fg.unwrap_or(theme.header_badge_fg)
 }
 
 fn mode_bg(theme: &SidebarRenderTheme) -> Color {
     theme.header_active_bg.unwrap_or(theme.header_mode)
-}
-
-fn header_segment_style(theme: &SidebarRenderTheme) -> Style {
-    let mut style = Style::default();
-    if let Some(fg) = theme.header_active_fg {
-        style = style.fg(fg);
-    }
-    if let Some(bg) = theme.header_active_bg {
-        style = style.bg(bg);
-    }
-    if theme.header_active_bold {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    style
 }
 
 pub fn render_rows(rows: &[SidebarRow], state: &SidebarState, width: usize) -> String {
@@ -2232,6 +2209,27 @@ mod tests {
     }
 
     #[test]
+    fn header_title_uses_singular_task_label_for_one_agent() {
+        let counts = BadgeCounts {
+            total: 1,
+            idle: 1,
+            ..BadgeCounts::default()
+        };
+
+        let header = build_header_layout_with_counts(
+            &SidebarState::default(),
+            80,
+            &SidebarRenderTheme::default(),
+            counts,
+        );
+
+        assert_eq!(
+            header.lines[0].text,
+            format!(" ≣ repo     \u{e0b0} 1 task \u{e0b0}")
+        );
+    }
+
+    #[test]
     fn header_hit_test_ignores_total_segment_and_zero_count_chips() {
         let state = SidebarState {
             view_mode: ViewMode::ByCategory,
@@ -2285,12 +2283,8 @@ mod tests {
             ..BadgeCounts::default()
         };
 
-        let header = build_header_layout_with_counts(
-            &state,
-            80,
-            &SidebarRenderTheme::default(),
-            counts,
-        );
+        let header =
+            build_header_layout_with_counts(&state, 80, &SidebarRenderTheme::default(), counts);
 
         assert!(
             header.lines[1].text.contains("▲ 2"),
@@ -2392,8 +2386,16 @@ badge:
 
         let header = build_header_layout_with_counts(&state, 80, &theme, rich_header_counts());
 
-        assert!(header.lines[1].text.contains("W 1"), "{:?}", header.lines[1].text);
-        assert!(!header.lines[1].text.contains("● 1"), "{:?}", header.lines[1].text);
+        assert!(
+            header.lines[1].text.contains("W 1"),
+            "{:?}",
+            header.lines[1].text
+        );
+        assert!(
+            !header.lines[1].text.contains("● 1"),
+            "{:?}",
+            header.lines[1].text
+        );
     }
 
     #[test]

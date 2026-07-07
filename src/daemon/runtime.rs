@@ -386,7 +386,7 @@ impl RuntimeState {
                 self.ui_state.apply(SidebarAction::CycleViewMode, &row_refs)
             }
             SidebarInputAction::SetFilter(filter) => {
-                if filter_is_available(self.counts, filter) {
+                if self.counts.filter_is_available(filter) {
                     self.ui_state.set_filter(filter)
                 } else {
                     false
@@ -809,16 +809,12 @@ impl RuntimeState {
     }
 }
 
-fn filter_is_available(counts: BadgeCounts, filter: crate::sidebar::state::StatusFilter) -> bool {
-    filter == crate::sidebar::state::StatusFilter::All || counts.count_for_filter(filter) > 0
-}
-
 fn next_available_filter(
     current: crate::sidebar::state::StatusFilter,
     counts: BadgeCounts,
 ) -> crate::sidebar::state::StatusFilter {
     let mut next = current.next();
-    while !filter_is_available(counts, next) {
+    while !counts.filter_is_available(next) {
         next = next.next();
     }
     next
@@ -1464,7 +1460,7 @@ mod tests {
             ..BadgeCounts::default()
         };
 
-        assert!(filter_is_available(counts, StatusFilter::AttentionOnly));
+        assert!(counts.filter_is_available(StatusFilter::AttentionOnly));
     }
 
     #[test]

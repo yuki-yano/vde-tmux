@@ -101,14 +101,14 @@ rtk git commit -m "ヘッダーの色解決・グリフ・powerline 遷移を設
 
 **Files:** `src/sidebar/render.rs`、`src/sidebar/tree.rs`、`src/sidebar/tui.rs`
 
-- [ ] `BadgeCounts::from_rows` を削除(呼び出し 0 件)
-- [ ] `filter_name`(tui.rs:611)と `filter_key`(tui.rs:1056)を単一のマッピングに統合(`StatusFilter` のメソッドにするのが素直)
-- [ ] フィルタ選択可否の述語を共有化: `filter_is_available` 相当を `BadgeCounts`(または `StatusFilter`)側に移し、`runtime.rs` と `render.rs` のチップ action 判定(`All || active || count > 0`)が同じ関数を参照する形にする(active の特別扱いは render 側で OR する)
-- [ ] `header_segment_style` と `render_header_lines` の `unwrap_or_else` fallback を削除(全 segment が `Some(style)` を持つ)
-- [ ] bold 判定 `!header_style_configured(theme) || theme.header_active_bold` を `header_bold(theme)` ヘルパーに抽出し、`mode_segment_style` / `chip_style` の両方から使う
-- [ ] `build_header_title_line` をチップ行と同じ pieces 方式(`Vec<(String, Option<Style>, Option<HeaderAction>)>` を1ループで segment 化)に統一
-- [ ] `full_text.clone()`(render.rs:303 付近)を move に、`" {} tasks "` を 1 件時 `"1 task"` に修正(テスト更新)
-- [ ] `rtk cargo test` / `rtk cargo clippy --all-targets` / `rtk cargo fmt --check` 通過を確認してコミット
+- [x] `BadgeCounts::from_rows` を削除(呼び出し 0 件)
+- [x] `filter_name`(tui.rs:611)と `filter_key`(tui.rs:1056)を単一のマッピングに統合(`StatusFilter` のメソッドにするのが素直)
+- [x] フィルタ選択可否の述語を共有化: `filter_is_available` 相当を `BadgeCounts`(または `StatusFilter`)側に移し、`runtime.rs` と `render.rs` のチップ action 判定(`All || active || count > 0`)が同じ関数を参照する形にする(active の特別扱いは render 側で OR する)
+- [x] `header_segment_style` と `render_header_lines` の `unwrap_or_else` fallback を削除(全 segment が `Some(style)` を持つ)
+- [x] bold 判定 `!header_style_configured(theme) || theme.header_active_bold` を `header_bold(theme)` ヘルパーに抽出し、`mode_segment_style` / `chip_style` の両方から使う
+- [x] `build_header_title_line` をチップ行と同じ pieces 方式(`Vec<(String, Option<Style>, Option<HeaderAction>)>` を1ループで segment 化)に統一
+- [x] `full_text.clone()`(render.rs:303 付近)を move に、`" {} tasks "` を 1 件時 `"1 task"` に修正(テスト更新)
+- [x] `rtk cargo test` / `rtk cargo clippy --all-targets` / `rtk cargo fmt --check` 通過を確認してコミット
 
 ```bash
 rtk git add -A
@@ -119,26 +119,26 @@ rtk git commit -m "sidebar ヘッダーの dead code と重複ロジックを整
 
 ### 機能完了条件
 
-- [ ] blocked 0 件・working N 件のとき ▲ チップが N 表示・クリック可能で、attn ビューに到達できる(tab サイクル含む)
-- [ ] `counts` を持たない旧形式 snapshot を受けてもクライアントが停止せず、counts は全 0 として動作する
-- [ ] 購読ストリーム中の不正な1行で購読スレッドが恒久停止しない
-- [ ] `header.colors.bg` がモードバッジとアクティブ all チップの両方に効く
-- [ ] `badge.glyphs` のカスタムグリフが行バッジ・statusline・ヘッダーチップで一致する
-- [ ] `header.suffix` に任意 glyph を設定してもモードバッジ側と総数セグメント側の遷移が対称になる
-- [ ] `docs/migration.md` の例をそのままコピーした config がパースエラーにならない
-- [ ] 総数 1 件のとき `1 task` と表示される
+- [x] blocked 0 件・working N 件のとき ▲ チップが N 表示・クリック可能で、attn ビューに到達できる(tab サイクル含む)
+- [x] `counts` を持たない旧形式 snapshot を受けてもクライアントが停止せず、counts は全 0 として動作する
+- [x] 購読ストリーム中の不正な1行で購読スレッドが恒久停止しない
+- [x] `header.colors.bg` がモードバッジとアクティブ all チップの両方に効く
+- [x] `badge.glyphs` のカスタムグリフが行バッジ・statusline・ヘッダーチップで一致する
+- [x] `header.suffix` に任意 glyph を設定してもモードバッジ側と総数セグメント側の遷移が対称になる
+- [x] `docs/migration.md` の例をそのままコピーした config がパースエラーにならない
+- [x] 総数 1 件のとき `1 task` と表示される
 
 ### テスト完了条件
 
-- [ ] Task 1〜5 の新規テストがすべて通る
-- [ ] `rtk cargo test` 全通過、`rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
-- [ ] 削除した `from_rows` / `header_segment_style` / `filter_name` 等への参照が残っていない(`rg` で確認)
+- [x] Task 1〜5 の新規テストがすべて通る
+- [x] `rtk cargo test` 全通過、`rtk cargo clippy --all-targets` 警告ゼロ、`rtk cargo fmt --check` 通過
+- [x] 削除した `from_rows` / `header_segment_style` / `filter_name` 等への参照が残っていない(`rg` で確認)
 
 ### 運用反映条件
 
-- [ ] README のヘッダー仕様(▲ チップの意味、suffix の挙動、chip_prefix/chip_suffix)を更新
-- [ ] `docs/migration.md` が現行スキーマと一致
-- [ ] `rtk cargo install --path . --force` で再インストールし、`vt sidebar close && vt sidebar open` で表示崩れがないことを目視確認
+- [x] README のヘッダー仕様(▲ チップの意味、suffix の挙動、chip_prefix/chip_suffix)を更新
+- [x] `docs/migration.md` が現行スキーマと一致
+- [x] `rtk cargo install --path . --force` で再インストールし、`vt sidebar close && vt sidebar open` で表示崩れがないことを目視確認
 
 ## スコープ外
 

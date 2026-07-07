@@ -65,20 +65,6 @@ pub struct BadgeCounts {
 }
 
 impl BadgeCounts {
-    pub fn from_rows(rows: &[SidebarRow]) -> Self {
-        let mut counts = Self::default();
-        for row in rows.iter().filter(|row| row.kind == SidebarRowKind::Chat) {
-            counts.total += 1;
-            match row.badge_state {
-                Some(BadgeState::Blocked) => counts.blocked += 1,
-                Some(BadgeState::Working) => counts.working += 1,
-                Some(BadgeState::Done) => counts.done += 1,
-                Some(BadgeState::Idle) | None => counts.idle += 1,
-            }
-        }
-        counts
-    }
-
     pub fn count_for_filter(self, filter: StatusFilter) -> usize {
         match filter {
             StatusFilter::All => self.total,
@@ -87,6 +73,10 @@ impl BadgeCounts {
             StatusFilter::DoneOnly => self.done,
             StatusFilter::IdleOnly => self.idle,
         }
+    }
+
+    pub fn filter_is_available(self, filter: StatusFilter) -> bool {
+        filter == StatusFilter::All || self.count_for_filter(filter) > 0
     }
 }
 
@@ -2002,6 +1992,24 @@ mod tests {
         assert!(rows.iter().any(|row| row.id == "chat::%1"));
         assert!(rows.iter().any(|row| row.id == "chat::%2"));
         assert!(rows.iter().all(|row| row.id != "chat::%3"));
+    }
+
+    #[test]
+    fn badge_counts_filter_availability_uses_filter_counts() {
+        let counts = BadgeCounts {
+            total: 2,
+            attention: 0,
+            blocked: 0,
+            working: 2,
+            done: 0,
+            idle: 0,
+        };
+
+        assert!(counts.filter_is_available(crate::sidebar::state::StatusFilter::All));
+        assert!(!counts.filter_is_available(crate::sidebar::state::StatusFilter::AttentionOnly));
+        assert!(counts.filter_is_available(crate::sidebar::state::StatusFilter::WorkingOnly));
+        assert!(!counts.filter_is_available(crate::sidebar::state::StatusFilter::DoneOnly));
+        assert!(!counts.filter_is_available(crate::sidebar::state::StatusFilter::IdleOnly));
     }
 
     #[test]
