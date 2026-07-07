@@ -84,11 +84,80 @@ hook がなくても pane の実行コマンドからエージェントは検出
 }
 ```
 
-**Codex**：`~/.codex/config.toml` に追加する。
+`PostToolUse` hook により、vde-tmux は Claude Code の task tool events（`TaskCreate` / `TaskUpdate`、および emit された場合の `TodoWrite` snapshot）から collapsed の `done/total` counter と expanded task rows を表示する。
 
-```toml
-notify = ["vt", "hook", "codex"]
+**Codex**：`~/.codex/hooks.json`（または project-local な `.codex/hooks.json`）に追加し、Codex の `/hooks` で review / trust する。
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          { "type": "command", "command": "vt hook codex SessionStart" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vt hook codex UserPromptSubmit" }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vt hook codex PermissionRequest" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^update_plan$",
+        "hooks": [
+          { "type": "command", "command": "vt hook codex PostToolUse" }
+        ]
+      },
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          { "type": "command", "command": "vt hook codex PostToolUse" }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vt hook codex SubagentStart" }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vt hook codex SubagentStop" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vt hook codex Stop" }
+        ]
+      }
+    ]
+  }
+}
 ```
+
+`notify = ["vt", "hook", "codex"]` は legacy turn-complete notification だけを報告するため、task / subagent / worktree activity の detail rows には不十分である。
+`PostToolUse` hook により、vde-tmux は `update_plan` snapshot から collapsed の `done/total` counter と expanded task rows を表示し、認識できる `vw exec` Bash command を prompt 下の一時的な `vw exec <worktree_name>` row として表示する。
+`SubagentStart` / `SubagentStop` からは expanded の `Agent - ... #id` rows を表示する。
+Codex subagent は session metadata を解決できる場合、`Agent - Fermat #019f` のように Codex nickname を優先し、取れない場合は hook の `agent_type` を表示する。
+pane が linked git worktree 上にある場合、expanded detail の先頭に `+ <worktree_name>` が表示される。この active worktree row は `vw exec` activity とは別物であり、従来の `session · pane_id` place row は表示しない。
+detail row の色は `sidebar.colors` の `task_done`、`task_working`、`task_pending`、`task_label`、`subagent_label`、`subagent_id`、`worktree`、`worktree_activity` で上書きできる。
 
 **その他のエージェント**：汎用の低レベルコマンドで任意のエージェントから状態を報告できる。
 

@@ -82,11 +82,80 @@ Agents are detected even without hooks (from the pane's running command), but ho
 }
 ```
 
-**Codex** — add to `~/.codex/config.toml`:
+The `PostToolUse` hook lets vde-tmux read Claude Code task tool events (`TaskCreate` / `TaskUpdate`, plus `TodoWrite` snapshots when emitted) for the collapsed `done/total` counter and expanded task rows.
 
-```toml
-notify = ["vt", "hook", "codex"]
+**Codex** — add to `~/.codex/hooks.json` (or a project-local `.codex/hooks.json`), then review and trust the hooks from Codex with `/hooks`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          { "type": "command", "command": "vt hook codex SessionStart" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vt hook codex UserPromptSubmit" }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vt hook codex PermissionRequest" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^update_plan$",
+        "hooks": [
+          { "type": "command", "command": "vt hook codex PostToolUse" }
+        ]
+      },
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          { "type": "command", "command": "vt hook codex PostToolUse" }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vt hook codex SubagentStart" }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vt hook codex SubagentStop" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vt hook codex Stop" }
+        ]
+      }
+    ]
+  }
+}
 ```
+
+`notify = ["vt", "hook", "codex"]` only reports legacy turn-complete notifications; by itself it is not enough for task, subagent, or worktree activity detail rows.
+The `PostToolUse` hooks let vde-tmux read `update_plan` snapshots for the collapsed `done/total` counter and expanded task rows, and detect recognized `vw exec` Bash commands as a temporary `vw exec <worktree_name>` row under the prompt.
+`SubagentStart` and `SubagentStop` add expanded `Agent - ... #id` rows.
+For Codex subagents, vde-tmux resolves the session metadata when possible and prefers the Codex nickname, such as `Agent - Fermat #019f`; otherwise it shows the hook `agent_type`.
+When a pane is inside a linked git worktree, expanded details start with `+ <worktree_name>`; this active worktree row is separate from `vw exec` activity, and the old `session · pane_id` place row is not shown.
+Detail colors can be overridden under `sidebar.colors` with `task_done`, `task_working`, `task_pending`, `task_label`, `subagent_label`, `subagent_id`, `worktree`, and `worktree_activity`.
 
 **Other agents** — anything can report its state through the generic low-level command:
 
