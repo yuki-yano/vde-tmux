@@ -171,6 +171,7 @@ pub fn run_interactive_with_io(
     runner: &dyn TmuxRunner,
     io: &mut dyn SessionManagerIo,
 ) -> Result<()> {
+    ensure_tmux_server(runner)?;
     let entries = build_entries(runner)?;
     let rows = entries.iter().map(render_entry).collect::<Vec<_>>();
     let Some(selected) = io.choose(&rows)? else {
@@ -184,12 +185,23 @@ fn run_interactive_outside_tmux_with_io(
     io: &mut dyn SessionManagerIo,
     attach: &mut dyn SessionAttachIo,
 ) -> Result<()> {
+    ensure_tmux_server(runner)?;
     let entries = build_entries(runner)?;
     let rows = entries.iter().map(render_entry).collect::<Vec<_>>();
     let Some(selected) = io.choose(&rows)? else {
         return Ok(());
     };
     run_selection_outside_tmux(runner, &selected, attach)
+}
+
+fn ensure_tmux_server(runner: &dyn TmuxRunner) -> Result<()> {
+    if runner.run(&["has-session"]).is_ok() {
+        return Ok(());
+    }
+    runner
+        .run(&["new-session", "-d"])
+        .context("failed to start tmux server")?;
+    Ok(())
 }
 
 fn build_entries(runner: &dyn TmuxRunner) -> Result<Vec<ManagerEntry>> {
@@ -1218,6 +1230,7 @@ mod tests {
             "#{pane_current_command}",
         ]
         .join(&FIELD_SEP.to_string());
+        mock.stub(&["has-session"], "");
         mock.stub(
             &["list-sessions", "-F", &session_format],
             "main\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\nni.zsh\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
@@ -1250,6 +1263,47 @@ mod tests {
     }
 
     #[test]
+    fn interactive_session_manager_starts_tmux_server_when_missing() {
+        let mock = MockTmuxRunner::new();
+        let session_format = crate::session::session_list_format();
+        let window_format = [
+            "#{session_name}",
+            "#{window_index}",
+            "#{window_id}",
+            "#{window_name}",
+            "#{window_panes}",
+            "#{window_active}",
+            "#{pane_current_command}",
+        ]
+        .join(&FIELD_SEP.to_string());
+        mock.stub(&["new-session", "-d"], "");
+        mock.stub(
+            &["list-sessions", "-F", &session_format],
+            "main\u{1f}0\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
+        );
+        mock.stub(
+            &["list-windows", "-a", "-F", &window_format],
+            "main\t1\t@1\tzsh\t1\t1\tzsh\n",
+        );
+        mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+        let mut io = MockSessionManagerIo {
+            selection: None,
+            seen_rows: Vec::new(),
+        };
+
+        run_interactive_with_io(&mock, &mut io).unwrap();
+
+        assert!(io.seen_rows.iter().any(|row| row.contains("main")));
+        assert_eq!(
+            &mock.calls()[..2],
+            &[
+                vec!["has-session".to_string()],
+                vec!["new-session".to_string(), "-d".to_string()],
+            ]
+        );
+    }
+
+    #[test]
     fn outside_tmux_session_manager_attaches_selected_session() {
         let mock = MockTmuxRunner::new();
         let session_format = crate::session::session_list_format();
@@ -1263,6 +1317,7 @@ mod tests {
             "#{pane_current_command}",
         ]
         .join(&FIELD_SEP.to_string());
+        mock.stub(&["has-session"], "");
         mock.stub(
             &["list-sessions", "-F", &session_format],
             "main\u{1f}0\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\nni.zsh\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
@@ -1329,6 +1384,7 @@ mod tests {
             "#{pane_current_command}",
         ]
         .join(&FIELD_SEP.to_string());
+        mock.stub(&["has-session"], "");
         mock.stub(
             &["list-sessions", "-F", &session_format],
             "ni.zsh\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",

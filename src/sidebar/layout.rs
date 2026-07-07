@@ -41,6 +41,19 @@ pub fn open(
     open_unchecked(runner, target, self_exe, width, min_width)
 }
 
+pub fn open_if_auto_all_enabled(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    self_exe: &Path,
+    width: SidebarWidth,
+    min_width: u16,
+) -> Result<()> {
+    if !auto_all_enabled(runner)? {
+        return Ok(());
+    }
+    open(runner, target, self_exe, width, min_width)
+}
+
 pub fn close(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
     let Some(sidebar) = find_sidebar_pane(runner, target)? else {
         return restore_or_clear_stale_baseline(runner, target);
@@ -57,7 +70,7 @@ fn close_sidebar_pane(runner: &dyn TmuxRunner, target: &str, sidebar: &SidebarPa
     let current_panes = capture_pane_ids(runner, target)?;
     if let (Some(layout), Some(saved_panes)) = (saved_layout.as_deref(), saved_panes.as_ref())
         && saved_panes == &current_panes
-        && !layout.contains(&sidebar.pane_id)
+        && layout_matches_panes(layout, &current_panes)
     {
         runner.run(&["select-layout", "-t", target, layout])?;
     }
@@ -300,7 +313,9 @@ fn restore_or_clear_saved_baseline(
 ) -> Result<()> {
     let current_panes = capture_pane_ids(runner, target)?;
     match (saved_layout, saved_panes) {
-        (Some(layout), Some(saved_panes)) if saved_panes == &current_panes => {
+        (Some(layout), Some(saved_panes))
+            if saved_panes == &current_panes && layout_matches_panes(layout, &current_panes) =>
+        {
             runner.run(&["select-layout", "-t", target, layout])?;
             clear_baseline(runner, target)
         }
@@ -435,6 +450,62 @@ fn parse_saved_baseline(output: &str) -> (Option<String>, Option<BTreeSet<String
     (layout, panes)
 }
 
+fn layout_matches_panes(layout: &str, panes: &BTreeSet<String>) -> bool {
+    let layout_panes = layout_pane_ids(layout);
+    layout_panes.is_empty() || layout_panes == panes.clone()
+}
+
+fn layout_pane_ids(layout: &str) -> BTreeSet<String> {
+    let bytes = layout.as_bytes();
+    let mut ids = BTreeSet::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut cursor = index;
+        if !consume_digits(bytes, &mut cursor)
+            || !consume_byte(bytes, &mut cursor, b'x')
+            || !consume_digits(bytes, &mut cursor)
+            || !consume_byte(bytes, &mut cursor, b',')
+            || !consume_digits(bytes, &mut cursor)
+            || !consume_byte(bytes, &mut cursor, b',')
+            || !consume_digits(bytes, &mut cursor)
+        {
+            index = start + 1;
+            continue;
+        }
+        if consume_byte(bytes, &mut cursor, b',') {
+            let pane_start = cursor;
+            if consume_digits(bytes, &mut cursor) {
+                ids.insert(format!("%{}", &layout[pane_start..cursor]));
+                index = cursor;
+                continue;
+            }
+        }
+        index = start + 1;
+    }
+    ids
+}
+
+fn consume_digits(bytes: &[u8], cursor: &mut usize) -> bool {
+    let start = *cursor;
+    while *cursor < bytes.len() && bytes[*cursor].is_ascii_digit() {
+        *cursor += 1;
+    }
+    *cursor > start
+}
+
+fn consume_byte(bytes: &[u8], cursor: &mut usize, expected: u8) -> bool {
+    if bytes.get(*cursor).copied() != Some(expected) {
+        return false;
+    }
+    *cursor += 1;
+    true
+}
+
 fn capture_existing_pane_ids(
     runner: &dyn TmuxRunner,
     target: &str,
@@ -454,6 +525,16 @@ fn list_window_ids(runner: &dyn TmuxRunner) -> Result<Vec<String>> {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect())
+}
+
+fn auto_all_enabled(runner: &dyn TmuxRunner) -> Result<bool> {
+    let output = runner.run(&["show-hooks", "-g", AFTER_NEW_WINDOW_HOOK])?;
+    Ok(output.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix(AFTER_NEW_WINDOW_HOOK)
+            .map(|command| !command.trim().is_empty())
+            .unwrap_or(false)
+    }))
 }
 
 fn install_auto_hooks(runner: &dyn TmuxRunner, self_exe: &Path, width: SidebarWidth) -> Result<()> {
@@ -1161,6 +1242,41 @@ mod tests {
         close(&mock, "@1").unwrap();
 
         assert_eq!(mock.calls().len(), 6);
+    }
+
+    #[test]
+    fn close_does_not_restore_layout_that_still_contains_sidebar_pane() {
+        let mock = MockTmuxRunner::new();
+        let layout_with_sidebar = "abcd,120x40,0,0{80x40,0,0,1,39x40,81,0,9}";
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%9\t1\t40\n%1\t\t80\n",
+        );
+        mock.stub(
+            &["show-options", "-w", "-t", "@1"],
+            &format!(
+                "{KEY_LAYOUT_BASELINE} \"{layout_with_sidebar}\"\n{KEY_LAYOUT_PANES} \"%1\"\n"
+            ),
+        );
+        mock.stub(&["kill-pane", "-t", "%9"], "");
+        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_BASELINE],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-w", "-u", "-t", "@1", KEY_LAYOUT_PANES],
+            "",
+        );
+
+        close(&mock, "@1").unwrap();
+
+        assert!(
+            !mock
+                .calls()
+                .iter()
+                .any(|call| call.first().map(String::as_str) == Some("select-layout"))
+        );
     }
 
     #[test]

@@ -178,10 +178,23 @@ pub fn switch_project(runner: &dyn TmuxRunner, config: &Config, path: &str) -> R
     }
     let session_name = session_name_for_path(path);
     let sessions = list_sessions(runner)?;
-    let category = if let Some(session) = find_session(&sessions, &session_name) {
-        resolve_category_for_session(config, session)
+    let (category, created_window) = if let Some(session) = find_session(&sessions, &session_name) {
+        (resolve_category_for_session(config, session), None)
     } else {
-        runner.run(&["new-session", "-d", "-s", &session_name, "-c", path])?;
+        let created_window = runner
+            .run(&[
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-s",
+                &session_name,
+                "-c",
+                path,
+            ])?
+            .trim()
+            .to_string();
         set_session_option(runner, &session_name, KEY_PROJECT_PATH, path)?;
         let session = SessionInfo {
             name: session_name.clone(),
@@ -190,8 +203,20 @@ pub fn switch_project(runner: &dyn TmuxRunner, config: &Config, path: &str) -> R
         };
         let category = resolve_category_for_session(config, &session);
         set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
-        category
+        (category, Some(created_window))
     };
+    if let Some(window) = created_window
+        .as_deref()
+        .filter(|window| !window.is_empty())
+    {
+        crate::sidebar::layout::open_if_auto_all_enabled(
+            runner,
+            window,
+            &std::env::current_exe()?,
+            config.sidebar.width,
+            config.sidebar.min_width,
+        )?;
+    }
     switch_client_for_client(runner, &client, &session_name)?;
     remember_session_for_client(runner, &client, &category, &session_name)
 }
@@ -297,12 +322,15 @@ mod tests {
             &[
                 "new-session",
                 "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
                 "-s",
                 "ni.zsh",
                 "-c",
                 "/Users/me/repos/ni.zsh",
             ],
-            "",
+            "@1\n",
         );
         mock.stub(
             &[
@@ -323,6 +351,10 @@ mod tests {
                 "public",
             ],
             "",
+        );
+        mock.stub(
+            &["show-hooks", "-g", "after-new-window[90]"],
+            "after-new-window[90] \n",
         );
         mock.stub(
             &["switch-client", "-c", "/dev/ttys001", "-t", "=ni.zsh:"],
@@ -354,7 +386,20 @@ mod tests {
             "\t/dev/ttys001\n",
         );
         mock.stub(&["list-sessions", "-F", &format], "");
-        mock.stub(&["new-session", "-d", "-s", "repo", "-c", "/tmp/repo"], "");
+        mock.stub(
+            &[
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-s",
+                "repo",
+                "-c",
+                "/tmp/repo",
+            ],
+            "@1\n",
+        );
         mock.stub(
             &[
                 "set-option",
@@ -375,6 +420,10 @@ mod tests {
             ],
             "",
         );
+        mock.stub(
+            &["show-hooks", "-g", "after-new-window[90]"],
+            "after-new-window[90] \n",
+        );
         mock.stub(&["switch-client", "-c", "/dev/ttys001", "-t", "=repo:"], "");
         mock.stub(
             &[
@@ -386,7 +435,137 @@ mod tests {
             "",
         );
         switch_project(&mock, &config, "/tmp/repo").unwrap();
-        assert_eq!(mock.calls().len(), 7);
+        assert_eq!(mock.calls().len(), 8);
+    }
+
+    #[test]
+    fn switch_project_opens_sidebar_for_created_session_when_all_sidebar_is_enabled() {
+        let mock = MockTmuxRunner::new();
+        let format = crate::session::session_list_format();
+        let exe = std::env::current_exe().unwrap();
+        let attach_command = format!("{} sidebar attach", shell_quote(&exe.display().to_string()));
+        let mut config = crate::config::Config::default();
+        config.categories.default_category = Some("public".to_string());
+        config.sidebar.width = crate::config::SidebarWidth::Columns(40);
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "\t/dev/ttys001\n",
+        );
+        mock.stub(&["list-sessions", "-F", &format], "");
+        mock.stub(
+            &[
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-s",
+                "repo",
+                "-c",
+                "/tmp/repo",
+            ],
+            "@9\n",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "repo",
+                crate::options::KEY_PROJECT_PATH,
+                "/tmp/repo",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "repo",
+                crate::options::KEY_CATEGORY,
+                "public",
+            ],
+            "",
+        );
+        mock.stub(
+            &["show-hooks", "-g", "after-new-window[90]"],
+            "after-new-window[90] run-shell 'vt sidebar layout-applied'\n",
+        );
+        mock.stub(
+            &[
+                "list-panes",
+                "-t",
+                "@9",
+                "-F",
+                crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+            ],
+            "%1\t\t80\n",
+        );
+        mock.stub(&["show-options", "-w", "-t", "@9"], "");
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@9",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-before\n",
+        );
+        mock.stub(&["list-panes", "-t", "@9", "-F", "#{pane_id}"], "%1\n");
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@9",
+                crate::options::KEY_LAYOUT_BASELINE,
+                "layout-before",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@9",
+                crate::options::KEY_LAYOUT_PANES,
+                "%1",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "split-window",
+                "-d",
+                "-t",
+                "@9",
+                "-hbf",
+                "-l",
+                "40",
+                &attach_command,
+            ],
+            "",
+        );
+        mock.stub(&["switch-client", "-c", "/dev/ttys001", "-t", "=repo:"], "");
+        mock.stub(
+            &[
+                "set-option",
+                "-g",
+                "@vde_client_2f6465762f74747973303031_public",
+                "repo",
+            ],
+            "",
+        );
+
+        switch_project(&mock, &config, "/tmp/repo").unwrap();
+
+        assert!(mock.calls().iter().any(|call| {
+            call.first().map(String::as_str) == Some("split-window")
+                && call.get(2).map(String::as_str) == Some("-t")
+                && call.get(3).map(String::as_str) == Some("@9")
+        }));
     }
 
     #[test]
@@ -418,8 +597,18 @@ mod tests {
         );
         mock.stub(&["list-sessions", "-F", &format], "");
         mock.stub(
-            &["new-session", "-d", "-s", "ni.zsh", "-c", "/tmp/ni.zsh"],
-            "",
+            &[
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-s",
+                "ni.zsh",
+                "-c",
+                "/tmp/ni.zsh",
+            ],
+            "@1\n",
         );
         mock.stub(
             &[
@@ -440,6 +629,10 @@ mod tests {
                 "public",
             ],
             "",
+        );
+        mock.stub(
+            &["show-hooks", "-g", "after-new-window[90]"],
+            "after-new-window[90] \n",
         );
         mock.stub(
             &["switch-client", "-c", "/dev/ttys001", "-t", "=ni.zsh:"],

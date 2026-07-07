@@ -12,7 +12,6 @@ pub trait TmuxRunner {
     fn run(&self, args: &[&str]) -> Result<String>;
 }
 
-///
 pub fn run_command(program: &str, args: &[&str], timeout: Option<Duration>) -> Result<String> {
     let mut child = Command::new(program)
         .args(args)
