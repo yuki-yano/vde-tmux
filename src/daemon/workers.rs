@@ -200,8 +200,9 @@ pub fn apply_capture_detection(
     let mut observed_activity_epoch = None;
     let running_has_started_at =
         pane.status == "running" && pane.started_at.trim().parse::<i64>().is_ok();
-    let has_hook_state = !pane.status.trim().is_empty() || !pane.wait_reason.trim().is_empty();
-    let should_detect_wait_reason = !has_hook_state;
+    let has_hook_wait_reason = !pane.wait_reason.trim().is_empty();
+    let status_allows_capture_detection = pane.status.trim().is_empty() || pane.status == "running";
+    let should_detect_wait_reason = !has_hook_wait_reason && status_allows_capture_detection;
     let should_capture = should_detect_wait_reason || pane.status == "running";
     if should_capture && let Ok(tail) = io.capture_tail(&pane.pane_id) {
         if should_detect_wait_reason && let Some(wait_reason) = detect_codex_wait_reason(&tail) {
@@ -449,20 +450,20 @@ mod tests {
     }
 
     #[test]
-    fn hook_status_takes_precedence_over_capture_prompt_detection() {
+    fn running_status_without_wait_reason_uses_capture_prompt_detection() {
         let io = MockWorkerIo::default();
-        let mut active = pane("%1", "claude", "running");
+        let mut active = pane("%1", "codex", "running");
         active.started_at = "990".to_string();
         io.captures.lock().unwrap().insert(
             "%1".to_string(),
-            "Claude needs your permission to use Bash\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n"
+            "Question 1/1 (1 unanswered)\n今の気分に一番近いものはどれですか？\n› 1. 集中したい\n"
                 .to_string(),
         );
 
         let pane = apply_capture_detection(&io, active, 1_000, 30);
 
-        assert_eq!(pane.status, "running");
-        assert_eq!(pane.wait_reason, "");
+        assert_eq!(pane.status, "waiting");
+        assert_eq!(pane.wait_reason, "codex_question_prompt");
     }
 
     #[test]
