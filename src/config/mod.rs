@@ -411,10 +411,7 @@ pub struct SidebarColorsConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SidebarHeaderConfig {
-    pub format: String,
-    pub prefix: String,
-    pub suffix: String,
-    pub separator: String,
+    pub powerline: bool,
     pub bold: bool,
     pub colors: SegmentColors,
 }
@@ -422,10 +419,7 @@ pub struct SidebarHeaderConfig {
 impl Default for SidebarHeaderConfig {
     fn default() -> Self {
         Self {
-            format: "{label}".to_string(),
-            prefix: String::new(),
-            suffix: String::new(),
-            separator: String::new(),
+            powerline: true,
             bold: false,
             colors: SegmentColors::default(),
         }
@@ -642,10 +636,7 @@ mod tests {
             r##"
 sidebar:
   header:
-    prefix: "["
-    suffix: "]"
-    format: " {label} "
-    separator: " "
+    powerline: false
     bold: true
     colors:
       fg: white
@@ -654,13 +645,20 @@ sidebar:
         )
         .unwrap();
 
-        assert_eq!(config.sidebar.header.prefix, "[");
-        assert_eq!(config.sidebar.header.suffix, "]");
-        assert_eq!(config.sidebar.header.format, " {label} ");
-        assert_eq!(config.sidebar.header.separator, " ");
+        assert!(!config.sidebar.header.powerline);
         assert!(config.sidebar.header.bold);
         assert_eq!(config.sidebar.header.colors.fg.as_deref(), Some("white"));
         assert_eq!(config.sidebar.header.colors.bg.as_deref(), Some("24"));
+    }
+
+    #[test]
+    fn sidebar_header_rejects_removed_format_keys() {
+        for key in ["format", "prefix", "suffix", "separator"] {
+            let yaml = format!("sidebar:\n  header:\n    {key}: x\n");
+            let err = serde_yaml_ng::from_str::<Config>(&yaml).unwrap_err();
+
+            assert!(err.to_string().contains(key), "{err}");
+        }
     }
 
     #[test]

@@ -131,7 +131,7 @@ rtk git commit -m "0件のステータスフィルタを適用不可にする"
 - Modify: `src/config/schema.rs` / `src/config/mod.rs`(`header.format/prefix/suffix/separator` 廃止、`header.powerline` 追加)
 - Modify: `src/sidebar/tui.rs`(ヒットテスト呼び出し側の追従。`header.row_count()` ベースの既存処理は原則そのまま動く想定)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 `render.rs` tests(既存の 1997 / 2021 / 2102 / 2129 / 2172 / 2216 系は仕様変更に合わせて書き換え or 削除):
 
@@ -141,12 +141,12 @@ rtk git commit -m "0件のステータスフィルタを適用不可にする"
 - `powerline: false` 時に矢印グリフが含まれない
 - 幅を絞ると総数セグメントが落ち、さらに絞ると truncate される
 
-- [ ] **Step 2: テストが失敗することを確認**
+- [x] **Step 2: テストが失敗することを確認**
 
 Run: `rtk cargo test --lib sidebar::render`
 Expected: FAIL
 
-- [ ] **Step 3: 実装**
+- [x] **Step 3: 実装**
 
 1. `HeaderSegment.action` を `Option<HeaderAction>` にし、`header_hit_test` は `None` の segment を無視する。矢印・総数セグメントも style 付き segment として表現する(action は `None`)。
 2. `build_header_layout_with_counts` を仕様サマリどおり2行構成に書き換える。`view_mode_label_padded` は維持。
@@ -154,7 +154,7 @@ Expected: FAIL
 4. config: `sidebar.header` から `format/prefix/suffix/separator` を削除し、`powerline`(boolean, default true)を追加。schema テスト(253-262)を更新。`colors`/`bold` はモードバッジの上書きとして残す。
 5. `header_filter_item` / `format_header_segment` 等の不要になった分岐を整理する。
 
-- [ ] **Step 4: テスト通過を確認してコミット**
+- [x] **Step 4: テスト通過を確認してコミット**
 
 Run: `rtk cargo test`(tui 側のヘッダー行数に依存するテストの期待値更新を含む)
 

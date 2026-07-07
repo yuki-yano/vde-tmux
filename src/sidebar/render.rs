@@ -23,10 +23,8 @@ pub struct SidebarRenderTheme {
     pub header_active_bg: Option<Color>,
     pub header_active_fg: Option<Color>,
     pub header_active_bold: bool,
-    pub header_format: String,
-    pub header_prefix: String,
-    pub header_suffix: String,
-    pub header_separator: String,
+    pub header_badge_fg: Color,
+    pub header_powerline: bool,
     pub badge_glyphs: crate::config::BadgeGlyphs,
     pub badge_blocked: Color,
     pub badge_working: Color,
@@ -73,10 +71,8 @@ impl Default for SidebarRenderTheme {
             header_active_bg: None,
             header_active_fg: None,
             header_active_bold: false,
-            header_format: "{label}".to_string(),
-            header_prefix: String::new(),
-            header_suffix: String::new(),
-            header_separator: String::new(),
+            header_badge_fg: Color::Indexed(16),
+            header_powerline: true,
             badge_glyphs: crate::config::BadgeGlyphs::default(),
             badge_blocked: Color::Red,
             badge_working: Color::Green,
@@ -111,10 +107,8 @@ impl SidebarRenderTheme {
             header_active_bg: parse_color(config.header_active_bg.as_deref()),
             header_active_fg: parse_color(config.header_active_fg.as_deref()),
             header_active_bold: default.header_active_bold,
-            header_format: default.header_format,
-            header_prefix: default.header_prefix,
-            header_suffix: default.header_suffix,
-            header_separator: default.header_separator,
+            header_badge_fg: default.header_badge_fg,
+            header_powerline: default.header_powerline,
             badge_glyphs: default.badge_glyphs,
             // badge の色は from_app_config で共通の badge.colors から設定する。
             // ここ(sidebar.colors 単体)では ANSI 既定のままにしておく。
@@ -142,10 +136,7 @@ impl SidebarRenderTheme {
         theme.header_active_bg =
             parse_color(config.header.colors.bg.as_deref()).or(theme.header_active_bg);
         theme.header_active_bold = config.header.bold;
-        theme.header_format = config.header.format.clone();
-        theme.header_prefix = config.header.prefix.clone();
-        theme.header_suffix = config.header.suffix.clone();
-        theme.header_separator = config.header.separator.clone();
+        theme.header_powerline = config.header.powerline;
         theme
     }
 
@@ -238,7 +229,7 @@ pub struct HeaderLine {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderSegment {
     pub range: std::ops::Range<u16>,
-    pub action: HeaderAction,
+    pub action: Option<HeaderAction>,
     pub style: Option<Style>,
 }
 
@@ -263,158 +254,189 @@ pub fn build_header_layout_with_counts(
     if width <= 2 {
         return HeaderLayout::default();
     }
-    let mode_badge = format_header_segment(
-        &format!("≣ {}", view_mode_label_padded(state.view_mode)),
-        theme,
-    );
-    let separator = if theme.header_separator.is_empty() {
-        " · ".to_string()
+
+    let title = build_header_title_line(state, width as usize, theme, counts);
+    let chips = build_header_chip_line(state, width as usize, theme, counts);
+    HeaderLayout {
+        lines: vec![title, chips],
+    }
+}
+
+const POWERLINE_ARROW: &str = "\u{e0b0}";
+
+fn build_header_title_line(
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+    counts: BadgeCounts,
+) -> HeaderLine {
+    let mode_text = format!(" ≣ {} ", view_mode_label_padded(state.view_mode));
+    let total_text = format!(" {} tasks ", counts.total);
+    let full_text = if theme.header_powerline {
+        format!("{mode_text}{POWERLINE_ARROW}{total_text}{POWERLINE_ARROW}")
     } else {
-        theme.header_separator.clone()
+        format!("{mode_text}{total_text}")
     };
-    let filter_items = [
-        header_filter_item(
-            state.filter,
-            HeaderFilterSpec {
-                filter: StatusFilter::All,
-                glyph: "≡",
-                name: "all",
-                count: counts.total,
-                badge_state: None,
-                action: HeaderAction::SetFilter(StatusFilter::All),
-            },
-            theme,
-        ),
-        header_filter_item(
-            state.filter,
-            HeaderFilterSpec {
-                filter: StatusFilter::AttentionOnly,
-                glyph: "▲",
-                name: "attn",
-                count: counts.blocked,
-                badge_state: Some(BadgeState::Blocked),
-                action: HeaderAction::SetFilter(StatusFilter::AttentionOnly),
-            },
-            theme,
-        ),
-        header_filter_item(
-            state.filter,
-            HeaderFilterSpec {
-                filter: StatusFilter::WorkingOnly,
-                glyph: "●",
-                name: "working",
-                count: counts.working,
-                badge_state: Some(BadgeState::Working),
-                action: HeaderAction::SetFilter(StatusFilter::WorkingOnly),
-            },
-            theme,
-        ),
-        header_filter_item(
-            state.filter,
-            HeaderFilterSpec {
-                filter: StatusFilter::DoneOnly,
-                glyph: "✓",
-                name: "done",
-                count: counts.done,
-                badge_state: Some(BadgeState::Done),
-                action: HeaderAction::SetFilter(StatusFilter::DoneOnly),
-            },
-            theme,
-        ),
-        header_filter_item(
-            state.filter,
-            HeaderFilterSpec {
-                filter: StatusFilter::IdleOnly,
-                glyph: "○",
-                name: "idle",
-                count: counts.idle,
-                badge_state: Some(BadgeState::Idle),
-                action: HeaderAction::SetFilter(StatusFilter::IdleOnly),
-            },
-            theme,
-        ),
-    ];
-    let filter_badges = filter_items
-        .iter()
-        .map(|(label, _, _, _, _)| label.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let full_text = format!(" {mode_badge}{separator}{filter_badges}");
-    let text = truncate_display(&full_text, width as usize);
+    let include_total = display_width(&full_text) <= width;
+    let text = if include_total {
+        full_text.clone()
+    } else if display_width(&mode_text) <= width {
+        mode_text.clone()
+    } else {
+        truncate_display(&mode_text, width)
+    };
+
     let mut segments = Vec::new();
-    let mode_len = display_width(&mode_badge);
-    let separator_len = display_width(&separator);
-    if let Some(range) = visible_segment_range(&text, 1, mode_len) {
+    let mode_len = display_width(&mode_text);
+    if let Some(range) = visible_segment_range(&text, 0, mode_len) {
         segments.push(HeaderSegment {
             range,
-            action: HeaderAction::CycleViewMode,
+            action: Some(HeaderAction::CycleViewMode),
             style: Some(mode_segment_style(theme)),
         });
     }
-    let mut start = 1 + mode_len + separator_len;
-    for (label, action, filter, badge_state, count) in filter_items {
-        let label_len = display_width(&label);
-        if let Some(range) = visible_segment_range(&text, start, label_len) {
-            let style = if state.filter == filter {
-                active_filter_style(theme, badge_state)
-            } else if count == 0 {
-                // 0件は控えめに(状態色で塗らない)
-                Style::default().fg(theme.marker)
-            } else if let Some(badge_state) = badge_state {
-                Style::default().fg(theme.badge_color(badge_state))
+
+    let mut start = mode_len;
+    if include_total && theme.header_powerline {
+        if let Some(range) = visible_segment_range(&text, start, 1) {
+            segments.push(HeaderSegment {
+                range,
+                action: None,
+                style: Some(Style::default().fg(mode_bg(theme)).bg(theme.active_bg)),
+            });
+        }
+        start += 1;
+    }
+    if include_total {
+        let total_len = display_width(&total_text);
+        if let Some(range) = visible_segment_range(&text, start, total_len) {
+            segments.push(HeaderSegment {
+                range,
+                action: None,
+                style: Some(Style::default().fg(theme.detail).bg(theme.active_bg)),
+            });
+        }
+        start += total_len;
+    }
+    if include_total && theme.header_powerline {
+        if let Some(range) = visible_segment_range(&text, start, 1) {
+            segments.push(HeaderSegment {
+                range,
+                action: None,
+                style: Some(Style::default().fg(theme.active_bg)),
+            });
+        }
+    }
+
+    HeaderLine { text, segments }
+}
+
+#[derive(Clone, Copy)]
+struct HeaderChipSpec {
+    filter: StatusFilter,
+    count: usize,
+    glyph: &'static str,
+    badge_state: Option<BadgeState>,
+}
+
+fn build_header_chip_line(
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+    counts: BadgeCounts,
+) -> HeaderLine {
+    let specs = [
+        HeaderChipSpec {
+            filter: StatusFilter::All,
+            glyph: "≡",
+            count: counts.total,
+            badge_state: None,
+        },
+        HeaderChipSpec {
+            filter: StatusFilter::AttentionOnly,
+            glyph: "▲",
+            count: counts.blocked,
+            badge_state: Some(BadgeState::Blocked),
+        },
+        HeaderChipSpec {
+            filter: StatusFilter::WorkingOnly,
+            glyph: "●",
+            count: counts.working,
+            badge_state: Some(BadgeState::Working),
+        },
+        HeaderChipSpec {
+            filter: StatusFilter::DoneOnly,
+            glyph: "✓",
+            count: counts.done,
+            badge_state: Some(BadgeState::Done),
+        },
+        HeaderChipSpec {
+            filter: StatusFilter::IdleOnly,
+            glyph: "○",
+            count: counts.idle,
+            badge_state: Some(BadgeState::Idle),
+        },
+    ];
+
+    let labels = specs.map(|spec| chip_label(spec));
+    let full_text = labels.join("");
+    let text = truncate_display(&full_text, width);
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (spec, label) in specs.into_iter().zip(labels) {
+        let len = display_width(&label);
+        if let Some(range) = visible_segment_range(&text, start, len) {
+            let active = state.filter == spec.filter;
+            let action = if spec.filter == StatusFilter::All || active || spec.count > 0 {
+                Some(HeaderAction::SetFilter(spec.filter))
             } else {
-                Style::default()
+                None
             };
             segments.push(HeaderSegment {
                 range,
                 action,
-                style: Some(style),
+                style: Some(chip_style(theme, active, spec.badge_state, spec.count)),
             });
         }
-        start += label_len + 1;
+        start += len;
     }
-    HeaderLayout {
-        lines: vec![HeaderLine { text, segments }],
-    }
+
+    HeaderLine { text, segments }
 }
 
-struct HeaderFilterSpec {
-    filter: StatusFilter,
-    count: usize,
-    glyph: &'static str,
-    name: &'static str,
-    badge_state: Option<BadgeState>,
-    action: HeaderAction,
-}
-
-fn header_filter_item(
-    active_filter: StatusFilter,
-    spec: HeaderFilterSpec,
-    theme: &SidebarRenderTheme,
-) -> (
-    String,
-    HeaderAction,
-    StatusFilter,
-    Option<BadgeState>,
-    usize,
-) {
-    let label = if active_filter == spec.filter {
-        format!("{} {}:{}", spec.glyph, spec.name, spec.count)
+fn chip_label(spec: HeaderChipSpec) -> String {
+    if spec.filter == StatusFilter::All {
+        format!(" {} all {} ", spec.glyph, spec.count)
     } else {
-        format!("{} {}", spec.glyph, spec.count)
-    };
-    (
-        format_header_segment(&label, theme),
-        spec.action,
-        spec.filter,
-        spec.badge_state,
-        spec.count,
-    )
+        format!(" {} {} ", spec.glyph, spec.count)
+    }
 }
 
-fn format_header_segment(label: &str, theme: &SidebarRenderTheme) -> String {
-    let body = theme.header_format.replace("{label}", label);
-    format!("{}{}{}", theme.header_prefix, body, theme.header_suffix)
+fn chip_style(
+    theme: &SidebarRenderTheme,
+    active: bool,
+    badge_state: Option<BadgeState>,
+    count: usize,
+) -> Style {
+    if active {
+        return Style::default()
+            .fg(theme.header_badge_fg)
+            .bg(chip_color(theme, badge_state))
+            .add_modifier(Modifier::BOLD);
+    }
+    if count == 0 {
+        return Style::default().fg(theme.marker);
+    }
+    Style::default()
+        .fg(chip_color(theme, badge_state))
+        .bg(theme.active_bg)
+}
+
+fn chip_color(theme: &SidebarRenderTheme, badge_state: Option<BadgeState>) -> Color {
+    match badge_state {
+        Some(state) => theme.badge_color(state),
+        None => theme.header_mode,
+    }
 }
 
 pub fn header_hit_test(layout: &HeaderLayout, row: u16, column: u16) -> Option<HeaderAction> {
@@ -424,7 +446,7 @@ pub fn header_hit_test(layout: &HeaderLayout, row: u16, column: u16) -> Option<H
         .segments
         .iter()
         .find(|segment| segment.range.contains(&column))
-        .map(|segment| segment.action)
+        .and_then(|segment| segment.action)
 }
 
 pub fn render_header_lines(
@@ -472,33 +494,23 @@ pub fn build_footer_line(width: usize) -> Line<'static> {
 /// `sidebar.header` で明示スタイルが設定されていればそれを優先し、
 /// 無指定なら header_mode 色 + BOLD。
 fn mode_segment_style(theme: &SidebarRenderTheme) -> Style {
-    if header_style_configured(theme) {
-        header_segment_style(theme)
-    } else {
-        Style::default()
-            .fg(theme.header_mode)
-            .add_modifier(Modifier::BOLD)
-    }
-}
-
-/// 現在アクティブなフィルタセグメントの強調。
-/// 明示スタイルがあればそれを優先し、無指定なら
-/// 「状態色 + selection_bg + BOLD」でアクティブを示す。
-fn active_filter_style(theme: &SidebarRenderTheme, badge_state: Option<BadgeState>) -> Style {
-    if header_style_configured(theme) {
-        return header_segment_style(theme);
-    }
-    let mut style = Style::default()
-        .bg(theme.selection_bg)
-        .add_modifier(Modifier::BOLD);
-    if let Some(badge_state) = badge_state {
-        style = style.fg(theme.badge_color(badge_state));
+    let mut style = Style::default().fg(mode_fg(theme)).bg(mode_bg(theme));
+    if !header_style_configured(theme) || theme.header_active_bold {
+        style = style.add_modifier(Modifier::BOLD);
     }
     style
 }
 
 fn header_style_configured(theme: &SidebarRenderTheme) -> bool {
     theme.header_active_fg.is_some() || theme.header_active_bg.is_some() || theme.header_active_bold
+}
+
+fn mode_fg(theme: &SidebarRenderTheme) -> Color {
+    theme.header_active_fg.unwrap_or(theme.header_badge_fg)
+}
+
+fn mode_bg(theme: &SidebarRenderTheme) -> Color {
+    theme.header_active_bg.unwrap_or(theme.header_mode)
 }
 
 fn header_segment_style(theme: &SidebarRenderTheme) -> Style {
@@ -1736,10 +1748,13 @@ mod tests {
             ..SidebarState::default()
         };
 
-        assert_eq!(mode_segment_style(&theme).fg, Some(Color::Indexed(147)));
+        let mode_style = mode_segment_style(&theme);
+        assert_eq!(mode_style.fg, Some(Color::Indexed(16)));
+        assert_eq!(mode_style.bg, Some(Color::Indexed(147)));
+        assert!(mode_style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(
             build_header_layout(&state, 80).lines[0].text,
-            " ≣ repo     · ≡ all:0 ▲ 0 ● 0 ✓ 0 ○ 0"
+            format!(" ≣ repo     \u{e0b0} 0 tasks \u{e0b0}")
         );
     }
 
@@ -1750,7 +1765,7 @@ mod tests {
                 view_mode,
                 ..SidebarState::default()
             };
-            build_header_layout(&state, 80).lines[0].text.clone()
+            build_header_layout(&state, 80).lines[1].text.clone()
         };
         let flat = text_for(ViewMode::Flat);
         let repo = text_for(ViewMode::ByRepo);
@@ -1968,148 +1983,185 @@ mod tests {
         assert!(!text.contains('▲'), "{text:?}");
     }
 
+    fn rich_header_counts() -> BadgeCounts {
+        BadgeCounts {
+            total: 7,
+            blocked: 1,
+            working: 1,
+            done: 0,
+            idle: 5,
+        }
+    }
+
+    fn segment_text(line: &HeaderLine, segment: &HeaderSegment) -> String {
+        slice_display(&line.text, segment.range.start, segment.range.end)
+    }
+
+    fn style_for_segment(layout: &HeaderLayout, row: usize, needle: &str) -> Style {
+        let line = &layout.lines[row];
+        line.segments
+            .iter()
+            .find(|segment| segment_text(line, segment).contains(needle))
+            .unwrap_or_else(|| panic!("segment {needle:?} not found in {:?}", line.segments))
+            .style
+            .expect("segment style")
+    }
+
     #[test]
-    fn header_layout_shows_current_values_only_and_hit_tests_tokens() {
+    fn header_layout_uses_powerline_title_and_filter_chip_rows() {
+        let state = SidebarState {
+            view_mode: ViewMode::ByCategory,
+            filter: StatusFilter::All,
+            ..SidebarState::default()
+        };
+
+        let header = build_header_layout_with_counts(
+            &state,
+            80,
+            &SidebarRenderTheme::default(),
+            rich_header_counts(),
+        );
+
+        assert_eq!(header.row_count(), 2);
+        assert_eq!(
+            header.lines[0].text,
+            format!(" ≣ category \u{e0b0} 7 tasks \u{e0b0}")
+        );
+        assert_eq!(header.lines[1].text, " ≡ all 7  ▲ 1  ● 1  ✓ 0  ○ 5 ");
+    }
+
+    #[test]
+    fn header_hit_test_ignores_total_segment_and_zero_count_chips() {
+        let state = SidebarState {
+            view_mode: ViewMode::ByCategory,
+            filter: StatusFilter::All,
+            ..SidebarState::default()
+        };
+
+        let header = build_header_layout_with_counts(
+            &state,
+            80,
+            &SidebarRenderTheme::default(),
+            rich_header_counts(),
+        );
+
+        assert_eq!(
+            header_hit_test(&header, 0, 2),
+            Some(HeaderAction::CycleViewMode)
+        );
+        assert_eq!(header_hit_test(&header, 0, 14), None);
+        assert_eq!(
+            header_hit_test(&header, 1, 1),
+            Some(HeaderAction::SetFilter(StatusFilter::All))
+        );
+        assert_eq!(
+            header_hit_test(&header, 1, 10),
+            Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
+        );
+        assert_eq!(
+            header_hit_test(&header, 1, 15),
+            Some(HeaderAction::SetFilter(StatusFilter::WorkingOnly))
+        );
+        assert_eq!(header_hit_test(&header, 1, 20), None);
+        assert_eq!(
+            header_hit_test(&header, 1, 25),
+            Some(HeaderAction::SetFilter(StatusFilter::IdleOnly))
+        );
+    }
+
+    #[test]
+    fn header_chip_styles_distinguish_active_nonzero_and_zero_states() {
+        let theme = SidebarRenderTheme::default();
+        let counts = BadgeCounts {
+            total: 7,
+            blocked: 0,
+            working: 2,
+            done: 0,
+            idle: 5,
+        };
         let state = SidebarState {
             view_mode: ViewMode::ByCategory,
             filter: StatusFilter::AttentionOnly,
             ..SidebarState::default()
         };
 
-        let header = build_header_layout(&state, 80);
+        let header = build_header_layout_with_counts(&state, 80, &theme, counts);
 
-        assert_eq!(
-            header.lines[0].text,
-            " ≣ category · ≡ 0 ▲ attn:0 ● 0 ✓ 0 ○ 0"
-        );
-        assert_eq!(
-            header_hit_test(&header, 0, 2),
-            Some(HeaderAction::CycleViewMode)
-        );
-        assert_eq!(
-            header_hit_test(&header, 0, 19),
-            Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
-        );
+        let mode = style_for_segment(&header, 0, "≣ category");
+        assert_eq!(mode.fg, Some(Color::Indexed(16)));
+        assert_eq!(mode.bg, Some(theme.header_mode));
+        assert!(mode.add_modifier.contains(Modifier::BOLD));
+
+        let active = style_for_segment(&header, 1, "▲ 0");
+        assert_eq!(active.fg, Some(Color::Indexed(16)));
+        assert_eq!(active.bg, Some(theme.badge_blocked));
+        assert!(active.add_modifier.contains(Modifier::BOLD));
+
+        let working = style_for_segment(&header, 1, "● 2");
+        assert_eq!(working.fg, Some(theme.badge_working));
+        assert_eq!(working.bg, Some(theme.active_bg));
+
+        let done = style_for_segment(&header, 1, "✓ 0");
+        assert_eq!(done.fg, Some(theme.marker));
+        assert_eq!(done.bg, None);
+        assert!(!done.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
-    fn header_shows_badge_counts_as_filter_segments() {
-        let mut blocked = row(
-            "chat::%1",
-            SidebarRowKind::Chat,
-            0,
-            "codex",
-            RollupLevel::Permission,
-        );
-        blocked.badge_state = Some(BadgeState::Blocked);
-        let mut working = row(
-            "chat::%2",
-            SidebarRowKind::Chat,
-            0,
-            "claude",
-            RollupLevel::Running,
-        );
-        working.badge_state = Some(BadgeState::Working);
-        let mut done = row(
-            "chat::%3",
-            SidebarRowKind::Chat,
-            0,
-            "opencode",
-            RollupLevel::Idle,
-        );
-        done.badge_state = Some(BadgeState::Done);
-        let idle = row(
-            "chat::%4",
-            SidebarRowKind::Chat,
-            0,
-            "cursor",
-            RollupLevel::Idle,
-        );
-        let repo = row(
-            "repo::misc::app",
-            SidebarRowKind::Repo,
-            0,
-            "app",
-            RollupLevel::Running,
-        );
-        let counts = BadgeCounts::from_rows(&[blocked, working, done, idle, repo]);
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            filter: StatusFilter::IdleOnly,
-            ..SidebarState::default()
-        };
-
-        let header =
-            build_header_layout_with_counts(&state, 80, &SidebarRenderTheme::default(), counts);
-
-        assert_eq!(
-            header.lines[0].text,
-            " ≣ repo     · ≡ 4 ▲ 1 ● 1 ✓ 1 ○ idle:1"
-        );
-        assert_eq!(
-            header_hit_test(&header, 0, 2),
-            Some(HeaderAction::CycleViewMode)
-        );
-        assert_eq!(
-            header_hit_test(&header, 0, 14),
-            Some(HeaderAction::SetFilter(StatusFilter::All))
-        );
-        assert_eq!(
-            header_hit_test(&header, 0, 19),
-            Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
-        );
-        assert_eq!(
-            header_hit_test(&header, 0, 23),
-            Some(HeaderAction::SetFilter(StatusFilter::WorkingOnly))
-        );
-        assert_eq!(
-            header_hit_test(&header, 0, 27),
-            Some(HeaderAction::SetFilter(StatusFilter::DoneOnly))
-        );
-        assert_eq!(
-            header_hit_test(&header, 0, 31),
-            Some(HeaderAction::SetFilter(StatusFilter::IdleOnly))
-        );
-        assert!(header.lines[0].segments[5].style.is_some());
-    }
-
-    #[test]
-    fn header_layout_defaults_to_compact_dot_separated_segments() {
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            filter: StatusFilter::All,
-            ..SidebarState::default()
-        };
-
-        let header = build_header_layout(&state, 80);
-
-        assert_eq!(
-            header.lines[0].text,
-            " ≣ repo     · ≡ all:0 ▲ 0 ● 0 ✓ 0 ○ 0"
-        );
-        assert_eq!(header.lines[0].segments[0].range, 1..11);
-        assert_eq!(header.lines[0].segments[1].range, 14..21);
-        assert_eq!(
-            header_hit_test(&header, 0, 3),
-            Some(HeaderAction::CycleViewMode)
-        );
-        assert_eq!(
-            header_hit_test(&header, 0, 15),
-            Some(HeaderAction::SetFilter(StatusFilter::All))
-        );
-        assert_eq!(header_hit_test(&header, 0, 12), None);
-    }
-
-    #[test]
-    fn header_layout_can_be_configured_as_pill_buttons() {
+    fn header_powerline_can_be_disabled() {
         let config = serde_yaml_ng::from_str::<crate::config::Config>(
             r##"
 sidebar:
   header:
-    prefix: "["
-    suffix: "]"
-    format: " {label} "
-    separator: " "
+    powerline: false
+"##,
+        )
+        .unwrap();
+        let theme = SidebarRenderTheme::from_sidebar_config(&config.sidebar);
+        let header = build_header_layout_with_counts(
+            &SidebarState::default(),
+            80,
+            &theme,
+            rich_header_counts(),
+        );
+
+        assert!(!theme.header_powerline);
+        assert!(!header.lines[0].text.contains('\u{e0b0}'));
+        assert_eq!(header.lines[0].text, " ≣ repo      7 tasks ");
+    }
+
+    #[test]
+    fn header_width_fallback_drops_total_before_truncating_mode() {
+        let state = SidebarState {
+            view_mode: ViewMode::ByCategory,
+            ..SidebarState::default()
+        };
+
+        let compact = build_header_layout_with_counts(
+            &state,
+            12,
+            &SidebarRenderTheme::default(),
+            rich_header_counts(),
+        );
+        assert_eq!(compact.lines[0].text, " ≣ category ");
+        assert!(!compact.lines[0].text.contains("tasks"));
+
+        let narrow = build_header_layout_with_counts(
+            &state,
+            6,
+            &SidebarRenderTheme::default(),
+            rich_header_counts(),
+        );
+        assert!(display_width(&narrow.lines[0].text) <= 6);
+        assert!(narrow.lines[0].text.ends_with('…'), "{:?}", narrow.lines[0].text);
+    }
+
+    #[test]
+    fn header_mode_badge_style_can_be_configured() {
+        let config = serde_yaml_ng::from_str::<crate::config::Config>(
+            r##"
+sidebar:
+  header:
     bold: true
     colors:
       fg: white
@@ -2118,56 +2170,16 @@ sidebar:
         )
         .unwrap();
         let theme = SidebarRenderTheme::from_sidebar_config(&config.sidebar);
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            filter: StatusFilter::All,
-            ..SidebarState::default()
-        };
-
-        let header = build_header_layout_with_theme(&state, 80, &theme);
-        let lines = render_header_lines(&header, &theme);
-
-        assert_eq!(
-            header.lines[0].text,
-            " [ ≣ repo     ] [ ≡ all:0 ] [ ▲ 0 ] [ ● 0 ] [ ✓ 0 ] [ ○ 0 ]"
-        );
-        assert_eq!(header.lines[0].segments[0].range, 1..15);
-        assert_eq!(header.lines[0].segments[1].range, 16..27);
-        assert_eq!(lines[0].spans[1].style.fg, Some(Color::White));
-        assert_eq!(lines[0].spans[1].style.bg, Some(Color::Indexed(24)));
-        assert!(
-            lines[0].spans[1]
-                .style
-                .add_modifier
-                .contains(Modifier::BOLD)
-        );
-    }
-
-    #[test]
-    fn header_segments_use_display_cells_with_cjk_prefix() {
-        let mut config = crate::config::Config::default();
-        config.sidebar.header.prefix = "「".to_string();
-        config.sidebar.header.suffix = "」".to_string();
-        let theme = SidebarRenderTheme::from_app_config(&config);
         let state = SidebarState::default();
 
-        let layout = build_header_layout_with_counts(&state, 60, &theme, BadgeCounts::default());
-        let line = &layout.lines[0];
-        let mode = &line.segments[0];
-        let mode_text = format_header_segment(
-            &format!("≣ {}", view_mode_label_padded(state.view_mode)),
-            &theme,
-        );
+        let header = build_header_layout_with_counts(&state, 80, &theme, rich_header_counts());
+        let lines = render_header_lines(&header, &theme);
+        let mode = style_for_segment(&header, 0, "≣ repo");
 
-        assert_eq!(
-            (mode.range.end - mode.range.start) as usize,
-            display_width(&mode_text)
-        );
-        let lines = render_header_lines(&layout, &theme);
-        assert!(
-            lines[0].spans.iter().any(|span| span.content == mode_text),
-            "{lines:?}"
-        );
+        assert_eq!(mode.fg, Some(Color::White));
+        assert_eq!(mode.bg, Some(Color::Indexed(24)));
+        assert!(mode.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(lines[0].spans[0].style, mode);
     }
 
     #[test]
@@ -2185,40 +2197,6 @@ sidebar:
 
         assert!(rendered.contains("● codex (%1)"), "{rendered}");
         assert!(!rendered.contains("[running]"), "{rendered}");
-    }
-
-    #[test]
-    fn header_segments_are_colorized_by_default() {
-        let theme = SidebarRenderTheme::default();
-        let counts = BadgeCounts {
-            total: 4,
-            blocked: 0,
-            working: 1,
-            done: 0,
-            idle: 3,
-        };
-        let state = SidebarState::default(); // filter = All がアクティブ
-        let header = build_header_layout_with_counts(&state, 60, &theme, counts);
-        let segments = &header.lines[0].segments;
-        // mode: header_mode 色 + BOLD
-        assert_eq!(
-            segments[0].style,
-            Some(
-                Style::default()
-                    .fg(Color::Indexed(147))
-                    .add_modifier(Modifier::BOLD)
-            )
-        );
-        // アクティブフィルタ(≡): selection_bg + BOLD で強調
-        let active = segments[1].style.unwrap();
-        assert_eq!(active.bg, Some(Color::Indexed(237)));
-        assert!(active.add_modifier.contains(Modifier::BOLD));
-        // 0件(▲0)は marker 色、非0(●1)は状態色
-        assert_eq!(
-            segments[2].style,
-            Some(Style::default().fg(Color::DarkGray))
-        );
-        assert_eq!(segments[3].style, Some(Style::default().fg(Color::Green)));
     }
 
     #[test]
