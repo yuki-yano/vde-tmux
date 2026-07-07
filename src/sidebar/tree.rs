@@ -96,7 +96,6 @@ struct AgentPane {
     repo: String,
     category: String,
     agent: String,
-    status: String,
     prompt: String,
     wait_reason: String,
     started_at: String,
@@ -221,7 +220,6 @@ pub fn build_rows_ctx(
                 repo,
                 category,
                 agent,
-                status: pane.status.clone(),
                 prompt: pane.prompt.clone(),
                 wait_reason: pane.wait_reason.clone(),
                 started_at: pane.started_at.clone(),
@@ -592,15 +590,7 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
 }
 
 fn expanded_chat_label(pane: &AgentPane) -> String {
-    format!("{}: {}", pane.agent, state_context_label(pane))
-}
-
-fn state_context_label(pane: &AgentPane) -> String {
-    let mut state = status_label(&pane.status).to_string();
-    if let Some(wait_reason) = non_empty(&pane.wait_reason) {
-        state.push_str(&format!(" ({wait_reason})"));
-    }
-    state
+    pane.agent.clone()
 }
 
 fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
@@ -719,20 +709,10 @@ fn parse_tasks(raw: &str) -> Option<(i64, i64)> {
     Some((done.trim().parse().ok()?, total.trim().parse().ok()?))
 }
 
-fn status_label(raw: &str) -> &'static str {
-    match raw {
-        "running" => "running",
-        "waiting" => "waiting",
-        "idle" => "idle",
-        "error" => "error",
-        _ => "unknown",
-    }
-}
-
 fn pane_matches_filter(pane: &AgentPane, filter: StatusFilter) -> bool {
     match filter {
         StatusFilter::All => true,
-        StatusFilter::AttentionOnly => pane.attention || pane.badge_state == BadgeState::Blocked,
+        StatusFilter::AttentionOnly => pane.badge_state == BadgeState::Blocked,
         StatusFilter::WorkingOnly => pane.badge_state == BadgeState::Working,
         StatusFilter::DoneOnly => pane.badge_state == BadgeState::Done,
         StatusFilter::IdleOnly => pane.badge_state == BadgeState::Idle,
@@ -1374,7 +1354,7 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .any(|row| row.kind == SidebarRowKind::Chat && row.label == "codex: running")
+                .any(|row| row.kind == SidebarRowKind::Chat && row.label == "codex")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%5::state"));
         assert!(
@@ -1385,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_chat_row_shows_agent_state_without_inline_time() {
+    fn expanded_chat_row_shows_agent_without_inline_state() {
         let mut agent = pane("main", "%1", "/tmp/app", "claude", "running");
         agent.prompt = "review the long plan".to_string();
         agent.started_at = "925".to_string();
@@ -1413,7 +1393,7 @@ mod tests {
             .find(|row| row.id == "chat::%1")
             .expect("expanded chat row");
 
-        assert_eq!(expanded_chat.label, "claude: running");
+        assert_eq!(expanded_chat.label, "claude");
 
         let triage_ctx = RowBuildContext {
             triage: BTreeSet::from(["%1".to_string()]),
@@ -1426,7 +1406,7 @@ mod tests {
             .find(|row| row.id == "chat::%1")
             .expect("triage chat row");
 
-        assert_eq!(triage_chat.label, "claude: running");
+        assert_eq!(triage_chat.label, "claude");
     }
 
     #[test]
@@ -1488,7 +1468,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex: running")
+            Some("codex")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
         assert_eq!(
@@ -1520,7 +1500,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex: idle")
+            Some("codex")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
 
@@ -1535,7 +1515,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%2")
                 .map(|row| row.label.as_str()),
-            Some("claude: idle")
+            Some("claude")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%2::state"));
     }
@@ -1558,7 +1538,14 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex: waiting (permission_prompt)")
+            Some("codex")
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "chat::%1")
+                .and_then(|row| row.meta.as_ref())
+                .and_then(|meta| meta.wait_reason.as_deref()),
+            Some("permission_prompt")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
     }
@@ -1583,7 +1570,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex: running")
+            Some("codex")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
 
@@ -1598,7 +1585,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%2")
                 .map(|row| row.label.as_str()),
-            Some("claude: running")
+            Some("claude")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%2::state"));
     }
@@ -1691,8 +1678,8 @@ mod tests {
         let mut calm = pane("main", "%1", "/tmp/calm", "codex", "idle");
         calm.attention = "0".to_string();
         let running = pane("main", "%2", "/tmp/active", "codex", "running");
-        let mut attention = pane("main", "%3", "/tmp/active", "claude", "idle");
-        attention.attention = "1".to_string();
+        let mut attention = pane("main", "%3", "/tmp/active", "claude", "waiting");
+        attention.wait_reason = "permission_prompt".to_string();
         let state = SidebarState {
             filter: crate::sidebar::state::StatusFilter::AttentionOnly,
             ..SidebarState::default()
@@ -1707,6 +1694,22 @@ mod tests {
             rows.iter()
                 .any(|row| row.kind == SidebarRowKind::Repo && row.label == "active")
         );
+    }
+
+    #[test]
+    fn attention_only_filter_drops_completed_attention_panes() {
+        let mut completed = pane("main", "%1", "/tmp/done", "codex", "idle");
+        completed.attention = "1".to_string();
+        completed.completed_at = "900".to_string();
+        let state = SidebarState {
+            filter: crate::sidebar::state::StatusFilter::AttentionOnly,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows_at(&Config::default(), &[completed], &state, 1000);
+
+        assert!(rows.iter().all(|row| row.id != "chat::%1"));
+        assert!(rows.iter().all(|row| row.kind != SidebarRowKind::Repo));
     }
 
     #[test]

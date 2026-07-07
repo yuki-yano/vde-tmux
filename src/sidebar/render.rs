@@ -13,12 +13,6 @@ use ratatui::text::{Line, Span};
 /// - 実況: live(マゼンタ)は LIVE/EVENTS 見出し専用の孤立色
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRenderTheme {
-    pub error: Color,
-    pub running: Color,
-    pub permission: Color,
-    pub background: Color,
-    pub waiting: Color,
-    pub idle: Color,
     pub selection_bg: Color,
     pub header_active_bg: Option<Color>,
     pub header_active_fg: Option<Color>,
@@ -67,12 +61,6 @@ pub enum JumpRowAction {
 impl Default for SidebarRenderTheme {
     fn default() -> Self {
         Self {
-            error: Color::Red,
-            running: Color::Green,
-            permission: Color::LightRed,
-            background: Color::DarkGray,
-            waiting: Color::Yellow,
-            idle: Color::Reset,
             selection_bg: Color::Indexed(237),
             header_active_bg: None,
             header_active_fg: None,
@@ -107,12 +95,6 @@ impl SidebarRenderTheme {
     pub fn from_config(config: &crate::config::SidebarColorsConfig) -> Self {
         let default = Self::default();
         Self {
-            error: parse_color(config.error.as_deref()).unwrap_or(default.error),
-            running: parse_color(config.running.as_deref()).unwrap_or(default.running),
-            permission: parse_color(config.permission.as_deref()).unwrap_or(default.permission),
-            background: parse_color(config.background.as_deref()).unwrap_or(default.background),
-            waiting: parse_color(config.waiting.as_deref()).unwrap_or(default.waiting),
-            idle: parse_color(config.idle.as_deref()).unwrap_or(default.idle),
             selection_bg: parse_color(config.selection_bg.as_deref())
                 .unwrap_or(default.selection_bg),
             header_active_bg: parse_color(config.header_active_bg.as_deref()),
@@ -176,12 +158,11 @@ impl SidebarRenderTheme {
 
     fn rollup_color(&self, level: RollupLevel) -> Color {
         match level {
-            RollupLevel::Error => self.error,
-            RollupLevel::Running => self.running,
-            RollupLevel::Permission => self.permission,
-            RollupLevel::Background => self.background,
-            RollupLevel::Waiting => self.waiting,
-            RollupLevel::Idle => self.idle,
+            RollupLevel::Error | RollupLevel::Permission | RollupLevel::Waiting => {
+                self.badge_color(BadgeState::Blocked)
+            }
+            RollupLevel::Running => self.badge_color(BadgeState::Working),
+            RollupLevel::Background | RollupLevel::Idle => self.badge_color(BadgeState::Idle),
         }
     }
 
@@ -1262,18 +1243,45 @@ fn elapsed_full_label(secs: i64) -> String {
 }
 
 fn expanded_chat_right_label(row: &SidebarRow) -> Option<String> {
+    let state = expanded_chat_state_label(row)?;
     match row.badge_state? {
         BadgeState::Blocked | BadgeState::Working => row
             .meta
             .as_ref()
             .and_then(|meta| meta.elapsed_secs)
-            .map(elapsed_full_label),
+            .map(|secs| format!("{state} {}", elapsed_full_label(secs))),
         BadgeState::Done | BadgeState::Idle => row
             .meta
             .as_ref()
             .and_then(|meta| meta.completed_age_secs)
-            .map(|secs| format!("done {} ago", elapsed_label(secs))),
+            .map(|secs| format!("{state} {} ago", elapsed_label(secs))),
     }
+}
+
+fn expanded_chat_state_label(row: &SidebarRow) -> Option<String> {
+    let badge_state = row.badge_state?;
+    let mut state = match badge_state {
+        BadgeState::Blocked => match row.rollup {
+            RollupLevel::Error => "error",
+            RollupLevel::Permission | RollupLevel::Waiting => "waiting",
+            _ => "blocked",
+        },
+        BadgeState::Working => "running",
+        BadgeState::Done => "done",
+        BadgeState::Idle => "idle",
+    }
+    .to_string();
+
+    if matches!(badge_state, BadgeState::Blocked)
+        && let Some(wait_reason) = row
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.wait_reason.as_deref())
+            .filter(|value| !value.trim().is_empty())
+    {
+        state.push_str(&format!(" ({wait_reason})"));
+    }
+    Some(state)
 }
 
 fn right_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
@@ -1282,7 +1290,7 @@ fn right_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
             Style::default().fg(theme.badge_color(BadgeState::Blocked))
         }
         SidebarRowKind::Chat if row.expanded && right_label(row).is_some() => {
-            Style::default().fg(theme.detail)
+            Style::default().fg(theme.badge_color(row.badge_state.unwrap_or(BadgeState::Idle)))
         }
         SidebarRowKind::Chat
             if row.badge_state == Some(BadgeState::Done)
@@ -2543,12 +2551,12 @@ sidebar:
     }
 
     #[test]
-    fn expanded_chat_row_colors_status_and_context_in_label() {
+    fn expanded_chat_row_right_aligns_state_and_time_with_state_color() {
         let mut chat = row(
             "chat::%1",
             SidebarRowKind::Chat,
             0,
-            "codex: running",
+            "codex",
             RollupLevel::Running,
         );
         chat.badge_state = Some(BadgeState::Working);
@@ -2560,8 +2568,11 @@ sidebar:
         });
         let theme = SidebarRenderTheme::default();
 
-        assert_eq!(right_label(&chat).as_deref(), Some("12m 00s"));
-        assert_eq!(right_style(&chat, &theme).fg, Some(theme.detail));
+        assert_eq!(right_label(&chat).as_deref(), Some("running 12m 00s"));
+        assert_eq!(
+            right_style(&chat, &theme).fg,
+            Some(theme.badge_color(BadgeState::Working))
+        );
         let lines = render_lines(&[chat], &SidebarState::default(), 40, &theme);
         let chat_spans = &lines[0].spans;
 
@@ -2573,9 +2584,18 @@ sidebar:
                     && span.style.fg == Some(Color::Reset)),
             "{chat_spans:?}"
         );
-        assert_span_fg(chat_spans, ": ", Color::Reset);
-        assert_span_fg(chat_spans, "running", theme.running);
-        assert!(line_to_string(lines[0].clone()).ends_with("12m 00s "));
+        assert!(
+            !chat_spans
+                .iter()
+                .any(|span| span.content.as_ref() == "running"),
+            "{chat_spans:?}"
+        );
+        assert_span_fg(
+            chat_spans,
+            "running 12m 00s",
+            theme.badge_color(BadgeState::Working),
+        );
+        assert!(line_to_string(lines[0].clone()).ends_with("running 12m 00s "));
     }
 
     #[test]
@@ -2584,25 +2604,32 @@ sidebar:
             "chat::%1",
             SidebarRowKind::Chat,
             0,
-            "codex: waiting (permission_prompt)",
+            "codex",
             RollupLevel::Permission,
         );
         chat.badge_state = Some(BadgeState::Blocked);
         chat.expanded = true;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
+            wait_reason: Some("permission_prompt".to_string()),
             elapsed_secs: Some(120),
             ..Default::default()
         });
         let theme = SidebarRenderTheme::default();
 
-        assert_eq!(right_label(&chat).as_deref(), Some("2m 00s"));
+        assert_eq!(
+            right_label(&chat).as_deref(),
+            Some("waiting (permission_prompt) 2m 00s")
+        );
         let lines = render_lines(&[chat], &SidebarState::default(), 60, &theme);
         let chat_spans = &lines[0].spans;
 
-        assert_span_fg(chat_spans, "waiting", theme.permission);
-        assert_span_fg(chat_spans, " (permission_prompt)", theme.detail);
-        assert!(line_to_string(lines[0].clone()).ends_with("2m 00s "));
+        assert_span_fg(
+            chat_spans,
+            "waiting (permission_prompt) 2m 00s",
+            theme.badge_color(BadgeState::Blocked),
+        );
+        assert!(line_to_string(lines[0].clone()).ends_with("waiting (permission_prompt) 2m 00s "));
     }
 
     #[test]
@@ -2611,7 +2638,7 @@ sidebar:
             "chat::%1",
             SidebarRowKind::Chat,
             0,
-            "codex: idle",
+            "codex",
             RollupLevel::Idle,
         );
         chat.badge_state = Some(BadgeState::Idle);
@@ -2623,11 +2650,46 @@ sidebar:
         });
         let theme = SidebarRenderTheme::default();
 
-        assert_eq!(right_label(&chat).as_deref(), Some("done 13m ago"));
-        assert_eq!(right_style(&chat, &theme).fg, Some(theme.detail));
+        assert_eq!(right_label(&chat).as_deref(), Some("idle 13m ago"));
+        assert_eq!(
+            right_style(&chat, &theme).fg,
+            Some(theme.badge_color(BadgeState::Idle))
+        );
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 32);
-        assert!(rendered.ends_with("done 13m ago "), "{rendered:?}");
+        assert!(rendered.ends_with("idle 13m ago "), "{rendered:?}");
+    }
+
+    #[test]
+    fn expanded_done_chat_row_right_aligns_done_age_with_done_color() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex",
+            RollupLevel::Idle,
+        );
+        chat.badge_state = Some(BadgeState::Done);
+        chat.expanded = true;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            completed_age_secs: Some(815),
+            ..Default::default()
+        });
+        let theme = SidebarRenderTheme::default();
+
+        assert_eq!(right_label(&chat).as_deref(), Some("done 13m ago"));
+        assert_eq!(
+            right_style(&chat, &theme).fg,
+            Some(theme.badge_color(BadgeState::Done))
+        );
+
+        let lines = render_lines(&[chat], &SidebarState::default(), 32, &theme);
+        assert_span_fg(
+            &lines[0].spans,
+            "done 13m ago",
+            theme.badge_color(BadgeState::Done),
+        );
     }
 
     #[test]
@@ -2735,6 +2797,46 @@ badge:
         assert_eq!(
             theme.badge_color(BadgeState::Idle),
             Color::Rgb(0xa8, 0xa8, 0xb2)
+        );
+    }
+
+    #[test]
+    fn sidebar_rollup_colors_use_shared_badge_colors() {
+        let config = serde_yaml_ng::from_str::<crate::config::Config>(
+            r##"
+badge:
+  colors:
+    blocked: "#ff1111"
+    working: "#22ff22"
+    idle: "#999999"
+"##,
+        )
+        .unwrap();
+        let theme = SidebarRenderTheme::from_app_config(&config);
+
+        assert_eq!(
+            theme.rollup_color(RollupLevel::Running),
+            Color::Rgb(0x22, 0xff, 0x22)
+        );
+        assert_eq!(
+            theme.rollup_color(RollupLevel::Permission),
+            Color::Rgb(0xff, 0x11, 0x11)
+        );
+        assert_eq!(
+            theme.rollup_color(RollupLevel::Waiting),
+            Color::Rgb(0xff, 0x11, 0x11)
+        );
+        assert_eq!(
+            theme.rollup_color(RollupLevel::Error),
+            Color::Rgb(0xff, 0x11, 0x11)
+        );
+        assert_eq!(
+            theme.rollup_color(RollupLevel::Background),
+            Color::Rgb(0x99, 0x99, 0x99)
+        );
+        assert_eq!(
+            theme.rollup_color(RollupLevel::Idle),
+            Color::Rgb(0x99, 0x99, 0x99)
         );
     }
 
@@ -2887,10 +2989,10 @@ badge:
 
         chat.expanded = true;
 
-        assert_eq!(right_label(&chat).as_deref(), Some("13m 00s"));
+        assert_eq!(right_label(&chat).as_deref(), Some("running 13m 00s"));
         assert_eq!(
             right_style(&chat, &SidebarRenderTheme::default()).fg,
-            Some(SidebarRenderTheme::default().detail)
+            Some(SidebarRenderTheme::default().badge_color(BadgeState::Working))
         );
     }
 
