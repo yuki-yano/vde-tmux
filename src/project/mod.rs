@@ -1,5 +1,3 @@
-//! project path から tmux session を作成または切替する。
-
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};

@@ -1,6 +1,3 @@
-//! 単一 config(~/.config/vde/tmux/config.yml)のスキーマ。snake_case。
-//! すべてのフィールドに default を持たせ、部分的な config でも常に動く。
-
 pub mod load;
 pub mod schema;
 
@@ -78,7 +75,6 @@ pub struct StatuslineConfig {
     pub session_badge: SessionBadgeConfig,
 }
 
-// current session の既定だけ bold にするため手書き default にする。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StatuslineSessionsConfig {
@@ -86,9 +82,6 @@ pub struct StatuslineSessionsConfig {
     pub current: SegmentStyle,
     pub other: SegmentStyle,
     pub badge_style: BadgeStyle,
-    /// 隣接セッションセグメントの「間」にだけ挿入する区切り(既定: 空=区切りなし)。
-    /// tmux markup を含められる(例: `#[fg=#4a4860]│#[default]`)。
-    /// 先頭/末尾には付かず、クリック用の session range の外に置かれる。
     pub separator: String,
 }
 
@@ -149,18 +142,14 @@ pub struct SegmentColors {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StatuslineCategoryConfig {
-    /// "list"(全カテゴリ列挙)または "current"(現在のみ)。
     pub mode: String,
     pub format: String,
     pub inactive_format: String,
     pub prefix: String,
     pub suffix: String,
-    /// 非アクティブ category 用の prefix/suffix。未設定(空)なら prefix/suffix を共用する。
-    /// pill 装飾のキャップ色を active/inactive で切り替えるために使う。
     pub inactive_prefix: String,
     pub inactive_suffix: String,
     pub bold: bool,
-    /// format 中の {badge}(カテゴリ内 worst 状態のグリフ)を描画するか(既定 false)。
     pub show_badge: bool,
     pub colors: SegmentColors,
     pub inactive_colors: SegmentColors,
@@ -188,7 +177,6 @@ impl Default for StatuslineCategoryConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SummaryConfig {
     pub enabled: bool,
-    /// true なら summary から idle(○)のカウントを省く。
     pub hide_idle: bool,
 }
 
@@ -201,11 +189,9 @@ impl Default for SummaryConfig {
     }
 }
 
-/// `vt statusline-attention` の出力装飾。空出力時は装飾ごと出さない。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AttentionConfig {
-    /// `{attention}` プレースホルダに本文が入る。
     pub format: String,
     pub prefix: String,
     pub suffix: String,
@@ -233,7 +219,6 @@ impl Default for AttentionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SessionBadgeConfig {
     pub enabled: bool,
-    /// グリフ直後に付ける区切り文字列。
     pub suffix: String,
     pub hide_idle: bool,
 }
@@ -337,8 +322,6 @@ pub struct SidebarLiveConfig {
     pub enabled: bool,
     pub lines: u16,
     pub interval_ms: u64,
-    /// LIVE で「これを含む最後の行」以下を切り落とすマーカー
-    /// (Codex / Claude Code の入力欄・フッターを隠す)。空にすると無効。
     pub cut_markers: Vec<String>,
 }
 
@@ -349,11 +332,8 @@ impl Default for SidebarLiveConfig {
             lines: 3,
             interval_ms: 2000,
             cut_markers: [
-                // Claude Code: 入力ボックス上辺
                 "╭",
-                // Claude Code: フッター
                 "? for shortcuts",
-                // Codex: 入力プロンプト / プレースホルダ / フッター
                 "› ",
                 "❯",
                 "Ask Codex",
@@ -411,7 +391,6 @@ pub struct SidebarHeaderConfig {
     pub suffix: String,
     pub bold: bool,
     pub colors: SegmentColors,
-    /// filter chip の前後キャップ(例: "\u{e0b6}" / "\u{e0b4}" で pill 形)。空なら矩形塗り。
     pub chip_prefix: String,
     pub chip_suffix: String,
 }
@@ -714,7 +693,6 @@ daemon:
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(config.statusline.sessions.show_index);
         assert_eq!(config.daemon.poll_ms, 250);
-        // 触っていないキーは default のまま
         assert_eq!(config.daemon.git.poll_interval_ms, 10_000);
         assert_eq!(config.statusline.sessions.current.format, " {session} ");
     }

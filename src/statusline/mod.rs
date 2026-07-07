@@ -1,5 +1,3 @@
-//! vtm 相当の statusline sessions/category 描画。
-
 use anyhow::{Result, anyhow};
 
 use crate::category::{resolve_category_for_session, sessions_in_category, sorted_categories};
@@ -106,7 +104,6 @@ pub fn render_statusline_sessions_with_stale(
             };
             let state = if stale { "" } else { &session.state };
             let label = if config.statusline.sessions.show_index {
-                // `{num}: {session}` 形式。show_index=false で番号ごと省く。
                 format!("{}: {}", index + 1, session.name)
             } else {
                 session.name.clone()
@@ -120,8 +117,6 @@ pub fn render_statusline_sessions_with_stale(
                 config.statusline.sessions.badge_style,
                 &config.badge.colors,
             );
-            // クリックで switch-client できるよう tmux の session range で包む
-            // (.tmux.conf 側の MouseDown1Status バインドが `-t =` で拾う)
             if session.id.is_empty() {
                 segment
             } else {
@@ -183,16 +178,12 @@ pub fn render_statusline_category(
                 .replace("{count}", &category_sessions.len().to_string())
                 .replace("{badge}", &badge);
             let segment = tmux_style_category(&config.statusline.category, &body, active);
-            // クリックで `vt statusline-category switch N` を発火させる user range
             format!("#[range=user|{}]{segment}#[norange]", index + 1)
         })
         .collect::<Vec<_>>()
         .join("")
 }
 
-/// category 内の最悪 agent 状態(`@vde_session_state` 由来)を色付きグリフにする。
-/// `statusline.category.show_badge`(既定 false)が無効な場合と、
-/// 状態を持つ session が無い場合は空文字列。
 fn category_badge_fragment(
     config: &Config,
     category_sessions: &[&SessionInfo],
@@ -231,8 +222,6 @@ fn category_badge_fragment(
     }
 }
 
-/// `vt statusline-attention` の CLI エントリ。daemon(または fallback)の
-/// 素のテキストを config の装飾で包む。空なら装飾ごと出さない。
 pub fn statusline_attention(
     runner: &dyn TmuxRunner,
     env: &std::collections::BTreeMap<String, String>,
@@ -300,8 +289,6 @@ fn render_session_segment(
         return format!("{glyph} {segment}");
     }
     let fragment = badge_fragment(badge, state, style, badge_style, colors);
-    // format に {badge} があればそこへ(存在時のみ末尾スペース付き)、
-    // 無ければ従来どおりラベル直前へ密着連結する。
     let (badge_token, label) = if style.format.contains("{badge}") {
         let token = if fragment.is_empty() {
             String::new()
@@ -613,7 +600,6 @@ mod tests {
             "main",
             "work",
         );
-        // `{num}: {session}` 形式
         assert!(rendered.contains("1: main"), "{rendered}");
         assert!(rendered.contains("2: sub"), "{rendered}");
         assert!(!rendered.contains("1 main"), "{rendered}");
@@ -630,12 +616,10 @@ mod tests {
         main.state = "blocked".to_string();
         let rendered =
             render_statusline_sessions(&config, &[main, session("sub", "work")], "main", "work");
-        // badge あり: グリフの後にスペース1つ → "▲ 1: main"
         assert!(
             rendered.contains("#[fg=#ff6b6b]▲#[fg=default] 1: main"),
             "{rendered}"
         );
-        // badge なし: 余分なスペースが残らない → " 2: sub "
         assert!(rendered.contains(" 2: sub "), "{rendered}");
         assert!(!rendered.contains("  2: sub"), "{rendered}");
     }
@@ -674,14 +658,12 @@ mod tests {
         let mut config = Config::default();
         config.statusline.category.format = "{badge}{category} ".to_string();
         config.statusline.category.show_badge = true;
-        // 状態なし → バッジなし
         let rendered = render_statusline_category(&config, &[session("a", "work")], "work");
         assert!(rendered.contains("work "), "{rendered}");
         assert!(
             !rendered.contains("▲") && !rendered.contains("○"),
             "{rendered}"
         );
-        // idle のみ → 色付きの ○
         let mut idle = session("a", "work");
         idle.state = "idle".to_string();
         let rendered = render_statusline_category(&config, &[idle], "work");
@@ -711,7 +693,6 @@ mod tests {
             rendered,
             "<#[fg=#FFD9D6,bg=#6E2A28] ▲ proxy · perm 2m #[default]>"
         );
-        // 空入力は装飾ごと出さない(pill の殻を残さない)
         assert_eq!(
             render_attention_segment(&config.statusline.attention, ""),
             ""
@@ -729,12 +710,9 @@ mod tests {
         let mut c = session("c", "work");
         c.id = "$3".to_string();
         let rendered = render_statusline_sessions(&config, &[a, b, c], "a", "work");
-        // 3 セグメント → 区切りは間の 2 箇所だけ
         assert_eq!(rendered.matches('│').count(), 2, "{rendered}");
-        // 先頭・末尾には付かない
         assert!(!rendered.starts_with("#[fg=#4a4860]│"), "{rendered}");
         assert!(!rendered.ends_with("│#[default]"), "{rendered}");
-        // 区切りは range の外(#[norange] と次の #[range= の間)に入る
         assert!(
             rendered.contains("#[norange]#[fg=#4a4860]│#[default]#[range=session|$2]"),
             "{rendered}"
@@ -750,7 +728,6 @@ mod tests {
             "a",
             "work",
         );
-        // 既定は区切りなし → 従来どおり密着連結
         assert!(!rendered.contains('│'), "{rendered}");
     }
 
@@ -762,7 +739,6 @@ mod tests {
         let rendered = render_statusline_sessions(&config, &[main], "main", "work");
         assert!(rendered.starts_with("#[range=session|$3]"), "{rendered}");
         assert!(rendered.ends_with("#[norange]"), "{rendered}");
-        // id が空(テスト用フィクスチャ等)なら range を付けない
         let rendered =
             render_statusline_sessions(&config, &[session("sub", "work")], "main", "work");
         assert!(!rendered.contains("#[range="), "{rendered}");

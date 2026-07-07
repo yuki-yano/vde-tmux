@@ -1,5 +1,3 @@
-//! daemon の snapshot 集約と statusline badge。
-
 pub mod lifecycle;
 pub mod protocol;
 pub mod runtime;
@@ -144,7 +142,6 @@ pub fn format_attention(entries: &[(String, RollupLevel, i64)]) -> String {
     } else {
         String::new()
     };
-    // 装飾(色・pill)は statusline::render_attention_segment 側で付ける
     format!("▲ {session} · {reason} {elapsed}{suffix}")
 }
 

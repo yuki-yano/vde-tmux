@@ -1,5 +1,3 @@
-//! vtm session-manager 相当の tmux command。
-
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};

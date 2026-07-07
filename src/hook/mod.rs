@@ -1,5 +1,3 @@
-//! hook 入力を @vde_* pane option 書き込みへ変換する。
-
 pub mod adapter;
 pub mod writer;
 

@@ -3,8 +3,6 @@ use serde::{Deserialize, Serialize};
 use crate::config::BadgeGlyphs;
 use crate::hook::RollupLevel;
 
-/// statusline sessions の表示 4 状態。
-/// 宣言順 = 注意度の高い順(session 集約は min を取る)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum BadgeState {
     Blocked,
@@ -24,7 +22,6 @@ impl BadgeState {
     }
 }
 
-/// RollupLevel(6 値)を未読フラグ込みで 4 状態へ畳む。
 pub fn badge_state(level: RollupLevel, unread: bool) -> BadgeState {
     match level {
         RollupLevel::Error | RollupLevel::Permission | RollupLevel::Waiting => BadgeState::Blocked,
@@ -39,8 +36,6 @@ pub fn badge_state(level: RollupLevel, unread: bool) -> BadgeState {
     }
 }
 
-/// session 内の pane 状態を集約してバッジ文字列(グリフ + suffix)を返す。
-/// agent pane が 1 つも無ければ None(バッジを消す)。
 pub fn session_badge_value(
     states: impl IntoIterator<Item = BadgeState>,
     glyphs: &BadgeGlyphs,

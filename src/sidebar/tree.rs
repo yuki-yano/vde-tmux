@@ -222,7 +222,6 @@ pub fn build_rows_ctx(
                 repo_path: pane.current_path.clone(),
                 attention: pane.attention == "1",
                 flash: ctx.flash.contains(&pane.pane_id),
-                // 複数 client が別 window を見ている場合は、複数系譜を active として扱う。
                 active: pane.window_active && pane.session_attached,
             });
     }
@@ -626,8 +625,6 @@ fn group_meta(panes: &[AgentPane], triage: &BTreeSet<String>) -> RowMeta {
     }
 }
 
-/// 経過秒の人間可読表記。<60s は秒、<60m は分、<10h は時+分、
-/// <48h は時のみ、以上は日のみ(桁が大きいほど粒度を落とす)。
 pub fn humanize_secs(secs: i64) -> String {
     let secs = secs.max(0);
     if secs < 60 {

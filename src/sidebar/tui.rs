@@ -687,7 +687,6 @@ fn render_live_lines(
         if !ansi {
             return plain();
         }
-        // capture-pane -e の ANSI を元の色のまま描画する。パース失敗時はプレーン
         match format!(" {line}").into_text() {
             Ok(text) => text.lines.into_iter().next().unwrap_or_else(plain),
             Err(_) => plain(),
@@ -755,7 +754,7 @@ fn truncate_spans_to_width(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<
     if width == 0 {
         return Vec::new();
     }
-    let target = width.saturating_sub(1); // 末尾の「…」1桁を確保
+    let target = width.saturating_sub(1);
     let mut used = 0usize;
     let mut out = Vec::new();
     let mut ellipsis_style = Style::default();
@@ -796,16 +795,8 @@ pub(crate) fn extract_tail(raw: &str, limit: usize, cut_markers: &[String]) -> V
     lines
 }
 
-/// 入力欄/フッター UI は画面最下部の帯にしか現れないため、
-/// マーカー探索は末尾 CUT_SCAN_TAIL 行に限定する。本文中に偶然
-/// マーカー文字(`❯` や `╭` など)が写り込んでも、帯の外なら
-/// LIVE の本文が丸ごと切り落とされることはない。
 const CUT_SCAN_TAIL: usize = 15;
 
-/// Codex / Claude Code の入力欄・フッター以下を落とすための切断位置。
-/// 末尾帯の中で各マーカーの「最後の出現行」を求め、その最小 index で切る
-/// (Claude Code は入力ボックス上辺 `╭`、Codex は入力プロンプト等が
-///  常に最下部 UI 帯にあるため、最後の出現 = 入力欄になる)。
 fn cut_index(lines: &[&str], markers: &[String]) -> Option<usize> {
     let scan_start = lines.len().saturating_sub(CUT_SCAN_TAIL);
     markers
@@ -820,7 +811,6 @@ fn cut_index(lines: &[&str], markers: &[String]) -> Option<usize> {
         .min()
 }
 
-/// マーカー判定・空行判定用の簡易 ANSI エスケープ除去(CSI / OSC / 単独 ESC)。
 pub(crate) fn strip_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -832,7 +822,6 @@ pub(crate) fn strip_ansi(input: &str) -> String {
         match chars.peek() {
             Some('[') => {
                 chars.next();
-                // CSI: パラメータ/中間バイトを読み飛ばし、終端バイト(@-~)で終わる
                 for next in chars.by_ref() {
                     if ('\u{40}'..='\u{7e}').contains(&next) {
                         break;
@@ -841,7 +830,6 @@ pub(crate) fn strip_ansi(input: &str) -> String {
             }
             Some(']') => {
                 chars.next();
-                // OSC: BEL または ESC \ で終わる
                 while let Some(next) = chars.next() {
                     if next == '\u{7}' {
                         break;
@@ -1371,8 +1359,6 @@ mod tests {
         let lines = render_live_lines(&snapshot(), &live, 3, 24, 0, &SidebarRenderTheme::default());
         let body = &lines[1];
 
-        // 色付き span が残ること(省略記号だけが色付きでも通ってしまわないよう、
-        // 本文テキスト自体が残っていることまで確認する)
         assert!(
             body.spans
                 .iter()
@@ -1410,21 +1396,16 @@ mod tests {
     #[test]
     fn live_tail_cuts_below_agent_input_area() {
         let markers = crate::config::SidebarLiveConfig::default().cut_markers;
-        // Claude Code 風: 入力ボックスとフッターが末尾に居る
         let raw =
             "output 1\noutput 2\n\n╭──────────╮\n│ >        │\n╰──────────╯\n? for shortcuts\n";
         assert_eq!(extract_tail(raw, 5, &markers), vec!["output 1", "output 2"]);
-        // Codex 風: 入力プロンプトとフッター
         let raw = "thinking...\ndone!\n› type here\n⏎ send  95% context left\n";
         assert_eq!(extract_tail(raw, 5, &markers), vec!["thinking...", "done!"]);
-        // Claude/Codex の新しいプロンプト/ステータス行。ここが残ると LIVE の
-        // 限られた行数が footer で埋まり、本文が押し出される。
         let raw = "important 1\nimportant 2\n❯\u{a0}\nnew task? /clear to save tokens\nbypass permissions on\n";
         assert_eq!(
             extract_tail(raw, 5, &markers),
             vec!["important 1", "important 2"]
         );
-        // マーカーが無い出力はそのまま
         let raw = "plain 1\nplain 2\n";
         assert_eq!(extract_tail(raw, 5, &markers), vec!["plain 1", "plain 2"]);
     }
@@ -1432,7 +1413,6 @@ mod tests {
     #[test]
     fn stray_marker_outside_bottom_band_does_not_cut_live_tail() {
         let markers = crate::config::SidebarLiveConfig::default().cut_markers;
-        // 本文中(末尾帯 CUT_SCAN_TAIL 行の外)に ❯ が写り込んでも切断しない
         let mut lines = vec!["❯ quoted shell prompt".to_string()];
         lines.extend((0..20).map(|i| format!("body {i}")));
         let raw = lines.join("\n");
@@ -1440,7 +1420,6 @@ mod tests {
             extract_tail(&raw, 3, &markers),
             vec!["body 17", "body 18", "body 19"]
         );
-        // 末尾帯の中のマーカーは従来どおり切断する
         let mut lines = (0..20).map(|i| format!("body {i}")).collect::<Vec<_>>();
         lines.push("❯\u{a0}".to_string());
         let raw = lines.join("\n");

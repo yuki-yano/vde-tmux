@@ -1,14 +1,9 @@
-//! @vde_* option バスの契約。キー名の定義と読み書き API はこのモジュールに集約する。
-//! writer 原則(設計書 §3.1): キーごとに通常 writer は 1 箇所。
-//! pane state は hook CLI が書き、daemon は stale state の GC として unset のみ行う。
-
 pub mod snapshot;
 
 use anyhow::Result;
 
 use crate::tmux::TmuxRunner;
 
-// --- pane スコープ(writer: hook CLI) ---
 pub const KEY_AGENT: &str = "@vde_agent";
 pub const KEY_STATUS: &str = "@vde_status";
 pub const KEY_PROMPT: &str = "@vde_prompt";
@@ -17,29 +12,23 @@ pub const KEY_WAIT_REASON: &str = "@vde_wait_reason";
 pub const KEY_ATTENTION: &str = "@vde_attention";
 pub const KEY_STARTED_AT: &str = "@vde_started_at";
 pub const KEY_COMPLETED_AT: &str = "@vde_completed_at";
-pub const KEY_TASKS: &str = "@vde_tasks"; // "done/total" 形式(旧 total/done の 2 キーを統合)
+pub const KEY_TASKS: &str = "@vde_tasks";
 pub const KEY_SUBAGENTS: &str = "@vde_subagents";
 
-// --- pane スコープ(writer: sidebar attach) ---
 pub const KEY_SIDEBAR_MARKER: &str = "@vde_sidebar";
 
-// --- window スコープ(writer: layout モジュール) ---
 pub const KEY_LAYOUT_BASELINE: &str = "@vde_layout_baseline";
 pub const KEY_LAYOUT_PANES: &str = "@vde_layout_panes";
 
-// --- session スコープ(writer: vt category / project) ---
 pub const KEY_CATEGORY: &str = "@vde_category";
 pub const KEY_CATEGORY_OVERRIDE: &str = "@vde_category_override";
 pub const KEY_PROJECT_PATH: &str = "@vde_project_path";
 
-// --- session スコープ(writer: daemon) ---
 pub const KEY_SESSION_STATUS: &str = "@vde_session_status";
 pub const KEY_SESSION_STATE: &str = "@vde_session_state";
 
-// --- global スコープ(writer: daemon) ---
 pub const KEY_HEARTBEAT: &str = "@vde_heartbeat";
 
-/// hook CLI が書く pane キーの全列挙(snapshot reader と writer の網羅テストに使う)。
 pub const PANE_STATE_KEYS: &[&str] = &[
     KEY_AGENT,
     KEY_STATUS,

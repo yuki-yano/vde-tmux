@@ -1,5 +1,3 @@
-//! daemon lifecycle と socket directory 検証。
-
 use std::collections::BTreeMap;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;

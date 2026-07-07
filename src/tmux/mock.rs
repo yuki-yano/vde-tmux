@@ -1,6 +1,3 @@
-//! テスト用の TmuxRunner 実装。stub 登録した引数列に対して固定応答を返し、
-//! 呼び出し履歴を記録する。本体ビルドには含まれない。
-
 use std::cell::RefCell;
 use std::collections::HashMap;
 

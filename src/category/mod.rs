@@ -1,5 +1,3 @@
-//! Config と session metadata から effective category を決める純関数。
-
 use std::collections::BTreeSet;
 
 use crate::config::Config;

@@ -1,5 +1,3 @@
-//! Claude/Codex hook payload を AgentEvent に変換する。
-
 use std::io::BufRead;
 use std::path::Path;
 

@@ -5,22 +5,13 @@ use crate::sidebar::tree::{BadgeCounts, SidebarRow, SidebarRowKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// サイドバーの配色。色は 5 族の規約で運用する:
-/// - 状態族: badge_* / rollup 色(▲赤 ●緑 ✓シアン ○灰)。状態を示す場所にだけ使う
-/// - 構造族: repo(青太字)/ category(ピーチ太字)/ branch(淡シアン 73)
-/// - 操作族: ラベンダー 147/103(mode ≣ / active ▎ / preview ⌕)
-/// - 本文族: 本文=通常色 / 補足=detail(246)/ 記号=marker(暗灰)
-/// - 実況: live(マゼンタ)は LIVE/EVENTS 見出し専用の孤立色
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRenderTheme {
     pub selection_bg: Color,
     pub header_active_bg: Option<Color>,
     pub header_active_fg: Option<Color>,
-    /// active filter chip の反転文字色。未指定なら mode badge と同じ解決順
     pub header_chip_fg: Option<Color>,
-    /// "N tasks" チップの背景色。未指定なら active_bg
     pub header_total_bg: Option<Color>,
-    /// "N tasks" チップの "tasks" ラベル文字色。未指定なら detail
     pub header_total_fg: Option<Color>,
     pub header_active_bold: bool,
     pub header_badge_fg: Color,
@@ -28,7 +19,6 @@ pub struct SidebarRenderTheme {
     pub header_prefix: String,
     pub header_suffix: String,
     pub header_outer_bg: Option<Color>,
-    /// filter chip の前後キャップ(例: nerd font 半円  / )。空なら矩形塗り。
     pub header_chip_prefix: String,
     pub header_chip_suffix: String,
     pub badge_glyphs: crate::config::BadgeGlyphs,
@@ -36,25 +26,15 @@ pub struct SidebarRenderTheme {
     pub badge_working: Color,
     pub badge_done: Color,
     pub badge_idle: Color,
-    /// Detail / meta 行の前景色(DIM は使わず読める中間グレーにする)
     pub detail: Color,
-    /// 展開マーカー ▾/▸ の色
     pub marker: Color,
-    /// 開閉操作の ▾/▸ を強調する色
     pub toggle: Color,
-    /// category 見出しの色
     pub category: Color,
-    /// ヘッダー mode セグメントの色
     pub header_mode: Color,
-    /// active chat 行の薄背景色
     pub active_bg: Color,
-    /// active 系譜の左端バー色
     pub active_bar: Color,
-    /// repo 名(および category 見出し)の色
     pub repo: Color,
-    /// git branch 名の色
     pub branch: Color,
-    /// LIVE / EVENTS 見出しラベルの色
     pub live: Color,
 }
 
@@ -120,8 +100,6 @@ impl SidebarRenderTheme {
             header_chip_prefix: default.header_chip_prefix,
             header_chip_suffix: default.header_chip_suffix,
             badge_glyphs: default.badge_glyphs,
-            // badge の色は from_app_config で共通の badge.colors から設定する。
-            // ここ(sidebar.colors 単体)では ANSI 既定のままにしておく。
             badge_blocked: default.badge_blocked,
             badge_working: default.badge_working,
             badge_done: default.badge_done,
@@ -158,7 +136,6 @@ impl SidebarRenderTheme {
 
     pub fn from_app_config(config: &crate::config::Config) -> Self {
         let mut theme = Self::from_sidebar_config(&config.sidebar);
-        // badge の glyph / 色は statusline と共通の `badge.*` を単一ソースにする。
         theme.badge_glyphs = config.badge.glyphs.clone();
         let badge = &config.badge.colors;
         theme.badge_blocked = parse_color(Some(&badge.blocked)).unwrap_or(theme.badge_blocked);
@@ -411,7 +388,6 @@ fn build_header_chip_line(
         },
     ];
 
-    // (text片, style, action)。style が None の片(チップ間の空白)は segment を作らない。
     let caps_enabled = !theme.header_chip_prefix.is_empty() || !theme.header_chip_suffix.is_empty();
     let mut pieces: Vec<(String, Option<Style>, Option<HeaderAction>)> = Vec::new();
     for (index, spec) in specs.into_iter().enumerate() {
@@ -425,7 +401,6 @@ fn build_header_chip_line(
         if caps_enabled && index > 0 {
             pieces.push((" ".to_string(), None, None));
         }
-        // bg 塗りのあるチップだけキャップで pill にする(0件チップは dim テキストのみ)。
         let bg = chip_bg(theme, active, spec.count, spec.badge_state);
         match bg {
             Some(bg) if caps_enabled => {
@@ -463,7 +438,6 @@ fn build_header_chip_line(
     HeaderLine { text, segments }
 }
 
-/// チップの背景色。アクティブは状態色、非アクティブ非0件は active_bg、0件は塗りなし。
 fn chip_bg(
     theme: &SidebarRenderTheme,
     active: bool,
@@ -498,9 +472,6 @@ fn chip_style(
     count: usize,
 ) -> Style {
     if active {
-        // 反転 fg は header_chip_fg 優先、未指定なら mode badge と同じ解決順(header.colors 優先)。
-        // mode を fg-only にしつつ chip の反転文字色を暗色に保つ場合に分離が必要になる。
-        // Indexed(16) 固定だと base16 系テーマでパレット 16 が再定義され黒にならない。
         let mut style = Style::default()
             .fg(theme.header_chip_fg.unwrap_or_else(|| mode_fg(theme)))
             .bg(chip_color(theme, badge_state));
@@ -575,9 +546,6 @@ pub fn build_footer_line(width: usize) -> Line<'static> {
     ))
 }
 
-/// ヘッダーの mode(view 切替)セグメントの色。
-/// `sidebar.header` で明示スタイルが設定されていればそれを優先し、
-/// 無指定なら header_mode 色 + BOLD。
 fn mode_segment_style(theme: &SidebarRenderTheme) -> Style {
     let mut style = Style::default().fg(mode_fg(theme)).bg(mode_bg(theme));
     if header_bold(theme) {
@@ -823,8 +791,6 @@ fn push_leading_marker_span(
     }
 }
 
-/// Chat 行のラベルを「agent 名(太字)+ 残り(通常)」に分ける。
-/// それ以外の行、および truncate で agent 名が欠けた場合は単一 span。
 fn label_spans(
     label: String,
     row: &SidebarRow,
@@ -1317,8 +1283,6 @@ fn git_badge_width(git: &GitBadgeText) -> usize {
 }
 
 fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
-    // 状態(rollup)の色はバッジグリフと右カラムだけに載せ、
-    // 本文テキストは通常色に保つ(理想形の多トーン構成)。
     match row.kind {
         SidebarRowKind::Zone => Style::default().fg(Color::Reset),
         SidebarRowKind::Category => Style::default()
@@ -1332,19 +1296,12 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
     }
 }
 
-/// Jump 行のアクションチップの全文(幅計算と truncate 判定に使う)。
 const JUMP_ROW_LABEL: &str = "[↗ jump] [⌕ preview]";
-/// jump グリフの淡シアン(branch の明るい Cyan と彩度で差別化する)
 const ACTION_JUMP_GLYPH: Color = Color::Indexed(73);
-/// preview グリフは jump と同じ操作アクセント色に揃える。
 const ACTION_PREVIEW_GLYPH: Color = ACTION_JUMP_GLYPH;
 
-/// Jump 行の [↗ jump] [⌕ preview] チップ。ブラケットは marker、
-/// ラベルは detail で detail ゾーンに馴染ませ、グリフ1文字だけ
-/// 淡色アクセントにして「押せる」ことを示す。
 fn jump_action_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'static>> {
     if label != JUMP_ROW_LABEL {
-        // 幅不足で truncate された場合も、操作グリフだけは色を保持する。
         return action_label_spans(label, theme);
     }
     let bracket = Style::default().fg(theme.marker);
@@ -1403,9 +1360,6 @@ fn action_label_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'stat
     spans
 }
 
-/// Jump 行のクリック列をアクションへ変換する。
-/// レイアウトは " " + indent(2*depth) + "[↗ jump]"(8桁) + " " + "[⌕ preview]"(11桁)。
-/// クリック範囲はブラケット込み(見た目のチップと一致させる)。
 pub fn jump_row_action_at(row: &SidebarRow, column: u16) -> Option<JumpRowAction> {
     if row.kind != SidebarRowKind::Jump {
         return None;
@@ -1471,8 +1425,6 @@ fn view_mode_label(view_mode: ViewMode) -> &'static str {
     }
 }
 
-/// mode ラベルを最長ラベル("category")に合わせて右空白で固定幅にする。
-/// mode 切替でヘッダー後続(フィルタ群)の表示位置がずれないようにするため。
 fn view_mode_label_padded(view_mode: ViewMode) -> String {
     let width = [ViewMode::Flat, ViewMode::ByRepo, ViewMode::ByCategory]
         .into_iter()
@@ -1857,8 +1809,6 @@ mod tests {
             &SidebarRenderTheme::default(),
         );
 
-        // 多トーン検証は colorize_follows_ideal_multi_tone_scheme も参照
-        // 先頭 span は padding(DarkGray)、開閉 marker は操作色、ラベル span が category 色 + BOLD
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::DarkGray));
         assert!(
             lines[0]
@@ -1948,7 +1898,6 @@ mod tests {
         let repo = text_for(ViewMode::ByRepo);
         let category = text_for(ViewMode::ByCategory);
 
-        // mode を切り替えてもフィルタ群の開始位置と全体幅が動かない
         assert_eq!(flat.find('≡'), repo.find('≡'), "{flat:?} vs {repo:?}");
         assert_eq!(
             repo.find('≡'),
@@ -2081,7 +2030,6 @@ mod tests {
             "{rendered:?}"
         );
 
-        // グリフだけ淡色アクセント、ラベルは detail、ブラケットは marker
         let theme = SidebarRenderTheme::default();
         let lines = render_lines(&[jump], &SidebarState::default(), 40, &theme);
         let style_of = |needle: &str| {
@@ -2321,7 +2269,6 @@ mod tests {
         let active = style_for_segment(&header, 1, "▲ 1");
         assert_eq!(active.fg, Some(Color::Rgb(0x19, 0x16, 0x27)));
         assert_eq!(active.bg, Some(theme.badge_blocked));
-        // 明示スタイル設定時は bold も header_active_bold(既定 false)に従う。
         assert!(!active.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -2444,19 +2391,16 @@ sidebar:
         let header = build_header_layout_with_counts(&state, 80, &theme, counts);
         let line = &header.lines[1];
 
-        // bg 塗りのあるチップ(all/attn/idle)だけキャップで囲まれる。
         assert_eq!(
             line.text,
             "\u{e0b6} ≡ all 3 \u{e0b4} \u{e0b6} ▲ 1 \u{e0b4}  ● 0   ✓ 0  \u{e0b6} ○ 2 \u{e0b4}"
         );
-        // キャップの fg はチップ bg と一致し、クリックも同じ action になる。
         let cap = style_for_segment(&header, 1, "\u{e0b6}");
         assert_eq!(cap.fg, Some(theme.header_mode));
         assert_eq!(
             header_hit_test(&header, 1, 0),
             Some(HeaderAction::SetFilter(StatusFilter::All))
         );
-        // 0件チップはキャップなし・クリック不可のまま。
         let zero = style_for_segment(&header, 1, "● 0");
         assert_eq!(zero.fg, Some(theme.marker));
         assert_eq!(zero.bg, None);
@@ -2607,8 +2551,6 @@ sidebar:
 
     #[test]
     fn colorize_follows_ideal_multi_tone_scheme() {
-        // running な chat 行でも本文は通常色、状態色はバッジと右カラムのみ。
-        // agent 名は太字、prompt は通常。Detail は DIM ではなく読める中間グレー。
         let mut chat = row(
             "chat::%1",
             SidebarRowKind::Chat,
@@ -2645,7 +2587,6 @@ sidebar:
         );
 
         let chat_spans = &lines[0].spans;
-        // agent 名: 通常色 + BOLD
         assert!(
             chat_spans
                 .iter()
@@ -2654,7 +2595,6 @@ sidebar:
                     && span.style.add_modifier.contains(Modifier::BOLD)),
             "{chat_spans:?}"
         );
-        // prompt 部分: 通常色・非 BOLD(running でも緑にしない)
         assert!(
             chat_spans
                 .iter()
@@ -2663,7 +2603,6 @@ sidebar:
                     && !span.style.add_modifier.contains(Modifier::BOLD)),
             "{chat_spans:?}"
         );
-        // padding は marker 色(DarkGray)、開閉 marker は操作色で強調
         assert_eq!(chat_spans[0].style.fg, Some(Color::DarkGray));
         assert!(
             chat_spans.iter().any(|span| span.content.as_ref() == "▸ "
@@ -2671,14 +2610,12 @@ sidebar:
                 && span.style.add_modifier.contains(Modifier::BOLD)),
             "{chat_spans:?}"
         );
-        // 右カラム(経過)は rollup 色で DIM なし
         assert!(
             chat_spans.iter().any(|span| span.content.as_ref() == "13m"
                 && span.style.fg == Some(Color::Green)
                 && !span.style.add_modifier.contains(Modifier::DIM)),
             "{chat_spans:?}"
         );
-        // Detail 行: DIM なしの中間グレー
         let detail_spans = &lines[1].spans;
         assert!(
             detail_spans
@@ -2688,7 +2625,6 @@ sidebar:
                     && !span.style.add_modifier.contains(Modifier::DIM)),
             "{detail_spans:?}"
         );
-        // prompt detail 行: 閉じた chat 行の prompt と同じ通常色
         let prompt_detail_spans = &lines[2].spans;
         assert!(
             prompt_detail_spans
@@ -2863,7 +2799,6 @@ sidebar:
             &SidebarRenderTheme::default(),
         );
         let spans = &lines[0].spans;
-        // repo 名は repo 色 + BOLD、branch は淡シアン(73)非 BOLD
         assert!(
             spans.iter().any(|span| span.content.as_ref() == "app"
                 && span.style.fg == Some(Color::Blue)
@@ -2920,7 +2855,6 @@ sidebar:
 
     #[test]
     fn sidebar_badge_colors_use_shared_badge_colors() {
-        // badge.colors を statusline / sidebar 共通のソースとして使う。
         let config = serde_yaml_ng::from_str::<crate::config::Config>(
             r##"
 badge:
@@ -2939,7 +2873,6 @@ badge:
             theme.badge_color(BadgeState::Done),
             Color::Rgb(0x5a, 0xa6, 0xff)
         );
-        // 未指定の状態は badge.colors の既定(hex)を使う。
         assert_eq!(
             theme.badge_color(BadgeState::Blocked),
             Color::Rgb(0xff, 0x6b, 0x6b)

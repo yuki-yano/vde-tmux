@@ -1,5 +1,3 @@
-//! daemon server と request handler。
-
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::FromRawFd;

@@ -1,5 +1,3 @@
-//! daemon と client の NDJSON protocol。
-
 use serde::{Deserialize, Serialize};
 
 use super::DaemonSnapshot;

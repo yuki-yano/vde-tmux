@@ -1,5 +1,3 @@
-//! tmux session と client の読み取り、切替、per-client 記憶を扱う。
-
 use anyhow::{Result, anyhow, bail};
 
 use crate::category::{adjacent_category, resolve_category_for_session, sessions_in_category};

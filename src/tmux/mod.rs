@@ -1,6 +1,3 @@
-//! tmux コマンド発行層。全機能はこの trait 経由で tmux を呼ぶ
-//! (具象 Command 直呼びを禁止し、MockTmuxRunner で全経路をテスト可能にする)。
-
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -12,11 +9,9 @@ use anyhow::{Context, Result, bail};
 pub mod mock;
 
 pub trait TmuxRunner {
-    /// `tmux <args>` を実行し、成功した場合は stdout をそのまま返す。
     fn run(&self, args: &[&str]) -> Result<String>;
 }
 
-/// 外部コマンドを実行し stdout を返す。timeout 指定時は超過で kill してエラーを返す。
 ///
 pub fn run_command(program: &str, args: &[&str], timeout: Option<Duration>) -> Result<String> {
     let mut child = Command::new(program)
@@ -78,8 +73,6 @@ fn collect_pipe_output(handle: Option<thread::JoinHandle<String>>) -> String {
         .unwrap_or_default()
 }
 
-/// 実 tmux を呼ぶ Runner。timeout は経路ごとに選ぶ:
-/// hook 経路はエージェントをブロックしないため必ず Some を指定する。
 #[derive(Debug, Clone, Default)]
 pub struct SystemTmuxRunner {
     timeout: Option<Duration>,

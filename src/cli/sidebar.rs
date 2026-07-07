@@ -32,7 +32,6 @@ pub(crate) enum SidebarCommand {
         #[arg(long, value_parser = parse_sidebar_width)]
         width: Option<SidebarWidth>,
     },
-    /// 未表示なら開く / 非フォーカスならフォーカス / フォーカス中なら閉じる
     #[command(name = "focus-toggle")]
     FocusToggle {
         #[arg(long)]

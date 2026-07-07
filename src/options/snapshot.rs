@@ -1,6 +1,3 @@
-//! 全 pane の @vde_* 状態を list-panes 1 コールで取得する一括 reader。
-//! daemon の tmux worker と statusline フォールバックの両方がこれを使う。
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
@@ -11,7 +8,6 @@ use crate::tmux::TmuxRunner;
 
 const FIELD_SEP: char = '\u{1f}';
 
-/// 1 pane 分の観測値。@vde_* が未設定のフィールドは空文字列。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PaneSnapshot {
     pub session: String,
@@ -21,9 +17,7 @@ pub struct PaneSnapshot {
     pub current_command: String,
     pub pane_tty: String,
     pub pane_pid: String,
-    /// この pane の window がセッションのカレント window か(#{window_active})。
     pub window_active: bool,
-    /// セッションにクライアントがアタッチされているか(#{session_attached} > 0)。
     pub session_attached: bool,
     pub is_sidebar: bool,
     pub agent: String,
@@ -36,12 +30,9 @@ pub struct PaneSnapshot {
     pub completed_at: String,
     pub tasks: String,
     pub subagents: String,
-    /// `pane_current_command`、process tree、TTY のいずれかで現在 agent を観測できたか。
     pub agent_observed: bool,
 }
 
-/// list-panes -a に渡す -F フォーマット文字列を組み立てる。
-/// 固定 9 フィールド + @vde_sidebar + PANE_STATE_KEYS の順。
 pub fn snapshot_format() -> String {
     let mut fields: Vec<String> = vec![
         "#{session_name}".into(),
@@ -59,8 +50,6 @@ pub fn snapshot_format() -> String {
     fields.join(&FIELD_SEP.to_string())
 }
 
-/// list-panes -a の出力(snapshot_format 準拠)をパースする。
-/// フィールド数が合わない行はスキップして残りを返す(壊れた 1 行で全体を落とさない)。
 pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
     let expected = 10 + PANE_STATE_KEYS.len();
     output
@@ -99,7 +88,6 @@ pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
         .collect()
 }
 
-/// 全セッションの pane snapshot を 1 コールで取得する。
 pub fn read_all_panes(runner: &dyn TmuxRunner) -> Result<Vec<PaneSnapshot>> {
     let format = snapshot_format();
     let output = runner.run(&["list-panes", "-a", "-F", &format])?;

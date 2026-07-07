@@ -108,8 +108,6 @@ pub fn toggle_all(
     Ok(())
 }
 
-/// 3状態トグル: 未表示なら開く、表示中でフォーカスが外れていれば
-/// サイドバーへフォーカスを移す、フォーカス中なら閉じる。
 pub fn focus_toggle(
     runner: &dyn TmuxRunner,
     target: &str,
@@ -120,7 +118,6 @@ pub fn focus_toggle(
     let Some(sidebar) = find_sidebar_pane(runner, target)? else {
         return open_unchecked(runner, target, self_exe, width, min_width);
     };
-    // window を target-pane に与えると、その window のアクティブ pane に解決される
     let active = runner
         .run(&["display-message", "-p", "-t", target, "#{pane_id}"])?
         .trim()

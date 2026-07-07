@@ -1,5 +1,3 @@
-//! AgentEvent 由来の PaneOptionWrite を tmux pane option へ反映する。
-
 use std::collections::BTreeMap;
 
 use anyhow::Result;

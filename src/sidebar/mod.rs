@@ -1,5 +1,3 @@
-//! サイドバーの state / tree / render / tmux layout 操作。
-
 pub mod client;
 pub mod input;
 pub mod layout;

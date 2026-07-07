@@ -1,13 +1,8 @@
-//! config のパス解決と読み込み。
-//! 方針(設計書 §3.3): 読めない・パースできない場合は default + 警告で継続し、
-//! daemon / statusline を絶対に止めない。
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::Config;
 
-/// $XDG_CONFIG_HOME(未設定なら $HOME/.config)/vde/tmux/config.yml
 pub fn config_file_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     let base = match env.get("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir),
@@ -16,15 +11,12 @@ pub fn config_file_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     Some(base.join("vde").join("tmux").join("config.yml"))
 }
 
-/// 読み込み結果。warnings は呼び出し側(CLI 境界)が stderr に出す。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedConfig {
     pub config: Config,
     pub warnings: Vec<String>,
 }
 
-/// YAML 文字列から Config を得る。空文字列は default。
-/// パース失敗時は default + 位置情報付き警告(serde_path_to_error)。
 pub fn parse_config(yaml: &str) -> LoadedConfig {
     parse_config_with_env(yaml, &BTreeMap::new())
 }
@@ -122,8 +114,6 @@ fn is_env_name(value: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-/// ファイルから読み込む。ファイル不在は警告なしの default(初回利用で騒がない)。
-/// 読み取りエラー・パースエラーは default + 警告。
 pub fn load_config(env: &BTreeMap<String, String>) -> LoadedConfig {
     let Some(path) = config_file_path(env) else {
         return LoadedConfig {
