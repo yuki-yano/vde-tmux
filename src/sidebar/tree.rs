@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::category::resolve_category_for_session;
 use crate::config::Config;
 use crate::daemon::session_badge::{BadgeState, badge_state};
-use crate::hook::{AgentStatus, RollupLevel, pane_rollup_level};
+use crate::git::WorktreeInfo;
+use crate::hook::{
+    AgentStatus, RollupLevel, TaskItem, TaskItemStatus, WorktreeActivity, pane_rollup_level,
+};
 use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane};
 use crate::session::SessionInfo;
 use crate::sidebar::state::{SidebarRowRef, SidebarState, StatusFilter, ViewMode};
@@ -82,7 +85,6 @@ impl BadgeCounts {
 
 #[derive(Debug, Clone)]
 struct AgentPane {
-    session: String,
     pane_id: String,
     repo: String,
     category: String,
@@ -92,7 +94,10 @@ struct AgentPane {
     started_at: String,
     completed_at: String,
     tasks: String,
+    task_items: String,
     subagents: String,
+    worktree_activity: String,
+    worktree: Option<WorktreeInfo>,
     rollup: RollupLevel,
     badge_state: BadgeState,
     repo_path: String,
@@ -104,6 +109,7 @@ struct AgentPane {
 #[derive(Debug, Clone, Default)]
 pub struct RowBuildContext {
     pub git: BTreeMap<String, crate::git::GitBadge>,
+    pub worktrees: BTreeMap<String, crate::git::WorktreeInfo>,
     pub unread: BTreeMap<String, bool>,
     pub triage: BTreeSet<String>,
     pub flash: BTreeSet<String>,
@@ -124,7 +130,17 @@ pub fn build_rows_with_git(
     state: &SidebarState,
     git: &BTreeMap<String, crate::git::GitBadge>,
 ) -> Vec<SidebarRow> {
-    build_rows_with_git_and_unread(config, panes, state, git, &BTreeMap::new())
+    build_rows_with_git_and_worktrees(config, panes, state, git, &BTreeMap::new())
+}
+
+pub fn build_rows_with_git_and_worktrees(
+    config: &Config,
+    panes: &[PaneSnapshot],
+    state: &SidebarState,
+    git: &BTreeMap<String, crate::git::GitBadge>,
+    worktrees: &BTreeMap<String, crate::git::WorktreeInfo>,
+) -> Vec<SidebarRow> {
+    build_rows_with_git_worktrees_and_unread(config, panes, state, git, worktrees, &BTreeMap::new())
 }
 
 pub fn build_rows_with_git_and_unread(
@@ -134,7 +150,15 @@ pub fn build_rows_with_git_and_unread(
     git: &BTreeMap<String, crate::git::GitBadge>,
     unread: &BTreeMap<String, bool>,
 ) -> Vec<SidebarRow> {
-    build_rows_at_with_git_and_unread(config, panes, state, git, unread, now_epoch_secs())
+    build_rows_at_with_git_worktrees_and_unread(
+        config,
+        panes,
+        state,
+        git,
+        &BTreeMap::new(),
+        unread,
+        now_epoch_secs(),
+    )
 }
 
 pub fn build_rows_at(
@@ -160,7 +184,15 @@ pub fn build_rows_at_with_git(
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
 ) -> Vec<SidebarRow> {
-    build_rows_at_with_git_and_unread(config, panes, state, git, &BTreeMap::new(), now)
+    build_rows_at_with_git_worktrees_and_unread(
+        config,
+        panes,
+        state,
+        git,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        now,
+    )
 }
 
 pub fn build_rows_at_with_git_and_unread(
@@ -171,12 +203,52 @@ pub fn build_rows_at_with_git_and_unread(
     unread: &BTreeMap<String, bool>,
     now: i64,
 ) -> Vec<SidebarRow> {
+    build_rows_at_with_git_worktrees_and_unread(
+        config,
+        panes,
+        state,
+        git,
+        &BTreeMap::new(),
+        unread,
+        now,
+    )
+}
+
+fn build_rows_with_git_worktrees_and_unread(
+    config: &Config,
+    panes: &[PaneSnapshot],
+    state: &SidebarState,
+    git: &BTreeMap<String, crate::git::GitBadge>,
+    worktrees: &BTreeMap<String, crate::git::WorktreeInfo>,
+    unread: &BTreeMap<String, bool>,
+) -> Vec<SidebarRow> {
+    build_rows_at_with_git_worktrees_and_unread(
+        config,
+        panes,
+        state,
+        git,
+        worktrees,
+        unread,
+        now_epoch_secs(),
+    )
+}
+
+fn build_rows_at_with_git_worktrees_and_unread(
+    config: &Config,
+    panes: &[PaneSnapshot],
+    state: &SidebarState,
+    git: &BTreeMap<String, crate::git::GitBadge>,
+    worktrees: &BTreeMap<String, crate::git::WorktreeInfo>,
+    unread: &BTreeMap<String, bool>,
+    now: i64,
+) -> Vec<SidebarRow> {
     build_rows_ctx(
         config,
         panes,
         state,
         &RowBuildContext {
             git: git.clone(),
+            worktrees: worktrees.clone(),
             unread: unread.clone(),
             triage: BTreeSet::new(),
             flash: BTreeSet::new(),
@@ -206,7 +278,6 @@ pub fn build_rows_ctx(
             .entry((category.clone(), repo.clone()))
             .or_default()
             .push(AgentPane {
-                session: pane.session.clone(),
                 pane_id: pane.pane_id.clone(),
                 repo,
                 category,
@@ -216,7 +287,10 @@ pub fn build_rows_ctx(
                 started_at: pane.started_at.clone(),
                 completed_at: pane.completed_at.clone(),
                 tasks: pane.tasks.clone(),
+                task_items: pane.task_items.clone(),
                 subagents: pane.subagents.clone(),
+                worktree_activity: pane.worktree_activity.clone(),
+                worktree: ctx.worktrees.get(&pane.current_path).cloned(),
                 rollup,
                 badge_state: badge_state(rollup, unread),
                 repo_path: pane.current_path.clone(),
@@ -541,28 +615,51 @@ fn detail_row(pane: &AgentPane, depth: usize, suffix: &str, label: String) -> Si
 }
 
 fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarRow>) {
+    if let Some(worktree) = &pane.worktree {
+        rows.push(detail_row(
+            pane,
+            depth,
+            "worktree",
+            format!("+ {}", sanitize_detail_label(&worktree.name)),
+        ));
+    }
     if let Some(prompt) = non_empty(&pane.prompt) {
         rows.push(detail_row(pane, depth, "prompt", prompt.to_string()));
     }
-    rows.push(detail_row(
-        pane,
-        depth,
-        "place",
-        format!("{} · {}", pane.session, pane.pane_id),
-    ));
+
+    let worktree_activity = decode_worktree_activity(&pane.worktree_activity);
+    if let Some(activity) = worktree_activity
+        .as_ref()
+        .filter(|activity| !same_worktree_path(pane.worktree.as_ref(), activity))
+    {
+        rows.push(detail_row(
+            pane,
+            depth,
+            "worktree-activity",
+            format!("vw exec {}", sanitize_detail_label(&activity.name)),
+        ));
+    }
+
+    let task_items = decode_task_items(&pane.task_items);
+    if let Some(last_index) = task_items.len().checked_sub(1) {
+        for (index, item) in task_items.iter().enumerate() {
+            rows.push(detail_row(
+                pane,
+                depth,
+                &format!("task::{index}::{}", task_status_key(item.status)),
+                task_detail_label(index, last_index, item),
+            ));
+        }
+    }
+
     let subagents = decode_subagents(&pane.subagents);
     if let Some(last_index) = subagents.len().checked_sub(1) {
-        for (index, (agent_id, agent_type)) in subagents.iter().enumerate() {
-            let connector = if index == last_index {
-                "\u{2514}"
-            } else {
-                "\u{251c}"
-            };
+        for (index, subagent) in subagents.iter().enumerate() {
             rows.push(detail_row(
                 pane,
                 depth,
                 &format!("subagent::{index}"),
-                format!("{connector} {agent_type}{}", subagent_id_suffix(agent_id)),
+                subagent_detail_label(index, last_index, subagent),
             ));
         }
     }
@@ -580,6 +677,84 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
         active: pane.active,
         meta: None,
     });
+}
+
+fn decode_task_items(raw: &str) -> Vec<TaskItem> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn decode_worktree_activity(raw: &str) -> Option<WorktreeActivity> {
+    serde_json::from_str(raw).ok()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubagentDetail {
+    agent_id: String,
+    agent_type: String,
+    display_name: Option<String>,
+}
+
+impl SubagentDetail {
+    fn label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.agent_type)
+    }
+}
+
+fn same_worktree_path(worktree: Option<&WorktreeInfo>, activity: &WorktreeActivity) -> bool {
+    worktree
+        .map(|worktree| worktree.path == activity.path)
+        .unwrap_or(false)
+}
+
+fn task_detail_label(index: usize, last_index: usize, item: &TaskItem) -> String {
+    format!(
+        "{} {} Task - {}",
+        tree_connector(index, last_index),
+        task_status_icon(item.status),
+        sanitize_detail_label(&item.step)
+    )
+}
+
+fn subagent_detail_label(index: usize, last_index: usize, subagent: &SubagentDetail) -> String {
+    format!(
+        "{} Agent - {}{}",
+        tree_connector(index, last_index),
+        sanitize_detail_label(subagent.label()),
+        subagent_id_suffix(&subagent.agent_id)
+    )
+}
+
+fn tree_connector(index: usize, last_index: usize) -> &'static str {
+    if index == last_index {
+        "\u{2514}"
+    } else {
+        "\u{251c}"
+    }
+}
+
+fn task_status_icon(status: TaskItemStatus) -> &'static str {
+    match status {
+        TaskItemStatus::Completed => "✓",
+        TaskItemStatus::InProgress => "●",
+        TaskItemStatus::Pending => "○",
+    }
+}
+
+fn task_status_key(status: TaskItemStatus) -> &'static str {
+    match status {
+        TaskItemStatus::Completed => "completed",
+        TaskItemStatus::InProgress => "in_progress",
+        TaskItemStatus::Pending => "pending",
+    }
+}
+
+fn sanitize_detail_label(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn expanded_chat_label(pane: &AgentPane) -> String {
@@ -662,13 +837,24 @@ pub fn humanize_secs_full(secs: i64) -> String {
     }
 }
 
-fn decode_subagents(raw: &str) -> Vec<(String, String)> {
+fn decode_subagents(raw: &str) -> Vec<SubagentDetail> {
     raw.split('|')
         .filter(|entry| !entry.is_empty())
         .filter_map(|entry| {
-            entry
-                .split_once(':')
-                .map(|(id, agent_type)| (id.to_string(), agent_type.to_string()))
+            entry.split_once(':').map(|(agent_id, rest)| {
+                let (agent_type, display_name) = match rest.split_once(':') {
+                    Some((agent_type, display_name)) => (
+                        agent_type.to_string(),
+                        (!display_name.is_empty()).then(|| display_name.to_string()),
+                    ),
+                    None => (rest.to_string(), None),
+                };
+                SubagentDetail {
+                    agent_id: agent_id.to_string(),
+                    agent_type,
+                    display_name,
+                }
+            })
         })
         .collect()
 }
@@ -854,7 +1040,9 @@ impl EmptyStringExt for String {
 mod tests {
     use super::*;
     use crate::config::{CategoryRule, Config};
+    use crate::git::{WorktreeInfo, WorktreeSource};
     use crate::hook::RollupLevel;
+    use crate::hook::{TaskItem, TaskItemStatus, WorktreeActivity, WorktreeActivityKind};
     use crate::options::snapshot::PaneSnapshot;
     use crate::sidebar::state::{SidebarState, ViewMode};
 
@@ -1095,12 +1283,7 @@ mod tests {
                 .active
         );
         assert!(rows.iter().find(|row| row.id == "chat::%1").unwrap().active);
-        assert!(
-            rows.iter()
-                .find(|row| row.id == "detail::%1::place")
-                .unwrap()
-                .active
-        );
+        assert!(!rows.iter().any(|row| row.id == "detail::%1::place"));
         assert!(rows.iter().find(|row| row.id == "jump::%1").unwrap().active);
         assert!(
             !rows
@@ -1355,10 +1538,7 @@ mod tests {
                 .any(|row| row.kind == SidebarRowKind::Chat && row.label == "codex")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%5::state"));
-        assert!(
-            rows.iter()
-                .any(|row| row.kind == SidebarRowKind::Detail && row.label == "main · %5")
-        );
+        assert!(!rows.iter().any(|row| row.id == "detail::%5::place"));
         assert_eq!(rows.last().unwrap().kind, SidebarRowKind::Jump);
     }
 
@@ -1444,12 +1624,13 @@ mod tests {
         assert!(!rows.iter().any(|row| row.id == "meta::%1"));
         assert!(rows.iter().any(|row| row.id == "detail::%1::prompt"));
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
-        assert!(rows.iter().any(|row| row.id == "detail::%1::place"));
+        assert!(!rows.iter().any(|row| row.id == "detail::%1::place"));
+        assert!(!rows.iter().any(|row| row.id.contains("::task::")));
         assert!(rows.iter().any(|row| row.id == "jump::%1"));
     }
 
     #[test]
-    fn expanded_chat_row_carries_state_and_place_detail_remains() {
+    fn expanded_chat_row_carries_state_and_omits_place_detail() {
         let mut agent = pane("vde-tmux", "%1", "/tmp/app", "codex", "running");
         agent.prompt = "fix bug".to_string();
         agent.started_at = "280".to_string();
@@ -1469,12 +1650,7 @@ mod tests {
             Some("codex")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "detail::%1::place")
-                .map(|row| row.label.as_str()),
-            Some("vde-tmux · %1")
-        );
+        assert!(!rows.iter().any(|row| row.id == "detail::%1::place"));
         assert!(!rows.iter().any(|row| row.id == "detail::%1::status"));
         assert!(!rows.iter().any(|row| row.id == "detail::%1::elapsed"));
         assert!(!rows.iter().any(|row| row.id == "detail::%1::session"));
@@ -1633,7 +1809,205 @@ mod tests {
 
         assert_eq!(
             labels,
-            vec!["\u{251c} Explore #sub1", "\u{2514} general-purpose #ab12"]
+            vec![
+                "\u{251c} Agent - Explore #sub1",
+                "\u{2514} Agent - general-purpose #ab12"
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_detail_rows_prefer_subagent_display_name_when_present() {
+        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
+        agent.subagents = "019f3c28:default:Ramanujan".to_string();
+        let mut state = SidebarState::default();
+        state.toggle_expanded("chat::%5");
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
+
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "detail::%5::subagent::0")
+                .map(|row| row.label.as_str()),
+            Some("\u{2514} Agent - Ramanujan #019f")
+        );
+    }
+
+    #[test]
+    fn expanded_chat_detail_rows_include_task_items_under_prompt() {
+        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
+        agent.prompt = "fix bug".to_string();
+        agent.tasks = "1/3".to_string();
+        agent.task_items = crate::hook::encode_task_items(&[
+            TaskItem {
+                step: "Explore current sidebar rows".to_string(),
+                status: TaskItemStatus::Completed,
+            },
+            TaskItem {
+                step: "Implement task item rows".to_string(),
+                status: TaskItemStatus::InProgress,
+            },
+            TaskItem {
+                step: "Verify rendering".to_string(),
+                status: TaskItemStatus::Pending,
+            },
+        ]);
+        let mut state = SidebarState::default();
+        state.toggle_expanded("chat::%5");
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
+        let details = rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Detail)
+            .map(|row| (row.id.as_str(), row.label.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            details,
+            vec![
+                ("detail::%5::prompt", "fix bug"),
+                (
+                    "detail::%5::task::0::completed",
+                    "\u{251c} ✓ Task - Explore current sidebar rows"
+                ),
+                (
+                    "detail::%5::task::1::in_progress",
+                    "\u{251c} ● Task - Implement task item rows"
+                ),
+                (
+                    "detail::%5::task::2::pending",
+                    "\u{2514} ○ Task - Verify rendering"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn expanded_chat_detail_rows_order_worktree_prompt_activity_tasks_subagents_jump() {
+        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
+        agent.prompt = "fix bug".to_string();
+        agent.task_items = crate::hook::encode_task_items(&[TaskItem {
+            step: "Implement".to_string(),
+            status: TaskItemStatus::InProgress,
+        }]);
+        agent.worktree_activity = crate::hook::encode_worktree_activity(&WorktreeActivity {
+            kind: WorktreeActivityKind::VwExec,
+            name: "temp".to_string(),
+            path: "/tmp/worktrees/temp".to_string(),
+            command: "vw exec /tmp/worktrees/temp -- cargo test".to_string(),
+            observed_at: 42,
+        });
+        agent.subagents = "sub12345:Explore".to_string();
+        let mut state = SidebarState::default();
+        state.toggle_expanded("chat::%5");
+        let ctx = RowBuildContext {
+            worktrees: BTreeMap::from([(
+                "/tmp/app".to_string(),
+                WorktreeInfo {
+                    name: "active".to_string(),
+                    path: "/tmp/worktrees/active".to_string(),
+                    source: WorktreeSource::GitLinked,
+                    branch: None,
+                    dirty: None,
+                    locked: None,
+                },
+            )]),
+            now: 1075,
+            ..RowBuildContext::default()
+        };
+
+        let rows = build_rows_ctx(&Config::default(), &[agent], &state, &ctx).0;
+        let sequence = rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Detail || row.kind == SidebarRowKind::Jump)
+            .map(|row| (row.id.as_str(), row.label.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            sequence,
+            vec![
+                ("detail::%5::worktree", "+ active"),
+                ("detail::%5::prompt", "fix bug"),
+                ("detail::%5::worktree-activity", "vw exec temp"),
+                (
+                    "detail::%5::task::0::in_progress",
+                    "\u{2514} ● Task - Implement"
+                ),
+                ("detail::%5::subagent::0", "\u{2514} Agent - Explore #sub1"),
+                ("jump::%5", "jump"),
+            ]
+        );
+    }
+
+    #[test]
+    fn expanded_chat_detail_omits_vw_exec_activity_when_same_as_active_worktree() {
+        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
+        agent.prompt = "fix bug".to_string();
+        agent.worktree_activity = crate::hook::encode_worktree_activity(&WorktreeActivity {
+            kind: WorktreeActivityKind::VwExec,
+            name: "active".to_string(),
+            path: "/tmp/worktrees/active".to_string(),
+            command: "vw exec /tmp/worktrees/active -- cargo test".to_string(),
+            observed_at: 42,
+        });
+        let mut state = SidebarState::default();
+        state.toggle_expanded("chat::%5");
+        let ctx = RowBuildContext {
+            worktrees: BTreeMap::from([(
+                "/tmp/app".to_string(),
+                WorktreeInfo {
+                    name: "active".to_string(),
+                    path: "/tmp/worktrees/active".to_string(),
+                    source: WorktreeSource::GitLinked,
+                    branch: None,
+                    dirty: None,
+                    locked: None,
+                },
+            )]),
+            now: 1075,
+            ..RowBuildContext::default()
+        };
+
+        let rows = build_rows_ctx(&Config::default(), &[agent], &state, &ctx).0;
+
+        assert!(rows.iter().any(|row| row.id == "detail::%5::worktree"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.id == "detail::%5::worktree-activity")
+        );
+    }
+
+    #[test]
+    fn expanded_chat_detail_omits_task_items_when_json_is_malformed() {
+        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
+        agent.prompt = "fix bug".to_string();
+        agent.task_items = "{not-json".to_string();
+        let mut state = SidebarState::default();
+        state.toggle_expanded("chat::%5");
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
+
+        assert!(!rows.iter().any(|row| row.id.contains("::task::")));
+    }
+
+    #[test]
+    fn expanded_chat_detail_sanitizes_control_characters_in_task_steps() {
+        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
+        agent.task_items = crate::hook::encode_task_items(&[TaskItem {
+            step: "Explore\nrows\tquickly".to_string(),
+            status: TaskItemStatus::Completed,
+        }]);
+        let mut state = SidebarState::default();
+        state.toggle_expanded("chat::%5");
+
+        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
+
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "detail::%5::task::0::completed")
+                .map(|row| row.label.as_str()),
+            Some("\u{2514} ✓ Task - Explore rows quickly")
         );
     }
 
@@ -1647,7 +2021,7 @@ mod tests {
         let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
         let subagent_index = rows
             .iter()
-            .position(|row| row.label == "\u{2514} Explore #sub1")
+            .position(|row| row.label == "\u{2514} Agent - Explore #sub1")
             .expect("subagent row should exist");
         let jump_index = rows
             .iter()

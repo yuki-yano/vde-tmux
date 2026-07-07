@@ -1971,6 +1971,8 @@ mod tests {
             "",
             "",
             "",
+            "",
+            "",
         ]
         .join("\u{1f}");
         mock.stub(

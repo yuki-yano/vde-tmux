@@ -59,7 +59,9 @@ pub fn claude_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Re
                 agent_event.prompt_source = Some(OptionUpdate::Set("user".to_string()));
             }
             agent_event.tasks = Some(OptionUpdate::Unset);
+            agent_event.task_items = Some(OptionUpdate::Unset);
             agent_event.subagents = Some(OptionUpdate::Unset);
+            agent_event.worktree_activity = Some(OptionUpdate::Unset);
         }
         "PreToolUse" | "PostToolUse" => {
             agent_event.status = Some(AgentStatus::Running);
@@ -100,6 +102,9 @@ pub fn codex_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Res
                 agent_event.prompt = Some(OptionUpdate::Set(prompt));
                 agent_event.prompt_source = Some(OptionUpdate::Set("user".to_string()));
             }
+            agent_event.tasks = Some(OptionUpdate::Unset);
+            agent_event.task_items = Some(OptionUpdate::Unset);
+            agent_event.worktree_activity = Some(OptionUpdate::Unset);
         }
         "SessionStart" => {
             apply_session_start(&mut agent_event, payload.source, payload.transcript_path);
@@ -153,6 +158,7 @@ fn apply_session_start(
             agent_event.clear_state = true;
             agent_event.status = Some(AgentStatus::Idle);
             agent_event.attention = Some(false);
+            agent_event.worktree_activity = Some(OptionUpdate::Unset);
             if source.as_deref() == Some("resume")
                 && let Some(prompt) = transcript_path
                     .as_deref()

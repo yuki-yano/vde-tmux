@@ -125,7 +125,15 @@ pub fn config_schema() -> Value {
                         "properties": {
                             "selection_bg": { "type": "string" },
                             "header_active_bg": { "type": "string" },
-                            "header_active_fg": { "type": "string" }
+                            "header_active_fg": { "type": "string" },
+                            "task_done": { "type": "string" },
+                            "task_working": { "type": "string" },
+                            "task_pending": { "type": "string" },
+                            "task_label": { "type": "string" },
+                            "subagent_label": { "type": "string" },
+                            "subagent_id": { "type": "string" },
+                            "worktree": { "type": "string" },
+                            "worktree_activity": { "type": "string" }
                         }
                     },
                     "header": {
@@ -263,6 +271,25 @@ mod tests {
         }
         assert!(colors.get("attention").is_none());
         assert!(colors.get("selection_active_bg").is_none());
+    }
+
+    #[test]
+    fn schema_contains_sidebar_task_subagent_and_worktree_detail_colors() {
+        let schema = config_schema();
+        let colors = &schema["properties"]["sidebar"]["properties"]["colors"]["properties"];
+
+        for key in [
+            "task_done",
+            "task_working",
+            "task_pending",
+            "task_label",
+            "subagent_label",
+            "subagent_id",
+            "worktree",
+            "worktree_activity",
+        ] {
+            assert_eq!(colors[key]["type"], "string", "{key}");
+        }
     }
 
     #[test]

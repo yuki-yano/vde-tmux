@@ -288,6 +288,8 @@ fn dispatch_statusline_summary_falls_back_to_tmux_snapshot() {
         "",
         "",
         "",
+        "",
+        "",
     ]
     .join("\u{1f}");
     mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
@@ -328,6 +330,8 @@ fn dispatch_statusline_attention_falls_back_to_tmux_snapshot() {
         "permission_prompt",
         "",
         &started.to_string(),
+        "",
+        "",
         "",
         "",
         "",

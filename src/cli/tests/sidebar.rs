@@ -37,6 +37,8 @@ fn dispatch_sidebar_attach_once_marks_and_renders() {
         "",
         "",
         "",
+        "",
+        "",
     ]
     .join("\u{1f}");
     mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
@@ -103,6 +105,8 @@ fn dispatch_sidebar_attach_once_restores_persisted_state() {
         "",
         "codex",
         "running",
+        "",
+        "",
         "",
         "",
         "",

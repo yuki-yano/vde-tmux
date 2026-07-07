@@ -141,6 +141,30 @@
             },
             "selection_bg": {
               "type": "string"
+            },
+            "subagent_id": {
+              "type": "string"
+            },
+            "subagent_label": {
+              "type": "string"
+            },
+            "task_done": {
+              "type": "string"
+            },
+            "task_label": {
+              "type": "string"
+            },
+            "task_pending": {
+              "type": "string"
+            },
+            "task_working": {
+              "type": "string"
+            },
+            "worktree": {
+              "type": "string"
+            },
+            "worktree_activity": {
+              "type": "string"
             }
           },
           "type": "object"

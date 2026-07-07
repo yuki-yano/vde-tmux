@@ -36,6 +36,14 @@ pub struct SidebarRenderTheme {
     pub repo: Color,
     pub branch: Color,
     pub live: Color,
+    pub task_done: Color,
+    pub task_working: Color,
+    pub task_pending: Color,
+    pub task_label: Color,
+    pub subagent_label: Color,
+    pub subagent_id: Color,
+    pub worktree: Color,
+    pub worktree_activity: Color,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +84,14 @@ impl Default for SidebarRenderTheme {
             repo: Color::Blue,
             branch: Color::Indexed(73),
             live: Color::Magenta,
+            task_done: Color::Indexed(220),
+            task_working: Color::Indexed(220),
+            task_pending: Color::DarkGray,
+            task_label: Color::Indexed(246),
+            subagent_label: Color::Indexed(73),
+            subagent_id: Color::Indexed(73),
+            worktree: Color::Indexed(73),
+            worktree_activity: Color::Indexed(73),
         }
     }
 }
@@ -114,6 +130,18 @@ impl SidebarRenderTheme {
             repo: parse_color(config.repo.as_deref()).unwrap_or(default.repo),
             branch: parse_color(config.branch.as_deref()).unwrap_or(default.branch),
             live: parse_color(config.live.as_deref()).unwrap_or(default.live),
+            task_done: parse_color(config.task_done.as_deref()).unwrap_or(default.task_done),
+            task_working: parse_color(config.task_working.as_deref())
+                .unwrap_or(default.task_working),
+            task_pending: parse_color(config.task_pending.as_deref())
+                .unwrap_or(default.task_pending),
+            task_label: parse_color(config.task_label.as_deref()).unwrap_or(default.task_label),
+            subagent_label: parse_color(config.subagent_label.as_deref())
+                .unwrap_or(default.subagent_label),
+            subagent_id: parse_color(config.subagent_id.as_deref()).unwrap_or(default.subagent_id),
+            worktree: parse_color(config.worktree.as_deref()).unwrap_or(default.worktree),
+            worktree_activity: parse_color(config.worktree_activity.as_deref())
+                .unwrap_or(default.worktree_activity),
         }
     }
 
@@ -797,6 +825,11 @@ fn label_spans(
     base: Style,
     theme: &SidebarRenderTheme,
 ) -> Vec<Span<'static>> {
+    if row.kind == SidebarRowKind::Detail
+        && let Some(spans) = detail_label_spans(&label, row, theme)
+    {
+        return spans;
+    }
     if row.kind == SidebarRowKind::Chat
         && let Some(agent) = row
             .meta
@@ -822,6 +855,99 @@ fn label_spans(
         ];
     }
     vec![Span::styled(label, base)]
+}
+
+fn detail_label_spans(
+    label: &str,
+    row: &SidebarRow,
+    theme: &SidebarRenderTheme,
+) -> Option<Vec<Span<'static>>> {
+    if row.id.contains("::task::") {
+        return task_detail_label_spans(label, row, theme);
+    }
+    if row.id.contains("::subagent::") {
+        return subagent_detail_label_spans(label, theme);
+    }
+    if row.id.ends_with("::worktree-activity") {
+        return Some(vec![Span::styled(
+            label.to_string(),
+            Style::default().fg(theme.worktree_activity),
+        )]);
+    }
+    if row.id.ends_with("::worktree") {
+        return Some(vec![Span::styled(
+            label.to_string(),
+            Style::default().fg(theme.worktree),
+        )]);
+    }
+    None
+}
+
+fn task_detail_label_spans(
+    label: &str,
+    row: &SidebarRow,
+    theme: &SidebarRenderTheme,
+) -> Option<Vec<Span<'static>>> {
+    let (connector, rest) = split_tree_connector(label)?;
+    let mut chars = rest.chars();
+    let icon = chars.next()?;
+    let body = chars.collect::<String>();
+    Some(vec![
+        Span::styled(connector, Style::default().fg(theme.marker)),
+        Span::styled(
+            icon.to_string(),
+            Style::default().fg(task_detail_icon_color(row, theme)),
+        ),
+        Span::styled(body, Style::default().fg(theme.task_label)),
+    ])
+}
+
+fn subagent_detail_label_spans(
+    label: &str,
+    theme: &SidebarRenderTheme,
+) -> Option<Vec<Span<'static>>> {
+    let (connector, rest) = split_tree_connector(label)?;
+    let mut spans = vec![Span::styled(connector, Style::default().fg(theme.marker))];
+    if let Some((agent_label, id)) = rest.rsplit_once(" #") {
+        spans.push(Span::styled(
+            agent_label.to_string(),
+            Style::default().fg(theme.subagent_label),
+        ));
+        spans.push(Span::styled(
+            format!(" #{id}"),
+            Style::default().fg(theme.subagent_id),
+        ));
+    } else {
+        spans.push(Span::styled(
+            rest.to_string(),
+            Style::default().fg(theme.subagent_label),
+        ));
+    }
+    Some(spans)
+}
+
+fn split_tree_connector(label: &str) -> Option<(String, &str)> {
+    let mut iter = label.char_indices();
+    let (_, connector) = iter.next()?;
+    if connector != '\u{251c}' && connector != '\u{2514}' {
+        return None;
+    }
+    let (space_index, space) = iter.next()?;
+    if space != ' ' {
+        return None;
+    }
+    let rest_index = space_index + space.len_utf8();
+    Some((label[..rest_index].to_string(), &label[rest_index..]))
+}
+
+fn task_detail_icon_color(row: &SidebarRow, theme: &SidebarRenderTheme) -> Color {
+    if row.id.ends_with("::completed") {
+        theme.task_done
+    } else if row.id.ends_with("::in_progress") {
+        theme.task_working
+    } else {
+        theme.task_pending
+    }
 }
 
 fn state_context_spans(
@@ -1551,6 +1677,41 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_render_theme_reads_task_subagent_and_worktree_detail_colors() {
+        let config = crate::config::SidebarColorsConfig {
+            task_done: Some("220".to_string()),
+            task_working: Some("221".to_string()),
+            task_pending: Some("darkgray".to_string()),
+            task_label: Some("246".to_string()),
+            subagent_label: Some("73".to_string()),
+            subagent_id: Some("74".to_string()),
+            worktree: Some("cyan".to_string()),
+            worktree_activity: Some("#4fd08a".to_string()),
+            ..Default::default()
+        };
+        let theme = SidebarRenderTheme::from_config(&config);
+
+        assert_eq!(theme.task_done, Color::Indexed(220));
+        assert_eq!(theme.task_working, Color::Indexed(221));
+        assert_eq!(theme.task_pending, Color::DarkGray);
+        assert_eq!(theme.task_label, Color::Indexed(246));
+        assert_eq!(theme.subagent_label, Color::Indexed(73));
+        assert_eq!(theme.subagent_id, Color::Indexed(74));
+        assert_eq!(theme.worktree, Color::Cyan);
+        assert_eq!(theme.worktree_activity, Color::Rgb(79, 208, 138));
+
+        let default = SidebarRenderTheme::default();
+        assert_eq!(default.task_done, Color::Indexed(220));
+        assert_eq!(default.task_working, Color::Indexed(220));
+        assert_eq!(default.task_pending, Color::DarkGray);
+        assert_eq!(default.task_label, Color::Indexed(246));
+        assert_eq!(default.subagent_label, Color::Indexed(73));
+        assert_eq!(default.subagent_id, Color::Indexed(73));
+        assert_eq!(default.worktree, Color::Indexed(73));
+        assert_eq!(default.worktree_activity, Color::Indexed(73));
+    }
+
+    #[test]
     fn width_tier_boundaries() {
         assert_eq!(WidthTier::from_width(2), WidthTier::Rail);
         assert_eq!(WidthTier::from_width(3), WidthTier::Micro);
@@ -1687,6 +1848,36 @@ mod tests {
         let text = render_rows(&[chat, jump], &SidebarState::default(), 2);
 
         assert_eq!(text, "●1\n──\n●");
+    }
+
+    #[test]
+    fn dense_micro_and_rail_modes_continue_to_omit_detail_rows() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(BadgeState::Working);
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            elapsed_secs: Some(60),
+            ..Default::default()
+        });
+        let detail = row(
+            "detail::%1::task::0::in_progress",
+            SidebarRowKind::Detail,
+            1,
+            "\u{2514} ● Task - Build",
+            RollupLevel::Running,
+        );
+        let rows = vec![chat, detail];
+
+        for width in [2, 12, 30] {
+            let rendered = render_rows(&rows, &SidebarState::default(), width);
+            assert!(!rendered.contains("Task - Build"), "{width}: {rendered:?}");
+        }
     }
 
     #[test]
@@ -2566,10 +2757,10 @@ sidebar:
             ..Default::default()
         });
         let detail = row(
-            "detail::%1::place",
+            "detail::%1::note",
             SidebarRowKind::Detail,
             1,
-            "main · %1",
+            "plain detail",
             RollupLevel::Running,
         );
         let prompt_detail = row(
@@ -2620,7 +2811,7 @@ sidebar:
         assert!(
             detail_spans
                 .iter()
-                .any(|span| span.content.as_ref().contains("main · %1")
+                .any(|span| span.content.as_ref().contains("plain detail")
                     && span.style.fg == Some(Color::Indexed(246))
                     && !span.style.add_modifier.contains(Modifier::DIM)),
             "{detail_spans:?}"
@@ -2634,6 +2825,123 @@ sidebar:
                     && !span.style.add_modifier.contains(Modifier::DIM)),
             "{prompt_detail_spans:?}"
         );
+    }
+
+    #[test]
+    fn task_detail_rows_colorize_status_icons() {
+        let theme = SidebarRenderTheme::default();
+        let rows = vec![
+            row(
+                "detail::%1::task::0::completed",
+                SidebarRowKind::Detail,
+                1,
+                "\u{251c} ✓ Task - Explore",
+                RollupLevel::Running,
+            ),
+            row(
+                "detail::%1::task::1::in_progress",
+                SidebarRowKind::Detail,
+                1,
+                "\u{251c} ● Task - Build",
+                RollupLevel::Running,
+            ),
+            row(
+                "detail::%1::task::2::pending",
+                SidebarRowKind::Detail,
+                1,
+                "\u{2514} ○ Task - Verify",
+                RollupLevel::Running,
+            ),
+        ];
+
+        let lines = render_lines(&rows, &SidebarState::default(), 60, &theme);
+
+        assert_span_fg(&lines[0].spans, "✓", theme.task_done);
+        assert_span_fg(&lines[1].spans, "●", theme.task_working);
+        assert_span_fg(&lines[2].spans, "○", theme.task_pending);
+        assert_span_fg(&lines[0].spans, " Task - Explore", theme.task_label);
+        assert_span_fg(&lines[0].spans, "\u{251c} ", theme.marker);
+    }
+
+    #[test]
+    fn subagent_detail_rows_colorize_label_and_id() {
+        let theme = SidebarRenderTheme::default();
+        let detail = row(
+            "detail::%1::subagent::0",
+            SidebarRowKind::Detail,
+            1,
+            "\u{2514} Agent - Explore #sub1",
+            RollupLevel::Running,
+        );
+
+        let lines = render_lines(&[detail], &SidebarState::default(), 60, &theme);
+
+        assert_span_fg(&lines[0].spans, "\u{2514} ", theme.marker);
+        assert_span_fg(&lines[0].spans, "Agent - Explore", theme.subagent_label);
+        assert_span_fg(&lines[0].spans, " #sub1", theme.subagent_id);
+    }
+
+    #[test]
+    fn worktree_detail_row_uses_worktree_color() {
+        let theme = SidebarRenderTheme::default();
+        let detail = row(
+            "detail::%1::worktree",
+            SidebarRowKind::Detail,
+            1,
+            "+ feature",
+            RollupLevel::Running,
+        );
+
+        let lines = render_lines(&[detail], &SidebarState::default(), 60, &theme);
+
+        assert_span_fg(&lines[0].spans, "+ feature", theme.worktree);
+    }
+
+    #[test]
+    fn worktree_activity_detail_row_uses_worktree_activity_color() {
+        let theme = SidebarRenderTheme::default();
+        let detail = row(
+            "detail::%1::worktree-activity",
+            SidebarRowKind::Detail,
+            1,
+            "vw exec feature",
+            RollupLevel::Running,
+        );
+
+        let lines = render_lines(&[detail], &SidebarState::default(), 60, &theme);
+
+        assert_span_fg(&lines[0].spans, "vw exec feature", theme.worktree_activity);
+    }
+
+    #[test]
+    fn prompt_detail_row_keeps_reset_color() {
+        let theme = SidebarRenderTheme::default();
+        let detail = row(
+            "detail::%1::prompt",
+            SidebarRowKind::Detail,
+            1,
+            "fix flicker",
+            RollupLevel::Running,
+        );
+
+        let lines = render_lines(&[detail], &SidebarState::default(), 60, &theme);
+
+        assert_span_fg(&lines[0].spans, "fix flicker", Color::Reset);
+    }
+
+    #[test]
+    fn narrow_width_truncates_task_detail_without_panicking() {
+        let detail = row(
+            "detail::%1::task::0::in_progress",
+            SidebarRowKind::Detail,
+            1,
+            "\u{2514} ● Task - Implement an extremely long task label",
+            RollupLevel::Running,
+        );
+
+        let rendered = render_rows(&[detail], &SidebarState::default(), 36);
+
+        assert!(rendered.contains('●'), "{rendered:?}");
     }
 
     #[test]

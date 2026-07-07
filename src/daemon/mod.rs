@@ -392,7 +392,9 @@ mod tests {
             pane.started_at.as_str(),
             pane.completed_at.as_str(),
             pane.tasks.as_str(),
+            pane.task_items.as_str(),
             pane.subagents.as_str(),
+            pane.worktree_activity.as_str(),
         ]
         .join("\u{1f}")
     }

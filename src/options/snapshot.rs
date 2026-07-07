@@ -29,7 +29,9 @@ pub struct PaneSnapshot {
     pub started_at: String,
     pub completed_at: String,
     pub tasks: String,
+    pub task_items: String,
     pub subagents: String,
+    pub worktree_activity: String,
     pub agent_observed: bool,
 }
 
@@ -81,7 +83,9 @@ pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
                 started_at: fields[16].to_string(),
                 completed_at: fields[17].to_string(),
                 tasks: fields[18].to_string(),
-                subagents: fields[19].to_string(),
+                task_items: fields[19].to_string(),
+                subagents: fields[20].to_string(),
+                worktree_activity: fields[21].to_string(),
                 agent_observed,
             })
         })
@@ -305,7 +309,9 @@ pub fn has_pane_state(pane: &PaneSnapshot) -> bool {
         pane.started_at.as_str(),
         pane.completed_at.as_str(),
         pane.tasks.as_str(),
+        pane.task_items.as_str(),
         pane.subagents.as_str(),
+        pane.worktree_activity.as_str(),
     ]
     .iter()
     .any(|value| !value.is_empty())
@@ -338,6 +344,8 @@ mod tests {
 
     #[test]
     fn parse_snapshot_lines_reads_activity_fields() {
+        let task_items = r#"[{"step":"Explore","status":"completed"}]"#;
+        let worktree_activity = r#"{"kind":"vw_exec","name":"feature","path":"/tmp/feature","command":"test","observed_at":42}"#;
         let raw = line(&[
             "main",
             "@1",
@@ -358,12 +366,16 @@ mod tests {
             "",
             "",
             "",
+            task_items,
             "",
+            worktree_activity,
         ]);
         let panes = parse_snapshot_lines(&raw);
         assert_eq!(panes.len(), 1);
         assert!(panes[0].window_active);
         assert!(panes[0].session_attached);
+        assert_eq!(panes[0].task_items, task_items);
+        assert_eq!(panes[0].worktree_activity, worktree_activity);
 
         let detached = line(&[
             "main",
@@ -378,6 +390,8 @@ mod tests {
             "",
             "codex",
             "running",
+            "",
+            "",
             "",
             "",
             "",
@@ -414,6 +428,8 @@ mod tests {
             "1720000000",
             "",
             "2/5",
+            r#"[{"step":"Run tests","status":"in_progress"}]"#,
+            "",
             "",
         ]);
         let panes = parse_snapshot_lines(&raw);
@@ -425,6 +441,10 @@ mod tests {
         assert_eq!(pane.agent, "claude");
         assert_eq!(pane.status, "running");
         assert_eq!(pane.tasks, "2/5");
+        assert_eq!(
+            pane.task_items,
+            r#"[{"step":"Run tests","status":"in_progress"}]"#
+        );
     }
 
     #[test]
@@ -450,11 +470,15 @@ mod tests {
             "",
             "",
             "",
+            "",
+            "",
         ]);
         let panes = parse_snapshot_lines(&raw);
         assert_eq!(panes.len(), 1);
         assert!(panes[0].is_sidebar);
         assert_eq!(panes[0].agent, "");
+        assert_eq!(panes[0].task_items, "");
+        assert_eq!(panes[0].worktree_activity, "");
     }
 
     #[test]
@@ -469,6 +493,8 @@ mod tests {
             "123",
             "0",
             "0",
+            "",
+            "",
             "",
             "",
             "",
@@ -554,6 +580,8 @@ mod tests {
             "",
             "",
             "",
+            "",
+            "",
         ]);
 
         let panes = parse_snapshot_lines(&raw);
@@ -601,5 +629,20 @@ mod tests {
         let commands = "-zsh\nnode /Users/me/.npm/bin/claude --dangerously-skip-permissions\n";
 
         assert_eq!(detect_agent_from_tty_commands(commands), Some("claude"));
+    }
+
+    #[test]
+    fn pane_state_includes_task_items_and_worktree_activity() {
+        let task_items = PaneSnapshot {
+            task_items: "[]".to_string(),
+            ..PaneSnapshot::default()
+        };
+        assert!(has_pane_state(&task_items));
+
+        let activity = PaneSnapshot {
+            worktree_activity: "{}".to_string(),
+            ..PaneSnapshot::default()
+        };
+        assert!(has_pane_state(&activity));
     }
 }

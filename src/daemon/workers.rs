@@ -6,7 +6,7 @@ use anyhow::Result;
 
 use crate::daemon::runtime::DaemonEvent;
 use crate::detect::{demote_stale_running, detect_codex_wait_reason};
-use crate::git::{GitRunner, SystemGitRunner, collect_git_badges};
+use crate::git::{GitRunner, SystemGitRunner, collect_git_badges, collect_worktree_infos};
 use crate::hook::AgentStatus;
 use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane, read_all_panes};
 use crate::sidebar::layout::jump_to_pane;
@@ -186,8 +186,10 @@ pub fn poll_git_once(
     latest_panes: Arc<LatestPanes>,
     tx: Sender<DaemonEvent>,
 ) -> Result<()> {
-    let badges = collect_git_badges(git.as_ref(), &latest_panes.load());
-    tx.send(DaemonEvent::GitStatusUpdated(badges))?;
+    let panes = latest_panes.load();
+    let badges = collect_git_badges(git.as_ref(), &panes);
+    let worktrees = collect_worktree_infos(git.as_ref(), &panes);
+    tx.send(DaemonEvent::GitStatusUpdated { badges, worktrees })?;
     Ok(())
 }
 
@@ -338,6 +340,10 @@ mod tests {
     struct MockGitRunner {
         branch: String,
         counts: String,
+        top_level: Option<String>,
+        git_dir: Option<String>,
+        common_dir: Option<String>,
+        superproject: Option<String>,
     }
 
     impl GitRunner for MockGitRunner {
@@ -347,8 +353,27 @@ mod tests {
                 ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"] => {
                     Ok(self.counts.clone())
                 }
+                ["rev-parse", "--show-toplevel"] => self
+                    .top_level
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("not a repo")),
+                ["rev-parse", "--git-dir"] => self
+                    .git_dir
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("not a repo")),
+                ["rev-parse", "--git-common-dir"] => self
+                    .common_dir
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("not a repo")),
+                ["rev-parse", "--show-superproject-working-tree"] => {
+                    Ok(self.superproject.clone().unwrap_or_default())
+                }
                 _ => anyhow::bail!("unexpected git args: {args:?}"),
             }
+        }
+
+        fn run_vw(&self, _cwd: &str, args: &[&str]) -> anyhow::Result<String> {
+            anyhow::bail!("unexpected vw args: {args:?}")
         }
     }
 
@@ -390,14 +415,19 @@ mod tests {
         let git = Arc::new(MockGitRunner {
             branch: "main\n".to_string(),
             counts: "0\t1\n".to_string(),
+            top_level: Some("/tmp/app\n".to_string()),
+            git_dir: Some("/tmp/repo/.git/worktrees/app\n".to_string()),
+            common_dir: Some("/tmp/repo/.git\n".to_string()),
+            superproject: Some("\n".to_string()),
         });
 
         poll_git_once(git, panes, tx).unwrap();
 
-        let DaemonEvent::GitStatusUpdated(badges) = rx.recv().unwrap() else {
+        let DaemonEvent::GitStatusUpdated { badges, worktrees } = rx.recv().unwrap() else {
             panic!("expected git status updated");
         };
         assert_eq!(badges["/tmp/app"].branch, "main");
+        assert_eq!(worktrees["/tmp/app"].name, "app");
     }
 
     #[test]

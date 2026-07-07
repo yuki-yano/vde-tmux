@@ -22,6 +22,39 @@ fn dispatch_hook_emit_writes_pane_options() {
             "-u",
             "-t",
             "%1",
+            crate::options::KEY_TASKS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEMS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEM_IDS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
             crate::options::KEY_WAIT_REASON,
         ],
         "",
@@ -73,6 +106,28 @@ fn dispatch_hook_claude_reads_stdin_json() {
             "%1",
             crate::options::KEY_STATUS,
             "running",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEMS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEM_IDS,
         ],
         "",
     );
@@ -153,6 +208,17 @@ fn dispatch_hook_claude_reads_stdin_json() {
         ],
         "",
     );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_WORKTREE_ACTIVITY,
+        ],
+        "",
+    );
     run_with_input_at(
         ["vt", "hook", "claude", "UserPromptSubmit"],
         r#"{"prompt":"hello"}"#,
@@ -161,7 +227,7 @@ fn dispatch_hook_claude_reads_stdin_json() {
         123,
     )
     .unwrap();
-    assert_eq!(mock.calls().len(), 8);
+    assert_eq!(mock.calls().len(), 11);
 }
 
 #[test]
@@ -226,6 +292,39 @@ fn dispatch_hook_claude_stop_writes_idle_attention_and_completed_at() {
             "%1",
             crate::options::KEY_STATUS,
             "idle",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASKS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEMS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEM_IDS,
         ],
         "",
     );
@@ -361,6 +460,730 @@ fn dispatch_hook_codex_tool_use_does_not_write_running() {
     .unwrap();
 
     assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn dispatch_hook_codex_update_plan_writes_task_snapshot() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    let task_items = crate::hook::encode_task_items(&[
+        crate::hook::TaskItem {
+            step: "Explore".to_string(),
+            status: crate::hook::TaskItemStatus::Completed,
+        },
+        crate::hook::TaskItem {
+            step: "Implement".to_string(),
+            status: crate::hook::TaskItemStatus::InProgress,
+        },
+        crate::hook::TaskItem {
+            step: "Verify".to_string(),
+            status: crate::hook::TaskItemStatus::Pending,
+        },
+    ]);
+    mock.stub(&["show-options", "-p", "-t", "%1"], "");
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_TASKS,
+            "1/3",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEMS,
+            &task_items,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEM_IDS,
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "PostToolUse"],
+        r#"{"tool_name":"update_plan","tool_input":{"plan":[{"step":"Explore","status":"completed"},{"step":"Implement","status":"in_progress"},{"step":"Verify","status":"pending"}]}}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 4);
+}
+
+#[test]
+fn dispatch_hook_codex_update_plan_empty_unsets_task_options() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(&["show-options", "-p", "-t", "%1"], "@vde_tasks \"1/1\"\n");
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASKS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEMS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEM_IDS,
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "PostToolUse"],
+        r#"{"tool_name":"update_plan","tool_input":{"plan":[]}}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 4);
+}
+
+#[test]
+fn dispatch_hook_claude_todo_write_writes_task_snapshot() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    let task_items = crate::hook::encode_task_items(&[
+        crate::hook::TaskItem {
+            step: "Explore".to_string(),
+            status: crate::hook::TaskItemStatus::Completed,
+        },
+        crate::hook::TaskItem {
+            step: "Implement".to_string(),
+            status: crate::hook::TaskItemStatus::InProgress,
+        },
+        crate::hook::TaskItem {
+            step: "Verify".to_string(),
+            status: crate::hook::TaskItemStatus::Pending,
+        },
+    ]);
+    mock.stub(&["show-options", "-p", "-t", "%1"], "");
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_TASKS,
+            "1/3",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEMS,
+            &task_items,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEM_IDS,
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "claude", "PostToolUse"],
+        r#"{"tool_name":"TodoWrite","tool_input":{"todos":[{"content":"Explore","status":"completed","activeForm":"Exploring"},{"content":"Implement","status":"in_progress","activeForm":"Implementing"},{"content":"Verify","status":"pending","activeForm":"Verifying"}]}}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 4);
+}
+
+#[test]
+fn dispatch_hook_claude_todo_write_empty_unsets_task_options() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_tasks \"1/1\"\n@vde_task_items '[{\"step\":\"Explore\",\"status\":\"completed\"}]'\n",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASKS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEMS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEM_IDS,
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "claude", "PostToolUse"],
+        r#"{"tool_name":"TodoWrite","tool_input":{"todos":[]}}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 4);
+}
+
+#[test]
+fn dispatch_hook_claude_task_create_writes_task_item_with_id() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    let task_items = crate::hook::encode_task_items(&[crate::hook::TaskItem {
+        step: "ブランチと最新コミットを確認".to_string(),
+        status: crate::hook::TaskItemStatus::Pending,
+    }]);
+    let task_item_ids = serde_json::to_string(&["1"]).unwrap();
+    mock.stub(&["show-options", "-p", "-t", "%1"], "");
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_TASKS,
+            "0/1",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEMS,
+            &task_items,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEM_IDS,
+            &task_item_ids,
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "claude", "PostToolUse"],
+        r#"{"tool_name":"TaskCreate","tool_input":{"subject":"ブランチと最新コミットを確認","description":"git でカレントブランチと最新コミットを表示する（読み取り専用）","activeForm":"ブランチと最新コミットを確認中"},"tool_response":{"task":{"id":"1","subject":"ブランチと最新コミットを確認"}}}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 4);
+}
+
+#[test]
+fn dispatch_hook_claude_task_update_updates_existing_task_item() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    let initial_items = crate::hook::encode_task_items(&[
+        crate::hook::TaskItem {
+            step: "現在日時".to_string(),
+            status: crate::hook::TaskItemStatus::Completed,
+        },
+        crate::hook::TaskItem {
+            step: "カレントディレクトリ".to_string(),
+            status: crate::hook::TaskItemStatus::Pending,
+        },
+    ]);
+    let initial_ids = serde_json::to_string(&["1", "2"]).unwrap();
+    let updated_items = crate::hook::encode_task_items(&[
+        crate::hook::TaskItem {
+            step: "現在日時".to_string(),
+            status: crate::hook::TaskItemStatus::Completed,
+        },
+        crate::hook::TaskItem {
+            step: "カレントディレクトリ".to_string(),
+            status: crate::hook::TaskItemStatus::InProgress,
+        },
+    ]);
+    let escaped_items = serde_json::to_string(&initial_items).unwrap();
+    let escaped_ids = serde_json::to_string(&initial_ids).unwrap();
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        &format!(
+            "@vde_tasks \"1/2\"\n@vde_task_items {escaped_items}\n@vde_task_item_ids {escaped_ids}\n"
+        ),
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_TASKS,
+            "1/2",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEMS,
+            &updated_items,
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "claude", "PostToolUse"],
+        r#"{"tool_name":"TaskUpdate","tool_input":{"taskId":"2","status":"in_progress"},"tool_response":{"success":true,"taskId":"2","updatedFields":["status"],"statusChange":{"from":"pending","to":"in_progress"}}}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 3);
+}
+
+#[test]
+fn dispatch_hook_codex_update_plan_missing_fields_is_ignored() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "PostToolUse"],
+        r#"{"tool_name":"update_plan","tool_input":{"plan":[{"step":"Explore"}]}}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn dispatch_hook_codex_bash_vw_exec_writes_worktree_activity() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    let expected = crate::hook::encode_worktree_activity(&crate::hook::WorktreeActivity {
+        kind: crate::hook::WorktreeActivityKind::VwExec,
+        name: "feature".to_string(),
+        path: "/tmp/worktrees/feature".to_string(),
+        command: "vw exec /tmp/worktrees/feature -- cargo test".to_string(),
+        observed_at: 123,
+    });
+    mock.stub(&["show-options", "-p", "-t", "%1"], "");
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_WORKTREE_ACTIVITY,
+            &expected,
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "PostToolUse"],
+        r#"{"tool_name":"Bash","tool_input":{"command":"vw exec /tmp/worktrees/feature -- cargo test"}}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 2);
+}
+
+#[test]
+fn dispatch_hook_codex_bash_non_vw_exec_is_ignored() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "PostToolUse"],
+        r#"{"tool_name":"Bash","tool_input":{"command":"cargo test"}}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn dispatch_hook_codex_non_plan_non_bash_post_tool_use_is_ignored() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "PostToolUse"],
+        r#"{"tool_name":"Read","tool_input":{"file_path":"README.md"}}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn dispatch_hook_codex_subagent_start_appends_or_replaces() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_subagents \"a:Explore\"\n",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_SUBAGENTS,
+            "a:Plan",
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "SubagentStart"],
+        r#"{"agent_id":"a","agent_type":"Plan"}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 2);
+}
+
+#[test]
+fn dispatch_hook_codex_subagent_stop_removes_and_unsets_last_entry() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_subagents \"a:Explore\"\n",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_SUBAGENTS,
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "SubagentStop"],
+        r#"{"agent_id":"a"}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 2);
+}
+
+#[test]
+fn dispatch_hook_codex_subagent_stop_removes_one_entry() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_subagents \"a:Explore|b:Plan\"\n",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_SUBAGENTS,
+            "b:Plan",
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "SubagentStop"],
+        r#"{"agent_id":"a"}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 2);
+}
+
+#[test]
+fn dispatch_hook_codex_user_prompt_submit_clears_worktree_activity() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_STATUS,
+            "running",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASKS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEMS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEM_IDS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_WAIT_REASON,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_AGENT,
+            "codex",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_STARTED_AT,
+            "123",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_WORKTREE_ACTIVITY,
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "UserPromptSubmit"],
+        "{}",
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 8);
+}
+
+#[test]
+fn dispatch_hook_codex_session_start_clears_worktree_activity() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    for key in crate::options::PANE_STATE_KEYS {
+        mock.stub(&["set-option", "-p", "-u", "-t", "%1", key], "");
+    }
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEM_IDS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_STATUS,
+            "idle",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_AGENT,
+            "codex",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_ATTENTION,
+            "0",
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "SessionStart"],
+        r#"{"source":"startup"}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert!(mock.calls().iter().any(|call| {
+        call == &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_WORKTREE_ACTIVITY,
+        ]
+    }));
+    assert_eq!(
+        mock.calls().len(),
+        crate::options::PANE_STATE_KEYS.len() + 5
+    );
 }
 
 #[test]

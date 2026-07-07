@@ -13,7 +13,10 @@ pub const KEY_ATTENTION: &str = "@vde_attention";
 pub const KEY_STARTED_AT: &str = "@vde_started_at";
 pub const KEY_COMPLETED_AT: &str = "@vde_completed_at";
 pub const KEY_TASKS: &str = "@vde_tasks";
+pub const KEY_TASK_ITEMS: &str = "@vde_task_items";
+pub const KEY_TASK_ITEM_IDS: &str = "@vde_task_item_ids";
 pub const KEY_SUBAGENTS: &str = "@vde_subagents";
+pub const KEY_WORKTREE_ACTIVITY: &str = "@vde_worktree_activity";
 
 pub const KEY_SIDEBAR_MARKER: &str = "@vde_sidebar";
 
@@ -39,7 +42,9 @@ pub const PANE_STATE_KEYS: &[&str] = &[
     KEY_STARTED_AT,
     KEY_COMPLETED_AT,
     KEY_TASKS,
+    KEY_TASK_ITEMS,
     KEY_SUBAGENTS,
+    KEY_WORKTREE_ACTIVITY,
 ];
 
 pub fn set_pane_option(

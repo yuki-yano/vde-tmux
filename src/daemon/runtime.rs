@@ -10,7 +10,7 @@ use crate::daemon::{
     DaemonSnapshot, SidebarFrame, TransitionEvent, build_snapshot_with_sidebar, format_attention,
     render_summary,
 };
-use crate::git::GitBadge;
+use crate::git::{GitBadge, WorktreeInfo};
 use crate::options::snapshot::{PaneSnapshot, effective_agent, has_pane_state, is_live_agent_pane};
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
 use crate::sidebar::state::{RepoId, SidebarAction, SidebarState};
@@ -41,7 +41,10 @@ pub enum DaemonEvent {
         event: SidebarClientEvent,
     },
     PanesUpdated(Vec<PaneSnapshot>),
-    GitStatusUpdated(BTreeMap<String, GitBadge>),
+    GitStatusUpdated {
+        badges: BTreeMap<String, GitBadge>,
+        worktrees: BTreeMap<String, WorktreeInfo>,
+    },
     QuerySummary {
         reply: Sender<ServerMessage>,
     },
@@ -157,6 +160,7 @@ pub struct RuntimeState {
     pub ui_state: SidebarState,
     pub panes: Vec<PaneSnapshot>,
     git_badges: BTreeMap<String, GitBadge>,
+    worktrees: BTreeMap<String, WorktreeInfo>,
     rows: Vec<SidebarRow>,
     counts: BadgeCounts,
     snapshot: Option<DaemonSnapshot>,
@@ -182,6 +186,7 @@ impl RuntimeState {
             ui_state,
             panes: Vec::new(),
             git_badges: BTreeMap::new(),
+            worktrees: BTreeMap::new(),
             rows: Vec::new(),
             counts: BadgeCounts::default(),
             snapshot: None,
@@ -231,8 +236,9 @@ impl RuntimeState {
                 effects.extend(self.sync_heartbeat());
                 effects
             }
-            DaemonEvent::GitStatusUpdated(git_badges) => {
-                self.git_badges = git_badges;
+            DaemonEvent::GitStatusUpdated { badges, worktrees } => {
+                self.git_badges = badges;
+                self.worktrees = worktrees;
                 self.rebuild_snapshot();
                 self.broadcast_if_needed();
                 Vec::new()
@@ -278,6 +284,7 @@ impl RuntimeState {
             &self.ui_state,
             &RowBuildContext {
                 git: self.git_badges.clone(),
+                worktrees: self.worktrees.clone(),
                 unread: self.unread.clone(),
                 triage: self.triage.clone(),
                 flash: self.flash.keys().cloned().collect(),
@@ -878,7 +885,9 @@ mod tests {
             started_at: String::new(),
             completed_at: String::new(),
             tasks: String::new(),
+            task_items: String::new(),
             subagents: String::new(),
+            worktree_activity: String::new(),
             agent_observed: true,
         }
     }
@@ -945,6 +954,26 @@ mod tests {
         state.rebuild_snapshot();
 
         assert!(state.should_push());
+    }
+
+    #[test]
+    fn git_status_updated_stores_worktree_info() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let worktree = WorktreeInfo {
+            name: "feature".to_string(),
+            path: "/tmp/worktrees/feature".to_string(),
+            source: crate::git::WorktreeSource::GitLinked,
+            branch: None,
+            dirty: None,
+            locked: None,
+        };
+
+        state.apply_event(DaemonEvent::GitStatusUpdated {
+            badges: BTreeMap::new(),
+            worktrees: BTreeMap::from([("/tmp/worktrees/feature".to_string(), worktree.clone())]),
+        });
+
+        assert_eq!(state.worktrees["/tmp/worktrees/feature"], worktree);
     }
 
     #[test]

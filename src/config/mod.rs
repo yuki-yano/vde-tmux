@@ -381,6 +381,14 @@ pub struct SidebarColorsConfig {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub live: Option<String>,
+    pub task_done: Option<String>,
+    pub task_working: Option<String>,
+    pub task_pending: Option<String>,
+    pub task_label: Option<String>,
+    pub subagent_label: Option<String>,
+    pub subagent_id: Option<String>,
+    pub worktree: Option<String>,
+    pub worktree_activity: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -613,6 +621,40 @@ mod tests {
             let err = serde_yaml_ng::from_str::<Config>(&yaml).unwrap_err();
             assert!(err.to_string().contains(key), "{err}");
         }
+    }
+
+    #[test]
+    fn sidebar_colors_accept_task_subagent_and_worktree_detail_color_keys() {
+        let config = serde_yaml_ng::from_str::<Config>(
+            r##"
+sidebar:
+  colors:
+    task_done: "220"
+    task_working: "221"
+    task_pending: darkgray
+    task_label: "246"
+    subagent_label: "73"
+    subagent_id: "74"
+    worktree: cyan
+    worktree_activity: "#4fd08a"
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(config.sidebar.colors.task_done.as_deref(), Some("220"));
+        assert_eq!(config.sidebar.colors.task_working.as_deref(), Some("221"));
+        assert_eq!(
+            config.sidebar.colors.task_pending.as_deref(),
+            Some("darkgray")
+        );
+        assert_eq!(config.sidebar.colors.task_label.as_deref(), Some("246"));
+        assert_eq!(config.sidebar.colors.subagent_label.as_deref(), Some("73"));
+        assert_eq!(config.sidebar.colors.subagent_id.as_deref(), Some("74"));
+        assert_eq!(config.sidebar.colors.worktree.as_deref(), Some("cyan"));
+        assert_eq!(
+            config.sidebar.colors.worktree_activity.as_deref(),
+            Some("#4fd08a")
+        );
     }
 
     #[test]

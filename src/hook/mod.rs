@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::options::{
     KEY_AGENT, KEY_ATTENTION, KEY_COMPLETED_AT, KEY_PROMPT, KEY_PROMPT_SOURCE, KEY_STARTED_AT,
-    KEY_STATUS, KEY_SUBAGENTS, KEY_TASKS, KEY_WAIT_REASON, PANE_STATE_KEYS,
+    KEY_STATUS, KEY_SUBAGENTS, KEY_TASK_ITEM_IDS, KEY_TASK_ITEMS, KEY_TASKS, KEY_WAIT_REASON,
+    KEY_WORKTREE_ACTIVITY, PANE_STATE_KEYS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,10 +106,40 @@ impl TaskProgress {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskItemStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskItem {
+    pub step: String,
+    pub status: TaskItemStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeActivityKind {
+    VwExec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeActivity {
+    pub kind: WorktreeActivityKind,
+    pub name: String,
+    pub path: String,
+    pub command: String,
+    pub observed_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentEntry {
     pub agent_id: String,
     pub agent_type: String,
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -123,7 +154,9 @@ pub struct AgentEvent {
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub tasks: Option<OptionUpdate<TaskProgress>>,
+    pub task_items: Option<OptionUpdate<Vec<TaskItem>>>,
     pub subagents: Option<OptionUpdate<Vec<SubagentEntry>>>,
+    pub worktree_activity: Option<OptionUpdate<WorktreeActivity>>,
 }
 
 pub fn derive_event_writes(event: &AgentEvent) -> Vec<PaneOptionWrite> {
@@ -134,6 +167,7 @@ pub fn derive_event_writes(event: &AgentEvent) -> Vec<PaneOptionWrite> {
                 .iter()
                 .map(|key| PaneOptionWrite::unset(key)),
         );
+        writes.push(PaneOptionWrite::unset(KEY_TASK_ITEM_IDS));
     }
     if let Some(status) = event.status {
         writes.push(PaneOptionWrite::set(KEY_STATUS, status.as_str()));
@@ -179,6 +213,20 @@ pub fn derive_event_writes(event: &AgentEvent) -> Vec<PaneOptionWrite> {
             OptionUpdate::Unset => writes.push(PaneOptionWrite::unset(KEY_TASKS)),
         }
     }
+    if let Some(update) = &event.task_items {
+        match update {
+            OptionUpdate::Set(items) => {
+                writes.push(PaneOptionWrite::set(
+                    KEY_TASK_ITEMS,
+                    encode_task_items(items),
+                ));
+            }
+            OptionUpdate::Unset => writes.push(PaneOptionWrite::unset(KEY_TASK_ITEMS)),
+        }
+        if matches!(update, OptionUpdate::Unset) {
+            writes.push(PaneOptionWrite::unset(KEY_TASK_ITEM_IDS));
+        }
+    }
     if let Some(update) = &event.subagents {
         match update {
             OptionUpdate::Set(subagents) => {
@@ -188,6 +236,15 @@ pub fn derive_event_writes(event: &AgentEvent) -> Vec<PaneOptionWrite> {
                 ));
             }
             OptionUpdate::Unset => writes.push(PaneOptionWrite::unset(KEY_SUBAGENTS)),
+        }
+    }
+    if let Some(update) = &event.worktree_activity {
+        match update {
+            OptionUpdate::Set(activity) => writes.push(PaneOptionWrite::set(
+                KEY_WORKTREE_ACTIVITY,
+                encode_worktree_activity(activity),
+            )),
+            OptionUpdate::Unset => writes.push(PaneOptionWrite::unset(KEY_WORKTREE_ACTIVITY)),
         }
     }
     writes
@@ -208,14 +265,32 @@ pub fn encode_subagents(entries: &[SubagentEntry]) -> String {
     entries
         .iter()
         .map(|entry| {
-            format!(
-                "{}:{}",
-                sanitize_subagent_field(&entry.agent_id),
-                sanitize_subagent_field(&entry.agent_type)
-            )
+            let id = sanitize_subagent_field(&entry.agent_id);
+            let agent_type = sanitize_subagent_field(&entry.agent_type);
+            match entry
+                .display_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+            {
+                Some(display_name) => {
+                    format!(
+                        "{id}:{agent_type}:{}",
+                        sanitize_subagent_field(display_name)
+                    )
+                }
+                None => format!("{id}:{agent_type}"),
+            }
         })
         .collect::<Vec<_>>()
         .join("|")
+}
+
+pub fn encode_task_items(items: &[TaskItem]) -> String {
+    serde_json::to_string(items).expect("TaskItem serialization should not fail")
+}
+
+pub fn encode_worktree_activity(activity: &WorktreeActivity) -> String {
+    serde_json::to_string(activity).expect("WorktreeActivity serialization should not fail")
 }
 
 fn sanitize_subagent_field(raw: &str) -> String {
@@ -235,7 +310,7 @@ mod tests {
     use super::*;
     use crate::options::{
         KEY_AGENT, KEY_PROMPT, KEY_PROMPT_SOURCE, KEY_STARTED_AT, KEY_STATUS, KEY_SUBAGENTS,
-        KEY_TASKS, KEY_WAIT_REASON,
+        KEY_TASK_ITEM_IDS, KEY_TASK_ITEMS, KEY_TASKS, KEY_WAIT_REASON, KEY_WORKTREE_ACTIVITY,
     };
 
     #[test]
@@ -291,6 +366,7 @@ mod tests {
             subagents: Some(OptionUpdate::Set(vec![SubagentEntry {
                 agent_id: "abc".to_string(),
                 agent_type: "Explore".to_string(),
+                display_name: None,
             }])),
             ..AgentEvent::default()
         };
@@ -300,6 +376,117 @@ mod tests {
                 PaneOptionWrite::set(KEY_AGENT, "claude"),
                 PaneOptionWrite::set(KEY_TASKS, "2/5"),
                 PaneOptionWrite::set(KEY_SUBAGENTS, "abc:Explore"),
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_subagents_includes_display_name_when_present() {
+        let encoded = encode_subagents(&[SubagentEntry {
+            agent_id: "019f3c28".to_string(),
+            agent_type: "default".to_string(),
+            display_name: Some("Ramanujan".to_string()),
+        }]);
+
+        assert_eq!(encoded, "019f3c28:default:Ramanujan");
+    }
+
+    #[test]
+    fn encode_task_items_writes_json_snapshot() {
+        let encoded = encode_task_items(&[
+            TaskItem {
+                step: "Explore current sidebar rows".to_string(),
+                status: TaskItemStatus::Completed,
+            },
+            TaskItem {
+                step: "Implement task rows".to_string(),
+                status: TaskItemStatus::InProgress,
+            },
+            TaskItem {
+                step: "Verify rendering".to_string(),
+                status: TaskItemStatus::Pending,
+            },
+        ]);
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap(),
+            serde_json::json!([
+                {"step": "Explore current sidebar rows", "status": "completed"},
+                {"step": "Implement task rows", "status": "in_progress"},
+                {"step": "Verify rendering", "status": "pending"}
+            ])
+        );
+    }
+
+    #[test]
+    fn encode_worktree_activity_writes_json_snapshot() {
+        let encoded = encode_worktree_activity(&WorktreeActivity {
+            kind: WorktreeActivityKind::VwExec,
+            name: "feature/login".to_string(),
+            path: "/tmp/worktrees/feature/login".to_string(),
+            command: "vw exec feature/login -- cargo test".to_string(),
+            observed_at: 1_720_000_000,
+        });
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap(),
+            serde_json::json!({
+                "kind": "vw_exec",
+                "name": "feature/login",
+                "path": "/tmp/worktrees/feature/login",
+                "command": "vw exec feature/login -- cargo test",
+                "observed_at": 1_720_000_000
+            })
+        );
+    }
+
+    #[test]
+    fn derive_event_writes_sets_task_items_and_worktree_activity() {
+        let activity = WorktreeActivity {
+            kind: WorktreeActivityKind::VwExec,
+            name: "feature/login".to_string(),
+            path: "/tmp/worktrees/feature/login".to_string(),
+            command: "vw exec feature/login -- cargo test".to_string(),
+            observed_at: 42,
+        };
+        let event = AgentEvent {
+            task_items: Some(OptionUpdate::Set(vec![TaskItem {
+                step: "Run tests".to_string(),
+                status: TaskItemStatus::Pending,
+            }])),
+            worktree_activity: Some(OptionUpdate::Set(activity.clone())),
+            ..AgentEvent::default()
+        };
+
+        assert_eq!(
+            derive_event_writes(&event),
+            vec![
+                PaneOptionWrite::set(
+                    KEY_TASK_ITEMS,
+                    encode_task_items(&[TaskItem {
+                        step: "Run tests".to_string(),
+                        status: TaskItemStatus::Pending,
+                    }])
+                ),
+                PaneOptionWrite::set(KEY_WORKTREE_ACTIVITY, encode_worktree_activity(&activity)),
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_event_writes_unsets_task_items_and_worktree_activity() {
+        let event = AgentEvent {
+            task_items: Some(OptionUpdate::Unset),
+            worktree_activity: Some(OptionUpdate::Unset),
+            ..AgentEvent::default()
+        };
+
+        assert_eq!(
+            derive_event_writes(&event),
+            vec![
+                PaneOptionWrite::unset(KEY_TASK_ITEMS),
+                PaneOptionWrite::unset(KEY_TASK_ITEM_IDS),
+                PaneOptionWrite::unset(KEY_WORKTREE_ACTIVITY),
             ]
         );
     }
@@ -321,6 +508,7 @@ mod tests {
         for key in crate::options::PANE_STATE_KEYS {
             assert!(writes.contains(&PaneOptionWrite::unset(key)), "{key}");
         }
+        assert!(writes.contains(&PaneOptionWrite::unset(KEY_TASK_ITEM_IDS)));
         assert!(writes.contains(&PaneOptionWrite::set(KEY_STATUS, "idle")));
         assert!(writes.contains(&PaneOptionWrite::set(KEY_AGENT, "codex")));
         assert!(writes.contains(&PaneOptionWrite::set(KEY_PROMPT, "latest prompt")));
