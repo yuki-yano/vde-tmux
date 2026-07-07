@@ -166,6 +166,7 @@ sidebar header は 2 行構成で表示する。
 1 行目は `≣ repo      7 tasks ` のような mode badge と総数セグメント、2 行目は `≡ all 7  ▲ 1  ● 1  ✓ 0  ○ 5` の filter chip 列。
 
 chip は状態に応じて表示を分ける。
+状態 chip の glyph は `badge.glyphs` に従い、`≡ all` の glyph だけは固定。
 アクティブ chip は状態色 bg + 暗色 fg + bold で反転し、適用中に 0 件になっても `▲ 0` の反転表示を維持する。
 非アクティブかつ非 0 件の chip は `active_bg` bg + 状態色 fg、0 件 chip は marker 色の dim 表示でクリック対象外。
 `all` は常に適用でき、`tab` filter cycle は 0 件状態をスキップする。
@@ -179,7 +180,9 @@ filter 適用中に rows が空になっても header は残り、rows 領域に
 `sidebar.header` は statusline の segment と同じ考え方で、`format` / `prefix` / `suffix` / `bold` / `colors` を設定できる。
 `format` の `{label}` は `≣ repo` などの固定幅 mode label に置換される。
 既定の `suffix: ""` は mode badge と総数セグメントを powerline 表示にし、`suffix: ""` にすると矢印なしの矩形塗りになる。
-`colors.outer_bg` は suffix の遷移先背景色として使う。
+`suffix` が非空なら mode badge 後と総数セグメント後の両方に同じ glyph を描画する。
+`colors.bg` は mode badge とアクティブな `all` chip の背景色に使い、`colors.outer_bg` は suffix の遷移先背景色として使う。
+filter chip の前後キャップは `chip_prefix` / `chip_suffix` で指定でき、空文字ならキャップなしの矩形表示になる。
 `sidebar.header.powerline` と `separator` は受け付けない。
 
 ## Sidebar Detail View

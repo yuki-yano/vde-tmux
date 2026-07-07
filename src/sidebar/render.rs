@@ -380,18 +380,13 @@ fn format_header_mode_body(view_mode: ViewMode, theme: &SidebarRenderTheme) -> S
 }
 
 fn header_total_suffix(theme: &SidebarRenderTheme) -> &str {
-    if theme.header_suffix == POWERLINE_ARROW {
-        POWERLINE_ARROW
-    } else {
-        ""
-    }
+    theme.header_suffix.as_str()
 }
 
 #[derive(Clone, Copy)]
 struct HeaderChipSpec {
     filter: StatusFilter,
     count: usize,
-    glyph: &'static str,
     badge_state: Option<BadgeState>,
 }
 
@@ -404,31 +399,26 @@ fn build_header_chip_line(
     let specs = [
         HeaderChipSpec {
             filter: StatusFilter::All,
-            glyph: "≡",
             count: counts.total,
             badge_state: None,
         },
         HeaderChipSpec {
             filter: StatusFilter::AttentionOnly,
-            glyph: "▲",
             count: counts.attention,
             badge_state: Some(BadgeState::Blocked),
         },
         HeaderChipSpec {
             filter: StatusFilter::WorkingOnly,
-            glyph: "●",
             count: counts.working,
             badge_state: Some(BadgeState::Working),
         },
         HeaderChipSpec {
             filter: StatusFilter::DoneOnly,
-            glyph: "✓",
             count: counts.done,
             badge_state: Some(BadgeState::Done),
         },
         HeaderChipSpec {
             filter: StatusFilter::IdleOnly,
-            glyph: "○",
             count: counts.idle,
             badge_state: Some(BadgeState::Idle),
         },
@@ -456,12 +446,12 @@ fn build_header_chip_line(
                 if !theme.header_chip_prefix.is_empty() {
                     pieces.push((theme.header_chip_prefix.clone(), Some(cap), action));
                 }
-                pieces.push((chip_label(spec), Some(style), action));
+                pieces.push((chip_label(theme, spec), Some(style), action));
                 if !theme.header_chip_suffix.is_empty() {
                     pieces.push((theme.header_chip_suffix.clone(), Some(cap), action));
                 }
             }
-            _ => pieces.push((chip_label(spec), Some(style), action)),
+            _ => pieces.push((chip_label(theme, spec), Some(style), action)),
         }
     }
 
@@ -502,11 +492,15 @@ fn chip_bg(
     }
 }
 
-fn chip_label(spec: HeaderChipSpec) -> String {
+fn chip_label(theme: &SidebarRenderTheme, spec: HeaderChipSpec) -> String {
     if spec.filter == StatusFilter::All {
-        format!(" {} all {} ", spec.glyph, spec.count)
+        format!(" ≡ all {} ", spec.count)
     } else {
-        format!(" {} {} ", spec.glyph, spec.count)
+        let glyph = spec
+            .badge_state
+            .map(|state| theme.badge_glyph(state))
+            .unwrap_or("?");
+        format!(" {} {} ", glyph, spec.count)
     }
 }
 
@@ -539,7 +533,7 @@ fn chip_style(
 fn chip_color(theme: &SidebarRenderTheme, badge_state: Option<BadgeState>) -> Color {
     match badge_state {
         Some(state) => theme.badge_color(state),
-        None => theme.header_mode,
+        None => mode_bg(theme),
     }
 }
 
@@ -2367,6 +2361,68 @@ mod tests {
     }
 
     #[test]
+    fn active_all_chip_bg_follows_configured_header_bg() {
+        let theme = SidebarRenderTheme {
+            header_active_bg: Some(Color::Rgb(0x45, 0x3f, 0x9e)),
+            ..SidebarRenderTheme::default()
+        };
+        let state = SidebarState {
+            filter: StatusFilter::All,
+            ..SidebarState::default()
+        };
+
+        let header = build_header_layout_with_counts(&state, 80, &theme, rich_header_counts());
+
+        let active = style_for_segment(&header, 1, "≡ all 7");
+        assert_eq!(active.bg, Some(Color::Rgb(0x45, 0x3f, 0x9e)));
+    }
+
+    #[test]
+    fn header_chips_use_configured_badge_glyphs() {
+        let config = serde_yaml_ng::from_str::<crate::config::Config>(
+            r##"
+badge:
+  glyphs:
+    working: "W"
+"##,
+        )
+        .unwrap();
+        let theme = SidebarRenderTheme::from_app_config(&config);
+        let state = SidebarState::default();
+
+        let header = build_header_layout_with_counts(&state, 80, &theme, rich_header_counts());
+
+        assert!(header.lines[1].text.contains("W 1"), "{:?}", header.lines[1].text);
+        assert!(!header.lines[1].text.contains("● 1"), "{:?}", header.lines[1].text);
+    }
+
+    #[test]
+    fn custom_header_suffix_is_rendered_after_total_segment() {
+        let config = serde_yaml_ng::from_str::<crate::config::Config>(
+            r##"
+sidebar:
+  header:
+    suffix: ""
+"##,
+        )
+        .unwrap();
+        let theme = SidebarRenderTheme::from_sidebar_config(&config.sidebar);
+
+        let header = build_header_layout_with_counts(
+            &SidebarState::default(),
+            80,
+            &theme,
+            rich_header_counts(),
+        );
+
+        assert!(
+            header.lines[0].text.ends_with("7 tasks "),
+            "{:?}",
+            header.lines[0].text
+        );
+    }
+
+    #[test]
     fn chip_caps_render_as_pill_and_skip_zero_chips() {
         let theme = SidebarRenderTheme {
             header_chip_prefix: "\u{e0b6}".to_string(),
@@ -2521,7 +2577,7 @@ sidebar:
         let mode = style_for_segment(&header, 0, "≣ repo");
         let suffix = style_for_segment(&header, 0, "]");
 
-        assert_eq!(header.lines[0].text, "[ ≣ repo     ] 7 tasks ");
+        assert_eq!(header.lines[0].text, "[ ≣ repo     ] 7 tasks ]");
         assert_eq!(mode.fg, Some(Color::White));
         assert_eq!(mode.bg, Some(Color::Indexed(24)));
         assert!(mode.add_modifier.contains(Modifier::BOLD));
