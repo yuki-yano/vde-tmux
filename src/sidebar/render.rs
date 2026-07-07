@@ -456,10 +456,15 @@ fn chip_style(
     count: usize,
 ) -> Style {
     if active {
-        return Style::default()
-            .fg(theme.header_badge_fg)
-            .bg(chip_color(theme, badge_state))
-            .add_modifier(Modifier::BOLD);
+        // 反転 fg / bold は mode badge と同じ解決順(header.colors 優先)にする。
+        // Indexed(16) 固定だと base16 系テーマでパレット 16 が再定義され黒にならない。
+        let mut style = Style::default()
+            .fg(mode_fg(theme))
+            .bg(chip_color(theme, badge_state));
+        if !header_style_configured(theme) || theme.header_active_bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        return style;
     }
     if count == 0 {
         return Style::default().fg(theme.marker);
@@ -2108,6 +2113,33 @@ mod tests {
             header_hit_test(&header, 1, 25),
             Some(HeaderAction::SetFilter(StatusFilter::IdleOnly))
         );
+    }
+
+    #[test]
+    fn active_chip_fg_follows_configured_header_fg() {
+        let theme = SidebarRenderTheme {
+            header_active_fg: Some(Color::Rgb(0x19, 0x16, 0x27)),
+            ..SidebarRenderTheme::default()
+        };
+        let counts = BadgeCounts {
+            total: 3,
+            blocked: 1,
+            working: 1,
+            done: 0,
+            idle: 1,
+        };
+        let state = SidebarState {
+            filter: StatusFilter::AttentionOnly,
+            ..SidebarState::default()
+        };
+
+        let header = build_header_layout_with_counts(&state, 80, &theme, counts);
+
+        let active = style_for_segment(&header, 1, "▲ 1");
+        assert_eq!(active.fg, Some(Color::Rgb(0x19, 0x16, 0x27)));
+        assert_eq!(active.bg, Some(theme.badge_blocked));
+        // 明示スタイル設定時は bold も header_active_bold(既定 false)に従う。
+        assert!(!active.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
