@@ -74,6 +74,12 @@ sidebar:
     toggle: "147"
     category: "215"
     header_mode: "147"
+    # active filter chip の文字色。未指定なら header.colors.fg と同じ解決順
+    header_chip_fg: ""
+    # "N tasks" チップの背景色。未指定なら active_bg
+    header_total_bg: ""
+    # "N tasks" チップの "tasks" ラベル文字色。未指定なら detail
+    header_total_fg: ""
     active_bg: "235"
     active_bar: "147"
 daemon:

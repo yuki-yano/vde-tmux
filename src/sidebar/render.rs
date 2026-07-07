@@ -16,6 +16,12 @@ pub struct SidebarRenderTheme {
     pub selection_bg: Color,
     pub header_active_bg: Option<Color>,
     pub header_active_fg: Option<Color>,
+    /// active filter chip の反転文字色。未指定なら mode badge と同じ解決順
+    pub header_chip_fg: Option<Color>,
+    /// "N tasks" チップの背景色。未指定なら active_bg
+    pub header_total_bg: Option<Color>,
+    /// "N tasks" チップの "tasks" ラベル文字色。未指定なら detail
+    pub header_total_fg: Option<Color>,
     pub header_active_bold: bool,
     pub header_badge_fg: Color,
     pub header_format: String,
@@ -64,6 +70,9 @@ impl Default for SidebarRenderTheme {
             selection_bg: Color::Indexed(237),
             header_active_bg: None,
             header_active_fg: None,
+            header_chip_fg: None,
+            header_total_bg: None,
+            header_total_fg: None,
             header_active_bold: false,
             header_badge_fg: Color::Indexed(16),
             header_format: " {label} ".to_string(),
@@ -99,6 +108,9 @@ impl SidebarRenderTheme {
                 .unwrap_or(default.selection_bg),
             header_active_bg: parse_color(config.header_active_bg.as_deref()),
             header_active_fg: parse_color(config.header_active_fg.as_deref()),
+            header_chip_fg: parse_color(config.header_chip_fg.as_deref()),
+            header_total_bg: parse_color(config.header_total_bg.as_deref()),
+            header_total_fg: parse_color(config.header_total_fg.as_deref()),
             header_active_bold: default.header_active_bold,
             header_badge_fg: default.header_badge_fg,
             header_format: default.header_format,
@@ -298,6 +310,7 @@ fn build_header_title_line(
         });
     }
 
+    let total_bg = theme.header_total_bg.unwrap_or(theme.active_bg);
     let mut start = mode_len;
     if include_total && !mode_suffix.is_empty() {
         let suffix_len = display_width(mode_suffix);
@@ -305,22 +318,38 @@ fn build_header_title_line(
             segments.push(HeaderSegment {
                 range,
                 action: None,
-                style: Some(
-                    Style::default()
-                        .fg(mode_bg(theme))
-                        .bg(header_outer_bg(theme)),
-                ),
+                style: Some(Style::default().fg(mode_bg(theme)).bg(total_bg)),
             });
         }
         start += suffix_len;
     }
     if include_total {
+        // 数字(情報)は通常文字色 + bold で立たせ、"tasks" ラベルは detail に落とす。
+        let count_len = display_width(&format!(" {}", counts.total));
         let total_len = display_width(&total_text);
-        if let Some(range) = visible_segment_range(&text, start, total_len) {
+        if let Some(range) = visible_segment_range(&text, start, count_len) {
             segments.push(HeaderSegment {
                 range,
                 action: None,
-                style: Some(Style::default().fg(theme.detail).bg(theme.active_bg)),
+                style: Some(
+                    Style::default()
+                        .fg(Color::Reset)
+                        .bg(total_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            });
+        }
+        if let Some(range) =
+            visible_segment_range(&text, start + count_len, total_len - count_len)
+        {
+            segments.push(HeaderSegment {
+                range,
+                action: None,
+                style: Some(
+                    Style::default()
+                        .fg(theme.header_total_fg.unwrap_or(theme.detail))
+                        .bg(total_bg),
+                ),
             });
         }
         start += total_len;
@@ -332,7 +361,7 @@ fn build_header_title_line(
         segments.push(HeaderSegment {
             range,
             action: None,
-            style: Some(Style::default().fg(theme.active_bg)),
+            style: Some(Style::default().fg(total_bg)),
         });
     }
 
@@ -488,10 +517,11 @@ fn chip_style(
     count: usize,
 ) -> Style {
     if active {
-        // 反転 fg / bold は mode badge と同じ解決順(header.colors 優先)にする。
+        // 反転 fg は header_chip_fg 優先、未指定なら mode badge と同じ解決順(header.colors 優先)。
+        // mode を fg-only にしつつ chip の反転文字色を暗色に保つ場合に分離が必要になる。
         // Indexed(16) 固定だと base16 系テーマでパレット 16 が再定義され黒にならない。
         let mut style = Style::default()
-            .fg(mode_fg(theme))
+            .fg(theme.header_chip_fg.unwrap_or_else(|| mode_fg(theme)))
             .bg(chip_color(theme, badge_state));
         if !header_style_configured(theme) || theme.header_active_bold {
             style = style.add_modifier(Modifier::BOLD);
@@ -585,10 +615,6 @@ fn mode_fg(theme: &SidebarRenderTheme) -> Color {
 
 fn mode_bg(theme: &SidebarRenderTheme) -> Color {
     theme.header_active_bg.unwrap_or(theme.header_mode)
-}
-
-fn header_outer_bg(theme: &SidebarRenderTheme) -> Color {
-    theme.header_outer_bg.unwrap_or(theme.active_bg)
 }
 
 fn header_segment_style(theme: &SidebarRenderTheme) -> Style {
@@ -2274,6 +2300,34 @@ mod tests {
         assert_eq!(active.bg, Some(theme.badge_blocked));
         // 明示スタイル設定時は bold も header_active_bold(既定 false)に従う。
         assert!(!active.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn header_chip_fg_overrides_active_chip_fg_but_not_mode_fg() {
+        let theme = SidebarRenderTheme {
+            header_active_fg: Some(Color::Rgb(0x98, 0xb2, 0xf6)),
+            header_chip_fg: Some(Color::Rgb(0x23, 0x23, 0x32)),
+            ..SidebarRenderTheme::default()
+        };
+        let counts = BadgeCounts {
+            total: 3,
+            blocked: 1,
+            working: 1,
+            done: 0,
+            idle: 1,
+        };
+        let state = SidebarState {
+            filter: StatusFilter::AttentionOnly,
+            ..SidebarState::default()
+        };
+
+        let header = build_header_layout_with_counts(&state, 80, &theme, counts);
+
+        let active = style_for_segment(&header, 1, "▲ 1");
+        assert_eq!(active.fg, Some(Color::Rgb(0x23, 0x23, 0x32)));
+        assert_eq!(active.bg, Some(theme.badge_blocked));
+        let mode = style_for_segment(&header, 0, "≣");
+        assert_eq!(mode.fg, Some(Color::Rgb(0x98, 0xb2, 0xf6)));
     }
 
     #[test]
