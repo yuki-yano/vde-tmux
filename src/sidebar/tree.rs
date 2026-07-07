@@ -57,6 +57,7 @@ pub struct RowMeta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BadgeCounts {
     pub total: usize,
+    pub attention: usize,
     pub blocked: usize,
     pub working: usize,
     pub done: usize,
@@ -81,7 +82,7 @@ impl BadgeCounts {
     pub fn count_for_filter(self, filter: StatusFilter) -> usize {
         match filter {
             StatusFilter::All => self.total,
-            StatusFilter::AttentionOnly => self.blocked,
+            StatusFilter::AttentionOnly => self.attention,
             StatusFilter::WorkingOnly => self.working,
             StatusFilter::DoneOnly => self.done,
             StatusFilter::IdleOnly => self.idle,
@@ -281,6 +282,9 @@ fn badge_counts_from_agent_panes<'a>(
     let mut counts = BadgeCounts::default();
     for pane in panes {
         counts.total += 1;
+        if pane_matches_attention_filter(pane) {
+            counts.attention += 1;
+        }
         match pane.badge_state {
             BadgeState::Blocked => counts.blocked += 1,
             BadgeState::Working => counts.working += 1,
@@ -712,11 +716,18 @@ fn parse_tasks(raw: &str) -> Option<(i64, i64)> {
 fn pane_matches_filter(pane: &AgentPane, filter: StatusFilter) -> bool {
     match filter {
         StatusFilter::All => true,
-        StatusFilter::AttentionOnly => pane.badge_state == BadgeState::Blocked,
+        StatusFilter::AttentionOnly => pane_matches_attention_filter(pane),
         StatusFilter::WorkingOnly => pane.badge_state == BadgeState::Working,
         StatusFilter::DoneOnly => pane.badge_state == BadgeState::Done,
         StatusFilter::IdleOnly => pane.badge_state == BadgeState::Idle,
     }
+}
+
+fn pane_matches_attention_filter(pane: &AgentPane) -> bool {
+    pane.completed_at.trim().is_empty()
+        && (pane.attention
+            || pane.badge_state == BadgeState::Blocked
+            || pane.badge_state == BadgeState::Working)
 }
 
 fn order_repo_groups(groups: &mut [Vec<AgentPane>], state: &SidebarState) {
@@ -1688,7 +1699,7 @@ mod tests {
         let rows = build_rows(&Config::default(), &[calm, running, attention], &state);
 
         assert!(rows.iter().all(|row| !row.id.contains("%1")));
-        assert!(rows.iter().all(|row| !row.id.contains("%2")));
+        assert!(rows.iter().any(|row| row.id.contains("%2")));
         assert!(rows.iter().any(|row| row.id.contains("%3")));
         assert!(
             rows.iter()
@@ -1943,14 +1954,54 @@ mod tests {
         );
 
         assert!(rows.iter().any(|row| row.id == "chat::%1"));
-        assert!(rows.iter().all(|row| row.id != "chat::%2"));
+        assert!(rows.iter().any(|row| row.id == "chat::%2"));
         assert!(rows.iter().all(|row| row.id != "chat::%3"));
         assert!(rows.iter().all(|row| row.id != "chat::%4"));
         assert_eq!(counts.total, 4);
+        assert_eq!(counts.attention, 2);
         assert_eq!(counts.blocked, 1);
         assert_eq!(counts.working, 1);
         assert_eq!(counts.done, 0);
         assert_eq!(counts.idle, 2);
+    }
+
+    #[test]
+    fn attention_count_matches_attention_filter_predicate_without_blocked_panes() {
+        let working_a = pane("main", "%1", "/tmp/app", "codex", "running");
+        let working_b = pane("main", "%2", "/tmp/app", "claude", "running");
+        let idle = pane("main", "%3", "/tmp/app", "opencode", "idle");
+        let state = SidebarState {
+            view_mode: ViewMode::ByRepo,
+            filter: crate::sidebar::state::StatusFilter::AttentionOnly,
+            ..SidebarState::default()
+        };
+
+        let (rows, counts) = build_rows_ctx(
+            &Config::default(),
+            &[working_a, working_b, idle],
+            &state,
+            &RowBuildContext {
+                now: 1000,
+                ..RowBuildContext::default()
+            },
+        );
+
+        assert_eq!(counts.blocked, 0);
+        assert_eq!(counts.working, 2);
+        assert_eq!(counts.attention, 2);
+        assert_eq!(
+            counts.count_for_filter(crate::sidebar::state::StatusFilter::AttentionOnly),
+            2
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Chat)
+                .count(),
+            2
+        );
+        assert!(rows.iter().any(|row| row.id == "chat::%1"));
+        assert!(rows.iter().any(|row| row.id == "chat::%2"));
+        assert!(rows.iter().all(|row| row.id != "chat::%3"));
     }
 
     #[test]

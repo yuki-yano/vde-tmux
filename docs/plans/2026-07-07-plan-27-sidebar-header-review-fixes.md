@@ -36,10 +36,10 @@ Plan 26(sidebar ヘッダーのリッチ化)の実装に対して 8 観点の品
 
 仕様: `BadgeCounts` に `attention: usize` を追加し、`pane_matches_filter(AttentionOnly)` と**同一の述語**(`attention || Blocked || Working`)で算出する。`count_for_filter(AttentionOnly)` は `self.attention` を返す。▲ チップの count も同フィールドに切り替える(表示の意味が「blocked 数」から「attn ビュー該当数」に変わることを README に明記)。
 
-- [ ] **Step 1: 失敗するテストを書く** — blocked 0 / working 2 の panes で `counts.attention == 2`、`filter_is_available(counts, AttentionOnly) == true`、▲ チップが count 2 でクリック可能、`tab` サイクルが AttentionOnly をスキップしない
-- [ ] **Step 2: FAIL 確認** — `rtk cargo test --lib sidebar::tree`
-- [ ] **Step 3: 実装** — 述語は `pane_matches_filter` と共通の関数に切り出して二重実装を避ける(指摘8の runtime/render 述語統合はここでやってもよい)
-- [ ] **Step 4: テスト通過 + コミット**
+- [x] **Step 1: 失敗するテストを書く** — blocked 0 / working 2 の panes で `counts.attention == 2`、`filter_is_available(counts, AttentionOnly) == true`、▲ チップが count 2 でクリック可能、`tab` サイクルが AttentionOnly をスキップしない
+- [x] **Step 2: FAIL 確認** — `rtk cargo test --lib sidebar::tree`
+- [x] **Step 3: 実装** — 述語は `pane_matches_filter` と共通の関数に切り出して二重実装を避ける(指摘8の runtime/render 述語統合はここでやってもよい)
+- [x] **Step 4: テスト通過 + コミット**
 
 ```bash
 rtk git add -A

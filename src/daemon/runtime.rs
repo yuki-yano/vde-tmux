@@ -1455,6 +1455,41 @@ mod tests {
     }
 
     #[test]
+    fn attention_filter_is_available_when_working_panes_match_attention_view() {
+        let counts = BadgeCounts {
+            total: 2,
+            attention: 2,
+            blocked: 0,
+            working: 2,
+            ..BadgeCounts::default()
+        };
+
+        assert!(filter_is_available(counts, StatusFilter::AttentionOnly));
+    }
+
+    #[test]
+    fn toggle_filter_does_not_skip_attention_when_only_working_panes_match() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                filter: StatusFilter::All,
+                ..SidebarState::default()
+            },
+        );
+        state.counts = BadgeCounts {
+            total: 2,
+            attention: 2,
+            blocked: 0,
+            working: 2,
+            ..BadgeCounts::default()
+        };
+
+        client_key(&mut state, "tab");
+
+        assert_eq!(state.ui_state.filter, StatusFilter::AttentionOnly);
+    }
+
+    #[test]
     fn toggle_filter_converges_to_all_when_all_status_counts_are_zero() {
         let mut state = RuntimeState::new(
             Config::default(),

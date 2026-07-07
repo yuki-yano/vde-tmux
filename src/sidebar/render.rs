@@ -411,7 +411,7 @@ fn build_header_chip_line(
         HeaderChipSpec {
             filter: StatusFilter::AttentionOnly,
             glyph: "▲",
-            count: counts.blocked,
+            count: counts.attention,
             badge_state: Some(BadgeState::Blocked),
         },
         HeaderChipSpec {
@@ -2192,6 +2192,7 @@ mod tests {
     fn rich_header_counts() -> BadgeCounts {
         BadgeCounts {
             total: 7,
+            attention: 2,
             blocked: 1,
             working: 1,
             done: 0,
@@ -2233,7 +2234,7 @@ mod tests {
             header.lines[0].text,
             format!(" ≣ category \u{e0b0} 7 tasks \u{e0b0}")
         );
-        assert_eq!(header.lines[1].text, " ≡ all 7  ▲ 1  ● 1  ✓ 0  ○ 5 ");
+        assert_eq!(header.lines[1].text, " ≡ all 7  ▲ 2  ● 1  ✓ 0  ○ 5 ");
     }
 
     #[test]
@@ -2276,6 +2277,39 @@ mod tests {
     }
 
     #[test]
+    fn attention_chip_uses_attention_count_and_is_clickable_without_blocked_count() {
+        let state = SidebarState {
+            view_mode: ViewMode::ByCategory,
+            filter: StatusFilter::All,
+            ..SidebarState::default()
+        };
+        let counts = BadgeCounts {
+            total: 2,
+            attention: 2,
+            blocked: 0,
+            working: 2,
+            ..BadgeCounts::default()
+        };
+
+        let header = build_header_layout_with_counts(
+            &state,
+            80,
+            &SidebarRenderTheme::default(),
+            counts,
+        );
+
+        assert!(
+            header.lines[1].text.contains("▲ 2"),
+            "{:?}",
+            header.lines[1].text
+        );
+        assert_eq!(
+            header_hit_test(&header, 1, 10),
+            Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
+        );
+    }
+
+    #[test]
     fn active_chip_fg_follows_configured_header_fg() {
         let theme = SidebarRenderTheme {
             header_active_fg: Some(Color::Rgb(0x19, 0x16, 0x27)),
@@ -2283,6 +2317,7 @@ mod tests {
         };
         let counts = BadgeCounts {
             total: 3,
+            attention: 1,
             blocked: 1,
             working: 1,
             done: 0,
@@ -2311,6 +2346,7 @@ mod tests {
         };
         let counts = BadgeCounts {
             total: 3,
+            attention: 1,
             blocked: 1,
             working: 1,
             done: 0,
@@ -2339,6 +2375,7 @@ mod tests {
         };
         let counts = BadgeCounts {
             total: 3,
+            attention: 1,
             blocked: 1,
             working: 0,
             done: 0,
@@ -2372,6 +2409,7 @@ mod tests {
         let theme = SidebarRenderTheme::default();
         let counts = BadgeCounts {
             total: 7,
+            attention: 0,
             blocked: 0,
             working: 2,
             done: 0,

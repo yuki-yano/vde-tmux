@@ -1544,6 +1544,7 @@ mod tests {
             },
             BadgeCounts {
                 total: 7,
+                attention: 0,
                 blocked: 0,
                 working: 2,
                 done: 0,
@@ -1600,6 +1601,7 @@ mod tests {
             },
             BadgeCounts {
                 total: 7,
+                attention: 0,
                 blocked: 0,
                 working: 2,
                 done: 0,

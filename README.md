@@ -171,6 +171,8 @@ chip は状態に応じて表示を分ける。
 `all` は常に適用でき、`tab` filter cycle は 0 件状態をスキップする。
 
 件数は filter 適用前の全 agent pane から算出するため、filter 中も他状態の件数は変わらない。
+`▲` は blocked 専用件数ではなく、attn ビューに表示される agent pane 数を示す。
+このため explicit attention・blocked・working の pane が `▲` 件数と `tab` cycle の対象になる。
 filter 適用中に rows が空になっても header は残り、rows 領域に `no attn agents` と `tab: next filter · click ≡ all to reset` を表示する。
 `all` filter で本当に 0 件のときは `no agents` のみ表示する。
 
