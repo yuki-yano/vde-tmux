@@ -512,10 +512,6 @@ fn draw_snapshot_in_area(
         draw_placeholder(frame, area, "no sidebar data");
         return;
     };
-    if sidebar.rows.is_empty() {
-        draw_placeholder(frame, area, "no agents");
-        return;
-    };
     let header = build_header_layout_with_counts(
         &sidebar.state,
         area.width,
@@ -539,15 +535,22 @@ fn draw_snapshot_in_area(
         height: areas.rows_height,
         ..area
     };
-    let rendered =
-        render_lines_with_indices(&sidebar.rows, &sidebar.state, area.width as usize, theme);
-    let items = rendered
-        .lines
-        .into_iter()
-        .skip(scroll)
-        .take(areas.rows_height as usize)
-        .map(ListItem::new)
-        .collect::<Vec<_>>();
+    let items = if sidebar.rows.is_empty() {
+        empty_rows_placeholder_lines(sidebar.state.filter, theme)
+            .into_iter()
+            .map(ListItem::new)
+            .collect::<Vec<_>>()
+    } else {
+        let rendered =
+            render_lines_with_indices(&sidebar.rows, &sidebar.state, area.width as usize, theme);
+        rendered
+            .lines
+            .into_iter()
+            .skip(scroll)
+            .take(areas.rows_height as usize)
+            .map(ListItem::new)
+            .collect::<Vec<_>>()
+    };
     let list = List::new(items).block(Block::default().borders(Borders::NONE));
     frame.render_widget(list, rows_area);
     if areas.live_rows > 0
@@ -587,6 +590,37 @@ fn draw_placeholder(frame: &mut ratatui::Frame<'_>, area: Rect, message: &str) {
     let list = List::new(vec![ListItem::new(Line::from(message.to_string()))])
         .block(Block::default().borders(Borders::NONE));
     frame.render_widget(list, area);
+}
+
+fn empty_rows_placeholder_lines(
+    filter: StatusFilter,
+    theme: &SidebarRenderTheme,
+) -> Vec<Line<'static>> {
+    if filter == StatusFilter::All {
+        return vec![Line::from("no agents")];
+    }
+    vec![
+        Line::from(Span::styled(
+            format!("no {} agents", filter_name(filter)),
+            Style::default().fg(theme.detail),
+        )),
+        Line::from(Span::styled(
+            "tab: next filter · click ≡ all to reset",
+            Style::default()
+                .fg(theme.marker)
+                .add_modifier(Modifier::DIM),
+        )),
+    ]
+}
+
+fn filter_name(filter: StatusFilter) -> &'static str {
+    match filter {
+        StatusFilter::All => "all",
+        StatusFilter::AttentionOnly => "attn",
+        StatusFilter::WorkingOnly => "working",
+        StatusFilter::DoneOnly => "done",
+        StatusFilter::IdleOnly => "idle",
+    }
 }
 
 fn render_live_lines(
@@ -1121,14 +1155,19 @@ fn spawn_detached_sidebar_close(exe: &Path, window: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::protocol::{ClientMessage, ServerMessage, SidebarClientEvent};
     use crate::daemon::{DaemonSnapshot, SidebarFrame};
     use crate::hook::RollupLevel;
     use crate::sidebar::render::{HeaderLayout, HeaderLine};
     use crate::sidebar::state::SidebarState;
     use crate::sidebar::tree::{BadgeCounts, SidebarRow, SidebarRowKind};
+    use crate::tmux::mock::MockTmuxRunner;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn row() -> SidebarRow {
         SidebarRow {
@@ -1481,8 +1520,63 @@ mod tests {
         assert!(rendered.contains("connecting to daemon..."));
     }
 
+    fn rendered_buffer(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    fn empty_sidebar_snapshot(state: SidebarState, counts: BadgeCounts) -> DaemonSnapshot {
+        DaemonSnapshot {
+            agent_count: counts.total,
+            rollup: RollupLevel::Idle,
+            panes: Vec::new(),
+            sidebar: Some(SidebarFrame {
+                state,
+                counts,
+                rows: Vec::new(),
+            }),
+            events: Vec::new(),
+        }
+    }
+
     #[test]
-    fn renders_no_agents_placeholder_for_empty_sidebar_rows() {
+    fn renders_filter_context_placeholder_and_header_for_empty_filtered_rows() {
+        let snapshot = empty_sidebar_snapshot(
+            SidebarState {
+                filter: StatusFilter::AttentionOnly,
+                ..SidebarState::default()
+            },
+            BadgeCounts {
+                total: 7,
+                blocked: 0,
+                working: 2,
+                done: 0,
+                idle: 5,
+            },
+        );
+        let backend = TestBackend::new(60, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        draw_snapshot(&mut terminal, &snapshot).unwrap();
+
+        let rendered = rendered_buffer(&terminal);
+        assert!(rendered.contains("≣ repo"), "{rendered}");
+        assert!(rendered.contains("≡ all 7"), "{rendered}");
+        assert!(rendered.contains("▲ 0"), "{rendered}");
+        assert!(rendered.contains("no attn agents"), "{rendered}");
+        assert!(
+            rendered.contains("tab: next filter · click ≡ all to reset"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn renders_plain_no_agents_with_header_for_empty_all_filter() {
         let snapshot = DaemonSnapshot {
             agent_count: 0,
             rollup: RollupLevel::Idle,
@@ -1494,19 +1588,78 @@ mod tests {
             }),
             events: Vec::new(),
         };
-        let backend = TestBackend::new(40, 2);
+        let backend = TestBackend::new(60, 5);
         let mut terminal = Terminal::new(backend).unwrap();
 
         draw_snapshot(&mut terminal, &snapshot).unwrap();
 
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("no agents"));
+        let rendered = rendered_buffer(&terminal);
+        assert!(rendered.contains("≣ repo"), "{rendered}");
+        assert!(rendered.contains("no agents"), "{rendered}");
+        assert!(!rendered.contains("tab: next filter"), "{rendered}");
+        assert!(!rendered.contains("no all agents"), "{rendered}");
+    }
+
+    #[test]
+    fn empty_rows_still_allow_header_chip_clicks() {
+        let snapshot = empty_sidebar_snapshot(
+            SidebarState {
+                filter: StatusFilter::AttentionOnly,
+                ..SidebarState::default()
+            },
+            BadgeCounts {
+                total: 7,
+                blocked: 0,
+                working: 2,
+                done: 0,
+                idle: 5,
+            },
+        );
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/vt-click-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let message: ClientMessage = serde_json::from_str(line.trim()).unwrap();
+            let ClientMessage::SidebarEvent {
+                event: SidebarClientEvent::Key { key },
+                ..
+            } = message
+            else {
+                panic!("unexpected message: {message:?}");
+            };
+            tx.send(key).unwrap();
+            serde_json::to_writer(&mut stream, &ServerMessage::Ack).unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        let env = BTreeMap::new();
+        let runner = MockTmuxRunner::new();
+        let theme = SidebarRenderTheme::default();
+        let context = ClickContext {
+            socket: &socket,
+            runner: &runner,
+            env: &env,
+            theme: &theme,
+            preview_history_lines: 2000,
+            live_lines: 0,
+        };
+
+        handle_left_click(&context, &snapshot, 1, 1, 0).unwrap();
+
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "all");
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(socket);
     }
 
     #[test]

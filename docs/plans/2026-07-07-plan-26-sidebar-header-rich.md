@@ -169,7 +169,7 @@ rtk git commit -m "sidebar ヘッダーを powerline バッジとフィルタチ
 - Modify: `src/sidebar/tui.rs`(515-517 の early return 廃止、空状態プレースホルダの文脈表示)
 - Modify: `src/sidebar/render.rs`(必要なら `filter_name(StatusFilter)` ヘルパー追加)
 
-- [ ] **Step 1: 失敗するテストを書く**
+- [x] **Step 1: 失敗するテストを書く**
 
 既存 `renders_no_agents_placeholder_for_empty_sidebar_rows`(tui.rs:1481)を分割・拡張:
 
@@ -177,19 +177,19 @@ rtk git commit -m "sidebar ヘッダーを powerline バッジとフィルタチ
 - rows 空 + `filter: All` → ヘッダーは描画され、`no agents` のみ(ヒント行なし)
 - rows 空でもヘッダークリック(チップ座標)で `SetFilter` が発火する(クリック処理パスに rows 空の early return がないこと)
 
-- [ ] **Step 2: テストが失敗することを確認**
+- [x] **Step 2: テストが失敗することを確認**
 
 Run: `rtk cargo test --lib sidebar::tui`
 Expected: FAIL(現状はヘッダーなしで "no agents" のみ)
 
-- [ ] **Step 3: 実装**
+- [x] **Step 3: 実装**
 
 1. `tui.rs:515-517` の early return を廃止し、rows 空でもヘッダーを組み立てて描画、rows 領域にのみプレースホルダを出す。
 2. プレースホルダ: フィルタ適用中は `no {name} agents`(name は all/attn/working/done/idle)+ dim のヒント行。`all` は従来文言。
 3. `snapshot.sidebar` 自体がない場合の `no sidebar data` は従来どおり。
 4. クリック処理(958-974 周辺)に rows 空で bail する分岐が残っていないか確認して除去。
 
-- [ ] **Step 4: テスト通過を確認してコミット**
+- [x] **Step 4: テスト通過を確認してコミット**
 
 Run: `rtk cargo test`
 
