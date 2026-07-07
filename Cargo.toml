@@ -6,6 +6,7 @@ license = "MIT"
 authors = ["Yuki Yano"]
 repository = "https://github.com/yuki-yano/vde-tmux"
 description = "tmux state & UI manager: session/category, statusline, agent sidebar"
+exclude = ["AGENTS.md", "CLAUDE.md"]
 
 [[bin]]
 name = "vt"
