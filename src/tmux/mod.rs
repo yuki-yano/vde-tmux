@@ -3,6 +3,7 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -17,8 +18,6 @@ pub trait TmuxRunner {
 
 /// 外部コマンドを実行し stdout を返す。timeout 指定時は超過で kill してエラーを返す。
 ///
-/// 注意: 出力の読み取りはプロセス終了後に行うため、pipe バッファ(64KB 程度)を大きく
-/// 超える出力を出すコマンドには使わない(tmux / git の想定出力は十分小さい)。
 pub fn run_command(program: &str, args: &[&str], timeout: Option<Duration>) -> Result<String> {
     let mut child = Command::new(program)
         .args(args)
@@ -27,6 +26,9 @@ pub fn run_command(program: &str, args: &[&str], timeout: Option<Duration>) -> R
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn {program}"))?;
+
+    let mut stdout = child.stdout.take().map(read_pipe_in_background);
+    let mut stderr = child.stderr.take().map(read_pipe_in_background);
 
     let status = match timeout {
         None => child
@@ -48,21 +50,32 @@ pub fn run_command(program: &str, args: &[&str], timeout: Option<Duration>) -> R
         }
     };
 
-    let mut stdout = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
+    let stdout = collect_pipe_output(stdout.take());
     if status.success() {
         return Ok(stdout);
     }
-    let mut stderr = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
+    let stderr = collect_pipe_output(stderr.take());
     bail!(
         "{program} {args:?} failed (exit: {code:?}): {stderr}",
         code = status.code()
     )
+}
+
+fn read_pipe_in_background<R>(mut pipe: R) -> thread::JoinHandle<String>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = String::new();
+        let _ = pipe.read_to_string(&mut output);
+        output
+    })
+}
+
+fn collect_pipe_output(handle: Option<thread::JoinHandle<String>>) -> String {
+    handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default()
 }
 
 /// 実 tmux を呼ぶ Runner。timeout は経路ごとに選ぶ:
@@ -129,6 +142,21 @@ mod tests {
     fn run_command_captures_stdout() {
         let out = run_command("/bin/sh", &["-c", "printf hello"], None).unwrap();
         assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn run_command_drains_large_stdout_while_waiting() {
+        let out = run_command(
+            "/bin/sh",
+            &[
+                "-c",
+                "i=0; while [ $i -lt 2048 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i + 1)); done",
+            ],
+            Some(Duration::from_secs(2)),
+        )
+        .unwrap();
+
+        assert_eq!(out.len(), 2048 * 64);
     }
 
     #[test]
