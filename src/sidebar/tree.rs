@@ -748,11 +748,7 @@ fn status_label(raw: &str) -> &'static str {
 fn pane_matches_filter(pane: &AgentPane, filter: StatusFilter) -> bool {
     match filter {
         StatusFilter::All => true,
-        StatusFilter::AttentionOnly => {
-            pane.attention
-                || pane.badge_state == BadgeState::Blocked
-                || pane.badge_state == BadgeState::Working
-        }
+        StatusFilter::AttentionOnly => pane.attention || pane.badge_state == BadgeState::Blocked,
         StatusFilter::WorkingOnly => pane.badge_state == BadgeState::Working,
         StatusFilter::DoneOnly => pane.badge_state == BadgeState::Done,
         StatusFilter::IdleOnly => pane.badge_state == BadgeState::Idle,
@@ -1703,16 +1699,23 @@ mod tests {
     fn attention_only_filter_drops_calm_panes_and_empty_groups() {
         let mut calm = pane("main", "%1", "/tmp/calm", "codex", "idle");
         calm.attention = "0".to_string();
-        let active = pane("main", "%2", "/tmp/active", "codex", "running");
+        let running = pane("main", "%2", "/tmp/active", "codex", "running");
+        let mut attention = pane("main", "%3", "/tmp/active", "claude", "idle");
+        attention.attention = "1".to_string();
         let state = SidebarState {
             filter: crate::sidebar::state::StatusFilter::AttentionOnly,
             ..SidebarState::default()
         };
 
-        let rows = build_rows(&Config::default(), &[calm, active], &state);
+        let rows = build_rows(&Config::default(), &[calm, running, attention], &state);
 
         assert!(rows.iter().all(|row| !row.id.contains("%1")));
-        assert!(rows.iter().any(|row| row.id.contains("%2")));
+        assert!(rows.iter().all(|row| !row.id.contains("%2")));
+        assert!(rows.iter().any(|row| row.id.contains("%3")));
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == SidebarRowKind::Repo && row.label == "active")
+        );
     }
 
     #[test]
@@ -1946,7 +1949,7 @@ mod tests {
         );
 
         assert!(rows.iter().any(|row| row.id == "chat::%1"));
-        assert!(rows.iter().any(|row| row.id == "chat::%2"));
+        assert!(rows.iter().all(|row| row.id != "chat::%2"));
         assert!(rows.iter().all(|row| row.id != "chat::%3"));
         assert!(rows.iter().all(|row| row.id != "chat::%4"));
         assert_eq!(counts.total, 4);
