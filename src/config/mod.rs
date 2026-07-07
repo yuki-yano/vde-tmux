@@ -385,17 +385,9 @@ impl Default for SidebarPreviewConfig {
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SidebarColorsConfig {
-    pub error: Option<String>,
-    pub running: Option<String>,
-    pub permission: Option<String>,
-    pub background: Option<String>,
-    pub waiting: Option<String>,
-    pub idle: Option<String>,
     pub selection_bg: Option<String>,
     pub header_active_bg: Option<String>,
     pub header_active_fg: Option<String>,
-    // badge の色は statusline と共通の `badge.colors` を単一ソースにするため
-    // sidebar 個別の badge_* キーは持たない(from_app_config で badge.colors を適用)。
     pub detail: Option<String>,
     pub marker: Option<String>,
     pub toggle: Option<String>,
@@ -615,18 +607,30 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_colors_accept_old_sidebar_color_keys() {
+    fn sidebar_colors_accept_ui_color_keys_and_reject_state_color_keys() {
         let config = serde_yaml_ng::from_str::<Config>(
-            "sidebar:\n  colors:\n    running: green\n    selection_bg: \"237\"\n    header_active_bg: \"24\"\n",
+            "sidebar:\n  colors:\n    selection_bg: \"237\"\n    header_active_bg: \"24\"\n",
         )
         .unwrap();
 
-        assert_eq!(config.sidebar.colors.running.as_deref(), Some("green"));
         assert_eq!(config.sidebar.colors.selection_bg.as_deref(), Some("237"));
         assert_eq!(
             config.sidebar.colors.header_active_bg.as_deref(),
             Some("24")
         );
+
+        for key in [
+            "error",
+            "running",
+            "permission",
+            "background",
+            "waiting",
+            "idle",
+        ] {
+            let yaml = format!("sidebar:\n  colors:\n    {key}: red\n");
+            let err = serde_yaml_ng::from_str::<Config>(&yaml).unwrap_err();
+            assert!(err.to_string().contains(key), "{err}");
+        }
     }
 
     #[test]

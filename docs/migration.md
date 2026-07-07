@@ -34,7 +34,7 @@ M7 の一括切替で使う作業メモ。
 
 新 config は `~/.config/vde/tmux/config.yml`。
 旧 vtm config と旧 sidebar config は自動移行しない。
-JSON Schema は `vt config schema` で確認する。
+JSON Schema は `schemas/config.schema.json` を LSP から参照し、`vt config schema` でも確認する。
 主な対応は次のとおり。
 
 ```yaml
@@ -89,12 +89,6 @@ sidebar:
     #   fg: white
     #   bg: "24"
   colors:
-    running: green
-    waiting: yellow
-    permission: light_red
-    error: red
-    background: dark_gray
-    idle: reset
     selection_bg: "237"
 daemon:
   poll_ms: 1000
@@ -121,6 +115,8 @@ tmux の `status-interval` は `1` を推奨する。
 daemon heartbeat は `@vde_heartbeat` に書かれ、graceful shutdown で消える。
 daemon が強制終了して heartbeat が stale になると、`statusline-sessions` の既存バッジは `?` として表示される。
 `sidebar.colors.attention` / `selection_active_bg` は未使用のため削除する。
+`sidebar.colors.error` / `running` / `permission` / `background` / `waiting` / `idle` は削除する。
+sidebar の状態色は `badge.colors.{blocked,working,done,idle}` で設定する。
 
 ## Pane Option Bus
 

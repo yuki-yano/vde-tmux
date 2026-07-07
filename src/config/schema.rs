@@ -123,12 +123,6 @@ pub fn config_schema() -> Value {
                         "type": "object",
                         "additionalProperties": true,
                         "properties": {
-                            "error": { "type": "string" },
-                            "running": { "type": "string" },
-                            "permission": { "type": "string" },
-                            "background": { "type": "string" },
-                            "waiting": { "type": "string" },
-                            "idle": { "type": "string" },
                             "selection_bg": { "type": "string" },
                             "header_active_bg": { "type": "string" },
                             "header_active_fg": { "type": "string" }
@@ -198,6 +192,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn checked_in_schema_file_matches_config_schema() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("schemas")
+            .join("config.schema.json");
+        let raw = std::fs::read_to_string(path).unwrap();
+        let schema: Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(schema, config_schema());
+    }
+
+    #[test]
     fn schema_contains_top_level_sections() {
         let schema = config_schema();
         let properties = schema
@@ -246,6 +251,16 @@ mod tests {
 
         assert_eq!(colors["header_active_bg"]["type"], "string");
         assert_eq!(colors["selection_bg"]["type"], "string");
+        for key in [
+            "error",
+            "running",
+            "permission",
+            "background",
+            "waiting",
+            "idle",
+        ] {
+            assert!(colors.get(key).is_none(), "{key}");
+        }
         assert!(colors.get("attention").is_none());
         assert!(colors.get("selection_active_bg").is_none());
     }

@@ -1,0 +1,301 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "badge": {
+      "additionalProperties": true,
+      "properties": {
+        "colors": {
+          "additionalProperties": true,
+          "properties": {
+            "blocked": {
+              "type": "string"
+            },
+            "done": {
+              "type": "string"
+            },
+            "idle": {
+              "type": "string"
+            },
+            "working": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "glyphs": {
+          "additionalProperties": true,
+          "properties": {
+            "blocked": {
+              "type": "string"
+            },
+            "done": {
+              "type": "string"
+            },
+            "idle": {
+              "type": "string"
+            },
+            "working": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "categories": {
+      "additionalProperties": true,
+      "properties": {
+        "default_category": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_names": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "order": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "rules": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "category": {
+                "type": "string"
+              },
+              "path_patterns": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "session_name_rules": {
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "daemon": {
+      "additionalProperties": true,
+      "properties": {
+        "git": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "poll_ms": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "notify": {
+      "additionalProperties": true,
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "popup": {
+      "additionalProperties": false,
+      "properties": {
+        "height": {
+          "type": "string"
+        },
+        "width": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "sidebar": {
+      "additionalProperties": true,
+      "properties": {
+        "colors": {
+          "additionalProperties": true,
+          "properties": {
+            "header_active_bg": {
+              "type": "string"
+            },
+            "header_active_fg": {
+              "type": "string"
+            },
+            "selection_bg": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "header": {
+          "additionalProperties": true,
+          "properties": {
+            "bold": {
+              "type": "boolean"
+            },
+            "chip_prefix": {
+              "type": "string"
+            },
+            "chip_suffix": {
+              "type": "string"
+            },
+            "colors": {
+              "additionalProperties": true,
+              "properties": {
+                "bg": {
+                  "type": "string"
+                },
+                "fg": {
+                  "type": "string"
+                },
+                "outer_bg": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "format": {
+              "type": "string"
+            },
+            "prefix": {
+              "type": "string"
+            },
+            "suffix": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "live": {
+          "additionalProperties": true,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "interval_ms": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "lines": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "min_width": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "preview": {
+          "additionalProperties": true,
+          "properties": {
+            "history_lines": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "width": {
+          "oneOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "pattern": "^(100|[1-9][0-9]?)%$",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "statusline": {
+      "additionalProperties": true,
+      "properties": {
+        "category": {
+          "additionalProperties": true,
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "inactive_format": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string"
+            },
+            "show_badge": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "session_badge": {
+          "additionalProperties": true,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "hide_idle": {
+              "type": "boolean"
+            },
+            "suffix": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "sessions": {
+          "additionalProperties": true,
+          "properties": {
+            "badge_style": {
+              "enum": [
+                "inline",
+                "plain",
+                "outer"
+              ],
+              "type": "string"
+            },
+            "separator": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "summary": {
+          "additionalProperties": true,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "title": "vde-tmux config",
+  "type": "object"
+}
