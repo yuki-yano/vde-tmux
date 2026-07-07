@@ -77,17 +77,17 @@ sidebar:
   preview:
     history_lines: 2000
   header:
-    format: "{label} "
-    separator: ""
-    # pill 風にしたい場合:
-    # prefix: "["
-    # suffix: "]"
-    # format: " {label} "
-    # separator: " "
-    # bold: true
-    # colors:
-    #   fg: white
-    #   bg: "24"
+    format: " {label} "
+    prefix: ""
+    suffix: ""
+    bold: true
+    colors:
+      fg: "16"
+      bg: "147"
+      outer_bg: "235"
+    # filter chip を pill 風にする場合はここにキャップ glyph を入れる。空なら矩形表示。
+    chip_prefix: ""
+    chip_suffix: ""
   colors:
     selection_bg: "237"
 daemon:
