@@ -77,6 +77,16 @@ impl BadgeCounts {
         }
         counts
     }
+
+    pub fn count_for_filter(self, filter: StatusFilter) -> usize {
+        match filter {
+            StatusFilter::All => self.total,
+            StatusFilter::AttentionOnly => self.blocked,
+            StatusFilter::WorkingOnly => self.working,
+            StatusFilter::DoneOnly => self.done,
+            StatusFilter::IdleOnly => self.idle,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

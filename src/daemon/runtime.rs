@@ -376,9 +376,16 @@ impl RuntimeState {
             SidebarInputAction::CycleViewMode => {
                 self.ui_state.apply(SidebarAction::CycleViewMode, &row_refs)
             }
-            SidebarInputAction::SetFilter(filter) => self.ui_state.set_filter(filter),
+            SidebarInputAction::SetFilter(filter) => {
+                if filter_is_available(self.counts, filter) {
+                    self.ui_state.set_filter(filter)
+                } else {
+                    false
+                }
+            }
             SidebarInputAction::ToggleFilter => {
-                self.ui_state.apply(SidebarAction::ToggleFilter, &row_refs)
+                let filter = next_available_filter(self.ui_state.filter, self.counts);
+                self.ui_state.set_filter(filter)
             }
             SidebarInputAction::ToggleRow(row_id) => {
                 if let Some(rest) = row_id
@@ -793,13 +800,28 @@ impl RuntimeState {
     }
 }
 
+fn filter_is_available(counts: BadgeCounts, filter: crate::sidebar::state::StatusFilter) -> bool {
+    filter == crate::sidebar::state::StatusFilter::All || counts.count_for_filter(filter) > 0
+}
+
+fn next_available_filter(
+    current: crate::sidebar::state::StatusFilter,
+    counts: BadgeCounts,
+) -> crate::sidebar::state::StatusFilter {
+    let mut next = current.next();
+    while !filter_is_available(counts, next) {
+        next = next.next();
+    }
+    next
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
     use crate::daemon::protocol::{ServerMessage, SidebarClientEvent};
     use crate::options::snapshot::PaneSnapshot;
-    use crate::sidebar::state::SidebarState;
+    use crate::sidebar::state::{SidebarState, StatusFilter};
     use std::time::{Duration, Instant};
 
     fn pane(pane_id: &str, path: &str, agent: &str, status: &str) -> PaneSnapshot {
@@ -862,6 +884,15 @@ mod tests {
             .and_then(|row| row.meta.as_ref())
             .and_then(|meta| meta.flash)
             .unwrap_or(false)
+    }
+
+    fn client_key(state: &mut RuntimeState, key: &str) {
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::Key {
+                key: key.to_string(),
+            },
+        });
     }
 
     #[test]
@@ -1350,6 +1381,101 @@ mod tests {
         let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
         assert!(rows.iter().all(|row| !row.id.contains("%1")));
         assert!(rows.iter().any(|row| row.id.contains("%2")));
+    }
+
+    #[test]
+    fn set_filter_ignores_zero_count_status_filter() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                filter: StatusFilter::WorkingOnly,
+                ..SidebarState::default()
+            },
+        );
+        state.counts = BadgeCounts {
+            total: 1,
+            working: 1,
+            done: 0,
+            ..BadgeCounts::default()
+        };
+
+        client_key(&mut state, "done");
+
+        assert_eq!(state.ui_state.filter, StatusFilter::WorkingOnly);
+        assert_eq!(state.ui_state.version, 0);
+        assert!(state.state_dirty_since().is_none());
+    }
+
+    #[test]
+    fn set_filter_all_is_always_allowed() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                filter: StatusFilter::WorkingOnly,
+                ..SidebarState::default()
+            },
+        );
+        state.counts = BadgeCounts::default();
+
+        client_key(&mut state, "all");
+
+        assert_eq!(state.ui_state.filter, StatusFilter::All);
+        assert_eq!(state.ui_state.version, 1);
+    }
+
+    #[test]
+    fn toggle_filter_skips_zero_count_statuses() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                filter: StatusFilter::WorkingOnly,
+                ..SidebarState::default()
+            },
+        );
+        state.counts = BadgeCounts {
+            total: 2,
+            working: 1,
+            done: 0,
+            idle: 1,
+            ..BadgeCounts::default()
+        };
+
+        client_key(&mut state, "tab");
+
+        assert_eq!(state.ui_state.filter, StatusFilter::IdleOnly);
+    }
+
+    #[test]
+    fn toggle_filter_converges_to_all_when_all_status_counts_are_zero() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                filter: StatusFilter::WorkingOnly,
+                ..SidebarState::default()
+            },
+        );
+        state.counts = BadgeCounts::default();
+
+        client_key(&mut state, "tab");
+
+        assert_eq!(state.ui_state.filter, StatusFilter::All);
+    }
+
+    #[test]
+    fn filter_is_not_reset_when_active_filter_count_becomes_zero() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                filter: StatusFilter::AttentionOnly,
+                ..SidebarState::default()
+            },
+        );
+
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "idle",
+        )]));
+
+        assert_eq!(state.ui_state.filter, StatusFilter::AttentionOnly);
     }
 
     #[test]
