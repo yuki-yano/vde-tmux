@@ -221,7 +221,7 @@ M6 runtime smoke ok
 - `vt sidebar open` で daemon subscribe TUI を開き、header の現在値表示(` repo · all`)を確認する。
 - `v` で `category` に切り替わることを確認する。
 - `Tab` で `attention` filter に切り替わり、attention 不要な idle pane が消えることを確認する。
-- Chat 行で `Space` を押し、状態行(`running · ...`)と場所行(`session · %pane`)の Detail 行が出ることを確認する。
+- Chat 行で `Space` を押し、状態行(`state running · ...`)と場所行(`session · %pane`)の Detail 行が出ることを確認する。
 - `p` または Detail 行クリックで preview が floating pane として開くことを確認する。
 
 ## Session Manager popup
@@ -392,7 +392,7 @@ Plan 12 固有の scratch runtime smoke も pass。
 executed_at=2026-07-05 01:11:13 JST
 scratch=vde-m12-runtime-<timestamp>
 checked=stale agent exclusion with zsh pane retaining @vde_agent
-checked=badge glyphs 🔴/🟡/🔵/🟢 and unread -> viewed transition via control-mode attach
+checked=badge glyphs ▲/●/✓/○ and unread -> viewed transition via control-mode attach
 checked=path_patterns with ${WORK_OWNER} expansion resolves category work
 checked=preview floating pane width matches target pane, centered by pane_left, q/Esc close
 checked=preview source capture includes scrollback via capture-pane -S -2000
@@ -524,8 +524,8 @@ checked=rtk cargo fmt --check && rtk cargo clippy --all-targets && rtk cargo tes
 checked=rtk cargo install --path . --force replaced vt and vde-tmux
 checked=branch default Indexed 73 and colors.branch override path covered by sidebar::render::tests::branch_defaults_to_muted_cyan / repo_branch_is_rendered_in_branch_color
 checked=expanded chat row agent-only label and right-label suppression covered by sidebar::tree::tests::expanded_chat_row_shows_agent_name_only and sidebar::render::tests::expanded_chat_row_suppresses_right_label
-checked=detail state/place rows, no status:/elapsed:/session: rows, running elapsed, idle done {t} ago, blocked wait_reason, completed_at missing omission, and tasks condition covered by sidebar::tree detail/state_line tests
-checked=state detail glyph/state-word coloring and place row detail coloring covered by sidebar::render::tests::state_detail_row_colors_glyph_and_state_word
+checked=detail state/place rows, no status:/elapsed:/session: rows, state running elapsed, state idle done {t} ago, blocked wait_reason, completed_at missing omission, and tasks condition covered by sidebar::tree detail/state_line tests
+checked=state detail renders as detail text without status badge, and parent chat row owns the status badge, covered by sidebar::render::tests::state_detail_row_renders_as_detail_text_without_status_badge
 checked=Enter on selected detail row still previews parent pane via daemon::runtime::tests::enter_on_detail_returns_preview_effect
 result=Plan 24 sidebar detail view smoke ok
 ```
