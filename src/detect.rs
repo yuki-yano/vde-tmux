@@ -1,11 +1,10 @@
 use crate::hook::AgentStatus;
 
+// capture-pane may include deeper scrollback; only recent screen lines should drive waiting state.
+const WAIT_REASON_SCAN_TAIL_LINES: usize = 30;
+
 pub fn detect_codex_wait_reason(screen_tail: &str) -> Option<&'static str> {
-    let lines = screen_tail
-        .lines()
-        .map(|line| line.trim().to_ascii_lowercase())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
+    let lines = recent_wait_reason_lines(screen_tail);
 
     for (index, line) in lines.iter().enumerate() {
         if !looks_like_permission_question(line) {
@@ -24,6 +23,16 @@ pub fn detect_codex_wait_reason(screen_tail: &str) -> Option<&'static str> {
         return Some("codex_question_prompt");
     }
     None
+}
+
+fn recent_wait_reason_lines(screen_tail: &str) -> Vec<String> {
+    let raw_lines = screen_tail.lines().collect::<Vec<_>>();
+    let scan_start = raw_lines.len().saturating_sub(WAIT_REASON_SCAN_TAIL_LINES);
+    raw_lines[scan_start..]
+        .iter()
+        .map(|line| line.trim().to_ascii_lowercase())
+        .filter(|line| !line.is_empty())
+        .collect()
 }
 
 fn looks_like_permission_question(line: &str) -> bool {
@@ -166,9 +175,43 @@ mod tests {
     }
 
     #[test]
+    fn detects_permission_prompt_within_recent_30_lines() {
+        let mut text = String::from("? Allow command to run?\n  y) yes\n");
+        for index in 0..28 {
+            text.push_str(&format!("new output {index}\n"));
+        }
+
+        assert_eq!(detect_codex_wait_reason(&text), Some("permission_prompt"));
+    }
+
+    #[test]
     fn does_not_detect_codex_question_prompt_after_answered_status() {
         let text = "Question 1/1 (1 unanswered)\nRun this commit plan?\nQuestions 1/1 answered\n";
         assert_eq!(detect_codex_wait_reason(text), None);
+    }
+
+    #[test]
+    fn does_not_detect_stale_question_prompt_outside_recent_tail() {
+        let mut text = String::from(
+            "Question 1/1 (1 unanswered)\nRun this commit plan?\n› 1. y (Recommended)\n  2. n\n",
+        );
+        for index in 0..30 {
+            text.push_str(&format!("new output {index}\n"));
+        }
+
+        assert_eq!(detect_codex_wait_reason(&text), None);
+    }
+
+    #[test]
+    fn does_not_detect_stale_claude_permission_prompt_outside_recent_tail() {
+        let mut text = String::from(
+            "Claude needs your permission to use Bash\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n",
+        );
+        for index in 0..30 {
+            text.push_str(&format!("new output {index}\n"));
+        }
+
+        assert_eq!(detect_codex_wait_reason(&text), None);
     }
 
     #[test]

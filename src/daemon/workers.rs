@@ -200,9 +200,11 @@ pub fn apply_capture_detection(
     let mut observed_activity_epoch = None;
     let running_has_started_at =
         pane.status == "running" && pane.started_at.trim().parse::<i64>().is_ok();
-    let should_capture = pane.wait_reason.trim().is_empty() || pane.status == "running";
+    let has_hook_state = !pane.status.trim().is_empty() || !pane.wait_reason.trim().is_empty();
+    let should_detect_wait_reason = !has_hook_state;
+    let should_capture = should_detect_wait_reason || pane.status == "running";
     if should_capture && let Ok(tail) = io.capture_tail(&pane.pane_id) {
-        if let Some(wait_reason) = detect_codex_wait_reason(&tail) {
+        if should_detect_wait_reason && let Some(wait_reason) = detect_codex_wait_reason(&tail) {
             pane.status = "waiting".to_string();
             pane.wait_reason = wait_reason.to_string();
         } else if running_has_started_at && !tail.trim().is_empty() {
@@ -384,10 +386,9 @@ mod tests {
     #[test]
     fn tmux_worker_applies_capture_pane_detection() {
         let io = Arc::new(MockWorkerIo::default());
-        io.panes
-            .lock()
-            .unwrap()
-            .push(pane("%1", "codex", "running"));
+        let mut pane = pane("%1", "", "");
+        pane.current_command = "codex".to_string();
+        io.panes.lock().unwrap().push(pane);
         io.captures.lock().unwrap().insert(
             "%1".to_string(),
             "? Allow command to run?\n  y) yes\n  n) no\n".to_string(),
@@ -445,6 +446,23 @@ mod tests {
         assert_eq!(panes[0].agent, "claude");
         assert_eq!(panes[0].status, "waiting");
         assert_eq!(panes[0].wait_reason, "permission_prompt");
+    }
+
+    #[test]
+    fn hook_status_takes_precedence_over_capture_prompt_detection() {
+        let io = MockWorkerIo::default();
+        let mut active = pane("%1", "claude", "running");
+        active.started_at = "990".to_string();
+        io.captures.lock().unwrap().insert(
+            "%1".to_string(),
+            "Claude needs your permission to use Bash\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n"
+                .to_string(),
+        );
+
+        let pane = apply_capture_detection(&io, active, 1_000, 30);
+
+        assert_eq!(pane.status, "running");
+        assert_eq!(pane.wait_reason, "");
     }
 
     #[test]
