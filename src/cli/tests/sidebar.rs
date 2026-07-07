@@ -184,7 +184,16 @@ fn dispatch_sidebar_open_uses_layout_operations() {
         "",
     );
     mock.stub(
-        &["split-window", "-t", "@1", "-hbf", "-l", "40", &command],
+        &[
+            "split-window",
+            "-d",
+            "-t",
+            "@1",
+            "-hbf",
+            "-l",
+            "40",
+            &command,
+        ],
         "",
     );
     mock.stub(
@@ -204,7 +213,6 @@ fn dispatch_sidebar_open_uses_layout_operations() {
         ],
         "",
     );
-
     crate::cli::sidebar::run_sidebar_command_with_ensure(
         crate::cli::sidebar::SidebarCommand::Open {
             window: Some("@1".to_string()),
@@ -344,7 +352,16 @@ fn dispatch_sidebar_open_accepts_percent_width() {
         "",
     );
     mock.stub(
-        &["split-window", "-t", "@1", "-hbf", "-l", "64", &command],
+        &[
+            "split-window",
+            "-d",
+            "-t",
+            "@1",
+            "-hbf",
+            "-l",
+            "64",
+            &command,
+        ],
         "",
     );
 
@@ -413,7 +430,16 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
         "",
     );
     mock.stub(
-        &["split-window", "-t", "@1", "-hbf", "-l", "40", &command],
+        &[
+            "split-window",
+            "-d",
+            "-t",
+            "@1",
+            "-hbf",
+            "-l",
+            "40",
+            &command,
+        ],
         "",
     );
     mock.stub(
@@ -433,6 +459,22 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
         ],
         "",
     );
+    mock.stub(
+        &[
+            "set-hook",
+            "-g",
+            "pane-exited[90]",
+            &format!(
+                "run-shell {}",
+                shell_quote_for_test(&format!(
+                    "{} sidebar layout-changed --window {}",
+                    shell_quote_for_test(&exe.display().to_string()),
+                    shell_quote_for_test("#{window_id}"),
+                ))
+            ),
+        ],
+        "",
+    );
 
     crate::cli::sidebar::run_sidebar_command_with_ensure(
         crate::cli::sidebar::SidebarCommand::Toggle {
@@ -447,7 +489,7 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 9);
+    assert_eq!(mock.calls().len(), 10);
 }
 
 #[test]
@@ -631,7 +673,16 @@ fn sidebar_layout_applied_ensures_daemon_started() {
         "",
     );
     mock.stub(
-        &["split-window", "-t", "@1", "-hbf", "-l", "40", &command],
+        &[
+            "split-window",
+            "-d",
+            "-t",
+            "@1",
+            "-hbf",
+            "-l",
+            "40",
+            &command,
+        ],
         "",
     );
     let called = Cell::new(false);
@@ -653,6 +704,68 @@ fn sidebar_layout_applied_ensures_daemon_started() {
 
     assert!(called.get());
     assert_eq!(mock.calls().len(), 8);
+}
+
+#[test]
+fn sidebar_layout_changed_closes_lonely_sidebar_without_starting_daemon() {
+    use std::cell::Cell;
+
+    let mock = MockTmuxRunner::new();
+    mock.stub(&["display-message", "-p", "#{window_id}"], "@1\n");
+    mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%9\n");
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@1",
+            "-F",
+            crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+        ],
+        "%9\t1\t40\n",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-w",
+            "-u",
+            "-t",
+            "@1",
+            crate::options::KEY_LAYOUT_BASELINE,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-w",
+            "-u",
+            "-t",
+            "@1",
+            crate::options::KEY_LAYOUT_PANES,
+        ],
+        "",
+    );
+    mock.stub(&["kill-pane", "-t", "%9"], "");
+    let called = Cell::new(false);
+
+    crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::LayoutChanged { window: None },
+        &mock,
+        &env(),
+        &crate::config::Config::default(),
+        |_| {
+            called.set(true);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert!(!called.get());
+    assert!(mock.calls().contains(&vec![
+        "kill-pane".to_string(),
+        "-t".to_string(),
+        "%9".to_string(),
+    ]));
 }
 
 fn shell_quote_for_test(value: &str) -> String {

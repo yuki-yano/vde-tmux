@@ -61,6 +61,11 @@ pub(crate) enum SidebarCommand {
         #[arg(long, value_parser = parse_sidebar_width)]
         width: Option<SidebarWidth>,
     },
+    #[command(name = "layout-changed")]
+    LayoutChanged {
+        #[arg(long)]
+        window: Option<String>,
+    },
     Jump {
         pane: String,
     },
@@ -190,6 +195,11 @@ where
                 width.unwrap_or(config.sidebar.width),
                 config.sidebar.min_width,
             )?;
+            Ok(None)
+        }
+        SidebarCommand::LayoutChanged { window } => {
+            let target = resolve_window_target(runner, window)?;
+            crate::sidebar::layout::layout_changed(runner, &target)?;
             Ok(None)
         }
         SidebarCommand::Jump { pane } => {
