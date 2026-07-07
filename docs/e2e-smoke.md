@@ -221,7 +221,7 @@ M6 runtime smoke ok
 - `vt sidebar open` で daemon subscribe TUI を開き、header の現在値表示(` repo · all`)を確認する。
 - `v` で `category` に切り替わることを確認する。
 - `Tab` で `attention` filter に切り替わり、attention 不要な idle pane が消えることを確認する。
-- Chat 行で `Space` を押し、chat 行が `${agent}: ${state} · ${time}` になり、prompt と場所行(`session · %pane`)の Detail 行が出ることを確認する。
+- Chat 行で `Space` を押し、chat 行の左側が `${agent}: ${state}` になり、時間が同じ行の右端に揃い、prompt と場所行(`session · %pane`)の Detail 行が出ることを確認する。
 - `p` または Detail 行クリックで preview が floating pane として開くことを確認する。
 
 ### Sidebar header rich smoke
@@ -545,9 +545,9 @@ scratch=plan24-installed-binary
 checked=rtk cargo fmt --check && rtk cargo clippy --all-targets && rtk cargo test passed
 checked=rtk cargo install --path . --force replaced vt and vde-tmux
 checked=branch default Indexed 73 and colors.branch override path covered by sidebar::render::tests::branch_defaults_to_muted_cyan / repo_branch_is_rendered_in_branch_color
-checked=expanded chat row state/time label and right-label suppression covered by sidebar::tree::tests::expanded_chat_row_shows_agent_state_and_time and sidebar::render::tests::expanded_chat_row_suppresses_right_label
-checked=expanded chat row carries state/time, detail state row is omitted, place row remains, state idle done {t} ago, blocked wait_reason, and completed_at missing omission covered by sidebar::tree detail/state_line tests
-checked=expanded chat row colors state/context in label, covered by sidebar::render::tests::expanded_chat_row_colors_status_and_context_in_label
+checked=expanded chat row state label and right-aligned time covered by sidebar::tree::tests::expanded_chat_row_shows_agent_state_without_inline_time and sidebar::render::tests::expanded_chat_row_uses_full_elapsed_right_label
+checked=expanded chat row carries state, detail state row is omitted, place row remains, expanded idle done {t} ago, blocked wait_reason, and completed_at missing omission covered by sidebar::tree detail/state_line tests
+checked=expanded chat row colors state/context in label and keeps time in the right column, covered by sidebar::render::tests::expanded_chat_row_colors_status_and_context_in_label
 checked=Enter on selected detail row still previews parent pane via daemon::runtime::tests::enter_on_detail_returns_preview_effect
 result=Plan 24 sidebar detail view smoke ok
 ```

@@ -1230,7 +1230,7 @@ fn right_label(row: &SidebarRow) -> Option<String> {
         }
         SidebarRowKind::Chat => {
             if row.expanded {
-                return None;
+                return expanded_chat_right_label(row);
             }
             match row.rollup {
                 RollupLevel::Error => Some("err".to_string()),
@@ -1257,10 +1257,32 @@ fn elapsed_label(secs: i64) -> String {
     crate::sidebar::tree::humanize_secs(secs)
 }
 
+fn elapsed_full_label(secs: i64) -> String {
+    crate::sidebar::tree::humanize_secs_full(secs)
+}
+
+fn expanded_chat_right_label(row: &SidebarRow) -> Option<String> {
+    match row.badge_state? {
+        BadgeState::Blocked | BadgeState::Working => row
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.elapsed_secs)
+            .map(elapsed_full_label),
+        BadgeState::Done | BadgeState::Idle => row
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.completed_age_secs)
+            .map(|secs| format!("done {} ago", elapsed_label(secs))),
+    }
+}
+
 fn right_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
     match row.kind {
         SidebarRowKind::Category | SidebarRowKind::Repo => {
             Style::default().fg(theme.badge_color(BadgeState::Blocked))
+        }
+        SidebarRowKind::Chat if row.expanded && right_label(row).is_some() => {
+            Style::default().fg(theme.detail)
         }
         SidebarRowKind::Chat
             if row.badge_state == Some(BadgeState::Done)
@@ -2526,17 +2548,20 @@ sidebar:
             "chat::%1",
             SidebarRowKind::Chat,
             0,
-            "codex: running · 12m",
+            "codex: running",
             RollupLevel::Running,
         );
         chat.badge_state = Some(BadgeState::Working);
         chat.expanded = true;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
+            elapsed_secs: Some(720),
             ..Default::default()
         });
         let theme = SidebarRenderTheme::default();
 
+        assert_eq!(right_label(&chat).as_deref(), Some("12m 00s"));
+        assert_eq!(right_style(&chat, &theme).fg, Some(theme.detail));
         let lines = render_lines(&[chat], &SidebarState::default(), 40, &theme);
         let chat_spans = &lines[0].spans;
 
@@ -2550,7 +2575,7 @@ sidebar:
         );
         assert_span_fg(chat_spans, ": ", Color::Reset);
         assert_span_fg(chat_spans, "running", theme.running);
-        assert_span_fg(chat_spans, " · 12m", theme.detail);
+        assert!(line_to_string(lines[0].clone()).ends_with("12m 00s "));
     }
 
     #[test]
@@ -2559,22 +2584,50 @@ sidebar:
             "chat::%1",
             SidebarRowKind::Chat,
             0,
-            "codex: waiting (permission_prompt) · 2m 00s",
+            "codex: waiting (permission_prompt)",
             RollupLevel::Permission,
         );
         chat.badge_state = Some(BadgeState::Blocked);
         chat.expanded = true;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
+            elapsed_secs: Some(120),
             ..Default::default()
         });
         let theme = SidebarRenderTheme::default();
 
+        assert_eq!(right_label(&chat).as_deref(), Some("2m 00s"));
         let lines = render_lines(&[chat], &SidebarState::default(), 60, &theme);
         let chat_spans = &lines[0].spans;
 
         assert_span_fg(chat_spans, "waiting", theme.permission);
-        assert_span_fg(chat_spans, " (permission_prompt) · 2m 00s", theme.detail);
+        assert_span_fg(chat_spans, " (permission_prompt)", theme.detail);
+        assert!(line_to_string(lines[0].clone()).ends_with("2m 00s "));
+    }
+
+    #[test]
+    fn expanded_idle_chat_row_right_aligns_completed_age() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: idle",
+            RollupLevel::Idle,
+        );
+        chat.badge_state = Some(BadgeState::Idle);
+        chat.expanded = true;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            completed_age_secs: Some(815),
+            ..Default::default()
+        });
+        let theme = SidebarRenderTheme::default();
+
+        assert_eq!(right_label(&chat).as_deref(), Some("done 13m ago"));
+        assert_eq!(right_style(&chat, &theme).fg, Some(theme.detail));
+
+        let rendered = render_rows(&[chat], &SidebarState::default(), 32);
+        assert!(rendered.ends_with("done 13m ago "), "{rendered:?}");
     }
 
     #[test]
@@ -2815,7 +2868,7 @@ badge:
     }
 
     #[test]
-    fn expanded_chat_row_suppresses_right_label() {
+    fn expanded_chat_row_uses_full_elapsed_right_label() {
         let mut chat = row(
             "chat::%1",
             SidebarRowKind::Chat,
@@ -2834,7 +2887,11 @@ badge:
 
         chat.expanded = true;
 
-        assert_eq!(right_label(&chat), None);
+        assert_eq!(right_label(&chat).as_deref(), Some("13m 00s"));
+        assert_eq!(
+            right_style(&chat, &SidebarRenderTheme::default()).fg,
+            Some(SidebarRenderTheme::default().detail)
+        );
     }
 
     #[test]

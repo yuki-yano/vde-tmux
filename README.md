@@ -180,9 +180,9 @@ filter 適用中に rows が空になっても header は残り、rows 領域に
 
 ## Sidebar Detail View
 
-sidebar の Standard 幅で chat 行を展開すると、chat 行自体は `${agent}: ${state} · ${time}` を表示し、右ラベルは出さない。prompt は展開内の先頭 detail 行に集約する。
+sidebar の Standard 幅で chat 行を展開すると、左側は `${agent}: ${state}` を表示し、時間は同じ行の右端カラムに揃えて表示する。prompt は展開内の先頭 detail 行に集約する。
 
-展開メタは `prompt 行 + 場所行` を表示し、state 情報は親 chat 行に集約する。状態部分は状態色、wait reason や時間は detail 色で表示する。場所行は `vde-tmux · %51` の形式で session と pane id を detail 色で表示する。
+展開メタは `prompt 行 + 場所行` を表示し、state 情報は親 chat 行に集約する。状態部分は状態色、wait reason や右端の時間は detail 色で表示する。場所行は `vde-tmux · %51` の形式で session と pane id を detail 色で表示する。
 
 時間表記は `45s` / `12m` / `1h30m` / `38h` / `2d` のように humanize する。running / blocked は `started_at` からの経過、idle / done は `completed_at` からの `done {t} ago` を表示し、`completed_at` が無い idle は時間部を省略する。
 

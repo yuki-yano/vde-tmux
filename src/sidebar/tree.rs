@@ -465,7 +465,7 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
             kind: SidebarRowKind::Chat,
             depth: 1,
             label: if expanded {
-                expanded_chat_label(pane, now)
+                expanded_chat_label(pane)
             } else {
                 format!("{} · {}", pane.agent, pane.repo)
             },
@@ -509,7 +509,7 @@ fn push_chat_row(
     let expanded = state.is_expanded_with_default(&id, false);
     let meta = chat_meta(pane, now);
     let label = if expanded {
-        expanded_chat_label(pane, now)
+        expanded_chat_label(pane)
     } else {
         chat_label(pane)
     };
@@ -591,34 +591,16 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
     });
 }
 
-fn expanded_chat_label(pane: &AgentPane, now: i64) -> String {
-    format!("{}: {}", pane.agent, state_summary_label(pane, now))
+fn expanded_chat_label(pane: &AgentPane) -> String {
+    format!("{}: {}", pane.agent, state_context_label(pane))
 }
 
-fn state_summary_label(pane: &AgentPane, now: i64) -> String {
+fn state_context_label(pane: &AgentPane) -> String {
     let mut state = status_label(&pane.status).to_string();
     if let Some(wait_reason) = non_empty(&pane.wait_reason) {
         state.push_str(&format!(" ({wait_reason})"));
     }
-    if let Some(time) = state_time_label(pane, now) {
-        state.push_str(&format!(" · {time}"));
-    }
     state
-}
-
-/// 状態行の時間部。blocked/working は started_at からの経過、
-/// idle(done 含む)は completed_at からの `done {t} ago`。不明なら None。
-fn state_time_label(pane: &AgentPane, now: i64) -> Option<String> {
-    match pane.badge_state {
-        BadgeState::Blocked | BadgeState::Working => {
-            let started_at = pane.started_at.parse::<i64>().ok()?;
-            Some(humanize_secs_full(now - started_at))
-        }
-        BadgeState::Done | BadgeState::Idle => {
-            let completed_at = pane.completed_at.parse::<i64>().ok()?;
-            Some(format!("done {} ago", humanize_secs(now - completed_at)))
-        }
-    }
 }
 
 fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
@@ -1392,8 +1374,7 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .any(|row| row.kind == SidebarRowKind::Chat
-                    && row.label == "codex: running · 1m 15s")
+                .any(|row| row.kind == SidebarRowKind::Chat && row.label == "codex: running")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%5::state"));
         assert!(
@@ -1404,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_chat_row_shows_agent_state_and_time() {
+    fn expanded_chat_row_shows_agent_state_without_inline_time() {
         let mut agent = pane("main", "%1", "/tmp/app", "claude", "running");
         agent.prompt = "review the long plan".to_string();
         agent.started_at = "925".to_string();
@@ -1432,7 +1413,7 @@ mod tests {
             .find(|row| row.id == "chat::%1")
             .expect("expanded chat row");
 
-        assert_eq!(expanded_chat.label, "claude: running · 1m 15s");
+        assert_eq!(expanded_chat.label, "claude: running");
 
         let triage_ctx = RowBuildContext {
             triage: BTreeSet::from(["%1".to_string()]),
@@ -1445,7 +1426,7 @@ mod tests {
             .find(|row| row.id == "chat::%1")
             .expect("triage chat row");
 
-        assert_eq!(triage_chat.label, "claude: running · 1m 15s");
+        assert_eq!(triage_chat.label, "claude: running");
     }
 
     #[test]
@@ -1507,7 +1488,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex: running · 12m 00s")
+            Some("codex: running")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
         assert_eq!(
@@ -1539,7 +1520,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex: idle · done 38h ago")
+            Some("codex: idle")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
 
@@ -1577,7 +1558,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex: waiting (permission_prompt) · 2m 00s")
+            Some("codex: waiting (permission_prompt)")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
     }
@@ -1602,7 +1583,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex: running · 12m 00s")
+            Some("codex: running")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
 
@@ -1617,7 +1598,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%2")
                 .map(|row| row.label.as_str()),
-            Some("claude: running · 12m 00s")
+            Some("claude: running")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%2::state"));
     }
