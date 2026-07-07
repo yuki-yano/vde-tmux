@@ -33,9 +33,7 @@ vde-tmux watches all agent panes and answers one question at a glance: **which p
 ## Installation
 
 ```bash
-git clone https://github.com/yuki-yano/vde-tmux
-cd vde-tmux
-cargo install --path .
+cargo install --git https://github.com/yuki-yano/vde-tmux vde-tmux
 ```
 
 This installs two binaries that provide the identical CLI:

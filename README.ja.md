@@ -35,9 +35,7 @@ vde-tmux はすべての agent pane を監視し、**いまどの pane が自分
 ## インストール
 
 ```bash
-git clone https://github.com/yuki-yano/vde-tmux
-cd vde-tmux
-cargo install --path .
+cargo install --git https://github.com/yuki-yano/vde-tmux vde-tmux
 ```
 
 同一の CLI を提供する 2 つのバイナリがインストールされる。
