@@ -224,6 +224,28 @@ M6 runtime smoke ok
 - Chat 行で `Space` を押し、状態行(`state running · ...`)と場所行(`session · %pane`)の Detail 行が出ることを確認する。
 - `p` または Detail 行クリックで preview が floating pane として開くことを確認する。
 
+### Sidebar header rich smoke
+
+Plan 26 の header 表示は `docs/sidebar-header-proposals.html` の状態 1〜3 と照合する。
+TUI の alt-screen capture が安定しない場合は目視確認を優先し、filter/count 遷移は daemon snapshot と unit test で補助確認する。
+
+確認手順:
+
+- `vt hook emit` で blocked 1 / working 1 / idle 5 相当の agent pane を作り、sidebar を開く。
+- 状態 1: `all` filter で 1 行目が `≣ category  7 tasks `、2 行目が `≡ all 7  ▲ 1  ● 1  ✓ 0  ○ 5` 相当であることを確認する。
+- `▲ 1` chip をクリックし、状態 2: attn filter に切り替わり、他状態の件数が filter 前のまま残ることを確認する。
+- `✓ 0` chip をクリックしても filter が変わらないことを確認する。
+- `Tab` を押し、0件の done をスキップして次の非0 filter に進むことを確認する。
+- attn filter 適用中に blocked pane を working/idle へ遷移させ、状態 3: header が残り、active chip が `▲ 0` の反転表示を維持し、rows 領域に `no attn agents` と `tab: next filter · click ≡ all to reset` が出ることを確認する。
+- 空状態で `≡ all` chip をクリックし、all filter に戻って rows が再表示されることを確認する。
+- `sidebar.header.suffix: ""` の scratch config で再起動し、1 行目から powerline 矢印が消えることを確認する。
+
+実施メモ(2026-07-07):
+
+- scratch tmux + isolated daemon/config/state で確認。header/rows の capture を安定させるため `sidebar.live.enabled: false` を scratch config に設定し、`sidebar attach` pane へ `VDE_TMUX_SOCKET_NAME` / `VDE_DAEMON_SOCKET` / `XDG_STATE_HOME` / `XDG_CONFIG_HOME` を明示して起動した。
+- 初期状態: counts `total=7, blocked=1, working=1, done=0, idle=5`、1 行目に `≣ category` / `7 tasks` / ``、2 行目に `≡ all 7  ▲ 1  ● 1  ✓ 0  ○ 5` を確認。
+- attn filter、0 件 done no-op、`tab` の done skip、attn 空状態(`▲ 0` + `no attn agents` + 復帰ヒント)、all 復帰、`suffix: ""` の矢印なしを確認。
+
 ## Session Manager popup
 
 本番 tmux server は使わず、scratch server だけを使う。

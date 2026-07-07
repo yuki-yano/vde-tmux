@@ -24,7 +24,10 @@ pub struct SidebarRenderTheme {
     pub header_active_fg: Option<Color>,
     pub header_active_bold: bool,
     pub header_badge_fg: Color,
-    pub header_powerline: bool,
+    pub header_format: String,
+    pub header_prefix: String,
+    pub header_suffix: String,
+    pub header_outer_bg: Option<Color>,
     pub badge_glyphs: crate::config::BadgeGlyphs,
     pub badge_blocked: Color,
     pub badge_working: Color,
@@ -72,7 +75,10 @@ impl Default for SidebarRenderTheme {
             header_active_fg: None,
             header_active_bold: false,
             header_badge_fg: Color::Indexed(16),
-            header_powerline: true,
+            header_format: " {label} ".to_string(),
+            header_prefix: String::new(),
+            header_suffix: POWERLINE_ARROW.to_string(),
+            header_outer_bg: Some(Color::Indexed(235)),
             badge_glyphs: crate::config::BadgeGlyphs::default(),
             badge_blocked: Color::Red,
             badge_working: Color::Green,
@@ -108,7 +114,10 @@ impl SidebarRenderTheme {
             header_active_fg: parse_color(config.header_active_fg.as_deref()),
             header_active_bold: default.header_active_bold,
             header_badge_fg: default.header_badge_fg,
-            header_powerline: default.header_powerline,
+            header_format: default.header_format,
+            header_prefix: default.header_prefix,
+            header_suffix: default.header_suffix,
+            header_outer_bg: default.header_outer_bg,
             badge_glyphs: default.badge_glyphs,
             // badge の色は from_app_config で共通の badge.colors から設定する。
             // ここ(sidebar.colors 単体)では ANSI 既定のままにしておく。
@@ -135,8 +144,12 @@ impl SidebarRenderTheme {
             parse_color(config.header.colors.fg.as_deref()).or(theme.header_active_fg);
         theme.header_active_bg =
             parse_color(config.header.colors.bg.as_deref()).or(theme.header_active_bg);
+        theme.header_outer_bg =
+            parse_color(config.header.colors.outer_bg.as_deref()).or(theme.header_outer_bg);
         theme.header_active_bold = config.header.bold;
-        theme.header_powerline = config.header.powerline;
+        theme.header_format = config.header.format.clone();
+        theme.header_prefix = config.header.prefix.clone();
+        theme.header_suffix = config.header.suffix.clone();
         theme
     }
 
@@ -270,13 +283,12 @@ fn build_header_title_line(
     theme: &SidebarRenderTheme,
     counts: BadgeCounts,
 ) -> HeaderLine {
-    let mode_text = format!(" ≣ {} ", view_mode_label_padded(state.view_mode));
+    let mode_body = format_header_mode_body(state.view_mode, theme);
+    let mode_text = format!("{}{}", theme.header_prefix, mode_body);
+    let mode_suffix = theme.header_suffix.as_str();
     let total_text = format!(" {} tasks ", counts.total);
-    let full_text = if theme.header_powerline {
-        format!("{mode_text}{POWERLINE_ARROW}{total_text}{POWERLINE_ARROW}")
-    } else {
-        format!("{mode_text}{total_text}")
-    };
+    let total_suffix = header_total_suffix(theme);
+    let full_text = format!("{mode_text}{mode_suffix}{total_text}{total_suffix}");
     let include_total = display_width(&full_text) <= width;
     let text = if include_total {
         full_text.clone()
@@ -297,15 +309,20 @@ fn build_header_title_line(
     }
 
     let mut start = mode_len;
-    if include_total && theme.header_powerline {
-        if let Some(range) = visible_segment_range(&text, start, 1) {
+    if include_total && !mode_suffix.is_empty() {
+        let suffix_len = display_width(mode_suffix);
+        if let Some(range) = visible_segment_range(&text, start, suffix_len) {
             segments.push(HeaderSegment {
                 range,
                 action: None,
-                style: Some(Style::default().fg(mode_bg(theme)).bg(theme.active_bg)),
+                style: Some(
+                    Style::default()
+                        .fg(mode_bg(theme))
+                        .bg(header_outer_bg(theme)),
+                ),
             });
         }
-        start += 1;
+        start += suffix_len;
     }
     if include_total {
         let total_len = display_width(&total_text);
@@ -318,17 +335,37 @@ fn build_header_title_line(
         }
         start += total_len;
     }
-    if include_total && theme.header_powerline {
-        if let Some(range) = visible_segment_range(&text, start, 1) {
-            segments.push(HeaderSegment {
-                range,
-                action: None,
-                style: Some(Style::default().fg(theme.active_bg)),
-            });
-        }
+    if include_total
+        && !total_suffix.is_empty()
+        && let Some(range) = visible_segment_range(&text, start, display_width(total_suffix))
+    {
+        segments.push(HeaderSegment {
+            range,
+            action: None,
+            style: Some(Style::default().fg(theme.active_bg)),
+        });
     }
 
     HeaderLine { text, segments }
+}
+
+fn format_header_mode_body(view_mode: ViewMode, theme: &SidebarRenderTheme) -> String {
+    let mode = view_mode_label(view_mode);
+    let mode_padded = view_mode_label_padded(view_mode);
+    let label = format!("≣ {mode_padded}");
+    theme
+        .header_format
+        .replace("{label}", &label)
+        .replace("{mode_padded}", &mode_padded)
+        .replace("{mode}", mode)
+}
+
+fn header_total_suffix(theme: &SidebarRenderTheme) -> &str {
+    if theme.header_suffix == POWERLINE_ARROW {
+        POWERLINE_ARROW
+    } else {
+        ""
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -378,7 +415,7 @@ fn build_header_chip_line(
         },
     ];
 
-    let labels = specs.map(|spec| chip_label(spec));
+    let labels = specs.map(chip_label);
     let full_text = labels.join("");
     let text = truncate_display(&full_text, width);
     let mut segments = Vec::new();
@@ -511,6 +548,10 @@ fn mode_fg(theme: &SidebarRenderTheme) -> Color {
 
 fn mode_bg(theme: &SidebarRenderTheme) -> Color {
     theme.header_active_bg.unwrap_or(theme.header_mode)
+}
+
+fn header_outer_bg(theme: &SidebarRenderTheme) -> Color {
+    theme.header_outer_bg.unwrap_or(theme.active_bg)
 }
 
 fn header_segment_style(theme: &SidebarRenderTheme) -> Style {
@@ -2108,12 +2149,12 @@ mod tests {
     }
 
     #[test]
-    fn header_powerline_can_be_disabled() {
+    fn header_suffix_can_remove_powerline_arrow() {
         let config = serde_yaml_ng::from_str::<crate::config::Config>(
             r##"
 sidebar:
   header:
-    powerline: false
+    suffix: ""
 "##,
         )
         .unwrap();
@@ -2125,7 +2166,7 @@ sidebar:
             rich_header_counts(),
         );
 
-        assert!(!theme.header_powerline);
+        assert_eq!(theme.header_suffix, "");
         assert!(!header.lines[0].text.contains('\u{e0b0}'));
         assert_eq!(header.lines[0].text, " ≣ repo      7 tasks ");
     }
@@ -2153,7 +2194,11 @@ sidebar:
             rich_header_counts(),
         );
         assert!(display_width(&narrow.lines[0].text) <= 6);
-        assert!(narrow.lines[0].text.ends_with('…'), "{:?}", narrow.lines[0].text);
+        assert!(
+            narrow.lines[0].text.ends_with('…'),
+            "{:?}",
+            narrow.lines[0].text
+        );
     }
 
     #[test]
@@ -2162,10 +2207,14 @@ sidebar:
             r##"
 sidebar:
   header:
+    format: " {label} "
+    prefix: "["
+    suffix: "]"
     bold: true
     colors:
       fg: white
       bg: "24"
+      outer_bg: "235"
 "##,
         )
         .unwrap();
@@ -2175,10 +2224,14 @@ sidebar:
         let header = build_header_layout_with_counts(&state, 80, &theme, rich_header_counts());
         let lines = render_header_lines(&header, &theme);
         let mode = style_for_segment(&header, 0, "≣ repo");
+        let suffix = style_for_segment(&header, 0, "]");
 
+        assert_eq!(header.lines[0].text, "[ ≣ repo     ] 7 tasks ");
         assert_eq!(mode.fg, Some(Color::White));
         assert_eq!(mode.bg, Some(Color::Indexed(24)));
         assert!(mode.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(suffix.fg, Some(Color::Indexed(24)));
+        assert_eq!(suffix.bg, Some(Color::Indexed(235)));
         assert_eq!(lines[0].spans[0].style, mode);
     }
 

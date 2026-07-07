@@ -39,6 +39,7 @@ pub enum QueryTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum ServerMessage {
     Summary { text: String },
     Attention { text: String },

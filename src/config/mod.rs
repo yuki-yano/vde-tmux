@@ -411,7 +411,9 @@ pub struct SidebarColorsConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SidebarHeaderConfig {
-    pub powerline: bool,
+    pub format: String,
+    pub prefix: String,
+    pub suffix: String,
     pub bold: bool,
     pub colors: SegmentColors,
 }
@@ -419,9 +421,15 @@ pub struct SidebarHeaderConfig {
 impl Default for SidebarHeaderConfig {
     fn default() -> Self {
         Self {
-            powerline: true,
-            bold: false,
-            colors: SegmentColors::default(),
+            format: " {label} ".to_string(),
+            prefix: String::new(),
+            suffix: "\u{e0b0}".to_string(),
+            bold: true,
+            colors: SegmentColors {
+                fg: Some("16".to_string()),
+                bg: Some("147".to_string()),
+                outer_bg: Some("235".to_string()),
+            },
         }
     }
 }
@@ -636,24 +644,33 @@ mod tests {
             r##"
 sidebar:
   header:
-    powerline: false
+    format: " {label} "
+    prefix: "["
+    suffix: "]"
     bold: true
     colors:
       fg: white
       bg: "24"
+      outer_bg: "235"
 "##,
         )
         .unwrap();
 
-        assert!(!config.sidebar.header.powerline);
+        assert_eq!(config.sidebar.header.format, " {label} ");
+        assert_eq!(config.sidebar.header.prefix, "[");
+        assert_eq!(config.sidebar.header.suffix, "]");
         assert!(config.sidebar.header.bold);
         assert_eq!(config.sidebar.header.colors.fg.as_deref(), Some("white"));
         assert_eq!(config.sidebar.header.colors.bg.as_deref(), Some("24"));
+        assert_eq!(
+            config.sidebar.header.colors.outer_bg.as_deref(),
+            Some("235")
+        );
     }
 
     #[test]
-    fn sidebar_header_rejects_removed_format_keys() {
-        for key in ["format", "prefix", "suffix", "separator"] {
+    fn sidebar_header_rejects_removed_keys() {
+        for key in ["powerline", "separator"] {
             let yaml = format!("sidebar:\n  header:\n    {key}: x\n");
             let err = serde_yaml_ng::from_str::<Config>(&yaml).unwrap_err();
 

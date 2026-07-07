@@ -512,12 +512,7 @@ fn draw_snapshot_in_area(
         draw_placeholder(frame, area, "no sidebar data");
         return;
     };
-    let header = build_header_layout_with_counts(
-        &sidebar.state,
-        area.width,
-        theme,
-        sidebar.counts,
-    );
+    let header = build_header_layout_with_counts(&sidebar.state, area.width, theme, sidebar.counts);
     let live_lines = live.map(|live| live.requested_lines).unwrap_or(0);
     let areas = compute_areas(area, &header, live_lines);
     if areas.header_rows > 0 {
@@ -985,12 +980,8 @@ fn handle_left_click(
         return Ok(());
     };
     let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-    let header = build_header_layout_with_counts(
-        &sidebar.state,
-        width,
-        context.theme,
-        sidebar.counts,
-    );
+    let header =
+        build_header_layout_with_counts(&sidebar.state, width, context.theme, sidebar.counts);
     if row < header.row_count() {
         match header_hit_test(&header, row, column) {
             Some(HeaderAction::CycleViewMode) => {

@@ -59,17 +59,14 @@ sidebar:
     lines: 3
     interval_ms: 2000
   header:
-    format: "{label} "
-    separator: ""
-    # pill 風にしたい場合:
-    # prefix: "["
-    # suffix: "]"
-    # format: " {label} "
-    # separator: " "
-    # bold: true
-    # colors:
-    #   fg: white
-    #   bg: "24"
+    format: " {label} "
+    prefix: ""
+    suffix: ""
+    bold: true
+    colors:
+      fg: "16"
+      bg: "147"
+      outer_bg: "235"
   colors:
     running: green
     waiting: yellow
@@ -158,9 +155,28 @@ set -g window-status-activity-style 'fg=#ff6b6b'
 ```
 
 塗りは矩形で使う。
-powerline キャップを `prefix` / `suffix` に設定すると、外置きグリフとカプセル形状が視覚的に衝突する。
 breadcrumb 等でバーの下に別の面を重ねている場合、その地色を `#121218` 目安まで一段暗くしないとバー地 `#1a1926` と同化する。
 hex 色をそのまま使うには tmux の truecolor 設定が必要になる。
+
+## Sidebar Header
+
+sidebar header は 2 行構成で表示する。
+1 行目は `≣ repo      7 tasks ` のような mode badge と総数セグメント、2 行目は `≡ all 7  ▲ 1  ● 1  ✓ 0  ○ 5` の filter chip 列。
+
+chip は状態に応じて表示を分ける。
+アクティブ chip は状態色 bg + 暗色 fg + bold で反転し、適用中に 0 件になっても `▲ 0` の反転表示を維持する。
+非アクティブかつ非 0 件の chip は `active_bg` bg + 状態色 fg、0 件 chip は marker 色の dim 表示でクリック対象外。
+`all` は常に適用でき、`tab` filter cycle は 0 件状態をスキップする。
+
+件数は filter 適用前の全 agent pane から算出するため、filter 中も他状態の件数は変わらない。
+filter 適用中に rows が空になっても header は残り、rows 領域に `no attn agents` と `tab: next filter · click ≡ all to reset` を表示する。
+`all` filter で本当に 0 件のときは `no agents` のみ表示する。
+
+`sidebar.header` は statusline の segment と同じ考え方で、`format` / `prefix` / `suffix` / `bold` / `colors` を設定できる。
+`format` の `{label}` は `≣ repo` などの固定幅 mode label に置換される。
+既定の `suffix: ""` は mode badge と総数セグメントを powerline 表示にし、`suffix: ""` にすると矢印なしの矩形塗りになる。
+`colors.outer_bg` は suffix の遷移先背景色として使う。
+`sidebar.header.powerline` と `separator` は受け付けない。
 
 ## Sidebar Detail View
 

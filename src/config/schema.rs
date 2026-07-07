@@ -138,7 +138,9 @@ pub fn config_schema() -> Value {
                         "type": "object",
                         "additionalProperties": true,
                         "properties": {
-                            "powerline": { "type": "boolean" },
+                            "format": { "type": "string" },
+                            "prefix": { "type": "string" },
+                            "suffix": { "type": "string" },
                             "bold": { "type": "boolean" },
                             "colors": {
                                 "type": "object",
@@ -251,10 +253,10 @@ mod tests {
         let schema = config_schema();
         let header = &schema["properties"]["sidebar"]["properties"]["header"]["properties"];
 
-        assert_eq!(header["powerline"]["type"], "boolean");
-        assert!(header.get("format").is_none());
-        assert!(header.get("prefix").is_none());
-        assert!(header.get("suffix").is_none());
+        assert_eq!(header["format"]["type"], "string");
+        assert_eq!(header["prefix"]["type"], "string");
+        assert_eq!(header["suffix"]["type"], "string");
+        assert!(header.get("powerline").is_none());
         assert!(header.get("separator").is_none());
         assert_eq!(header["bold"]["type"], "boolean");
         assert_eq!(header["colors"]["type"], "object");
