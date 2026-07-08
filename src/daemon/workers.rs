@@ -19,6 +19,7 @@ pub trait WorkerIo: Send + Sync + 'static {
     fn capture_tail(&self, pane_id: &str) -> Result<String>;
     fn jump_to_pane(&self, pane_id: &str) -> Result<()>;
     fn preview_pane(&self, pane_id: &str, history_lines: u32) -> Result<()>;
+    fn set_pane_option(&self, pane_id: &str, key: &str, value: &str) -> Result<()>;
     fn unset_pane_option(&self, pane_id: &str, key: &str) -> Result<()>;
     fn set_session_option(&self, session: &str, key: &str, value: &str) -> Result<()>;
     fn unset_session_option(&self, session: &str, key: &str) -> Result<()>;
@@ -60,6 +61,10 @@ impl WorkerIo for SystemWorkerIo {
             pane_id,
             history_lines,
         )
+    }
+
+    fn set_pane_option(&self, pane_id: &str, key: &str, value: &str) -> Result<()> {
+        crate::options::set_pane_option(&self.runner, pane_id, key, value)
     }
 
     fn unset_pane_option(&self, pane_id: &str, key: &str) -> Result<()> {
@@ -407,6 +412,10 @@ mod tests {
         }
 
         fn preview_pane(&self, _pane_id: &str, _history_lines: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_pane_option(&self, _pane_id: &str, _key: &str, _value: &str) -> anyhow::Result<()> {
             Ok(())
         }
 

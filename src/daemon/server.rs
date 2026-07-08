@@ -465,6 +465,41 @@ fn handle_runtime_effects(
                     }
                 }
             }
+            RuntimeEffect::MarkPaneDone {
+                pane_id,
+                completed_at,
+            } => {
+                if let Err(error) =
+                    worker_io.set_pane_option(&pane_id, crate::options::KEY_STATUS, "idle")
+                {
+                    eprintln!("[vde-tmux] mark done status write failed: {pane_id}: {error:#}");
+                }
+                if let Err(error) =
+                    worker_io.set_pane_option(&pane_id, crate::options::KEY_ATTENTION, "1")
+                {
+                    eprintln!("[vde-tmux] mark done attention write failed: {pane_id}: {error:#}");
+                }
+                if let Err(error) = worker_io.set_pane_option(
+                    &pane_id,
+                    crate::options::KEY_COMPLETED_AT,
+                    &completed_at.to_string(),
+                ) {
+                    eprintln!(
+                        "[vde-tmux] mark done completed_at write failed: {pane_id}: {error:#}"
+                    );
+                }
+                for key in [
+                    crate::options::KEY_WAIT_REASON,
+                    crate::options::KEY_TASKS,
+                    crate::options::KEY_TASK_ITEMS,
+                    crate::options::KEY_TASK_ITEM_IDS,
+                    crate::options::KEY_SUBAGENTS,
+                ] {
+                    if let Err(error) = worker_io.unset_pane_option(&pane_id, key) {
+                        eprintln!("[vde-tmux] mark done unset failed: {pane_id} {key}: {error:#}");
+                    }
+                }
+            }
             RuntimeEffect::Heartbeat(epoch) => {
                 if let Err(error) =
                     worker_io.set_global_option(crate::options::KEY_HEARTBEAT, &epoch.to_string())
@@ -692,7 +727,7 @@ mod tests {
         panes: std::sync::Mutex<Vec<crate::options::snapshot::PaneSnapshot>>,
         jumps: std::sync::Mutex<Vec<String>>,
         previews: std::sync::Mutex<Vec<(String, u32)>>,
-        pane_options: std::sync::Mutex<Vec<(String, String)>>,
+        pane_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
         session_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
         global_options: std::sync::Mutex<Vec<(String, Option<String>)>>,
         notify_calls: std::sync::Mutex<Vec<(String, String, String, String)>>,
@@ -724,11 +759,20 @@ mod tests {
             Ok(())
         }
 
+        fn set_pane_option(&self, pane_id: &str, key: &str, value: &str) -> anyhow::Result<()> {
+            self.pane_options.lock().unwrap().push((
+                pane_id.to_string(),
+                key.to_string(),
+                Some(value.to_string()),
+            ));
+            Ok(())
+        }
+
         fn unset_pane_option(&self, pane_id: &str, key: &str) -> anyhow::Result<()> {
             self.pane_options
                 .lock()
                 .unwrap()
-                .push((pane_id.to_string(), key.to_string()));
+                .push((pane_id.to_string(), key.to_string(), None));
             Ok(())
         }
 
@@ -1062,8 +1106,70 @@ mod tests {
         let calls = io.pane_options.lock().unwrap().clone();
         let expected = crate::options::PANE_STATE_KEYS
             .iter()
-            .map(|key| ("%1".to_string(), (*key).to_string()))
+            .map(|key| ("%1".to_string(), (*key).to_string(), None))
             .collect::<Vec<_>>();
         assert_eq!(calls, expected);
+    }
+
+    #[test]
+    fn mark_pane_done_effect_sets_idle_and_resets_task_state() {
+        let io = LoopWorkerIo::default();
+
+        handle_runtime_effects(
+            vec![RuntimeEffect::MarkPaneDone {
+                pane_id: "%1".to_string(),
+                completed_at: 1234,
+            }],
+            None,
+            &io,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            io.pane_options.lock().unwrap().as_slice(),
+            &[
+                (
+                    "%1".to_string(),
+                    crate::options::KEY_STATUS.to_string(),
+                    Some("idle".to_string())
+                ),
+                (
+                    "%1".to_string(),
+                    crate::options::KEY_ATTENTION.to_string(),
+                    Some("1".to_string())
+                ),
+                (
+                    "%1".to_string(),
+                    crate::options::KEY_COMPLETED_AT.to_string(),
+                    Some("1234".to_string())
+                ),
+                (
+                    "%1".to_string(),
+                    crate::options::KEY_WAIT_REASON.to_string(),
+                    None
+                ),
+                (
+                    "%1".to_string(),
+                    crate::options::KEY_TASKS.to_string(),
+                    None
+                ),
+                (
+                    "%1".to_string(),
+                    crate::options::KEY_TASK_ITEMS.to_string(),
+                    None
+                ),
+                (
+                    "%1".to_string(),
+                    crate::options::KEY_TASK_ITEM_IDS.to_string(),
+                    None
+                ),
+                (
+                    "%1".to_string(),
+                    crate::options::KEY_SUBAGENTS.to_string(),
+                    None
+                ),
+            ]
+        );
     }
 }

@@ -26,7 +26,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use crate::config::{Config, SidebarLiveConfig};
 use crate::daemon::DaemonSnapshot;
 use crate::sidebar::client::{
-    send_sidebar_jump, send_sidebar_key, send_sidebar_toggle, socket_path, subscribe,
+    send_sidebar_jump, send_sidebar_key, send_sidebar_mark_done, send_sidebar_toggle, socket_path,
+    subscribe,
 };
 use crate::sidebar::preview::open_preview_floating_pane;
 use crate::sidebar::render::{
@@ -410,6 +411,7 @@ enum ClickAction {
     ToggleRow(String),
     PreviewPane(String),
     JumpPane(String),
+    MarkDone(String),
 }
 
 fn single_click_action(row: &ClickedRow) -> Option<ClickAction> {
@@ -1001,6 +1003,11 @@ fn handle_left_click(
                     dispatch_click_action(context, ClickAction::PreviewPane(pane_id));
                 }
             }
+            Some(JumpRowAction::MarkDone) => {
+                if let Some(pane_id) = clicked.pane_id.clone() {
+                    dispatch_click_action(context, ClickAction::MarkDone(pane_id));
+                }
+            }
             None => {}
         }
         return Ok(());
@@ -1026,6 +1033,9 @@ fn dispatch_click_action(context: &ClickContext<'_>, action: ClickAction) {
         }
         ClickAction::JumpPane(pane_id) => {
             send_sidebar_request(send_sidebar_jump(context.socket, &pane_id));
+        }
+        ClickAction::MarkDone(pane_id) => {
+            send_sidebar_request(send_sidebar_mark_done(context.socket, &pane_id));
         }
     }
 }
@@ -1616,6 +1626,88 @@ mod tests {
         handle_left_click(&context, &snapshot, 1, 1, 0).unwrap();
 
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "all");
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn mark_done_left_click_sends_sidebar_event() {
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/vt-mark-done-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let message: ClientMessage = serde_json::from_str(line.trim()).unwrap();
+            let ClientMessage::SidebarEvent {
+                event: SidebarClientEvent::MarkDone { pane },
+                ..
+            } = message
+            else {
+                panic!("unexpected message: {message:?}");
+            };
+            tx.send(pane).unwrap();
+            serde_json::to_writer(&mut stream, &ServerMessage::Ack).unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        let env = BTreeMap::new();
+        let runner = MockTmuxRunner::new();
+        let theme = SidebarRenderTheme::default();
+        let jump = SidebarRow {
+            id: "jump::%1".to_string(),
+            kind: SidebarRowKind::Jump,
+            depth: 2,
+            label: "jump".to_string(),
+            chat_count: 1,
+            rollup: RollupLevel::Running,
+            badge_state: None,
+            expanded: true,
+            pane_id: Some("%1".to_string()),
+            git: None,
+            active: false,
+            meta: None,
+        };
+        let column = (crate::sidebar::render::jump_row_action_start(&jump) + 8 + 11) as u16;
+        let snapshot = DaemonSnapshot {
+            agent_count: 1,
+            rollup: RollupLevel::Running,
+            panes: Vec::new(),
+            sidebar: Some(SidebarFrame {
+                state: SidebarState::default(),
+                counts: BadgeCounts::default(),
+                rows: vec![jump],
+            }),
+            events: Vec::new(),
+        };
+        let width = crossterm::terminal::size().unwrap_or((80, 24)).0;
+        let header = build_header_layout_with_counts(
+            &SidebarState::default(),
+            width,
+            &theme,
+            BadgeCounts::default(),
+        );
+        let context = ClickContext {
+            socket: &socket,
+            runner: &runner,
+            env: &env,
+            theme: &theme,
+            preview_history_lines: 2000,
+            live_lines: 0,
+        };
+
+        handle_left_click(&context, &snapshot, header.row_count(), column, 0).unwrap();
+
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "%1");
         handle.join().unwrap();
         let _ = std::fs::remove_file(socket);
     }

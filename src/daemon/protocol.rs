@@ -33,6 +33,9 @@ pub enum SidebarClientEvent {
     JumpPane {
         pane: String,
     },
+    MarkDone {
+        pane: String,
+    },
     SelectContext {
         pane: Option<String>,
         session: Option<String>,
@@ -117,6 +120,23 @@ mod tests {
         assert_eq!(
             json,
             r#"{"op":"sidebar_event","proto":1,"event":{"type":"key","key":"j"}}"#
+        );
+        let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn sidebar_event_roundtrips_mark_done() {
+        let message = ClientMessage::SidebarEvent {
+            proto: 1,
+            event: SidebarClientEvent::MarkDone {
+                pane: "%1".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            json,
+            r#"{"op":"sidebar_event","proto":1,"event":{"type":"mark_done","pane":"%1"}}"#
         );
         let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, message);

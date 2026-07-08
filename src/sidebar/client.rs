@@ -38,6 +38,18 @@ pub fn send_sidebar_jump(socket: &Path, pane: &str) -> Result<()> {
     )
 }
 
+pub fn send_sidebar_mark_done(socket: &Path, pane: &str) -> Result<()> {
+    request_ack(
+        socket,
+        ClientMessage::SidebarEvent {
+            proto: 1,
+            event: SidebarClientEvent::MarkDone {
+                pane: pane.to_string(),
+            },
+        },
+    )
+}
+
 pub fn send_sidebar_select_context(
     socket: &Path,
     pane: Option<&str>,

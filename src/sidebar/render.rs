@@ -50,6 +50,7 @@ pub struct SidebarRenderTheme {
 pub enum JumpRowAction {
     Jump,
     Preview,
+    MarkDone,
 }
 
 impl Default for SidebarRenderTheme {
@@ -1422,7 +1423,7 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
     }
 }
 
-const JUMP_ROW_LABEL: &str = "[↗ jump] [⌕ preview]";
+const JUMP_ROW_LABEL: &str = "[↗ Jump][⌕ Preview][✓ Mark Done]";
 const ACTION_JUMP_GLYPH: Color = Color::Indexed(73);
 const ACTION_PREVIEW_GLYPH: Color = ACTION_JUMP_GLYPH;
 
@@ -1435,12 +1436,15 @@ fn jump_action_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'stati
     vec![
         Span::styled("[".to_string(), bracket),
         Span::styled("↗".to_string(), Style::default().fg(ACTION_JUMP_GLYPH)),
-        Span::styled(" jump".to_string(), text),
+        Span::styled(" Jump".to_string(), text),
         Span::styled("]".to_string(), bracket),
-        Span::raw(" ".to_string()),
         Span::styled("[".to_string(), bracket),
         Span::styled("⌕".to_string(), Style::default().fg(ACTION_PREVIEW_GLYPH)),
-        Span::styled(" preview".to_string(), text),
+        Span::styled(" Preview".to_string(), text),
+        Span::styled("]".to_string(), bracket),
+        Span::styled("[".to_string(), bracket),
+        Span::styled("✓".to_string(), Style::default().fg(theme.badge_done)),
+        Span::styled(" Mark Done".to_string(), text),
         Span::styled("]".to_string(), bracket),
     ]
 }
@@ -1472,6 +1476,13 @@ fn action_label_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'stat
                     Style::default().fg(ACTION_PREVIEW_GLYPH),
                 ));
             }
+            '✓' => {
+                flush_text(&mut spans, &mut text);
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(theme.badge_done),
+                ));
+            }
             '[' | ']' => {
                 flush_text(&mut spans, &mut text);
                 spans.push(Span::styled(
@@ -1490,18 +1501,26 @@ pub fn jump_row_action_at(row: &SidebarRow, column: u16) -> Option<JumpRowAction
     if row.kind != SidebarRowKind::Jump {
         return None;
     }
-    let jump_start = 1 + 2 * row.depth;
+    let jump_start = jump_row_action_start(row);
     let jump_end = jump_start + 8;
-    let preview_start = jump_end + 1;
+    let preview_start = jump_end;
     let preview_end = preview_start + 11;
+    let mark_done_start = preview_end;
+    let mark_done_end = mark_done_start + 13;
     let column = column as usize;
     if (jump_start..jump_end).contains(&column) {
         Some(JumpRowAction::Jump)
     } else if (preview_start..preview_end).contains(&column) {
         Some(JumpRowAction::Preview)
+    } else if (mark_done_start..mark_done_end).contains(&column) {
+        Some(JumpRowAction::MarkDone)
     } else {
         None
     }
+}
+
+pub fn jump_row_action_start(row: &SidebarRow) -> usize {
+    3 + 2 * row.depth
 }
 
 fn line_to_string(line: Line<'_>) -> String {
@@ -2205,7 +2224,7 @@ mod tests {
     }
 
     #[test]
-    fn jump_row_renders_two_action_buttons() {
+    fn jump_row_renders_action_buttons() {
         let jump = row(
             "jump::%1",
             SidebarRowKind::Jump,
@@ -2217,12 +2236,12 @@ mod tests {
         let rendered = render_rows(std::slice::from_ref(&jump), &SidebarState::default(), 40);
 
         assert!(
-            rendered.starts_with("     └ [↗ jump] [⌕ preview]"),
+            rendered.starts_with("     └ [↗ Jump][⌕ Preview][✓ Mark Done]"),
             "{rendered:?}"
         );
 
         let theme = SidebarRenderTheme::default();
-        let lines = render_lines(&[jump], &SidebarState::default(), 40, &theme);
+        let lines = render_lines(&[jump], &SidebarState::default(), 80, &theme);
         let style_of = |needle: &str| {
             lines[0]
                 .spans
@@ -2233,15 +2252,17 @@ mod tests {
         };
         assert_eq!(style_of("↗").fg, Some(Color::Indexed(73)));
         assert_eq!(style_of("⌕").fg, Some(Color::Indexed(73)));
-        assert_eq!(style_of(" jump").fg, Some(theme.detail));
-        assert_eq!(style_of(" preview").fg, Some(theme.detail));
+        assert_eq!(style_of("✓").fg, Some(theme.badge_done));
+        assert_eq!(style_of(" Jump").fg, Some(theme.detail));
+        assert_eq!(style_of(" Preview").fg, Some(theme.detail));
+        assert_eq!(style_of(" Mark Done").fg, Some(theme.detail));
         assert_eq!(style_of("[").fg, Some(theme.marker));
     }
 
     #[test]
     fn truncated_jump_row_keeps_preview_icon_color() {
         let theme = SidebarRenderTheme::default();
-        let spans = jump_action_spans("[↗ jump] [⌕ pre…", &theme);
+        let spans = jump_action_spans("[↗ Jump][⌕ Preview][✓ Mark…", &theme);
         let style_of = |needle: &str| {
             spans
                 .iter()
@@ -2252,6 +2273,7 @@ mod tests {
 
         assert_eq!(style_of("↗").fg, Some(Color::Indexed(73)));
         assert_eq!(style_of("⌕").fg, Some(Color::Indexed(73)));
+        assert_eq!(style_of("✓").fg, Some(theme.badge_done));
     }
 
     #[test]
@@ -2264,14 +2286,16 @@ mod tests {
             RollupLevel::Running,
         );
 
-        // " " + indent(4) + "[↗ jump]"(5..13) + " "(13) + "[⌕ preview]"(14..25)
-        assert_eq!(jump_row_action_at(&jump, 4), None);
-        assert_eq!(jump_row_action_at(&jump, 5), Some(JumpRowAction::Jump));
-        assert_eq!(jump_row_action_at(&jump, 12), Some(JumpRowAction::Jump));
-        assert_eq!(jump_row_action_at(&jump, 13), None);
-        assert_eq!(jump_row_action_at(&jump, 14), Some(JumpRowAction::Preview));
-        assert_eq!(jump_row_action_at(&jump, 24), Some(JumpRowAction::Preview));
-        assert_eq!(jump_row_action_at(&jump, 25), None);
+        // " " + indent(4) + "└ " => actions start at 7.
+        // "[↗ Jump]"(7..15) + "[⌕ Preview]"(15..26) + "[✓ Mark Done]"(26..39)
+        assert_eq!(jump_row_action_at(&jump, 6), None);
+        assert_eq!(jump_row_action_at(&jump, 7), Some(JumpRowAction::Jump));
+        assert_eq!(jump_row_action_at(&jump, 14), Some(JumpRowAction::Jump));
+        assert_eq!(jump_row_action_at(&jump, 15), Some(JumpRowAction::Preview));
+        assert_eq!(jump_row_action_at(&jump, 25), Some(JumpRowAction::Preview));
+        assert_eq!(jump_row_action_at(&jump, 26), Some(JumpRowAction::MarkDone));
+        assert_eq!(jump_row_action_at(&jump, 38), Some(JumpRowAction::MarkDone));
+        assert_eq!(jump_row_action_at(&jump, 39), None);
     }
 
     #[test]

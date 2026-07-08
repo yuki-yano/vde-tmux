@@ -65,6 +65,10 @@ pub enum RuntimeEffect {
         pane_id: String,
         history_lines: u32,
     },
+    MarkPaneDone {
+        pane_id: String,
+        completed_at: i64,
+    },
     SaveState(SidebarState),
     SetSessionBadge {
         session: String,
@@ -104,6 +108,16 @@ fn normalize_context_value(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn apply_manual_done_to_pane(pane: &mut PaneSnapshot, completed_at: i64) {
+    pane.status = "idle".to_string();
+    pane.wait_reason.clear();
+    pane.attention = "1".to_string();
+    pane.completed_at = completed_at.to_string();
+    pane.tasks.clear();
+    pane.task_items.clear();
+    pane.subagents.clear();
 }
 
 #[derive(Debug)]
@@ -190,6 +204,7 @@ pub struct RuntimeState {
     dirty_state_since: Option<Instant>,
     pane_was_idle: BTreeMap<String, bool>,
     unread: BTreeMap<String, bool>,
+    manual_done: BTreeMap<String, i64>,
     triage: BTreeSet<String>,
     calm_streak: BTreeMap<String, u8>,
     prev_badges: BTreeMap<String, BadgeState>,
@@ -217,6 +232,7 @@ impl RuntimeState {
             dirty_state_since: None,
             pane_was_idle: BTreeMap::new(),
             unread: BTreeMap::new(),
+            manual_done: BTreeMap::new(),
             triage: BTreeSet::new(),
             calm_streak: BTreeMap::new(),
             prev_badges: BTreeMap::new(),
@@ -245,6 +261,8 @@ impl RuntimeState {
             }
             DaemonEvent::Client { event, .. } => self.apply_client_event(event),
             DaemonEvent::PanesUpdated(panes) => {
+                let mut panes = panes;
+                self.apply_manual_done_overrides(&mut panes);
                 self.panes = panes;
                 let clear_pane_state_effects = self.clear_stale_pane_state_effects();
                 self.update_unread();
@@ -398,12 +416,32 @@ impl RuntimeState {
         match event {
             SidebarClientEvent::Key { key } => self.apply_key(&key),
             SidebarClientEvent::JumpPane { pane } => {
+                self.manual_done.remove(&pane);
                 self.unread.insert(pane.clone(), false);
                 self.ui_state.selection = Some(format!("chat::{pane}"));
                 self.mark_state_dirty(Instant::now());
                 self.rebuild_snapshot();
                 self.broadcast_if_needed();
                 vec![RuntimeEffect::JumpPane(pane)]
+            }
+            SidebarClientEvent::MarkDone { pane } => {
+                let completed_at = now_epoch_secs();
+                if !self.mark_pane_done(&pane, completed_at) {
+                    return Vec::new();
+                }
+                self.triage.remove(&pane);
+                self.calm_streak.remove(&pane);
+                self.update_triage();
+                let mut effects = vec![RuntimeEffect::MarkPaneDone {
+                    pane_id: pane,
+                    completed_at,
+                }];
+                effects.extend(self.update_transitions());
+                self.rebuild_snapshot();
+                self.broadcast_if_needed();
+                effects.extend(self.sync_session_badges());
+                effects.extend(self.sync_heartbeat());
+                effects
             }
             SidebarClientEvent::SelectContext { pane, session } => {
                 let Some(context) = SelectionContext::new(pane, session) else {
@@ -418,6 +456,40 @@ impl RuntimeState {
                 Vec::new()
             }
         }
+    }
+
+    fn mark_pane_done(&mut self, pane_id: &str, completed_at: i64) -> bool {
+        let Some(pane) = self.panes.iter_mut().find(|pane| pane.pane_id == pane_id) else {
+            return false;
+        };
+        apply_manual_done_to_pane(pane, completed_at);
+        self.manual_done.insert(pane_id.to_string(), completed_at);
+        self.unread.insert(pane_id.to_string(), true);
+        self.pane_was_idle.insert(pane_id.to_string(), true);
+        true
+    }
+
+    fn apply_manual_done_overrides(&mut self, panes: &mut [PaneSnapshot]) {
+        let mut next_manual_done = BTreeMap::new();
+        for pane in panes {
+            let Some(&completed_at) = self.manual_done.get(&pane.pane_id) else {
+                continue;
+            };
+            if !is_live_agent_pane(pane) {
+                continue;
+            }
+            let started_after_mark_done = pane
+                .started_at
+                .trim()
+                .parse::<i64>()
+                .is_ok_and(|started_at| started_at > completed_at);
+            if started_after_mark_done {
+                continue;
+            }
+            apply_manual_done_to_pane(pane, completed_at);
+            next_manual_done.insert(pane.pane_id.clone(), completed_at);
+        }
+        self.manual_done = next_manual_done;
     }
 
     fn apply_pending_selection_context(&mut self) -> bool {
@@ -535,6 +607,7 @@ impl RuntimeState {
             SidebarInputAction::Activate => {
                 match activate_selected(self.ui_state.selection.as_deref(), &self.rows) {
                     Some(SidebarCommand::JumpPane(pane_id)) => {
+                        self.manual_done.remove(&pane_id);
                         self.unread.insert(pane_id.clone(), false);
                         self.rebuild_snapshot();
                         self.broadcast_if_needed();
@@ -687,9 +760,12 @@ impl RuntimeState {
     fn update_unread(&mut self) {
         let mut next_was_idle = BTreeMap::new();
         let mut next_unread = BTreeMap::new();
+        let mut next_manual_done = BTreeMap::new();
         for pane in self.panes.iter().filter(|pane| is_live_agent_pane(pane)) {
             let level = crate::sidebar::tree::rollup_for_pane(pane);
             let is_idle = level == crate::hook::RollupLevel::Idle;
+            let manual_done_completed_at = self.manual_done.get(&pane.pane_id).copied();
+            let manual_done = manual_done_completed_at.is_some() && is_idle;
             let was_idle = self.pane_was_idle.get(&pane.pane_id).copied();
             let mut unread = self.unread.get(&pane.pane_id).copied().unwrap_or(false);
             match was_idle {
@@ -697,10 +773,14 @@ impl RuntimeState {
                 Some(false) if is_idle => unread = true,
                 _ => {}
             }
+            if manual_done {
+                unread = true;
+                next_manual_done.insert(pane.pane_id.clone(), manual_done_completed_at.unwrap());
+            }
             if !is_idle {
                 unread = false;
             }
-            if pane.window_active && pane.session_attached {
+            if pane.window_active && pane.session_attached && !manual_done {
                 unread = false;
             }
             next_was_idle.insert(pane.pane_id.clone(), is_idle);
@@ -708,6 +788,7 @@ impl RuntimeState {
         }
         self.pane_was_idle = next_was_idle;
         self.unread = next_unread;
+        self.manual_done = next_manual_done;
     }
 
     fn update_triage(&mut self) {
@@ -2061,6 +2142,140 @@ mod tests {
         assert_eq!(
             chat.badge_state,
             Some(crate::daemon::session_badge::BadgeState::Idle)
+        );
+    }
+
+    #[test]
+    fn mark_done_updates_pane_and_resets_task_state() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut pane = agent_pane("main", "%1", "running");
+        pane.window_active = true;
+        pane.session_attached = true;
+        pane.wait_reason = "permission_prompt".to_string();
+        pane.tasks = "1/3".to_string();
+        pane.task_items = "[]".to_string();
+        pane.subagents = "agent1234:Explore".to_string();
+        state.apply_event(DaemonEvent::PanesUpdated(vec![pane]));
+
+        let effects = state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::MarkDone {
+                pane: "%1".to_string(),
+            },
+        });
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::MarkPaneDone { pane_id, completed_at }
+                if pane_id == "%1" && *completed_at > 0
+        )));
+        let pane = state
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == "%1")
+            .unwrap();
+        assert_eq!(pane.status, "idle");
+        assert_eq!(pane.wait_reason, "");
+        assert_eq!(pane.tasks, "");
+        assert_eq!(pane.task_items, "");
+        assert_eq!(pane.subagents, "");
+        assert!(!pane.completed_at.is_empty());
+
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        let chat = rows.iter().find(|row| row.id == "chat::%1").unwrap();
+        assert_eq!(
+            chat.badge_state,
+            Some(crate::daemon::session_badge::BadgeState::Done)
+        );
+
+        let refreshed_panes = state.panes.clone();
+        state.apply_event(DaemonEvent::PanesUpdated(refreshed_panes));
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        let chat = rows.iter().find(|row| row.id == "chat::%1").unwrap();
+        assert_eq!(
+            chat.badge_state,
+            Some(crate::daemon::session_badge::BadgeState::Done)
+        );
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::JumpPane {
+                pane: "%1".to_string(),
+            },
+        });
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        let chat = rows.iter().find(|row| row.id == "chat::%1").unwrap();
+        assert_eq!(
+            chat.badge_state,
+            Some(crate::daemon::session_badge::BadgeState::Idle)
+        );
+    }
+
+    #[test]
+    fn mark_done_keeps_done_across_stale_running_update() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut running = agent_pane("main", "%1", "running");
+        running.started_at = "100".to_string();
+        state.apply_event(DaemonEvent::PanesUpdated(vec![running.clone()]));
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::MarkDone {
+                pane: "%1".to_string(),
+            },
+        });
+        let completed_at = state.panes[0].completed_at.parse::<i64>().unwrap();
+
+        state.apply_event(DaemonEvent::PanesUpdated(vec![running]));
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        let chat = rows.iter().find(|row| row.id == "chat::%1").unwrap();
+        assert_eq!(
+            chat.badge_state,
+            Some(crate::daemon::session_badge::BadgeState::Done)
+        );
+
+        let mut new_running = agent_pane("main", "%1", "running");
+        new_running.started_at = (completed_at + 1).to_string();
+        state.apply_event(DaemonEvent::PanesUpdated(vec![new_running]));
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        let chat = rows.iter().find(|row| row.id == "chat::%1").unwrap();
+        assert_eq!(
+            chat.badge_state,
+            Some(crate::daemon::session_badge::BadgeState::Working)
+        );
+    }
+
+    #[test]
+    fn mark_done_removes_blocked_pane_from_triage_immediately() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut blocked = agent_pane("main", "%1", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
+        state.apply_event(DaemonEvent::PanesUpdated(vec![blocked]));
+        assert!(
+            state
+                .snapshot()
+                .unwrap()
+                .sidebar
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|row| row.id == "zone::triage")
+        );
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::MarkDone {
+                pane: "%1".to_string(),
+            },
+        });
+
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        assert!(rows.iter().all(|row| row.id != "zone::triage"));
+        let chat = rows.iter().find(|row| row.id == "chat::%1").unwrap();
+        assert_eq!(
+            chat.badge_state,
+            Some(crate::daemon::session_badge::BadgeState::Done)
         );
     }
 
