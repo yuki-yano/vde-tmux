@@ -436,6 +436,7 @@ pub struct SidebarColorsConfig {
     pub header_active_bg: Option<String>,
     pub header_active_fg: Option<String>,
     pub header_chip_fg: Option<String>,
+    pub header_filter_bg: Option<String>,
     pub header_total_bg: Option<String>,
     pub header_total_fg: Option<String>,
     pub detail: Option<String>,
@@ -666,7 +667,7 @@ mod tests {
     #[test]
     fn sidebar_colors_accept_ui_color_keys_and_reject_state_color_keys() {
         let config = serde_yaml_ng::from_str::<Config>(
-            "sidebar:\n  colors:\n    selection_bg: \"237\"\n    header_active_bg: \"24\"\n",
+            "sidebar:\n  colors:\n    selection_bg: \"237\"\n    header_active_bg: \"24\"\n    header_filter_bg: \"255\"\n",
         )
         .unwrap();
 
@@ -674,6 +675,10 @@ mod tests {
         assert_eq!(
             config.sidebar.colors.header_active_bg.as_deref(),
             Some("24")
+        );
+        assert_eq!(
+            config.sidebar.colors.header_filter_bg.as_deref(),
+            Some("255")
         );
 
         for key in [

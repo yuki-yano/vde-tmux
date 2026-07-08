@@ -215,6 +215,7 @@ pub fn config_schema() -> Value {
                             "badge_idle": { "type": "string" },
                             "header_active_bg": { "type": "string" },
                             "header_active_fg": { "type": "string" },
+                            "header_filter_bg": { "type": "string" },
                             "task_done": { "type": "string" },
                             "task_working": { "type": "string" },
                             "task_pending": { "type": "string" },
@@ -347,6 +348,7 @@ mod tests {
         let colors = &schema["properties"]["sidebar"]["properties"]["colors"]["properties"];
 
         assert_eq!(colors["header_active_bg"]["type"], "string");
+        assert_eq!(colors["header_filter_bg"]["type"], "string");
         assert_eq!(colors["selection_bg"]["type"], "string");
         for key in ["badge_blocked", "badge_working", "badge_done", "badge_idle"] {
             assert_eq!(colors[key]["type"], "string", "{key}");

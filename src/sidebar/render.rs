@@ -11,6 +11,7 @@ pub struct SidebarRenderTheme {
     pub header_active_bg: Option<Color>,
     pub header_active_fg: Option<Color>,
     pub header_chip_fg: Option<Color>,
+    pub header_filter_bg: Option<Color>,
     pub header_total_bg: Option<Color>,
     pub header_total_fg: Option<Color>,
     pub header_active_bold: bool,
@@ -60,6 +61,7 @@ impl Default for SidebarRenderTheme {
             header_active_bg: None,
             header_active_fg: None,
             header_chip_fg: None,
+            header_filter_bg: None,
             header_total_bg: None,
             header_total_fg: None,
             header_active_bold: false,
@@ -106,6 +108,7 @@ impl SidebarRenderTheme {
             header_active_bg: parse_color(config.header_active_bg.as_deref()),
             header_active_fg: parse_color(config.header_active_fg.as_deref()),
             header_chip_fg: parse_color(config.header_chip_fg.as_deref()),
+            header_filter_bg: parse_color(config.header_filter_bg.as_deref()),
             header_total_bg: parse_color(config.header_total_bg.as_deref()),
             header_total_fg: parse_color(config.header_total_fg.as_deref()),
             header_active_bold: default.header_active_bold,
@@ -531,7 +534,7 @@ fn chip_style(
 fn chip_color(theme: &SidebarRenderTheme, badge_state: Option<BadgeState>) -> Color {
     match badge_state {
         Some(state) => theme.badge_color(state),
-        None => mode_bg(theme),
+        None => filter_bg(theme),
     }
 }
 
@@ -608,6 +611,10 @@ fn mode_fg(theme: &SidebarRenderTheme) -> Color {
 
 fn mode_bg(theme: &SidebarRenderTheme) -> Color {
     theme.header_active_bg.unwrap_or(theme.header_mode)
+}
+
+fn filter_bg(theme: &SidebarRenderTheme) -> Color {
+    theme.header_filter_bg.unwrap_or_else(|| mode_bg(theme))
 }
 
 pub fn render_rows(rows: &[SidebarRow], state: &SidebarState, width: usize) -> String {
@@ -1986,9 +1993,9 @@ fn parse_color(raw: Option<&str>) -> Option<Color> {
 
 fn view_mode_label(view_mode: ViewMode) -> &'static str {
     match view_mode {
-        ViewMode::Flat => "flat",
-        ViewMode::ByRepo => "repo",
-        ViewMode::ByCategory => "category",
+        ViewMode::Flat => "Flat",
+        ViewMode::ByRepo => "Repository",
+        ViewMode::ByCategory => "Category",
     }
 }
 
@@ -2513,7 +2520,7 @@ mod tests {
         assert!(mode_style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(
             build_header_layout(&state, 80).lines[0].text,
-            format!(" ≣ repo     \u{e0b0} 0 tasks \u{e0b0}")
+            format!(" ≣ Repository \u{e0b0} 0 tasks \u{e0b0}")
         );
     }
 
@@ -2841,7 +2848,7 @@ mod tests {
         assert_eq!(header.row_count(), 2);
         assert_eq!(
             header.lines[0].text,
-            format!(" ≣ category \u{e0b0} 7 tasks \u{e0b0}")
+            format!(" ≣ Category   \u{e0b0} 7 tasks \u{e0b0}")
         );
         assert_eq!(header.lines[1].text, " ≡ all 7  ▲ 2  ● 1  ✓ 0  ○ 5 ");
     }
@@ -2863,7 +2870,7 @@ mod tests {
 
         assert_eq!(
             header.lines[0].text,
-            format!(" ≣ repo     \u{e0b0} 1 task \u{e0b0}")
+            format!(" ≣ Repository \u{e0b0} 1 task \u{e0b0}")
         );
     }
 
@@ -2992,9 +2999,10 @@ mod tests {
     }
 
     #[test]
-    fn active_all_chip_bg_follows_configured_header_bg() {
+    fn active_all_chip_bg_follows_configured_filter_bg() {
         let theme = SidebarRenderTheme {
             header_active_bg: Some(Color::Rgb(0x45, 0x3f, 0x9e)),
+            header_filter_bg: Some(Color::Rgb(0xee, 0xee, 0xf4)),
             ..SidebarRenderTheme::default()
         };
         let state = SidebarState {
@@ -3005,7 +3013,7 @@ mod tests {
         let header = build_header_layout_with_counts(&state, 80, &theme, rich_header_counts());
 
         let active = style_for_segment(&header, 1, "≡ all 7");
-        assert_eq!(active.bg, Some(Color::Rgb(0x45, 0x3f, 0x9e)));
+        assert_eq!(active.bg, Some(Color::Rgb(0xee, 0xee, 0xf4)));
     }
 
     #[test]
@@ -3115,7 +3123,7 @@ sidebar:
 
         let header = build_header_layout_with_counts(&state, 80, &theme, counts);
 
-        let mode = style_for_segment(&header, 0, "≣ category");
+        let mode = style_for_segment(&header, 0, "≣ Category");
         assert_eq!(mode.fg, Some(Color::Indexed(16)));
         assert_eq!(mode.bg, Some(theme.header_mode));
         assert!(mode.add_modifier.contains(Modifier::BOLD));
@@ -3155,7 +3163,7 @@ sidebar:
 
         assert_eq!(theme.header_suffix, "");
         assert!(!header.lines[0].text.contains('\u{e0b0}'));
-        assert_eq!(header.lines[0].text, " ≣ repo      7 tasks ");
+        assert_eq!(header.lines[0].text, " ≣ Repository  7 tasks ");
     }
 
     #[test]
@@ -3171,7 +3179,7 @@ sidebar:
             &SidebarRenderTheme::default(),
             rich_header_counts(),
         );
-        assert_eq!(compact.lines[0].text, " ≣ category ");
+        assert_eq!(compact.lines[0].text, " ≣ Category…");
         assert!(!compact.lines[0].text.contains("tasks"));
 
         let narrow = build_header_layout_with_counts(
@@ -3210,10 +3218,10 @@ sidebar:
 
         let header = build_header_layout_with_counts(&state, 80, &theme, rich_header_counts());
         let lines = render_header_lines(&header, &theme);
-        let mode = style_for_segment(&header, 0, "≣ repo");
+        let mode = style_for_segment(&header, 0, "≣ Repository");
         let suffix = style_for_segment(&header, 0, "]");
 
-        assert_eq!(header.lines[0].text, "[ ≣ repo     ] 7 tasks ]");
+        assert_eq!(header.lines[0].text, "[ ≣ Repository ] 7 tasks ]");
         assert_eq!(mode.fg, Some(Color::White));
         assert_eq!(mode.bg, Some(Color::Indexed(24)));
         assert!(mode.add_modifier.contains(Modifier::BOLD));

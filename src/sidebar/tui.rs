@@ -1597,7 +1597,7 @@ mod tests {
         draw_snapshot(&mut terminal, &snapshot).unwrap();
 
         let rendered = rendered_buffer(&terminal);
-        assert!(rendered.contains("≣ repo"), "{rendered}");
+        assert!(rendered.contains("≣ Repository"), "{rendered}");
         assert!(rendered.contains("≡ all 7"), "{rendered}");
         assert!(rendered.contains("▲ 0"), "{rendered}");
         assert!(rendered.contains("no attn agents"), "{rendered}");
@@ -1626,7 +1626,7 @@ mod tests {
         draw_snapshot(&mut terminal, &snapshot).unwrap();
 
         let rendered = rendered_buffer(&terminal);
-        assert!(rendered.contains("≣ repo"), "{rendered}");
+        assert!(rendered.contains("≣ Repository"), "{rendered}");
         assert!(rendered.contains("no agents"), "{rendered}");
         assert!(!rendered.contains("tab: next filter"), "{rendered}");
         assert!(!rendered.contains("no all agents"), "{rendered}");

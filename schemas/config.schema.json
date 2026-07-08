@@ -151,6 +151,9 @@
             "header_active_fg": {
               "type": "string"
             },
+            "header_filter_bg": {
+              "type": "string"
+            },
             "selection_bg": {
               "type": "string"
             },
