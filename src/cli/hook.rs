@@ -9,7 +9,10 @@ use clap::Subcommand;
 use serde_json::Value;
 
 use crate::hook::adapter::{
-    claude_event_from_json, codex_event_from_json, codex_notify_event_from_arg,
+    claude_event_from_json, codex_event_from_json_with_home, codex_notify_event_from_arg,
+};
+use crate::hook::origin::{
+    HookOrigin, claude_hook_origin, codex_hook_origin, find_codex_session_file,
 };
 use crate::hook::writer::{ProgressEvent, apply_progress_event, resolve_pane, write_pane_options};
 use crate::hook::{
@@ -109,17 +112,21 @@ pub(crate) fn run_hook_command(
             let Some(arg) = arg else {
                 return Ok(());
             };
+            let codex_home = codex_home_from_env(env);
             if arg.trim_start().starts_with('{') {
                 let event = codex_notify_event_from_arg(&arg, now_epoch)?;
                 return write_agent_event(runner, env, &event);
             }
-            if let Some(progress_event) = codex_aux_event_from_input(&arg, input, now_epoch)? {
+            if let Some(progress_event) =
+                codex_aux_event_from_input(&arg, input, now_epoch, codex_home.as_deref())?
+            {
                 if let Some(pane) = resolve_pane(runner, env)? {
                     apply_progress_event(runner, &pane, progress_event)?;
                 }
                 return Ok(());
             }
-            let event = codex_event_from_json(&arg, input, now_epoch)?;
+            let event =
+                codex_event_from_json_with_home(&arg, input, now_epoch, codex_home.as_deref())?;
             write_agent_event(runner, env, &event)
         }
     }
@@ -181,18 +188,19 @@ fn parse_subagents_arg(raw: &str) -> Result<Vec<SubagentEntry>> {
 fn claude_progress_event_from_input(event: &str, input: &str) -> Result<Option<ProgressEvent>> {
     #[derive(serde::Deserialize, Default)]
     struct Payload {
+        agent_transcript_path: Option<String>,
         hook_event_name: Option<String>,
         agent_id: Option<String>,
         agent_type: Option<String>,
+        #[allow(dead_code)]
+        session_id: Option<String>,
+        transcript_path: Option<String>,
     }
 
     let payload_value: Value = serde_json::from_str(input.trim()).unwrap_or(Value::Null);
     let payload: Payload = serde_json::from_value(payload_value.clone()).unwrap_or_default();
     let event = payload.hook_event_name.as_deref().unwrap_or(event);
     let progress = match event {
-        "TaskCreated" => ProgressEvent::TaskCreated,
-        "TaskCompleted" => ProgressEvent::TaskCompleted,
-        "PostToolUse" => return claude_post_tool_use_event(&payload_value),
         "SubagentStart" => {
             let Some(agent_id) = payload.agent_id else {
                 return Ok(None);
@@ -209,6 +217,17 @@ fn claude_progress_event_from_input(event: &str, input: &str) -> Result<Option<P
             };
             ProgressEvent::SubagentStop { agent_id }
         }
+        "TaskCreated" | "TaskCompleted" | "PostToolUse"
+            if claude_hook_origin(
+                payload.transcript_path.as_deref(),
+                payload.agent_transcript_path.as_deref(),
+            ) == HookOrigin::Subagent =>
+        {
+            return Ok(None);
+        }
+        "TaskCreated" => ProgressEvent::TaskCreated,
+        "TaskCompleted" => ProgressEvent::TaskCompleted,
+        "PostToolUse" => return claude_post_tool_use_event(&payload_value),
         _ => return Ok(None),
     };
     Ok(Some(progress))
@@ -331,17 +350,35 @@ fn codex_aux_event_from_input(
     event: &str,
     input: &str,
     now_epoch: i64,
+    codex_home: Option<&Path>,
 ) -> Result<Option<ProgressEvent>> {
     let payload: Value = match serde_json::from_str(input.trim()) {
         Ok(payload) => payload,
         Err(_) => return Ok(None),
     };
     match event {
-        "PostToolUse" => codex_post_tool_use_event(&payload, now_epoch),
-        "SubagentStart" => codex_subagent_start_event(&payload),
+        "PostToolUse" => {
+            if is_guarded_codex_post_tool_use(&payload)
+                && codex_hook_origin(
+                    payload.get("session_id").and_then(Value::as_str),
+                    codex_home,
+                ) == HookOrigin::Subagent
+            {
+                return Ok(None);
+            }
+            codex_post_tool_use_event(&payload, now_epoch)
+        }
+        "SubagentStart" => codex_subagent_start_event_with_home(&payload, codex_home),
         "SubagentStop" => codex_subagent_stop_event(&payload),
         _ => Ok(None),
     }
+}
+
+fn is_guarded_codex_post_tool_use(payload: &Value) -> bool {
+    matches!(
+        payload.get("tool_name").and_then(Value::as_str),
+        Some("update_plan" | "Bash")
+    )
 }
 
 fn codex_post_tool_use_event(payload: &Value, now_epoch: i64) -> Result<Option<ProgressEvent>> {
@@ -456,10 +493,6 @@ fn path_basename(raw: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn codex_subagent_start_event(payload: &Value) -> Result<Option<ProgressEvent>> {
-    codex_subagent_start_event_with_home(payload, codex_home().as_deref())
-}
-
 fn codex_subagent_start_event_with_home(
     payload: &Value,
     codex_home: Option<&Path>,
@@ -478,12 +511,12 @@ fn codex_subagent_start_event_with_home(
     })))
 }
 
-fn codex_home() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
+fn codex_home_from_env(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    if let Some(path) = env.get("CODEX_HOME").filter(|path| !path.trim().is_empty()) {
         return Some(PathBuf::from(path));
     }
-    std::env::var_os("HOME")
-        .filter(|path| !path.is_empty())
+    env.get("HOME")
+        .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
         .map(|home| home.join(".codex"))
 }
@@ -491,26 +524,6 @@ fn codex_home() -> Option<PathBuf> {
 fn codex_subagent_display_name(codex_home: &Path, agent_id: &str) -> Option<String> {
     let path = find_codex_session_file(&codex_home.join("sessions"), agent_id)?;
     read_codex_session_display_name(&path)
-}
-
-fn find_codex_session_file(dir: &Path, agent_id: &str) -> Option<PathBuf> {
-    for entry in fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_codex_session_file(&path, agent_id) {
-                return Some(found);
-            }
-            continue;
-        }
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".jsonl") && name.contains(agent_id))
-        {
-            return Some(path);
-        }
-    }
-    None
 }
 
 fn read_codex_session_display_name(path: &Path) -> Option<String> {

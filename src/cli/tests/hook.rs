@@ -1,4 +1,7 @@
 use super::*;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn dispatch_hook_emit_writes_pane_options() {
@@ -528,6 +531,148 @@ fn dispatch_hook_codex_update_plan_writes_task_snapshot() {
 }
 
 #[test]
+fn dispatch_hook_codex_subagent_lifecycle_origin_guard_ignores_parent_state_writes() {
+    let codex_home = unique_temp_dir("codex-subagent-lifecycle");
+    let session_id = "subagent-lifecycle-session";
+    write_codex_subagent_session(&codex_home, session_id);
+    let env = codex_env(&codex_home);
+    let cases = vec![
+        (
+            "UserPromptSubmit",
+            serde_json::json!({"session_id": session_id, "prompt": "child prompt"}).to_string(),
+        ),
+        (
+            "SessionStart",
+            serde_json::json!({"session_id": session_id, "source": "startup"}).to_string(),
+        ),
+        (
+            "Stop",
+            serde_json::json!({"session_id": session_id}).to_string(),
+        ),
+        (
+            "PermissionRequest",
+            serde_json::json!({"session_id": session_id}).to_string(),
+        ),
+    ];
+
+    for (event, input) in cases {
+        let mock = MockTmuxRunner::new();
+        run_with_input_at(["vt", "hook", "codex", event], &input, &mock, &env, 123).unwrap();
+        assert!(
+            mock.calls().is_empty(),
+            "{event} should not write parent pane state: {:?}",
+            mock.calls()
+        );
+    }
+
+    fs::remove_dir_all(codex_home).unwrap();
+}
+
+#[test]
+fn dispatch_hook_codex_subagent_progress_origin_guard_ignores_task_and_worktree_writes() {
+    let codex_home = unique_temp_dir("codex-subagent-progress");
+    let session_id = "subagent-progress-session";
+    write_codex_subagent_session(&codex_home, session_id);
+    let env = codex_env(&codex_home);
+    let cases = vec![
+        serde_json::json!({
+            "session_id": session_id,
+            "tool_name": "update_plan",
+            "tool_input": {
+                "plan": [
+                    {"step": "Explore", "status": "completed"},
+                    {"step": "Implement", "status": "in_progress"}
+                ]
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "session_id": session_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": "vw exec /tmp/worktrees/feature -- cargo test"}
+        })
+        .to_string(),
+    ];
+
+    for input in cases {
+        let mock = MockTmuxRunner::new();
+        run_with_input_at(
+            ["vt", "hook", "codex", "PostToolUse"],
+            &input,
+            &mock,
+            &env,
+            123,
+        )
+        .unwrap();
+        assert!(
+            mock.calls().is_empty(),
+            "subagent PostToolUse should not write parent pane state: {:?}",
+            mock.calls()
+        );
+    }
+
+    fs::remove_dir_all(codex_home).unwrap();
+}
+
+#[test]
+fn dispatch_hook_codex_subagent_lifecycle_origin_guard_keeps_subagent_rows() {
+    let codex_home = unique_temp_dir("codex-subagent-rows");
+    write_codex_subagent_session(&codex_home, "agent-a");
+    let env = codex_env(&codex_home);
+
+    let start_mock = MockTmuxRunner::new();
+    start_mock.stub(&["show-options", "-p", "-t", "%1"], "");
+    start_mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_SUBAGENTS,
+            "agent-a:Plan",
+        ],
+        "",
+    );
+    run_with_input_at(
+        ["vt", "hook", "codex", "SubagentStart"],
+        r#"{"session_id":"agent-a","agent_id":"agent-a","agent_type":"Plan"}"#,
+        &start_mock,
+        &env,
+        123,
+    )
+    .unwrap();
+    assert_eq!(start_mock.calls().len(), 2);
+
+    let stop_mock = MockTmuxRunner::new();
+    stop_mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_subagents \"agent-a:Plan\"\n",
+    );
+    stop_mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_SUBAGENTS,
+        ],
+        "",
+    );
+    run_with_input_at(
+        ["vt", "hook", "codex", "SubagentStop"],
+        r#"{"session_id":"agent-a","agent_id":"agent-a"}"#,
+        &stop_mock,
+        &env,
+        123,
+    )
+    .unwrap();
+    assert_eq!(stop_mock.calls().len(), 2);
+
+    fs::remove_dir_all(codex_home).unwrap();
+}
+
+#[test]
 fn dispatch_hook_codex_update_plan_empty_unsets_task_options() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
@@ -641,6 +786,126 @@ fn dispatch_hook_claude_todo_write_writes_task_snapshot() {
     .unwrap();
 
     assert_eq!(mock.calls().len(), 4);
+}
+
+#[test]
+fn dispatch_hook_claude_subagent_lifecycle_origin_guard_ignores_parent_state_writes() {
+    let root = unique_temp_dir("claude-subagent-lifecycle");
+    let transcript = write_claude_subagent_transcript(&root, "lifecycle");
+    let transcript = transcript.display().to_string();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    let cases = vec![
+        (
+            "UserPromptSubmit",
+            serde_json::json!({"transcript_path": transcript.clone(), "prompt": "child prompt"})
+                .to_string(),
+        ),
+        (
+            "SessionStart",
+            serde_json::json!({"transcript_path": transcript.clone(), "source": "startup"})
+                .to_string(),
+        ),
+        (
+            "Stop",
+            serde_json::json!({"transcript_path": transcript.clone()}).to_string(),
+        ),
+        (
+            "Notification",
+            serde_json::json!({
+                "transcript_path": transcript.clone(),
+                "notification_type": "permission_prompt"
+            })
+            .to_string(),
+        ),
+        (
+            "PreToolUse",
+            serde_json::json!({"transcript_path": transcript.clone()}).to_string(),
+        ),
+        (
+            "PostToolUse",
+            serde_json::json!({
+                "transcript_path": transcript.clone(),
+                "tool_name": "Read",
+                "tool_input": {"file_path": "README.md"}
+            })
+            .to_string(),
+        ),
+    ];
+
+    for (event, input) in cases {
+        let mock = MockTmuxRunner::new();
+        run_with_input_at(["vt", "hook", "claude", event], &input, &mock, &env, 123).unwrap();
+        assert!(
+            mock.calls().is_empty(),
+            "{event} should not write parent pane state: {:?}",
+            mock.calls()
+        );
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dispatch_hook_claude_subagent_task_origin_guard_ignores_task_writes() {
+    let root = unique_temp_dir("claude-subagent-task");
+    let transcript = write_claude_subagent_transcript(&root, "task");
+    let transcript = transcript.display().to_string();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    let cases = vec![
+        (
+            "PostToolUse",
+            serde_json::json!({
+                "transcript_path": transcript.clone(),
+                "tool_name": "TodoWrite",
+                "tool_input": {
+                    "todos": [
+                        {"content": "Explore", "status": "completed"},
+                        {"content": "Implement", "status": "in_progress"}
+                    ]
+                }
+            })
+            .to_string(),
+        ),
+        (
+            "PostToolUse",
+            serde_json::json!({
+                "transcript_path": transcript.clone(),
+                "tool_name": "TaskCreate",
+                "tool_input": {"subject": "Explore"},
+                "tool_response": {"task": {"id": "1", "subject": "Explore"}}
+            })
+            .to_string(),
+        ),
+        (
+            "PostToolUse",
+            serde_json::json!({
+                "transcript_path": transcript.clone(),
+                "tool_name": "TaskUpdate",
+                "tool_input": {"taskId": "1", "status": "completed"}
+            })
+            .to_string(),
+        ),
+        (
+            "TaskCreated",
+            serde_json::json!({"transcript_path": transcript.clone()}).to_string(),
+        ),
+        (
+            "TaskCompleted",
+            serde_json::json!({"transcript_path": transcript.clone()}).to_string(),
+        ),
+    ];
+
+    for (event, input) in cases {
+        let mock = MockTmuxRunner::new();
+        run_with_input_at(["vt", "hook", "claude", event], &input, &mock, &env, 123).unwrap();
+        assert!(
+            mock.calls().is_empty(),
+            "{event} should not write parent task state: {:?}",
+            mock.calls()
+        );
+    }
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1285,6 +1550,9 @@ fn dispatch_hook_claude_task_created_updates_progress() {
 
 #[test]
 fn dispatch_hook_claude_stop_payload_subagent_stop_updates_subagents_without_done() {
+    let root = unique_temp_dir("claude-subagent-stop");
+    let agent_transcript = write_claude_subagent_transcript(&root, "stop");
+    let agent_transcript = agent_transcript.display().to_string();
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
     mock.stub(
@@ -1303,14 +1571,14 @@ fn dispatch_hook_claude_stop_payload_subagent_stop_updates_subagents_without_don
         "",
     );
 
-    run_with_input_at(
-        ["vt", "hook", "claude", "Stop"],
-        r#"{"hook_event_name":"SubagentStop","agent_id":"a","agent_type":"Explore"}"#,
-        &mock,
-        &env,
-        456,
-    )
-    .unwrap();
+    let input = serde_json::json!({
+        "hook_event_name": "SubagentStop",
+        "agent_id": "a",
+        "agent_type": "Explore",
+        "agent_transcript_path": agent_transcript
+    })
+    .to_string();
+    run_with_input_at(["vt", "hook", "claude", "Stop"], &input, &mock, &env, 456).unwrap();
 
     assert_eq!(
         mock.calls(),
@@ -1331,4 +1599,51 @@ fn dispatch_hook_claude_stop_payload_subagent_stop_updates_subagents_without_don
             ],
         ]
     );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn codex_env(codex_home: &Path) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("TMUX_PANE".to_string(), "%1".to_string()),
+        ("CODEX_HOME".to_string(), codex_home.display().to_string()),
+    ])
+}
+
+fn write_codex_subagent_session(codex_home: &Path, session_id: &str) {
+    let sessions = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("08");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join(format!("rollout-{session_id}.jsonl")),
+        serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "thread_source": "subagent",
+                "parent_thread_id": "parent-session"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn write_claude_subagent_transcript(root: &Path, name: &str) -> PathBuf {
+    let dir = root.join("subagents");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.jsonl"));
+    fs::write(&path, r#"{"isSidechain":true}"#).unwrap();
+    path
+}
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("vde-tmux-{name}-{}-{nanos}", std::process::id()))
 }

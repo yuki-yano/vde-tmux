@@ -1,17 +1,21 @@
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::hook::origin::{HookOrigin, claude_hook_origin, codex_hook_origin};
 use crate::hook::{AgentEvent, AgentStatus, OptionUpdate};
 
 #[derive(Debug, Deserialize, Default)]
 struct ClaudeHookPayload {
+    agent_transcript_path: Option<String>,
     hook_event_name: Option<String>,
     notification_type: Option<String>,
     prompt: Option<String>,
+    #[allow(dead_code)]
+    session_id: Option<String>,
     source: Option<String>,
     transcript_path: Option<String>,
 }
@@ -19,6 +23,7 @@ struct ClaudeHookPayload {
 #[derive(Debug, Deserialize, Default)]
 struct CodexHookPayload {
     prompt: Option<String>,
+    session_id: Option<String>,
     source: Option<String>,
     transcript_path: Option<String>,
 }
@@ -31,7 +36,14 @@ struct CodexNotifyPayload {
 
 pub fn claude_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Result<AgentEvent> {
     let payload: ClaudeHookPayload = serde_json::from_str(raw_json.trim()).unwrap_or_default();
+    let origin = claude_hook_origin(
+        payload.transcript_path.as_deref(),
+        payload.agent_transcript_path.as_deref(),
+    );
     let event = payload.hook_event_name.as_deref().unwrap_or(event);
+    if origin == HookOrigin::Subagent && is_guarded_claude_lifecycle_event(event) {
+        return Ok(AgentEvent::default());
+    }
     let mut agent_event = AgentEvent {
         agent: "claude".to_string(),
         ..AgentEvent::default()
@@ -77,7 +89,20 @@ pub fn claude_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Re
 }
 
 pub fn codex_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Result<AgentEvent> {
+    codex_event_from_json_with_home(event, raw_json, now_epoch, codex_home().as_deref())
+}
+
+pub fn codex_event_from_json_with_home(
+    event: &str,
+    raw_json: &str,
+    now_epoch: i64,
+    codex_home: Option<&Path>,
+) -> Result<AgentEvent> {
     let payload: CodexHookPayload = serde_json::from_str(raw_json.trim()).unwrap_or_default();
+    let origin = codex_hook_origin(payload.session_id.as_deref(), codex_home);
+    if origin == HookOrigin::Subagent && is_guarded_codex_lifecycle_event(event) {
+        return Ok(AgentEvent::default());
+    }
     let mut agent_event = AgentEvent {
         agent: "codex".to_string(),
         ..AgentEvent::default()
@@ -114,6 +139,35 @@ pub fn codex_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Res
         }
     }
     Ok(agent_event)
+}
+
+fn is_guarded_claude_lifecycle_event(event: &str) -> bool {
+    matches!(
+        event,
+        "UserPromptSubmit"
+            | "SessionStart"
+            | "Stop"
+            | "Notification"
+            | "PreToolUse"
+            | "PostToolUse"
+    )
+}
+
+fn is_guarded_codex_lifecycle_event(event: &str) -> bool {
+    matches!(
+        event,
+        "UserPromptSubmit" | "SessionStart" | "Stop" | "PermissionRequest"
+    )
+}
+
+fn codex_home() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    std::env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".codex"))
 }
 
 pub fn codex_notify_event_from_arg(raw_json: &str, now_epoch: i64) -> Result<AgentEvent> {
