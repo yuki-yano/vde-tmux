@@ -287,6 +287,14 @@ fn dispatch_hook_claude_notification_permission_writes_waiting() {
 fn dispatch_hook_claude_stop_writes_idle_attention_and_completed_at() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    let root = unique_temp_dir("claude-stop-parent-transcript");
+    fs::create_dir_all(&root).unwrap();
+    let transcript = root.join("root.jsonl");
+    fs::write(
+        &transcript,
+        r#"{"type":"user","isSidechain":false,"parentUuid":"parent-message"}"#,
+    )
+    .unwrap();
     mock.stub(
         &[
             "set-option",
@@ -387,9 +395,17 @@ fn dispatch_hook_claude_stop_writes_idle_attention_and_completed_at() {
         "",
     );
 
-    run_with_input_at(["vt", "hook", "claude", "Stop"], "{}", &mock, &env, 456).unwrap();
+    run_with_input_at(
+        ["vt", "hook", "claude", "Stop"],
+        &serde_json::json!({"transcript_path": transcript.display().to_string()}).to_string(),
+        &mock,
+        &env,
+        456,
+    )
+    .unwrap();
 
     assert_eq!(mock.calls().len(), 6);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

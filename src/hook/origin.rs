@@ -109,8 +109,6 @@ fn value_has_claude_subagent_marker(value: &Value) -> bool {
     match value {
         Value::Object(map) => {
             if map.get("isSidechain").and_then(Value::as_bool) == Some(true)
-                || non_empty_str(map.get("parentUuid"))
-                || non_empty_str(map.get("parent_uuid"))
                 || non_empty_str(map.get("parent_thread_id"))
                 || map.get("thread_source").and_then(Value::as_str) == Some("subagent")
                 || map
@@ -210,11 +208,26 @@ mod tests {
     }
 
     #[test]
-    fn claude_origin_detects_subagent_marker_in_transcript() {
+    fn claude_origin_treats_parent_uuid_as_parent_conversation_chain() {
         let root = unique_temp_dir("claude-origin-marker");
         fs::create_dir_all(&root).unwrap();
         let transcript = root.join("agent.jsonl");
         fs::write(&transcript, r#"{"parentUuid":"parent-session"}"#).unwrap();
+
+        assert_eq!(
+            claude_hook_origin(transcript.to_str(), None),
+            HookOrigin::Parent
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_origin_detects_subagent_marker_in_transcript() {
+        let root = unique_temp_dir("claude-origin-parent-thread");
+        fs::create_dir_all(&root).unwrap();
+        let transcript = root.join("agent.jsonl");
+        fs::write(&transcript, r#"{"parent_thread_id":"parent-session"}"#).unwrap();
 
         assert_eq!(
             claude_hook_origin(transcript.to_str(), None),
