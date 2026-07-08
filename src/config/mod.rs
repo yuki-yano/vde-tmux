@@ -281,7 +281,7 @@ pub struct SessionBadgeChipConfig {
 impl Default for SessionBadgeChipConfig {
     fn default() -> Self {
         Self {
-            bg: "#262639".to_string(),
+            bg: "#303047".to_string(),
             cap_left: "\u{e0b6}".to_string(),
             cap_right: "\u{e0b4}".to_string(),
         }
@@ -910,7 +910,7 @@ categories:
         let config = SessionBadgeConfig::default();
         assert!(config.enabled);
         assert_eq!(config.mode, SessionBadgeMode::Rollup);
-        assert_eq!(config.chip.bg, "#262639");
+        assert_eq!(config.chip.bg, "#303047");
         assert_eq!(config.chip.cap_left, "\u{e0b6}");
         assert_eq!(config.chip.cap_right, "\u{e0b4}");
         assert_eq!(config.suffix, "");

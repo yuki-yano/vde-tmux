@@ -440,7 +440,7 @@ fn render_chip_session_segment(
     );
     if let Some(segment_bg) = &style.colors.bg {
         return format!(
-            "{chip_start}#[bg={segment_bg}]{}",
+            "{chip_start}#[bg={segment_bg}]{}#[default] ",
             tmux_style_segment_without_prefix(style, &body)
         );
     }
@@ -643,6 +643,24 @@ mod tests {
         session.badge = badge.to_string();
         session.state = state.to_string();
         session
+    }
+
+    fn tmux_visible_width(text: &str) -> usize {
+        let mut plain = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '#' && chars.peek() == Some(&'[') {
+                let _ = chars.next();
+                for style_ch in chars.by_ref() {
+                    if style_ch == ']' {
+                        break;
+                    }
+                }
+            } else {
+                plain.push(ch);
+            }
+        }
+        unicode_width::UnicodeWidthStr::width(plain.as_str())
     }
 
     fn window(index: &str, id: &str, name: &str, active: bool) -> WindowInfo {
@@ -865,7 +883,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "#[fg=#262639]#[bg=#262639] #[fg=#4fd08a]● 1#[fg=default] #[fg=#a8a8b2]○ 3#[fg=default] #[fg=#262639,bg=default]#[default]  sub "
+            "#[fg=#303047]#[bg=#303047] #[fg=#4fd08a]● 1#[fg=default] #[fg=#a8a8b2]○ 3#[fg=default] #[fg=#303047,bg=default]#[default]  sub "
         );
     }
 
@@ -886,9 +904,27 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "#[fg=#262639]#[bg=#262639] #[fg=#4fd08a]● 1#[fg=default] #[fg=#a8a8b2]○ 3#[fg=default] #[bg=#453f9e]#[bold,fg=#ecebff,bg=#453f9e] main #[default]<suffix>"
+            "#[fg=#303047]#[bg=#303047] #[fg=#4fd08a]● 1#[fg=default] #[fg=#a8a8b2]○ 3#[fg=default] #[bg=#453f9e]#[bold,fg=#ecebff,bg=#453f9e] main #[default]<suffix>#[default] "
         );
         assert!(!rendered.contains("<prefix>"), "{rendered}");
+    }
+
+    #[test]
+    fn chip_current_and_other_segments_keep_equal_visible_width() {
+        let mut config = Config::default();
+        config.statusline.session_badge.mode = SessionBadgeMode::Counts;
+        config.statusline.sessions.badge_style = BadgeStyle::Chip;
+        config.statusline.sessions.current.colors.fg = Some("#ecebff".to_string());
+        config.statusline.sessions.current.colors.bg = Some("#453f9e".to_string());
+        config.statusline.sessions.current.suffix = ">".to_string();
+        let mut main = session("main", "work");
+        main.badge = "● 1 ○ 3".to_string();
+        main.state = "working".to_string();
+
+        let current = render_statusline_sessions(&config, &[main.clone()], "main", "work");
+        let other = render_statusline_sessions(&config, &[main], "other", "work");
+
+        assert_eq!(tmux_visible_width(&current), tmux_visible_width(&other));
     }
 
     #[test]
@@ -916,7 +952,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "#[fg=#262639]#[bg=#262639] #[fg=#ff6b6b]▲#[fg=default] #[fg=#262639,bg=default]#[default]  sub "
+            "#[fg=#303047]#[bg=#303047] #[fg=#ff6b6b]▲#[fg=default] #[fg=#303047,bg=default]#[default]  sub "
         );
     }
 

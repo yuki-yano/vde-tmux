@@ -275,7 +275,7 @@ statusline:
   session_badge:
     mode: rollup       # rollup | counts
     chip:
-      bg: "#262639"
+      bg: "#303047"
       cap_left: ""
       cap_right: ""
   sessions:
@@ -315,7 +315,7 @@ A truecolor preset that keeps state glyphs readable on the bar and uses fills on
 statusline:
   session_badge:
     chip:
-      bg: "#262639"
+      bg: "#303047"
       cap_left: ""
       cap_right: ""
   category:
