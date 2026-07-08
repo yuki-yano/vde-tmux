@@ -531,6 +531,143 @@ fn dispatch_hook_codex_update_plan_writes_task_snapshot() {
 }
 
 #[test]
+fn dispatch_hook_codex_create_goal_writes_goal_prompt_and_running() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_STATUS,
+            "running",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_WAIT_REASON,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_AGENT,
+            "codex",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_STARTED_AT,
+            "123",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_PROMPT,
+            "Ship the goal",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_PROMPT_SOURCE,
+            "goal",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASKS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEMS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_TASK_ITEM_IDS,
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_WORKTREE_ACTIVITY,
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "codex", "PostToolUse"],
+        r#"{"tool_name":"create_goal","tool_input":{"objective":"Ship the\ngoal"}}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert_eq!(mock.calls().len(), 10);
+    assert!(mock.calls().iter().any(|call| {
+        call == &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_PROMPT,
+            "Ship the goal",
+        ]
+    }));
+}
+
+#[test]
 fn dispatch_hook_codex_subagent_lifecycle_origin_guard_ignores_parent_state_writes() {
     let codex_home = unique_temp_dir("codex-subagent-lifecycle");
     let session_id = "subagent-lifecycle-session";
@@ -590,6 +727,12 @@ fn dispatch_hook_codex_subagent_progress_origin_guard_ignores_task_and_worktree_
             "session_id": session_id,
             "tool_name": "Bash",
             "tool_input": {"command": "vw exec /tmp/worktrees/feature -- cargo test"}
+        })
+        .to_string(),
+        serde_json::json!({
+            "session_id": session_id,
+            "tool_name": "create_goal",
+            "tool_input": {"objective": "child goal"}
         })
         .to_string(),
     ];

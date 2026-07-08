@@ -9,7 +9,8 @@ use clap::Subcommand;
 use serde_json::Value;
 
 use crate::hook::adapter::{
-    claude_event_from_json, codex_event_from_json_with_home, codex_notify_event_from_arg,
+    build_prompt_preview, claude_event_from_json, codex_event_from_json_with_home,
+    codex_notify_event_from_arg,
 };
 use crate::hook::origin::{
     HookOrigin, claude_hook_origin, codex_hook_origin, find_codex_session_file,
@@ -117,11 +118,18 @@ pub(crate) fn run_hook_command(
                 let event = codex_notify_event_from_arg(&arg, now_epoch)?;
                 return write_agent_event(runner, env, &event);
             }
-            if let Some(progress_event) =
+            if let Some(aux_event) =
                 codex_aux_event_from_input(&arg, input, now_epoch, codex_home.as_deref())?
             {
-                if let Some(pane) = resolve_pane(runner, env)? {
-                    apply_progress_event(runner, &pane, progress_event)?;
+                match aux_event {
+                    CodexAuxEvent::Progress(progress_event) => {
+                        if let Some(pane) = resolve_pane(runner, env)? {
+                            apply_progress_event(runner, &pane, progress_event)?;
+                        }
+                    }
+                    CodexAuxEvent::Agent(event) => {
+                        write_agent_event(runner, env, &event)?;
+                    }
                 }
                 return Ok(());
             }
@@ -346,12 +354,17 @@ fn claude_task_status_from_str(raw: &str) -> Option<TaskItemStatus> {
     }
 }
 
+enum CodexAuxEvent {
+    Progress(ProgressEvent),
+    Agent(AgentEvent),
+}
+
 fn codex_aux_event_from_input(
     event: &str,
     input: &str,
     now_epoch: i64,
     codex_home: Option<&Path>,
-) -> Result<Option<ProgressEvent>> {
+) -> Result<Option<CodexAuxEvent>> {
     let payload: Value = match serde_json::from_str(input.trim()) {
         Ok(payload) => payload,
         Err(_) => return Ok(None),
@@ -368,8 +381,9 @@ fn codex_aux_event_from_input(
             }
             codex_post_tool_use_event(&payload, now_epoch)
         }
-        "SubagentStart" => codex_subagent_start_event_with_home(&payload, codex_home),
-        "SubagentStop" => codex_subagent_stop_event(&payload),
+        "SubagentStart" => Ok(codex_subagent_start_event_with_home(&payload, codex_home)?
+            .map(CodexAuxEvent::Progress)),
+        "SubagentStop" => Ok(codex_subagent_stop_event(&payload)?.map(CodexAuxEvent::Progress)),
         _ => Ok(None),
     }
 }
@@ -377,19 +391,42 @@ fn codex_aux_event_from_input(
 fn is_guarded_codex_post_tool_use(payload: &Value) -> bool {
     matches!(
         payload.get("tool_name").and_then(Value::as_str),
-        Some("update_plan" | "Bash")
+        Some("update_plan" | "Bash" | "create_goal")
     )
 }
 
-fn codex_post_tool_use_event(payload: &Value, now_epoch: i64) -> Result<Option<ProgressEvent>> {
+fn codex_post_tool_use_event(payload: &Value, now_epoch: i64) -> Result<Option<CodexAuxEvent>> {
     let Some(tool_name) = payload.get("tool_name").and_then(Value::as_str) else {
         return Ok(None);
     };
     match tool_name {
-        "update_plan" => codex_update_plan_event(payload),
-        "Bash" => codex_bash_event(payload, now_epoch),
+        "update_plan" => Ok(codex_update_plan_event(payload)?.map(CodexAuxEvent::Progress)),
+        "Bash" => Ok(codex_bash_event(payload, now_epoch)?.map(CodexAuxEvent::Progress)),
+        "create_goal" => Ok(codex_create_goal_event(payload, now_epoch)?.map(CodexAuxEvent::Agent)),
         _ => Ok(None),
     }
+}
+
+fn codex_create_goal_event(payload: &Value, now_epoch: i64) -> Result<Option<AgentEvent>> {
+    let Some(objective) = payload
+        .get("tool_input")
+        .and_then(|tool_input| tool_input.get("objective"))
+        .and_then(Value::as_str)
+        .and_then(build_prompt_preview)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(AgentEvent {
+        agent: "codex".to_string(),
+        status: Some(AgentStatus::Running),
+        prompt: Some(OptionUpdate::Set(objective)),
+        prompt_source: Some(OptionUpdate::Set("goal".to_string())),
+        started_at: Some(now_epoch),
+        tasks: Some(OptionUpdate::Unset),
+        task_items: Some(OptionUpdate::Unset),
+        worktree_activity: Some(OptionUpdate::Unset),
+        ..AgentEvent::default()
+    }))
 }
 
 fn codex_update_plan_event(payload: &Value) -> Result<Option<ProgressEvent>> {
