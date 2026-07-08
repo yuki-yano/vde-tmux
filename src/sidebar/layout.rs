@@ -8,6 +8,8 @@ use crate::options::{KEY_LAYOUT_BASELINE, KEY_LAYOUT_PANES, KEY_SIDEBAR_MARKER};
 use crate::tmux::TmuxRunner;
 
 pub const SIDEBAR_PANE_FORMAT: &str = "#{pane_id}\t#{@vde_sidebar}\t#{pane_width}";
+pub(crate) const ENV_SELECTION_PANE: &str = "VDE_TMUX_SELECTION_PANE";
+pub(crate) const ENV_SELECTION_SESSION: &str = "VDE_TMUX_SELECTION_SESSION";
 const RAIL_WIDTH: u16 = 2;
 const AFTER_NEW_WINDOW_HOOK: &str = "after-new-window[90]";
 const PANE_EXIT_HOOK: &str = "pane-exited[90]";
@@ -16,6 +18,26 @@ const PANE_EXIT_HOOK: &str = "pane-exited[90]";
 struct SidebarPane {
     pane_id: String,
     width: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidebarAttachContext {
+    pub pane: Option<String>,
+    pub session: Option<String>,
+}
+
+impl SidebarAttachContext {
+    pub(crate) fn new(pane: Option<String>, session: Option<String>) -> Option<Self> {
+        let pane = normalize_context_value(pane);
+        let session = normalize_context_value(session);
+        (pane.is_some() || session.is_some()).then_some(Self { pane, session })
+    }
+}
+
+fn normalize_context_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 pub fn attach(runner: &dyn TmuxRunner, env: &BTreeMap<String, String>) -> Result<()> {
@@ -35,10 +57,21 @@ pub fn open(
     width: SidebarWidth,
     min_width: u16,
 ) -> Result<()> {
+    open_with_attach_context(runner, target, self_exe, width, min_width, None)
+}
+
+pub(crate) fn open_with_attach_context(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    self_exe: &Path,
+    width: SidebarWidth,
+    min_width: u16,
+    attach_context: Option<&SidebarAttachContext>,
+) -> Result<()> {
     if find_sidebar_pane(runner, target)?.is_some() {
         return Ok(());
     }
-    open_unchecked(runner, target, self_exe, width, min_width)
+    open_unchecked(runner, target, self_exe, width, min_width, attach_context)
 }
 
 pub fn open_if_auto_all_enabled(
@@ -86,10 +119,21 @@ pub fn toggle(
     width: SidebarWidth,
     min_width: u16,
 ) -> Result<()> {
+    toggle_with_attach_context(runner, target, self_exe, width, min_width, None)
+}
+
+pub(crate) fn toggle_with_attach_context(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    self_exe: &Path,
+    width: SidebarWidth,
+    min_width: u16,
+    attach_context: Option<&SidebarAttachContext>,
+) -> Result<()> {
     if let Some(sidebar) = find_sidebar_pane(runner, target)? {
         close_sidebar_pane(runner, target, &sidebar)
     } else {
-        open_unchecked(runner, target, self_exe, width, min_width)
+        open_unchecked(runner, target, self_exe, width, min_width, attach_context)
     }
 }
 
@@ -98,6 +142,16 @@ pub fn toggle_all(
     self_exe: &Path,
     width: SidebarWidth,
     min_width: u16,
+) -> Result<()> {
+    toggle_all_with_attach_context(runner, self_exe, width, min_width, None)
+}
+
+pub(crate) fn toggle_all_with_attach_context(
+    runner: &dyn TmuxRunner,
+    self_exe: &Path,
+    width: SidebarWidth,
+    min_width: u16,
+    attach_context: Option<&SidebarAttachContext>,
 ) -> Result<()> {
     let windows = list_window_ids(runner)?;
     let sidebars = windows
@@ -114,7 +168,7 @@ pub fn toggle_all(
     } else {
         for (window, sidebar) in sidebars {
             if sidebar.is_none() {
-                open_unchecked(runner, &window, self_exe, width, min_width)?;
+                open_unchecked(runner, &window, self_exe, width, min_width, attach_context)?;
             }
         }
         install_auto_hooks(runner, self_exe, width)?;
@@ -129,8 +183,19 @@ pub fn focus_toggle(
     width: SidebarWidth,
     min_width: u16,
 ) -> Result<()> {
+    focus_toggle_with_attach_context(runner, target, self_exe, width, min_width, None)
+}
+
+pub(crate) fn focus_toggle_with_attach_context(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    self_exe: &Path,
+    width: SidebarWidth,
+    min_width: u16,
+    attach_context: Option<&SidebarAttachContext>,
+) -> Result<()> {
     let Some(sidebar) = find_sidebar_pane(runner, target)? else {
-        return open_unchecked(runner, target, self_exe, width, min_width);
+        return open_unchecked(runner, target, self_exe, width, min_width, attach_context);
     };
     let active = runner
         .run(&["display-message", "-p", "-t", target, "#{pane_id}"])?
@@ -214,7 +279,7 @@ pub fn layout_applied(
     if let Some(sidebar) = find_sidebar_pane(runner, target)? {
         return reconcile_existing_sidebar(runner, target, &panes, &sidebar);
     }
-    open_unchecked(runner, target, self_exe, width, min_width)
+    open_unchecked(runner, target, self_exe, width, min_width, None)
 }
 
 pub fn layout_changed(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
@@ -255,6 +320,7 @@ fn open_unchecked(
     self_exe: &Path,
     width: SidebarWidth,
     min_width: u16,
+    attach_context: Option<&SidebarAttachContext>,
 ) -> Result<()> {
     prepare_baseline_for_open(runner, target)?;
     let layout = capture_window_layout(runner, target)?;
@@ -264,7 +330,7 @@ fn open_unchecked(
     let socket_name = std::env::var("VDE_TMUX_SOCKET_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let command = attach_shell_command(self_exe, socket_name.as_deref());
+    let command = attach_shell_command(self_exe, socket_name.as_deref(), attach_context);
     runner.run(&[
         "split-window",
         "-d",
@@ -614,17 +680,31 @@ fn shell_quote(value: &str) -> String {
     quoted
 }
 
-fn attach_shell_command(self_exe: &Path, socket_name: Option<&str>) -> String {
+fn attach_shell_command(
+    self_exe: &Path,
+    socket_name: Option<&str>,
+    attach_context: Option<&SidebarAttachContext>,
+) -> String {
     let command = format!(
         "{} sidebar attach",
         shell_quote(&self_exe.display().to_string())
     );
-    match socket_name.filter(|value| !value.trim().is_empty()) {
-        Some(socket_name) => format!(
-            "VDE_TMUX_SOCKET_NAME={} {command}",
-            shell_quote(socket_name)
-        ),
-        None => command,
+    let mut env = Vec::new();
+    if let Some(socket_name) = socket_name.filter(|value| !value.trim().is_empty()) {
+        env.push(format!("VDE_TMUX_SOCKET_NAME={}", shell_quote(socket_name)));
+    }
+    if let Some(context) = attach_context {
+        if let Some(pane) = context.pane.as_deref() {
+            env.push(format!("{ENV_SELECTION_PANE}={}", shell_quote(pane)));
+        }
+        if let Some(session) = context.session.as_deref() {
+            env.push(format!("{ENV_SELECTION_SESSION}={}", shell_quote(session)));
+        }
+    }
+    if env.is_empty() {
+        command
+    } else {
+        format!("{} {command}", env.join(" "))
     }
 }
 
@@ -690,12 +770,25 @@ mod tests {
     #[test]
     fn attach_shell_command_propagates_tmux_socket_name() {
         assert_eq!(
-            attach_shell_command(&exe(), Some("scratch")),
+            attach_shell_command(&exe(), Some("scratch"), None),
             "VDE_TMUX_SOCKET_NAME='scratch' '/tmp/vt' sidebar attach"
         );
         assert_eq!(
-            attach_shell_command(&exe(), None),
+            attach_shell_command(&exe(), None, None),
             "'/tmp/vt' sidebar attach"
+        );
+    }
+
+    #[test]
+    fn attach_shell_command_propagates_selection_context() {
+        let context = SidebarAttachContext {
+            pane: Some("%1".to_string()),
+            session: Some("main".to_string()),
+        };
+
+        assert_eq!(
+            attach_shell_command(&exe(), Some("scratch"), Some(&context)),
+            "VDE_TMUX_SOCKET_NAME='scratch' VDE_TMUX_SELECTION_PANE='%1' VDE_TMUX_SELECTION_SESSION='main' '/tmp/vt' sidebar attach"
         );
     }
 

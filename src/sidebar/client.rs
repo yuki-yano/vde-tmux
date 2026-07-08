@@ -38,6 +38,23 @@ pub fn send_sidebar_jump(socket: &Path, pane: &str) -> Result<()> {
     )
 }
 
+pub fn send_sidebar_select_context(
+    socket: &Path,
+    pane: Option<&str>,
+    session: Option<&str>,
+) -> Result<()> {
+    request_ack(
+        socket,
+        ClientMessage::SidebarEvent {
+            proto: 1,
+            event: SidebarClientEvent::SelectContext {
+                pane: pane.map(ToOwned::to_owned),
+                session: session.map(ToOwned::to_owned),
+            },
+        },
+    )
+}
+
 pub fn send_sidebar_toggle(socket: &Path, row_id: &str) -> Result<()> {
     send_sidebar_key(socket, &format!("toggle:{row_id}"))
 }

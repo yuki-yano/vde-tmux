@@ -27,8 +27,16 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SidebarClientEvent {
-    Key { key: String },
-    JumpPane { pane: String },
+    Key {
+        key: String,
+    },
+    JumpPane {
+        pane: String,
+    },
+    SelectContext {
+        pane: Option<String>,
+        session: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +117,24 @@ mod tests {
         assert_eq!(
             json,
             r#"{"op":"sidebar_event","proto":1,"event":{"type":"key","key":"j"}}"#
+        );
+        let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn sidebar_event_roundtrips_select_context() {
+        let message = ClientMessage::SidebarEvent {
+            proto: 1,
+            event: SidebarClientEvent::SelectContext {
+                pane: Some("%1".to_string()),
+                session: Some("main".to_string()),
+            },
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            json,
+            r#"{"op":"sidebar_event","proto":1,"event":{"type":"select_context","pane":"%1","session":"main"}}"#
         );
         let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, message);

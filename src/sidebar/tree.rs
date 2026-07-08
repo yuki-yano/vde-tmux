@@ -370,6 +370,22 @@ pub fn row_refs(rows: &[SidebarRow]) -> Vec<SidebarRowRef> {
         .collect()
 }
 
+pub(crate) fn chat_row_id(pane_id: &str) -> String {
+    format!("chat::{pane_id}")
+}
+
+pub(crate) fn repo_row_id_for_pane(config: &Config, pane: &PaneSnapshot) -> String {
+    let repo = repo_label(pane);
+    let category = category_for_pane(config, pane, &repo);
+    repo_id(&category, &repo)
+}
+
+pub(crate) fn category_row_id_for_pane(config: &Config, pane: &PaneSnapshot) -> String {
+    let repo = repo_label(pane);
+    let category = category_for_pane(config, pane, &repo);
+    format!("category::{category}")
+}
+
 fn category_rows(
     groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,

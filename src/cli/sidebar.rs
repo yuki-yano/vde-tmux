@@ -7,6 +7,8 @@ use clap::Subcommand;
 use crate::config::SidebarWidth;
 use crate::tmux::TmuxRunner;
 
+const SELECTION_CONTEXT_FORMAT: &str = "#{pane_id}\u{1f}#{session_name}";
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum SidebarCommand {
     Attach {
@@ -97,6 +99,7 @@ where
         SidebarCommand::Attach { once } => {
             ensure_daemon(env)?;
             crate::sidebar::layout::attach(runner, env)?;
+            try_seed_sidebar_selection_from_env(env);
             if once {
                 return crate::sidebar::once::render_once(runner, env, config).map(Some);
             }
@@ -119,12 +122,16 @@ where
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
             let target = resolve_window_target(runner, window)?;
-            crate::sidebar::layout::open(
+            let selection_context = resolve_selection_context(runner, env).ok();
+            try_seed_sidebar_selection(env, selection_context.as_ref());
+            let attach_context = selection_context.as_ref().and_then(to_attach_context);
+            crate::sidebar::layout::open_with_attach_context(
                 runner,
                 &target,
                 &std::env::current_exe()?,
                 width.unwrap_or(config.sidebar.width),
                 config.sidebar.min_width,
+                attach_context.as_ref(),
             )?;
             Ok(None)
         }
@@ -133,21 +140,26 @@ where
             if all && window.is_some() {
                 bail!("--all and --window cannot be used together");
             }
+            let selection_context = resolve_selection_context(runner, env).ok();
+            try_seed_sidebar_selection(env, selection_context.as_ref());
+            let attach_context = selection_context.as_ref().and_then(to_attach_context);
             if all {
-                crate::sidebar::layout::toggle_all(
+                crate::sidebar::layout::toggle_all_with_attach_context(
                     runner,
                     &std::env::current_exe()?,
                     width.unwrap_or(config.sidebar.width),
                     config.sidebar.min_width,
+                    attach_context.as_ref(),
                 )?;
             } else {
                 let target = resolve_window_target(runner, window)?;
-                crate::sidebar::layout::toggle(
+                crate::sidebar::layout::toggle_with_attach_context(
                     runner,
                     &target,
                     &std::env::current_exe()?,
                     width.unwrap_or(config.sidebar.width),
                     config.sidebar.min_width,
+                    attach_context.as_ref(),
                 )?;
             }
             Ok(None)
@@ -155,12 +167,16 @@ where
         SidebarCommand::FocusToggle { window, width } => {
             ensure_daemon(env)?;
             let target = resolve_window_target(runner, window)?;
-            crate::sidebar::layout::focus_toggle(
+            let selection_context = resolve_selection_context(runner, env).ok();
+            try_seed_sidebar_selection(env, selection_context.as_ref());
+            let attach_context = selection_context.as_ref().and_then(to_attach_context);
+            crate::sidebar::layout::focus_toggle_with_attach_context(
                 runner,
                 &target,
                 &std::env::current_exe()?,
                 width.unwrap_or(config.sidebar.width),
                 config.sidebar.min_width,
+                attach_context.as_ref(),
             )?;
             Ok(None)
         }
@@ -210,6 +226,8 @@ where
         }
         SidebarCommand::Focus { window } => {
             let target = resolve_window_target(runner, window)?;
+            let selection_context = resolve_selection_context(runner, env).ok();
+            try_seed_sidebar_selection(env, selection_context.as_ref());
             crate::sidebar::layout::focus(runner, &target)?;
             Ok(None)
         }
@@ -222,6 +240,81 @@ fn ensure_sidebar_daemon_started(env: &BTreeMap<String, String>) -> Result<()> {
 
 fn parse_sidebar_width(value: &str) -> std::result::Result<SidebarWidth, String> {
     value.parse()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarSelectionContext {
+    pane: Option<String>,
+    session: Option<String>,
+}
+
+fn try_seed_sidebar_selection(
+    env: &BTreeMap<String, String>,
+    context: Option<&SidebarSelectionContext>,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    if context.pane.is_none() && context.session.is_none() {
+        return;
+    }
+    let _ = crate::sidebar::client::send_sidebar_select_context(
+        &crate::sidebar::client::socket_path(env),
+        context.pane.as_deref(),
+        context.session.as_deref(),
+    );
+}
+
+fn try_seed_sidebar_selection_from_env(env: &BTreeMap<String, String>) {
+    let context = SidebarSelectionContext {
+        pane: normalize_context_field(
+            env.get(crate::sidebar::layout::ENV_SELECTION_PANE)
+                .map(String::as_str),
+        ),
+        session: normalize_context_field(
+            env.get(crate::sidebar::layout::ENV_SELECTION_SESSION)
+                .map(String::as_str),
+        ),
+    };
+    try_seed_sidebar_selection(env, Some(&context));
+}
+
+fn to_attach_context(
+    context: &SidebarSelectionContext,
+) -> Option<crate::sidebar::layout::SidebarAttachContext> {
+    crate::sidebar::layout::SidebarAttachContext::new(context.pane.clone(), context.session.clone())
+}
+
+fn resolve_selection_context(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<SidebarSelectionContext> {
+    let mut args = vec!["display-message", "-p"];
+    if let Some(pane) = env
+        .get("TMUX_PANE")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        args.extend(["-t", pane]);
+    }
+    args.extend(["-F", SELECTION_CONTEXT_FORMAT]);
+    let output = runner.run(&args)?;
+    Ok(parse_selection_context(output.trim()))
+}
+
+fn parse_selection_context(raw: &str) -> SidebarSelectionContext {
+    let mut fields = raw.split('\u{1f}');
+    SidebarSelectionContext {
+        pane: normalize_context_field(fields.next()),
+        session: normalize_context_field(fields.next()),
+    }
+}
+
+fn normalize_context_field(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn resolve_window_target(runner: &dyn TmuxRunner, window: Option<String>) -> Result<String> {

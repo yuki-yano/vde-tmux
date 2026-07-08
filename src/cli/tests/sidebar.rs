@@ -138,10 +138,8 @@ fn dispatch_sidebar_attach_once_restores_persisted_state() {
 fn dispatch_sidebar_open_uses_layout_operations() {
     let mock = MockTmuxRunner::new();
     let exe = std::env::current_exe().unwrap();
-    let command = format!(
-        "{} sidebar attach",
-        shell_quote_for_test(&exe.display().to_string())
-    );
+    let command = sidebar_attach_command_for_selection_test(&exe);
+    stub_selection_context(&mock);
     mock.stub(
         &[
             "list-panes",
@@ -230,13 +228,14 @@ fn dispatch_sidebar_open_uses_layout_operations() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 7);
+    assert_eq!(mock.calls().len(), 8);
 }
 
 #[test]
 fn dispatch_sidebar_focus_selects_sidebar_pane() {
     let mock = MockTmuxRunner::new();
     mock.stub(&["display-message", "-p", "#{window_id}"], "@1\n");
+    stub_selection_context(&mock);
     mock.stub(
         &[
             "list-panes",
@@ -269,6 +268,7 @@ fn dispatch_sidebar_focus_selects_sidebar_pane() {
 fn dispatch_sidebar_focus_without_sidebar_is_noop() {
     let mock = MockTmuxRunner::new();
     mock.stub(&["display-message", "-p", "#{window_id}"], "@1\n");
+    stub_selection_context(&mock);
     mock.stub(
         &[
             "list-panes",
@@ -302,10 +302,8 @@ fn dispatch_sidebar_focus_without_sidebar_is_noop() {
 fn dispatch_sidebar_open_accepts_percent_width() {
     let mock = MockTmuxRunner::new();
     let exe = std::env::current_exe().unwrap();
-    let command = format!(
-        "{} sidebar attach",
-        shell_quote_for_test(&exe.display().to_string())
-    );
+    let command = sidebar_attach_command_for_selection_test(&exe);
+    stub_selection_context(&mock);
     mock.stub(
         &[
             "list-panes",
@@ -377,17 +375,15 @@ fn dispatch_sidebar_open_accepts_percent_width() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 7);
+    assert_eq!(mock.calls().len(), 8);
 }
 
 #[test]
 fn dispatch_sidebar_toggle_all_uses_all_windows() {
     let mock = MockTmuxRunner::new();
     let exe = std::env::current_exe().unwrap();
-    let command = format!(
-        "{} sidebar attach",
-        shell_quote_for_test(&exe.display().to_string())
-    );
+    let command = sidebar_attach_command_for_selection_test(&exe);
+    stub_selection_context(&mock);
     mock.stub(&["list-windows", "-a", "-F", "#{window_id}"], "@1\n");
     mock.stub(
         &[
@@ -494,7 +490,104 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 10);
+    assert_eq!(mock.calls().len(), 11);
+}
+
+#[test]
+fn dispatch_sidebar_focus_sends_current_selection_context() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let socket = unique_socket_path("vde-tmux-sidebar-select-context");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(&mut stream).read_line(&mut line).unwrap();
+                    let message: crate::daemon::protocol::ClientMessage =
+                        serde_json::from_str(line.trim()).unwrap();
+                    tx.send(message).unwrap();
+                    serde_json::to_writer(
+                        &mut stream,
+                        &crate::daemon::protocol::ServerMessage::Ack,
+                    )
+                    .unwrap();
+                    stream.write_all(b"\n").unwrap();
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    let env = BTreeMap::from([
+        (
+            "VDE_DAEMON_SOCKET".to_string(),
+            socket.display().to_string(),
+        ),
+        ("TMUX_PANE".to_string(), "%source".to_string()),
+    ]);
+    let mock = MockTmuxRunner::new();
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "%source",
+            "-F",
+            "#{pane_id}\u{1f}#{session_name}",
+        ],
+        "%source\u{1f}main\n",
+    );
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@1",
+            "-F",
+            crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+        ],
+        "%9\t1\t40\n%1\t\t80\n",
+    );
+    mock.stub(&["select-pane", "-t", "%9"], "");
+
+    crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Focus {
+            window: Some("@1".to_string()),
+        },
+        &mock,
+        &env,
+        &crate::config::Config::default(),
+        |_| Ok(()),
+    )
+    .unwrap();
+
+    let message = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        message,
+        crate::daemon::protocol::ClientMessage::SidebarEvent {
+            proto: 1,
+            event: crate::daemon::protocol::SidebarClientEvent::SelectContext {
+                pane: Some("%source".to_string()),
+                session: Some("main".to_string())
+            }
+        }
+    );
+    handle.join().unwrap();
+    std::fs::remove_file(socket).unwrap();
 }
 
 #[test]
@@ -785,6 +878,25 @@ fn shell_quote_for_test(value: &str) -> String {
     }
     quoted.push('\'');
     quoted
+}
+
+fn stub_selection_context(mock: &MockTmuxRunner) {
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-F",
+            "#{pane_id}\u{1f}#{session_name}",
+        ],
+        "%1\u{1f}main\n",
+    );
+}
+
+fn sidebar_attach_command_for_selection_test(exe: &std::path::Path) -> String {
+    format!(
+        "VDE_TMUX_SELECTION_PANE='%1' VDE_TMUX_SELECTION_SESSION='main' {} sidebar attach",
+        shell_quote_for_test(&exe.display().to_string())
+    )
 }
 
 fn unique_socket_path(label: &str) -> std::path::PathBuf {

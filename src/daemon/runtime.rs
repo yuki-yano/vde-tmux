@@ -15,8 +15,8 @@ use crate::options::snapshot::{PaneSnapshot, effective_agent, has_pane_state, is
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
 use crate::sidebar::state::{RepoId, SidebarAction, SidebarState};
 use crate::sidebar::tree::{
-    BadgeCounts, RowBuildContext, SidebarRow, SidebarRowKind, build_rows_ctx, now_epoch_secs,
-    row_refs,
+    BadgeCounts, RowBuildContext, SidebarRow, SidebarRowKind, build_rows_ctx,
+    category_row_id_for_pane, chat_row_id, now_epoch_secs, repo_row_id_for_pane, row_refs,
 };
 
 const STATE_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -84,6 +84,26 @@ pub enum RuntimeEffect {
         agent: String,
         state: BadgeState,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionContext {
+    pane: Option<String>,
+    session: Option<String>,
+}
+
+impl SelectionContext {
+    fn new(pane: Option<String>, session: Option<String>) -> Option<Self> {
+        let pane = normalize_context_value(pane);
+        let session = normalize_context_value(session);
+        (pane.is_some() || session.is_some()).then_some(Self { pane, session })
+    }
+}
+
+fn normalize_context_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug)]
@@ -177,6 +197,7 @@ pub struct RuntimeState {
     flash: BTreeMap<String, u8>,
     written_badges: BTreeMap<String, (String, String)>,
     last_heartbeat: i64,
+    pending_selection_context: Option<SelectionContext>,
 }
 
 impl RuntimeState {
@@ -203,6 +224,7 @@ impl RuntimeState {
             flash: BTreeMap::new(),
             written_badges: BTreeMap::new(),
             last_heartbeat: 0,
+            pending_selection_context: None,
         }
     }
 
@@ -229,6 +251,10 @@ impl RuntimeState {
                 self.update_triage();
                 let transition_effects = self.update_transitions();
                 self.rebuild_snapshot();
+                if self.apply_pending_selection_context() {
+                    self.mark_state_dirty(Instant::now());
+                    self.rebuild_snapshot();
+                }
                 self.broadcast_if_needed();
                 let mut effects = clear_pane_state_effects;
                 effects.extend(transition_effects);
@@ -240,6 +266,10 @@ impl RuntimeState {
                 self.git_badges = badges;
                 self.worktrees = worktrees;
                 self.rebuild_snapshot();
+                if self.apply_pending_selection_context() {
+                    self.mark_state_dirty(Instant::now());
+                    self.rebuild_snapshot();
+                }
                 self.broadcast_if_needed();
                 Vec::new()
             }
@@ -375,7 +405,80 @@ impl RuntimeState {
                 self.broadcast_if_needed();
                 vec![RuntimeEffect::JumpPane(pane)]
             }
+            SidebarClientEvent::SelectContext { pane, session } => {
+                let Some(context) = SelectionContext::new(pane, session) else {
+                    return Vec::new();
+                };
+                self.pending_selection_context = Some(context);
+                if self.apply_pending_selection_context() {
+                    self.mark_state_dirty(Instant::now());
+                    self.rebuild_snapshot();
+                    self.broadcast_if_needed();
+                }
+                Vec::new()
+            }
         }
+    }
+
+    fn apply_pending_selection_context(&mut self) -> bool {
+        let Some(context) = self.pending_selection_context.clone() else {
+            return false;
+        };
+        let Some(selection) = self.selection_for_context(&context) else {
+            return false;
+        };
+        self.pending_selection_context = None;
+        if self.ui_state.selection.as_deref() == Some(selection.as_str()) {
+            return false;
+        }
+        self.ui_state.selection = Some(selection);
+        self.ui_state.version += 1;
+        true
+    }
+
+    fn selection_for_context(&self, context: &SelectionContext) -> Option<String> {
+        if let Some(pane_id) = context.pane.as_deref()
+            && let Some(selection) = self.selection_for_pane(pane_id)
+        {
+            return Some(selection);
+        }
+        let session = context.session.as_deref()?;
+        if let Some(row) = self.rows.iter().find(|row| {
+            row.kind == SidebarRowKind::Chat
+                && row
+                    .pane_id
+                    .as_deref()
+                    .and_then(|pane_id| self.pane_for_id(pane_id))
+                    .map(|pane| pane.session == session)
+                    .unwrap_or(false)
+        }) {
+            return Some(row.id.clone());
+        }
+        self.panes
+            .iter()
+            .filter(|pane| pane.session == session && is_live_agent_pane(pane))
+            .find_map(|pane| self.selection_for_pane(&pane.pane_id))
+    }
+
+    fn selection_for_pane(&self, pane_id: &str) -> Option<String> {
+        let pane = self.pane_for_id(pane_id)?;
+        if !is_live_agent_pane(pane) {
+            return None;
+        }
+        let candidates = [
+            chat_row_id(&pane.pane_id),
+            repo_row_id_for_pane(&self.config, pane),
+            category_row_id_for_pane(&self.config, pane),
+        ];
+        candidates.into_iter().find(|candidate| {
+            self.rows
+                .iter()
+                .any(|row| row.id.as_str() == candidate.as_str())
+        })
+    }
+
+    fn pane_for_id(&self, pane_id: &str) -> Option<&PaneSnapshot> {
+        self.panes.iter().find(|pane| pane.pane_id == pane_id)
     }
 
     fn apply_key(&mut self, key: &str) -> Vec<RuntimeEffect> {
@@ -1193,6 +1296,97 @@ mod tests {
 
         assert_eq!(state.ui_state.selection.as_deref(), Some("repo::misc::app"));
         assert!(state.state_dirty_since().is_some());
+    }
+
+    #[test]
+    fn select_context_prefers_exact_visible_pane() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![
+            agent_pane("main", "%1", "running"),
+            agent_pane("main", "%2", "running"),
+        ]));
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::SelectContext {
+                pane: Some("%2".to_string()),
+                session: Some("main".to_string()),
+            },
+        });
+
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%2"));
+        assert!(state.state_dirty_since().is_some());
+    }
+
+    #[test]
+    fn select_context_falls_back_to_session_agent_when_pane_is_not_sidebar_row() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        state.apply_event(DaemonEvent::PanesUpdated(vec![
+            PaneSnapshot {
+                session: "main".to_string(),
+                window_id: "@1".to_string(),
+                pane_id: "%shell".to_string(),
+                current_path: "/tmp/shell".to_string(),
+                current_command: "zsh".to_string(),
+                ..PaneSnapshot::default()
+            },
+            agent_pane("main", "%agent", "running"),
+            agent_pane("other", "%other", "running"),
+        ]));
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::SelectContext {
+                pane: Some("%shell".to_string()),
+                session: Some("main".to_string()),
+            },
+        });
+
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%agent"));
+    }
+
+    #[test]
+    fn select_context_waits_for_rows_when_panes_are_not_loaded_yet() {
+        let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::SelectContext {
+                pane: Some("%1".to_string()),
+                session: Some("main".to_string()),
+            },
+        });
+        assert_eq!(state.ui_state.selection, None);
+
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+
+        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
+    }
+
+    #[test]
+    fn select_context_uses_visible_group_when_chat_row_is_collapsed() {
+        let mut state = RuntimeState::new(
+            Config::default(),
+            SidebarState {
+                collapsed: BTreeSet::from(["repo::misc::tmp".to_string()]),
+                ..SidebarState::default()
+            },
+        );
+        state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+
+        state.apply_event(DaemonEvent::Client {
+            client_id: ClientId(1),
+            event: SidebarClientEvent::SelectContext {
+                pane: Some("%1".to_string()),
+                session: Some("main".to_string()),
+            },
+        });
+
+        assert_eq!(state.ui_state.selection.as_deref(), Some("repo::misc::tmp"));
     }
 
     #[test]
