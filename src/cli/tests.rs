@@ -10,6 +10,21 @@ fn tmux_env() -> BTreeMap<String, String> {
     BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())])
 }
 
+fn window_row(
+    session: &str,
+    index: &str,
+    id: &str,
+    name: &str,
+    panes: &str,
+    active: &str,
+    command: &str,
+) -> String {
+    [
+        session, index, id, name, panes, active, "0", "0", "0", "0", command,
+    ]
+    .join("\u{1f}")
+}
+
 mod hook;
 mod sidebar;
 
@@ -43,6 +58,116 @@ fn dispatch_statusline_sessions_show_index_overrides_config() {
         .unwrap();
 
     assert!(output.contains("1: main"));
+}
+
+#[test]
+fn dispatch_statusline_windows_prints_output() {
+    let mock = MockTmuxRunner::new();
+    let format = crate::window::window_list_format();
+    mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+    mock.stub(
+        &["list-windows", "-t", "=main:", "-F", &format],
+        &format!(
+            "{}\n{}\n",
+            window_row("main", "1", "@1", "zsh", "1", "0", "zsh"),
+            window_row("main", "2", "@2", "editor", "2", "1", "nvim")
+        ),
+    );
+
+    let output = run_with(["vt", "statusline-windows"], &mock, &env())
+        .unwrap()
+        .unwrap();
+
+    assert!(output.contains("#[range=user|window:@1]"), "{output}");
+    assert!(output.contains("1:zsh"), "{output}");
+    assert!(output.contains("2:editor"), "{output}");
+}
+
+#[test]
+fn dispatch_statusline_windows_switch_selects_window() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(&["select-window", "-t", "@2"], "");
+
+    run_with(["vt", "statusline-windows", "switch", "@2"], &mock, &env()).unwrap();
+
+    assert_eq!(
+        mock.calls(),
+        vec![vec![
+            "select-window".to_string(),
+            "-t".to_string(),
+            "@2".to_string()
+        ]]
+    );
+}
+
+#[test]
+fn dispatch_statusline_click_routes_window_range() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(&["select-window", "-t", "@2"], "");
+
+    run_with(["vt", "statusline-click", "window:@2"], &mock, &env()).unwrap();
+
+    assert_eq!(
+        mock.calls(),
+        vec![vec![
+            "select-window".to_string(),
+            "-t".to_string(),
+            "@2".to_string()
+        ]]
+    );
+}
+
+#[test]
+fn dispatch_statusline_click_routes_session_range() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(&["switch-client", "-t", "$2"], "");
+
+    run_with(["vt", "statusline-click", "session:$2"], &mock, &env()).unwrap();
+
+    assert_eq!(
+        mock.calls(),
+        vec![vec![
+            "switch-client".to_string(),
+            "-t".to_string(),
+            "$2".to_string()
+        ]]
+    );
+}
+
+#[test]
+fn dispatch_statusline_click_routes_category_index() {
+    let mock = MockTmuxRunner::new();
+    let format = crate::session::session_list_format();
+    mock.stub(
+        &["list-sessions", "-F", &format],
+        "a\u{1f}1\u{1f}100\u{1f}alpha\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\nb\u{1f}1\u{1f}100\u{1f}beta\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
+    );
+    mock.stub(
+        &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+        "abc\t/dev/ttys001\n",
+    );
+    mock.stub(&["show-option", "-gqv", "@vde_client_616263_beta"], "");
+    mock.stub(&["switch-client", "-c", "abc", "-t", "=b:"], "");
+    mock.stub(&["set-option", "-g", "@vde_client_616263_beta", "b"], "");
+
+    run_with(["vt", "statusline-click", "2"], &mock, &env()).unwrap();
+
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|call| call == &vec!["switch-client", "-c", "abc", "-t", "=b:"])
+    );
+}
+
+#[test]
+fn dispatch_statusline_click_ignores_empty_zero_and_unknown_ranges() {
+    for range in ["", "0", "pane:%1"] {
+        let mock = MockTmuxRunner::new();
+
+        run_with(["vt", "statusline-click", range], &mock, &env()).unwrap();
+
+        assert!(mock.calls().is_empty(), "{range}");
+    }
 }
 
 #[test]
@@ -210,23 +335,17 @@ fn dispatch_popups_use_configured_size() {
 fn dispatch_session_manager_renders_preview() {
     let mock = MockTmuxRunner::new();
     let session_format = crate::session::session_list_format();
-    let window_format = [
-        "#{session_name}",
-        "#{window_index}",
-        "#{window_id}",
-        "#{window_name}",
-        "#{window_panes}",
-        "#{window_active}",
-        "#{pane_current_command}",
-    ]
-    .join("\t");
+    let window_format = crate::window::window_list_format();
     mock.stub(
         &["list-sessions", "-F", &session_format],
         "ni.zsh\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
     );
     mock.stub(
         &["list-windows", "-t", "=ni.zsh:", "-F", &window_format],
-        "ni.zsh\t2\t@9\teditor\t2\t1\tnvim\n",
+        &format!(
+            "{}\n",
+            window_row("ni.zsh", "2", "@9", "editor", "2", "1", "nvim")
+        ),
     );
     mock.stub(
         &[

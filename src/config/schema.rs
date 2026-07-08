@@ -87,6 +87,78 @@ pub fn config_schema() -> Value {
                             "separator": { "type": "string" }
                         }
                     },
+                    "windows": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "separator": { "type": "string" },
+                            "current": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "format": { "type": "string" },
+                                    "prefix": { "type": "string" },
+                                    "suffix": { "type": "string" },
+                                    "bold": { "type": "boolean" },
+                                    "colors": {
+                                        "type": "object",
+                                        "additionalProperties": true,
+                                        "properties": {
+                                            "fg": { "type": "string" },
+                                            "bg": { "type": "string" },
+                                            "outer_bg": { "type": "string" }
+                                        }
+                                    }
+                                }
+                            },
+                            "other": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "format": { "type": "string" },
+                                    "prefix": { "type": "string" },
+                                    "suffix": { "type": "string" },
+                                    "bold": { "type": "boolean" },
+                                    "colors": {
+                                        "type": "object",
+                                        "additionalProperties": true,
+                                        "properties": {
+                                            "fg": { "type": "string" },
+                                            "bg": { "type": "string" },
+                                            "outer_bg": { "type": "string" }
+                                        }
+                                    }
+                                }
+                            },
+                            "last": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "fg": { "type": "string" },
+                                    "bg": { "type": "string" },
+                                    "outer_bg": { "type": "string" }
+                                }
+                            },
+                            "bell": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "fg": { "type": "string" },
+                                    "bg": { "type": "string" },
+                                    "outer_bg": { "type": "string" }
+                                }
+                            },
+                            "activity": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "fg": { "type": "string" },
+                                    "bg": { "type": "string" },
+                                    "outer_bg": { "type": "string" }
+                                }
+                            }
+                        }
+                    },
                     "category": {
                         "type": "object",
                         "additionalProperties": true,
@@ -372,6 +444,16 @@ mod tests {
             schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["badge_style"]
                 ["enum"][2],
             "outer"
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["windows"]["properties"]["current"]["properties"]
+                ["format"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["windows"]["properties"]["bell"]["properties"]
+                ["fg"]["type"],
+            "string"
         );
     }
 }

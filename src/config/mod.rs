@@ -69,6 +69,7 @@ pub struct SessionNameRule {
 #[serde(default, deny_unknown_fields)]
 pub struct StatuslineConfig {
     pub sessions: StatuslineSessionsConfig,
+    pub windows: StatuslineWindowsConfig,
     pub category: StatuslineCategoryConfig,
     pub summary: SummaryConfig,
     pub attention: AttentionConfig,
@@ -95,6 +96,37 @@ impl Default for StatuslineSessionsConfig {
             },
             other: SegmentStyle::default(),
             badge_style: BadgeStyle::Inline,
+            separator: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatuslineWindowsConfig {
+    pub current: SegmentStyle,
+    pub other: SegmentStyle,
+    pub last: SegmentColors,
+    pub bell: SegmentColors,
+    pub activity: SegmentColors,
+    pub separator: String,
+}
+
+impl Default for StatuslineWindowsConfig {
+    fn default() -> Self {
+        Self {
+            current: SegmentStyle {
+                format: " {index}:{window} ".to_string(),
+                bold: true,
+                ..SegmentStyle::default()
+            },
+            other: SegmentStyle {
+                format: " {index}:{window} ".to_string(),
+                ..SegmentStyle::default()
+            },
+            last: SegmentColors::default(),
+            bell: SegmentColors::default(),
+            activity: SegmentColors::default(),
             separator: String::new(),
         }
     }
@@ -737,6 +769,69 @@ daemon:
         assert_eq!(config.daemon.poll_ms, 250);
         assert_eq!(config.daemon.git.poll_interval_ms, 10_000);
         assert_eq!(config.statusline.sessions.current.format, " {session} ");
+        assert_eq!(
+            config.statusline.windows.current.format,
+            " {index}:{window} "
+        );
+        assert!(config.statusline.windows.current.bold);
+    }
+
+    #[test]
+    fn statusline_windows_section_parses_styles_and_overlays() {
+        let yaml = r##"
+statusline:
+  windows:
+    separator: "#[fg=#8f8ba8]│#[default]"
+    current:
+      format: " {index}:{window} "
+      bold: false
+      colors:
+        fg: "#20233a"
+        bg: "#9d8cf5"
+      prefix: "#[fg=#9d8cf5]"
+      suffix: "#[fg=#9d8cf5,bg=default]#[default]"
+    other:
+      format: " {name} "
+      colors:
+        fg: "#9591ad"
+    bell:
+      fg: "#ff6b6b"
+    activity:
+      fg: "#ff6b6b"
+"##;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+
+        assert_eq!(
+            config.statusline.windows.separator,
+            "#[fg=#8f8ba8]│#[default]"
+        );
+        assert_eq!(
+            config.statusline.windows.current.format,
+            " {index}:{window} "
+        );
+        assert!(!config.statusline.windows.current.bold);
+        assert_eq!(
+            config.statusline.windows.current.colors.fg.as_deref(),
+            Some("#20233a")
+        );
+        assert_eq!(
+            config.statusline.windows.current.colors.bg.as_deref(),
+            Some("#9d8cf5")
+        );
+        assert_eq!(config.statusline.windows.current.prefix, "#[fg=#9d8cf5]");
+        assert_eq!(config.statusline.windows.other.format, " {name} ");
+        assert_eq!(
+            config.statusline.windows.other.colors.fg.as_deref(),
+            Some("#9591ad")
+        );
+        assert_eq!(
+            config.statusline.windows.bell.fg.as_deref(),
+            Some("#ff6b6b")
+        );
+        assert_eq!(
+            config.statusline.windows.activity.fg.as_deref(),
+            Some("#ff6b6b")
+        );
     }
 
     #[test]

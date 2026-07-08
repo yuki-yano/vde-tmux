@@ -41,6 +41,13 @@ enum Command {
         #[command(subcommand)]
         command: Option<StatuslineSessionsCommand>,
     },
+    #[command(name = "statusline-windows")]
+    StatuslineWindows {
+        #[command(subcommand)]
+        command: Option<StatuslineWindowsCommand>,
+    },
+    #[command(name = "statusline-click")]
+    StatuslineClick { range: Option<String> },
     Daemon {
         #[arg(long)]
         socket: Option<String>,
@@ -105,6 +112,11 @@ enum StatuslineCategoryCommand {
 #[derive(Debug, Subcommand)]
 enum StatuslineSessionsCommand {
     Switch { index: usize },
+}
+
+#[derive(Debug, Subcommand)]
+enum StatuslineWindowsCommand {
+    Switch { target: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -275,6 +287,19 @@ where
                 )?))
             }
         },
+        Command::StatuslineWindows { command } => match command {
+            Some(StatuslineWindowsCommand::Switch { target }) => {
+                crate::statusline::switch_statusline_window(runner, &target)?;
+                Ok(None)
+            }
+            None => Ok(Some(crate::statusline::statusline_windows(
+                runner, &config,
+            )?)),
+        },
+        Command::StatuslineClick { range } => {
+            crate::statusline::handle_statusline_click(runner, &config, range.as_deref())?;
+            Ok(None)
+        }
         Command::StatuslineSummary => Ok(Some(daemon::statusline_summary(runner, env, &config)?)),
         Command::StatuslineAttention => {
             Ok(Some(daemon::statusline_attention(runner, env, &config)?))

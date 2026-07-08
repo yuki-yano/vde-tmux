@@ -9,6 +9,7 @@ use crate::session::{
     switch_client_for_client,
 };
 use crate::tmux::{TmuxRunner, tmux_args};
+use crate::window::{list_windows, list_windows_for_target};
 use anyhow::{Context, Result};
 use unicode_width::UnicodeWidthStr;
 
@@ -304,53 +305,6 @@ fn build_entries(runner: &dyn TmuxRunner) -> Result<Vec<ManagerEntry>> {
         }
     }
     Ok(render_selector_rows(&rows))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WindowInfo {
-    session: String,
-    index: String,
-    id: String,
-    name: String,
-    panes: i64,
-    active: bool,
-    command: String,
-}
-
-fn list_windows(runner: &dyn TmuxRunner) -> Result<Vec<WindowInfo>> {
-    let format = [
-        "#{session_name}",
-        "#{window_index}",
-        "#{window_id}",
-        "#{window_name}",
-        "#{window_panes}",
-        "#{window_active}",
-        "#{pane_current_command}",
-    ]
-    .join(&FIELD_SEP.to_string());
-    let output = runner.run(&["list-windows", "-a", "-F", &format])?;
-    Ok(output
-        .lines()
-        .filter_map(|line| {
-            let fields = line.split(FIELD_SEP).collect::<Vec<_>>();
-            if fields.len() != 7 || fields[0].is_empty() || fields[2].is_empty() {
-                return None;
-            }
-            Some(WindowInfo {
-                session: fields[0].to_string(),
-                index: fields[1].to_string(),
-                id: fields[2].to_string(),
-                name: if fields[3].is_empty() {
-                    "(unnamed)".to_string()
-                } else {
-                    fields[3].to_string()
-                },
-                panes: fields[4].parse().unwrap_or_default(),
-                active: fields[5] == "1",
-                command: fields[6].to_string(),
-            })
-        })
-        .collect())
 }
 
 fn render_selector_rows(rows: &[SelectorRow]) -> Vec<ManagerEntry> {
@@ -785,42 +739,6 @@ struct PaneInfo {
     active: bool,
 }
 
-fn list_windows_for_target(runner: &dyn TmuxRunner, target: &str) -> Result<Vec<WindowInfo>> {
-    let format = [
-        "#{session_name}",
-        "#{window_index}",
-        "#{window_id}",
-        "#{window_name}",
-        "#{window_panes}",
-        "#{window_active}",
-        "#{pane_current_command}",
-    ]
-    .join(&FIELD_SEP.to_string());
-    let output = runner.run(&["list-windows", "-t", target, "-F", &format])?;
-    Ok(output
-        .lines()
-        .filter_map(|line| {
-            let fields = line.split(FIELD_SEP).collect::<Vec<_>>();
-            if fields.len() != 7 || fields[0].is_empty() || fields[2].is_empty() {
-                return None;
-            }
-            Some(WindowInfo {
-                session: fields[0].to_string(),
-                index: fields[1].to_string(),
-                id: fields[2].to_string(),
-                name: if fields[3].is_empty() {
-                    "(unnamed)".to_string()
-                } else {
-                    fields[3].to_string()
-                },
-                panes: fields[4].parse().unwrap_or_default(),
-                active: fields[5] == "1",
-                command: fields[6].to_string(),
-            })
-        })
-        .collect())
-}
-
 fn list_panes(runner: &dyn TmuxRunner, target: &str) -> Result<Vec<PaneInfo>> {
     let format = [
         "#{pane_index}",
@@ -1165,6 +1083,21 @@ mod tests {
         }
     }
 
+    fn window_row(
+        session: &str,
+        index: &str,
+        id: &str,
+        name: &str,
+        panes: &str,
+        active: &str,
+        command: &str,
+    ) -> String {
+        [
+            session, index, id, name, panes, active, "0", "0", "0", "0", command,
+        ]
+        .join("\u{1f}")
+    }
+
     #[test]
     fn open_popup_uses_display_popup_for_inner_session_manager() {
         let mock = MockTmuxRunner::new();
@@ -1220,16 +1153,7 @@ mod tests {
     fn interactive_session_manager_switches_selected_session() {
         let mock = MockTmuxRunner::new();
         let session_format = crate::session::session_list_format();
-        let window_format = [
-            "#{session_name}",
-            "#{window_index}",
-            "#{window_id}",
-            "#{window_name}",
-            "#{window_panes}",
-            "#{window_active}",
-            "#{pane_current_command}",
-        ]
-        .join(&FIELD_SEP.to_string());
+        let window_format = crate::window::window_list_format();
         mock.stub(&["has-session"], "");
         mock.stub(
             &["list-sessions", "-F", &session_format],
@@ -1237,7 +1161,11 @@ mod tests {
         );
         mock.stub(
             &["list-windows", "-a", "-F", &window_format],
-            "main\t1\t@1\tzsh\t1\t1\tzsh\nni.zsh\t1\t@2\tzsh\t1\t1\tzsh\n",
+            &format!(
+                "{}\n{}\n",
+                window_row("main", "1", "@1", "zsh", "1", "1", "zsh"),
+                window_row("ni.zsh", "1", "@2", "zsh", "1", "1", "zsh")
+            ),
         );
         mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
         mock.stub(
@@ -1266,16 +1194,7 @@ mod tests {
     fn interactive_session_manager_starts_tmux_server_when_missing() {
         let mock = MockTmuxRunner::new();
         let session_format = crate::session::session_list_format();
-        let window_format = [
-            "#{session_name}",
-            "#{window_index}",
-            "#{window_id}",
-            "#{window_name}",
-            "#{window_panes}",
-            "#{window_active}",
-            "#{pane_current_command}",
-        ]
-        .join(&FIELD_SEP.to_string());
+        let window_format = crate::window::window_list_format();
         mock.stub(&["new-session", "-d"], "");
         mock.stub(
             &["list-sessions", "-F", &session_format],
@@ -1283,7 +1202,10 @@ mod tests {
         );
         mock.stub(
             &["list-windows", "-a", "-F", &window_format],
-            "main\t1\t@1\tzsh\t1\t1\tzsh\n",
+            &format!(
+                "{}\n",
+                window_row("main", "1", "@1", "zsh", "1", "1", "zsh")
+            ),
         );
         mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
         let mut io = MockSessionManagerIo {
@@ -1307,16 +1229,7 @@ mod tests {
     fn outside_tmux_session_manager_attaches_selected_session() {
         let mock = MockTmuxRunner::new();
         let session_format = crate::session::session_list_format();
-        let window_format = [
-            "#{session_name}",
-            "#{window_index}",
-            "#{window_id}",
-            "#{window_name}",
-            "#{window_panes}",
-            "#{window_active}",
-            "#{pane_current_command}",
-        ]
-        .join(&FIELD_SEP.to_string());
+        let window_format = crate::window::window_list_format();
         mock.stub(&["has-session"], "");
         mock.stub(
             &["list-sessions", "-F", &session_format],
@@ -1324,7 +1237,11 @@ mod tests {
         );
         mock.stub(
             &["list-windows", "-a", "-F", &window_format],
-            "main\t1\t@1\tzsh\t1\t1\tzsh\nni.zsh\t1\t@2\tzsh\t1\t1\tzsh\n",
+            &format!(
+                "{}\n{}\n",
+                window_row("main", "1", "@1", "zsh", "1", "1", "zsh"),
+                window_row("ni.zsh", "1", "@2", "zsh", "1", "1", "zsh")
+            ),
         );
         let selected = render_entry(&ManagerEntry {
             action: "session".to_string(),
@@ -1374,16 +1291,7 @@ mod tests {
     fn interactive_session_manager_switches_selected_window() {
         let mock = MockTmuxRunner::new();
         let session_format = crate::session::session_list_format();
-        let window_format = [
-            "#{session_name}",
-            "#{window_index}",
-            "#{window_id}",
-            "#{window_name}",
-            "#{window_panes}",
-            "#{window_active}",
-            "#{pane_current_command}",
-        ]
-        .join(&FIELD_SEP.to_string());
+        let window_format = crate::window::window_list_format();
         mock.stub(&["has-session"], "");
         mock.stub(
             &["list-sessions", "-F", &session_format],
@@ -1391,7 +1299,10 @@ mod tests {
         );
         mock.stub(
             &["list-windows", "-a", "-F", &window_format],
-            "ni.zsh\t2\t@9\teditor\t2\t1\tnvim\n",
+            &format!(
+                "{}\n",
+                window_row("ni.zsh", "2", "@9", "editor", "2", "1", "nvim")
+            ),
         );
         mock.stub(&["display-message", "-p", "#{session_name}"], "ni.zsh\n");
         mock.stub(
@@ -1579,23 +1490,17 @@ mod tests {
     fn render_preview_for_session_includes_windows_and_capture() {
         let mock = MockTmuxRunner::new();
         let session_format = crate::session::session_list_format();
-        let window_format = [
-            "#{session_name}",
-            "#{window_index}",
-            "#{window_id}",
-            "#{window_name}",
-            "#{window_panes}",
-            "#{window_active}",
-            "#{pane_current_command}",
-        ]
-        .join(&FIELD_SEP.to_string());
+        let window_format = crate::window::window_list_format();
         mock.stub(
             &["list-sessions", "-F", &session_format],
             "ni.zsh\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
         );
         mock.stub(
             &["list-windows", "-t", "=ni.zsh:", "-F", &window_format],
-            "ni.zsh\t2\t@9\teditor\t2\t1\tnvim\n",
+            &format!(
+                "{}\n",
+                window_row("ni.zsh", "2", "@9", "editor", "2", "1", "nvim")
+            ),
         );
         mock.stub(
             &[

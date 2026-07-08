@@ -51,14 +51,22 @@ In `~/.tmux.conf`:
 
 ```tmux
 set -g status-interval 1
-set -g status-left '#(vt statusline-category)#(vt statusline-sessions --show-index)'
+set -g status-left-length 10000
+set -g status-left '#(vt statusline-category)#[fg=#8f8ba8] │ #[default]#(vt statusline-sessions --show-index)#[fg=#8f8ba8] │ #[default]#(vt statusline-windows)'
 set -g status-right '#(vt statusline-attention) #(vt statusline-summary)'
+setw -g window-status-format ''
+setw -g window-status-current-format ''
+set -g window-status-separator ''
+bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_range}'"
 ```
 
 - `statusline-category` — the current category (and the other categories, depending on config)
 - `statusline-sessions` — sessions in the current category, each prefixed with an agent state badge
+- `statusline-windows` — windows in the current session, formatted by `statusline.windows`
 - `statusline-summary` — state counts across all agents, e.g. `▲2 ●1`
 - `statusline-attention` — blocked agents you cannot currently see, e.g. `▲ session · perm 2m`
+
+Set `status-left-length` to a large value to remove the artificial left segment cap; the terminal width remains the real display limit. `statusline-windows` replaces tmux's native window list, so the native `window-status-*` formats should be empty when using it.
 
 Status updates appear within roughly `daemon.poll_ms + status-interval` (about 2 seconds with the defaults).
 The background daemon that collects agent state is started automatically; you never need to launch it yourself (`vt daemon` / `vt daemon stop` exist for manual control).
@@ -318,17 +326,35 @@ statusline:
       format: " {session} "
       colors:
         fg: "#9591ad"
+  windows:
+    separator: "#[fg=#8f8ba8]│#[default]"
+    current:
+      format: " {index}:{window} "
+      bold: false
+      colors:
+        fg: "#20233a"
+        bg: "#9d8cf5"
+      prefix: "#[fg=#9d8cf5]"
+      suffix: "#[fg=#9d8cf5,bg=default]#[default]"
+    other:
+      format: " {index}:{window} "
+      colors:
+        fg: "#9591ad"
+    bell:
+      fg: "#ff6b6b"
+    activity:
+      fg: "#ff6b6b"
 ```
 
 ```tmux
 # ~/.tmux.conf
 set -ga terminal-overrides ',*:Tc'
 set -g status-style 'bg=#1a1926,fg=#9591ad'
-set -g status-left-length 60
-set -g window-status-format '#[fg=#9591ad] #I:#W '
-set -g window-status-current-format '#[fg=#ecebff,bg=#453f9e] #I:#W '
-set -g window-status-bell-style 'fg=#ff6b6b'
-set -g window-status-activity-style 'fg=#ff6b6b'
+set -g status-left-length 10000
+setw -g window-status-format ''
+setw -g window-status-current-format ''
+set -g window-status-separator ''
+bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_range}'"
 ```
 
 Hex colors require tmux truecolor support (the `terminal-overrides` line above).

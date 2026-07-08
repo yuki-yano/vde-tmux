@@ -1,11 +1,13 @@
 use anyhow::{Result, anyhow};
 
 use crate::category::{resolve_category_for_session, sessions_in_category, sorted_categories};
-use crate::config::{BadgeStyle, Config, SegmentStyle, StatuslineCategoryConfig};
+use crate::config::{BadgeStyle, Config, SegmentColors, SegmentStyle, StatuslineCategoryConfig};
 use crate::session::{
-    SessionInfo, current_session_name, find_session, list_sessions, switch_client, use_category,
+    SessionInfo, current_session_name, exact_session_target, find_session, list_sessions,
+    switch_client, use_category,
 };
 use crate::tmux::TmuxRunner;
+use crate::window::{WindowInfo, list_windows_for_target, select_window};
 
 pub fn statusline_sessions(runner: &dyn TmuxRunner, config: &Config) -> Result<String> {
     let sessions = list_sessions(runner)?;
@@ -38,6 +40,13 @@ pub fn statusline_category(runner: &dyn TmuxRunner, config: &Config) -> Result<S
     ))
 }
 
+pub fn statusline_windows(runner: &dyn TmuxRunner, config: &Config) -> Result<String> {
+    let current_session = current_session_name(runner)?;
+    let target = exact_session_target(&current_session);
+    let windows = list_windows_for_target(runner, &target)?;
+    Ok(render_statusline_windows(config, &windows))
+}
+
 pub fn switch_statusline_session(
     runner: &dyn TmuxRunner,
     config: &Config,
@@ -53,6 +62,10 @@ pub fn switch_statusline_session(
     switch_client(runner, &session.name)
 }
 
+pub fn switch_statusline_window(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
+    select_window(runner, target)
+}
+
 pub fn switch_statusline_category(
     runner: &dyn TmuxRunner,
     config: &Config,
@@ -64,6 +77,39 @@ pub fn switch_statusline_category(
         .get(index)
         .ok_or_else(|| anyhow!("category index out of range: {index}"))?;
     use_category(runner, config, category)
+}
+
+pub fn handle_statusline_click(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    range: Option<&str>,
+) -> Result<()> {
+    let Some(range) = range.map(str::trim).filter(|range| !range.is_empty()) else {
+        return Ok(());
+    };
+    if let Some(target) = range.strip_prefix("window:") {
+        if !target.trim().is_empty() {
+            return select_window(runner, target);
+        }
+        return Ok(());
+    }
+    if let Some(target) = range.strip_prefix("session:") {
+        if !target.trim().is_empty() {
+            runner.run(&["switch-client", "-t", target])?;
+        }
+        return Ok(());
+    }
+    if range.starts_with('$') {
+        runner.run(&["switch-client", "-t", range])?;
+        return Ok(());
+    }
+    if let Ok(index) = range.parse::<usize>() {
+        if index == 0 {
+            return Ok(());
+        }
+        return switch_statusline_category(runner, config, index - 1);
+    }
+    Ok(())
 }
 
 pub fn render_statusline_sessions(
@@ -120,11 +166,35 @@ pub fn render_statusline_sessions_with_stale(
             if session.id.is_empty() {
                 segment
             } else {
-                format!("#[range=session|{}]{segment}#[norange]", session.id)
+                format!("#[range=user|session:{}]{segment}#[norange]", session.id)
             }
         })
         .collect::<Vec<_>>()
         .join(&config.statusline.sessions.separator)
+}
+
+pub fn render_statusline_windows(config: &Config, windows: &[WindowInfo]) -> String {
+    windows
+        .iter()
+        .map(|window| {
+            let style = window_segment_style(config, window);
+            let body = style
+                .format
+                .replace("{index}", &window.index)
+                .replace("{window}", &window.name)
+                .replace("{name}", &window.name)
+                .replace("{id}", &window.id)
+                .replace("{panes}", &window.panes.to_string())
+                .replace("{command}", &window.command);
+            let segment = tmux_style_segment(&style, &body);
+            if window.id.is_empty() {
+                segment
+            } else {
+                format!("#[range=user|window:{}]{segment}#[norange]", window.id)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(&config.statusline.windows.separator)
 }
 
 pub fn is_heartbeat_stale(heartbeat: Option<i64>, now: i64, poll_ms: u64) -> bool {
@@ -307,6 +377,35 @@ fn render_session_segment(
     tmux_style_segment(style, &body)
 }
 
+fn window_segment_style(config: &Config, window: &WindowInfo) -> SegmentStyle {
+    let mut style = if window.active {
+        config.statusline.windows.current.clone()
+    } else {
+        config.statusline.windows.other.clone()
+    };
+    if window.last {
+        apply_color_overlay(&mut style.colors, &config.statusline.windows.last);
+    }
+    if window.bell {
+        apply_color_overlay(&mut style.colors, &config.statusline.windows.bell);
+    } else if window.activity || window.silence {
+        apply_color_overlay(&mut style.colors, &config.statusline.windows.activity);
+    }
+    style
+}
+
+fn apply_color_overlay(target: &mut SegmentColors, overlay: &SegmentColors) {
+    if let Some(fg) = &overlay.fg {
+        target.fg = Some(fg.clone());
+    }
+    if let Some(bg) = &overlay.bg {
+        target.bg = Some(bg.clone());
+    }
+    if let Some(outer_bg) = &overlay.outer_bg {
+        target.outer_bg = Some(outer_bg.clone());
+    }
+}
+
 fn badge_fragment(
     badge: &str,
     state: &str,
@@ -384,6 +483,7 @@ mod tests {
     use super::*;
     use crate::config::{BadgeStyle, Config};
     use crate::session::SessionInfo;
+    use crate::window::WindowInfo;
 
     fn session(name: &str, category: &str) -> SessionInfo {
         SessionInfo {
@@ -398,6 +498,99 @@ mod tests {
         session.badge = badge.to_string();
         session.state = state.to_string();
         session
+    }
+
+    fn window(index: &str, id: &str, name: &str, active: bool) -> WindowInfo {
+        WindowInfo {
+            session: "main".to_string(),
+            index: index.to_string(),
+            id: id.to_string(),
+            name: name.to_string(),
+            panes: 1,
+            active,
+            last: false,
+            bell: false,
+            activity: false,
+            silence: false,
+            command: "zsh".to_string(),
+        }
+    }
+
+    #[test]
+    fn render_statusline_windows_uses_current_and_other_styles_with_ranges() {
+        let mut config = Config::default();
+        config.statusline.windows.current.colors.fg = Some("#20233a".to_string());
+        config.statusline.windows.current.colors.bg = Some("#9d8cf5".to_string());
+        config.statusline.windows.current.prefix = "#[fg=#9d8cf5]".to_string();
+        config.statusline.windows.current.suffix =
+            "#[fg=#9d8cf5,bg=default]#[default]".to_string();
+        config.statusline.windows.other.colors.fg = Some("#9591ad".to_string());
+        config.statusline.windows.separator = "#[fg=#8f8ba8]│#[default]".to_string();
+        let rendered = render_statusline_windows(
+            &config,
+            &[
+                window("1", "@1", "zsh", false),
+                window("2", "@2", "editor", true),
+            ],
+        );
+
+        assert!(
+            rendered.contains("#[range=user|window:@1]#[fg=#9591ad] 1:zsh #[default]#[norange]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("#[range=user|window:@2]#[fg=#9d8cf5]#[bold,fg=#20233a,bg=#9d8cf5] 2:editor #[default]#[fg=#9d8cf5,bg=default]#[default]#[norange]"),
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches('│').count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn render_statusline_windows_replaces_all_placeholders() {
+        let mut config = Config::default();
+        config.statusline.windows.other.format =
+            " {index}:{window}:{name}:{id}:{panes}:{command} ".to_string();
+        let mut item = window("3", "@7", "logs", false);
+        item.panes = 4;
+        item.command = "tail".to_string();
+
+        let rendered = render_statusline_windows(&config, &[item]);
+
+        assert!(rendered.contains(" 3:logs:logs:@7:4:tail "), "{rendered}");
+    }
+
+    #[test]
+    fn render_statusline_windows_applies_bell_before_activity_overlay() {
+        let mut config = Config::default();
+        config.statusline.windows.other.colors.fg = Some("#9591ad".to_string());
+        config.statusline.windows.bell.fg = Some("#ff6b6b".to_string());
+        config.statusline.windows.activity.fg = Some("#ffaa00".to_string());
+        let mut item = window("1", "@1", "alert", false);
+        item.bell = true;
+        item.activity = true;
+
+        let rendered = render_statusline_windows(&config, &[item]);
+
+        assert!(rendered.contains("#[fg=#ff6b6b] 1:alert "), "{rendered}");
+        assert!(!rendered.contains("#ffaa00"), "{rendered}");
+    }
+
+    #[test]
+    fn render_statusline_windows_applies_activity_and_last_overlays() {
+        let mut config = Config::default();
+        config.statusline.windows.other.colors.fg = Some("#9591ad".to_string());
+        config.statusline.windows.last.bg = Some("#333333".to_string());
+        config.statusline.windows.activity.fg = Some("#ff6b6b".to_string());
+        let mut item = window("1", "@1", "active", false);
+        item.last = true;
+        item.silence = true;
+
+        let rendered = render_statusline_windows(&config, &[item]);
+
+        assert!(
+            rendered.contains("#[fg=#ff6b6b,bg=#333333] 1:active "),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -714,7 +907,7 @@ mod tests {
         assert!(!rendered.starts_with("#[fg=#4a4860]│"), "{rendered}");
         assert!(!rendered.ends_with("│#[default]"), "{rendered}");
         assert!(
-            rendered.contains("#[norange]#[fg=#4a4860]│#[default]#[range=session|$2]"),
+            rendered.contains("#[norange]#[fg=#4a4860]│#[default]#[range=user|session:$2]"),
             "{rendered}"
         );
     }
@@ -737,7 +930,10 @@ mod tests {
         let mut main = session("main", "work");
         main.id = "$3".to_string();
         let rendered = render_statusline_sessions(&config, &[main], "main", "work");
-        assert!(rendered.starts_with("#[range=session|$3]"), "{rendered}");
+        assert!(
+            rendered.starts_with("#[range=user|session:$3]"),
+            "{rendered}"
+        );
         assert!(rendered.ends_with("#[norange]"), "{rendered}");
         let rendered =
             render_statusline_sessions(&config, &[session("sub", "work")], "main", "work");

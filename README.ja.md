@@ -53,14 +53,22 @@ cargo install --git https://github.com/yuki-yano/vde-tmux vde-tmux
 
 ```tmux
 set -g status-interval 1
-set -g status-left '#(vt statusline-category)#(vt statusline-sessions --show-index)'
+set -g status-left-length 10000
+set -g status-left '#(vt statusline-category)#[fg=#8f8ba8] │ #[default]#(vt statusline-sessions --show-index)#[fg=#8f8ba8] │ #[default]#(vt statusline-windows)'
 set -g status-right '#(vt statusline-attention) #(vt statusline-summary)'
+setw -g window-status-format ''
+setw -g window-status-current-format ''
+set -g window-status-separator ''
+bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_range}'"
 ```
 
 - `statusline-category`：現在のカテゴリ（設定によっては他カテゴリも）
 - `statusline-sessions`：現在カテゴリのセッション一覧。各セッション名の前に agent 状態バッジが付く
+- `statusline-windows`：現在 session の window 一覧。`statusline.windows` で整形する
 - `statusline-summary`：全 agent の状態別カウント。例 `▲2 ●1`
 - `statusline-attention`：いま見えていない blocked agent の通知。例 `▲ session · perm 2m`
+
+`status-left-length` には十分大きい値を指定し、左セグメント側の人工的な長さ制限を外す。実際の表示上限は端末幅である。`statusline-windows` は tmux native の window list を置き換えるため、併用時は native の `window-status-*` format を空にする。
 
 表示への反映はおおむね `daemon.poll_ms + status-interval`（デフォルトで約 2 秒）以内に行われる。
 agent 状態を収集するバックグラウンドの daemon は自動起動するため、自分で起動する必要はない（手動制御用に `vt daemon` / `vt daemon stop` もある）。
@@ -320,17 +328,35 @@ statusline:
       format: " {session} "
       colors:
         fg: "#9591ad"
+  windows:
+    separator: "#[fg=#8f8ba8]│#[default]"
+    current:
+      format: " {index}:{window} "
+      bold: false
+      colors:
+        fg: "#20233a"
+        bg: "#9d8cf5"
+      prefix: "#[fg=#9d8cf5]"
+      suffix: "#[fg=#9d8cf5,bg=default]#[default]"
+    other:
+      format: " {index}:{window} "
+      colors:
+        fg: "#9591ad"
+    bell:
+      fg: "#ff6b6b"
+    activity:
+      fg: "#ff6b6b"
 ```
 
 ```tmux
 # ~/.tmux.conf
 set -ga terminal-overrides ',*:Tc'
 set -g status-style 'bg=#1a1926,fg=#9591ad'
-set -g status-left-length 60
-set -g window-status-format '#[fg=#9591ad] #I:#W '
-set -g window-status-current-format '#[fg=#ecebff,bg=#453f9e] #I:#W '
-set -g window-status-bell-style 'fg=#ff6b6b'
-set -g window-status-activity-style 'fg=#ff6b6b'
+set -g status-left-length 10000
+setw -g window-status-format ''
+setw -g window-status-current-format ''
+set -g window-status-separator ''
+bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_range}'"
 ```
 
 hex 指定の色を使うには tmux の truecolor 設定（上記の `terminal-overrides` 行）が必要になる。

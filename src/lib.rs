@@ -12,3 +12,4 @@ pub mod session_manager;
 pub mod sidebar;
 pub mod statusline;
 pub mod tmux;
+pub mod window;
