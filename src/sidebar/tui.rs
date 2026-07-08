@@ -207,15 +207,11 @@ pub fn run_loop<B: Backend>(
                     sidebar.state.selection.as_deref().and_then(|selection| {
                         sidebar.rows.iter().position(|row| row.id == selection)
                     });
-                let selection_index = selected_row_index.and_then(|row_index| {
-                    rendered
-                        .row_indices
-                        .iter()
-                        .position(|mapped| *mapped == Some(row_index))
-                });
-                scroll = resolve_scroll(
+                let selection_range = selected_row_index
+                    .and_then(|row_index| rendered_row_range(&rendered.row_indices, row_index));
+                scroll = resolve_scroll_range(
                     scroll,
-                    selection_index,
+                    selection_range,
                     rendered.lines.len(),
                     areas.rows_height as usize,
                 );
@@ -918,9 +914,24 @@ pub(crate) fn compute_areas(area: Rect, header: &HeaderLayout, live_lines: u16) 
     }
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_scroll(
     prev: usize,
     selection_index: Option<usize>,
+    rows_len: usize,
+    viewport: usize,
+) -> usize {
+    resolve_scroll_range(
+        prev,
+        selection_index.map(|index| (index, index)),
+        rows_len,
+        viewport,
+    )
+}
+
+pub(crate) fn resolve_scroll_range(
+    prev: usize,
+    selection_range: Option<(usize, usize)>,
     rows_len: usize,
     viewport: usize,
 ) -> usize {
@@ -929,14 +940,24 @@ pub(crate) fn resolve_scroll(
     }
     let max_scroll = rows_len - viewport;
     let mut scroll = prev.min(max_scroll);
-    if let Some(index) = selection_index {
-        if index < scroll {
-            scroll = index;
-        } else if index >= scroll + viewport {
-            scroll = index + 1 - viewport;
+    if let Some((start, end)) = selection_range {
+        if start < scroll {
+            scroll = start;
+        } else if end >= scroll + viewport {
+            scroll = end + 1 - viewport;
         }
     }
     scroll.min(max_scroll)
+}
+
+fn rendered_row_range(row_indices: &[Option<usize>], row_index: usize) -> Option<(usize, usize)> {
+    let start = row_indices
+        .iter()
+        .position(|mapped| *mapped == Some(row_index))?;
+    let end = row_indices
+        .iter()
+        .rposition(|mapped| *mapped == Some(row_index))?;
+    Some((start, end))
 }
 
 struct ClickContext<'a> {
@@ -1181,6 +1202,12 @@ mod tests {
     }
 
     #[test]
+    fn scroll_keeps_two_line_selection_visible() {
+        assert_eq!(resolve_scroll_range(0, Some((9, 10)), 20, 10), 1);
+        assert_eq!(resolve_scroll_range(5, Some((4, 5)), 20, 10), 4);
+    }
+
+    #[test]
     fn click_maps_through_scroll_offset() {
         let rows = (0..30)
             .map(|index| SidebarRow {
@@ -1204,6 +1231,44 @@ mod tests {
         assert_eq!(
             row_for_click(&snapshot, 2, 1, 6).map(|row| row.id.as_str()),
             Some("chat::%7")
+        );
+    }
+
+    #[test]
+    fn click_on_second_digest_line_maps_to_same_chat_row() {
+        let mut chat = row();
+        chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            prompt: Some("review PR".to_string()),
+            elapsed_secs: Some(120),
+            ..Default::default()
+        });
+        let rows = vec![chat];
+        let snapshot = DaemonSnapshot {
+            agent_count: 1,
+            rollup: RollupLevel::Running,
+            panes: Vec::new(),
+            sidebar: Some(SidebarFrame {
+                state: SidebarState::default(),
+                counts: BadgeCounts::default(),
+                rows,
+            }),
+            events: Vec::new(),
+        };
+        let sidebar = snapshot.sidebar.as_ref().unwrap();
+        let rendered = render_lines_with_indices(
+            &sidebar.rows,
+            &sidebar.state,
+            40,
+            &crate::sidebar::render::SidebarRenderTheme::default(),
+        );
+
+        assert_eq!(rendered.row_indices, vec![Some(0), Some(0)]);
+        assert_eq!(
+            row_for_click_with_indices(&snapshot, 2, 1, 0, &rendered.row_indices)
+                .map(|row| row.id.as_str()),
+            Some("chat::%1")
         );
     }
 

@@ -205,6 +205,7 @@ bind-key g run-shell "vt project selector --popup"
 
 サイドバーは現在の tmux window 内に開く TUI pane である。
 agent pane をフラット、repository 別、カテゴリ別のいずれかでグルーピングして一覧し、各エージェントの状態、直近の prompt、経過時間（`45s`、`12m`、`1h30m` など）を表示する。
+標準幅の閉じた agent 行は 2 行 digest で表示され、1 行目に状態、経過時間、task 進捗（`☑ done/total`）、実行中 subagent 数（`↳ n`）をまとめ、2 行目に prompt と必要に応じて `↩ permission` のような短縮 blocked 理由を表示する。
 行を展開すると prompt の全文と pane の場所が表示され、window レイアウトの変更にはサイドバーが自動で追従する。
 
 ### キーバインド

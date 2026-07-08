@@ -637,14 +637,158 @@ pub fn render_lines_with_indices(
         WidthTier::Rail => render_rail_lines(rows, state, theme),
         WidthTier::Micro => render_micro_lines(rows, state, width, theme),
         WidthTier::Dense => render_dense_lines(rows, state, width, theme),
-        WidthTier::Standard => RenderedLines {
-            lines: rows
-                .iter()
-                .map(|row| render_row_line(row, state, width, theme))
-                .collect(),
-            row_indices: (0..rows.len()).map(Some).collect(),
-        },
+        WidthTier::Standard => render_standard_lines(rows, state, width, theme),
     }
+}
+
+fn render_standard_lines(
+    rows: &[SidebarRow],
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> RenderedLines {
+    let mut lines = Vec::new();
+    let mut row_indices = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        if row.kind == SidebarRowKind::Chat && !row.expanded {
+            lines.extend(render_closed_chat_digest_lines(row, state, width, theme));
+            row_indices.push(Some(index));
+            row_indices.push(Some(index));
+        } else {
+            lines.push(render_row_line(row, state, width, theme));
+            row_indices.push(Some(index));
+        }
+    }
+    RenderedLines { lines, row_indices }
+}
+
+fn render_closed_chat_digest_lines(
+    row: &SidebarRow,
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> Vec<Line<'static>> {
+    vec![
+        render_closed_chat_summary_line(row, state, width, theme),
+        render_closed_chat_prompt_line(row, state, width, theme),
+    ]
+}
+
+fn render_closed_chat_summary_line(
+    row: &SidebarRow,
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> Line<'static> {
+    let selected = state.selection.as_deref() == Some(row.id.as_str());
+    let indent = "  ".repeat(row.depth);
+    let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
+    let glyph = theme.badge_glyph(badge_state);
+    let agent_source = chat_agent_label(row);
+
+    let mut prefix = Vec::new();
+    push_leading_marker_span(&mut prefix, row, theme, &indent);
+    prefix.push(Span::styled(
+        " ".to_string(),
+        Style::default().fg(theme.marker),
+    ));
+    prefix.push(Span::styled("▸ ".to_string(), toggle_marker_style(theme)));
+    prefix.push(Span::styled(
+        format!("{glyph} "),
+        badge_style(theme.badge_color(badge_state), row),
+    ));
+    let prefix_width: usize = prefix.iter().map(|span| display_width(&span.content)).sum();
+    let available_after_prefix = width.saturating_sub(1).saturating_sub(prefix_width);
+    let min_agent_width = display_width(&agent_source)
+        .min(7)
+        .min(available_after_prefix);
+    let right_budget = width
+        .saturating_sub(1)
+        .saturating_sub(prefix_width)
+        .saturating_sub(min_agent_width)
+        .saturating_sub(1);
+    let right = closed_chat_right_label_for_width(row, right_budget);
+    let right_width = display_width(&right);
+    let right_reserved = if right_width > 0 { right_width + 1 } else { 0 };
+    let agent_budget = width
+        .saturating_sub(1)
+        .saturating_sub(prefix_width)
+        .saturating_sub(right_reserved);
+    let agent = truncate_display(&agent_source, agent_budget);
+
+    let mut spans = prefix;
+    spans.push(Span::styled(
+        agent,
+        row_style(row, theme).add_modifier(Modifier::BOLD),
+    ));
+    let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
+    let filler = width
+        .saturating_sub(1)
+        .saturating_sub(used)
+        .saturating_sub(right_width);
+    spans.push(Span::raw(" ".repeat(filler)));
+    if !right.is_empty() {
+        spans.push(Span::styled(right, right_style(row, theme)));
+    }
+    spans.push(Span::raw(" ".to_string()));
+    style_chat_digest_line(Line::from(spans), row, selected, theme)
+}
+
+fn render_closed_chat_prompt_line(
+    row: &SidebarRow,
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> Line<'static> {
+    let selected = state.selection.as_deref() == Some(row.id.as_str());
+    let indent = format!("{}   ", "  ".repeat(row.depth));
+    let mut spans = Vec::new();
+    push_leading_marker_span(&mut spans, row, theme, &indent);
+    let prefix_width: usize = spans.iter().map(|span| display_width(&span.content)).sum();
+    let available = width.saturating_sub(1).saturating_sub(prefix_width);
+    let reason = closed_chat_reason_token(row);
+    let reason_width = reason.as_deref().map(display_width).unwrap_or(0);
+    let (prompt_budget, reason) = match reason {
+        Some(reason) if available > reason_width + 1 => {
+            (available - reason_width - 1, Some(reason))
+        }
+        _ => (available, None),
+    };
+    let prompt = truncate_display(&chat_prompt_label(row), prompt_budget);
+    spans.push(Span::styled(prompt, row_style(row, theme)));
+    let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
+    let reason_width = reason.as_deref().map(display_width).unwrap_or(0);
+    let filler = width
+        .saturating_sub(1)
+        .saturating_sub(used)
+        .saturating_sub(reason_width);
+    spans.push(Span::raw(" ".repeat(filler)));
+    if let Some(reason) = reason {
+        spans.push(Span::styled(
+            reason,
+            Style::default().fg(theme.rollup_color(row.rollup)),
+        ));
+    }
+    spans.push(Span::raw(" ".to_string()));
+    style_chat_digest_line(Line::from(spans), row, selected, theme)
+}
+
+fn style_chat_digest_line(
+    mut line: Line<'static>,
+    row: &SidebarRow,
+    selected: bool,
+    theme: &SidebarRenderTheme,
+) -> Line<'static> {
+    if selected {
+        line = line.style(
+            Style::default()
+                .bg(theme.selection_bg)
+                .add_modifier(Modifier::BOLD),
+        );
+    } else if row.active {
+        line = line.style(Style::default().bg(theme.active_bg));
+    }
+    line
 }
 
 fn render_row_line(
@@ -1333,6 +1477,155 @@ fn right_label(row: &SidebarRow) -> Option<String> {
         }
         SidebarRowKind::Detail | SidebarRowKind::Jump | SidebarRowKind::Zone => None,
     }
+}
+
+fn closed_chat_right_label_for_width(row: &SidebarRow, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    let parts = closed_chat_right_parts(row);
+    let mut included = Vec::new();
+    for part in parts {
+        let candidate = if included.is_empty() {
+            part.clone()
+        } else {
+            format!("{} · {part}", included.join(" · "))
+        };
+        if display_width(&candidate) <= budget {
+            included.push(part);
+        } else if included.is_empty() {
+            return truncate_display(&part, budget);
+        }
+    }
+    included.join(" · ")
+}
+
+fn closed_chat_right_parts(row: &SidebarRow) -> Vec<String> {
+    let mut parts = Vec::new();
+    if let Some(state_or_time) = closed_chat_state_or_time_label(row) {
+        parts.push(state_or_time);
+    }
+    if let Some(task) = task_progress_token(row) {
+        parts.push(task);
+    }
+    if let Some(subagents) = subagent_count_token(row) {
+        parts.push(subagents);
+    }
+    parts
+}
+
+fn closed_chat_state_or_time_label(row: &SidebarRow) -> Option<String> {
+    let meta = row.meta.as_ref();
+    match row.rollup {
+        RollupLevel::Error => Some(join_state_and_elapsed("err", meta)),
+        RollupLevel::Permission => Some(join_state_and_elapsed(
+            meta.and_then(|meta| meta.wait_reason.as_deref())
+                .map(short_wait_reason)
+                .unwrap_or_else(|| "permission".to_string())
+                .as_str(),
+            meta,
+        )),
+        RollupLevel::Waiting => Some(join_state_and_elapsed(
+            meta.and_then(|meta| meta.wait_reason.as_deref())
+                .map(short_wait_reason)
+                .unwrap_or_else(|| "wait".to_string())
+                .as_str(),
+            meta,
+        )),
+        RollupLevel::Background => Some(join_state_and_elapsed("bg", meta)),
+        RollupLevel::Running => meta
+            .and_then(|meta| meta.elapsed_secs)
+            .map(short_elapsed_label),
+        RollupLevel::Idle => meta
+            .and_then(|meta| meta.completed_age_secs)
+            .map(|secs| format!("{} ago", short_elapsed_label(secs))),
+    }
+}
+
+fn join_state_and_elapsed(state: &str, meta: Option<&crate::sidebar::tree::RowMeta>) -> String {
+    match meta.and_then(|meta| meta.elapsed_secs) {
+        Some(secs) => format!("{state} · {}", short_elapsed_label(secs)),
+        None => state.to_string(),
+    }
+}
+
+fn task_progress_token(row: &SidebarRow) -> Option<String> {
+    let meta = row.meta.as_ref()?;
+    let done = meta.tasks_done?;
+    let total = meta.tasks_total?;
+    (total > 0).then(|| format!("☑ {done}/{total}"))
+}
+
+fn subagent_count_token(row: &SidebarRow) -> Option<String> {
+    let count = row.meta.as_ref()?.subagent_count?;
+    (count > 0).then(|| format!("↳ {count}"))
+}
+
+fn closed_chat_reason_token(row: &SidebarRow) -> Option<String> {
+    if !matches!(
+        row.rollup,
+        RollupLevel::Permission | RollupLevel::Waiting | RollupLevel::Error
+    ) {
+        return None;
+    }
+    row.meta
+        .as_ref()
+        .and_then(|meta| meta.wait_reason.as_deref())
+        .filter(|reason| !reason.trim().is_empty())
+        .map(|reason| format!("↩ {}", short_wait_reason(reason)))
+}
+
+fn short_wait_reason(reason: &str) -> String {
+    let reason = reason.trim();
+    match reason {
+        "permission_prompt" | "permission" => "permission".to_string(),
+        "waiting_input" | "input" | "user_input" => "input".to_string(),
+        "rate_limit" | "rate_limited" => "rate-limit".to_string(),
+        "network_error" => "network".to_string(),
+        _ => truncate_display(&reason.replace('_', "-"), 16),
+    }
+}
+
+fn short_elapsed_label(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let minutes = secs / 60;
+    if minutes < 10 {
+        return format!("{minutes}m{:02}s", secs % 60);
+    }
+    elapsed_label(secs)
+}
+
+fn chat_agent_label(row: &SidebarRow) -> String {
+    row.meta
+        .as_ref()
+        .and_then(|meta| meta.agent.as_deref())
+        .filter(|agent| !agent.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            row.label
+                .split(':')
+                .next()
+                .unwrap_or(row.label.as_str())
+                .to_string()
+        })
+}
+
+fn chat_prompt_label(row: &SidebarRow) -> String {
+    if let Some(prompt) = row
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.prompt.as_deref())
+        .filter(|prompt| !prompt.trim().is_empty())
+    {
+        return prompt.to_string();
+    }
+    row.label
+        .split_once(':')
+        .map(|(_, prompt)| prompt.trim().to_string())
+        .unwrap_or_default()
 }
 
 fn elapsed_label(secs: i64) -> String {
@@ -2210,6 +2503,7 @@ mod tests {
             RollupLevel::Running,
         );
         chat.active = true;
+        chat.expanded = false;
         let theme = SidebarRenderTheme::default();
 
         let lines = render_lines(
@@ -2225,6 +2519,9 @@ mod tests {
         assert_eq!(line_to_string(lines[1].clone()).chars().next(), Some('▎'));
         assert_eq!(lines[1].spans[0].style.fg, Some(theme.active_bar));
         assert_eq!(lines[1].style.bg, Some(theme.active_bg));
+        assert_eq!(line_to_string(lines[2].clone()).chars().next(), Some('▎'));
+        assert_eq!(lines[2].spans[0].style.fg, Some(theme.active_bar));
+        assert_eq!(lines[2].style.bg, Some(theme.active_bg));
 
         let selected = SidebarState {
             selection: Some("chat::%1".to_string()),
@@ -2232,6 +2529,7 @@ mod tests {
         };
         let selected_lines = render_lines(&[chat], &selected, 40, &theme);
         assert_eq!(selected_lines[0].style.bg, Some(theme.selection_bg));
+        assert_eq!(selected_lines[1].style.bg, Some(theme.selection_bg));
     }
 
     #[test]
@@ -2824,10 +3122,19 @@ sidebar:
         assert!(
             chat_spans
                 .iter()
-                .any(|span| span.content.as_ref().contains(": fix flicker")
+                .any(|span| span.content.as_ref() == "claude"
+                    && span.style.fg == Some(Color::Reset)
+                    && span.style.add_modifier.contains(Modifier::BOLD)),
+            "{chat_spans:?}"
+        );
+        let prompt_spans = &lines[1].spans;
+        assert!(
+            prompt_spans
+                .iter()
+                .any(|span| span.content.as_ref().contains("fix flicker")
                     && span.style.fg == Some(Color::Reset)
                     && !span.style.add_modifier.contains(Modifier::BOLD)),
-            "{chat_spans:?}"
+            "{prompt_spans:?}"
         );
         assert_eq!(chat_spans[0].style.fg, Some(Color::DarkGray));
         assert!(
@@ -2842,7 +3149,7 @@ sidebar:
                 && !span.style.add_modifier.contains(Modifier::DIM)),
             "{chat_spans:?}"
         );
-        let detail_spans = &lines[1].spans;
+        let detail_spans = &lines[2].spans;
         assert!(
             detail_spans
                 .iter()
@@ -2851,7 +3158,7 @@ sidebar:
                     && !span.style.add_modifier.contains(Modifier::DIM)),
             "{detail_spans:?}"
         );
-        let prompt_detail_spans = &lines[2].spans;
+        let prompt_detail_spans = &lines[3].spans;
         assert!(
             prompt_detail_spans
                 .iter()
@@ -3354,19 +3661,155 @@ badge:
     }
 
     #[test]
-    fn chat_row_right_aligns_status_short_label() {
+    fn closed_chat_standard_renders_two_line_digest_with_signals() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: review sidebar state shape",
+            RollupLevel::Permission,
+        );
+        chat.badge_state = Some(BadgeState::Blocked);
+        chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            prompt: Some("review sidebar state shape".to_string()),
+            wait_reason: Some("permission_prompt".to_string()),
+            elapsed_secs: Some(127),
+            tasks_done: Some(2),
+            tasks_total: Some(5),
+            subagent_count: Some(2),
+            ..Default::default()
+        });
+        let rendered = render_lines_with_indices(
+            &[chat],
+            &SidebarState::default(),
+            64,
+            &SidebarRenderTheme::default(),
+        );
+        let text = rendered
+            .lines
+            .iter()
+            .cloned()
+            .map(line_to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.row_indices, vec![Some(0), Some(0)]);
+        assert_eq!(text.len(), 2);
+        assert!(text[0].contains("▸ ▲ codex"), "{text:?}");
+        assert!(
+            text[0].ends_with("permission · 2m07s · ☑ 2/5 · ↳ 2 "),
+            "{text:?}"
+        );
+        assert!(
+            text[1].starts_with("    review sidebar state shape"),
+            "{text:?}"
+        );
+        assert!(text[1].ends_with("↩ permission "), "{text:?}");
+        assert!(
+            text.iter().all(|line| display_width(line) == 64),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn closed_chat_selection_styles_both_digest_lines() {
         let mut chat = row(
             "chat::%1",
             SidebarRowKind::Chat,
             0,
             "codex: review PR",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(BadgeState::Working);
+        chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            prompt: Some("review PR".to_string()),
+            elapsed_secs: Some(522),
+            ..Default::default()
+        });
+        let state = SidebarState {
+            selection: Some("chat::%1".to_string()),
+            ..SidebarState::default()
+        };
+
+        let lines = render_lines(&[chat], &state, 40, &SidebarRenderTheme::default());
+
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines
+                .iter()
+                .all(|line| { line.style.bg == Some(SidebarRenderTheme::default().selection_bg) })
+        );
+        assert!(line_to_string(lines[0].clone()).ends_with("8m42s "));
+    }
+
+    #[test]
+    fn standard_boundary_switches_closed_chat_from_dense_to_digest() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: review PR",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(BadgeState::Working);
+        chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            prompt: Some("review PR".to_string()),
+            elapsed_secs: Some(720),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            render_rows(&[chat.clone()], &SidebarState::default(), 35)
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            render_rows(&[chat], &SidebarState::default(), 36)
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn closed_chat_digest_truncates_long_right_tokens_to_width() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: review very long sidebar prompt",
             RollupLevel::Permission,
         );
         chat.badge_state = Some(BadgeState::Blocked);
         chat.expanded = false;
-        let rendered = render_rows(&[chat], &SidebarState::default(), 40);
-        assert!(rendered.ends_with("perm "), "{rendered:?}");
-        assert!(rendered.contains("▲ codex: review PR"), "{rendered:?}");
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            prompt: Some("review very long sidebar prompt".to_string()),
+            wait_reason: Some("very_long_custom_wait_reason".to_string()),
+            elapsed_secs: Some(8 * 60 + 42),
+            tasks_done: Some(123),
+            tasks_total: Some(999),
+            subagent_count: Some(42),
+            ..Default::default()
+        });
+
+        let rendered = render_rows(&[chat], &SidebarState::default(), 36);
+
+        assert_eq!(rendered.lines().count(), 2, "{rendered:?}");
+        assert!(
+            rendered.lines().all(|line| display_width(line) == 36),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.lines().next().unwrap().contains('…'),
+            "{rendered:?}"
+        );
     }
 
     #[test]

@@ -203,6 +203,7 @@ Glyphs and colors are configurable via `badge.glyphs` and `badge.colors`.
 
 The sidebar is a TUI pane inside the current tmux window.
 It lists agent panes grouped flat, by repository, or by category, and shows each agent's state, latest prompt, and elapsed time (`45s`, `12m`, `1h30m`, ...).
+Closed agent rows use a two-line digest at standard widths: the first line keeps the state, elapsed time, task progress (`☑ done/total`), and running subagent count (`↳ n`) scannable, while the second line keeps the prompt readable and shows a shortened blocked reason such as `↩ permission` when relevant.
 Expanding a row reveals the full prompt and the pane's location, and the sidebar auto-follows window layout changes.
 
 ### Key bindings
