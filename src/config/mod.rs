@@ -429,6 +429,10 @@ impl Default for SidebarPreviewConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SidebarColorsConfig {
     pub selection_bg: Option<String>,
+    pub badge_blocked: Option<String>,
+    pub badge_working: Option<String>,
+    pub badge_done: Option<String>,
+    pub badge_idle: Option<String>,
     pub header_active_bg: Option<String>,
     pub header_active_fg: Option<String>,
     pub header_chip_fg: Option<String>,

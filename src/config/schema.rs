@@ -209,6 +209,10 @@ pub fn config_schema() -> Value {
                         "additionalProperties": true,
                         "properties": {
                             "selection_bg": { "type": "string" },
+                            "badge_blocked": { "type": "string" },
+                            "badge_working": { "type": "string" },
+                            "badge_done": { "type": "string" },
+                            "badge_idle": { "type": "string" },
                             "header_active_bg": { "type": "string" },
                             "header_active_fg": { "type": "string" },
                             "task_done": { "type": "string" },
@@ -344,6 +348,9 @@ mod tests {
 
         assert_eq!(colors["header_active_bg"]["type"], "string");
         assert_eq!(colors["selection_bg"]["type"], "string");
+        for key in ["badge_blocked", "badge_working", "badge_done", "badge_idle"] {
+            assert_eq!(colors[key]["type"], "string", "{key}");
+        }
         for key in [
             "error",
             "running",

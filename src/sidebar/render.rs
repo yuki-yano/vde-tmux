@@ -117,10 +117,12 @@ impl SidebarRenderTheme {
             header_chip_prefix: default.header_chip_prefix,
             header_chip_suffix: default.header_chip_suffix,
             badge_glyphs: default.badge_glyphs,
-            badge_blocked: default.badge_blocked,
-            badge_working: default.badge_working,
-            badge_done: default.badge_done,
-            badge_idle: default.badge_idle,
+            badge_blocked: parse_color(config.badge_blocked.as_deref())
+                .unwrap_or(default.badge_blocked),
+            badge_working: parse_color(config.badge_working.as_deref())
+                .unwrap_or(default.badge_working),
+            badge_done: parse_color(config.badge_done.as_deref()).unwrap_or(default.badge_done),
+            badge_idle: parse_color(config.badge_idle.as_deref()).unwrap_or(default.badge_idle),
             detail: parse_color(config.detail.as_deref()).unwrap_or(default.detail),
             marker: parse_color(config.marker.as_deref()).unwrap_or(default.marker),
             toggle: parse_color(config.toggle.as_deref()).unwrap_or(default.toggle),
@@ -167,10 +169,19 @@ impl SidebarRenderTheme {
         let mut theme = Self::from_sidebar_config(&config.sidebar);
         theme.badge_glyphs = config.badge.glyphs.clone();
         let badge = &config.badge.colors;
-        theme.badge_blocked = parse_color(Some(&badge.blocked)).unwrap_or(theme.badge_blocked);
-        theme.badge_working = parse_color(Some(&badge.working)).unwrap_or(theme.badge_working);
-        theme.badge_done = parse_color(Some(&badge.done)).unwrap_or(theme.badge_done);
-        theme.badge_idle = parse_color(Some(&badge.idle)).unwrap_or(theme.badge_idle);
+        let overrides = &config.sidebar.colors;
+        theme.badge_blocked = parse_color(overrides.badge_blocked.as_deref())
+            .or_else(|| parse_color(Some(&badge.blocked)))
+            .unwrap_or(theme.badge_blocked);
+        theme.badge_working = parse_color(overrides.badge_working.as_deref())
+            .or_else(|| parse_color(Some(&badge.working)))
+            .unwrap_or(theme.badge_working);
+        theme.badge_done = parse_color(overrides.badge_done.as_deref())
+            .or_else(|| parse_color(Some(&badge.done)))
+            .unwrap_or(theme.badge_done);
+        theme.badge_idle = parse_color(overrides.badge_idle.as_deref())
+            .or_else(|| parse_color(Some(&badge.idle)))
+            .unwrap_or(theme.badge_idle);
         theme
     }
 
@@ -3213,6 +3224,56 @@ badge:
             theme.badge_color(BadgeState::Idle),
             Color::Rgb(0xa8, 0xa8, 0xb2)
         );
+    }
+
+    #[test]
+    fn sidebar_colors_badge_overrides_take_precedence_over_badge_colors() {
+        let config = serde_yaml_ng::from_str::<crate::config::Config>(
+            r##"
+badge:
+  colors:
+    working: "#57d98a"
+    idle: "#c6c3d8"
+sidebar:
+  colors:
+    badge_idle: "#8b88a0"
+    badge_done: "#4d7fc4"
+"##,
+        )
+        .unwrap();
+        let theme = SidebarRenderTheme::from_app_config(&config);
+        assert_eq!(
+            theme.badge_color(BadgeState::Idle),
+            Color::Rgb(0x8b, 0x88, 0xa0)
+        );
+        assert_eq!(
+            theme.badge_color(BadgeState::Done),
+            Color::Rgb(0x4d, 0x7f, 0xc4)
+        );
+        assert_eq!(
+            theme.badge_color(BadgeState::Working),
+            Color::Rgb(0x57, 0xd9, 0x8a)
+        );
+        assert_eq!(
+            theme.badge_color(BadgeState::Blocked),
+            Color::Rgb(0xff, 0x6b, 0x6b)
+        );
+    }
+
+    #[test]
+    fn sidebar_colors_badge_overrides_apply_without_app_config() {
+        let config = serde_yaml_ng::from_str::<crate::config::SidebarColorsConfig>(
+            r##"
+badge_working: "#3fae7a"
+"##,
+        )
+        .unwrap();
+        let theme = SidebarRenderTheme::from_config(&config);
+        assert_eq!(
+            theme.badge_color(BadgeState::Working),
+            Color::Rgb(0x3f, 0xae, 0x7a)
+        );
+        assert_eq!(theme.badge_color(BadgeState::Idle), Color::Indexed(248));
     }
 
     #[test]

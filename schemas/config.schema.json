@@ -133,6 +133,18 @@
         "colors": {
           "additionalProperties": true,
           "properties": {
+            "badge_blocked": {
+              "type": "string"
+            },
+            "badge_done": {
+              "type": "string"
+            },
+            "badge_idle": {
+              "type": "string"
+            },
+            "badge_working": {
+              "type": "string"
+            },
             "header_active_bg": {
               "type": "string"
             },
