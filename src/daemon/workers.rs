@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, mpsc::Sender};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -110,6 +112,64 @@ impl LatestPanes {
     }
 }
 
+#[derive(Debug, Default)]
+struct CaptureActivityTracker {
+    panes: BTreeMap<String, CaptureActivityState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureActivityState {
+    started_at: Option<i64>,
+    fingerprint: u64,
+    last_changed_at: i64,
+}
+
+impl CaptureActivityTracker {
+    fn record_tail(
+        &mut self,
+        pane_id: &str,
+        started_at: Option<i64>,
+        now_epoch: i64,
+        tail: &str,
+    ) -> Option<i64> {
+        if tail.trim().is_empty() {
+            return None;
+        }
+        let fingerprint = capture_fingerprint(tail);
+        let baseline = started_at.unwrap_or(now_epoch);
+        match self.panes.get_mut(pane_id) {
+            Some(state) if state.started_at == started_at => {
+                if state.fingerprint != fingerprint {
+                    state.fingerprint = fingerprint;
+                    state.last_changed_at = now_epoch;
+                }
+                Some(state.last_changed_at)
+            }
+            _ => {
+                self.panes.insert(
+                    pane_id.to_string(),
+                    CaptureActivityState {
+                        started_at,
+                        fingerprint,
+                        last_changed_at: baseline,
+                    },
+                );
+                Some(baseline)
+            }
+        }
+    }
+
+    fn prune(&mut self, pane_ids: &BTreeSet<String>) {
+        self.panes.retain(|pane_id, _| pane_ids.contains(pane_id));
+    }
+}
+
+fn capture_fingerprint(tail: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    tail.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub fn start_tmux_worker(
     io: Arc<dyn WorkerIo>,
     latest_panes: Arc<LatestPanes>,
@@ -118,12 +178,14 @@ pub fn start_tmux_worker(
     stale_threshold_seconds: i64,
 ) {
     thread::spawn(move || {
+        let mut capture_activity = CaptureActivityTracker::default();
         loop {
             if let Err(error) = poll_tmux_once_with_latest(
                 io.clone(),
                 latest_panes.clone(),
                 tx.clone(),
                 stale_threshold_seconds,
+                &mut capture_activity,
             ) {
                 eprintln!("[vde-tmux] daemon tmux worker error: {error:#}");
             }
@@ -138,7 +200,14 @@ pub fn poll_tmux_once(
     stale_threshold_seconds: i64,
 ) -> Result<()> {
     let latest = Arc::new(LatestPanes::default());
-    poll_tmux_once_with_latest(io, latest, tx, stale_threshold_seconds)
+    let mut capture_activity = CaptureActivityTracker::default();
+    poll_tmux_once_with_latest(
+        io,
+        latest,
+        tx,
+        stale_threshold_seconds,
+        &mut capture_activity,
+    )
 }
 
 fn poll_tmux_once_with_latest(
@@ -146,8 +215,10 @@ fn poll_tmux_once_with_latest(
     latest_panes: Arc<LatestPanes>,
     tx: Sender<DaemonEvent>,
     stale_threshold_seconds: i64,
+    capture_activity: &mut CaptureActivityTracker,
 ) -> Result<()> {
-    let panes = read_panes_with_detection(io.as_ref(), stale_threshold_seconds)?;
+    let panes =
+        read_panes_with_detection_tracked(io.as_ref(), stale_threshold_seconds, capture_activity)?;
     latest_panes.store(panes.clone());
     tx.send(DaemonEvent::PanesUpdated(panes))?;
     Ok(())
@@ -157,11 +228,34 @@ pub fn read_panes_with_detection(
     io: &dyn WorkerIo,
     stale_threshold_seconds: i64,
 ) -> Result<Vec<PaneSnapshot>> {
+    let mut capture_activity = CaptureActivityTracker::default();
+    read_panes_with_detection_tracked(io, stale_threshold_seconds, &mut capture_activity)
+}
+
+fn read_panes_with_detection_tracked(
+    io: &dyn WorkerIo,
+    stale_threshold_seconds: i64,
+    capture_activity: &mut CaptureActivityTracker,
+) -> Result<Vec<PaneSnapshot>> {
     let now = now_epoch();
-    Ok(io
-        .read_panes()?
+    let panes = io.read_panes()?;
+    capture_activity.prune(
+        &panes
+            .iter()
+            .map(|pane| pane.pane_id.clone())
+            .collect::<BTreeSet<_>>(),
+    );
+    Ok(panes
         .into_iter()
-        .map(|pane| apply_capture_detection(io, pane, now, stale_threshold_seconds))
+        .map(|pane| {
+            apply_capture_detection_with_tracker(
+                io,
+                pane,
+                now,
+                stale_threshold_seconds,
+                capture_activity,
+            )
+        })
         .collect())
 }
 
@@ -199,9 +293,26 @@ pub fn system_git_runner(timeout: Duration) -> SystemGitRunner {
 
 pub fn apply_capture_detection(
     io: &dyn WorkerIo,
+    pane: PaneSnapshot,
+    now_epoch: i64,
+    stale_threshold_seconds: i64,
+) -> PaneSnapshot {
+    let mut capture_activity = CaptureActivityTracker::default();
+    apply_capture_detection_with_tracker(
+        io,
+        pane,
+        now_epoch,
+        stale_threshold_seconds,
+        &mut capture_activity,
+    )
+}
+
+fn apply_capture_detection_with_tracker(
+    io: &dyn WorkerIo,
     mut pane: PaneSnapshot,
     now_epoch: i64,
     stale_threshold_seconds: i64,
+    capture_activity: &mut CaptureActivityTracker,
 ) -> PaneSnapshot {
     if !is_live_agent_pane(&pane) {
         return pane;
@@ -212,8 +323,8 @@ pub fn apply_capture_detection(
         pane.agent = agent.to_string();
     }
     let mut observed_activity_epoch = None;
-    let running_has_started_at =
-        pane.status == "running" && pane.started_at.trim().parse::<i64>().is_ok();
+    let started_at = pane.started_at.trim().parse::<i64>().ok();
+    let running_has_started_at = pane.status == "running" && started_at.is_some();
     let has_hook_wait_reason = !pane.wait_reason.trim().is_empty();
     let status_allows_capture_detection = pane.status.trim().is_empty() || pane.status == "running";
     let should_detect_wait_reason = !has_hook_wait_reason && status_allows_capture_detection;
@@ -222,18 +333,16 @@ pub fn apply_capture_detection(
         if should_detect_wait_reason && let Some(wait_reason) = detect_codex_wait_reason(&tail) {
             pane.status = "waiting".to_string();
             pane.wait_reason = wait_reason.to_string();
-        } else if running_has_started_at && !tail.trim().is_empty() {
-            observed_activity_epoch = Some(now_epoch);
+        } else if running_has_started_at {
+            observed_activity_epoch =
+                capture_activity.record_tail(&pane.pane_id, started_at, now_epoch, &tail);
         }
     }
     if pane.status == "running" && !running_has_started_at {
         pane.status = "idle".to_string();
         pane.wait_reason.clear();
     }
-    let last_activity = observed_activity_epoch
-        .or_else(|| pane.completed_at.parse::<i64>().ok())
-        .or_else(|| pane.started_at.parse::<i64>().ok())
-        .unwrap_or(now_epoch);
+    let last_activity = observed_activity_epoch.or(started_at).unwrap_or(now_epoch);
     let status = parse_status(&pane.status);
     if demote_stale_running(status, last_activity, now_epoch, stale_threshold_seconds)
         == Some(AgentStatus::Idle)
@@ -529,18 +638,91 @@ mod tests {
     }
 
     #[test]
-    fn running_pane_with_captured_activity_is_not_demoted_to_idle() {
+    fn stale_running_with_stable_non_empty_tail_is_demoted_to_idle() {
         let io = MockWorkerIo::default();
-        let mut active = pane("%1", "claude", "running");
-        active.started_at = "100".to_string();
+        let mut stale = pane("%1", "claude", "running");
+        stale.started_at = "100".to_string();
         io.captures
             .lock()
             .unwrap()
             .insert("%1".to_string(), "Claude is still working\n".to_string());
 
+        let pane = apply_capture_detection(&io, stale, 1_000, 30);
+
+        assert_eq!(pane.status, "idle");
+    }
+
+    #[test]
+    fn running_pane_with_changed_capture_tail_is_not_demoted_to_idle() {
+        let io = MockWorkerIo::default();
+        let mut active = pane("%1", "claude", "running");
+        active.started_at = "970".to_string();
+        let mut tracker = CaptureActivityTracker::default();
+        io.captures
+            .lock()
+            .unwrap()
+            .insert("%1".to_string(), "Working (1s)\n".to_string());
+        let pane = apply_capture_detection_with_tracker(&io, active.clone(), 990, 30, &mut tracker);
+        assert_eq!(pane.status, "running");
+
+        io.captures
+            .lock()
+            .unwrap()
+            .insert("%1".to_string(), "Working (40s)\n".to_string());
+        let pane = apply_capture_detection_with_tracker(&io, active, 1_000, 30, &mut tracker);
+
+        assert_eq!(pane.status, "running");
+    }
+
+    #[test]
+    fn running_pane_uses_started_at_over_stale_completed_at() {
+        let io = MockWorkerIo::default();
+        let mut active = pane("%1", "codex", "running");
+        active.started_at = "990".to_string();
+        active.completed_at = "100".to_string();
+        io.captures
+            .lock()
+            .unwrap()
+            .insert("%1".to_string(), "Codex is ready for input\n".to_string());
+
         let pane = apply_capture_detection(&io, active, 1_000, 30);
 
         assert_eq!(pane.status, "running");
+    }
+
+    #[test]
+    fn capture_activity_tracker_resets_when_started_at_changes() {
+        let io = MockWorkerIo::default();
+        let mut first = pane("%1", "codex", "running");
+        first.started_at = "100".to_string();
+        let mut tracker = CaptureActivityTracker::default();
+        io.captures
+            .lock()
+            .unwrap()
+            .insert("%1".to_string(), "same tail\n".to_string());
+        let first_result = apply_capture_detection_with_tracker(&io, first, 200, 30, &mut tracker);
+        assert_eq!(first_result.status, "idle");
+
+        let mut second = pane("%1", "codex", "running");
+        second.started_at = "990".to_string();
+        let second_result =
+            apply_capture_detection_with_tracker(&io, second, 1_000, 30, &mut tracker);
+
+        assert_eq!(second_result.status, "running");
+    }
+
+    #[test]
+    fn capture_activity_tracker_prunes_disappeared_panes() {
+        let io = MockWorkerIo::default();
+        let mut tracker = CaptureActivityTracker::default();
+        tracker.record_tail("%1", Some(100), 100, "tail\n");
+        tracker.record_tail("%2", Some(100), 100, "tail\n");
+
+        io.panes.lock().unwrap().push(pane("%2", "codex", "idle"));
+        read_panes_with_detection_tracked(&io, 30, &mut tracker).unwrap();
+
+        assert!(!tracker.panes.contains_key("%1"));
+        assert!(tracker.panes.contains_key("%2"));
     }
 
     #[test]
