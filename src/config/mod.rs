@@ -139,6 +139,7 @@ pub enum BadgeStyle {
     Inline,
     Plain,
     Outer,
+    Chip,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -251,6 +252,8 @@ impl Default for AttentionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SessionBadgeConfig {
     pub enabled: bool,
+    pub mode: SessionBadgeMode,
+    pub chip: SessionBadgeChipConfig,
     pub suffix: String,
     pub hide_idle: bool,
 }
@@ -259,10 +262,38 @@ impl Default for SessionBadgeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: SessionBadgeMode::Rollup,
+            chip: SessionBadgeChipConfig::default(),
             suffix: String::new(),
             hide_idle: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionBadgeChipConfig {
+    pub bg: String,
+    pub cap_left: String,
+    pub cap_right: String,
+}
+
+impl Default for SessionBadgeChipConfig {
+    fn default() -> Self {
+        Self {
+            bg: "#262639".to_string(),
+            cap_left: "\u{e0b6}".to_string(),
+            cap_right: "\u{e0b4}".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBadgeMode {
+    #[default]
+    Rollup,
+    Counts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -878,6 +909,10 @@ categories:
         let badge = BadgeConfig::default();
         let config = SessionBadgeConfig::default();
         assert!(config.enabled);
+        assert_eq!(config.mode, SessionBadgeMode::Rollup);
+        assert_eq!(config.chip.bg, "#262639");
+        assert_eq!(config.chip.cap_left, "\u{e0b6}");
+        assert_eq!(config.chip.cap_right, "\u{e0b4}");
         assert_eq!(config.suffix, "");
         assert!(!config.hide_idle);
         assert_eq!(badge.glyphs.blocked, "▲");
@@ -926,6 +961,40 @@ categories:
         )
         .unwrap_err();
         assert!(err.to_string().contains("glyphs"));
+    }
+
+    #[test]
+    fn session_badge_mode_parses_counts() {
+        let config =
+            serde_yaml_ng::from_str::<Config>("statusline:\n  session_badge:\n    mode: counts\n")
+                .unwrap();
+
+        assert_eq!(
+            config.statusline.session_badge.mode,
+            SessionBadgeMode::Counts
+        );
+    }
+
+    #[test]
+    fn statusline_sessions_badge_style_and_session_badge_chip_parse() {
+        let config = serde_yaml_ng::from_str::<Config>(
+            r##"
+statusline:
+  sessions:
+    badge_style: chip
+  session_badge:
+    chip:
+      bg: "#30304a"
+      cap_left: "<"
+      cap_right: ">"
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(config.statusline.sessions.badge_style, BadgeStyle::Chip);
+        assert_eq!(config.statusline.session_badge.chip.bg, "#30304a");
+        assert_eq!(config.statusline.session_badge.chip.cap_left, "<");
+        assert_eq!(config.statusline.session_badge.chip.cap_right, ">");
     }
 
     #[test]

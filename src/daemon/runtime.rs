@@ -812,12 +812,7 @@ impl RuntimeState {
             }
             for (session, list) in states {
                 let state = list.iter().copied().min().unwrap_or(BadgeState::Idle);
-                if let Some(value) = session_badge_value(
-                    list,
-                    badge_glyphs,
-                    &badge_config.suffix,
-                    badge_config.hide_idle,
-                ) {
+                if let Some(value) = session_badge_value(list, badge_glyphs, badge_config) {
                     desired.insert(session, (value, state.as_str().to_string()));
                 }
             }
@@ -2114,6 +2109,28 @@ mod tests {
             vec![RuntimeEffect::SetSessionBadge {
                 session: "main".to_string(),
                 value: "▲".to_string(),
+                state: "blocked".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn session_badge_counts_mode_writes_state_counts() {
+        let mut config = Config::default();
+        config.statusline.session_badge.mode = crate::config::SessionBadgeMode::Counts;
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![
+            agent_pane("main", "%1", "waiting"),
+            agent_pane("main", "%2", "waiting"),
+            agent_pane("main", "%3", "running"),
+            agent_pane("main", "%4", "idle"),
+        ]));
+
+        assert_eq!(
+            without_heartbeat(&effects),
+            vec![RuntimeEffect::SetSessionBadge {
+                session: "main".to_string(),
+                value: "▲ 2 ● 1 ○ 1".to_string(),
                 state: "blocked".to_string(),
             }]
         );

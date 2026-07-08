@@ -278,11 +278,33 @@
         "session_badge": {
           "additionalProperties": true,
           "properties": {
+            "chip": {
+              "additionalProperties": true,
+              "properties": {
+                "bg": {
+                  "type": "string"
+                },
+                "cap_left": {
+                  "type": "string"
+                },
+                "cap_right": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
             "enabled": {
               "type": "boolean"
             },
             "hide_idle": {
               "type": "boolean"
+            },
+            "mode": {
+              "enum": [
+                "rollup",
+                "counts"
+              ],
+              "type": "string"
             },
             "suffix": {
               "type": "string"
@@ -297,7 +319,8 @@
               "enum": [
                 "inline",
                 "plain",
-                "outer"
+                "outer",
+                "chip"
               ],
               "type": "string"
             },

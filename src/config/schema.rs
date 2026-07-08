@@ -82,7 +82,7 @@ pub fn config_schema() -> Value {
                         "properties": {
                             "badge_style": {
                                 "type": "string",
-                                "enum": ["inline", "plain", "outer"]
+                                "enum": ["inline", "plain", "outer", "chip"]
                             },
                             "separator": { "type": "string" }
                         }
@@ -174,6 +174,19 @@ pub fn config_schema() -> Value {
                         "additionalProperties": true,
                         "properties": {
                             "enabled": { "type": "boolean" },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["rollup", "counts"]
+                            },
+                            "chip": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "bg": { "type": "string" },
+                                    "cap_left": { "type": "string" },
+                                    "cap_right": { "type": "string" }
+                                }
+                            },
                             "suffix": { "type": "string" },
                             "hide_idle": { "type": "boolean" }
                         }
@@ -427,6 +440,16 @@ mod tests {
             "boolean"
         );
         assert_eq!(
+            schema["properties"]["statusline"]["properties"]["session_badge"]["properties"]["mode"]
+                ["enum"][1],
+            "counts"
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["session_badge"]["properties"]["chip"]
+                ["properties"]["bg"]["type"],
+            "string"
+        );
+        assert_eq!(
             schema["properties"]["statusline"]["properties"]["summary"]["properties"]["enabled"]["type"],
             "boolean"
         );
@@ -444,6 +467,11 @@ mod tests {
             schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["badge_style"]
                 ["enum"][2],
             "outer"
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["badge_style"]
+                ["enum"][3],
+            "chip"
         );
         assert_eq!(
             schema["properties"]["statusline"]["properties"]["windows"]["properties"]["current"]["properties"]

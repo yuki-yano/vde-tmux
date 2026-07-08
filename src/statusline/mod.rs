@@ -1,7 +1,11 @@
 use anyhow::{Result, anyhow};
 
 use crate::category::{resolve_category_for_session, sessions_in_category, sorted_categories};
-use crate::config::{BadgeStyle, Config, SegmentColors, SegmentStyle, StatuslineCategoryConfig};
+use crate::config::{
+    BadgeConfig, BadgeGlyphs, BadgeStyle, Config, SegmentColors, SegmentStyle,
+    SessionBadgeChipConfig, SessionBadgeMode, StatuslineCategoryConfig,
+};
+use crate::daemon::session_badge::{BadgeState, glyph_for_state};
 use crate::session::{
     SessionInfo, current_session_name, exact_session_target, find_session, list_sessions,
     switch_client, use_category,
@@ -148,21 +152,25 @@ pub fn render_statusline_sessions_with_stale(
             } else {
                 &session.badge
             };
-            let state = if stale { "" } else { &session.state };
+            let counts_mode = config.statusline.session_badge.mode == SessionBadgeMode::Counts;
+            let state = if stale || counts_mode {
+                ""
+            } else {
+                &session.state
+            };
             let label = if config.statusline.sessions.show_index {
                 format!("{}: {}", index + 1, session.name)
             } else {
                 session.name.clone()
             };
-            let segment = render_session_segment(
-                style,
-                badge,
-                state,
-                &label,
-                index,
-                config.statusline.sessions.badge_style,
-                &config.badge.colors,
-            );
+            let badge_options = SessionBadgeRenderOptions {
+                badge_style: config.statusline.sessions.badge_style,
+                separate_badge: counts_mode,
+                badge_config: &config.badge,
+                chip_config: &config.statusline.session_badge.chip,
+            };
+            let segment =
+                render_session_segment(style, badge, state, &label, index, &badge_options);
             if session.id.is_empty() {
                 segment
             } else {
@@ -333,16 +341,25 @@ fn current_category(config: &Config, sessions: &[SessionInfo], current_session: 
         .unwrap_or_default()
 }
 
+struct SessionBadgeRenderOptions<'a> {
+    badge_style: BadgeStyle,
+    separate_badge: bool,
+    badge_config: &'a BadgeConfig,
+    chip_config: &'a SessionBadgeChipConfig,
+}
+
 fn render_session_segment(
     style: &SegmentStyle,
     badge: &str,
     state: &str,
     label: &str,
     index: usize,
-    badge_style: BadgeStyle,
-    colors: &crate::config::BadgeColors,
+    options: &SessionBadgeRenderOptions<'_>,
 ) -> String {
-    if badge_style == BadgeStyle::Outer {
+    if options.badge_style == BadgeStyle::Chip {
+        return render_chip_session_segment(style, badge, state, label, index, options);
+    }
+    if options.badge_style == BadgeStyle::Outer {
         let body = style
             .format
             .replace("{badge}", "")
@@ -352,13 +369,28 @@ fn render_session_segment(
         if badge.is_empty() {
             return segment;
         }
-        let glyph = match colors.for_state(state) {
-            Some(color) => format!("#[fg={color}]{badge}#[default]"),
-            None => badge.to_string(),
+        let glyph = if options.separate_badge {
+            counts_badge_fragment(badge, "default", options.badge_config)
+        } else {
+            match options.badge_config.colors.for_state(state) {
+                Some(color) => format!("#[fg={color}]{badge}#[default]"),
+                None => badge.to_string(),
+            }
         };
         return format!("{glyph} {segment}");
     }
-    let fragment = badge_fragment(badge, state, style, badge_style, colors);
+    let fragment = if options.separate_badge && options.badge_style != BadgeStyle::Plain {
+        let restore = style.colors.fg.as_deref().unwrap_or("default");
+        counts_badge_fragment(badge, restore, options.badge_config)
+    } else {
+        badge_fragment(
+            badge,
+            state,
+            style,
+            options.badge_style,
+            &options.badge_config.colors,
+        )
+    };
     let (badge_token, label) = if style.format.contains("{badge}") {
         let token = if fragment.is_empty() {
             String::new()
@@ -366,6 +398,13 @@ fn render_session_segment(
             format!("{fragment} ")
         };
         (token, label.to_string())
+    } else if options.separate_badge && !fragment.is_empty() {
+        let separator = if fragment.chars().last().is_some_and(char::is_whitespace) {
+            ""
+        } else {
+            " "
+        };
+        (String::new(), format!("{fragment}{separator}{label}"))
     } else {
         (String::new(), format!("{fragment}{label}"))
     };
@@ -375,6 +414,100 @@ fn render_session_segment(
         .replace("{session}", &label)
         .replace("{index}", &(index + 1).to_string());
     tmux_style_segment(style, &body)
+}
+
+fn render_chip_session_segment(
+    style: &SegmentStyle,
+    badge: &str,
+    state: &str,
+    label: &str,
+    index: usize,
+    options: &SessionBadgeRenderOptions<'_>,
+) -> String {
+    let body = style
+        .format
+        .replace("{badge}", "")
+        .replace("{session}", label)
+        .replace("{index}", &(index + 1).to_string());
+    if badge.is_empty() {
+        return tmux_style_segment(style, &body);
+    }
+
+    let chip_body = chip_badge_body(badge, state, options.separate_badge, options.badge_config);
+    let chip_start = format!(
+        "#[fg={}]{}#[bg={}] {chip_body} ",
+        options.chip_config.bg, options.chip_config.cap_left, options.chip_config.bg
+    );
+    if let Some(segment_bg) = &style.colors.bg {
+        return format!(
+            "{chip_start}#[bg={segment_bg}]{}",
+            tmux_style_segment_without_prefix(style, &body)
+        );
+    }
+
+    let chip_end = format!(
+        "#[fg={},bg=default]{}#[default]",
+        options.chip_config.bg, options.chip_config.cap_right
+    );
+    format!(
+        "{chip_start}{chip_end} {}",
+        tmux_style_segment(style, &body)
+    )
+}
+
+fn chip_badge_body(
+    badge: &str,
+    state: &str,
+    separate_badge: bool,
+    badge_config: &BadgeConfig,
+) -> String {
+    if separate_badge {
+        return counts_badge_fragment(badge, "default", badge_config);
+    }
+    match badge_config.colors.for_state(state) {
+        Some(color) => format!("#[fg={color}]{badge}#[fg=default]"),
+        None => badge.to_string(),
+    }
+}
+
+fn counts_badge_fragment(badge: &str, restore_fg: &str, badge_config: &BadgeConfig) -> String {
+    let tokens = badge.split_whitespace().collect::<Vec<_>>();
+    let mut parts = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if index + 1 < tokens.len()
+            && let Some(state) = count_glyph_state(tokens[index], &badge_config.glyphs)
+            && tokens[index + 1].chars().all(|c| c.is_ascii_digit())
+        {
+            let color = match state {
+                BadgeState::Blocked => &badge_config.colors.blocked,
+                BadgeState::Working => &badge_config.colors.working,
+                BadgeState::Done => &badge_config.colors.done,
+                BadgeState::Idle => &badge_config.colors.idle,
+            };
+            parts.push(format!(
+                "#[fg={color}]{} {}#[fg={restore_fg}]",
+                tokens[index],
+                tokens[index + 1]
+            ));
+            index += 2;
+            continue;
+        }
+        parts.push(tokens[index].to_string());
+        index += 1;
+    }
+    parts.join(" ")
+}
+
+fn count_glyph_state(token: &str, glyphs: &BadgeGlyphs) -> Option<BadgeState> {
+    [
+        BadgeState::Blocked,
+        BadgeState::Working,
+        BadgeState::Done,
+        BadgeState::Idle,
+    ]
+    .into_iter()
+    .find(|state| token == glyph_for_state(*state, glyphs))
 }
 
 fn window_segment_style(config: &Config, window: &WindowInfo) -> SegmentStyle {
@@ -429,6 +562,19 @@ fn badge_fragment(
 }
 
 fn tmux_style_segment(style: &SegmentStyle, body: &str) -> String {
+    format!(
+        "{}{}{}",
+        style.prefix,
+        tmux_style_segment_body(style, body),
+        style.suffix
+    )
+}
+
+fn tmux_style_segment_without_prefix(style: &SegmentStyle, body: &str) -> String {
+    format!("{}{}", tmux_style_segment_body(style, body), style.suffix)
+}
+
+fn tmux_style_segment_body(style: &SegmentStyle, body: &str) -> String {
     let mut attrs = Vec::new();
     if style.bold {
         attrs.push("bold".to_string());
@@ -439,12 +585,11 @@ fn tmux_style_segment(style: &SegmentStyle, body: &str) -> String {
     if let Some(bg) = &style.colors.bg {
         attrs.push(format!("bg={bg}"));
     }
-    let styled = if attrs.is_empty() {
+    if attrs.is_empty() {
         body.to_string()
     } else {
         format!("#[{}]{}#[default]", attrs.join(","), body)
-    };
-    format!("{}{}{}", style.prefix, styled, style.suffix)
+    }
 }
 
 fn tmux_style_category(config: &StatuslineCategoryConfig, body: &str, active: bool) -> String {
@@ -481,7 +626,7 @@ fn tmux_style_category(config: &StatuslineCategoryConfig, body: &str, active: bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BadgeStyle, Config};
+    use crate::config::{BadgeStyle, Config, SessionBadgeMode};
     use crate::session::SessionInfo;
     use crate::window::WindowInfo;
 
@@ -671,6 +816,107 @@ mod tests {
         assert_eq!(
             rendered,
             "#[bold] #[fg=#ff6b6b]▲#[fg=default]main #[default]"
+        );
+    }
+
+    #[test]
+    fn counts_session_badge_colors_each_count_and_separates_label() {
+        let mut config = Config::default();
+        config.statusline.session_badge.mode = SessionBadgeMode::Counts;
+        let mut main = session("main", "work");
+        main.badge = "▲ 2 ● 1 ○ 5".to_string();
+        main.state = "blocked".to_string();
+        let rendered = render_statusline_sessions(&config, &[main], "main", "work");
+
+        assert_eq!(
+            rendered,
+            "#[bold] #[fg=#ff6b6b]▲ 2#[fg=default] #[fg=#4fd08a]● 1#[fg=default] #[fg=#a8a8b2]○ 5#[fg=default] main #[default]"
+        );
+    }
+
+    #[test]
+    fn outer_counts_session_badge_colors_counts_before_segment() {
+        let mut config = Config::default();
+        config.statusline.session_badge.mode = SessionBadgeMode::Counts;
+        config.statusline.sessions.badge_style = BadgeStyle::Outer;
+        config.statusline.sessions.current.colors.fg = Some("#ecebff".to_string());
+        config.statusline.sessions.current.colors.bg = Some("#453f9e".to_string());
+        let mut main = session("main", "work");
+        main.badge = "● 1 ○ 3".to_string();
+        main.state = "working".to_string();
+        let rendered = render_statusline_sessions(&config, &[main], "main", "work");
+
+        assert_eq!(
+            rendered,
+            "#[fg=#4fd08a]● 1#[fg=default] #[fg=#a8a8b2]○ 3#[fg=default] #[bold,fg=#ecebff,bg=#453f9e] main #[default]"
+        );
+    }
+
+    #[test]
+    fn chip_counts_badge_wraps_normal_session_before_segment() {
+        let mut config = Config::default();
+        config.statusline.session_badge.mode = SessionBadgeMode::Counts;
+        config.statusline.sessions.badge_style = BadgeStyle::Chip;
+        let mut sub = session("sub", "work");
+        sub.badge = "● 1 ○ 3".to_string();
+        sub.state = "working".to_string();
+
+        let rendered = render_statusline_sessions(&config, &[sub], "main", "work");
+
+        assert_eq!(
+            rendered,
+            "#[fg=#262639]#[bg=#262639] #[fg=#4fd08a]● 1#[fg=default] #[fg=#a8a8b2]○ 3#[fg=default] #[fg=#262639,bg=default]#[default]  sub "
+        );
+    }
+
+    #[test]
+    fn chip_counts_badge_connects_to_current_segment_without_prefix() {
+        let mut config = Config::default();
+        config.statusline.session_badge.mode = SessionBadgeMode::Counts;
+        config.statusline.sessions.badge_style = BadgeStyle::Chip;
+        config.statusline.sessions.current.colors.fg = Some("#ecebff".to_string());
+        config.statusline.sessions.current.colors.bg = Some("#453f9e".to_string());
+        config.statusline.sessions.current.prefix = "<prefix>".to_string();
+        config.statusline.sessions.current.suffix = "<suffix>".to_string();
+        let mut main = session("main", "work");
+        main.badge = "● 1 ○ 3".to_string();
+        main.state = "working".to_string();
+
+        let rendered = render_statusline_sessions(&config, &[main], "main", "work");
+
+        assert_eq!(
+            rendered,
+            "#[fg=#262639]#[bg=#262639] #[fg=#4fd08a]● 1#[fg=default] #[fg=#a8a8b2]○ 3#[fg=default] #[bg=#453f9e]#[bold,fg=#ecebff,bg=#453f9e] main #[default]<suffix>"
+        );
+        assert!(!rendered.contains("<prefix>"), "{rendered}");
+    }
+
+    #[test]
+    fn chip_without_badge_renders_regular_segment_with_prefix() {
+        let mut config = Config::default();
+        config.statusline.sessions.badge_style = BadgeStyle::Chip;
+        config.statusline.sessions.current.prefix = "<prefix>".to_string();
+        config.statusline.sessions.current.suffix = "<suffix>".to_string();
+
+        let rendered =
+            render_statusline_sessions(&config, &[session("main", "work")], "main", "work");
+
+        assert_eq!(rendered, "<prefix>#[bold] main #[default]<suffix>");
+    }
+
+    #[test]
+    fn chip_rollup_badge_uses_state_color_inside_chip() {
+        let mut config = Config::default();
+        config.statusline.sessions.badge_style = BadgeStyle::Chip;
+        let mut sub = session("sub", "work");
+        sub.badge = "▲".to_string();
+        sub.state = "blocked".to_string();
+
+        let rendered = render_statusline_sessions(&config, &[sub], "main", "work");
+
+        assert_eq!(
+            rendered,
+            "#[fg=#262639]#[bg=#262639] #[fg=#ff6b6b]▲#[fg=default] #[fg=#262639,bg=default]#[default]  sub "
         );
     }
 

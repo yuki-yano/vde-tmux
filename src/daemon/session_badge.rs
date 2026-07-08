@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::config::BadgeGlyphs;
+use crate::config::{BadgeGlyphs, SessionBadgeConfig, SessionBadgeMode};
 use crate::hook::RollupLevel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -39,6 +39,22 @@ pub fn badge_state(level: RollupLevel, unread: bool) -> BadgeState {
 pub fn session_badge_value(
     states: impl IntoIterator<Item = BadgeState>,
     glyphs: &BadgeGlyphs,
+    config: &SessionBadgeConfig,
+) -> Option<String> {
+    let states = states.into_iter().collect::<Vec<_>>();
+    match config.mode {
+        SessionBadgeMode::Rollup => {
+            session_badge_rollup_value(states, glyphs, &config.suffix, config.hide_idle)
+        }
+        SessionBadgeMode::Counts => {
+            session_badge_counts_value(states, glyphs, &config.suffix, config.hide_idle)
+        }
+    }
+}
+
+fn session_badge_rollup_value(
+    states: impl IntoIterator<Item = BadgeState>,
+    glyphs: &BadgeGlyphs,
     suffix: &str,
     hide_idle: bool,
 ) -> Option<String> {
@@ -47,6 +63,43 @@ pub fn session_badge_value(
         return None;
     }
     Some(format!("{}{suffix}", glyph_for_state(state, glyphs)))
+}
+
+fn session_badge_counts_value(
+    states: impl IntoIterator<Item = BadgeState>,
+    glyphs: &BadgeGlyphs,
+    suffix: &str,
+    hide_idle: bool,
+) -> Option<String> {
+    let mut blocked = 0usize;
+    let mut working = 0usize;
+    let mut done = 0usize;
+    let mut idle = 0usize;
+    for state in states {
+        match state {
+            BadgeState::Blocked => blocked += 1,
+            BadgeState::Working => working += 1,
+            BadgeState::Done => done += 1,
+            BadgeState::Idle => idle += 1,
+        }
+    }
+    if hide_idle {
+        idle = 0;
+    }
+    let parts = [
+        (BadgeState::Blocked, blocked),
+        (BadgeState::Working, working),
+        (BadgeState::Done, done),
+        (BadgeState::Idle, idle),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .map(|(state, count)| format!("{} {count}", glyph_for_state(state, glyphs)))
+    .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("{}{suffix}", parts.join(" ")))
 }
 
 pub fn glyph_for_state(state: BadgeState, glyphs: &BadgeGlyphs) -> &str {
@@ -106,8 +159,7 @@ mod tests {
         let value = session_badge_value(
             [BadgeState::Idle, BadgeState::Blocked, BadgeState::Working],
             &glyphs,
-            &config.suffix,
-            false,
+            &config,
         );
         assert_eq!(value.as_deref(), Some("▲"));
     }
@@ -122,23 +174,28 @@ mod tests {
             done: "D".to_string(),
             ..BadgeGlyphs::default()
         };
-        let value = session_badge_value([BadgeState::Done], &glyphs, &config.suffix, false);
+        let value = session_badge_value([BadgeState::Done], &glyphs, &config);
         assert_eq!(value.as_deref(), Some("D|"));
     }
 
     #[test]
     fn hide_idle_suppresses_idle_badge_only() {
         let glyphs = BadgeGlyphs::default();
+        let config = SessionBadgeConfig {
+            hide_idle: true,
+            ..SessionBadgeConfig::default()
+        };
         assert_eq!(
-            session_badge_value([BadgeState::Idle], &glyphs, "", true),
+            session_badge_value([BadgeState::Idle], &glyphs, &config),
             None
         );
         assert_eq!(
-            session_badge_value([BadgeState::Done], &glyphs, "", true).as_deref(),
+            session_badge_value([BadgeState::Done], &glyphs, &config).as_deref(),
             Some("✓")
         );
+        let config = SessionBadgeConfig::default();
         assert_eq!(
-            session_badge_value([BadgeState::Idle], &glyphs, "", false).as_deref(),
+            session_badge_value([BadgeState::Idle], &glyphs, &config).as_deref(),
             Some("○")
         );
     }
@@ -147,7 +204,7 @@ mod tests {
     fn session_badge_value_is_none_for_no_agents() {
         let config = SessionBadgeConfig::default();
         assert_eq!(
-            session_badge_value([], &BadgeGlyphs::default(), &config.suffix, false),
+            session_badge_value([], &BadgeGlyphs::default(), &config),
             None
         );
     }
@@ -159,8 +216,57 @@ mod tests {
             ..crate::config::BadgeGlyphs::default()
         };
 
-        let value = session_badge_value([BadgeState::Working], &glyphs, "|", false);
+        let config = SessionBadgeConfig {
+            suffix: "|".to_string(),
+            ..SessionBadgeConfig::default()
+        };
+        let value = session_badge_value([BadgeState::Working], &glyphs, &config);
 
         assert_eq!(value.as_deref(), Some("W|"));
+    }
+
+    #[test]
+    fn counts_mode_renders_non_zero_state_counts_in_priority_order() {
+        let config = SessionBadgeConfig {
+            mode: SessionBadgeMode::Counts,
+            ..SessionBadgeConfig::default()
+        };
+
+        let value = session_badge_value(
+            [
+                BadgeState::Idle,
+                BadgeState::Blocked,
+                BadgeState::Working,
+                BadgeState::Blocked,
+            ],
+            &BadgeGlyphs::default(),
+            &config,
+        );
+
+        assert_eq!(value.as_deref(), Some("▲ 2 ● 1 ○ 1"));
+    }
+
+    #[test]
+    fn counts_mode_hides_idle_and_appends_suffix() {
+        let config = SessionBadgeConfig {
+            mode: SessionBadgeMode::Counts,
+            hide_idle: true,
+            suffix: "|".to_string(),
+            ..SessionBadgeConfig::default()
+        };
+
+        assert_eq!(
+            session_badge_value([BadgeState::Idle], &BadgeGlyphs::default(), &config),
+            None
+        );
+        assert_eq!(
+            session_badge_value(
+                [BadgeState::Done, BadgeState::Idle],
+                &BadgeGlyphs::default(),
+                &config,
+            )
+            .as_deref(),
+            Some("✓ 1|")
+        );
     }
 }

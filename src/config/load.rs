@@ -262,16 +262,28 @@ categories:
 
     #[test]
     fn parse_config_accepts_session_badge_overrides() {
-        let yaml = r#"
+        let yaml = r##"
 statusline:
   session_badge:
+    mode: counts
+    chip:
+      bg: "#30304a"
+      cap_left: "<"
+      cap_right: ">"
     suffix: ""
 badge:
   glyphs:
     blocked: "!"
-"#;
+"##;
         let loaded = parse_config(yaml);
         assert!(loaded.warnings.is_empty());
+        assert_eq!(
+            loaded.config.statusline.session_badge.mode,
+            crate::config::SessionBadgeMode::Counts
+        );
+        assert_eq!(loaded.config.statusline.session_badge.chip.bg, "#30304a");
+        assert_eq!(loaded.config.statusline.session_badge.chip.cap_left, "<");
+        assert_eq!(loaded.config.statusline.session_badge.chip.cap_right, ">");
         assert_eq!(loaded.config.statusline.session_badge.suffix, "");
         assert_eq!(loaded.config.badge.glyphs.blocked, "!");
         assert_eq!(loaded.config.badge.glyphs.working, "●");

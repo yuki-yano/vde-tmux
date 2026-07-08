@@ -61,10 +61,12 @@ bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_rang
 ```
 
 - `statusline-category` — the current category (and the other categories, depending on config)
-- `statusline-sessions` — sessions in the current category, each prefixed with an agent state badge
+- `statusline-sessions` — sessions in the current category, each prefixed with an agent state badge. Set `statusline.session_badge.mode: counts` to show counts such as `▲ 2 ● 1 ○ 5`
 - `statusline-windows` — windows in the current session, formatted by `statusline.windows`
 - `statusline-summary` — state counts across all agents, e.g. `▲2 ●1`
 - `statusline-attention` — blocked agents you cannot currently see, e.g. `▲ session · perm 2m`
+
+Use `statusline.sessions.badge_style: chip` to render session badges as a connected chip before each session segment. The chip color and cap glyphs are configured under `statusline.session_badge.chip`.
 
 Set `status-left-length` to a large value to remove the artificial left segment cap; the terminal width remains the real display limit. `statusline-windows` replaces tmux's native window list, so the native `window-status-*` formats should be empty when using it.
 
@@ -270,8 +272,14 @@ categories:
         - github.com/acme/*
 
 statusline:
+  session_badge:
+    mode: rollup       # rollup | counts
+    chip:
+      bg: "#262639"
+      cap_left: ""
+      cap_right: ""
   sessions:
-    badge_style: inline   # inline | plain | outer
+    badge_style: inline   # inline | plain | outer | chip
   summary:
     enabled: true
 
@@ -305,6 +313,11 @@ A truecolor preset that keeps state glyphs readable on the bar and uses fills on
 ```yaml
 # ~/.config/vde/tmux/config.yml
 statusline:
+  session_badge:
+    chip:
+      bg: "#262639"
+      cap_left: ""
+      cap_right: ""
   category:
     mode: list
     format: "{category} {name} "
@@ -315,7 +328,7 @@ statusline:
     inactive_colors:
       fg: "#9591ad"
   sessions:
-    badge_style: outer
+    badge_style: outer   # inline | plain | outer | chip
     current:
       format: " {session} "
       bold: true

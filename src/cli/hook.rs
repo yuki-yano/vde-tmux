@@ -354,6 +354,7 @@ fn claude_task_status_from_str(raw: &str) -> Option<TaskItemStatus> {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum CodexAuxEvent {
     Progress(ProgressEvent),
     Agent(AgentEvent),
