@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -963,12 +964,50 @@ fn compare_agent_panes(
             .position(|pane_id| pane_id == &pane.pane_id)
             .unwrap_or(usize::MAX)
     };
-    right
-        .attention
-        .cmp(&left.attention)
-        .then_with(|| left.rollup.cmp(&right.rollup))
+    chat_sort_bucket(left)
+        .cmp(&chat_sort_bucket(right))
+        .then_with(|| Reverse(chat_sort_time(left)).cmp(&Reverse(chat_sort_time(right))))
         .then_with(|| manual_position(left).cmp(&manual_position(right)))
         .then_with(|| left.pane_id.cmp(&right.pane_id))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ChatSortBucket {
+    NeedsAttention,
+    Running,
+    Done,
+    Idle,
+}
+
+fn chat_sort_bucket(pane: &AgentPane) -> ChatSortBucket {
+    match pane.rollup {
+        RollupLevel::Error | RollupLevel::Permission | RollupLevel::Waiting => {
+            ChatSortBucket::NeedsAttention
+        }
+        RollupLevel::Running => ChatSortBucket::Running,
+        RollupLevel::Background | RollupLevel::Idle
+            if parse_epoch(&pane.completed_at).is_some()
+                || pane.badge_state == BadgeState::Done =>
+        {
+            ChatSortBucket::Done
+        }
+        RollupLevel::Background | RollupLevel::Idle if pane.attention => {
+            ChatSortBucket::NeedsAttention
+        }
+        RollupLevel::Background | RollupLevel::Idle => ChatSortBucket::Idle,
+    }
+}
+
+fn chat_sort_time(pane: &AgentPane) -> Option<i64> {
+    match chat_sort_bucket(pane) {
+        ChatSortBucket::NeedsAttention | ChatSortBucket::Running => parse_epoch(&pane.started_at),
+        ChatSortBucket::Done => parse_epoch(&pane.completed_at),
+        ChatSortBucket::Idle => None,
+    }
+}
+
+fn parse_epoch(raw: &str) -> Option<i64> {
+    raw.trim().parse().ok()
 }
 
 fn repo_id(category: &str, repo: &str) -> String {
@@ -1258,7 +1297,7 @@ mod tests {
         assert_eq!(rows[1].kind, SidebarRowKind::Repo);
         assert_eq!(rows[1].label, "app");
         assert_eq!(rows[2].kind, SidebarRowKind::Chat);
-        assert_eq!(rows[2].pane_id.as_deref(), Some("%1"));
+        assert_eq!(rows[2].pane_id.as_deref(), Some("%2"));
         assert_eq!(rows.len(), 4);
     }
 
@@ -1509,6 +1548,82 @@ mod tests {
         };
 
         let rows = build_rows(&Config::default(), &[quiet, attention], &state);
+
+        assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
+        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn running_panes_sort_by_started_at_desc() {
+        let mut older = pane("main", "%1", "/tmp/app", "codex", "running");
+        older.started_at = "800".to_string();
+        let mut newer = pane("main", "%2", "/tmp/app", "claude", "running");
+        newer.started_at = "900".to_string();
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows(&Config::default(), &[older, newer], &state);
+
+        assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
+        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn completed_attention_does_not_sort_before_running_pane() {
+        let mut completed = pane("main", "%1", "/tmp/app", "codex", "idle");
+        completed.attention = "1".to_string();
+        completed.completed_at = "900".to_string();
+        let mut running = pane("main", "%2", "/tmp/app", "claude", "running");
+        running.started_at = "800".to_string();
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows(&Config::default(), &[completed, running], &state);
+
+        assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
+        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn stale_attention_on_running_pane_uses_started_at_order() {
+        let mut stale_attention = pane("main", "%1", "/tmp/app", "codex", "running");
+        stale_attention.attention = "1".to_string();
+        stale_attention.started_at = "800".to_string();
+        stale_attention.completed_at = "700".to_string();
+        let mut clean_running = pane("main", "%2", "/tmp/app", "claude", "running");
+        clean_running.started_at = "900".to_string();
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows(
+            &Config::default(),
+            &[stale_attention, clean_running],
+            &state,
+        );
+
+        assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
+        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn completed_panes_sort_by_completed_at_desc_before_manual_order() {
+        let mut older = pane("main", "%1", "/tmp/app", "codex", "idle");
+        older.completed_at = "800".to_string();
+        let mut newer = pane("main", "%2", "/tmp/app", "claude", "idle");
+        newer.completed_at = "900".to_string();
+        let state = SidebarState {
+            view_mode: ViewMode::Flat,
+            manual_chat_order: vec!["%1".to_string(), "%2".to_string()],
+            ..SidebarState::default()
+        };
+
+        let rows = build_rows(&Config::default(), &[older, newer], &state);
 
         assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
         assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
