@@ -787,7 +787,6 @@ pub(crate) fn extract_tail(raw: &str, limit: usize, cut_markers: &[String]) -> V
     let cut = cut_index(&all, cut_markers).unwrap_or(all.len());
     let mut lines = all[..cut]
         .iter()
-        .filter(|line| !strip_ansi(line).trim().is_empty())
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
     let start = lines.len().saturating_sub(limit);
@@ -1388,8 +1387,12 @@ mod tests {
     }
 
     #[test]
-    fn live_tail_keeps_last_nonempty_lines() {
-        assert_eq!(extract_tail("a\nb\n\nc\n\n\n", 3, &[]), vec!["a", "b", "c"]);
+    fn live_tail_keeps_blank_lines() {
+        assert_eq!(
+            extract_tail("a\nb\n\nc\n\n\n", 6, &[]),
+            vec!["a", "b", "", "c", "", ""]
+        );
+        assert_eq!(extract_tail("a\n\nb\nc\n", 3, &[]), vec!["", "b", "c"]);
         assert_eq!(extract_tail("a\nb\nc\nd\n", 2, &[]), vec!["c", "d"]);
     }
 
@@ -1398,7 +1401,10 @@ mod tests {
         let markers = crate::config::SidebarLiveConfig::default().cut_markers;
         let raw =
             "output 1\noutput 2\n\n╭──────────╮\n│ >        │\n╰──────────╯\n? for shortcuts\n";
-        assert_eq!(extract_tail(raw, 5, &markers), vec!["output 1", "output 2"]);
+        assert_eq!(
+            extract_tail(raw, 5, &markers),
+            vec!["output 1", "output 2", ""]
+        );
         let raw = "thinking...\ndone!\n› type here\n⏎ send  95% context left\n";
         assert_eq!(extract_tail(raw, 5, &markers), vec!["thinking...", "done!"]);
         let raw = "important 1\nimportant 2\n❯\u{a0}\nnew task? /clear to save tokens\nbypass permissions on\n";
