@@ -10,10 +10,10 @@ use serde_json::Value;
 
 use crate::hook::adapter::{
     build_prompt_preview, claude_event_from_json, codex_event_from_json_with_home,
-    codex_notify_event_from_arg,
+    codex_notify_event_from_arg_with_home,
 };
 use crate::hook::origin::{
-    HookOrigin, claude_hook_origin, codex_hook_origin, find_codex_session_file,
+    HookOrigin, claude_hook_origin, codex_hook_origin_from_payload, find_codex_session_file,
 };
 use crate::hook::writer::{ProgressEvent, apply_progress_event, resolve_pane, write_pane_options};
 use crate::hook::{
@@ -115,7 +115,8 @@ pub(crate) fn run_hook_command(
             };
             let codex_home = codex_home_from_env(env);
             if arg.trim_start().starts_with('{') {
-                let event = codex_notify_event_from_arg(&arg, now_epoch)?;
+                let event =
+                    codex_notify_event_from_arg_with_home(&arg, now_epoch, codex_home.as_deref())?;
                 return write_agent_event(runner, env, &event);
             }
             if let Some(aux_event) =
@@ -373,8 +374,10 @@ fn codex_aux_event_from_input(
     match event {
         "PostToolUse" => {
             if is_guarded_codex_post_tool_use(&payload)
-                && codex_hook_origin(
+                && codex_hook_origin_from_payload(
                     payload.get("session_id").and_then(Value::as_str),
+                    payload.get("agent_id").and_then(Value::as_str),
+                    payload.get("transcript_path").and_then(Value::as_str),
                     codex_home,
                 ) == HookOrigin::Subagent
             {

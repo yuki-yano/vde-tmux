@@ -23,6 +23,37 @@ pub fn codex_hook_origin(session_id: Option<&str>, codex_home: Option<&Path>) ->
     codex_hook_origin_from_session_file(&path)
 }
 
+pub fn codex_hook_origin_from_payload(
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+    transcript_path: Option<&str>,
+    codex_home: Option<&Path>,
+) -> HookOrigin {
+    if let Some(path) = transcript_path
+        .filter(|path| !path.trim().is_empty())
+        .map(Path::new)
+        && let Some(origin) = codex_session_file_origin(path)
+    {
+        return origin;
+    }
+
+    let agent_id = agent_id.filter(|id| !id.trim().is_empty());
+    let session_id = session_id.filter(|id| !id.trim().is_empty());
+    if let Some(agent_id) = agent_id {
+        if let Some(codex_home) = codex_home
+            && let Some(path) = find_codex_session_file(&codex_home.join("sessions"), agent_id)
+            && let Some(origin) = codex_session_file_origin(&path)
+        {
+            return origin;
+        }
+        if session_id.is_some_and(|session_id| session_id != agent_id) {
+            return HookOrigin::Subagent;
+        }
+    }
+
+    codex_hook_origin(session_id, codex_home)
+}
+
 pub fn claude_hook_origin(
     transcript_path: Option<&str>,
     agent_transcript_path: Option<&str>,
@@ -66,20 +97,23 @@ pub(crate) fn find_codex_session_file(dir: &Path, session_id: &str) -> Option<Pa
 }
 
 fn codex_hook_origin_from_session_file(path: &Path) -> HookOrigin {
-    let Some(value) = read_jsonl_values(path, 40)
+    codex_session_file_origin(path).unwrap_or(HookOrigin::Parent)
+}
+
+fn codex_session_file_origin(path: &Path) -> Option<HookOrigin> {
+    let value = read_jsonl_values(path, 40)
         .into_iter()
-        .find(|value| value.get("type").and_then(Value::as_str) == Some("session_meta"))
-    else {
-        return HookOrigin::Parent;
-    };
+        .find(|value| value.get("type").and_then(Value::as_str) == Some("session_meta"))?;
     let payload = value.get("payload").unwrap_or(&value);
-    if payload.get("thread_source").and_then(Value::as_str) == Some("subagent")
-        || non_empty_str(payload.get("parent_thread_id"))
-    {
-        HookOrigin::Subagent
-    } else {
-        HookOrigin::Parent
-    }
+    Some(
+        if payload.get("thread_source").and_then(Value::as_str) == Some("subagent")
+            || non_empty_str(payload.get("parent_thread_id"))
+        {
+            HookOrigin::Subagent
+        } else {
+            HookOrigin::Parent
+        },
+    )
 }
 
 fn claude_hook_origin_from_transcript(path: &Path) -> HookOrigin {
@@ -171,6 +205,60 @@ mod tests {
             codex_hook_origin(Some("missing-session"), Some(&root)),
             HookOrigin::Parent
         );
+    }
+
+    #[test]
+    fn codex_origin_payload_uses_agent_id_when_session_id_is_parent() {
+        let root = unique_temp_dir("codex-origin-agent-id");
+        let sessions = root.join("sessions").join("2026").join("07").join("08");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("rollout-parent-session.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"parent-session","session_id":"parent-session","thread_source":"user"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            sessions.join("rollout-subagent-session.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"subagent-session","session_id":"parent-session","thread_source":"subagent","parent_thread_id":"parent-session"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_hook_origin_from_payload(
+                Some("parent-session"),
+                Some("subagent-session"),
+                None,
+                Some(&root),
+            ),
+            HookOrigin::Subagent
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_origin_payload_prefers_parent_transcript_path_over_agent_id_mismatch() {
+        let root = unique_temp_dir("codex-origin-parent-transcript");
+        let sessions = root.join("sessions").join("2026").join("07").join("08");
+        fs::create_dir_all(&sessions).unwrap();
+        let parent_path = sessions.join("rollout-parent-session.jsonl");
+        fs::write(
+            &parent_path,
+            r#"{"type":"session_meta","payload":{"id":"parent-session","session_id":"parent-session","thread_source":"user"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_hook_origin_from_payload(
+                Some("parent-session"),
+                Some("other-agent"),
+                parent_path.to_str(),
+                Some(&root),
+            ),
+            HookOrigin::Parent
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

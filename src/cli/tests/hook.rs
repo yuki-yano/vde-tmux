@@ -722,6 +722,99 @@ fn dispatch_hook_codex_subagent_lifecycle_origin_guard_ignores_parent_state_writ
 }
 
 #[test]
+fn dispatch_hook_codex_subagent_lifecycle_origin_guard_uses_agent_id_when_session_id_is_parent() {
+    let codex_home = unique_temp_dir("codex-subagent-lifecycle-real-payload");
+    let parent_id = "parent-session";
+    let agent_id = "subagent-session";
+    write_codex_parent_session(&codex_home, parent_id);
+    let transcript_path =
+        write_codex_subagent_session_with_parent(&codex_home, agent_id, parent_id);
+    let env = codex_env(&codex_home);
+    let cases = vec![
+        (
+            "UserPromptSubmit",
+            serde_json::json!({
+                "session_id": parent_id,
+                "agent_id": agent_id,
+                "transcript_path": transcript_path,
+                "prompt": "child prompt"
+            })
+            .to_string(),
+        ),
+        (
+            "SessionStart",
+            serde_json::json!({
+                "session_id": parent_id,
+                "agent_id": agent_id,
+                "transcript_path": transcript_path,
+                "source": "startup"
+            })
+            .to_string(),
+        ),
+        (
+            "Stop",
+            serde_json::json!({
+                "session_id": parent_id,
+                "agent_id": agent_id,
+                "transcript_path": transcript_path
+            })
+            .to_string(),
+        ),
+        (
+            "PermissionRequest",
+            serde_json::json!({
+                "session_id": parent_id,
+                "agent_id": agent_id,
+                "transcript_path": transcript_path
+            })
+            .to_string(),
+        ),
+    ];
+
+    for (event, input) in cases {
+        let mock = MockTmuxRunner::new();
+        run_with_input_at(["vt", "hook", "codex", event], &input, &mock, &env, 123).unwrap();
+        assert!(
+            mock.calls().is_empty(),
+            "{event} should not write parent pane state: {:?}",
+            mock.calls()
+        );
+    }
+
+    fs::remove_dir_all(codex_home).unwrap();
+}
+
+#[test]
+fn dispatch_hook_codex_subagent_lifecycle_origin_guard_uses_agent_id_without_transcript_path() {
+    let codex_home = unique_temp_dir("codex-subagent-lifecycle-agent-id-only");
+    let parent_id = "parent-session";
+    let agent_id = "subagent-session";
+    write_codex_parent_session(&codex_home, parent_id);
+    write_codex_subagent_session_with_parent(&codex_home, agent_id, parent_id);
+    let env = codex_env(&codex_home);
+    let input = serde_json::json!({
+        "session_id": parent_id,
+        "agent_id": agent_id,
+        "prompt": "child prompt"
+    })
+    .to_string();
+
+    let mock = MockTmuxRunner::new();
+    run_with_input_at(
+        ["vt", "hook", "codex", "UserPromptSubmit"],
+        &input,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert!(mock.calls().is_empty());
+
+    fs::remove_dir_all(codex_home).unwrap();
+}
+
+#[test]
 fn dispatch_hook_codex_subagent_progress_origin_guard_ignores_task_and_worktree_writes() {
     let codex_home = unique_temp_dir("codex-subagent-progress");
     let session_id = "subagent-progress-session";
@@ -774,6 +867,98 @@ fn dispatch_hook_codex_subagent_progress_origin_guard_ignores_task_and_worktree_
 }
 
 #[test]
+fn dispatch_hook_codex_subagent_progress_origin_guard_uses_agent_id_when_session_id_is_parent() {
+    let codex_home = unique_temp_dir("codex-subagent-progress-real-payload");
+    let parent_id = "parent-session";
+    let agent_id = "subagent-session";
+    write_codex_parent_session(&codex_home, parent_id);
+    let transcript_path =
+        write_codex_subagent_session_with_parent(&codex_home, agent_id, parent_id);
+    let env = codex_env(&codex_home);
+    let cases = vec![
+        serde_json::json!({
+            "session_id": parent_id,
+            "agent_id": agent_id,
+            "transcript_path": transcript_path,
+            "tool_name": "update_plan",
+            "tool_input": {
+                "plan": [
+                    {"step": "Explore", "status": "completed"},
+                    {"step": "Implement", "status": "in_progress"}
+                ]
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "session_id": parent_id,
+            "agent_id": agent_id,
+            "transcript_path": transcript_path,
+            "tool_name": "Bash",
+            "tool_input": {"command": "vw exec /tmp/worktrees/feature -- cargo test"}
+        })
+        .to_string(),
+        serde_json::json!({
+            "session_id": parent_id,
+            "agent_id": agent_id,
+            "transcript_path": transcript_path,
+            "tool_name": "create_goal",
+            "tool_input": {"objective": "child goal"}
+        })
+        .to_string(),
+    ];
+
+    for input in cases {
+        let mock = MockTmuxRunner::new();
+        run_with_input_at(
+            ["vt", "hook", "codex", "PostToolUse"],
+            &input,
+            &mock,
+            &env,
+            123,
+        )
+        .unwrap();
+        assert!(
+            mock.calls().is_empty(),
+            "subagent PostToolUse should not write parent pane state: {:?}",
+            mock.calls()
+        );
+    }
+
+    fs::remove_dir_all(codex_home).unwrap();
+}
+
+#[test]
+fn dispatch_hook_codex_subagent_progress_origin_guard_uses_agent_id_without_transcript_path() {
+    let codex_home = unique_temp_dir("codex-subagent-progress-agent-id-only");
+    let parent_id = "parent-session";
+    let agent_id = "subagent-session";
+    write_codex_parent_session(&codex_home, parent_id);
+    write_codex_subagent_session_with_parent(&codex_home, agent_id, parent_id);
+    let env = codex_env(&codex_home);
+    let input = serde_json::json!({
+        "session_id": parent_id,
+        "agent_id": agent_id,
+        "tool_name": "create_goal",
+        "tool_input": {"objective": "child goal"}
+    })
+    .to_string();
+
+    let mock = MockTmuxRunner::new();
+    run_with_input_at(
+        ["vt", "hook", "codex", "PostToolUse"],
+        &input,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
+    assert!(mock.calls().is_empty());
+
+    fs::remove_dir_all(codex_home).unwrap();
+}
+
+#[test]
 fn dispatch_hook_codex_subagent_lifecycle_origin_guard_keeps_subagent_rows() {
     let codex_home = unique_temp_dir("codex-subagent-rows");
     write_codex_subagent_session(&codex_home, "agent-a");
@@ -821,6 +1006,67 @@ fn dispatch_hook_codex_subagent_lifecycle_origin_guard_keeps_subagent_rows() {
     run_with_input_at(
         ["vt", "hook", "codex", "SubagentStop"],
         r#"{"session_id":"agent-a","agent_id":"agent-a"}"#,
+        &stop_mock,
+        &env,
+        123,
+    )
+    .unwrap();
+    assert_eq!(stop_mock.calls().len(), 2);
+
+    fs::remove_dir_all(codex_home).unwrap();
+}
+
+#[test]
+fn dispatch_hook_codex_subagent_rows_keep_parent_session_payload() {
+    let codex_home = unique_temp_dir("codex-subagent-rows-real-payload");
+    let parent_id = "parent-session";
+    let agent_id = "agent-a";
+    write_codex_parent_session(&codex_home, parent_id);
+    write_codex_subagent_session_with_parent(&codex_home, agent_id, parent_id);
+    let env = codex_env(&codex_home);
+
+    let start_mock = MockTmuxRunner::new();
+    start_mock.stub(&["show-options", "-p", "-t", "%1"], "");
+    start_mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_SUBAGENTS,
+            "agent-a:Plan",
+        ],
+        "",
+    );
+    run_with_input_at(
+        ["vt", "hook", "codex", "SubagentStart"],
+        r#"{"session_id":"parent-session","agent_id":"agent-a","agent_type":"Plan"}"#,
+        &start_mock,
+        &env,
+        123,
+    )
+    .unwrap();
+    assert_eq!(start_mock.calls().len(), 2);
+
+    let stop_mock = MockTmuxRunner::new();
+    stop_mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_subagents \"agent-a:Plan\"\n",
+    );
+    stop_mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_SUBAGENTS,
+        ],
+        "",
+    );
+    run_with_input_at(
+        ["vt", "hook", "codex", "SubagentStop"],
+        r#"{"session_id":"parent-session","agent_id":"agent-a"}"#,
         &stop_mock,
         &env,
         123,
@@ -1681,6 +1927,35 @@ fn dispatch_hook_codex_notify_reads_argv_json() {
 }
 
 #[test]
+fn dispatch_hook_codex_notify_origin_guard_uses_agent_id_when_session_id_is_parent() {
+    let codex_home = unique_temp_dir("codex-subagent-notify-real-payload");
+    let parent_id = "parent-session";
+    let agent_id = "subagent-session";
+    write_codex_parent_session(&codex_home, parent_id);
+    let transcript_path =
+        write_codex_subagent_session_with_parent(&codex_home, agent_id, parent_id);
+    let env = codex_env(&codex_home);
+    let arg = serde_json::json!({
+        "type": "agent-turn-complete",
+        "session_id": parent_id,
+        "agent_id": agent_id,
+        "transcript_path": transcript_path
+    })
+    .to_string();
+
+    let mock = MockTmuxRunner::new();
+    run_with_input_at(["vt", "hook", "codex", &arg], "", &mock, &env, 456).unwrap();
+
+    assert!(
+        mock.calls().is_empty(),
+        "subagent notify should not write parent pane state: {:?}",
+        mock.calls()
+    );
+
+    fs::remove_dir_all(codex_home).unwrap();
+}
+
+#[test]
 fn dispatch_hook_claude_task_created_updates_progress() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
@@ -1769,26 +2044,61 @@ fn codex_env(codex_home: &Path) -> BTreeMap<String, String> {
     ])
 }
 
-fn write_codex_subagent_session(codex_home: &Path, session_id: &str) {
+fn write_codex_parent_session(codex_home: &Path, session_id: &str) -> PathBuf {
     let sessions = codex_home
         .join("sessions")
         .join("2026")
         .join("07")
         .join("08");
     fs::create_dir_all(&sessions).unwrap();
+    let path = sessions.join(format!("rollout-{session_id}.jsonl"));
     fs::write(
-        sessions.join(format!("rollout-{session_id}.jsonl")),
+        &path,
         serde_json::json!({
             "type": "session_meta",
             "payload": {
                 "id": session_id,
-                "thread_source": "subagent",
-                "parent_thread_id": "parent-session"
+                "session_id": session_id,
+                "thread_source": "user"
             }
         })
         .to_string(),
     )
     .unwrap();
+    path
+}
+
+fn write_codex_subagent_session(codex_home: &Path, session_id: &str) -> PathBuf {
+    write_codex_subagent_session_with_parent(codex_home, session_id, "parent-session")
+}
+
+fn write_codex_subagent_session_with_parent(
+    codex_home: &Path,
+    session_id: &str,
+    parent_session_id: &str,
+) -> PathBuf {
+    let sessions = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("08");
+    fs::create_dir_all(&sessions).unwrap();
+    let path = sessions.join(format!("rollout-{session_id}.jsonl"));
+    fs::write(
+        &path,
+        serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "session_id": parent_session_id,
+                "thread_source": "subagent",
+                "parent_thread_id": parent_session_id
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
 }
 
 fn write_claude_subagent_transcript(root: &Path, name: &str) -> PathBuf {
