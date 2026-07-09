@@ -191,13 +191,9 @@ pub fn run_daemon_server(
         return Ok(());
     };
     for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                if let Err(error) = handle_stream(runner, config, stream) {
-                    eprintln!("[vde-tmux] daemon connection error: {error:#}");
-                }
-            }
-            Err(error) => return Err(error.into()),
+        let stream = stream?;
+        if let Err(error) = handle_stream(runner, config, stream) {
+            eprintln!("[vde-tmux] daemon connection error: {error:#}");
         }
     }
     Ok(())
