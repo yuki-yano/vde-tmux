@@ -20,9 +20,6 @@ pub const KEY_WORKTREE_ACTIVITY: &str = "@vde_worktree_activity";
 
 pub const KEY_SIDEBAR_MARKER: &str = "@vde_sidebar";
 
-pub const KEY_LAYOUT_BASELINE: &str = "@vde_layout_baseline";
-pub const KEY_LAYOUT_PANES: &str = "@vde_layout_panes";
-
 pub const KEY_CATEGORY: &str = "@vde_category";
 pub const KEY_CATEGORY_OVERRIDE: &str = "@vde_category_override";
 pub const KEY_PROJECT_PATH: &str = "@vde_project_path";
@@ -129,8 +126,6 @@ mod tests {
         let mut keys: Vec<&str> = PANE_STATE_KEYS.to_vec();
         keys.extend([
             KEY_SIDEBAR_MARKER,
-            KEY_LAYOUT_BASELINE,
-            KEY_LAYOUT_PANES,
             KEY_CATEGORY,
             KEY_CATEGORY_OVERRIDE,
             KEY_PROJECT_PATH,

@@ -51,10 +51,6 @@ pub(crate) enum SidebarCommand {
         #[arg(long, value_parser = parse_sidebar_width)]
         width: Option<SidebarWidth>,
     },
-    Rebaseline {
-        #[arg(long)]
-        window: Option<String>,
-    },
     #[command(name = "layout-applied")]
     LayoutApplied {
         #[arg(long)]
@@ -193,11 +189,6 @@ where
                 width.unwrap_or(config.sidebar.width),
                 config.sidebar.min_width,
             )?;
-            Ok(None)
-        }
-        SidebarCommand::Rebaseline { window } => {
-            let target = resolve_window_target(runner, window)?;
-            crate::sidebar::layout::rebaseline(runner, &target)?;
             Ok(None)
         }
         SidebarCommand::LayoutApplied { window, width } => {

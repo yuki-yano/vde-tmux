@@ -500,7 +500,6 @@ mod tests {
             ],
             "%1\t\t80\n",
         );
-        mock.stub(&["show-options", "-w", "-t", "@9"], "");
         mock.stub(
             &[
                 "display-message",
@@ -511,29 +510,6 @@ mod tests {
                 "#{window_layout}",
             ],
             "layout-before\n",
-        );
-        mock.stub(&["list-panes", "-t", "@9", "-F", "#{pane_id}"], "%1\n");
-        mock.stub(
-            &[
-                "set-option",
-                "-w",
-                "-t",
-                "@9",
-                crate::options::KEY_LAYOUT_BASELINE,
-                "layout-before",
-            ],
-            "",
-        );
-        mock.stub(
-            &[
-                "set-option",
-                "-w",
-                "-t",
-                "@9",
-                crate::options::KEY_LAYOUT_PANES,
-                "%1",
-            ],
-            "",
         );
         mock.stub(
             &[

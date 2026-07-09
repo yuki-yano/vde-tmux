@@ -158,7 +158,6 @@ fn dispatch_sidebar_open_uses_layout_operations() {
         ],
         "%1\t\t80\n",
     );
-    mock.stub(&["show-options", "-w", "-t", "@1"], "");
     mock.stub(
         &[
             "display-message",
@@ -169,29 +168,6 @@ fn dispatch_sidebar_open_uses_layout_operations() {
             "#{window_layout}",
         ],
         "layout-before\n",
-    );
-    mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
-    mock.stub(
-        &[
-            "set-option",
-            "-w",
-            "-t",
-            "@1",
-            crate::options::KEY_LAYOUT_BASELINE,
-            "layout-before",
-        ],
-        "",
-    );
-    mock.stub(
-        &[
-            "set-option",
-            "-w",
-            "-t",
-            "@1",
-            crate::options::KEY_LAYOUT_PANES,
-            "%1",
-        ],
-        "",
     );
     mock.stub(
         &[
@@ -236,7 +212,7 @@ fn dispatch_sidebar_open_uses_layout_operations() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 8);
+    assert_eq!(mock.calls().len(), 4);
 }
 
 #[test]
@@ -322,11 +298,6 @@ fn dispatch_sidebar_open_accepts_percent_width() {
         ],
         "%1\t\t640\n",
     );
-    mock.stub(&["show-options", "-w", "-t", "@1"], "");
-    mock.stub(
-        &["display-message", "-p", "-t", "@1", "-F", "#{window_width}"],
-        "640\n",
-    );
     let layout = "abcd,640x132,0,0,1";
     mock.stub(
         &[
@@ -338,29 +309,6 @@ fn dispatch_sidebar_open_accepts_percent_width() {
             "#{window_layout}",
         ],
         &format!("{layout}\n"),
-    );
-    mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
-    mock.stub(
-        &[
-            "set-option",
-            "-w",
-            "-t",
-            "@1",
-            crate::options::KEY_LAYOUT_BASELINE,
-            layout,
-        ],
-        "",
-    );
-    mock.stub(
-        &[
-            "set-option",
-            "-w",
-            "-t",
-            "@1",
-            crate::options::KEY_LAYOUT_PANES,
-            "%1",
-        ],
-        "",
     );
     mock.stub(
         &[
@@ -383,7 +331,7 @@ fn dispatch_sidebar_open_accepts_percent_width() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 8);
+    assert_eq!(mock.calls().len(), 4);
 }
 
 #[test]
@@ -403,7 +351,6 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
         ],
         "%1\t\t80\n",
     );
-    mock.stub(&["show-options", "-w", "-t", "@1"], "");
     mock.stub(
         &[
             "display-message",
@@ -414,29 +361,6 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
             "#{window_layout}",
         ],
         "layout-before\n",
-    );
-    mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
-    mock.stub(
-        &[
-            "set-option",
-            "-w",
-            "-t",
-            "@1",
-            crate::options::KEY_LAYOUT_BASELINE,
-            "layout-before",
-        ],
-        "",
-    );
-    mock.stub(
-        &[
-            "set-option",
-            "-w",
-            "-t",
-            "@1",
-            crate::options::KEY_LAYOUT_PANES,
-            "%1",
-        ],
-        "",
     );
     mock.stub(
         &[
@@ -498,7 +422,7 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 11);
+    assert_eq!(mock.calls().len(), 7);
 }
 
 #[test]
@@ -743,7 +667,6 @@ fn sidebar_layout_applied_ensures_daemon_started() {
         ],
         "%1\t\t80\n",
     );
-    mock.stub(&["show-options", "-w", "-t", "@1"], "");
     mock.stub(
         &[
             "display-message",
@@ -756,28 +679,6 @@ fn sidebar_layout_applied_ensures_daemon_started() {
         "layout-before\n",
     );
     mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
-    mock.stub(
-        &[
-            "set-option",
-            "-w",
-            "-t",
-            "@1",
-            crate::options::KEY_LAYOUT_BASELINE,
-            "layout-before",
-        ],
-        "",
-    );
-    mock.stub(
-        &[
-            "set-option",
-            "-w",
-            "-t",
-            "@1",
-            crate::options::KEY_LAYOUT_PANES,
-            "%1",
-        ],
-        "",
-    );
     mock.stub(
         &[
             "split-window",
@@ -809,7 +710,7 @@ fn sidebar_layout_applied_ensures_daemon_started() {
     .unwrap();
 
     assert!(called.get());
-    assert_eq!(mock.calls().len(), 8);
+    assert_eq!(mock.calls().len(), 4);
 }
 
 #[test]
@@ -828,28 +729,6 @@ fn sidebar_layout_changed_closes_lonely_sidebar_without_starting_daemon() {
             crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
         ],
         "%9\t1\t40\n",
-    );
-    mock.stub(
-        &[
-            "set-option",
-            "-w",
-            "-u",
-            "-t",
-            "@1",
-            crate::options::KEY_LAYOUT_BASELINE,
-        ],
-        "",
-    );
-    mock.stub(
-        &[
-            "set-option",
-            "-w",
-            "-u",
-            "-t",
-            "@1",
-            crate::options::KEY_LAYOUT_PANES,
-        ],
-        "",
     );
     mock.stub(&["kill-pane", "-t", "%9"], "");
     let called = Cell::new(false);
