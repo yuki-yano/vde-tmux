@@ -74,7 +74,7 @@ Use `statusline.sessions.badge_style: chip` to render session badges as a connec
 Set `status-left-length` to a large value to remove the artificial left segment cap; the terminal width remains the real display limit. `statusline-windows` replaces tmux's native window list, so the native `window-status-*` formats should be empty when using it.
 
 Status updates appear within roughly `daemon.poll_ms + status-interval` (about 2 seconds with the defaults).
-The background daemon that collects agent state is started automatically; you never need to launch it yourself (`vt daemon` / `vt daemon stop` exist for manual control).
+The background daemon that collects agent state is started automatically; you never need to launch it yourself (`vt daemon` / `vt daemon stop` / `vt daemon restart` exist for manual control).
 
 ### 2. Hook up your agents
 

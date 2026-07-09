@@ -187,18 +187,9 @@ pub fn run_daemon_server(
     config: &Config,
     socket_path: &Path,
 ) -> Result<()> {
-    if let Some(parent) = socket_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        crate::daemon::lifecycle::ensure_secure_socket_dir(parent)?;
-    }
-    if socket_path.exists() {
-        fs::remove_file(socket_path)
-            .with_context(|| format!("failed to remove {}", socket_path.display()))?;
-    }
-    let listener = UnixListener::bind(socket_path)
-        .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+    let Some((listener, _instance_lock)) = bind_daemon_listener(socket_path)? else {
+        return Ok(());
+    };
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -217,18 +208,9 @@ pub fn run_runtime_daemon_server(
     socket_path: &Path,
     env: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
-    if let Some(parent) = socket_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        crate::daemon::lifecycle::ensure_secure_socket_dir(parent)?;
-    }
-    if socket_path.exists() {
-        fs::remove_file(socket_path)
-            .with_context(|| format!("failed to remove {}", socket_path.display()))?;
-    }
-    let listener = UnixListener::bind(socket_path)
-        .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+    let Some((listener, _instance_lock)) = bind_daemon_listener(socket_path)? else {
+        return Ok(());
+    };
 
     let (tx, rx) = mpsc::channel();
     install_shutdown_signal_handler(tx.clone())?;
@@ -284,6 +266,41 @@ pub fn run_runtime_daemon_server(
         worker_io,
         capture_activity,
     )
+}
+
+fn bind_daemon_listener(
+    socket_path: &Path,
+) -> Result<Option<(UnixListener, crate::daemon::lifecycle::DaemonFileLock)>> {
+    if let Some(parent) = socket_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        crate::daemon::lifecycle::ensure_secure_socket_dir(parent)?;
+    }
+    if crate::daemon::lifecycle::daemon_socket_responds(socket_path) {
+        return Ok(None);
+    }
+    let Some(instance_lock) =
+        crate::daemon::lifecycle::try_acquire_daemon_instance_lock(socket_path)?
+    else {
+        if crate::daemon::lifecycle::wait_for_daemon_socket(socket_path, Duration::from_secs(5)) {
+            return Ok(None);
+        }
+        bail!(
+            "daemon instance lock is already held for {}",
+            socket_path.display()
+        );
+    };
+    if crate::daemon::lifecycle::daemon_socket_responds(socket_path) {
+        return Ok(None);
+    }
+    if socket_path.exists() {
+        fs::remove_file(socket_path)
+            .with_context(|| format!("failed to remove {}", socket_path.display()))?;
+    }
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+    Ok(Some((listener, instance_lock)))
 }
 
 pub fn install_shutdown_signal_handler(tx: Sender<DaemonEvent>) -> Result<()> {
@@ -750,6 +767,47 @@ mod tests {
             server.write_timeout().unwrap(),
             Some(Duration::from_millis(500))
         );
+    }
+
+    #[test]
+    fn bind_daemon_listener_keeps_existing_responsive_socket() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/vt-srv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream).read_line(&mut request).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &ServerMessage::Summary {
+                    text: String::new(),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+
+        let listener = bind_daemon_listener(&socket).unwrap();
+
+        assert!(listener.is_none());
+        handle.join().unwrap();
+        assert!(socket.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

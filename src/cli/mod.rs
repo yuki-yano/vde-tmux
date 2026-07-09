@@ -137,6 +137,10 @@ enum DaemonCommand {
         #[arg(long)]
         socket: Option<String>,
     },
+    Restart {
+        #[arg(long)]
+        socket: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -327,6 +331,9 @@ where
             Some(DaemonCommand::Stop {
                 socket: stop_socket,
             }) => daemon::stop_daemon(env, stop_socket.as_deref().or(socket.as_deref())),
+            Some(DaemonCommand::Restart {
+                socket: restart_socket,
+            }) => daemon::restart_daemon(env, restart_socket.as_deref().or(socket.as_deref())),
             None => daemon::run_daemon(runner, env, socket.as_deref()),
         },
         Command::Config { command } => match command {
