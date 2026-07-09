@@ -67,27 +67,63 @@ pub fn write_pane_options(
     pane: &str,
     writes: &[PaneOptionWrite],
 ) -> Result<()> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    let output = runner.run(&["show-options", "-p", "-t", pane])?;
+    let mut current = parse_pane_options(&output);
+    write_pane_options_with_current(runner, pane, writes, &mut current)
+}
+
+fn write_pane_options_with_current(
+    runner: &dyn TmuxRunner,
+    pane: &str,
+    writes: &[PaneOptionWrite],
+    current: &mut BTreeMap<String, String>,
+) -> Result<()> {
     for write in writes {
         match &write.value {
-            PaneOptionValue::Set(value) => set_pane_option(runner, pane, write.key, value)?,
-            PaneOptionValue::Unset => unset_pane_option(runner, pane, write.key)?,
+            PaneOptionValue::Set(value) => {
+                if current.get(write.key) == Some(value) {
+                    continue;
+                }
+                set_pane_option(runner, pane, write.key, value)?;
+                current.insert(write.key.to_string(), value.clone());
+            }
+            PaneOptionValue::Unset => {
+                if !current.contains_key(write.key) {
+                    continue;
+                }
+                unset_pane_option(runner, pane, write.key)?;
+                current.remove(write.key);
+            }
         }
     }
     Ok(())
 }
 
+fn parse_pane_options(output: &str) -> BTreeMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| parse_pane_option_line(line.trim()))
+        .collect()
+}
+
+fn parse_pane_option_line(line: &str) -> Option<(String, String)> {
+    if line.is_empty() {
+        return None;
+    }
+    let (name, value) = match line.split_once(char::is_whitespace) {
+        Some((name, value)) => (name.trim(), unquote_option_value(value.trim())),
+        None => (line, String::new()),
+    };
+    Some((name.to_string(), value))
+}
+
 pub fn parse_progress_state(output: &str) -> ProgressState {
     let mut state = ProgressState::default();
-    for line in output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (name, value) = match line.split_once(char::is_whitespace) {
-            Some((name, value)) => (name.trim(), unquote_option_value(value.trim())),
-            None => (line, String::new()),
-        };
-        match name {
+    for (name, value) in parse_pane_options(output) {
+        match name.as_str() {
             KEY_TASKS => state.tasks = parse_tasks(&value),
             KEY_TASK_ITEMS => {
                 state.task_items = serde_json::from_str(&value).unwrap_or_default();
@@ -111,6 +147,7 @@ pub fn apply_progress_event(
     event: ProgressEvent,
 ) -> Result<()> {
     let output = runner.run(&["show-options", "-p", "-t", pane])?;
+    let mut current = parse_pane_options(&output);
     let mut state = parse_progress_state(&output);
     let writes = match event {
         ProgressEvent::TaskCreated => {
@@ -199,7 +236,7 @@ pub fn apply_progress_event(
             }
         }
     };
-    write_pane_options(runner, pane, &writes)
+    write_pane_options_with_current(runner, pane, &writes, &mut current)
 }
 
 fn trim_option_value(raw: &str) -> &str {
@@ -294,6 +331,10 @@ mod tests {
     #[test]
     fn write_pane_options_sets_and_unsets() {
         let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["show-options", "-p", "-t", "%1"],
+            "@vde_status \"running\"\n",
+        );
         mock.stub(&["set-option", "-p", "-t", "%1", KEY_AGENT, "codex"], "");
         mock.stub(&["set-option", "-p", "-u", "-t", "%1", KEY_STATUS], "");
         write_pane_options(
@@ -305,7 +346,59 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(mock.calls().len(), 2);
+        assert_eq!(mock.calls().len(), 3);
+    }
+
+    #[test]
+    fn write_pane_options_skips_unchanged_sets_and_absent_unsets() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["show-options", "-p", "-t", "%1"],
+            "@vde_agent \"codex\"\n",
+        );
+
+        write_pane_options(
+            &mock,
+            "%1",
+            &[
+                PaneOptionWrite::set(KEY_AGENT, "codex"),
+                PaneOptionWrite::unset(KEY_STATUS),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            vec![vec![
+                "show-options".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                "%1".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn write_pane_options_tracks_projected_state_for_clear_then_set() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["show-options", "-p", "-t", "%1"],
+            "@vde_status \"idle\"\n",
+        );
+        mock.stub(&["set-option", "-p", "-u", "-t", "%1", KEY_STATUS], "");
+        mock.stub(&["set-option", "-p", "-t", "%1", KEY_STATUS, "idle"], "");
+
+        write_pane_options(
+            &mock,
+            "%1",
+            &[
+                PaneOptionWrite::unset(KEY_STATUS),
+                PaneOptionWrite::set(KEY_STATUS, "idle"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(mock.calls().len(), 3);
     }
 
     #[test]
@@ -403,13 +496,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(mock.calls().len(), 4);
+        assert_eq!(mock.calls().len(), 3);
     }
 
     #[test]
     fn task_snapshot_unsets_empty_progress_and_items() {
         let mock = MockTmuxRunner::new();
-        mock.stub(&["show-options", "-p", "-t", "%1"], "@vde_tasks \"1/1\"\n");
+        mock.stub(
+            &["show-options", "-p", "-t", "%1"],
+            "@vde_tasks \"1/1\"\n@vde_task_items \"[]\"\n@vde_task_item_ids '[\"1\"]'\n",
+        );
         mock.stub(&["set-option", "-p", "-u", "-t", "%1", KEY_TASKS], "");
         mock.stub(&["set-option", "-p", "-u", "-t", "%1", KEY_TASK_ITEMS], "");
         mock.stub(

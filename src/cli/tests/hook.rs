@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn dispatch_hook_emit_writes_pane_options() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(&["show-options", "-p", "-t", "%1"], "");
     mock.stub(
         &[
             "set-option",
@@ -101,6 +102,10 @@ fn dispatch_hook_emit_writes_pane_options() {
 fn dispatch_hook_claude_reads_stdin_json() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_wait_reason \"permission_prompt\"\n@vde_tasks \"1/1\"\n@vde_task_items \"[]\"\n@vde_task_item_ids '[\"1\"]'\n@vde_subagents \"a:Plan\"\n@vde_worktree_activity '{}'\n",
+    );
     mock.stub(
         &[
             "set-option",
@@ -230,13 +235,14 @@ fn dispatch_hook_claude_reads_stdin_json() {
         123,
     )
     .unwrap();
-    assert_eq!(mock.calls().len(), 11);
+    assert_eq!(mock.calls().len(), 12);
 }
 
 #[test]
 fn dispatch_hook_claude_notification_permission_writes_waiting() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(&["show-options", "-p", "-t", "%1"], "");
     mock.stub(
         &[
             "set-option",
@@ -280,6 +286,81 @@ fn dispatch_hook_claude_notification_permission_writes_waiting() {
     )
     .unwrap();
 
+    assert_eq!(mock.calls().len(), 4);
+}
+
+#[test]
+fn dispatch_hook_claude_tool_use_skips_unchanged_running_state() {
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    for hook in ["PreToolUse", "PostToolUse"] {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["show-options", "-p", "-t", "%1"],
+            "@vde_status \"running\"\n@vde_agent \"claude\"\n",
+        );
+
+        run_with_input_at(
+            ["vt", "hook", "claude", hook],
+            r#"{"tool_name":"Read"}"#,
+            &mock,
+            &env,
+            123,
+        )
+        .unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            vec![vec![
+                "show-options".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                "%1".to_string(),
+            ]],
+            "{hook}"
+        );
+    }
+}
+
+#[test]
+fn dispatch_hook_claude_tool_use_clears_permission_wait() {
+    let mock = MockTmuxRunner::new();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_status \"waiting\"\n@vde_wait_reason \"permission_prompt\"\n@vde_agent \"claude\"\n",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            crate::options::KEY_STATUS,
+            "running",
+        ],
+        "",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            "%1",
+            crate::options::KEY_WAIT_REASON,
+        ],
+        "",
+    );
+
+    run_with_input_at(
+        ["vt", "hook", "claude", "PreToolUse"],
+        r#"{"tool_name":"Read"}"#,
+        &mock,
+        &env,
+        123,
+    )
+    .unwrap();
+
     assert_eq!(mock.calls().len(), 3);
 }
 
@@ -295,6 +376,10 @@ fn dispatch_hook_claude_stop_writes_idle_attention_and_completed_at() {
         r#"{"type":"user","isSidechain":false,"parentUuid":"parent-message"}"#,
     )
     .unwrap();
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_wait_reason \"permission_prompt\"\n@vde_subagents \"a:Plan\"\n",
+    );
     mock.stub(
         &[
             "set-option",
@@ -404,7 +489,7 @@ fn dispatch_hook_claude_stop_writes_idle_attention_and_completed_at() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 6);
+    assert_eq!(mock.calls().len(), 7);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -412,6 +497,7 @@ fn dispatch_hook_claude_stop_writes_idle_attention_and_completed_at() {
 fn dispatch_hook_codex_event_reads_stdin_json() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(&["show-options", "-p", "-t", "%1"], "");
     mock.stub(
         &[
             "set-option",
@@ -453,7 +539,7 @@ fn dispatch_hook_codex_event_reads_stdin_json() {
         123,
     )
     .unwrap();
-    assert_eq!(mock.calls().len(), 3);
+    assert_eq!(mock.calls().len(), 4);
 }
 
 #[test]
@@ -499,7 +585,10 @@ fn dispatch_hook_codex_update_plan_writes_task_snapshot() {
             status: crate::hook::TaskItemStatus::Pending,
         },
     ]);
-    mock.stub(&["show-options", "-p", "-t", "%1"], "");
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_task_item_ids '[\"old\"]'\n",
+    );
     mock.stub(
         &[
             "set-option",
@@ -550,6 +639,10 @@ fn dispatch_hook_codex_update_plan_writes_task_snapshot() {
 fn dispatch_hook_codex_create_goal_writes_goal_prompt_and_running() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_wait_reason \"permission_prompt\"\n@vde_tasks \"1/1\"\n@vde_task_items \"[]\"\n@vde_task_item_ids '[\"1\"]'\n@vde_worktree_activity '{}'\n",
+    );
     mock.stub(
         &[
             "set-option",
@@ -670,7 +763,7 @@ fn dispatch_hook_codex_create_goal_writes_goal_prompt_and_running() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 10);
+    assert_eq!(mock.calls().len(), 11);
     assert!(mock.calls().iter().any(|call| {
         call == &[
             "set-option",
@@ -1081,7 +1174,10 @@ fn dispatch_hook_codex_subagent_rows_keep_parent_session_payload() {
 fn dispatch_hook_codex_update_plan_empty_unsets_task_options() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
-    mock.stub(&["show-options", "-p", "-t", "%1"], "@vde_tasks \"1/1\"\n");
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_tasks \"1/1\"\n@vde_task_items \"[]\"\n@vde_task_item_ids '[\"1\"]'\n",
+    );
     mock.stub(
         &[
             "set-option",
@@ -1146,7 +1242,10 @@ fn dispatch_hook_claude_todo_write_writes_task_snapshot() {
             status: crate::hook::TaskItemStatus::Pending,
         },
     ]);
-    mock.stub(&["show-options", "-p", "-t", "%1"], "");
+    mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_task_item_ids '[\"old\"]'\n",
+    );
     mock.stub(
         &[
             "set-option",
@@ -1319,7 +1418,7 @@ fn dispatch_hook_claude_todo_write_empty_unsets_task_options() {
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
     mock.stub(
         &["show-options", "-p", "-t", "%1"],
-        "@vde_tasks \"1/1\"\n@vde_task_items '[{\"step\":\"Explore\",\"status\":\"completed\"}]'\n",
+        "@vde_tasks \"1/1\"\n@vde_task_items '[{\"step\":\"Explore\",\"status\":\"completed\"}]'\n@vde_task_item_ids '[\"1\"]'\n",
     );
     mock.stub(
         &[
@@ -1488,7 +1587,7 @@ fn dispatch_hook_claude_task_update_updates_existing_task_item() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 3);
+    assert_eq!(mock.calls().len(), 2);
 }
 
 #[test]
@@ -1679,6 +1778,10 @@ fn dispatch_hook_codex_user_prompt_submit_clears_worktree_activity() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
     mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_wait_reason \"permission_prompt\"\n@vde_tasks \"1/1\"\n@vde_task_items \"[]\"\n@vde_task_item_ids '[\"1\"]'\n@vde_worktree_activity '{}'\n",
+    );
+    mock.stub(
         &[
             "set-option",
             "-p",
@@ -1776,13 +1879,23 @@ fn dispatch_hook_codex_user_prompt_submit_clears_worktree_activity() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 8);
+    assert_eq!(mock.calls().len(), 9);
 }
 
 #[test]
 fn dispatch_hook_codex_session_start_clears_worktree_activity() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+    let current = crate::options::PANE_STATE_KEYS
+        .iter()
+        .map(|key| format!("{key} \"existing\""))
+        .chain(std::iter::once(format!(
+            "{} '[\"1\"]'",
+            crate::options::KEY_TASK_ITEM_IDS
+        )))
+        .collect::<Vec<_>>()
+        .join("\n");
+    mock.stub(&["show-options", "-p", "-t", "%1"], &current);
     for key in crate::options::PANE_STATE_KEYS {
         mock.stub(&["set-option", "-p", "-u", "-t", "%1", key], "");
     }
@@ -1861,6 +1974,10 @@ fn dispatch_hook_codex_notify_reads_argv_json() {
     let mock = MockTmuxRunner::new();
     let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
     mock.stub(
+        &["show-options", "-p", "-t", "%1"],
+        "@vde_wait_reason \"permission_prompt\"\n",
+    );
+    mock.stub(
         &[
             "set-option",
             "-p",
@@ -1923,7 +2040,7 @@ fn dispatch_hook_codex_notify_reads_argv_json() {
         456,
     )
     .unwrap();
-    assert_eq!(mock.calls().len(), 5);
+    assert_eq!(mock.calls().len(), 6);
 }
 
 #[test]

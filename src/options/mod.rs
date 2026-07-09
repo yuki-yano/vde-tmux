@@ -32,8 +32,6 @@ pub const KEY_WINDOW_STATUS: &str = "@vde_window_status";
 pub const KEY_WINDOW_STATE: &str = "@vde_window_state";
 pub const KEY_WINDOW_AGENT_COUNTS: &str = "@vde_window_agent_counts";
 
-pub const KEY_HEARTBEAT: &str = "@vde_heartbeat";
-
 pub const PANE_STATE_KEYS: &[&str] = &[
     KEY_AGENT,
     KEY_STATUS,
@@ -135,7 +133,6 @@ mod tests {
             KEY_WINDOW_STATUS,
             KEY_WINDOW_STATE,
             KEY_WINDOW_AGENT_COUNTS,
-            KEY_HEARTBEAT,
         ]);
         for key in keys {
             assert!(key.starts_with("@vde_"), "{key} が @vde_ 名前空間でない");

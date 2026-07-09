@@ -23,19 +23,11 @@ pub fn statusline_sessions(runner: &dyn TmuxRunner, config: &Config) -> Result<S
     let sessions = list_sessions(runner)?;
     let current_session = current_session_name(runner)?;
     let current_category = current_category(config, &sessions, &current_session);
-    let heartbeat = crate::options::show_global_option(runner, crate::options::KEY_HEARTBEAT)?
-        .and_then(|value| value.parse::<i64>().ok());
-    let stale = is_heartbeat_stale(
-        heartbeat,
-        crate::sidebar::tree::now_epoch_secs(),
-        config.daemon.poll_ms,
-    );
-    Ok(render_statusline_sessions_with_stale(
+    Ok(render_statusline_sessions(
         config,
         &sessions,
         &current_session,
         &current_category,
-        stale,
     ))
 }
 
@@ -145,22 +137,6 @@ pub fn render_statusline_sessions(
     current_session: &str,
     current_category: &str,
 ) -> String {
-    render_statusline_sessions_with_stale(
-        config,
-        sessions,
-        current_session,
-        current_category,
-        false,
-    )
-}
-
-pub fn render_statusline_sessions_with_stale(
-    config: &Config,
-    sessions: &[SessionInfo],
-    current_session: &str,
-    current_category: &str,
-    stale: bool,
-) -> String {
     sessions_in_category(config, sessions, current_category)
         .iter()
         .enumerate()
@@ -170,17 +146,8 @@ pub fn render_statusline_sessions_with_stale(
             } else {
                 &config.statusline.sessions.other
             };
-            let badge = if stale && !session.badge.is_empty() {
-                "?"
-            } else {
-                &session.badge
-            };
             let counts_mode = config.statusline.session_badge.mode == SessionBadgeMode::Counts;
-            let state = if stale || counts_mode {
-                ""
-            } else {
-                &session.state
-            };
+            let state = if counts_mode { "" } else { &session.state };
             let label = if config.statusline.sessions.show_index {
                 format!("{}: {}", index + 1, session.name)
             } else {
@@ -193,7 +160,7 @@ pub fn render_statusline_sessions_with_stale(
                 chip_config: &config.statusline.session_badge.chip,
             };
             let segment =
-                render_session_segment(style, badge, state, &label, index, &badge_options);
+                render_session_segment(style, &session.badge, state, &label, index, &badge_options);
             if session.id.is_empty() {
                 segment
             } else {
@@ -251,14 +218,6 @@ pub fn render_statusline_windows(config: &Config, windows: &[WindowInfo]) -> Str
         })
         .collect::<Vec<_>>()
         .join(&config.statusline.windows.separator)
-}
-
-pub fn is_heartbeat_stale(heartbeat: Option<i64>, now: i64, poll_ms: u64) -> bool {
-    let Some(heartbeat) = heartbeat else {
-        return false;
-    };
-    let threshold = std::cmp::max(5_i64, (poll_ms.saturating_mul(3) / 1000) as i64);
-    now.saturating_sub(heartbeat) > threshold
 }
 
 pub fn render_statusline_category(
@@ -1946,29 +1905,5 @@ mod tests {
         );
         assert!(rendered.contains("work 2"), "{rendered}");
         assert!(rendered.contains("private 1"), "{rendered}");
-    }
-
-    #[test]
-    fn stale_heartbeat_replaces_badges_with_question_mark() {
-        assert!(is_heartbeat_stale(Some(940), 1000, 1000));
-        assert!(!is_heartbeat_stale(Some(998), 1000, 1000));
-        assert!(!is_heartbeat_stale(None, 1000, 1000));
-
-        let config = Config::default();
-        let mut main = session("main", "work");
-        main.badge = "▲".to_string();
-        main.state = "blocked".to_string();
-        let rendered =
-            render_statusline_sessions_with_stale(&config, &[main], "main", "work", true);
-        assert!(rendered.contains("?main"), "{rendered}");
-        assert!(!rendered.contains("▲main"), "{rendered}");
-    }
-
-    #[test]
-    fn heartbeat_stale_boundary_is_strictly_greater_than_threshold() {
-        assert!(!is_heartbeat_stale(Some(995), 1000, 1000));
-        assert!(is_heartbeat_stale(Some(994), 1000, 1000));
-        assert!(!is_heartbeat_stale(Some(988), 1000, 4000));
-        assert!(is_heartbeat_stale(Some(987), 1000, 4000));
     }
 }
