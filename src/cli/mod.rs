@@ -154,6 +154,10 @@ enum SessionCycleCommand {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    New {
+        #[arg(short = 'c', long = "cwd")]
+        cwd: Option<String>,
+    },
     #[command(name = "set-category")]
     SetCategory { session: String, category: String },
 }
@@ -356,6 +360,12 @@ where
         }
         Command::Session { command } => {
             match command {
+                SessionCommand::New { cwd } => {
+                    crate::session::create_session(runner, &config, env, cwd.as_deref())?;
+                    let _ = crate::sidebar::client::request_pane_refresh(
+                        &crate::sidebar::client::socket_path(env),
+                    );
+                }
                 SessionCommand::SetCategory { session, category } => {
                     crate::session::set_session_category_override(runner, &session, &category)?;
                 }

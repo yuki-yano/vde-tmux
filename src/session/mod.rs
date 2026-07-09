@@ -1,9 +1,15 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Result, anyhow, bail};
 
-use crate::category::{adjacent_category, resolve_category_for_session, sessions_in_category};
+use crate::category::{
+    adjacent_category, resolve_category_for_session, resolve_dynamic_category_for_session,
+    sessions_in_category,
+};
 use crate::config::Config;
 use crate::options::{
-    KEY_CATEGORY, KEY_CATEGORY_OVERRIDE, set_global_option, set_session_option, show_global_option,
+    KEY_CATEGORY, KEY_CATEGORY_OVERRIDE, KEY_PROJECT_PATH, set_global_option, set_session_option,
+    show_global_option,
 };
 use crate::tmux::TmuxRunner;
 
@@ -202,9 +208,87 @@ pub fn set_session_category_override(
     set_session_option(runner, session_name, KEY_CATEGORY, category)
 }
 
+pub fn create_session(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&str>,
+) -> Result<String> {
+    let client = current_client_name(runner)?;
+    if client.trim().is_empty() {
+        bail!("no tmux client available for session creation");
+    }
+    let cwd = resolve_session_cwd(runner, env, cwd)?;
+    let session_name = runner
+        .run(&[
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{session_name}",
+            "-c",
+            &cwd,
+        ])?
+        .trim()
+        .to_string();
+    if session_name.is_empty() {
+        bail!("tmux did not return a new session name");
+    }
+    set_session_option(runner, &session_name, KEY_PROJECT_PATH, &cwd)?;
+    let session = SessionInfo {
+        name: session_name.clone(),
+        project_path: cwd,
+        ..SessionInfo::default()
+    };
+    let category = resolve_dynamic_category_for_session(config, &session);
+    set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
+    switch_client_for_client(runner, &client, &session_name)?;
+    if !category.is_empty() {
+        remember_session_for_client(runner, &client, &category, &session_name)?;
+    }
+    Ok(session_name)
+}
+
+fn resolve_session_cwd(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&str>,
+) -> Result<String> {
+    let cwd = match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+        Some(cwd) => cwd.to_string(),
+        None => runner
+            .run(&["display-message", "-p", "#{pane_current_path}"])?
+            .trim()
+            .to_string(),
+    };
+    let cwd = expand_tilde_path(&cwd, env.get("HOME").map(String::as_str));
+    if cwd.trim().is_empty() {
+        bail!("session cwd is empty");
+    }
+    Ok(cwd)
+}
+
+fn expand_tilde_path(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|home| !home.is_empty()) else {
+        return path.to_string();
+    };
+    if path == "~" {
+        return home.to_string();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if rest.is_empty() {
+            home.to_string()
+        } else {
+            format!("{home}/{rest}")
+        }
+    } else {
+        path.to_string()
+    }
+}
+
 pub fn refresh_session_categories(runner: &dyn TmuxRunner, config: &Config) -> Result<()> {
     for session in list_sessions(runner)? {
-        let category = resolve_category_for_session(config, &session);
+        let category = resolve_dynamic_category_for_session(config, &session);
         set_session_option(runner, &session.name, KEY_CATEGORY, &category)?;
     }
     Ok(())
@@ -463,6 +547,65 @@ mod tests {
     }
 
     #[test]
+    fn create_session_sets_project_category_switches_and_remembers() {
+        let mock = MockTmuxRunner::new();
+        let mut config = crate::config::Config::default();
+        config.categories.default_category = Some("public".to_string());
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "client\t/dev/ttys001\n",
+        );
+        mock.stub(
+            &[
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{session_name}",
+                "-c",
+                "/Users/me",
+            ],
+            "zsh\n",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "zsh",
+                crate::options::KEY_PROJECT_PATH,
+                "/Users/me",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "zsh",
+                crate::options::KEY_CATEGORY,
+                "public",
+            ],
+            "",
+        );
+        mock.stub(&["switch-client", "-c", "client", "-t", "=zsh:"], "");
+        mock.stub(
+            &["set-option", "-g", "@vde_client_636c69656e74_public", "zsh"],
+            "",
+        );
+
+        let session = create_session(
+            &mock,
+            &config,
+            &BTreeMap::from([("HOME".to_string(), "/Users/me".to_string())]),
+            Some("~/"),
+        )
+        .unwrap();
+
+        assert_eq!(session, "zsh");
+        assert_eq!(mock.calls().len(), 6);
+    }
+
+    #[test]
     fn cycle_session_switches_next_in_current_category() {
         let mock = MockTmuxRunner::new();
         let format = session_list_format();
@@ -560,6 +703,30 @@ mod tests {
             "",
         );
         refresh_session_categories(&mock, &crate::config::Config::default()).unwrap();
+        assert_eq!(mock.calls().len(), 2);
+    }
+
+    #[test]
+    fn refresh_session_categories_uses_default_over_stale_stored_category() {
+        let mock = MockTmuxRunner::new();
+        let format = session_list_format();
+        let mut config = crate::config::Config::default();
+        config.categories.default_category = Some("public".to_string());
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}/Users/me\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "main",
+                crate::options::KEY_CATEGORY,
+                "public",
+            ],
+            "",
+        );
+        refresh_session_categories(&mock, &config).unwrap();
         assert_eq!(mock.calls().len(), 2);
     }
 }

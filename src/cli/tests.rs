@@ -220,6 +220,46 @@ fn dispatch_category_use_switches_category() {
 }
 
 #[test]
+fn dispatch_session_new_creates_managed_session() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(
+        &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+        "abc\t/dev/ttys001\n",
+    );
+    mock.stub(
+        &[
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{session_name}",
+            "-c",
+            "/tmp/repo",
+        ],
+        "repo\n",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-t",
+            "repo",
+            crate::options::KEY_PROJECT_PATH,
+            "/tmp/repo",
+        ],
+        "",
+    );
+    mock.stub(
+        &["set-option", "-t", "repo", crate::options::KEY_CATEGORY, ""],
+        "",
+    );
+    mock.stub(&["switch-client", "-c", "abc", "-t", "=repo:"], "");
+
+    run_with(["vt", "session", "new", "-c", "/tmp/repo"], &mock, &env()).unwrap();
+
+    assert_eq!(mock.calls().len(), 5);
+}
+
+#[test]
 fn dispatch_project_selector_popup_opens_popup() {
     let mock = MockTmuxRunner::new();
     let exe = std::env::current_exe().unwrap().display().to_string();
@@ -426,6 +466,10 @@ fn dispatch_statusline_summary_falls_back_to_tmux_snapshot() {
         "123",
         "0",
         "0",
+        "0",
+        "",
+        "",
+        "",
         "",
         "codex",
         "running",
@@ -471,6 +515,10 @@ fn dispatch_statusline_attention_falls_back_to_tmux_snapshot() {
         "123",
         "0",
         "0",
+        "0",
+        "",
+        "",
+        "",
         "",
         "codex",
         "waiting",

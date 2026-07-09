@@ -4,6 +4,18 @@ use crate::config::Config;
 use crate::session::{Direction, SessionInfo};
 
 pub fn resolve_category_for_session(config: &Config, session: &SessionInfo) -> String {
+    resolve_category_for_session_with_stored(config, session, true)
+}
+
+pub fn resolve_dynamic_category_for_session(config: &Config, session: &SessionInfo) -> String {
+    resolve_category_for_session_with_stored(config, session, false)
+}
+
+fn resolve_category_for_session_with_stored(
+    config: &Config,
+    session: &SessionInfo,
+    use_stored_category: bool,
+) -> String {
     if !session.category_override.is_empty() {
         return session.category_override.clone();
     }
@@ -25,7 +37,7 @@ pub fn resolve_category_for_session(config: &Config, session: &SessionInfo) -> S
             return rule.category.clone();
         }
     }
-    if !session.category.is_empty() {
+    if use_stored_category && !session.category.is_empty() {
         return session.category.clone();
     }
     config
@@ -228,6 +240,32 @@ mod tests {
         let mut config = Config::default();
         config.categories.default_category = Some("default".to_string());
         let actual = resolve_category_for_session(&config, &session("repo", "", "work", ""));
+        assert_eq!(actual, "work");
+    }
+
+    #[test]
+    fn dynamic_category_uses_default_instead_of_stored_category() {
+        let mut config = Config::default();
+        config.categories.default_category = Some("public".to_string());
+        let actual = resolve_dynamic_category_for_session(
+            &config,
+            &session("repo", "/Users/me", "work", ""),
+        );
+        assert_eq!(actual, "public");
+    }
+
+    #[test]
+    fn dynamic_category_still_prefers_project_rule() {
+        let mut config = Config::default();
+        config.categories.default_category = Some("public".to_string());
+        config.categories.rules.push(CategoryRule {
+            category: "work".to_string(),
+            path_patterns: vec!["github.com/acme/*".to_string()],
+        });
+        let actual = resolve_dynamic_category_for_session(
+            &config,
+            &session("repo", "/Users/me/src/github.com/acme/app", "public", ""),
+        );
         assert_eq!(actual, "work");
     }
 

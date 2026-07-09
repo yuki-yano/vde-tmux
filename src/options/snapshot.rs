@@ -18,8 +18,12 @@ pub struct PaneSnapshot {
     pub pane_tty: String,
     pub pane_pid: String,
     pub window_active: bool,
+    pub pane_active: bool,
     pub session_attached: bool,
     pub is_sidebar: bool,
+    pub session_category: String,
+    pub session_project_path: String,
+    pub session_category_override: String,
     pub agent: String,
     pub status: String,
     pub prompt: String,
@@ -45,15 +49,19 @@ pub fn snapshot_format() -> String {
         "#{pane_tty}".into(),
         "#{pane_pid}".into(),
         "#{window_active}".into(),
+        "#{pane_active}".into(),
         "#{session_attached}".into(),
         format!("#{{{key}}}", key = super::KEY_SIDEBAR_MARKER),
+        format!("#{{{key}}}", key = super::KEY_CATEGORY),
+        format!("#{{{key}}}", key = super::KEY_PROJECT_PATH),
+        format!("#{{{key}}}", key = super::KEY_CATEGORY_OVERRIDE),
     ];
     fields.extend(PANE_STATE_KEYS.iter().map(|key| format!("#{{{key}}}")));
     fields.join(&FIELD_SEP.to_string())
 }
 
 pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
-    let expected = 10 + PANE_STATE_KEYS.len();
+    let expected = 14 + PANE_STATE_KEYS.len();
     output
         .lines()
         .filter_map(|line| {
@@ -72,20 +80,24 @@ pub fn parse_snapshot_lines(output: &str) -> Vec<PaneSnapshot> {
                 pane_tty: fields[5].to_string(),
                 pane_pid: fields[6].to_string(),
                 window_active: fields[7] == "1",
-                session_attached: !fields[8].is_empty() && fields[8] != "0",
-                is_sidebar: fields[9] == "1",
-                agent: fields[10].to_string(),
-                status: fields[11].to_string(),
-                prompt: fields[12].to_string(),
-                prompt_source: fields[13].to_string(),
-                wait_reason: fields[14].to_string(),
-                attention: fields[15].to_string(),
-                started_at: fields[16].to_string(),
-                completed_at: fields[17].to_string(),
-                tasks: fields[18].to_string(),
-                task_items: fields[19].to_string(),
-                subagents: fields[20].to_string(),
-                worktree_activity: fields[21].to_string(),
+                pane_active: fields[8] == "1",
+                session_attached: !fields[9].is_empty() && fields[9] != "0",
+                is_sidebar: fields[10] == "1",
+                session_category: fields[11].to_string(),
+                session_project_path: fields[12].to_string(),
+                session_category_override: fields[13].to_string(),
+                agent: fields[14].to_string(),
+                status: fields[15].to_string(),
+                prompt: fields[16].to_string(),
+                prompt_source: fields[17].to_string(),
+                wait_reason: fields[18].to_string(),
+                attention: fields[19].to_string(),
+                started_at: fields[20].to_string(),
+                completed_at: fields[21].to_string(),
+                tasks: fields[22].to_string(),
+                task_items: fields[23].to_string(),
+                subagents: fields[24].to_string(),
+                worktree_activity: fields[25].to_string(),
                 agent_observed,
             })
         })
@@ -331,7 +343,7 @@ mod tests {
     fn format_field_count_matches_parser_expectation() {
         assert_eq!(
             snapshot_format().matches('\u{1f}').count(),
-            10 + PANE_STATE_KEYS.len() - 1
+            14 + PANE_STATE_KEYS.len() - 1
         );
     }
 
@@ -339,7 +351,11 @@ mod tests {
     fn snapshot_format_includes_window_active_and_session_attached() {
         let format = snapshot_format();
         assert!(format.contains("#{window_active}"));
+        assert!(format.contains("#{pane_active}"));
         assert!(format.contains("#{session_attached}"));
+        assert!(format.contains("#{@vde_category}"));
+        assert!(format.contains("#{@vde_project_path}"));
+        assert!(format.contains("#{@vde_category_override}"));
     }
 
     #[test]
@@ -355,7 +371,11 @@ mod tests {
             "/dev/ttys001",
             "123",
             "1",
+            "1",
             "2",
+            "",
+            "public",
+            "/tmp",
             "",
             "codex",
             "running",
@@ -387,6 +407,10 @@ mod tests {
             "123",
             "0",
             "0",
+            "0",
+            "",
+            "",
+            "",
             "",
             "codex",
             "running",
@@ -417,7 +441,11 @@ mod tests {
             "/dev/ttys001",
             "123",
             "0",
+            "1",
             "0",
+            "",
+            "work",
+            "/Users/me/repo",
             "",
             "claude",
             "running",
@@ -459,7 +487,11 @@ mod tests {
             "123",
             "0",
             "0",
+            "0",
             "1",
+            "",
+            "",
+            "",
             "",
             "",
             "",
@@ -493,6 +525,10 @@ mod tests {
             "123",
             "0",
             "0",
+            "0",
+            "",
+            "",
+            "",
             "",
             "",
             "",
@@ -569,6 +605,10 @@ mod tests {
             "74605",
             "0",
             "0",
+            "0",
+            "",
+            "",
+            "",
             "",
             "",
             "",

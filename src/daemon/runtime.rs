@@ -3,6 +3,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::category::resolve_dynamic_category_for_session;
 use crate::config::Config;
 use crate::daemon::protocol::{ServerMessage, SidebarClientEvent};
 use crate::daemon::session_badge::{BadgeState, BadgeStateCounts, badge_state};
@@ -12,6 +13,7 @@ use crate::daemon::{
 };
 use crate::git::{GitBadge, WorktreeInfo};
 use crate::options::snapshot::{PaneSnapshot, effective_agent, has_pane_state, is_live_agent_pane};
+use crate::session::SessionInfo;
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
 use crate::sidebar::state::{RepoId, SidebarAction, SidebarState};
 use crate::sidebar::tree::{
@@ -75,6 +77,14 @@ pub enum RuntimeEffect {
         value: String,
         state: String,
     },
+    SetSessionProjectPath {
+        session: String,
+        path: String,
+    },
+    SetSessionCategory {
+        session: String,
+        category: String,
+    },
     SetSessionAgentCounts {
         session: String,
         counts: String,
@@ -134,6 +144,19 @@ fn apply_manual_done_to_pane(pane: &mut PaneSnapshot, completed_at: i64) {
     pane.tasks.clear();
     pane.task_items.clear();
     pane.subagents.clear();
+}
+
+fn pane_is_better_session_representative(candidate: &PaneSnapshot, current: &PaneSnapshot) -> bool {
+    pane_representative_rank(candidate) > pane_representative_rank(current)
+}
+
+fn pane_representative_rank(pane: &PaneSnapshot) -> u8 {
+    match (pane.window_active, pane.pane_active) {
+        (true, true) => 3,
+        (true, false) => 2,
+        (false, true) => 1,
+        (false, false) => 0,
+    }
 }
 
 #[derive(Debug)]
@@ -295,6 +318,7 @@ impl RuntimeState {
                 }
                 self.broadcast_if_needed();
                 let mut effects = clear_pane_state_effects;
+                effects.extend(self.sync_session_categories());
                 effects.extend(transition_effects);
                 effects.extend(self.sync_session_badges());
                 effects.extend(self.sync_window_badges());
@@ -979,6 +1003,49 @@ impl RuntimeState {
         effects
     }
 
+    fn sync_session_categories(&self) -> Vec<RuntimeEffect> {
+        let mut by_session = BTreeMap::<String, &PaneSnapshot>::new();
+        for pane in self.panes.iter().filter(|pane| {
+            !pane.session.is_empty()
+                && !pane.current_path.is_empty()
+                && !pane.is_sidebar
+                && pane.window_active
+                && pane.pane_active
+                && pane.session_category_override.is_empty()
+        }) {
+            by_session
+                .entry(pane.session.clone())
+                .and_modify(|current| {
+                    if pane_is_better_session_representative(pane, current) {
+                        *current = pane;
+                    }
+                })
+                .or_insert(pane);
+        }
+
+        let mut effects = Vec::new();
+        for (session, pane) in by_session {
+            let session_info = SessionInfo {
+                name: session.clone(),
+                category: pane.session_category.clone(),
+                project_path: pane.current_path.clone(),
+                category_override: pane.session_category_override.clone(),
+                ..SessionInfo::default()
+            };
+            let category = resolve_dynamic_category_for_session(&self.config, &session_info);
+            if pane.session_project_path != pane.current_path {
+                effects.push(RuntimeEffect::SetSessionProjectPath {
+                    session: session.clone(),
+                    path: pane.current_path.clone(),
+                });
+            }
+            if pane.session_category != category {
+                effects.push(RuntimeEffect::SetSessionCategory { session, category });
+            }
+        }
+        effects
+    }
+
     fn sync_window_badges(&mut self) -> Vec<RuntimeEffect> {
         use crate::daemon::session_badge::agent_badge_value_from_counts;
 
@@ -1173,8 +1240,12 @@ mod tests {
             pane_tty: String::new(),
             pane_pid: String::new(),
             window_active: false,
+            pane_active: false,
             session_attached: false,
             is_sidebar: false,
+            session_category: String::new(),
+            session_project_path: String::new(),
+            session_category_override: String::new(),
             agent: "codex".to_string(),
             status: status.to_string(),
             prompt: String::new(),
@@ -2486,6 +2557,86 @@ mod tests {
             RuntimeEffect::SetSessionAgentCounts { session, counts }
                 if session == "main" && counts.contains(r#""working":1"#) && counts.contains(r#""idle":1"#)
         )));
+    }
+
+    #[test]
+    fn active_pane_path_updates_session_project_path_and_category() {
+        let mut config = Config::default();
+        config.categories.default_category = Some("public".to_string());
+        config.categories.rules.push(crate::config::CategoryRule {
+            category: "work".to_string(),
+            path_patterns: vec!["github.com/acme/*".to_string()],
+        });
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        let mut pane = agent_pane("main", "%1", "running");
+        pane.window_active = true;
+        pane.pane_active = true;
+        pane.current_path = "/Users/me/repos/github.com/acme/app".to_string();
+        pane.session_category = "public".to_string();
+        pane.session_project_path = "/Users/me".to_string();
+
+        let effects = without_heartbeat(&state.apply_event(DaemonEvent::PanesUpdated(vec![pane])));
+
+        assert!(effects.contains(&RuntimeEffect::SetSessionProjectPath {
+            session: "main".to_string(),
+            path: "/Users/me/repos/github.com/acme/app".to_string(),
+        }));
+        assert!(effects.contains(&RuntimeEffect::SetSessionCategory {
+            session: "main".to_string(),
+            category: "work".to_string(),
+        }));
+    }
+
+    #[test]
+    fn active_pane_path_can_move_session_back_to_default_category() {
+        let mut config = Config::default();
+        config.categories.default_category = Some("public".to_string());
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        let mut pane = agent_pane("main", "%1", "running");
+        pane.window_active = true;
+        pane.pane_active = true;
+        pane.current_path = "/Users/me".to_string();
+        pane.session_category = "work".to_string();
+        pane.session_project_path = "/Users/me/repos/github.com/acme/app".to_string();
+
+        let effects = without_heartbeat(&state.apply_event(DaemonEvent::PanesUpdated(vec![pane])));
+
+        assert!(effects.contains(&RuntimeEffect::SetSessionProjectPath {
+            session: "main".to_string(),
+            path: "/Users/me".to_string(),
+        }));
+        assert!(effects.contains(&RuntimeEffect::SetSessionCategory {
+            session: "main".to_string(),
+            category: "public".to_string(),
+        }));
+    }
+
+    #[test]
+    fn session_category_sync_respects_manual_override() {
+        let mut config = Config::default();
+        config.categories.default_category = Some("public".to_string());
+        config.categories.rules.push(crate::config::CategoryRule {
+            category: "work".to_string(),
+            path_patterns: vec!["github.com/acme/*".to_string()],
+        });
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        let mut pane = agent_pane("main", "%1", "running");
+        pane.window_active = true;
+        pane.pane_active = true;
+        pane.current_path = "/Users/me/repos/github.com/acme/app".to_string();
+        pane.session_category = "private".to_string();
+        pane.session_project_path = "/Users/me".to_string();
+        pane.session_category_override = "private".to_string();
+
+        let effects = without_heartbeat(&state.apply_event(DaemonEvent::PanesUpdated(vec![pane])));
+
+        assert!(!effects.iter().any(|effect| {
+            matches!(
+                effect,
+                RuntimeEffect::SetSessionProjectPath { .. }
+                    | RuntimeEffect::SetSessionCategory { .. }
+            )
+        }));
     }
 
     #[test]

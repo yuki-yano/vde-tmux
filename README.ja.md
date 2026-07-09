@@ -187,6 +187,7 @@ tmux バインドの例。
 ```tmux
 bind-key e run-shell "vt sidebar focus-toggle"   # 開く → フォーカス → 閉じる
 bind-key b run-shell "vt sidebar focus"          # pane へジャンプした後にサイドバーへ戻る
+bind-key -n M-C run-shell "vt session new -c ~/"  # home で管理対象セッションを作る
 bind-key s run-shell "vt session-manager --popup"
 bind-key g run-shell "vt project selector --popup"
 ```
@@ -249,6 +250,7 @@ categories:
 
 - `vt category next` / `vt category prev` / `vt category use <name>`：カテゴリを切り替える。各カテゴリで最後にいたセッションを記憶していて、そこへ復帰する
 - `vt session-cycle next` / `vt session-cycle prev`：現在カテゴリ内のセッションを巡回する
+- `vt session new [-c <path>]`：管理対象の tmux セッションを作成し、project path / category metadata を初期化する
 - `vt session set-category <session> <category>`：セッションのカテゴリを手動で上書きする
 - `vt session-manager --popup`：セッション、window、pane の切替と kill ができる fzf UI
 - `vt project switch <path>` / `vt project selector --popup`：ghq 管理下のプロジェクトに対応するセッションを作成、または切り替える

@@ -446,6 +446,20 @@ fn handle_runtime_effects(
                     eprintln!("[vde-tmux] session state set failed: {error:#}");
                 }
             }
+            RuntimeEffect::SetSessionProjectPath { session, path } => {
+                if let Err(error) =
+                    worker_io.set_session_option(&session, crate::options::KEY_PROJECT_PATH, &path)
+                {
+                    eprintln!("[vde-tmux] session project path set failed: {error:#}");
+                }
+            }
+            RuntimeEffect::SetSessionCategory { session, category } => {
+                if let Err(error) =
+                    worker_io.set_session_option(&session, crate::options::KEY_CATEGORY, &category)
+                {
+                    eprintln!("[vde-tmux] session category set failed: {error:#}");
+                }
+            }
             RuntimeEffect::SetSessionAgentCounts { session, counts } => {
                 if let Err(error) = worker_io.set_session_option(
                     &session,
@@ -604,6 +618,10 @@ mod tests {
             "123",
             "0",
             "0",
+            "0",
+            "",
+            "",
+            "",
             "",
             agent,
             status,
@@ -916,6 +934,39 @@ mod tests {
             status: status.to_string(),
             ..crate::options::snapshot::PaneSnapshot::default()
         }
+    }
+
+    #[test]
+    fn runtime_effects_write_session_category_metadata() {
+        let io = LoopWorkerIo::default();
+        handle_runtime_effects(
+            vec![
+                RuntimeEffect::SetSessionProjectPath {
+                    session: "main".to_string(),
+                    path: "/tmp/repo".to_string(),
+                },
+                RuntimeEffect::SetSessionCategory {
+                    session: "main".to_string(),
+                    category: "work".to_string(),
+                },
+            ],
+            None,
+            &io,
+            None,
+        )
+        .unwrap();
+
+        let options = io.session_options.lock().unwrap().clone();
+        assert!(options.contains(&(
+            "main".to_string(),
+            crate::options::KEY_PROJECT_PATH.to_string(),
+            Some("/tmp/repo".to_string()),
+        )));
+        assert!(options.contains(&(
+            "main".to_string(),
+            crate::options::KEY_CATEGORY.to_string(),
+            Some("work".to_string()),
+        )));
     }
 
     #[test]

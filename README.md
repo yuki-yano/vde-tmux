@@ -187,6 +187,7 @@ Convenient tmux bindings:
 ```tmux
 bind-key e run-shell "vt sidebar focus-toggle"   # open → focus → close
 bind-key b run-shell "vt sidebar focus"          # return to the sidebar after jumping to a pane
+bind-key -n M-C run-shell "vt session new -c ~/"  # create a managed session at home
 bind-key s run-shell "vt session-manager --popup"
 bind-key g run-shell "vt project selector --popup"
 ```
@@ -249,6 +250,7 @@ categories:
 
 - `vt category next` / `vt category prev` / `vt category use <name>` — switch category; vde-tmux remembers the last session you used in each category and returns to it
 - `vt session-cycle next` / `vt session-cycle prev` — cycle through the sessions of the current category
+- `vt session new [-c <path>]` — create a managed tmux session and initialize its project path/category metadata
 - `vt session set-category <session> <category>` — manually override a session's category
 - `vt session-manager --popup` — fzf UI to switch or kill sessions, windows, and panes
 - `vt project switch <path>` / `vt project selector --popup` — create or switch to a session for a ghq-managed project
