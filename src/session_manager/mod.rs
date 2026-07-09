@@ -431,10 +431,12 @@ fn run_selection_outside_tmux(
     } else {
         &entry.session
     };
-    if entry.action == "window" && !entry.target.is_empty() {
-        runner.run(&["select-window", "-t", &entry.target])?;
-    }
-    attach.attach_session(&exact_session_target(session))
+    let target = if entry.action == "window" && !entry.target.is_empty() {
+        entry.target.clone()
+    } else {
+        exact_session_target(session)
+    };
+    attach.attach_session(&target)
 }
 
 fn parse_selection_output(output: &str) -> (String, Vec<ManagerEntry>) {
@@ -1269,9 +1271,8 @@ mod tests {
     }
 
     #[test]
-    fn outside_tmux_session_manager_selects_window_before_attaching() {
+    fn outside_tmux_session_manager_attaches_selected_window() {
         let mock = MockTmuxRunner::new();
-        mock.stub(&["select-window", "-t", "@9"], "");
         let selected = render_entry(&ManagerEntry {
             action: "window".to_string(),
             name: "@9".to_string(),
@@ -1283,8 +1284,8 @@ mod tests {
 
         run_selection_outside_tmux(&mock, &selected, &mut attach).unwrap();
 
-        assert_eq!(mock.calls(), vec![vec!["select-window", "-t", "@9"]]);
-        assert_eq!(attach.targets, vec!["=ni.zsh:"]);
+        assert!(mock.calls().is_empty());
+        assert_eq!(attach.targets, vec!["@9"]);
     }
 
     #[test]
