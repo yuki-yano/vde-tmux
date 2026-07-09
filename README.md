@@ -54,6 +54,8 @@ set -g status-interval 1
 set -g status-left-length 10000
 set -g status-left '#(vt statusline-category)#[fg=#8f8ba8] │ #[default]#(vt statusline-sessions --show-index)#[fg=#8f8ba8] │ #[default]#(vt statusline-windows)'
 set -g status-right '#(vt statusline-attention) #(vt statusline-summary)'
+set -g pane-border-status bottom
+set -g pane-border-format '#(vt statusline-pane --target #{pane_id})'
 setw -g window-status-format ''
 setw -g window-status-current-format ''
 set -g window-status-separator ''
@@ -63,6 +65,7 @@ bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_rang
 - `statusline-category` — the current category (and the other categories, depending on config)
 - `statusline-sessions` — sessions in the current category, each prefixed with an agent state badge. Set `statusline.session_badge.mode: counts` to show counts such as `▲ 2 ● 1 ○ 5`
 - `statusline-windows` — windows in the current session, formatted by `statusline.windows`
+- `statusline-pane` — the current pane border label, formatted by `statusline.panes`
 - `statusline-summary` — state counts across all agents, e.g. `▲2 ●1`
 - `statusline-attention` — blocked agents you cannot currently see, e.g. `▲ session · perm 2m`
 
@@ -358,6 +361,23 @@ statusline:
       fg: "#ff6b6b"
     activity:
       fg: "#ff6b6b"
+  panes:
+    current:
+      format: " {pane}  {detail} "
+      colors:
+        fg: "#e7e3f6"
+        bg: "#4a4a70"
+        outer_bg: "#1C1C1C"
+      prefix: "#[fg=#4a4a70,bg=#1C1C1C]"
+      suffix: "#[fg=#4a4a70,bg=#1C1C1C]#[default]"
+    other:
+      format: " {pane} #[fg=#9696CE]#[fg=#BDC4E3] {detail} "
+      colors:
+        fg: "#BDC4E3"
+        bg: "#373A56"
+        outer_bg: "#1C1C1C"
+      prefix: "#[fg=#373A56,bg=#1C1C1C]"
+      suffix: "#[fg=#373A56,bg=#1C1C1C]#[default]"
 ```
 
 ```tmux
@@ -368,10 +388,14 @@ set -g status-left-length 10000
 setw -g window-status-format ''
 setw -g window-status-current-format ''
 set -g window-status-separator ''
+set -g pane-border-status bottom
+set -g pane-border-format '#(vt statusline-pane --target #{pane_id})'
 bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_range}'"
 ```
 
 Hex colors require tmux truecolor support (the `terminal-overrides` line above).
+`statusline.panes.*.format` supports `{pane}` / `{id}` / `{process}` / `{agent}` / `{name}` / `{badge}` / `{status}` / `{time}` / `{detail}`.
+`{detail}` is the compact default: agent panes show the colored badge, agent name, status, and elapsed time; non-agent panes show the process name.
 
 ## Files and runtime paths
 

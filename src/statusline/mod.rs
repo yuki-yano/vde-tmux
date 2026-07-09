@@ -5,13 +5,17 @@ use crate::config::{
     BadgeConfig, BadgeGlyphs, BadgeStyle, Config, SegmentColors, SegmentStyle,
     SessionBadgeChipConfig, SessionBadgeMode, StatuslineCategoryConfig,
 };
-use crate::daemon::session_badge::{BadgeState, glyph_for_state};
+use crate::daemon::session_badge::{BadgeState, badge_state, glyph_for_state};
+use crate::hook::{AgentStatus, pane_rollup_level};
+use crate::options::snapshot::detect_agent_from_command;
 use crate::session::{
     SessionInfo, current_session_name, exact_session_target, find_session, list_sessions,
     switch_client, use_category,
 };
 use crate::tmux::TmuxRunner;
 use crate::window::{WindowInfo, list_windows_for_target, select_window};
+
+const PANE_FIELD_SEP: char = '\u{1f}';
 
 pub fn statusline_sessions(runner: &dyn TmuxRunner, config: &Config) -> Result<String> {
     let sessions = list_sessions(runner)?;
@@ -49,6 +53,23 @@ pub fn statusline_windows(runner: &dyn TmuxRunner, config: &Config) -> Result<St
     let target = exact_session_target(&current_session);
     let windows = list_windows_for_target(runner, &target)?;
     Ok(render_statusline_windows(config, &windows))
+}
+
+pub fn statusline_pane(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    target: Option<&str>,
+    text_fg: Option<&str>,
+) -> Result<String> {
+    let format = pane_status_format();
+    let output = if let Some(target) = target.filter(|target| !target.trim().is_empty()) {
+        runner.run(&["display-message", "-p", "-t", target, &format])?
+    } else {
+        runner.run(&["display-message", "-p", &format])?
+    };
+    let pane = parse_pane_status(output.trim()).unwrap_or_default();
+    let now = crate::sidebar::tree::now_epoch_secs();
+    Ok(render_statusline_pane(config, &pane, text_fg, now))
 }
 
 pub fn switch_statusline_session(
@@ -260,6 +281,266 @@ pub fn render_statusline_category(
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn pane_status_format() -> String {
+    [
+        "#{pane_id}",
+        "#{pane_active}",
+        "#{pane_current_command}",
+        "#{@vde_agent}",
+        "#{@vde_status}",
+        "#{@vde_wait_reason}",
+        "#{@vde_attention}",
+        "#{@vde_started_at}",
+        "#{@vde_completed_at}",
+    ]
+    .join(&PANE_FIELD_SEP.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct PaneStatusInfo {
+    pane_id: String,
+    active: bool,
+    current_command: String,
+    agent: String,
+    status: String,
+    wait_reason: String,
+    attention: String,
+    started_at: String,
+    completed_at: String,
+}
+
+fn parse_pane_status(raw: &str) -> Option<PaneStatusInfo> {
+    let fields = raw.split(PANE_FIELD_SEP).collect::<Vec<_>>();
+    if fields.len() != 9 {
+        return None;
+    }
+    Some(PaneStatusInfo {
+        pane_id: fields[0].to_string(),
+        active: fields[1] == "1",
+        current_command: fields[2].to_string(),
+        agent: fields[3].to_string(),
+        status: fields[4].to_string(),
+        wait_reason: fields[5].to_string(),
+        attention: fields[6].to_string(),
+        started_at: fields[7].to_string(),
+        completed_at: fields[8].to_string(),
+    })
+}
+
+fn render_statusline_pane(
+    config: &Config,
+    pane: &PaneStatusInfo,
+    text_fg_override: Option<&str>,
+    now: i64,
+) -> String {
+    let style = if pane.active {
+        &config.statusline.panes.current
+    } else {
+        &config.statusline.panes.other
+    };
+    let text_fg = normalize_tmux_color(
+        text_fg_override
+            .or(style.colors.fg.as_deref())
+            .unwrap_or("default"),
+    );
+    let detail = render_statusline_pane_detail(config, pane, &text_fg, now);
+    let body = render_statusline_pane_body(config, pane, &style.format, &detail, &text_fg, now);
+    tmux_style_segment(style, &body)
+}
+
+fn render_statusline_pane_body(
+    config: &Config,
+    pane: &PaneStatusInfo,
+    format: &str,
+    detail: &str,
+    text_fg: &str,
+    now: i64,
+) -> String {
+    let agent = pane_agent_label(pane);
+    let process = tmux_plain_text(&pane.current_command);
+    let name = agent.clone().unwrap_or_else(|| process.clone());
+    let (badge, status, time) = if agent.is_some() {
+        let state = pane_badge_state(pane);
+        (
+            pane_badge_fragment(config, state, text_fg),
+            pane_status_fragment(config, pane, state, text_fg),
+            pane_time_fragment(config, pane, state, text_fg, now),
+        )
+    } else {
+        (String::new(), String::new(), String::new())
+    };
+
+    format
+        .replace("{pane}", &tmux_plain_text(&pane.pane_id))
+        .replace("{id}", &tmux_plain_text(&pane.pane_id))
+        .replace("{process}", &process)
+        .replace(
+            "{agent}",
+            &tmux_plain_text(agent.as_deref().unwrap_or_default()),
+        )
+        .replace("{name}", &tmux_plain_text(&name))
+        .replace("{badge}", &badge)
+        .replace("{status}", &status)
+        .replace("{time}", &time)
+        .replace("{detail}", detail)
+}
+
+fn render_statusline_pane_detail(
+    config: &Config,
+    pane: &PaneStatusInfo,
+    text_fg: &str,
+    now: i64,
+) -> String {
+    let Some(agent) = pane_agent_label(pane) else {
+        return tmux_plain_text(&pane.current_command);
+    };
+    let badge_state = pane_badge_state(pane);
+    let glyph = glyph_for_state(badge_state, &config.badge.glyphs);
+    let badge_color = config
+        .badge
+        .colors
+        .for_state(badge_state.as_str())
+        .unwrap_or("default");
+    let text_fg = normalize_tmux_color(text_fg);
+    let status = pane_status_label(pane, badge_state);
+    let elapsed = pane_time_label(pane, badge_state, now)
+        .map(|label| format!(" {label}"))
+        .unwrap_or_default();
+    format!(
+        "#[fg={badge_color}]{glyph} #[fg={text_fg}]{} #[fg={text_fg}] #[fg={badge_color}]{status}{elapsed}#[fg={text_fg}]",
+        tmux_plain_text(&agent)
+    )
+}
+
+fn pane_badge_fragment(config: &Config, state: BadgeState, text_fg: &str) -> String {
+    let glyph = glyph_for_state(state, &config.badge.glyphs);
+    let badge_color = config
+        .badge
+        .colors
+        .for_state(state.as_str())
+        .unwrap_or("default");
+    format!("#[fg={badge_color}]{glyph}#[fg={text_fg}]")
+}
+
+fn pane_status_fragment(
+    config: &Config,
+    pane: &PaneStatusInfo,
+    state: BadgeState,
+    text_fg: &str,
+) -> String {
+    let color = config
+        .badge
+        .colors
+        .for_state(state.as_str())
+        .unwrap_or("default");
+    format!(
+        "#[fg={color}]{}#[fg={text_fg}]",
+        pane_status_label(pane, state)
+    )
+}
+
+fn pane_time_fragment(
+    config: &Config,
+    pane: &PaneStatusInfo,
+    state: BadgeState,
+    text_fg: &str,
+    now: i64,
+) -> String {
+    let Some(label) = pane_time_label(pane, state, now) else {
+        return String::new();
+    };
+    let color = config
+        .badge
+        .colors
+        .for_state(state.as_str())
+        .unwrap_or("default");
+    format!("#[fg={color}]{label}#[fg={text_fg}]")
+}
+
+fn pane_agent_label(pane: &PaneStatusInfo) -> Option<String> {
+    let agent = pane.agent.trim();
+    if !agent.is_empty() {
+        return Some(crate::agent::display_agent_name(agent));
+    }
+    detect_agent_from_command(&pane.current_command).map(crate::agent::display_agent_name)
+}
+
+fn pane_badge_state(pane: &PaneStatusInfo) -> BadgeState {
+    let Some(status) = parse_agent_status(&pane.status) else {
+        return BadgeState::Working;
+    };
+    badge_state(
+        pane_rollup_level(Some(status), non_empty(pane.wait_reason.as_str())),
+        false,
+    )
+}
+
+fn pane_status_label(pane: &PaneStatusInfo, state: BadgeState) -> &'static str {
+    if state == BadgeState::Done {
+        return "done";
+    }
+    match parse_agent_status(&pane.status) {
+        Some(AgentStatus::Running) | None => "running",
+        Some(AgentStatus::Waiting) => "waiting",
+        Some(AgentStatus::Idle) => "idle",
+        Some(AgentStatus::Error) => "error",
+    }
+}
+
+fn pane_time_label(pane: &PaneStatusInfo, state: BadgeState, now: i64) -> Option<String> {
+    let (epoch, suffix) = match state {
+        BadgeState::Done | BadgeState::Idle => (pane.completed_at.trim(), " ago"),
+        BadgeState::Blocked | BadgeState::Working => (pane.started_at.trim(), ""),
+    };
+    let epoch = epoch.parse::<i64>().ok()?;
+    Some(format!("{}{}", short_elapsed_label(now - epoch), suffix))
+}
+
+fn short_elapsed_label(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let minutes = secs / 60;
+    if minutes < 10 {
+        return format!("{minutes}m{:02}s", secs % 60);
+    }
+    crate::sidebar::tree::humanize_secs(secs)
+}
+
+fn parse_agent_status(raw: &str) -> Option<AgentStatus> {
+    match raw {
+        "running" => Some(AgentStatus::Running),
+        "waiting" => Some(AgentStatus::Waiting),
+        "idle" => Some(AgentStatus::Idle),
+        "error" => Some(AgentStatus::Error),
+        _ => None,
+    }
+}
+
+fn non_empty(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    (!raw.is_empty()).then_some(raw)
+}
+
+fn normalize_tmux_color(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.len() == 6 && raw.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        format!("#{raw}")
+    } else if raw.is_empty() {
+        "default".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+fn tmux_plain_text(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .replace("#[", "# [")
 }
 
 fn category_badge_fragment(
@@ -677,6 +958,85 @@ mod tests {
             silence: false,
             command: "zsh".to_string(),
         }
+    }
+
+    #[test]
+    fn render_statusline_pane_detail_renders_agent_state_badge_and_elapsed() {
+        let pane = PaneStatusInfo {
+            pane_id: "%1".to_string(),
+            current_command: "node".to_string(),
+            agent: "codex".to_string(),
+            status: "running".to_string(),
+            started_at: "917".to_string(),
+            ..PaneStatusInfo::default()
+        };
+
+        let rendered = render_statusline_pane_detail(&Config::default(), &pane, "1E1E2E", 1000);
+
+        assert_eq!(
+            rendered,
+            "#[fg=#4fd08a]● #[fg=#1E1E2E]Codex #[fg=#1E1E2E] #[fg=#4fd08a]running 1m23s#[fg=#1E1E2E]"
+        );
+    }
+
+    #[test]
+    fn render_statusline_pane_detail_renders_idle_age() {
+        let pane = PaneStatusInfo {
+            pane_id: "%1".to_string(),
+            current_command: "node".to_string(),
+            agent: "codex".to_string(),
+            status: "idle".to_string(),
+            attention: "1".to_string(),
+            completed_at: "185".to_string(),
+            ..PaneStatusInfo::default()
+        };
+
+        let rendered = render_statusline_pane_detail(&Config::default(), &pane, "#9696CE", 1000);
+
+        assert_eq!(
+            rendered,
+            "#[fg=#a8a8b2]○ #[fg=#9696CE]Codex #[fg=#9696CE] #[fg=#a8a8b2]idle 13m ago#[fg=#9696CE]"
+        );
+    }
+
+    #[test]
+    fn render_statusline_pane_detail_uses_process_for_non_agent() {
+        let pane = PaneStatusInfo {
+            pane_id: "%1".to_string(),
+            current_command: "zsh".to_string(),
+            ..PaneStatusInfo::default()
+        };
+
+        let rendered = render_statusline_pane_detail(&Config::default(), &pane, "default", 1000);
+
+        assert_eq!(rendered, "zsh");
+    }
+
+    #[test]
+    fn render_statusline_pane_uses_configured_format_and_placeholders() {
+        let mut config = Config::default();
+        config.statusline.panes.current.format =
+            "{pane}|{badge}|{agent}|{status}|{time}|{detail}|{name}|{process}".to_string();
+        config.statusline.panes.current.prefix = "<".to_string();
+        config.statusline.panes.current.suffix = ">".to_string();
+        config.statusline.panes.current.colors.fg = Some("#eeeeee".to_string());
+        config.statusline.panes.current.colors.bg = None;
+        let pane = PaneStatusInfo {
+            pane_id: "%1".to_string(),
+            active: true,
+            current_command: "node".to_string(),
+            agent: "codex".to_string(),
+            status: "running".to_string(),
+            started_at: "970".to_string(),
+            ..PaneStatusInfo::default()
+        };
+
+        let rendered = render_statusline_pane(&config, &pane, None, 1000);
+
+        assert_eq!(
+            rendered,
+            "<#[fg=#eeeeee]%1|#[fg=#4fd08a]●#[fg=#eeeeee]|Codex|#[fg=#4fd08a]running#[fg=#eeeeee]|#[fg=#4fd08a]30s#[fg=#eeeeee]|#[fg=#4fd08a]● #[fg=#eeeeee]Codex #[fg=#eeeeee] #[fg=#4fd08a]running 30s#[fg=#eeeeee]|Codex|node#[default]>"
+        );
     }
 
     #[test]

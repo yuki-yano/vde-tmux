@@ -1,3 +1,4 @@
+use crate::agent::{display_agent_label_prefix, display_agent_name};
 use crate::daemon::session_badge::{BadgeState, glyph_for_state};
 use crate::hook::RollupLevel;
 use crate::sidebar::state::{SidebarState, StatusFilter, ViewMode};
@@ -865,6 +866,7 @@ fn render_row_line(
     let label_source = match row.kind {
         SidebarRowKind::Category => format!("◆ {}", row.label),
         SidebarRowKind::Jump => JUMP_ROW_LABEL.to_string(),
+        SidebarRowKind::Chat => chat_display_label(row),
         _ => row.label.clone(),
     };
     let label = truncate_display(&label_source, label_budget);
@@ -1024,7 +1026,8 @@ fn label_spans(
             .as_ref()
             .and_then(|meta| meta.agent.as_deref())
             .filter(|agent| !agent.is_empty())
-        && label.starts_with(agent)
+            .map(display_agent_name)
+        && label.starts_with(&agent)
     {
         let (agent_part, rest) = label.split_at(agent.len());
         if row.expanded
@@ -1252,7 +1255,7 @@ fn render_chat_dense_line(
         .as_ref()
         .and_then(|meta| meta.agent.as_deref())
         .unwrap_or_else(|| row.label.split(':').next().unwrap_or(row.label.as_str()));
-    let agent = truncate_display(agent, 7);
+    let agent = truncate_display(&display_agent_name(agent), 7);
     let origin = row
         .meta
         .as_ref()
@@ -1720,14 +1723,29 @@ fn chat_agent_label(row: &SidebarRow) -> String {
         .as_ref()
         .and_then(|meta| meta.agent.as_deref())
         .filter(|agent| !agent.trim().is_empty())
-        .map(str::to_string)
+        .map(display_agent_name)
         .unwrap_or_else(|| {
-            row.label
-                .split(':')
-                .next()
-                .unwrap_or(row.label.as_str())
-                .to_string()
+            display_agent_name(row.label.split(':').next().unwrap_or(row.label.as_str()))
         })
+}
+
+fn chat_display_label(row: &SidebarRow) -> String {
+    let Some(raw_agent) = row
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.agent.as_deref())
+        .filter(|agent| !agent.trim().is_empty())
+    else {
+        return display_agent_label_prefix(&row.label);
+    };
+    let display_agent = display_agent_name(raw_agent);
+    if row.label.starts_with(&display_agent) {
+        return row.label.clone();
+    }
+    if let Some(rest) = row.label.strip_prefix(raw_agent) {
+        return format!("{display_agent}{rest}");
+    }
+    display_agent_label_prefix(&row.label)
 }
 
 fn chat_prompt_label(row: &SidebarRow) -> String {
@@ -2189,7 +2207,7 @@ mod tests {
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 30);
 
-        assert!(rendered.contains("● claude  vde"), "{rendered:?}");
+        assert!(rendered.contains("● Claude  vde"), "{rendered:?}");
         assert!(rendered.ends_with("13m "), "{rendered:?}");
     }
 
@@ -2354,7 +2372,7 @@ mod tests {
         let rendered = render_rows(&rows, &state, 40);
 
         assert!(rendered.contains(" ▾ app"));
-        assert!(rendered.contains("   ▾ codex %1"));
+        assert!(rendered.contains("   ▾ Codex %1"));
         assert!(!rendered.contains("> "));
     }
 
@@ -3243,7 +3261,7 @@ sidebar:
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 80);
 
-        assert!(rendered.contains("● codex (%1)"), "{rendered}");
+        assert!(rendered.contains("● Codex (%1)"), "{rendered}");
         assert!(!rendered.contains("[running]"), "{rendered}");
     }
 
@@ -3288,7 +3306,7 @@ sidebar:
         assert!(
             chat_spans
                 .iter()
-                .any(|span| span.content.as_ref() == "claude"
+                .any(|span| span.content.as_ref() == "Claude"
                     && span.style.fg == Some(Color::Reset)
                     && span.style.add_modifier.contains(Modifier::BOLD)),
             "{chat_spans:?}"
@@ -3296,7 +3314,7 @@ sidebar:
         assert!(
             chat_spans
                 .iter()
-                .any(|span| span.content.as_ref() == "claude"
+                .any(|span| span.content.as_ref() == "Claude"
                     && span.style.fg == Some(Color::Reset)
                     && span.style.add_modifier.contains(Modifier::BOLD)),
             "{chat_spans:?}"
@@ -3489,7 +3507,7 @@ sidebar:
         assert!(
             chat_spans
                 .iter()
-                .any(|span| span.content.as_ref() == "codex"
+                .any(|span| span.content.as_ref() == "Codex"
                     && span.style.add_modifier.contains(Modifier::BOLD)
                     && span.style.fg == Some(Color::Reset)),
             "{chat_spans:?}"
@@ -3866,7 +3884,7 @@ badge:
 
         assert_eq!(rendered.row_indices, vec![Some(0), Some(0)]);
         assert_eq!(text.len(), 2);
-        assert!(text[0].contains("▸ ▲ codex"), "{text:?}");
+        assert!(text[0].contains("▸ ▲ Codex"), "{text:?}");
         assert!(
             text[0].ends_with("permission · 2m07s · ☑ 2/5 · ↳ 2 "),
             "{text:?}"

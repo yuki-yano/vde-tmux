@@ -84,6 +84,36 @@ fn dispatch_statusline_windows_prints_output() {
 }
 
 #[test]
+fn dispatch_statusline_pane_prints_pane_segment() {
+    let mock = MockTmuxRunner::new();
+    let format = [
+        "#{pane_id}",
+        "#{pane_active}",
+        "#{pane_current_command}",
+        "#{@vde_agent}",
+        "#{@vde_status}",
+        "#{@vde_wait_reason}",
+        "#{@vde_attention}",
+        "#{@vde_started_at}",
+        "#{@vde_completed_at}",
+    ]
+    .join("\u{1f}");
+    mock.stub(
+        &["display-message", "-p", "-t", "%1", &format],
+        "%1\u{1f}1\u{1f}node\u{1f}codex\u{1f}running\u{1f}\u{1f}0\u{1f}\u{1f}\n",
+    );
+
+    let output = run_with(["vt", "statusline-pane", "--target", "%1"], &mock, &env())
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        output,
+        "#[fg=#4a4a70,bg=#1C1C1C]#[fg=#e7e3f6,bg=#4a4a70] %1  #[fg=#4fd08a]● #[fg=#e7e3f6]Codex #[fg=#e7e3f6] #[fg=#4fd08a]running#[fg=#e7e3f6] #[default]#[fg=#4a4a70,bg=#1C1C1C]#[default]"
+    );
+}
+
+#[test]
 fn dispatch_statusline_windows_switch_selects_window() {
     let mock = MockTmuxRunner::new();
     mock.stub(&["select-window", "-t", "@2"], "");

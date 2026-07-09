@@ -46,6 +46,13 @@ enum Command {
         #[command(subcommand)]
         command: Option<StatuslineWindowsCommand>,
     },
+    #[command(name = "statusline-pane")]
+    StatuslinePane {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long = "text-fg")]
+        text_fg: Option<String>,
+    },
     #[command(name = "statusline-click")]
     StatuslineClick { range: Option<String> },
     Daemon {
@@ -296,6 +303,14 @@ where
                 runner, &config,
             )?)),
         },
+        Command::StatuslinePane { target, text_fg } => {
+            Ok(Some(crate::statusline::statusline_pane(
+                runner,
+                &config,
+                target.as_deref(),
+                text_fg.as_deref(),
+            )?))
+        }
         Command::StatuslineClick { range } => {
             crate::statusline::handle_statusline_click(runner, &config, range.as_deref())?;
             Ok(None)

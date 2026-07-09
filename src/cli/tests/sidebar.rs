@@ -52,7 +52,7 @@ fn dispatch_sidebar_attach_once_marks_and_renders() {
     )
     .unwrap();
 
-    assert!(output.unwrap().contains("codex"));
+    assert!(output.unwrap().contains("Codex"));
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn dispatch_sidebar_attach_once_restores_persisted_state() {
     let output = output.unwrap();
 
     assert!(output.contains(" ▸ app"));
-    assert!(!output.contains("codex %1"));
+    assert!(!output.contains("Codex %1"));
     std::fs::remove_dir_all(state_home).unwrap();
 }
 

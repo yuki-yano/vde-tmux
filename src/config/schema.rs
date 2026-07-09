@@ -159,6 +159,50 @@ pub fn config_schema() -> Value {
                             }
                         }
                     },
+                    "panes": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                            "current": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "format": { "type": "string" },
+                                    "prefix": { "type": "string" },
+                                    "suffix": { "type": "string" },
+                                    "bold": { "type": "boolean" },
+                                    "colors": {
+                                        "type": "object",
+                                        "additionalProperties": true,
+                                        "properties": {
+                                            "fg": { "type": "string" },
+                                            "bg": { "type": "string" },
+                                            "outer_bg": { "type": "string" }
+                                        }
+                                    }
+                                }
+                            },
+                            "other": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "format": { "type": "string" },
+                                    "prefix": { "type": "string" },
+                                    "suffix": { "type": "string" },
+                                    "bold": { "type": "boolean" },
+                                    "colors": {
+                                        "type": "object",
+                                        "additionalProperties": true,
+                                        "properties": {
+                                            "fg": { "type": "string" },
+                                            "bg": { "type": "string" },
+                                            "outer_bg": { "type": "string" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
                     "category": {
                         "type": "object",
                         "additionalProperties": true,
@@ -490,6 +534,11 @@ mod tests {
         assert_eq!(
             schema["properties"]["statusline"]["properties"]["windows"]["properties"]["bell"]["properties"]
                 ["fg"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["panes"]["properties"]["current"]["properties"]
+                ["format"]["type"],
             "string"
         );
     }

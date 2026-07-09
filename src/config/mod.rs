@@ -70,6 +70,7 @@ pub struct SessionNameRule {
 pub struct StatuslineConfig {
     pub sessions: StatuslineSessionsConfig,
     pub windows: StatuslineWindowsConfig,
+    pub panes: StatuslinePanesConfig,
     pub category: StatuslineCategoryConfig,
     pub summary: SummaryConfig,
     pub attention: AttentionConfig,
@@ -128,6 +129,42 @@ impl Default for StatuslineWindowsConfig {
             bell: SegmentColors::default(),
             activity: SegmentColors::default(),
             separator: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatuslinePanesConfig {
+    pub current: SegmentStyle,
+    pub other: SegmentStyle,
+}
+
+impl Default for StatuslinePanesConfig {
+    fn default() -> Self {
+        Self {
+            current: SegmentStyle {
+                format: " {pane} \u{e0b1} {detail} ".to_string(),
+                prefix: "#[fg=#4a4a70,bg=#1C1C1C]\u{e0b6}".to_string(),
+                suffix: "#[fg=#4a4a70,bg=#1C1C1C]\u{e0b4}#[default]".to_string(),
+                colors: SegmentColors {
+                    fg: Some("#e7e3f6".to_string()),
+                    bg: Some("#4a4a70".to_string()),
+                    outer_bg: Some("#1C1C1C".to_string()),
+                },
+                ..SegmentStyle::default()
+            },
+            other: SegmentStyle {
+                format: " {pane} #[fg=#9696CE]\u{e0b1}#[fg=#BDC4E3] {detail} ".to_string(),
+                prefix: "#[fg=#373A56,bg=#1C1C1C]\u{e0b6}".to_string(),
+                suffix: "#[fg=#373A56,bg=#1C1C1C]\u{e0b4}#[default]".to_string(),
+                colors: SegmentColors {
+                    fg: Some("#BDC4E3".to_string()),
+                    bg: Some("#373A56".to_string()),
+                    outer_bg: Some("#1C1C1C".to_string()),
+                },
+                ..SegmentStyle::default()
+            },
         }
     }
 }
@@ -814,6 +851,10 @@ daemon:
             " {index}:{window} "
         );
         assert!(config.statusline.windows.current.bold);
+        assert_eq!(
+            config.statusline.panes.current.format,
+            " {pane} \u{e0b1} {detail} "
+        );
     }
 
     #[test]
@@ -871,6 +912,43 @@ statusline:
         assert_eq!(
             config.statusline.windows.activity.fg.as_deref(),
             Some("#ff6b6b")
+        );
+    }
+
+    #[test]
+    fn statusline_panes_section_parses_styles() {
+        let yaml = r##"
+statusline:
+  panes:
+    current:
+      format: " {pane} | {detail} "
+      bold: true
+      colors:
+        fg: "#cbc8dd"
+        bg: "#3d3d5f"
+      prefix: "#[fg=#3d3d5f]"
+      suffix: "#[fg=#3d3d5f]#[default]"
+    other:
+      format: " {id} {process} "
+      colors:
+        fg: "#BDC4E3"
+"##;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+
+        assert_eq!(
+            config.statusline.panes.current.format,
+            " {pane} | {detail} "
+        );
+        assert!(config.statusline.panes.current.bold);
+        assert_eq!(
+            config.statusline.panes.current.colors.bg.as_deref(),
+            Some("#3d3d5f")
+        );
+        assert_eq!(config.statusline.panes.current.prefix, "#[fg=#3d3d5f]");
+        assert_eq!(config.statusline.panes.other.format, " {id} {process} ");
+        assert_eq!(
+            config.statusline.panes.other.colors.fg.as_deref(),
+            Some("#BDC4E3")
         );
     }
 

@@ -869,7 +869,7 @@ fn event_tail(
                 .unwrap_or_else(|| "·".to_string());
             format!(
                 "{ago} {} {} → {}",
-                event.agent,
+                crate::agent::display_agent_name(&event.agent),
                 from,
                 theme.badge_glyph(event.to)
             )
@@ -1297,7 +1297,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("codex (%1)"));
+        assert!(rendered.contains("Codex (%1)"));
     }
 
     #[test]
@@ -1531,7 +1531,7 @@ mod tests {
 
         let lines = event_tail(&snapshot, 3, 1000, &theme);
 
-        assert_eq!(lines, vec!["2m前 codex ● → ▲".to_string()]);
+        assert_eq!(lines, vec!["2m前 Codex ● → ▲".to_string()]);
     }
 
     #[test]

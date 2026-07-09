@@ -290,6 +290,78 @@
           },
           "type": "object"
         },
+        "panes": {
+          "additionalProperties": true,
+          "properties": {
+            "current": {
+              "additionalProperties": true,
+              "properties": {
+                "bold": {
+                  "type": "boolean"
+                },
+                "colors": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "bg": {
+                      "type": "string"
+                    },
+                    "fg": {
+                      "type": "string"
+                    },
+                    "outer_bg": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "format": {
+                  "type": "string"
+                },
+                "prefix": {
+                  "type": "string"
+                },
+                "suffix": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "other": {
+              "additionalProperties": true,
+              "properties": {
+                "bold": {
+                  "type": "boolean"
+                },
+                "colors": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "bg": {
+                      "type": "string"
+                    },
+                    "fg": {
+                      "type": "string"
+                    },
+                    "outer_bg": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "format": {
+                  "type": "string"
+                },
+                "prefix": {
+                  "type": "string"
+                },
+                "suffix": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "type": "object"
+        },
         "session_badge": {
           "additionalProperties": true,
           "properties": {

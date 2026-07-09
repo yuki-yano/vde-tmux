@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod category;
 pub mod cli;
 pub mod config;

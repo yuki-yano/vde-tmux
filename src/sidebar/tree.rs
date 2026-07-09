@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::display_agent_name;
 use crate::category::resolve_category_for_session;
 use crate::config::Config;
 use crate::daemon::session_badge::{BadgeState, badge_state};
@@ -549,7 +550,7 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
             label: if expanded {
                 expanded_chat_label(pane)
             } else {
-                format!("{} · {}", pane.agent, pane.repo)
+                format!("{} · {}", display_agent_name(&pane.agent), pane.repo)
             },
             chat_count: 1,
             rollup: pane.rollup,
@@ -775,13 +776,13 @@ fn sanitize_detail_label(raw: &str) -> String {
 }
 
 fn expanded_chat_label(pane: &AgentPane) -> String {
-    pane.agent.clone()
+    display_agent_name(&pane.agent)
 }
 
 fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
     let tasks = parse_tasks(&pane.tasks);
     RowMeta {
-        agent: Some(pane.agent.clone()),
+        agent: Some(display_agent_name(&pane.agent)),
         prompt: non_empty(&pane.prompt).map(str::to_string),
         wait_reason: non_empty(&pane.wait_reason).map(str::to_string),
         elapsed_secs: pane
@@ -886,10 +887,11 @@ fn subagent_id_suffix(agent_id: &str) -> String {
 }
 
 fn chat_label(pane: &AgentPane) -> String {
+    let agent = display_agent_name(&pane.agent);
     let base = if let Some(prompt) = non_empty(&pane.prompt) {
-        format!("{}: {prompt}", pane.agent)
+        format!("{agent}: {prompt}")
     } else {
-        format!("{} ({})", pane.agent, pane.pane_id)
+        format!("{agent} ({})", pane.pane_id)
     };
     if let Some((done, total)) = parse_tasks(&pane.tasks) {
         format!("{base} {done}/{total}")
@@ -1257,7 +1259,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[1].meta.as_ref().and_then(|meta| meta.agent.as_deref()),
-            Some("claude")
+            Some("Claude")
         );
     }
 
@@ -1666,7 +1668,7 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .any(|row| row.kind == SidebarRowKind::Chat && row.label == "codex")
+                .any(|row| row.kind == SidebarRowKind::Chat && row.label == "Codex")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%5::state"));
         assert!(!rows.iter().any(|row| row.id == "detail::%5::place"));
@@ -1688,7 +1690,7 @@ mod tests {
             .find(|row| row.id == "chat::%1")
             .expect("collapsed chat row");
 
-        assert_eq!(collapsed_chat.label, "claude: review the long plan");
+        assert_eq!(collapsed_chat.label, "Claude: review the long plan");
 
         let mut expanded_state = SidebarState {
             view_mode: ViewMode::Flat,
@@ -1702,7 +1704,7 @@ mod tests {
             .find(|row| row.id == "chat::%1")
             .expect("expanded chat row");
 
-        assert_eq!(expanded_chat.label, "claude");
+        assert_eq!(expanded_chat.label, "Claude");
 
         let triage_ctx = RowBuildContext {
             triage: BTreeSet::from(["%1".to_string()]),
@@ -1715,7 +1717,7 @@ mod tests {
             .find(|row| row.id == "chat::%1")
             .expect("triage chat row");
 
-        assert_eq!(triage_chat.label, "claude");
+        assert_eq!(triage_chat.label, "Claude");
     }
 
     #[test]
@@ -1778,7 +1780,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex")
+            Some("Codex")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
         assert!(!rows.iter().any(|row| row.id == "detail::%1::place"));
@@ -1805,7 +1807,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex")
+            Some("Codex")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
 
@@ -1820,7 +1822,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%2")
                 .map(|row| row.label.as_str()),
-            Some("claude")
+            Some("Claude")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%2::state"));
     }
@@ -1843,7 +1845,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex")
+            Some("Codex")
         );
         assert_eq!(
             rows.iter()
@@ -1875,7 +1877,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%1")
                 .map(|row| row.label.as_str()),
-            Some("codex")
+            Some("Codex")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
 
@@ -1890,7 +1892,7 @@ mod tests {
             rows.iter()
                 .find(|row| row.id == "chat::%2")
                 .map(|row| row.label.as_str()),
-            Some("claude")
+            Some("Claude")
         );
         assert!(!rows.iter().any(|row| row.id == "detail::%2::state"));
     }
@@ -2297,7 +2299,7 @@ mod tests {
             .find(|row| row.kind == SidebarRowKind::Chat)
             .expect("chat row");
         let meta = chat.meta.as_ref().expect("chat meta");
-        assert_eq!(meta.agent.as_deref(), Some("codex"));
+        assert_eq!(meta.agent.as_deref(), Some("Codex"));
         assert_eq!(meta.prompt.as_deref(), Some("fix bug"));
         assert_eq!(meta.elapsed_secs, Some(75));
         assert_eq!(meta.tasks_done, Some(2));
@@ -2367,7 +2369,7 @@ mod tests {
         assert_eq!(rows[0].chat_count, 1);
         assert_eq!(rows[1].id, "chat::%1");
         assert_eq!(rows[1].depth, 1);
-        assert_eq!(rows[1].label, "codex · app");
+        assert_eq!(rows[1].label, "Codex · app");
         assert!(!rows[2..].iter().any(|row| row.id == "chat::%1"));
     }
 
