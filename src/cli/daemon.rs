@@ -447,6 +447,7 @@ mod tests {
         while !stop.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
                     let mut request = String::new();
                     BufReader::new(&mut stream).read_line(&mut request).unwrap();
                     serde_json::to_writer(

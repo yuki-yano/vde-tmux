@@ -287,6 +287,11 @@ fn dispatch_sidebar_open_accepts_percent_width() {
     let mock = MockTmuxRunner::new();
     let exe = std::env::current_exe().unwrap();
     let command = sidebar_attach_command_for_selection_test(&exe);
+    let (socket, handle) = spawn_ready_daemon_socket("vde-tmux-sidebar-open-percent");
+    let env = BTreeMap::from([(
+        "VDE_DAEMON_SOCKET".to_string(),
+        socket.display().to_string(),
+    )]);
     stub_selection_context(&mock);
     mock.stub(
         &[
@@ -327,11 +332,12 @@ fn dispatch_sidebar_open_accepts_percent_width() {
     crate::cli::run_with(
         ["vt", "sidebar", "open", "--window", "@1", "--width", "10%"],
         &mock,
-        &env(),
+        &env,
     )
     .unwrap();
 
     assert_eq!(mock.calls().len(), 4);
+    handle.join().unwrap();
 }
 
 #[test]
@@ -794,6 +800,51 @@ fn unique_socket_path(label: &str) -> std::path::PathBuf {
             .unwrap()
             .as_nanos()
     ))
+}
+
+fn spawn_ready_daemon_socket(label: &str) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    let socket = unique_socket_path(label);
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let socket_for_thread = socket.clone();
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut handled = 0usize;
+        while handled < 2 && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(&mut stream).read_line(&mut line).unwrap();
+                    let message: crate::daemon::protocol::ClientMessage =
+                        serde_json::from_str(line.trim()).unwrap();
+                    let response = match message {
+                        crate::daemon::protocol::ClientMessage::Query {
+                            what: crate::daemon::protocol::QueryTarget::Summary,
+                            ..
+                        } => crate::daemon::protocol::ServerMessage::Summary {
+                            text: String::new(),
+                        },
+                        _ => crate::daemon::protocol::ServerMessage::Ack,
+                    };
+                    serde_json::to_writer(&mut stream, &response).unwrap();
+                    stream.write_all(b"\n").unwrap();
+                    handled += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        drop(listener);
+        let _ = std::fs::remove_file(socket_for_thread);
+    });
+    (socket, handle)
 }
 
 #[test]
