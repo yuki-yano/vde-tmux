@@ -122,6 +122,37 @@ struct CaptureActivityTracker {
     panes: BTreeMap<String, CaptureActivityState>,
 }
 
+#[derive(Debug, Default)]
+pub struct SharedCaptureActivity {
+    tracker: Mutex<CaptureActivityTracker>,
+}
+
+impl SharedCaptureActivity {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn prune(&self, pane_ids: &BTreeSet<String>) {
+        self.tracker
+            .lock()
+            .expect("capture activity tracker poisoned")
+            .prune(pane_ids);
+    }
+
+    fn record_tail(
+        &self,
+        pane_id: &str,
+        started_at: Option<i64>,
+        now_epoch: i64,
+        tail: &str,
+    ) -> Option<i64> {
+        self.tracker
+            .lock()
+            .expect("capture activity tracker poisoned")
+            .record_tail(pane_id, started_at, now_epoch, tail)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CaptureActivityState {
     started_at: Option<i64>,
@@ -178,19 +209,19 @@ fn capture_fingerprint(tail: &str) -> u64 {
 pub fn start_tmux_worker(
     io: Arc<dyn WorkerIo>,
     latest_panes: Arc<LatestPanes>,
+    capture_activity: Arc<SharedCaptureActivity>,
     tx: Sender<DaemonEvent>,
     poll: Duration,
     stale_threshold_seconds: i64,
 ) {
     thread::spawn(move || {
-        let mut capture_activity = CaptureActivityTracker::default();
         loop {
             if let Err(error) = poll_tmux_once_with_latest(
                 io.clone(),
                 latest_panes.clone(),
+                capture_activity.clone(),
                 tx.clone(),
                 stale_threshold_seconds,
-                &mut capture_activity,
             ) {
                 eprintln!("[vde-tmux] daemon tmux worker error: {error:#}");
             }
@@ -205,25 +236,22 @@ pub fn poll_tmux_once(
     stale_threshold_seconds: i64,
 ) -> Result<()> {
     let latest = Arc::new(LatestPanes::default());
-    let mut capture_activity = CaptureActivityTracker::default();
-    poll_tmux_once_with_latest(
-        io,
-        latest,
-        tx,
-        stale_threshold_seconds,
-        &mut capture_activity,
-    )
+    let capture_activity = Arc::new(SharedCaptureActivity::new());
+    poll_tmux_once_with_latest(io, latest, capture_activity, tx, stale_threshold_seconds)
 }
 
 fn poll_tmux_once_with_latest(
     io: Arc<dyn WorkerIo>,
     latest_panes: Arc<LatestPanes>,
+    capture_activity: Arc<SharedCaptureActivity>,
     tx: Sender<DaemonEvent>,
     stale_threshold_seconds: i64,
-    capture_activity: &mut CaptureActivityTracker,
 ) -> Result<()> {
-    let panes =
-        read_panes_with_detection_tracked(io.as_ref(), stale_threshold_seconds, capture_activity)?;
+    let panes = read_panes_with_shared_capture_activity(
+        io.as_ref(),
+        stale_threshold_seconds,
+        capture_activity.as_ref(),
+    )?;
     latest_panes.store(panes.clone());
     tx.send(DaemonEvent::PanesUpdated(panes))?;
     Ok(())
@@ -235,6 +263,35 @@ pub fn read_panes_with_detection(
 ) -> Result<Vec<PaneSnapshot>> {
     let mut capture_activity = CaptureActivityTracker::default();
     read_panes_with_detection_tracked(io, stale_threshold_seconds, &mut capture_activity)
+}
+
+pub fn read_panes_with_shared_capture_activity(
+    io: &dyn WorkerIo,
+    stale_threshold_seconds: i64,
+    capture_activity: &SharedCaptureActivity,
+) -> Result<Vec<PaneSnapshot>> {
+    let now = now_epoch();
+    let panes = io.read_panes()?;
+    capture_activity.prune(
+        &panes
+            .iter()
+            .map(|pane| pane.pane_id.clone())
+            .collect::<BTreeSet<_>>(),
+    );
+    Ok(panes
+        .into_iter()
+        .map(|pane| {
+            apply_capture_detection_with_recorder(
+                io,
+                pane,
+                now,
+                stale_threshold_seconds,
+                |pane_id, started_at, now_epoch, tail| {
+                    capture_activity.record_tail(pane_id, started_at, now_epoch, tail)
+                },
+            )
+        })
+        .collect())
 }
 
 fn read_panes_with_detection_tracked(
@@ -314,10 +371,28 @@ pub fn apply_capture_detection(
 
 fn apply_capture_detection_with_tracker(
     io: &dyn WorkerIo,
-    mut pane: PaneSnapshot,
+    pane: PaneSnapshot,
     now_epoch: i64,
     stale_threshold_seconds: i64,
     capture_activity: &mut CaptureActivityTracker,
+) -> PaneSnapshot {
+    apply_capture_detection_with_recorder(
+        io,
+        pane,
+        now_epoch,
+        stale_threshold_seconds,
+        |pane_id, started_at, now_epoch, tail| {
+            capture_activity.record_tail(pane_id, started_at, now_epoch, tail)
+        },
+    )
+}
+
+fn apply_capture_detection_with_recorder(
+    io: &dyn WorkerIo,
+    mut pane: PaneSnapshot,
+    now_epoch: i64,
+    stale_threshold_seconds: i64,
+    mut record_tail: impl FnMut(&str, Option<i64>, i64, &str) -> Option<i64>,
 ) -> PaneSnapshot {
     if !is_live_agent_pane(&pane) {
         return pane;
@@ -339,8 +414,7 @@ fn apply_capture_detection_with_tracker(
             pane.status = "waiting".to_string();
             pane.wait_reason = wait_reason.to_string();
         } else if running_has_started_at {
-            observed_activity_epoch =
-                capture_activity.record_tail(&pane.pane_id, started_at, now_epoch, &tail);
+            observed_activity_epoch = record_tail(&pane.pane_id, started_at, now_epoch, &tail);
         }
     }
     if pane.status == "running" && !running_has_started_at {

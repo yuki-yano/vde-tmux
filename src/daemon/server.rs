@@ -233,11 +233,13 @@ pub fn run_runtime_daemon_server(
     let (tx, rx) = mpsc::channel();
     install_shutdown_signal_handler(tx.clone())?;
     let latest_panes = Arc::new(crate::daemon::workers::LatestPanes::default());
+    let capture_activity = Arc::new(crate::daemon::workers::SharedCaptureActivity::new());
     let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
     let worker_io = Arc::new(crate::daemon::workers::SystemWorkerIo::new(runner));
     crate::daemon::workers::start_tmux_worker(
         worker_io.clone(),
         latest_panes.clone(),
+        capture_activity.clone(),
         tx.clone(),
         Duration::from_millis(config.daemon.poll_ms),
         300,
@@ -280,6 +282,7 @@ pub fn run_runtime_daemon_server(
         rx,
         Some(state_path),
         worker_io,
+        capture_activity,
     )
 }
 
@@ -349,13 +352,17 @@ pub fn run_runtime_loop(
     rx: mpsc::Receiver<DaemonEvent>,
     state_path: Option<std::path::PathBuf>,
     worker_io: Arc<dyn crate::daemon::workers::WorkerIo>,
+    capture_activity: Arc<crate::daemon::workers::SharedCaptureActivity>,
 ) -> Result<()> {
     let notify_command = state.notify_command().map(str::to_string);
     while state.is_running() {
         let effects = match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(DaemonEvent::RefreshPanes { reply }) => {
-                refresh_panes_once(&mut state, worker_io.as_ref(), reply)
-            }
+            Ok(DaemonEvent::RefreshPanes { reply }) => refresh_panes_once(
+                &mut state,
+                worker_io.as_ref(),
+                capture_activity.as_ref(),
+                reply,
+            ),
             Ok(event) => state.apply_event(event),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 state.apply_event(DaemonEvent::DebounceCheck(std::time::Instant::now()))
@@ -383,9 +390,14 @@ pub fn run_runtime_loop(
 fn refresh_panes_once(
     state: &mut RuntimeState,
     worker_io: &dyn crate::daemon::workers::WorkerIo,
+    capture_activity: &crate::daemon::workers::SharedCaptureActivity,
     reply: Sender<ServerMessage>,
 ) -> Vec<RuntimeEffect> {
-    match crate::daemon::workers::read_panes_with_detection(worker_io, 300) {
+    match crate::daemon::workers::read_panes_with_shared_capture_activity(
+        worker_io,
+        300,
+        capture_activity,
+    ) {
         Ok(panes) => {
             let effects = state.apply_event(DaemonEvent::PanesUpdated(panes));
             let _ = reply.send(ServerMessage::Ack);
@@ -788,6 +800,7 @@ mod tests {
     #[derive(Default)]
     struct LoopWorkerIo {
         panes: std::sync::Mutex<Vec<crate::options::snapshot::PaneSnapshot>>,
+        captures: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
         jumps: std::sync::Mutex<Vec<String>>,
         previews: std::sync::Mutex<Vec<(String, u32)>>,
         pane_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
@@ -802,8 +815,14 @@ mod tests {
             Ok(self.panes.lock().unwrap().clone())
         }
 
-        fn capture_tail(&self, _pane_id: &str) -> anyhow::Result<String> {
-            Ok(String::new())
+        fn capture_tail(&self, pane_id: &str) -> anyhow::Result<String> {
+            Ok(self
+                .captures
+                .lock()
+                .unwrap()
+                .get(pane_id)
+                .cloned()
+                .unwrap_or_default())
         }
 
         fn jump_to_pane(&self, pane_id: &str) -> anyhow::Result<()> {
@@ -907,6 +926,10 @@ mod tests {
         }
     }
 
+    fn shared_capture_activity() -> Arc<crate::daemon::workers::SharedCaptureActivity> {
+        Arc::new(crate::daemon::workers::SharedCaptureActivity::new())
+    }
+
     #[test]
     fn runtime_effects_write_session_category_metadata() {
         let io = LoopWorkerIo::default();
@@ -978,6 +1001,7 @@ mod tests {
             rx,
             None,
             io.clone(),
+            shared_capture_activity(),
         )
         .unwrap();
 
@@ -1014,6 +1038,7 @@ mod tests {
             rx,
             None,
             io,
+            shared_capture_activity(),
         )
         .unwrap();
 
@@ -1024,6 +1049,47 @@ mod tests {
                 text: "#[fg=#ff6b6b]▲1#[default]".to_string()
             }
         );
+    }
+
+    #[test]
+    fn refresh_panes_reuses_shared_capture_activity() {
+        use crate::daemon::runtime::RuntimeState;
+        use crate::sidebar::state::SidebarState;
+        use std::sync::{Arc, mpsc};
+
+        let io = Arc::new(LoopWorkerIo::default());
+        let mut pane = test_agent_pane("main", "%1", "running");
+        pane.started_at = (crate::sidebar::tree::now_epoch_secs() - 1_000).to_string();
+        io.panes.lock().unwrap().push(pane);
+        io.captures
+            .lock()
+            .unwrap()
+            .insert("%1".to_string(), "Working (1s)\n".to_string());
+        let capture_activity = shared_capture_activity();
+        let initial = crate::daemon::workers::read_panes_with_shared_capture_activity(
+            io.as_ref(),
+            300,
+            capture_activity.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(initial[0].status, "idle");
+        io.captures
+            .lock()
+            .unwrap()
+            .insert("%1".to_string(), "Working (2s)\n".to_string());
+
+        let mut state =
+            RuntimeState::new(crate::config::Config::default(), SidebarState::default());
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let effects =
+            refresh_panes_once(&mut state, io.as_ref(), capture_activity.as_ref(), reply_tx);
+
+        assert_eq!(reply_rx.recv().unwrap(), ServerMessage::Ack);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::SetSessionBadge { session, state, .. }
+                if session == "main" && state == "working"
+        )));
     }
 
     #[test]
@@ -1055,6 +1121,7 @@ mod tests {
             rx,
             None,
             io,
+            shared_capture_activity(),
         )
         .unwrap();
 
@@ -1109,6 +1176,7 @@ mod tests {
             rx,
             Some(state_path.clone()),
             io,
+            shared_capture_activity(),
         )
         .unwrap();
 
@@ -1129,7 +1197,7 @@ mod tests {
         let state = RuntimeState::new(crate::config::Config::default(), SidebarState::default());
         let handle = {
             let io = io.clone();
-            thread::spawn(move || run_runtime_loop(state, rx, None, io))
+            thread::spawn(move || run_runtime_loop(state, rx, None, io, shared_capture_activity()))
         };
         tx.send(DaemonEvent::PanesUpdated(vec![test_agent_pane(
             "main", "%1", "running",
