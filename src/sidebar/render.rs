@@ -1519,7 +1519,6 @@ enum ClosedChatRightTone {
     State,
     TaskDone,
     TaskWorking,
-    TaskPending,
     Subagent,
 }
 
@@ -1596,7 +1595,6 @@ fn closed_chat_right_tone_style(
         ClosedChatRightTone::State => right_style(row, theme),
         ClosedChatRightTone::TaskDone => Style::default().fg(theme.task_done),
         ClosedChatRightTone::TaskWorking => Style::default().fg(theme.task_working),
-        ClosedChatRightTone::TaskPending => Style::default().fg(theme.task_pending),
         ClosedChatRightTone::Subagent => Style::default().fg(theme.subagent_label),
     }
 }
@@ -1666,10 +1664,8 @@ fn task_progress_token(row: &SidebarRow) -> Option<ClosedChatRightPart> {
 fn task_progress_tone(done: i64, total: i64) -> ClosedChatRightTone {
     if done >= total {
         ClosedChatRightTone::TaskDone
-    } else if done > 0 {
-        ClosedChatRightTone::TaskWorking
     } else {
-        ClosedChatRightTone::TaskPending
+        ClosedChatRightTone::TaskWorking
     }
 }
 
@@ -3900,6 +3896,32 @@ badge:
             text.iter().all(|line| display_width(line) == 64),
             "{text:?}"
         );
+    }
+
+    #[test]
+    fn closed_chat_task_progress_with_zero_done_uses_working_color() {
+        let mut chat = row(
+            "chat::%1",
+            SidebarRowKind::Chat,
+            0,
+            "codex: implement sidebar task colors",
+            RollupLevel::Running,
+        );
+        chat.badge_state = Some(BadgeState::Working);
+        chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            prompt: Some("implement sidebar task colors".to_string()),
+            elapsed_secs: Some(42),
+            tasks_done: Some(0),
+            tasks_total: Some(3),
+            ..Default::default()
+        });
+        let theme = SidebarRenderTheme::default();
+
+        let lines = render_lines(&[chat], &SidebarState::default(), 64, &theme);
+
+        assert_span_fg(&lines[0].spans, "☑ 0/3", theme.task_working);
     }
 
     #[test]
