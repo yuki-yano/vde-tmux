@@ -68,7 +68,7 @@ bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_rang
 - `statusline-summary`：全 agent の状態別カウント。例 `▲2 ●1`
 - `statusline-attention`：いま見えていない blocked agent の通知。例 `▲ session · perm 2m`
 
-`statusline.sessions.badge_style: chip` を使うと、各 session セグメントの前に接続された chip として session badge を表示する。chip の色と左右 cap は `statusline.session_badge.chip` で設定する。
+`statusline.sessions.badge_style: chip` を使うと、各 session セグメントの前に接続された chip として session badge を表示する。category/window の badge は `statusline.category.agent_badge` / `statusline.windows.agent_badge` で状態の集計方法を設定し、`statusline.category.badge_style` / `statusline.windows.badge_style` で見た目を設定する。inline 系の表示位置は `{badge}` placeholder で指定する。chip の色と左右 cap は `statusline.session_badge.chip` で設定する。
 
 `status-left-length` には十分大きい値を指定し、左セグメント側の人工的な長さ制限を外す。実際の表示上限は端末幅である。`statusline-windows` は tmux native の window list を置き換えるため、併用時は native の `window-status-*` format を空にする。
 
@@ -283,6 +283,21 @@ statusline:
       cap_right: ""
   sessions:
     badge_style: inline   # inline | plain | outer | chip
+  category:
+    format: "{badge}{category} "
+    badge_style: chip   # inline | plain | outer | chip
+    agent_badge:
+      enabled: true
+      mode: rollup        # rollup | counts
+  windows:
+    badge_style: inline   # inline | plain | outer | chip
+    current:
+      format: " {badge}{index}:{window} "
+    other:
+      format: " {badge}{index}:{window} "
+    agent_badge:
+      enabled: false
+      mode: rollup        # rollup | counts
   summary:
     enabled: true
 
@@ -323,8 +338,12 @@ statusline:
       cap_right: ""
   category:
     mode: list
-    format: "{category} {name} "
-    inactive_format: "{category} "
+    format: "{badge}{category} {name} "
+    inactive_format: "{badge}{category} "
+    badge_style: chip
+    agent_badge:
+      enabled: true
+      mode: rollup
     colors:
       fg: "#ecebff"
       bg: "#453f9e"
@@ -344,6 +363,10 @@ statusline:
         fg: "#9591ad"
   windows:
     separator: "#[fg=#8f8ba8]│#[default]"
+    badge_style: inline
+    agent_badge:
+      enabled: false
+      mode: rollup
     current:
       format: " {index}:{window} "
       bold: false

@@ -69,7 +69,7 @@ bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_rang
 - `statusline-summary` — state counts across all agents, e.g. `▲2 ●1`
 - `statusline-attention` — blocked agents you cannot currently see, e.g. `▲ session · perm 2m`
 
-Use `statusline.sessions.badge_style: chip` to render session badges as a connected chip before each session segment. The chip color and cap glyphs are configured under `statusline.session_badge.chip`.
+Use `statusline.sessions.badge_style: chip` to render session badges as a connected chip before each session segment. Category and window badges use `statusline.category.agent_badge` / `statusline.windows.agent_badge` for state selection, `statusline.category.badge_style` / `statusline.windows.badge_style` for placement, and the `{badge}` placeholder for inline styles. The chip color and cap glyphs are configured under `statusline.session_badge.chip`.
 
 Set `status-left-length` to a large value to remove the artificial left segment cap; the terminal width remains the real display limit. `statusline-windows` replaces tmux's native window list, so the native `window-status-*` formats should be empty when using it.
 
@@ -284,6 +284,21 @@ statusline:
       cap_right: ""
   sessions:
     badge_style: inline   # inline | plain | outer | chip
+  category:
+    format: "{badge}{category} "
+    badge_style: chip   # inline | plain | outer | chip
+    agent_badge:
+      enabled: true
+      mode: rollup        # rollup | counts
+  windows:
+    badge_style: inline   # inline | plain | outer | chip
+    current:
+      format: " {badge}{index}:{window} "
+    other:
+      format: " {badge}{index}:{window} "
+    agent_badge:
+      enabled: false
+      mode: rollup        # rollup | counts
   summary:
     enabled: true
 
@@ -324,8 +339,12 @@ statusline:
       cap_right: ""
   category:
     mode: list
-    format: "{category} {name} "
-    inactive_format: "{category} "
+    format: "{badge}{category} {name} "
+    inactive_format: "{badge}{category} "
+    badge_style: chip
+    agent_badge:
+      enabled: true
+      mode: rollup
     colors:
       fg: "#ecebff"
       bg: "#453f9e"
@@ -345,6 +364,10 @@ statusline:
         fg: "#9591ad"
   windows:
     separator: "#[fg=#8f8ba8]│#[default]"
+    badge_style: inline
+    agent_badge:
+      enabled: false
+      mode: rollup
     current:
       format: " {index}:{window} "
       bold: false
