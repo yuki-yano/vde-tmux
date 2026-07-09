@@ -120,15 +120,15 @@ pub(crate) fn ensure_daemon_started_with_lock(
     exe: &Path,
     spawner: &dyn DaemonSpawner,
 ) -> Result<()> {
-    if daemon_socket_responds(&socket) {
+    if daemon_socket_responds(socket) {
         return Ok(());
     }
     if socket.exists() {
-        std::fs::remove_file(&socket)
+        std::fs::remove_file(socket)
             .with_context(|| format!("failed to remove stale socket {}", socket.display()))?;
     }
-    spawner.spawn_detached(exe, &socket)?;
-    if wait_for_daemon_socket(&socket, DAEMON_START_TIMEOUT) {
+    spawner.spawn_detached(exe, socket)?;
+    if wait_for_daemon_socket(socket, DAEMON_START_TIMEOUT) {
         return Ok(());
     }
     bail!(
@@ -244,6 +244,7 @@ fn open_lock_file(path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(path)
         .with_context(|| format!("failed to open lock file {}", path.display()))
