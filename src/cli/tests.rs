@@ -20,7 +20,7 @@ fn window_row(
     command: &str,
 ) -> String {
     [
-        session, index, id, name, panes, active, "0", "0", "0", "0", command,
+        session, index, id, name, panes, active, "0", "0", "0", "0", command, "", "", "",
     ]
     .join("\u{1f}")
 }
@@ -34,7 +34,7 @@ fn dispatch_statusline_sessions_prints_output() {
     let format = crate::session::session_list_format();
     mock.stub(
         &["list-sessions", "-F", &format],
-        "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
+        "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
     );
     mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
     mock.stub(&["show-option", "-gqv", "@vde_heartbeat"], "");
@@ -48,7 +48,7 @@ fn dispatch_statusline_sessions_show_index_overrides_config() {
     let format = crate::session::session_list_format();
     mock.stub(
         &["list-sessions", "-F", &format],
-        "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
+        "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
     );
     mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
     mock.stub(&["show-option", "-gqv", "@vde_heartbeat"], "");
@@ -170,7 +170,7 @@ fn dispatch_statusline_click_routes_category_index() {
     let format = crate::session::session_list_format();
     mock.stub(
         &["list-sessions", "-F", &format],
-        "a\u{1f}1\u{1f}100\u{1f}alpha\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\nb\u{1f}1\u{1f}100\u{1f}beta\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
+        "a\u{1f}1\u{1f}100\u{1f}alpha\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\nb\u{1f}1\u{1f}100\u{1f}beta\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
     );
     mock.stub(
         &["display-message", "-p", "#{client_name}\t#{client_tty}"],
@@ -210,7 +210,7 @@ fn dispatch_category_use_switches_category() {
     );
     mock.stub(
         &["list-sessions", "-F", &format],
-        "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
+        "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
     );
     mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "");
     mock.stub(&["switch-client", "-c", "abc", "-t", "=main:"], "");
@@ -368,7 +368,7 @@ fn dispatch_session_manager_renders_preview() {
     let window_format = crate::window::window_list_format();
     mock.stub(
         &["list-sessions", "-F", &session_format],
-        "ni.zsh\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
+        "ni.zsh\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
     );
     mock.stub(
         &["list-windows", "-t", "=ni.zsh:", "-F", &window_format],
@@ -552,7 +552,7 @@ fn dispatch_hooks_on_client_session_changed_requests_pane_refresh() {
     let format = crate::session::session_list_format();
     mock.stub(
         &["list-sessions", "-F", &format],
-        "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
+        "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
     );
     mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
 
@@ -638,7 +638,7 @@ fn config_warning_is_written_to_stderr_without_polluting_statusline_stdout() {
     let format = crate::session::session_list_format();
     mock.stub(
         &["list-sessions", "-F", &format],
-        "main\u{1f}1\u{1f}100\u{1f}misc\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\n",
+        "main\u{1f}1\u{1f}100\u{1f}misc\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
     );
     mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
 

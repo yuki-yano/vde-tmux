@@ -275,6 +275,37 @@
         "category": {
           "additionalProperties": true,
           "properties": {
+            "agent_badge": {
+              "additionalProperties": true,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "hide_idle": {
+                  "type": "boolean"
+                },
+                "mode": {
+                  "enum": [
+                    "rollup",
+                    "counts"
+                  ],
+                  "type": "string"
+                },
+                "suffix": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "badge_style": {
+              "enum": [
+                "inline",
+                "plain",
+                "outer",
+                "chip"
+              ],
+              "type": "string"
+            },
             "format": {
               "type": "string"
             },
@@ -283,9 +314,6 @@
             },
             "mode": {
               "type": "string"
-            },
-            "show_badge": {
-              "type": "boolean"
             }
           },
           "type": "object"
@@ -443,6 +471,37 @@
                 }
               },
               "type": "object"
+            },
+            "agent_badge": {
+              "additionalProperties": true,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "hide_idle": {
+                  "type": "boolean"
+                },
+                "mode": {
+                  "enum": [
+                    "rollup",
+                    "counts"
+                  ],
+                  "type": "string"
+                },
+                "suffix": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "badge_style": {
+              "enum": [
+                "inline",
+                "plain",
+                "outer",
+                "chip"
+              ],
+              "type": "string"
             },
             "bell": {
               "additionalProperties": true,

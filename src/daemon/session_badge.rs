@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::config::{BadgeGlyphs, SessionBadgeConfig, SessionBadgeMode};
+use crate::config::{AgentBadgeConfig, BadgeGlyphs, SessionBadgeConfig, SessionBadgeMode};
 use crate::hook::RollupLevel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -19,6 +19,64 @@ impl BadgeState {
             BadgeState::Done => "done",
             BadgeState::Idle => "idle",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BadgeStateCounts {
+    pub blocked: usize,
+    pub working: usize,
+    pub done: usize,
+    pub idle: usize,
+}
+
+impl BadgeStateCounts {
+    pub fn from_states(states: impl IntoIterator<Item = BadgeState>) -> Self {
+        let mut counts = Self::default();
+        for state in states {
+            counts.push(state);
+        }
+        counts
+    }
+
+    pub fn push(&mut self, state: BadgeState) {
+        match state {
+            BadgeState::Blocked => self.blocked += 1,
+            BadgeState::Working => self.working += 1,
+            BadgeState::Done => self.done += 1,
+            BadgeState::Idle => self.idle += 1,
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.blocked += other.blocked;
+        self.working += other.working;
+        self.done += other.done;
+        self.idle += other.idle;
+    }
+
+    pub fn total(self) -> usize {
+        self.blocked + self.working + self.done + self.idle
+    }
+
+    pub fn rollup_state(self) -> Option<BadgeState> {
+        [
+            (BadgeState::Blocked, self.blocked),
+            (BadgeState::Working, self.working),
+            (BadgeState::Done, self.done),
+            (BadgeState::Idle, self.idle),
+        ]
+        .into_iter()
+        .find_map(|(state, count)| (count > 0).then_some(state))
+    }
+
+    pub fn encode(self) -> String {
+        serde_json::to_string(&self).expect("BadgeStateCounts serialization should not fail")
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        serde_json::from_str(raw).ok()
     }
 }
 
@@ -41,56 +99,64 @@ pub fn session_badge_value(
     glyphs: &BadgeGlyphs,
     config: &SessionBadgeConfig,
 ) -> Option<String> {
-    let states = states.into_iter().collect::<Vec<_>>();
-    match config.mode {
-        SessionBadgeMode::Rollup => {
-            session_badge_rollup_value(states, glyphs, &config.suffix, config.hide_idle)
-        }
-        SessionBadgeMode::Counts => {
-            session_badge_counts_value(states, glyphs, &config.suffix, config.hide_idle)
-        }
-    }
+    badge_value_from_counts(
+        BadgeStateCounts::from_states(states),
+        glyphs,
+        config.mode,
+        &config.suffix,
+        config.hide_idle,
+    )
 }
 
-fn session_badge_rollup_value(
-    states: impl IntoIterator<Item = BadgeState>,
+pub fn agent_badge_value_from_counts(
+    counts: BadgeStateCounts,
     glyphs: &BadgeGlyphs,
+    config: &AgentBadgeConfig,
+) -> Option<String> {
+    badge_value_from_counts(
+        counts,
+        glyphs,
+        config.mode,
+        &config.suffix,
+        config.hide_idle,
+    )
+}
+
+pub fn badge_value_from_counts(
+    mut counts: BadgeStateCounts,
+    glyphs: &BadgeGlyphs,
+    mode: SessionBadgeMode,
     suffix: &str,
     hide_idle: bool,
 ) -> Option<String> {
-    let state = states.into_iter().min()?;
-    if hide_idle && state == BadgeState::Idle {
-        return None;
+    if hide_idle {
+        counts.idle = 0;
     }
+    match mode {
+        SessionBadgeMode::Rollup => badge_rollup_value(counts, glyphs, suffix),
+        SessionBadgeMode::Counts => badge_counts_value(counts, glyphs, suffix),
+    }
+}
+
+fn badge_rollup_value(
+    counts: BadgeStateCounts,
+    glyphs: &BadgeGlyphs,
+    suffix: &str,
+) -> Option<String> {
+    let state = counts.rollup_state()?;
     Some(format!("{}{suffix}", glyph_for_state(state, glyphs)))
 }
 
-fn session_badge_counts_value(
-    states: impl IntoIterator<Item = BadgeState>,
+fn badge_counts_value(
+    counts: BadgeStateCounts,
     glyphs: &BadgeGlyphs,
     suffix: &str,
-    hide_idle: bool,
 ) -> Option<String> {
-    let mut blocked = 0usize;
-    let mut working = 0usize;
-    let mut done = 0usize;
-    let mut idle = 0usize;
-    for state in states {
-        match state {
-            BadgeState::Blocked => blocked += 1,
-            BadgeState::Working => working += 1,
-            BadgeState::Done => done += 1,
-            BadgeState::Idle => idle += 1,
-        }
-    }
-    if hide_idle {
-        idle = 0;
-    }
     let parts = [
-        (BadgeState::Blocked, blocked),
-        (BadgeState::Working, working),
-        (BadgeState::Done, done),
-        (BadgeState::Idle, idle),
+        (BadgeState::Blocked, counts.blocked),
+        (BadgeState::Working, counts.working),
+        (BadgeState::Done, counts.done),
+        (BadgeState::Idle, counts.idle),
     ]
     .into_iter()
     .filter(|(_, count)| *count > 0)

@@ -2,10 +2,12 @@ use anyhow::{Result, anyhow};
 
 use crate::category::{resolve_category_for_session, sessions_in_category, sorted_categories};
 use crate::config::{
-    BadgeConfig, BadgeGlyphs, BadgeStyle, Config, SegmentColors, SegmentStyle,
+    AgentBadgeConfig, BadgeConfig, BadgeGlyphs, BadgeStyle, Config, SegmentColors, SegmentStyle,
     SessionBadgeChipConfig, SessionBadgeMode, StatuslineCategoryConfig,
 };
-use crate::daemon::session_badge::{BadgeState, badge_state, glyph_for_state};
+use crate::daemon::session_badge::{
+    BadgeState, BadgeStateCounts, agent_badge_value_from_counts, badge_state, glyph_for_state,
+};
 use crate::hook::{AgentStatus, pane_rollup_level};
 use crate::options::snapshot::detect_agent_from_command;
 use crate::session::{
@@ -207,15 +209,40 @@ pub fn render_statusline_windows(config: &Config, windows: &[WindowInfo]) -> Str
         .iter()
         .map(|window| {
             let style = window_segment_style(config, window);
+            let badge = window_agent_badge(config, window);
+            let badge_fragment = agent_badge_fragment_for_config(
+                config,
+                &config.statusline.windows.agent_badge,
+                config.statusline.windows.badge_style,
+                badge.as_ref(),
+                &style.colors,
+            );
             let body = style
                 .format
+                .replace("{badge}", &badge_fragment)
                 .replace("{index}", &window.index)
                 .replace("{window}", &window.name)
                 .replace("{name}", &window.name)
                 .replace("{id}", &window.id)
                 .replace("{panes}", &window.panes.to_string())
-                .replace("{command}", &window.command);
-            let segment = tmux_style_segment(&style, &body);
+                .replace("{command}", &window.command)
+                .replace("{state}", &window.state);
+            let segment = if config.statusline.windows.badge_style == BadgeStyle::Chip {
+                match badge.as_ref() {
+                    Some((value, state)) => render_chip_agent_segment(
+                        &style,
+                        value,
+                        state,
+                        &body,
+                        config.statusline.windows.agent_badge.mode == SessionBadgeMode::Counts,
+                        &config.badge,
+                        &config.statusline.session_badge.chip,
+                    ),
+                    None => tmux_style_segment(&style, &body),
+                }
+            } else {
+                tmux_style_segment(&style, &body)
+            };
             if window.id.is_empty() {
                 segment
             } else {
@@ -265,7 +292,14 @@ pub fn render_statusline_category(
             } else {
                 &config.statusline.category.inactive_colors
             };
-            let badge = category_badge_fragment(config, &category_sessions, colors);
+            let badge = category_agent_badge(config, &category_sessions);
+            let badge_fragment = agent_badge_fragment_for_config(
+                config,
+                &config.statusline.category.agent_badge,
+                config.statusline.category.badge_style,
+                badge.as_ref(),
+                colors,
+            );
             let format = if active {
                 &config.statusline.category.format
             } else {
@@ -275,8 +309,17 @@ pub fn render_statusline_category(
                 .replace("{category}", label)
                 .replace("{name}", category)
                 .replace("{count}", &category_sessions.len().to_string())
-                .replace("{badge}", &badge);
-            let segment = tmux_style_category(&config.statusline.category, &body, active);
+                .replace("{badge}", &badge_fragment);
+            let segment = if config.statusline.category.badge_style == BadgeStyle::Chip {
+                match badge.as_ref() {
+                    Some((value, state)) => {
+                        render_chip_category_segment(config, value, state, &body, active)
+                    }
+                    None => tmux_style_category(&config.statusline.category, &body, active),
+                }
+            } else {
+                tmux_style_category(&config.statusline.category, &body, active)
+            };
             format!("#[range=user|{}]{segment}#[norange]", index + 1)
         })
         .collect::<Vec<_>>()
@@ -543,42 +586,72 @@ fn tmux_plain_text(raw: &str) -> String {
         .replace("#[", "# [")
 }
 
-fn category_badge_fragment(
+fn category_agent_badge(
     config: &Config,
     category_sessions: &[&SessionInfo],
+) -> Option<(String, String)> {
+    let badge_config = &config.statusline.category.agent_badge;
+    if !badge_config.enabled {
+        return None;
+    }
+    let counts = category_sessions
+        .iter()
+        .filter_map(|session| BadgeStateCounts::decode(&session.agent_counts))
+        .fold(BadgeStateCounts::default(), |mut total, counts| {
+            total.merge(counts);
+            total
+        });
+    let value = agent_badge_value_from_counts(counts, &config.badge.glyphs, badge_config)?;
+    let state = counts
+        .rollup_state()
+        .unwrap_or(BadgeState::Idle)
+        .as_str()
+        .to_string();
+    Some((value, state))
+}
+
+fn window_agent_badge(config: &Config, window: &WindowInfo) -> Option<(String, String)> {
+    let badge_config = &config.statusline.windows.agent_badge;
+    if !badge_config.enabled {
+        return None;
+    }
+    match BadgeStateCounts::decode(&window.agent_counts) {
+        Some(counts) => {
+            let value = agent_badge_value_from_counts(counts, &config.badge.glyphs, badge_config)?;
+            let state = counts
+                .rollup_state()
+                .unwrap_or(BadgeState::Idle)
+                .as_str()
+                .to_string();
+            Some((value, state))
+        }
+        None if !window.badge.is_empty() => Some((window.badge.clone(), window.state.clone())),
+        None => None,
+    }
+}
+
+fn agent_badge_fragment_for_config(
+    config: &Config,
+    agent_config: &AgentBadgeConfig,
+    badge_style: BadgeStyle,
+    badge: Option<&(String, String)>,
     colors: &crate::config::SegmentColors,
 ) -> String {
-    if !config.statusline.category.show_badge {
+    if badge_style == BadgeStyle::Chip {
         return String::new();
     }
-    let rank = |state: &str| match state {
-        "blocked" => Some(0_u8),
-        "working" => Some(1),
-        "done" => Some(2),
-        "idle" => Some(3),
-        _ => None,
-    };
-    let worst = category_sessions
-        .iter()
-        .filter_map(|session| rank(&session.state).map(|rank| (rank, session.state.as_str())))
-        .min_by_key(|(rank, _)| *rank);
-    let Some((_, state)) = worst else {
+    let Some((value, state)) = badge else {
         return String::new();
     };
-    let glyphs = &config.badge.glyphs;
-    let glyph = match state {
-        "blocked" => &glyphs.blocked,
-        "working" => &glyphs.working,
-        "done" => &glyphs.done,
-        _ => &glyphs.idle,
-    };
-    match config.badge.colors.for_state(state) {
-        Some(color) => {
-            let restore = colors.fg.as_deref().unwrap_or("default");
-            format!("#[fg={color}]{glyph}#[fg={restore}]")
-        }
-        None => glyph.to_string(),
-    }
+    agent_badge_fragment(
+        config,
+        agent_config,
+        badge_style,
+        value,
+        state,
+        colors.fg.as_deref(),
+        colors.bg.as_deref(),
+    )
 }
 
 pub fn statusline_attention(
@@ -714,26 +787,86 @@ fn render_chip_session_segment(
         return tmux_style_segment(style, &body);
     }
 
-    let chip_body = chip_badge_body(badge, state, options.separate_badge, options.badge_config);
+    render_chip_agent_segment(
+        style,
+        badge,
+        state,
+        &body,
+        options.separate_badge,
+        options.badge_config,
+        options.chip_config,
+    )
+}
+
+fn render_chip_agent_segment(
+    style: &SegmentStyle,
+    badge: &str,
+    state: &str,
+    body: &str,
+    separate_badge: bool,
+    badge_config: &BadgeConfig,
+    chip_config: &SessionBadgeChipConfig,
+) -> String {
+    if badge.is_empty() {
+        return tmux_style_segment(style, body);
+    }
+
+    let chip_body = chip_badge_body(badge, state, separate_badge, badge_config);
     let chip_start = format!(
         "#[fg={}]{}#[bg={}] {chip_body} ",
-        options.chip_config.bg, options.chip_config.cap_left, options.chip_config.bg
+        chip_config.bg, chip_config.cap_left, chip_config.bg
     );
     if let Some(segment_bg) = &style.colors.bg {
         return format!(
             "{chip_start}#[bg={segment_bg}]{}#[default] ",
-            tmux_style_segment_without_prefix(style, &body)
+            tmux_style_segment_without_prefix(style, body)
         );
     }
 
     let chip_end = format!(
         "#[fg={},bg=default]{}#[default]",
-        options.chip_config.bg, options.chip_config.cap_right
+        chip_config.bg, chip_config.cap_right
     );
-    format!(
-        "{chip_start}{chip_end} {}",
-        tmux_style_segment(style, &body)
-    )
+    format!("{chip_start}{chip_end} {}", tmux_style_segment(style, body))
+}
+
+fn render_chip_category_segment(
+    config: &Config,
+    badge: &str,
+    state: &str,
+    body: &str,
+    active: bool,
+) -> String {
+    if badge.is_empty() {
+        return tmux_style_category(&config.statusline.category, body, active);
+    }
+
+    let chip_config = &config.statusline.session_badge.chip;
+    let counts_mode = config.statusline.category.agent_badge.mode == SessionBadgeMode::Counts;
+    let chip_body = chip_badge_body(badge, state, counts_mode, &config.badge);
+    let chip_start = format!(
+        "#[fg={}]{}#[bg={}] {chip_body} ",
+        chip_config.bg, chip_config.cap_left, chip_config.bg
+    );
+    let colors = category_colors(&config.statusline.category, active);
+    let segment_bg = colors.bg.as_deref().unwrap_or(chip_config.bg.as_str());
+    let styled = tmux_style_category_body_with_bg(
+        &config.statusline.category,
+        body,
+        active,
+        Some(segment_bg),
+    );
+    let suffix = if colors.bg.is_some() {
+        category_affixes(&config.statusline.category, active)
+            .1
+            .to_string()
+    } else {
+        format!(
+            "#[fg={},bg=default]{}#[default] ",
+            chip_config.bg, chip_config.cap_right
+        )
+    };
+    format!("{chip_start}#[bg={segment_bg}]{styled}{suffix}")
 }
 
 fn chip_badge_body(
@@ -778,6 +911,48 @@ fn counts_badge_fragment(badge: &str, restore_fg: &str, badge_config: &BadgeConf
         index += 1;
     }
     parts.join(" ")
+}
+
+fn agent_badge_fragment(
+    config: &Config,
+    agent_config: &AgentBadgeConfig,
+    badge_style: BadgeStyle,
+    badge: &str,
+    state: &str,
+    restore_fg: Option<&str>,
+    restore_bg: Option<&str>,
+) -> String {
+    if badge.is_empty() {
+        return String::new();
+    }
+    let restore_fg = restore_fg.unwrap_or("default");
+    let restore_bg = restore_bg.unwrap_or("default");
+    let counts_mode = agent_config.mode == SessionBadgeMode::Counts;
+    match badge_style {
+        BadgeStyle::Plain => badge.to_string(),
+        BadgeStyle::Chip => {
+            let chip_config = &config.statusline.session_badge.chip;
+            let chip_body = chip_badge_body(badge, state, counts_mode, &config.badge);
+            format!(
+                "#[fg={},bg={restore_bg}]{}#[fg={restore_fg},bg={}] {chip_body} #[fg={},bg={restore_bg}]{}#[fg={restore_fg},bg={restore_bg}]",
+                chip_config.bg,
+                chip_config.cap_left,
+                chip_config.bg,
+                chip_config.bg,
+                chip_config.cap_right
+            )
+        }
+        BadgeStyle::Inline | BadgeStyle::Outer => {
+            if counts_mode {
+                counts_badge_fragment(badge, restore_fg, &config.badge)
+            } else {
+                match config.badge.colors.for_state(state) {
+                    Some(color) => format!("#[fg={color}]{badge}#[fg={restore_fg}]"),
+                    None => badge.to_string(),
+                }
+            }
+        }
+    }
 }
 
 fn count_glyph_state(token: &str, glyphs: &BadgeGlyphs) -> Option<BadgeState> {
@@ -873,12 +1048,41 @@ fn tmux_style_segment_body(style: &SegmentStyle, body: &str) -> String {
     }
 }
 
-fn tmux_style_category(config: &StatuslineCategoryConfig, body: &str, active: bool) -> String {
-    let colors = if active {
+fn category_colors(config: &StatuslineCategoryConfig, active: bool) -> &SegmentColors {
+    if active {
         &config.colors
     } else {
         &config.inactive_colors
-    };
+    }
+}
+
+fn category_affixes(config: &StatuslineCategoryConfig, active: bool) -> (&str, &str) {
+    let use_inactive =
+        !active && (!config.inactive_prefix.is_empty() || !config.inactive_suffix.is_empty());
+    if use_inactive {
+        (&config.inactive_prefix, &config.inactive_suffix)
+    } else {
+        (&config.prefix, &config.suffix)
+    }
+}
+
+fn tmux_style_category(config: &StatuslineCategoryConfig, body: &str, active: bool) -> String {
+    let styled = tmux_style_category_body(config, body, active);
+    let (prefix, suffix) = category_affixes(config, active);
+    format!("{prefix}{styled}{suffix}")
+}
+
+fn tmux_style_category_body(config: &StatuslineCategoryConfig, body: &str, active: bool) -> String {
+    tmux_style_category_body_with_bg(config, body, active, None)
+}
+
+fn tmux_style_category_body_with_bg(
+    config: &StatuslineCategoryConfig,
+    body: &str,
+    active: bool,
+    bg_override: Option<&str>,
+) -> String {
+    let colors = category_colors(config, active);
     let mut attrs = Vec::new();
     if config.bold && active {
         attrs.push("bold".to_string());
@@ -886,22 +1090,14 @@ fn tmux_style_category(config: &StatuslineCategoryConfig, body: &str, active: bo
     if let Some(fg) = &colors.fg {
         attrs.push(format!("fg={fg}"));
     }
-    if let Some(bg) = &colors.bg {
+    if let Some(bg) = bg_override.or(colors.bg.as_deref()) {
         attrs.push(format!("bg={bg}"));
     }
-    let styled = if attrs.is_empty() {
+    if attrs.is_empty() {
         body.to_string()
     } else {
         format!("#[{}]{}#[default]", attrs.join(","), body)
-    };
-    let use_inactive =
-        !active && (!config.inactive_prefix.is_empty() || !config.inactive_suffix.is_empty());
-    let (prefix, suffix) = if use_inactive {
-        (&config.inactive_prefix, &config.inactive_suffix)
-    } else {
-        (&config.prefix, &config.suffix)
-    };
-    format!("{prefix}{styled}{suffix}")
+    }
 }
 
 #[cfg(test)]
@@ -957,6 +1153,9 @@ mod tests {
             activity: false,
             silence: false,
             command: "zsh".to_string(),
+            badge: String::new(),
+            state: String::new(),
+            agent_counts: String::new(),
         }
     }
 
@@ -1072,14 +1271,52 @@ mod tests {
     fn render_statusline_windows_replaces_all_placeholders() {
         let mut config = Config::default();
         config.statusline.windows.other.format =
-            " {index}:{window}:{name}:{id}:{panes}:{command} ".to_string();
+            " {badge}{index}:{window}:{name}:{id}:{panes}:{command}:{state} ".to_string();
         let mut item = window("3", "@7", "logs", false);
         item.panes = 4;
         item.command = "tail".to_string();
+        item.state = "working".to_string();
 
         let rendered = render_statusline_windows(&config, &[item]);
 
-        assert!(rendered.contains(" 3:logs:logs:@7:4:tail "), "{rendered}");
+        assert!(
+            rendered.contains(" 3:logs:logs:@7:4:tail:working "),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn window_badge_uses_state_color_and_restores_segment_fg() {
+        let mut config = Config::default();
+        config.statusline.windows.agent_badge.enabled = true;
+        config.statusline.windows.other.format = " {badge}{window} ".to_string();
+        config.statusline.windows.other.colors.fg = Some("white".to_string());
+        let mut item = window("1", "@1", "agent", false);
+        item.agent_counts = r#"{"working":1}"#.to_string();
+
+        let rendered = render_statusline_windows(&config, &[item]);
+
+        assert!(
+            rendered.contains("#[fg=#4fd08a]●#[fg=white]agent"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn window_counts_badge_colors_each_count() {
+        let mut config = Config::default();
+        config.statusline.windows.agent_badge.enabled = true;
+        config.statusline.windows.agent_badge.mode = SessionBadgeMode::Counts;
+        config.statusline.windows.other.format = " {badge} {window} ".to_string();
+        let mut item = window("1", "@1", "agent", false);
+        item.agent_counts = r#"{"blocked":2,"working":1}"#.to_string();
+
+        let rendered = render_statusline_windows(&config, &[item]);
+
+        assert!(
+            rendered.contains("#[fg=#ff6b6b]▲ 2#[fg=default] #[fg=#4fd08a]● 1#[fg=default] agent"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1464,7 +1701,7 @@ mod tests {
         let mut config = Config::default();
         config.statusline.category.format = "{badge}{category} ".to_string();
         let mut blocked = session("a", "work");
-        blocked.state = "blocked".to_string();
+        blocked.agent_counts = r#"{"blocked":1}"#.to_string();
         let rendered = render_statusline_category(&config, &[blocked], "work");
         assert!(rendered.contains("work "), "{rendered}");
         assert!(!rendered.contains('▲'), "{rendered}");
@@ -1474,13 +1711,13 @@ mod tests {
     fn category_badge_shows_worst_state_with_color_and_restore() {
         let mut config = Config::default();
         config.statusline.category.format = "{badge}{category} ".to_string();
-        config.statusline.category.show_badge = true;
+        config.statusline.category.agent_badge.enabled = true;
         config.badge.colors.blocked = "#aa0000".to_string();
         config.statusline.category.colors.fg = Some("#1C1C1C".to_string());
         let mut blocked = session("a", "work");
-        blocked.state = "blocked".to_string();
+        blocked.agent_counts = r#"{"blocked":1}"#.to_string();
         let mut working = session("b", "work");
-        working.state = "working".to_string();
+        working.agent_counts = r#"{"working":1}"#.to_string();
         let rendered = render_statusline_category(&config, &[blocked, working], "work");
         assert!(
             rendered.contains("#[fg=#aa0000]▲#[fg=#1C1C1C]work"),
@@ -1492,7 +1729,7 @@ mod tests {
     fn category_badge_is_empty_without_agent_state_and_idle_is_colored() {
         let mut config = Config::default();
         config.statusline.category.format = "{badge}{category} ".to_string();
-        config.statusline.category.show_badge = true;
+        config.statusline.category.agent_badge.enabled = true;
         let rendered = render_statusline_category(&config, &[session("a", "work")], "work");
         assert!(rendered.contains("work "), "{rendered}");
         assert!(
@@ -1500,10 +1737,78 @@ mod tests {
             "{rendered}"
         );
         let mut idle = session("a", "work");
-        idle.state = "idle".to_string();
+        idle.agent_counts = r#"{"idle":1}"#.to_string();
         let rendered = render_statusline_category(&config, &[idle], "work");
         assert!(
             rendered.contains("#[fg=#a8a8b2]○#[fg=default]work"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn category_counts_badge_sums_session_agent_counts() {
+        let mut config = Config::default();
+        config.statusline.category.format = "{badge}{category} ".to_string();
+        config.statusline.category.agent_badge.enabled = true;
+        config.statusline.category.agent_badge.mode = SessionBadgeMode::Counts;
+        let mut first = session("a", "work");
+        first.agent_counts = r#"{"blocked":1,"working":1}"#.to_string();
+        let mut second = session("b", "work");
+        second.agent_counts = r#"{"working":1,"idle":3}"#.to_string();
+
+        let rendered = render_statusline_category(&config, &[first, second], "work");
+
+        assert!(
+            rendered.contains("#[fg=#ff6b6b]▲ 1#[fg=default] #[fg=#4fd08a]● 2#[fg=default] #[fg=#a8a8b2]○ 3#[fg=default]work"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn category_chip_badge_uses_session_badge_chip_style() {
+        let mut config = Config::default();
+        config.statusline.category.format = "{badge}{category} ".to_string();
+        config.statusline.category.agent_badge.enabled = true;
+        config.statusline.category.badge_style = BadgeStyle::Chip;
+        config.statusline.session_badge.chip.bg = "#30304a".to_string();
+        config.statusline.session_badge.chip.cap_left = "<".to_string();
+        config.statusline.session_badge.chip.cap_right = ">".to_string();
+        config.statusline.category.colors.fg = Some("#eeeeee".to_string());
+        config.statusline.category.colors.bg = Some("#101010".to_string());
+        let mut item = session("a", "work");
+        item.agent_counts = r#"{"working":1}"#.to_string();
+
+        let rendered = render_statusline_category(&config, &[item], "work");
+
+        assert!(
+            rendered.contains(
+                "#[fg=#30304a]<#[bg=#30304a] #[fg=#4fd08a]●#[fg=default] #[bg=#101010]#[fg=#eeeeee,bg=#101010]work"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn inactive_category_chip_badge_stays_one_pill_without_inactive_bg() {
+        let mut config = Config::default();
+        config.statusline.category.format = "{badge}{category} ".to_string();
+        config.statusline.category.inactive_format = "{badge}{category} ".to_string();
+        config.statusline.category.agent_badge.enabled = true;
+        config.statusline.category.badge_style = BadgeStyle::Chip;
+        config.statusline.session_badge.chip.bg = "#30304a".to_string();
+        config.statusline.session_badge.chip.cap_left = "<".to_string();
+        config.statusline.session_badge.chip.cap_right = ">".to_string();
+        config.statusline.category.inactive_colors.fg = Some("#bbbbbb".to_string());
+        config.statusline.category.inactive_colors.bg = None;
+        let mut item = session("a", "work");
+        item.agent_counts = r#"{"working":1}"#.to_string();
+
+        let rendered = render_statusline_category(&config, &[item], "other");
+
+        assert!(
+            rendered.contains(
+                "#[fg=#30304a]<#[bg=#30304a] #[fg=#4fd08a]●#[fg=default] #[bg=#30304a]#[fg=#bbbbbb,bg=#30304a]work #[default]#[fg=#30304a,bg=default]>#[default]"
+            ),
             "{rendered}"
         );
     }

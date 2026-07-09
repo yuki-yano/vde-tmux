@@ -29,6 +29,11 @@ pub const KEY_PROJECT_PATH: &str = "@vde_project_path";
 
 pub const KEY_SESSION_STATUS: &str = "@vde_session_status";
 pub const KEY_SESSION_STATE: &str = "@vde_session_state";
+pub const KEY_SESSION_AGENT_COUNTS: &str = "@vde_session_agent_counts";
+
+pub const KEY_WINDOW_STATUS: &str = "@vde_window_status";
+pub const KEY_WINDOW_STATE: &str = "@vde_window_state";
+pub const KEY_WINDOW_AGENT_COUNTS: &str = "@vde_window_agent_counts";
 
 pub const KEY_HEARTBEAT: &str = "@vde_heartbeat";
 
@@ -69,6 +74,11 @@ pub fn set_window_option(
     value: &str,
 ) -> Result<()> {
     runner.run(&["set-option", "-w", "-t", window, key, value])?;
+    Ok(())
+}
+
+pub fn unset_window_option(runner: &dyn TmuxRunner, window: &str, key: &str) -> Result<()> {
+    runner.run(&["set-option", "-w", "-u", "-t", window, key])?;
     Ok(())
 }
 
@@ -126,6 +136,10 @@ mod tests {
             KEY_PROJECT_PATH,
             KEY_SESSION_STATUS,
             KEY_SESSION_STATE,
+            KEY_SESSION_AGENT_COUNTS,
+            KEY_WINDOW_STATUS,
+            KEY_WINDOW_STATE,
+            KEY_WINDOW_AGENT_COUNTS,
             KEY_HEARTBEAT,
         ]);
         for key in keys {

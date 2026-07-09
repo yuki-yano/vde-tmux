@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::daemon::protocol::{ServerMessage, SidebarClientEvent};
-use crate::daemon::session_badge::{BadgeState, badge_state};
+use crate::daemon::session_badge::{BadgeState, BadgeStateCounts, badge_state};
 use crate::daemon::{
     DaemonSnapshot, SidebarFrame, TransitionEvent, build_snapshot_with_sidebar, format_attention,
     render_summary,
@@ -75,8 +75,24 @@ pub enum RuntimeEffect {
         value: String,
         state: String,
     },
+    SetSessionAgentCounts {
+        session: String,
+        counts: String,
+    },
     ClearSessionBadge {
         session: String,
+    },
+    ClearSessionAgentCounts {
+        session: String,
+    },
+    SetWindowBadge {
+        window: String,
+        value: String,
+        state: String,
+        counts: String,
+    },
+    ClearWindowBadge {
+        window: String,
     },
     ClearPaneState {
         pane_id: String,
@@ -211,6 +227,8 @@ pub struct RuntimeState {
     events: VecDeque<TransitionEvent>,
     flash: BTreeMap<String, u8>,
     written_badges: BTreeMap<String, (String, String)>,
+    written_session_counts: BTreeMap<String, String>,
+    written_window_badges: BTreeMap<String, (String, String, String)>,
     last_heartbeat: i64,
     pending_selection_context: Option<SelectionContext>,
 }
@@ -239,6 +257,8 @@ impl RuntimeState {
             events: VecDeque::new(),
             flash: BTreeMap::new(),
             written_badges: BTreeMap::new(),
+            written_session_counts: BTreeMap::new(),
+            written_window_badges: BTreeMap::new(),
             last_heartbeat: 0,
             pending_selection_context: None,
         }
@@ -277,6 +297,7 @@ impl RuntimeState {
                 let mut effects = clear_pane_state_effects;
                 effects.extend(transition_effects);
                 effects.extend(self.sync_session_badges());
+                effects.extend(self.sync_window_badges());
                 effects.extend(self.sync_heartbeat());
                 effects
             }
@@ -318,8 +339,20 @@ impl RuntimeState {
                         session: session.clone(),
                     })
                     .collect::<Vec<_>>();
+                effects.extend(self.written_session_counts.keys().map(|session| {
+                    RuntimeEffect::ClearSessionAgentCounts {
+                        session: session.clone(),
+                    }
+                }));
+                effects.extend(self.written_window_badges.keys().map(|window| {
+                    RuntimeEffect::ClearWindowBadge {
+                        window: window.clone(),
+                    }
+                }));
                 effects.push(RuntimeEffect::ClearHeartbeat);
                 self.written_badges.clear();
+                self.written_session_counts.clear();
+                self.written_window_badges.clear();
                 effects
             }
         }
@@ -440,6 +473,7 @@ impl RuntimeState {
                 self.rebuild_snapshot();
                 self.broadcast_if_needed();
                 effects.extend(self.sync_session_badges());
+                effects.extend(self.sync_window_badges());
                 effects.extend(self.sync_heartbeat());
                 effects
             }
@@ -876,27 +910,36 @@ impl RuntimeState {
     }
 
     fn sync_session_badges(&mut self) -> Vec<RuntimeEffect> {
-        use crate::daemon::session_badge::session_badge_value;
+        use crate::daemon::session_badge::badge_value_from_counts;
 
         let badge_config = &self.config.statusline.session_badge;
         let badge_glyphs = &self.config.badge.glyphs;
         let mut desired = BTreeMap::new();
+        let mut desired_counts = BTreeMap::new();
+        let session_counts =
+            self.badge_counts_by(|pane| (!pane.session.is_empty()).then_some(pane.session.clone()));
+
         if badge_config.enabled {
-            let mut states: BTreeMap<String, Vec<BadgeState>> = BTreeMap::new();
-            for pane in self.panes.iter().filter(|pane| is_live_agent_pane(pane)) {
-                let level = crate::sidebar::tree::rollup_for_pane(pane);
-                let unread = self.unread.get(&pane.pane_id).copied().unwrap_or(false);
-                states
-                    .entry(pane.session.clone())
-                    .or_default()
-                    .push(badge_state(level, unread));
-            }
-            for (session, list) in states {
-                let state = list.iter().copied().min().unwrap_or(BadgeState::Idle);
-                if let Some(value) = session_badge_value(list, badge_glyphs, badge_config) {
-                    desired.insert(session, (value, state.as_str().to_string()));
+            for (session, counts) in &session_counts {
+                let state = counts.rollup_state().unwrap_or(BadgeState::Idle);
+                if let Some(value) = badge_value_from_counts(
+                    *counts,
+                    badge_glyphs,
+                    badge_config.mode,
+                    &badge_config.suffix,
+                    badge_config.hide_idle,
+                ) {
+                    desired.insert(session.clone(), (value, state.as_str().to_string()));
                 }
             }
+        }
+        if self.config.statusline.category.agent_badge.enabled {
+            desired_counts.extend(
+                session_counts
+                    .into_iter()
+                    .filter(|(_, counts)| counts.total() > 0)
+                    .map(|(session, counts)| (session, counts.encode())),
+            );
         }
 
         let mut effects = Vec::new();
@@ -909,6 +952,14 @@ impl RuntimeState {
                 });
             }
         }
+        for (session, counts) in &desired_counts {
+            if self.written_session_counts.get(session) != Some(counts) {
+                effects.push(RuntimeEffect::SetSessionAgentCounts {
+                    session: session.clone(),
+                    counts: counts.clone(),
+                });
+            }
+        }
         for session in self.written_badges.keys() {
             if !desired.contains_key(session) {
                 effects.push(RuntimeEffect::ClearSessionBadge {
@@ -916,8 +967,77 @@ impl RuntimeState {
                 });
             }
         }
+        for session in self.written_session_counts.keys() {
+            if !desired_counts.contains_key(session) {
+                effects.push(RuntimeEffect::ClearSessionAgentCounts {
+                    session: session.clone(),
+                });
+            }
+        }
         self.written_badges = desired;
+        self.written_session_counts = desired_counts;
         effects
+    }
+
+    fn sync_window_badges(&mut self) -> Vec<RuntimeEffect> {
+        use crate::daemon::session_badge::agent_badge_value_from_counts;
+
+        let badge_config = &self.config.statusline.windows.agent_badge;
+        let mut desired = BTreeMap::new();
+        if badge_config.enabled {
+            for (window, counts) in self.badge_counts_by(|pane| {
+                (!pane.window_id.is_empty()).then_some(pane.window_id.clone())
+            }) {
+                let state = counts.rollup_state().unwrap_or(BadgeState::Idle);
+                if let Some(value) =
+                    agent_badge_value_from_counts(counts, &self.config.badge.glyphs, badge_config)
+                {
+                    desired.insert(window, (value, state.as_str().to_string(), counts.encode()));
+                }
+            }
+        }
+
+        let mut effects = Vec::new();
+        for (window, (value, state, counts)) in &desired {
+            if self.written_window_badges.get(window)
+                != Some(&(value.clone(), state.clone(), counts.clone()))
+            {
+                effects.push(RuntimeEffect::SetWindowBadge {
+                    window: window.clone(),
+                    value: value.clone(),
+                    state: state.clone(),
+                    counts: counts.clone(),
+                });
+            }
+        }
+        for window in self.written_window_badges.keys() {
+            if !desired.contains_key(window) {
+                effects.push(RuntimeEffect::ClearWindowBadge {
+                    window: window.clone(),
+                });
+            }
+        }
+        self.written_window_badges = desired;
+        effects
+    }
+
+    fn badge_counts_by(
+        &self,
+        key_for_pane: impl Fn(&PaneSnapshot) -> Option<String>,
+    ) -> BTreeMap<String, BadgeStateCounts> {
+        let mut counts = BTreeMap::new();
+        for pane in self.panes.iter().filter(|pane| is_live_agent_pane(pane)) {
+            let Some(key) = key_for_pane(pane) else {
+                continue;
+            };
+            let level = crate::sidebar::tree::rollup_for_pane(pane);
+            let unread = self.unread.get(&pane.pane_id).copied().unwrap_or(false);
+            counts
+                .entry(key)
+                .or_insert_with(BadgeStateCounts::default)
+                .push(badge_state(level, unread));
+        }
+        counts
     }
 
     fn clear_stale_pane_state_effects(&self) -> Vec<RuntimeEffect> {
@@ -2352,6 +2472,47 @@ mod tests {
     }
 
     #[test]
+    fn category_badge_enabled_writes_session_agent_counts() {
+        let mut config = Config::default();
+        config.statusline.category.agent_badge.enabled = true;
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![
+            agent_pane("main", "%1", "running"),
+            agent_pane("main", "%2", "idle"),
+        ]));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::SetSessionAgentCounts { session, counts }
+                if session == "main" && counts.contains(r#""working":1"#) && counts.contains(r#""idle":1"#)
+        )));
+    }
+
+    #[test]
+    fn window_badge_enabled_writes_window_badge() {
+        let mut config = Config::default();
+        config.statusline.windows.agent_badge.enabled = true;
+        config.statusline.windows.agent_badge.mode = crate::config::SessionBadgeMode::Counts;
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        let mut waiting = agent_pane("main", "%2", "waiting");
+        waiting.wait_reason = "permission_prompt".to_string();
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![
+            agent_pane("main", "%1", "running"),
+            waiting,
+        ]));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::SetWindowBadge { window, value, state, counts }
+                if window == "@1"
+                    && value == "▲ 1 ● 1"
+                    && state == "blocked"
+                    && counts.contains(r#""blocked":1"#)
+                    && counts.contains(r#""working":1"#)
+        )));
+    }
+
+    #[test]
     fn sessions_get_independent_badges() {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
         let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![
@@ -2407,6 +2568,31 @@ mod tests {
             ]
         );
         assert!(!state.is_running());
+    }
+
+    #[test]
+    fn shutdown_clears_category_and_window_agent_badges() {
+        let mut config = Config::default();
+        config.statusline.category.agent_badge.enabled = true;
+        config.statusline.windows.agent_badge.enabled = true;
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let effects = state.apply_event(DaemonEvent::Shutdown);
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::ClearSessionBadge { session } if session == "main"
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::ClearSessionAgentCounts { session } if session == "main"
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::ClearWindowBadge { window } if window == "@1"
+        )));
     }
 
     #[test]

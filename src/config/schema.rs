@@ -156,6 +156,23 @@ pub fn config_schema() -> Value {
                                     "bg": { "type": "string" },
                                     "outer_bg": { "type": "string" }
                                 }
+                            },
+                            "badge_style": {
+                                "type": "string",
+                                "enum": ["inline", "plain", "outer", "chip"]
+                            },
+                            "agent_badge": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "enabled": { "type": "boolean" },
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": ["rollup", "counts"]
+                                    },
+                                    "suffix": { "type": "string" },
+                                    "hide_idle": { "type": "boolean" }
+                                }
                             }
                         }
                     },
@@ -210,7 +227,23 @@ pub fn config_schema() -> Value {
                             "mode": { "type": "string" },
                             "format": { "type": "string" },
                             "inactive_format": { "type": "string" },
-                            "show_badge": { "type": "boolean" }
+                            "badge_style": {
+                                "type": "string",
+                                "enum": ["inline", "plain", "outer", "chip"]
+                            },
+                            "agent_badge": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "properties": {
+                                    "enabled": { "type": "boolean" },
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": ["rollup", "counts"]
+                                    },
+                                    "suffix": { "type": "string" },
+                                    "hide_idle": { "type": "boolean" }
+                                }
+                            }
                         }
                     },
                     "session_badge": {
@@ -512,6 +545,16 @@ mod tests {
             "string"
         );
         assert_eq!(
+            schema["properties"]["statusline"]["properties"]["category"]["properties"]["agent_badge"]
+                ["properties"]["mode"]["enum"][1],
+            "counts"
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["category"]["properties"]["badge_style"]
+                ["enum"][3],
+            "chip"
+        );
+        assert_eq!(
             schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["badge_style"]
                 ["enum"][0],
             "inline"
@@ -535,6 +578,16 @@ mod tests {
             schema["properties"]["statusline"]["properties"]["windows"]["properties"]["bell"]["properties"]
                 ["fg"]["type"],
             "string"
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["windows"]["properties"]["agent_badge"]
+                ["properties"]["enabled"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["windows"]["properties"]["badge_style"]
+                ["enum"][1],
+            "plain"
         );
         assert_eq!(
             schema["properties"]["statusline"]["properties"]["panes"]["properties"]["current"]["properties"]

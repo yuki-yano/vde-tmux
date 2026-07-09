@@ -110,6 +110,8 @@ pub struct StatuslineWindowsConfig {
     pub last: SegmentColors,
     pub bell: SegmentColors,
     pub activity: SegmentColors,
+    pub agent_badge: AgentBadgeConfig,
+    pub badge_style: BadgeStyle,
     pub separator: String,
 }
 
@@ -128,6 +130,8 @@ impl Default for StatuslineWindowsConfig {
             last: SegmentColors::default(),
             bell: SegmentColors::default(),
             activity: SegmentColors::default(),
+            agent_badge: AgentBadgeConfig::default(),
+            badge_style: BadgeStyle::Inline,
             separator: String::new(),
         }
     }
@@ -181,6 +185,26 @@ pub enum BadgeStyle {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct AgentBadgeConfig {
+    pub enabled: bool,
+    pub mode: SessionBadgeMode,
+    pub suffix: String,
+    pub hide_idle: bool,
+}
+
+impl Default for AgentBadgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: SessionBadgeMode::Rollup,
+            suffix: String::new(),
+            hide_idle: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SegmentStyle {
     pub format: String,
     pub prefix: String,
@@ -220,7 +244,8 @@ pub struct StatuslineCategoryConfig {
     pub inactive_prefix: String,
     pub inactive_suffix: String,
     pub bold: bool,
-    pub show_badge: bool,
+    pub agent_badge: AgentBadgeConfig,
+    pub badge_style: BadgeStyle,
     pub colors: SegmentColors,
     pub inactive_colors: SegmentColors,
 }
@@ -236,7 +261,8 @@ impl Default for StatuslineCategoryConfig {
             inactive_prefix: String::new(),
             inactive_suffix: String::new(),
             bold: false,
-            show_badge: false,
+            agent_badge: AgentBadgeConfig::default(),
+            badge_style: BadgeStyle::Inline,
             colors: SegmentColors::default(),
             inactive_colors: SegmentColors::default(),
         }
@@ -879,6 +905,12 @@ statusline:
       fg: "#ff6b6b"
     activity:
       fg: "#ff6b6b"
+    badge_style: chip
+    agent_badge:
+      enabled: true
+      mode: counts
+      hide_idle: true
+      suffix: "|"
 "##;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
 
@@ -913,6 +945,14 @@ statusline:
             config.statusline.windows.activity.fg.as_deref(),
             Some("#ff6b6b")
         );
+        assert!(config.statusline.windows.agent_badge.enabled);
+        assert_eq!(
+            config.statusline.windows.agent_badge.mode,
+            SessionBadgeMode::Counts
+        );
+        assert_eq!(config.statusline.windows.badge_style, BadgeStyle::Chip);
+        assert!(config.statusline.windows.agent_badge.hide_idle);
+        assert_eq!(config.statusline.windows.agent_badge.suffix, "|");
     }
 
     #[test]
@@ -1060,6 +1100,30 @@ categories:
             config.statusline.session_badge.mode,
             SessionBadgeMode::Counts
         );
+    }
+
+    #[test]
+    fn statusline_category_agent_badge_parses() {
+        let config = serde_yaml_ng::from_str::<Config>(
+            r#"
+statusline:
+  category:
+    badge_style: chip
+    agent_badge:
+      enabled: true
+      mode: counts
+      suffix: " "
+"#,
+        )
+        .unwrap();
+
+        assert!(config.statusline.category.agent_badge.enabled);
+        assert_eq!(
+            config.statusline.category.agent_badge.mode,
+            SessionBadgeMode::Counts
+        );
+        assert_eq!(config.statusline.category.badge_style, BadgeStyle::Chip);
+        assert_eq!(config.statusline.category.agent_badge.suffix, " ");
     }
 
     #[test]

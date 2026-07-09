@@ -23,6 +23,8 @@ pub trait WorkerIo: Send + Sync + 'static {
     fn unset_pane_option(&self, pane_id: &str, key: &str) -> Result<()>;
     fn set_session_option(&self, session: &str, key: &str, value: &str) -> Result<()>;
     fn unset_session_option(&self, session: &str, key: &str) -> Result<()>;
+    fn set_window_option(&self, window: &str, key: &str, value: &str) -> Result<()>;
+    fn unset_window_option(&self, window: &str, key: &str) -> Result<()>;
     fn set_global_option(&self, key: &str, value: &str) -> Result<()>;
     fn unset_global_option(&self, key: &str) -> Result<()>;
     fn run_notify(&self, command: &str, pane_id: &str, agent: &str, state: &str) -> Result<()>;
@@ -77,6 +79,14 @@ impl WorkerIo for SystemWorkerIo {
 
     fn unset_session_option(&self, session: &str, key: &str) -> Result<()> {
         crate::options::unset_session_option(&self.runner, session, key)
+    }
+
+    fn set_window_option(&self, window: &str, key: &str, value: &str) -> Result<()> {
+        crate::options::set_window_option(&self.runner, window, key, value)
+    }
+
+    fn unset_window_option(&self, window: &str, key: &str) -> Result<()> {
+        crate::options::unset_window_option(&self.runner, window, key)
     }
 
     fn set_global_option(&self, key: &str, value: &str) -> Result<()> {
@@ -433,6 +443,14 @@ mod tests {
         }
 
         fn unset_session_option(&self, _session: &str, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_window_option(&self, _window: &str, _key: &str, _value: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn unset_window_option(&self, _window: &str, _key: &str) -> anyhow::Result<()> {
             Ok(())
         }
 

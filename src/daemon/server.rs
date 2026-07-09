@@ -446,6 +446,15 @@ fn handle_runtime_effects(
                     eprintln!("[vde-tmux] session state set failed: {error:#}");
                 }
             }
+            RuntimeEffect::SetSessionAgentCounts { session, counts } => {
+                if let Err(error) = worker_io.set_session_option(
+                    &session,
+                    crate::options::KEY_SESSION_AGENT_COUNTS,
+                    &counts,
+                ) {
+                    eprintln!("[vde-tmux] session agent counts set failed: {error:#}");
+                }
+            }
             RuntimeEffect::ClearSessionBadge { session } => {
                 if let Err(error) =
                     worker_io.unset_session_option(&session, crate::options::KEY_SESSION_STATUS)
@@ -456,6 +465,54 @@ fn handle_runtime_effects(
                     worker_io.unset_session_option(&session, crate::options::KEY_SESSION_STATE)
                 {
                     eprintln!("[vde-tmux] session state clear failed: {error:#}");
+                }
+            }
+            RuntimeEffect::ClearSessionAgentCounts { session } => {
+                if let Err(error) = worker_io
+                    .unset_session_option(&session, crate::options::KEY_SESSION_AGENT_COUNTS)
+                {
+                    eprintln!("[vde-tmux] session agent counts clear failed: {error:#}");
+                }
+            }
+            RuntimeEffect::SetWindowBadge {
+                window,
+                value,
+                state,
+                counts,
+            } => {
+                if let Err(error) =
+                    worker_io.set_window_option(&window, crate::options::KEY_WINDOW_STATUS, &value)
+                {
+                    eprintln!("[vde-tmux] window badge set failed: {error:#}");
+                }
+                if let Err(error) =
+                    worker_io.set_window_option(&window, crate::options::KEY_WINDOW_STATE, &state)
+                {
+                    eprintln!("[vde-tmux] window state set failed: {error:#}");
+                }
+                if let Err(error) = worker_io.set_window_option(
+                    &window,
+                    crate::options::KEY_WINDOW_AGENT_COUNTS,
+                    &counts,
+                ) {
+                    eprintln!("[vde-tmux] window agent counts set failed: {error:#}");
+                }
+            }
+            RuntimeEffect::ClearWindowBadge { window } => {
+                if let Err(error) =
+                    worker_io.unset_window_option(&window, crate::options::KEY_WINDOW_STATUS)
+                {
+                    eprintln!("[vde-tmux] window badge clear failed: {error:#}");
+                }
+                if let Err(error) =
+                    worker_io.unset_window_option(&window, crate::options::KEY_WINDOW_STATE)
+                {
+                    eprintln!("[vde-tmux] window state clear failed: {error:#}");
+                }
+                if let Err(error) =
+                    worker_io.unset_window_option(&window, crate::options::KEY_WINDOW_AGENT_COUNTS)
+                {
+                    eprintln!("[vde-tmux] window agent counts clear failed: {error:#}");
                 }
             }
             RuntimeEffect::ClearPaneState { pane_id } => {
@@ -729,6 +786,7 @@ mod tests {
         previews: std::sync::Mutex<Vec<(String, u32)>>,
         pane_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
         session_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
+        window_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
         global_options: std::sync::Mutex<Vec<(String, Option<String>)>>,
         notify_calls: std::sync::Mutex<Vec<(String, String, String, String)>>,
         fail_jump: bool,
@@ -790,6 +848,23 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((session.to_string(), key.to_string(), None));
+            Ok(())
+        }
+
+        fn set_window_option(&self, window: &str, key: &str, value: &str) -> anyhow::Result<()> {
+            self.window_options.lock().unwrap().push((
+                window.to_string(),
+                key.to_string(),
+                Some(value.to_string()),
+            ));
+            Ok(())
+        }
+
+        fn unset_window_option(&self, window: &str, key: &str) -> anyhow::Result<()> {
+            self.window_options
+                .lock()
+                .unwrap()
+                .push((window.to_string(), key.to_string(), None));
             Ok(())
         }
 
