@@ -75,9 +75,9 @@ pub fn switch_statusline_session(
     let current_session = current_session_name(runner)?;
     let current_category = current_category(config, &sessions, &current_session);
     let category_sessions = sessions_in_category(config, &sessions, &current_category);
-    let session = category_sessions
-        .get(index)
-        .ok_or_else(|| anyhow!("session index out of range: {index}"))?;
+    let Some(session) = category_sessions.get(index) else {
+        return Ok(());
+    };
     switch_client(runner, &session.name)
 }
 

@@ -59,6 +59,25 @@ fn dispatch_statusline_sessions_show_index_overrides_config() {
 }
 
 #[test]
+fn dispatch_statusline_sessions_switch_missing_index_is_noop() {
+    let mock = MockTmuxRunner::new();
+    let format = crate::session::session_list_format();
+    mock.stub(
+        &["list-sessions", "-F", &format],
+        "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
+    );
+    mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+
+    run_with(["vt", "statusline-sessions", "switch", "2"], &mock, &env()).unwrap();
+
+    assert!(
+        mock.calls()
+            .iter()
+            .all(|call| call.first().map(String::as_str) != Some("switch-client"))
+    );
+}
+
+#[test]
 fn dispatch_statusline_windows_prints_output() {
     let mock = MockTmuxRunner::new();
     let format = crate::window::window_list_format();
