@@ -1912,9 +1912,11 @@ mod tests {
     #[test]
     fn client_filter_key_rebuilds_rows_to_attention_only() {
         let mut state = RuntimeState::new(Config::default(), SidebarState::default());
+        let mut blocked = pane("%2", "/tmp/active", "codex", "waiting");
+        blocked.wait_reason = "permission_prompt".to_string();
         state.apply_event(DaemonEvent::PanesUpdated(vec![
             pane("%1", "/tmp/calm", "codex", "idle"),
-            pane("%2", "/tmp/active", "codex", "running"),
+            blocked,
         ]));
 
         state.apply_event(DaemonEvent::Client {
@@ -1992,20 +1994,20 @@ mod tests {
     }
 
     #[test]
-    fn attention_filter_is_available_when_working_panes_match_attention_view() {
+    fn attention_filter_is_unavailable_when_only_working_panes_match() {
         let counts = BadgeCounts {
             total: 2,
-            attention: 2,
+            attention: 0,
             blocked: 0,
             working: 2,
             ..BadgeCounts::default()
         };
 
-        assert!(counts.filter_is_available(StatusFilter::AttentionOnly));
+        assert!(!counts.filter_is_available(StatusFilter::AttentionOnly));
     }
 
     #[test]
-    fn toggle_filter_does_not_skip_attention_when_only_working_panes_match() {
+    fn toggle_filter_skips_attention_when_only_working_panes_match() {
         let mut state = RuntimeState::new(
             Config::default(),
             SidebarState {
@@ -2015,7 +2017,7 @@ mod tests {
         );
         state.counts = BadgeCounts {
             total: 2,
-            attention: 2,
+            attention: 0,
             blocked: 0,
             working: 2,
             ..BadgeCounts::default()
@@ -2023,7 +2025,7 @@ mod tests {
 
         client_key(&mut state, "tab");
 
-        assert_eq!(state.ui_state.filter, StatusFilter::AttentionOnly);
+        assert_eq!(state.ui_state.filter, StatusFilter::WorkingOnly);
     }
 
     #[test]

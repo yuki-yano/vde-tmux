@@ -325,6 +325,7 @@ pub fn build_rows_ctx(
             .values()
             .flat_map(|panes| panes.iter())
             .chain(triage_panes.iter()),
+        &ctx.triage,
     );
     for panes in groups.values_mut() {
         panes.retain(|pane| pane_matches_filter(pane, state.filter));
@@ -343,11 +344,12 @@ pub fn build_rows_ctx(
 
 fn badge_counts_from_agent_panes<'a>(
     panes: impl IntoIterator<Item = &'a AgentPane>,
+    triage: &BTreeSet<String>,
 ) -> BadgeCounts {
     let mut counts = BadgeCounts::default();
     for pane in panes {
         counts.total += 1;
-        if pane_matches_attention_filter(pane) {
+        if pane_matches_attention_filter(pane) || triage.contains(&pane.pane_id) {
             counts.attention += 1;
         }
         match pane.badge_state {
@@ -810,7 +812,7 @@ fn group_meta(panes: &[AgentPane], triage: &BTreeSet<String>) -> RowMeta {
             panes
                 .iter()
                 .filter(|pane| {
-                    pane.badge_state == BadgeState::Blocked || triage.contains(&pane.pane_id)
+                    pane_matches_attention_filter(pane) || triage.contains(&pane.pane_id)
                 })
                 .count(),
         ),
@@ -917,9 +919,7 @@ fn pane_matches_filter(pane: &AgentPane, filter: StatusFilter) -> bool {
 
 fn pane_matches_attention_filter(pane: &AgentPane) -> bool {
     pane.completed_at.trim().is_empty()
-        && (pane.attention
-            || pane.badge_state == BadgeState::Blocked
-            || pane.badge_state == BadgeState::Working)
+        && (pane.attention || pane.badge_state == BadgeState::Blocked)
 }
 
 fn order_repo_groups(groups: &mut [Vec<AgentPane>], state: &SidebarState) {
@@ -2179,22 +2179,29 @@ mod tests {
     }
 
     #[test]
-    fn attention_only_filter_drops_calm_panes_and_empty_groups() {
+    fn attention_only_filter_drops_calm_and_plain_running_panes() {
         let mut calm = pane("main", "%1", "/tmp/calm", "codex", "idle");
         calm.attention = "0".to_string();
         let running = pane("main", "%2", "/tmp/active", "codex", "running");
         let mut attention = pane("main", "%3", "/tmp/active", "claude", "waiting");
         attention.wait_reason = "permission_prompt".to_string();
+        let mut flagged = pane("main", "%4", "/tmp/active", "opencode", "idle");
+        flagged.attention = "1".to_string();
         let state = SidebarState {
             filter: crate::sidebar::state::StatusFilter::AttentionOnly,
             ..SidebarState::default()
         };
 
-        let rows = build_rows(&Config::default(), &[calm, running, attention], &state);
+        let rows = build_rows(
+            &Config::default(),
+            &[calm, running, attention, flagged],
+            &state,
+        );
 
         assert!(rows.iter().all(|row| !row.id.contains("%1")));
-        assert!(rows.iter().any(|row| row.id.contains("%2")));
+        assert!(rows.iter().all(|row| !row.id.contains("%2")));
         assert!(rows.iter().any(|row| row.id.contains("%3")));
+        assert!(rows.iter().any(|row| row.id.contains("%4")));
         assert!(
             rows.iter()
                 .any(|row| row.kind == SidebarRowKind::Repo && row.label == "active")
@@ -2448,11 +2455,11 @@ mod tests {
         );
 
         assert!(rows.iter().any(|row| row.id == "chat::%1"));
-        assert!(rows.iter().any(|row| row.id == "chat::%2"));
+        assert!(rows.iter().all(|row| row.id != "chat::%2"));
         assert!(rows.iter().all(|row| row.id != "chat::%3"));
         assert!(rows.iter().all(|row| row.id != "chat::%4"));
         assert_eq!(counts.total, 4);
-        assert_eq!(counts.attention, 2);
+        assert_eq!(counts.attention, 1);
         assert_eq!(counts.blocked, 1);
         assert_eq!(counts.working, 1);
         assert_eq!(counts.done, 0);
@@ -2460,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_count_matches_attention_filter_predicate_without_blocked_panes() {
+    fn attention_filter_excludes_plain_working_panes() {
         let working_a = pane("main", "%1", "/tmp/app", "codex", "running");
         let working_b = pane("main", "%2", "/tmp/app", "claude", "running");
         let idle = pane("main", "%3", "/tmp/app", "opencode", "idle");
@@ -2482,19 +2489,19 @@ mod tests {
 
         assert_eq!(counts.blocked, 0);
         assert_eq!(counts.working, 2);
-        assert_eq!(counts.attention, 2);
+        assert_eq!(counts.attention, 0);
         assert_eq!(
             counts.count_for_filter(crate::sidebar::state::StatusFilter::AttentionOnly),
-            2
+            0
         );
         assert_eq!(
             rows.iter()
                 .filter(|row| row.kind == SidebarRowKind::Chat)
                 .count(),
-            2
+            0
         );
-        assert!(rows.iter().any(|row| row.id == "chat::%1"));
-        assert!(rows.iter().any(|row| row.id == "chat::%2"));
+        assert!(rows.iter().all(|row| row.id != "chat::%1"));
+        assert!(rows.iter().all(|row| row.id != "chat::%2"));
         assert!(rows.iter().all(|row| row.id != "chat::%3"));
     }
 
