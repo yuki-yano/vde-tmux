@@ -65,6 +65,7 @@ bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_rang
 - `statusline-category`：現在のカテゴリ（設定によっては他カテゴリも）
 - `statusline-sessions`：現在カテゴリのセッション一覧。各セッション名の前に agent 状態バッジが付く。`statusline.session_badge.mode: counts` では `▲ 2 ● 1 ○ 5` のように表示する
 - `statusline-windows`：現在 session の window 一覧。`statusline.windows` で整形する
+- `statusline-pane`：現在 pane の border label。`statusline.panes` で整形する
 - `statusline-summary`：全 agent の状態別カウント。例 `▲2 ●1`
 - `statusline-attention`：いま見えていない blocked agent の通知。例 `▲ session · perm 2m`
 
