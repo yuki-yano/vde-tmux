@@ -347,6 +347,10 @@ pub fn config_schema() -> Value {
                 "additionalProperties": true,
                 "properties": {
                     "poll_ms": { "type": "integer", "minimum": 1 },
+                    "done_clear_on": {
+                        "type": "string",
+                        "enum": ["window", "pane"]
+                    },
                     "git": { "type": "object", "additionalProperties": true }
                 }
             },
@@ -499,6 +503,16 @@ mod tests {
         assert_eq!(live["interval_ms"]["type"], "integer");
         assert_eq!(notify["enabled"]["type"], "boolean");
         assert_eq!(notify["command"]["type"], "string");
+    }
+
+    #[test]
+    fn schema_contains_done_clear_on() {
+        let schema = config_schema();
+        let daemon = &schema["properties"]["daemon"]["properties"];
+
+        assert_eq!(daemon["done_clear_on"]["type"], "string");
+        assert_eq!(daemon["done_clear_on"]["enum"][0], "window");
+        assert_eq!(daemon["done_clear_on"]["enum"][1], "pane");
     }
 
     #[test]

@@ -92,6 +92,13 @@
     "daemon": {
       "additionalProperties": true,
       "properties": {
+        "done_clear_on": {
+          "enum": [
+            "window",
+            "pane"
+          ],
+          "type": "string"
+        },
         "git": {
           "additionalProperties": true,
           "type": "object"

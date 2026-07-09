@@ -277,6 +277,9 @@ categories:
       path_patterns:
         - github.com/acme/*
 
+daemon:
+  done_clear_on: window # window | pane
+
 statusline:
   session_badge:
     mode: rollup       # rollup | counts
@@ -326,6 +329,8 @@ notify:
 ```
 
 `${ENV_VAR}` expansion is available inside `path_patterns` and session-name `patterns`.
+
+`daemon.done_clear_on` controls when a `Done` badge is acknowledged. `window` clears it when the containing window is viewed; `pane` keeps it until that pane itself is focused.
 
 ### Recommended status line colors
 

@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::category::resolve_dynamic_category_for_session;
-use crate::config::Config;
+use crate::config::{Config, DoneClearOn};
 use crate::daemon::protocol::{ServerMessage, SidebarClientEvent};
 use crate::daemon::session_badge::{BadgeState, BadgeStateCounts, badge_state};
 use crate::daemon::{
@@ -155,6 +155,15 @@ fn pane_representative_rank(pane: &PaneSnapshot) -> u8 {
         (false, true) => 1,
         (false, false) => 0,
     }
+}
+
+fn pane_has_acknowledged_done(pane: &PaneSnapshot, clear_on: DoneClearOn) -> bool {
+    pane.session_attached
+        && pane.window_active
+        && match clear_on {
+            DoneClearOn::Window => true,
+            DoneClearOn::Pane => pane.pane_active,
+        }
 }
 
 #[derive(Debug)]
@@ -831,7 +840,7 @@ impl RuntimeState {
             if !is_idle {
                 unread = false;
             }
-            if pane.window_active && pane.session_attached && !manual_done {
+            if pane_has_acknowledged_done(pane, self.config.daemon.done_clear_on) && !manual_done {
                 unread = false;
             }
             next_was_idle.insert(pane.pane_id.clone(), is_idle);
@@ -2286,6 +2295,45 @@ mod tests {
                 state: "idle".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn pane_done_clear_requires_pane_focus_when_configured() {
+        let mut config = Config::default();
+        config.daemon.done_clear_on = DoneClearOn::Pane;
+        let mut state = RuntimeState::new(config, SidebarState::default());
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "running",
+        )]));
+        let _ = state.apply_event(DaemonEvent::PanesUpdated(vec![agent_pane(
+            "main", "%1", "idle",
+        )]));
+
+        let mut viewed_window = agent_pane("main", "%1", "idle");
+        viewed_window.window_active = true;
+        viewed_window.session_attached = true;
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![viewed_window]));
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::SetSessionBadge { state, .. } if state == "idle"
+        )));
+        let rows = &state.snapshot().unwrap().sidebar.as_ref().unwrap().rows;
+        let chat = rows.iter().find(|row| row.id == "chat::%1").unwrap();
+        assert_eq!(
+            chat.badge_state,
+            Some(crate::daemon::session_badge::BadgeState::Done)
+        );
+
+        let mut focused_pane = agent_pane("main", "%1", "idle");
+        focused_pane.window_active = true;
+        focused_pane.pane_active = true;
+        focused_pane.session_attached = true;
+        let effects = state.apply_event(DaemonEvent::PanesUpdated(vec![focused_pane]));
+        assert!(effects.contains(&RuntimeEffect::SetSessionBadge {
+            session: "main".to_string(),
+            value: "○".to_string(),
+            state: "idle".to_string(),
+        }));
     }
 
     #[test]
