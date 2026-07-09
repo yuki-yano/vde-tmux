@@ -219,21 +219,9 @@ pub fn create_session(
         bail!("no tmux client available for session creation");
     }
     let cwd = resolve_session_cwd(runner, env, cwd)?;
-    let session_name = runner
-        .run(&[
-            "new-session",
-            "-d",
-            "-P",
-            "-F",
-            "#{session_name}",
-            "-c",
-            &cwd,
-        ])?
-        .trim()
-        .to_string();
-    if session_name.is_empty() {
-        bail!("tmux did not return a new session name");
-    }
+    let created_format = format!("#{{session_name}}{FIELD_SEP}#{{window_id}}");
+    let created = runner.run(&["new-session", "-d", "-P", "-F", &created_format, "-c", &cwd])?;
+    let (session_name, window_id) = parse_created_session(&created)?;
     set_session_option(runner, &session_name, KEY_PROJECT_PATH, &cwd)?;
     let session = SessionInfo {
         name: session_name.clone(),
@@ -243,10 +231,31 @@ pub fn create_session(
     let category = resolve_dynamic_category_for_session(config, &session);
     set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
     switch_client_for_client(runner, &client, &session_name)?;
+    if !window_id.is_empty() {
+        crate::sidebar::layout::open_if_auto_all_enabled(
+            runner,
+            &window_id,
+            &std::env::current_exe()?,
+            config.sidebar.width,
+            config.sidebar.min_width,
+        )?;
+    }
     if !category.is_empty() {
         remember_session_for_client(runner, &client, &category, &session_name)?;
     }
     Ok(session_name)
+}
+
+fn parse_created_session(output: &str) -> Result<(String, String)> {
+    let line = output.trim();
+    let Some((session_name, window_id)) = line.split_once(FIELD_SEP) else {
+        bail!("tmux did not return session/window ids for new session");
+    };
+    let session_name = session_name.trim().to_string();
+    if session_name.is_empty() {
+        bail!("tmux did not return a new session name");
+    }
+    Ok((session_name, window_id.trim().to_string()))
 }
 
 fn resolve_session_cwd(
@@ -561,11 +570,11 @@ mod tests {
                 "-d",
                 "-P",
                 "-F",
-                "#{session_name}",
+                "#{session_name}\u{1f}#{window_id}",
                 "-c",
                 "/Users/me",
             ],
-            "zsh\n",
+            "zsh\u{1f}@9\n",
         );
         mock.stub(
             &[
@@ -589,6 +598,10 @@ mod tests {
         );
         mock.stub(&["switch-client", "-c", "client", "-t", "=zsh:"], "");
         mock.stub(
+            &["show-hooks", "-g", "after-new-window[90]"],
+            "after-new-window[90] \n",
+        );
+        mock.stub(
             &["set-option", "-g", "@vde_client_636c69656e74_public", "zsh"],
             "",
         );
@@ -602,7 +615,150 @@ mod tests {
         .unwrap();
 
         assert_eq!(session, "zsh");
-        assert_eq!(mock.calls().len(), 6);
+        assert_eq!(mock.calls().len(), 7);
+    }
+
+    #[test]
+    fn create_session_opens_sidebar_for_created_window_when_all_sidebar_is_enabled() {
+        let mock = MockTmuxRunner::new();
+        let exe = std::env::current_exe().unwrap();
+        let attach_command = format!(
+            "{} sidebar attach",
+            shell_quote_for_test(&exe.display().to_string())
+        );
+        let mut config = crate::config::Config::default();
+        config.categories.default_category = Some("public".to_string());
+        config.sidebar.width = crate::config::SidebarWidth::Columns(40);
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "client\t/dev/ttys001\n",
+        );
+        mock.stub(
+            &[
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{session_name}\u{1f}#{window_id}",
+                "-c",
+                "/Users/me",
+            ],
+            "zsh\u{1f}@9\n",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "zsh",
+                crate::options::KEY_PROJECT_PATH,
+                "/Users/me",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "zsh",
+                crate::options::KEY_CATEGORY,
+                "public",
+            ],
+            "",
+        );
+        mock.stub(&["switch-client", "-c", "client", "-t", "=zsh:"], "");
+        mock.stub(
+            &["show-hooks", "-g", "after-new-window[90]"],
+            "after-new-window[90] run-shell 'vt sidebar layout-applied'\n",
+        );
+        mock.stub(
+            &[
+                "list-panes",
+                "-t",
+                "@9",
+                "-F",
+                crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+            ],
+            "%1\t\t80\n",
+        );
+        mock.stub(&["show-options", "-w", "-t", "@9"], "");
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@9",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-before\n",
+        );
+        mock.stub(&["list-panes", "-t", "@9", "-F", "#{pane_id}"], "%1\n");
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@9",
+                crate::options::KEY_LAYOUT_BASELINE,
+                "layout-before",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-w",
+                "-t",
+                "@9",
+                crate::options::KEY_LAYOUT_PANES,
+                "%1",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "split-window",
+                "-d",
+                "-t",
+                "@9",
+                "-hbf",
+                "-l",
+                "40",
+                &attach_command,
+            ],
+            "",
+        );
+        mock.stub(
+            &["set-option", "-g", "@vde_client_636c69656e74_public", "zsh"],
+            "",
+        );
+
+        create_session(
+            &mock,
+            &config,
+            &BTreeMap::from([("HOME".to_string(), "/Users/me".to_string())]),
+            Some("~/"),
+        )
+        .unwrap();
+
+        assert!(mock.calls().iter().any(|call| {
+            call.first().map(String::as_str) == Some("split-window")
+                && call.get(2).map(String::as_str) == Some("-t")
+                && call.get(3).map(String::as_str) == Some("@9")
+        }));
+        let calls = mock.calls();
+        let switch_index = calls
+            .iter()
+            .position(|call| call.first().map(String::as_str) == Some("switch-client"))
+            .unwrap();
+        let split_index = calls
+            .iter()
+            .position(|call| call.first().map(String::as_str) == Some("split-window"))
+            .unwrap();
+        assert!(
+            switch_index < split_index,
+            "sidebar should open after the created session is attached"
+        );
     }
 
     #[test]
@@ -728,5 +884,19 @@ mod tests {
         );
         refresh_session_categories(&mock, &config).unwrap();
         assert_eq!(mock.calls().len(), 2);
+    }
+
+    fn shell_quote_for_test(value: &str) -> String {
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('\'');
+        for ch in value.chars() {
+            if ch == '\'' {
+                quoted.push_str("'\\''");
+            } else {
+                quoted.push(ch);
+            }
+        }
+        quoted.push('\'');
+        quoted
     }
 }

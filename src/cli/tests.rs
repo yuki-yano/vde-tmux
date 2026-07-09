@@ -232,11 +232,11 @@ fn dispatch_session_new_creates_managed_session() {
             "-d",
             "-P",
             "-F",
-            "#{session_name}",
+            "#{session_name}\u{1f}#{window_id}",
             "-c",
             "/tmp/repo",
         ],
-        "repo\n",
+        "repo\u{1f}@9\n",
     );
     mock.stub(
         &[
@@ -253,10 +253,14 @@ fn dispatch_session_new_creates_managed_session() {
         "",
     );
     mock.stub(&["switch-client", "-c", "abc", "-t", "=repo:"], "");
+    mock.stub(
+        &["show-hooks", "-g", "after-new-window[90]"],
+        "after-new-window[90] \n",
+    );
 
     run_with(["vt", "session", "new", "-c", "/tmp/repo"], &mock, &env()).unwrap();
 
-    assert_eq!(mock.calls().len(), 5);
+    assert_eq!(mock.calls().len(), 6);
 }
 
 #[test]
