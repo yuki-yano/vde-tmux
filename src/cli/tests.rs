@@ -105,7 +105,9 @@ fn dispatch_statusline_pane_prints_pane_segment() {
     let mock = MockTmuxRunner::new();
     let format = [
         "#{pane_id}",
+        "#{window_active}",
         "#{pane_active}",
+        "#{session_attached}",
         "#{pane_current_command}",
         "#{@vde_agent}",
         "#{@vde_status}",
@@ -117,7 +119,7 @@ fn dispatch_statusline_pane_prints_pane_segment() {
     .join("\u{1f}");
     mock.stub(
         &["display-message", "-p", "-t", "%1", &format],
-        "%1\u{1f}1\u{1f}node\u{1f}codex\u{1f}running\u{1f}\u{1f}0\u{1f}\u{1f}\n",
+        "%1\u{1f}1\u{1f}1\u{1f}1\u{1f}node\u{1f}codex\u{1f}running\u{1f}\u{1f}0\u{1f}\u{1f}\n",
     );
 
     let output = run_with(["vt", "statusline-pane", "--target", "%1"], &mock, &env())

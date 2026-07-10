@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 
 use crate::category::{resolve_category_for_session, sessions_in_category, sorted_categories};
+use crate::config::DoneClearOn;
 use crate::config::{
     AgentBadgeConfig, BadgeConfig, BadgeGlyphs, BadgeStyle, Config, SegmentColors, SegmentStyle,
     SessionBadgeChipConfig, SessionBadgeMode, StatuslineCategoryConfig,
@@ -288,7 +289,9 @@ pub fn render_statusline_category(
 fn pane_status_format() -> String {
     [
         "#{pane_id}",
+        "#{window_active}",
         "#{pane_active}",
+        "#{session_attached}",
         "#{pane_current_command}",
         "#{@vde_agent}",
         "#{@vde_status}",
@@ -303,7 +306,9 @@ fn pane_status_format() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct PaneStatusInfo {
     pane_id: String,
+    window_active: bool,
     active: bool,
+    session_attached: bool,
     current_command: String,
     agent: String,
     status: String,
@@ -315,19 +320,21 @@ struct PaneStatusInfo {
 
 fn parse_pane_status(raw: &str) -> Option<PaneStatusInfo> {
     let fields = raw.split(PANE_FIELD_SEP).collect::<Vec<_>>();
-    if fields.len() != 9 {
+    if fields.len() != 11 {
         return None;
     }
     Some(PaneStatusInfo {
         pane_id: fields[0].to_string(),
-        active: fields[1] == "1",
-        current_command: fields[2].to_string(),
-        agent: fields[3].to_string(),
-        status: fields[4].to_string(),
-        wait_reason: fields[5].to_string(),
-        attention: fields[6].to_string(),
-        started_at: fields[7].to_string(),
-        completed_at: fields[8].to_string(),
+        window_active: fields[1] == "1",
+        active: fields[2] == "1",
+        session_attached: !fields[3].is_empty() && fields[3] != "0",
+        current_command: fields[4].to_string(),
+        agent: fields[5].to_string(),
+        status: fields[6].to_string(),
+        wait_reason: fields[7].to_string(),
+        attention: fields[8].to_string(),
+        started_at: fields[9].to_string(),
+        completed_at: fields[10].to_string(),
     })
 }
 
@@ -364,7 +371,7 @@ fn render_statusline_pane_body(
     let process = tmux_plain_text(&pane.current_command);
     let name = agent.clone().unwrap_or_else(|| process.clone());
     let (badge, status, time) = if agent.is_some() {
-        let state = pane_badge_state(pane);
+        let state = pane_badge_state(config, pane);
         (
             pane_badge_fragment(config, state, text_fg),
             pane_status_fragment(config, pane, state, text_fg),
@@ -398,7 +405,7 @@ fn render_statusline_pane_detail(
     let Some(agent) = pane_agent_label(pane) else {
         return tmux_plain_text(&pane.current_command);
     };
-    let badge_state = pane_badge_state(pane);
+    let badge_state = pane_badge_state(config, pane);
     let glyph = glyph_for_state(badge_state, &config.badge.glyphs);
     let badge_color = config
         .badge
@@ -469,14 +476,26 @@ fn pane_agent_label(pane: &PaneStatusInfo) -> Option<String> {
     detect_agent_from_command(&pane.current_command).map(crate::agent::display_agent_name)
 }
 
-fn pane_badge_state(pane: &PaneStatusInfo) -> BadgeState {
+fn pane_badge_state(config: &Config, pane: &PaneStatusInfo) -> BadgeState {
     let Some(status) = parse_agent_status(&pane.status) else {
         return BadgeState::Working;
     };
     badge_state(
         pane_rollup_level(Some(status), non_empty(pane.wait_reason.as_str())),
-        false,
+        pane_attention_unread(config, pane),
     )
+}
+
+fn pane_attention_unread(config: &Config, pane: &PaneStatusInfo) -> bool {
+    if pane.attention.trim() != "1" {
+        return false;
+    }
+    !(pane.session_attached
+        && pane.window_active
+        && match config.daemon.done_clear_on {
+            DoneClearOn::Window => true,
+            DoneClearOn::Pane => pane.active,
+        })
 }
 
 fn pane_status_label(pane: &PaneStatusInfo, state: BadgeState) -> &'static str {
@@ -1141,6 +1160,8 @@ mod tests {
     fn render_statusline_pane_detail_renders_idle_age() {
         let pane = PaneStatusInfo {
             pane_id: "%1".to_string(),
+            window_active: true,
+            session_attached: true,
             current_command: "node".to_string(),
             agent: "codex".to_string(),
             status: "idle".to_string(),
@@ -1150,6 +1171,56 @@ mod tests {
         };
 
         let rendered = render_statusline_pane_detail(&Config::default(), &pane, "#9696CE", 1000);
+
+        assert_eq!(
+            rendered,
+            "#[fg=#a8a8b2]○ #[fg=#9696CE]Codex #[fg=#9696CE] #[fg=#a8a8b2]idle 13m ago#[fg=#9696CE]"
+        );
+    }
+
+    #[test]
+    fn render_statusline_pane_detail_keeps_done_until_focused_when_configured() {
+        let mut config = Config::default();
+        config.daemon.done_clear_on = DoneClearOn::Pane;
+        let pane = PaneStatusInfo {
+            pane_id: "%1".to_string(),
+            window_active: true,
+            active: false,
+            session_attached: true,
+            current_command: "node".to_string(),
+            agent: "codex".to_string(),
+            status: "idle".to_string(),
+            attention: "1".to_string(),
+            completed_at: "185".to_string(),
+            ..PaneStatusInfo::default()
+        };
+
+        let rendered = render_statusline_pane_detail(&config, &pane, "#9696CE", 1000);
+
+        assert_eq!(
+            rendered,
+            "#[fg=#45cbe6]✓ #[fg=#9696CE]Codex #[fg=#9696CE] #[fg=#45cbe6]done 13m ago#[fg=#9696CE]"
+        );
+    }
+
+    #[test]
+    fn render_statusline_pane_detail_clears_done_when_pane_focused() {
+        let mut config = Config::default();
+        config.daemon.done_clear_on = DoneClearOn::Pane;
+        let pane = PaneStatusInfo {
+            pane_id: "%1".to_string(),
+            window_active: true,
+            active: true,
+            session_attached: true,
+            current_command: "node".to_string(),
+            agent: "codex".to_string(),
+            status: "idle".to_string(),
+            attention: "1".to_string(),
+            completed_at: "185".to_string(),
+            ..PaneStatusInfo::default()
+        };
+
+        let rendered = render_statusline_pane_detail(&config, &pane, "#9696CE", 1000);
 
         assert_eq!(
             rendered,
