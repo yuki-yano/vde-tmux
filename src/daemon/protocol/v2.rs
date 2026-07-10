@@ -1,3 +1,12 @@
+use std::io;
+use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::session_badge::{BadgeState, BadgeStateCounts};
@@ -9,6 +18,351 @@ use crate::pane_state::{
 };
 
 pub const PROTOCOL_VERSION: u16 = 2;
+pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub struct V2Client {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+    daemon_instance_id: DaemonInstanceId,
+    server_identity: String,
+    phase: DaemonPhase,
+    hook_health: HookHealth,
+    deadline: Instant,
+}
+
+impl V2Client {
+    pub fn connect(socket: &Path, expected_server_identity: &str) -> Result<Self> {
+        Self::connect_with_timeout(socket, expected_server_identity, CLIENT_REQUEST_TIMEOUT)
+    }
+
+    pub fn connect_with_timeout(
+        socket: &Path,
+        expected_server_identity: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::connect_with_deadline(socket, expected_server_identity, Instant::now() + timeout)
+    }
+
+    pub fn connect_with_deadline(
+        socket: &Path,
+        expected_server_identity: &str,
+        deadline: Instant,
+    ) -> Result<Self> {
+        let mut writer = connect_unix_with_deadline(socket, deadline)
+            .with_context(|| format!("failed to connect to daemon socket {}", socket.display()))?;
+        let reader_stream = writer.try_clone()?;
+        let mut reader = BufReader::new(reader_stream);
+        write_client_message(
+            &mut writer,
+            &ClientMessage::Hello {
+                proto: PROTOCOL_VERSION,
+            },
+            deadline,
+        )?;
+        let response = read_server_message(&mut reader, deadline)?;
+        let ServerMessage::HelloAck {
+            proto,
+            daemon_instance_id,
+            server_identity,
+            phase,
+            hook_health,
+        } = response
+        else {
+            return server_response_error("HelloAck", response);
+        };
+        if proto != PROTOCOL_VERSION {
+            bail!("daemon returned unsupported protocol version {proto}");
+        }
+        if server_identity != expected_server_identity {
+            bail!(
+                "daemon server identity mismatch: expected {expected_server_identity}, received {server_identity}"
+            );
+        }
+        Ok(Self {
+            writer,
+            reader,
+            daemon_instance_id,
+            server_identity,
+            phase,
+            hook_health,
+            deadline,
+        })
+    }
+
+    pub fn daemon_instance_id(&self) -> &DaemonInstanceId {
+        &self.daemon_instance_id
+    }
+
+    pub fn server_identity(&self) -> &str {
+        &self.server_identity
+    }
+
+    pub fn phase(&self) -> DaemonPhase {
+        self.phase
+    }
+
+    pub fn hook_health(&self) -> HookHealth {
+        self.hook_health
+    }
+
+    pub fn request(&mut self, message: &ClientMessage) -> Result<ServerMessage> {
+        if message.proto() != PROTOCOL_VERSION {
+            bail!("client request must use protocol version {PROTOCOL_VERSION}");
+        }
+        if matches!(message, ClientMessage::Hello { .. }) {
+            bail!("Hello is only valid as the first connection frame");
+        }
+        if message
+            .mutation_instance_id()
+            .is_some_and(|instance_id| instance_id != &self.daemon_instance_id)
+        {
+            bail!("client request uses a stale daemon instance ID");
+        }
+        write_client_message(&mut self.writer, message, self.deadline)?;
+        read_server_message(&mut self.reader, self.deadline)
+    }
+}
+
+fn connect_unix_with_deadline(socket: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    if deadline.checked_duration_since(Instant::now()).is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "daemon connect deadline exceeded",
+        ));
+    }
+    let path = socket.as_os_str().as_bytes();
+    if path.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "daemon socket path contains NUL",
+        ));
+    }
+
+    // SAFETY: socket has no pointer arguments and returns a new owned descriptor on success.
+    let raw_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: raw_fd was just returned by socket and ownership is transferred exactly once.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    // SAFETY: fcntl marks a valid owned descriptor close-on-exec.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl reads flags for a valid owned descriptor.
+    let original_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if original_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl updates flags for a valid owned descriptor.
+    if unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            libc::F_SETFL,
+            original_flags | libc::O_NONBLOCK,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: zero is a valid initial representation for sockaddr_un before fields are filled.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if path.len() >= address.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "daemon socket path is too long",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    #[cfg(any(
+        target_os = "aix",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "hurd",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    ))]
+    {
+        address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
+    }
+    // SAFETY: sun_path has been capacity-checked, both regions are valid, and they do not overlap.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path.as_ptr(),
+            address.sun_path.as_mut_ptr().cast::<u8>(),
+            path.len(),
+        );
+    }
+    // SAFETY: address points to an initialized sockaddr_un with a valid length.
+    let connect_result = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&raw const address).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if connect_result < 0 {
+        let error = io::Error::last_os_error();
+        let code = error.raw_os_error().unwrap_or_default();
+        if code != libc::EINPROGRESS && code != libc::EAGAIN && code != libc::EWOULDBLOCK {
+            return Err(error);
+        }
+        wait_for_unix_connect(&fd, deadline)?;
+    }
+
+    // SAFETY: fcntl restores the original blocking flags on a valid descriptor.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, original_flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: ownership moves from OwnedFd into UnixStream exactly once.
+    Ok(unsafe { UnixStream::from_raw_fd(fd.into_raw_fd()) })
+}
+
+fn wait_for_unix_connect(fd: &OwnedFd, deadline: Instant) -> io::Result<()> {
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daemon connect deadline exceeded",
+            ));
+        };
+        let timeout_ms = remaining
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        let mut poll_fd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: poll_fd points to one initialized pollfd for the duration of the call.
+        let result = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_ms) };
+        if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daemon connect deadline exceeded",
+            ));
+        }
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+
+        let mut socket_error: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: socket_error and length are valid output buffers for SO_ERROR.
+        if unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&raw mut socket_error).cast(),
+                &raw mut length,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        return if socket_error == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(socket_error))
+        };
+    }
+}
+
+fn write_client_message(
+    writer: &mut UnixStream,
+    message: &ClientMessage,
+    deadline: Instant,
+) -> Result<()> {
+    let mut frame = serde_json::to_vec(message)?;
+    if frame.len() > MAX_REQUEST_FRAME_BYTES {
+        bail!("request frame exceeds 1 MiB");
+    }
+    frame.push(b'\n');
+    let mut written = 0;
+    while written < frame.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("daemon request write deadline exceeded");
+        }
+        writer.set_write_timeout(Some(remaining))?;
+        match writer.write(&frame[written..]) {
+            Ok(0) => bail!("daemon closed the connection while reading the request"),
+            Ok(count) => written += count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                bail!("daemon request write deadline exceeded")
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn read_server_message(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Instant,
+) -> Result<ServerMessage> {
+    let mut frame = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("daemon response read deadline exceeded");
+        }
+        reader.get_ref().set_read_timeout(Some(remaining))?;
+        let chunk = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                bail!("daemon response read deadline exceeded")
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if chunk.is_empty() {
+            bail!("daemon closed the connection before responding");
+        }
+        let consumed = chunk
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(chunk.len(), |position| position + 1);
+        frame.extend_from_slice(&chunk[..consumed]);
+        reader.consume(consumed);
+        if frame.len() > MAX_RESPONSE_FRAME_BYTES.saturating_add(1) {
+            bail!("daemon response exceeds 16 MiB");
+        }
+        if frame.last() == Some(&b'\n') {
+            break;
+        }
+    }
+    Ok(serde_json::from_slice(&frame)?)
+}
+
+fn server_response_error<T>(expected: &str, response: ServerMessage) -> Result<T> {
+    if let ServerMessage::Error { code, message, .. } = response {
+        bail!("daemon returned {code:?}: {message}");
+    }
+    bail!("expected {expected}, received {response:?}")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -491,7 +845,7 @@ pub fn decode_request_frame(frame: &[u8]) -> Result<ClientMessage, ServerMessage
 pub fn encode_response_frame(message: &ServerMessage) -> Result<Vec<u8>, ServerMessage> {
     let mut frame = serde_json::to_vec(message)
         .map_err(|error| ServerMessage::error(ErrorCode::InternalError, error.to_string(), None))?;
-    if frame.len().saturating_add(1) > MAX_RESPONSE_FRAME_BYTES {
+    if frame.len() > MAX_RESPONSE_FRAME_BYTES {
         return Err(ServerMessage::error(
             ErrorCode::FrameTooLarge,
             "response frame exceeds 16 MiB",
@@ -641,6 +995,16 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn unix_connect_rejects_an_expired_deadline_before_opening_socket() {
+        let error = connect_unix_with_deadline(
+            Path::new("/tmp/vde-tmux-never-connect.sock"),
+            Instant::now() - Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

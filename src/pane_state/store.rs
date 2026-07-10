@@ -1172,6 +1172,77 @@ mod tests {
     }
 
     #[test]
+    fn notifications_are_emitted_only_when_badge_changes_to_blocked() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = FakeIo::default();
+        apply_begin(&mut runtime, &mut io);
+        let visibility = VisibilitySnapshot::default();
+        let mut clock = FakeClock::default();
+
+        let waiting = envelope(PaneEvent::WaitRequested {
+            observed_at: 2,
+            reason: WaitReason::PermissionPrompt,
+        });
+        runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &waiting,
+                &visibility,
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        assert_eq!(runtime.notification_jobs().len(), 1);
+
+        runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &waiting,
+                &visibility,
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        assert_eq!(runtime.notification_jobs().len(), 1);
+
+        runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &envelope(PaneEvent::ActivityObserved { observed_at: 3 }),
+                &visibility,
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        assert_eq!(runtime.notification_jobs().len(), 1);
+
+        runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &envelope(PaneEvent::WaitRequested {
+                    observed_at: 4,
+                    reason: WaitReason::Other("input".to_string()),
+                }),
+                &visibility,
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        assert_eq!(runtime.notification_jobs().len(), 2);
+
+        runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &envelope(PaneEvent::CompleteRun { completed_at: 5 }),
+                &visibility,
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        assert_eq!(runtime.notification_jobs().len(), 2);
+    }
+
+    #[test]
     fn third_value_quarantines_external_writer_result() {
         let mut runtime = CanonicalStateRuntime::default();
         let mut io = FakeIo {

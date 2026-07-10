@@ -9,16 +9,24 @@ use clap::Subcommand;
 use serde_json::Value;
 
 use crate::hook::adapter::{
-    build_prompt_preview, claude_event_from_json, codex_event_from_json_with_home,
-    codex_notify_event_from_arg_with_home,
+    TypedAdapterContext, build_prompt_preview, claude_event_from_json,
+    claude_typed_event_from_json, codex_event_from_json_with_home,
+    codex_notify_event_from_arg_with_home, codex_typed_event_from_json_with_home,
+    typed_progress_event,
 };
 use crate::hook::origin::{
     HookOrigin, claude_hook_origin, codex_hook_origin_from_payload, find_codex_session_file,
 };
-use crate::hook::writer::{ProgressEvent, apply_progress_event, resolve_pane, write_pane_options};
+use crate::hook::writer::{
+    ProgressEvent, apply_progress_event, resolve_pane, typed_progress_operations,
+    write_pane_options,
+};
 use crate::hook::{
     AgentEvent, AgentStatus, OptionUpdate, SubagentEntry, TaskItem, TaskItemStatus, TaskProgress,
     WorktreeActivity, WorktreeActivityKind, derive_event_writes,
+};
+use crate::pane_state::{
+    AgentKind, AgentSessionId, PaneEvent, PaneEventEnvelope, PromptState, normalize_text,
 };
 use crate::tmux::TmuxRunner;
 
@@ -139,6 +147,82 @@ pub(crate) fn run_hook_command(
             write_agent_event(runner, env, &event)
         }
     }
+}
+
+#[allow(dead_code)] // Connected to the command entrypoint at the Phase 6 producer cutover.
+pub(crate) fn claude_typed_event_from_input(
+    event: &str,
+    input: &str,
+    context: &TypedAdapterContext,
+) -> Result<Option<PaneEventEnvelope>> {
+    if let Some(progress_event) = claude_progress_event_from_input(event, input)? {
+        let session_id = required_payload_session(input)?;
+        return Ok(Some(typed_progress_event(
+            "claude",
+            session_id,
+            typed_progress_operations(progress_event)?,
+            context,
+        )?));
+    }
+    claude_typed_event_from_json(event, input, context)
+}
+
+#[allow(dead_code)] // Connected to the command entrypoint at the Phase 6 producer cutover.
+pub(crate) fn codex_typed_event_from_input(
+    event: &str,
+    input: &str,
+    context: &TypedAdapterContext,
+    codex_home: Option<&Path>,
+) -> Result<Option<PaneEventEnvelope>> {
+    if event.trim_start().starts_with('{') {
+        bail!("UnsupportedLegacyNotify: Codex agent-turn-complete notify is not supported");
+    }
+    if let Some(aux_event) =
+        codex_aux_event_from_input(event, input, context.observed_at, codex_home)?
+    {
+        let session_id = required_payload_session(input)?;
+        return match aux_event {
+            CodexAuxEvent::Progress(progress_event) => Ok(Some(typed_progress_event(
+                "codex",
+                session_id,
+                typed_progress_operations(progress_event)?,
+                context,
+            )?)),
+            CodexAuxEvent::Agent(event) => {
+                let Some(OptionUpdate::Set(text)) = event.prompt else {
+                    return Ok(None);
+                };
+                let Some(OptionUpdate::Set(source)) = event.prompt_source else {
+                    return Ok(None);
+                };
+                let prompt = PromptState {
+                    text: normalize_text(&text),
+                    source: normalize_text(&source),
+                };
+                prompt.validate()?;
+                Ok(Some(context.envelope(
+                    AgentKind::parse("codex")?,
+                    AgentSessionId::parse(session_id)?,
+                    PaneEvent::BeginRun {
+                        started_at: event.started_at.unwrap_or(context.observed_at),
+                        prompt: Some(prompt),
+                    },
+                )))
+            }
+        };
+    }
+    codex_typed_event_from_json_with_home(event, input, context, codex_home)
+}
+
+#[allow(dead_code)] // Used by the typed adapters above during the Phase 6 producer cutover.
+fn required_payload_session(input: &str) -> Result<String> {
+    let payload: Value = serde_json::from_str(input.trim())?;
+    let session_id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|session_id| !session_id.trim().is_empty());
+    session_id.ok_or_else(|| anyhow::anyhow!("InvalidRequest: hook payload requires session_id"))
 }
 
 fn write_agent_event(
@@ -597,6 +681,7 @@ fn codex_subagent_stop_event(payload: &Value) -> Result<Option<ProgressEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pane_state::{DaemonInstanceId, EventId, ProgressOperation};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -629,6 +714,72 @@ mod tests {
         assert_eq!(entry.display_name.as_deref(), Some("Ramanujan"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn typed_context() -> TypedAdapterContext {
+        TypedAdapterContext {
+            daemon_instance_id: DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100")
+                .unwrap(),
+            event_id: EventId::parse("102132435465768798a9bacbdcedfe0f").unwrap(),
+            pane_instance: crate::pane_state::PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 42,
+            },
+            observed_at: 123,
+        }
+    }
+
+    #[test]
+    fn claude_progress_fixture_maps_to_typed_operation_with_session() {
+        let envelope = claude_typed_event_from_input(
+            "TaskCreated",
+            r#"{"session_id":"claude-session"}"#,
+            &typed_context(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            envelope.agent_session_id.unwrap().as_str(),
+            "claude-session"
+        );
+        assert_eq!(
+            envelope.event,
+            PaneEvent::ProgressUpdated {
+                observed_at: 123,
+                operations: vec![ProgressOperation::TaskCreated],
+            }
+        );
+    }
+
+    #[test]
+    fn codex_goal_fixture_maps_to_begin_run_and_legacy_notify_is_rejected() {
+        let envelope = codex_typed_event_from_input(
+            "PostToolUse",
+            r#"{"session_id":"codex-session","tool_name":"create_goal","tool_input":{"objective":"ship\nthe change"}}"#,
+            &typed_context(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            envelope.event,
+            PaneEvent::BeginRun {
+                started_at: 123,
+                prompt: Some(PromptState {
+                    text: "ship the change".to_string(),
+                    source: "goal".to_string(),
+                }),
+            }
+        );
+
+        let error = codex_typed_event_from_input(
+            r#"{"type":"agent-turn-complete"}"#,
+            "",
+            &typed_context(),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("UnsupportedLegacyNotify"));
     }
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {
