@@ -13,6 +13,7 @@ use crate::daemon::{
 };
 use crate::git::{GitBadge, WorktreeInfo};
 use crate::options::snapshot::{PaneSnapshot, effective_agent, has_pane_state, is_live_agent_pane};
+pub use crate::pane_state::CanonicalStateRuntime as CanonicalPaneStateRuntime;
 use crate::session::SessionInfo;
 use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
 use crate::sidebar::state::{RepoId, SidebarAction, SidebarState};
@@ -25,6 +26,32 @@ const STATE_DEBOUNCE: Duration = Duration::from_millis(200);
 const TRIAGE_LEAVE_POLLS: u8 = 2;
 const FLASH_POLLS: u8 = 2;
 const EVENT_CAP: usize = 20;
+
+#[allow(dead_code)] // Activated by the v2 production cutover in Phase 6.
+pub(crate) struct LeasedCanonicalPaneStateRuntime {
+    pub runtime: CanonicalPaneStateRuntime,
+    _writer_lease: crate::daemon::lifecycle::DaemonFileLock,
+}
+
+impl LeasedCanonicalPaneStateRuntime {
+    #[allow(dead_code)] // Activated by the v2 production cutover in Phase 6.
+    pub fn bootstrap(
+        namespace: &std::path::Path,
+        load_after_lease: impl FnOnce() -> Result<
+            Vec<crate::pane_state::RawPaneRecord>,
+            crate::pane_state::StoreError,
+        >,
+    ) -> Result<Self, crate::pane_state::StoreError> {
+        let lease = crate::daemon::lifecycle::try_acquire_writer_lease(namespace)
+            .map_err(|error| crate::pane_state::StoreError::PersistFailed(error.to_string()))?
+            .ok_or(crate::pane_state::StoreError::WriterLeaseHeld)?;
+        let entries = load_after_lease()?;
+        Ok(Self {
+            runtime: CanonicalPaneStateRuntime::hydrate(entries),
+            _writer_lease: lease,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClientId(pub u64);
@@ -1209,6 +1236,32 @@ mod tests {
     use crate::options::snapshot::PaneSnapshot;
     use crate::sidebar::state::{SidebarState, StatusFilter};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn canonical_bootstrap_acquires_writer_lease_before_loading_state() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-runtime-bootstrap-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let namespace = root.join("server");
+        let first =
+            LeasedCanonicalPaneStateRuntime::bootstrap(&namespace, || Ok(Vec::new())).unwrap();
+        assert_eq!(first.runtime.snapshot_revision(), 0);
+        let mut loader_called = false;
+        let second = LeasedCanonicalPaneStateRuntime::bootstrap(&namespace, || {
+            loader_called = true;
+            Ok(Vec::new())
+        });
+        assert!(matches!(
+            second,
+            Err(crate::pane_state::StoreError::WriterLeaseHeld)
+        ));
+        assert!(!loader_called);
+        drop(first);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn pane(pane_id: &str, path: &str, agent: &str, status: &str) -> PaneSnapshot {
         PaneSnapshot {

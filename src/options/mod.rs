@@ -17,6 +17,7 @@ pub const KEY_TASK_ITEMS: &str = "@vde_task_items";
 pub const KEY_TASK_ITEM_IDS: &str = "@vde_task_item_ids";
 pub const KEY_SUBAGENTS: &str = "@vde_subagents";
 pub const KEY_WORKTREE_ACTIVITY: &str = "@vde_worktree_activity";
+pub const KEY_PANE_STATE: &str = "@vde_pane_state";
 
 pub const KEY_SIDEBAR_MARKER: &str = "@vde_sidebar";
 

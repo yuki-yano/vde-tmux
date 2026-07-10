@@ -202,6 +202,11 @@ pub(crate) fn try_acquire_daemon_instance_lock(socket: &Path) -> Result<Option<D
     try_lock_file(&daemon_lock_path(socket, ".lock"))
 }
 
+#[allow(dead_code)] // Connected when the v2 daemon becomes the production entrypoint in Phase 6.
+pub(crate) fn try_acquire_writer_lease(namespace: &Path) -> Result<Option<DaemonFileLock>> {
+    try_lock_file(&daemon_lock_path(namespace, ".writer.lock"))
+}
+
 fn daemon_lock_path(socket: &Path, suffix: &str) -> PathBuf {
     let mut name = socket
         .file_name()
@@ -267,6 +272,24 @@ mod tests {
     fn unique_dir(label: &str) -> PathBuf {
         let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
         PathBuf::from(format!("/tmp/vt-{label}-{}-{counter}", std::process::id()))
+    }
+
+    #[test]
+    fn writer_lease_rejects_second_writer_for_same_namespace() {
+        let root = unique_dir("writer-lease");
+        std::fs::create_dir_all(&root).unwrap();
+        let namespace = root.join("server-incarnation");
+        let first = super::try_acquire_writer_lease(&namespace).unwrap();
+        assert!(first.is_some());
+        let second = super::try_acquire_writer_lease(&namespace).unwrap();
+        assert!(second.is_none());
+        drop(first);
+        assert!(
+            super::try_acquire_writer_lease(&namespace)
+                .unwrap()
+                .is_some()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
