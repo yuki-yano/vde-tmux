@@ -3,6 +3,8 @@ pub mod protocol;
 pub mod runtime;
 pub mod server;
 pub mod session_badge;
+pub mod topology;
+pub mod view_hooks;
 pub mod workers;
 
 use std::cmp::Reverse;

@@ -30,6 +30,26 @@ pub struct V2Client {
     deadline: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2RequestFailureStage {
+    BeforeFullWrite,
+    AfterFullWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2RequestError {
+    pub stage: V2RequestFailureStage,
+    pub message: String,
+}
+
+impl std::fmt::Display for V2RequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for V2RequestError {}
+
 impl V2Client {
     pub fn connect(socket: &Path, expected_server_identity: &str) -> Result<Self> {
         Self::connect_with_timeout(socket, expected_server_identity, CLIENT_REQUEST_TIMEOUT)
@@ -106,6 +126,31 @@ impl V2Client {
     }
 
     pub fn request(&mut self, message: &ClientMessage) -> Result<ServerMessage> {
+        self.request_with_stage(message).map_err(anyhow::Error::new)
+    }
+
+    pub fn request_with_stage(
+        &mut self,
+        message: &ClientMessage,
+    ) -> std::result::Result<ServerMessage, V2RequestError> {
+        self.validate_request(message)
+            .map_err(|error| V2RequestError {
+                stage: V2RequestFailureStage::BeforeFullWrite,
+                message: error.to_string(),
+            })?;
+        write_client_message(&mut self.writer, message, self.deadline).map_err(|error| {
+            V2RequestError {
+                stage: V2RequestFailureStage::BeforeFullWrite,
+                message: error.to_string(),
+            }
+        })?;
+        read_server_message(&mut self.reader, self.deadline).map_err(|error| V2RequestError {
+            stage: V2RequestFailureStage::AfterFullWrite,
+            message: error.to_string(),
+        })
+    }
+
+    fn validate_request(&self, message: &ClientMessage) -> Result<()> {
         if message.proto() != PROTOCOL_VERSION {
             bail!("client request must use protocol version {PROTOCOL_VERSION}");
         }
@@ -118,8 +163,7 @@ impl V2Client {
         {
             bail!("client request uses a stale daemon instance ID");
         }
-        write_client_message(&mut self.writer, message, self.deadline)?;
-        read_server_message(&mut self.reader, self.deadline)
+        Ok(())
     }
 }
 

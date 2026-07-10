@@ -856,19 +856,38 @@ pub struct ViewEvent {
 
 impl ViewEvent {
     pub fn validate(&self) -> Result<(), ModelError> {
+        if self.hook_kind == ViewHookKind::ClientDetached && self.occurrence.is_some() {
+            return Err(ModelError(
+                "client-detached event cannot contain a view occurrence".to_string(),
+            ));
+        }
         if self.witnesses.len() > MAX_VIEW_WITNESSES {
             return Err(ModelError("too many client witnesses".to_string()));
         }
         let mut witness_pids = BTreeSet::new();
         for witness in &self.witnesses {
-            if !witness_pids.insert(witness.client_pid) {
+            if witness.client_pid == 0 || !witness_pids.insert(witness.client_pid) {
                 return Err(ModelError("duplicate client witness".to_string()));
             }
+            validate_tmux_entity_id(&witness.session_id, '$', "witness session")?;
+            validate_tmux_entity_id(&witness.window_id, '@', "witness window")?;
             witness.active_pane.validate()?;
         }
+        if self
+            .source_client
+            .as_ref()
+            .is_some_and(|source| source.client_pid == 0)
+        {
+            return Err(ModelError("invalid source client PID".to_string()));
+        }
         if let Some(occurrence) = &self.occurrence {
+            validate_tmux_entity_id(&occurrence.session_id, '$', "occurrence session")?;
+            validate_tmux_entity_id(&occurrence.window_id, '@', "occurrence window")?;
             if occurrence.observed_panes.len() > MAX_VIEW_PANES {
                 return Err(ModelError("too many panes in view occurrence".to_string()));
+            }
+            for pane in &occurrence.observed_panes {
+                pane.validate()?;
             }
             let panes = occurrence.observed_panes.iter().collect::<BTreeSet<_>>();
             if panes.len() != occurrence.observed_panes.len()
@@ -876,8 +895,25 @@ impl ViewEvent {
             {
                 return Err(ModelError("invalid panes in view occurrence".to_string()));
             }
+            if self.witnesses.iter().any(|witness| {
+                witness.window_id == occurrence.window_id && !panes.contains(&witness.active_pane)
+            }) {
+                return Err(ModelError(
+                    "client witness active pane is not in the declared window".to_string(),
+                ));
+            }
         }
         Ok(())
+    }
+}
+
+fn validate_tmux_entity_id(value: &str, prefix: char, field: &str) -> Result<(), ModelError> {
+    if value.strip_prefix(prefix).is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    }) {
+        Ok(())
+    } else {
+        Err(ModelError(format!("invalid {field} ID")))
     }
 }
 
@@ -894,6 +930,7 @@ pub struct CaptureTrackerSnapshot {
     pub replacement_kind: Option<AgentKind>,
     pub replacement_streak: u8,
     pub fingerprint: Option<[u8; 32]>,
+    pub last_change_at: Option<i64>,
     pub rebaseline_pending: bool,
 }
 

@@ -344,6 +344,7 @@ fn reduce_observation(
         tracker.fingerprint = capture
             .as_ref()
             .and_then(|capture| capture.observed_fingerprint);
+        tracker.last_change_at = tracker.fingerprint.map(|_| *observed_at);
         bump_tracker(&mut tracker)?;
         return finish_state_reduction(current, state, tracker, Some(context.tracker));
     }
@@ -392,6 +393,7 @@ fn reduce_observation(
                 tracker.fingerprint = capture
                     .as_ref()
                     .and_then(|capture| capture.observed_fingerprint);
+                tracker.last_change_at = tracker.fingerprint.map(|_| *observed_at);
             }
         }
         AgentPresenceObservation::Present(observed_agent) => {
@@ -426,6 +428,7 @@ fn reduce_observation(
                 tracker.fingerprint = capture
                     .as_ref()
                     .and_then(|capture| capture.observed_fingerprint);
+                tracker.last_change_at = tracker.fingerprint.map(|_| *observed_at);
             }
         }
     }
@@ -1030,9 +1033,12 @@ fn apply_capture(
     let Some(capture) = capture else {
         return Ok(());
     };
+    let fingerprint_changed = capture.observed_fingerprint.is_some()
+        && capture.observed_fingerprint != tracker.fingerprint;
     if tracker.rebaseline_pending {
         if capture.observed_fingerprint.is_some() {
             tracker.fingerprint = capture.observed_fingerprint;
+            tracker.last_change_at = Some(observed_at);
             tracker.rebaseline_pending = false;
         }
         return Ok(());
@@ -1055,6 +1061,9 @@ fn apply_capture(
     }
     if capture.observed_fingerprint.is_some() {
         tracker.fingerprint = capture.observed_fingerprint;
+        if fingerprint_changed || tracker.last_change_at.is_none() {
+            tracker.last_change_at = Some(observed_at);
+        }
     }
     Ok(())
 }
@@ -1078,6 +1087,7 @@ fn reset_tracker_for_state(
         replacement_kind: None,
         replacement_streak: 0,
         fingerprint: None,
+        last_change_at: None,
         rebaseline_pending: false,
     })
 }
@@ -1354,6 +1364,43 @@ mod tests {
         );
         assert_eq!(active(&stale).agent_epoch, 2);
         assert_eq!(active(&stale).acknowledged_seq, 0);
+    }
+
+    #[test]
+    fn old_view_through_sequence_cannot_acknowledge_a_later_run() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let first_begin = begin(None, &tracker);
+        let first_complete = reduce_once(
+            first_begin.record.as_ref(),
+            PaneEvent::CompleteRun { completed_at: 2 },
+            &first_begin.tracker_delta.as_ref().unwrap().next,
+        );
+        let first_version = active(&first_complete).version();
+        let second_begin = reduce_once(
+            first_complete.record.as_ref(),
+            PaneEvent::BeginRun {
+                started_at: 3,
+                prompt: None,
+            },
+            &first_complete.tracker_delta.as_ref().unwrap().next,
+        );
+        let second_complete = reduce_once(
+            second_begin.record.as_ref(),
+            PaneEvent::CompleteRun { completed_at: 4 },
+            &second_begin.tracker_delta.as_ref().unwrap().next,
+        );
+        let acknowledged = reduce_once(
+            second_complete.record.as_ref(),
+            PaneEvent::AcknowledgeView {
+                expected_state_id: first_version.state_id,
+                expected_agent_epoch: first_version.agent_epoch,
+                through_seq: 1,
+            },
+            &second_complete.tracker_delta.as_ref().unwrap().next,
+        );
+        assert_eq!(active(&acknowledged).completed_seq, 2);
+        assert_eq!(active(&acknowledged).acknowledged_seq, 1);
+        assert_eq!(resolve_badge(active(&acknowledged)), BadgeState::Done);
     }
 
     #[test]

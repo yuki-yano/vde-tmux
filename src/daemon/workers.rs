@@ -1,18 +1,628 @@
 use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::sync::{Arc, Mutex, mpsc::Sender};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 
 use crate::daemon::runtime::DaemonEvent;
+use crate::daemon::topology::ServerIdentity;
 use crate::detect::{demote_stale_running, detect_codex_wait_reason};
 use crate::git::{GitRunner, SystemGitRunner, collect_git_badges, collect_worktree_infos};
 use crate::hook::AgentStatus;
 use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane, read_all_panes};
+use crate::pane_state::ObservationDispatchSnapshot;
 use crate::sidebar::layout::jump_to_pane;
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
+use crate::{
+    pane_state::{
+        AgentKind, AgentPresenceObservation, CaptureInference, CaptureObservation,
+        CaptureTrackerSnapshot, DaemonInstanceId, EventId, LifecycleState, PaneEvent,
+        PaneEventEnvelope, PaneInstance, PaneState, StoredStateDescriptor, WaitReason,
+    },
+    tmux::{run_command, tmux_args},
+};
+
+pub const CAPTURE_HISTORY_LINES: &str = "-80";
+pub const STALE_CAPTURE_SECONDS: i64 = 300;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessDetection {
+    pub agents: BTreeSet<AgentKind>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentProcessSnapshot {
+    commands: BTreeMap<u32, String>,
+    children: BTreeMap<u32, Vec<u32>>,
+    complete: bool,
+}
+
+impl AgentProcessSnapshot {
+    pub fn parse(output: &str, command_succeeded: bool) -> Self {
+        let mut snapshot = Self {
+            complete: command_succeeded,
+            ..Self::default()
+        };
+        if !command_succeeded {
+            return snapshot;
+        }
+        for line in output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let mut fields = line.split_whitespace();
+            let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+                snapshot.complete = false;
+                continue;
+            };
+            let Some(ppid) = fields
+                .next()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            else {
+                snapshot.complete = false;
+                continue;
+            };
+            let command = fields.collect::<Vec<_>>().join(" ");
+            if command.is_empty() {
+                snapshot.complete = false;
+                continue;
+            }
+            if snapshot.commands.insert(pid, command).is_some() {
+                snapshot.complete = false;
+            }
+            snapshot.children.entry(ppid).or_default().push(pid);
+        }
+        snapshot
+    }
+
+    pub fn detect_from_pid_tree(&self, root_pid: u32) -> ProcessDetection {
+        if !self.complete || !self.commands.contains_key(&root_pid) {
+            return ProcessDetection {
+                agents: BTreeSet::new(),
+                complete: false,
+            };
+        }
+        let mut agents = BTreeSet::new();
+        let mut stack = vec![root_pid];
+        let mut visited = BTreeSet::new();
+        while let Some(pid) = stack.pop() {
+            if !visited.insert(pid) {
+                continue;
+            }
+            if let Some(command) = self.commands.get(&pid)
+                && let Some(agent) = detect_process_agent(command)
+            {
+                agents.insert(agent);
+            }
+            if let Some(children) = self.children.get(&pid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        ProcessDetection {
+            agents,
+            complete: true,
+        }
+    }
+}
+
+fn detect_process_agent(command: &str) -> Option<AgentKind> {
+    let mut fields = command.split_whitespace();
+    let executable = fields.next()?.rsplit('/').next()?.to_ascii_lowercase();
+    let direct = matches!(executable.as_str(), "claude" | "codex" | "opencode")
+        .then_some(executable.as_str());
+    let interpreted = matches!(
+        executable.as_str(),
+        "node" | "bun" | "deno" | "python" | "python3"
+    )
+    .then(|| fields.next())
+    .flatten()
+    .and_then(|script| {
+        script
+            .split(['/', '\\'])
+            .map(str::to_ascii_lowercase)
+            .find_map(|component| match component.as_str() {
+                "claude" | "claude-code" => Some("claude"),
+                "codex" | "codex-cli" => Some("codex"),
+                "opencode" => Some("opencode"),
+                _ => None,
+            })
+    });
+    direct
+        .or(interpreted)
+        .and_then(|agent| AgentKind::parse(agent).ok())
+}
+
+pub fn read_agent_process_snapshot(timeout: Duration) -> AgentProcessSnapshot {
+    match run_command("ps", &["-ax", "-o", "pid=,ppid=,command="], Some(timeout)) {
+        Ok(output) => AgentProcessSnapshot::parse(&output, true),
+        Err(_) => AgentProcessSnapshot::parse("", false),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureBatchOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub trait ObservationWorkerIo: Send + Sync + 'static {
+    fn capture_batch(&self, args: &[String]) -> Result<CaptureBatchOutput>;
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemObservationWorkerIo {
+    socket_name: Option<String>,
+    timeout: Duration,
+}
+
+impl SystemObservationWorkerIo {
+    pub fn new(socket_name: Option<String>) -> Self {
+        Self {
+            socket_name,
+            timeout: Duration::from_secs(1),
+        }
+    }
+
+    pub fn with_timeout(socket_name: Option<String>, timeout: Duration) -> Self {
+        Self {
+            socket_name,
+            timeout,
+        }
+    }
+}
+
+impl ObservationWorkerIo for SystemObservationWorkerIo {
+    fn capture_batch(&self, args: &[String]) -> Result<CaptureBatchOutput> {
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let tmux_args = tmux_args(self.socket_name.as_deref(), &refs);
+        let mut child = std::process::Command::new("tmux")
+            .args(tmux_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let stdout = child.stdout.take().map(|mut stdout| {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                stdout.read_to_end(&mut bytes).map(|_| bytes)
+            })
+        });
+        let stderr = child.stderr.take().map(|mut stderr| {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).map(|_| bytes)
+            })
+        });
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("tmux capture batch timed out after {:?}", self.timeout);
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        let stdout = stdout
+            .ok_or_else(|| anyhow::anyhow!("capture stdout was not piped"))?
+            .join()
+            .map_err(|_| anyhow::anyhow!("capture stdout reader panicked"))??;
+        let stderr = stderr
+            .ok_or_else(|| anyhow::anyhow!("capture stderr was not piped"))?
+            .join()
+            .map_err(|_| anyhow::anyhow!("capture stderr reader panicked"))??;
+        Ok(CaptureBatchOutput {
+            exit_code: status.code(),
+            stdout: String::from_utf8(stdout)?,
+            stderr: String::from_utf8(stderr)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureBatchError {
+    Random(String),
+    Io(String),
+    ProcessFailed(Option<i32>),
+    Stderr(String),
+    DelimiterMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidIdentityHeader,
+    IdentityMismatch {
+        expected: ServerIdentity,
+        actual: ServerIdentity,
+    },
+}
+
+impl std::fmt::Display for CaptureBatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Random(message) | Self::Io(message) => formatter.write_str(message),
+            Self::ProcessFailed(code) => write!(formatter, "capture batch failed with {code:?}"),
+            Self::Stderr(stderr) => write!(formatter, "capture batch wrote stderr: {stderr}"),
+            Self::DelimiterMismatch { expected, actual } => write!(
+                formatter,
+                "capture delimiter count mismatch: expected {expected}, received {actual}"
+            ),
+            Self::InvalidIdentityHeader => formatter.write_str("invalid capture identity header"),
+            Self::IdentityMismatch { expected, actual } => write!(
+                formatter,
+                "tmux server identity mismatch: expected {}:{}, received {}:{}",
+                expected.pid, expected.start_time, actual.pid, actual.start_time
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CaptureBatchError {}
+
+pub fn generate_capture_delimiter() -> Result<String, CaptureBatchError> {
+    EventId::generate()
+        .map(|event_id| event_id.as_str().to_string())
+        .map_err(|error| CaptureBatchError::Random(error.to_string()))
+}
+
+pub fn capture_batch_args(panes: &[PaneInstance], delimiter: &str) -> Vec<String> {
+    let mut args = vec![
+        "display-message".to_string(),
+        "-p".to_string(),
+        capture_identity_format(delimiter),
+        ";".to_string(),
+    ];
+    for (index, pane) in panes.iter().enumerate() {
+        if index > 0 {
+            args.push(";".to_string());
+            args.extend([
+                "display-message".to_string(),
+                "-p".to_string(),
+                delimiter.to_string(),
+                ";".to_string(),
+            ]);
+        }
+        args.extend([
+            "capture-pane".to_string(),
+            "-p".to_string(),
+            "-S".to_string(),
+            CAPTURE_HISTORY_LINES.to_string(),
+            "-t".to_string(),
+            pane.pane_id.clone(),
+        ]);
+    }
+    args
+}
+
+fn capture_identity_format(delimiter: &str) -> String {
+    format!("__vde_capture_identity_{delimiter}__#{{pid}}:#{{start_time}}")
+}
+
+pub fn collect_capture_batch(
+    io: &dyn ObservationWorkerIo,
+    panes: &[PaneInstance],
+    expected_identity: &ServerIdentity,
+) -> std::result::Result<Vec<String>, CaptureBatchError> {
+    if panes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let delimiter = generate_capture_delimiter()?;
+    let output = io
+        .capture_batch(&capture_batch_args(panes, &delimiter))
+        .map_err(|error| CaptureBatchError::Io(error.to_string()))?;
+    parse_capture_batch(output, panes.len(), &delimiter, expected_identity)
+}
+
+pub fn parse_capture_batch(
+    output: CaptureBatchOutput,
+    pane_count: usize,
+    delimiter: &str,
+    expected_identity: &ServerIdentity,
+) -> Result<Vec<String>, CaptureBatchError> {
+    let (identity_line, stdout) = output
+        .stdout
+        .split_once('\n')
+        .ok_or(CaptureBatchError::InvalidIdentityHeader)?;
+    let prefix = format!("__vde_capture_identity_{delimiter}__");
+    let identity = identity_line
+        .strip_suffix('\r')
+        .unwrap_or(identity_line)
+        .strip_prefix(&prefix)
+        .and_then(|value| value.split_once(':'))
+        .and_then(|(pid, start_time)| {
+            Some(ServerIdentity {
+                pid: pid.parse().ok()?,
+                start_time: start_time.parse().ok()?,
+            })
+        })
+        .ok_or(CaptureBatchError::InvalidIdentityHeader)?;
+    if &identity != expected_identity {
+        return Err(CaptureBatchError::IdentityMismatch {
+            expected: expected_identity.clone(),
+            actual: identity,
+        });
+    }
+    if output.exit_code != Some(0) {
+        return Err(CaptureBatchError::ProcessFailed(output.exit_code));
+    }
+    if !output.stderr.is_empty() {
+        return Err(CaptureBatchError::Stderr(output.stderr));
+    }
+    let mut tails = vec![String::new()];
+    let mut delimiter_count = 0;
+    for line in stdout.split_inclusive('\n') {
+        let value = line.strip_suffix('\n').unwrap_or(line);
+        let value = value.strip_suffix('\r').unwrap_or(value);
+        if value == delimiter {
+            delimiter_count += 1;
+            tails.push(String::new());
+        } else {
+            tails
+                .last_mut()
+                .expect("capture tails always has one entry")
+                .push_str(line);
+        }
+    }
+    let expected = pane_count.saturating_sub(1);
+    if delimiter_count != expected || tails.len() != pane_count {
+        return Err(CaptureBatchError::DelimiterMismatch {
+            expected,
+            actual: delimiter_count,
+        });
+    }
+    Ok(tails)
+}
+
+pub fn classify_presence(
+    current: Option<&PaneState>,
+    detected_agents: &BTreeSet<AgentKind>,
+    scan_complete: bool,
+) -> AgentPresenceObservation {
+    if !scan_complete {
+        return AgentPresenceObservation::Unknown;
+    }
+    if let Some(current) = current
+        && detected_agents.contains(&current.agent)
+    {
+        return AgentPresenceObservation::Present(current.agent.clone());
+    }
+    match detected_agents.len() {
+        0 => match current {
+            Some(state) if !supports_process_detection(&state.agent) || !state.scan_verified => {
+                AgentPresenceObservation::Unknown
+            }
+            _ => AgentPresenceObservation::Absent,
+        },
+        1 => AgentPresenceObservation::Present(
+            detected_agents
+                .iter()
+                .next()
+                .expect("one detected agent")
+                .clone(),
+        ),
+        _ => AgentPresenceObservation::Unknown,
+    }
+}
+
+pub fn infer_capture(
+    state: Option<&PaneState>,
+    tracker: &CaptureTrackerSnapshot,
+    tail: &str,
+    observed_at: i64,
+) -> CaptureObservation {
+    let observed_fingerprint = capture_sha256(tail);
+    let inference = if observed_fingerprint.is_none()
+        || tracker.rebaseline_pending
+        || tracker.fingerprint.is_none()
+    {
+        CaptureInference::NoChange
+    } else if let Some(reason) = detect_codex_wait_reason(tail) {
+        CaptureInference::PermissionWait {
+            reason: if reason == "permission_prompt" {
+                WaitReason::PermissionPrompt
+            } else {
+                WaitReason::Other(reason.to_string())
+            },
+        }
+    } else if observed_fingerprint != tracker.fingerprint {
+        CaptureInference::ActivityObserved
+    } else if state.is_some_and(|state| {
+        matches!(state.lifecycle, LifecycleState::Running)
+            && observed_at.saturating_sub(
+                state
+                    .started_at
+                    .into_iter()
+                    .chain(tracker.last_change_at)
+                    .max()
+                    .unwrap_or(observed_at),
+            ) >= STALE_CAPTURE_SECONDS
+    }) {
+        CaptureInference::StaleRunCompleted
+    } else {
+        CaptureInference::NoChange
+    };
+    CaptureObservation {
+        inference,
+        observed_fingerprint,
+    }
+}
+
+pub fn capture_sha256(tail: &str) -> Option<[u8; 32]> {
+    if tail.trim().is_empty() {
+        return None;
+    }
+    Some(Sha256::digest(tail.as_bytes()).into())
+}
+
+pub fn observation_envelope(
+    daemon_instance_id: DaemonInstanceId,
+    pane_instance: PaneInstance,
+    base: Option<StoredStateDescriptor>,
+    tracker: &CaptureTrackerSnapshot,
+    observed_at: i64,
+    presence: AgentPresenceObservation,
+    capture: Option<CaptureObservation>,
+) -> Result<PaneEventEnvelope> {
+    let capture = (!matches!(presence, AgentPresenceObservation::Unknown))
+        .then_some(capture)
+        .flatten();
+    Ok(PaneEventEnvelope {
+        daemon_instance_id,
+        event_id: EventId::generate()?,
+        pane_instance,
+        agent: None,
+        agent_session_id: None,
+        event: PaneEvent::ObservationBatch {
+            base,
+            tracker_generation: tracker.generation,
+            observed_at,
+            presence,
+            capture,
+        },
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationPollResult {
+    pub envelopes: Vec<PaneEventEnvelope>,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservationPollError {
+    UnverifiedServerIdentity(CaptureBatchError),
+    Event(String),
+}
+
+impl std::fmt::Display for ObservationPollError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnverifiedServerIdentity(error) => write!(formatter, "{error}"),
+            Self::Event(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ObservationPollError {}
+
+impl ObservationPollError {
+    pub fn requires_daemon_exit(&self) -> bool {
+        matches!(self, Self::UnverifiedServerIdentity(_))
+    }
+}
+
+pub fn run_observation_poll(
+    io: &dyn ObservationWorkerIo,
+    dispatch: &[ObservationDispatchSnapshot],
+    processes: &AgentProcessSnapshot,
+    daemon_instance_id: &DaemonInstanceId,
+    expected_identity: &ServerIdentity,
+    observed_at: i64,
+) -> std::result::Result<ObservationPollResult, ObservationPollError> {
+    let panes = dispatch
+        .iter()
+        .map(|snapshot| snapshot.pane_instance.clone())
+        .collect::<Vec<_>>();
+    let (tails, mut diagnostics) = match collect_capture_batch(io, &panes, expected_identity) {
+        Ok(tails) => (Some(tails), Vec::new()),
+        Err(error @ CaptureBatchError::InvalidIdentityHeader)
+        | Err(error @ CaptureBatchError::IdentityMismatch { .. }) => {
+            return Err(ObservationPollError::UnverifiedServerIdentity(error));
+        }
+        Err(error) => (None, vec![format!("capture_batch_discarded: {error}")]),
+    };
+    let mut envelopes = Vec::new();
+    for (index, snapshot) in dispatch.iter().enumerate() {
+        if matches!(
+            snapshot.base,
+            Some(StoredStateDescriptor::Quarantined { .. })
+        ) {
+            diagnostics.push(format!(
+                "quarantined_observation_skipped: {}",
+                snapshot.pane_instance.pane_id
+            ));
+            continue;
+        }
+        let detection = processes.detect_from_pid_tree(snapshot.pane_instance.pane_pid);
+        let presence = classify_presence(
+            snapshot.state.as_ref(),
+            &detection.agents,
+            detection.complete,
+        );
+        if detection.complete && detection.agents.len() > 1 {
+            diagnostics.push(format!(
+                "ambiguous_agent_processes: {}",
+                snapshot.pane_instance.pane_id
+            ));
+        }
+        let capture = tails
+            .as_ref()
+            .and_then(|tails| tails.get(index))
+            .map(|tail| {
+                infer_capture(
+                    snapshot.state.as_ref(),
+                    &snapshot.tracker,
+                    tail,
+                    observed_at,
+                )
+            });
+        envelopes.push(
+            observation_envelope(
+                daemon_instance_id.clone(),
+                snapshot.pane_instance.clone(),
+                snapshot.base.clone(),
+                &snapshot.tracker,
+                observed_at,
+                presence,
+                capture,
+            )
+            .map_err(|error| ObservationPollError::Event(error.to_string()))?,
+        );
+    }
+    Ok(ObservationPollResult {
+        envelopes,
+        diagnostics,
+    })
+}
+
+pub fn pane_removal_envelopes(
+    daemon_instance_id: &DaemonInstanceId,
+    previous: &[ObservationDispatchSnapshot],
+    current: &BTreeSet<PaneInstance>,
+    topology_complete: bool,
+) -> Result<Vec<PaneEventEnvelope>> {
+    if !topology_complete {
+        return Ok(Vec::new());
+    }
+    previous
+        .iter()
+        .filter(|snapshot| !current.contains(&snapshot.pane_instance))
+        .map(|snapshot| {
+            Ok(PaneEventEnvelope {
+                daemon_instance_id: daemon_instance_id.clone(),
+                event_id: EventId::generate()?,
+                pane_instance: snapshot.pane_instance.clone(),
+                agent: None,
+                agent_session_id: None,
+                event: PaneEvent::PaneRemoved {
+                    expected: snapshot.base.clone(),
+                },
+            })
+        })
+        .collect()
+}
+
+fn supports_process_detection(agent: &AgentKind) -> bool {
+    matches!(agent.as_str(), "claude" | "codex" | "opencode")
+}
 
 pub trait WorkerIo: Send + Sync + 'static {
     fn read_panes(&self) -> Result<Vec<PaneSnapshot>>;
@@ -457,6 +1067,351 @@ mod tests {
     use crate::options::snapshot::PaneSnapshot;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex, mpsc};
+
+    struct MockObservationIo {
+        calls: Mutex<usize>,
+        tails: Vec<String>,
+    }
+
+    impl ObservationWorkerIo for MockObservationIo {
+        fn capture_batch(&self, args: &[String]) -> anyhow::Result<CaptureBatchOutput> {
+            *self.calls.lock().unwrap() += 1;
+            let delimiter = args
+                .iter()
+                .find_map(|value| {
+                    value
+                        .strip_prefix("__vde_capture_identity_")
+                        .and_then(|value| value.split_once("__"))
+                        .map(|(delimiter, _)| delimiter.to_string())
+                })
+                .unwrap_or_default();
+            Ok(CaptureBatchOutput {
+                exit_code: Some(0),
+                stdout: format!(
+                    "__vde_capture_identity_{delimiter}__{}:{}\n{}",
+                    server_identity().pid,
+                    server_identity().start_time,
+                    self.tails.join(&format!("{delimiter}\n"))
+                ),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn server_identity() -> ServerIdentity {
+        ServerIdentity {
+            pid: 4242,
+            start_time: 99,
+        }
+    }
+
+    fn pane_instance(id: &str, pid: u32) -> PaneInstance {
+        PaneInstance {
+            pane_id: id.to_string(),
+            pane_pid: pid,
+        }
+    }
+
+    fn canonical_state(agent: &str) -> PaneState {
+        PaneState {
+            schema_version: crate::pane_state::PANE_STATE_SCHEMA_VERSION,
+            state_id: crate::pane_state::StateId::parse("00112233445566778899aabbccddeeff")
+                .unwrap(),
+            revision: 1,
+            pane_instance: pane_instance("%1", 11),
+            agent: AgentKind::parse(agent).unwrap(),
+            agent_session_id: None,
+            agent_epoch: 1,
+            agent_present: true,
+            scan_verified: true,
+            synthetic_completion_armed: false,
+            lifecycle: LifecycleState::Running,
+            run_seq: 1,
+            completed_seq: 0,
+            acknowledged_seq: 0,
+            started_at: Some(100),
+            completed_at: None,
+            prompt: None,
+            tasks: crate::pane_state::TaskState::default(),
+            subagents: Vec::new(),
+            worktree_activity: None,
+        }
+    }
+
+    #[test]
+    fn capture_batch_uses_one_worker_call_for_all_panes() {
+        let io = MockObservationIo {
+            calls: Mutex::new(0),
+            tails: vec![
+                "one\n".to_string(),
+                "two\n".to_string(),
+                "three\n".to_string(),
+            ],
+        };
+        let panes = vec![
+            pane_instance("%1", 11),
+            pane_instance("%2", 22),
+            pane_instance("%3", 33),
+        ];
+        assert_eq!(
+            collect_capture_batch(&io, &panes, &server_identity()).unwrap(),
+            io.tails
+        );
+        assert_eq!(*io.calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn capture_batch_rejects_nonzero_stderr_and_delimiter_races() {
+        let delimiter = "00112233445566778899aabbccddeeff";
+        for output in [
+            CaptureBatchOutput {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            CaptureBatchOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: "pane vanished".to_string(),
+            },
+            CaptureBatchOutput {
+                exit_code: Some(0),
+                stdout: "first only\n".to_string(),
+                stderr: String::new(),
+            },
+            CaptureBatchOutput {
+                exit_code: Some(0),
+                stdout: format!("first\n{delimiter}\ncollision\n{delimiter}\nsecond\n"),
+                stderr: String::new(),
+            },
+        ] {
+            assert!(parse_capture_batch(output, 2, delimiter, &server_identity()).is_err());
+        }
+    }
+
+    #[test]
+    fn capture_batch_rejects_first_middle_and_last_pane_disappearance() {
+        let delimiter = "00112233445566778899aabbccddeeff";
+        let first_missing = CaptureBatchOutput {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "first pane missing".to_string(),
+        };
+        let middle_missing = CaptureBatchOutput {
+            exit_code: Some(1),
+            stdout: format!("first\n{delimiter}\n"),
+            stderr: "middle pane missing".to_string(),
+        };
+        let last_missing = CaptureBatchOutput {
+            exit_code: Some(1),
+            stdout: format!("first\n{delimiter}\nsecond\n{delimiter}\n"),
+            stderr: "last pane missing".to_string(),
+        };
+        assert!(parse_capture_batch(first_missing, 3, delimiter, &server_identity()).is_err());
+        assert!(parse_capture_batch(middle_missing, 3, delimiter, &server_identity()).is_err());
+        assert!(parse_capture_batch(last_missing, 3, delimiter, &server_identity()).is_err());
+    }
+
+    #[test]
+    fn capture_batch_rejects_server_identity_mismatch() {
+        let delimiter = "00112233445566778899aabbccddeeff";
+        let output = CaptureBatchOutput {
+            exit_code: Some(1),
+            stdout: format!("__vde_capture_identity_{delimiter}__43:99\ntail\n"),
+            stderr: "pane disappeared".to_string(),
+        };
+        assert!(matches!(
+            parse_capture_batch(output, 1, delimiter, &server_identity()),
+            Err(CaptureBatchError::IdentityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn presence_is_three_state_and_prefers_current_kind() {
+        let state = canonical_state("codex");
+        let agents = BTreeSet::from([
+            AgentKind::parse("claude").unwrap(),
+            AgentKind::parse("codex").unwrap(),
+        ]);
+        assert_eq!(
+            classify_presence(Some(&state), &agents, true),
+            AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap())
+        );
+        assert_eq!(
+            classify_presence(None, &agents, true),
+            AgentPresenceObservation::Unknown
+        );
+        assert_eq!(
+            classify_presence(Some(&state), &BTreeSet::new(), false),
+            AgentPresenceObservation::Unknown
+        );
+        let mut generic = canonical_state("generic");
+        generic.scan_verified = false;
+        assert_eq!(
+            classify_presence(Some(&generic), &BTreeSet::new(), true),
+            AgentPresenceObservation::Unknown
+        );
+    }
+
+    #[test]
+    fn process_snapshot_collects_all_agent_kinds_and_marks_malformed_input_incomplete() {
+        let snapshot = AgentProcessSnapshot::parse(
+            "   10     1 zsh\n   11    10 codex\n   12    10 /usr/bin/claude --resume\n   13    12 opencode\n   14    10 rg codex\n",
+            true,
+        );
+        let detection = snapshot.detect_from_pid_tree(10);
+        assert!(detection.complete);
+        assert_eq!(
+            detection
+                .agents
+                .iter()
+                .map(AgentKind::as_str)
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "opencode"]
+        );
+
+        let malformed = AgentProcessSnapshot::parse("10 1 zsh\nbroken\n", true);
+        assert!(!malformed.detect_from_pid_tree(10).complete);
+        assert!(
+            !AgentProcessSnapshot::parse("", false)
+                .detect_from_pid_tree(10)
+                .complete
+        );
+    }
+
+    #[test]
+    fn capture_inference_handles_baseline_change_rebaseline_and_stale() {
+        let state = canonical_state("opencode");
+        let baseline = infer_capture(
+            Some(&state),
+            &CaptureTrackerSnapshot::default(),
+            "first\n",
+            100,
+        );
+        assert_eq!(baseline.inference, CaptureInference::NoChange);
+        let permission_baseline = infer_capture(
+            Some(&state),
+            &CaptureTrackerSnapshot::default(),
+            "Allow command execution?\n1. Yes\n2. No\n",
+            100,
+        );
+        assert_eq!(permission_baseline.inference, CaptureInference::NoChange);
+        let mut tracker = CaptureTrackerSnapshot {
+            fingerprint: baseline.observed_fingerprint,
+            last_change_at: Some(100),
+            ..CaptureTrackerSnapshot::default()
+        };
+        assert_eq!(
+            infer_capture(Some(&state), &tracker, "changed\n", 101).inference,
+            CaptureInference::ActivityObserved
+        );
+        tracker.rebaseline_pending = true;
+        assert_eq!(
+            infer_capture(Some(&state), &tracker, "changed\n", 500).inference,
+            CaptureInference::NoChange
+        );
+        tracker.rebaseline_pending = false;
+        assert_eq!(
+            infer_capture(Some(&state), &tracker, "first\n", 500).inference,
+            CaptureInference::StaleRunCompleted
+        );
+        assert!(
+            infer_capture(Some(&state), &tracker, "   \n", 500)
+                .observed_fingerprint
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unknown_presence_drops_capture_from_observation_envelope() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let envelope = observation_envelope(
+            DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            pane_instance("%1", 11),
+            None,
+            &tracker,
+            100,
+            AgentPresenceObservation::Unknown,
+            Some(CaptureObservation {
+                inference: CaptureInference::ActivityObserved,
+                observed_fingerprint: Some([1; 32]),
+            }),
+        )
+        .unwrap();
+        let PaneEvent::ObservationBatch { capture, .. } = envelope.event else {
+            panic!("expected observation batch");
+        };
+        assert!(capture.is_none());
+    }
+
+    #[test]
+    fn observation_poll_connects_frozen_dispatch_process_scan_and_single_capture() {
+        let state = canonical_state("opencode");
+        let tracker = CaptureTrackerSnapshot {
+            epoch: Some((state.state_id.clone(), state.agent_epoch)),
+            fingerprint: capture_sha256("before\n"),
+            last_change_at: Some(100),
+            ..CaptureTrackerSnapshot::default()
+        };
+        let dispatch = vec![ObservationDispatchSnapshot {
+            pane_instance: state.pane_instance.clone(),
+            base: Some(StoredStateDescriptor::Canonical {
+                version: state.version(),
+            }),
+            tracker,
+            state: Some(state),
+        }];
+        let io = MockObservationIo {
+            calls: Mutex::new(0),
+            tails: vec!["after\n".to_string()],
+        };
+        let processes = AgentProcessSnapshot::parse("11 1 opencode\n", true);
+        let result = run_observation_poll(
+            &io,
+            &dispatch,
+            &processes,
+            &DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            &server_identity(),
+            200,
+        )
+        .unwrap();
+        assert_eq!(*io.calls.lock().unwrap(), 1);
+        let PaneEvent::ObservationBatch {
+            presence, capture, ..
+        } = &result.envelopes[0].event
+        else {
+            panic!("expected observation batch");
+        };
+        assert_eq!(
+            *presence,
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap())
+        );
+        assert_eq!(
+            capture.as_ref().unwrap().inference,
+            CaptureInference::ActivityObserved
+        );
+    }
+
+    #[test]
+    fn incomplete_topology_never_emits_pane_removal() {
+        let state = canonical_state("codex");
+        let previous = vec![ObservationDispatchSnapshot {
+            pane_instance: state.pane_instance.clone(),
+            base: Some(StoredStateDescriptor::Canonical {
+                version: state.version(),
+            }),
+            tracker: CaptureTrackerSnapshot::default(),
+            state: Some(state),
+        }];
+        let daemon = DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap();
+        assert!(
+            pane_removal_envelopes(&daemon, &previous, &BTreeSet::new(), false)
+                .unwrap()
+                .is_empty()
+        );
+        let removed = pane_removal_envelopes(&daemon, &previous, &BTreeSet::new(), true).unwrap();
+        assert!(matches!(removed[0].event, PaneEvent::PaneRemoved { .. }));
+    }
 
     #[derive(Default)]
     struct MockWorkerIo {

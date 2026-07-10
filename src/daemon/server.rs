@@ -161,7 +161,27 @@ pub struct V2ConnectionState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V2SequencedMutation {
     pub accepted_seq: u64,
-    pub message: crate::daemon::protocol::v2::ClientMessage,
+    pub mutation: V2AcceptedMutation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum V2AcceptedMutation {
+    External(crate::daemon::protocol::v2::ClientMessage),
+    Internal(V2InternalMutation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum V2InternalMutation {
+    PaneEvent(Box<crate::pane_state::PaneEventEnvelope>),
+    RefreshTopology,
+    TargetedPaneRefresh { pane_id: String },
+    ReconcileViews,
+    SidebarProjection,
+    GitProjection,
+    TriageProjection,
+    DiagnosticProjection,
+    HookHealthProjection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +192,7 @@ pub enum V2Route {
     Query(crate::daemon::protocol::v2::ClientMessage),
     Mutation(V2SequencedMutation),
     Queued { accepted_seq: u64 },
+    DroppedInternal,
 }
 
 #[derive(Debug, Clone)]
@@ -205,8 +226,17 @@ impl V2Router {
         self.phase
     }
 
+    #[cfg(test)]
     pub fn set_phase(&mut self, phase: crate::daemon::protocol::v2::DaemonPhase) {
         self.phase = phase;
+    }
+
+    pub fn begin_hydration(&mut self) -> Result<(), &'static str> {
+        if self.phase != crate::daemon::protocol::v2::DaemonPhase::InstallingHooks {
+            return Err("daemon may enter hydration only after hook installation");
+        }
+        self.phase = crate::daemon::protocol::v2::DaemonPhase::Hydrating;
+        Ok(())
     }
 
     pub fn set_hook_health(&mut self, health: crate::daemon::protocol::v2::HookHealth) {
@@ -314,14 +344,9 @@ impl V2Router {
             ));
         }
 
-        let accepted_seq = match self.next_accepted_seq.checked_add(1) {
-            Some(next) => {
-                let accepted = self.next_accepted_seq;
-                self.next_accepted_seq = next;
-                accepted
-            }
+        let accepted_seq = match self.allocate_accepted_seq() {
+            Some(accepted_seq) => accepted_seq,
             None => {
-                self.fatal = true;
                 return V2Route::Fatal(V2ServerMessage::error(
                     ErrorCode::InternalError,
                     "accepted sequence overflow",
@@ -333,7 +358,7 @@ impl V2Router {
         let is_view = matches!(message, V2ClientMessage::SubmitViewEvent { .. });
         let mutation = V2SequencedMutation {
             accepted_seq,
-            message,
+            mutation: V2AcceptedMutation::External(message),
         };
         if self.phase == crate::daemon::protocol::v2::DaemonPhase::Serving {
             return V2Route::Mutation(mutation);
@@ -349,11 +374,70 @@ impl V2Router {
         }
     }
 
-    pub fn drain_bootstrap_fifo(&mut self) -> Vec<V2SequencedMutation> {
-        if self.phase != crate::daemon::protocol::v2::DaemonPhase::Serving {
-            return Vec::new();
+    pub fn finish_bootstrap<E>(
+        &mut self,
+        apply_fifo_and_reconcile: impl FnOnce(Vec<V2SequencedMutation>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        assert_eq!(
+            self.phase,
+            crate::daemon::protocol::v2::DaemonPhase::Hydrating,
+            "bootstrap may finish only from Hydrating"
+        );
+        let queued = self.bootstrap_fifo.drain(..).collect();
+        apply_fifo_and_reconcile(queued)?;
+        self.phase = crate::daemon::protocol::v2::DaemonPhase::Serving;
+        Ok(())
+    }
+
+    pub fn accept_internal(&mut self, mutation: V2InternalMutation) -> V2Route {
+        use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+
+        if self.fatal {
+            return V2Route::Fatal(ServerMessage::error(
+                ErrorCode::InternalError,
+                "daemon router is fail-stopped",
+                None,
+            ));
         }
-        self.bootstrap_fifo.drain(..).collect()
+        if self.phase != crate::daemon::protocol::v2::DaemonPhase::Serving
+            && self.bootstrap_fifo.len() >= V2_BOOTSTRAP_FIFO_CAPACITY
+        {
+            return V2Route::DroppedInternal;
+        }
+        let accepted_seq = match self.allocate_accepted_seq() {
+            Some(accepted_seq) => accepted_seq,
+            None => {
+                return V2Route::Fatal(ServerMessage::error(
+                    ErrorCode::InternalError,
+                    "accepted sequence overflow",
+                    None,
+                ));
+            }
+        };
+        let mutation = V2SequencedMutation {
+            accepted_seq,
+            mutation: V2AcceptedMutation::Internal(mutation),
+        };
+        if self.phase == crate::daemon::protocol::v2::DaemonPhase::Serving {
+            V2Route::Mutation(mutation)
+        } else {
+            self.bootstrap_fifo.push_back(mutation);
+            V2Route::Queued { accepted_seq }
+        }
+    }
+
+    fn allocate_accepted_seq(&mut self) -> Option<u64> {
+        match self.next_accepted_seq.checked_add(1) {
+            Some(next) => {
+                let accepted = self.next_accepted_seq;
+                self.next_accepted_seq = next;
+                Some(accepted)
+            }
+            None => {
+                self.fatal = true;
+                None
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1106,6 +1190,37 @@ mod tests {
     }
 
     #[test]
+    fn v2_internal_and_external_mutations_share_one_accepted_sequence() {
+        let mut router = V2Router::new(v2_daemon_id(), "server");
+        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        let mut connection = V2ConnectionState::default();
+        v2_handshake(&mut router, &mut connection);
+        let V2Route::Mutation(external) = router.route(&mut connection, v2_begin()) else {
+            panic!("expected external mutation");
+        };
+        let V2Route::Mutation(internal) =
+            router.accept_internal(V2InternalMutation::RefreshTopology)
+        else {
+            panic!("expected internal mutation");
+        };
+        let V2Route::Mutation(next_external) = router.route(&mut connection, v2_begin()) else {
+            panic!("expected external mutation");
+        };
+        assert_eq!(
+            (
+                external.accepted_seq,
+                internal.accepted_seq,
+                next_external.accepted_seq,
+            ),
+            (1, 2, 3)
+        );
+        assert!(matches!(
+            internal.mutation,
+            V2AcceptedMutation::Internal(V2InternalMutation::RefreshTopology)
+        ));
+    }
+
+    #[test]
     fn v2_bootstrap_fifo_preserves_order_and_rejects_overflow_without_consuming_seq() {
         let mut router = V2Router::new(v2_daemon_id(), "server");
         router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Hydrating);
@@ -1126,8 +1241,17 @@ mod tests {
                 ..
             })
         ));
-        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
-        let queued = router.drain_bootstrap_fifo();
+        assert_eq!(
+            router.accept_internal(V2InternalMutation::ReconcileViews),
+            V2Route::DroppedInternal
+        );
+        let mut queued = Vec::new();
+        router
+            .finish_bootstrap::<()>(|mutations| {
+                queued = mutations;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(queued.len(), V2_BOOTSTRAP_FIFO_CAPACITY);
         assert!(
             queued
@@ -1138,6 +1262,37 @@ mod tests {
             panic!("expected mutation");
         };
         assert_eq!(next.accepted_seq, 65);
+    }
+
+    #[test]
+    fn v2_bootstrap_failure_keeps_hydrating_and_never_serves_queries() {
+        let mut router = V2Router::new(v2_daemon_id(), "server");
+        router.begin_hydration().unwrap();
+        let mut connection = V2ConnectionState::default();
+        v2_handshake(&mut router, &mut connection);
+        assert!(matches!(
+            router.route(&mut connection, v2_begin()),
+            V2Route::Queued { accepted_seq: 1 }
+        ));
+        let result = router.finish_bootstrap(|queued| {
+            assert_eq!(queued.len(), 1);
+            Err("initial reconciliation failed")
+        });
+        assert_eq!(result, Err("initial reconciliation failed"));
+        assert_eq!(
+            router.phase(),
+            crate::daemon::protocol::v2::DaemonPhase::Hydrating
+        );
+        assert!(matches!(
+            router.route(
+                &mut connection,
+                crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot { proto: 2 },
+            ),
+            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::NotReady,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1176,6 +1331,79 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn v2_rejects_invalid_view_before_consuming_accepted_sequence() {
+        let mut router = V2Router::new(v2_daemon_id(), "server");
+        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        let mut connection = V2ConnectionState::default();
+        v2_handshake(&mut router, &mut connection);
+        let pane = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        let invalid = crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent {
+            proto: 2,
+            event: crate::pane_state::ViewEvent {
+                daemon_instance_id: v2_daemon_id(),
+                event_id: v2_event_id(),
+                hook_kind: crate::pane_state::ViewHookKind::WindowPaneChanged,
+                occurrence: Some(crate::pane_state::ViewOccurrence {
+                    session_id: "$1".to_string(),
+                    window_id: "@1".to_string(),
+                    active_pane: pane.clone(),
+                    observed_panes: vec![
+                        pane,
+                        crate::pane_state::PaneInstance {
+                            pane_id: "invalid".to_string(),
+                            pane_pid: 0,
+                        },
+                    ],
+                }),
+                source_client: Some(crate::pane_state::SourceClientHint { client_pid: 10 }),
+                witnesses: Vec::new(),
+            },
+        };
+        assert!(matches!(
+            router.route(&mut connection, invalid),
+            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+        let detached_pane = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        let detached_with_occurrence =
+            crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent {
+                proto: 2,
+                event: crate::pane_state::ViewEvent {
+                    daemon_instance_id: v2_daemon_id(),
+                    event_id: v2_event_id(),
+                    hook_kind: crate::pane_state::ViewHookKind::ClientDetached,
+                    occurrence: Some(crate::pane_state::ViewOccurrence {
+                        session_id: "$1".to_string(),
+                        window_id: "@1".to_string(),
+                        active_pane: detached_pane.clone(),
+                        observed_panes: vec![detached_pane],
+                    }),
+                    source_client: Some(crate::pane_state::SourceClientHint { client_pid: 10 }),
+                    witnesses: Vec::new(),
+                },
+            };
+        assert!(matches!(
+            router.route(&mut connection, detached_with_occurrence),
+            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+        let V2Route::Mutation(mutation) = router.route(&mut connection, v2_begin()) else {
+            panic!("expected mutation after rejected view");
+        };
+        assert_eq!(mutation.accepted_seq, 1);
     }
 
     #[test]

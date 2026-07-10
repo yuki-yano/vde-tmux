@@ -57,7 +57,12 @@ impl std::error::Error for StoreError {}
 
 impl StoreError {
     pub fn requires_daemon_exit(&self) -> bool {
-        matches!(self, Self::FailStop(_))
+        matches!(
+            self,
+            Self::FailStop(_)
+                | Self::CounterOverflow(_)
+                | Self::Reduce(ReduceError::CounterOverflow(_))
+        )
     }
 }
 
@@ -231,10 +236,6 @@ impl<'a> TmuxPaneStateStoreIo<'a> {
 
 impl PaneStateStoreIo for TmuxPaneStateStoreIo<'_> {
     fn write_candidate(&mut self, pane: &PaneInstance, candidate: &str) -> WriteAttempt {
-        let server_guard = format!(
-            "#{{&&:#{{==:#{{pid}},{}}},#{{==:#{{start_time}},{}}}}}",
-            self.server_pid, self.server_start_time
-        );
         let pane_guard = format!("#{{==:#{{pane_pid}},{}}}", pane.pane_pid);
         let set_and_read = format!(
             "set-option -p -t {} {} {} ; show-options -pqv -t {} {}",
@@ -251,13 +252,14 @@ impl PaneStateStoreIo for TmuxPaneStateStoreIo<'_> {
             quote_tmux_command_argument(&set_and_read),
             quote_tmux_command_argument(&format!("display-message -p '{PANE_MISMATCH_SENTINEL}'")),
         );
-        let result = self.runner.run(&[
-            "if-shell",
-            "-F",
-            &server_guard,
-            &pane_command,
-            &format!("display-message -p '{SERVER_MISMATCH_SENTINEL}'"),
-        ]);
+        let guarded = server_guarded_command_args(
+            self.server_pid,
+            self.server_start_time,
+            pane_command,
+            SERVER_MISMATCH_SENTINEL,
+        );
+        let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
+        let result = self.runner.run(&refs);
         match result {
             Ok(output) if output.trim() == SERVER_MISMATCH_SENTINEL => WriteAttempt::ServerMismatch,
             Ok(output) if output.trim() == PANE_MISMATCH_SENTINEL => WriteAttempt::PaneMissing,
@@ -309,6 +311,39 @@ impl PaneStateStoreIo for TmuxPaneStateStoreIo<'_> {
 
 pub fn quote_tmux_command_argument(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+pub fn server_guarded_command_args(
+    server_pid: u32,
+    server_start_time: i64,
+    true_command: String,
+    mismatch_sentinel: &str,
+) -> Vec<String> {
+    vec![
+        "if-shell".to_string(),
+        "-F".to_string(),
+        format!(
+            "#{{&&:#{{==:#{{pid}},{server_pid}}},#{{==:#{{start_time}},{server_start_time}}}}}"
+        ),
+        true_command,
+        format!(
+            "display-message -p {}",
+            quote_tmux_command_argument(mismatch_sentinel)
+        ),
+    ]
+}
+
+pub fn tmux_command_string(args: &[String]) -> String {
+    args.iter()
+        .map(|argument| {
+            if argument == ";" {
+                ";".to_string()
+            } else {
+                quote_tmux_command_argument(argument)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -367,6 +402,48 @@ pub enum QueryPaneAvailability {
     NotReady,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationDispatchSnapshot {
+    pub pane_instance: PaneInstance,
+    pub base: Option<StoredStateDescriptor>,
+    pub tracker: CaptureTrackerSnapshot,
+    pub state: Option<PaneState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewBatchFailure {
+    pub pane_instance: PaneInstance,
+    pub error: StoreError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewBatchApplyResult {
+    pub committed: usize,
+    pub failed: Vec<ViewBatchFailure>,
+    pub snapshot_revision: u64,
+}
+
+#[derive(Debug)]
+pub struct ViewBatchContinuation {
+    batch_id: u64,
+    working: Box<CanonicalStateRuntime>,
+    remaining: VecDeque<PaneEventEnvelope>,
+    pending_pane: PaneInstance,
+    committed: usize,
+    failed: Vec<ViewBatchFailure>,
+    projection_changed: bool,
+    revision_before: u64,
+    done_clear_on: DoneClearOn,
+}
+
+#[derive(Debug)]
+pub enum ViewBatchProgress {
+    Complete(ViewBatchApplyResult),
+    Pending(ViewBatchContinuation),
+    Blocked(StoreError),
+    Fatal(StoreError),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CanonicalStateRuntime {
     records: BTreeMap<PaneInstance, StoredPaneRecord>,
@@ -381,6 +458,8 @@ pub struct CanonicalStateRuntime {
     snapshot_frame_too_large: bool,
     fail_stopped: bool,
     pending: Option<Box<PendingTransaction>>,
+    next_view_batch_id: u64,
+    active_view_batch_id: Option<u64>,
 }
 
 impl CanonicalStateRuntime {
@@ -422,6 +501,26 @@ impl CanonicalStateRuntime {
         self.trackers.get(pane).cloned().unwrap_or_default()
     }
 
+    pub fn freeze_observation_dispatch(
+        &self,
+        panes: impl IntoIterator<Item = PaneInstance>,
+    ) -> Vec<ObservationDispatchSnapshot> {
+        let mut snapshots = panes
+            .into_iter()
+            .map(|pane_instance| ObservationDispatchSnapshot {
+                base: self.descriptor(&pane_instance),
+                tracker: self.tracker(&pane_instance),
+                state: match self.records.get(&pane_instance) {
+                    Some(StoredPaneRecord::Active(state)) => Some(state.clone()),
+                    _ => None,
+                },
+                pane_instance,
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.pane_instance.cmp(&right.pane_instance));
+        snapshots
+    }
+
     pub fn diagnostics(&self) -> &VecDeque<PaneStateDiagnostic> {
         &self.diagnostics
     }
@@ -447,7 +546,7 @@ impl CanonicalStateRuntime {
     }
 
     pub fn sequenced_mutations_paused(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.active_view_batch_id.is_some()
     }
 
     pub fn query_committed_snapshot_revision(&self) -> u64 {
@@ -459,7 +558,7 @@ impl CanonicalStateRuntime {
         pane: &PaneInstance,
         presentation_cache_hit: bool,
     ) -> QueryPaneAvailability {
-        if presentation_cache_hit || self.pending.is_none() {
+        if presentation_cache_hit || !self.sequenced_mutations_paused() {
             QueryPaneAvailability::Ready(self.descriptor(pane))
         } else {
             QueryPaneAvailability::NotReady
@@ -477,7 +576,7 @@ impl CanonicalStateRuntime {
         if self.fail_stopped {
             return Err(StoreError::FailStop("daemon is fail-stopped".to_string()));
         }
-        if self.pending.is_some() {
+        if self.sequenced_mutations_paused() {
             return Err(StoreError::PersistPending);
         }
         if self.quarantined.contains_key(&envelope.pane_instance) {
@@ -530,7 +629,7 @@ impl CanonicalStateRuntime {
         draft.derive_candidate_projection(&envelope.pane_instance, current, Some(&candidate));
         draft.bump_snapshot_revision()?;
         draft.validate_projection()?;
-        draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        let _ = draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
 
         let success = ApplyResult {
             outcome: ReductionOutcome::CanonicalChanged,
@@ -571,6 +670,216 @@ impl CanonicalStateRuntime {
         }
     }
 
+    pub fn apply_view_acknowledgement_batch(
+        &mut self,
+        io: &mut dyn PaneStateStoreIo,
+        clock: &mut dyn RecoveryClock,
+        envelopes: &[PaneEventEnvelope],
+        done_clear_on: DoneClearOn,
+    ) -> ViewBatchProgress {
+        if self.fail_stopped {
+            return ViewBatchProgress::Fatal(StoreError::FailStop(
+                "daemon is fail-stopped".to_string(),
+            ));
+        }
+        if self.sequenced_mutations_paused() {
+            return ViewBatchProgress::Blocked(StoreError::PersistPending);
+        }
+        let Some(batch_id) = self.next_view_batch_id.checked_add(1) else {
+            self.fail_stopped = true;
+            return ViewBatchProgress::Fatal(StoreError::CounterOverflow("view batch ID"));
+        };
+        self.next_view_batch_id = batch_id;
+        self.active_view_batch_id = Some(batch_id);
+        let mut working = self.clone();
+        working.active_view_batch_id = None;
+        let continuation = ViewBatchContinuation {
+            batch_id,
+            working: Box::new(working),
+            remaining: envelopes.iter().cloned().collect(),
+            pending_pane: PaneInstance {
+                pane_id: "%0".to_string(),
+                pane_pid: 1,
+            },
+            committed: 0,
+            failed: Vec::new(),
+            projection_changed: false,
+            revision_before: self.snapshot_revision,
+            done_clear_on,
+        };
+        self.advance_view_batch(io, clock, continuation)
+    }
+
+    pub fn resume_view_acknowledgement_batch(
+        &mut self,
+        io: &mut dyn PaneStateStoreIo,
+        clock: &mut dyn RecoveryClock,
+        mut continuation: ViewBatchContinuation,
+    ) -> ViewBatchProgress {
+        if self.active_view_batch_id != Some(continuation.batch_id)
+            || self.snapshot_revision != continuation.revision_before
+        {
+            self.fail_stopped = true;
+            self.active_view_batch_id = None;
+            return ViewBatchProgress::Fatal(StoreError::FailStop(
+                "invalid or stale view batch continuation".to_string(),
+            ));
+        }
+        match continuation.working.resolve_pending(io, clock) {
+            Ok(PendingResolution::StillPending) => {
+                return ViewBatchProgress::Pending(continuation);
+            }
+            Ok(PendingResolution::Applied(result)) => {
+                continuation.projection_changed |=
+                    continuation.working.snapshot_revision != continuation.revision_before;
+                if result.outcome == ReductionOutcome::CanonicalChanged {
+                    continuation.committed += 1;
+                }
+            }
+            Ok(PendingResolution::Reset(_)) => unreachable!("view batch cannot reset pane state"),
+            Err(error) if error.requires_daemon_exit() => {
+                self.fail_stopped = true;
+                self.active_view_batch_id = None;
+                return ViewBatchProgress::Fatal(error);
+            }
+            Err(error) => {
+                if let Err(fatal) = continuation.working.push_diagnostic(
+                    continuation.pending_pane.clone(),
+                    format!("view acknowledgment failed: {error}"),
+                ) {
+                    self.fail_stopped = true;
+                    self.active_view_batch_id = None;
+                    return ViewBatchProgress::Fatal(fatal);
+                }
+                continuation.projection_changed = true;
+                continuation.failed.push(ViewBatchFailure {
+                    pane_instance: continuation.pending_pane.clone(),
+                    error,
+                });
+            }
+        }
+        self.advance_view_batch(io, clock, continuation)
+    }
+
+    fn advance_view_batch(
+        &mut self,
+        io: &mut dyn PaneStateStoreIo,
+        clock: &mut dyn RecoveryClock,
+        mut continuation: ViewBatchContinuation,
+    ) -> ViewBatchProgress {
+        while let Some(envelope) = continuation.remaining.pop_front() {
+            continuation.working.snapshot_revision = continuation.revision_before;
+            if !matches!(envelope.event, PaneEvent::AcknowledgeView { .. }) {
+                let error = StoreError::Reduce(ReduceError::InvalidRequest(
+                    "view batch accepts only AcknowledgeView events".to_string(),
+                ));
+                if let Err(fatal) = continuation.working.push_diagnostic(
+                    envelope.pane_instance.clone(),
+                    format!("view acknowledgment failed: {error}"),
+                ) {
+                    self.fail_stopped = true;
+                    self.active_view_batch_id = None;
+                    return ViewBatchProgress::Fatal(fatal);
+                }
+                continuation.projection_changed = true;
+                continuation.failed.push(ViewBatchFailure {
+                    pane_instance: envelope.pane_instance,
+                    error,
+                });
+                continue;
+            }
+            match continuation.working.apply_event(
+                io,
+                clock,
+                &envelope,
+                &VisibilitySnapshot::default(),
+                continuation.done_clear_on,
+            ) {
+                Ok(result) => {
+                    continuation.projection_changed |=
+                        continuation.working.snapshot_revision != continuation.revision_before;
+                    if result.outcome == ReductionOutcome::CanonicalChanged {
+                        continuation.committed += 1;
+                    }
+                }
+                Err(StoreError::PersistPending) => {
+                    continuation.pending_pane = envelope.pane_instance;
+                    return ViewBatchProgress::Pending(continuation);
+                }
+                Err(error) if error.requires_daemon_exit() => {
+                    self.fail_stopped = true;
+                    self.active_view_batch_id = None;
+                    return ViewBatchProgress::Fatal(error);
+                }
+                Err(error) => {
+                    if let Err(fatal) = continuation.working.push_diagnostic(
+                        envelope.pane_instance.clone(),
+                        format!("view acknowledgment failed: {error}"),
+                    ) {
+                        self.fail_stopped = true;
+                        self.active_view_batch_id = None;
+                        return ViewBatchProgress::Fatal(fatal);
+                    }
+                    continuation.projection_changed = true;
+                    continuation.failed.push(ViewBatchFailure {
+                        pane_instance: envelope.pane_instance,
+                        error,
+                    });
+                }
+            }
+        }
+        continuation.working.snapshot_revision = continuation.revision_before;
+        if continuation.projection_changed {
+            let Some(revision) = continuation.revision_before.checked_add(1) else {
+                self.fail_stopped = true;
+                self.active_view_batch_id = None;
+                return ViewBatchProgress::Fatal(StoreError::CounterOverflow("snapshot revision"));
+            };
+            continuation.working.snapshot_revision = revision;
+        }
+        if let Err(error) = continuation.working.validate_projection() {
+            self.fail_stopped = true;
+            self.active_view_batch_id = None;
+            return ViewBatchProgress::Fatal(error);
+        }
+        let preflight_changed = match continuation
+            .working
+            .preflight_projection(MAX_RESPONSE_FRAME_BYTES)
+        {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.fail_stopped = true;
+                self.active_view_batch_id = None;
+                return ViewBatchProgress::Fatal(error);
+            }
+        };
+        if preflight_changed && !continuation.projection_changed {
+            let Some(revision) = continuation.revision_before.checked_add(1) else {
+                self.fail_stopped = true;
+                self.active_view_batch_id = None;
+                return ViewBatchProgress::Fatal(StoreError::CounterOverflow("snapshot revision"));
+            };
+            continuation.working.snapshot_revision = revision;
+            if let Err(error) = continuation
+                .working
+                .preflight_projection(MAX_RESPONSE_FRAME_BYTES)
+            {
+                self.fail_stopped = true;
+                self.active_view_batch_id = None;
+                return ViewBatchProgress::Fatal(error);
+            }
+        }
+        continuation.projection_changed |= preflight_changed;
+        let result = ViewBatchApplyResult {
+            committed: continuation.committed,
+            failed: continuation.failed,
+            snapshot_revision: continuation.working.snapshot_revision,
+        };
+        continuation.working.active_view_batch_id = None;
+        *self = *continuation.working;
+        ViewBatchProgress::Complete(result)
+    }
+
     pub fn reset(
         &mut self,
         io: &mut dyn PaneStateStoreIo,
@@ -583,7 +892,7 @@ impl CanonicalStateRuntime {
         if self.fail_stopped {
             return Err(StoreError::FailStop("daemon is fail-stopped".to_string()));
         }
-        if self.pending.is_some() {
+        if self.sequenced_mutations_paused() {
             return Err(StoreError::PersistPending);
         }
         let current_descriptor = self
@@ -620,7 +929,7 @@ impl CanonicalStateRuntime {
         draft.derive_candidate_projection(pane, self.records.get(pane), Some(&tombstone));
         draft.bump_snapshot_revision()?;
         draft.validate_projection()?;
-        draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        let _ = draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
         let transaction = PendingTransaction {
             pane: pane.clone(),
             expected: Some(expected_raw),
@@ -799,7 +1108,7 @@ impl CanonicalStateRuntime {
         }
     }
 
-    fn preflight_projection(&mut self, response_limit: usize) -> Result<(), StoreError> {
+    fn preflight_projection(&mut self, response_limit: usize) -> Result<bool, StoreError> {
         #[derive(Serialize)]
         struct ProjectionPreflight<'a> {
             snapshot_revision: u64,
@@ -827,6 +1136,8 @@ impl CanonicalStateRuntime {
                 .collect(),
         })
         .map_err(|error| StoreError::PersistFailed(error.to_string()))?;
+        let previous_frame_too_large = self.snapshot_frame_too_large;
+        let diagnostics_before = self.diagnostics.clone();
         self.snapshot_frame_too_large = bytes.len() > response_limit;
         if self.snapshot_frame_too_large
             && !self
@@ -846,7 +1157,8 @@ impl CanonicalStateRuntime {
                 self.diagnostics.pop_front();
             }
         }
-        Ok(())
+        Ok(previous_frame_too_large != self.snapshot_frame_too_large
+            || diagnostics_before != self.diagnostics)
     }
 
     fn bump_snapshot_revision(&mut self) -> Result<(), StoreError> {
@@ -872,6 +1184,7 @@ impl CanonicalStateRuntime {
         self.bump_snapshot_revision()?;
         self.validate_projection()?;
         self.preflight_projection(MAX_RESPONSE_FRAME_BYTES)
+            .map(|_| ())
     }
 
     fn validate_projection(&self) -> Result<(), StoreError> {
@@ -968,6 +1281,25 @@ mod tests {
         }
     }
 
+    struct ExpectedPaneIo {
+        fail_pane_id: String,
+        expected: String,
+    }
+
+    impl PaneStateStoreIo for ExpectedPaneIo {
+        fn write_candidate(&mut self, pane: &PaneInstance, candidate: &str) -> WriteAttempt {
+            if pane.pane_id == self.fail_pane_id {
+                WriteAttempt::ReadBack(Some(self.expected.clone()))
+            } else {
+                WriteAttempt::ReadBack(Some(candidate.to_string()))
+            }
+        }
+
+        fn read_independent(&mut self, _pane: &PaneInstance) -> IndependentRead {
+            IndependentRead::Unavailable("unused".to_string())
+        }
+    }
+
     #[derive(Debug, Default)]
     struct FakeClock(Duration);
 
@@ -992,6 +1324,13 @@ mod tests {
             agent: Some(AgentKind::parse("codex").unwrap()),
             agent_session_id: Some(AgentSessionId::parse("session").unwrap()),
             event,
+        }
+    }
+
+    fn envelope_for(pane_instance: PaneInstance, event: PaneEvent) -> PaneEventEnvelope {
+        PaneEventEnvelope {
+            pane_instance,
+            ..envelope(event)
         }
     }
 
@@ -1240,6 +1579,447 @@ mod tests {
             )
             .unwrap();
         assert_eq!(runtime.notification_jobs().len(), 2);
+    }
+
+    #[test]
+    fn window_view_batch_commits_successes_keeps_failures_and_publishes_once() {
+        let first = pane();
+        let second = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 200,
+        };
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = FakeIo::default();
+        let mut clock = FakeClock::default();
+        for pane_instance in [&first, &second] {
+            runtime
+                .apply_event(
+                    &mut io,
+                    &mut clock,
+                    &envelope_for(
+                        pane_instance.clone(),
+                        PaneEvent::BeginRun {
+                            started_at: 1,
+                            prompt: None,
+                        },
+                    ),
+                    &VisibilitySnapshot::default(),
+                    DoneClearOn::Window,
+                )
+                .unwrap();
+            runtime
+                .apply_event(
+                    &mut io,
+                    &mut clock,
+                    &envelope_for(
+                        pane_instance.clone(),
+                        PaneEvent::CompleteRun { completed_at: 2 },
+                    ),
+                    &VisibilitySnapshot::default(),
+                    DoneClearOn::Window,
+                )
+                .unwrap();
+        }
+        let revision_before = runtime.snapshot_revision();
+        let expected_second = serialize_record(runtime.record(&second).unwrap()).unwrap();
+        let acknowledgements = [&first, &second]
+            .into_iter()
+            .map(|pane_instance| {
+                let StoredPaneRecord::Active(state) = runtime.record(pane_instance).unwrap() else {
+                    unreachable!();
+                };
+                envelope_for(
+                    pane_instance.clone(),
+                    PaneEvent::AcknowledgeView {
+                        expected_state_id: state.state_id.clone(),
+                        expected_agent_epoch: state.agent_epoch,
+                        through_seq: state.completed_seq,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let progress = runtime.apply_view_acknowledgement_batch(
+            &mut ExpectedPaneIo {
+                fail_pane_id: second.pane_id.clone(),
+                expected: expected_second,
+            },
+            &mut clock,
+            &acknowledgements,
+            DoneClearOn::Window,
+        );
+        let ViewBatchProgress::Complete(result) = progress else {
+            panic!("expected completed partial batch");
+        };
+
+        assert_eq!(result.committed, 1);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].pane_instance, second);
+        assert_eq!(result.snapshot_revision, revision_before + 1);
+        let StoredPaneRecord::Active(first_state) = runtime.record(&first).unwrap() else {
+            unreachable!();
+        };
+        assert_eq!(first_state.acknowledged_seq, first_state.completed_seq);
+        let StoredPaneRecord::Active(second_state) =
+            runtime.record(&result.failed[0].pane_instance).unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(second_state.acknowledged_seq, 0);
+        assert!(runtime.diagnostics().iter().any(|diagnostic| {
+            diagnostic.pane_instance == result.failed[0].pane_instance
+                && diagnostic.message.contains("view acknowledgment failed")
+        }));
+    }
+
+    #[test]
+    fn window_view_batch_keeps_live_snapshot_hidden_while_outcome_is_pending() {
+        struct PendingBatchIo {
+            candidate: Option<String>,
+        }
+
+        impl PaneStateStoreIo for PendingBatchIo {
+            fn write_candidate(&mut self, _pane: &PaneInstance, candidate: &str) -> WriteAttempt {
+                self.candidate = Some(candidate.to_string());
+                WriteAttempt::OutcomeUnknown("timeout".to_string())
+            }
+
+            fn read_independent(&mut self, _pane: &PaneInstance) -> IndependentRead {
+                IndependentRead::Value(self.candidate.clone())
+            }
+        }
+
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut setup_io = FakeIo::default();
+        let mut clock = FakeClock::default();
+        runtime
+            .apply_event(
+                &mut setup_io,
+                &mut clock,
+                &begin_event(),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Window,
+            )
+            .unwrap();
+        runtime
+            .apply_event(
+                &mut setup_io,
+                &mut clock,
+                &envelope(PaneEvent::CompleteRun { completed_at: 2 }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Window,
+            )
+            .unwrap();
+        let StoredPaneRecord::Active(state) = runtime.record(&pane()).unwrap() else {
+            unreachable!();
+        };
+        let acknowledgement = envelope(PaneEvent::AcknowledgeView {
+            expected_state_id: state.state_id.clone(),
+            expected_agent_epoch: state.agent_epoch,
+            through_seq: state.completed_seq,
+        });
+        let revision_before = runtime.snapshot_revision();
+        let mut pending_io = PendingBatchIo { candidate: None };
+
+        let ViewBatchProgress::Pending(continuation) = runtime.apply_view_acknowledgement_batch(
+            &mut pending_io,
+            &mut clock,
+            &[acknowledgement],
+            DoneClearOn::Window,
+        ) else {
+            panic!("expected pending view batch");
+        };
+        assert!(runtime.sequenced_mutations_paused());
+        assert_eq!(
+            runtime.query_pane_while_paused(
+                &PaneInstance {
+                    pane_id: "%99".to_string(),
+                    pane_pid: 999,
+                },
+                false,
+            ),
+            QueryPaneAvailability::NotReady
+        );
+        assert_eq!(
+            runtime
+                .apply_event(
+                    &mut setup_io,
+                    &mut clock,
+                    &begin_event(),
+                    &VisibilitySnapshot::default(),
+                    DoneClearOn::Window,
+                )
+                .unwrap_err(),
+            StoreError::PersistPending
+        );
+        let StoredPaneRecord::Active(state) = runtime.record(&pane()).unwrap() else {
+            unreachable!();
+        };
+        assert_eq!(state.acknowledged_seq, 0);
+        assert_eq!(runtime.snapshot_revision(), revision_before);
+
+        let ViewBatchProgress::Complete(result) =
+            runtime.resume_view_acknowledgement_batch(&mut pending_io, &mut clock, continuation)
+        else {
+            panic!("expected resolved view batch");
+        };
+        assert_eq!(result.committed, 1);
+        assert!(result.failed.is_empty());
+        assert_eq!(runtime.snapshot_revision(), revision_before + 1);
+        let StoredPaneRecord::Active(state) = runtime.record(&pane()).unwrap() else {
+            unreachable!();
+        };
+        assert_eq!(state.acknowledged_seq, state.completed_seq);
+        assert!(!runtime.sequenced_mutations_paused());
+    }
+
+    #[test]
+    fn multi_pane_view_batch_resolves_late_pending_and_publishes_once() {
+        struct LatePendingIo {
+            pending_pane: String,
+            candidate: Option<String>,
+        }
+
+        impl PaneStateStoreIo for LatePendingIo {
+            fn write_candidate(&mut self, pane: &PaneInstance, candidate: &str) -> WriteAttempt {
+                if pane.pane_id == self.pending_pane {
+                    self.candidate = Some(candidate.to_string());
+                    WriteAttempt::OutcomeUnknown("timeout".to_string())
+                } else {
+                    WriteAttempt::ReadBack(Some(candidate.to_string()))
+                }
+            }
+
+            fn read_independent(&mut self, _pane: &PaneInstance) -> IndependentRead {
+                IndependentRead::Value(self.candidate.clone())
+            }
+        }
+
+        let panes = [
+            pane(),
+            PaneInstance {
+                pane_id: "%2".to_string(),
+                pane_pid: 200,
+            },
+        ];
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut setup_io = FakeIo::default();
+        let mut clock = FakeClock::default();
+        for pane_instance in &panes {
+            for event in [
+                PaneEvent::BeginRun {
+                    started_at: 1,
+                    prompt: None,
+                },
+                PaneEvent::CompleteRun { completed_at: 2 },
+            ] {
+                runtime
+                    .apply_event(
+                        &mut setup_io,
+                        &mut clock,
+                        &envelope_for(pane_instance.clone(), event),
+                        &VisibilitySnapshot::default(),
+                        DoneClearOn::Window,
+                    )
+                    .unwrap();
+            }
+        }
+        let acknowledgements = panes
+            .iter()
+            .map(|pane_instance| {
+                let StoredPaneRecord::Active(state) = runtime.record(pane_instance).unwrap() else {
+                    unreachable!();
+                };
+                envelope_for(
+                    pane_instance.clone(),
+                    PaneEvent::AcknowledgeView {
+                        expected_state_id: state.state_id.clone(),
+                        expected_agent_epoch: state.agent_epoch,
+                        through_seq: state.completed_seq,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let revision_before = runtime.snapshot_revision();
+        let mut io = LatePendingIo {
+            pending_pane: panes[1].pane_id.clone(),
+            candidate: None,
+        };
+        let ViewBatchProgress::Pending(continuation) = runtime.apply_view_acknowledgement_batch(
+            &mut io,
+            &mut clock,
+            &acknowledgements,
+            DoneClearOn::Window,
+        ) else {
+            panic!("expected pending second pane");
+        };
+        assert_eq!(runtime.snapshot_revision(), revision_before);
+        for pane_instance in &panes {
+            let StoredPaneRecord::Active(state) = runtime.record(pane_instance).unwrap() else {
+                unreachable!();
+            };
+            assert_eq!(state.acknowledged_seq, 0);
+        }
+        let ViewBatchProgress::Complete(result) =
+            runtime.resume_view_acknowledgement_batch(&mut io, &mut clock, continuation)
+        else {
+            panic!("expected completed multi-pane batch");
+        };
+        assert_eq!(result.committed, 2);
+        assert_eq!(runtime.snapshot_revision(), revision_before + 1);
+        for pane_instance in &panes {
+            let StoredPaneRecord::Active(state) = runtime.record(pane_instance).unwrap() else {
+                unreachable!();
+            };
+            assert_eq!(state.acknowledged_seq, state.completed_seq);
+        }
+    }
+
+    #[test]
+    fn normal_pending_transaction_blocks_view_batch_start() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut pending_io = FakeIo {
+            write_results: VecDeque::from([WriteAttempt::OutcomeUnknown("timeout".to_string())]),
+            ..FakeIo::default()
+        };
+        let mut clock = FakeClock::default();
+        assert_eq!(
+            runtime
+                .apply_event(
+                    &mut pending_io,
+                    &mut clock,
+                    &begin_event(),
+                    &VisibilitySnapshot::default(),
+                    DoneClearOn::Window,
+                )
+                .unwrap_err(),
+            StoreError::PersistPending
+        );
+        assert!(matches!(
+            runtime.apply_view_acknowledgement_batch(
+                &mut pending_io,
+                &mut clock,
+                &[],
+                DoneClearOn::Window,
+            ),
+            ViewBatchProgress::Blocked(StoreError::PersistPending)
+        ));
+    }
+
+    #[test]
+    fn observation_dispatched_before_explicit_event_cannot_change_state_or_tracker() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = FakeIo::default();
+        let mut clock = FakeClock::default();
+        apply_begin(&mut runtime, &mut io);
+        let dispatched = runtime.freeze_observation_dispatch([pane()]).remove(0);
+
+        let duplicate_begin = begin_event();
+        let result = runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &duplicate_begin,
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        assert_eq!(result.outcome, ReductionOutcome::TrackerOnly);
+        let tracker_after_explicit = runtime.tracker(&pane());
+        assert!(tracker_after_explicit.generation > dispatched.tracker.generation);
+        let record_after_explicit = runtime.record(&pane()).cloned();
+
+        let stale_observation = envelope(PaneEvent::ObservationBatch {
+            base: dispatched.base,
+            tracker_generation: dispatched.tracker.generation,
+            observed_at: 2,
+            presence: AgentPresenceObservation::Absent,
+            capture: Some(CaptureObservation {
+                inference: CaptureInference::ActivityObserved,
+                observed_fingerprint: Some([7; 32]),
+            }),
+        });
+        let stale_result = runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &stale_observation,
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        assert_eq!(stale_result.outcome, ReductionOutcome::Noop);
+        assert_eq!(runtime.record(&pane()), record_after_explicit.as_ref());
+        assert_eq!(runtime.tracker(&pane()), tracker_after_explicit);
+    }
+
+    #[test]
+    fn window_view_batch_counter_overflow_is_fatal() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = FakeIo::default();
+        let mut clock = FakeClock::default();
+        apply_begin(&mut runtime, &mut io);
+        runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &envelope(PaneEvent::CompleteRun { completed_at: 2 }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Window,
+            )
+            .unwrap();
+        let StoredPaneRecord::Active(state) = runtime.record(&pane()).unwrap() else {
+            unreachable!();
+        };
+        let acknowledgement = envelope(PaneEvent::AcknowledgeView {
+            expected_state_id: state.state_id.clone(),
+            expected_agent_epoch: state.agent_epoch,
+            through_seq: state.completed_seq,
+        });
+        runtime.snapshot_revision = u64::MAX;
+
+        assert!(matches!(
+            runtime.apply_view_acknowledgement_batch(
+                &mut io,
+                &mut clock,
+                &[acknowledgement],
+                DoneClearOn::Window,
+            ),
+            ViewBatchProgress::Fatal(StoreError::CounterOverflow("snapshot revision"))
+        ));
+        assert!(runtime.is_fail_stopped());
+    }
+
+    #[test]
+    fn no_op_view_batch_bumps_revision_when_preflight_adds_diagnostic() {
+        let mut runtime = CanonicalStateRuntime {
+            diagnostics: (0..MAX_DIAGNOSTICS)
+                .map(|index| PaneStateDiagnostic {
+                    pane_instance: PaneInstance {
+                        pane_id: format!("%{}", index + 1),
+                        pane_pid: index as u32 + 1,
+                    },
+                    message: "x".repeat(70_000),
+                })
+                .collect(),
+            ..CanonicalStateRuntime::default()
+        };
+        let ViewBatchProgress::Complete(result) = runtime.apply_view_acknowledgement_batch(
+            &mut FakeIo::default(),
+            &mut FakeClock::default(),
+            &[],
+            DoneClearOn::Pane,
+        ) else {
+            panic!("expected completed empty batch");
+        };
+        assert_eq!(result.snapshot_revision, 1);
+        assert!(runtime.snapshot_frame_too_large());
+        assert!(
+            runtime
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "resolved snapshot exceeds frame limit")
+        );
     }
 
     #[test]
