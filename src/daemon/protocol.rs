@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use super::DaemonSnapshot;
 
+pub mod v2;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ClientMessage {

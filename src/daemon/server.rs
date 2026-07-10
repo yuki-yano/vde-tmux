@@ -21,6 +21,385 @@ use crate::tmux::TmuxRunner;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 static SHUTDOWN_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
+const V2_BOOTSTRAP_FIFO_CAPACITY: usize = 64;
+pub const V2_FRAME_START_TIMEOUT: Duration = Duration::from_secs(2);
+pub const V2_FRAME_BODY_TIMEOUT: Duration = Duration::from_millis(100);
+pub const V2_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+
+pub struct V2FrameReader {
+    reader: BufReader<UnixStream>,
+}
+
+impl V2FrameReader {
+    pub fn new(stream: UnixStream) -> Self {
+        Self {
+            reader: BufReader::new(stream),
+        }
+    }
+
+    pub fn stream_mut(&mut self) -> &mut UnixStream {
+        self.reader.get_mut()
+    }
+}
+
+#[allow(clippy::result_large_err)]
+pub fn read_v2_request_frame(
+    connection: &mut V2FrameReader,
+) -> std::result::Result<Vec<u8>, crate::daemon::protocol::v2::ServerMessage> {
+    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+    use crate::pane_state::MAX_REQUEST_FRAME_BYTES;
+
+    connection
+        .reader
+        .get_mut()
+        .set_read_timeout(Some(V2_FRAME_START_TIMEOUT))
+        .map_err(|error| ServerMessage::error(ErrorCode::InternalError, error.to_string(), None))?;
+    let mut frame = Vec::new();
+    let mut body_deadline: Option<std::time::Instant> = None;
+    loop {
+        if let Some(deadline) = body_deadline {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return Err(ServerMessage::error(
+                    ErrorCode::InvalidRequest,
+                    "request frame body deadline exceeded",
+                    None,
+                ));
+            };
+            connection
+                .reader
+                .get_mut()
+                .set_read_timeout(Some(remaining))
+                .map_err(|error| {
+                    ServerMessage::error(ErrorCode::InternalError, error.to_string(), None)
+                })?;
+        }
+        let available = connection.reader.fill_buf().map_err(|error| {
+            let stage = if body_deadline.is_some() {
+                "body"
+            } else {
+                "start"
+            };
+            ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                format!("request frame {stage} deadline exceeded: {error}"),
+                None,
+            )
+        })?;
+        if available.is_empty() {
+            return Err(ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                "connection closed before request frame completed",
+                None,
+            ));
+        }
+        if body_deadline.is_none() {
+            body_deadline = Some(std::time::Instant::now() + V2_FRAME_BODY_TIMEOUT);
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |position| position + 1);
+        if frame.len().saturating_add(take).saturating_sub(1) > MAX_REQUEST_FRAME_BYTES {
+            return Err(ServerMessage::error(
+                ErrorCode::FrameTooLarge,
+                "request frame exceeds 1 MiB",
+                None,
+            ));
+        }
+        frame.extend_from_slice(&available[..take]);
+        connection.reader.consume(take);
+        if newline.is_some() {
+            frame.pop();
+            return Ok(frame);
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+pub fn write_v2_response(
+    stream: &mut UnixStream,
+    message: &crate::daemon::protocol::v2::ServerMessage,
+) -> std::result::Result<(), crate::daemon::protocol::v2::ServerMessage> {
+    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage, encode_response_frame};
+
+    let frame = encode_response_frame(message)?;
+    let deadline = std::time::Instant::now() + V2_RESPONSE_WRITE_TIMEOUT;
+    let mut written = 0;
+    while written < frame.len() {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Err(ServerMessage::error(
+                ErrorCode::InternalError,
+                "response write deadline exceeded",
+                None,
+            ));
+        };
+        stream.set_write_timeout(Some(remaining)).map_err(|error| {
+            ServerMessage::error(ErrorCode::InternalError, error.to_string(), None)
+        })?;
+        let count = stream.write(&frame[written..]).map_err(|error| {
+            ServerMessage::error(
+                ErrorCode::InternalError,
+                format!("response write failed: {error}"),
+                None,
+            )
+        })?;
+        if count == 0 {
+            return Err(ServerMessage::error(
+                ErrorCode::InternalError,
+                "response stream closed before frame completed",
+                None,
+            ));
+        }
+        written += count;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct V2ConnectionState {
+    hello_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2SequencedMutation {
+    pub accepted_seq: u64,
+    pub message: crate::daemon::protocol::v2::ClientMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum V2Route {
+    Response(crate::daemon::protocol::v2::ServerMessage),
+    Fatal(crate::daemon::protocol::v2::ServerMessage),
+    Query(crate::daemon::protocol::v2::ClientMessage),
+    Mutation(V2SequencedMutation),
+    Queued { accepted_seq: u64 },
+}
+
+#[derive(Debug, Clone)]
+pub struct V2Router {
+    daemon_instance_id: crate::pane_state::DaemonInstanceId,
+    server_identity: String,
+    phase: crate::daemon::protocol::v2::DaemonPhase,
+    hook_health: crate::daemon::protocol::v2::HookHealth,
+    next_accepted_seq: u64,
+    bootstrap_fifo: std::collections::VecDeque<V2SequencedMutation>,
+    fatal: bool,
+}
+
+impl V2Router {
+    pub fn new(
+        daemon_instance_id: crate::pane_state::DaemonInstanceId,
+        server_identity: impl Into<String>,
+    ) -> Self {
+        Self {
+            daemon_instance_id,
+            server_identity: server_identity.into(),
+            phase: crate::daemon::protocol::v2::DaemonPhase::InstallingHooks,
+            hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
+            next_accepted_seq: 1,
+            bootstrap_fifo: std::collections::VecDeque::new(),
+            fatal: false,
+        }
+    }
+
+    pub fn phase(&self) -> crate::daemon::protocol::v2::DaemonPhase {
+        self.phase
+    }
+
+    pub fn set_phase(&mut self, phase: crate::daemon::protocol::v2::DaemonPhase) {
+        self.phase = phase;
+    }
+
+    pub fn set_hook_health(&mut self, health: crate::daemon::protocol::v2::HookHealth) {
+        self.hook_health = health;
+    }
+
+    pub fn is_fatal(&self) -> bool {
+        self.fatal
+    }
+
+    pub fn route(
+        &mut self,
+        connection: &mut V2ConnectionState,
+        message: crate::daemon::protocol::v2::ClientMessage,
+    ) -> V2Route {
+        use crate::daemon::protocol::v2::{
+            ClientMessage as V2ClientMessage, ErrorCode, PROTOCOL_VERSION,
+            ServerMessage as V2ServerMessage,
+        };
+
+        if self.fatal {
+            return V2Route::Fatal(V2ServerMessage::error(
+                ErrorCode::InternalError,
+                "daemon router is fail-stopped",
+                message.event_id().cloned(),
+            ));
+        }
+
+        if !connection.hello_complete {
+            return match message {
+                V2ClientMessage::Hello { proto } if proto == PROTOCOL_VERSION => {
+                    connection.hello_complete = true;
+                    V2Route::Response(V2ServerMessage::HelloAck {
+                        proto: PROTOCOL_VERSION,
+                        daemon_instance_id: self.daemon_instance_id.clone(),
+                        server_identity: self.server_identity.clone(),
+                        phase: self.phase,
+                        hook_health: self.hook_health,
+                    })
+                }
+                V2ClientMessage::Hello { .. } => V2Route::Response(V2ServerMessage::error(
+                    ErrorCode::UnsupportedProtocol,
+                    "protocol version 2 is required",
+                    None,
+                )),
+                _ => V2Route::Response(V2ServerMessage::error(
+                    ErrorCode::InvalidRequest,
+                    "Hello must be the first message on a connection",
+                    None,
+                )),
+            };
+        }
+
+        if message.proto() != PROTOCOL_VERSION {
+            return V2Route::Response(V2ServerMessage::error(
+                ErrorCode::UnsupportedProtocol,
+                "protocol version 2 is required",
+                message.event_id().cloned(),
+            ));
+        }
+        if matches!(message, V2ClientMessage::Hello { .. }) {
+            return V2Route::Response(V2ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                "Hello may only be sent once",
+                None,
+            ));
+        }
+        if let Some(instance_id) = message.mutation_instance_id()
+            && instance_id != &self.daemon_instance_id
+        {
+            return V2Route::Response(V2ServerMessage::error(
+                ErrorCode::StaleDaemonInstance,
+                "mutation targets a stale daemon instance",
+                message.event_id().cloned(),
+            ));
+        }
+        if let Err(error) = validate_v2_origin(&message) {
+            return V2Route::Response(error);
+        }
+
+        if message.is_query() {
+            if self.phase != crate::daemon::protocol::v2::DaemonPhase::Serving {
+                return V2Route::Response(V2ServerMessage::error(
+                    ErrorCode::NotReady,
+                    format!("daemon phase is {:?}", self.phase),
+                    None,
+                ));
+            }
+            return V2Route::Query(message);
+        }
+        if !message.is_mutation() {
+            return V2Route::Response(V2ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                "unsupported message",
+                None,
+            ));
+        }
+        if self.phase != crate::daemon::protocol::v2::DaemonPhase::Serving
+            && self.bootstrap_fifo.len() >= V2_BOOTSTRAP_FIFO_CAPACITY
+        {
+            return V2Route::Response(V2ServerMessage::error(
+                ErrorCode::QueueFull,
+                "bootstrap FIFO is full",
+                message.event_id().cloned(),
+            ));
+        }
+
+        let accepted_seq = match self.next_accepted_seq.checked_add(1) {
+            Some(next) => {
+                let accepted = self.next_accepted_seq;
+                self.next_accepted_seq = next;
+                accepted
+            }
+            None => {
+                self.fatal = true;
+                return V2Route::Fatal(V2ServerMessage::error(
+                    ErrorCode::InternalError,
+                    "accepted sequence overflow",
+                    message.event_id().cloned(),
+                ));
+            }
+        };
+        let event_id = message.event_id().cloned();
+        let is_view = matches!(message, V2ClientMessage::SubmitViewEvent { .. });
+        let mutation = V2SequencedMutation {
+            accepted_seq,
+            message,
+        };
+        if self.phase == crate::daemon::protocol::v2::DaemonPhase::Serving {
+            return V2Route::Mutation(mutation);
+        }
+        self.bootstrap_fifo.push_back(mutation);
+        if is_view {
+            V2Route::Response(V2ServerMessage::ViewQueued {
+                event_id: event_id.expect("view mutation has event ID"),
+                accepted_seq,
+            })
+        } else {
+            V2Route::Queued { accepted_seq }
+        }
+    }
+
+    pub fn drain_bootstrap_fifo(&mut self) -> Vec<V2SequencedMutation> {
+        if self.phase != crate::daemon::protocol::v2::DaemonPhase::Serving {
+            return Vec::new();
+        }
+        self.bootstrap_fifo.drain(..).collect()
+    }
+
+    #[cfg(test)]
+    fn set_next_accepted_seq(&mut self, value: u64) {
+        self.next_accepted_seq = value;
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_v2_origin(
+    message: &crate::daemon::protocol::v2::ClientMessage,
+) -> std::result::Result<(), crate::daemon::protocol::v2::ServerMessage> {
+    use crate::daemon::protocol::v2::{ClientMessage, ErrorCode, ServerMessage};
+    use crate::pane_state::PaneEvent;
+
+    match message {
+        ClientMessage::SubmitPaneEvent { envelope, .. }
+            if !matches!(
+                envelope.event,
+                PaneEvent::AgentSessionStarted { .. }
+                    | PaneEvent::BeginRun { .. }
+                    | PaneEvent::ActivityObserved { .. }
+                    | PaneEvent::WaitRequested { .. }
+                    | PaneEvent::CompleteRun { .. }
+                    | PaneEvent::FailRun { .. }
+                    | PaneEvent::ProgressUpdated { .. }
+                    | PaneEvent::ExplicitStateReported { .. }
+            ) =>
+        {
+            Err(ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                "pane event variant is internal-only",
+                Some(envelope.event_id.clone()),
+            ))
+        }
+        ClientMessage::SubmitViewEvent { event, .. } => event.validate().map_err(|error| {
+            ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                error.to_string(),
+                Some(event.event_id.clone()),
+            )
+        }),
+        _ => Ok(()),
+    }
+}
+
 pub fn handle_message(
     runner: &dyn TmuxRunner,
     config: &Config,
@@ -619,6 +998,253 @@ mod tests {
     use crate::daemon::protocol::{ClientMessage, ServerMessage};
     use crate::options::snapshot::snapshot_format;
     use crate::tmux::mock::MockTmuxRunner;
+
+    const V2_EVENT_ID: &str = "102132435465768798a9bacbdcedfe0f";
+    const V2_DAEMON_ID: &str = "ffeeddccbbaa99887766554433221100";
+
+    fn v2_daemon_id() -> crate::pane_state::DaemonInstanceId {
+        crate::pane_state::DaemonInstanceId::parse(V2_DAEMON_ID).unwrap()
+    }
+
+    fn v2_event_id() -> crate::pane_state::EventId {
+        crate::pane_state::EventId::parse(V2_EVENT_ID).unwrap()
+    }
+
+    fn v2_pane_event(
+        event: crate::pane_state::PaneEvent,
+    ) -> crate::daemon::protocol::v2::ClientMessage {
+        crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent {
+            proto: 2,
+            envelope: crate::pane_state::PaneEventEnvelope {
+                daemon_instance_id: v2_daemon_id(),
+                event_id: v2_event_id(),
+                pane_instance: crate::pane_state::PaneInstance {
+                    pane_id: "%1".to_string(),
+                    pane_pid: 100,
+                },
+                agent: Some(crate::pane_state::AgentKind::parse("codex").unwrap()),
+                agent_session_id: Some(
+                    crate::pane_state::AgentSessionId::parse("session").unwrap(),
+                ),
+                event,
+            },
+        }
+    }
+
+    fn v2_begin() -> crate::daemon::protocol::v2::ClientMessage {
+        v2_pane_event(crate::pane_state::PaneEvent::BeginRun {
+            started_at: 1,
+            prompt: None,
+        })
+    }
+
+    fn v2_handshake(router: &mut V2Router, connection: &mut V2ConnectionState) {
+        let route = router.route(
+            connection,
+            crate::daemon::protocol::v2::ClientMessage::Hello { proto: 2 },
+        );
+        assert!(matches!(
+            route,
+            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::HelloAck {
+                proto: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn v2_requires_hello_and_rejects_v1_before_side_effects() {
+        let mut router = V2Router::new(v2_daemon_id(), "server");
+        let mut connection = V2ConnectionState::default();
+        assert!(matches!(
+            router.route(&mut connection, v2_begin()),
+            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+        assert!(matches!(
+            router.route(
+                &mut connection,
+                crate::daemon::protocol::v2::ClientMessage::Hello { proto: 1 },
+            ),
+            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::UnsupportedProtocol,
+                ..
+            })
+        ));
+        v2_handshake(&mut router, &mut connection);
+        assert!(matches!(
+            router.route(
+                &mut connection,
+                crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot { proto: 1 },
+            ),
+            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::UnsupportedProtocol,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn v2_read_only_query_does_not_consume_accepted_sequence() {
+        let mut router = V2Router::new(v2_daemon_id(), "server");
+        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        let mut connection = V2ConnectionState::default();
+        v2_handshake(&mut router, &mut connection);
+        assert!(matches!(
+            router.route(
+                &mut connection,
+                crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot { proto: 2 },
+            ),
+            V2Route::Query(_)
+        ));
+        let V2Route::Mutation(mutation) = router.route(&mut connection, v2_begin()) else {
+            panic!("expected mutation");
+        };
+        assert_eq!(mutation.accepted_seq, 1);
+    }
+
+    #[test]
+    fn v2_bootstrap_fifo_preserves_order_and_rejects_overflow_without_consuming_seq() {
+        let mut router = V2Router::new(v2_daemon_id(), "server");
+        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Hydrating);
+        let mut connection = V2ConnectionState::default();
+        v2_handshake(&mut router, &mut connection);
+        for expected in 1..=V2_BOOTSTRAP_FIFO_CAPACITY as u64 {
+            assert_eq!(
+                router.route(&mut connection, v2_begin()),
+                V2Route::Queued {
+                    accepted_seq: expected
+                }
+            );
+        }
+        assert!(matches!(
+            router.route(&mut connection, v2_begin()),
+            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::QueueFull,
+                ..
+            })
+        ));
+        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        let queued = router.drain_bootstrap_fifo();
+        assert_eq!(queued.len(), V2_BOOTSTRAP_FIFO_CAPACITY);
+        assert!(
+            queued
+                .windows(2)
+                .all(|window| window[0].accepted_seq < window[1].accepted_seq)
+        );
+        let V2Route::Mutation(next) = router.route(&mut connection, v2_begin()) else {
+            panic!("expected mutation");
+        };
+        assert_eq!(next.accepted_seq, 65);
+    }
+
+    #[test]
+    fn v2_rejects_stale_instance_and_internal_event_origins() {
+        let mut router = V2Router::new(v2_daemon_id(), "server");
+        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        let mut connection = V2ConnectionState::default();
+        v2_handshake(&mut router, &mut connection);
+        let mut stale = v2_begin();
+        let crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent { envelope, .. } =
+            &mut stale
+        else {
+            unreachable!();
+        };
+        envelope.daemon_instance_id =
+            crate::pane_state::DaemonInstanceId::parse("00112233445566778899aabbccddeeff").unwrap();
+        assert!(matches!(
+            router.route(&mut connection, stale),
+            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::StaleDaemonInstance,
+                ..
+            })
+        ));
+        let internal = v2_pane_event(crate::pane_state::PaneEvent::AcknowledgeView {
+            expected_state_id: crate::pane_state::StateId::parse(
+                "00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+            expected_agent_epoch: 1,
+            through_seq: 1,
+        });
+        assert!(matches!(
+            router.route(&mut connection, internal),
+            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn v2_accepted_sequence_overflow_is_internal_error() {
+        let mut router = V2Router::new(v2_daemon_id(), "server");
+        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        router.set_next_accepted_seq(u64::MAX);
+        let mut connection = V2ConnectionState::default();
+        v2_handshake(&mut router, &mut connection);
+        assert!(matches!(
+            router.route(&mut connection, v2_begin()),
+            V2Route::Fatal(crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::InternalError,
+                ..
+            })
+        ));
+        assert!(router.is_fatal());
+    }
+
+    #[test]
+    fn v2_frame_body_deadline_is_typed_and_bounded() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let mut reader = V2FrameReader::new(server);
+        client.write_all(b"{").unwrap();
+        let started = std::time::Instant::now();
+        let error = read_v2_request_frame(&mut reader).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            error,
+            crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn v2_frame_reader_and_writer_use_newline_framing() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let mut reader = V2FrameReader::new(server);
+        client
+            .write_all(
+                b"{\"op\":\"hello\",\"proto\":2}\n{\"op\":\"query_resolved_snapshot\",\"proto\":2}\n",
+            )
+            .unwrap();
+        let frame = read_v2_request_frame(&mut reader).unwrap();
+        assert_eq!(
+            crate::daemon::protocol::v2::decode_request_frame(&frame).unwrap(),
+            crate::daemon::protocol::v2::ClientMessage::Hello { proto: 2 }
+        );
+        let second = read_v2_request_frame(&mut reader).unwrap();
+        assert_eq!(
+            crate::daemon::protocol::v2::decode_request_frame(&second).unwrap(),
+            crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot { proto: 2 }
+        );
+        let response = crate::daemon::protocol::v2::ServerMessage::error(
+            crate::daemon::protocol::v2::ErrorCode::NotReady,
+            "not ready",
+            None,
+        );
+        write_v2_response(reader.stream_mut(), &response).unwrap();
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::daemon::protocol::v2::ServerMessage>(line.trim())
+                .unwrap(),
+            response
+        );
+    }
 
     fn pane_line(agent: &str, status: &str, wait_reason: &str) -> String {
         [
