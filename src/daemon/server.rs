@@ -1233,7 +1233,7 @@ impl ProductionV2Coordinator {
             let state = state
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("canonical state is not initialized"))?;
-            state.resolved_snapshot()
+            state.checked_resolved_snapshot()?
         };
         let revision = snapshot.snapshot_revision;
         let mut cache = self
@@ -1341,6 +1341,7 @@ impl ProductionV2Coordinator {
                     {
                         return Ok(());
                     }
+                    let _ = state.checked_resolved_snapshot()?;
                     let (global, sessions, panes) = state.display_projection();
                     (global, sessions, panes, state.projection_config.clone())
                 };
@@ -2794,6 +2795,7 @@ fn finish_pane_event_projection(
         false,
         revision_before,
     )?;
+    let _ = state.checked_resolved_snapshot()?;
     Ok(result)
 }
 

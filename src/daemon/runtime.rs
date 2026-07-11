@@ -320,6 +320,14 @@ impl CanonicalCoordinatorState {
         )
     }
 
+    pub(crate) fn checked_resolved_snapshot(
+        &self,
+    ) -> Result<crate::daemon::protocol::v2::ResolvedSnapshot, crate::pane_state::StoreError> {
+        let snapshot = self.resolved_snapshot();
+        preflight_resolved_snapshot_against_runtime(&snapshot, &self.leased.runtime)?;
+        Ok(snapshot)
+    }
+
     fn resolved_snapshot_from(
         &self,
         runtime: &CanonicalPaneStateRuntime,
@@ -1158,6 +1166,51 @@ fn preflight_resolved_snapshot(
     };
     let _bytes = serde_json::to_vec(&message)
         .map_err(|error| crate::pane_state::StoreError::Random(error.to_string()))?;
+    Ok(())
+}
+
+fn preflight_resolved_snapshot_against_runtime(
+    snapshot: &crate::daemon::protocol::v2::ResolvedSnapshot,
+    runtime: &CanonicalPaneStateRuntime,
+) -> Result<(), crate::pane_state::StoreError> {
+    preflight_resolved_snapshot(snapshot)?;
+    for pane in &snapshot.panes {
+        match (&pane.stored, &pane.resolved) {
+            (
+                Some(crate::pane_state::StoredStateDescriptor::Canonical { version }),
+                Some(resolved),
+            ) if version == &resolved.canonical.version() => {}
+            (Some(crate::pane_state::StoredStateDescriptor::Canonical { version }), None) => {
+                let confirmed_ended = matches!(
+                    runtime.record(&pane.pane_instance),
+                    Some(crate::pane_state::StoredPaneRecord::Active(state))
+                        if &state.version() == version
+                            && !state.agent_present
+                            && state.completed_seq == state.acknowledged_seq
+                );
+                if !confirmed_ended {
+                    return Err(crate::pane_state::StoreError::FailStop(format!(
+                        "projection invariant violated for {}: canonical state is unresolved without a confirmed agent end",
+                        pane.pane_instance.pane_id
+                    )));
+                }
+            }
+            (Some(crate::pane_state::StoredStateDescriptor::Canonical { .. }), Some(_)) => {
+                return Err(crate::pane_state::StoreError::FailStop(format!(
+                    "projection invariant violated for {}: stored and resolved canonical versions differ",
+                    pane.pane_instance.pane_id
+                )));
+            }
+            (None | Some(crate::pane_state::StoredStateDescriptor::Reset { .. }), None)
+            | (Some(crate::pane_state::StoredStateDescriptor::Quarantined { .. }), None) => {}
+            (_, Some(_)) => {
+                return Err(crate::pane_state::StoreError::FailStop(format!(
+                    "projection invariant violated for {}: resolved state has no canonical storage",
+                    pane.pane_instance.pane_id
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2107,6 +2160,21 @@ mod tests {
                 "changed field {changed_field} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn checked_snapshot_rejects_unresolved_present_canonical_state() {
+        let (state, root) = canonical_sidebar_fixture(SidebarState::default());
+        state.checked_resolved_snapshot().unwrap();
+        let mut invalid = state.resolved_snapshot();
+        invalid.panes[0].resolved = None;
+
+        let error = preflight_resolved_snapshot_against_runtime(&invalid, &state.leased.runtime)
+            .unwrap_err();
+
+        assert!(error.requires_daemon_exit());
+        assert!(error.to_string().contains("without a confirmed agent end"));
+        remove_canonical_sidebar_fixture(state, root);
     }
 
     fn status_metadata() -> StatusProjectionMetadata {

@@ -699,10 +699,13 @@ impl CanonicalStateRuntime {
     }
 
     pub fn mark_projection_changed(&mut self) -> Result<u64, StoreError> {
-        self.bump_snapshot_revision()?;
-        self.validate_projection()?;
-        let _ = self.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
-        Ok(self.snapshot_revision)
+        let mut draft = self.clone();
+        draft.bump_snapshot_revision()?;
+        draft.validate_projection()?;
+        let _ = draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        let revision = draft.snapshot_revision;
+        *self = draft;
+        Ok(revision)
     }
 
     pub fn remove_absent_pane(
@@ -2781,6 +2784,25 @@ mod tests {
         assert_eq!(error, StoreError::CounterOverflow("snapshot revision"));
         assert_eq!(runtime.snapshot_revision(), u64::MAX);
         assert!(runtime.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn projection_validation_failure_does_not_advance_revision() {
+        let mut runtime = CanonicalStateRuntime {
+            diagnostics: std::iter::repeat_with(|| PaneStateDiagnostic {
+                pane_instance: pane(),
+                message: "overflow".to_string(),
+            })
+            .take(MAX_DIAGNOSTICS + 1)
+            .collect(),
+            ..CanonicalStateRuntime::default()
+        };
+
+        let error = runtime.mark_projection_changed().unwrap_err();
+
+        assert!(error.to_string().contains("projection collection exceeds"));
+        assert_eq!(runtime.snapshot_revision(), 0);
+        assert_eq!(runtime.diagnostics().len(), MAX_DIAGNOSTICS + 1);
     }
 
     #[test]
