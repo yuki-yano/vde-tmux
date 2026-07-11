@@ -1529,6 +1529,20 @@ pub fn client_view_query_args(token: &str) -> Vec<String> {
     ]
 }
 
+pub fn guarded_client_view_query_args(token: &str) -> Vec<String> {
+    let mut args = client_view_query_args(token);
+    debug_assert_eq!(args.get(3).map(String::as_str), Some(";"));
+    debug_assert_eq!(args.get(4).map(String::as_str), Some("list-clients"));
+    let list_clients = args.split_off(4);
+    args.extend([
+        "if-shell".to_string(),
+        "-F".to_string(),
+        "#{>:#{server_sessions},0}".to_string(),
+        tmux_command_string(&list_clients),
+    ]);
+    args
+}
+
 pub fn parse_client_view_query(
     output: &str,
     token: &str,

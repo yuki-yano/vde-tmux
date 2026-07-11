@@ -323,6 +323,24 @@ pub fn poll_query_args(framing: &QueryFraming) -> Vec<String> {
     ]
 }
 
+pub fn guarded_poll_query_args(framing: &QueryFraming) -> Vec<String> {
+    vec![
+        "display-message".to_string(),
+        "-p".to_string(),
+        framing.identity_format(),
+        ";".to_string(),
+        "if-shell".to_string(),
+        "-F".to_string(),
+        "#{>:#{server_sessions},0}".to_string(),
+        crate::pane_state::store::tmux_command_string(&[
+            "list-panes".to_string(),
+            "-a".to_string(),
+            "-F".to_string(),
+            framing.pane_format(),
+        ]),
+    ]
+}
+
 pub fn hydrate_query_args(framing: &QueryFraming) -> Vec<String> {
     vec![
         "display-message".to_string(),
@@ -340,6 +358,8 @@ pub fn hydrate_query_args(framing: &QueryFraming) -> Vec<String> {
 }
 
 pub fn status_metadata_query_args(framing: &QueryFraming) -> Vec<String> {
+    // tmux returns an empty successful result for list-sessions with zero sessions. list-windows
+    // needs the explicit guard because it otherwise exits with "no current target".
     vec![
         "display-message".to_string(),
         "-p".to_string(),

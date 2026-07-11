@@ -207,6 +207,7 @@ pub(crate) enum V2AcceptedMutation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum V2InternalMutation {
     PaneEvent(Box<crate::pane_state::PaneEventEnvelope>),
+    ObservationPollProjection(Box<ObservationPollProjection>),
     RefreshTopology,
     TargetedPaneRefresh {
         pane_id: String,
@@ -217,7 +218,6 @@ pub(crate) enum V2InternalMutation {
         worktrees: std::collections::BTreeMap<String, crate::git::WorktreeInfo>,
     },
     TriageProjection,
-    StatusMetadataProjection(Box<super::runtime::StatusProjectionMetadata>),
     DiagnosticProjection {
         pane_instance: Option<crate::pane_state::PaneInstance>,
         message: String,
@@ -230,6 +230,16 @@ pub(crate) enum V2InternalMutation {
         diagnostic: Option<String>,
     },
     SidebarEffectCompleted(SidebarEffectCompletion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservationPollProjection {
+    topology: crate::daemon::topology::TopologySnapshot,
+    status_metadata: super::runtime::StatusProjectionMetadata,
+    witnesses: Vec<crate::pane_state::ClientWitness>,
+    observation_bases:
+        BTreeMap<crate::pane_state::PaneInstance, Option<crate::pane_state::StoredStateDescriptor>>,
+    view_base: crate::daemon::view_hooks::ViewRegistry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1922,7 +1932,9 @@ fn mutation_changes_topology_targets(mutation: &V2SequencedMutation) -> bool {
             | crate::daemon::protocol::v2::ClientMessage::RefreshTopology { .. },
         )
         | V2AcceptedMutation::Internal(
-            V2InternalMutation::RefreshTopology | V2InternalMutation::TargetedPaneRefresh { .. },
+            V2InternalMutation::ObservationPollProjection(_)
+            | V2InternalMutation::RefreshTopology
+            | V2InternalMutation::TargetedPaneRefresh { .. },
         ) => true,
         V2AcceptedMutation::External(
             crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent { envelope, .. },
@@ -1951,7 +1963,7 @@ fn start_canonical_observation_worker(coordinator: Arc<ProductionV2Coordinator>,
         );
         let mut last_hook_check = Instant::now();
         while !coordinator.shutdown.load(Ordering::SeqCst) {
-            let dispatch = {
+            let (dispatch, view_base) = {
                 let state_guard = coordinator
                     .state
                     .lock()
@@ -1969,7 +1981,10 @@ fn start_canonical_observation_worker(coordinator: Arc<ProductionV2Coordinator>,
                 panes.extend(state.leased.runtime.tracked_panes());
                 panes.sort();
                 panes.dedup();
-                state.leased.runtime.freeze_observation_dispatch(panes)
+                (
+                    state.leased.runtime.freeze_observation_dispatch(panes),
+                    state.views.clone(),
+                )
             };
             let daemon_instance_id = coordinator
                 .router
@@ -1977,63 +1992,53 @@ fn start_canonical_observation_worker(coordinator: Arc<ProductionV2Coordinator>,
                 .expect("v2 router lock poisoned")
                 .daemon_instance_id()
                 .clone();
-            let topology = match query_full_topology(&coordinator, Duration::from_secs(1)) {
-                Ok(topology) => topology,
-                Err(error) if error.requires_daemon_exit() => {
-                    coordinator.fail_stop(error.to_string());
-                    break;
-                }
-                Err(error) => {
-                    for snapshot in &dispatch {
-                        match crate::daemon::workers::observation_envelope(
-                            daemon_instance_id.clone(),
-                            snapshot.pane_instance.clone(),
-                            snapshot.base.clone(),
-                            &snapshot.tracker,
-                            epoch_seconds(),
-                            crate::pane_state::AgentPresenceObservation::Unknown,
-                            None,
-                        ) {
-                            Ok(envelope) => {
-                                let _ = coordinator.enqueue_internal(
-                                    V2InternalMutation::PaneEvent(Box::new(envelope)),
-                                );
-                            }
-                            Err(build_error) => {
-                                coordinator.fail_stop(build_error.to_string());
-                                return;
-                            }
-                        }
-                    }
-                    let pane = dispatch
-                        .first()
-                        .map(|snapshot| snapshot.pane_instance.clone());
-                    let _ =
-                        coordinator.enqueue_internal(V2InternalMutation::DiagnosticProjection {
-                            pane_instance: pane,
-                            message: format!("observation_topology_failed: {error}"),
-                        });
-                    thread::sleep(poll);
-                    continue;
-                }
-            };
-            let status_metadata =
-                match query_status_projection_metadata(&coordinator, Duration::from_secs(1)) {
-                    Ok(metadata) => Some(metadata),
+            let mut projection =
+                match query_observation_poll_projection(&coordinator, Duration::from_secs(1)) {
+                    Ok(projection) => projection,
                     Err(error) if error.requires_daemon_exit() => {
                         coordinator.fail_stop(error.to_string());
                         break;
                     }
                     Err(error) => {
+                        for snapshot in &dispatch {
+                            match crate::daemon::workers::observation_envelope(
+                                daemon_instance_id.clone(),
+                                snapshot.pane_instance.clone(),
+                                snapshot.base.clone(),
+                                &snapshot.tracker,
+                                epoch_seconds(),
+                                crate::pane_state::AgentPresenceObservation::Unknown,
+                                None,
+                            ) {
+                                Ok(envelope) => {
+                                    let _ = coordinator.enqueue_internal(
+                                        V2InternalMutation::PaneEvent(Box::new(envelope)),
+                                    );
+                                }
+                                Err(build_error) => {
+                                    coordinator.fail_stop(build_error.to_string());
+                                    return;
+                                }
+                            }
+                        }
+                        let pane = dispatch
+                            .first()
+                            .map(|snapshot| snapshot.pane_instance.clone());
                         let _ = coordinator.enqueue_internal(
                             V2InternalMutation::DiagnosticProjection {
-                                pane_instance: None,
-                                message: format!("status_metadata_query_failed: {error}"),
+                                pane_instance: pane,
+                                message: format!("observation_projection_failed: {error}"),
                             },
                         );
-                        None
+                        thread::sleep(poll);
+                        continue;
                     }
                 };
+            projection.observation_bases = dispatch
+                .iter()
+                .map(|snapshot| (snapshot.pane_instance.clone(), snapshot.base.clone()))
+                .collect();
+            projection.view_base = view_base;
             let processes =
                 crate::daemon::workers::read_agent_process_snapshot(Duration::from_secs(1));
             match crate::daemon::workers::run_observation_poll(
@@ -2045,12 +2050,15 @@ fn start_canonical_observation_worker(coordinator: Arc<ProductionV2Coordinator>,
                 epoch_seconds(),
             ) {
                 Ok(result) => {
-                    let _ = coordinator.enqueue_internal(V2InternalMutation::RefreshTopology);
-                    if let Some(metadata) = status_metadata {
-                        let _ = coordinator.enqueue_internal(
-                            V2InternalMutation::StatusMetadataProjection(Box::new(metadata)),
-                        );
-                    }
+                    let current = projection
+                        .topology
+                        .panes
+                        .iter()
+                        .map(|pane| pane.pane_instance.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let _ = coordinator.enqueue_internal(
+                        V2InternalMutation::ObservationPollProjection(Box::new(projection)),
+                    );
                     for envelope in result.envelopes {
                         if !coordinator
                             .enqueue_internal(V2InternalMutation::PaneEvent(Box::new(envelope)))
@@ -2058,11 +2066,6 @@ fn start_canonical_observation_worker(coordinator: Arc<ProductionV2Coordinator>,
                             break;
                         }
                     }
-                    let current = topology
-                        .panes
-                        .iter()
-                        .map(|pane| pane.pane_instance.clone())
-                        .collect::<std::collections::BTreeSet<_>>();
                     match crate::daemon::workers::pane_removal_envelopes(
                         &daemon_instance_id,
                         &dispatch,
@@ -2100,7 +2103,6 @@ fn start_canonical_observation_worker(coordinator: Arc<ProductionV2Coordinator>,
                         );
                     }
                     let _ = coordinator.enqueue_internal(V2InternalMutation::TriageProjection);
-                    let _ = coordinator.enqueue_internal(V2InternalMutation::ReconcileViews);
                 }
                 Err(error) if error.requires_daemon_exit() => {
                     coordinator.fail_stop(error.to_string());
@@ -2337,6 +2339,17 @@ fn apply_production_mutation(
         V2AcceptedMutation::Internal(V2InternalMutation::TargetedPaneRefresh { pane_id }) => {
             targeted_pane_refresh_response(coordinator, &pane_id)
         }
+        V2AcceptedMutation::Internal(V2InternalMutation::ObservationPollProjection(projection)) => {
+            match apply_observation_poll_projection(coordinator, *projection) {
+                Ok(revision) => ServerMessage::SnapshotAck {
+                    event_id: crate::pane_state::EventId::generate()
+                        .expect("OS random source failed after daemon startup"),
+                    accepted_seq,
+                    snapshot_revision: revision,
+                },
+                Err(error) => observation_poll_error_response(coordinator, error),
+            }
+        }
         V2AcceptedMutation::Internal(V2InternalMutation::RefreshTopology) => {
             match refresh_full_topology(coordinator) {
                 Ok(revision) => ServerMessage::SnapshotAck {
@@ -2502,24 +2515,6 @@ fn apply_production_mutation(
                 .as_mut()
                 .expect("state initialized before triage projection");
             if let Err(error) = state.leased.runtime.advance_poll_projection() {
-                return production_store_error_response(coordinator, error, None);
-            }
-            ServerMessage::SnapshotAck {
-                event_id: crate::pane_state::EventId::generate()
-                    .expect("OS random source failed after daemon startup"),
-                accepted_seq,
-                snapshot_revision: state.leased.runtime.snapshot_revision(),
-            }
-        }
-        V2AcceptedMutation::Internal(V2InternalMutation::StatusMetadataProjection(metadata)) => {
-            let mut state_guard = coordinator
-                .state
-                .lock()
-                .expect("canonical state lock poisoned");
-            let state = state_guard
-                .as_mut()
-                .expect("state initialized before status metadata projection");
-            if let Err(error) = state.replace_status_metadata(*metadata) {
                 return production_store_error_response(coordinator, error, None);
             }
             ServerMessage::SnapshotAck {
@@ -3665,6 +3660,189 @@ fn query_full_topology(
     crate::daemon::topology::parse_topology(&output, &framing, &coordinator.incarnation.identity)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservationPollFraming {
+    query: crate::daemon::topology::QueryFraming,
+    topology_end: String,
+    status_end: String,
+    client_end: String,
+    final_end: String,
+}
+
+impl ObservationPollFraming {
+    fn generate() -> Result<Self, crate::daemon::topology::TopologyError> {
+        Self::from_query(crate::daemon::topology::QueryFraming::generate()?)
+    }
+
+    fn from_query(
+        query: crate::daemon::topology::QueryFraming,
+    ) -> Result<Self, crate::daemon::topology::TopologyError> {
+        let token = query.token();
+        if token.is_empty() {
+            return Err(crate::daemon::topology::TopologyError::InvalidFraming(
+                "observation poll query token is empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            topology_end: format!("__vde_poll_topology_end_{token}__"),
+            status_end: format!("__vde_poll_status_end_{token}__"),
+            client_end: format!("__vde_poll_client_end_{token}__"),
+            final_end: format!("__vde_poll_final_end_{token}__"),
+            query,
+        })
+    }
+
+    fn query_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        append_tmux_command(
+            &mut args,
+            crate::daemon::topology::guarded_poll_query_args(&self.query),
+        );
+        append_tmux_display_marker(&mut args, &self.topology_end);
+        append_tmux_command(
+            &mut args,
+            crate::daemon::topology::status_metadata_query_args(&self.query),
+        );
+        append_tmux_display_marker(&mut args, &self.status_end);
+        append_tmux_command(
+            &mut args,
+            crate::daemon::view_hooks::guarded_client_view_query_args(self.query.token()),
+        );
+        append_tmux_display_marker(&mut args, &self.client_end);
+        append_tmux_display_marker(&mut args, &self.final_end);
+        args
+    }
+}
+
+fn append_tmux_command(args: &mut Vec<String>, command: Vec<String>) {
+    if !args.is_empty() {
+        args.push(";".to_string());
+    }
+    args.extend(command);
+}
+
+fn append_tmux_display_marker(args: &mut Vec<String>, marker: &str) {
+    append_tmux_command(
+        args,
+        vec![
+            "display-message".to_string(),
+            "-p".to_string(),
+            marker.to_string(),
+        ],
+    );
+}
+
+#[derive(Debug)]
+enum ObservationPollQueryError {
+    Framing(String),
+    Topology(crate::daemon::topology::TopologyError),
+    Client(crate::daemon::view_hooks::FreshVisibilityError),
+}
+
+impl ObservationPollQueryError {
+    fn requires_daemon_exit(&self) -> bool {
+        match self {
+            Self::Framing(_) => false,
+            Self::Topology(error) => error.requires_daemon_exit(),
+            Self::Client(error) => error.requires_daemon_exit(),
+        }
+    }
+}
+
+impl std::fmt::Display for ObservationPollQueryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Framing(message) => formatter.write_str(message),
+            Self::Topology(error) => write!(formatter, "{error}"),
+            Self::Client(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ObservationPollQueryError {}
+
+fn query_observation_poll_projection(
+    coordinator: &ProductionV2Coordinator,
+    timeout: Duration,
+) -> Result<ObservationPollProjection, ObservationPollQueryError> {
+    let framing =
+        ObservationPollFraming::generate().map_err(ObservationPollQueryError::Topology)?;
+    let args = framing.query_args();
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let runner = crate::tmux::SystemTmuxRunner::from_env(timeout);
+    let output = runner.run(&refs).map_err(|error| {
+        ObservationPollQueryError::Topology(crate::daemon::topology::TopologyError::Query(
+            error.to_string(),
+        ))
+    })?;
+    parse_observation_poll_projection(&output, &framing, &coordinator.incarnation.identity)
+}
+
+fn parse_observation_poll_projection(
+    output: &str,
+    framing: &ObservationPollFraming,
+    expected_identity: &crate::daemon::topology::ServerIdentity,
+) -> Result<ObservationPollProjection, ObservationPollQueryError> {
+    let (topology_frame, remainder) =
+        split_observation_poll_frame(output, &framing.topology_end, "topology")?;
+    let (status_frame, remainder) =
+        split_observation_poll_frame(remainder, &framing.status_end, "status")?;
+    let (client_frame, remainder) =
+        split_observation_poll_frame(remainder, &framing.client_end, "client")?;
+    let expected_final = format!("{}\n", framing.final_end);
+    if remainder != expected_final {
+        return Err(ObservationPollQueryError::Framing(
+            "observation poll final marker is missing or not final".to_string(),
+        ));
+    }
+
+    let topology_frame = format!("{topology_frame}\n");
+    let status_frame = format!("{status_frame}\n");
+    let client_frame = format!("{client_frame}\n");
+    let topology =
+        crate::daemon::topology::parse_topology(&topology_frame, &framing.query, expected_identity)
+            .map_err(ObservationPollQueryError::Topology)?;
+    let status = crate::daemon::topology::parse_status_metadata(
+        &status_frame,
+        &framing.query,
+        expected_identity,
+    )
+    .map_err(ObservationPollQueryError::Topology)?;
+    let witnesses = crate::daemon::view_hooks::parse_client_view_query(
+        &client_frame,
+        framing.query.token(),
+        expected_identity,
+    )
+    .map_err(ObservationPollQueryError::Client)?;
+
+    Ok(ObservationPollProjection {
+        topology,
+        status_metadata: status_projection_metadata(status),
+        witnesses,
+        observation_bases: BTreeMap::new(),
+        view_base: crate::daemon::view_hooks::ViewRegistry::default(),
+    })
+}
+
+fn split_observation_poll_frame<'a>(
+    output: &'a str,
+    marker: &str,
+    section: &str,
+) -> Result<(&'a str, &'a str), ObservationPollQueryError> {
+    let delimiter = format!("\n{marker}\n");
+    let Some((frame, remainder)) = output.split_once(&delimiter) else {
+        return Err(ObservationPollQueryError::Framing(format!(
+            "observation poll {section} marker is missing"
+        )));
+    };
+    if remainder.starts_with(&format!("{marker}\n")) || remainder.contains(&delimiter) {
+        return Err(ObservationPollQueryError::Framing(format!(
+            "observation poll {section} marker is duplicated"
+        )));
+    }
+    Ok((frame, remainder))
+}
+
 fn query_status_projection_metadata(
     coordinator: &ProductionV2Coordinator,
     timeout: Duration,
@@ -3681,6 +3859,12 @@ fn query_status_projection_metadata(
         &framing,
         &coordinator.incarnation.identity,
     )?;
+    Ok(status_projection_metadata(snapshot))
+}
+
+fn status_projection_metadata(
+    snapshot: crate::daemon::topology::StatusMetadataSnapshot,
+) -> super::runtime::StatusProjectionMetadata {
     let mut metadata = super::runtime::StatusProjectionMetadata::default();
     for session in snapshot.sessions {
         if let Some(category) = session.category.clone() {
@@ -3705,7 +3889,7 @@ fn query_status_projection_metadata(
             },
         );
     }
-    Ok(metadata)
+    metadata
 }
 
 fn query_client_witnesses(
@@ -3749,6 +3933,49 @@ fn refresh_full_topology(
     })?;
     state.replace_topology(topology)?;
     Ok(state.leased.runtime.snapshot_revision())
+}
+
+fn apply_observation_poll_projection(
+    coordinator: &ProductionV2Coordinator,
+    projection: ObservationPollProjection,
+) -> Result<u64> {
+    {
+        let mut state_guard = coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned");
+        let state = state_guard
+            .as_mut()
+            .context("state initialized before observation projection")?;
+        state.replace_topology(projection.topology)?;
+        state.replace_status_metadata(projection.status_metadata)?;
+    }
+    reconcile_views_with_witnesses(
+        coordinator,
+        &projection.witnesses,
+        Some(&projection.observation_bases),
+        Some(&projection.view_base),
+    )?;
+    Ok(coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned")
+        .as_ref()
+        .map_or(0, |state| state.leased.runtime.snapshot_revision()))
+}
+
+fn observation_poll_error_response(
+    coordinator: &ProductionV2Coordinator,
+    error: anyhow::Error,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    match error.downcast::<crate::pane_state::store::StoreError>() {
+        Ok(store_error) => production_store_error_response(coordinator, store_error, None),
+        Err(error) => crate::daemon::protocol::v2::ServerMessage::error(
+            crate::daemon::protocol::v2::ErrorCode::InternalError,
+            error.to_string(),
+            None,
+        ),
+    }
 }
 
 fn targeted_pane_refresh_response(
@@ -4109,6 +4336,20 @@ fn initial_view_reconciliation(coordinator: &ProductionV2Coordinator) -> Result<
             return Ok(());
         }
     };
+    reconcile_views_with_witnesses(coordinator, &witnesses, None, None)
+}
+
+fn reconcile_views_with_witnesses(
+    coordinator: &ProductionV2Coordinator,
+    witnesses: &[crate::pane_state::ClientWitness],
+    observation_bases: Option<
+        &BTreeMap<
+            crate::pane_state::PaneInstance,
+            Option<crate::pane_state::StoredStateDescriptor>,
+        >,
+    >,
+    view_base: Option<&crate::daemon::view_hooks::ViewRegistry>,
+) -> Result<()> {
     let mut state_guard = coordinator
         .state
         .lock()
@@ -4116,8 +4357,11 @@ fn initial_view_reconciliation(coordinator: &ProductionV2Coordinator) -> Result<
     let state = state_guard
         .as_mut()
         .expect("state initialized before reconciliation");
+    if !observation_view_base_matches(&state.views, view_base) {
+        return Ok(());
+    }
     let window_panes = state.window_panes();
-    let records = state.records_snapshot();
+    let records = records_at_observation_base(state.records_snapshot(), observation_bases);
     let revision_before = state.leased.runtime.snapshot_revision();
     let mut next_views = state.views.clone();
     let result = crate::daemon::view_hooks::reconcile_current_views(
@@ -4127,7 +4371,7 @@ fn initial_view_reconciliation(coordinator: &ProductionV2Coordinator) -> Result<
             .lock()
             .expect("v2 router lock poisoned")
             .daemon_instance_id(),
-        &witnesses,
+        witnesses,
         &window_panes,
         coordinator.done_clear_on,
         &records,
@@ -4213,6 +4457,32 @@ fn initial_view_reconciliation(coordinator: &ProductionV2Coordinator) -> Result<
             Err(anyhow::Error::new(error))
         }
     }
+}
+
+fn observation_view_base_matches(
+    current: &crate::daemon::view_hooks::ViewRegistry,
+    observation_base: Option<&crate::daemon::view_hooks::ViewRegistry>,
+) -> bool {
+    observation_base.is_none_or(|base| current == base)
+}
+
+fn records_at_observation_base(
+    mut records: BTreeMap<crate::pane_state::PaneInstance, crate::pane_state::StoredPaneRecord>,
+    observation_bases: Option<
+        &BTreeMap<
+            crate::pane_state::PaneInstance,
+            Option<crate::pane_state::StoredStateDescriptor>,
+        >,
+    >,
+) -> BTreeMap<crate::pane_state::PaneInstance, crate::pane_state::StoredPaneRecord> {
+    if let Some(observation_bases) = observation_bases {
+        records.retain(|pane, record| {
+            observation_bases
+                .get(pane)
+                .is_some_and(|base| base.as_ref() == Some(&record.descriptor()))
+        });
+    }
+    records
 }
 
 fn bind_daemon_listener(
@@ -4308,6 +4578,189 @@ mod tests {
     use super::*;
     const V2_EVENT_ID: &str = "102132435465768798a9bacbdcedfe0f";
     const V2_DAEMON_ID: &str = "ffeeddccbbaa99887766554433221100";
+    const POLL_TOKEN: &str = "00112233445566778899aabbccddeeff";
+
+    fn observation_poll_framing() -> ObservationPollFraming {
+        ObservationPollFraming::from_query(
+            crate::daemon::topology::QueryFraming::from_token(POLL_TOKEN).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn observation_poll_output(framing: &ObservationPollFraming) -> String {
+        let field = framing.query.field_separator();
+        let row = framing.query.row_separator();
+        let identity = framing
+            .query
+            .identity_format()
+            .replace("#{pid}", "123")
+            .replace("#{start_time}", "456");
+        let topology = [
+            "$1", "main", "@1", "0", "1", "0", "window", "%1", "100", "/tmp", "zsh", "1",
+        ]
+        .join(field);
+        let status_session = [
+            "__vde_sm_00112233445566778899aabbccddeeff__",
+            "$1",
+            "main",
+            "work",
+            "1",
+            "10",
+        ]
+        .join(field);
+        let status_window = [
+            "__vde_wm_00112233445566778899aabbccddeeff__",
+            "@1",
+            "0",
+            "1",
+            "0",
+        ]
+        .join(field);
+        let client = ["99", "$1", "@1", "%1", "100", "0", ""]
+            .join(&format!("__vde_client_field_{POLL_TOKEN}__"));
+        format!(
+            "{identity}\n{topology}{row}\n{}\n{identity}\n{status_session}{row}\n{status_window}{row}\n{}\n__vde_client_identity_{POLL_TOKEN}__123:456\n{client}__vde_client_row_{POLL_TOKEN}__\n{}\n{}\n",
+            framing.topology_end, framing.status_end, framing.client_end, framing.final_end
+        )
+    }
+
+    fn empty_observation_poll_output(framing: &ObservationPollFraming) -> String {
+        let identity = framing
+            .query
+            .identity_format()
+            .replace("#{pid}", "123")
+            .replace("#{start_time}", "456");
+        format!(
+            "{identity}\n{}\n{identity}\n{}\n__vde_client_identity_{POLL_TOKEN}__123:456\n{}\n{}\n",
+            framing.topology_end, framing.status_end, framing.client_end, framing.final_end
+        )
+    }
+
+    #[test]
+    fn observation_poll_query_is_one_guarded_command_group() {
+        let framing = observation_poll_framing();
+        let args = framing.query_args();
+        let rendered = args.join(" ");
+
+        assert!(rendered.contains("list-panes"));
+        assert!(rendered.contains("list-sessions"));
+        assert!(rendered.contains("list-windows"));
+        assert!(rendered.contains("list-clients"));
+        assert_eq!(rendered.matches("#{>:#{server_sessions},0}").count(), 3);
+        assert!(rendered.contains(&framing.topology_end));
+        assert!(rendered.contains(&framing.status_end));
+        assert!(rendered.contains(&framing.client_end));
+        assert!(rendered.contains(&framing.final_end));
+        assert!(!rendered.contains("capture-pane"));
+    }
+
+    #[test]
+    fn observation_poll_parser_is_all_or_nothing() {
+        let framing = observation_poll_framing();
+        let identity = crate::daemon::topology::ServerIdentity {
+            pid: 123,
+            start_time: 456,
+        };
+        let output = observation_poll_output(&framing);
+        let projection = parse_observation_poll_projection(&output, &framing, &identity).unwrap();
+
+        assert_eq!(projection.topology.panes.len(), 1);
+        assert_eq!(projection.status_metadata.sessions.len(), 1);
+        assert_eq!(projection.status_metadata.windows.len(), 1);
+        assert_eq!(projection.witnesses.len(), 1);
+
+        let truncated = output.replace(&format!("{}\n", framing.final_end), "");
+        assert!(matches!(
+            parse_observation_poll_projection(&truncated, &framing, &identity),
+            Err(ObservationPollQueryError::Framing(_))
+        ));
+        let malformed = output.replace("$1__vde_f_", "$1__broken_f_");
+        assert!(parse_observation_poll_projection(&malformed, &framing, &identity).is_err());
+
+        let empty = parse_observation_poll_projection(
+            &empty_observation_poll_output(&framing),
+            &framing,
+            &identity,
+        )
+        .unwrap();
+        assert!(empty.topology.panes.is_empty());
+        assert!(empty.status_metadata.sessions.is_empty());
+        assert!(empty.status_metadata.windows.is_empty());
+        assert!(empty.witnesses.is_empty());
+
+        let duplicated = output.replacen(
+            &format!("{}\n", framing.topology_end),
+            &format!("{}\n{}\n", framing.topology_end, framing.topology_end),
+            1,
+        );
+        assert!(matches!(
+            parse_observation_poll_projection(&duplicated, &framing, &identity),
+            Err(ObservationPollQueryError::Framing(message))
+                if message.contains("duplicated")
+        ));
+    }
+
+    #[test]
+    fn stale_poll_view_and_state_bases_block_reconciliation_inputs() {
+        let pane = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        let state = |revision, completed_seq| {
+            crate::pane_state::StoredPaneRecord::Active(crate::pane_state::PaneState {
+                schema_version: crate::pane_state::PANE_STATE_SCHEMA_VERSION,
+                state_id: crate::pane_state::StateId::parse(POLL_TOKEN).unwrap(),
+                revision,
+                pane_instance: pane.clone(),
+                agent: crate::pane_state::AgentKind::parse("codex").unwrap(),
+                agent_session_id: None,
+                agent_epoch: 1,
+                agent_present: true,
+                scan_verified: true,
+                synthetic_completion_armed: false,
+                lifecycle: crate::pane_state::LifecycleState::Idle,
+                run_seq: completed_seq,
+                completed_seq,
+                acknowledged_seq: 0,
+                started_at: Some(1),
+                completed_at: Some(2),
+                prompt: None,
+                tasks: crate::pane_state::TaskState::default(),
+                subagents: Vec::new(),
+                worktree_activity: None,
+            })
+        };
+        let observed = state(3, 1);
+        let newer = state(4, 2);
+        let bases = BTreeMap::from([(pane.clone(), Some(observed.descriptor()))]);
+
+        assert_eq!(
+            records_at_observation_base(BTreeMap::from([(pane.clone(), observed)]), Some(&bases),)
+                .len(),
+            1
+        );
+        assert!(
+            records_at_observation_base(BTreeMap::from([(pane.clone(), newer)]), Some(&bases))
+                .is_empty()
+        );
+
+        let view_base = crate::daemon::view_hooks::ViewRegistry::default();
+        let mut current = view_base.clone();
+        current
+            .reconcile(
+                &[crate::pane_state::ClientWitness {
+                    client_pid: 10,
+                    session_id: "$1".to_string(),
+                    window_id: "@1".to_string(),
+                    active_pane: pane.clone(),
+                    control_mode: false,
+                    active_pane_flag: false,
+                }],
+                &BTreeMap::from([("@1".to_string(), vec![pane])]),
+            )
+            .unwrap();
+        assert!(!observation_view_base_matches(&current, Some(&view_base)));
+    }
 
     fn v2_daemon_id() -> crate::pane_state::DaemonInstanceId {
         crate::pane_state::DaemonInstanceId::parse(V2_DAEMON_ID).unwrap()
@@ -4464,6 +4917,40 @@ mod tests {
         assert!(coordinator.shutdown_ready.load(Ordering::SeqCst));
         assert!(matches!(
             receiver.recv_timeout(Duration::from_millis(100)).unwrap(),
+            crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::InternalError,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn observation_poll_store_fail_stop_reaches_coordinator() {
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: "/tmp/vde-test-tmux.sock".into(),
+                identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                hash: "b".repeat(64),
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+
+        let response = observation_poll_error_response(
+            &coordinator,
+            anyhow::Error::new(crate::pane_state::store::StoreError::FailStop(
+                "projection invariant failed".to_string(),
+            )),
+        );
+
+        assert!(coordinator.router.lock().unwrap().is_fatal());
+        assert!(matches!(
+            response,
             crate::daemon::protocol::v2::ServerMessage::Error {
                 code: crate::daemon::protocol::v2::ErrorCode::InternalError,
                 ..
