@@ -547,7 +547,12 @@ impl ResetTombstone {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "record_type", content = "record", rename_all = "snake_case")]
+#[serde(
+    tag = "record_type",
+    content = "record",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 #[allow(clippy::large_enum_variant)]
 pub enum StoredPaneRecord {
     Active(PaneState),
@@ -582,7 +587,7 @@ impl StoredPaneRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StoredStateDescriptor {
     Canonical { version: StateVersion },
     Quarantined { quarantine_id: String },
@@ -1018,6 +1023,17 @@ mod tests {
         let mut value = serde_json::to_value(record).unwrap();
         value["record"]["unknown"] = serde_json::json!(true);
         assert!(serde_json::from_value::<StoredPaneRecord>(value).is_err());
+
+        let mut value = serde_json::to_value(StoredPaneRecord::Active(valid_state())).unwrap();
+        value["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<StoredPaneRecord>(value).is_err());
+
+        let descriptor = StoredStateDescriptor::Canonical {
+            version: valid_state().version(),
+        };
+        let mut value = serde_json::to_value(descriptor).unwrap();
+        value["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<StoredStateDescriptor>(value).is_err());
 
         let event = r#"{"type":"begin_run","data":{"started_at":1,"prompt":null,"extra":true}}"#;
         assert!(serde_json::from_str::<PaneEvent>(event).is_err());

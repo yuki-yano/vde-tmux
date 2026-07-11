@@ -76,6 +76,7 @@ impl From<ReduceError> for StoreError {
 #[allow(clippy::large_enum_variant)]
 pub enum LoadedPaneRecord {
     Missing,
+    Uninitialized { raw: String },
     Valid(StoredPaneRecord),
     Quarantined(QuarantinedPaneRecord),
 }
@@ -108,25 +109,43 @@ pub fn load_record(entry: RawPaneRecord) -> LoadedPaneRecord {
     let Some(raw) = entry.raw else {
         return LoadedPaneRecord::Missing;
     };
-    let loaded = if raw.len() > MAX_STORED_RECORD_BYTES {
-        Err("serialized pane state exceeds 256 KiB".to_string())
-    } else {
-        serde_json::from_str::<StoredPaneRecord>(&raw)
-            .map_err(|error| error.to_string())
-            .and_then(|record| {
-                record.validate().map_err(|error| error.to_string())?;
-                if record.pane_instance() != &entry.pane_instance {
-                    return Err("stored pane instance does not match current pane".to_string());
-                }
-                Ok(record)
-            })
-    };
-    match loaded {
-        Ok(record) => LoadedPaneRecord::Valid(record),
-        Err(message) => {
-            LoadedPaneRecord::Quarantined(quarantine(entry.pane_instance, raw, message))
-        }
+    if raw.len() > MAX_STORED_RECORD_BYTES {
+        return LoadedPaneRecord::Quarantined(quarantine(
+            entry.pane_instance,
+            raw,
+            "serialized pane state exceeds 256 KiB".to_string(),
+        ));
     }
+    let record = match serde_json::from_str::<StoredPaneRecord>(&raw) {
+        Ok(record) => record,
+        Err(error) => {
+            return LoadedPaneRecord::Quarantined(quarantine(
+                entry.pane_instance,
+                raw,
+                error.to_string(),
+            ));
+        }
+    };
+    if record.pane_instance().pane_id == entry.pane_instance.pane_id
+        && record.pane_instance().pane_pid != entry.pane_instance.pane_pid
+    {
+        return LoadedPaneRecord::Uninitialized { raw };
+    }
+    if let Err(error) = record.validate() {
+        return LoadedPaneRecord::Quarantined(quarantine(
+            entry.pane_instance,
+            raw,
+            error.to_string(),
+        ));
+    }
+    if record.pane_instance() != &entry.pane_instance {
+        return LoadedPaneRecord::Quarantined(quarantine(
+            entry.pane_instance,
+            raw,
+            "stored pane instance does not match current pane".to_string(),
+        ));
+    }
+    LoadedPaneRecord::Valid(record)
 }
 
 pub fn quarantine_id(raw: &[u8]) -> String {
@@ -273,10 +292,33 @@ impl PaneStateStoreIo for TmuxPaneStateStoreIo<'_> {
 
     fn read_independent(&mut self, pane: &PaneInstance) -> IndependentRead {
         let header = "#{pid}|#{start_time}|#{pane_pid}|#{@vde_pane_state}";
-        match self
-            .runner
-            .run(&["display-message", "-p", "-t", &pane.pane_id, header])
-        {
+        let pane_guard = format!("#{{==:#{{pane_pid}},{}}}", pane.pane_pid);
+        let read_command = tmux_command_string(&[
+            "display-message".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            pane.pane_id.clone(),
+            header.to_string(),
+        ]);
+        let pane_command = format!(
+            "if-shell -F -t {} {} {} {}",
+            pane.pane_id,
+            quote_tmux_command_argument(&pane_guard),
+            quote_tmux_command_argument(&read_command),
+            quote_tmux_command_argument(&format!("display-message -p '{PANE_MISMATCH_SENTINEL}'")),
+        );
+        let guarded = server_guarded_command_args(
+            self.server_pid,
+            self.server_start_time,
+            pane_command,
+            SERVER_MISMATCH_SENTINEL,
+        );
+        let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
+        match self.runner.run(&refs) {
+            Ok(output) if output.trim() == SERVER_MISMATCH_SENTINEL => {
+                IndependentRead::ServerMismatch
+            }
+            Ok(output) if output.trim() == PANE_MISMATCH_SENTINEL => IndependentRead::PaneMissing,
             Ok(output) => {
                 let mut fields = output.trim_end().splitn(4, '|');
                 let identity = (
@@ -297,14 +339,7 @@ impl PaneStateStoreIo for TmuxPaneStateStoreIo<'_> {
                     .map(str::to_string);
                 IndependentRead::Value(value)
             }
-            Err(error) => {
-                let message = error.to_string();
-                if message.contains("can't find pane") || message.contains("no such pane") {
-                    IndependentRead::PaneMissing
-                } else {
-                    IndependentRead::Unavailable(message)
-                }
-            }
+            Err(error) => IndependentRead::Unavailable(error.to_string()),
         }
     }
 }
@@ -456,6 +491,7 @@ pub enum ViewBatchProgress {
 pub struct CanonicalStateRuntime {
     records: BTreeMap<PaneInstance, StoredPaneRecord>,
     quarantined: BTreeMap<PaneInstance, QuarantinedPaneRecord>,
+    uninitialized_raw: BTreeMap<PaneInstance, String>,
     trackers: BTreeMap<PaneInstance, CaptureTrackerSnapshot>,
     diagnostics: VecDeque<PaneStateDiagnostic>,
     transitions: VecDeque<CanonicalTransition>,
@@ -478,6 +514,9 @@ impl CanonicalStateRuntime {
             let pane = entry.pane_instance.clone();
             match load_record(entry) {
                 LoadedPaneRecord::Missing => {}
+                LoadedPaneRecord::Uninitialized { raw } => {
+                    runtime.uninitialized_raw.insert(pane, raw);
+                }
                 LoadedPaneRecord::Valid(record) => {
                     if let StoredPaneRecord::Active(state) = &record {
                         runtime.trackers.insert(
@@ -511,6 +550,7 @@ impl CanonicalStateRuntime {
             .records
             .keys()
             .chain(self.quarantined.keys())
+            .chain(self.uninitialized_raw.keys())
             .chain(self.trackers.keys())
             .cloned()
             .collect::<Vec<_>>();
@@ -630,29 +670,32 @@ impl CanonicalStateRuntime {
         projection_changed: bool,
         revision_before: u64,
     ) -> Result<u64, StoreError> {
+        let mut draft = self.clone();
         let mut changed = projection_changed;
         if let Some(pane) = diagnostic_pane {
             for message in messages {
-                self.diagnostics.push_back(PaneStateDiagnostic {
+                draft.diagnostics.push_back(PaneStateDiagnostic {
                     pane_instance: pane.clone(),
                     message,
                 });
-                while self.diagnostics.len() > MAX_DIAGNOSTICS {
-                    self.diagnostics.pop_front();
+                while draft.diagnostics.len() > MAX_DIAGNOSTICS {
+                    draft.diagnostics.pop_front();
                 }
                 changed = true;
             }
         }
-        if changed && self.snapshot_revision == revision_before {
-            self.bump_snapshot_revision()?;
+        if changed && draft.snapshot_revision == revision_before {
+            draft.bump_snapshot_revision()?;
         }
-        self.validate_projection()?;
-        let preflight_changed = self.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
-        if preflight_changed && self.snapshot_revision == revision_before {
-            self.bump_snapshot_revision()?;
-            let _ = self.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        draft.validate_projection()?;
+        let preflight_changed = draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        if preflight_changed && draft.snapshot_revision == revision_before {
+            draft.bump_snapshot_revision()?;
+            let _ = draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
         }
-        Ok(self.snapshot_revision)
+        let revision = draft.snapshot_revision;
+        *self = draft;
+        Ok(revision)
     }
 
     pub fn mark_projection_changed(&mut self) -> Result<u64, StoreError> {
@@ -676,18 +719,21 @@ impl CanonicalStateRuntime {
         if self.descriptor(pane).as_ref() != expected {
             return Ok(false);
         }
-        let removed = self.records.remove(pane).is_some()
-            | self.quarantined.remove(pane).is_some()
-            | self.trackers.remove(pane).is_some();
+        let mut draft = self.clone();
+        let removed = draft.records.remove(pane).is_some()
+            | draft.quarantined.remove(pane).is_some()
+            | draft.uninitialized_raw.remove(pane).is_some()
+            | draft.trackers.remove(pane).is_some();
         if !removed {
             return Ok(false);
         }
-        self.triage.remove(pane);
-        self.triage_calm_polls.remove(pane);
-        self.flash.remove(pane);
-        self.bump_snapshot_revision()?;
-        self.validate_projection()?;
-        let _ = self.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        draft.triage.remove(pane);
+        draft.triage_calm_polls.remove(pane);
+        draft.flash.remove(pane);
+        draft.bump_snapshot_revision()?;
+        draft.validate_projection()?;
+        let _ = draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        *self = draft;
         Ok(true)
     }
 
@@ -785,12 +831,16 @@ impl CanonicalStateRuntime {
 
         let candidate = reduction.record.expect("canonical mutation has a record");
         let candidate_raw = serialize_record(&candidate)?;
-        let expected_raw = current.map(serialize_record).transpose()?;
+        let expected_raw = match current {
+            Some(record) => Some(serialize_record(record)?),
+            None => self.uninitialized_raw.get(&envelope.pane_instance).cloned(),
+        };
         let mut draft = self.clone();
         draft
             .records
             .insert(envelope.pane_instance.clone(), candidate.clone());
         draft.quarantined.remove(&envelope.pane_instance);
+        draft.uninitialized_raw.remove(&envelope.pane_instance);
         if let Some(delta) = reduction.tracker_delta {
             draft
                 .trackers
@@ -1217,6 +1267,7 @@ impl CanonicalStateRuntime {
                 draft.pending = None;
                 draft.records.remove(&transaction.pane);
                 draft.trackers.remove(&transaction.pane);
+                draft.uninitialized_raw.remove(&transaction.pane);
                 draft
                     .quarantined
                     .insert(transaction.pane.clone(), quarantined.clone());
@@ -1393,17 +1444,19 @@ impl CanonicalStateRuntime {
         pane_instance: PaneInstance,
         message: String,
     ) -> Result<(), StoreError> {
-        self.diagnostics.push_back(PaneStateDiagnostic {
+        let mut draft = self.clone();
+        draft.diagnostics.push_back(PaneStateDiagnostic {
             pane_instance,
             message,
         });
-        while self.diagnostics.len() > MAX_DIAGNOSTICS {
-            self.diagnostics.pop_front();
+        while draft.diagnostics.len() > MAX_DIAGNOSTICS {
+            draft.diagnostics.pop_front();
         }
-        self.bump_snapshot_revision()?;
-        self.validate_projection()?;
-        self.preflight_projection(MAX_RESPONSE_FRAME_BYTES)
-            .map(|_| ())
+        draft.bump_snapshot_revision()?;
+        draft.validate_projection()?;
+        let _ = draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        *self = draft;
+        Ok(())
     }
 
     fn validate_projection(&self) -> Result<(), StoreError> {
@@ -1638,6 +1691,52 @@ mod tests {
         ]);
         assert!(runtime.quarantined(&pane()).is_some());
         assert!(!runtime.is_fail_stopped());
+    }
+
+    #[test]
+    fn hydrate_pid_mismatch_is_uninitialized_and_preserves_first_write_expected_value() {
+        let mut source = CanonicalStateRuntime::default();
+        let mut source_io = FakeIo::default();
+        apply_begin(&mut source, &mut source_io);
+        let StoredPaneRecord::Active(mut stale_state) = source.record(&pane()).unwrap().clone()
+        else {
+            unreachable!();
+        };
+        stale_state.pane_instance.pane_pid = 99;
+        let stale_raw = serialize_record(&StoredPaneRecord::Active(stale_state)).unwrap();
+
+        let mut runtime = CanonicalStateRuntime::hydrate([RawPaneRecord {
+            pane_instance: pane(),
+            raw: Some(stale_raw.clone()),
+        }]);
+        assert!(runtime.record(&pane()).is_none());
+        assert!(runtime.quarantined(&pane()).is_none());
+        assert!(runtime.descriptor(&pane()).is_none());
+        assert_eq!(runtime.tracked_panes(), vec![pane()]);
+
+        let mut unchanged_io = FakeIo {
+            write_results: VecDeque::from([WriteAttempt::ReadBack(Some(stale_raw))]),
+            ..FakeIo::default()
+        };
+        let error = runtime
+            .apply_event(
+                &mut unchanged_io,
+                &mut FakeClock::default(),
+                &begin_event(),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            StoreError::PersistFailed("pane state write did not commit".to_string())
+        );
+        assert!(runtime.record(&pane()).is_none());
+        assert!(runtime.quarantined(&pane()).is_none());
+
+        apply_begin(&mut runtime, &mut FakeIo::default());
+        assert!(runtime.record(&pane()).is_some());
+        assert!(!runtime.uninitialized_raw.contains_key(&pane()));
     }
 
     #[test]
@@ -2669,6 +2768,62 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_overflow_does_not_partially_mutate_projection() {
+        let mut runtime = CanonicalStateRuntime {
+            snapshot_revision: u64::MAX,
+            ..CanonicalStateRuntime::default()
+        };
+
+        let error = runtime
+            .add_diagnostic(pane(), "must not remain")
+            .unwrap_err();
+
+        assert_eq!(error, StoreError::CounterOverflow("snapshot revision"));
+        assert_eq!(runtime.snapshot_revision(), u64::MAX);
+        assert!(runtime.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn finish_projection_overflow_does_not_partially_apply_diagnostics() {
+        let mut runtime = CanonicalStateRuntime {
+            snapshot_revision: u64::MAX,
+            ..CanonicalStateRuntime::default()
+        };
+
+        let error = runtime
+            .finish_sequenced_projection(
+                Some(&pane()),
+                ["must not remain".to_string()],
+                false,
+                u64::MAX,
+            )
+            .unwrap_err();
+
+        assert_eq!(error, StoreError::CounterOverflow("snapshot revision"));
+        assert_eq!(runtime.snapshot_revision(), u64::MAX);
+        assert!(runtime.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn absent_pane_removal_overflow_does_not_partially_remove_state() {
+        let mut runtime = CanonicalStateRuntime::default();
+        apply_begin(&mut runtime, &mut FakeIo::default());
+        let expected = runtime.descriptor(&pane());
+        let record_before = runtime.record(&pane()).cloned();
+        let tracker_before = runtime.tracker(&pane());
+        runtime.snapshot_revision = u64::MAX;
+
+        let error = runtime
+            .remove_absent_pane(&pane(), expected.as_ref())
+            .unwrap_err();
+
+        assert_eq!(error, StoreError::CounterOverflow("snapshot revision"));
+        assert_eq!(runtime.snapshot_revision(), u64::MAX);
+        assert_eq!(runtime.record(&pane()), record_before.as_ref());
+        assert_eq!(runtime.tracker(&pane()), tracker_before);
+    }
+
+    #[test]
     fn third_value_quarantines_external_writer_result() {
         let mut runtime = CanonicalStateRuntime::default();
         let mut io = FakeIo {
@@ -2965,6 +3120,58 @@ mod tests {
         assert!(calls[0][3].contains("#{==:#{pane_pid},100}"));
         assert!(calls[0][3].contains("set-option -p -t %1 @vde_pane_state"));
         assert!(calls[0][3].contains(PANE_MISMATCH_SENTINEL));
+    }
+
+    #[test]
+    fn independent_read_uses_typed_if_shell_pane_missing_sentinel() {
+        #[derive(Default)]
+        struct MissingPaneRunner {
+            calls: std::cell::RefCell<Vec<Vec<String>>>,
+        }
+
+        impl TmuxRunner for MissingPaneRunner {
+            fn run(&self, args: &[&str]) -> anyhow::Result<String> {
+                self.calls
+                    .borrow_mut()
+                    .push(args.iter().map(|arg| (*arg).to_string()).collect());
+                Ok(PANE_MISMATCH_SENTINEL.to_string())
+            }
+        }
+
+        let runner = MissingPaneRunner::default();
+        let mut store_io = TmuxPaneStateStoreIo::new(&runner, 7_001, 1_234_567);
+        assert_eq!(
+            store_io.read_independent(&pane()),
+            IndependentRead::PaneMissing
+        );
+
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0], "if-shell");
+        assert_eq!(
+            calls[0][2],
+            "#{&&:#{==:#{pid},7001},#{==:#{start_time},1234567}}"
+        );
+        assert!(calls[0][3].contains("if-shell -F -t %1"));
+        assert!(calls[0][3].contains("#{==:#{pane_pid},100}"));
+        assert!(calls[0][3].contains(PANE_MISMATCH_SENTINEL));
+    }
+
+    #[test]
+    fn independent_read_does_not_parse_tmux_error_text_as_pane_missing() {
+        struct ErrorRunner;
+
+        impl TmuxRunner for ErrorRunner {
+            fn run(&self, _args: &[&str]) -> anyhow::Result<String> {
+                anyhow::bail!("can't find pane: %1")
+            }
+        }
+
+        let mut store_io = TmuxPaneStateStoreIo::new(&ErrorRunner, 7_001, 1_234_567);
+        assert_eq!(
+            store_io.read_independent(&pane()),
+            IndependentRead::Unavailable("can't find pane: %1".to_string())
+        );
     }
 
     #[test]

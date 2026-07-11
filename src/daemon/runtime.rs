@@ -1137,6 +1137,21 @@ pub(crate) fn build_status_snapshot(
 fn preflight_resolved_snapshot(
     snapshot: &crate::daemon::protocol::v2::ResolvedSnapshot,
 ) -> Result<(), crate::pane_state::StoreError> {
+    for pane in &snapshot.panes {
+        if let (
+            Some(crate::pane_state::StoredStateDescriptor::Canonical { version }),
+            Some(resolved),
+        ) = (&pane.stored, &pane.resolved)
+            && version != &resolved.canonical.version()
+        {
+            return Err(crate::pane_state::StoreError::Reduce(
+                crate::pane_state::reducer::ReduceError::StateInvariantViolation(format!(
+                    "projection invariant violated for {}: stored and resolved canonical versions differ",
+                    pane.pane_instance.pane_id
+                )),
+            ));
+        }
+    }
     let message = crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
         snapshot_revision: snapshot.snapshot_revision,
         snapshot: snapshot.clone(),
@@ -2061,6 +2076,36 @@ mod tests {
             }],
             events: Vec::new(),
             diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolved_snapshot_preflight_requires_full_canonical_version_match() {
+        let valid = status_resolved_snapshot();
+        preflight_resolved_snapshot(&valid).unwrap();
+
+        for changed_field in ["state_id", "agent_epoch", "revision"] {
+            let mut mismatched = valid.clone();
+            let Some(crate::pane_state::StoredStateDescriptor::Canonical { version }) =
+                mismatched.panes[0].stored.as_mut()
+            else {
+                panic!("fixture pane must have canonical stored state");
+            };
+            match changed_field {
+                "state_id" => {
+                    version.state_id =
+                        crate::pane_state::StateId::parse("abcdefabcdefabcdefabcdefabcdefab")
+                            .unwrap();
+                }
+                "agent_epoch" => version.agent_epoch += 1,
+                "revision" => version.revision += 1,
+                _ => unreachable!(),
+            }
+            let error = preflight_resolved_snapshot(&mismatched).unwrap_err();
+            assert!(
+                error.to_string().contains("canonical versions differ"),
+                "changed field {changed_field} was accepted"
+            );
         }
     }
 

@@ -1228,6 +1228,7 @@ pub trait ViewEventSender {
 pub struct SocketViewEventSender<'a> {
     pub socket: &'a Path,
     pub server_identity: &'a str,
+    pub initial_client: Option<V2Client>,
 }
 
 impl ViewEventSender for SocketViewEventSender<'_> {
@@ -1236,13 +1237,14 @@ impl ViewEventSender for SocketViewEventSender<'_> {
         event: &ViewEvent,
         deadline: Instant,
     ) -> std::result::Result<V2ServerMessage, V2RequestError> {
-        let mut client =
-            V2Client::connect_with_deadline(self.socket, self.server_identity, deadline).map_err(
-                |error| V2RequestError {
+        let mut client = match self.initial_client.take() {
+            Some(client) => client,
+            None => V2Client::connect_with_deadline(self.socket, self.server_identity, deadline)
+                .map_err(|error| V2RequestError {
                     stage: V2RequestFailureStage::BeforeFullWrite,
                     message: error.to_string(),
-                },
-            )?;
+                })?,
+        };
         if client.daemon_instance_id() != &event.daemon_instance_id {
             return Err(V2RequestError {
                 stage: V2RequestFailureStage::BeforeFullWrite,
@@ -1295,6 +1297,7 @@ pub fn deliver_view_event(
         &mut SocketViewEventSender {
             socket,
             server_identity,
+            initial_client: None,
         },
         event,
         deadline,
@@ -1306,8 +1309,36 @@ pub fn deliver_view_event_with(
     event: &ViewEvent,
     deadline: Instant,
 ) -> Result<V2ServerMessage, ViewDeliveryError> {
-    let mut delivery = ViewDeliveryContract::default();
-    while delivery.begin_attempt() {
+    deliver_view_event_with_contract(
+        sender,
+        event,
+        deadline,
+        ViewDeliveryContract::default(),
+        false,
+    )
+}
+
+pub fn deliver_view_event_with_active_attempt(
+    sender: &mut dyn ViewEventSender,
+    event: &ViewEvent,
+    deadline: Instant,
+    delivery: ViewDeliveryContract,
+) -> Result<V2ServerMessage, ViewDeliveryError> {
+    deliver_view_event_with_contract(sender, event, deadline, delivery, true)
+}
+
+fn deliver_view_event_with_contract(
+    sender: &mut dyn ViewEventSender,
+    event: &ViewEvent,
+    deadline: Instant,
+    mut delivery: ViewDeliveryContract,
+    mut attempt_active: bool,
+) -> Result<V2ServerMessage, ViewDeliveryError> {
+    loop {
+        if !attempt_active && !delivery.begin_attempt() {
+            break;
+        }
+        attempt_active = false;
         if Instant::now() >= deadline {
             return Err(ViewDeliveryError {
                 event_id: event.event_id.clone(),
@@ -2243,6 +2274,46 @@ mod tests {
         assert_eq!(error.event_id, view.event_id);
         assert_eq!(error.stage, ViewDeliveryFailureStage::AfterFullWrite);
         assert_eq!(ambiguous.event_ids.len(), 1);
+    }
+
+    #[test]
+    fn foreground_delivery_counts_probe_connects_in_three_attempt_budget() {
+        let target = pane("%1", 11);
+        let view = event(
+            ViewOccurrence {
+                session_id: "$1".to_string(),
+                window_id: "@1".to_string(),
+                active_pane: target.clone(),
+                observed_panes: vec![target],
+            },
+            Vec::new(),
+        );
+        let before = || V2RequestError {
+            stage: V2RequestFailureStage::BeforeFullWrite,
+            message: "connect failed".to_string(),
+        };
+        let mut delivery = ViewDeliveryContract::default();
+        assert!(delivery.begin_attempt());
+        assert!(delivery.may_retry(DeliveryFailureStage::BeforeFullWrite));
+        assert!(delivery.begin_attempt());
+        assert!(delivery.may_retry(DeliveryFailureStage::BeforeFullWrite));
+        assert!(delivery.begin_attempt());
+
+        let mut sender = MockViewSender {
+            responses: VecDeque::from([Err(before())]),
+            event_ids: Vec::new(),
+        };
+        let error = deliver_view_event_with_active_attempt(
+            &mut sender,
+            &view,
+            Instant::now() + Duration::from_millis(500),
+            delivery,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.stage, ViewDeliveryFailureStage::BeforeFullWrite);
+        assert_eq!(error.event_id, view.event_id);
+        assert_eq!(sender.event_ids, vec![view.event_id]);
     }
 
     #[test]

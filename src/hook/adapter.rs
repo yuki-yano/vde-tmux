@@ -609,6 +609,91 @@ mod tests {
     }
 
     #[test]
+    fn generic_typed_event_rejects_invalid_field_lifecycle_combinations() {
+        let cases = [
+            (
+                GenericEmitInput {
+                    prompt: Some("prompt".to_string()),
+                    prompt_source: Some("user".to_string()),
+                    clear_prompt: true,
+                    ..GenericEmitInput::default()
+                },
+                "--prompt and --clear-prompt are mutually exclusive",
+            ),
+            (
+                GenericEmitInput {
+                    status: Some("idle".to_string()),
+                    started_at: Some(123),
+                    ..GenericEmitInput::default()
+                },
+                "--started-at requires --status running",
+            ),
+            (
+                GenericEmitInput {
+                    status: Some("running".to_string()),
+                    wait_reason: Some("permission".to_string()),
+                    ..GenericEmitInput::default()
+                },
+                "--wait-reason requires --status waiting",
+            ),
+            (
+                GenericEmitInput {
+                    status: Some("running".to_string()),
+                    attention: true,
+                    ..GenericEmitInput::default()
+                },
+                "--attention requires --status idle",
+            ),
+            (
+                GenericEmitInput {
+                    status: Some("running".to_string()),
+                    completed_at: Some(123),
+                    ..GenericEmitInput::default()
+                },
+                "--completed-at requires --status idle",
+            ),
+            (
+                GenericEmitInput {
+                    prompt: Some("prompt".to_string()),
+                    ..GenericEmitInput::default()
+                },
+                "--prompt requires exactly one non-empty --prompt-source",
+            ),
+            (
+                GenericEmitInput {
+                    prompt_source: Some("user".to_string()),
+                    ..GenericEmitInput::default()
+                },
+                "--prompt requires exactly one non-empty --prompt-source",
+            ),
+            (
+                GenericEmitInput {
+                    tasks: Some(CanonicalTaskProgress { done: 0, total: 1 }),
+                    clear_tasks: true,
+                    ..GenericEmitInput::default()
+                },
+                "--tasks and --clear-tasks are mutually exclusive",
+            ),
+            (
+                GenericEmitInput {
+                    subagents: Some(Vec::new()),
+                    clear_subagents: true,
+                    ..GenericEmitInput::default()
+                },
+                "--subagents and --clear-subagents are mutually exclusive",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let error = generic_typed_event(input, &typed_context()).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn generic_typed_event_maps_task_and_subagent_field_updates() {
         let envelope = generic_typed_event(
             GenericEmitInput {

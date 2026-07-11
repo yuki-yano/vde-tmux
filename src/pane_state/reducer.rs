@@ -1796,6 +1796,173 @@ mod tests {
     }
 
     #[test]
+    fn row_four_unarmed_completion_does_not_bind_or_apply_report_fields() {
+        let reset = reset_record();
+        let unarmed = observe(
+            Some(&reset),
+            &CaptureTrackerSnapshot::default(),
+            AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+            None,
+            1,
+        );
+        let tracker = unarmed.tracker_delta.as_ref().unwrap().next.clone();
+        let original = unarmed.record.clone();
+
+        let completion = reduce_explicit_once(
+            original.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::CompleteRun { completed_at: 2 },
+            &tracker,
+        )
+        .unwrap();
+        assert_eq!(completion.record, original);
+        assert!(active(&completion).agent_session_id.is_none());
+
+        let report = reduce_explicit_once(
+            completion.record.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::ExplicitStateReported {
+                report: ExplicitStateReport {
+                    observed_at: 3,
+                    lifecycle: Some(ReportedLifecycle::Idle),
+                    started_at: None,
+                    completed_at: Some(3),
+                    prompt: Some(FieldUpdate::Set(PromptState {
+                        text: "must not apply".to_string(),
+                        source: "test".to_string(),
+                    })),
+                    tasks: Some(FieldUpdate::Set(TaskProgress { done: 1, total: 1 })),
+                    subagents: None,
+                    attention: true,
+                },
+            },
+            &tracker,
+        )
+        .unwrap();
+        assert_eq!(report.record, original);
+        assert!(active(&report).agent_session_id.is_none());
+        assert!(active(&report).prompt.is_none());
+        assert_eq!(active(&report).tasks, TaskState::default());
+    }
+
+    #[test]
+    fn field_only_report_applies_only_to_exact_present_identity() {
+        let discovered = discover("codex");
+        let begun = reduce_explicit_once(
+            discovered.record.as_ref(),
+            "codex",
+            "session",
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: None,
+            },
+            &discovered.tracker_delta.as_ref().unwrap().next,
+        )
+        .unwrap();
+        let begun_tracker = begun.tracker_delta.as_ref().unwrap().next.clone();
+        let field_report = PaneEvent::ExplicitStateReported {
+            report: ExplicitStateReport {
+                observed_at: 2,
+                lifecycle: None,
+                started_at: None,
+                completed_at: None,
+                prompt: Some(FieldUpdate::Set(PromptState {
+                    text: "field-only".to_string(),
+                    source: "test".to_string(),
+                })),
+                tasks: None,
+                subagents: None,
+                attention: false,
+            },
+        };
+
+        let exact = reduce_explicit_once(
+            begun.record.as_ref(),
+            "codex",
+            "session",
+            field_report.clone(),
+            &begun_tracker,
+        )
+        .unwrap();
+        assert_eq!(active(&exact).prompt.as_ref().unwrap().text, "field-only");
+
+        let absent_once = observe(
+            begun.record.as_ref(),
+            &begun_tracker,
+            AgentPresenceObservation::Absent,
+            None,
+            3,
+        );
+        let absent = observe(
+            absent_once.record.as_ref(),
+            &absent_once.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Absent,
+            None,
+            4,
+        );
+        assert_eq!(
+            reduce_explicit_once(
+                absent.record.as_ref(),
+                "codex",
+                "session",
+                field_report.clone(),
+                &absent.tracker_delta.as_ref().unwrap().next,
+            )
+            .unwrap_err(),
+            ReduceError::StaleAgentEvent
+        );
+
+        let missing = reduce_explicit_once(
+            None,
+            "codex",
+            "session",
+            field_report.clone(),
+            &CaptureTrackerSnapshot::default(),
+        )
+        .unwrap();
+        assert_eq!(missing.outcome, ReductionOutcome::Noop);
+        assert!(missing.record.is_none());
+
+        let reset = reset_record();
+        let reset_result = reduce_explicit_once(
+            Some(&reset),
+            "codex",
+            "session",
+            field_report.clone(),
+            &CaptureTrackerSnapshot::default(),
+        )
+        .unwrap();
+        assert_eq!(reset_result.record, Some(reset));
+
+        let unbound = discover("codex");
+        let unbound_result = reduce_explicit_once(
+            unbound.record.as_ref(),
+            "codex",
+            "session",
+            field_report.clone(),
+            &unbound.tracker_delta.as_ref().unwrap().next,
+        )
+        .unwrap();
+        assert_eq!(unbound_result.record, unbound.record);
+        assert!(active(&unbound_result).prompt.is_none());
+        assert!(active(&unbound_result).agent_session_id.is_none());
+
+        assert_eq!(
+            reduce_explicit_once(
+                begun.record.as_ref(),
+                "codex",
+                "different-session",
+                field_report,
+                &begun_tracker,
+            )
+            .unwrap_err(),
+            ReduceError::StaleAgentEvent
+        );
+    }
+
+    #[test]
     fn presence_matrix_converges_only_after_confirmed_absence() {
         let explicit = reduce_once(
             None,

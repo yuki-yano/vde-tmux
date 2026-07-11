@@ -74,8 +74,8 @@ pub(crate) fn run_hook_command(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
     now_epoch: i64,
+    deadline: Instant,
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(2);
     match command {
         HookCommand::Emit {
             agent,
@@ -292,26 +292,49 @@ pub(crate) fn run_view_hook_command(
                 None,
                 deadline,
             )?;
-        let probe = crate::daemon::protocol::v2::V2Client::connect_with_deadline(
-            &socket,
-            &incarnation.hash,
-            deadline,
-        )?;
+        let event_id = crate::pane_state::EventId::generate()?;
+        let mut delivery = crate::daemon::view_hooks::ViewDeliveryContract::default();
+        let probe = loop {
+            if Instant::now() >= deadline {
+                bail!("view hook 500ms deadline exceeded while connecting to pane-state daemon");
+            }
+            if !delivery.begin_attempt() {
+                bail!(
+                    "view event {} failed before full write: connection attempts exhausted",
+                    event_id.as_str()
+                );
+            }
+            match crate::daemon::protocol::v2::V2Client::connect_with_deadline(
+                &socket,
+                &incarnation.hash,
+                deadline,
+            ) {
+                Ok(client) => break client,
+                Err(_)
+                    if delivery.may_retry(
+                        crate::daemon::view_hooks::DeliveryFailureStage::BeforeFullWrite,
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        };
         let built = crate::daemon::view_hooks::build_foreground_view_event(
             probe.daemon_instance_id().clone(),
-            crate::pane_state::EventId::generate()?,
+            event_id,
             hook_kind,
             snapshot.occurrence,
             snapshot.source_client,
             snapshot.witnesses,
             config.daemon.done_clear_on,
         )?;
-        drop(probe);
-        crate::daemon::view_hooks::deliver_view_event(
-            &socket,
-            &incarnation.hash,
+        crate::daemon::view_hooks::deliver_view_event_with_active_attempt(
+            &mut crate::daemon::view_hooks::SocketViewEventSender {
+                socket: &socket,
+                server_identity: &incarnation.hash,
+                initial_client: Some(probe),
+            },
             &built.event,
             deadline,
+            delivery,
         )?;
         Ok(())
     })();

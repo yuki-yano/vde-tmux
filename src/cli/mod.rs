@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -280,12 +281,26 @@ pub fn run() -> ExitCode {
     } else {
         Duration::from_secs(3)
     };
-    let mut input = String::new();
-    if is_agent_hook {
-        let _ = std::io::stdin().read_to_string(&mut input);
-    }
+    let agent_hook_deadline = is_agent_hook.then(|| Instant::now() + Duration::from_secs(2));
+    let input = match agent_hook_deadline {
+        Some(deadline) => match read_agent_hook_input_until(deadline) {
+            Ok(input) => input,
+            Err(error) => {
+                eprintln!("{error:#}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => String::new(),
+    };
     let runner = SystemTmuxRunner::from_env(timeout);
-    match run_with_input_at(args, &input, &runner, &current_env(), now_epoch()) {
+    match run_with_input_at_with_hook_deadline(
+        args,
+        &input,
+        &runner,
+        &current_env(),
+        now_epoch(),
+        agent_hook_deadline,
+    ) {
         Ok(Some(output)) => {
             println!("{output}");
             ExitCode::SUCCESS
@@ -295,6 +310,71 @@ pub fn run() -> ExitCode {
             eprintln!("{error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn read_agent_hook_input_until(deadline: Instant) -> Result<String> {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    read_agent_hook_input_from_until(&mut input, deadline)
+}
+
+pub(crate) fn read_agent_hook_input_from_until<R>(
+    input: &mut R,
+    deadline: Instant,
+) -> Result<String>
+where
+    R: Read + AsRawFd,
+{
+    let mut bytes = Vec::new();
+    loop {
+        if !wait_for_input(input.as_raw_fd(), deadline)? {
+            return String::from_utf8(bytes)
+                .map_err(|error| anyhow::anyhow!("agent hook stdin is not UTF-8: {error}"));
+        }
+        let mut chunk = [0_u8; 8192];
+        let read = input.read(&mut chunk)?;
+        if read == 0 {
+            return String::from_utf8(bytes)
+                .map_err(|error| anyhow::anyhow!("agent hook stdin is not UTF-8: {error}"));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn wait_for_input(fd: RawFd, deadline: Instant) -> Result<bool> {
+    if fd < 0 {
+        return Ok(false);
+    }
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            bail!("agent hook 2s deadline exceeded while reading stdin");
+        };
+        let timeout_ms = remaining
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll_fd points to one initialized descriptor for the duration of the call.
+        let result = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_ms) };
+        if result == 0 {
+            bail!("agent hook 2s deadline exceeded while reading stdin");
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if poll_fd.revents & libc::POLLNVAL != 0 {
+            return Ok(false);
+        }
+        return Ok(true);
     }
 }
 
@@ -325,6 +405,30 @@ where
     run_with_input_at_writing_warnings(args, input, runner, env, now_epoch, &mut stderr)
 }
 
+fn run_with_input_at_with_hook_deadline<I, T>(
+    args: I,
+    input: &str,
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    now_epoch: i64,
+    hook_deadline: Option<Instant>,
+) -> Result<Option<String>>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let mut stderr = std::io::stderr();
+    run_with_input_at_writing_warnings_and_hook_deadline(
+        args,
+        input,
+        runner,
+        env,
+        now_epoch,
+        &mut stderr,
+        hook_deadline,
+    )
+}
+
 pub(crate) fn run_with_input_at_writing_warnings<I, T, W>(
     args: I,
     input: &str,
@@ -332,6 +436,31 @@ pub(crate) fn run_with_input_at_writing_warnings<I, T, W>(
     env: &BTreeMap<String, String>,
     now_epoch: i64,
     warning_writer: &mut W,
+) -> Result<Option<String>>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+    W: Write,
+{
+    run_with_input_at_writing_warnings_and_hook_deadline(
+        args,
+        input,
+        runner,
+        env,
+        now_epoch,
+        warning_writer,
+        None,
+    )
+}
+
+fn run_with_input_at_writing_warnings_and_hook_deadline<I, T, W>(
+    args: I,
+    input: &str,
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    now_epoch: i64,
+    warning_writer: &mut W,
+    hook_deadline: Option<Instant>,
 ) -> Result<Option<String>>
 where
     I: IntoIterator<Item = T>,
@@ -638,7 +767,14 @@ where
             Ok(None)
         }
         Command::Hook { command } => {
-            hook::run_hook_command(command, input, runner, env, now_epoch)?;
+            hook::run_hook_command(
+                command,
+                input,
+                runner,
+                env,
+                now_epoch,
+                hook_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(2)),
+            )?;
             Ok(None)
         }
     }

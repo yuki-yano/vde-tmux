@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::process::Child;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -198,12 +200,16 @@ impl ObservationWorkerIo for SystemObservationWorkerIo {
         });
         let deadline = Instant::now() + self.timeout;
         let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    terminate_child_bounded(child, Duration::from_millis(100));
+                    return Err(error.into());
+                }
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child_bounded(child, Duration::from_millis(100));
                 anyhow::bail!("tmux capture batch timed out after {:?}", self.timeout);
             }
             thread::sleep(Duration::from_millis(5));
@@ -222,6 +228,15 @@ impl ObservationWorkerIo for SystemObservationWorkerIo {
             stderr: String::from_utf8(stderr)?,
         })
     }
+}
+
+fn terminate_child_bounded(mut child: Child, timeout: Duration) {
+    let _ = child.kill();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(child.wait());
+    });
+    let _ = receiver.recv_timeout(timeout);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -895,6 +910,7 @@ pub fn system_git_runner(timeout: Duration) -> SystemGitRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
     use std::sync::Mutex;
 
     struct MockObservationIo {
@@ -932,6 +948,23 @@ mod tests {
             pid: 4242,
             start_time: 99,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_termination_does_not_block_the_poll_worker() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+
+        terminate_child_bounded(child, Duration::from_millis(100));
+
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     fn pane_instance(id: &str, pid: u32) -> PaneInstance {

@@ -366,8 +366,7 @@ pub fn parse_hydrate_records(
     framing: &QueryFraming,
     expected_identity: &ServerIdentity,
 ) -> Result<Vec<crate::pane_state::RawPaneRecord>, TopologyError> {
-    let (identity, rows) = parse_envelope(output, framing)?;
-    verify_identity(identity, expected_identity)?;
+    let (_identity, rows) = parse_envelope(output, framing, expected_identity)?;
     let mut records = BTreeMap::<PaneInstance, Option<String>>::new();
     for row in rows {
         let fields = row.split(&framing.field).collect::<Vec<_>>();
@@ -376,6 +375,7 @@ pub fn parse_hydrate_records(
                 "hydrate row has an invalid field count".to_string(),
             ));
         }
+        reject_query_sentinels(&fields, framing, "hydrate")?;
         validate_pane_id(fields[0])?;
         let pane_pid = fields[1]
             .parse::<u32>()
@@ -449,8 +449,7 @@ pub fn parse_session_count(
     framing: &QueryFraming,
     expected_identity: &ServerIdentity,
 ) -> Result<usize, TopologyError> {
-    let (identity, rows) = parse_envelope(output, framing)?;
-    verify_identity(identity, expected_identity)?;
+    let (_identity, rows) = parse_envelope(output, framing, expected_identity)?;
     let mut sessions = BTreeSet::new();
     for row in rows {
         let Some(session_id) = row.strip_prefix(&framing.session) else {
@@ -469,8 +468,7 @@ pub fn parse_status_metadata(
     framing: &QueryFraming,
     expected_identity: &ServerIdentity,
 ) -> Result<StatusMetadataSnapshot, TopologyError> {
-    let (identity, rows) = parse_envelope(output, framing)?;
-    verify_identity(identity.clone(), expected_identity)?;
+    let (identity, rows) = parse_envelope(output, framing, expected_identity)?;
     let mut sessions = BTreeMap::<String, StatusSessionMetadata>::new();
     let mut windows = BTreeMap::<String, StatusWindowMetadata>::new();
 
@@ -548,8 +546,7 @@ pub fn parse_topology(
     framing: &QueryFraming,
     expected_identity: &ServerIdentity,
 ) -> Result<TopologySnapshot, TopologyError> {
-    let (identity, rows) = parse_envelope(output, framing)?;
-    verify_identity(identity.clone(), expected_identity)?;
+    let (identity, rows) = parse_envelope(output, framing, expected_identity)?;
     let mut panes = BTreeMap::<PaneInstance, TopologyPane>::new();
     let mut pane_pids = BTreeMap::<String, u32>::new();
     for row in rows {
@@ -657,6 +654,7 @@ pub fn parse_topology(
 fn parse_envelope<'a>(
     output: &'a str,
     framing: &QueryFraming,
+    expected_identity: &ServerIdentity,
 ) -> Result<(ServerIdentity, Vec<&'a str>), TopologyError> {
     if !output.trim_end_matches('\n').ends_with(&framing.row) {
         return Err(TopologyError::InvalidFraming(
@@ -683,6 +681,7 @@ fn parse_envelope<'a>(
             .parse::<i64>()
             .map_err(|_| TopologyError::InvalidFraming("invalid server start time".to_string()))?,
     };
+    verify_identity(identity.clone(), expected_identity)?;
     let mut rows = Vec::new();
     for chunk in chunks {
         let chunk = chunk.strip_prefix('\n').unwrap_or(chunk);
@@ -1149,6 +1148,41 @@ mod tests {
             parse_topology(&output(&rows), &framing(), &identity()),
             Err(TopologyError::TooManyRows(_))
         ));
+    }
+
+    #[test]
+    fn identity_mismatch_precedes_row_limit_failure() {
+        let row = vec![
+            "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "1",
+        ];
+        let rows = std::iter::repeat_n(row, MAX_TOPOLOGY_ROWS + 1).collect::<Vec<_>>();
+        let wrong = ServerIdentity {
+            pid: 999,
+            start_time: 456,
+        };
+        assert!(matches!(
+            parse_topology(&output(&rows), &framing(), &wrong),
+            Err(TopologyError::IdentityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn hydrate_rejects_query_sentinel_collisions() {
+        let framing = framing();
+        for sentinel in [&framing.field, &framing.row, &framing.header] {
+            let mut framed = format!(
+                "{}{}123{}456{}\n",
+                framing.header, framing.field, framing.field, framing.row
+            );
+            framed.push_str(&format!(
+                "%3{}99{}{{\"prompt\":\"collision{sentinel}\"}}{}\n",
+                framing.field, framing.field, framing.row
+            ));
+            assert!(matches!(
+                parse_hydrate_records(&framed, &framing, &identity()),
+                Err(TopologyError::InvalidRow(_))
+            ));
+        }
     }
 
     #[test]

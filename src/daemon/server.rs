@@ -99,7 +99,8 @@ pub fn read_v2_request_frame(
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
         let take = newline.map_or(available.len(), |position| position + 1);
-        if frame.len().saturating_add(take).saturating_sub(1) > MAX_REQUEST_FRAME_BYTES {
+        let body_bytes = request_frame_body_bytes(frame.len(), take, newline.is_some());
+        if body_bytes > MAX_REQUEST_FRAME_BYTES {
             return Err(ServerMessage::error(
                 ErrorCode::FrameTooLarge,
                 "request frame exceeds 1 MiB",
@@ -115,14 +116,29 @@ pub fn read_v2_request_frame(
     }
 }
 
+fn request_frame_body_bytes(buffered: usize, take: usize, newline_terminated: bool) -> usize {
+    buffered
+        .saturating_add(take)
+        .saturating_sub(usize::from(newline_terminated))
+}
+
 #[allow(clippy::result_large_err)]
 pub fn write_v2_response(
     stream: &mut UnixStream,
     message: &crate::daemon::protocol::v2::ServerMessage,
 ) -> std::result::Result<(), crate::daemon::protocol::v2::ServerMessage> {
-    use crate::daemon::protocol::v2::encode_response_frame;
+    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage, encode_response_frame};
 
-    let frame = encode_response_frame(message)?;
+    let frame = match encode_response_frame(message) {
+        Ok(frame) => frame,
+        Err(
+            error @ ServerMessage::Error {
+                code: ErrorCode::FrameTooLarge,
+                ..
+            },
+        ) => encode_response_frame(&error)?,
+        Err(error) => return Err(error),
+    };
     write_v2_frame(stream, &frame)
 }
 
@@ -143,7 +159,8 @@ fn write_v2_frame(
                 None,
             ));
         };
-        stream.set_write_timeout(Some(remaining)).map_err(|error| {
+        let timeout = bounded_write_timeout(remaining);
+        stream.set_write_timeout(Some(timeout)).map_err(|error| {
             ServerMessage::error(ErrorCode::InternalError, error.to_string(), None)
         })?;
         let count = stream.write(&frame[written..]).map_err(|error| {
@@ -163,6 +180,10 @@ fn write_v2_frame(
         written += count;
     }
     Ok(())
+}
+
+fn bounded_write_timeout(remaining: Duration) -> Duration {
+    remaining.max(Duration::from_millis(1))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -511,22 +532,8 @@ fn validate_v2_origin(
     message: &crate::daemon::protocol::v2::ClientMessage,
 ) -> std::result::Result<(), crate::daemon::protocol::v2::ServerMessage> {
     use crate::daemon::protocol::v2::{ClientMessage, ErrorCode, ServerMessage};
-    use crate::pane_state::PaneEvent;
-
     match message {
-        ClientMessage::SubmitPaneEvent { envelope, .. }
-            if !matches!(
-                envelope.event,
-                PaneEvent::AgentSessionStarted { .. }
-                    | PaneEvent::BeginRun { .. }
-                    | PaneEvent::ActivityObserved { .. }
-                    | PaneEvent::WaitRequested { .. }
-                    | PaneEvent::CompleteRun { .. }
-                    | PaneEvent::FailRun { .. }
-                    | PaneEvent::ProgressUpdated { .. }
-                    | PaneEvent::ExplicitStateReported { .. }
-            ) =>
-        {
+        ClientMessage::SubmitPaneEvent { envelope, .. } if !envelope.event.is_external() => {
             Err(ServerMessage::error(
                 ErrorCode::InvalidRequest,
                 "pane event variant is internal-only",
@@ -3153,9 +3160,10 @@ fn scoped_view_refresh(
     use crate::daemon::view_hooks::ScopedViewRefresh;
     use crate::pane_state::ViewHookKind;
 
-    let topology = query_full_topology(coordinator, Duration::from_millis(100))
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let topology = query_full_topology(coordinator, scoped_view_refresh_remaining(deadline)?)
         .map_err(|error| (error.to_string(), error.requires_daemon_exit()))?;
-    let witnesses = query_client_witnesses(coordinator, Duration::from_millis(100))
+    let witnesses = query_client_witnesses(coordinator, scoped_view_refresh_remaining(deadline)?)
         .map_err(|error| (error.to_string(), error.requires_daemon_exit()))?;
     let occurrence = event.occurrence.as_ref();
     let window_id = occurrence.map(|value| value.window_id.as_str());
@@ -3260,6 +3268,15 @@ fn scoped_view_refresh(
             }
         }
     }
+}
+
+fn scoped_view_refresh_remaining(
+    deadline: Instant,
+) -> std::result::Result<Duration, (String, bool)> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| ("scoped view refresh deadline exceeded".to_string(), false))
 }
 
 fn apply_reset(
@@ -3788,6 +3805,28 @@ fn targeted_pane_refresh_outcome_response(
             }
         }
         Err(error) => {
+            if matches!(
+                &error,
+                crate::daemon::topology::TopologyError::Query(_)
+                    | crate::daemon::topology::TopologyError::Deadline
+            ) {
+                let diagnostic_result = {
+                    let mut state_guard = coordinator
+                        .state
+                        .lock()
+                        .expect("canonical state lock poisoned");
+                    state_guard
+                        .as_mut()
+                        .expect("state initialized before targeted refresh")
+                        .add_global_diagnostic(
+                            ErrorCode::InternalError,
+                            format!("targeted pane refresh for {pane_id} failed: {error}"),
+                        )
+                };
+                if let Err(store_error) = diagnostic_result {
+                    return production_store_error_response(coordinator, store_error, None);
+                }
+            }
             if error.requires_daemon_exit() {
                 coordinator.fail_stop(error.to_string());
             }
@@ -4362,14 +4401,18 @@ mod tests {
             })
             .unwrap();
         let file_deadline = Instant::now() + Duration::from_secs(1);
-        while !pid_file.exists() && Instant::now() < file_deadline {
+        let pid = loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = contents.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < file_deadline,
+                "notification descendant PID was not written"
+            );
             thread::sleep(Duration::from_millis(10));
-        }
-        let pid = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
+        };
         let exit_deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let exists = unsafe { libc::kill(pid, 0) } == 0
@@ -4664,7 +4707,10 @@ mod tests {
             crate::daemon::topology::TargetedRefreshOutcome,
             crate::daemon::topology::TopologyError,
         >,
-    ) -> crate::daemon::protocol::v2::ServerMessage {
+    ) -> (
+        crate::daemon::protocol::v2::ServerMessage,
+        Vec<crate::daemon::protocol::v2::DaemonDiagnostic>,
+    ) {
         let root = std::env::temp_dir().join(format!(
             "vde-query-pane-refresh-{}-{}",
             std::process::id(),
@@ -4739,14 +4785,24 @@ mod tests {
 
         let response = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         query.join().unwrap();
+        let diagnostics = coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .global_diagnostics
+            .iter()
+            .cloned()
+            .collect();
         drop(coordinator);
         std::fs::remove_dir_all(root).unwrap();
-        response
+        (response, diagnostics)
     }
 
     #[test]
     fn query_pane_cache_miss_waits_for_targeted_refresh_and_returns_found() {
-        let response = query_pane_cache_miss_with_refresh_outcome(Ok(
+        let (response, diagnostics) = query_pane_cache_miss_with_refresh_outcome(Ok(
             crate::daemon::topology::TargetedRefreshOutcome::Found(
                 crate::daemon::topology::TopologyPane {
                     pane_instance: crate::pane_state::PaneInstance {
@@ -4762,6 +4818,7 @@ mod tests {
                 },
             ),
         ));
+        assert!(diagnostics.is_empty());
         assert!(matches!(
             response,
             crate::daemon::protocol::v2::ServerMessage::PaneResult {
@@ -4782,7 +4839,8 @@ mod tests {
         assert!(matches!(
             query_pane_cache_miss_with_refresh_outcome(Ok(
                 crate::daemon::topology::TargetedRefreshOutcome::NotFound,
-            )),
+            ))
+            .0,
             crate::daemon::protocol::v2::ServerMessage::Error {
                 code: crate::daemon::protocol::v2::ErrorCode::PaneNotFound,
                 ..
@@ -4794,13 +4852,36 @@ mod tests {
     fn query_pane_cache_miss_returns_internal_error_after_refresh_failure() {
         let failure =
             crate::daemon::topology::TopologyError::Query("tmux query failed".to_string());
+        let (response, diagnostics) = query_pane_cache_miss_with_refresh_outcome(Err(failure));
         assert!(matches!(
-            query_pane_cache_miss_with_refresh_outcome(Err(failure)),
+            response,
             crate::daemon::protocol::v2::ServerMessage::Error {
                 code: crate::daemon::protocol::v2::ErrorCode::InternalError,
                 ..
             }
         ));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            crate::daemon::protocol::v2::ErrorCode::InternalError
+        );
+        assert!(diagnostics[0].message.contains("tmux query failed"));
+    }
+
+    #[test]
+    fn query_pane_cache_miss_records_refresh_timeout_diagnostic() {
+        let (response, diagnostics) = query_pane_cache_miss_with_refresh_outcome(Err(
+            crate::daemon::topology::TopologyError::Deadline,
+        ));
+        assert!(matches!(
+            response,
+            crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::InternalError,
+                ..
+            }
+        ));
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("deadline exceeded"));
     }
 
     #[test]
@@ -5458,21 +5539,33 @@ mod tests {
                 ..
             })
         ));
-        let internal = v2_pane_event(crate::pane_state::PaneEvent::AcknowledgeView {
-            expected_state_id: crate::pane_state::StateId::parse(
-                "00112233445566778899aabbccddeeff",
-            )
-            .unwrap(),
-            expected_agent_epoch: 1,
-            through_seq: 1,
-        });
-        assert!(matches!(
-            router.route(&mut connection, internal),
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
-                ..
-            })
-        ));
+        let internal_events = [
+            crate::pane_state::PaneEvent::AcknowledgeView {
+                expected_state_id: crate::pane_state::StateId::parse(
+                    "00112233445566778899aabbccddeeff",
+                )
+                .unwrap(),
+                expected_agent_epoch: 1,
+                through_seq: 1,
+            },
+            crate::pane_state::PaneEvent::ObservationBatch {
+                base: None,
+                tracker_generation: 0,
+                observed_at: 1,
+                presence: crate::pane_state::AgentPresenceObservation::Unknown,
+                capture: None,
+            },
+            crate::pane_state::PaneEvent::PaneRemoved { expected: None },
+        ];
+        for internal_event in internal_events {
+            assert!(matches!(
+                router.route(&mut connection, v2_pane_event(internal_event)),
+                V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
+                    code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -5614,6 +5707,61 @@ mod tests {
                 .unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn v2_request_frame_limit_counts_newline_only_when_present() {
+        assert_eq!(
+            request_frame_body_bytes(crate::pane_state::MAX_REQUEST_FRAME_BYTES, 1, true),
+            crate::pane_state::MAX_REQUEST_FRAME_BYTES
+        );
+        assert_eq!(
+            request_frame_body_bytes(crate::pane_state::MAX_REQUEST_FRAME_BYTES, 1, false),
+            crate::pane_state::MAX_REQUEST_FRAME_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn v2_oversized_response_writes_typed_error_on_same_stream() {
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let oversized = crate::daemon::protocol::v2::ServerMessage::error(
+            crate::daemon::protocol::v2::ErrorCode::InternalError,
+            "x".repeat(crate::pane_state::MAX_RESPONSE_FRAME_BYTES),
+            None,
+        );
+        write_v2_response(&mut server, &oversized).unwrap();
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<crate::daemon::protocol::v2::ServerMessage>(line.trim())
+                .unwrap(),
+            crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::FrameTooLarge,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn response_write_timeout_has_one_millisecond_floor() {
+        assert_eq!(
+            bounded_write_timeout(Duration::from_nanos(1)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            bounded_write_timeout(Duration::from_millis(2)),
+            Duration::from_millis(2)
+        );
+    }
+
+    #[test]
+    fn scoped_view_refresh_uses_one_shared_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let first = scoped_view_refresh_remaining(deadline).unwrap();
+        let second = scoped_view_refresh_remaining(deadline).unwrap();
+        assert!(second <= first);
+        assert!(second <= Duration::from_millis(100));
+        assert!(scoped_view_refresh_remaining(Instant::now() - Duration::from_millis(1)).is_err());
     }
 
     fn legacy_cleanup_topology() -> crate::daemon::topology::TopologySnapshot {
