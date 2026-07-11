@@ -27,15 +27,22 @@ struct Cli {
 enum Command {
     #[command(name = "statusline-category")]
     StatuslineCategory {
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
         #[command(subcommand)]
         command: Option<StatuslineCategoryCommand>,
     },
     #[command(name = "statusline-summary")]
     StatuslineSummary,
     #[command(name = "statusline-attention")]
-    StatuslineAttention,
+    StatuslineAttention {
+        #[arg(long = "session-id")]
+        session_id: String,
+    },
     #[command(name = "statusline-sessions")]
     StatuslineSessions {
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
         #[arg(long = "show-index")]
         show_index: bool,
         #[command(subcommand)]
@@ -43,21 +50,29 @@ enum Command {
     },
     #[command(name = "statusline-windows")]
     StatuslineWindows {
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
         #[command(subcommand)]
         command: Option<StatuslineWindowsCommand>,
     },
     #[command(name = "statusline-pane")]
     StatuslinePane {
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long = "text-fg")]
-        text_fg: Option<String>,
+        target: String,
     },
     #[command(name = "statusline-click")]
     StatuslineClick { range: Option<String> },
     Daemon {
-        #[arg(long)]
+        #[arg(long, hide = true)]
         socket: Option<String>,
+        #[arg(long, hide = true)]
+        server_identity: Option<String>,
+        #[arg(long, hide = true)]
+        server_pid: Option<u32>,
+        #[arg(long, hide = true)]
+        server_start_time: Option<i64>,
+        #[arg(long, hide = true)]
+        tmux_server_socket: Option<String>,
         #[command(subcommand)]
         command: Option<DaemonCommand>,
     },
@@ -89,6 +104,11 @@ enum Command {
     Hooks {
         #[command(subcommand)]
         command: HooksCommand,
+    },
+    #[command(name = "pane-state")]
+    PaneState {
+        #[command(subcommand)]
+        command: PaneStateCommand,
     },
     Project {
         #[command(subcommand)]
@@ -133,14 +153,9 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
-    Stop {
-        #[arg(long)]
-        socket: Option<String>,
-    },
-    Restart {
-        #[arg(long)]
-        socket: Option<String>,
-    },
+    Ensure,
+    Stop,
+    Restart,
 }
 
 #[derive(Debug, Subcommand)]
@@ -179,6 +194,44 @@ enum HooksCommand {
         client_name: Option<String>,
         session_name: Option<String>,
     },
+    #[command(name = "pane-state-view", hide = true)]
+    PaneStateView {
+        event_kind: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        protocol: u16,
+        #[arg(long = "hook-session")]
+        hook_session: Option<String>,
+        #[arg(long = "hook-window")]
+        hook_window: Option<String>,
+        #[arg(long = "hook-pane")]
+        hook_pane: Option<String>,
+        #[arg(long = "hook-client")]
+        hook_client: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PaneStateCommand {
+    #[command(name = "cleanup-legacy")]
+    CleanupLegacy {
+        #[arg(long, required = true)]
+        all: bool,
+    },
+    Reset {
+        #[arg(long)]
+        target: String,
+    },
+    Hooks {
+        #[command(subcommand)]
+        command: PaneStateHooksCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PaneStateHooksCommand {
+    Uninstall,
 }
 
 #[derive(Debug, Subcommand)]
@@ -206,14 +259,18 @@ fn current_env() -> BTreeMap<String, String> {
 
 pub fn run() -> ExitCode {
     let args = std::env::args_os().collect::<Vec<_>>();
-    let is_hook = args.get(1).and_then(|arg| arg.to_str()) == Some("hook");
-    let timeout = if is_hook {
+    let is_agent_hook = args.get(1).and_then(|arg| arg.to_str()) == Some("hook");
+    let is_view_hook = args.get(1).and_then(|arg| arg.to_str()) == Some("hooks")
+        && args.get(2).and_then(|arg| arg.to_str()) == Some("pane-state-view");
+    let timeout = if is_view_hook {
+        Duration::from_millis(100)
+    } else if is_agent_hook {
         Duration::from_millis(300)
     } else {
         Duration::from_secs(3)
     };
     let mut input = String::new();
-    if is_hook {
+    if is_agent_hook {
         let _ = std::io::stdin().read_to_string(&mut input);
     }
     let runner = SystemTmuxRunner::from_env(timeout);
@@ -275,16 +332,28 @@ where
     emit_config_warnings(&loaded.warnings, warning_writer)?;
     let config = loaded.config;
     match cli.command {
-        Command::StatuslineCategory { command } => match command {
+        Command::StatuslineCategory {
+            session_id,
+            command,
+        } => match command {
             Some(StatuslineCategoryCommand::Switch { index }) => {
                 crate::statusline::switch_statusline_category(runner, &config, cli_index(index))?;
                 Ok(None)
             }
-            None => Ok(Some(crate::statusline::statusline_category(
-                runner, &config,
-            )?)),
+            None => Ok(Some(
+                daemon::statusline_session_segments(
+                    runner,
+                    env,
+                    &config,
+                    session_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("--session-id is required"))?,
+                )?
+                .category,
+            )),
         },
         Command::StatuslineSessions {
+            session_id,
             show_index,
             command,
         } => match command {
@@ -297,45 +366,93 @@ where
                 if show_index {
                     config.statusline.sessions.show_index = true;
                 }
-                Ok(Some(crate::statusline::statusline_sessions(
-                    runner, &config,
-                )?))
+                Ok(Some(
+                    daemon::statusline_session_segments(
+                        runner,
+                        env,
+                        &config,
+                        session_id
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("--session-id is required"))?,
+                    )?
+                    .sessions,
+                ))
             }
         },
-        Command::StatuslineWindows { command } => match command {
+        Command::StatuslineWindows {
+            session_id,
+            command,
+        } => match command {
             Some(StatuslineWindowsCommand::Switch { target }) => {
                 crate::statusline::switch_statusline_window(runner, &target)?;
                 Ok(None)
             }
-            None => Ok(Some(crate::statusline::statusline_windows(
-                runner, &config,
-            )?)),
+            None => Ok(Some(
+                daemon::statusline_session_segments(
+                    runner,
+                    env,
+                    &config,
+                    session_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("--session-id is required"))?,
+                )?
+                .windows,
+            )),
         },
-        Command::StatuslinePane { target, text_fg } => {
-            Ok(Some(crate::statusline::statusline_pane(
-                runner,
-                &config,
-                target.as_deref(),
-                text_fg.as_deref(),
-            )?))
-        }
+        Command::StatuslinePane { target } => Ok(Some(daemon::statusline_pane(
+            runner, env, &config, &target,
+        )?)),
         Command::StatuslineClick { range } => {
             crate::statusline::handle_statusline_click(runner, &config, range.as_deref())?;
             Ok(None)
         }
         Command::StatuslineSummary => Ok(Some(daemon::statusline_summary(runner, env, &config)?)),
-        Command::StatuslineAttention => {
-            Ok(Some(daemon::statusline_attention(runner, env, &config)?))
+        Command::StatuslineAttention { session_id } => Ok(Some(daemon::statusline_attention(
+            runner,
+            env,
+            &config,
+            &session_id,
+        )?)),
+        Command::Daemon {
+            socket,
+            server_identity,
+            server_pid,
+            server_start_time,
+            tmux_server_socket,
+            command,
+        } => {
+            if command.is_some()
+                && (server_identity.is_some()
+                    || server_pid.is_some()
+                    || server_start_time.is_some()
+                    || tmux_server_socket.is_some())
+            {
+                bail!(
+                    "explicit server incarnation arguments are valid only for daemon foreground startup"
+                );
+            }
+            if command.is_some() && socket.is_some() {
+                bail!(
+                    "InvalidRequest: --socket is internal to spawned daemon startup and cannot override the v2 incarnation namespace"
+                );
+            }
+            match command {
+                Some(DaemonCommand::Ensure) => {
+                    daemon::ensure_daemon(runner, env, socket.as_deref())
+                }
+                Some(DaemonCommand::Stop) => daemon::stop_daemon(runner, env, None),
+                Some(DaemonCommand::Restart) => daemon::restart_daemon(runner, env, None),
+                None => daemon::run_daemon(
+                    runner,
+                    env,
+                    socket.as_deref(),
+                    server_identity.as_deref(),
+                    server_pid,
+                    server_start_time,
+                    tmux_server_socket.as_deref(),
+                ),
+            }
         }
-        Command::Daemon { socket, command } => match command {
-            Some(DaemonCommand::Stop {
-                socket: stop_socket,
-            }) => daemon::stop_daemon(env, stop_socket.as_deref().or(socket.as_deref())),
-            Some(DaemonCommand::Restart {
-                socket: restart_socket,
-            }) => daemon::restart_daemon(env, restart_socket.as_deref().or(socket.as_deref())),
-            None => daemon::run_daemon(runner, env, socket.as_deref()),
-        },
         Command::Config { command } => match command {
             ConfigCommand::Schema => daemon::config_schema(),
         },
@@ -369,9 +486,7 @@ where
             match command {
                 SessionCommand::New { cwd } => {
                     crate::session::create_session(runner, &config, env, cwd.as_deref())?;
-                    let _ = crate::sidebar::client::request_pane_refresh(
-                        &crate::sidebar::client::socket_path(env),
-                    );
+                    let _ = request_canonical_topology_refresh(runner, env);
                 }
                 SessionCommand::SetCategory { session, category } => {
                     crate::session::set_session_category_override(runner, &session, &category)?;
@@ -402,13 +517,43 @@ where
                         client_name.as_deref(),
                         session_name.as_deref(),
                     )?;
-                    let _ = crate::sidebar::client::request_pane_refresh(
-                        &crate::sidebar::client::socket_path(env),
-                    );
+                    let _ = request_canonical_topology_refresh(runner, env);
                 }
+                HooksCommand::PaneStateView {
+                    event_kind,
+                    owner,
+                    protocol,
+                    hook_session,
+                    hook_window,
+                    hook_pane,
+                    hook_client,
+                } => hook::run_view_hook_command(
+                    &event_kind,
+                    &owner,
+                    protocol,
+                    hook_session.as_deref(),
+                    hook_window.as_deref(),
+                    hook_pane.as_deref(),
+                    hook_client.as_deref(),
+                    runner,
+                    env,
+                    &config,
+                )?,
             }
             Ok(None)
         }
+        Command::PaneState { command } => match command {
+            PaneStateCommand::CleanupLegacy { all } => {
+                if !all {
+                    bail!("--all is required");
+                }
+                daemon::cleanup_legacy_state(runner, env)
+            }
+            PaneStateCommand::Reset { target } => daemon::reset_pane_state(runner, env, &target),
+            PaneStateCommand::Hooks {
+                command: PaneStateHooksCommand::Uninstall,
+            } => daemon::uninstall_pane_state_hooks(runner, env),
+        },
         Command::Project { command } => {
             match command {
                 ProjectCommand::Switch { path } => {
@@ -490,6 +635,15 @@ fn emit_config_warnings<W: Write>(warnings: &[String], writer: &mut W) -> Result
         writeln!(writer, "vde-tmux config warning: {warning}")?;
     }
     Ok(())
+}
+
+fn request_canonical_topology_refresh(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<()> {
+    let (incarnation, socket) =
+        crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, None)?;
+    crate::sidebar::client::request_topology_refresh_v2(&socket, &incarnation.hash)
 }
 
 fn cli_index(index: usize) -> usize {

@@ -355,8 +355,10 @@ pub struct PaneStateDiagnostic {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CanonicalTransition {
     pub pane_instance: PaneInstance,
+    pub agent: Option<AgentKind>,
     pub from: Option<crate::daemon::session_badge::BadgeState>,
     pub to: Option<crate::daemon::session_badge::BadgeState>,
+    pub at_epoch: i64,
     pub state_version: Option<StateVersion>,
 }
 
@@ -436,6 +438,12 @@ pub struct ViewBatchContinuation {
     done_clear_on: DoneClearOn,
 }
 
+impl ViewBatchContinuation {
+    pub fn pending_recovery_remaining(&self, clock: &dyn RecoveryClock) -> Option<Duration> {
+        self.working.pending_recovery_remaining(clock)
+    }
+}
+
 #[derive(Debug)]
 pub enum ViewBatchProgress {
     Complete(ViewBatchApplyResult),
@@ -453,6 +461,7 @@ pub struct CanonicalStateRuntime {
     transitions: VecDeque<CanonicalTransition>,
     notification_jobs: VecDeque<CanonicalNotification>,
     triage: BTreeMap<PaneInstance, crate::daemon::session_badge::BadgeState>,
+    triage_calm_polls: BTreeMap<PaneInstance, u8>,
     flash: BTreeMap<PaneInstance, u8>,
     snapshot_revision: u64,
     snapshot_frame_too_large: bool,
@@ -493,6 +502,23 @@ impl CanonicalStateRuntime {
         self.records.get(pane)
     }
 
+    pub fn records_snapshot(&self) -> BTreeMap<PaneInstance, StoredPaneRecord> {
+        self.records.clone()
+    }
+
+    pub fn tracked_panes(&self) -> Vec<PaneInstance> {
+        let mut panes = self
+            .records
+            .keys()
+            .chain(self.quarantined.keys())
+            .chain(self.trackers.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        panes.sort();
+        panes.dedup();
+        panes
+    }
+
     pub fn quarantined(&self, pane: &PaneInstance) -> Option<&QuarantinedPaneRecord> {
         self.quarantined.get(pane)
     }
@@ -529,8 +555,140 @@ impl CanonicalStateRuntime {
         &self.transitions
     }
 
+    pub fn triage_panes(&self) -> impl Iterator<Item = &PaneInstance> {
+        self.triage.keys()
+    }
+
+    pub fn triage_entries(
+        &self,
+    ) -> impl Iterator<Item = (&PaneInstance, crate::daemon::session_badge::BadgeState)> {
+        self.triage.iter().map(|(pane, badge)| (pane, *badge))
+    }
+
+    pub fn flashing_panes(&self) -> impl Iterator<Item = &PaneInstance> {
+        self.flash.keys()
+    }
+
     pub fn notification_jobs(&self) -> &VecDeque<CanonicalNotification> {
         &self.notification_jobs
+    }
+
+    pub fn drain_notification_jobs(&mut self) -> Vec<CanonicalNotification> {
+        self.notification_jobs.drain(..).collect()
+    }
+
+    pub fn advance_poll_projection(&mut self) -> Result<bool, StoreError> {
+        let mut draft = self.clone();
+        let mut visible_changed = false;
+        let triaged = draft.triage.keys().cloned().collect::<Vec<_>>();
+        for pane in triaged {
+            if record_badge(draft.records.get(&pane))
+                == Some(crate::daemon::session_badge::BadgeState::Blocked)
+            {
+                draft.triage_calm_polls.remove(&pane);
+                continue;
+            }
+            let calm = draft.triage_calm_polls.entry(pane.clone()).or_default();
+            *calm = calm.saturating_add(1);
+            if *calm >= 2 {
+                draft.triage.remove(&pane);
+                draft.triage_calm_polls.remove(&pane);
+                visible_changed = true;
+            }
+        }
+        let flashing = draft.flash.keys().cloned().collect::<Vec<_>>();
+        for pane in flashing {
+            let remaining = draft.flash.get(&pane).copied().unwrap_or_default();
+            if remaining <= 1 {
+                draft.flash.remove(&pane);
+                visible_changed = true;
+            } else {
+                draft.flash.insert(pane, remaining - 1);
+            }
+        }
+        if visible_changed {
+            draft.bump_snapshot_revision()?;
+        }
+        draft.validate_projection()?;
+        let _ = draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        *self = draft;
+        Ok(visible_changed)
+    }
+
+    pub fn add_diagnostic(
+        &mut self,
+        pane_instance: PaneInstance,
+        message: impl Into<String>,
+    ) -> Result<(), StoreError> {
+        self.push_diagnostic(pane_instance, message.into())
+    }
+
+    pub fn finish_sequenced_projection(
+        &mut self,
+        diagnostic_pane: Option<&PaneInstance>,
+        messages: impl IntoIterator<Item = String>,
+        projection_changed: bool,
+        revision_before: u64,
+    ) -> Result<u64, StoreError> {
+        let mut changed = projection_changed;
+        if let Some(pane) = diagnostic_pane {
+            for message in messages {
+                self.diagnostics.push_back(PaneStateDiagnostic {
+                    pane_instance: pane.clone(),
+                    message,
+                });
+                while self.diagnostics.len() > MAX_DIAGNOSTICS {
+                    self.diagnostics.pop_front();
+                }
+                changed = true;
+            }
+        }
+        if changed && self.snapshot_revision == revision_before {
+            self.bump_snapshot_revision()?;
+        }
+        self.validate_projection()?;
+        let preflight_changed = self.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        if preflight_changed && self.snapshot_revision == revision_before {
+            self.bump_snapshot_revision()?;
+            let _ = self.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        }
+        Ok(self.snapshot_revision)
+    }
+
+    pub fn mark_projection_changed(&mut self) -> Result<u64, StoreError> {
+        self.bump_snapshot_revision()?;
+        self.validate_projection()?;
+        let _ = self.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        Ok(self.snapshot_revision)
+    }
+
+    pub fn remove_absent_pane(
+        &mut self,
+        pane: &PaneInstance,
+        expected: Option<&StoredStateDescriptor>,
+    ) -> Result<bool, StoreError> {
+        if self.fail_stopped {
+            return Err(StoreError::FailStop("daemon is fail-stopped".to_string()));
+        }
+        if self.sequenced_mutations_paused() {
+            return Err(StoreError::PersistPending);
+        }
+        if self.descriptor(pane).as_ref() != expected {
+            return Ok(false);
+        }
+        let removed = self.records.remove(pane).is_some()
+            | self.quarantined.remove(pane).is_some()
+            | self.trackers.remove(pane).is_some();
+        if !removed {
+            return Ok(false);
+        }
+        self.triage.remove(pane);
+        self.triage_calm_polls.remove(pane);
+        self.flash.remove(pane);
+        self.bump_snapshot_revision()?;
+        self.validate_projection()?;
+        let _ = self.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
+        Ok(true)
     }
 
     pub fn snapshot_frame_too_large(&self) -> bool {
@@ -541,12 +699,24 @@ impl CanonicalStateRuntime {
         self.snapshot_revision
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_revision_for_test(&mut self, revision: u64) {
+        self.snapshot_revision = revision;
+    }
+
     pub fn is_fail_stopped(&self) -> bool {
         self.fail_stopped
     }
 
     pub fn sequenced_mutations_paused(&self) -> bool {
         self.pending.is_some() || self.active_view_batch_id.is_some()
+    }
+
+    pub fn pending_recovery_remaining(&self, clock: &dyn RecoveryClock) -> Option<Duration> {
+        self.pending.as_ref().map(|transaction| {
+            STORE_RECOVERY_DEADLINE
+                .saturating_sub(clock.elapsed().saturating_sub(transaction.started_at))
+        })
     }
 
     pub fn query_committed_snapshot_revision(&self) -> u64 {
@@ -626,7 +796,12 @@ impl CanonicalStateRuntime {
                 .trackers
                 .insert(envelope.pane_instance.clone(), delta.next);
         }
-        draft.derive_candidate_projection(&envelope.pane_instance, current, Some(&candidate));
+        draft.derive_candidate_projection(
+            &envelope.pane_instance,
+            current,
+            Some(&candidate),
+            transition_at_epoch(&envelope.event, Some(&candidate)),
+        );
         draft.bump_snapshot_revision()?;
         draft.validate_projection()?;
         let _ = draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
@@ -926,7 +1101,7 @@ impl CanonicalStateRuntime {
         draft.records.insert(pane.clone(), tombstone.clone());
         draft.quarantined.remove(pane);
         draft.trackers.remove(pane);
-        draft.derive_candidate_projection(pane, self.records.get(pane), Some(&tombstone));
+        draft.derive_candidate_projection(pane, self.records.get(pane), Some(&tombstone), reset_at);
         draft.bump_snapshot_revision()?;
         draft.validate_projection()?;
         let _ = draft.preflight_projection(MAX_RESPONSE_FRAME_BYTES)?;
@@ -975,6 +1150,15 @@ impl CanonicalStateRuntime {
         let Some(transaction) = self.pending.take().map(|pending| *pending) else {
             return Ok(PendingResolution::StillPending);
         };
+        let elapsed = clock.elapsed().saturating_sub(transaction.started_at);
+        if elapsed >= STORE_RECOVERY_DEADLINE {
+            return self.finish_pending_outcome(
+                transaction,
+                PersistOutcome::FailStop(
+                    "pane state outcome remained unknown for 5 seconds".to_string(),
+                ),
+            );
+        }
         let outcome = match io.read_independent(&transaction.pane) {
             IndependentRead::Value(read_back) => classify_read_back(
                 read_back,
@@ -1055,7 +1239,7 @@ impl CanonicalStateRuntime {
         }
     }
 
-    fn descriptor(&self, pane: &PaneInstance) -> Option<StoredStateDescriptor> {
+    pub fn descriptor(&self, pane: &PaneInstance) -> Option<StoredStateDescriptor> {
         self.records
             .get(pane)
             .map(StoredPaneRecord::descriptor)
@@ -1073,17 +1257,51 @@ impl CanonicalStateRuntime {
         pane: &PaneInstance,
         previous: Option<&StoredPaneRecord>,
         current: Option<&StoredPaneRecord>,
+        at_epoch: i64,
     ) {
         let previous_badge = record_badge(previous);
         let current_badge = record_badge(current);
+        let discarded_completion = match (previous, current) {
+            (Some(StoredPaneRecord::Active(previous)), Some(StoredPaneRecord::Active(current))) => {
+                previous_badge == Some(crate::daemon::session_badge::BadgeState::Done)
+                    && (previous.state_id != current.state_id
+                        || previous.agent_epoch != current.agent_epoch
+                        || previous.agent != current.agent
+                        || previous.agent_session_id != current.agent_session_id)
+            }
+            _ => false,
+        };
+        let (agent, at_epoch) = if discarded_completion {
+            let previous = match previous {
+                Some(StoredPaneRecord::Active(previous)) => previous,
+                _ => unreachable!("discarded completion requires a previous active state"),
+            };
+            (
+                Some(previous.agent.clone()),
+                previous
+                    .completed_at
+                    .or(previous.started_at)
+                    .unwrap_or(at_epoch),
+            )
+        } else {
+            (
+                current
+                    .and_then(record_agent)
+                    .or_else(|| previous.and_then(record_agent))
+                    .cloned(),
+                at_epoch,
+            )
+        };
         let state_version = match current {
             Some(StoredPaneRecord::Active(state)) => Some(state.version()),
             _ => None,
         };
         self.transitions.push_back(CanonicalTransition {
             pane_instance: pane.clone(),
+            agent,
             from: previous_badge,
             to: current_badge,
+            at_epoch,
             state_version: state_version.clone(),
         });
         while self.transitions.len() > MAX_DIAGNOSTICS {
@@ -1105,6 +1323,7 @@ impl CanonicalStateRuntime {
         }
         if let Some(badge @ crate::daemon::session_badge::BadgeState::Blocked) = current_badge {
             self.triage.insert(pane.clone(), badge);
+            self.triage_calm_polls.remove(pane);
         }
     }
 
@@ -1201,6 +1420,9 @@ impl CanonicalStateRuntime {
         if self.transitions.len() > MAX_DIAGNOSTICS
             || self.diagnostics.len() > MAX_DIAGNOSTICS
             || self.notification_jobs.len() > 64
+            || self.triage.len() > MAX_DIAGNOSTICS
+            || self.triage_calm_polls.len() > MAX_DIAGNOSTICS
+            || self.flash.len() > MAX_DIAGNOSTICS
         {
             return Err(StoreError::PersistFailed(
                 "projection collection exceeds configured bound".to_string(),
@@ -1216,6 +1438,35 @@ fn record_badge(
     match record {
         Some(StoredPaneRecord::Active(state)) => Some(crate::pane_state::resolve_badge(state)),
         _ => None,
+    }
+}
+
+fn record_agent(record: &StoredPaneRecord) -> Option<&AgentKind> {
+    match record {
+        StoredPaneRecord::Active(state) => Some(&state.agent),
+        StoredPaneRecord::Reset(_) => None,
+    }
+}
+
+fn transition_at_epoch(event: &PaneEvent, current: Option<&StoredPaneRecord>) -> i64 {
+    match event {
+        PaneEvent::AgentSessionStarted { observed_at, .. }
+        | PaneEvent::ActivityObserved { observed_at }
+        | PaneEvent::WaitRequested { observed_at, .. }
+        | PaneEvent::FailRun { observed_at, .. }
+        | PaneEvent::ProgressUpdated { observed_at, .. }
+        | PaneEvent::ObservationBatch { observed_at, .. } => *observed_at,
+        PaneEvent::BeginRun { started_at, .. } => *started_at,
+        PaneEvent::CompleteRun { completed_at } | PaneEvent::MarkDone { completed_at, .. } => {
+            *completed_at
+        }
+        PaneEvent::ExplicitStateReported { report } => report.observed_at,
+        PaneEvent::AcknowledgeView { .. } | PaneEvent::PaneRemoved { .. } => current
+            .and_then(|record| match record {
+                StoredPaneRecord::Active(state) => state.completed_at.or(state.started_at),
+                StoredPaneRecord::Reset(tombstone) => Some(tombstone.reset_at),
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -1508,6 +1759,122 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.transitions().len(), transition_count + 1);
         assert_eq!(runtime.notification_jobs().len(), 1);
+    }
+
+    #[test]
+    fn same_agent_new_session_keeps_completed_transition_identity_and_time() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = FakeIo::default();
+        let mut clock = FakeClock::default();
+        let visibility = VisibilitySnapshot::default();
+        apply_begin(&mut runtime, &mut io);
+        runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &envelope(PaneEvent::CompleteRun { completed_at: 20 }),
+                &visibility,
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+
+        let completed = runtime.transitions().back().unwrap().clone();
+        assert_eq!(
+            completed.agent.as_ref().map(AgentKind::as_str),
+            Some("codex")
+        );
+        assert_eq!(completed.at_epoch, 20);
+        assert_eq!(
+            completed.to,
+            Some(crate::daemon::session_badge::BadgeState::Done)
+        );
+
+        let mut restarted = envelope(PaneEvent::AgentSessionStarted {
+            observed_at: 30,
+            source: AgentSessionSource::Startup,
+            resumed_prompt: None,
+        });
+        restarted.agent_session_id = Some(AgentSessionId::parse("next-session").unwrap());
+        runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &restarted,
+                &visibility,
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+
+        let StoredPaneRecord::Active(current) = runtime.record(&pane()).unwrap() else {
+            panic!("expected active pane state");
+        };
+        assert_eq!(
+            current
+                .agent_session_id
+                .as_ref()
+                .map(AgentSessionId::as_str),
+            Some("next-session")
+        );
+        assert!(runtime.transitions().contains(&completed));
+        let discarded = runtime.transitions().back().unwrap();
+        assert_eq!(
+            discarded.agent.as_ref().map(AgentKind::as_str),
+            Some("codex")
+        );
+        assert_eq!(discarded.at_epoch, 20);
+        assert_eq!(
+            discarded.from,
+            Some(crate::daemon::session_badge::BadgeState::Done)
+        );
+        assert_eq!(
+            discarded.to,
+            Some(crate::daemon::session_badge::BadgeState::Idle)
+        );
+    }
+
+    #[test]
+    fn triage_and_flash_leave_after_two_calm_poll_projections() {
+        let mut runtime = CanonicalStateRuntime::default();
+        apply_begin(&mut runtime, &mut FakeIo::default());
+        runtime
+            .apply_event(
+                &mut FakeIo::default(),
+                &mut FakeClock::default(),
+                &envelope(PaneEvent::WaitRequested {
+                    observed_at: 2,
+                    reason: WaitReason::PermissionPrompt,
+                }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        runtime
+            .apply_event(
+                &mut FakeIo::default(),
+                &mut FakeClock::default(),
+                &envelope(PaneEvent::ActivityObserved { observed_at: 3 }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        assert_eq!(runtime.triage_panes().count(), 1);
+        assert_eq!(
+            runtime
+                .triage_entries()
+                .map(|(pane, badge)| (pane.clone(), badge))
+                .collect::<Vec<_>>(),
+            vec![(pane(), crate::daemon::session_badge::BadgeState::Blocked)]
+        );
+        assert_eq!(runtime.flashing_panes().count(), 1);
+        let revision = runtime.snapshot_revision();
+
+        assert!(!runtime.advance_poll_projection().unwrap());
+        assert_eq!(runtime.snapshot_revision(), revision);
+        assert_eq!(runtime.triage_panes().count(), 1);
+        assert!(runtime.advance_poll_projection().unwrap());
+        assert_eq!(runtime.snapshot_revision(), revision + 1);
+        assert_eq!(runtime.triage_panes().count(), 0);
+        assert_eq!(runtime.flashing_panes().count(), 0);
     }
 
     #[test]
@@ -2111,6 +2478,7 @@ mod tests {
         let mut runtime = CanonicalStateRuntime::default();
         let mut io = FakeIo {
             write_results: VecDeque::from([WriteAttempt::OutcomeUnknown("timeout".to_string())]),
+            reads: VecDeque::from([IndependentRead::Value(None)]),
             ..FakeIo::default()
         };
         let mut clock = FakeClock::default();
@@ -2129,6 +2497,53 @@ mod tests {
         assert!(matches!(error, StoreError::FailStop(_)));
         assert!(runtime.is_fail_stopped());
         assert!(error.requires_daemon_exit());
+        assert_eq!(io.reads.len(), 1, "expired recovery must not start a read");
+    }
+
+    #[test]
+    fn independent_read_that_exhausts_deadline_fail_stops_immediately() {
+        use std::sync::{Arc, Mutex};
+
+        struct SharedClock(Arc<Mutex<Duration>>);
+        impl RecoveryClock for SharedClock {
+            fn elapsed(&self) -> Duration {
+                *self.0.lock().unwrap()
+            }
+        }
+        struct DeadlineReadIo(Arc<Mutex<Duration>>);
+        impl PaneStateStoreIo for DeadlineReadIo {
+            fn write_candidate(&mut self, _pane: &PaneInstance, _candidate: &str) -> WriteAttempt {
+                unreachable!()
+            }
+
+            fn read_independent(&mut self, _pane: &PaneInstance) -> IndependentRead {
+                *self.0.lock().unwrap() = STORE_RECOVERY_DEADLINE;
+                IndependentRead::Unavailable("timeout".to_string())
+            }
+        }
+
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut initial_io = FakeIo {
+            write_results: VecDeque::from([WriteAttempt::OutcomeUnknown("timeout".to_string())]),
+            ..FakeIo::default()
+        };
+        runtime
+            .apply_event(
+                &mut initial_io,
+                &mut FakeClock::default(),
+                &begin_event(),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap_err();
+        let elapsed = Arc::new(Mutex::new(Duration::from_millis(4_999)));
+        let clock = SharedClock(elapsed.clone());
+        let error = runtime
+            .resolve_pending(&mut DeadlineReadIo(elapsed), &clock)
+            .unwrap_err();
+
+        assert!(matches!(error, StoreError::FailStop(_)));
+        assert!(runtime.is_fail_stopped());
     }
 
     #[test]

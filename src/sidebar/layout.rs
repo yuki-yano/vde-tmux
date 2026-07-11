@@ -231,15 +231,25 @@ pub fn rail(
 }
 
 pub fn jump_to_pane(runner: &dyn TmuxRunner, pane_id: &str) -> Result<()> {
-    let panes = crate::options::snapshot::read_all_panes(runner)?;
-    let pane = panes
-        .iter()
-        .find(|pane| pane.pane_id == pane_id)
+    const FIELD_SEP: char = '\u{1f}';
+    let format = ["#{session_name}", "#{window_id}", "#{pane_id}"].join(&FIELD_SEP.to_string());
+    let output = runner.run(&["list-panes", "-a", "-F", &format])?;
+    let (session, window_id) = output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(FIELD_SEP);
+            let session = fields.next()?;
+            let window_id = fields.next()?;
+            let candidate_pane_id = fields.next()?;
+            (fields.next().is_none() && candidate_pane_id == pane_id)
+                .then_some((session, window_id))
+        })
+        .next()
         .with_context(|| format!("pane not found: {pane_id}"))?;
-    let target = crate::session::exact_session_target(&pane.session);
+    let target = crate::session::exact_session_target(session);
     runner.run(&["switch-client", "-t", &target])?;
-    runner.run(&["select-window", "-t", &pane.window_id])?;
-    runner.run(&["select-pane", "-t", &pane.pane_id])?;
+    runner.run(&["select-window", "-t", window_id])?;
+    runner.run(&["select-pane", "-t", pane_id])?;
     Ok(())
 }
 
@@ -1974,43 +1984,10 @@ mod tests {
     #[test]
     fn jump_to_pane_switches_session_window_and_pane() {
         let mock = MockTmuxRunner::new();
-        let line = [
-            "main",
-            "@1",
-            "%1",
-            "/tmp",
-            "zsh",
-            "/dev/ttys001",
-            "123",
-            "0",
-            "0",
-            "0",
-            "",
-            "",
-            "",
-            "",
-            "codex",
-            "running",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-        ]
-        .join("\u{1f}");
+        let format = ["#{session_name}", "#{window_id}", "#{pane_id}"].join("\u{1f}");
         mock.stub(
-            &[
-                "list-panes",
-                "-a",
-                "-F",
-                crate::options::snapshot::snapshot_format().as_str(),
-            ],
-            &format!("{line}\n"),
+            &["list-panes", "-a", "-F", &format],
+            "main\u{1f}@1\u{1f}%1\n",
         );
         mock.stub(&["switch-client", "-t", "=main:"], "");
         mock.stub(&["select-window", "-t", "@1"], "");

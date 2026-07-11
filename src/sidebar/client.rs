@@ -1,80 +1,22 @@
-use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 
-use crate::daemon::DaemonSnapshot;
 use crate::daemon::protocol::v2::{
-    ClientMessage as V2ClientMessage, PROTOCOL_VERSION, ServerMessage as V2ServerMessage,
-    SidebarCommand as V2SidebarCommand, V2Client,
+    ClientMessage as V2ClientMessage, PROTOCOL_VERSION, ResolvedSnapshot,
+    ServerMessage as V2ServerMessage, SidebarCommand as V2SidebarCommand, V2Client,
 };
-use crate::daemon::protocol::{ClientMessage, ServerMessage, SidebarClientEvent};
-use crate::pane_state::{EventId, PaneInstance, StateVersion};
+use crate::pane_state::{
+    EventId, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, PaneInstance, StateVersion,
+};
 
-pub fn socket_path(env: &BTreeMap<String, String>) -> PathBuf {
-    crate::daemon::daemon_socket_path(env, None)
-}
-
-pub fn send_sidebar_key(socket: &Path, key: &str) -> Result<()> {
-    request_ack(
-        socket,
-        ClientMessage::SidebarEvent {
-            proto: 1,
-            event: SidebarClientEvent::Key {
-                key: key.to_string(),
-            },
-        },
-    )
-}
-
-pub fn send_sidebar_jump(socket: &Path, pane: &str) -> Result<()> {
-    request_ack(
-        socket,
-        ClientMessage::SidebarEvent {
-            proto: 1,
-            event: SidebarClientEvent::JumpPane {
-                pane: pane.to_string(),
-            },
-        },
-    )
-}
-
-pub fn send_sidebar_mark_done(socket: &Path, pane: &str) -> Result<()> {
-    request_ack(
-        socket,
-        ClientMessage::SidebarEvent {
-            proto: 1,
-            event: SidebarClientEvent::MarkDone {
-                pane: pane.to_string(),
-            },
-        },
-    )
-}
-
-pub fn send_sidebar_select_context(
-    socket: &Path,
-    pane: Option<&str>,
-    session: Option<&str>,
-) -> Result<()> {
-    request_ack(
-        socket,
-        ClientMessage::SidebarEvent {
-            proto: 1,
-            event: SidebarClientEvent::SelectContext {
-                pane: pane.map(ToOwned::to_owned),
-                session: session.map(ToOwned::to_owned),
-            },
-        },
-    )
-}
-
-pub fn send_sidebar_toggle(socket: &Path, row_id: &str) -> Result<()> {
-    send_sidebar_key(socket, &format!("toggle:{row_id}"))
-}
+const V2_SIDEBAR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const V2_SUBSCRIBE_INITIAL_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub fn send_sidebar_key_v2(socket: &Path, server_identity: &str, key: &str) -> Result<()> {
     request_v2_sidebar(
@@ -84,7 +26,8 @@ pub fn send_sidebar_key_v2(socket: &Path, server_identity: &str, key: &str) -> R
             key: key.to_string(),
         },
         V2SidebarResponse::SnapshotAck,
-    )
+    )?;
+    Ok(())
 }
 
 pub fn send_sidebar_jump_v2(socket: &Path, server_identity: &str, pane_id: &str) -> Result<()> {
@@ -95,7 +38,8 @@ pub fn send_sidebar_jump_v2(socket: &Path, server_identity: &str, pane_id: &str)
             pane_id: pane_id.to_string(),
         },
         V2SidebarResponse::SnapshotAck,
-    )
+    )?;
+    Ok(())
 }
 
 pub fn send_sidebar_mark_done_v2(
@@ -112,7 +56,8 @@ pub fn send_sidebar_mark_done_v2(
             expected,
         },
         V2SidebarResponse::PaneEventResult,
-    )
+    )?;
+    Ok(())
 }
 
 pub fn send_sidebar_select_context_v2(
@@ -129,61 +74,76 @@ pub fn send_sidebar_select_context_v2(
             session_id: session_id.map(ToOwned::to_owned),
         },
         V2SidebarResponse::SnapshotAck,
-    )
+    )?;
+    Ok(())
 }
 
-pub fn request_pane_refresh(socket: &Path) -> Result<()> {
-    request_ack(socket, ClientMessage::RefreshPanes { proto: 1 })
+pub fn request_topology_refresh_v2(socket: &Path, server_identity: &str) -> Result<()> {
+    let mut client = V2Client::connect(socket, server_identity)?;
+    let event_id = EventId::generate()?;
+    let response = client.request(&V2ClientMessage::RefreshTopology {
+        proto: PROTOCOL_VERSION,
+        daemon_instance_id: client.daemon_instance_id().clone(),
+        event_id: event_id.clone(),
+    })?;
+    expect_v2_mutation_response(response, &event_id, V2SidebarResponse::SnapshotAck)?;
+    Ok(())
 }
 
-pub fn subscribe(socket: &Path, tx: Sender<DaemonSnapshot>) -> Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
-    serde_json::to_writer(&mut stream, &ClientMessage::Subscribe { proto: 1 })?;
-    stream.write_all(b"\n")?;
+pub fn query_resolved_snapshot_v2(
+    socket: &Path,
+    server_identity: &str,
+) -> Result<ResolvedSnapshot> {
+    let mut client = V2Client::connect(socket, server_identity)?;
+    let response = client.request(&V2ClientMessage::QueryResolvedSnapshot {
+        proto: PROTOCOL_VERSION,
+    })?;
+    match response {
+        V2ServerMessage::ResolvedSnapshotResult {
+            snapshot_revision,
+            snapshot,
+        } if snapshot.snapshot_revision == snapshot_revision => Ok(snapshot),
+        V2ServerMessage::ResolvedSnapshotResult {
+            snapshot_revision,
+            snapshot,
+        } => bail!(
+            "daemon snapshot revision mismatch: envelope={snapshot_revision}, snapshot={}",
+            snapshot.snapshot_revision
+        ),
+        V2ServerMessage::Error { code, message, .. } => bail!("{code:?}: {message}"),
+        other => bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
+pub fn subscribe_v2(
+    socket: &Path,
+    server_identity: &str,
+    tx: Sender<ResolvedSnapshot>,
+) -> Result<()> {
+    let mut subscription = V2SnapshotSubscription::connect(socket, server_identity)?;
+    let first = subscription.read_initial_snapshot()?.ok_or_else(|| {
+        anyhow::anyhow!("daemon closed the subscription before the initial snapshot")
+    })?;
+    tx.send(first)
+        .map_err(|_| anyhow::anyhow!("sidebar snapshot receiver disconnected"))?;
+    subscription.clear_read_timeout()?;
     thread::spawn(move || {
-        let reader = BufReader::new(stream);
-        for line in reader.lines() {
-            let raw = match line {
-                Ok(raw) => raw,
+        loop {
+            match subscription.read_next_snapshot() {
+                Ok(Some(snapshot)) => {
+                    if tx.send(snapshot).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
                 Err(error) => {
-                    eprintln!("[vde-tmux] daemon subscribe read error: {error:#}");
+                    eprintln!("[vde-tmux] v2 sidebar subscribe error: {error:#}");
                     break;
                 }
-            };
-            let message = match serde_json::from_str::<ServerMessage>(raw.trim()) {
-                Ok(message) => message,
-                Err(error) => {
-                    eprintln!("[vde-tmux] daemon subscribe decode error: {error:#}");
-                    continue;
-                }
-            };
-            match message {
-                ServerMessage::Snapshot { snapshot } => match tx.send(snapshot) {
-                    Ok(()) => {}
-                    Err(_) => break,
-                },
-                ServerMessage::Error { message } => {
-                    eprintln!("[vde-tmux] daemon subscribe error: {message}");
-                    break;
-                }
-                _ => {}
             }
         }
     });
     Ok(())
-}
-
-fn request_ack(socket: &Path, message: ClientMessage) -> Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
-    serde_json::to_writer(&mut stream, &message)?;
-    stream.write_all(b"\n")?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
-    match serde_json::from_str::<ServerMessage>(line.trim())? {
-        ServerMessage::Ack => Ok(()),
-        ServerMessage::Error { message } => bail!(message),
-        other => bail!("unexpected daemon response: {other:?}"),
-    }
 }
 
 fn request_v2_sidebar(
@@ -191,30 +151,101 @@ fn request_v2_sidebar(
     server_identity: &str,
     command: V2SidebarCommand,
     expected_response: V2SidebarResponse,
-) -> Result<()> {
-    let mut client = V2Client::connect(socket, server_identity)?;
+) -> Result<u64> {
+    let deadline = Instant::now() + V2_SIDEBAR_COMMAND_TIMEOUT;
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_write_timeout(Some(V2_SIDEBAR_COMMAND_TIMEOUT))?;
+    stream.set_read_timeout(Some(V2_SIDEBAR_COMMAND_TIMEOUT))?;
+    write_v2_client_frame(
+        &mut stream,
+        &V2ClientMessage::Hello {
+            proto: PROTOCOL_VERSION,
+        },
+        deadline,
+    )?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let hello = read_v2_server_frame(&mut reader, Some(deadline))?
+        .ok_or_else(|| anyhow::anyhow!("daemon closed the connection before HelloAck"))?;
+    let V2ServerMessage::HelloAck {
+        proto,
+        daemon_instance_id,
+        server_identity: actual_server_identity,
+        ..
+    } = hello
+    else {
+        return v2_server_error("HelloAck", hello);
+    };
+    if proto != PROTOCOL_VERSION {
+        bail!("daemon returned unsupported protocol version {proto}");
+    }
+    if actual_server_identity != server_identity {
+        bail!(
+            "daemon server identity mismatch: expected {server_identity}, received {actual_server_identity}"
+        );
+    }
     let event_id = EventId::generate()?;
-    let response = client.request(&V2ClientMessage::SidebarCommand {
-        proto: PROTOCOL_VERSION,
-        daemon_instance_id: client.daemon_instance_id().clone(),
-        event_id: event_id.clone(),
-        command,
-    })?;
+    write_v2_client_frame(
+        &mut stream,
+        &V2ClientMessage::SidebarCommand {
+            proto: PROTOCOL_VERSION,
+            daemon_instance_id,
+            event_id: event_id.clone(),
+            command,
+        },
+        deadline,
+    )?;
+    let response = read_v2_server_frame(&mut reader, Some(deadline))?
+        .ok_or_else(|| anyhow::anyhow!("daemon closed the connection before responding"))?;
+    expect_v2_mutation_response(response, &event_id, expected_response)
+}
+
+fn expect_v2_mutation_response(
+    response: V2ServerMessage,
+    event_id: &EventId,
+    expected_response: V2SidebarResponse,
+) -> Result<u64> {
     match (expected_response, response) {
+        (
+            V2SidebarResponse::PaneEventResult,
+            V2ServerMessage::PaneEventResult {
+                event_id: response_event_id,
+                snapshot_revision,
+                ..
+            },
+        ) if response_event_id == *event_id => Ok(snapshot_revision),
+        (
+            V2SidebarResponse::SnapshotAck,
+            V2ServerMessage::SnapshotAck {
+                event_id: response_event_id,
+                snapshot_revision,
+                ..
+            },
+        ) if response_event_id == *event_id => Ok(snapshot_revision),
         (
             V2SidebarResponse::PaneEventResult,
             V2ServerMessage::PaneEventResult {
                 event_id: response_event_id,
                 ..
             },
-        ) if response_event_id == event_id => Ok(()),
-        (
+        )
+        | (
             V2SidebarResponse::SnapshotAck,
             V2ServerMessage::SnapshotAck {
                 event_id: response_event_id,
                 ..
             },
-        ) if response_event_id == event_id => Ok(()),
+        ) => bail!(
+            "daemon response event ID mismatch: expected {event_id:?}, received {response_event_id:?}"
+        ),
+        (
+            _,
+            V2ServerMessage::Error {
+                event_id: Some(response_event_id),
+                ..
+            },
+        ) if response_event_id != *event_id => bail!(
+            "daemon response event ID mismatch: expected {event_id:?}, received {response_event_id:?}"
+        ),
         (_, V2ServerMessage::Error { code, message, .. }) => bail!("{code:?}: {message}"),
         (_, other) => bail!("unexpected daemon response: {other:?}"),
     }
@@ -226,12 +257,239 @@ enum V2SidebarResponse {
     PaneEventResult,
 }
 
+struct V2SnapshotSubscription {
+    reader: BufReader<UnixStream>,
+    last_revision: Option<u64>,
+    initial_deadline: Instant,
+}
+
+impl V2SnapshotSubscription {
+    fn connect(socket: &Path, server_identity: &str) -> Result<Self> {
+        let mut stream = UnixStream::connect(socket)?;
+        stream.set_write_timeout(Some(V2_SUBSCRIBE_INITIAL_TIMEOUT))?;
+        stream.set_read_timeout(Some(V2_SUBSCRIBE_INITIAL_TIMEOUT))?;
+        let deadline = Instant::now() + V2_SUBSCRIBE_INITIAL_TIMEOUT;
+        write_v2_client_frame(
+            &mut stream,
+            &V2ClientMessage::Hello {
+                proto: PROTOCOL_VERSION,
+            },
+            deadline,
+        )?;
+        let mut reader = BufReader::new(stream);
+        let hello = read_v2_server_frame(&mut reader, Some(deadline))?
+            .ok_or_else(|| anyhow::anyhow!("daemon closed the connection before HelloAck"))?;
+        let V2ServerMessage::HelloAck {
+            proto,
+            server_identity: actual_server_identity,
+            ..
+        } = hello
+        else {
+            return v2_server_error("HelloAck", hello);
+        };
+        if proto != PROTOCOL_VERSION {
+            bail!("daemon returned unsupported protocol version {proto}");
+        }
+        if actual_server_identity != server_identity {
+            bail!(
+                "daemon server identity mismatch: expected {server_identity}, received {actual_server_identity}"
+            );
+        }
+        write_v2_client_frame(
+            reader.get_mut(),
+            &V2ClientMessage::Subscribe {
+                proto: PROTOCOL_VERSION,
+            },
+            deadline,
+        )?;
+        Ok(Self {
+            reader,
+            last_revision: None,
+            initial_deadline: deadline,
+        })
+    }
+
+    fn clear_read_timeout(&self) -> Result<()> {
+        self.reader.get_ref().set_read_timeout(None)?;
+        Ok(())
+    }
+
+    fn read_next_snapshot(&mut self) -> Result<Option<ResolvedSnapshot>> {
+        self.read_next_snapshot_until(None)
+    }
+
+    fn read_initial_snapshot(&mut self) -> Result<Option<ResolvedSnapshot>> {
+        self.read_next_snapshot_until(Some(self.initial_deadline))
+    }
+
+    fn read_next_snapshot_until(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<ResolvedSnapshot>> {
+        loop {
+            let message = read_v2_server_frame(&mut self.reader, deadline)?;
+            let Some(message) = message else {
+                return Ok(None);
+            };
+            match message {
+                V2ServerMessage::ResolvedSnapshotResult {
+                    snapshot_revision,
+                    snapshot,
+                } => {
+                    if snapshot.snapshot_revision != snapshot_revision {
+                        bail!(
+                            "daemon snapshot revision mismatch: envelope={snapshot_revision}, snapshot={}",
+                            snapshot.snapshot_revision
+                        );
+                    }
+                    if self
+                        .last_revision
+                        .is_some_and(|last_revision| snapshot_revision <= last_revision)
+                    {
+                        continue;
+                    }
+                    self.last_revision = Some(snapshot_revision);
+                    return Ok(Some(snapshot));
+                }
+                V2ServerMessage::Error { code, message, .. } => {
+                    bail!("{code:?}: {message}")
+                }
+                other => bail!("unexpected daemon subscription response: {other:?}"),
+            }
+        }
+    }
+}
+
+fn write_v2_client_frame(
+    stream: &mut UnixStream,
+    message: &V2ClientMessage,
+    deadline: Instant,
+) -> Result<()> {
+    let mut frame = serde_json::to_vec(message)?;
+    if frame.len() > MAX_REQUEST_FRAME_BYTES {
+        bail!("request frame exceeds 1 MiB");
+    }
+    frame.push(b'\n');
+    let mut written = 0;
+    while written < frame.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("daemon request write deadline exceeded");
+        }
+        stream.set_write_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+        match stream.write(&frame[written..]) {
+            Ok(0) => bail!("daemon closed the connection while reading the request"),
+            Ok(count) => written += count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                bail!("daemon request write deadline exceeded")
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn read_v2_server_frame(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Option<Instant>,
+) -> Result<Option<V2ServerMessage>> {
+    let mut frame = Vec::new();
+    loop {
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("daemon response read deadline exceeded");
+            }
+            reader
+                .get_ref()
+                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+        }
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                bail!("daemon response read deadline exceeded")
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if available.is_empty() {
+            if frame.is_empty() {
+                return Ok(None);
+            }
+            bail!("daemon closed the connection before completing a response frame");
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if frame.len().saturating_add(take) > MAX_RESPONSE_FRAME_BYTES.saturating_add(1) {
+            bail!("daemon response frame exceeds 16 MiB");
+        }
+        frame.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            frame.pop();
+            return serde_json::from_slice(&frame).map(Some).map_err(Into::into);
+        }
+    }
+}
+
+fn v2_server_error<T>(expected: &str, response: V2ServerMessage) -> Result<T> {
+    match response {
+        V2ServerMessage::Error { code, message, .. } => bail!("{code:?}: {message}"),
+        other => bail!("expected {expected}, received {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    const DAEMON_INSTANCE_ID: &str = "ffeeddccbbaa99887766554433221100";
+    fn daemon_instance_id() -> crate::pane_state::DaemonInstanceId {
+        crate::pane_state::DaemonInstanceId::parse(DAEMON_INSTANCE_ID).unwrap()
+    }
+
+    fn write_hello_ack(stream: &mut UnixStream, server_identity: &str) {
+        serde_json::to_writer(
+            &mut *stream,
+            &V2ServerMessage::HelloAck {
+                proto: PROTOCOL_VERSION,
+                daemon_instance_id: daemon_instance_id(),
+                server_identity: server_identity.to_string(),
+                phase: crate::daemon::protocol::v2::DaemonPhase::Serving,
+                hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+    }
+
+    fn empty_resolved_snapshot(revision: u64) -> ResolvedSnapshot {
+        ResolvedSnapshot {
+            snapshot_revision: revision,
+            panes: Vec::new(),
+            sidebar: crate::daemon::SidebarFrame {
+                state: crate::sidebar::state::SidebarState::default(),
+                counts: crate::sidebar::tree::BadgeCounts::default(),
+                rows: Vec::new(),
+            },
+            attention: Vec::new(),
+            events: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
 
     #[test]
     fn v2_mark_done_handshakes_and_sends_full_state_version() {
@@ -368,86 +626,303 @@ mod tests {
     }
 
     #[test]
-    fn request_pane_refresh_sends_refresh_panes_message() {
-        let socket = unique_socket_path("vde-tmux-refresh-panes");
+    fn v2_sidebar_helpers_encode_all_four_commands() {
+        let socket = unique_socket_path("vt2-cmds");
         let listener = UnixListener::bind(&socket).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(1);
-            loop {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false).unwrap();
-                        let mut line = String::new();
-                        BufReader::new(&mut stream).read_line(&mut line).unwrap();
-                        let message: ClientMessage = serde_json::from_str(line.trim()).unwrap();
-                        tx.send(message).unwrap();
-                        serde_json::to_writer(&mut stream, &ServerMessage::Ack).unwrap();
-                        stream.write_all(b"\n").unwrap();
-                        return;
+        let expected_version = StateVersion {
+            state_id: crate::pane_state::StateId::parse("00112233445566778899aabbccddeeff")
+                .unwrap(),
+            agent_epoch: 4,
+            revision: 8,
+        };
+        let expected_commands = vec![
+            V2SidebarCommand::Key {
+                key: "down".to_string(),
+            },
+            V2SidebarCommand::JumpPane {
+                pane_id: "%3".to_string(),
+            },
+            V2SidebarCommand::MarkDone {
+                pane_instance: PaneInstance {
+                    pane_id: "%3".to_string(),
+                    pane_pid: 303,
+                },
+                expected: expected_version.clone(),
+            },
+            V2SidebarCommand::SelectContext {
+                pane_id: Some("%3".to_string()),
+                session_id: Some("$1".to_string()),
+            },
+        ];
+        let expected_for_server = expected_commands.clone();
+        let handle = thread::spawn(move || {
+            for expected in expected_for_server {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+                    V2ClientMessage::Hello {
+                        proto: PROTOCOL_VERSION
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
+                );
+                write_hello_ack(&mut stream, "scratch");
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                let V2ClientMessage::SidebarCommand {
+                    daemon_instance_id,
+                    event_id,
+                    command,
+                    ..
+                } = serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap()
+                else {
+                    panic!("expected sidebar command");
+                };
+                assert_eq!(daemon_instance_id, self::daemon_instance_id());
+                assert_eq!(command, expected);
+                let response = if matches!(command, V2SidebarCommand::MarkDone { .. }) {
+                    V2ServerMessage::PaneEventResult {
+                        event_id,
+                        accepted_seq: 1,
+                        state_version: None,
+                        snapshot_revision: 2,
+                        outcome: crate::daemon::protocol::v2::PaneApplyOutcome::Committed,
                     }
-                    Err(_) => return,
-                }
+                } else {
+                    V2ServerMessage::SnapshotAck {
+                        event_id,
+                        accepted_seq: 1,
+                        snapshot_revision: 2,
+                    }
+                };
+                serde_json::to_writer(&mut stream, &response).unwrap();
+                stream.write_all(b"\n").unwrap();
             }
         });
 
-        request_pane_refresh(&socket).unwrap();
+        send_sidebar_key_v2(&socket, "scratch", "down").unwrap();
+        send_sidebar_jump_v2(&socket, "scratch", "%3").unwrap();
+        send_sidebar_mark_done_v2(
+            &socket,
+            "scratch",
+            PaneInstance {
+                pane_id: "%3".to_string(),
+                pane_pid: 303,
+            },
+            expected_version,
+        )
+        .unwrap();
+        send_sidebar_select_context_v2(&socket, "scratch", Some("%3"), Some("$1")).unwrap();
 
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ClientMessage::RefreshPanes { proto: 1 }
-        );
         handle.join().unwrap();
         std::fs::remove_file(socket).unwrap();
     }
 
     #[test]
-    fn subscribe_skips_invalid_json_line_and_reads_next_snapshot() {
-        let socket = unique_socket_path("vt-sub-bad");
+    fn v2_refresh_topology_uses_hello_daemon_instance_and_event_id() {
+        let socket = unique_socket_path("vt2-refresh");
         let listener = UnixListener::bind(&socket).unwrap();
-        let server_socket = socket.clone();
-        let handle = std::thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
-            BufReader::new(&mut stream).read_line(&mut line).unwrap();
-            let message: ClientMessage = serde_json::from_str(line.trim()).unwrap();
-            assert_eq!(message, ClientMessage::Subscribe { proto: 1 });
-
-            stream.write_all(b"{not-json}\n").unwrap();
+            reader.read_line(&mut line).unwrap();
+            write_hello_ack(&mut stream, "scratch");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let V2ClientMessage::RefreshTopology {
+                daemon_instance_id,
+                event_id,
+                ..
+            } = serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap()
+            else {
+                panic!("expected topology refresh");
+            };
+            assert_eq!(daemon_instance_id, self::daemon_instance_id());
             serde_json::to_writer(
                 &mut stream,
-                &ServerMessage::Snapshot {
-                    snapshot: crate::daemon::build_snapshot(&[]),
+                &V2ServerMessage::SnapshotAck {
+                    event_id,
+                    accepted_seq: 7,
+                    snapshot_revision: 11,
                 },
             )
             .unwrap();
             stream.write_all(b"\n").unwrap();
-            std::fs::remove_file(server_socket).unwrap();
+        });
+
+        request_topology_refresh_v2(&socket, "scratch").unwrap();
+
+        handle.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn v2_mutation_rejects_mismatched_response_event_id() {
+        let socket = unique_socket_path("vt2-event");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            write_hello_ack(&mut stream, "scratch");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &V2ServerMessage::SnapshotAck {
+                    event_id: EventId::generate().unwrap(),
+                    accepted_seq: 1,
+                    snapshot_revision: 1,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+
+        let error = send_sidebar_key_v2(&socket, "scratch", "down").unwrap_err();
+        assert!(error.to_string().contains("response event ID mismatch"));
+
+        handle.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn v2_subscribe_delivers_only_strictly_increasing_revisions() {
+        let socket = unique_socket_path("vt2-sub");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+                V2ClientMessage::Hello { .. }
+            ));
+            write_hello_ack(&mut stream, "scratch");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+                V2ClientMessage::Subscribe {
+                    proto: PROTOCOL_VERSION
+                }
+            );
+            for revision in [1, 1, 0, 2] {
+                serde_json::to_writer(
+                    &mut stream,
+                    &V2ServerMessage::ResolvedSnapshotResult {
+                        snapshot_revision: revision,
+                        snapshot: empty_resolved_snapshot(revision),
+                    },
+                )
+                .unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+            // Keep the peer open until the client has cleared its finite initial timeout. Closing
+            // during that setsockopt is platform-racy on Darwin and is not representative of a
+            // persistent Subscribe connection.
+            release_rx.recv().unwrap();
         });
         let (tx, rx) = std::sync::mpsc::channel();
 
-        subscribe(&socket, tx).unwrap();
+        subscribe_v2(&socket, "scratch", tx).unwrap();
+        release_tx.send(()).unwrap();
 
-        let snapshot = rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(snapshot.agent_count, 0);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .snapshot_revision,
+            1
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .snapshot_revision,
+            2
+        );
         handle.join().unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn v2_subscribe_rejects_snapshot_revision_mismatch() {
+        let socket = unique_socket_path("vt2-sub-rev");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            write_hello_ack(&mut stream, "scratch");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &V2ServerMessage::ResolvedSnapshotResult {
+                    snapshot_revision: 2,
+                    snapshot: empty_resolved_snapshot(1),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let error = subscribe_v2(&socket, "scratch", tx).unwrap_err();
+        assert!(error.to_string().contains("snapshot revision mismatch"));
+
+        handle.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn v2_sidebar_command_waits_beyond_subscribe_initial_budget() {
+        assert!(V2_SIDEBAR_COMMAND_TIMEOUT > Duration::from_secs(2));
+        let socket = unique_socket_path("vt2-command-budget");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            write_hello_ack(&mut stream, "scratch");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let V2ClientMessage::SidebarCommand { event_id, .. } =
+                serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap()
+            else {
+                panic!("expected sidebar command");
+            };
+            thread::sleep(Duration::from_millis(600));
+            serde_json::to_writer(
+                &mut stream,
+                &V2ServerMessage::SnapshotAck {
+                    event_id,
+                    accepted_seq: 1,
+                    snapshot_revision: 1,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        let started = Instant::now();
+
+        send_sidebar_key_v2(&socket, "scratch", "down").unwrap();
+
+        assert!(started.elapsed() >= V2_SUBSCRIBE_INITIAL_TIMEOUT);
+        handle.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
     }
 
     fn unique_socket_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "{label}-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        static NEXT_SOCKET_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let socket_id = NEXT_SOCKET_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{label}-{}-{socket_id}.sock", std::process::id(),))
     }
 }

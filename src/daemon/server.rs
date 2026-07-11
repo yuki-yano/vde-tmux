@@ -1,27 +1,25 @@
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use super::protocol::{ClientMessage, QueryTarget, ServerMessage};
-use super::runtime::{ClientId, DaemonEvent, LatestSlot, RuntimeEffect, RuntimeState};
-use crate::config::Config;
-use crate::daemon::{build_snapshot, statusline_attention_fallback, statusline_summary_fallback};
-use crate::options::snapshot::read_all_panes;
 use crate::tmux::TmuxRunner;
 
-const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 static SHUTDOWN_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
 const V2_BOOTSTRAP_FIFO_CAPACITY: usize = 64;
+const V2_MUTATION_QUEUE_CAPACITY: usize = 64;
 pub const V2_FRAME_START_TIMEOUT: Duration = Duration::from_secs(2);
 pub const V2_FRAME_BODY_TIMEOUT: Duration = Duration::from_millis(100);
 pub const V2_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -39,6 +37,10 @@ impl V2FrameReader {
 
     pub fn stream_mut(&mut self) -> &mut UnixStream {
         self.reader.get_mut()
+    }
+
+    pub fn into_stream(self) -> UnixStream {
+        self.reader.into_inner()
     }
 }
 
@@ -118,9 +120,19 @@ pub fn write_v2_response(
     stream: &mut UnixStream,
     message: &crate::daemon::protocol::v2::ServerMessage,
 ) -> std::result::Result<(), crate::daemon::protocol::v2::ServerMessage> {
-    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage, encode_response_frame};
+    use crate::daemon::protocol::v2::encode_response_frame;
 
     let frame = encode_response_frame(message)?;
+    write_v2_frame(stream, &frame)
+}
+
+#[allow(clippy::result_large_err)]
+fn write_v2_frame(
+    stream: &mut UnixStream,
+    frame: &[u8],
+) -> std::result::Result<(), crate::daemon::protocol::v2::ServerMessage> {
+    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+
     let deadline = std::time::Instant::now() + V2_RESPONSE_WRITE_TIMEOUT;
     let mut written = 0;
     while written < frame.len() {
@@ -159,34 +171,49 @@ pub struct V2ConnectionState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct V2SequencedMutation {
+pub(crate) struct V2SequencedMutation {
     pub accepted_seq: u64,
     pub mutation: V2AcceptedMutation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
-pub enum V2AcceptedMutation {
+pub(crate) enum V2AcceptedMutation {
     External(crate::daemon::protocol::v2::ClientMessage),
     Internal(V2InternalMutation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum V2InternalMutation {
+pub(crate) enum V2InternalMutation {
     PaneEvent(Box<crate::pane_state::PaneEventEnvelope>),
     RefreshTopology,
-    TargetedPaneRefresh { pane_id: String },
+    TargetedPaneRefresh {
+        pane_id: String,
+    },
     ReconcileViews,
-    SidebarProjection,
-    GitProjection,
+    GitProjection {
+        badges: std::collections::BTreeMap<String, crate::git::GitBadge>,
+        worktrees: std::collections::BTreeMap<String, crate::git::WorktreeInfo>,
+    },
     TriageProjection,
-    DiagnosticProjection,
-    HookHealthProjection,
+    StatusMetadataProjection(Box<super::runtime::StatusProjectionMetadata>),
+    DiagnosticProjection {
+        pane_instance: Option<crate::pane_state::PaneInstance>,
+        message: String,
+    },
+    FrameTooLargeProjection {
+        rejected_revision: u64,
+    },
+    HookHealthProjection {
+        health: crate::daemon::protocol::v2::HookHealth,
+        diagnostic: Option<String>,
+    },
+    SidebarEffectCompleted(SidebarEffectCompletion),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
-pub enum V2Route {
+pub(crate) enum V2Route {
     Response(crate::daemon::protocol::v2::ServerMessage),
     Fatal(crate::daemon::protocol::v2::ServerMessage),
     Query(crate::daemon::protocol::v2::ClientMessage),
@@ -226,6 +253,10 @@ impl V2Router {
         self.phase
     }
 
+    pub fn daemon_instance_id(&self) -> &crate::pane_state::DaemonInstanceId {
+        &self.daemon_instance_id
+    }
+
     #[cfg(test)]
     pub fn set_phase(&mut self, phase: crate::daemon::protocol::v2::DaemonPhase) {
         self.phase = phase;
@@ -243,11 +274,19 @@ impl V2Router {
         self.hook_health = health;
     }
 
+    pub fn hook_health(&self) -> crate::daemon::protocol::v2::HookHealth {
+        self.hook_health
+    }
+
     pub fn is_fatal(&self) -> bool {
         self.fatal
     }
 
-    pub fn route(
+    pub fn mark_fatal(&mut self) {
+        self.fatal = true;
+    }
+
+    pub(crate) fn route(
         &mut self,
         connection: &mut V2ConnectionState,
         message: crate::daemon::protocol::v2::ClientMessage,
@@ -374,7 +413,8 @@ impl V2Router {
         }
     }
 
-    pub fn finish_bootstrap<E>(
+    #[cfg(test)]
+    pub(crate) fn finish_bootstrap<E>(
         &mut self,
         apply_fifo_and_reconcile: impl FnOnce(Vec<V2SequencedMutation>) -> Result<(), E>,
     ) -> Result<(), E> {
@@ -389,7 +429,27 @@ impl V2Router {
         Ok(())
     }
 
-    pub fn accept_internal(&mut self, mutation: V2InternalMutation) -> V2Route {
+    pub(crate) fn take_bootstrap_fifo(&mut self) -> Vec<V2SequencedMutation> {
+        assert_ne!(
+            self.phase,
+            crate::daemon::protocol::v2::DaemonPhase::Serving,
+            "Serving router has no bootstrap FIFO"
+        );
+        self.bootstrap_fifo.drain(..).collect()
+    }
+
+    pub(crate) fn enter_serving_if_bootstrap_empty(&mut self) -> bool {
+        if self.phase == crate::daemon::protocol::v2::DaemonPhase::Hydrating
+            && self.bootstrap_fifo.is_empty()
+        {
+            self.phase = crate::daemon::protocol::v2::DaemonPhase::Serving;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn accept_internal(&mut self, mutation: V2InternalMutation) -> V2Route {
         use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
 
         if self.fatal {
@@ -484,229 +544,3355 @@ fn validate_v2_origin(
     }
 }
 
-pub fn handle_message(
-    runner: &dyn TmuxRunner,
-    config: &Config,
-    message: ClientMessage,
-) -> Result<ServerMessage> {
-    match message {
-        ClientMessage::Query {
-            proto: _,
-            what: QueryTarget::Summary,
-        } => {
-            let text = statusline_summary_fallback(runner, config)?;
-            Ok(ServerMessage::Summary { text })
-        }
-        ClientMessage::Query {
-            proto: _,
-            what: QueryTarget::Attention,
-        } => {
-            let text = statusline_attention_fallback(runner)?;
-            Ok(ServerMessage::Attention { text })
-        }
-        ClientMessage::Subscribe { proto: _ } => {
-            let panes = read_all_panes(runner)?;
-            Ok(ServerMessage::Snapshot {
-                snapshot: build_snapshot(&panes),
-            })
-        }
-        ClientMessage::SidebarEvent { .. } => Ok(ServerMessage::Error {
-            message: "sidebar events require runtime daemon".to_string(),
-        }),
-        ClientMessage::RefreshPanes { .. } => Ok(ServerMessage::Error {
-            message: "refresh_panes requires runtime daemon".to_string(),
-        }),
-        ClientMessage::Shutdown { .. } => Ok(ServerMessage::Error {
-            message: "shutdown requires runtime daemon".to_string(),
-        }),
-    }
+#[derive(Debug)]
+struct ProductionMutation {
+    sequenced: V2SequencedMutation,
+    raw_frame_bytes: usize,
 }
 
-pub fn handle_stream(
-    runner: &dyn TmuxRunner,
-    config: &Config,
-    mut stream: UnixStream,
-) -> Result<()> {
-    let mut line = String::new();
-    {
-        let mut reader = BufReader::new(&mut stream);
-        reader.read_line(&mut line)?;
-    }
-    let response = match serde_json::from_str::<ClientMessage>(line.trim()) {
-        Ok(message) => handle_message(runner, config, message)?,
-        Err(error) => ServerMessage::Error {
-            message: error.to_string(),
-        },
-    };
-    serde_json::to_writer(&mut stream, &response)?;
-    stream.write_all(b"\n")?;
+#[derive(Debug)]
+struct NotificationWorkerJob {
+    pane_id: String,
+    agent: String,
+}
+
+struct SidebarTmuxJob {
+    effect: super::runtime::CanonicalSidebarEffect,
+    expected_pane: crate::pane_state::PaneInstance,
+    original_accepted_seq: u64,
+    event_id: crate::pane_state::EventId,
+    snapshot_revision: u64,
+}
+
+fn enqueue_sidebar_tmux_job(
+    tx: &SyncSender<SidebarTmuxJob>,
+    deferred_responses: &Mutex<BTreeSet<u64>>,
+    job: SidebarTmuxJob,
+) -> std::result::Result<(), crate::daemon::protocol::v2::ErrorCode> {
+    let original_accepted_seq = job.original_accepted_seq;
+    tx.try_send(job).map_err(|error| match error {
+        TrySendError::Full(_) => crate::daemon::protocol::v2::ErrorCode::QueueFull,
+        TrySendError::Disconnected(_) => crate::daemon::protocol::v2::ErrorCode::InternalError,
+    })?;
+    deferred_responses
+        .lock()
+        .expect("deferred response lock poisoned")
+        .insert(original_accepted_seq);
     Ok(())
 }
 
-pub fn handle_stream_with_runtime(
-    tx: Sender<DaemonEvent>,
-    client_id: ClientId,
-    mut stream: UnixStream,
-) -> Result<()> {
-    let mut line = String::new();
-    {
-        let mut reader = BufReader::new(&mut stream);
-        reader.read_line(&mut line)?;
-    }
-    let message = serde_json::from_str::<ClientMessage>(line.trim())?;
-    match message {
-        ClientMessage::Subscribe { proto: _ } => {
-            let slot = Arc::new(LatestSlot::new());
-            tx.send(DaemonEvent::Connect {
-                client_id,
-                slot: slot.clone(),
-            })?;
-            spawn_client_writer(client_id, stream, slot, tx);
-        }
-        ClientMessage::SidebarEvent { proto: _, event } => {
-            tx.send(DaemonEvent::Client { client_id, event })?;
-            write_server_message(&mut stream, &ServerMessage::Ack)?;
-        }
-        ClientMessage::RefreshPanes { proto: _ } => {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            tx.send(DaemonEvent::RefreshPanes { reply: reply_tx })?;
-            let response = reply_rx
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap_or_else(|error| ServerMessage::Error {
-                    message: error.to_string(),
-                });
-            write_server_message(&mut stream, &response)?;
-        }
-        ClientMessage::Shutdown { proto: _ } => {
-            tx.send(DaemonEvent::Shutdown)?;
-            write_server_message(&mut stream, &ServerMessage::Ack)?;
-        }
-        ClientMessage::Query {
-            proto: _,
-            what: QueryTarget::Summary,
-        } => {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            tx.send(DaemonEvent::QuerySummary { reply: reply_tx })?;
-            let response = reply_rx
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap_or_else(|error| ServerMessage::Error {
-                    message: error.to_string(),
-                });
-            write_server_message(&mut stream, &response)?;
-        }
-        ClientMessage::Query {
-            proto: _,
-            what: QueryTarget::Attention,
-        } => {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            tx.send(DaemonEvent::QueryAttention { reply: reply_tx })?;
-            let response = reply_rx
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap_or_else(|error| ServerMessage::Error {
-                    message: error.to_string(),
-                });
-            write_server_message(&mut stream, &response)?;
-        }
-    }
-    Ok(())
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SidebarEffectCompletion {
+    original_accepted_seq: u64,
+    event_id: crate::pane_state::EventId,
+    snapshot_revision: u64,
+    result: SidebarEffectResult,
 }
 
-fn spawn_client_writer(
-    client_id: ClientId,
-    mut stream: UnixStream,
-    slot: Arc<LatestSlot<ServerMessage>>,
-    tx: Sender<DaemonEvent>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SidebarEffectResult {
+    Succeeded,
+    ServerIncarnationMismatch,
+    PaneInstanceMismatch,
+    Failed(String),
+}
+
+enum SidebarStateSave {
+    State(crate::sidebar::state::SidebarState),
+    Flush(Sender<()>),
+}
+
+#[derive(Debug, Default)]
+struct ProductionQueue {
+    items: VecDeque<ProductionMutation>,
+    in_flight: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PublishedResolvedSnapshot {
+    revision: u64,
+    frame: Arc<Vec<u8>>,
+    message: Arc<crate::daemon::protocol::v2::ServerMessage>,
+    terminal: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StatusPushTrigger {
+    Snapshot,
+    RenderClock,
+    Flush,
+}
+
+struct ProductionV2Coordinator {
+    router: Mutex<V2Router>,
+    state: Mutex<Option<super::runtime::CanonicalCoordinatorState>>,
+    queue: Mutex<ProductionQueue>,
+    queue_ready: Condvar,
+    snapshot_cache: Mutex<Option<PublishedResolvedSnapshot>>,
+    snapshot_changed: Condvar,
+    waiters: Mutex<BTreeMap<u64, Sender<crate::daemon::protocol::v2::ServerMessage>>>,
+    deferred_responses: Mutex<BTreeSet<u64>>,
+    shutdown: AtomicBool,
+    shutdown_ready: AtomicBool,
+    incarnation: crate::daemon::lifecycle::TmuxServerIncarnation,
+    env: std::collections::BTreeMap<String, String>,
+    done_clear_on: crate::config::DoneClearOn,
+    notification_tx: Option<SyncSender<NotificationWorkerJob>>,
+    sidebar_tmux_tx: SyncSender<SidebarTmuxJob>,
+    sidebar_completion_rx: Mutex<Option<mpsc::Receiver<SidebarEffectCompletion>>>,
+    sidebar_state_tx: Sender<SidebarStateSave>,
+    status_push: Mutex<crate::daemon::status_push::StatusPushState>,
+    status_push_driver: Mutex<()>,
+    status_push_log: Mutex<()>,
+    status_push_started: Instant,
+}
+
+fn start_notification_worker(command: String) -> SyncSender<NotificationWorkerJob> {
+    start_notification_worker_with_timeout(command, Duration::from_secs(2))
+}
+
+fn start_sidebar_tmux_worker(
+    env: &BTreeMap<String, String>,
+    expected_server: crate::daemon::topology::ServerIdentity,
+) -> (
+    SyncSender<SidebarTmuxJob>,
+    mpsc::Receiver<SidebarEffectCompletion>,
 ) {
-    if let Err(error) = configure_client_writer_stream(&stream) {
-        eprintln!("[vde-tmux] daemon client writer setup error: {error:#}");
-        let _ = tx.send(DaemonEvent::Disconnect { client_id });
-        return;
-    }
+    let (tx, rx) = mpsc::sync_channel::<SidebarTmuxJob>(64);
+    let (completion_tx, completion_rx) = mpsc::channel::<SidebarEffectCompletion>();
+    let socket_name = env
+        .get("VDE_TMUX_SOCKET_NAME")
+        .cloned()
+        .filter(|value| !value.trim().is_empty());
     thread::spawn(move || {
-        while let Some(message) = slot.wait_for_update() {
-            if let Err(error) = write_server_message(&mut stream, &message) {
-                eprintln!("[vde-tmux] daemon client writer error: {error:#}");
-                let _ = tx.send(DaemonEvent::Disconnect { client_id });
+        use crate::daemon::workers::WorkerIo as _;
+
+        while let Ok(job) = rx.recv() {
+            let io = crate::daemon::workers::SystemWorkerIo::new(
+                socket_name.clone(),
+                expected_server.clone(),
+            );
+            let result = match job.effect {
+                super::runtime::CanonicalSidebarEffect::JumpPane(pane_id) => {
+                    debug_assert_eq!(pane_id, job.expected_pane.pane_id);
+                    io.jump_to_pane(&job.expected_pane)
+                }
+                super::runtime::CanonicalSidebarEffect::PreviewPane {
+                    pane_id,
+                    history_lines,
+                } => {
+                    debug_assert_eq!(pane_id, job.expected_pane.pane_id);
+                    io.preview_pane(&job.expected_pane, history_lines)
+                }
+            };
+            let result = match result {
+                Ok(()) => SidebarEffectResult::Succeeded,
+                Err(crate::daemon::workers::SidebarTmuxError::ServerIncarnationMismatch) => {
+                    SidebarEffectResult::ServerIncarnationMismatch
+                }
+                Err(crate::daemon::workers::SidebarTmuxError::PaneInstanceMismatch(_)) => {
+                    SidebarEffectResult::PaneInstanceMismatch
+                }
+                Err(error) => SidebarEffectResult::Failed(error.to_string()),
+            };
+            let _ = completion_tx.send(SidebarEffectCompletion {
+                original_accepted_seq: job.original_accepted_seq,
+                event_id: job.event_id,
+                snapshot_revision: job.snapshot_revision,
+                result,
+            });
+        }
+    });
+    (tx, completion_rx)
+}
+
+fn start_sidebar_state_worker(path: std::path::PathBuf) -> Sender<SidebarStateSave> {
+    let (tx, rx) = mpsc::channel::<SidebarStateSave>();
+    thread::spawn(move || {
+        loop {
+            match rx.recv() {
+                Ok(SidebarStateSave::State(state)) => {
+                    let mut pending = Some(state);
+                    loop {
+                        match rx.recv_timeout(Duration::from_millis(200)) {
+                            Ok(SidebarStateSave::State(state)) => pending = Some(state),
+                            Ok(SidebarStateSave::Flush(reply)) => {
+                                if let Some(state) = pending.take()
+                                    && let Err(error) =
+                                        crate::sidebar::store::save_state(&path, &state)
+                                {
+                                    eprintln!(
+                                        "[vde-tmux] sidebar state persistence failed: {error:#}"
+                                    );
+                                }
+                                let _ = reply.send(());
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                    if let Some(state) = pending.take()
+                        && let Err(error) = crate::sidebar::store::save_state(&path, &state)
+                    {
+                        eprintln!("[vde-tmux] sidebar state persistence failed: {error:#}");
+                    }
+                }
+                Ok(SidebarStateSave::Flush(reply)) => {
+                    let _ = reply.send(());
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    tx
+}
+
+fn start_notification_worker_with_timeout(
+    command: String,
+    timeout: Duration,
+) -> SyncSender<NotificationWorkerJob> {
+    let (sender, receiver) = mpsc::sync_channel::<NotificationWorkerJob>(64);
+    thread::spawn(move || {
+        while let Ok(job) = receiver.recv() {
+            let mut process = Command::new("/bin/sh");
+            process
+                .arg("-c")
+                .arg(&command)
+                .env("VDE_PANE_ID", &job.pane_id)
+                .env("VDE_AGENT", &job.agent)
+                .env("VDE_BADGE_STATE", "Blocked")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            unsafe {
+                process.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let child = process.spawn();
+            let mut child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    eprintln!("[vde-tmux] notification command spawn failed: {error}");
+                    continue;
+                }
+            };
+            let deadline = Instant::now() + timeout;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        if !status.success() {
+                            eprintln!(
+                                "[vde-tmux] notification command exited with status {status}"
+                            );
+                        }
+                        break;
+                    }
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) => {
+                        terminate_notification_process_group(&mut child);
+                        eprintln!("[vde-tmux] notification command timed out after {timeout:?}");
+                        break;
+                    }
+                    Err(error) => {
+                        terminate_notification_process_group(&mut child);
+                        eprintln!("[vde-tmux] notification command wait failed: {error}");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    sender
+}
+
+fn terminate_notification_process_group(child: &mut std::process::Child) {
+    let process_group = -(child.id() as i32);
+    let _ = unsafe { libc::kill(process_group, libc::SIGKILL) };
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+impl ProductionV2Coordinator {
+    fn new(
+        incarnation: crate::daemon::lifecycle::TmuxServerIncarnation,
+        env: std::collections::BTreeMap<String, String>,
+        done_clear_on: crate::config::DoneClearOn,
+        notification_command: Option<String>,
+    ) -> Result<Self> {
+        let notification_tx = notification_command.map(start_notification_worker);
+        let (sidebar_tmux_tx, sidebar_completion_rx) =
+            start_sidebar_tmux_worker(&env, incarnation.identity.clone());
+        let sidebar_state_tx = start_sidebar_state_worker(crate::sidebar::store::state_path(&env));
+        let status_push = crate::daemon::status_push::StatusPushState::new(
+            incarnation.identity.clone(),
+            Duration::ZERO,
+        )
+        .map_err(|error| anyhow::anyhow!("failed to initialize status push state: {error}"))?;
+        Ok(Self {
+            router: Mutex::new(V2Router::new(
+                crate::pane_state::DaemonInstanceId::generate()?,
+                incarnation.hash.clone(),
+            )),
+            state: Mutex::new(None),
+            queue: Mutex::new(ProductionQueue::default()),
+            queue_ready: Condvar::new(),
+            snapshot_cache: Mutex::new(None),
+            snapshot_changed: Condvar::new(),
+            waiters: Mutex::new(BTreeMap::new()),
+            deferred_responses: Mutex::new(BTreeSet::new()),
+            shutdown: AtomicBool::new(false),
+            shutdown_ready: AtomicBool::new(false),
+            incarnation,
+            env,
+            done_clear_on,
+            notification_tx,
+            sidebar_tmux_tx,
+            sidebar_completion_rx: Mutex::new(Some(sidebar_completion_rx)),
+            sidebar_state_tx,
+            status_push: Mutex::new(status_push),
+            status_push_driver: Mutex::new(()),
+            status_push_log: Mutex::new(()),
+            status_push_started: Instant::now(),
+        })
+    }
+
+    fn route_external(
+        &self,
+        connection: &mut V2ConnectionState,
+        message: crate::daemon::protocol::v2::ClientMessage,
+        raw_frame_bytes: usize,
+    ) -> crate::daemon::protocol::v2::ServerMessage {
+        use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+
+        if self.shutdown.load(Ordering::SeqCst) {
+            return ServerMessage::error(
+                ErrorCode::NotReady,
+                "daemon is shutting down",
+                message.event_id().cloned(),
+            );
+        }
+        let mut router = self.router.lock().expect("v2 router lock poisoned");
+        if self.shutdown.load(Ordering::SeqCst) {
+            return ServerMessage::error(
+                ErrorCode::NotReady,
+                "daemon is shutting down",
+                message.event_id().cloned(),
+            );
+        }
+        if router.phase() == crate::daemon::protocol::v2::DaemonPhase::Serving
+            && message.is_mutation()
+        {
+            let queue = self.queue.lock().expect("v2 queue lock poisoned");
+            if queue.items.len() + usize::from(queue.in_flight) >= V2_MUTATION_QUEUE_CAPACITY {
+                return ServerMessage::error(
+                    ErrorCode::QueueFull,
+                    "sequenced mutation queue is full",
+                    message.event_id().cloned(),
+                );
+            }
+        }
+        match router.route(connection, message) {
+            V2Route::Response(response) => response,
+            V2Route::Fatal(response) => {
+                drop(router);
+                self.fail_stop("v2 router entered fatal state");
+                response
+            }
+            V2Route::Query(query) => {
+                drop(router);
+                self.query(query)
+            }
+            V2Route::Mutation(sequenced) => {
+                let view = matches!(
+                    sequenced.mutation,
+                    V2AcceptedMutation::External(
+                        crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent { .. }
+                    )
+                );
+                let accepted_seq = sequenced.accepted_seq;
+                let event_id = match &sequenced.mutation {
+                    V2AcceptedMutation::External(message) => message.event_id().cloned(),
+                    V2AcceptedMutation::Internal(_) => None,
+                };
+                if view {
+                    self.enqueue_without_waiter_locked(sequenced, raw_frame_bytes);
+                    drop(router);
+                    return ServerMessage::ViewQueued {
+                        event_id: event_id.expect("view event has an event ID"),
+                        accepted_seq,
+                    };
+                }
+                let receiver = self.enqueue_locked(sequenced, raw_frame_bytes);
+                drop(router);
+                receiver.recv().unwrap_or_else(|error| {
+                    ServerMessage::error(
+                        ErrorCode::InternalError,
+                        format!("mutation response unavailable: {error}"),
+                        event_id,
+                    )
+                })
+            }
+            V2Route::Queued { accepted_seq } => {
+                let (sender, receiver) = mpsc::channel();
+                self.waiters
+                    .lock()
+                    .expect("v2 waiter lock poisoned")
+                    .insert(accepted_seq, sender);
+                drop(router);
+                receiver.recv().unwrap_or_else(|error| {
+                    ServerMessage::error(
+                        ErrorCode::InternalError,
+                        format!("bootstrap mutation response unavailable: {error}"),
+                        None,
+                    )
+                })
+            }
+            V2Route::DroppedInternal => {
+                ServerMessage::error(ErrorCode::QueueFull, "internal mutation was dropped", None)
+            }
+        }
+    }
+
+    #[allow(clippy::result_large_err)] // The typed protocol error is intentionally returned intact.
+    fn route_subscription(
+        &self,
+        connection: &mut V2ConnectionState,
+        message: crate::daemon::protocol::v2::ClientMessage,
+    ) -> Result<PublishedResolvedSnapshot, crate::daemon::protocol::v2::ServerMessage> {
+        use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err(ServerMessage::error(
+                ErrorCode::NotReady,
+                "daemon is shutting down",
+                None,
+            ));
+        }
+        let mut router = self.router.lock().expect("v2 router lock poisoned");
+        let route = router.route(connection, message);
+        match route {
+            V2Route::Query(crate::daemon::protocol::v2::ClientMessage::Subscribe { .. }) => {
+                drop(router);
+                if self
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned")
+                    .is_none()
+                {
+                    return Err(ServerMessage::error(
+                        ErrorCode::NotReady,
+                        "daemon is hydrating",
+                        None,
+                    ));
+                }
+                self.publish_resolved_snapshot().map_err(|error| {
+                    ServerMessage::error(ErrorCode::InternalError, error.to_string(), None)
+                })
+            }
+            V2Route::Response(response) => Err(response),
+            V2Route::Fatal(response) => {
+                drop(router);
+                self.fail_stop("v2 subscription route entered fatal state");
+                Err(response)
+            }
+            _ => Err(ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                "expected a Subscribe query",
+                None,
+            )),
+        }
+    }
+
+    fn enqueue_locked(
+        &self,
+        sequenced: V2SequencedMutation,
+        raw_frame_bytes: usize,
+    ) -> mpsc::Receiver<crate::daemon::protocol::v2::ServerMessage> {
+        let (sender, receiver) = mpsc::channel();
+        self.waiters
+            .lock()
+            .expect("v2 waiter lock poisoned")
+            .insert(sequenced.accepted_seq, sender);
+        self.queue
+            .lock()
+            .expect("v2 queue lock poisoned")
+            .items
+            .push_back(ProductionMutation {
+                sequenced,
+                raw_frame_bytes,
+            });
+        self.queue_ready.notify_one();
+        receiver
+    }
+
+    fn enqueue_without_waiter_locked(
+        &self,
+        sequenced: V2SequencedMutation,
+        raw_frame_bytes: usize,
+    ) {
+        self.queue
+            .lock()
+            .expect("v2 queue lock poisoned")
+            .items
+            .push_back(ProductionMutation {
+                sequenced,
+                raw_frame_bytes,
+            });
+        self.queue_ready.notify_one();
+    }
+
+    fn query(
+        &self,
+        message: crate::daemon::protocol::v2::ClientMessage,
+    ) -> crate::daemon::protocol::v2::ServerMessage {
+        use crate::daemon::protocol::v2::{ClientMessage, ErrorCode, ServerMessage};
+
+        match message {
+            ClientMessage::QueryResolvedSnapshot { .. } | ClientMessage::Subscribe { .. } => {
+                if self
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned")
+                    .is_none()
+                {
+                    return ServerMessage::error(ErrorCode::NotReady, "daemon is hydrating", None);
+                }
+                match self.publish_resolved_snapshot() {
+                    Ok(published) => (*published.message).clone(),
+                    Err(error) => {
+                        ServerMessage::error(ErrorCode::InternalError, error.to_string(), None)
+                    }
+                }
+            }
+            ClientMessage::QueryPane { pane_id, .. } => {
+                if let Err(error) = crate::daemon::topology::validate_pane_id(&pane_id) {
+                    return ServerMessage::error(
+                        ErrorCode::InvalidRequest,
+                        error.to_string(),
+                        None,
+                    );
+                }
+                {
+                    let state = self.state.lock().expect("canonical state lock poisoned");
+                    let Some(state) = state.as_ref() else {
+                        return ServerMessage::error(
+                            ErrorCode::NotReady,
+                            "daemon is hydrating",
+                            None,
+                        );
+                    };
+                    if let Some(pane) = state.pane_presentation(&pane_id) {
+                        return ServerMessage::PaneResult {
+                            snapshot_revision: state.leased.runtime.snapshot_revision(),
+                            pane,
+                        };
+                    }
+                    if state.leased.runtime.sequenced_mutations_paused() {
+                        return ServerMessage::error(
+                            ErrorCode::NotReady,
+                            "pane refresh is paused while persistence is recovering",
+                            None,
+                        );
+                    }
+                }
+                self.enqueue_internal_and_wait(V2InternalMutation::TargetedPaneRefresh { pane_id })
+            }
+            ClientMessage::QueryStatusSnapshot { context, .. } => {
+                let state = self.state.lock().expect("canonical state lock poisoned");
+                let Some(state) = state.as_ref() else {
+                    return ServerMessage::error(ErrorCode::NotReady, "daemon is hydrating", None);
+                };
+                let snapshot = state.status_snapshot(context);
+                ServerMessage::StatusSnapshotResult {
+                    snapshot_revision: snapshot.snapshot_revision,
+                    snapshot,
+                }
+            }
+            _ => ServerMessage::error(ErrorCode::InvalidRequest, "unsupported query", None),
+        }
+    }
+
+    fn enqueue_internal_and_wait(
+        &self,
+        mutation: V2InternalMutation,
+    ) -> crate::daemon::protocol::v2::ServerMessage {
+        use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+
+        if self.shutdown.load(Ordering::SeqCst) {
+            return ServerMessage::error(ErrorCode::NotReady, "daemon is shutting down", None);
+        }
+        let mut router = self.router.lock().expect("v2 router lock poisoned");
+        if self.shutdown.load(Ordering::SeqCst) {
+            return ServerMessage::error(ErrorCode::NotReady, "daemon is shutting down", None);
+        }
+        let queue = self.queue.lock().expect("v2 queue lock poisoned");
+        if queue.items.len() + usize::from(queue.in_flight) >= V2_MUTATION_QUEUE_CAPACITY {
+            return ServerMessage::error(
+                ErrorCode::QueueFull,
+                "sequenced mutation queue is full",
+                None,
+            );
+        }
+        drop(queue);
+        match router.accept_internal(mutation) {
+            V2Route::Mutation(sequenced) => {
+                let receiver = self.enqueue_locked(sequenced, 0);
+                drop(router);
+                receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap_or_else(|error| {
+                        ServerMessage::error(
+                            ErrorCode::InternalError,
+                            format!("internal mutation response unavailable: {error}"),
+                            None,
+                        )
+                    })
+            }
+            V2Route::Fatal(response) => {
+                drop(router);
+                self.fail_stop("v2 internal route entered fatal state");
+                response
+            }
+            V2Route::Response(response) => response,
+            V2Route::DroppedInternal | V2Route::Queued { .. } => ServerMessage::error(
+                ErrorCode::QueueFull,
+                "internal mutation was not accepted",
+                None,
+            ),
+            V2Route::Query(_) => unreachable!("internal mutation cannot become a query"),
+        }
+    }
+
+    fn enqueue_internal(&self, mutation: V2InternalMutation) -> bool {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut router = self.router.lock().expect("v2 router lock poisoned");
+        if self.shutdown.load(Ordering::SeqCst) {
+            return false;
+        }
+        let queue = self.queue.lock().expect("v2 queue lock poisoned");
+        if queue.items.len() + usize::from(queue.in_flight) >= V2_MUTATION_QUEUE_CAPACITY {
+            return false;
+        }
+        drop(queue);
+        match router.accept_internal(mutation) {
+            V2Route::Mutation(sequenced) => {
+                self.queue
+                    .lock()
+                    .expect("v2 queue lock poisoned")
+                    .items
+                    .push_back(ProductionMutation {
+                        sequenced,
+                        raw_frame_bytes: 0,
+                    });
+                self.queue_ready.notify_one();
+                true
+            }
+            V2Route::Queued { .. } => true,
+            V2Route::Fatal(_) => {
+                drop(router);
+                self.fail_stop("v2 internal route entered fatal state");
+                false
+            }
+            V2Route::DroppedInternal | V2Route::Response(_) | V2Route::Query(_) => false,
+        }
+    }
+
+    fn complete(&self, accepted_seq: u64, response: crate::daemon::protocol::v2::ServerMessage) {
+        if let Some(waiter) = self
+            .waiters
+            .lock()
+            .expect("v2 waiter lock poisoned")
+            .remove(&accepted_seq)
+            && waiter.send(response).is_err()
+        {
+            let _ = self.enqueue_internal(V2InternalMutation::DiagnosticProjection {
+                pane_instance: None,
+                message: format!("mutation_response_disconnected: accepted_seq={accepted_seq}"),
+            });
+        }
+    }
+
+    fn publish_resolved_snapshot(&self) -> Result<PublishedResolvedSnapshot> {
+        let snapshot = {
+            let state = self.state.lock().expect("canonical state lock poisoned");
+            let state = state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("canonical state is not initialized"))?;
+            state.resolved_snapshot()
+        };
+        let revision = snapshot.snapshot_revision;
+        let mut cache = self
+            .snapshot_cache
+            .lock()
+            .expect("snapshot cache lock poisoned");
+        if let Some(published) = cache.as_ref()
+            && published.revision >= revision
+        {
+            return Ok(published.clone());
+        }
+        let candidate = crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+            snapshot_revision: revision,
+            snapshot,
+        };
+        let (message, frame, terminal) =
+            match crate::daemon::protocol::v2::encode_response_frame(&candidate) {
+                Ok(frame) => (candidate, frame, false),
+                Err(
+                    error @ crate::daemon::protocol::v2::ServerMessage::Error {
+                        code: crate::daemon::protocol::v2::ErrorCode::FrameTooLarge,
+                        ..
+                    },
+                ) => {
+                    let frame = crate::daemon::protocol::v2::encode_response_frame(&error)
+                        .map_err(|nested| {
+                            anyhow::anyhow!(
+                                "failed to serialize FrameTooLarge response: {nested:?}"
+                            )
+                        })?;
+                    (error, frame, true)
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to serialize resolved snapshot: {error:?}"
+                    ));
+                }
+            };
+        let published = PublishedResolvedSnapshot {
+            revision,
+            frame: Arc::new(frame),
+            message: Arc::new(message),
+            terminal,
+        };
+        *cache = Some(published.clone());
+        drop(cache);
+        self.snapshot_changed.notify_all();
+        if terminal {
+            let _ = self.enqueue_internal(V2InternalMutation::FrameTooLargeProjection {
+                rejected_revision: revision,
+            });
+        }
+        Ok(published)
+    }
+
+    fn wait_for_snapshot_after(&self, revision: u64) -> Option<PublishedResolvedSnapshot> {
+        let mut cache = self
+            .snapshot_cache
+            .lock()
+            .expect("snapshot cache lock poisoned");
+        loop {
+            if let Some(published) = cache.as_ref()
+                && published.revision > revision
+            {
+                return Some(published.clone());
+            }
+            if self.shutdown.load(Ordering::SeqCst) {
+                return None;
+            }
+            cache = self
+                .snapshot_changed
+                .wait(cache)
+                .expect("snapshot cache lock poisoned while waiting");
+        }
+    }
+
+    fn drive_status_push(&self, trigger: StatusPushTrigger) -> Result<()> {
+        use crate::daemon::status_push::build_display_frame;
+
+        let _driver = self
+            .status_push_driver
+            .lock()
+            .expect("status push driver lock poisoned");
+        let now = self.status_push_started.elapsed();
+        let decision = match trigger {
+            StatusPushTrigger::Flush => self
+                .status_push
+                .lock()
+                .expect("status push lock poisoned")
+                .flush_coalesced(now)
+                .map_err(anyhow::Error::new)?,
+            StatusPushTrigger::Snapshot | StatusPushTrigger::RenderClock => {
+                let (global, sessions, panes, config) = {
+                    let state = self.state.lock().expect("canonical state lock poisoned");
+                    let state = state
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("canonical state is not initialized"))?;
+                    if matches!(trigger, StatusPushTrigger::Snapshot)
+                        && self
+                            .status_push
+                            .lock()
+                            .expect("status push lock poisoned")
+                            .last_snapshot_revision()
+                            == Some(state.leased.runtime.snapshot_revision())
+                    {
+                        return Ok(());
+                    }
+                    let (global, sessions, panes) = state.display_projection();
+                    (global, sessions, panes, state.projection_config.clone())
+                };
+                let frame =
+                    build_display_frame(&config, &global, &sessions, &panes, epoch_seconds())
+                        .map_err(anyhow::Error::new)?;
+                let mut push = self.status_push.lock().expect("status push lock poisoned");
+                match trigger {
+                    StatusPushTrigger::Snapshot => {
+                        push.on_snapshot_revision(global.snapshot_revision, now, frame)
+                    }
+                    StatusPushTrigger::RenderClock => push.on_render_clock(now, frame),
+                    StatusPushTrigger::Flush => unreachable!(),
+                }
+                .map_err(anyhow::Error::new)?
+            }
+        };
+        self.execute_status_push_decision(decision)
+    }
+
+    fn execute_status_push_decision(
+        &self,
+        decision: crate::daemon::status_push::StatusPushDecision,
+    ) -> Result<()> {
+        use crate::daemon::status_push::{
+            BatchExecution, StatusPushDecision, SystemDisplayBatchIo,
+        };
+
+        let StatusPushDecision::Batch(prepared) = decision else {
+            return Ok(());
+        };
+        let runner = self.status_push_runner(Duration::from_secs(1));
+        let mut io = SystemDisplayBatchIo::new(&runner);
+        let result = self
+            .status_push
+            .lock()
+            .expect("status push lock poisoned")
+            .execute_prepared(&prepared, &mut io)
+            .map_err(anyhow::Error::new)?;
+        match result {
+            BatchExecution::Committed => Ok(()),
+            BatchExecution::Failed(error) => {
+                self.log_status_push_error(&format!("status display batch failed: {error}"));
+                Ok(())
+            }
+            BatchExecution::PaneInstanceMismatch(pane) => {
+                self.status_push
+                    .lock()
+                    .expect("status push lock poisoned")
+                    .pane_removed(&pane);
+                self.log_status_push_error(&format!(
+                    "status display pane instance changed: {}:{}",
+                    pane.pane_id, pane.pane_pid
+                ));
+                Ok(())
+            }
+            BatchExecution::ServerIncarnationMismatch => {
+                self.fail_stop("tmux server incarnation changed during status display write");
+                bail!("tmux server incarnation changed during status display write")
+            }
+        }
+    }
+
+    fn write_status_shutdown_projection(&self) {
+        use crate::daemon::status_push::StatusPushDecision;
+
+        if self
+            .state
+            .lock()
+            .expect("canonical state lock poisoned")
+            .is_none()
+        {
+            return;
+        }
+        let _driver = self
+            .status_push_driver
+            .lock()
+            .expect("status push driver lock poisoned");
+        let started = Instant::now();
+        let first = self
+            .status_push
+            .lock()
+            .expect("status push lock poisoned")
+            .request_shutdown(
+                self.status_push_started.elapsed(),
+                "#[fg=yellow]vde daemon stopped#[default]".to_string(),
+            );
+        let mut decision = match first {
+            Ok(decision) => decision,
+            Err(error) => {
+                self.log_status_push_error(&format!(
+                    "failed to prepare status shutdown projection: {error}"
+                ));
+                return;
+            }
+        };
+        loop {
+            if started.elapsed() >= Duration::from_secs(2) {
+                self.log_status_push_error("status shutdown projection exceeded 2 second budget");
+                return;
+            }
+            match decision {
+                StatusPushDecision::Coalesced { ready_at } => {
+                    let now = self.status_push_started.elapsed();
+                    if ready_at > now {
+                        thread::sleep(
+                            (ready_at - now)
+                                .min(Duration::from_millis(100))
+                                .min(Duration::from_secs(2).saturating_sub(started.elapsed())),
+                        );
+                    }
+                }
+                StatusPushDecision::Batch(prepared) => {
+                    if let Err(error) =
+                        self.execute_status_push_decision(StatusPushDecision::Batch(prepared))
+                    {
+                        self.log_status_push_error(&format!(
+                            "failed to write status shutdown projection: {error:#}"
+                        ));
+                    }
+                }
+                StatusPushDecision::WaitingForInFlight => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                StatusPushDecision::Ignored | StatusPushDecision::NoChanges => return,
+            }
+            decision = match self
+                .status_push
+                .lock()
+                .expect("status push lock poisoned")
+                .flush_coalesced(self.status_push_started.elapsed())
+            {
+                Ok(decision) => decision,
+                Err(error) => {
+                    self.log_status_push_error(&format!(
+                        "failed to flush status shutdown projection: {error}"
+                    ));
+                    return;
+                }
+            };
+        }
+    }
+
+    fn status_push_runner(&self, timeout: Duration) -> crate::tmux::SystemTmuxRunner {
+        self.env
+            .get("VDE_TMUX_SOCKET_NAME")
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| crate::tmux::SystemTmuxRunner::with_socket_name(name, Some(timeout)))
+            .unwrap_or_else(|| crate::tmux::SystemTmuxRunner::with_timeout(timeout))
+    }
+
+    fn sync_status_push_topology_targets_locked(&self) {
+        let (sessions, panes) = {
+            let state = self.state.lock().expect("canonical state lock poisoned");
+            let Some(state) = state.as_ref() else {
+                return;
+            };
+            (
+                state
+                    .topology
+                    .panes
+                    .iter()
+                    .flat_map(|pane| {
+                        pane.session_links
+                            .iter()
+                            .map(|link| link.session_id.clone())
+                    })
+                    .collect(),
+                state
+                    .topology
+                    .panes
+                    .iter()
+                    .map(|pane| pane.pane_instance.clone())
+                    .collect(),
+            )
+        };
+        self.status_push
+            .lock()
+            .expect("status push lock poisoned")
+            .retain_topology_targets(&sessions, &panes);
+    }
+
+    fn log_status_push_error(&self, message: &str) {
+        const MAX_LOG_BYTES: u64 = 64 * 1024;
+        let _log = self
+            .status_push_log
+            .lock()
+            .expect("status push log lock poisoned");
+        let base = self
+            .env
+            .get("XDG_RUNTIME_DIR")
+            .filter(|value| !value.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("vde-tmux")
+            .join("status-push.log");
+        if let Some(parent) = base.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            eprintln!("[vde-tmux] {message}");
+            return;
+        }
+        if std::fs::metadata(&base).is_ok_and(|metadata| metadata.len() >= MAX_LOG_BYTES) {
+            let rotated = base.with_extension("log.1");
+            let _ = std::fs::remove_file(&rotated);
+            let _ = std::fs::rename(&base, rotated);
+        }
+        use std::io::Write as _;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&base)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{} {message}", epoch_seconds());
+            }
+            Err(_) => eprintln!("[vde-tmux] {message}"),
+        }
+    }
+
+    fn schedule_sidebar_effect(
+        &self,
+        effect: super::runtime::CanonicalSidebarEffect,
+        original_accepted_seq: u64,
+        event_id: crate::pane_state::EventId,
+        snapshot_revision: u64,
+    ) -> std::result::Result<(), crate::daemon::protocol::v2::ErrorCode> {
+        let pane_id = match &effect {
+            super::runtime::CanonicalSidebarEffect::JumpPane(pane_id)
+            | super::runtime::CanonicalSidebarEffect::PreviewPane { pane_id, .. } => pane_id,
+        };
+        let expected_pane = self
+            .state
+            .lock()
+            .expect("canonical state lock poisoned")
+            .as_ref()
+            .and_then(|state| state.pane_presentation(pane_id))
+            .map(|presentation| presentation.pane_instance)
+            .ok_or(crate::daemon::protocol::v2::ErrorCode::StaleSelection)?;
+        enqueue_sidebar_tmux_job(
+            &self.sidebar_tmux_tx,
+            &self.deferred_responses,
+            SidebarTmuxJob {
+                effect,
+                expected_pane,
+                original_accepted_seq,
+                event_id,
+                snapshot_revision,
+            },
+        )
+    }
+
+    fn is_deferred_response(&self, accepted_seq: u64) -> bool {
+        self.deferred_responses
+            .lock()
+            .expect("deferred response lock poisoned")
+            .contains(&accepted_seq)
+    }
+
+    fn finish_deferred_response(&self, accepted_seq: u64) {
+        self.deferred_responses
+            .lock()
+            .expect("deferred response lock poisoned")
+            .remove(&accepted_seq);
+    }
+
+    fn save_sidebar_state(&self, state: crate::sidebar::state::SidebarState) {
+        if self
+            .sidebar_state_tx
+            .send(SidebarStateSave::State(state))
+            .is_err()
+        {
+            eprintln!("[vde-tmux] sidebar state persistence worker stopped");
+        }
+    }
+
+    fn flush_sidebar_state(&self) {
+        let (reply, response) = mpsc::channel();
+        if self
+            .sidebar_state_tx
+            .send(SidebarStateSave::Flush(reply))
+            .is_ok()
+        {
+            let _ = response.recv_timeout(Duration::from_secs(1));
+        }
+    }
+
+    fn fail_stop(&self, message: impl Into<String>) {
+        let message = message.into();
+        let snapshot_cache = self
+            .snapshot_cache
+            .lock()
+            .expect("snapshot cache lock poisoned");
+        let first_shutdown = !self.shutdown.swap(true, Ordering::SeqCst);
+        self.shutdown_ready.store(true, Ordering::SeqCst);
+        self.snapshot_changed.notify_all();
+        drop(snapshot_cache);
+        if first_shutdown {
+            eprintln!("[vde-tmux] canonical daemon fail-stop: {message}");
+        }
+        self.router
+            .lock()
+            .expect("v2 router lock poisoned")
+            .mark_fatal();
+        self.queue
+            .lock()
+            .expect("v2 queue lock poisoned")
+            .items
+            .clear();
+        let waiters = std::mem::take(&mut *self.waiters.lock().expect("v2 waiter lock poisoned"));
+        for (_, waiter) in waiters {
+            let _ = waiter.send(crate::daemon::protocol::v2::ServerMessage::error(
+                crate::daemon::protocol::v2::ErrorCode::InternalError,
+                format!("daemon fail-stopped: {message}"),
+                None,
+            ));
+        }
+        self.queue_ready.notify_all();
+    }
+
+    fn begin_graceful_shutdown(&self, current_accepted_seq: u64) {
+        self.begin_shutdown(Some(current_accepted_seq));
+    }
+
+    fn begin_signal_shutdown(&self) {
+        self.begin_shutdown(None);
+        self.mark_shutdown_ready();
+    }
+
+    fn begin_shutdown(&self, current_accepted_seq: Option<u64>) {
+        self.flush_sidebar_state();
+        self.write_status_shutdown_projection();
+        let snapshot_cache = self
+            .snapshot_cache
+            .lock()
+            .expect("snapshot cache lock poisoned");
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.snapshot_changed.notify_all();
+        drop(snapshot_cache);
+        self.router
+            .lock()
+            .expect("v2 router lock poisoned")
+            .mark_fatal();
+        self.queue
+            .lock()
+            .expect("v2 queue lock poisoned")
+            .items
+            .clear();
+        let mut waiters = self.waiters.lock().expect("v2 waiter lock poisoned");
+        let current = current_accepted_seq.and_then(|accepted_seq| {
+            waiters
+                .remove(&accepted_seq)
+                .map(|waiter| (accepted_seq, waiter))
+        });
+        let abandoned = std::mem::take(&mut *waiters);
+        if let Some((accepted_seq, current)) = current {
+            waiters.insert(accepted_seq, current);
+        }
+        drop(waiters);
+        for (_, waiter) in abandoned {
+            let _ = waiter.send(crate::daemon::protocol::v2::ServerMessage::error(
+                crate::daemon::protocol::v2::ErrorCode::NotReady,
+                "daemon is shutting down",
+                None,
+            ));
+        }
+        self.queue_ready.notify_all();
+    }
+
+    fn mark_shutdown_ready(&self) {
+        let snapshot_cache = self
+            .snapshot_cache
+            .lock()
+            .expect("snapshot cache lock poisoned");
+        self.shutdown_ready.store(true, Ordering::SeqCst);
+        self.snapshot_changed.notify_all();
+        drop(snapshot_cache);
+    }
+
+    fn wait_for_shutdown(&self) {
+        let mut snapshot_cache = self
+            .snapshot_cache
+            .lock()
+            .expect("snapshot cache lock poisoned");
+        while !self.shutdown_ready.load(Ordering::SeqCst) {
+            snapshot_cache = self
+                .snapshot_changed
+                .wait(snapshot_cache)
+                .expect("snapshot cache lock poisoned while waiting for shutdown");
+        }
+    }
+}
+
+fn handle_v2_runtime_stream(
+    coordinator: Arc<ProductionV2Coordinator>,
+    stream: UnixStream,
+) -> Result<()> {
+    let mut connection = V2FrameReader::new(stream);
+    let frame = match read_v2_request_frame(&mut connection) {
+        Ok(frame) => frame,
+        Err(response) => {
+            let _ = write_v2_response(connection.stream_mut(), &response);
+            return Ok(());
+        }
+    };
+    let mut connection_state = V2ConnectionState::default();
+    let message = match crate::daemon::protocol::v2::decode_request_frame(&frame) {
+        Ok(message) => message,
+        Err(response) => {
+            let _ = write_v2_response(connection.stream_mut(), &response);
+            return Ok(());
+        }
+    };
+    let response = coordinator.route_external(&mut connection_state, message, frame.len());
+    write_v2_response(connection.stream_mut(), &response)
+        .map_err(|error| anyhow::anyhow!("failed to write v2 handshake: {error:?}"))?;
+    if !matches!(
+        response,
+        crate::daemon::protocol::v2::ServerMessage::HelloAck { .. }
+    ) {
+        return Ok(());
+    }
+
+    let frame = match read_v2_request_frame(&mut connection) {
+        Ok(frame) => frame,
+        Err(response) => {
+            let _ = write_v2_response(connection.stream_mut(), &response);
+            return Ok(());
+        }
+    };
+    let message = match crate::daemon::protocol::v2::decode_request_frame(&frame) {
+        Ok(message) => message,
+        Err(response) => {
+            let _ = write_v2_response(connection.stream_mut(), &response);
+            return Ok(());
+        }
+    };
+    let subscribe = matches!(
+        &message,
+        crate::daemon::protocol::v2::ClientMessage::Subscribe { .. }
+    );
+    if subscribe {
+        let published = match coordinator.route_subscription(&mut connection_state, message) {
+            Ok(published) => published,
+            Err(response) => {
+                let _ = write_v2_response(connection.stream_mut(), &response);
+                return Ok(());
+            }
+        };
+        if let Err(error) = write_v2_frame(connection.stream_mut(), &published.frame) {
+            let _ = coordinator.enqueue_internal(V2InternalMutation::DiagnosticProjection {
+                pane_instance: None,
+                message: format!("subscriber_initial_write_failed: {error:?}"),
+            });
+            return Ok(());
+        }
+        if published.terminal {
+            return Ok(());
+        }
+        return stream_v2_subscription(coordinator, connection.into_stream(), published.revision);
+    }
+    let response = coordinator.route_external(&mut connection_state, message, frame.len());
+    let _ = write_v2_response(connection.stream_mut(), &response);
+    Ok(())
+}
+
+fn stream_v2_subscription(
+    coordinator: Arc<ProductionV2Coordinator>,
+    mut stream: UnixStream,
+    mut last_revision: u64,
+) -> Result<()> {
+    while let Some(published) = coordinator.wait_for_snapshot_after(last_revision) {
+        if let Err(error) = write_v2_frame(&mut stream, &published.frame) {
+            let _ = coordinator.enqueue_internal(V2InternalMutation::DiagnosticProjection {
+                pane_instance: None,
+                message: format!(
+                    "subscriber_write_failed: after_revision={last_revision} error={error:?}"
+                ),
+            });
+            break;
+        }
+        last_revision = published.revision;
+        if published.terminal {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn start_v2_mutation_worker(coordinator: Arc<ProductionV2Coordinator>) {
+    thread::spawn(move || {
+        loop {
+            let mutation = {
+                let mut queue = coordinator.queue.lock().expect("v2 queue lock poisoned");
+                while queue.items.is_empty() && !coordinator.shutdown.load(Ordering::SeqCst) {
+                    queue = coordinator
+                        .queue_ready
+                        .wait(queue)
+                        .expect("v2 queue lock poisoned while waiting");
+                }
+                if coordinator.shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                queue.in_flight = true;
+                queue.items.pop_front()
+            };
+            let Some(mutation) = mutation else {
+                continue;
+            };
+            debug_assert!(mutation.raw_frame_bytes <= crate::pane_state::MAX_REQUEST_FRAME_BYTES);
+            let accepted_seq = mutation.sequenced.accepted_seq;
+            let graceful_shutdown = matches!(
+                &mutation.sequenced.mutation,
+                V2AcceptedMutation::External(
+                    crate::daemon::protocol::v2::ClientMessage::Shutdown { .. }
+                )
+            );
+            let changes_topology_targets = mutation_changes_topology_targets(&mutation.sequenced);
+            let status_driver = changes_topology_targets.then(|| {
+                coordinator
+                    .status_push_driver
+                    .lock()
+                    .expect("status push driver lock poisoned")
+            });
+            let response = apply_production_mutation(&coordinator, mutation.sequenced);
+            if changes_topology_targets {
+                coordinator.sync_status_push_topology_targets_locked();
+            }
+            drop(status_driver);
+            if let Err(error) = coordinator.publish_resolved_snapshot() {
+                coordinator.fail_stop(error.to_string());
+            }
+            if !coordinator.is_deferred_response(accepted_seq) {
+                coordinator.complete(accepted_seq, response);
+            }
+            if graceful_shutdown {
+                coordinator.mark_shutdown_ready();
+            }
+            let mut queue = coordinator.queue.lock().expect("v2 queue lock poisoned");
+            queue.in_flight = false;
+            coordinator.queue_ready.notify_all();
+        }
+    });
+}
+
+fn start_sidebar_completion_forwarder(coordinator: Arc<ProductionV2Coordinator>) {
+    let receiver = coordinator
+        .sidebar_completion_rx
+        .lock()
+        .expect("sidebar completion receiver lock poisoned")
+        .take()
+        .expect("sidebar completion forwarder started once");
+    thread::spawn(move || {
+        while let Ok(completion) = receiver.recv() {
+            if coordinator.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            if !coordinator.enqueue_internal(V2InternalMutation::SidebarEffectCompleted(completion))
+            {
+                coordinator
+                    .fail_stop("sidebar completion could not enter sequenced mutation queue");
                 break;
             }
         }
     });
 }
 
-fn configure_client_writer_stream(stream: &UnixStream) -> Result<()> {
-    stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
-    Ok(())
+fn mutation_changes_topology_targets(mutation: &V2SequencedMutation) -> bool {
+    match &mutation.mutation {
+        V2AcceptedMutation::External(
+            crate::daemon::protocol::v2::ClientMessage::RefreshPanes { .. }
+            | crate::daemon::protocol::v2::ClientMessage::RefreshTopology { .. },
+        )
+        | V2AcceptedMutation::Internal(
+            V2InternalMutation::RefreshTopology | V2InternalMutation::TargetedPaneRefresh { .. },
+        ) => true,
+        V2AcceptedMutation::External(
+            crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent { envelope, .. },
+        ) => {
+            matches!(
+                envelope.event,
+                crate::pane_state::PaneEvent::PaneRemoved { .. }
+            )
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::PaneEvent(envelope)) => matches!(
+            envelope.event,
+            crate::pane_state::PaneEvent::PaneRemoved { .. }
+        ),
+        _ => false,
+    }
 }
 
-fn write_server_message(stream: &mut UnixStream, message: &ServerMessage) -> Result<()> {
-    serde_json::to_writer(&mut *stream, message)?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    Ok(())
+fn start_canonical_observation_worker(coordinator: Arc<ProductionV2Coordinator>, poll: Duration) {
+    thread::spawn(move || {
+        let capture_io = crate::daemon::workers::SystemObservationWorkerIo::new(
+            coordinator
+                .env
+                .get("VDE_TMUX_SOCKET_NAME")
+                .cloned()
+                .filter(|value| !value.trim().is_empty()),
+        );
+        let mut last_hook_check = Instant::now();
+        while !coordinator.shutdown.load(Ordering::SeqCst) {
+            let dispatch = {
+                let state_guard = coordinator
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned");
+                let Some(state) = state_guard.as_ref() else {
+                    thread::sleep(poll);
+                    continue;
+                };
+                let mut panes = state
+                    .topology
+                    .panes
+                    .iter()
+                    .map(|pane| pane.pane_instance.clone())
+                    .collect::<Vec<_>>();
+                panes.extend(state.leased.runtime.tracked_panes());
+                panes.sort();
+                panes.dedup();
+                state.leased.runtime.freeze_observation_dispatch(panes)
+            };
+            let daemon_instance_id = coordinator
+                .router
+                .lock()
+                .expect("v2 router lock poisoned")
+                .daemon_instance_id()
+                .clone();
+            let topology = match query_full_topology(&coordinator, Duration::from_secs(1)) {
+                Ok(topology) => topology,
+                Err(error) if error.requires_daemon_exit() => {
+                    coordinator.fail_stop(error.to_string());
+                    break;
+                }
+                Err(error) => {
+                    for snapshot in &dispatch {
+                        match crate::daemon::workers::observation_envelope(
+                            daemon_instance_id.clone(),
+                            snapshot.pane_instance.clone(),
+                            snapshot.base.clone(),
+                            &snapshot.tracker,
+                            epoch_seconds(),
+                            crate::pane_state::AgentPresenceObservation::Unknown,
+                            None,
+                        ) {
+                            Ok(envelope) => {
+                                let _ = coordinator.enqueue_internal(
+                                    V2InternalMutation::PaneEvent(Box::new(envelope)),
+                                );
+                            }
+                            Err(build_error) => {
+                                coordinator.fail_stop(build_error.to_string());
+                                return;
+                            }
+                        }
+                    }
+                    let pane = dispatch
+                        .first()
+                        .map(|snapshot| snapshot.pane_instance.clone());
+                    let _ =
+                        coordinator.enqueue_internal(V2InternalMutation::DiagnosticProjection {
+                            pane_instance: pane,
+                            message: format!("observation_topology_failed: {error}"),
+                        });
+                    thread::sleep(poll);
+                    continue;
+                }
+            };
+            let status_metadata =
+                match query_status_projection_metadata(&coordinator, Duration::from_secs(1)) {
+                    Ok(metadata) => Some(metadata),
+                    Err(error) if error.requires_daemon_exit() => {
+                        coordinator.fail_stop(error.to_string());
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = coordinator.enqueue_internal(
+                            V2InternalMutation::DiagnosticProjection {
+                                pane_instance: None,
+                                message: format!("status_metadata_query_failed: {error}"),
+                            },
+                        );
+                        None
+                    }
+                };
+            let processes =
+                crate::daemon::workers::read_agent_process_snapshot(Duration::from_secs(1));
+            match crate::daemon::workers::run_observation_poll(
+                &capture_io,
+                &dispatch,
+                &processes,
+                &daemon_instance_id,
+                &coordinator.incarnation.identity,
+                epoch_seconds(),
+            ) {
+                Ok(result) => {
+                    let _ = coordinator.enqueue_internal(V2InternalMutation::RefreshTopology);
+                    if let Some(metadata) = status_metadata {
+                        let _ = coordinator.enqueue_internal(
+                            V2InternalMutation::StatusMetadataProjection(Box::new(metadata)),
+                        );
+                    }
+                    for envelope in result.envelopes {
+                        if !coordinator
+                            .enqueue_internal(V2InternalMutation::PaneEvent(Box::new(envelope)))
+                        {
+                            break;
+                        }
+                    }
+                    let current = topology
+                        .panes
+                        .iter()
+                        .map(|pane| pane.pane_instance.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    match crate::daemon::workers::pane_removal_envelopes(
+                        &daemon_instance_id,
+                        &dispatch,
+                        &current,
+                        true,
+                    ) {
+                        Ok(removals) => {
+                            for envelope in removals {
+                                if !coordinator.enqueue_internal(V2InternalMutation::PaneEvent(
+                                    Box::new(envelope),
+                                )) {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let _ = coordinator.enqueue_internal(
+                                V2InternalMutation::DiagnosticProjection {
+                                    pane_instance: dispatch
+                                        .first()
+                                        .map(|snapshot| snapshot.pane_instance.clone()),
+                                    message: format!("pane_removal_build_failed: {error}"),
+                                },
+                            );
+                        }
+                    }
+                    for message in result.diagnostics {
+                        let _ = coordinator.enqueue_internal(
+                            V2InternalMutation::DiagnosticProjection {
+                                pane_instance: dispatch
+                                    .first()
+                                    .map(|snapshot| snapshot.pane_instance.clone()),
+                                message,
+                            },
+                        );
+                    }
+                    let _ = coordinator.enqueue_internal(V2InternalMutation::TriageProjection);
+                    let _ = coordinator.enqueue_internal(V2InternalMutation::ReconcileViews);
+                }
+                Err(error) if error.requires_daemon_exit() => {
+                    coordinator.fail_stop(error.to_string());
+                    break;
+                }
+                Err(error) => {
+                    let _ =
+                        coordinator.enqueue_internal(V2InternalMutation::DiagnosticProjection {
+                            pane_instance: dispatch
+                                .first()
+                                .map(|snapshot| snapshot.pane_instance.clone()),
+                            message: format!("observation_poll_failed: {error}"),
+                        });
+                }
+            }
+            if last_hook_check.elapsed() >= Duration::from_secs(10) {
+                let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(1));
+                match crate::daemon::view_hooks::monitor_hooks(
+                    &runner,
+                    &coordinator.incarnation.identity,
+                ) {
+                    Ok(health) => {
+                        let _ = coordinator.enqueue_internal(
+                            V2InternalMutation::HookHealthProjection {
+                                health,
+                                diagnostic: None,
+                            },
+                        );
+                    }
+                    Err(crate::daemon::view_hooks::HookError::ServerMismatch) => {
+                        coordinator
+                            .fail_stop("tmux server incarnation changed during hook monitor");
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = coordinator.enqueue_internal(
+                            V2InternalMutation::HookHealthProjection {
+                                health: crate::daemon::protocol::v2::HookHealth::Degraded,
+                                diagnostic: Some(format!("hook_health_degraded: {error}")),
+                            },
+                        );
+                    }
+                }
+                last_hook_check = Instant::now();
+            }
+            thread::sleep(poll);
+        }
+    });
 }
 
-pub fn run_daemon_server(
-    runner: &dyn TmuxRunner,
-    config: &Config,
-    socket_path: &Path,
-) -> Result<()> {
-    let Some((listener, _instance_lock)) = bind_daemon_listener(socket_path)? else {
-        return Ok(());
+fn start_canonical_git_worker(coordinator: Arc<ProductionV2Coordinator>, poll: Duration) {
+    thread::spawn(move || {
+        let git = crate::daemon::workers::system_git_runner(Duration::from_millis(500));
+        while !coordinator.shutdown.load(Ordering::SeqCst) {
+            let paths = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned")
+                .as_ref()
+                .map(|state| {
+                    state
+                        .resolved_snapshot()
+                        .panes
+                        .into_iter()
+                        .filter(|pane| pane.resolved.is_some())
+                        .map(|pane| pane.current_path)
+                        .filter(|path| !path.trim().is_empty())
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            let badges =
+                crate::git::collect_git_badges_for_paths(&git, paths.iter().map(String::as_str));
+            let worktrees = crate::git::collect_worktree_infos_for_paths(
+                &git,
+                paths.iter().map(String::as_str),
+            );
+            let _ = coordinator
+                .enqueue_internal(V2InternalMutation::GitProjection { badges, worktrees });
+            let started = Instant::now();
+            while started.elapsed() < poll && !coordinator.shutdown.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(100).min(poll));
+            }
+        }
+    });
+}
+
+fn start_status_push_worker(coordinator: Arc<ProductionV2Coordinator>) {
+    thread::spawn(move || {
+        while !coordinator.shutdown.load(Ordering::SeqCst) {
+            for trigger in [
+                StatusPushTrigger::Snapshot,
+                StatusPushTrigger::RenderClock,
+                StatusPushTrigger::Flush,
+            ] {
+                if let Err(error) = coordinator.drive_status_push(trigger) {
+                    if coordinator.shutdown.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    coordinator.log_status_push_error(&format!(
+                        "status display projection failed: {error:#}"
+                    ));
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+}
+
+fn apply_production_mutation(
+    coordinator: &ProductionV2Coordinator,
+    sequenced: V2SequencedMutation,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    use crate::daemon::protocol::v2::{ClientMessage, ErrorCode, ServerMessage};
+
+    let accepted_seq = sequenced.accepted_seq;
+    let response = match sequenced.mutation {
+        V2AcceptedMutation::External(ClientMessage::SubmitPaneEvent { envelope, .. }) => {
+            apply_external_pane_event(coordinator, accepted_seq, envelope)
+        }
+        V2AcceptedMutation::External(ClientMessage::SubmitViewEvent { event, .. }) => {
+            apply_external_view_event(coordinator, accepted_seq, event)
+        }
+        V2AcceptedMutation::External(ClientMessage::RefreshPanes { event_id, .. })
+        | V2AcceptedMutation::External(ClientMessage::RefreshTopology { event_id, .. }) => {
+            match refresh_full_topology(coordinator) {
+                Ok(revision) => ServerMessage::SnapshotAck {
+                    event_id,
+                    accepted_seq,
+                    snapshot_revision: revision,
+                },
+                Err(error) => production_store_error_response(coordinator, error, Some(event_id)),
+            }
+        }
+        V2AcceptedMutation::External(ClientMessage::ResetPaneState {
+            event_id,
+            pane_instance,
+            expected,
+            ..
+        }) => apply_reset(coordinator, accepted_seq, event_id, pane_instance, expected),
+        V2AcceptedMutation::External(ClientMessage::CleanupLegacyState { event_id, .. }) => {
+            apply_legacy_cleanup(coordinator, accepted_seq, event_id)
+        }
+        V2AcceptedMutation::External(ClientMessage::SidebarCommand {
+            event_id, command, ..
+        }) => match command {
+            crate::daemon::protocol::v2::SidebarCommand::MarkDone {
+                pane_instance,
+                expected,
+            } => {
+                let envelope = crate::pane_state::PaneEventEnvelope {
+                    daemon_instance_id: coordinator
+                        .router
+                        .lock()
+                        .expect("v2 router lock poisoned")
+                        .daemon_instance_id()
+                        .clone(),
+                    event_id,
+                    pane_instance,
+                    agent: None,
+                    agent_session_id: None,
+                    event: crate::pane_state::PaneEvent::MarkDone {
+                        expected,
+                        completed_at: epoch_seconds(),
+                    },
+                };
+                apply_external_pane_event(coordinator, accepted_seq, envelope)
+            }
+            crate::daemon::protocol::v2::SidebarCommand::Key { key } => {
+                apply_sidebar_ui_command(coordinator, accepted_seq, event_id, |state| {
+                    state.apply_sidebar_key(&key)
+                })
+            }
+            crate::daemon::protocol::v2::SidebarCommand::JumpPane { pane_id } => {
+                let exists = coordinator
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned")
+                    .as_ref()
+                    .is_some_and(|state| state.pane_presentation(&pane_id).is_some());
+                if !exists {
+                    ServerMessage::error(
+                        ErrorCode::StaleSelection,
+                        format!("sidebar pane selection is stale: {pane_id}"),
+                        Some(event_id),
+                    )
+                } else {
+                    apply_sidebar_ui_command(coordinator, accepted_seq, event_id, |state| {
+                        let mut result = state.select_sidebar_context(Some(&pane_id), None)?;
+                        result.effect = Some(super::runtime::CanonicalSidebarEffect::JumpPane(
+                            pane_id.clone(),
+                        ));
+                        Ok(result)
+                    })
+                }
+            }
+            crate::daemon::protocol::v2::SidebarCommand::SelectContext {
+                pane_id,
+                session_id,
+            } => apply_sidebar_ui_command(coordinator, accepted_seq, event_id, |state| {
+                state.select_sidebar_context(pane_id.as_deref(), session_id.as_deref())
+            }),
+        },
+        V2AcceptedMutation::External(ClientMessage::UninstallHooks { event_id, .. }) => {
+            let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
+            match crate::daemon::view_hooks::uninstall_hooks(
+                &runner,
+                &coordinator.incarnation.identity,
+            ) {
+                Ok(()) => ServerMessage::HooksUninstalled {
+                    event_id,
+                    accepted_seq,
+                },
+                Err(error) => ServerMessage::error(
+                    ErrorCode::HookCollision,
+                    error.to_string(),
+                    Some(event_id),
+                ),
+            }
+        }
+        V2AcceptedMutation::External(ClientMessage::Shutdown { event_id, .. }) => {
+            coordinator.begin_graceful_shutdown(accepted_seq);
+            ServerMessage::ShutdownAccepted {
+                event_id,
+                accepted_seq,
+            }
+        }
+        V2AcceptedMutation::External(
+            ClientMessage::Hello { .. }
+            | ClientMessage::QueryResolvedSnapshot { .. }
+            | ClientMessage::QueryStatusSnapshot { .. }
+            | ClientMessage::QueryPane { .. }
+            | ClientMessage::Subscribe { .. },
+        ) => unreachable!("v2 router cannot sequence a read-only request"),
+        V2AcceptedMutation::Internal(V2InternalMutation::TargetedPaneRefresh { pane_id }) => {
+            targeted_pane_refresh_response(coordinator, &pane_id)
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::RefreshTopology) => {
+            match refresh_full_topology(coordinator) {
+                Ok(revision) => ServerMessage::SnapshotAck {
+                    event_id: crate::pane_state::EventId::generate()
+                        .expect("OS random source failed after daemon startup"),
+                    accepted_seq,
+                    snapshot_revision: revision,
+                },
+                Err(error) => production_store_error_response(coordinator, error, None),
+            }
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::ReconcileViews) => {
+            match initial_view_reconciliation(coordinator) {
+                Ok(()) => {
+                    let revision = coordinator
+                        .state
+                        .lock()
+                        .expect("canonical state lock poisoned")
+                        .as_ref()
+                        .map_or(0, |state| state.leased.runtime.snapshot_revision());
+                    ServerMessage::SnapshotAck {
+                        event_id: crate::pane_state::EventId::generate()
+                            .expect("OS random source failed after daemon startup"),
+                        accepted_seq,
+                        snapshot_revision: revision,
+                    }
+                }
+                Err(error) => {
+                    ServerMessage::error(ErrorCode::InternalError, error.to_string(), None)
+                }
+            }
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::PaneEvent(envelope)) => {
+            apply_external_pane_event(coordinator, accepted_seq, *envelope)
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::DiagnosticProjection {
+            pane_instance,
+            message,
+        }) => {
+            let mut state_guard = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned");
+            let state = state_guard
+                .as_mut()
+                .expect("state initialized before diagnostic");
+            let result = if let Some(pane) = pane_instance {
+                state.leased.runtime.add_diagnostic(pane, message)
+            } else {
+                state
+                    .add_global_diagnostic(ErrorCode::InternalError, message)
+                    .map(|_| ())
+            };
+            if let Err(error) = result {
+                return production_store_error_response(coordinator, error, None);
+            }
+            ServerMessage::SnapshotAck {
+                event_id: crate::pane_state::EventId::generate()
+                    .expect("OS random source failed after daemon startup"),
+                accepted_seq,
+                snapshot_revision: state.leased.runtime.snapshot_revision(),
+            }
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::FrameTooLargeProjection {
+            rejected_revision,
+        }) => {
+            let mut state_guard = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned");
+            let state = state_guard
+                .as_mut()
+                .expect("state initialized before frame-size diagnostic");
+            if let Err(error) = state.record_frame_too_large_diagnostic(rejected_revision) {
+                return production_store_error_response(coordinator, error, None);
+            }
+            ServerMessage::SnapshotAck {
+                event_id: crate::pane_state::EventId::generate()
+                    .expect("OS random source failed after daemon startup"),
+                accepted_seq,
+                snapshot_revision: state.leased.runtime.snapshot_revision(),
+            }
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::HookHealthProjection {
+            health,
+            diagnostic,
+        }) => {
+            let mut state_guard = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned");
+            let state = state_guard
+                .as_mut()
+                .expect("state initialized before hook health projection");
+            if let Err(error) = state.set_hook_health(health, diagnostic) {
+                return production_store_error_response(coordinator, error, None);
+            }
+            coordinator
+                .router
+                .lock()
+                .expect("v2 router lock poisoned")
+                .set_hook_health(health);
+            ServerMessage::SnapshotAck {
+                event_id: crate::pane_state::EventId::generate()
+                    .expect("OS random source failed after daemon startup"),
+                accepted_seq,
+                snapshot_revision: state.leased.runtime.snapshot_revision(),
+            }
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::SidebarEffectCompleted(completion)) => {
+            let fail_stop = matches!(
+                completion.result,
+                SidebarEffectResult::ServerIncarnationMismatch
+            );
+            let original_response = match completion.result {
+                SidebarEffectResult::Succeeded => ServerMessage::SnapshotAck {
+                    event_id: completion.event_id.clone(),
+                    accepted_seq: completion.original_accepted_seq,
+                    snapshot_revision: completion.snapshot_revision,
+                },
+                SidebarEffectResult::PaneInstanceMismatch => ServerMessage::error(
+                    ErrorCode::StaleSelection,
+                    "sidebar pane selection became stale before tmux mutation",
+                    Some(completion.event_id.clone()),
+                ),
+                SidebarEffectResult::ServerIncarnationMismatch => ServerMessage::error(
+                    ErrorCode::InternalError,
+                    "tmux server incarnation changed during sidebar command",
+                    Some(completion.event_id.clone()),
+                ),
+                SidebarEffectResult::Failed(message) => {
+                    eprintln!("[vde-tmux] sidebar tmux command failed: {message}");
+                    ServerMessage::error(
+                        ErrorCode::InternalError,
+                        message,
+                        Some(completion.event_id.clone()),
+                    )
+                }
+            };
+            coordinator.finish_deferred_response(completion.original_accepted_seq);
+            coordinator.complete(completion.original_accepted_seq, original_response);
+            if fail_stop {
+                coordinator.fail_stop("tmux server incarnation changed during sidebar command");
+            }
+            let snapshot_revision = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned")
+                .as_ref()
+                .map_or(0, |state| state.leased.runtime.snapshot_revision());
+            ServerMessage::SnapshotAck {
+                event_id: completion.event_id,
+                accepted_seq,
+                snapshot_revision,
+            }
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::TriageProjection) => {
+            let mut state_guard = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned");
+            let state = state_guard
+                .as_mut()
+                .expect("state initialized before triage projection");
+            if let Err(error) = state.leased.runtime.advance_poll_projection() {
+                return production_store_error_response(coordinator, error, None);
+            }
+            ServerMessage::SnapshotAck {
+                event_id: crate::pane_state::EventId::generate()
+                    .expect("OS random source failed after daemon startup"),
+                accepted_seq,
+                snapshot_revision: state.leased.runtime.snapshot_revision(),
+            }
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::StatusMetadataProjection(metadata)) => {
+            let mut state_guard = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned");
+            let state = state_guard
+                .as_mut()
+                .expect("state initialized before status metadata projection");
+            if let Err(error) = state.replace_status_metadata(*metadata) {
+                return production_store_error_response(coordinator, error, None);
+            }
+            ServerMessage::SnapshotAck {
+                event_id: crate::pane_state::EventId::generate()
+                    .expect("OS random source failed after daemon startup"),
+                accepted_seq,
+                snapshot_revision: state.leased.runtime.snapshot_revision(),
+            }
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::GitProjection { badges, worktrees }) => {
+            let mut state_guard = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned");
+            let state = state_guard
+                .as_mut()
+                .expect("state initialized before git projection");
+            if let Err(error) = state.replace_git_projection(badges, worktrees) {
+                return production_store_error_response(coordinator, error, None);
+            }
+            ServerMessage::SnapshotAck {
+                event_id: crate::pane_state::EventId::generate()
+                    .expect("OS random source failed after daemon startup"),
+                accepted_seq,
+                snapshot_revision: state.leased.runtime.snapshot_revision(),
+            }
+        }
     };
-    for stream in listener.incoming() {
-        let stream = stream?;
-        if let Err(error) = handle_stream(runner, config, stream) {
-            eprintln!("[vde-tmux] daemon connection error: {error:#}");
+    if let ServerMessage::Error {
+        code: ErrorCode::InternalError,
+        message,
+        ..
+    } = &response
+        && coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned")
+            .as_ref()
+            .is_some_and(|state| state.leased.runtime.is_fail_stopped())
+    {
+        coordinator.fail_stop(message.clone());
+    }
+    response
+}
+
+fn apply_sidebar_ui_command(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    event_id: crate::pane_state::EventId,
+    apply: impl FnOnce(
+        &mut super::runtime::CanonicalCoordinatorState,
+    ) -> std::result::Result<
+        super::runtime::CanonicalSidebarMutationResult,
+        crate::pane_state::StoreError,
+    >,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    use crate::daemon::protocol::v2::ServerMessage;
+
+    let (result, state_to_save) = {
+        let mut state_guard = coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned");
+        let state = state_guard
+            .as_mut()
+            .expect("state initialized before sidebar command");
+        let result = match apply(state) {
+            Ok(result) => result,
+            Err(error) => {
+                return production_store_error_response(coordinator, error, Some(event_id));
+            }
+        };
+        let state_to_save = result.state_changed.then(|| state.ui_state.clone());
+        (result, state_to_save)
+    };
+    if let Some(state) = state_to_save {
+        coordinator.save_sidebar_state(state);
+    }
+    if let Some(effect) = result.effect
+        && let Err(code) = coordinator.schedule_sidebar_effect(
+            effect,
+            accepted_seq,
+            event_id.clone(),
+            result.snapshot_revision,
+        )
+    {
+        return ServerMessage::error(
+            code,
+            "sidebar tmux command queue is unavailable",
+            Some(event_id),
+        );
+    }
+    ServerMessage::SnapshotAck {
+        event_id,
+        accepted_seq,
+        snapshot_revision: result.snapshot_revision,
+    }
+}
+
+fn apply_external_pane_event(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    envelope: crate::pane_state::PaneEventEnvelope,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    use crate::daemon::protocol::v2::{PaneApplyOutcome, ServerMessage};
+    use crate::pane_state::store::{PendingResolution, StoreError};
+
+    let event_id = envelope.event_id.clone();
+    if let crate::pane_state::PaneEvent::PaneRemoved { expected } = &envelope.event {
+        return apply_pane_removal(
+            coordinator,
+            accepted_seq,
+            event_id,
+            envelope.pane_instance,
+            expected.clone(),
+        );
+    }
+    let (visibility, visibility_diagnostic) =
+        match completion_visibility_for_event(coordinator, &envelope) {
+            Ok(value) => value,
+            Err(error) => {
+                coordinator.fail_stop(error.to_string());
+                return production_store_error_response(coordinator, error, Some(event_id));
+            }
+        };
+    let mut clock = crate::pane_state::store::SystemRecoveryClock::start();
+    let (initial, revision_before) = {
+        let mut state_guard = coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned");
+        let Some(state) = state_guard.as_mut() else {
+            return crate::daemon::protocol::v2::ServerMessage::error(
+                crate::daemon::protocol::v2::ErrorCode::NotReady,
+                "daemon is hydrating",
+                Some(event_id),
+            );
+        };
+        let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
+        let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
+            &runner,
+            coordinator.incarnation.identity.pid,
+            coordinator.incarnation.identity.start_time,
+        );
+        let revision_before = state.leased.runtime.snapshot_revision();
+        let initial = state.leased.runtime.apply_event(
+            &mut io,
+            &mut clock,
+            &envelope,
+            &visibility,
+            coordinator.done_clear_on,
+        );
+        let initial = initial.and_then(|result| {
+            finish_pane_event_projection(
+                coordinator,
+                state,
+                &envelope.pane_instance,
+                visibility_diagnostic.as_deref(),
+                revision_before,
+                result,
+            )
+        });
+        (initial, revision_before)
+    };
+    let result = match initial {
+        Ok(result) => Ok(result),
+        Err(StoreError::PersistPending) => loop {
+            thread::sleep(crate::pane_state::store::STORE_RECOVERY_RETRY_INTERVAL);
+            let resolved = {
+                let mut state_guard = coordinator
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned");
+                let state = state_guard
+                    .as_mut()
+                    .expect("state initialized before recovery");
+                let timeout = bounded_recovery_timeout(
+                    state.leased.runtime.pending_recovery_remaining(&clock),
+                );
+                let runner = crate::tmux::SystemTmuxRunner::from_env(timeout);
+                let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
+                    &runner,
+                    coordinator.incarnation.identity.pid,
+                    coordinator.incarnation.identity.start_time,
+                );
+                match state.leased.runtime.resolve_pending(&mut io, &clock) {
+                    Ok(PendingResolution::Applied(result)) => finish_pane_event_projection(
+                        coordinator,
+                        state,
+                        &envelope.pane_instance,
+                        visibility_diagnostic.as_deref(),
+                        revision_before,
+                        result,
+                    )
+                    .map(PendingResolution::Applied),
+                    other => other,
+                }
+            };
+            match resolved {
+                Ok(PendingResolution::StillPending) => continue,
+                Ok(PendingResolution::Applied(result)) => break Ok(result),
+                Ok(PendingResolution::Reset(_)) => unreachable!("pane event cannot resolve reset"),
+                Err(error) => break Err(error),
+            }
+        },
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(result) => ServerMessage::PaneEventResult {
+            event_id,
+            accepted_seq,
+            state_version: result.state_version,
+            snapshot_revision: result.snapshot_revision,
+            outcome: if result.outcome
+                == crate::pane_state::reducer::ReductionOutcome::CanonicalChanged
+            {
+                PaneApplyOutcome::Committed
+            } else {
+                PaneApplyOutcome::Noop
+            },
+        },
+        Err(error) => {
+            if error.requires_daemon_exit() {
+                coordinator.fail_stop(error.to_string());
+            }
+            production_store_error_response(coordinator, error, Some(event_id))
         }
     }
-    Ok(())
+}
+
+fn finish_pane_event_projection(
+    coordinator: &ProductionV2Coordinator,
+    state: &mut super::runtime::CanonicalCoordinatorState,
+    pane: &crate::pane_state::PaneInstance,
+    visibility_diagnostic: Option<&str>,
+    revision_before: u64,
+    mut result: crate::pane_state::store::ApplyResult,
+) -> Result<crate::pane_state::store::ApplyResult, crate::pane_state::store::StoreError> {
+    let mut messages = visibility_diagnostic
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for notification in state.leased.runtime.drain_notification_jobs() {
+        let agent = match state.leased.runtime.record(&notification.pane_instance) {
+            Some(crate::pane_state::StoredPaneRecord::Active(active))
+                if active.version() == notification.state_version =>
+            {
+                active.agent.as_str().to_string()
+            }
+            _ => {
+                messages.push(format!(
+                    "notification_target_missing: pane={} state={:?}",
+                    notification.pane_instance.pane_id, notification.state_version
+                ));
+                continue;
+            }
+        };
+        let Some(sender) = coordinator.notification_tx.as_ref() else {
+            continue;
+        };
+        let job = NotificationWorkerJob {
+            pane_id: notification.pane_instance.pane_id.clone(),
+            agent,
+        };
+        if let Err(error) = sender.try_send(job) {
+            let reason = match error {
+                TrySendError::Full(_) => "queue_full",
+                TrySendError::Disconnected(_) => "worker_disconnected",
+            };
+            messages.push(format!(
+                "notification_dispatch_failed: pane={} reason={reason}",
+                notification.pane_instance.pane_id
+            ));
+        }
+    }
+    result.snapshot_revision = state.leased.runtime.finish_sequenced_projection(
+        Some(pane),
+        messages,
+        false,
+        revision_before,
+    )?;
+    Ok(result)
+}
+
+fn apply_pane_removal(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    event_id: crate::pane_state::EventId,
+    pane: crate::pane_state::PaneInstance,
+    expected: Option<crate::pane_state::StoredStateDescriptor>,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    use crate::daemon::protocol::v2::{PaneApplyOutcome, ServerMessage};
+    let topology = match query_full_topology(coordinator, Duration::from_millis(100)) {
+        Ok(topology) => topology,
+        Err(error) => {
+            if error.requires_daemon_exit() {
+                coordinator.fail_stop(error.to_string());
+            }
+            return ServerMessage::error(
+                crate::daemon::protocol::v2::ErrorCode::InternalError,
+                error.to_string(),
+                Some(event_id),
+            );
+        }
+    };
+    let still_present = topology
+        .panes
+        .iter()
+        .any(|current| current.pane_instance == pane);
+    let mut state_guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let state = state_guard
+        .as_mut()
+        .expect("state initialized before pane removal");
+    let topology_changed = state.topology != topology;
+    state.topology = topology;
+    if still_present {
+        if topology_changed && let Err(error) = state.leased.runtime.mark_projection_changed() {
+            return production_store_error_response(coordinator, error, Some(event_id));
+        }
+        return ServerMessage::PaneEventResult {
+            event_id,
+            accepted_seq,
+            state_version: state
+                .leased
+                .runtime
+                .record(&pane)
+                .and_then(|record| match record {
+                    crate::pane_state::StoredPaneRecord::Active(state) => Some(state.version()),
+                    crate::pane_state::StoredPaneRecord::Reset(_) => None,
+                }),
+            snapshot_revision: state.leased.runtime.snapshot_revision(),
+            outcome: PaneApplyOutcome::Noop,
+        };
+    }
+    let removed = match state
+        .leased
+        .runtime
+        .remove_absent_pane(&pane, expected.as_ref())
+    {
+        Ok(removed) => removed,
+        Err(error) => {
+            return production_store_error_response(coordinator, error, Some(event_id));
+        }
+    };
+    if topology_changed
+        && !removed
+        && let Err(error) = state.leased.runtime.mark_projection_changed()
+    {
+        return production_store_error_response(coordinator, error, Some(event_id));
+    }
+    ServerMessage::PaneEventResult {
+        event_id,
+        accepted_seq,
+        state_version: None,
+        snapshot_revision: state.leased.runtime.snapshot_revision(),
+        outcome: if removed {
+            PaneApplyOutcome::Committed
+        } else {
+            PaneApplyOutcome::Noop
+        },
+    }
+}
+
+fn completion_visibility_for_event(
+    coordinator: &ProductionV2Coordinator,
+    envelope: &crate::pane_state::PaneEventEnvelope,
+) -> Result<
+    (crate::pane_state::VisibilitySnapshot, Option<String>),
+    crate::pane_state::store::StoreError,
+> {
+    use crate::pane_state::{
+        AgentPresenceObservation, CaptureInference, LifecycleState, PaneEvent, ReportedLifecycle,
+        StoredPaneRecord,
+    };
+
+    let (current, tracker) = {
+        let state_guard = coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned");
+        let state = state_guard.as_ref();
+        let current = state
+            .and_then(|state| state.leased.runtime.record(&envelope.pane_instance))
+            .and_then(|record| match record {
+                StoredPaneRecord::Active(state) => Some(state.clone()),
+                StoredPaneRecord::Reset(_) => None,
+            });
+        let tracker = state
+            .map(|state| state.leased.runtime.tracker(&envelope.pane_instance))
+            .unwrap_or_default();
+        (current, tracker)
+    };
+    let may_complete = match &envelope.event {
+        PaneEvent::CompleteRun { .. } => current.as_ref().is_none_or(|state| {
+            state.run_seq > state.completed_seq || state.synthetic_completion_armed
+        }),
+        PaneEvent::ExplicitStateReported { report }
+            if matches!(report.lifecycle, Some(ReportedLifecycle::Idle)) =>
+        {
+            current
+                .as_ref()
+                .map_or(report.completed_at.is_some() || report.attention, |state| {
+                    state.run_seq > state.completed_seq
+                        || (state.synthetic_completion_armed
+                            && (report.completed_at.is_some() || report.attention))
+                })
+        }
+        PaneEvent::ObservationBatch {
+            presence, capture, ..
+        } => current.as_ref().is_some_and(|state| {
+            let absence_evidence = match presence {
+                AgentPresenceObservation::Absent => true,
+                AgentPresenceObservation::Present(kind) => kind != &state.agent,
+                AgentPresenceObservation::Unknown => false,
+            };
+            let confirmed_absence_can_complete = absence_evidence
+                && tracker.absence_count >= 1
+                && state.scan_verified
+                && !matches!(state.lifecycle, LifecycleState::Idle);
+            let stale_capture_can_complete =
+                matches!(
+                    capture,
+                    Some(crate::pane_state::CaptureObservation {
+                        inference: CaptureInference::StaleRunCompleted,
+                        ..
+                    })
+                ) && matches!(state.lifecycle, LifecycleState::Running);
+            confirmed_absence_can_complete || stale_capture_can_complete
+        }),
+        _ => false,
+    };
+    if !may_complete {
+        return Ok((crate::pane_state::VisibilitySnapshot::default(), None));
+    }
+    let io = crate::daemon::view_hooks::SystemFreshVisibilityIo::new(
+        coordinator
+            .env
+            .get("VDE_TMUX_SOCKET_NAME")
+            .cloned()
+            .filter(|value| !value.trim().is_empty()),
+        coordinator.incarnation.identity.clone(),
+    );
+    match crate::daemon::view_hooks::completion_visibility(&io, &envelope.pane_instance) {
+        Ok(result) => Ok((result.snapshot, result.diagnostic)),
+        Err(error) => Err(crate::pane_state::store::StoreError::FailStop(
+            error.to_string(),
+        )),
+    }
+}
+
+fn apply_external_view_event(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    event: crate::pane_state::ViewEvent,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    use crate::daemon::protocol::v2::{
+        ErrorCode, PaneMutationFailure, ServerMessage, ViewApplyResult,
+    };
+    use crate::pane_state::store::{ViewBatchApplyResult, ViewBatchProgress};
+
+    let event_id = event.event_id.clone();
+    let scoped_refresh = match scoped_view_refresh(coordinator, &event) {
+        Ok(refresh) => refresh,
+        Err(error) if error.1 => {
+            coordinator.fail_stop(error.0.clone());
+            return ServerMessage::error(ErrorCode::InternalError, error.0, Some(event_id));
+        }
+        Err(_) => crate::daemon::view_hooks::ScopedViewRefresh::QueryFailed,
+    };
+    let mut state_guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let Some(state) = state_guard.as_mut() else {
+        return ServerMessage::error(ErrorCode::NotReady, "daemon is hydrating", Some(event_id));
+    };
+    let records = state.records_snapshot();
+    let revision_before = state.leased.runtime.snapshot_revision();
+    let mut next_views = state.views.clone();
+    let processing = match crate::daemon::view_hooks::process_view_event(
+        &mut next_views,
+        &event,
+        scoped_refresh,
+        coordinator.done_clear_on,
+        &records,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            return ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                error.to_string(),
+                Some(event_id),
+            );
+        }
+    };
+    let diagnostic_pane = event
+        .occurrence
+        .as_ref()
+        .map(|occurrence| occurrence.active_pane.clone())
+        .or_else(|| {
+            state
+                .topology
+                .panes
+                .first()
+                .map(|pane| pane.pane_instance.clone())
+        });
+    let registry_changed = processing.registry_changed;
+    let diagnostics = processing.diagnostics;
+    if processing.acknowledgements.is_empty() {
+        state.views = next_views;
+        let revision = match state.leased.runtime.finish_sequenced_projection(
+            diagnostic_pane.as_ref(),
+            diagnostics,
+            registry_changed,
+            revision_before,
+        ) {
+            Ok(revision) => revision,
+            Err(error) => {
+                return production_store_error_response(coordinator, error, Some(event_id));
+            }
+        };
+        let result = if revision == revision_before {
+            ViewApplyResult::Noop {
+                snapshot_revision: revision,
+            }
+        } else {
+            ViewApplyResult::TopologyOnly {
+                snapshot_revision: revision,
+            }
+        };
+        return ServerMessage::ViewResult {
+            event_id,
+            accepted_seq,
+            result,
+        };
+    }
+    let mut clock = crate::pane_state::store::SystemRecoveryClock::start();
+    let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
+    let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
+        &runner,
+        coordinator.incarnation.identity.pid,
+        coordinator.incarnation.identity.start_time,
+    );
+    let mut progress = state.leased.runtime.apply_view_acknowledgement_batch(
+        &mut io,
+        &mut clock,
+        &processing.acknowledgements,
+        coordinator.done_clear_on,
+    );
+    loop {
+        match progress {
+            ViewBatchProgress::Complete(mut result) => {
+                let state = state_guard
+                    .as_mut()
+                    .expect("state initialized after view batch");
+                state.views = next_views;
+                result.snapshot_revision = match state.leased.runtime.finish_sequenced_projection(
+                    diagnostic_pane.as_ref(),
+                    diagnostics,
+                    registry_changed,
+                    revision_before,
+                ) {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        return production_store_error_response(coordinator, error, Some(event_id));
+                    }
+                };
+                return ServerMessage::ViewResult {
+                    event_id,
+                    accepted_seq,
+                    result: view_result(result),
+                };
+            }
+            ViewBatchProgress::Pending(continuation) => {
+                drop(state_guard);
+                thread::sleep(crate::pane_state::store::STORE_RECOVERY_RETRY_INTERVAL);
+                state_guard = coordinator
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned");
+                let state = state_guard
+                    .as_mut()
+                    .expect("state initialized during view recovery");
+                let timeout =
+                    bounded_recovery_timeout(continuation.pending_recovery_remaining(&clock));
+                let runner = crate::tmux::SystemTmuxRunner::from_env(timeout);
+                let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
+                    &runner,
+                    coordinator.incarnation.identity.pid,
+                    coordinator.incarnation.identity.start_time,
+                );
+                progress = state.leased.runtime.resume_view_acknowledgement_batch(
+                    &mut io,
+                    &mut clock,
+                    continuation,
+                );
+            }
+            ViewBatchProgress::Blocked(error) => {
+                return production_store_error_response(coordinator, error, Some(event_id));
+            }
+            ViewBatchProgress::Fatal(error) => {
+                coordinator.fail_stop(error.to_string());
+                return production_store_error_response(coordinator, error, Some(event_id));
+            }
+        }
+    }
+
+    fn view_result(result: ViewBatchApplyResult) -> ViewApplyResult {
+        if result.failed.is_empty() {
+            if result.committed == 0 {
+                ViewApplyResult::Noop {
+                    snapshot_revision: result.snapshot_revision,
+                }
+            } else {
+                ViewApplyResult::Committed {
+                    snapshot_revision: result.snapshot_revision,
+                    panes: result.committed,
+                }
+            }
+        } else {
+            ViewApplyResult::Partial {
+                snapshot_revision: result.snapshot_revision,
+                committed: result.committed,
+                failed: result
+                    .failed
+                    .into_iter()
+                    .map(|failure| PaneMutationFailure {
+                        pane_instance: failure.pane_instance,
+                        code: store_error_code(&failure.error),
+                        message: failure.error.to_string(),
+                    })
+                    .collect(),
+            }
+        }
+    }
+}
+
+fn scoped_view_refresh(
+    coordinator: &ProductionV2Coordinator,
+    event: &crate::pane_state::ViewEvent,
+) -> std::result::Result<crate::daemon::view_hooks::ScopedViewRefresh, (String, bool)> {
+    use crate::daemon::view_hooks::ScopedViewRefresh;
+    use crate::pane_state::ViewHookKind;
+
+    let topology = query_full_topology(coordinator, Duration::from_millis(100))
+        .map_err(|error| (error.to_string(), error.requires_daemon_exit()))?;
+    let witnesses = query_client_witnesses(coordinator, Duration::from_millis(100))
+        .map_err(|error| (error.to_string(), error.requires_daemon_exit()))?;
+    let occurrence = event.occurrence.as_ref();
+    let window_id = occurrence.map(|value| value.window_id.as_str());
+    let window = window_id.and_then(|window_id| {
+        let panes = topology
+            .panes
+            .iter()
+            .filter(|pane| pane.window_id == window_id)
+            .map(|pane| pane.pane_instance.clone())
+            .collect::<Vec<_>>();
+        let active = topology
+            .panes
+            .iter()
+            .find(|pane| pane.window_id == window_id && pane.active)
+            .map(|pane| pane.pane_instance.clone());
+        active.map(|active_pane| (window_id.to_string(), active_pane, panes))
+    });
+    match event.hook_kind {
+        ViewHookKind::WindowPaneChanged => window
+            .map(
+                |(window_id, active_pane, observed_panes)| ScopedViewRefresh::Window {
+                    window_id,
+                    active_pane,
+                    observed_panes,
+                },
+            )
+            .ok_or_else(|| ("view window is no longer present".to_string(), false)),
+        ViewHookKind::SessionWindowChanged => {
+            let session_id = occurrence
+                .map(|value| value.session_id.clone())
+                .ok_or_else(|| ("view session occurrence is missing".to_string(), false))?;
+            let current_window = topology.panes.iter().find_map(|pane| {
+                pane.session_links
+                    .iter()
+                    .any(|link| link.session_id == session_id && link.window_active)
+                    .then(|| pane.window_id.clone())
+            });
+            let current_window = current_window
+                .ok_or_else(|| ("view session is no longer present".to_string(), false))?;
+            let observed_panes = topology
+                .panes
+                .iter()
+                .filter(|pane| pane.window_id == current_window)
+                .map(|pane| pane.pane_instance.clone())
+                .collect::<Vec<_>>();
+            let active_pane = topology
+                .panes
+                .iter()
+                .find(|pane| pane.window_id == current_window && pane.active)
+                .map(|pane| pane.pane_instance.clone())
+                .ok_or_else(|| ("view session active pane is missing".to_string(), false))?;
+            Ok(ScopedViewRefresh::Session {
+                session_id,
+                window_id: current_window,
+                active_pane,
+                observed_panes,
+            })
+        }
+        ViewHookKind::ClientSessionChanged | ViewHookKind::ClientAttached => {
+            let client_pid = event
+                .source_client
+                .as_ref()
+                .map(|source| source.client_pid)
+                .ok_or_else(|| ("view source client is missing".to_string(), false))?;
+            let witness = witnesses
+                .into_iter()
+                .find(|witness| witness.client_pid == client_pid)
+                .ok_or_else(|| ("view source client is no longer present".to_string(), false))?;
+            let observed_panes = topology
+                .panes
+                .iter()
+                .filter(|pane| pane.window_id == witness.window_id)
+                .map(|pane| pane.pane_instance.clone())
+                .collect();
+            Ok(ScopedViewRefresh::Client {
+                witness,
+                observed_panes,
+            })
+        }
+        ViewHookKind::ClientDetached => {
+            let client_pid = event
+                .source_client
+                .as_ref()
+                .map(|source| source.client_pid)
+                .ok_or_else(|| ("detached client PID is missing".to_string(), false))?;
+            if let Some(witness) = witnesses
+                .into_iter()
+                .find(|value| value.client_pid == client_pid)
+            {
+                let observed_panes = topology
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.window_id == witness.window_id)
+                    .map(|pane| pane.pane_instance.clone())
+                    .collect();
+                Ok(ScopedViewRefresh::Client {
+                    witness,
+                    observed_panes,
+                })
+            } else {
+                Ok(ScopedViewRefresh::ClientAbsent { client_pid })
+            }
+        }
+    }
+}
+
+fn apply_reset(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    event_id: crate::pane_state::EventId,
+    pane: crate::pane_state::PaneInstance,
+    expected: crate::pane_state::StoredStateDescriptor,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    use crate::daemon::protocol::v2::{ResetOutcome, ServerMessage};
+    use crate::pane_state::store::{PendingResolution, StoreError};
+
+    let previous = expected.clone();
+    let tombstone_id = match crate::pane_state::ResetTombstoneId::generate() {
+        Ok(value) => value,
+        Err(error) => {
+            return production_store_error_response(
+                coordinator,
+                StoreError::Random(error.to_string()),
+                Some(event_id),
+            );
+        }
+    };
+    let mut clock = crate::pane_state::store::SystemRecoveryClock::start();
+    let initial = {
+        let mut state_guard = coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned");
+        let Some(state) = state_guard.as_mut() else {
+            return crate::daemon::protocol::v2::ServerMessage::error(
+                crate::daemon::protocol::v2::ErrorCode::NotReady,
+                "daemon is hydrating",
+                Some(event_id),
+            );
+        };
+        let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
+        let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
+            &runner,
+            coordinator.incarnation.identity.pid,
+            coordinator.incarnation.identity.start_time,
+        );
+        state.leased.runtime.reset(
+            &mut io,
+            &mut clock,
+            &pane,
+            &expected,
+            epoch_seconds(),
+            tombstone_id,
+        )
+    };
+    let current = match initial {
+        Ok(current) => Ok(current),
+        Err(StoreError::PersistPending) => loop {
+            thread::sleep(crate::pane_state::store::STORE_RECOVERY_RETRY_INTERVAL);
+            let resolution = {
+                let mut state_guard = coordinator
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned");
+                let state = state_guard
+                    .as_mut()
+                    .expect("state initialized during reset recovery");
+                let timeout = bounded_recovery_timeout(
+                    state.leased.runtime.pending_recovery_remaining(&clock),
+                );
+                let runner = crate::tmux::SystemTmuxRunner::from_env(timeout);
+                let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
+                    &runner,
+                    coordinator.incarnation.identity.pid,
+                    coordinator.incarnation.identity.start_time,
+                );
+                state.leased.runtime.resolve_pending(&mut io, &clock)
+            };
+            match resolution {
+                Ok(PendingResolution::StillPending) => continue,
+                Ok(PendingResolution::Reset(current)) => break Ok(current),
+                Ok(PendingResolution::Applied(_)) => {
+                    unreachable!("reset cannot resolve pane event")
+                }
+                Err(error) => break Err(error),
+            }
+        },
+        Err(error) => Err(error),
+    };
+    match current {
+        Ok(current) => {
+            let revision = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned")
+                .as_ref()
+                .expect("state initialized after reset")
+                .leased
+                .runtime
+                .snapshot_revision();
+            ServerMessage::ResetResult {
+                event_id,
+                accepted_seq,
+                previous: previous.clone(),
+                current: current.clone(),
+                outcome: if current == previous {
+                    ResetOutcome::AlreadyReset
+                } else {
+                    ResetOutcome::Replaced
+                },
+                snapshot_revision: revision,
+            }
+        }
+        Err(error) => {
+            if error.requires_daemon_exit() {
+                coordinator.fail_stop(error.to_string());
+            }
+            production_store_error_response(coordinator, error, Some(event_id))
+        }
+    }
+}
+
+const LEGACY_CLEANUP_SERVER_MISMATCH_SENTINEL: &str = "__vde_legacy_cleanup_server_mismatch__";
+const LEGACY_CLEANUP_PANE_MISMATCH_PREFIX: &str = "__vde_legacy_cleanup_pane_mismatch__";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyCleanupItem {
+    scope: &'static str,
+    target: String,
+    option: &'static str,
+    pane_pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyCleanupOutcome {
+    attempted: u64,
+    removed: u64,
+    failed: Vec<crate::daemon::protocol::v2::LegacyCleanupFailure>,
+    server_mismatch: bool,
+}
+
+fn legacy_cleanup_items(
+    topology: &crate::daemon::topology::TopologySnapshot,
+) -> Vec<LegacyCleanupItem> {
+    use crate::options::{
+        LEGACY_PANE_OPTION_KEYS, LEGACY_SESSION_OPTION_KEYS, LEGACY_WINDOW_OPTION_KEYS,
+    };
+
+    let mut panes = topology
+        .panes
+        .iter()
+        .map(|pane| pane.pane_instance.clone())
+        .collect::<Vec<_>>();
+    panes.sort();
+    panes.dedup();
+    let sessions = topology
+        .panes
+        .iter()
+        .flat_map(|pane| {
+            pane.session_links
+                .iter()
+                .map(|link| link.session_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let windows = topology
+        .panes
+        .iter()
+        .map(|pane| pane.window_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    panes
+        .into_iter()
+        .flat_map(|pane| {
+            LEGACY_PANE_OPTION_KEYS
+                .iter()
+                .copied()
+                .map(move |option| LegacyCleanupItem {
+                    scope: "pane",
+                    target: pane.pane_id.clone(),
+                    option,
+                    pane_pid: Some(pane.pane_pid),
+                })
+        })
+        .chain(sessions.into_iter().flat_map(|target| {
+            LEGACY_SESSION_OPTION_KEYS
+                .iter()
+                .copied()
+                .map(move |option| LegacyCleanupItem {
+                    scope: "session",
+                    target: target.clone(),
+                    option,
+                    pane_pid: None,
+                })
+        }))
+        .chain(windows.into_iter().flat_map(|target| {
+            LEGACY_WINDOW_OPTION_KEYS
+                .iter()
+                .copied()
+                .map(move |option| LegacyCleanupItem {
+                    scope: "window",
+                    target: target.clone(),
+                    option,
+                    pane_pid: None,
+                })
+        }))
+        .collect()
+}
+
+fn legacy_cleanup_command(item: &LegacyCleanupItem, index: usize) -> String {
+    let mut unset = vec!["set-option".to_string()];
+    match item.scope {
+        "pane" => unset.extend(["-p".to_string(), "-u".to_string()]),
+        "session" => unset.push("-u".to_string()),
+        "window" => unset.extend(["-w".to_string(), "-u".to_string()]),
+        _ => unreachable!("legacy cleanup scope is fixed"),
+    }
+    unset.extend([
+        "-t".to_string(),
+        item.target.clone(),
+        item.option.to_string(),
+    ]);
+    let unset = crate::pane_state::store::tmux_command_string(&unset);
+    let Some(pane_pid) = item.pane_pid else {
+        return unset;
+    };
+    crate::pane_state::store::tmux_command_string(&[
+        "if-shell".to_string(),
+        "-F".to_string(),
+        "-t".to_string(),
+        item.target.clone(),
+        format!("#{{==:#{{pane_pid}},{pane_pid}}}"),
+        unset,
+        format!("display-message -p '{LEGACY_CLEANUP_PANE_MISMATCH_PREFIX}:{index}'"),
+    ])
+}
+
+fn execute_legacy_cleanup(
+    runner: &dyn crate::tmux::TmuxRunner,
+    expected_server: &crate::daemon::topology::ServerIdentity,
+    items: &[LegacyCleanupItem],
+) -> LegacyCleanupOutcome {
+    let attempted = u64::try_from(items.len()).unwrap_or(u64::MAX);
+    if items.is_empty() {
+        return LegacyCleanupOutcome {
+            attempted,
+            removed: 0,
+            failed: Vec::new(),
+            server_mismatch: false,
+        };
+    }
+    let command = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| legacy_cleanup_command(item, index))
+        .collect::<Vec<_>>()
+        .join(" ; ");
+    let guarded = crate::pane_state::store::server_guarded_command_args(
+        expected_server.pid,
+        expected_server.start_time,
+        command,
+        LEGACY_CLEANUP_SERVER_MISMATCH_SENTINEL,
+    );
+    let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
+    match runner.run(&refs) {
+        Ok(output)
+            if output
+                .lines()
+                .any(|line| line.trim() == LEGACY_CLEANUP_SERVER_MISMATCH_SENTINEL) =>
+        {
+            LegacyCleanupOutcome {
+                attempted,
+                removed: 0,
+                failed: Vec::new(),
+                server_mismatch: true,
+            }
+        }
+        Ok(output) => {
+            let mismatches = output
+                .lines()
+                .filter_map(|line| {
+                    line.trim()
+                        .strip_prefix(&format!("{LEGACY_CLEANUP_PANE_MISMATCH_PREFIX}:"))
+                        .and_then(|index| index.parse::<usize>().ok())
+                })
+                .collect::<BTreeSet<_>>();
+            let failed = mismatches
+                .into_iter()
+                .filter_map(|index| items.get(index))
+                .map(|item| crate::daemon::protocol::v2::LegacyCleanupFailure {
+                    scope: item.scope.to_string(),
+                    target: item.target.clone(),
+                    option: item.option.to_string(),
+                    message: "pane instance changed before cleanup".to_string(),
+                })
+                .collect::<Vec<_>>();
+            LegacyCleanupOutcome {
+                attempted,
+                removed: attempted.saturating_sub(failed.len() as u64),
+                failed,
+                server_mismatch: false,
+            }
+        }
+        Err(error) => {
+            let detail = error.to_string().chars().take(256).collect::<String>();
+            let message = format!("tmux legacy cleanup batch failed: {detail}");
+            LegacyCleanupOutcome {
+                attempted,
+                removed: 0,
+                failed: items
+                    .iter()
+                    .map(|item| crate::daemon::protocol::v2::LegacyCleanupFailure {
+                        scope: item.scope.to_string(),
+                        target: item.target.clone(),
+                        option: item.option.to_string(),
+                        message: message.clone(),
+                    })
+                    .collect(),
+                server_mismatch: false,
+            }
+        }
+    }
+}
+
+fn apply_legacy_cleanup(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    event_id: crate::pane_state::EventId,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    use crate::daemon::protocol::v2::ServerMessage;
+
+    let topology = match query_full_topology(coordinator, Duration::from_secs(1)) {
+        Ok(topology) => topology,
+        Err(error) => {
+            if error.requires_daemon_exit() {
+                coordinator.fail_stop(error.to_string());
+            }
+            return ServerMessage::error(
+                crate::daemon::protocol::v2::ErrorCode::InternalError,
+                error.to_string(),
+                Some(event_id),
+            );
+        }
+    };
+    let items = legacy_cleanup_items(&topology);
+    let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
+    let outcome = execute_legacy_cleanup(&runner, &coordinator.incarnation.identity, &items);
+    if outcome.server_mismatch {
+        coordinator.fail_stop("tmux server incarnation changed during legacy cleanup");
+        return ServerMessage::error(
+            crate::daemon::protocol::v2::ErrorCode::InternalError,
+            "tmux server incarnation changed during legacy cleanup",
+            Some(event_id),
+        );
+    }
+    let snapshot_revision = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned")
+        .as_ref()
+        .map_or(0, |state| state.leased.runtime.snapshot_revision());
+    ServerMessage::CleanupLegacyResult {
+        event_id,
+        accepted_seq,
+        attempted: outcome.attempted,
+        removed: outcome.removed,
+        failed: outcome.failed,
+        snapshot_revision,
+    }
+}
+
+fn query_full_topology(
+    coordinator: &ProductionV2Coordinator,
+    timeout: Duration,
+) -> Result<crate::daemon::topology::TopologySnapshot, crate::daemon::topology::TopologyError> {
+    let framing = crate::daemon::topology::QueryFraming::generate()?;
+    let args = crate::daemon::topology::poll_query_args(&framing);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let runner = crate::tmux::SystemTmuxRunner::from_env(timeout);
+    let output = runner
+        .run(&refs)
+        .map_err(|error| crate::daemon::topology::TopologyError::Query(error.to_string()))?;
+    crate::daemon::topology::parse_topology(&output, &framing, &coordinator.incarnation.identity)
+}
+
+fn query_status_projection_metadata(
+    coordinator: &ProductionV2Coordinator,
+    timeout: Duration,
+) -> Result<super::runtime::StatusProjectionMetadata, crate::daemon::topology::TopologyError> {
+    let framing = crate::daemon::topology::QueryFraming::generate()?;
+    let args = crate::daemon::topology::status_metadata_query_args(&framing);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let runner = crate::tmux::SystemTmuxRunner::from_env(timeout);
+    let output = runner
+        .run(&refs)
+        .map_err(|error| crate::daemon::topology::TopologyError::Query(error.to_string()))?;
+    let snapshot = crate::daemon::topology::parse_status_metadata(
+        &output,
+        &framing,
+        &coordinator.incarnation.identity,
+    )?;
+    let mut metadata = super::runtime::StatusProjectionMetadata::default();
+    for session in snapshot.sessions {
+        if let Some(category) = session.category.clone() {
+            metadata.categories.insert(category);
+        }
+        metadata.sessions.insert(
+            session.session_id,
+            super::runtime::SessionProjectionMetadata {
+                category: session.category,
+                attached: Some(session.attached),
+                created_at: Some(session.created_at),
+            },
+        );
+    }
+    for window in snapshot.windows {
+        metadata.windows.insert(
+            window.window_id,
+            super::runtime::WindowProjectionMetadata {
+                bell: Some(window.bell),
+                activity: Some(window.activity),
+                silence: Some(window.silence),
+            },
+        );
+    }
+    Ok(metadata)
+}
+
+fn query_client_witnesses(
+    coordinator: &ProductionV2Coordinator,
+    timeout: Duration,
+) -> Result<Vec<crate::pane_state::ClientWitness>, crate::daemon::view_hooks::FreshVisibilityError>
+{
+    let token = crate::pane_state::EventId::generate()
+        .map_err(|error| crate::daemon::view_hooks::FreshVisibilityError::Query(error.to_string()))?
+        .as_str()
+        .to_string();
+    let args = crate::daemon::view_hooks::client_view_query_args(&token);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let runner = crate::tmux::SystemTmuxRunner::from_env(timeout);
+    let output = runner.run(&refs).map_err(|error| {
+        crate::daemon::view_hooks::FreshVisibilityError::Query(error.to_string())
+    })?;
+    crate::daemon::view_hooks::parse_client_view_query(
+        &output,
+        &token,
+        &coordinator.incarnation.identity,
+    )
+}
+
+fn refresh_full_topology(
+    coordinator: &ProductionV2Coordinator,
+) -> Result<u64, crate::pane_state::store::StoreError> {
+    let topology = query_full_topology(coordinator, Duration::from_secs(1)).map_err(|error| {
+        if error.requires_daemon_exit() {
+            crate::pane_state::store::StoreError::FailStop(error.to_string())
+        } else {
+            crate::pane_state::store::StoreError::PersistFailed(error.to_string())
+        }
+    })?;
+    let mut state_guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let state = state_guard.as_mut().ok_or_else(|| {
+        crate::pane_state::store::StoreError::PersistFailed("daemon is hydrating".to_string())
+    })?;
+    state.replace_topology(topology)?;
+    Ok(state.leased.runtime.snapshot_revision())
+}
+
+fn targeted_pane_refresh_response(
+    coordinator: &ProductionV2Coordinator,
+    pane_id: &str,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+    let io = crate::daemon::topology::SystemTargetedRefreshIo::new(
+        coordinator
+            .env
+            .get("VDE_TMUX_SOCKET_NAME")
+            .cloned()
+            .filter(|value| !value.trim().is_empty()),
+    );
+    match crate::daemon::topology::targeted_refresh(&io, pane_id, &coordinator.incarnation.identity)
+    {
+        Ok(crate::daemon::topology::TargetedRefreshOutcome::NotFound) => {
+            ServerMessage::error(ErrorCode::PaneNotFound, "pane was not found", None)
+        }
+        Ok(crate::daemon::topology::TargetedRefreshOutcome::Found(pane)) => {
+            let mut state_guard = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned");
+            let state = state_guard
+                .as_mut()
+                .expect("state initialized before targeted refresh");
+            let mut topology = state.topology.clone();
+            topology
+                .panes
+                .retain(|existing| existing.pane_instance.pane_id != pane_id);
+            topology.panes.push(pane);
+            topology
+                .panes
+                .sort_by(|left, right| left.pane_instance.cmp(&right.pane_instance));
+            if let Err(error) = state.replace_topology(topology) {
+                return production_store_error_response(coordinator, error, None);
+            }
+            match state.pane_presentation(pane_id) {
+                Some(pane) => ServerMessage::PaneResult {
+                    snapshot_revision: state.leased.runtime.snapshot_revision(),
+                    pane,
+                },
+                None => ServerMessage::error(
+                    ErrorCode::InternalError,
+                    "targeted refresh did not populate pane cache",
+                    None,
+                ),
+            }
+        }
+        Err(error) => {
+            if error.requires_daemon_exit() {
+                coordinator.fail_stop(error.to_string());
+            }
+            ServerMessage::error(ErrorCode::InternalError, error.to_string(), None)
+        }
+    }
+}
+
+fn store_error_code(
+    error: &crate::pane_state::store::StoreError,
+) -> crate::daemon::protocol::v2::ErrorCode {
+    use crate::daemon::protocol::v2::ErrorCode;
+    use crate::pane_state::reducer::ReduceError;
+    use crate::pane_state::store::StoreError;
+    match error {
+        StoreError::StateTooLarge => ErrorCode::StateTooLarge,
+        StoreError::StateLoad(_) | StoreError::ExternalWriter(_) => ErrorCode::StateLoadError,
+        StoreError::InvalidPaneInstance => ErrorCode::InvalidPaneInstance,
+        StoreError::StaleStateIdentity => ErrorCode::StaleStateIdentity,
+        StoreError::WriterLeaseHeld => ErrorCode::WriterLeaseHeld,
+        StoreError::PersistPending => ErrorCode::NotReady,
+        StoreError::PersistFailed(_) => ErrorCode::PersistFailed,
+        StoreError::FailStop(_) | StoreError::CounterOverflow(_) | StoreError::Random(_) => {
+            ErrorCode::InternalError
+        }
+        StoreError::Reduce(reduce) => match reduce {
+            ReduceError::InvalidRequest(_) | ReduceError::MissingStateId => {
+                ErrorCode::InvalidRequest
+            }
+            ReduceError::InvalidPaneInstance => ErrorCode::InvalidPaneInstance,
+            ReduceError::StaleStateIdentity => ErrorCode::StaleStateIdentity,
+            ReduceError::StaleSelection => ErrorCode::StaleSelection,
+            ReduceError::StaleAgentEvent => ErrorCode::StaleAgentEvent,
+            ReduceError::InvalidProgressOperation(_) => ErrorCode::InvalidProgressOperation,
+            ReduceError::StateInvariantViolation(_) => ErrorCode::StateInvariantViolation,
+            ReduceError::CounterOverflow(_) => ErrorCode::InternalError,
+        },
+    }
+}
+
+fn store_error_response(
+    error: crate::pane_state::store::StoreError,
+    event_id: Option<crate::pane_state::EventId>,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    crate::daemon::protocol::v2::ServerMessage::error(
+        store_error_code(&error),
+        error.to_string(),
+        event_id,
+    )
+}
+
+fn production_store_error_response(
+    coordinator: &ProductionV2Coordinator,
+    error: crate::pane_state::store::StoreError,
+    event_id: Option<crate::pane_state::EventId>,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    if error.requires_daemon_exit() {
+        coordinator.fail_stop(error.to_string());
+    }
+    store_error_response(error, event_id)
+}
+
+fn epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
+}
+
+fn bounded_recovery_timeout(remaining: Option<Duration>) -> Duration {
+    remaining
+        .unwrap_or(Duration::from_secs(3))
+        .min(Duration::from_secs(3))
+        .max(Duration::from_millis(1))
 }
 
 pub fn run_runtime_daemon_server(
     config: crate::config::Config,
     socket_path: &Path,
     env: &std::collections::BTreeMap<String, String>,
+    incarnation: crate::daemon::lifecycle::TmuxServerIncarnation,
 ) -> Result<()> {
+    incarnation.verify(
+        &crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3)),
+        env,
+    )?;
+    if let Some(parent) = socket_path.parent() {
+        crate::daemon::lifecycle::ensure_secure_socket_dir(parent)?;
+    }
+    let writer_namespace = crate::daemon::writer_lease_namespace(&incarnation.hash);
+    if let Some(parent) = writer_namespace.parent() {
+        crate::daemon::lifecycle::ensure_secure_socket_dir(parent)?;
+    }
+    let leased = super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&writer_namespace)
+        .map_err(anyhow::Error::new)?;
     let Some((listener, _instance_lock)) = bind_daemon_listener(socket_path)? else {
         return Ok(());
     };
 
-    let (tx, rx) = mpsc::channel();
-    install_shutdown_signal_handler(tx.clone())?;
-    let latest_panes = Arc::new(crate::daemon::workers::LatestPanes::default());
-    let capture_activity = Arc::new(crate::daemon::workers::SharedCaptureActivity::new());
-    let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
-    let worker_io = Arc::new(crate::daemon::workers::SystemWorkerIo::new(runner));
-    crate::daemon::workers::start_tmux_worker(
-        worker_io.clone(),
-        latest_panes.clone(),
-        capture_activity.clone(),
-        tx.clone(),
-        Duration::from_millis(config.daemon.poll_ms),
-        300,
-    );
-    crate::daemon::workers::start_git_worker(
-        Arc::new(crate::daemon::workers::system_git_runner(
-            Duration::from_millis(config.daemon.git.timeout_ms),
-        )),
-        latest_panes,
-        tx.clone(),
-        Duration::from_millis(config.daemon.git.poll_interval_ms),
-    );
-
-    let listener_tx = tx.clone();
+    let notification_command = (config.notify.enabled && !config.notify.command.trim().is_empty())
+        .then(|| config.notify.command.clone());
+    let coordinator = Arc::new(ProductionV2Coordinator::new(
+        incarnation,
+        env.clone(),
+        config.daemon.done_clear_on,
+        notification_command,
+    )?);
+    install_shutdown_signal_handler(coordinator.clone())?;
+    let listener_coordinator = coordinator.clone();
     thread::spawn(move || {
-        let mut next_client_id = 1_u64;
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let client_id = ClientId(next_client_id);
-                    next_client_id += 1;
-                    if let Err(error) =
-                        handle_stream_with_runtime(listener_tx.clone(), client_id, stream)
-                    {
-                        eprintln!("[vde-tmux] daemon connection error: {error:#}");
-                    }
+                    let coordinator = listener_coordinator.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = handle_v2_runtime_stream(coordinator, stream) {
+                            eprintln!("[vde-tmux] daemon connection error: {error:#}");
+                        }
+                    });
                 }
                 Err(error) => {
                     eprintln!("[vde-tmux] daemon listener error: {error:#}");
@@ -716,15 +3902,257 @@ pub fn run_runtime_daemon_server(
         }
     });
 
+    bootstrap_v2_runtime(&coordinator, leased, env, &config)?;
+    start_v2_mutation_worker(coordinator.clone());
+    start_sidebar_completion_forwarder(coordinator.clone());
+    start_canonical_observation_worker(
+        coordinator.clone(),
+        Duration::from_millis(config.daemon.poll_ms),
+    );
+    start_canonical_git_worker(
+        coordinator.clone(),
+        Duration::from_millis(config.daemon.git.poll_interval_ms),
+    );
+    start_status_push_worker(coordinator.clone());
+
+    coordinator.wait_for_shutdown();
+    Ok(())
+}
+
+fn bootstrap_v2_runtime(
+    coordinator: &ProductionV2Coordinator,
+    mut leased: super::runtime::LeasedCanonicalPaneStateRuntime,
+    env: &std::collections::BTreeMap<String, String>,
+    config: &crate::config::Config,
+) -> Result<()> {
+    let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
+    crate::daemon::view_hooks::install_hooks(&runner, &coordinator.incarnation.identity)
+        .map_err(|error| anyhow::anyhow!("failed to install pane-state hooks: {error}"))?;
+    coordinator
+        .router
+        .lock()
+        .expect("v2 router lock poisoned")
+        .begin_hydration()
+        .map_err(anyhow::Error::msg)?;
+
+    let session_framing = crate::daemon::topology::QueryFraming::generate()?;
+    let session_args = crate::daemon::topology::targeted_session_query_args(&session_framing);
+    let session_refs = session_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let session_output = runner.run(&session_refs)?;
+    let session_count = crate::daemon::topology::parse_session_count(
+        &session_output,
+        &session_framing,
+        &coordinator.incarnation.identity,
+    )?;
+    let (records, topology, witnesses) = if session_count == 0 {
+        (
+            Vec::new(),
+            crate::daemon::topology::TopologySnapshot {
+                server_identity: coordinator.incarnation.identity.clone(),
+                panes: Vec::new(),
+            },
+            Vec::new(),
+        )
+    } else {
+        let hydrate_framing = crate::daemon::topology::QueryFraming::generate()?;
+        let hydrate_args = crate::daemon::topology::hydrate_query_args(&hydrate_framing);
+        let hydrate_refs = hydrate_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let hydrate_output = runner.run(&hydrate_refs)?;
+        let records = crate::daemon::topology::parse_hydrate_records(
+            &hydrate_output,
+            &hydrate_framing,
+            &coordinator.incarnation.identity,
+        )?;
+        let topology = query_full_topology(coordinator, Duration::from_secs(1))?;
+        let witnesses = query_client_witnesses(coordinator, Duration::from_secs(1))?;
+        (records, topology, witnesses)
+    };
+    leased.hydrate(records);
+    let mut views = crate::daemon::view_hooks::ViewRegistry::default();
+    let mut window_panes = BTreeMap::<String, Vec<crate::pane_state::PaneInstance>>::new();
+    for pane in &topology.panes {
+        window_panes
+            .entry(pane.window_id.clone())
+            .or_default()
+            .push(pane.pane_instance.clone());
+    }
+    views
+        .reconcile(&witnesses, &window_panes)
+        .map_err(|error| anyhow::anyhow!("failed to build initial view registry: {error}"))?;
+    let status_metadata = query_status_projection_metadata(coordinator, Duration::from_secs(1))?;
     let state_path = crate::sidebar::store::state_path(env);
     let ui_state = crate::sidebar::store::load_state(&state_path)?;
-    run_runtime_loop(
-        RuntimeState::new(config, ui_state),
-        rx,
-        Some(state_path),
-        worker_io,
-        capture_activity,
-    )
+    let mut canonical =
+        super::runtime::CanonicalCoordinatorState::new(leased, topology, views, ui_state);
+    canonical.status_metadata = status_metadata;
+    canonical.projection_config = config.clone();
+    *coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned") = Some(canonical);
+
+    let mut initial_reconciliation_queued = false;
+    loop {
+        let queued = coordinator
+            .router
+            .lock()
+            .expect("v2 router lock poisoned")
+            .take_bootstrap_fifo();
+        for mutation in queued {
+            let accepted_seq = mutation.accepted_seq;
+            let response = apply_production_mutation(coordinator, mutation);
+            coordinator.publish_resolved_snapshot()?;
+            if !coordinator.is_deferred_response(accepted_seq) {
+                coordinator.complete(accepted_seq, response);
+            }
+        }
+        if !initial_reconciliation_queued {
+            let mut router = coordinator.router.lock().expect("v2 router lock poisoned");
+            for mutation in [
+                V2InternalMutation::RefreshTopology,
+                V2InternalMutation::ReconcileViews,
+            ] {
+                if matches!(router.accept_internal(mutation), V2Route::Fatal(_)) {
+                    bail!("accepted sequence overflow during initial reconciliation");
+                }
+            }
+            initial_reconciliation_queued = true;
+            continue;
+        }
+        coordinator.publish_resolved_snapshot()?;
+        coordinator.drive_status_push(StatusPushTrigger::Snapshot)?;
+        let mut router = coordinator.router.lock().expect("v2 router lock poisoned");
+        if router.enter_serving_if_bootstrap_empty() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn initial_view_reconciliation(coordinator: &ProductionV2Coordinator) -> Result<()> {
+    let witnesses = match query_client_witnesses(coordinator, Duration::from_millis(250)) {
+        Ok(witnesses) => witnesses,
+        Err(error) if error.requires_daemon_exit() => return Err(error.into()),
+        Err(error) => {
+            let mut state_guard = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned");
+            if let Some(state) = state_guard.as_mut()
+                && let Some(pane) = state.topology.panes.first()
+            {
+                state.leased.runtime.add_diagnostic(
+                    pane.pane_instance.clone(),
+                    format!("initial_view_reconciliation_failed: {error}"),
+                )?;
+            }
+            return Ok(());
+        }
+    };
+    let mut state_guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let state = state_guard
+        .as_mut()
+        .expect("state initialized before reconciliation");
+    let window_panes = state.window_panes();
+    let records = state.records_snapshot();
+    let revision_before = state.leased.runtime.snapshot_revision();
+    let mut next_views = state.views.clone();
+    let result = crate::daemon::view_hooks::reconcile_current_views(
+        &mut next_views,
+        coordinator
+            .router
+            .lock()
+            .expect("v2 router lock poisoned")
+            .daemon_instance_id(),
+        &witnesses,
+        &window_panes,
+        coordinator.done_clear_on,
+        &records,
+    )?;
+    let registry_changed = result.registry_changed;
+    if result.acknowledgements.is_empty() {
+        state.views = next_views;
+        state.leased.runtime.finish_sequenced_projection(
+            None,
+            std::iter::empty(),
+            registry_changed,
+            revision_before,
+        )?;
+        return Ok(());
+    }
+    let mut clock = crate::pane_state::store::SystemRecoveryClock::start();
+    let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
+    let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
+        &runner,
+        coordinator.incarnation.identity.pid,
+        coordinator.incarnation.identity.start_time,
+    );
+    let progress = state.leased.runtime.apply_view_acknowledgement_batch(
+        &mut io,
+        &mut clock,
+        &result.acknowledgements,
+        coordinator.done_clear_on,
+    );
+    match progress {
+        crate::pane_state::store::ViewBatchProgress::Complete(_) => {
+            let state = state_guard
+                .as_mut()
+                .expect("state initialized after reconciliation");
+            state.views = next_views;
+            state.leased.runtime.finish_sequenced_projection(
+                None,
+                std::iter::empty(),
+                registry_changed,
+                revision_before,
+            )?;
+            Ok(())
+        }
+        crate::pane_state::store::ViewBatchProgress::Pending(mut continuation) => loop {
+            drop(state_guard);
+            thread::sleep(crate::pane_state::store::STORE_RECOVERY_RETRY_INTERVAL);
+            state_guard = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned");
+            let state = state_guard
+                .as_mut()
+                .expect("state initialized during reconciliation");
+            let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
+            let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
+                &runner,
+                coordinator.incarnation.identity.pid,
+                coordinator.incarnation.identity.start_time,
+            );
+            match state.leased.runtime.resume_view_acknowledgement_batch(
+                &mut io,
+                &mut clock,
+                continuation,
+            ) {
+                crate::pane_state::store::ViewBatchProgress::Complete(_) => {
+                    state.views = next_views;
+                    state.leased.runtime.finish_sequenced_projection(
+                        None,
+                        std::iter::empty(),
+                        registry_changed,
+                        revision_before,
+                    )?;
+                    break Ok(());
+                }
+                crate::pane_state::store::ViewBatchProgress::Pending(next) => continuation = next,
+                crate::pane_state::store::ViewBatchProgress::Blocked(error)
+                | crate::pane_state::store::ViewBatchProgress::Fatal(error) => {
+                    break Err(anyhow::Error::new(error));
+                }
+            }
+        },
+        crate::pane_state::store::ViewBatchProgress::Blocked(error)
+        | crate::pane_state::store::ViewBatchProgress::Fatal(error) => {
+            Err(anyhow::Error::new(error))
+        }
+    }
 }
 
 fn bind_daemon_listener(
@@ -736,24 +4164,16 @@ fn bind_daemon_listener(
     {
         crate::daemon::lifecycle::ensure_secure_socket_dir(parent)?;
     }
-    if crate::daemon::lifecycle::daemon_socket_responds(socket_path) {
-        return Ok(None);
-    }
     let Some(instance_lock) =
         crate::daemon::lifecycle::try_acquire_daemon_instance_lock(socket_path)?
     else {
-        if crate::daemon::lifecycle::wait_for_daemon_socket(socket_path, Duration::from_secs(5)) {
-            return Ok(None);
-        }
-        bail!(
-            "daemon instance lock is already held for {}",
-            socket_path.display()
-        );
-    };
-    if crate::daemon::lifecycle::daemon_socket_responds(socket_path) {
         return Ok(None);
-    }
+    };
     if socket_path.exists() {
+        crate::daemon::lifecycle::verify_stale_socket_can_be_removed(
+            socket_path,
+            Instant::now() + Duration::from_secs(3),
+        )?;
         fs::remove_file(socket_path)
             .with_context(|| format!("failed to remove {}", socket_path.display()))?;
     }
@@ -762,7 +4182,7 @@ fn bind_daemon_listener(
     Ok(Some((listener, instance_lock)))
 }
 
-pub fn install_shutdown_signal_handler(tx: Sender<DaemonEvent>) -> Result<()> {
+fn install_shutdown_signal_handler(coordinator: Arc<ProductionV2Coordinator>) -> Result<()> {
     let mut fds = [0; 2];
     // SAFETY: `pipe` writes two valid file descriptors into `fds` on success.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -776,7 +4196,7 @@ pub fn install_shutdown_signal_handler(tx: Sender<DaemonEvent>) -> Result<()> {
     install_shutdown_signal(libc::SIGINT)?;
     // SAFETY: `fds[0]` is a fresh read end returned by `pipe` and is now owned by `File`.
     let reader = unsafe { fs::File::from_raw_fd(fds[0]) };
-    spawn_shutdown_forwarder(reader, tx);
+    spawn_shutdown_forwarder(reader, coordinator);
     Ok(())
 }
 
@@ -811,278 +4231,21 @@ extern "C" fn shutdown_signal_handler(_signum: libc::c_int) {
     }
 }
 
-fn spawn_shutdown_forwarder<R>(mut reader: R, tx: Sender<DaemonEvent>)
+fn spawn_shutdown_forwarder<R>(mut reader: R, coordinator: Arc<ProductionV2Coordinator>)
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
         let mut byte = [0_u8; 1];
         if reader.read(&mut byte).is_ok() {
-            let _ = tx.send(DaemonEvent::Shutdown);
+            coordinator.begin_signal_shutdown();
         }
     });
-}
-
-pub fn run_runtime_loop(
-    mut state: RuntimeState,
-    rx: mpsc::Receiver<DaemonEvent>,
-    state_path: Option<std::path::PathBuf>,
-    worker_io: Arc<dyn crate::daemon::workers::WorkerIo>,
-    capture_activity: Arc<crate::daemon::workers::SharedCaptureActivity>,
-) -> Result<()> {
-    let notify_command = state.notify_command().map(str::to_string);
-    while state.is_running() {
-        let effects = match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(DaemonEvent::RefreshPanes { reply }) => refresh_panes_once(
-                &mut state,
-                worker_io.as_ref(),
-                capture_activity.as_ref(),
-                reply,
-            ),
-            Ok(event) => state.apply_event(event),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                state.apply_event(DaemonEvent::DebounceCheck(std::time::Instant::now()))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        handle_runtime_effects(
-            effects,
-            state_path.as_deref(),
-            worker_io.as_ref(),
-            notify_command.as_deref(),
-        )?;
-    }
-    handle_runtime_effects(
-        state.apply_event(DaemonEvent::DebounceCheck(
-            std::time::Instant::now() + Duration::from_secs(1),
-        )),
-        state_path.as_deref(),
-        worker_io.as_ref(),
-        notify_command.as_deref(),
-    )?;
-    Ok(())
-}
-
-fn refresh_panes_once(
-    state: &mut RuntimeState,
-    worker_io: &dyn crate::daemon::workers::WorkerIo,
-    capture_activity: &crate::daemon::workers::SharedCaptureActivity,
-    reply: Sender<ServerMessage>,
-) -> Vec<RuntimeEffect> {
-    match crate::daemon::workers::read_panes_with_shared_capture_activity(
-        worker_io,
-        300,
-        capture_activity,
-    ) {
-        Ok(panes) => {
-            let effects = state.apply_event(DaemonEvent::PanesUpdated(panes));
-            let _ = reply.send(ServerMessage::Ack);
-            effects
-        }
-        Err(error) => {
-            let _ = reply.send(ServerMessage::Error {
-                message: error.to_string(),
-            });
-            Vec::new()
-        }
-    }
-}
-
-fn handle_runtime_effects(
-    effects: Vec<RuntimeEffect>,
-    state_path: Option<&Path>,
-    worker_io: &dyn crate::daemon::workers::WorkerIo,
-    notify_command: Option<&str>,
-) -> Result<()> {
-    for effect in effects {
-        match effect {
-            RuntimeEffect::JumpPane(pane_id) => {
-                if let Err(error) = worker_io.jump_to_pane(&pane_id) {
-                    eprintln!("[vde-tmux] daemon jump error: {error:#}");
-                }
-            }
-            RuntimeEffect::PreviewPane {
-                pane_id,
-                history_lines,
-            } => {
-                if let Err(error) = worker_io.preview_pane(&pane_id, history_lines) {
-                    eprintln!("[vde-tmux] daemon preview error: {error:#}");
-                }
-            }
-            RuntimeEffect::SaveState(state) => {
-                if let Some(path) = state_path {
-                    crate::sidebar::store::save_state(path, &state)?;
-                }
-            }
-            RuntimeEffect::SetSessionBadge {
-                session,
-                value,
-                state,
-            } => {
-                if let Err(error) = worker_io.set_session_option(
-                    &session,
-                    crate::options::KEY_SESSION_STATUS,
-                    &value,
-                ) {
-                    eprintln!("[vde-tmux] session badge set failed: {error:#}");
-                }
-                if let Err(error) = worker_io.set_session_option(
-                    &session,
-                    crate::options::KEY_SESSION_STATE,
-                    &state,
-                ) {
-                    eprintln!("[vde-tmux] session state set failed: {error:#}");
-                }
-            }
-            RuntimeEffect::SetSessionProjectPath { session, path } => {
-                if let Err(error) =
-                    worker_io.set_session_option(&session, crate::options::KEY_PROJECT_PATH, &path)
-                {
-                    eprintln!("[vde-tmux] session project path set failed: {error:#}");
-                }
-            }
-            RuntimeEffect::SetSessionCategory { session, category } => {
-                if let Err(error) =
-                    worker_io.set_session_option(&session, crate::options::KEY_CATEGORY, &category)
-                {
-                    eprintln!("[vde-tmux] session category set failed: {error:#}");
-                }
-            }
-            RuntimeEffect::SetSessionAgentCounts { session, counts } => {
-                if let Err(error) = worker_io.set_session_option(
-                    &session,
-                    crate::options::KEY_SESSION_AGENT_COUNTS,
-                    &counts,
-                ) {
-                    eprintln!("[vde-tmux] session agent counts set failed: {error:#}");
-                }
-            }
-            RuntimeEffect::ClearSessionBadge { session } => {
-                if let Err(error) =
-                    worker_io.unset_session_option(&session, crate::options::KEY_SESSION_STATUS)
-                {
-                    eprintln!("[vde-tmux] session badge clear failed: {error:#}");
-                }
-                if let Err(error) =
-                    worker_io.unset_session_option(&session, crate::options::KEY_SESSION_STATE)
-                {
-                    eprintln!("[vde-tmux] session state clear failed: {error:#}");
-                }
-            }
-            RuntimeEffect::ClearSessionAgentCounts { session } => {
-                if let Err(error) = worker_io
-                    .unset_session_option(&session, crate::options::KEY_SESSION_AGENT_COUNTS)
-                {
-                    eprintln!("[vde-tmux] session agent counts clear failed: {error:#}");
-                }
-            }
-            RuntimeEffect::SetWindowBadge {
-                window,
-                value,
-                state,
-                counts,
-            } => {
-                if let Err(error) =
-                    worker_io.set_window_option(&window, crate::options::KEY_WINDOW_STATUS, &value)
-                {
-                    eprintln!("[vde-tmux] window badge set failed: {error:#}");
-                }
-                if let Err(error) =
-                    worker_io.set_window_option(&window, crate::options::KEY_WINDOW_STATE, &state)
-                {
-                    eprintln!("[vde-tmux] window state set failed: {error:#}");
-                }
-                if let Err(error) = worker_io.set_window_option(
-                    &window,
-                    crate::options::KEY_WINDOW_AGENT_COUNTS,
-                    &counts,
-                ) {
-                    eprintln!("[vde-tmux] window agent counts set failed: {error:#}");
-                }
-            }
-            RuntimeEffect::ClearWindowBadge { window } => {
-                if let Err(error) =
-                    worker_io.unset_window_option(&window, crate::options::KEY_WINDOW_STATUS)
-                {
-                    eprintln!("[vde-tmux] window badge clear failed: {error:#}");
-                }
-                if let Err(error) =
-                    worker_io.unset_window_option(&window, crate::options::KEY_WINDOW_STATE)
-                {
-                    eprintln!("[vde-tmux] window state clear failed: {error:#}");
-                }
-                if let Err(error) =
-                    worker_io.unset_window_option(&window, crate::options::KEY_WINDOW_AGENT_COUNTS)
-                {
-                    eprintln!("[vde-tmux] window agent counts clear failed: {error:#}");
-                }
-            }
-            RuntimeEffect::ClearPaneState { pane_id } => {
-                for key in crate::options::PANE_STATE_KEYS {
-                    if let Err(error) = worker_io.unset_pane_option(&pane_id, key) {
-                        eprintln!("[vde-tmux] pane state clear failed: {pane_id} {key}: {error:#}");
-                    }
-                }
-            }
-            RuntimeEffect::MarkPaneDone {
-                pane_id,
-                completed_at,
-            } => {
-                if let Err(error) =
-                    worker_io.set_pane_option(&pane_id, crate::options::KEY_STATUS, "idle")
-                {
-                    eprintln!("[vde-tmux] mark done status write failed: {pane_id}: {error:#}");
-                }
-                if let Err(error) =
-                    worker_io.set_pane_option(&pane_id, crate::options::KEY_ATTENTION, "1")
-                {
-                    eprintln!("[vde-tmux] mark done attention write failed: {pane_id}: {error:#}");
-                }
-                if let Err(error) = worker_io.set_pane_option(
-                    &pane_id,
-                    crate::options::KEY_COMPLETED_AT,
-                    &completed_at.to_string(),
-                ) {
-                    eprintln!(
-                        "[vde-tmux] mark done completed_at write failed: {pane_id}: {error:#}"
-                    );
-                }
-                for key in [
-                    crate::options::KEY_WAIT_REASON,
-                    crate::options::KEY_TASKS,
-                    crate::options::KEY_TASK_ITEMS,
-                    crate::options::KEY_TASK_ITEM_IDS,
-                    crate::options::KEY_SUBAGENTS,
-                ] {
-                    if let Err(error) = worker_io.unset_pane_option(&pane_id, key) {
-                        eprintln!("[vde-tmux] mark done unset failed: {pane_id} {key}: {error:#}");
-                    }
-                }
-            }
-            RuntimeEffect::Notify {
-                pane_id,
-                agent,
-                state,
-            } => {
-                if let Some(command) = notify_command
-                    && let Err(error) =
-                        worker_io.run_notify(command, &pane_id, &agent, &format!("{state:?}"))
-                {
-                    eprintln!("[vde-tmux] notify command failed: {error:#}");
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::protocol::{ClientMessage, ServerMessage};
-    use crate::options::snapshot::snapshot_format;
-    use crate::tmux::mock::MockTmuxRunner;
-
     const V2_EVENT_ID: &str = "102132435465768798a9bacbdcedfe0f";
     const V2_DAEMON_ID: &str = "ffeeddccbbaa99887766554433221100";
 
@@ -1133,6 +4296,508 @@ mod tests {
                 proto: 2,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn canonical_notification_worker_exports_blocked_environment() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-notification-worker-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let output = root.join("env.txt");
+        let command = format!(
+            "printf '%s|%s|%s' \"$VDE_PANE_ID\" \"$VDE_AGENT\" \"$VDE_BADGE_STATE\" > '{}'",
+            output.display()
+        );
+        let sender = start_notification_worker(command);
+        sender
+            .try_send(NotificationWorkerJob {
+                pane_id: "%7".to_string(),
+                agent: "codex".to_string(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !output.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "%7|codex|Blocked"
+        );
+        drop(sender);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canonical_notification_timeout_kills_descendant_processes() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-notification-timeout-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("child.pid");
+        let command = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let sender = start_notification_worker_with_timeout(command, Duration::from_millis(100));
+        sender
+            .try_send(NotificationWorkerJob {
+                pane_id: "%7".to_string(),
+                agent: "codex".to_string(),
+            })
+            .unwrap();
+        let file_deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_file.exists() && Instant::now() < file_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let exit_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let exists = unsafe { libc::kill(pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            if !exists {
+                break;
+            }
+            assert!(
+                Instant::now() < exit_deadline,
+                "notification descendant survived timeout"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(sender);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn production_fail_stop_marks_router_and_releases_waiters() {
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: "/tmp/vde-test-tmux.sock".into(),
+                identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                hash: "a".repeat(64),
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        coordinator.waiters.lock().unwrap().insert(1, sender);
+
+        coordinator.fail_stop("counter overflow");
+
+        assert!(coordinator.router.lock().unwrap().is_fatal());
+        assert!(coordinator.shutdown.load(Ordering::SeqCst));
+        assert!(coordinator.shutdown_ready.load(Ordering::SeqCst));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(100)).unwrap(),
+            crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::InternalError,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn disconnected_mutation_waiter_enqueues_sequenced_diagnostic() {
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: "/tmp/vde-test-tmux.sock".into(),
+                identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                hash: "d".repeat(64),
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        coordinator
+            .router
+            .lock()
+            .unwrap()
+            .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        coordinator.waiters.lock().unwrap().insert(3, sender);
+
+        coordinator.complete(
+            3,
+            crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+                event_id: v2_event_id(),
+                accepted_seq: 3,
+                snapshot_revision: 0,
+            },
+        );
+
+        let queue = coordinator.queue.lock().unwrap();
+        assert!(matches!(
+            queue.items.front().map(|item| &item.sequenced.mutation),
+            Some(V2AcceptedMutation::Internal(
+                V2InternalMutation::DiagnosticProjection {
+                    pane_instance: None,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn graceful_shutdown_releases_later_waiters_and_keeps_current_response() {
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: "/tmp/vde-test-tmux.sock".into(),
+                identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                hash: "b".repeat(64),
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        let (current_tx, current_rx) = mpsc::channel();
+        let (later_tx, later_rx) = mpsc::channel();
+        coordinator
+            .waiters
+            .lock()
+            .unwrap()
+            .extend([(4, current_tx), (5, later_tx)]);
+
+        coordinator.begin_graceful_shutdown(4);
+        assert!(!coordinator.shutdown_ready.load(Ordering::SeqCst));
+
+        assert!(matches!(
+            later_rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+            crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::NotReady,
+                ..
+            }
+        ));
+        assert!(current_rx.try_recv().is_err());
+        let response = coordinator.route_external(
+            &mut V2ConnectionState::default(),
+            crate::daemon::protocol::v2::ClientMessage::Hello { proto: 2 },
+            0,
+        );
+        assert!(matches!(
+            response,
+            crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::NotReady,
+                ..
+            }
+        ));
+        assert!(!coordinator.enqueue_internal(V2InternalMutation::RefreshTopology));
+        assert!(current_rx.try_recv().is_err());
+        coordinator.complete(
+            4,
+            crate::daemon::protocol::v2::ServerMessage::ShutdownAccepted {
+                event_id: v2_event_id(),
+                accepted_seq: 4,
+            },
+        );
+        assert!(matches!(
+            current_rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+            crate::daemon::protocol::v2::ServerMessage::ShutdownAccepted {
+                accepted_seq: 4,
+                ..
+            }
+        ));
+        coordinator.mark_shutdown_ready();
+        assert!(coordinator.shutdown_ready.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn snapshot_waiter_cannot_miss_shutdown_notification() {
+        let coordinator = Arc::new(
+            ProductionV2Coordinator::new(
+                crate::daemon::lifecycle::TmuxServerIncarnation {
+                    socket_path: "/tmp/vde-test-tmux.sock".into(),
+                    identity: crate::daemon::topology::ServerIdentity {
+                        pid: 1,
+                        start_time: 2,
+                    },
+                    hash: "e".repeat(64),
+                },
+                BTreeMap::new(),
+                crate::config::DoneClearOn::Pane,
+                None,
+            )
+            .unwrap(),
+        );
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = {
+            let coordinator = coordinator.clone();
+            thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = coordinator.wait_for_snapshot_after(0);
+                done_tx.send(result).unwrap();
+            })
+        };
+        started_rx.recv().unwrap();
+
+        coordinator.begin_graceful_shutdown(u64::MAX);
+
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .unwrap()
+                .is_none()
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn published_snapshot_frame_is_shared_and_replaced_only_for_new_revision() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-published-snapshot-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: root.join("tmux.sock"),
+                identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                hash: "c".repeat(64),
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        let leased =
+            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
+                .unwrap();
+        *coordinator.state.lock().unwrap() =
+            Some(super::super::runtime::CanonicalCoordinatorState::new(
+                leased,
+                crate::daemon::topology::TopologySnapshot {
+                    server_identity: crate::daemon::topology::ServerIdentity {
+                        pid: 1,
+                        start_time: 2,
+                    },
+                    panes: Vec::new(),
+                },
+                crate::daemon::view_hooks::ViewRegistry::default(),
+                crate::sidebar::state::SidebarState::default(),
+            ));
+
+        let first = coordinator.publish_resolved_snapshot().unwrap();
+        assert!(matches!(
+            coordinator.query(
+                crate::daemon::protocol::v2::ClientMessage::QueryStatusSnapshot {
+                    proto: 2,
+                    context: crate::daemon::protocol::v2::StatusContext::Global,
+                }
+            ),
+            crate::daemon::protocol::v2::ServerMessage::StatusSnapshotResult {
+                snapshot_revision: 0,
+                ..
+            }
+        ));
+        let same = coordinator.publish_resolved_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&first.frame, &same.frame));
+        assert!(Arc::ptr_eq(&first.message, &same.message));
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .leased
+            .runtime
+            .mark_projection_changed()
+            .unwrap();
+        let changed = coordinator.publish_resolved_snapshot().unwrap();
+        assert_eq!(changed.revision, first.revision + 1);
+        assert!(!Arc::ptr_eq(&first.frame, &changed.frame));
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .leased
+            .runtime
+            .set_snapshot_revision_for_test(first.revision);
+        let stale_publisher = coordinator.publish_resolved_snapshot().unwrap();
+        assert_eq!(stale_publisher.revision, changed.revision);
+        assert!(Arc::ptr_eq(&stale_publisher.frame, &changed.frame));
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_resolved_snapshot_commits_and_queues_frame_too_large_diagnostic() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-frame-too-large-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: root.join("tmux.sock"),
+                identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                hash: "f".repeat(64),
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        coordinator
+            .router
+            .lock()
+            .unwrap()
+            .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        let leased =
+            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
+                .unwrap();
+        let mut state = super::super::runtime::CanonicalCoordinatorState::new(
+            leased,
+            crate::daemon::topology::TopologySnapshot {
+                server_identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                panes: Vec::new(),
+            },
+            crate::daemon::view_hooks::ViewRegistry::default(),
+            crate::sidebar::state::SidebarState::default(),
+        );
+        state
+            .replace_topology(crate::daemon::topology::TopologySnapshot {
+                server_identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                panes: vec![crate::daemon::topology::TopologyPane {
+                    pane_instance: crate::pane_state::PaneInstance {
+                        pane_id: "%1".to_string(),
+                        pane_pid: 101,
+                    },
+                    session_links: Vec::new(),
+                    window_id: "@1".to_string(),
+                    window_name: "x".repeat(crate::pane_state::MAX_RESPONSE_FRAME_BYTES),
+                    current_path: "/tmp".to_string(),
+                    current_command: "zsh".to_string(),
+                    active: false,
+                }],
+            })
+            .unwrap();
+        assert_eq!(state.leased.runtime.snapshot_revision(), 1);
+        *coordinator.state.lock().unwrap() = Some(state);
+
+        let published = coordinator.publish_resolved_snapshot().unwrap();
+        assert!(published.terminal);
+        assert!(matches!(
+            published.message.as_ref(),
+            crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::FrameTooLarge,
+                ..
+            }
+        ));
+        let mutation = coordinator.queue.lock().unwrap().items.pop_front().unwrap();
+        assert!(matches!(
+            &mutation.sequenced.mutation,
+            V2AcceptedMutation::Internal(V2InternalMutation::FrameTooLargeProjection {
+                rejected_revision: 1
+            })
+        ));
+        let response = apply_production_mutation(&coordinator, mutation.sequenced);
+        assert!(matches!(
+            response,
+            crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+                snapshot_revision: 2,
+                ..
+            }
+        ));
+        let state = coordinator.state.lock().unwrap();
+        assert!(
+            state
+                .as_ref()
+                .unwrap()
+                .global_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == crate::daemon::protocol::v2::ErrorCode::FrameTooLarge)
+        );
+
+        drop(state);
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_subscription_frame_is_written_once_then_stream_closes() {
+        let coordinator = Arc::new(
+            ProductionV2Coordinator::new(
+                crate::daemon::lifecycle::TmuxServerIncarnation {
+                    socket_path: "/tmp/vde-test-tmux.sock".into(),
+                    identity: crate::daemon::topology::ServerIdentity {
+                        pid: 1,
+                        start_time: 2,
+                    },
+                    hash: "a".repeat(64),
+                },
+                BTreeMap::new(),
+                crate::config::DoneClearOn::Pane,
+                None,
+            )
+            .unwrap(),
+        );
+        let message = crate::daemon::protocol::v2::ServerMessage::error(
+            crate::daemon::protocol::v2::ErrorCode::FrameTooLarge,
+            "too large",
+            None,
+        );
+        let frame = crate::daemon::protocol::v2::encode_response_frame(&message).unwrap();
+        *coordinator.snapshot_cache.lock().unwrap() = Some(PublishedResolvedSnapshot {
+            revision: 2,
+            frame: Arc::new(frame),
+            message: Arc::new(message),
+            terminal: true,
+        });
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let handle = {
+            let coordinator = coordinator.clone();
+            thread::spawn(move || stream_v2_subscription(coordinator, server, 1).unwrap())
+        };
+
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).unwrap();
+        handle.join().unwrap();
+        let frames = raw.lines().collect::<Vec<_>>();
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            serde_json::from_str::<crate::daemon::protocol::v2::ServerMessage>(frames[0]).unwrap(),
+            crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::FrameTooLarge,
+                ..
+            }
         ));
     }
 
@@ -1218,6 +4883,217 @@ mod tests {
             internal.mutation,
             V2AcceptedMutation::Internal(V2InternalMutation::RefreshTopology)
         ));
+    }
+
+    #[test]
+    fn sidebar_worker_completion_reenters_the_shared_sequence_after_external_command() {
+        let mut router = V2Router::new(v2_daemon_id(), "server");
+        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        let mut connection = V2ConnectionState::default();
+        v2_handshake(&mut router, &mut connection);
+        let command = crate::daemon::protocol::v2::ClientMessage::SidebarCommand {
+            proto: 2,
+            daemon_instance_id: v2_daemon_id(),
+            event_id: v2_event_id(),
+            command: crate::daemon::protocol::v2::SidebarCommand::JumpPane {
+                pane_id: "%1".to_string(),
+            },
+        };
+        let V2Route::Mutation(external) = router.route(&mut connection, command) else {
+            panic!("expected sidebar mutation");
+        };
+        let completion = SidebarEffectCompletion {
+            original_accepted_seq: external.accepted_seq,
+            event_id: v2_event_id(),
+            snapshot_revision: 7,
+            result: SidebarEffectResult::Succeeded,
+        };
+        let V2Route::Mutation(internal) =
+            router.accept_internal(V2InternalMutation::SidebarEffectCompleted(completion))
+        else {
+            panic!("expected sequenced sidebar completion");
+        };
+
+        assert_eq!(external.accepted_seq, 1);
+        assert_eq!(internal.accepted_seq, 2);
+        assert!(matches!(
+            internal.mutation,
+            V2AcceptedMutation::Internal(V2InternalMutation::SidebarEffectCompleted(
+                SidebarEffectCompletion {
+                    original_accepted_seq: 1,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn sidebar_dispatch_returns_before_worker_completion_and_releases_original_waiter_after_event()
+    {
+        let (job_tx, job_rx) = mpsc::sync_channel(1);
+        let deferred = Mutex::new(BTreeSet::new());
+        enqueue_sidebar_tmux_job(
+            &job_tx,
+            &deferred,
+            SidebarTmuxJob {
+                effect: super::super::runtime::CanonicalSidebarEffect::JumpPane("%1".to_string()),
+                expected_pane: crate::pane_state::PaneInstance {
+                    pane_id: "%1".to_string(),
+                    pane_pid: 100,
+                },
+                original_accepted_seq: 1,
+                event_id: v2_event_id(),
+                snapshot_revision: 7,
+            },
+        )
+        .unwrap();
+        assert!(deferred.lock().unwrap().contains(&1));
+        let pending = job_rx.try_recv().expect("job is queued without waiting");
+
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: "/tmp/vde-test-tmux.sock".into(),
+                identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                hash: "0".repeat(64),
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        coordinator
+            .deferred_responses
+            .lock()
+            .unwrap()
+            .insert(pending.original_accepted_seq);
+        let (waiter_tx, waiter_rx) = mpsc::channel();
+        coordinator.waiters.lock().unwrap().insert(1, waiter_tx);
+        assert!(waiter_rx.try_recv().is_err());
+
+        let internal_response = apply_production_mutation(
+            &coordinator,
+            V2SequencedMutation {
+                accepted_seq: 2,
+                mutation: V2AcceptedMutation::Internal(V2InternalMutation::SidebarEffectCompleted(
+                    SidebarEffectCompletion {
+                        original_accepted_seq: pending.original_accepted_seq,
+                        event_id: pending.event_id,
+                        snapshot_revision: pending.snapshot_revision,
+                        result: SidebarEffectResult::Succeeded,
+                    },
+                )),
+            },
+        );
+
+        assert!(matches!(
+            internal_response,
+            crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+                accepted_seq: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            waiter_rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+            crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+                accepted_seq: 1,
+                snapshot_revision: 7,
+                ..
+            }
+        ));
+        assert!(!coordinator.is_deferred_response(1));
+    }
+
+    #[test]
+    fn waiterless_view_queue_completion_does_not_emit_disconnected_diagnostic() {
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: "/tmp/vde-test-tmux.sock".into(),
+                identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                hash: "f".repeat(64),
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        coordinator
+            .router
+            .lock()
+            .unwrap()
+            .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        let mut connection = V2ConnectionState::default();
+        assert!(matches!(
+            coordinator.route_external(
+                &mut connection,
+                crate::daemon::protocol::v2::ClientMessage::Hello { proto: 2 },
+                0,
+            ),
+            crate::daemon::protocol::v2::ServerMessage::HelloAck { .. }
+        ));
+        let pane = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        let daemon_instance_id = coordinator
+            .router
+            .lock()
+            .unwrap()
+            .daemon_instance_id()
+            .clone();
+        let response = coordinator.route_external(
+            &mut connection,
+            crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent {
+                proto: 2,
+                event: crate::pane_state::ViewEvent {
+                    daemon_instance_id,
+                    event_id: v2_event_id(),
+                    hook_kind: crate::pane_state::ViewHookKind::WindowPaneChanged,
+                    occurrence: Some(crate::pane_state::ViewOccurrence {
+                        session_id: "$1".to_string(),
+                        window_id: "@1".to_string(),
+                        active_pane: pane.clone(),
+                        observed_panes: vec![pane],
+                    }),
+                    source_client: None,
+                    witnesses: Vec::new(),
+                },
+            },
+            128,
+        );
+        assert!(matches!(
+            response,
+            crate::daemon::protocol::v2::ServerMessage::ViewQueued {
+                accepted_seq: 1,
+                ..
+            }
+        ));
+        assert!(coordinator.waiters.lock().unwrap().is_empty());
+        let queued = coordinator.queue.lock().unwrap().items.pop_front().unwrap();
+        assert_eq!(queued.sequenced.accepted_seq, 1);
+        assert!(matches!(
+            queued.sequenced.mutation,
+            V2AcceptedMutation::External(
+                crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent { .. }
+            )
+        ));
+
+        coordinator.complete(
+            1,
+            crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+                event_id: v2_event_id(),
+                accepted_seq: 1,
+                snapshot_revision: 0,
+            },
+        );
+
+        assert!(coordinator.waiters.lock().unwrap().is_empty());
+        assert!(coordinator.queue.lock().unwrap().items.is_empty());
     }
 
     #[test]
@@ -1474,775 +5350,229 @@ mod tests {
         );
     }
 
-    fn pane_line(agent: &str, status: &str, wait_reason: &str) -> String {
-        [
-            "main",
-            "@1",
-            "%1",
-            "/tmp",
-            agent,
-            "/dev/ttys001",
-            "123",
-            "0",
-            "0",
-            "0",
-            "",
-            "",
-            "",
-            "",
-            agent,
-            status,
-            "",
-            "",
-            wait_reason,
-            "",
-            if status == "running" { "100" } else { "" },
-            "",
-            "",
-            "",
-            "",
-            "",
-        ]
-        .join("\u{1f}")
-    }
-
-    #[test]
-    fn handle_query_returns_summary_payload() {
-        let mock = MockTmuxRunner::new();
-        let format = snapshot_format();
-        mock.stub(
-            &["list-panes", "-a", "-F", &format],
-            &format!("{}\n", pane_line("codex", "running", "")),
-        );
-        let response = handle_message(
-            &mock,
-            &Config::default(),
-            ClientMessage::Query {
-                proto: 1,
-                what: crate::daemon::protocol::QueryTarget::Summary,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            response,
-            ServerMessage::Summary {
-                text: "#[fg=#4fd08a]●1#[default]".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn handle_query_summary_uses_supplied_config() {
-        let mock = MockTmuxRunner::new();
-        let format = snapshot_format();
-        mock.stub(
-            &["list-panes", "-a", "-F", &format],
-            &format!("{}\n", pane_line("codex", "running", "")),
-        );
-        let mut config = crate::config::Config::default();
-        config.statusline.summary.enabled = false;
-
-        let response = handle_message(
-            &mock,
-            &config,
-            ClientMessage::Query {
-                proto: 1,
-                what: crate::daemon::protocol::QueryTarget::Summary,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            response,
-            ServerMessage::Summary {
-                text: String::new()
-            }
-        );
-    }
-
-    #[test]
-    fn handle_subscribe_returns_snapshot() {
-        let mock = MockTmuxRunner::new();
-        let format = snapshot_format();
-        mock.stub(
-            &["list-panes", "-a", "-F", &format],
-            &format!("{}\n", pane_line("codex", "running", "")),
-        );
-        let response = handle_message(
-            &mock,
-            &Config::default(),
-            ClientMessage::Subscribe { proto: 1 },
-        )
-        .unwrap();
-        let ServerMessage::Snapshot { snapshot } = response else {
-            panic!("expected snapshot response");
+    fn legacy_cleanup_topology() -> crate::daemon::topology::TopologySnapshot {
+        let link = crate::daemon::protocol::v2::SessionLinkPresentation {
+            session_id: "$1".to_string(),
+            session_name: "main".to_string(),
+            window_index: 1,
+            window_active: true,
+            window_last: false,
         };
-        assert_eq!(snapshot.agent_count, 1);
-    }
-
-    #[test]
-    fn handle_subscribe_keeps_connection_and_pushes_snapshot() {
-        use crate::daemon::protocol::ServerMessage;
-        use crate::daemon::runtime::{ClientId, DaemonEvent};
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixStream;
-        use std::sync::mpsc;
-
-        let (mut client, server) = UnixStream::pair().unwrap();
-        serde_json::to_writer(&mut client, &ClientMessage::Subscribe { proto: 1 }).unwrap();
-        client.write_all(b"\n").unwrap();
-
-        let (tx, rx) = mpsc::channel();
-        handle_stream_with_runtime(tx, ClientId(1), server).unwrap();
-        let DaemonEvent::Connect { slot, .. } = rx.recv().unwrap() else {
-            panic!("expected connect event");
-        };
-        slot.publish(ServerMessage::Ack);
-
-        let mut line = String::new();
-        BufReader::new(client).read_line(&mut line).unwrap();
-        assert_eq!(line.trim(), r#"{"type":"ack"}"#);
-    }
-
-    #[test]
-    fn client_writer_stream_has_write_timeout() {
-        use std::os::unix::net::UnixStream;
-        use std::time::Duration;
-
-        let (_client, server) = UnixStream::pair().unwrap();
-
-        configure_client_writer_stream(&server).unwrap();
-
-        assert_eq!(
-            server.write_timeout().unwrap(),
-            Some(Duration::from_millis(500))
-        );
-    }
-
-    #[test]
-    fn bind_daemon_listener_keeps_existing_responsive_socket() {
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::fs::PermissionsExt;
-        use std::os::unix::net::UnixListener;
-        use std::thread;
-
-        let dir = std::path::PathBuf::from(format!(
-            "/tmp/vt-srv-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = String::new();
-            BufReader::new(&mut stream).read_line(&mut request).unwrap();
-            serde_json::to_writer(
-                &mut stream,
-                &ServerMessage::Summary {
-                    text: String::new(),
+        crate::daemon::topology::TopologySnapshot {
+            server_identity: crate::daemon::topology::ServerIdentity {
+                pid: 123,
+                start_time: 456,
+            },
+            panes: [
+                crate::pane_state::PaneInstance {
+                    pane_id: "%2".to_string(),
+                    pane_pid: 102,
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
-        });
-
-        let listener = bind_daemon_listener(&socket).unwrap();
-
-        assert!(listener.is_none());
-        handle.join().unwrap();
-        assert!(socket.exists());
-        std::fs::remove_dir_all(dir).unwrap();
+                crate::pane_state::PaneInstance {
+                    pane_id: "%1".to_string(),
+                    pane_pid: 101,
+                },
+            ]
+            .into_iter()
+            .map(|pane_instance| crate::daemon::topology::TopologyPane {
+                pane_instance,
+                session_links: vec![link.clone()],
+                window_id: "@1".to_string(),
+                window_name: "main".to_string(),
+                current_path: "/tmp".to_string(),
+                current_command: "zsh".to_string(),
+                active: true,
+            })
+            .collect(),
+        }
     }
 
     #[test]
-    fn shutdown_forwarder_sends_shutdown_event() {
-        use crate::daemon::runtime::DaemonEvent;
-        use std::io::Write;
-        use std::os::unix::net::UnixStream;
-        use std::sync::mpsc;
-        use std::time::Duration;
+    fn legacy_cleanup_uses_only_fixed_keys_and_deduplicates_linked_targets() {
+        let items = legacy_cleanup_items(&legacy_cleanup_topology());
 
-        let (mut signal_writer, signal_reader) = UnixStream::pair().unwrap();
-        let (tx, rx) = mpsc::channel();
-        spawn_shutdown_forwarder(signal_reader, tx);
-
-        signal_writer.write_all(b"x").unwrap();
-
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            DaemonEvent::Shutdown
-        ));
-    }
-
-    #[test]
-    fn handle_runtime_shutdown_sends_shutdown_event_and_ack() {
-        use crate::daemon::runtime::{ClientId, DaemonEvent};
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixStream;
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let (mut client, server) = UnixStream::pair().unwrap();
-        serde_json::to_writer(&mut client, &ClientMessage::Shutdown { proto: 1 }).unwrap();
-        client.write_all(b"\n").unwrap();
-
-        let (tx, rx) = mpsc::channel();
-        handle_stream_with_runtime(tx, ClientId(1), server).unwrap();
-
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            DaemonEvent::Shutdown
-        ));
-
-        let mut line = String::new();
-        BufReader::new(client).read_line(&mut line).unwrap();
-        assert_eq!(line.trim(), r#"{"type":"ack"}"#);
+        assert_eq!(items.len(), 32);
+        assert_eq!(items.iter().filter(|item| item.scope == "pane").count(), 26);
+        assert_eq!(
+            items.iter().filter(|item| item.scope == "session").count(),
+            3
+        );
+        assert_eq!(
+            items.iter().filter(|item| item.scope == "window").count(),
+            3
+        );
+        let options = items
+            .iter()
+            .map(|item| item.option)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(options.len(), 19);
+        assert!(!options.contains(crate::options::KEY_PANE_STATE));
+        assert!(!options.contains(crate::options::KEY_STATUS_PANE));
+        assert!(!options.contains(crate::options::KEY_SIDEBAR_MARKER));
     }
 
     #[derive(Default)]
-    struct LoopWorkerIo {
-        panes: std::sync::Mutex<Vec<crate::options::snapshot::PaneSnapshot>>,
-        captures: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
-        jumps: std::sync::Mutex<Vec<String>>,
-        previews: std::sync::Mutex<Vec<(String, u32)>>,
-        pane_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
-        session_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
-        window_options: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
-        notify_calls: std::sync::Mutex<Vec<(String, String, String, String)>>,
-        fail_jump: bool,
+    struct LegacyCleanupRunner {
+        output: String,
+        fail: bool,
+        calls: std::cell::RefCell<Vec<Vec<String>>>,
     }
 
-    impl crate::daemon::workers::WorkerIo for LoopWorkerIo {
-        fn read_panes(&self) -> anyhow::Result<Vec<crate::options::snapshot::PaneSnapshot>> {
-            Ok(self.panes.lock().unwrap().clone())
-        }
-
-        fn capture_tail(&self, pane_id: &str) -> anyhow::Result<String> {
-            Ok(self
-                .captures
-                .lock()
-                .unwrap()
-                .get(pane_id)
-                .cloned()
-                .unwrap_or_default())
-        }
-
-        fn jump_to_pane(&self, pane_id: &str) -> anyhow::Result<()> {
-            if self.fail_jump {
-                anyhow::bail!("jump failed");
+    impl crate::tmux::TmuxRunner for LegacyCleanupRunner {
+        fn run(&self, args: &[&str]) -> anyhow::Result<String> {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|arg| (*arg).to_string()).collect());
+            if self.fail {
+                anyhow::bail!("tmux cleanup failed");
             }
-            self.jumps.lock().unwrap().push(pane_id.to_string());
-            Ok(())
+            Ok(self.output.clone())
         }
-
-        fn preview_pane(&self, pane_id: &str, history_lines: u32) -> anyhow::Result<()> {
-            self.previews
-                .lock()
-                .unwrap()
-                .push((pane_id.to_string(), history_lines));
-            Ok(())
-        }
-
-        fn set_pane_option(&self, pane_id: &str, key: &str, value: &str) -> anyhow::Result<()> {
-            self.pane_options.lock().unwrap().push((
-                pane_id.to_string(),
-                key.to_string(),
-                Some(value.to_string()),
-            ));
-            Ok(())
-        }
-
-        fn unset_pane_option(&self, pane_id: &str, key: &str) -> anyhow::Result<()> {
-            self.pane_options
-                .lock()
-                .unwrap()
-                .push((pane_id.to_string(), key.to_string(), None));
-            Ok(())
-        }
-
-        fn set_session_option(&self, session: &str, key: &str, value: &str) -> anyhow::Result<()> {
-            self.session_options.lock().unwrap().push((
-                session.to_string(),
-                key.to_string(),
-                Some(value.to_string()),
-            ));
-            Ok(())
-        }
-
-        fn unset_session_option(&self, session: &str, key: &str) -> anyhow::Result<()> {
-            self.session_options
-                .lock()
-                .unwrap()
-                .push((session.to_string(), key.to_string(), None));
-            Ok(())
-        }
-
-        fn set_window_option(&self, window: &str, key: &str, value: &str) -> anyhow::Result<()> {
-            self.window_options.lock().unwrap().push((
-                window.to_string(),
-                key.to_string(),
-                Some(value.to_string()),
-            ));
-            Ok(())
-        }
-
-        fn unset_window_option(&self, window: &str, key: &str) -> anyhow::Result<()> {
-            self.window_options
-                .lock()
-                .unwrap()
-                .push((window.to_string(), key.to_string(), None));
-            Ok(())
-        }
-
-        fn run_notify(
-            &self,
-            command: &str,
-            pane_id: &str,
-            agent: &str,
-            state: &str,
-        ) -> anyhow::Result<()> {
-            self.notify_calls.lock().unwrap().push((
-                command.to_string(),
-                pane_id.to_string(),
-                agent.to_string(),
-                state.to_string(),
-            ));
-            Ok(())
-        }
-    }
-
-    fn test_agent_pane(
-        session: &str,
-        pane_id: &str,
-        status: &str,
-    ) -> crate::options::snapshot::PaneSnapshot {
-        crate::options::snapshot::PaneSnapshot {
-            session: session.to_string(),
-            window_id: "@1".to_string(),
-            pane_id: pane_id.to_string(),
-            current_path: "/tmp/app".to_string(),
-            current_command: "codex".to_string(),
-            agent: "codex".to_string(),
-            status: status.to_string(),
-            ..crate::options::snapshot::PaneSnapshot::default()
-        }
-    }
-
-    fn shared_capture_activity() -> Arc<crate::daemon::workers::SharedCaptureActivity> {
-        Arc::new(crate::daemon::workers::SharedCaptureActivity::new())
     }
 
     #[test]
-    fn runtime_effects_write_session_category_metadata() {
-        let io = LoopWorkerIo::default();
-        handle_runtime_effects(
-            vec![
-                RuntimeEffect::SetSessionProjectPath {
-                    session: "main".to_string(),
-                    path: "/tmp/repo".to_string(),
-                },
-                RuntimeEffect::SetSessionCategory {
-                    session: "main".to_string(),
-                    category: "work".to_string(),
-                },
-            ],
-            None,
-            &io,
-            None,
-        )
-        .unwrap();
+    fn legacy_cleanup_is_one_server_guarded_batch_with_per_pane_pid_guards() {
+        let topology = legacy_cleanup_topology();
+        let items = legacy_cleanup_items(&topology);
+        let runner = LegacyCleanupRunner::default();
 
-        let options = io.session_options.lock().unwrap().clone();
-        assert!(options.contains(&(
-            "main".to_string(),
-            crate::options::KEY_PROJECT_PATH.to_string(),
-            Some("/tmp/repo".to_string()),
-        )));
-        assert!(options.contains(&(
-            "main".to_string(),
-            crate::options::KEY_CATEGORY.to_string(),
-            Some("work".to_string()),
-        )));
-    }
+        let outcome = execute_legacy_cleanup(&runner, &topology.server_identity, &items);
 
-    #[test]
-    fn runtime_loop_answers_query_and_handles_jump_effect() {
-        use crate::daemon::protocol::SidebarClientEvent;
-        use crate::daemon::runtime::{ClientId, DaemonEvent, RuntimeState};
-        use crate::options::snapshot::PaneSnapshot;
-        use crate::sidebar::state::SidebarState;
-        use std::sync::{Arc, mpsc};
-
-        let io = Arc::new(LoopWorkerIo::default());
-        let (tx, rx) = mpsc::channel();
-        tx.send(DaemonEvent::PanesUpdated(vec![PaneSnapshot {
-            session: "main".to_string(),
-            window_id: "@1".to_string(),
-            pane_id: "%1".to_string(),
-            current_path: "/tmp/app".to_string(),
-            current_command: "codex".to_string(),
-            agent: "codex".to_string(),
-            status: "running".to_string(),
-            ..PaneSnapshot::default()
-        }]))
-        .unwrap();
-        let (reply_tx, reply_rx) = mpsc::channel();
-        tx.send(DaemonEvent::QuerySummary { reply: reply_tx })
-            .unwrap();
-        tx.send(DaemonEvent::Client {
-            client_id: ClientId(1),
-            event: SidebarClientEvent::JumpPane {
-                pane: "%1".to_string(),
-            },
-        })
-        .unwrap();
-        drop(tx);
-
-        run_runtime_loop(
-            RuntimeState::new(crate::config::Config::default(), SidebarState::default()),
-            rx,
-            None,
-            io.clone(),
-            shared_capture_activity(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            reply_rx.recv().unwrap(),
-            ServerMessage::Summary {
-                text: "#[fg=#4fd08a]●1#[default]".to_string()
-            }
-        );
-        assert_eq!(io.jumps.lock().unwrap().as_slice(), ["%1"]);
-    }
-
-    #[test]
-    fn runtime_loop_refresh_panes_reads_tmux_and_updates_snapshot() {
-        use crate::daemon::runtime::{DaemonEvent, RuntimeState};
-        use crate::sidebar::state::SidebarState;
-        use std::sync::{Arc, mpsc};
-
-        let io = Arc::new(LoopWorkerIo::default());
-        let mut pane = test_agent_pane("main", "%1", "waiting");
-        pane.wait_reason = "permission_prompt".to_string();
-        io.panes.lock().unwrap().push(pane);
-        let (tx, rx) = mpsc::channel();
-        let (refresh_tx, refresh_rx) = mpsc::channel();
-        tx.send(DaemonEvent::RefreshPanes { reply: refresh_tx })
-            .unwrap();
-        let (summary_tx, summary_rx) = mpsc::channel();
-        tx.send(DaemonEvent::QuerySummary { reply: summary_tx })
-            .unwrap();
-        drop(tx);
-
-        run_runtime_loop(
-            RuntimeState::new(crate::config::Config::default(), SidebarState::default()),
-            rx,
-            None,
-            io,
-            shared_capture_activity(),
-        )
-        .unwrap();
-
-        assert_eq!(refresh_rx.recv().unwrap(), ServerMessage::Ack);
-        assert_eq!(
-            summary_rx.recv().unwrap(),
-            ServerMessage::Summary {
-                text: "#[fg=#ff6b6b]▲1#[default]".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn refresh_panes_reuses_shared_capture_activity() {
-        use crate::daemon::runtime::RuntimeState;
-        use crate::sidebar::state::SidebarState;
-        use std::sync::{Arc, mpsc};
-
-        let io = Arc::new(LoopWorkerIo::default());
-        let mut pane = test_agent_pane("main", "%1", "running");
-        pane.started_at = (crate::sidebar::tree::now_epoch_secs() - 1_000).to_string();
-        io.panes.lock().unwrap().push(pane);
-        io.captures
-            .lock()
-            .unwrap()
-            .insert("%1".to_string(), "Working (1s)\n".to_string());
-        let capture_activity = shared_capture_activity();
-        let initial = crate::daemon::workers::read_panes_with_shared_capture_activity(
-            io.as_ref(),
-            300,
-            capture_activity.as_ref(),
-        )
-        .unwrap();
-        assert_eq!(initial[0].status, "idle");
-        io.captures
-            .lock()
-            .unwrap()
-            .insert("%1".to_string(), "Working (2s)\n".to_string());
-
-        let mut state =
-            RuntimeState::new(crate::config::Config::default(), SidebarState::default());
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let effects =
-            refresh_panes_once(&mut state, io.as_ref(), capture_activity.as_ref(), reply_tx);
-
-        assert_eq!(reply_rx.recv().unwrap(), ServerMessage::Ack);
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            RuntimeEffect::SetSessionBadge { session, state, .. }
-                if session == "main" && state == "working"
-        )));
-    }
-
-    #[test]
-    fn runtime_loop_keeps_running_when_jump_effect_fails() {
-        use crate::daemon::protocol::SidebarClientEvent;
-        use crate::daemon::runtime::{ClientId, DaemonEvent, RuntimeState};
-        use crate::sidebar::state::SidebarState;
-        use std::sync::{Arc, mpsc};
-
-        let io = Arc::new(LoopWorkerIo {
-            fail_jump: true,
-            ..LoopWorkerIo::default()
-        });
-        let (tx, rx) = mpsc::channel();
-        tx.send(DaemonEvent::Client {
-            client_id: ClientId(1),
-            event: SidebarClientEvent::JumpPane {
-                pane: "%1".to_string(),
-            },
-        })
-        .unwrap();
-        let (reply_tx, reply_rx) = mpsc::channel();
-        tx.send(DaemonEvent::QuerySummary { reply: reply_tx })
-            .unwrap();
-        drop(tx);
-
-        run_runtime_loop(
-            RuntimeState::new(crate::config::Config::default(), SidebarState::default()),
-            rx,
-            None,
-            io,
-            shared_capture_activity(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            reply_rx.recv().unwrap(),
-            ServerMessage::Summary {
-                text: String::new()
-            }
-        );
-    }
-
-    #[test]
-    fn runtime_loop_flushes_dirty_state_on_shutdown() {
-        use crate::daemon::protocol::SidebarClientEvent;
-        use crate::daemon::runtime::{ClientId, DaemonEvent, RuntimeState};
-        use crate::options::snapshot::PaneSnapshot;
-        use crate::sidebar::state::SidebarState;
-        use std::sync::{Arc, mpsc};
-
-        let dir = std::env::temp_dir().join(format!(
-            "vde-runtime-shutdown-flush-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let state_path = dir.join("state.json");
-        let io = Arc::new(LoopWorkerIo::default());
-        let (tx, rx) = mpsc::channel();
-        tx.send(DaemonEvent::PanesUpdated(vec![PaneSnapshot {
-            session: "main".to_string(),
-            window_id: "@1".to_string(),
-            pane_id: "%1".to_string(),
-            current_path: "/tmp/app".to_string(),
-            current_command: "codex".to_string(),
-            agent: "codex".to_string(),
-            status: "running".to_string(),
-            ..PaneSnapshot::default()
-        }]))
-        .unwrap();
-        tx.send(DaemonEvent::Client {
-            client_id: ClientId(1),
-            event: SidebarClientEvent::Key {
-                key: "j".to_string(),
-            },
-        })
-        .unwrap();
-        tx.send(DaemonEvent::Shutdown).unwrap();
-
-        run_runtime_loop(
-            RuntimeState::new(crate::config::Config::default(), SidebarState::default()),
-            rx,
-            Some(state_path.clone()),
-            io,
-            shared_capture_activity(),
-        )
-        .unwrap();
-
-        let saved = crate::sidebar::store::load_state(&state_path).unwrap();
-        assert_eq!(saved.selection.as_deref(), Some("repo::misc::app"));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn runtime_loop_executes_session_badge_effects() {
-        use crate::daemon::runtime::{DaemonEvent, RuntimeState};
-        use crate::sidebar::state::SidebarState;
-        use std::sync::{Arc, mpsc};
-        use std::thread;
-
-        let io = Arc::new(LoopWorkerIo::default());
-        let (tx, rx) = mpsc::channel();
-        let state = RuntimeState::new(crate::config::Config::default(), SidebarState::default());
-        let handle = {
-            let io = io.clone();
-            thread::spawn(move || run_runtime_loop(state, rx, None, io, shared_capture_activity()))
-        };
-        tx.send(DaemonEvent::PanesUpdated(vec![test_agent_pane(
-            "main", "%1", "running",
-        )]))
-        .unwrap();
-        tx.send(DaemonEvent::Shutdown).unwrap();
-        handle.join().unwrap().unwrap();
-
-        let calls = io.session_options.lock().unwrap().clone();
-        assert_eq!(
-            calls,
-            vec![
-                (
-                    "main".to_string(),
-                    "@vde_session_status".to_string(),
-                    Some("●".to_string()),
-                ),
-                (
-                    "main".to_string(),
-                    "@vde_session_state".to_string(),
-                    Some("working".to_string()),
-                ),
-                ("main".to_string(), "@vde_session_status".to_string(), None),
-                ("main".to_string(), "@vde_session_state".to_string(), None),
-            ]
-        );
-    }
-
-    #[test]
-    fn notify_effect_runs_command_via_worker_io() {
-        let io = LoopWorkerIo::default();
-
-        handle_runtime_effects(
-            vec![RuntimeEffect::Notify {
-                pane_id: "%1".to_string(),
-                agent: "codex".to_string(),
-                state: crate::daemon::session_badge::BadgeState::Blocked,
-            }],
-            None,
-            &io,
-            Some("true"),
-        )
-        .unwrap();
-
-        let calls = io.notify_calls.lock().unwrap();
-        assert_eq!(
-            calls.as_slice(),
-            &[(
-                "true".to_string(),
-                "%1".to_string(),
-                "codex".to_string(),
-                "Blocked".to_string()
-            )]
-        );
-    }
-
-    #[test]
-    fn clear_pane_state_effect_unsets_all_pane_state_keys() {
-        let io = LoopWorkerIo::default();
-
-        handle_runtime_effects(
-            vec![RuntimeEffect::ClearPaneState {
-                pane_id: "%1".to_string(),
-            }],
-            None,
-            &io,
-            None,
-        )
-        .unwrap();
-
-        let calls = io.pane_options.lock().unwrap().clone();
-        let expected = crate::options::PANE_STATE_KEYS
+        assert_eq!(outcome.attempted, 32);
+        assert_eq!(outcome.removed, 32);
+        assert!(outcome.failed.is_empty());
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0], "if-shell");
+        assert!(calls[0][2].contains("#{pid},123"));
+        assert!(calls[0][2].contains("#{start_time},456"));
+        assert!(calls[0][3].contains("#{pane_pid},101"));
+        assert!(calls[0][3].contains("#{pane_pid},102"));
+        for option in crate::options::LEGACY_PANE_OPTION_KEYS
             .iter()
-            .map(|key| ("%1".to_string(), (*key).to_string(), None))
-            .collect::<Vec<_>>();
-        assert_eq!(calls, expected);
+            .chain(crate::options::LEGACY_SESSION_OPTION_KEYS)
+            .chain(crate::options::LEGACY_WINDOW_OPTION_KEYS)
+        {
+            assert!(calls[0][3].contains(option), "missing {option}");
+        }
     }
 
     #[test]
-    fn mark_pane_done_effect_sets_idle_and_resets_task_state() {
-        let io = LoopWorkerIo::default();
+    fn legacy_cleanup_reports_pane_instance_mismatch_without_counting_removal() {
+        let topology = legacy_cleanup_topology();
+        let items = legacy_cleanup_items(&topology);
+        let runner = LegacyCleanupRunner {
+            output: format!("{LEGACY_CLEANUP_PANE_MISMATCH_PREFIX}:0\n"),
+            ..LegacyCleanupRunner::default()
+        };
 
-        handle_runtime_effects(
-            vec![RuntimeEffect::MarkPaneDone {
-                pane_id: "%1".to_string(),
-                completed_at: 1234,
-            }],
-            None,
-            &io,
-            None,
-        )
-        .unwrap();
+        let outcome = execute_legacy_cleanup(&runner, &topology.server_identity, &items);
 
-        assert_eq!(
-            io.pane_options.lock().unwrap().as_slice(),
-            &[
-                (
-                    "%1".to_string(),
-                    crate::options::KEY_STATUS.to_string(),
-                    Some("idle".to_string())
-                ),
-                (
-                    "%1".to_string(),
-                    crate::options::KEY_ATTENTION.to_string(),
-                    Some("1".to_string())
-                ),
-                (
-                    "%1".to_string(),
-                    crate::options::KEY_COMPLETED_AT.to_string(),
-                    Some("1234".to_string())
-                ),
-                (
-                    "%1".to_string(),
-                    crate::options::KEY_WAIT_REASON.to_string(),
-                    None
-                ),
-                (
-                    "%1".to_string(),
-                    crate::options::KEY_TASKS.to_string(),
-                    None
-                ),
-                (
-                    "%1".to_string(),
-                    crate::options::KEY_TASK_ITEMS.to_string(),
-                    None
-                ),
-                (
-                    "%1".to_string(),
-                    crate::options::KEY_TASK_ITEM_IDS.to_string(),
-                    None
-                ),
-                (
-                    "%1".to_string(),
-                    crate::options::KEY_SUBAGENTS.to_string(),
-                    None
-                ),
-            ]
+        assert_eq!(outcome.attempted, 32);
+        assert_eq!(outcome.removed, 31);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].scope, "pane");
+        assert_eq!(outcome.failed[0].target, "%1");
+        assert_eq!(outcome.failed[0].option, "@vde_agent");
+    }
+
+    #[test]
+    fn legacy_cleanup_server_mismatch_is_terminal_and_removes_nothing() {
+        let topology = legacy_cleanup_topology();
+        let items = legacy_cleanup_items(&topology);
+        let runner = LegacyCleanupRunner {
+            output: format!("{LEGACY_CLEANUP_SERVER_MISMATCH_SENTINEL}\n"),
+            ..LegacyCleanupRunner::default()
+        };
+
+        let outcome = execute_legacy_cleanup(&runner, &topology.server_identity, &items);
+
+        assert!(outcome.server_mismatch);
+        assert_eq!(outcome.removed, 0);
+        assert!(outcome.failed.is_empty());
+    }
+
+    #[test]
+    fn legacy_cleanup_empty_topology_is_a_zero_attempt_noop() {
+        let topology = crate::daemon::topology::TopologySnapshot {
+            server_identity: crate::daemon::topology::ServerIdentity {
+                pid: 123,
+                start_time: 456,
+            },
+            panes: Vec::new(),
+        };
+        let runner = LegacyCleanupRunner::default();
+
+        let outcome = execute_legacy_cleanup(
+            &runner,
+            &topology.server_identity,
+            &legacy_cleanup_items(&topology),
         );
+
+        assert_eq!(outcome.attempted, 0);
+        assert_eq!(outcome.removed, 0);
+        assert!(outcome.failed.is_empty());
+        assert!(runner.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn legacy_cleanup_batch_failure_is_typed_for_each_attempt() {
+        let topology = legacy_cleanup_topology();
+        let items = legacy_cleanup_items(&topology);
+        let runner = LegacyCleanupRunner {
+            fail: true,
+            ..LegacyCleanupRunner::default()
+        };
+
+        let outcome = execute_legacy_cleanup(&runner, &topology.server_identity, &items);
+
+        assert_eq!(outcome.attempted, 32);
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.failed.len(), 32);
+        assert!(
+            outcome.failed.iter().all(|failure| failure.message
+                == "tmux legacy cleanup batch failed: tmux cleanup failed")
+        );
+    }
+
+    #[test]
+    fn shutdown_forwarder_stops_v2_coordinator() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let (mut signal_writer, signal_reader) = UnixStream::pair().unwrap();
+        let coordinator = Arc::new(
+            ProductionV2Coordinator::new(
+                crate::daemon::lifecycle::TmuxServerIncarnation {
+                    socket_path: "/tmp/vde-test-tmux.sock".into(),
+                    identity: crate::daemon::topology::ServerIdentity {
+                        pid: 1,
+                        start_time: 2,
+                    },
+                    hash: "1".repeat(64),
+                },
+                BTreeMap::new(),
+                crate::config::DoneClearOn::Pane,
+                None,
+            )
+            .unwrap(),
+        );
+        spawn_shutdown_forwarder(signal_reader, coordinator.clone());
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = {
+            let coordinator = coordinator.clone();
+            thread::spawn(move || {
+                coordinator.wait_for_shutdown();
+                done_tx.send(()).unwrap();
+            })
+        };
+
+        signal_writer.write_all(b"x").unwrap();
+
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        waiter.join().unwrap();
+        assert!(coordinator.shutdown.load(Ordering::SeqCst));
+        assert!(coordinator.shutdown_ready.load(Ordering::SeqCst));
+        assert!(coordinator.router.lock().unwrap().is_fatal());
     }
 }

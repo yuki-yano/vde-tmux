@@ -6,12 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::agent::display_agent_name;
 use crate::category::resolve_category_for_session;
 use crate::config::Config;
-use crate::daemon::session_badge::{BadgeState, badge_state};
+use crate::daemon::session_badge::BadgeState;
 use crate::git::WorktreeInfo;
-use crate::hook::{
-    AgentStatus, RollupLevel, TaskItem, TaskItemStatus, WorktreeActivity, pane_rollup_level,
-};
-use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane};
+use crate::hook::{RollupLevel, TaskItem, TaskItemStatus, WorktreeActivity};
 use crate::session::SessionInfo;
 use crate::sidebar::state::{SidebarRowRef, SidebarState, StatusFilter, ViewMode};
 
@@ -96,14 +93,13 @@ struct AgentPane {
     started_at: String,
     completed_at: String,
     tasks: String,
-    task_items: String,
-    subagents: String,
-    worktree_activity: String,
+    task_items: Vec<TaskItem>,
+    subagents: Vec<SubagentDetail>,
+    worktree_activity: Option<WorktreeActivity>,
     worktree: Option<WorktreeInfo>,
     rollup: RollupLevel,
     badge_state: BadgeState,
     repo_path: String,
-    attention: bool,
     flash: bool,
     active: bool,
 }
@@ -112,195 +108,122 @@ struct AgentPane {
 pub struct RowBuildContext {
     pub git: BTreeMap<String, crate::git::GitBadge>,
     pub worktrees: BTreeMap<String, crate::git::WorktreeInfo>,
-    pub unread: BTreeMap<String, bool>,
     pub triage: BTreeSet<String>,
     pub flash: BTreeSet<String>,
     pub now: i64,
 }
 
-pub fn build_rows(
+pub fn build_rows_from_presentations(
     config: &Config,
-    panes: &[PaneSnapshot],
-    state: &SidebarState,
-) -> Vec<SidebarRow> {
-    build_rows_with_git(config, panes, state, &BTreeMap::new())
-}
-
-pub fn build_rows_with_git(
-    config: &Config,
-    panes: &[PaneSnapshot],
-    state: &SidebarState,
-    git: &BTreeMap<String, crate::git::GitBadge>,
-) -> Vec<SidebarRow> {
-    build_rows_with_git_and_worktrees(config, panes, state, git, &BTreeMap::new())
-}
-
-pub fn build_rows_with_git_and_worktrees(
-    config: &Config,
-    panes: &[PaneSnapshot],
-    state: &SidebarState,
-    git: &BTreeMap<String, crate::git::GitBadge>,
-    worktrees: &BTreeMap<String, crate::git::WorktreeInfo>,
-) -> Vec<SidebarRow> {
-    build_rows_with_git_worktrees_and_unread(config, panes, state, git, worktrees, &BTreeMap::new())
-}
-
-pub fn build_rows_with_git_and_unread(
-    config: &Config,
-    panes: &[PaneSnapshot],
-    state: &SidebarState,
-    git: &BTreeMap<String, crate::git::GitBadge>,
-    unread: &BTreeMap<String, bool>,
-) -> Vec<SidebarRow> {
-    build_rows_at_with_git_worktrees_and_unread(
-        config,
-        panes,
-        state,
-        git,
-        &BTreeMap::new(),
-        unread,
-        now_epoch_secs(),
-    )
-}
-
-pub fn build_rows_at(
-    config: &Config,
-    panes: &[PaneSnapshot],
-    state: &SidebarState,
-    now: i64,
-) -> Vec<SidebarRow> {
-    build_rows_at_with_git_and_unread(
-        config,
-        panes,
-        state,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        now,
-    )
-}
-
-pub fn build_rows_at_with_git(
-    config: &Config,
-    panes: &[PaneSnapshot],
-    state: &SidebarState,
-    git: &BTreeMap<String, crate::git::GitBadge>,
-    now: i64,
-) -> Vec<SidebarRow> {
-    build_rows_at_with_git_worktrees_and_unread(
-        config,
-        panes,
-        state,
-        git,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        now,
-    )
-}
-
-pub fn build_rows_at_with_git_and_unread(
-    config: &Config,
-    panes: &[PaneSnapshot],
-    state: &SidebarState,
-    git: &BTreeMap<String, crate::git::GitBadge>,
-    unread: &BTreeMap<String, bool>,
-    now: i64,
-) -> Vec<SidebarRow> {
-    build_rows_at_with_git_worktrees_and_unread(
-        config,
-        panes,
-        state,
-        git,
-        &BTreeMap::new(),
-        unread,
-        now,
-    )
-}
-
-fn build_rows_with_git_worktrees_and_unread(
-    config: &Config,
-    panes: &[PaneSnapshot],
-    state: &SidebarState,
-    git: &BTreeMap<String, crate::git::GitBadge>,
-    worktrees: &BTreeMap<String, crate::git::WorktreeInfo>,
-    unread: &BTreeMap<String, bool>,
-) -> Vec<SidebarRow> {
-    build_rows_at_with_git_worktrees_and_unread(
-        config,
-        panes,
-        state,
-        git,
-        worktrees,
-        unread,
-        now_epoch_secs(),
-    )
-}
-
-fn build_rows_at_with_git_worktrees_and_unread(
-    config: &Config,
-    panes: &[PaneSnapshot],
-    state: &SidebarState,
-    git: &BTreeMap<String, crate::git::GitBadge>,
-    worktrees: &BTreeMap<String, crate::git::WorktreeInfo>,
-    unread: &BTreeMap<String, bool>,
-    now: i64,
-) -> Vec<SidebarRow> {
-    build_rows_ctx(
-        config,
-        panes,
-        state,
-        &RowBuildContext {
-            git: git.clone(),
-            worktrees: worktrees.clone(),
-            unread: unread.clone(),
-            triage: BTreeSet::new(),
-            flash: BTreeSet::new(),
-            now,
-        },
-    )
-    .0
-}
-
-pub fn build_rows_ctx(
-    config: &Config,
-    panes: &[PaneSnapshot],
+    panes: &[crate::daemon::protocol::v2::PanePresentation],
     state: &SidebarState,
     ctx: &RowBuildContext,
+    visible_panes: &BTreeSet<String>,
 ) -> (Vec<SidebarRow>, BadgeCounts) {
     let mut groups: BTreeMap<(String, String), Vec<AgentPane>> = BTreeMap::new();
     for pane in panes {
-        if !is_live_agent_pane(pane) {
+        let Some(resolved) = pane.resolved.as_ref() else {
             continue;
-        }
-        let agent = effective_agent(pane).unwrap_or_default().to_string();
-        let repo = repo_label(pane);
-        let category = category_for_pane(config, pane, &repo);
-        let rollup = rollup_for_pane(pane);
-        let unread = ctx.unread.get(&pane.pane_id).copied().unwrap_or(false);
+        };
+        let canonical = &resolved.canonical;
+        let session_name = pane
+            .session_links
+            .first()
+            .map(|link| link.session_name.as_str())
+            .unwrap_or("repo");
+        let repo = repo_label_from_values(&pane.current_path, session_name);
+        let category = category_for_values(config, session_name, &pane.current_path, &repo);
+        let (rollup, wait_reason) = match &canonical.lifecycle {
+            crate::pane_state::LifecycleState::Idle => (RollupLevel::Idle, String::new()),
+            crate::pane_state::LifecycleState::Running => (RollupLevel::Running, String::new()),
+            crate::pane_state::LifecycleState::Waiting { reason } => match reason {
+                crate::pane_state::WaitReason::PermissionPrompt => {
+                    (RollupLevel::Permission, "permission_prompt".to_string())
+                }
+                crate::pane_state::WaitReason::Other(reason) => {
+                    (RollupLevel::Waiting, reason.clone())
+                }
+            },
+            crate::pane_state::LifecycleState::Error { reason } => {
+                (RollupLevel::Error, reason.clone().unwrap_or_default())
+            }
+        };
+        let task_items = canonical
+            .tasks
+            .items
+            .iter()
+            .map(|item| TaskItem {
+                step: item.step.clone(),
+                status: match item.status {
+                    crate::pane_state::TaskItemStatus::Pending => TaskItemStatus::Pending,
+                    crate::pane_state::TaskItemStatus::InProgress => TaskItemStatus::InProgress,
+                    crate::pane_state::TaskItemStatus::Completed => TaskItemStatus::Completed,
+                },
+            })
+            .collect::<Vec<_>>();
+        let subagents = canonical
+            .subagents
+            .iter()
+            .map(|subagent| SubagentDetail {
+                agent_id: subagent.agent_id.clone(),
+                agent_type: subagent.agent_type.clone(),
+                display_name: subagent.display_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let worktree_activity =
+            canonical
+                .worktree_activity
+                .as_ref()
+                .map(|activity| crate::hook::WorktreeActivity {
+                    kind: crate::hook::WorktreeActivityKind::VwExec,
+                    name: activity.name.clone(),
+                    path: activity.path.clone(),
+                    command: activity.command.clone(),
+                    observed_at: activity.observed_at,
+                });
         groups
             .entry((category.clone(), repo.clone()))
             .or_default()
             .push(AgentPane {
-                pane_id: pane.pane_id.clone(),
+                pane_id: pane.pane_instance.pane_id.clone(),
                 repo,
                 category,
-                agent,
-                prompt: pane.prompt.clone(),
-                wait_reason: pane.wait_reason.clone(),
-                started_at: pane.started_at.clone(),
-                completed_at: pane.completed_at.clone(),
-                tasks: pane.tasks.clone(),
-                task_items: pane.task_items.clone(),
-                subagents: pane.subagents.clone(),
-                worktree_activity: pane.worktree_activity.clone(),
+                agent: canonical.agent.as_str().to_string(),
+                prompt: canonical
+                    .prompt
+                    .as_ref()
+                    .map(|prompt| prompt.text.clone())
+                    .unwrap_or_default(),
+                wait_reason,
+                started_at: canonical
+                    .started_at
+                    .map_or_else(String::new, |value| value.to_string()),
+                completed_at: canonical
+                    .completed_at
+                    .map_or_else(String::new, |value| value.to_string()),
+                tasks: format!(
+                    "{}/{}",
+                    canonical.tasks.progress.done, canonical.tasks.progress.total
+                ),
+                task_items,
+                subagents,
+                worktree_activity,
                 worktree: ctx.worktrees.get(&pane.current_path).cloned(),
                 rollup,
-                badge_state: badge_state(rollup, unread),
+                badge_state: resolved.badge,
                 repo_path: pane.current_path.clone(),
-                attention: pane.attention == "1",
-                flash: ctx.flash.contains(&pane.pane_id),
-                active: pane.window_active && pane.session_attached,
+                flash: ctx.flash.contains(&pane.pane_instance.pane_id),
+                active: visible_panes.contains(&pane.pane_instance.pane_id),
             });
     }
+    build_rows_from_groups(groups, state, ctx)
+}
+
+fn build_rows_from_groups(
+    mut groups: BTreeMap<(String, String), Vec<AgentPane>>,
+    state: &SidebarState,
+    ctx: &RowBuildContext,
+) -> (Vec<SidebarRow>, BadgeCounts) {
     for panes in groups.values_mut() {
         order_agent_panes(panes, state);
     }
@@ -376,18 +299,6 @@ pub fn row_refs(rows: &[SidebarRow]) -> Vec<SidebarRowRef> {
 
 pub(crate) fn chat_row_id(pane_id: &str) -> String {
     format!("chat::{pane_id}")
-}
-
-pub(crate) fn repo_row_id_for_pane(config: &Config, pane: &PaneSnapshot) -> String {
-    let repo = repo_label(pane);
-    let category = category_for_pane(config, pane, &repo);
-    repo_id(&category, &repo)
-}
-
-pub(crate) fn category_row_id_for_pane(config: &Config, pane: &PaneSnapshot) -> String {
-    let repo = repo_label(pane);
-    let category = category_for_pane(config, pane, &repo);
-    format!("category::{category}")
 }
 
 fn category_rows(
@@ -647,8 +558,8 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
         rows.push(detail_row(pane, depth, "prompt", prompt.to_string()));
     }
 
-    let worktree_activity = decode_worktree_activity(&pane.worktree_activity);
-    if let Some(activity) = worktree_activity
+    if let Some(activity) = pane
+        .worktree_activity
         .as_ref()
         .filter(|activity| !same_worktree_path(pane.worktree.as_ref(), activity))
     {
@@ -660,9 +571,8 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
         ));
     }
 
-    let task_items = decode_task_items(&pane.task_items);
-    if let Some(last_index) = task_items.len().checked_sub(1) {
-        for (index, item) in task_items.iter().enumerate() {
+    if let Some(last_index) = pane.task_items.len().checked_sub(1) {
+        for (index, item) in pane.task_items.iter().enumerate() {
             rows.push(detail_row(
                 pane,
                 depth,
@@ -672,9 +582,8 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
         }
     }
 
-    let subagents = decode_subagents(&pane.subagents);
-    if let Some(last_index) = subagents.len().checked_sub(1) {
-        for (index, subagent) in subagents.iter().enumerate() {
+    if let Some(last_index) = pane.subagents.len().checked_sub(1) {
+        for (index, subagent) in pane.subagents.iter().enumerate() {
             rows.push(detail_row(
                 pane,
                 depth,
@@ -697,14 +606,6 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
         active: pane.active,
         meta: None,
     });
-}
-
-fn decode_task_items(raw: &str) -> Vec<TaskItem> {
-    serde_json::from_str(raw).unwrap_or_default()
-}
-
-fn decode_worktree_activity(raw: &str) -> Option<WorktreeActivity> {
-    serde_json::from_str(raw).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -799,7 +700,7 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
             .map(|completed_at| (now - completed_at).max(0)),
         tasks_done: tasks.map(|(done, _)| done),
         tasks_total: tasks.map(|(_, total)| total),
-        subagent_count: Some(decode_subagents(&pane.subagents).len()),
+        subagent_count: Some(pane.subagents.len()),
         attention_count: None,
         origin: None,
         flash: pane.flash.then_some(true),
@@ -857,28 +758,6 @@ pub fn humanize_secs_full(secs: i64) -> String {
     }
 }
 
-fn decode_subagents(raw: &str) -> Vec<SubagentDetail> {
-    raw.split('|')
-        .filter(|entry| !entry.is_empty())
-        .filter_map(|entry| {
-            entry.split_once(':').map(|(agent_id, rest)| {
-                let (agent_type, display_name) = match rest.split_once(':') {
-                    Some((agent_type, display_name)) => (
-                        agent_type.to_string(),
-                        (!display_name.is_empty()).then(|| display_name.to_string()),
-                    ),
-                    None => (rest.to_string(), None),
-                };
-                SubagentDetail {
-                    agent_id: agent_id.to_string(),
-                    agent_type,
-                    display_name,
-                }
-            })
-        })
-        .collect()
-}
-
 fn subagent_id_suffix(agent_id: &str) -> String {
     let prefix = agent_id.chars().take(4).collect::<String>();
     if prefix.is_empty() {
@@ -918,8 +797,7 @@ fn pane_matches_filter(pane: &AgentPane, filter: StatusFilter) -> bool {
 }
 
 fn pane_matches_attention_filter(pane: &AgentPane) -> bool {
-    pane.completed_at.trim().is_empty()
-        && (pane.attention || pane.badge_state == BadgeState::Blocked)
+    pane.badge_state == BadgeState::Blocked
 }
 
 fn order_repo_groups(groups: &mut [Vec<AgentPane>], state: &SidebarState) {
@@ -982,21 +860,11 @@ enum ChatSortBucket {
 }
 
 fn chat_sort_bucket(pane: &AgentPane) -> ChatSortBucket {
-    match pane.rollup {
-        RollupLevel::Error | RollupLevel::Permission | RollupLevel::Waiting => {
-            ChatSortBucket::NeedsAttention
-        }
-        RollupLevel::Running => ChatSortBucket::Running,
-        RollupLevel::Background | RollupLevel::Idle
-            if parse_epoch(&pane.completed_at).is_some()
-                || pane.badge_state == BadgeState::Done =>
-        {
-            ChatSortBucket::Done
-        }
-        RollupLevel::Background | RollupLevel::Idle if pane.attention => {
-            ChatSortBucket::NeedsAttention
-        }
-        RollupLevel::Background | RollupLevel::Idle => ChatSortBucket::Idle,
+    match pane.badge_state {
+        BadgeState::Blocked => ChatSortBucket::NeedsAttention,
+        BadgeState::Working => ChatSortBucket::Running,
+        BadgeState::Done => ChatSortBucket::Done,
+        BadgeState::Idle => ChatSortBucket::Idle,
     }
 }
 
@@ -1028,10 +896,10 @@ fn badge_rollup(panes: &[AgentPane]) -> Option<BadgeState> {
     panes.iter().map(|pane| pane.badge_state).min()
 }
 
-fn category_for_pane(config: &Config, pane: &PaneSnapshot, repo: &str) -> String {
+fn category_for_values(config: &Config, session_name: &str, path: &str, repo: &str) -> String {
     let session = SessionInfo {
-        name: pane.session.clone(),
-        project_path: pane.current_path.clone(),
+        name: session_name.to_string(),
+        project_path: path.to_string(),
         ..SessionInfo::default()
     };
     let category = resolve_category_for_session(config, &session);
@@ -1047,31 +915,17 @@ fn category_for_pane(config: &Config, pane: &PaneSnapshot, repo: &str) -> String
     .unwrap_or_else(|| repo.to_string())
 }
 
-fn repo_label(pane: &PaneSnapshot) -> String {
-    let path = pane.current_path.trim_end_matches('/');
+fn repo_label_from_values(path: &str, session_name: &str) -> String {
+    let path = path.trim_end_matches('/');
     let repo = path
         .rsplit('/')
         .find(|segment| !segment.is_empty())
-        .unwrap_or(&pane.session);
+        .unwrap_or(session_name);
     let repo = repo.trim();
     if repo.is_empty() {
         "repo".to_string()
     } else {
         repo.replace('\u{1f}', " ")
-    }
-}
-
-pub(crate) fn rollup_for_pane(pane: &PaneSnapshot) -> RollupLevel {
-    pane_rollup_level(parse_status(&pane.status), non_empty(&pane.wait_reason))
-}
-
-fn parse_status(raw: &str) -> Option<AgentStatus> {
-    match raw {
-        "running" => Some(AgentStatus::Running),
-        "waiting" => Some(AgentStatus::Waiting),
-        "idle" => Some(AgentStatus::Idle),
-        "error" => Some(AgentStatus::Error),
-        _ => None,
     }
 }
 
@@ -1096,29 +950,27 @@ impl EmptyStringExt for String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CategoryRule, Config};
-    use crate::git::{WorktreeInfo, WorktreeSource};
-    use crate::hook::RollupLevel;
-    use crate::hook::{TaskItem, TaskItemStatus, WorktreeActivity, WorktreeActivityKind};
-    use crate::options::snapshot::PaneSnapshot;
-    use crate::sidebar::state::{SidebarState, ViewMode};
 
-    fn pane(session: &str, pane_id: &str, path: &str, agent: &str, status: &str) -> PaneSnapshot {
-        PaneSnapshot {
-            session: session.to_string(),
-            pane_id: pane_id.to_string(),
-            current_path: path.to_string(),
-            current_command: agent.to_string(),
-            agent: agent.to_string(),
-            status: status.to_string(),
-            ..PaneSnapshot::default()
-        }
-    }
-
-    fn category_rule(category: &str, pattern: &str) -> CategoryRule {
-        CategoryRule {
-            category: category.to_string(),
-            path_patterns: vec![pattern.to_string()],
+    fn agent_pane(badge_state: BadgeState, completed_at: &str) -> AgentPane {
+        AgentPane {
+            pane_id: "%1".to_string(),
+            repo: "repo".to_string(),
+            category: "misc".to_string(),
+            agent: "codex".to_string(),
+            prompt: String::new(),
+            wait_reason: String::new(),
+            started_at: "100".to_string(),
+            completed_at: completed_at.to_string(),
+            tasks: "0/0".to_string(),
+            task_items: Vec::new(),
+            subagents: Vec::new(),
+            worktree_activity: None,
+            worktree: None,
+            rollup: RollupLevel::Idle,
+            badge_state,
+            repo_path: "/tmp/repo".to_string(),
+            flash: false,
+            active: false,
         }
     }
 
@@ -1138,7 +990,7 @@ mod tests {
 
     #[test]
     fn row_refs_exclude_non_focusable_rows() {
-        let rows = vec![
+        let rows = [
             SidebarRow {
                 id: "zone::triage".to_string(),
                 kind: SidebarRowKind::Zone,
@@ -1197,1526 +1049,34 @@ mod tests {
             },
         ];
 
-        let refs = row_refs(&rows);
-
-        assert_eq!(refs, vec![SidebarRowRef::new("repo::misc::app")]);
+        assert_eq!(row_refs(&rows), vec![SidebarRowRef::new("repo::misc::app")]);
     }
 
     #[test]
-    fn empty_panes_render_no_rows() {
-        let rows = build_rows(
+    fn empty_presentations_render_no_rows() {
+        let (rows, counts) = build_rows_from_presentations(
             &Config::default(),
             &[],
-            &SidebarState {
-                view_mode: ViewMode::ByCategory,
-                ..SidebarState::default()
-            },
-        );
-
-        assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn build_rows_excludes_sidebar_and_non_agent_panes() {
-        let mut sidebar = pane("main", "%9", "/tmp/sidebar", "codex", "running");
-        sidebar.is_sidebar = true;
-        let rows = build_rows(
-            &Config::default(),
-            &[
-                sidebar,
-                pane("shell", "%2", "/tmp/shell", "", ""),
-                pane("main", "%1", "/tmp/app", "codex", "running"),
-            ],
             &SidebarState::default(),
-        );
-
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].label, "app");
-        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
-    }
-
-    #[test]
-    fn build_rows_ignores_stale_hook_agent_when_command_is_not_agent() {
-        let mut hook_marked = pane("main", "%1", "/tmp/app", "codex", "running");
-        hook_marked.current_command = "node".to_string();
-
-        let rows = build_rows(&Config::default(), &[hook_marked], &SidebarState::default());
-
-        assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn build_rows_uses_command_agent_when_hook_options_are_missing() {
-        let mut command_agent = pane("main", "%1", "/tmp/app", "", "");
-        command_agent.current_command = "claude".to_string();
-
-        let rows = build_rows(
-            &Config::default(),
-            &[command_agent],
-            &SidebarState::default(),
-        );
-
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[1].meta.as_ref().and_then(|meta| meta.agent.as_deref()),
-            Some("Claude")
-        );
-    }
-
-    #[test]
-    fn build_rows_groups_agent_panes_by_category_and_repo() {
-        let mut config = Config::default();
-        config.categories.default_category = Some("misc".to_string());
-        config
-            .categories
-            .rules
-            .push(category_rule("work", "github.com/acme/*"));
-        let state = SidebarState {
-            view_mode: ViewMode::ByCategory,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows(
-            &config,
-            &[
-                pane("main", "%1", "/ghq/github.com/acme/app", "codex", "running"),
-                pane(
-                    "main",
-                    "%2",
-                    "/ghq/github.com/acme/app",
-                    "claude",
-                    "waiting",
-                ),
-                pane("shell", "%3", "/tmp", "", ""),
-            ],
-            &state,
-        );
-
-        assert_eq!(rows[0].kind, SidebarRowKind::Category);
-        assert_eq!(rows[0].label, "work");
-        assert_eq!(rows[0].chat_count, 2);
-        assert_eq!(rows[0].rollup, RollupLevel::Running);
-        assert_eq!(rows[1].kind, SidebarRowKind::Repo);
-        assert_eq!(rows[1].label, "app");
-        assert_eq!(rows[2].kind, SidebarRowKind::Chat);
-        assert_eq!(rows[2].pane_id.as_deref(), Some("%2"));
-        assert_eq!(rows.len(), 4);
-    }
-
-    #[test]
-    fn active_pane_marks_chat_row_and_ancestors() {
-        let mut config = Config::default();
-        config
-            .categories
-            .rules
-            .push(category_rule("active", "/tmp/active/*"));
-        config
-            .categories
-            .rules
-            .push(category_rule("idle", "/tmp/idle/*"));
-        let mut state = SidebarState {
-            view_mode: ViewMode::ByCategory,
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-        state.toggle_expanded("chat::%1");
-        let mut active = pane("main", "%1", "/tmp/active/app", "codex", "running");
-        active.window_active = true;
-        active.session_attached = true;
-        let inactive = pane("main", "%2", "/tmp/idle/other", "codex", "running");
-
-        let rows = build_rows(&config, &[active, inactive], &state);
-
-        assert!(
-            rows.iter()
-                .find(|row| row.id == "category::active")
-                .unwrap()
-                .active
-        );
-        assert!(
-            rows.iter()
-                .find(|row| row.id == "repo::active::app")
-                .unwrap()
-                .active
-        );
-        assert!(rows.iter().find(|row| row.id == "chat::%1").unwrap().active);
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::place"));
-        assert!(rows.iter().find(|row| row.id == "jump::%1").unwrap().active);
-        assert!(
-            !rows
-                .iter()
-                .find(|row| row.id == "category::idle")
-                .unwrap()
-                .active
-        );
-        assert!(
-            !rows
-                .iter()
-                .find(|row| row.id == "repo::idle::other")
-                .unwrap()
-                .active
-        );
-        assert!(!rows.iter().find(|row| row.id == "chat::%2").unwrap().active);
-    }
-
-    #[test]
-    fn detached_session_is_not_active() {
-        let mut pane = pane("main", "%1", "/tmp/app", "codex", "running");
-        pane.window_active = true;
-        pane.session_attached = false;
-
-        let rows = build_rows(&Config::default(), &[pane], &SidebarState::default());
-
-        assert!(!rows.iter().any(|row| row.active));
-    }
-
-    #[test]
-    fn by_category_rows_keep_same_repo_name_in_distinct_categories() {
-        let mut config = Config::default();
-        config
-            .categories
-            .rules
-            .push(category_rule("alpha", "github.com/acme/*"));
-        config
-            .categories
-            .rules
-            .push(category_rule("beta", "github.com/other/*"));
-        let state = SidebarState {
-            view_mode: ViewMode::ByCategory,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows(
-            &config,
-            &[
-                pane("a", "%1", "/ghq/github.com/acme/app", "codex", "running"),
-                pane("b", "%2", "/ghq/github.com/other/app", "claude", "idle"),
-            ],
-            &state,
-        );
-
-        let repo_rows = rows
-            .iter()
-            .filter(|row| row.kind == SidebarRowKind::Repo)
-            .collect::<Vec<_>>();
-        assert_eq!(repo_rows.len(), 2);
-        assert!(repo_rows.iter().all(|row| row.label == "app"));
-        assert_eq!(repo_rows[0].id, "repo::alpha::app");
-        assert_eq!(repo_rows[1].id, "repo::beta::app");
-    }
-
-    #[test]
-    fn by_repo_rows_are_sorted_by_category_then_repo() {
-        let mut config = Config::default();
-        config
-            .categories
-            .rules
-            .push(category_rule("work", "github.com/work/*"));
-        config
-            .categories
-            .rules
-            .push(category_rule("oss", "github.com/oss/*"));
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows(
-            &config,
-            &[
-                pane("work", "%2", "/ghq/github.com/work/zeta", "codex", "idle"),
-                pane("oss", "%1", "/ghq/github.com/oss/alpha", "codex", "idle"),
-            ],
-            &state,
-        );
-
-        let repo_labels = rows
-            .iter()
-            .filter(|row| row.kind == SidebarRowKind::Repo)
-            .map(|row| row.label.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(repo_labels, vec!["alpha", "zeta"]);
-    }
-
-    #[test]
-    fn flat_view_contains_only_chat_rows() {
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows(
-            &Config::default(),
-            &[
-                pane("main", "%1", "/tmp/app", "codex", "running"),
-                pane("main", "%2", "/tmp/app", "claude", "idle"),
-            ],
-            &state,
-        );
-
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| row.kind == SidebarRowKind::Chat));
-        assert_eq!(rows[0].pane_id.as_deref(), Some("%1"));
-        assert_eq!(rows[1].pane_id.as_deref(), Some("%2"));
-    }
-
-    #[test]
-    fn collapsed_repo_hides_chat_rows() {
-        let mut state = SidebarState::default();
-        state.collapsed.insert("repo::misc::app".to_string());
-        let rows = build_rows(
-            &Config::default(),
-            &[pane("main", "%1", "/tmp/app", "codex", "running")],
-            &state,
-        );
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, SidebarRowKind::Repo);
-        assert_eq!(rows[0].chat_count, 1);
-    }
-
-    #[test]
-    fn collapsed_category_hides_repo_rows() {
-        let mut state = SidebarState {
-            view_mode: ViewMode::ByCategory,
-            ..SidebarState::default()
-        };
-        state.collapsed.insert("category::misc".to_string());
-
-        let rows = build_rows(
-            &Config::default(),
-            &[pane("main", "%1", "/tmp/app", "codex", "running")],
-            &state,
-        );
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, SidebarRowKind::Category);
-        assert_eq!(rows[0].chat_count, 1);
-    }
-
-    #[test]
-    fn unknown_status_rolls_up_to_background() {
-        let rows = build_rows(
-            &Config::default(),
-            &[pane("main", "%1", "/tmp/app", "codex", "unknown")],
-            &SidebarState::default(),
-        );
-
-        assert_eq!(rows[0].rollup, RollupLevel::Background);
-    }
-
-    #[test]
-    fn repo_row_includes_git_badge_when_available() {
-        let mut git = std::collections::BTreeMap::new();
-        git.insert(
-            "/tmp/app".to_string(),
-            crate::git::GitBadge {
-                branch: "main".to_string(),
-                ahead: 2,
-                behind: 1,
-            },
-        );
-        let rows = build_rows_with_git(
-            &Config::default(),
-            &[pane("main", "%1", "/tmp/app", "codex", "running")],
-            &SidebarState::default(),
-            &git,
-        );
-
-        assert_eq!(rows[0].git.as_ref().unwrap().branch, "main");
-    }
-
-    #[test]
-    fn repo_row_has_no_git_badge_when_path_is_absent_from_cache() {
-        let rows = build_rows_with_git(
-            &Config::default(),
-            &[pane("main", "%1", "/tmp/app", "codex", "running")],
-            &SidebarState::default(),
-            &std::collections::BTreeMap::new(),
-        );
-
-        assert!(rows[0].git.is_none());
-    }
-
-    #[test]
-    fn attention_panes_sort_before_background_panes() {
-        let mut quiet = pane("main", "%1", "/tmp/app", "codex", "idle");
-        quiet.attention = "0".to_string();
-        let mut attention = pane("main", "%2", "/tmp/app", "claude", "idle");
-        attention.attention = "1".to_string();
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows(&Config::default(), &[quiet, attention], &state);
-
-        assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
-        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
-    }
-
-    #[test]
-    fn running_panes_sort_by_started_at_desc() {
-        let mut older = pane("main", "%1", "/tmp/app", "codex", "running");
-        older.started_at = "800".to_string();
-        let mut newer = pane("main", "%2", "/tmp/app", "claude", "running");
-        newer.started_at = "900".to_string();
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows(&Config::default(), &[older, newer], &state);
-
-        assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
-        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
-    }
-
-    #[test]
-    fn completed_attention_does_not_sort_before_running_pane() {
-        let mut completed = pane("main", "%1", "/tmp/app", "codex", "idle");
-        completed.attention = "1".to_string();
-        completed.completed_at = "900".to_string();
-        let mut running = pane("main", "%2", "/tmp/app", "claude", "running");
-        running.started_at = "800".to_string();
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows(&Config::default(), &[completed, running], &state);
-
-        assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
-        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
-    }
-
-    #[test]
-    fn stale_attention_on_running_pane_uses_started_at_order() {
-        let mut stale_attention = pane("main", "%1", "/tmp/app", "codex", "running");
-        stale_attention.attention = "1".to_string();
-        stale_attention.started_at = "800".to_string();
-        stale_attention.completed_at = "700".to_string();
-        let mut clean_running = pane("main", "%2", "/tmp/app", "claude", "running");
-        clean_running.started_at = "900".to_string();
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows(
-            &Config::default(),
-            &[stale_attention, clean_running],
-            &state,
-        );
-
-        assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
-        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
-    }
-
-    #[test]
-    fn completed_panes_sort_by_completed_at_desc_before_manual_order() {
-        let mut older = pane("main", "%1", "/tmp/app", "codex", "idle");
-        older.completed_at = "800".to_string();
-        let mut newer = pane("main", "%2", "/tmp/app", "claude", "idle");
-        newer.completed_at = "900".to_string();
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            manual_chat_order: vec!["%1".to_string(), "%2".to_string()],
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows(&Config::default(), &[older, newer], &state);
-
-        assert_eq!(rows[0].pane_id.as_deref(), Some("%2"));
-        assert_eq!(rows[1].pane_id.as_deref(), Some("%1"));
-    }
-
-    #[test]
-    fn chat_detail_rows_are_hidden_by_default_and_shown_when_toggled_open() {
-        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
-        agent.prompt = "fix the bug".to_string();
-        agent.started_at = "1000".to_string();
-
-        let rows = build_rows_at(
-            &Config::default(),
-            &[agent.clone()],
-            &SidebarState::default(),
-            1075,
-        );
-
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.kind == SidebarRowKind::Detail)
-                .count(),
-            0
-        );
-        assert!(
-            !rows
-                .iter()
-                .find(|row| row.id == "chat::%5")
-                .unwrap()
-                .expanded
-        );
-
-        let mut state = SidebarState::default();
-        state.toggle_expanded("chat::%5");
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
-
-        assert!(
-            rows.iter()
-                .any(|row| row.kind == SidebarRowKind::Detail && row.label == "fix the bug")
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.kind == SidebarRowKind::Chat && row.label == "Codex")
-        );
-        assert!(!rows.iter().any(|row| row.id == "detail::%5::state"));
-        assert!(!rows.iter().any(|row| row.id == "detail::%5::place"));
-        assert_eq!(rows.last().unwrap().kind, SidebarRowKind::Jump);
-    }
-
-    #[test]
-    fn expanded_chat_row_shows_agent_without_inline_state() {
-        let mut agent = pane("main", "%1", "/tmp/app", "claude", "running");
-        agent.prompt = "review the long plan".to_string();
-        agent.started_at = "925".to_string();
-        let collapsed_state = SidebarState {
-            view_mode: ViewMode::Flat,
-            ..SidebarState::default()
-        };
-        let collapsed = build_rows_at(&Config::default(), &[agent.clone()], &collapsed_state, 1000);
-        let collapsed_chat = collapsed
-            .iter()
-            .find(|row| row.id == "chat::%1")
-            .expect("collapsed chat row");
-
-        assert_eq!(collapsed_chat.label, "Claude: review the long plan");
-
-        let mut expanded_state = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-        expanded_state.toggle_expanded("chat::%1");
-        let expanded = build_rows_at(&Config::default(), &[agent.clone()], &expanded_state, 1000);
-        let expanded_chat = expanded
-            .iter()
-            .find(|row| row.id == "chat::%1")
-            .expect("expanded chat row");
-
-        assert_eq!(expanded_chat.label, "Claude");
-
-        let triage_ctx = RowBuildContext {
-            triage: BTreeSet::from(["%1".to_string()]),
-            now: 1000,
-            ..RowBuildContext::default()
-        };
-        let triage = build_rows_ctx(&Config::default(), &[agent], &expanded_state, &triage_ctx).0;
-        let triage_chat = triage
-            .iter()
-            .find(|row| row.id == "chat::%1")
-            .expect("triage chat row");
-
-        assert_eq!(triage_chat.label, "Claude");
-    }
-
-    #[test]
-    fn selected_chat_row_does_not_auto_expand_full_detail_rows() {
-        let mut agent = pane("main", "%1", "/tmp/app", "codex", "running");
-        agent.prompt = "fix bug".to_string();
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
-
-        let chat = rows.iter().find(|row| row.id == "chat::%1").unwrap();
-        assert!(!chat.expanded);
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::prompt"));
-        assert!(!rows.iter().any(|row| row.id == "jump::%1"));
-    }
-
-    #[test]
-    fn manually_expanded_chat_row_expands_full_detail_rows() {
-        let mut agent = pane("main", "%1", "/tmp/app", "codex", "running");
-        agent.prompt = "fix bug".to_string();
-        agent.started_at = "185".to_string();
-        agent.tasks = "2/5".to_string();
-        agent.subagents = "sub1:Explore|ab12:general-purpose".to_string();
-        let mut state = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-        state.toggle_expanded("chat::%1");
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
-
-        assert!(!rows.iter().any(|row| row.id == "meta::%1"));
-        assert!(rows.iter().any(|row| row.id == "detail::%1::prompt"));
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::place"));
-        assert!(!rows.iter().any(|row| row.id.contains("::task::")));
-        assert!(rows.iter().any(|row| row.id == "jump::%1"));
-    }
-
-    #[test]
-    fn expanded_chat_row_carries_state_and_omits_place_detail() {
-        let mut agent = pane("vde-tmux", "%1", "/tmp/app", "codex", "running");
-        agent.prompt = "fix bug".to_string();
-        agent.started_at = "280".to_string();
-        let mut state = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-        state.toggle_expanded("chat::%1");
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
-
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "chat::%1")
-                .map(|row| row.label.as_str()),
-            Some("Codex")
-        );
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::place"));
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::status"));
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::elapsed"));
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::session"));
-    }
-
-    #[test]
-    fn idle_state_line_uses_completed_at() {
-        let mut done = pane("main", "%1", "/tmp/app", "codex", "idle");
-        done.completed_at = (1000 - 38 * 3600).to_string();
-        let mut missing = pane("main", "%2", "/tmp/app", "claude", "idle");
-        missing.completed_at.clear();
-        let mut state = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-        state.toggle_expanded("chat::%1");
-
-        let rows = build_rows_at(&Config::default(), &[done], &state, 1000);
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "chat::%1")
-                .map(|row| row.label.as_str()),
-            Some("Codex")
-        );
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
-
-        let mut state = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("chat::%2".to_string()),
-            ..SidebarState::default()
-        };
-        state.toggle_expanded("chat::%2");
-        let rows = build_rows_at(&Config::default(), &[missing], &state, 1000);
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "chat::%2")
-                .map(|row| row.label.as_str()),
-            Some("Claude")
-        );
-        assert!(!rows.iter().any(|row| row.id == "detail::%2::state"));
-    }
-
-    #[test]
-    fn blocked_state_line_keeps_wait_reason() {
-        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
-        blocked.wait_reason = "permission_prompt".to_string();
-        blocked.started_at = "880".to_string();
-        let mut state = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-        state.toggle_expanded("chat::%1");
-
-        let rows = build_rows_at(&Config::default(), &[blocked], &state, 1000);
-
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "chat::%1")
-                .map(|row| row.label.as_str()),
-            Some("Codex")
-        );
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "chat::%1")
-                .and_then(|row| row.meta.as_ref())
-                .and_then(|meta| meta.wait_reason.as_deref()),
-            Some("permission_prompt")
-        );
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
-    }
-
-    #[test]
-    fn running_state_line_appends_tasks_progress() {
-        let mut with_tasks = pane("main", "%1", "/tmp/app", "codex", "running");
-        with_tasks.started_at = "280".to_string();
-        with_tasks.tasks = "3/5".to_string();
-        let mut zero_total = pane("main", "%2", "/tmp/app", "claude", "running");
-        zero_total.started_at = "280".to_string();
-        zero_total.tasks = "0/0".to_string();
-
-        let mut state = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-        state.toggle_expanded("chat::%1");
-        let rows = build_rows_at(&Config::default(), &[with_tasks], &state, 1000);
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "chat::%1")
-                .map(|row| row.label.as_str()),
-            Some("Codex")
-        );
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
-
-        let mut state = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("chat::%2".to_string()),
-            ..SidebarState::default()
-        };
-        state.toggle_expanded("chat::%2");
-        let rows = build_rows_at(&Config::default(), &[zero_total], &state, 1000);
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "chat::%2")
-                .map(|row| row.label.as_str()),
-            Some("Claude")
-        );
-        assert!(!rows.iter().any(|row| row.id == "detail::%2::state"));
-    }
-
-    #[test]
-    fn unselected_or_expanded_chat_rows_have_no_meta_row() {
-        let agent = pane("main", "%1", "/tmp/app", "codex", "running");
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            ..SidebarState::default()
-        };
-        let rows = build_rows_at(
-            &Config::default(),
-            std::slice::from_ref(&agent),
-            &state,
-            1000,
-        );
-        assert!(!rows.iter().any(|row| row.id == "meta::%1"));
-
-        let mut expanded = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-        expanded.toggle_expanded("chat::%1");
-        let rows = build_rows_at(&Config::default(), &[agent], &expanded, 1000);
-        assert!(!rows.iter().any(|row| row.id == "meta::%1"));
-        assert!(rows.iter().any(|row| row.id == "jump::%1"));
-    }
-
-    #[test]
-    fn chat_detail_rows_include_running_subagents_with_tree_connectors() {
-        let mut agent = pane("main", "%5", "/tmp/app", "claude", "running");
-        agent.subagents = "sub12345:Explore|ab120000:general-purpose".to_string();
-        let mut state = SidebarState::default();
-        state.toggle_expanded("chat::%5");
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
-        let labels = rows
-            .iter()
-            .filter(|row| {
-                row.kind == SidebarRowKind::Detail
-                    && (row.label.starts_with('\u{251c}') || row.label.starts_with('\u{2514}'))
-            })
-            .map(|row| row.label.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            labels,
-            vec![
-                "\u{251c} Agent - Explore #sub1",
-                "\u{2514} Agent - general-purpose #ab12"
-            ]
-        );
-    }
-
-    #[test]
-    fn chat_detail_rows_prefer_subagent_display_name_when_present() {
-        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
-        agent.subagents = "019f3c28:default:Ramanujan".to_string();
-        let mut state = SidebarState::default();
-        state.toggle_expanded("chat::%5");
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
-
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "detail::%5::subagent::0")
-                .map(|row| row.label.as_str()),
-            Some("\u{2514} Agent - Ramanujan #019f")
-        );
-    }
-
-    #[test]
-    fn expanded_chat_detail_rows_include_task_items_under_prompt() {
-        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
-        agent.prompt = "fix bug".to_string();
-        agent.tasks = "1/3".to_string();
-        agent.task_items = crate::hook::encode_task_items(&[
-            TaskItem {
-                step: "Explore current sidebar rows".to_string(),
-                status: TaskItemStatus::Completed,
-            },
-            TaskItem {
-                step: "Implement task item rows".to_string(),
-                status: TaskItemStatus::InProgress,
-            },
-            TaskItem {
-                step: "Verify rendering".to_string(),
-                status: TaskItemStatus::Pending,
-            },
-        ]);
-        let mut state = SidebarState::default();
-        state.toggle_expanded("chat::%5");
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
-        let details = rows
-            .iter()
-            .filter(|row| row.kind == SidebarRowKind::Detail)
-            .map(|row| (row.id.as_str(), row.label.as_str()))
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            details,
-            vec![
-                ("detail::%5::prompt", "fix bug"),
-                (
-                    "detail::%5::task::0::completed",
-                    "\u{251c} ✓ Task - Explore current sidebar rows"
-                ),
-                (
-                    "detail::%5::task::1::in_progress",
-                    "\u{251c} ● Task - Implement task item rows"
-                ),
-                (
-                    "detail::%5::task::2::pending",
-                    "\u{2514} ○ Task - Verify rendering"
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn expanded_chat_detail_rows_order_worktree_prompt_activity_tasks_subagents_jump() {
-        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
-        agent.prompt = "fix bug".to_string();
-        agent.task_items = crate::hook::encode_task_items(&[TaskItem {
-            step: "Implement".to_string(),
-            status: TaskItemStatus::InProgress,
-        }]);
-        agent.worktree_activity = crate::hook::encode_worktree_activity(&WorktreeActivity {
-            kind: WorktreeActivityKind::VwExec,
-            name: "temp".to_string(),
-            path: "/tmp/worktrees/temp".to_string(),
-            command: "vw exec /tmp/worktrees/temp -- cargo test".to_string(),
-            observed_at: 42,
-        });
-        agent.subagents = "sub12345:Explore".to_string();
-        let mut state = SidebarState::default();
-        state.toggle_expanded("chat::%5");
-        let ctx = RowBuildContext {
-            worktrees: BTreeMap::from([(
-                "/tmp/app".to_string(),
-                WorktreeInfo {
-                    name: "active".to_string(),
-                    path: "/tmp/worktrees/active".to_string(),
-                    source: WorktreeSource::GitLinked,
-                    branch: None,
-                    dirty: None,
-                    locked: None,
-                },
-            )]),
-            now: 1075,
-            ..RowBuildContext::default()
-        };
-
-        let rows = build_rows_ctx(&Config::default(), &[agent], &state, &ctx).0;
-        let sequence = rows
-            .iter()
-            .filter(|row| row.kind == SidebarRowKind::Detail || row.kind == SidebarRowKind::Jump)
-            .map(|row| (row.id.as_str(), row.label.as_str()))
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            sequence,
-            vec![
-                ("detail::%5::worktree", "+ active"),
-                ("detail::%5::prompt", "fix bug"),
-                ("detail::%5::worktree-activity", "vw exec temp"),
-                (
-                    "detail::%5::task::0::in_progress",
-                    "\u{2514} ● Task - Implement"
-                ),
-                ("detail::%5::subagent::0", "\u{2514} Agent - Explore #sub1"),
-                ("jump::%5", "jump"),
-            ]
-        );
-    }
-
-    #[test]
-    fn expanded_chat_detail_omits_vw_exec_activity_when_same_as_active_worktree() {
-        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
-        agent.prompt = "fix bug".to_string();
-        agent.worktree_activity = crate::hook::encode_worktree_activity(&WorktreeActivity {
-            kind: WorktreeActivityKind::VwExec,
-            name: "active".to_string(),
-            path: "/tmp/worktrees/active".to_string(),
-            command: "vw exec /tmp/worktrees/active -- cargo test".to_string(),
-            observed_at: 42,
-        });
-        let mut state = SidebarState::default();
-        state.toggle_expanded("chat::%5");
-        let ctx = RowBuildContext {
-            worktrees: BTreeMap::from([(
-                "/tmp/app".to_string(),
-                WorktreeInfo {
-                    name: "active".to_string(),
-                    path: "/tmp/worktrees/active".to_string(),
-                    source: WorktreeSource::GitLinked,
-                    branch: None,
-                    dirty: None,
-                    locked: None,
-                },
-            )]),
-            now: 1075,
-            ..RowBuildContext::default()
-        };
-
-        let rows = build_rows_ctx(&Config::default(), &[agent], &state, &ctx).0;
-
-        assert!(rows.iter().any(|row| row.id == "detail::%5::worktree"));
-        assert!(
-            !rows
-                .iter()
-                .any(|row| row.id == "detail::%5::worktree-activity")
-        );
-    }
-
-    #[test]
-    fn expanded_chat_detail_omits_task_items_when_json_is_malformed() {
-        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
-        agent.prompt = "fix bug".to_string();
-        agent.task_items = "{not-json".to_string();
-        let mut state = SidebarState::default();
-        state.toggle_expanded("chat::%5");
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
-
-        assert!(!rows.iter().any(|row| row.id.contains("::task::")));
-    }
-
-    #[test]
-    fn expanded_chat_detail_sanitizes_control_characters_in_task_steps() {
-        let mut agent = pane("main", "%5", "/tmp/app", "codex", "running");
-        agent.task_items = crate::hook::encode_task_items(&[TaskItem {
-            step: "Explore\nrows\tquickly".to_string(),
-            status: TaskItemStatus::Completed,
-        }]);
-        let mut state = SidebarState::default();
-        state.toggle_expanded("chat::%5");
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
-
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "detail::%5::task::0::completed")
-                .map(|row| row.label.as_str()),
-            Some("\u{2514} ✓ Task - Explore rows quickly")
-        );
-    }
-
-    #[test]
-    fn chat_detail_subagent_rows_appear_before_jump_row() {
-        let mut agent = pane("main", "%5", "/tmp/app", "claude", "running");
-        agent.subagents = "sub12345:Explore".to_string();
-        let mut state = SidebarState::default();
-        state.toggle_expanded("chat::%5");
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
-        let subagent_index = rows
-            .iter()
-            .position(|row| row.label == "\u{2514} Agent - Explore #sub1")
-            .expect("subagent row should exist");
-        let jump_index = rows
-            .iter()
-            .position(|row| row.kind == SidebarRowKind::Jump)
-            .expect("jump row should exist");
-
-        assert!(subagent_index < jump_index);
-    }
-
-    #[test]
-    fn chat_detail_omits_subagent_section_when_no_subagents_running() {
-        let agent = pane("main", "%5", "/tmp/app", "claude", "running");
-        let mut state = SidebarState::default();
-        state.toggle_expanded("chat::%5");
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1075);
-
-        assert!(!rows.iter().any(|row| {
-            row.kind == SidebarRowKind::Detail
-                && (row.label.starts_with('\u{251c}') || row.label.starts_with('\u{2514}'))
-        }));
-    }
-
-    #[test]
-    fn attention_only_filter_drops_calm_and_plain_running_panes() {
-        let mut calm = pane("main", "%1", "/tmp/calm", "codex", "idle");
-        calm.attention = "0".to_string();
-        let running = pane("main", "%2", "/tmp/active", "codex", "running");
-        let mut attention = pane("main", "%3", "/tmp/active", "claude", "waiting");
-        attention.wait_reason = "permission_prompt".to_string();
-        let mut flagged = pane("main", "%4", "/tmp/active", "opencode", "idle");
-        flagged.attention = "1".to_string();
-        let state = SidebarState {
-            filter: crate::sidebar::state::StatusFilter::AttentionOnly,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows(
-            &Config::default(),
-            &[calm, running, attention, flagged],
-            &state,
-        );
-
-        assert!(rows.iter().all(|row| !row.id.contains("%1")));
-        assert!(rows.iter().all(|row| !row.id.contains("%2")));
-        assert!(rows.iter().any(|row| row.id.contains("%3")));
-        assert!(rows.iter().any(|row| row.id.contains("%4")));
-        assert!(
-            rows.iter()
-                .any(|row| row.kind == SidebarRowKind::Repo && row.label == "active")
-        );
-    }
-
-    #[test]
-    fn attention_only_filter_drops_completed_attention_panes() {
-        let mut completed = pane("main", "%1", "/tmp/done", "codex", "idle");
-        completed.attention = "1".to_string();
-        completed.completed_at = "900".to_string();
-        let state = SidebarState {
-            filter: crate::sidebar::state::StatusFilter::AttentionOnly,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows_at(&Config::default(), &[completed], &state, 1000);
-
-        assert!(rows.iter().all(|row| row.id != "chat::%1"));
-        assert!(rows.iter().all(|row| row.kind != SidebarRowKind::Repo));
-    }
-
-    #[test]
-    fn working_done_idle_filters_partition_fleet_panes() {
-        let working = pane("main", "%1", "/tmp/app", "codex", "running");
-        let mut done = pane("main", "%2", "/tmp/app", "claude", "idle");
-        done.window_active = false;
-        done.session_attached = false;
-        let idle = pane("main", "%3", "/tmp/app", "opencode", "idle");
-
-        for (filter, expected) in [
-            (crate::sidebar::state::StatusFilter::WorkingOnly, "%1"),
-            (crate::sidebar::state::StatusFilter::DoneOnly, "%2"),
-            (crate::sidebar::state::StatusFilter::IdleOnly, "%3"),
-        ] {
-            let state = SidebarState {
-                view_mode: ViewMode::Flat,
-                filter,
-                ..SidebarState::default()
-            };
-
-            let rows = build_rows_ctx(
-                &Config::default(),
-                &[working.clone(), done.clone(), idle.clone()],
-                &state,
-                &RowBuildContext {
-                    unread: BTreeMap::from([("%2".to_string(), true)]),
-                    ..RowBuildContext::default()
-                },
-            )
-            .0;
-
-            assert_eq!(rows.len(), 1, "{filter:?}");
-            assert_eq!(rows[0].pane_id.as_deref(), Some(expected), "{filter:?}");
-        }
-    }
-
-    #[test]
-    fn repo_row_badge_state_is_minimum_of_children() {
-        let mut done = pane("main", "%1", "/tmp/app", "codex", "idle");
-        done.window_active = false;
-        done.session_attached = false;
-        let mut blocked = pane("main", "%2", "/tmp/app", "codex", "waiting");
-        blocked.wait_reason = "permission_prompt".to_string();
-        let unread = BTreeMap::from([("%1".to_string(), true)]);
-
-        let rows = build_rows_at_with_git_and_unread(
-            &Config::default(),
-            &[done, blocked],
-            &SidebarState::default(),
-            &BTreeMap::new(),
-            &unread,
-            1000,
-        );
-
-        let repo = rows
-            .iter()
-            .find(|row| row.kind == SidebarRowKind::Repo)
-            .unwrap();
-        assert_eq!(
-            repo.badge_state,
-            Some(crate::daemon::session_badge::BadgeState::Blocked)
-        );
-    }
-
-    #[test]
-    fn chat_rows_carry_row_meta() {
-        let mut agent = pane("main", "%1", "/tmp/app", "codex", "running");
-        agent.prompt = "fix bug".to_string();
-        agent.started_at = "925".to_string();
-        agent.tasks = "2/5".to_string();
-        agent.subagents = "sub1:Explore|ab12:general-purpose".to_string();
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
-
-        let chat = rows
-            .iter()
-            .find(|row| row.kind == SidebarRowKind::Chat)
-            .expect("chat row");
-        let meta = chat.meta.as_ref().expect("chat meta");
-        assert_eq!(meta.agent.as_deref(), Some("Codex"));
-        assert_eq!(meta.prompt.as_deref(), Some("fix bug"));
-        assert_eq!(meta.elapsed_secs, Some(75));
-        assert_eq!(meta.tasks_done, Some(2));
-        assert_eq!(meta.tasks_total, Some(5));
-        assert_eq!(meta.subagent_count, Some(2));
-    }
-
-    #[test]
-    fn completed_chat_rows_carry_completed_age_meta() {
-        let mut agent = pane("main", "%1", "/tmp/app", "codex", "idle");
-        agent.completed_at = "925".to_string();
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows_at(&Config::default(), &[agent], &state, 1000);
-
-        let chat = rows
-            .iter()
-            .find(|row| row.kind == SidebarRowKind::Chat)
-            .expect("chat row");
-        let meta = chat.meta.as_ref().expect("chat meta");
-        assert_eq!(meta.completed_age_secs, Some(75));
-    }
-
-    #[test]
-    fn repo_rows_carry_blocked_count_in_meta() {
-        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
-        blocked.wait_reason = "permission_prompt".to_string();
-        let running = pane("main", "%2", "/tmp/app", "claude", "running");
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows_at(&Config::default(), &[blocked, running], &state, 1000);
-
-        let repo = rows
-            .iter()
-            .find(|row| row.kind == SidebarRowKind::Repo)
-            .expect("repo row");
-        assert_eq!(
-            repo.meta.as_ref().and_then(|meta| meta.attention_count),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn blocked_panes_move_to_triage_zone_on_top() {
-        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
-        blocked.wait_reason = "permission_prompt".to_string();
-        let running = pane("main", "%2", "/tmp/app", "claude", "running");
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            ..SidebarState::default()
-        };
-        let ctx = RowBuildContext {
-            triage: BTreeSet::from(["%1".to_string()]),
-            now: 1000,
-            ..RowBuildContext::default()
-        };
-
-        let rows = build_rows_ctx(&Config::default(), &[blocked, running], &state, &ctx).0;
-
-        assert_eq!(rows[0].id, "zone::triage");
-        assert_eq!(rows[0].chat_count, 1);
-        assert_eq!(rows[1].id, "chat::%1");
-        assert_eq!(rows[1].depth, 1);
-        assert_eq!(rows[1].label, "Codex · app");
-        assert!(!rows[2..].iter().any(|row| row.id == "chat::%1"));
-    }
-
-    #[test]
-    fn triage_zone_is_absent_when_empty() {
-        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
-        blocked.wait_reason = "permission_prompt".to_string();
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows_ctx(
-            &Config::default(),
-            &[blocked],
-            &state,
-            &RowBuildContext {
-                now: 1000,
-                ..RowBuildContext::default()
-            },
-        )
-        .0;
-
-        assert!(rows.iter().all(|row| row.kind != SidebarRowKind::Zone));
-    }
-
-    #[test]
-    fn triage_ignores_attention_filter() {
-        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
-        blocked.wait_reason = "permission_prompt".to_string();
-        let idle = pane("main", "%2", "/tmp/app", "claude", "idle");
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            filter: crate::sidebar::state::StatusFilter::AttentionOnly,
-            ..SidebarState::default()
-        };
-        let ctx = RowBuildContext {
-            triage: BTreeSet::from(["%1".to_string()]),
-            now: 1000,
-            ..RowBuildContext::default()
-        };
-
-        let rows = build_rows_ctx(&Config::default(), &[blocked, idle], &state, &ctx).0;
-
-        assert!(rows.iter().any(|row| row.id == "chat::%1"));
-        assert!(rows.iter().all(|row| row.id != "chat::%2"));
-        assert_eq!(
-            rows.first().map(|row| row.id.as_str()),
-            Some("zone::triage")
-        );
-    }
-
-    #[test]
-    fn counts_are_computed_before_filter_and_include_triage() {
-        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
-        blocked.wait_reason = "permission_prompt".to_string();
-        let working = pane("main", "%2", "/tmp/app", "claude", "running");
-        let idle_a = pane("main", "%3", "/tmp/app", "opencode", "idle");
-        let idle_b = pane("main", "%4", "/tmp/app", "claude", "idle");
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            filter: crate::sidebar::state::StatusFilter::AttentionOnly,
-            ..SidebarState::default()
-        };
-        let ctx = RowBuildContext {
-            triage: BTreeSet::from(["%1".to_string()]),
-            now: 1000,
-            ..RowBuildContext::default()
-        };
-
-        let (rows, counts) = build_rows_ctx(
-            &Config::default(),
-            &[blocked, working, idle_a, idle_b],
-            &state,
-            &ctx,
-        );
-
-        assert!(rows.iter().any(|row| row.id == "chat::%1"));
-        assert!(rows.iter().all(|row| row.id != "chat::%2"));
-        assert!(rows.iter().all(|row| row.id != "chat::%3"));
-        assert!(rows.iter().all(|row| row.id != "chat::%4"));
-        assert_eq!(counts.total, 4);
-        assert_eq!(counts.attention, 1);
-        assert_eq!(counts.blocked, 1);
-        assert_eq!(counts.working, 1);
-        assert_eq!(counts.done, 0);
-        assert_eq!(counts.idle, 2);
-    }
-
-    #[test]
-    fn attention_filter_excludes_plain_working_panes() {
-        let working_a = pane("main", "%1", "/tmp/app", "codex", "running");
-        let working_b = pane("main", "%2", "/tmp/app", "claude", "running");
-        let idle = pane("main", "%3", "/tmp/app", "opencode", "idle");
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            filter: crate::sidebar::state::StatusFilter::AttentionOnly,
-            ..SidebarState::default()
-        };
-
-        let (rows, counts) = build_rows_ctx(
-            &Config::default(),
-            &[working_a, working_b, idle],
-            &state,
-            &RowBuildContext {
-                now: 1000,
-                ..RowBuildContext::default()
-            },
-        );
-
-        assert_eq!(counts.blocked, 0);
-        assert_eq!(counts.working, 2);
-        assert_eq!(counts.attention, 0);
-        assert_eq!(
-            counts.count_for_filter(crate::sidebar::state::StatusFilter::AttentionOnly),
-            0
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.kind == SidebarRowKind::Chat)
-                .count(),
-            0
-        );
-        assert!(rows.iter().all(|row| row.id != "chat::%1"));
-        assert!(rows.iter().all(|row| row.id != "chat::%2"));
-        assert!(rows.iter().all(|row| row.id != "chat::%3"));
-    }
-
-    #[test]
-    fn badge_counts_filter_availability_uses_filter_counts() {
-        let counts = BadgeCounts {
-            total: 2,
-            attention: 0,
-            blocked: 0,
-            working: 2,
-            done: 0,
-            idle: 0,
-        };
-
-        assert!(counts.filter_is_available(crate::sidebar::state::StatusFilter::All));
-        assert!(!counts.filter_is_available(crate::sidebar::state::StatusFilter::AttentionOnly));
-        assert!(counts.filter_is_available(crate::sidebar::state::StatusFilter::WorkingOnly));
-        assert!(!counts.filter_is_available(crate::sidebar::state::StatusFilter::DoneOnly));
-        assert!(!counts.filter_is_available(crate::sidebar::state::StatusFilter::IdleOnly));
-    }
-
-    #[test]
-    fn repo_attention_count_includes_triaged_panes() {
-        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
-        blocked.wait_reason = "permission_prompt".to_string();
-        let running = pane("main", "%2", "/tmp/app", "claude", "running");
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            ..SidebarState::default()
-        };
-        let ctx = RowBuildContext {
-            triage: BTreeSet::from(["%1".to_string()]),
-            now: 1000,
-            ..RowBuildContext::default()
-        };
-
-        let rows = build_rows_ctx(&Config::default(), &[blocked, running], &state, &ctx).0;
-        let repo = rows
-            .iter()
-            .find(|row| row.kind == SidebarRowKind::Repo)
-            .expect("repo row");
-
-        assert_eq!(
-            repo.meta.as_ref().and_then(|meta| meta.attention_count),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn repo_attention_count_keeps_triaged_pane_during_debounce() {
-        let calm = pane("main", "%1", "/tmp/app", "codex", "running");
-        let running = pane("main", "%2", "/tmp/app", "claude", "running");
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            ..SidebarState::default()
-        };
-        let ctx = RowBuildContext {
-            triage: BTreeSet::from(["%1".to_string()]),
-            now: 1000,
-            ..RowBuildContext::default()
-        };
-
-        let rows = build_rows_ctx(&Config::default(), &[calm, running], &state, &ctx).0;
-        let repo = rows
-            .iter()
-            .find(|row| row.kind == SidebarRowKind::Repo)
-            .expect("repo row");
-
-        assert_eq!(
-            repo.meta.as_ref().and_then(|meta| meta.attention_count),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn triage_rows_carry_origin_in_meta() {
-        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
-        blocked.wait_reason = "permission_prompt".to_string();
-        blocked.started_at = "940".to_string();
-        let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
-            ..SidebarState::default()
-        };
-        let ctx = RowBuildContext {
-            triage: BTreeSet::from(["%1".to_string()]),
-            now: 1000,
-            ..RowBuildContext::default()
-        };
-
-        let rows = build_rows_ctx(&Config::default(), &[blocked], &state, &ctx).0;
-        let chat = rows.iter().find(|row| row.id == "chat::%1").expect("chat");
-        let meta = chat.meta.as_ref().expect("chat meta");
-
-        assert_eq!(meta.origin.as_deref(), Some("misc/app"));
-    }
-
-    #[test]
-    fn selected_triage_row_shows_origin_detail() {
-        let mut blocked = pane("main", "%1", "/tmp/app", "codex", "waiting");
-        blocked.wait_reason = "permission_prompt".to_string();
-        let mut state = SidebarState {
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-        state.toggle_expanded("chat::%1");
-        let ctx = RowBuildContext {
-            triage: BTreeSet::from(["%1".to_string()]),
-            now: 1000,
-            ..RowBuildContext::default()
-        };
-
-        let rows = build_rows_ctx(&Config::default(), &[blocked], &state, &ctx).0;
-        let origin_row = rows
-            .iter()
-            .find(|row| row.id == "detail::%1::origin")
-            .expect("origin detail row");
-
-        assert!(origin_row.label.contains("misc/app"));
-    }
-
-    #[test]
-    fn manual_chat_expands_full_and_others_stay_single() {
-        let selected = pane("main", "%1", "/tmp/app", "codex", "running");
-        let second = pane("main", "%2", "/tmp/app", "claude", "running");
-        let other = pane("main", "%3", "/tmp/app", "opencode", "running");
-        let mut state = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-        state.toggle_expanded("chat::%1");
-        let ctx = RowBuildContext {
-            now: 1000,
-            ..RowBuildContext::default()
-        };
-
-        let rows = build_rows_ctx(&Config::default(), &[selected, second, other], &state, &ctx).0;
-
-        assert!(!rows.iter().any(|row| row.id == "detail::%1::state"));
-        assert!(rows.iter().any(|row| row.id == "jump::%1"));
-        assert!(!rows.iter().any(|row| row.id == "detail::%2::state"));
-        assert!(!rows.iter().any(|row| row.id == "meta::%3"));
-        assert!(!rows.iter().any(|row| row.id == "detail::%3::state"));
-    }
-
-    #[test]
-    fn selection_on_child_row_keeps_chat_expanded() {
-        let p = pane("main", "%1", "/tmp/app", "codex", "running");
-        let mut state = SidebarState {
-            view_mode: ViewMode::Flat,
-            selection: Some("jump::%1".to_string()),
-            ..SidebarState::default()
-        };
-        state.toggle_expanded("chat::%1");
-
-        let rows = build_rows_ctx(
-            &Config::default(),
-            &[p],
-            &state,
             &RowBuildContext::default(),
-        )
-        .0;
+            &BTreeSet::new(),
+        );
 
-        assert!(rows.iter().any(|row| row.id == "jump::%1"));
+        assert!(rows.is_empty());
+        assert_eq!(counts, BadgeCounts::default());
     }
 
     #[test]
-    fn manual_order_reorders_repo_rows() {
-        let state = SidebarState {
-            manual_order: vec![
-                crate::sidebar::state::RepoId::new("misc", "zeta"),
-                crate::sidebar::state::RepoId::new("misc", "alpha"),
-            ],
-            ..SidebarState::default()
-        };
+    fn filters_and_sorting_use_canonical_badge_not_completion_history() {
+        let idle_with_history = agent_pane(BadgeState::Idle, "200");
+        assert!(!pane_matches_attention_filter(&idle_with_history));
+        assert_eq!(chat_sort_bucket(&idle_with_history), ChatSortBucket::Idle);
 
-        let rows = build_rows(
-            &Config::default(),
-            &[
-                pane("main", "%1", "/tmp/alpha", "codex", "idle"),
-                pane("main", "%2", "/tmp/zeta", "codex", "idle"),
-            ],
-            &state,
+        let blocked_with_history = agent_pane(BadgeState::Blocked, "200");
+        assert!(pane_matches_attention_filter(&blocked_with_history));
+        assert_eq!(
+            chat_sort_bucket(&blocked_with_history),
+            ChatSortBucket::NeedsAttention
         );
-
-        let repo_labels = rows
-            .iter()
-            .filter(|row| row.kind == SidebarRowKind::Repo)
-            .map(|row| row.label.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(repo_labels, vec!["zeta", "alpha"]);
-    }
-
-    #[test]
-    fn manual_chat_order_reorders_chat_rows() {
-        let state = SidebarState {
-            view_mode: ViewMode::Flat,
-            manual_chat_order: vec!["%2".to_string(), "%1".to_string()],
-            ..SidebarState::default()
-        };
-
-        let rows = build_rows(
-            &Config::default(),
-            &[
-                pane("main", "%1", "/tmp/app", "codex", "idle"),
-                pane("main", "%2", "/tmp/app", "claude", "idle"),
-            ],
-            &state,
-        );
-
-        let chat_ids = rows
-            .iter()
-            .filter(|row| row.kind == SidebarRowKind::Chat)
-            .map(|row| row.id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(chat_ids, vec!["chat::%2", "chat::%1"]);
     }
 }

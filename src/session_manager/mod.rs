@@ -1095,7 +1095,7 @@ mod tests {
         command: &str,
     ) -> String {
         [
-            session, index, id, name, panes, active, "0", "0", "0", "0", command, "", "", "",
+            session, index, id, name, panes, active, "0", "0", "0", "0", command,
         ]
         .join("\u{1f}")
     }
@@ -1159,7 +1159,7 @@ mod tests {
         mock.stub(&["has-session"], "");
         mock.stub(
             &["list-sessions", "-F", &session_format],
-            "main\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\nni.zsh\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
+            "main\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}$1\nni.zsh\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}$2\n",
         );
         mock.stub(
             &["list-windows", "-a", "-F", &window_format],
@@ -1200,7 +1200,7 @@ mod tests {
         mock.stub(&["new-session", "-d"], "");
         mock.stub(
             &["list-sessions", "-F", &session_format],
-            "main\u{1f}0\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
+            "main\u{1f}0\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}$1\n",
         );
         mock.stub(
             &["list-windows", "-a", "-F", &window_format],
@@ -1235,7 +1235,7 @@ mod tests {
         mock.stub(&["has-session"], "");
         mock.stub(
             &["list-sessions", "-F", &session_format],
-            "main\u{1f}0\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\nni.zsh\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
+            "main\u{1f}0\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}$1\nni.zsh\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}$2\n",
         );
         mock.stub(
             &["list-windows", "-a", "-F", &window_format],
@@ -1296,7 +1296,7 @@ mod tests {
         mock.stub(&["has-session"], "");
         mock.stub(
             &["list-sessions", "-F", &session_format],
-            "ni.zsh\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
+            "ni.zsh\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}$2\n",
         );
         mock.stub(
             &["list-windows", "-a", "-F", &window_format],
@@ -1466,7 +1466,7 @@ mod tests {
         mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
         mock.stub(
             &["list-sessions", "-F", &session_format],
-            "main\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$1\nother\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
+            "main\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}$1\nother\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}$2\n",
         );
         mock.stub(
             &["display-message", "-p", "#{client_name}\t#{client_tty}"],
@@ -1494,7 +1494,7 @@ mod tests {
         let window_format = crate::window::window_list_format();
         mock.stub(
             &["list-sessions", "-F", &session_format],
-            "ni.zsh\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
+            "ni.zsh\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}$2\n",
         );
         mock.stub(
             &["list-windows", "-t", "=ni.zsh:", "-F", &window_format],

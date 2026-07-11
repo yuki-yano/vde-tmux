@@ -1,5 +1,146 @@
 use super::*;
 
+fn spawn_sidebar_snapshot_server(
+    sidebar: crate::daemon::SidebarFrame,
+) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, Write};
+
+    let socket = std::env::temp_dir().join(format!(
+        "vt2-cli-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<crate::daemon::protocol::v2::ClientMessage>(line.trim())
+                .unwrap(),
+            crate::daemon::protocol::v2::ClientMessage::Hello { .. }
+        ));
+        serde_json::to_writer(
+            &mut stream,
+            &crate::daemon::protocol::v2::ServerMessage::HelloAck {
+                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                daemon_instance_id: crate::pane_state::DaemonInstanceId::parse(
+                    "ffeeddccbbaa99887766554433221100",
+                )
+                .unwrap(),
+                server_identity: "scratch".to_string(),
+                phase: crate::daemon::protocol::v2::DaemonPhase::Serving,
+                hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::daemon::protocol::v2::ClientMessage>(line.trim())
+                .unwrap(),
+            crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot {
+                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            }
+        );
+        let snapshot = crate::daemon::protocol::v2::ResolvedSnapshot {
+            snapshot_revision: 3,
+            panes: Vec::new(),
+            sidebar,
+            attention: Vec::new(),
+            events: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        serde_json::to_writer(
+            &mut stream,
+            &crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+                snapshot_revision: 3,
+                snapshot,
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+    (socket, handle)
+}
+
+fn sidebar_row(
+    id: &str,
+    kind: crate::sidebar::tree::SidebarRowKind,
+    label: &str,
+    pane_id: Option<&str>,
+) -> crate::sidebar::tree::SidebarRow {
+    crate::sidebar::tree::SidebarRow {
+        id: id.to_string(),
+        kind,
+        depth: 0,
+        label: label.to_string(),
+        chat_count: 1,
+        rollup: crate::hook::RollupLevel::Running,
+        badge_state: None,
+        expanded: true,
+        pane_id: pane_id.map(ToOwned::to_owned),
+        git: None,
+        active: false,
+        meta: None,
+    }
+}
+
+fn spawn_v2_sidebar_command_server() -> (
+    std::path::PathBuf,
+    std::sync::mpsc::Receiver<crate::daemon::protocol::v2::ClientMessage>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{BufRead, Write};
+
+    let socket = unique_socket_path("vt2-cmd");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let daemon_instance_id =
+            crate::pane_state::DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap();
+        serde_json::to_writer(
+            &mut stream,
+            &crate::daemon::protocol::v2::ServerMessage::HelloAck {
+                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                daemon_instance_id,
+                server_identity: "scratch".to_string(),
+                phase: crate::daemon::protocol::v2::DaemonPhase::Serving,
+                hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let message =
+            serde_json::from_str::<crate::daemon::protocol::v2::ClientMessage>(line.trim())
+                .unwrap();
+        let event_id = message.event_id().cloned().unwrap();
+        tx.send(message).unwrap();
+        serde_json::to_writer(
+            &mut stream,
+            &crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+                event_id,
+                accepted_seq: 1,
+                snapshot_revision: 2,
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+    (socket, rx, handle)
+}
+
 #[test]
 fn dispatch_sidebar_attach_once_marks_and_renders() {
     let mock = MockTmuxRunner::new();
@@ -15,74 +156,34 @@ fn dispatch_sidebar_attach_once_marks_and_renders() {
         ],
         "",
     );
-    let format = crate::options::snapshot::snapshot_format();
-    let line = [
-        "main",
-        "@1",
-        "%1",
-        "/tmp/app",
-        "codex",
-        "/dev/ttys001",
-        "123",
-        "0",
-        "0",
-        "0",
-        "",
-        "",
-        "",
-        "",
-        "codex",
-        "running",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-    ]
-    .join("\u{1f}");
-    mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
+    let (socket, server) = spawn_sidebar_snapshot_server(crate::daemon::SidebarFrame {
+        state: crate::sidebar::state::SidebarState::default(),
+        counts: crate::sidebar::tree::BadgeCounts::default(),
+        rows: vec![sidebar_row(
+            "chat::%1",
+            crate::sidebar::tree::SidebarRowKind::Chat,
+            "codex (%1)",
+            Some("%1"),
+        )],
+    });
 
     let output = crate::cli::sidebar::run_sidebar_command_with_ensure(
         crate::cli::sidebar::SidebarCommand::Attach { once: true },
         &mock,
         &env,
         &crate::config::Config::default(),
-        |_| Ok(()),
+        |_, _| Ok(("scratch".to_string(), socket.clone())),
     )
     .unwrap();
 
     assert!(output.unwrap().contains("Codex"));
+    server.join().unwrap();
+    std::fs::remove_file(socket).unwrap();
 }
 
 #[test]
-fn dispatch_sidebar_attach_once_restores_persisted_state() {
-    let state_home = std::env::temp_dir().join(format!(
-        "vde-tmux-sidebar-state-cli-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let env = BTreeMap::from([
-        ("TMUX_PANE".to_string(), "%9".to_string()),
-        (
-            "XDG_STATE_HOME".to_string(),
-            state_home.display().to_string(),
-        ),
-    ]);
-    let state_path = crate::sidebar::store::state_path(&env);
-    let mut state = crate::sidebar::state::SidebarState {
-        selection: Some("repo::misc::app".to_string()),
-        ..crate::sidebar::state::SidebarState::default()
-    };
-    state.collapsed.insert("repo::misc::app".to_string());
-    crate::sidebar::store::save_state(&state_path, &state).unwrap();
-
+fn dispatch_sidebar_attach_once_uses_sidebar_state_from_v2_snapshot() {
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%9".to_string())]);
     let mock = MockTmuxRunner::new();
     mock.stub(
         &[
@@ -95,51 +196,43 @@ fn dispatch_sidebar_attach_once_restores_persisted_state() {
         ],
         "",
     );
-    let format = crate::options::snapshot::snapshot_format();
-    let line = [
-        "main",
-        "@1",
-        "%1",
-        "/tmp/app",
-        "codex",
-        "/dev/ttys001",
-        "123",
-        "0",
-        "0",
-        "0",
-        "",
-        "",
-        "",
-        "",
-        "codex",
-        "running",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-    ]
-    .join("\u{1f}");
-    mock.stub(&["list-panes", "-a", "-F", &format], &format!("{line}\n"));
+    let mut state = crate::sidebar::state::SidebarState::default();
+    state.collapsed.insert("repo::misc::app".to_string());
+    let mut repo = sidebar_row(
+        "repo::misc::app",
+        crate::sidebar::tree::SidebarRowKind::Repo,
+        "app",
+        None,
+    );
+    repo.expanded = false;
+    let (socket, server) = spawn_sidebar_snapshot_server(crate::daemon::SidebarFrame {
+        state,
+        counts: crate::sidebar::tree::BadgeCounts::default(),
+        rows: vec![
+            repo,
+            sidebar_row(
+                "chat::%1",
+                crate::sidebar::tree::SidebarRowKind::Chat,
+                "codex (%1)",
+                Some("%1"),
+            ),
+        ],
+    });
 
     let output = crate::cli::sidebar::run_sidebar_command_with_ensure(
         crate::cli::sidebar::SidebarCommand::Attach { once: true },
         &mock,
         &env,
         &crate::config::Config::default(),
-        |_| Ok(()),
+        |_, _| Ok(("scratch".to_string(), socket.clone())),
     )
     .unwrap();
     let output = output.unwrap();
 
     assert!(output.contains(" ▸ app"));
     assert!(!output.contains("Codex %1"));
-    std::fs::remove_dir_all(state_home).unwrap();
+    server.join().unwrap();
+    std::fs::remove_file(socket).unwrap();
 }
 
 #[test]
@@ -208,7 +301,12 @@ fn dispatch_sidebar_open_uses_layout_operations() {
         &mock,
         &env(),
         &crate::config::Config::default(),
-        |_| Ok(()),
+        |_, _| {
+            Ok((
+                "scratch".to_string(),
+                std::path::PathBuf::from("/tmp/vde-sidebar-test.sock"),
+            ))
+        },
     )
     .unwrap();
 
@@ -237,7 +335,12 @@ fn dispatch_sidebar_focus_selects_sidebar_pane() {
         &mock,
         &env(),
         &crate::config::Config::default(),
-        |_| Ok(()),
+        |_, _| {
+            Ok((
+                "scratch".to_string(),
+                std::path::PathBuf::from("/tmp/vde-sidebar-test.sock"),
+            ))
+        },
     )
     .unwrap();
 
@@ -269,7 +372,12 @@ fn dispatch_sidebar_focus_without_sidebar_is_noop() {
         &mock,
         &env(),
         &crate::config::Config::default(),
-        |_| Ok(()),
+        |_, _| {
+            Ok((
+                "scratch".to_string(),
+                std::path::PathBuf::from("/tmp/vde-sidebar-test.sock"),
+            ))
+        },
     )
     .unwrap();
 
@@ -287,11 +395,7 @@ fn dispatch_sidebar_open_accepts_percent_width() {
     let mock = MockTmuxRunner::new();
     let exe = std::env::current_exe().unwrap();
     let command = sidebar_attach_command_for_selection_test(&exe);
-    let (socket, handle) = spawn_ready_daemon_socket("vde-tmux-sidebar-open-percent");
-    let env = BTreeMap::from([(
-        "VDE_DAEMON_SOCKET".to_string(),
-        socket.display().to_string(),
-    )]);
+    let env = BTreeMap::new();
     stub_selection_context(&mock);
     mock.stub(
         &[
@@ -329,15 +433,25 @@ fn dispatch_sidebar_open_accepts_percent_width() {
         "",
     );
 
-    crate::cli::run_with(
-        ["vt", "sidebar", "open", "--window", "@1", "--width", "10%"],
+    crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Open {
+            window: Some("@1".to_string()),
+            width: Some(crate::config::SidebarWidth::Percent(10)),
+            delay_ms: None,
+        },
         &mock,
         &env,
+        &crate::config::Config::default(),
+        |_, _| {
+            Ok((
+                "scratch".to_string(),
+                std::path::PathBuf::from("/tmp/vde-sidebar-test.sock"),
+            ))
+        },
     )
     .unwrap();
 
     assert_eq!(mock.calls().len(), 4);
-    handle.join().unwrap();
 }
 
 #[test]
@@ -424,7 +538,12 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
         &mock,
         &env(),
         &crate::config::Config::default(),
-        |_| Ok(()),
+        |_, _| {
+            Ok((
+                "scratch".to_string(),
+                std::path::PathBuf::from("/tmp/vde-sidebar-test.sock"),
+            ))
+        },
     )
     .unwrap();
 
@@ -433,51 +552,8 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
 
 #[test]
 fn dispatch_sidebar_focus_sends_current_selection_context() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-
-    let socket = unique_socket_path("vde-tmux-sidebar-select-context");
-    let listener = UnixListener::bind(&socket).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let (tx, rx) = mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    let mut line = String::new();
-                    BufReader::new(&mut stream).read_line(&mut line).unwrap();
-                    let message: crate::daemon::protocol::ClientMessage =
-                        serde_json::from_str(line.trim()).unwrap();
-                    tx.send(message).unwrap();
-                    serde_json::to_writer(
-                        &mut stream,
-                        &crate::daemon::protocol::ServerMessage::Ack,
-                    )
-                    .unwrap();
-                    stream.write_all(b"\n").unwrap();
-                    return;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => return,
-            }
-        }
-    });
-    let env = BTreeMap::from([
-        (
-            "VDE_DAEMON_SOCKET".to_string(),
-            socket.display().to_string(),
-        ),
-        ("TMUX_PANE".to_string(), "%source".to_string()),
-    ]);
+    let (socket, rx, handle) = spawn_v2_sidebar_command_server();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%source".to_string())]);
     let mock = MockTmuxRunner::new();
     mock.stub(
         &[
@@ -509,19 +585,25 @@ fn dispatch_sidebar_focus_sends_current_selection_context() {
         &mock,
         &env,
         &crate::config::Config::default(),
-        |_| Ok(()),
+        |_, _| Ok(("scratch".to_string(), socket.clone())),
     )
     .unwrap();
 
     let message = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let event_id = message.event_id().unwrap().clone();
     assert_eq!(
         message,
-        crate::daemon::protocol::ClientMessage::SidebarEvent {
-            proto: 1,
-            event: crate::daemon::protocol::SidebarClientEvent::SelectContext {
-                pane: Some("%source".to_string()),
-                session: Some("main".to_string())
-            }
+        crate::daemon::protocol::v2::ClientMessage::SidebarCommand {
+            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            daemon_instance_id: crate::pane_state::DaemonInstanceId::parse(
+                "ffeeddccbbaa99887766554433221100"
+            )
+            .unwrap(),
+            event_id,
+            command: crate::daemon::protocol::v2::SidebarCommand::SelectContext {
+                pane_id: Some("%source".to_string()),
+                session_id: Some("main".to_string()),
+            },
         }
     );
     handle.join().unwrap();
@@ -530,124 +612,56 @@ fn dispatch_sidebar_focus_sends_current_selection_context() {
 
 #[test]
 fn dispatch_sidebar_jump_forwards_to_daemon_when_socket_exists() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-
-    let socket = unique_socket_path("vde-tmux-sidebar-jump");
-    let listener = UnixListener::bind(&socket).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let (tx, rx) = mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    let mut line = String::new();
-                    BufReader::new(&mut stream).read_line(&mut line).unwrap();
-                    let message: crate::daemon::protocol::ClientMessage =
-                        serde_json::from_str(line.trim()).unwrap();
-                    tx.send(message).unwrap();
-                    serde_json::to_writer(
-                        &mut stream,
-                        &crate::daemon::protocol::ServerMessage::Ack,
-                    )
-                    .unwrap();
-                    stream.write_all(b"\n").unwrap();
-                    return;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => return,
-            }
-        }
-    });
-    let env = BTreeMap::from([(
-        "VDE_DAEMON_SOCKET".to_string(),
-        socket.display().to_string(),
-    )]);
+    let (socket, rx, handle) = spawn_v2_sidebar_command_server();
     let mock = MockTmuxRunner::new();
 
-    run_with(["vt", "sidebar", "jump", "%1"], &mock, &env).unwrap();
+    crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Jump {
+            pane: "%1".to_string(),
+        },
+        &mock,
+        &BTreeMap::new(),
+        &crate::config::Config::default(),
+        |_, _| Ok(("scratch".to_string(), socket.clone())),
+    )
+    .unwrap();
 
     let message = rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(
+    assert!(matches!(
         message,
-        crate::daemon::protocol::ClientMessage::SidebarEvent {
-            proto: 1,
-            event: crate::daemon::protocol::SidebarClientEvent::JumpPane {
-                pane: "%1".to_string()
-            }
-        }
-    );
+        crate::daemon::protocol::v2::ClientMessage::SidebarCommand {
+            command: crate::daemon::protocol::v2::SidebarCommand::JumpPane { pane_id },
+            ..
+        } if pane_id == "%1"
+    ));
     handle.join().unwrap();
     std::fs::remove_file(socket).unwrap();
 }
 
 #[test]
 fn dispatch_sidebar_input_forwards_to_daemon_when_socket_exists() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-
-    let socket = unique_socket_path("vde-tmux-sidebar-input");
-    let listener = UnixListener::bind(&socket).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let (tx, rx) = mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    let mut line = String::new();
-                    BufReader::new(&mut stream).read_line(&mut line).unwrap();
-                    let message: crate::daemon::protocol::ClientMessage =
-                        serde_json::from_str(line.trim()).unwrap();
-                    tx.send(message).unwrap();
-                    serde_json::to_writer(
-                        &mut stream,
-                        &crate::daemon::protocol::ServerMessage::Ack,
-                    )
-                    .unwrap();
-                    stream.write_all(b"\n").unwrap();
-                    return;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => return,
-            }
-        }
-    });
-    let env = BTreeMap::from([(
-        "VDE_DAEMON_SOCKET".to_string(),
-        socket.display().to_string(),
-    )]);
+    let (socket, rx, handle) = spawn_v2_sidebar_command_server();
     let mock = MockTmuxRunner::new();
 
-    run_with(["vt", "sidebar", "input", "j"], &mock, &env).unwrap();
+    crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Input {
+            key: "j".to_string(),
+        },
+        &mock,
+        &BTreeMap::new(),
+        &crate::config::Config::default(),
+        |_, _| Ok(("scratch".to_string(), socket.clone())),
+    )
+    .unwrap();
 
     let message = rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(
+    assert!(matches!(
         message,
-        crate::daemon::protocol::ClientMessage::SidebarEvent {
-            proto: 1,
-            event: crate::daemon::protocol::SidebarClientEvent::Key {
-                key: "j".to_string()
-            }
-        }
-    );
+        crate::daemon::protocol::v2::ClientMessage::SidebarCommand {
+            command: crate::daemon::protocol::v2::SidebarCommand::Key { key },
+            ..
+        } if key == "j"
+    ));
     handle.join().unwrap();
     std::fs::remove_file(socket).unwrap();
 }
@@ -708,9 +722,12 @@ fn sidebar_layout_applied_ensures_daemon_started() {
         &mock,
         &env(),
         &crate::config::Config::default(),
-        |_| {
+        |_, _| {
             called.set(true);
-            Ok(())
+            Ok((
+                "scratch".to_string(),
+                std::path::PathBuf::from("/tmp/vde-sidebar-test.sock"),
+            ))
         },
     )
     .unwrap();
@@ -744,9 +761,12 @@ fn sidebar_layout_changed_closes_lonely_sidebar_without_starting_daemon() {
         &mock,
         &env(),
         &crate::config::Config::default(),
-        |_| {
+        |_, _| {
             called.set(true);
-            Ok(())
+            Ok((
+                "scratch".to_string(),
+                std::path::PathBuf::from("/tmp/vde-sidebar-test.sock"),
+            ))
         },
     )
     .unwrap();
@@ -793,58 +813,12 @@ fn sidebar_attach_command_for_selection_test(exe: &std::path::Path) -> String {
 }
 
 fn unique_socket_path(label: &str) -> std::path::PathBuf {
+    static NEXT_SOCKET_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let socket_id = NEXT_SOCKET_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::path::PathBuf::from(format!(
-        "/tmp/{label}-{}.sock",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "/tmp/{label}-{}-{socket_id}.sock",
+        std::process::id()
     ))
-}
-
-fn spawn_ready_daemon_socket(label: &str) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-    use std::time::{Duration, Instant};
-
-    let socket = unique_socket_path(label);
-    let listener = UnixListener::bind(&socket).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let socket_for_thread = socket.clone();
-    let handle = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut handled = 0usize;
-        while handled < 2 && Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    let mut line = String::new();
-                    BufReader::new(&mut stream).read_line(&mut line).unwrap();
-                    let message: crate::daemon::protocol::ClientMessage =
-                        serde_json::from_str(line.trim()).unwrap();
-                    let response = match message {
-                        crate::daemon::protocol::ClientMessage::Query {
-                            what: crate::daemon::protocol::QueryTarget::Summary,
-                            ..
-                        } => crate::daemon::protocol::ServerMessage::Summary {
-                            text: String::new(),
-                        },
-                        _ => crate::daemon::protocol::ServerMessage::Ack,
-                    };
-                    serde_json::to_writer(&mut stream, &response).unwrap();
-                    stream.write_all(b"\n").unwrap();
-                    handled += 1;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-        drop(listener);
-        let _ = std::fs::remove_file(socket_for_thread);
-    });
-    (socket, handle)
 }
 
 #[test]

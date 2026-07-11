@@ -10,6 +10,9 @@ pub const TOPOLOGY_FIELD_COUNT: usize = 12;
 pub const MAX_TOPOLOGY_ROWS: usize = 64;
 pub const TARGETED_REFRESH_TIMEOUT: Duration = Duration::from_millis(100);
 
+const STATUS_SESSION_FIELD_COUNT: usize = 6;
+const STATUS_WINDOW_FIELD_COUNT: usize = 5;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerIdentity {
     pub pid: u32,
@@ -23,6 +26,8 @@ pub struct QueryFraming {
     row: String,
     header: String,
     session: String,
+    status_session: String,
+    status_window: String,
 }
 
 impl QueryFraming {
@@ -50,6 +55,8 @@ impl QueryFraming {
             row: format!("__vde_r_{token}__"),
             header: format!("__vde_h_{token}__"),
             session: format!("__vde_s_{token}__"),
+            status_session: format!("__vde_sm_{token}__"),
+            status_window: format!("__vde_wm_{token}__"),
             token,
         })
     }
@@ -94,6 +101,39 @@ impl QueryFraming {
     pub fn session_format(&self) -> String {
         format!("{}#{{session_id}}{}", self.session, self.row)
     }
+
+    fn status_session_format(&self) -> String {
+        const FIELDS: [&str; STATUS_SESSION_FIELD_COUNT - 1] = [
+            "#{session_id}",
+            "#{session_name}",
+            "#{@vde_category}",
+            "#{session_attached}",
+            "#{session_created}",
+        ];
+        format!(
+            "{}{}{}{}",
+            self.status_session,
+            self.field,
+            FIELDS.join(&self.field),
+            self.row
+        )
+    }
+
+    fn status_window_format(&self) -> String {
+        const FIELDS: [&str; STATUS_WINDOW_FIELD_COUNT - 1] = [
+            "#{window_id}",
+            "#{window_bell_flag}",
+            "#{window_activity_flag}",
+            "#{window_silence_flag}",
+        ];
+        format!(
+            "{}{}{}{}",
+            self.status_window,
+            self.field,
+            FIELDS.join(&self.field),
+            self.row
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +154,30 @@ pub struct TopologySnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSessionMetadata {
+    pub session_id: String,
+    pub session_name: String,
+    pub category: Option<String>,
+    pub attached: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusWindowMetadata {
+    pub window_id: String,
+    pub bell: bool,
+    pub activity: bool,
+    pub silence: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusMetadataSnapshot {
+    pub server_identity: ServerIdentity,
+    pub sessions: Vec<StatusSessionMetadata>,
+    pub windows: Vec<StatusWindowMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopologyError {
     InvalidFraming(String),
     IdentityMismatch {
@@ -125,6 +189,12 @@ pub enum TopologyError {
     InvalidPaneId(String),
     Query(String),
     Deadline,
+}
+
+impl TopologyError {
+    pub fn requires_daemon_exit(&self) -> bool {
+        matches!(self, Self::IdentityMismatch { .. })
+    }
 }
 
 impl fmt::Display for TopologyError {
@@ -253,6 +323,86 @@ pub fn poll_query_args(framing: &QueryFraming) -> Vec<String> {
     ]
 }
 
+pub fn hydrate_query_args(framing: &QueryFraming) -> Vec<String> {
+    vec![
+        "display-message".to_string(),
+        "-p".to_string(),
+        framing.identity_format(),
+        ";".to_string(),
+        "list-panes".to_string(),
+        "-a".to_string(),
+        "-F".to_string(),
+        format!(
+            "#{{pane_id}}{}#{{pane_pid}}{}#{{@vde_pane_state}}{}",
+            framing.field, framing.field, framing.row
+        ),
+    ]
+}
+
+pub fn status_metadata_query_args(framing: &QueryFraming) -> Vec<String> {
+    vec![
+        "display-message".to_string(),
+        "-p".to_string(),
+        framing.identity_format(),
+        ";".to_string(),
+        "list-sessions".to_string(),
+        "-F".to_string(),
+        framing.status_session_format(),
+        ";".to_string(),
+        "if-shell".to_string(),
+        "-F".to_string(),
+        "#{>:#{server_sessions},0}".to_string(),
+        crate::pane_state::store::tmux_command_string(&[
+            "list-windows".to_string(),
+            "-a".to_string(),
+            "-F".to_string(),
+            framing.status_window_format(),
+        ]),
+    ]
+}
+
+pub fn parse_hydrate_records(
+    output: &str,
+    framing: &QueryFraming,
+    expected_identity: &ServerIdentity,
+) -> Result<Vec<crate::pane_state::RawPaneRecord>, TopologyError> {
+    let (identity, rows) = parse_envelope(output, framing)?;
+    verify_identity(identity, expected_identity)?;
+    let mut records = BTreeMap::<PaneInstance, Option<String>>::new();
+    for row in rows {
+        let fields = row.split(&framing.field).collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err(TopologyError::InvalidRow(
+                "hydrate row has an invalid field count".to_string(),
+            ));
+        }
+        validate_pane_id(fields[0])?;
+        let pane_pid = fields[1]
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| TopologyError::InvalidRow("invalid hydrate pane PID".to_string()))?;
+        let pane = PaneInstance {
+            pane_id: fields[0].to_string(),
+            pane_pid,
+        };
+        let raw = (!fields[2].is_empty()).then(|| fields[2].to_string());
+        if records
+            .insert(pane.clone(), raw.clone())
+            .is_some_and(|previous| previous != raw)
+        {
+            return Err(TopologyError::InvalidRow(format!(
+                "linked pane {} has inconsistent canonical state",
+                pane.pane_id
+            )));
+        }
+    }
+    Ok(records
+        .into_iter()
+        .map(|(pane_instance, raw)| crate::pane_state::RawPaneRecord { pane_instance, raw })
+        .collect())
+}
+
 pub fn targeted_session_query_args(framing: &QueryFraming) -> Vec<String> {
     vec![
         "display-message".to_string(),
@@ -312,6 +462,85 @@ pub fn parse_session_count(
         sessions.insert(session_id.to_string());
     }
     Ok(sessions.len())
+}
+
+pub fn parse_status_metadata(
+    output: &str,
+    framing: &QueryFraming,
+    expected_identity: &ServerIdentity,
+) -> Result<StatusMetadataSnapshot, TopologyError> {
+    let (identity, rows) = parse_envelope(output, framing)?;
+    verify_identity(identity.clone(), expected_identity)?;
+    let mut sessions = BTreeMap::<String, StatusSessionMetadata>::new();
+    let mut windows = BTreeMap::<String, StatusWindowMetadata>::new();
+
+    for row in rows {
+        let fields = row.split(&framing.field).collect::<Vec<_>>();
+        match fields.first().copied() {
+            Some(prefix) if prefix == framing.status_session => {
+                if fields.len() != STATUS_SESSION_FIELD_COUNT {
+                    return Err(TopologyError::InvalidRow(format!(
+                        "status session row has {} fields, expected {STATUS_SESSION_FIELD_COUNT}",
+                        fields.len()
+                    )));
+                }
+                reject_query_sentinels(&fields[1..], framing, "status session")?;
+                validate_prefixed_numeric_id(fields[1], '$', "session ID")?;
+                let metadata = StatusSessionMetadata {
+                    session_id: fields[1].to_string(),
+                    session_name: fields[2].to_string(),
+                    category: (!fields[3].is_empty()).then(|| fields[3].to_string()),
+                    attached: parse_attached(fields[4])?,
+                    created_at: parse_i64(fields[5], "session created at")?,
+                };
+                if sessions
+                    .insert(metadata.session_id.clone(), metadata.clone())
+                    .is_some_and(|previous| previous != metadata)
+                {
+                    return Err(TopologyError::InvalidRow(format!(
+                        "duplicate session {} has inconsistent status metadata",
+                        metadata.session_id
+                    )));
+                }
+            }
+            Some(prefix) if prefix == framing.status_window => {
+                if fields.len() != STATUS_WINDOW_FIELD_COUNT {
+                    return Err(TopologyError::InvalidRow(format!(
+                        "status window row has {} fields, expected {STATUS_WINDOW_FIELD_COUNT}",
+                        fields.len()
+                    )));
+                }
+                reject_query_sentinels(&fields[1..], framing, "status window")?;
+                validate_prefixed_numeric_id(fields[1], '@', "window ID")?;
+                let metadata = StatusWindowMetadata {
+                    window_id: fields[1].to_string(),
+                    bell: parse_bool(fields[2], "window bell flag")?,
+                    activity: parse_bool(fields[3], "window activity flag")?,
+                    silence: parse_bool(fields[4], "window silence flag")?,
+                };
+                if windows
+                    .insert(metadata.window_id.clone(), metadata.clone())
+                    .is_some_and(|previous| previous != metadata)
+                {
+                    return Err(TopologyError::InvalidRow(format!(
+                        "linked window {} has inconsistent status metadata",
+                        metadata.window_id
+                    )));
+                }
+            }
+            _ => {
+                return Err(TopologyError::InvalidRow(
+                    "status metadata row has an invalid prefix".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(StatusMetadataSnapshot {
+        server_identity: identity,
+        sessions: sessions.into_values().collect(),
+        windows: windows.into_values().collect(),
+    })
 }
 
 pub fn parse_topology(
@@ -510,6 +739,38 @@ fn parse_bool(value: &str, field: &str) -> Result<bool, TopologyError> {
     }
 }
 
+fn parse_attached(value: &str) -> Result<bool, TopologyError> {
+    value
+        .parse::<u64>()
+        .map(|client_count| client_count > 0)
+        .map_err(|_| TopologyError::InvalidRow("invalid session attached count".to_string()))
+}
+
+fn reject_query_sentinels(
+    values: &[&str],
+    framing: &QueryFraming,
+    row_kind: &str,
+) -> Result<(), TopologyError> {
+    let sentinels = [
+        framing.field.as_str(),
+        framing.row.as_str(),
+        framing.header.as_str(),
+        framing.session.as_str(),
+        framing.status_session.as_str(),
+        framing.status_window.as_str(),
+    ];
+    if values
+        .iter()
+        .any(|value| sentinels.iter().any(|sentinel| value.contains(sentinel)))
+    {
+        Err(TopologyError::InvalidRow(format!(
+            "{row_kind} value contains a query sentinel"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +816,217 @@ mod tests {
             output.push('\n');
         }
         output
+    }
+
+    fn status_metadata_output(rows: &[Vec<String>]) -> String {
+        let framing = framing();
+        let mut output = format!(
+            "{}{}123{}456{}\n",
+            framing.header, framing.field, framing.field, framing.row
+        );
+        for fields in rows {
+            output.push_str(&fields.join(&framing.field));
+            output.push_str(&framing.row);
+            output.push('\n');
+        }
+        output
+    }
+
+    fn status_session_row(
+        session_id: &str,
+        session_name: &str,
+        category: &str,
+        attached: &str,
+        created_at: &str,
+    ) -> Vec<String> {
+        vec![
+            framing().status_session,
+            session_id.to_string(),
+            session_name.to_string(),
+            category.to_string(),
+            attached.to_string(),
+            created_at.to_string(),
+        ]
+    }
+
+    fn status_window_row(
+        window_id: &str,
+        bell: &str,
+        activity: &str,
+        silence: &str,
+    ) -> Vec<String> {
+        vec![
+            framing().status_window,
+            window_id.to_string(),
+            bell.to_string(),
+            activity.to_string(),
+            silence.to_string(),
+        ]
+    }
+
+    #[test]
+    fn status_metadata_query_is_one_guarded_command_group() {
+        let framing = framing();
+        let args = status_metadata_query_args(&framing);
+        assert_eq!(
+            args,
+            vec![
+                "display-message",
+                "-p",
+                &framing.identity_format(),
+                ";",
+                "list-sessions",
+                "-F",
+                &framing.status_session_format(),
+                ";",
+                "if-shell",
+                "-F",
+                "#{>:#{server_sessions},0}",
+                &crate::pane_state::store::tmux_command_string(&[
+                    "list-windows".to_string(),
+                    "-a".to_string(),
+                    "-F".to_string(),
+                    framing.status_window_format(),
+                ]),
+            ]
+        );
+        assert_eq!(
+            framing.pane_format().split(&framing.field).count(),
+            TOPOLOGY_FIELD_COUNT
+        );
+    }
+
+    #[test]
+    fn status_metadata_parser_preserves_session_values_and_types_fields() {
+        let rows = vec![
+            status_session_row("$2", "beta\nteam", "", "0", "200"),
+            status_session_row("$1", "alpha\tteam", "work", "2", "100"),
+            status_window_row("@2", "1", "0", "1"),
+        ];
+        let snapshot =
+            parse_status_metadata(&status_metadata_output(&rows), &framing(), &identity()).unwrap();
+        assert_eq!(snapshot.server_identity, identity());
+        assert_eq!(
+            snapshot.sessions,
+            vec![
+                StatusSessionMetadata {
+                    session_id: "$1".to_string(),
+                    session_name: "alpha\tteam".to_string(),
+                    category: Some("work".to_string()),
+                    attached: true,
+                    created_at: 100,
+                },
+                StatusSessionMetadata {
+                    session_id: "$2".to_string(),
+                    session_name: "beta\nteam".to_string(),
+                    category: None,
+                    attached: false,
+                    created_at: 200,
+                },
+            ]
+        );
+        assert_eq!(
+            snapshot.windows,
+            vec![StatusWindowMetadata {
+                window_id: "@2".to_string(),
+                bell: true,
+                activity: false,
+                silence: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn linked_status_window_rows_are_deduplicated_but_must_agree() {
+        let duplicate = status_window_row("@2", "1", "0", "1");
+        let rows = vec![duplicate.clone(), duplicate];
+        let snapshot =
+            parse_status_metadata(&status_metadata_output(&rows), &framing(), &identity()).unwrap();
+        assert_eq!(snapshot.windows.len(), 1);
+
+        let inconsistent = vec![
+            status_window_row("@2", "1", "0", "1"),
+            status_window_row("@2", "0", "0", "1"),
+        ];
+        assert!(matches!(
+            parse_status_metadata(
+                &status_metadata_output(&inconsistent),
+                &framing(),
+                &identity()
+            ),
+            Err(TopologyError::InvalidRow(_))
+        ));
+    }
+
+    #[test]
+    fn zero_session_status_metadata_header_is_valid() {
+        let snapshot =
+            parse_status_metadata(&status_metadata_output(&[]), &framing(), &identity()).unwrap();
+        assert!(snapshot.sessions.is_empty());
+        assert!(snapshot.windows.is_empty());
+    }
+
+    #[test]
+    fn status_metadata_identity_mismatch_rejects_entire_batch() {
+        let wrong = ServerIdentity {
+            pid: 999,
+            start_time: 456,
+        };
+        assert!(matches!(
+            parse_status_metadata(&status_metadata_output(&[]), &framing(), &wrong),
+            Err(TopologyError::IdentityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_status_metadata_fields_reject_entire_batch() {
+        let invalid_rows = [
+            vec![framing().status_session, "$1".to_string()],
+            status_session_row("1", "alpha", "work", "1", "100"),
+            status_session_row("$1", "alpha", "work", "true", "100"),
+            status_session_row("$1", "alpha", "work", "-1", "100"),
+            status_session_row("$1", "alpha", "work", "1", "never"),
+            status_window_row("2", "0", "0", "0"),
+            status_window_row("@2", "2", "0", "0"),
+            vec!["unknown-prefix".to_string()],
+        ];
+        for row in invalid_rows {
+            assert!(matches!(
+                parse_status_metadata(&status_metadata_output(&[row]), &framing(), &identity()),
+                Err(TopologyError::InvalidRow(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn status_metadata_external_values_cannot_contain_query_sentinels() {
+        let framing = framing();
+        for sentinel in [&framing.field, &framing.row, &framing.header] {
+            let rows = vec![status_session_row(
+                "$1",
+                &format!("alpha{sentinel}collision"),
+                "work",
+                "1",
+                "100",
+            )];
+            assert!(
+                parse_status_metadata(&status_metadata_output(&rows), &framing, &identity())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn status_metadata_row_limit_is_all_or_nothing() {
+        let rows = std::iter::repeat_n(
+            status_window_row("@2", "0", "0", "0"),
+            MAX_TOPOLOGY_ROWS + 1,
+        )
+        .collect::<Vec<_>>();
+        assert!(matches!(
+            parse_status_metadata(&status_metadata_output(&rows), &framing(), &identity()),
+            Err(TopologyError::TooManyRows(_))
+        ));
     }
 
     #[test]

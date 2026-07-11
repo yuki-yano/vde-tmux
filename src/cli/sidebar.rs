@@ -89,23 +89,22 @@ pub(crate) fn run_sidebar_command_with_ensure<F>(
     ensure_daemon: F,
 ) -> Result<Option<String>>
 where
-    F: Fn(&BTreeMap<String, String>) -> Result<()>,
+    F: Fn(&dyn TmuxRunner, &BTreeMap<String, String>) -> Result<(String, std::path::PathBuf)>,
 {
     match command {
         SidebarCommand::Attach { once } => {
-            ensure_daemon(env)?;
+            let (server_identity, socket) = ensure_daemon(runner, env)?;
             crate::sidebar::layout::attach(runner, env)?;
-            try_seed_sidebar_selection_from_env(env);
+            try_seed_sidebar_selection_from_env(env, &socket, &server_identity);
             if once {
-                return crate::sidebar::once::render_once(runner, env, config).map(Some);
+                return crate::sidebar::once::render_once(&socket, &server_identity, config)
+                    .map(Some);
             }
-            crate::sidebar::tui::run_live_tui(env, config)
+            crate::sidebar::tui::run_live_tui(env, config, &socket, &server_identity)
         }
         SidebarCommand::Input { key } => {
-            crate::sidebar::client::send_sidebar_key(
-                &crate::sidebar::client::socket_path(env),
-                &key,
-            )?;
+            let (server_identity, socket) = ensure_daemon(runner, env)?;
+            crate::sidebar::client::send_sidebar_key_v2(&socket, &server_identity, &key)?;
             Ok(None)
         }
         SidebarCommand::Open {
@@ -113,13 +112,13 @@ where
             width,
             delay_ms,
         } => {
-            ensure_daemon(env)?;
+            let (server_identity, socket) = ensure_daemon(runner, env)?;
             if let Some(delay_ms) = delay_ms.filter(|value| *value > 0) {
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
             let target = resolve_window_target(runner, window)?;
             let selection_context = resolve_selection_context(runner, env).ok();
-            try_seed_sidebar_selection(env, selection_context.as_ref());
+            try_seed_sidebar_selection(selection_context.as_ref(), &socket, &server_identity);
             let attach_context = selection_context.as_ref().and_then(to_attach_context);
             crate::sidebar::layout::open_with_attach_context(
                 runner,
@@ -132,12 +131,12 @@ where
             Ok(None)
         }
         SidebarCommand::Toggle { all, window, width } => {
-            ensure_daemon(env)?;
+            let (server_identity, socket) = ensure_daemon(runner, env)?;
             if all && window.is_some() {
                 bail!("--all and --window cannot be used together");
             }
             let selection_context = resolve_selection_context(runner, env).ok();
-            try_seed_sidebar_selection(env, selection_context.as_ref());
+            try_seed_sidebar_selection(selection_context.as_ref(), &socket, &server_identity);
             let attach_context = selection_context.as_ref().and_then(to_attach_context);
             if all {
                 crate::sidebar::layout::toggle_all_with_attach_context(
@@ -161,10 +160,10 @@ where
             Ok(None)
         }
         SidebarCommand::FocusToggle { window, width } => {
-            ensure_daemon(env)?;
+            let (server_identity, socket) = ensure_daemon(runner, env)?;
             let target = resolve_window_target(runner, window)?;
             let selection_context = resolve_selection_context(runner, env).ok();
-            try_seed_sidebar_selection(env, selection_context.as_ref());
+            try_seed_sidebar_selection(selection_context.as_ref(), &socket, &server_identity);
             let attach_context = selection_context.as_ref().and_then(to_attach_context);
             crate::sidebar::layout::focus_toggle_with_attach_context(
                 runner,
@@ -192,7 +191,7 @@ where
             Ok(None)
         }
         SidebarCommand::LayoutApplied { window, width } => {
-            ensure_daemon(env)?;
+            let _ = ensure_daemon(runner, env)?;
             let target = resolve_window_target(runner, window)?;
             crate::sidebar::layout::layout_applied(
                 runner,
@@ -209,24 +208,28 @@ where
             Ok(None)
         }
         SidebarCommand::Jump { pane } => {
-            crate::sidebar::client::send_sidebar_jump(
-                &crate::sidebar::client::socket_path(env),
-                &pane,
-            )?;
+            let (server_identity, socket) = ensure_daemon(runner, env)?;
+            crate::sidebar::client::send_sidebar_jump_v2(&socket, &server_identity, &pane)?;
             Ok(None)
         }
         SidebarCommand::Focus { window } => {
+            let (server_identity, socket) = ensure_daemon(runner, env)?;
             let target = resolve_window_target(runner, window)?;
             let selection_context = resolve_selection_context(runner, env).ok();
-            try_seed_sidebar_selection(env, selection_context.as_ref());
+            try_seed_sidebar_selection(selection_context.as_ref(), &socket, &server_identity);
             crate::sidebar::layout::focus(runner, &target)?;
             Ok(None)
         }
     }
 }
 
-fn ensure_sidebar_daemon_started(env: &BTreeMap<String, String>) -> Result<()> {
-    crate::daemon::lifecycle::ensure_daemon_started(env, None)
+fn ensure_sidebar_daemon_started(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<(String, std::path::PathBuf)> {
+    let (incarnation, socket) =
+        crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, None)?;
+    Ok((incarnation.hash, socket))
 }
 
 fn parse_sidebar_width(value: &str) -> std::result::Result<SidebarWidth, String> {
@@ -240,8 +243,9 @@ struct SidebarSelectionContext {
 }
 
 fn try_seed_sidebar_selection(
-    env: &BTreeMap<String, String>,
     context: Option<&SidebarSelectionContext>,
+    socket: &std::path::Path,
+    server_identity: &str,
 ) {
     let Some(context) = context else {
         return;
@@ -249,14 +253,19 @@ fn try_seed_sidebar_selection(
     if context.pane.is_none() && context.session.is_none() {
         return;
     }
-    let _ = crate::sidebar::client::send_sidebar_select_context(
-        &crate::sidebar::client::socket_path(env),
+    let _ = crate::sidebar::client::send_sidebar_select_context_v2(
+        socket,
+        server_identity,
         context.pane.as_deref(),
         context.session.as_deref(),
     );
 }
 
-fn try_seed_sidebar_selection_from_env(env: &BTreeMap<String, String>) {
+fn try_seed_sidebar_selection_from_env(
+    env: &BTreeMap<String, String>,
+    socket: &std::path::Path,
+    server_identity: &str,
+) {
     let context = SidebarSelectionContext {
         pane: normalize_context_field(
             env.get(crate::sidebar::layout::ENV_SELECTION_PANE)
@@ -267,7 +276,7 @@ fn try_seed_sidebar_selection_from_env(env: &BTreeMap<String, String>) {
                 .map(String::as_str),
         ),
     };
-    try_seed_sidebar_selection(env, Some(&context));
+    try_seed_sidebar_selection(Some(&context), socket, server_identity);
 }
 
 fn to_attach_context(

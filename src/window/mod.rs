@@ -17,9 +17,6 @@ pub struct WindowInfo {
     pub activity: bool,
     pub silence: bool,
     pub command: String,
-    pub badge: String,
-    pub state: String,
-    pub agent_counts: String,
 }
 
 pub fn window_list_format() -> String {
@@ -35,9 +32,6 @@ pub fn window_list_format() -> String {
         "#{window_activity_flag}",
         "#{window_silence_flag}",
         "#{pane_current_command}",
-        "#{@vde_window_status}",
-        "#{@vde_window_state}",
-        "#{@vde_window_agent_counts}",
     ]
     .join(&FIELD_SEP.to_string())
 }
@@ -47,7 +41,7 @@ pub fn parse_windows(output: &str) -> Vec<WindowInfo> {
         .lines()
         .filter_map(|line| {
             let fields = line.split(FIELD_SEP).collect::<Vec<_>>();
-            if fields.len() != 14 || fields[0].is_empty() || fields[2].is_empty() {
+            if fields.len() != 11 || fields[0].is_empty() || fields[2].is_empty() {
                 return None;
             }
             Some(WindowInfo {
@@ -66,9 +60,6 @@ pub fn parse_windows(output: &str) -> Vec<WindowInfo> {
                 activity: fields[8] == "1",
                 silence: fields[9] == "1",
                 command: fields[10].to_string(),
-                badge: fields[11].to_string(),
-                state: fields[12].to_string(),
-                agent_counts: fields[13].to_string(),
             })
         })
         .collect()
@@ -99,23 +90,7 @@ mod tests {
     #[test]
     fn parse_windows_reads_flags_and_defaults_empty_name() {
         let sep = FIELD_SEP.to_string();
-        let output = [
-            "main",
-            "2",
-            "@9",
-            "",
-            "3",
-            "1",
-            "0",
-            "1",
-            "0",
-            "1",
-            "nvim",
-            "▲",
-            "blocked",
-            "{\"blocked\":1}",
-        ]
-        .join(&sep);
+        let output = ["main", "2", "@9", "", "3", "1", "0", "1", "0", "1", "nvim"].join(&sep);
         let windows = parse_windows(&(output + "\n"));
 
         assert_eq!(windows.len(), 1);
@@ -130,26 +105,19 @@ mod tests {
         assert!(!windows[0].activity);
         assert!(windows[0].silence);
         assert_eq!(windows[0].command, "nvim");
-        assert_eq!(windows[0].badge, "▲");
-        assert_eq!(windows[0].state, "blocked");
-        assert_eq!(windows[0].agent_counts, "{\"blocked\":1}");
     }
 
     #[test]
     fn parse_windows_ignores_malformed_and_missing_identity() {
         let sep = FIELD_SEP.to_string();
         let valid = [
-            "main", "1", "@1", "zsh", "1", "0", "0", "0", "0", "0", "zsh", "", "", "",
+            "main", "1", "@1", "zsh", "1", "0", "0", "0", "0", "0", "zsh",
         ]
         .join(&sep);
-        let missing_session = [
-            "", "1", "@2", "zsh", "1", "0", "0", "0", "0", "0", "zsh", "", "", "",
-        ]
-        .join(&sep);
-        let missing_window = [
-            "main", "1", "", "zsh", "1", "0", "0", "0", "0", "0", "zsh", "", "", "",
-        ]
-        .join(&sep);
+        let missing_session =
+            ["", "1", "@2", "zsh", "1", "0", "0", "0", "0", "0", "zsh"].join(&sep);
+        let missing_window =
+            ["main", "1", "", "zsh", "1", "0", "0", "0", "0", "0", "zsh"].join(&sep);
         let output = format!("{valid}\n{missing_session}\n{missing_window}\nshort\n");
 
         let windows = parse_windows(&output);

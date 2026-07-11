@@ -1,23 +1,14 @@
-pub mod snapshot;
-
 use anyhow::Result;
 
 use crate::tmux::TmuxRunner;
 
-pub const KEY_AGENT: &str = "@vde_agent";
-pub const KEY_STATUS: &str = "@vde_status";
-pub const KEY_PROMPT: &str = "@vde_prompt";
-pub const KEY_PROMPT_SOURCE: &str = "@vde_prompt_source";
-pub const KEY_WAIT_REASON: &str = "@vde_wait_reason";
-pub const KEY_ATTENTION: &str = "@vde_attention";
-pub const KEY_STARTED_AT: &str = "@vde_started_at";
-pub const KEY_COMPLETED_AT: &str = "@vde_completed_at";
-pub const KEY_TASKS: &str = "@vde_tasks";
-pub const KEY_TASK_ITEMS: &str = "@vde_task_items";
-pub const KEY_TASK_ITEM_IDS: &str = "@vde_task_item_ids";
-pub const KEY_SUBAGENTS: &str = "@vde_subagents";
-pub const KEY_WORKTREE_ACTIVITY: &str = "@vde_worktree_activity";
 pub const KEY_PANE_STATE: &str = "@vde_pane_state";
+pub const KEY_STATUS_SUMMARY: &str = "@vde_status_summary";
+pub const KEY_STATUS_CATEGORY: &str = "@vde_status_category";
+pub const KEY_STATUS_SESSIONS: &str = "@vde_status_sessions";
+pub const KEY_STATUS_WINDOWS: &str = "@vde_status_windows";
+pub const KEY_STATUS_ATTENTION: &str = "@vde_status_attention";
+pub const KEY_STATUS_PANE: &str = "@vde_status_pane";
 
 pub const KEY_SIDEBAR_MARKER: &str = "@vde_sidebar";
 
@@ -25,58 +16,36 @@ pub const KEY_CATEGORY: &str = "@vde_category";
 pub const KEY_CATEGORY_OVERRIDE: &str = "@vde_category_override";
 pub const KEY_PROJECT_PATH: &str = "@vde_project_path";
 
-pub const KEY_SESSION_STATUS: &str = "@vde_session_status";
-pub const KEY_SESSION_STATE: &str = "@vde_session_state";
-pub const KEY_SESSION_AGENT_COUNTS: &str = "@vde_session_agent_counts";
-
-pub const KEY_WINDOW_STATUS: &str = "@vde_window_status";
-pub const KEY_WINDOW_STATE: &str = "@vde_window_state";
-pub const KEY_WINDOW_AGENT_COUNTS: &str = "@vde_window_agent_counts";
-
-pub const PANE_STATE_KEYS: &[&str] = &[
-    KEY_AGENT,
-    KEY_STATUS,
-    KEY_PROMPT,
-    KEY_PROMPT_SOURCE,
-    KEY_WAIT_REASON,
-    KEY_ATTENTION,
-    KEY_STARTED_AT,
-    KEY_COMPLETED_AT,
-    KEY_TASKS,
-    KEY_TASK_ITEMS,
-    KEY_SUBAGENTS,
-    KEY_WORKTREE_ACTIVITY,
+/// Fixed pane-option list retained for `pane-state cleanup-legacy --all`.
+pub const LEGACY_PANE_OPTION_KEYS: &[&str] = &[
+    "@vde_agent",
+    "@vde_status",
+    "@vde_prompt",
+    "@vde_prompt_source",
+    "@vde_wait_reason",
+    "@vde_attention",
+    "@vde_started_at",
+    "@vde_completed_at",
+    "@vde_tasks",
+    "@vde_task_items",
+    "@vde_task_item_ids",
+    "@vde_subagents",
+    "@vde_worktree_activity",
 ];
 
-pub fn set_pane_option(
-    runner: &dyn TmuxRunner,
-    pane_id: &str,
-    key: &str,
-    value: &str,
-) -> Result<()> {
-    runner.run(&["set-option", "-p", "-t", pane_id, key, value])?;
-    Ok(())
-}
+/// Fixed session-option list retained for `pane-state cleanup-legacy --all`.
+pub const LEGACY_SESSION_OPTION_KEYS: &[&str] = &[
+    "@vde_session_status",
+    "@vde_session_state",
+    "@vde_session_agent_counts",
+];
 
-pub fn unset_pane_option(runner: &dyn TmuxRunner, pane_id: &str, key: &str) -> Result<()> {
-    runner.run(&["set-option", "-p", "-u", "-t", pane_id, key])?;
-    Ok(())
-}
-
-pub fn set_window_option(
-    runner: &dyn TmuxRunner,
-    window: &str,
-    key: &str,
-    value: &str,
-) -> Result<()> {
-    runner.run(&["set-option", "-w", "-t", window, key, value])?;
-    Ok(())
-}
-
-pub fn unset_window_option(runner: &dyn TmuxRunner, window: &str, key: &str) -> Result<()> {
-    runner.run(&["set-option", "-w", "-u", "-t", window, key])?;
-    Ok(())
-}
+/// Fixed window-option list retained for `pane-state cleanup-legacy --all`.
+pub const LEGACY_WINDOW_OPTION_KEYS: &[&str] = &[
+    "@vde_window_status",
+    "@vde_window_state",
+    "@vde_window_agent_counts",
+];
 
 pub fn set_session_option(
     runner: &dyn TmuxRunner,
@@ -122,18 +91,21 @@ mod tests {
 
     #[test]
     fn all_keys_use_vde_namespace() {
-        let mut keys: Vec<&str> = PANE_STATE_KEYS.to_vec();
+        let mut keys: Vec<&str> = LEGACY_PANE_OPTION_KEYS.to_vec();
+        keys.extend(LEGACY_SESSION_OPTION_KEYS);
+        keys.extend(LEGACY_WINDOW_OPTION_KEYS);
         keys.extend([
             KEY_SIDEBAR_MARKER,
             KEY_CATEGORY,
             KEY_CATEGORY_OVERRIDE,
             KEY_PROJECT_PATH,
-            KEY_SESSION_STATUS,
-            KEY_SESSION_STATE,
-            KEY_SESSION_AGENT_COUNTS,
-            KEY_WINDOW_STATUS,
-            KEY_WINDOW_STATE,
-            KEY_WINDOW_AGENT_COUNTS,
+            KEY_PANE_STATE,
+            KEY_STATUS_SUMMARY,
+            KEY_STATUS_CATEGORY,
+            KEY_STATUS_SESSIONS,
+            KEY_STATUS_WINDOWS,
+            KEY_STATUS_ATTENTION,
+            KEY_STATUS_PANE,
         ]);
         for key in keys {
             assert!(key.starts_with("@vde_"), "{key} が @vde_ 名前空間でない");
@@ -141,21 +113,59 @@ mod tests {
     }
 
     #[test]
-    fn set_pane_option_issues_scoped_set() {
-        let mock = MockTmuxRunner::new();
-        mock.stub(&["set-option", "-p", "-t", "%3", KEY_STATUS, "running"], "");
-        set_pane_option(&mock, "%3", KEY_STATUS, "running").unwrap();
+    fn legacy_cleanup_lists_are_fixed_and_exclude_canonical_and_display_options() {
         assert_eq!(
-            mock.calls(),
-            vec![vec![
-                "set-option".to_string(),
-                "-p".to_string(),
-                "-t".to_string(),
-                "%3".to_string(),
-                KEY_STATUS.to_string(),
-                "running".to_string(),
-            ]]
+            LEGACY_PANE_OPTION_KEYS,
+            [
+                "@vde_agent",
+                "@vde_status",
+                "@vde_prompt",
+                "@vde_prompt_source",
+                "@vde_wait_reason",
+                "@vde_attention",
+                "@vde_started_at",
+                "@vde_completed_at",
+                "@vde_tasks",
+                "@vde_task_items",
+                "@vde_task_item_ids",
+                "@vde_subagents",
+                "@vde_worktree_activity",
+            ]
         );
+        assert_eq!(
+            LEGACY_SESSION_OPTION_KEYS,
+            [
+                "@vde_session_status",
+                "@vde_session_state",
+                "@vde_session_agent_counts",
+            ]
+        );
+        assert_eq!(
+            LEGACY_WINDOW_OPTION_KEYS,
+            [
+                "@vde_window_status",
+                "@vde_window_state",
+                "@vde_window_agent_counts",
+            ]
+        );
+        let legacy = LEGACY_PANE_OPTION_KEYS
+            .iter()
+            .chain(LEGACY_SESSION_OPTION_KEYS)
+            .chain(LEGACY_WINDOW_OPTION_KEYS)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(legacy.len(), 19);
+        assert!(!legacy.contains(&KEY_PANE_STATE));
+        for key in [
+            KEY_STATUS_SUMMARY,
+            KEY_STATUS_CATEGORY,
+            KEY_STATUS_SESSIONS,
+            KEY_STATUS_WINDOWS,
+            KEY_STATUS_ATTENTION,
+            KEY_STATUS_PANE,
+        ] {
+            assert!(!legacy.contains(&key));
+        }
     }
 
     #[test]

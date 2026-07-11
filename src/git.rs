@@ -6,8 +6,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::options::snapshot::PaneSnapshot;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitBadge {
     pub branch: String,
@@ -130,15 +128,14 @@ pub fn parse_ahead_behind(raw: &str) -> Result<(u32, u32)> {
     Ok((fields[1].parse()?, fields[0].parse()?))
 }
 
-pub fn collect_git_badges(
+pub fn collect_git_badges_for_paths<'a>(
     runner: &dyn GitRunner,
-    panes: &[PaneSnapshot],
+    paths: impl IntoIterator<Item = &'a str>,
 ) -> BTreeMap<String, GitBadge> {
     let mut badges = BTreeMap::new();
-    for path in panes
-        .iter()
-        .filter(|pane| !pane.agent.trim().is_empty())
-        .map(|pane| pane.current_path.trim())
+    for path in paths
+        .into_iter()
+        .map(str::trim)
         .filter(|path| !path.is_empty())
     {
         if badges.contains_key(path) {
@@ -215,15 +212,14 @@ pub fn enrich_with_vw_metadata(mut info: WorktreeInfo, vw_list: &VwListOutput) -
     info
 }
 
-pub fn collect_worktree_infos(
+pub fn collect_worktree_infos_for_paths<'a>(
     runner: &dyn GitRunner,
-    panes: &[PaneSnapshot],
+    paths: impl IntoIterator<Item = &'a str>,
 ) -> BTreeMap<String, WorktreeInfo> {
     let mut infos = BTreeMap::new();
-    for path in panes
-        .iter()
-        .filter(|pane| !pane.agent.trim().is_empty())
-        .map(|pane| pane.current_path.trim())
+    for path in paths
+        .into_iter()
+        .map(str::trim)
         .filter(|path| !path.is_empty())
     {
         if infos.contains_key(path) {
@@ -447,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_git_badges_uses_unique_agent_paths() {
+    fn collect_git_badges_for_paths_uses_unique_paths() {
         let mut runner = MockGitRunner::default();
         runner.stub(&["/tmp/repo", "branch", "--show-current"], "main\n");
         runner.stub(
@@ -460,25 +456,8 @@ mod tests {
             ],
             "0\t1\n",
         );
-        let panes = vec![
-            crate::options::snapshot::PaneSnapshot {
-                current_path: "/tmp/repo".to_string(),
-                agent: "codex".to_string(),
-                ..Default::default()
-            },
-            crate::options::snapshot::PaneSnapshot {
-                current_path: "/tmp/repo".to_string(),
-                agent: "claude".to_string(),
-                ..Default::default()
-            },
-            crate::options::snapshot::PaneSnapshot {
-                current_path: "/tmp/not-repo".to_string(),
-                agent: "".to_string(),
-                ..Default::default()
-            },
-        ];
-
-        let badges = collect_git_badges(&runner, &panes);
+        let badges =
+            collect_git_badges_for_paths(&runner, ["/tmp/repo", "/tmp/repo", "/tmp/not-repo"]);
 
         assert_eq!(badges.len(), 1);
         assert_eq!(badges["/tmp/repo"].branch, "main");
@@ -673,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_worktree_infos_uses_unique_agent_paths() {
+    fn collect_worktree_infos_for_paths_uses_unique_paths() {
         let mut runner = MockGitRunner::default();
         stub_worktree_probe(
             &mut runner,
@@ -684,25 +663,14 @@ mod tests {
             "",
         );
         runner.stub_vw_error(&["/tmp/worktrees/feature", "list", "--json"], "vw missing");
-        let panes = vec![
-            crate::options::snapshot::PaneSnapshot {
-                current_path: "/tmp/worktrees/feature".to_string(),
-                agent: "codex".to_string(),
-                ..Default::default()
-            },
-            crate::options::snapshot::PaneSnapshot {
-                current_path: "/tmp/worktrees/feature".to_string(),
-                agent: "claude".to_string(),
-                ..Default::default()
-            },
-            crate::options::snapshot::PaneSnapshot {
-                current_path: "/tmp/not-agent".to_string(),
-                agent: String::new(),
-                ..Default::default()
-            },
-        ];
-
-        let infos = collect_worktree_infos(&runner, &panes);
+        let infos = collect_worktree_infos_for_paths(
+            &runner,
+            [
+                "/tmp/worktrees/feature",
+                "/tmp/worktrees/feature",
+                "/tmp/not-agent",
+            ],
+        );
 
         assert_eq!(infos.len(), 1);
         assert_eq!(infos["/tmp/worktrees/feature"].name, "feature");

@@ -861,6 +861,17 @@ impl ViewEvent {
                 "client-detached event cannot contain a view occurrence".to_string(),
             ));
         }
+        if matches!(
+            self.hook_kind,
+            ViewHookKind::ClientSessionChanged
+                | ViewHookKind::ClientAttached
+                | ViewHookKind::ClientDetached
+        ) && self.source_client.is_none()
+        {
+            return Err(ModelError(
+                "client view hook requires source_client".to_string(),
+            ));
+        }
         if self.witnesses.len() > MAX_VIEW_WITNESSES {
             return Err(ModelError("too many client witnesses".to_string()));
         }

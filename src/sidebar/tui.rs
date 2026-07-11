@@ -24,10 +24,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::config::{Config, SidebarLiveConfig};
-use crate::daemon::DaemonSnapshot;
+use crate::daemon::protocol::v2::ResolvedSnapshot;
 use crate::sidebar::client::{
-    send_sidebar_jump, send_sidebar_key, send_sidebar_mark_done, send_sidebar_toggle, socket_path,
-    subscribe,
+    send_sidebar_jump_v2, send_sidebar_key_v2, send_sidebar_mark_done_v2, subscribe_v2,
 };
 use crate::sidebar::preview::open_preview_floating_pane;
 use crate::sidebar::render::{
@@ -43,13 +42,17 @@ const LIVE_CARD_MIN_WIDTH: u16 = 24;
 
 static PANIC_RESTORE_HOOK: Once = Once::new();
 
-pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<Option<String>> {
+pub fn run_live_tui(
+    env: &BTreeMap<String, String>,
+    config: &Config,
+    socket: &Path,
+    server_identity: &str,
+) -> Result<Option<String>> {
     install_panic_restore_hook();
     let close_window =
         resolve_current_window_id(&SystemTmuxRunner::from_env(Duration::from_secs(1)), env)?;
-    let socket = socket_path(env);
     let (tx, rx) = mpsc::channel();
-    subscribe(&socket, tx)?;
+    subscribe_v2(socket, server_identity, tx)?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -68,7 +71,15 @@ pub fn run_live_tui(env: &BTreeMap<String, String>, config: &Config) -> Result<O
         live_capture_tx: &live_request_tx,
         live_capture_rx: &live_result_rx,
     };
-    let result = run_loop(&mut terminal, &socket, &rx, &runner, env, runtime_config);
+    let result = run_loop(
+        &mut terminal,
+        socket,
+        server_identity,
+        &rx,
+        &runner,
+        env,
+        runtime_config,
+    );
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -152,7 +163,8 @@ pub struct RunLoopConfig<'a> {
 pub fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     socket: &Path,
-    rx: &mpsc::Receiver<DaemonSnapshot>,
+    server_identity: &str,
+    rx: &mpsc::Receiver<ResolvedSnapshot>,
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
     config: RunLoopConfig<'_>,
@@ -160,7 +172,7 @@ pub fn run_loop<B: Backend>(
     let theme = config.theme;
     let preview_history_lines = config.preview_history_lines;
     let live_config = config.live;
-    let mut current: Option<DaemonSnapshot> = None;
+    let mut current: Option<ResolvedSnapshot> = None;
     let mut scroll: usize = 0;
     let mut live = LiveState {
         requested_lines: live_rows_requested(live_config),
@@ -173,6 +185,7 @@ pub fn run_loop<B: Backend>(
         }
         let context = ClickContext {
             socket,
+            server_identity,
             runner,
             env,
             theme,
@@ -189,35 +202,29 @@ pub fn run_loop<B: Backend>(
             );
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
-            if let Some(sidebar) = &snapshot.sidebar {
-                let header = build_header_layout_with_counts(
-                    &sidebar.state,
-                    area.width,
-                    theme,
-                    sidebar.counts,
-                );
-                let areas = compute_areas(area, &header, live.requested_lines);
-                let rendered = render_lines_with_indices(
-                    &sidebar.rows,
-                    &sidebar.state,
-                    area.width as usize,
-                    theme,
-                );
-                let selected_row_index =
-                    sidebar.state.selection.as_deref().and_then(|selection| {
-                        sidebar.rows.iter().position(|row| row.id == selection)
-                    });
-                let selection_range = selected_row_index
-                    .and_then(|row_index| rendered_row_range(&rendered.row_indices, row_index));
-                scroll = resolve_scroll_range(
-                    scroll,
-                    selection_range,
-                    rendered.lines.len(),
-                    areas.rows_height as usize,
-                );
-            } else {
-                scroll = 0;
-            }
+            let sidebar = &snapshot.sidebar;
+            let header =
+                build_header_layout_with_counts(&sidebar.state, area.width, theme, sidebar.counts);
+            let areas = compute_areas(area, &header, live.requested_lines);
+            let rendered = render_lines_with_indices(
+                &sidebar.rows,
+                &sidebar.state,
+                area.width as usize,
+                theme,
+            );
+            let selected_row_index = sidebar
+                .state
+                .selection
+                .as_deref()
+                .and_then(|selection| sidebar.rows.iter().position(|row| row.id == selection));
+            let selection_range = selected_row_index
+                .and_then(|row_index| rendered_row_range(&rendered.row_indices, row_index));
+            scroll = resolve_scroll_range(
+                scroll,
+                selection_range,
+                rendered.lines.len(),
+                areas.rows_height as usize,
+            );
             draw_snapshot_with_theme_and_scroll_live(
                 terminal,
                 snapshot,
@@ -240,11 +247,13 @@ pub fn run_loop<B: Backend>(
                         }
                     }
                     KeyCode::Char('e') => live.toggle_mode(),
-                    KeyCode::Char(' ') => send_sidebar_key(socket, "space")?,
-                    KeyCode::Char(ch) => send_sidebar_key(socket, &ch.to_string())?,
-                    KeyCode::Down => send_sidebar_key(socket, "down")?,
-                    KeyCode::Up => send_sidebar_key(socket, "up")?,
-                    KeyCode::Tab => send_sidebar_key(socket, "tab")?,
+                    KeyCode::Char(' ') => send_sidebar_key_v2(socket, server_identity, "space")?,
+                    KeyCode::Char(ch) => {
+                        send_sidebar_key_v2(socket, server_identity, &ch.to_string())?
+                    }
+                    KeyCode::Down => send_sidebar_key_v2(socket, server_identity, "down")?,
+                    KeyCode::Up => send_sidebar_key_v2(socket, server_identity, "up")?,
+                    KeyCode::Tab => send_sidebar_key_v2(socket, server_identity, "tab")?,
                     KeyCode::Enter => {
                         if let Some(snapshot) = &current
                             && selection_is_detail_row(snapshot)
@@ -252,7 +261,7 @@ pub fn run_loop<B: Backend>(
                         {
                             spawn_preview(runner, env, &pane_id, preview_history_lines);
                         } else {
-                            send_sidebar_key(socket, "enter")?;
+                            send_sidebar_key_v2(socket, server_identity, "enter")?;
                         }
                     }
                     _ => {}
@@ -269,8 +278,8 @@ pub fn run_loop<B: Backend>(
 }
 
 fn drain_snapshot_updates(
-    rx: &mpsc::Receiver<DaemonSnapshot>,
-    current: &mut Option<DaemonSnapshot>,
+    rx: &mpsc::Receiver<ResolvedSnapshot>,
+    current: &mut Option<ResolvedSnapshot>,
 ) -> std::result::Result<(), TuiExit> {
     loop {
         match rx.try_recv() {
@@ -286,7 +295,7 @@ fn live_rows_requested(config: &SidebarLiveConfig) -> u16 {
 }
 
 fn update_live_state(
-    snapshot: &DaemonSnapshot,
+    snapshot: &ResolvedSnapshot,
     config: &SidebarLiveConfig,
     live: &mut LiveState,
     request_tx: &mpsc::Sender<String>,
@@ -407,7 +416,10 @@ enum ClickAction {
     ToggleRow(String),
     PreviewPane(String),
     JumpPane(String),
-    MarkDone(String),
+    MarkDone {
+        pane_instance: crate::pane_state::PaneInstance,
+        expected: crate::pane_state::StateVersion,
+    },
 }
 
 fn single_click_action(row: &ClickedRow) -> Option<ClickAction> {
@@ -421,24 +433,24 @@ fn single_click_action(row: &ClickedRow) -> Option<ClickAction> {
 }
 
 #[cfg(test)]
-fn pane_for_click(snapshot: &DaemonSnapshot, row: u16) -> Option<String> {
+fn pane_for_click(snapshot: &ResolvedSnapshot, row: u16) -> Option<String> {
     row_for_click(snapshot, row, 0, 0)?.pane_id.clone()
 }
 
 #[cfg(test)]
 fn row_for_click(
-    snapshot: &DaemonSnapshot,
+    snapshot: &ResolvedSnapshot,
     row: u16,
     header_rows: u16,
     scroll: usize,
 ) -> Option<&SidebarRow> {
-    let rows_len = snapshot.sidebar.as_ref()?.rows.len();
+    let rows_len = snapshot.sidebar.rows.len();
     let row_indices = (0..rows_len).map(Some).collect::<Vec<_>>();
     row_for_click_with_indices(snapshot, row, header_rows, scroll, &row_indices)
 }
 
 fn row_for_click_with_indices<'a>(
-    snapshot: &'a DaemonSnapshot,
+    snapshot: &'a ResolvedSnapshot,
     row: u16,
     header_rows: u16,
     scroll: usize,
@@ -449,19 +461,19 @@ fn row_for_click_with_indices<'a>(
     }
     let display_index = usize::from(row - header_rows) + scroll;
     let row_index = row_indices.get(display_index).and_then(|index| *index)?;
-    snapshot.sidebar.as_ref()?.rows.get(row_index)
+    snapshot.sidebar.rows.get(row_index)
 }
 
 pub fn draw_snapshot<B: Backend>(
     terminal: &mut Terminal<B>,
-    snapshot: &DaemonSnapshot,
+    snapshot: &ResolvedSnapshot,
 ) -> Result<()> {
     draw_snapshot_with_theme(terminal, snapshot, &SidebarRenderTheme::default())
 }
 
 pub fn draw_snapshot_with_theme<B: Backend>(
     terminal: &mut Terminal<B>,
-    snapshot: &DaemonSnapshot,
+    snapshot: &ResolvedSnapshot,
     theme: &SidebarRenderTheme,
 ) -> Result<()> {
     draw_snapshot_with_theme_and_scroll(terminal, snapshot, theme, 0)
@@ -469,7 +481,7 @@ pub fn draw_snapshot_with_theme<B: Backend>(
 
 fn draw_snapshot_with_theme_and_scroll<B: Backend>(
     terminal: &mut Terminal<B>,
-    snapshot: &DaemonSnapshot,
+    snapshot: &ResolvedSnapshot,
     theme: &SidebarRenderTheme,
     scroll: usize,
 ) -> Result<()> {
@@ -478,7 +490,7 @@ fn draw_snapshot_with_theme_and_scroll<B: Backend>(
 
 fn draw_snapshot_with_theme_and_scroll_live<B: Backend>(
     terminal: &mut Terminal<B>,
-    snapshot: &DaemonSnapshot,
+    snapshot: &ResolvedSnapshot,
     theme: &SidebarRenderTheme,
     scroll: usize,
     live: Option<&LiveState>,
@@ -501,15 +513,12 @@ pub fn draw_connecting<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
 fn draw_snapshot_in_area(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    snapshot: &DaemonSnapshot,
+    snapshot: &ResolvedSnapshot,
     theme: &SidebarRenderTheme,
     scroll: usize,
     live: Option<&LiveState>,
 ) {
-    let Some(sidebar) = &snapshot.sidebar else {
-        draw_placeholder(frame, area, "no sidebar data");
-        return;
-    };
+    let sidebar = &snapshot.sidebar;
     let header = build_header_layout_with_counts(&sidebar.state, area.width, theme, sidebar.counts);
     let live_lines = live.map(|live| live.requested_lines).unwrap_or(0);
     let areas = compute_areas(area, &header, live_lines);
@@ -607,7 +616,7 @@ fn empty_rows_placeholder_lines(
 }
 
 fn render_live_lines(
-    snapshot: &DaemonSnapshot,
+    snapshot: &ResolvedSnapshot,
     live: &LiveState,
     live_rows: u16,
     width: u16,
@@ -846,7 +855,7 @@ pub(crate) fn strip_ansi(input: &str) -> String {
 }
 
 fn event_tail(
-    snapshot: &DaemonSnapshot,
+    snapshot: &ResolvedSnapshot,
     limit: usize,
     now: i64,
     theme: &SidebarRenderTheme,
@@ -962,6 +971,7 @@ fn rendered_row_range(row_indices: &[Option<usize>], row_index: usize) -> Option
 
 struct ClickContext<'a> {
     socket: &'a Path,
+    server_identity: &'a str,
     runner: &'a dyn TmuxRunner,
     env: &'a BTreeMap<String, String>,
     theme: &'a SidebarRenderTheme,
@@ -971,27 +981,35 @@ struct ClickContext<'a> {
 
 fn handle_left_click(
     context: &ClickContext<'_>,
-    snapshot: &DaemonSnapshot,
+    snapshot: &ResolvedSnapshot,
     row: u16,
     column: u16,
     scroll: usize,
 ) -> Result<()> {
-    let Some(sidebar) = &snapshot.sidebar else {
-        return Ok(());
-    };
+    let sidebar = &snapshot.sidebar;
     let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
     let header =
         build_header_layout_with_counts(&sidebar.state, width, context.theme, sidebar.counts);
     if row < header.row_count() {
         match header_hit_test(&header, row, column) {
-            Some(HeaderAction::CycleViewMode) => {
-                send_sidebar_request(send_sidebar_key(context.socket, "v"))
-            }
+            Some(HeaderAction::CycleViewMode) => send_sidebar_request(send_sidebar_key_v2(
+                context.socket,
+                context.server_identity,
+                "v",
+            )),
             Some(HeaderAction::ToggleFilter) => {
-                send_sidebar_request(send_sidebar_key(context.socket, "tab"));
+                send_sidebar_request(send_sidebar_key_v2(
+                    context.socket,
+                    context.server_identity,
+                    "tab",
+                ));
             }
             Some(HeaderAction::SetFilter(filter)) => {
-                send_sidebar_request(send_sidebar_key(context.socket, filter.key()));
+                send_sidebar_request(send_sidebar_key_v2(
+                    context.socket,
+                    context.server_identity,
+                    filter.key(),
+                ));
             }
             None => {}
         }
@@ -1025,8 +1043,16 @@ fn handle_left_click(
                 }
             }
             Some(JumpRowAction::MarkDone) => {
-                if let Some(pane_id) = clicked.pane_id.clone() {
-                    dispatch_click_action(context, ClickAction::MarkDone(pane_id));
+                if let Some(pane_id) = clicked.pane_id.clone()
+                    && let Some((pane_instance, expected)) = mark_done_target(snapshot, &pane_id)
+                {
+                    dispatch_click_action(
+                        context,
+                        ClickAction::MarkDone {
+                            pane_instance,
+                            expected,
+                        },
+                    );
                 }
             }
             None => {}
@@ -1042,7 +1068,11 @@ fn handle_left_click(
 fn dispatch_click_action(context: &ClickContext<'_>, action: ClickAction) {
     match action {
         ClickAction::ToggleRow(row_id) => {
-            send_sidebar_request(send_sidebar_toggle(context.socket, &row_id));
+            send_sidebar_request(send_sidebar_key_v2(
+                context.socket,
+                context.server_identity,
+                &format!("toggle:{row_id}"),
+            ));
         }
         ClickAction::PreviewPane(pane_id) => {
             spawn_preview(
@@ -1053,10 +1083,22 @@ fn dispatch_click_action(context: &ClickContext<'_>, action: ClickAction) {
             );
         }
         ClickAction::JumpPane(pane_id) => {
-            send_sidebar_request(send_sidebar_jump(context.socket, &pane_id));
+            send_sidebar_request(send_sidebar_jump_v2(
+                context.socket,
+                context.server_identity,
+                &pane_id,
+            ));
         }
-        ClickAction::MarkDone(pane_id) => {
-            send_sidebar_request(send_sidebar_mark_done(context.socket, &pane_id));
+        ClickAction::MarkDone {
+            pane_instance,
+            expected,
+        } => {
+            send_sidebar_request(send_sidebar_mark_done_v2(
+                context.socket,
+                context.server_identity,
+                pane_instance,
+                expected,
+            ));
         }
     }
 }
@@ -1067,8 +1109,28 @@ fn send_sidebar_request(result: Result<()>) {
     }
 }
 
-fn preview_pane_for_selection(snapshot: &DaemonSnapshot) -> Option<String> {
-    let sidebar = snapshot.sidebar.as_ref()?;
+fn mark_done_target(
+    snapshot: &ResolvedSnapshot,
+    pane_id: &str,
+) -> Option<(
+    crate::pane_state::PaneInstance,
+    crate::pane_state::StateVersion,
+)> {
+    snapshot.panes.iter().find_map(|pane| {
+        if pane.pane_instance.pane_id != pane_id {
+            return None;
+        }
+        let crate::pane_state::StoredStateDescriptor::Canonical { version } =
+            pane.stored.as_ref()?
+        else {
+            return None;
+        };
+        Some((pane.pane_instance.clone(), version.clone()))
+    })
+}
+
+fn preview_pane_for_selection(snapshot: &ResolvedSnapshot) -> Option<String> {
+    let sidebar = &snapshot.sidebar;
     let selection = sidebar.state.selection.as_deref()?;
     let row = sidebar.rows.iter().find(|row| row.id == selection)?;
     match row.kind {
@@ -1077,10 +1139,8 @@ fn preview_pane_for_selection(snapshot: &DaemonSnapshot) -> Option<String> {
     }
 }
 
-fn selection_is_detail_row(snapshot: &DaemonSnapshot) -> bool {
-    let Some(sidebar) = snapshot.sidebar.as_ref() else {
-        return false;
-    };
+fn selection_is_detail_row(snapshot: &ResolvedSnapshot) -> bool {
+    let sidebar = &snapshot.sidebar;
     let Some(selection) = sidebar.state.selection.as_deref() else {
         return false;
     };
@@ -1144,8 +1204,10 @@ fn spawn_detached_sidebar_close(exe: &Path, window: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::protocol::{ClientMessage, ServerMessage, SidebarClientEvent};
-    use crate::daemon::{DaemonSnapshot, SidebarFrame};
+    use crate::daemon::SidebarFrame;
+    use crate::daemon::protocol::v2::{
+        ClientMessage, ServerMessage, SidebarCommand as ProtocolSidebarCommand,
+    };
     use crate::hook::RollupLevel;
     use crate::sidebar::render::{HeaderLayout, HeaderLine};
     use crate::sidebar::state::SidebarState;
@@ -1175,13 +1237,25 @@ mod tests {
         }
     }
 
-    fn snapshot() -> DaemonSnapshot {
-        DaemonSnapshot {
-            agent_count: 1,
-            rollup: RollupLevel::Running,
+    fn snapshot() -> ResolvedSnapshot {
+        ResolvedSnapshot {
+            snapshot_revision: 1,
             panes: Vec::new(),
-            sidebar: None,
+            sidebar: SidebarFrame {
+                state: SidebarState::default(),
+                counts: BadgeCounts::default(),
+                rows: Vec::new(),
+            },
+            attention: Vec::new(),
             events: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn snapshot_with_sidebar(sidebar: SidebarFrame) -> ResolvedSnapshot {
+        ResolvedSnapshot {
+            sidebar,
+            ..snapshot()
         }
     }
 
@@ -1216,17 +1290,11 @@ mod tests {
                 ..row()
             })
             .collect();
-        let snapshot = DaemonSnapshot {
-            agent_count: 30,
-            rollup: RollupLevel::Running,
-            panes: Vec::new(),
-            sidebar: Some(SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts::default(),
-                rows,
-            }),
-            events: Vec::new(),
-        };
+        let snapshot = snapshot_with_sidebar(SidebarFrame {
+            state: SidebarState::default(),
+            counts: BadgeCounts::default(),
+            rows,
+        });
 
         assert_eq!(
             row_for_click(&snapshot, 2, 1, 6).map(|row| row.id.as_str()),
@@ -1245,18 +1313,12 @@ mod tests {
             ..Default::default()
         });
         let rows = vec![chat];
-        let snapshot = DaemonSnapshot {
-            agent_count: 1,
-            rollup: RollupLevel::Running,
-            panes: Vec::new(),
-            sidebar: Some(SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts::default(),
-                rows,
-            }),
-            events: Vec::new(),
-        };
-        let sidebar = snapshot.sidebar.as_ref().unwrap();
+        let snapshot = snapshot_with_sidebar(SidebarFrame {
+            state: SidebarState::default(),
+            counts: BadgeCounts::default(),
+            rows,
+        });
+        let sidebar = &snapshot.sidebar;
         let rendered = render_lines_with_indices(
             &sidebar.rows,
             &sidebar.state,
@@ -1274,17 +1336,11 @@ mod tests {
 
     #[test]
     fn renders_snapshot_rows_on_push() {
-        let snapshot = DaemonSnapshot {
-            agent_count: 1,
-            rollup: RollupLevel::Running,
-            panes: Vec::new(),
-            sidebar: Some(SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts::default(),
-                rows: vec![row()],
-            }),
-            events: Vec::new(),
-        };
+        let snapshot = snapshot_with_sidebar(SidebarFrame {
+            state: SidebarState::default(),
+            counts: BadgeCounts::default(),
+            rows: vec![row()],
+        });
         let backend = TestBackend::new(40, 4);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1302,17 +1358,11 @@ mod tests {
 
     #[test]
     fn footer_is_rendered_when_height_is_sufficient() {
-        let snapshot = DaemonSnapshot {
-            agent_count: 1,
-            rollup: RollupLevel::Running,
-            panes: Vec::new(),
-            sidebar: Some(SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts::default(),
-                rows: vec![row()],
-            }),
-            events: Vec::new(),
-        };
+        let snapshot = snapshot_with_sidebar(SidebarFrame {
+            state: SidebarState::default(),
+            counts: BadgeCounts::default(),
+            rows: vec![row()],
+        });
         let backend = TestBackend::new(40, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1330,17 +1380,11 @@ mod tests {
 
     #[test]
     fn footer_is_hidden_when_height_is_small() {
-        let snapshot = DaemonSnapshot {
-            agent_count: 1,
-            rollup: RollupLevel::Running,
-            panes: Vec::new(),
-            sidebar: Some(SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts::default(),
-                rows: vec![row()],
-            }),
-            events: Vec::new(),
-        };
+        let snapshot = snapshot_with_sidebar(SidebarFrame {
+            state: SidebarState::default(),
+            counts: BadgeCounts::default(),
+            rows: vec![row()],
+        });
         let backend = TestBackend::new(40, 8);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1519,7 +1563,7 @@ mod tests {
 
     #[test]
     fn event_tail_formats_ago_agent_and_glyphs() {
-        let mut snapshot = crate::daemon::build_snapshot_with_sidebar(&[], None);
+        let mut snapshot = snapshot();
         snapshot.events.push(crate::daemon::TransitionEvent {
             pane_id: "%1".to_string(),
             agent: "codex".to_string(),
@@ -1561,18 +1605,12 @@ mod tests {
             .collect::<String>()
     }
 
-    fn empty_sidebar_snapshot(state: SidebarState, counts: BadgeCounts) -> DaemonSnapshot {
-        DaemonSnapshot {
-            agent_count: counts.total,
-            rollup: RollupLevel::Idle,
-            panes: Vec::new(),
-            sidebar: Some(SidebarFrame {
-                state,
-                counts,
-                rows: Vec::new(),
-            }),
-            events: Vec::new(),
-        }
+    fn empty_sidebar_snapshot(state: SidebarState, counts: BadgeCounts) -> ResolvedSnapshot {
+        snapshot_with_sidebar(SidebarFrame {
+            state,
+            counts,
+            rows: Vec::new(),
+        })
     }
 
     #[test]
@@ -1609,17 +1647,11 @@ mod tests {
 
     #[test]
     fn renders_plain_no_agents_with_header_for_empty_all_filter() {
-        let snapshot = DaemonSnapshot {
-            agent_count: 0,
-            rollup: RollupLevel::Idle,
-            panes: Vec::new(),
-            sidebar: Some(SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts::default(),
-                rows: Vec::new(),
-            }),
-            events: Vec::new(),
-        };
+        let snapshot = snapshot_with_sidebar(SidebarFrame {
+            state: SidebarState::default(),
+            counts: BadgeCounts::default(),
+            rows: Vec::new(),
+        });
         let backend = TestBackend::new(60, 5);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -1660,20 +1692,51 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut line)
-                .unwrap();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ClientMessage>(line.trim()).unwrap(),
+                ClientMessage::Hello { .. }
+            ));
+            let daemon_instance_id =
+                crate::pane_state::DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100")
+                    .unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &ServerMessage::HelloAck {
+                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                    daemon_instance_id: daemon_instance_id.clone(),
+                    server_identity: "scratch".to_string(),
+                    phase: crate::daemon::protocol::v2::DaemonPhase::Serving,
+                    hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
             let message: ClientMessage = serde_json::from_str(line.trim()).unwrap();
-            let ClientMessage::SidebarEvent {
-                event: SidebarClientEvent::Key { key },
+            let ClientMessage::SidebarCommand {
+                daemon_instance_id: request_daemon,
+                event_id,
+                command: ProtocolSidebarCommand::Key { key },
                 ..
             } = message
             else {
                 panic!("unexpected message: {message:?}");
             };
+            assert_eq!(request_daemon, daemon_instance_id);
             tx.send(key).unwrap();
-            serde_json::to_writer(&mut stream, &ServerMessage::Ack).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &ServerMessage::SnapshotAck {
+                    event_id,
+                    accepted_seq: 1,
+                    snapshot_revision: 2,
+                },
+            )
+            .unwrap();
             stream.write_all(b"\n").unwrap();
         });
         let env = BTreeMap::new();
@@ -1681,6 +1744,7 @@ mod tests {
         let theme = SidebarRenderTheme::default();
         let context = ClickContext {
             socket: &socket,
+            server_identity: "scratch",
             runner: &runner,
             env: &env,
             theme: &theme,
@@ -1709,20 +1773,53 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut line)
-                .unwrap();
+            reader.read_line(&mut line).unwrap();
+            let daemon_instance_id =
+                crate::pane_state::DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100")
+                    .unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &ServerMessage::HelloAck {
+                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                    daemon_instance_id: daemon_instance_id.clone(),
+                    server_identity: "scratch".to_string(),
+                    phase: crate::daemon::protocol::v2::DaemonPhase::Serving,
+                    hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
             let message: ClientMessage = serde_json::from_str(line.trim()).unwrap();
-            let ClientMessage::SidebarEvent {
-                event: SidebarClientEvent::MarkDone { pane },
+            let ClientMessage::SidebarCommand {
+                daemon_instance_id: request_daemon,
+                event_id,
+                command:
+                    ProtocolSidebarCommand::MarkDone {
+                        pane_instance,
+                        expected,
+                    },
                 ..
             } = message
             else {
                 panic!("unexpected message: {message:?}");
             };
-            tx.send(pane).unwrap();
-            serde_json::to_writer(&mut stream, &ServerMessage::Ack).unwrap();
+            assert_eq!(request_daemon, daemon_instance_id);
+            tx.send((pane_instance.clone(), expected.clone())).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &ServerMessage::PaneEventResult {
+                    event_id,
+                    accepted_seq: 1,
+                    state_version: Some(expected),
+                    snapshot_revision: 2,
+                    outcome: crate::daemon::protocol::v2::PaneApplyOutcome::Committed,
+                },
+            )
+            .unwrap();
             stream.write_all(b"\n").unwrap();
         });
         let env = BTreeMap::new();
@@ -1743,17 +1840,36 @@ mod tests {
             meta: None,
         };
         let column = (crate::sidebar::render::jump_row_action_start(&jump) + 8 + 11) as u16;
-        let snapshot = DaemonSnapshot {
-            agent_count: 1,
-            rollup: RollupLevel::Running,
-            panes: Vec::new(),
-            sidebar: Some(SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts::default(),
-                rows: vec![jump],
-            }),
-            events: Vec::new(),
+        let mut snapshot = snapshot_with_sidebar(SidebarFrame {
+            state: SidebarState::default(),
+            counts: BadgeCounts::default(),
+            rows: vec![jump],
+        });
+        let version = crate::pane_state::StateVersion {
+            state_id: crate::pane_state::StateId::parse("00112233445566778899aabbccddeeff")
+                .unwrap(),
+            agent_epoch: 3,
+            revision: 9,
         };
+        snapshot
+            .panes
+            .push(crate::daemon::protocol::v2::PanePresentation {
+                pane_instance: crate::pane_state::PaneInstance {
+                    pane_id: "%1".to_string(),
+                    pane_pid: 101,
+                },
+                session_links: Vec::new(),
+                window_id: "@1".to_string(),
+                window_name: "main".to_string(),
+                current_path: "/tmp".to_string(),
+                current_command: "codex".to_string(),
+                active: true,
+                stored: Some(crate::pane_state::StoredStateDescriptor::Canonical {
+                    version: version.clone(),
+                }),
+                resolved: None,
+                diagnostic: None,
+            });
         let width = crossterm::terminal::size().unwrap_or((80, 24)).0;
         let header = build_header_layout_with_counts(
             &SidebarState::default(),
@@ -1763,6 +1879,7 @@ mod tests {
         );
         let context = ClickContext {
             socket: &socket,
+            server_identity: "scratch",
             runner: &runner,
             env: &env,
             theme: &theme,
@@ -1772,7 +1889,16 @@ mod tests {
 
         handle_left_click(&context, &snapshot, header.row_count(), column, 0).unwrap();
 
-        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "%1");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (
+                crate::pane_state::PaneInstance {
+                    pane_id: "%1".to_string(),
+                    pane_pid: 101,
+                },
+                version,
+            )
+        );
         handle.join().unwrap();
         let _ = std::fs::remove_file(socket);
     }
@@ -1797,47 +1923,11 @@ mod tests {
 
     #[test]
     fn pane_for_click_returns_agent_row_pane_id() {
-        let snapshot = DaemonSnapshot {
-            agent_count: 1,
-            rollup: RollupLevel::Running,
-            panes: Vec::new(),
-            sidebar: Some(SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts::default(),
-                rows: vec![
-                    SidebarRow {
-                        id: "repo::misc::app".to_string(),
-                        kind: SidebarRowKind::Repo,
-                        depth: 0,
-                        label: "app".to_string(),
-                        chat_count: 1,
-                        rollup: RollupLevel::Running,
-                        badge_state: None,
-                        expanded: true,
-                        pane_id: None,
-                        git: None,
-                        active: false,
-                        meta: None,
-                    },
-                    row(),
-                ],
-            }),
-            events: Vec::new(),
-        };
-
-        assert_eq!(pane_for_click(&snapshot, 1).as_deref(), Some("%1"));
-    }
-
-    #[test]
-    fn pane_for_click_ignores_non_agent_rows() {
-        let snapshot = DaemonSnapshot {
-            agent_count: 1,
-            rollup: RollupLevel::Running,
-            panes: Vec::new(),
-            sidebar: Some(SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts::default(),
-                rows: vec![SidebarRow {
+        let snapshot = snapshot_with_sidebar(SidebarFrame {
+            state: SidebarState::default(),
+            counts: BadgeCounts::default(),
+            rows: vec![
+                SidebarRow {
                     id: "repo::misc::app".to_string(),
                     kind: SidebarRowKind::Repo,
                     depth: 0,
@@ -1850,43 +1940,61 @@ mod tests {
                     git: None,
                     active: false,
                     meta: None,
-                }],
-            }),
-            events: Vec::new(),
-        };
+                },
+                row(),
+            ],
+        });
+
+        assert_eq!(pane_for_click(&snapshot, 1).as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn pane_for_click_ignores_non_agent_rows() {
+        let snapshot = snapshot_with_sidebar(SidebarFrame {
+            state: SidebarState::default(),
+            counts: BadgeCounts::default(),
+            rows: vec![SidebarRow {
+                id: "repo::misc::app".to_string(),
+                kind: SidebarRowKind::Repo,
+                depth: 0,
+                label: "app".to_string(),
+                chat_count: 1,
+                rollup: RollupLevel::Running,
+                badge_state: None,
+                expanded: true,
+                pane_id: None,
+                git: None,
+                active: false,
+                meta: None,
+            }],
+        });
 
         assert_eq!(pane_for_click(&snapshot, 0), None);
     }
 
     #[test]
     fn row_for_click_offsets_header_rows() {
-        let snapshot = DaemonSnapshot {
-            agent_count: 1,
-            rollup: RollupLevel::Running,
-            panes: Vec::new(),
-            sidebar: Some(SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts::default(),
-                rows: vec![
-                    SidebarRow {
-                        id: "repo::misc::app".to_string(),
-                        kind: SidebarRowKind::Repo,
-                        depth: 0,
-                        label: "app".to_string(),
-                        chat_count: 1,
-                        rollup: RollupLevel::Running,
-                        badge_state: None,
-                        expanded: true,
-                        pane_id: None,
-                        git: None,
-                        active: false,
-                        meta: None,
-                    },
-                    row(),
-                ],
-            }),
-            events: Vec::new(),
-        };
+        let snapshot = snapshot_with_sidebar(SidebarFrame {
+            state: SidebarState::default(),
+            counts: BadgeCounts::default(),
+            rows: vec![
+                SidebarRow {
+                    id: "repo::misc::app".to_string(),
+                    kind: SidebarRowKind::Repo,
+                    depth: 0,
+                    label: "app".to_string(),
+                    chat_count: 1,
+                    rollup: RollupLevel::Running,
+                    badge_state: None,
+                    expanded: true,
+                    pane_id: None,
+                    git: None,
+                    active: false,
+                    meta: None,
+                },
+                row(),
+            ],
+        });
 
         assert_eq!(
             row_for_click(&snapshot, 1, 1, 0).map(|row| row.id.as_str()),

@@ -6,7 +6,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::hook::origin::{HookOrigin, claude_hook_origin, codex_hook_origin_from_payload};
-use crate::hook::{AgentEvent, AgentStatus, OptionUpdate};
 use crate::pane_state::{
     AgentKind, AgentSessionId, AgentSessionSource, DaemonInstanceId, EventId, ExplicitStateReport,
     FieldUpdate, PaneEvent, PaneEventEnvelope, PaneInstance, ProgressOperation, PromptState,
@@ -357,127 +356,6 @@ struct CodexHookPayload {
     transcript_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct CodexNotifyPayload {
-    agent_id: Option<String>,
-    session_id: Option<String>,
-    transcript_path: Option<String>,
-    #[serde(rename = "type")]
-    kind: Option<String>,
-}
-
-pub fn claude_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Result<AgentEvent> {
-    let payload: ClaudeHookPayload = serde_json::from_str(raw_json.trim()).unwrap_or_default();
-    let origin = claude_hook_origin(
-        payload.transcript_path.as_deref(),
-        payload.agent_transcript_path.as_deref(),
-    );
-    let event = payload.hook_event_name.as_deref().unwrap_or(event);
-    if origin == HookOrigin::Subagent && is_guarded_claude_lifecycle_event(event) {
-        return Ok(AgentEvent::default());
-    }
-    let mut agent_event = AgentEvent {
-        agent: "claude".to_string(),
-        ..AgentEvent::default()
-    };
-    match event {
-        "Notification" if payload.notification_type.as_deref() == Some("permission_prompt") => {
-            agent_event.status = Some(AgentStatus::Waiting);
-            agent_event.wait_reason = Some(OptionUpdate::Set("permission_prompt".to_string()));
-        }
-        "Notification" => {}
-        "Stop" => {
-            agent_event.status = Some(AgentStatus::Idle);
-            agent_event.attention = Some(true);
-            agent_event.completed_at = Some(now_epoch);
-            agent_event.subagents = Some(OptionUpdate::Unset);
-        }
-        "UserPromptSubmit" => {
-            agent_event.status = Some(AgentStatus::Running);
-            agent_event.started_at = Some(now_epoch);
-            if let Some(prompt) = payload
-                .prompt
-                .and_then(|prompt| build_prompt_preview(&prompt))
-            {
-                agent_event.prompt = Some(OptionUpdate::Set(prompt));
-                agent_event.prompt_source = Some(OptionUpdate::Set("user".to_string()));
-            }
-            agent_event.tasks = Some(OptionUpdate::Unset);
-            agent_event.task_items = Some(OptionUpdate::Unset);
-            agent_event.subagents = Some(OptionUpdate::Unset);
-            agent_event.worktree_activity = Some(OptionUpdate::Unset);
-        }
-        "PreToolUse" | "PostToolUse" => {
-            agent_event.status = Some(AgentStatus::Running);
-        }
-        "SessionStart" => {
-            apply_session_start(&mut agent_event, payload.source, payload.transcript_path);
-        }
-        _ => {
-            agent_event.agent.clear();
-        }
-    }
-    Ok(agent_event)
-}
-
-pub fn codex_event_from_json(event: &str, raw_json: &str, now_epoch: i64) -> Result<AgentEvent> {
-    codex_event_from_json_with_home(event, raw_json, now_epoch, codex_home().as_deref())
-}
-
-pub fn codex_event_from_json_with_home(
-    event: &str,
-    raw_json: &str,
-    now_epoch: i64,
-    codex_home: Option<&Path>,
-) -> Result<AgentEvent> {
-    let payload: CodexHookPayload = serde_json::from_str(raw_json.trim()).unwrap_or_default();
-    let origin = codex_hook_origin_from_payload(
-        payload.session_id.as_deref(),
-        payload.agent_id.as_deref(),
-        payload.transcript_path.as_deref(),
-        codex_home,
-    );
-    if origin == HookOrigin::Subagent && is_guarded_codex_lifecycle_event(event) {
-        return Ok(AgentEvent::default());
-    }
-    let mut agent_event = AgentEvent {
-        agent: "codex".to_string(),
-        ..AgentEvent::default()
-    };
-    match event {
-        "PermissionRequest" => {
-            agent_event.status = Some(AgentStatus::Waiting);
-            agent_event.wait_reason = Some(OptionUpdate::Set("permission_prompt".to_string()));
-        }
-        "Stop" => {
-            agent_event.status = Some(AgentStatus::Idle);
-            agent_event.attention = Some(true);
-            agent_event.completed_at = Some(now_epoch);
-        }
-        "UserPromptSubmit" => {
-            agent_event.status = Some(AgentStatus::Running);
-            agent_event.started_at = Some(now_epoch);
-            if let Some(prompt) = payload
-                .prompt
-                .and_then(|prompt| build_prompt_preview(&prompt))
-            {
-                agent_event.prompt = Some(OptionUpdate::Set(prompt));
-                agent_event.prompt_source = Some(OptionUpdate::Set("user".to_string()));
-            }
-            agent_event.tasks = Some(OptionUpdate::Unset);
-            agent_event.task_items = Some(OptionUpdate::Unset);
-            agent_event.worktree_activity = Some(OptionUpdate::Unset);
-        }
-        "SessionStart" => {
-            apply_session_start(&mut agent_event, payload.source, payload.transcript_path);
-        }
-        _ => {
-            agent_event.agent.clear();
-        }
-    }
-    Ok(agent_event)
-}
-
 fn is_guarded_claude_lifecycle_event(event: &str) -> bool {
     matches!(
         event,
@@ -507,42 +385,6 @@ fn codex_home() -> Option<PathBuf> {
         .map(|home| home.join(".codex"))
 }
 
-pub fn codex_notify_event_from_arg(raw_json: &str, now_epoch: i64) -> Result<AgentEvent> {
-    codex_notify_event_from_arg_with_home(raw_json, now_epoch, None)
-}
-
-pub fn codex_notify_event_from_arg_with_home(
-    raw_json: &str,
-    now_epoch: i64,
-    codex_home: Option<&Path>,
-) -> Result<AgentEvent> {
-    let payload: CodexNotifyPayload = serde_json::from_str(raw_json.trim()).unwrap_or_default();
-    let origin = codex_hook_origin_from_payload(
-        payload.session_id.as_deref(),
-        payload.agent_id.as_deref(),
-        payload.transcript_path.as_deref(),
-        codex_home,
-    );
-    if origin == HookOrigin::Subagent && payload.kind.as_deref() == Some("agent-turn-complete") {
-        return Ok(AgentEvent::default());
-    }
-    let mut agent_event = AgentEvent {
-        agent: "codex".to_string(),
-        ..AgentEvent::default()
-    };
-    match payload.kind.as_deref() {
-        Some("agent-turn-complete") => {
-            agent_event.status = Some(AgentStatus::Idle);
-            agent_event.attention = Some(true);
-            agent_event.completed_at = Some(now_epoch);
-        }
-        _ => {
-            agent_event.agent.clear();
-        }
-    }
-    Ok(agent_event)
-}
-
 pub fn build_prompt_preview(raw: &str) -> Option<String> {
     let normalized = raw
         .chars()
@@ -553,32 +395,6 @@ pub fn build_prompt_preview(raw: &str) -> Option<String> {
         None
     } else {
         Some(preview)
-    }
-}
-
-fn apply_session_start(
-    agent_event: &mut AgentEvent,
-    source: Option<String>,
-    transcript_path: Option<String>,
-) {
-    match source.as_deref() {
-        Some("startup" | "resume" | "clear") => {
-            agent_event.clear_state = true;
-            agent_event.status = Some(AgentStatus::Idle);
-            agent_event.attention = Some(false);
-            agent_event.worktree_activity = Some(OptionUpdate::Unset);
-            if source.as_deref() == Some("resume")
-                && let Some(prompt) = transcript_path
-                    .as_deref()
-                    .and_then(latest_user_prompt_from_transcript)
-            {
-                agent_event.prompt = Some(OptionUpdate::Set(prompt));
-                agent_event.prompt_source = Some(OptionUpdate::Set("resume".to_string()));
-            }
-        }
-        _ => {
-            agent_event.agent.clear();
-        }
     }
 }
 
@@ -628,7 +444,6 @@ fn text_from_content(content: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hook::{AgentStatus, OptionUpdate};
 
     fn typed_context() -> TypedAdapterContext {
         TypedAdapterContext {
@@ -797,152 +612,5 @@ mod tests {
     fn semantic_empty_generic_report_skips_identity_validation() {
         let event = generic_typed_event(GenericEmitInput::default(), &typed_context()).unwrap();
         assert!(event.is_none());
-    }
-
-    #[test]
-    fn claude_user_prompt_submit_builds_running_event() {
-        let event =
-            claude_event_from_json("UserPromptSubmit", r#"{"prompt":"hello\nworld\t!"}"#, 123)
-                .unwrap();
-        assert_eq!(event.agent, "claude");
-        assert_eq!(event.status, Some(AgentStatus::Running));
-        assert_eq!(event.started_at, Some(123));
-        assert_eq!(
-            event.prompt,
-            Some(OptionUpdate::Set("hello world !".into()))
-        );
-        assert_eq!(event.prompt_source, Some(OptionUpdate::Set("user".into())));
-    }
-
-    #[test]
-    fn claude_notification_permission_builds_waiting_event() {
-        let event = claude_event_from_json(
-            "Notification",
-            r#"{"notification_type":"permission_prompt"}"#,
-            123,
-        )
-        .unwrap();
-        assert_eq!(event.agent, "claude");
-        assert_eq!(event.status, Some(AgentStatus::Waiting));
-        assert_eq!(
-            event.wait_reason,
-            Some(OptionUpdate::Set("permission_prompt".into()))
-        );
-    }
-
-    #[test]
-    fn codex_permission_request_builds_waiting_event() {
-        let event = codex_event_from_json("PermissionRequest", "{}", 123).unwrap();
-        assert_eq!(event.agent, "codex");
-        assert_eq!(event.status, Some(AgentStatus::Waiting));
-        assert_eq!(
-            event.wait_reason,
-            Some(OptionUpdate::Set("permission_prompt".into()))
-        );
-    }
-
-    #[test]
-    fn codex_tool_use_events_do_not_start_running_state() {
-        for hook in ["PreToolUse", "PostToolUse"] {
-            let event = codex_event_from_json(hook, "{}", 123).unwrap();
-            assert_eq!(event, AgentEvent::default());
-        }
-    }
-
-    #[test]
-    fn codex_notify_turn_complete_builds_idle_event() {
-        let event = codex_notify_event_from_arg(r#"{"type":"agent-turn-complete"}"#, 456).unwrap();
-        assert_eq!(event.agent, "codex");
-        assert_eq!(event.status, Some(AgentStatus::Idle));
-        assert_eq!(event.completed_at, Some(456));
-        assert_eq!(event.attention, Some(true));
-    }
-
-    #[test]
-    fn codex_notify_turn_complete_ignores_subagent_payload() {
-        let transcript_path = write_temp_transcript(
-            "codex-notify-subagent",
-            &[
-                r#"{"type":"session_meta","payload":{"id":"subagent-session","session_id":"parent-session","thread_source":"subagent","parent_thread_id":"parent-session"}}"#,
-            ],
-        );
-        let raw = format!(
-            r#"{{"type":"agent-turn-complete","session_id":"parent-session","agent_id":"subagent-session","transcript_path":{}}}"#,
-            serde_json::to_string(transcript_path.to_str().unwrap()).unwrap()
-        );
-
-        let event = codex_notify_event_from_arg_with_home(&raw, 456, None).unwrap();
-
-        assert_eq!(event, AgentEvent::default());
-    }
-
-    #[test]
-    fn codex_session_start_resume_clears_state_and_reads_latest_prompt_from_transcript() {
-        let path = write_temp_transcript(
-            "codex-session-start",
-            &[
-                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"old prompt"}]}}"#,
-                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}"#,
-                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"latest\nprompt"}]}}"#,
-            ],
-        );
-        let raw = format!(
-            r#"{{"source":"resume","transcript_path":{}}}"#,
-            serde_json::to_string(path.to_str().unwrap()).unwrap()
-        );
-
-        let event = codex_event_from_json("SessionStart", &raw, 123).unwrap();
-
-        assert!(event.clear_state);
-        assert_eq!(event.agent, "codex");
-        assert_eq!(event.status, Some(AgentStatus::Idle));
-        assert_eq!(event.attention, Some(false));
-        assert_eq!(
-            event.prompt,
-            Some(OptionUpdate::Set("latest prompt".to_string()))
-        );
-        assert_eq!(
-            event.prompt_source,
-            Some(OptionUpdate::Set("resume".to_string()))
-        );
-    }
-
-    #[test]
-    fn claude_session_start_resume_reads_message_content_from_transcript() {
-        let path = write_temp_transcript(
-            "claude-session-start",
-            &[
-                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"claude prompt"}]}}"#,
-            ],
-        );
-        let raw = format!(
-            r#"{{"source":"resume","transcript_path":{}}}"#,
-            serde_json::to_string(path.to_str().unwrap()).unwrap()
-        );
-
-        let event = claude_event_from_json("SessionStart", &raw, 123).unwrap();
-
-        assert!(event.clear_state);
-        assert_eq!(event.agent, "claude");
-        assert_eq!(
-            event.prompt,
-            Some(OptionUpdate::Set("claude prompt".to_string()))
-        );
-        assert_eq!(
-            event.prompt_source,
-            Some(OptionUpdate::Set("resume".to_string()))
-        );
-    }
-
-    fn write_temp_transcript(name: &str, lines: &[&str]) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "vde-tmux-{name}-{}.jsonl",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
-        path
     }
 }

@@ -1,22 +1,18 @@
-use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
-use std::sync::{Arc, Mutex, mpsc::Sender};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use crate::daemon::runtime::DaemonEvent;
 use crate::daemon::topology::ServerIdentity;
-use crate::detect::{demote_stale_running, detect_codex_wait_reason};
-use crate::git::{GitRunner, SystemGitRunner, collect_git_badges, collect_worktree_infos};
-use crate::hook::AgentStatus;
-use crate::options::snapshot::{PaneSnapshot, effective_agent, is_live_agent_pane, read_all_panes};
+use crate::detect::detect_codex_wait_reason;
+use crate::git::SystemGitRunner;
 use crate::pane_state::ObservationDispatchSnapshot;
 use crate::sidebar::layout::jump_to_pane;
-use crate::tmux::{SystemTmuxRunner, TmuxRunner};
+use crate::tmux::SystemTmuxRunner;
+use crate::tmux::TmuxRunner;
 use crate::{
     pane_state::{
         AgentKind, AgentPresenceObservation, CaptureInference, CaptureObservation,
@@ -624,449 +620,282 @@ fn supports_process_detection(agent: &AgentKind) -> bool {
     matches!(agent.as_str(), "claude" | "codex" | "opencode")
 }
 
+const SIDEBAR_SERVER_MISMATCH_SENTINEL: &str = "__vde_sidebar_server_mismatch__";
+const SIDEBAR_PANE_MISMATCH_SENTINEL: &str = "__vde_sidebar_pane_mismatch__";
+const SIDEBAR_JOB_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+pub enum SidebarTmuxError {
+    ServerIncarnationMismatch,
+    PaneInstanceMismatch(String),
+    Command(anyhow::Error),
+}
+
+impl std::fmt::Display for SidebarTmuxError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ServerIncarnationMismatch => write!(formatter, "tmux server incarnation changed"),
+            Self::PaneInstanceMismatch(pane_id) => {
+                write!(formatter, "pane instance changed: {pane_id}")
+            }
+            Self::Command(error) => write!(formatter, "tmux command failed: {error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for SidebarTmuxError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Command(error) => Some(error.as_ref()),
+            Self::ServerIncarnationMismatch | Self::PaneInstanceMismatch(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SidebarGuardError {
+    ServerIncarnationMismatch,
+    PaneInstanceMismatch,
+}
+
+impl std::fmt::Display for SidebarGuardError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ServerIncarnationMismatch => write!(formatter, "tmux server incarnation changed"),
+            Self::PaneInstanceMismatch => write!(formatter, "pane instance changed"),
+        }
+    }
+}
+
+impl std::error::Error for SidebarGuardError {}
+
+/// Applies the daemon's server-incarnation and selected-pane fences to every tmux operation made
+/// by the sidebar FIFO worker. Public, direct sidebar commands intentionally keep using their
+/// unguarded runner; only daemon-owned execution is wrapped here.
+struct GuardedSidebarTmuxRunner<'a> {
+    runner: &'a dyn TmuxRunner,
+    expected_server: &'a ServerIdentity,
+    expected_pane: &'a PaneInstance,
+}
+
+impl GuardedSidebarTmuxRunner<'_> {
+    fn is_read(args: &[&str]) -> bool {
+        matches!(
+            args.first().copied(),
+            Some("display-message" | "list-panes")
+        )
+    }
+
+    fn guarded_mutation_args(&self, args: &[&str]) -> Vec<String> {
+        let command = crate::pane_state::store::tmux_command_string(
+            &args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>(),
+        );
+        let pane_guard = format!("#{{==:#{{pane_pid}},{}}}", self.expected_pane.pane_pid);
+        let pane_command = crate::pane_state::store::tmux_command_string(&[
+            "if-shell".to_string(),
+            "-F".to_string(),
+            "-t".to_string(),
+            self.expected_pane.pane_id.clone(),
+            pane_guard,
+            command,
+            format!("display-message -p '{SIDEBAR_PANE_MISMATCH_SENTINEL}'"),
+        ]);
+        crate::pane_state::store::server_guarded_command_args(
+            self.expected_server.pid,
+            self.expected_server.start_time,
+            pane_command,
+            SIDEBAR_SERVER_MISMATCH_SENTINEL,
+        )
+    }
+
+    fn guarded_read_args(&self, args: &[&str], token: &str) -> Vec<String> {
+        let identity = format!("__vde_sidebar_identity_{token}__#{{pid}}:#{{start_time}}");
+        let mut guarded = vec![
+            "display-message".to_string(),
+            "-p".to_string(),
+            identity,
+            ";".to_string(),
+        ];
+        guarded.extend(args.iter().map(|arg| (*arg).to_string()));
+        guarded
+    }
+}
+
+impl TmuxRunner for GuardedSidebarTmuxRunner<'_> {
+    fn run(&self, args: &[&str]) -> Result<String> {
+        if !Self::is_read(args) {
+            let guarded = self.guarded_mutation_args(args);
+            let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
+            let output = self.runner.run(&refs).map_err(|error| {
+                if is_missing_pane_error(&error) {
+                    anyhow::Error::new(SidebarGuardError::PaneInstanceMismatch)
+                } else {
+                    error
+                }
+            })?;
+            if output
+                .lines()
+                .any(|line| line.trim() == SIDEBAR_SERVER_MISMATCH_SENTINEL)
+            {
+                return Err(SidebarGuardError::ServerIncarnationMismatch.into());
+            }
+            if output
+                .lines()
+                .any(|line| line.trim() == SIDEBAR_PANE_MISMATCH_SENTINEL)
+            {
+                return Err(SidebarGuardError::PaneInstanceMismatch.into());
+            }
+            return Ok(output);
+        }
+
+        let token = EventId::generate()?.as_str().to_string();
+        let guarded = self.guarded_read_args(args, &token);
+        let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = self.runner.run(&refs)?;
+        let (identity, body) = output.split_once('\n').ok_or_else(|| {
+            anyhow::anyhow!("sidebar tmux read did not return an identity envelope")
+        })?;
+        let expected = format!(
+            "__vde_sidebar_identity_{token}__{}:{}",
+            self.expected_server.pid, self.expected_server.start_time
+        );
+        if identity != expected {
+            return Err(SidebarGuardError::ServerIncarnationMismatch.into());
+        }
+        Ok(body.to_string())
+    }
+}
+
+fn classify_sidebar_error(error: anyhow::Error, pane: &PaneInstance) -> SidebarTmuxError {
+    match error.downcast_ref::<SidebarGuardError>() {
+        Some(SidebarGuardError::ServerIncarnationMismatch) => {
+            SidebarTmuxError::ServerIncarnationMismatch
+        }
+        Some(SidebarGuardError::PaneInstanceMismatch) => {
+            SidebarTmuxError::PaneInstanceMismatch(pane.pane_id.clone())
+        }
+        None if is_missing_pane_error(&error) => {
+            SidebarTmuxError::PaneInstanceMismatch(pane.pane_id.clone())
+        }
+        None => SidebarTmuxError::Command(error),
+    }
+}
+
+fn is_missing_pane_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("can't find pane") || message.contains("no such pane")
+}
+
 pub trait WorkerIo: Send + Sync + 'static {
-    fn read_panes(&self) -> Result<Vec<PaneSnapshot>>;
-    fn capture_tail(&self, pane_id: &str) -> Result<String>;
-    fn jump_to_pane(&self, pane_id: &str) -> Result<()>;
-    fn preview_pane(&self, pane_id: &str, history_lines: u32) -> Result<()>;
-    fn set_pane_option(&self, pane_id: &str, key: &str, value: &str) -> Result<()>;
-    fn unset_pane_option(&self, pane_id: &str, key: &str) -> Result<()>;
-    fn set_session_option(&self, session: &str, key: &str, value: &str) -> Result<()>;
-    fn unset_session_option(&self, session: &str, key: &str) -> Result<()>;
-    fn set_window_option(&self, window: &str, key: &str, value: &str) -> Result<()>;
-    fn unset_window_option(&self, window: &str, key: &str) -> Result<()>;
-    fn run_notify(&self, command: &str, pane_id: &str, agent: &str, state: &str) -> Result<()>;
+    fn jump_to_pane(&self, pane: &PaneInstance) -> std::result::Result<(), SidebarTmuxError>;
+    fn preview_pane(
+        &self,
+        pane: &PaneInstance,
+        history_lines: u32,
+    ) -> std::result::Result<(), SidebarTmuxError>;
+}
+
+trait TimedTmuxIo: Send + Sync {
+    fn run_with_timeout(&self, args: &[&str], timeout: Duration) -> Result<String>;
+}
+
+#[derive(Debug, Clone)]
+struct SystemTimedTmuxIo {
+    socket_name: Option<String>,
+}
+
+impl TimedTmuxIo for SystemTimedTmuxIo {
+    fn run_with_timeout(&self, args: &[&str], timeout: Duration) -> Result<String> {
+        let runner = self
+            .socket_name
+            .as_ref()
+            .map(|name| SystemTmuxRunner::with_socket_name(name, Some(timeout)))
+            .unwrap_or_else(|| SystemTmuxRunner::with_timeout(timeout));
+        runner.run(args)
+    }
+}
+
+struct JobBudgetTmuxRunner<'a> {
+    io: &'a dyn TimedTmuxIo,
+    deadline: Instant,
+}
+
+impl TmuxRunner for JobBudgetTmuxRunner<'_> {
+    fn run(&self, args: &[&str]) -> Result<String> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow::anyhow!("sidebar tmux command exceeded its 2 second budget"))?;
+        self.io.run_with_timeout(args, remaining)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct SystemWorkerIo {
-    runner: SystemTmuxRunner,
+    io: SystemTimedTmuxIo,
+    expected_server: ServerIdentity,
 }
 
 impl SystemWorkerIo {
-    pub fn new(runner: SystemTmuxRunner) -> Self {
-        Self { runner }
+    pub fn new(socket_name: Option<String>, expected_server: ServerIdentity) -> Self {
+        Self {
+            io: SystemTimedTmuxIo { socket_name },
+            expected_server,
+        }
     }
 }
 
 impl WorkerIo for SystemWorkerIo {
-    fn read_panes(&self) -> Result<Vec<PaneSnapshot>> {
-        read_all_panes(&self.runner)
+    fn jump_to_pane(&self, pane: &PaneInstance) -> std::result::Result<(), SidebarTmuxError> {
+        let budgeted = JobBudgetTmuxRunner {
+            io: &self.io,
+            deadline: Instant::now() + SIDEBAR_JOB_TIMEOUT,
+        };
+        let guarded = GuardedSidebarTmuxRunner {
+            runner: &budgeted,
+            expected_server: &self.expected_server,
+            expected_pane: pane,
+        };
+        jump_to_pane(&guarded, &pane.pane_id).map_err(|error| classify_sidebar_error(error, pane))
     }
 
-    fn capture_tail(&self, pane_id: &str) -> Result<String> {
-        self.runner
-            .run(&["capture-pane", "-p", "-S", "-80", "-t", pane_id])
-    }
-
-    fn jump_to_pane(&self, pane_id: &str) -> Result<()> {
-        jump_to_pane(&self.runner, pane_id)
-    }
-
-    fn preview_pane(&self, pane_id: &str, history_lines: u32) -> Result<()> {
+    fn preview_pane(
+        &self,
+        pane: &PaneInstance,
+        history_lines: u32,
+    ) -> std::result::Result<(), SidebarTmuxError> {
         let env = std::env::vars().collect();
+        let budgeted = JobBudgetTmuxRunner {
+            io: &self.io,
+            deadline: Instant::now() + SIDEBAR_JOB_TIMEOUT,
+        };
+        let guarded = GuardedSidebarTmuxRunner {
+            runner: &budgeted,
+            expected_server: &self.expected_server,
+            expected_pane: pane,
+        };
         crate::sidebar::preview::open_preview_floating_pane(
-            &self.runner,
+            &guarded,
             &env,
-            pane_id,
+            &pane.pane_id,
             history_lines,
         )
+        .map_err(|error| classify_sidebar_error(error, pane))
     }
-
-    fn set_pane_option(&self, pane_id: &str, key: &str, value: &str) -> Result<()> {
-        crate::options::set_pane_option(&self.runner, pane_id, key, value)
-    }
-
-    fn unset_pane_option(&self, pane_id: &str, key: &str) -> Result<()> {
-        crate::options::unset_pane_option(&self.runner, pane_id, key)
-    }
-
-    fn set_session_option(&self, session: &str, key: &str, value: &str) -> Result<()> {
-        crate::options::set_session_option(&self.runner, session, key, value)
-    }
-
-    fn unset_session_option(&self, session: &str, key: &str) -> Result<()> {
-        crate::options::unset_session_option(&self.runner, session, key)
-    }
-
-    fn set_window_option(&self, window: &str, key: &str, value: &str) -> Result<()> {
-        crate::options::set_window_option(&self.runner, window, key, value)
-    }
-
-    fn unset_window_option(&self, window: &str, key: &str) -> Result<()> {
-        crate::options::unset_window_option(&self.runner, window, key)
-    }
-
-    fn run_notify(&self, command: &str, pane_id: &str, agent: &str, state: &str) -> Result<()> {
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .env("VDE_PANE_ID", pane_id)
-            .env("VDE_AGENT", agent)
-            .env("VDE_BADGE_STATE", state)
-            .spawn()?;
-        thread::spawn(move || {
-            let _ = child.wait();
-        });
-        Ok(())
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct LatestPanes {
-    panes: Mutex<Vec<PaneSnapshot>>,
-}
-
-impl LatestPanes {
-    pub fn store(&self, panes: Vec<PaneSnapshot>) {
-        *self.panes.lock().expect("latest panes poisoned") = panes;
-    }
-
-    pub fn load(&self) -> Vec<PaneSnapshot> {
-        self.panes.lock().expect("latest panes poisoned").clone()
-    }
-}
-
-#[derive(Debug, Default)]
-struct CaptureActivityTracker {
-    panes: BTreeMap<String, CaptureActivityState>,
-}
-
-#[derive(Debug, Default)]
-pub struct SharedCaptureActivity {
-    tracker: Mutex<CaptureActivityTracker>,
-}
-
-impl SharedCaptureActivity {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn prune(&self, pane_ids: &BTreeSet<String>) {
-        self.tracker
-            .lock()
-            .expect("capture activity tracker poisoned")
-            .prune(pane_ids);
-    }
-
-    fn record_tail(
-        &self,
-        pane_id: &str,
-        started_at: Option<i64>,
-        now_epoch: i64,
-        tail: &str,
-    ) -> Option<i64> {
-        self.tracker
-            .lock()
-            .expect("capture activity tracker poisoned")
-            .record_tail(pane_id, started_at, now_epoch, tail)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CaptureActivityState {
-    started_at: Option<i64>,
-    fingerprint: u64,
-    last_changed_at: i64,
-}
-
-impl CaptureActivityTracker {
-    fn record_tail(
-        &mut self,
-        pane_id: &str,
-        started_at: Option<i64>,
-        now_epoch: i64,
-        tail: &str,
-    ) -> Option<i64> {
-        if tail.trim().is_empty() {
-            return None;
-        }
-        let fingerprint = capture_fingerprint(tail);
-        let baseline = started_at.unwrap_or(now_epoch);
-        match self.panes.get_mut(pane_id) {
-            Some(state) if state.started_at == started_at => {
-                if state.fingerprint != fingerprint {
-                    state.fingerprint = fingerprint;
-                    state.last_changed_at = now_epoch;
-                }
-                Some(state.last_changed_at)
-            }
-            _ => {
-                self.panes.insert(
-                    pane_id.to_string(),
-                    CaptureActivityState {
-                        started_at,
-                        fingerprint,
-                        last_changed_at: baseline,
-                    },
-                );
-                Some(baseline)
-            }
-        }
-    }
-
-    fn prune(&mut self, pane_ids: &BTreeSet<String>) {
-        self.panes.retain(|pane_id, _| pane_ids.contains(pane_id));
-    }
-}
-
-fn capture_fingerprint(tail: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    tail.hash(&mut hasher);
-    hasher.finish()
-}
-
-pub fn start_tmux_worker(
-    io: Arc<dyn WorkerIo>,
-    latest_panes: Arc<LatestPanes>,
-    capture_activity: Arc<SharedCaptureActivity>,
-    tx: Sender<DaemonEvent>,
-    poll: Duration,
-    stale_threshold_seconds: i64,
-) {
-    thread::spawn(move || {
-        loop {
-            if let Err(error) = poll_tmux_once_with_latest(
-                io.clone(),
-                latest_panes.clone(),
-                capture_activity.clone(),
-                tx.clone(),
-                stale_threshold_seconds,
-            ) {
-                eprintln!("[vde-tmux] daemon tmux worker error: {error:#}");
-            }
-            thread::sleep(poll);
-        }
-    });
-}
-
-pub fn poll_tmux_once(
-    io: Arc<dyn WorkerIo>,
-    tx: Sender<DaemonEvent>,
-    stale_threshold_seconds: i64,
-) -> Result<()> {
-    let latest = Arc::new(LatestPanes::default());
-    let capture_activity = Arc::new(SharedCaptureActivity::new());
-    poll_tmux_once_with_latest(io, latest, capture_activity, tx, stale_threshold_seconds)
-}
-
-fn poll_tmux_once_with_latest(
-    io: Arc<dyn WorkerIo>,
-    latest_panes: Arc<LatestPanes>,
-    capture_activity: Arc<SharedCaptureActivity>,
-    tx: Sender<DaemonEvent>,
-    stale_threshold_seconds: i64,
-) -> Result<()> {
-    let panes = read_panes_with_shared_capture_activity(
-        io.as_ref(),
-        stale_threshold_seconds,
-        capture_activity.as_ref(),
-    )?;
-    latest_panes.store(panes.clone());
-    tx.send(DaemonEvent::PanesUpdated(panes))?;
-    Ok(())
-}
-
-pub fn read_panes_with_detection(
-    io: &dyn WorkerIo,
-    stale_threshold_seconds: i64,
-) -> Result<Vec<PaneSnapshot>> {
-    let mut capture_activity = CaptureActivityTracker::default();
-    read_panes_with_detection_tracked(io, stale_threshold_seconds, &mut capture_activity)
-}
-
-pub fn read_panes_with_shared_capture_activity(
-    io: &dyn WorkerIo,
-    stale_threshold_seconds: i64,
-    capture_activity: &SharedCaptureActivity,
-) -> Result<Vec<PaneSnapshot>> {
-    let now = now_epoch();
-    let panes = io.read_panes()?;
-    capture_activity.prune(
-        &panes
-            .iter()
-            .map(|pane| pane.pane_id.clone())
-            .collect::<BTreeSet<_>>(),
-    );
-    Ok(panes
-        .into_iter()
-        .map(|pane| {
-            apply_capture_detection_with_recorder(
-                io,
-                pane,
-                now,
-                stale_threshold_seconds,
-                |pane_id, started_at, now_epoch, tail| {
-                    capture_activity.record_tail(pane_id, started_at, now_epoch, tail)
-                },
-            )
-        })
-        .collect())
-}
-
-fn read_panes_with_detection_tracked(
-    io: &dyn WorkerIo,
-    stale_threshold_seconds: i64,
-    capture_activity: &mut CaptureActivityTracker,
-) -> Result<Vec<PaneSnapshot>> {
-    let now = now_epoch();
-    let panes = io.read_panes()?;
-    capture_activity.prune(
-        &panes
-            .iter()
-            .map(|pane| pane.pane_id.clone())
-            .collect::<BTreeSet<_>>(),
-    );
-    Ok(panes
-        .into_iter()
-        .map(|pane| {
-            apply_capture_detection_with_tracker(
-                io,
-                pane,
-                now,
-                stale_threshold_seconds,
-                capture_activity,
-            )
-        })
-        .collect())
-}
-
-pub fn start_git_worker(
-    git: Arc<dyn GitRunner>,
-    latest_panes: Arc<LatestPanes>,
-    tx: Sender<DaemonEvent>,
-    poll: Duration,
-) {
-    thread::spawn(move || {
-        loop {
-            if let Err(error) = poll_git_once(git.clone(), latest_panes.clone(), tx.clone()) {
-                eprintln!("[vde-tmux] daemon git worker error: {error:#}");
-            }
-            thread::sleep(poll);
-        }
-    });
-}
-
-pub fn poll_git_once(
-    git: Arc<dyn GitRunner>,
-    latest_panes: Arc<LatestPanes>,
-    tx: Sender<DaemonEvent>,
-) -> Result<()> {
-    let panes = latest_panes.load();
-    let badges = collect_git_badges(git.as_ref(), &panes);
-    let worktrees = collect_worktree_infos(git.as_ref(), &panes);
-    tx.send(DaemonEvent::GitStatusUpdated { badges, worktrees })?;
-    Ok(())
 }
 
 pub fn system_git_runner(timeout: Duration) -> SystemGitRunner {
     SystemGitRunner::new(timeout)
 }
 
-pub fn apply_capture_detection(
-    io: &dyn WorkerIo,
-    pane: PaneSnapshot,
-    now_epoch: i64,
-    stale_threshold_seconds: i64,
-) -> PaneSnapshot {
-    let mut capture_activity = CaptureActivityTracker::default();
-    apply_capture_detection_with_tracker(
-        io,
-        pane,
-        now_epoch,
-        stale_threshold_seconds,
-        &mut capture_activity,
-    )
-}
-
-fn apply_capture_detection_with_tracker(
-    io: &dyn WorkerIo,
-    pane: PaneSnapshot,
-    now_epoch: i64,
-    stale_threshold_seconds: i64,
-    capture_activity: &mut CaptureActivityTracker,
-) -> PaneSnapshot {
-    apply_capture_detection_with_recorder(
-        io,
-        pane,
-        now_epoch,
-        stale_threshold_seconds,
-        |pane_id, started_at, now_epoch, tail| {
-            capture_activity.record_tail(pane_id, started_at, now_epoch, tail)
-        },
-    )
-}
-
-fn apply_capture_detection_with_recorder(
-    io: &dyn WorkerIo,
-    mut pane: PaneSnapshot,
-    now_epoch: i64,
-    stale_threshold_seconds: i64,
-    mut record_tail: impl FnMut(&str, Option<i64>, i64, &str) -> Option<i64>,
-) -> PaneSnapshot {
-    if !is_live_agent_pane(&pane) {
-        return pane;
-    }
-    if pane.agent.trim().is_empty()
-        && let Some(agent) = effective_agent(&pane)
-    {
-        pane.agent = agent.to_string();
-    }
-    let mut observed_activity_epoch = None;
-    let started_at = pane.started_at.trim().parse::<i64>().ok();
-    let running_has_started_at = pane.status == "running" && started_at.is_some();
-    let has_hook_wait_reason = !pane.wait_reason.trim().is_empty();
-    let status_allows_capture_detection = pane.status.trim().is_empty() || pane.status == "running";
-    let should_detect_wait_reason = !has_hook_wait_reason && status_allows_capture_detection;
-    let should_capture = should_detect_wait_reason || pane.status == "running";
-    if should_capture && let Ok(tail) = io.capture_tail(&pane.pane_id) {
-        if should_detect_wait_reason && let Some(wait_reason) = detect_codex_wait_reason(&tail) {
-            pane.status = "waiting".to_string();
-            pane.wait_reason = wait_reason.to_string();
-        } else if running_has_started_at {
-            observed_activity_epoch = record_tail(&pane.pane_id, started_at, now_epoch, &tail);
-        }
-    }
-    if pane.status == "running" && !running_has_started_at {
-        pane.status = "idle".to_string();
-        pane.wait_reason.clear();
-    }
-    let last_activity = observed_activity_epoch.or(started_at).unwrap_or(now_epoch);
-    let status = parse_status(&pane.status);
-    if demote_stale_running(status, last_activity, now_epoch, stale_threshold_seconds)
-        == Some(AgentStatus::Idle)
-    {
-        pane.status = "idle".to_string();
-        pane.wait_reason.clear();
-    }
-    pane
-}
-
-fn parse_status(raw: &str) -> Option<AgentStatus> {
-    match raw {
-        "running" => Some(AgentStatus::Running),
-        "waiting" => Some(AgentStatus::Waiting),
-        "idle" => Some(AgentStatus::Idle),
-        "error" => Some(AgentStatus::Error),
-        _ => None,
-    }
-}
-
-fn now_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::runtime::DaemonEvent;
-    use crate::git::GitRunner;
-    use crate::options::snapshot::PaneSnapshot;
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::Mutex;
 
     struct MockObservationIo {
         calls: Mutex<usize>,
@@ -1109,6 +938,71 @@ mod tests {
         PaneInstance {
             pane_id: id.to_string(),
             pane_pid: pid,
+        }
+    }
+
+    struct SidebarGuardRunner {
+        actual_server: ServerIdentity,
+        read_body: String,
+        mutation_output: String,
+        mutation_error: Option<String>,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl SidebarGuardRunner {
+        fn new(actual_server: ServerIdentity, read_body: impl Into<String>) -> Self {
+            Self {
+                actual_server,
+                read_body: read_body.into(),
+                mutation_output: String::new(),
+                mutation_error: None,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_mutation_output(mut self, output: impl Into<String>) -> Self {
+            self.mutation_output = output.into();
+            self
+        }
+
+        fn with_mutation_error(mut self, error: impl Into<String>) -> Self {
+            self.mutation_error = Some(error.into());
+            self
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl TmuxRunner for SidebarGuardRunner {
+        fn run(&self, args: &[&str]) -> Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|arg| (*arg).to_string()).collect());
+            if args.first() == Some(&"display-message") && args.get(3) == Some(&";") {
+                let identity = args[2]
+                    .replace("#{pid}", &self.actual_server.pid.to_string())
+                    .replace("#{start_time}", &self.actual_server.start_time.to_string());
+                return Ok(format!("{identity}\n{}", self.read_body));
+            }
+            if let Some(error) = &self.mutation_error {
+                anyhow::bail!(error.clone());
+            }
+            Ok(self.mutation_output.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct TimedTmuxRecorder {
+        timeouts: Mutex<Vec<Duration>>,
+    }
+
+    impl TimedTmuxIo for TimedTmuxRecorder {
+        fn run_with_timeout(&self, _args: &[&str], timeout: Duration) -> Result<String> {
+            self.timeouts.lock().unwrap().push(timeout);
+            Ok(String::new())
         }
     }
 
@@ -1158,6 +1052,143 @@ mod tests {
             io.tails
         );
         assert_eq!(*io.calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn sidebar_worker_wraps_reads_and_each_jump_mutation_in_server_and_pane_guards() {
+        let runner = SidebarGuardRunner::new(server_identity(), "main\u{1f}@1\u{1f}%1\n");
+        let pane = pane_instance("%1", 11);
+        let guarded = GuardedSidebarTmuxRunner {
+            runner: &runner,
+            expected_server: &server_identity(),
+            expected_pane: &pane,
+        };
+
+        jump_to_pane(&guarded, "%1").unwrap();
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0][0], "display-message");
+        assert_eq!(calls[0][3], ";");
+        for call in &calls[1..] {
+            assert_eq!(call[0], "if-shell");
+            assert!(call[2].contains("#{pid},4242"), "{call:?}");
+            assert!(call[2].contains("#{start_time},99"), "{call:?}");
+            assert!(call[3].contains("#{pane_pid},11"), "{call:?}");
+        }
+        assert!(calls[1][3].contains("switch-client"));
+        assert!(calls[2][3].contains("select-window"));
+        assert!(calls[3][3].contains("select-pane"));
+    }
+
+    #[test]
+    fn sidebar_worker_rejects_read_identity_mismatch_before_any_mutation() {
+        let runner = SidebarGuardRunner::new(
+            ServerIdentity {
+                pid: 4243,
+                start_time: 100,
+            },
+            "main\u{1f}@1\u{1f}%1\n",
+        );
+        let pane = pane_instance("%1", 11);
+        let expected_server = server_identity();
+        let guarded = GuardedSidebarTmuxRunner {
+            runner: &runner,
+            expected_server: &expected_server,
+            expected_pane: &pane,
+        };
+
+        let error = jump_to_pane(&guarded, "%1").unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<SidebarGuardError>(),
+            Some(SidebarGuardError::ServerIncarnationMismatch)
+        ));
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0], "display-message");
+    }
+
+    #[test]
+    fn sidebar_worker_reports_server_and_pane_guard_mismatches_without_direct_mutation() {
+        let pane = pane_instance("%1", 11);
+        let expected_server = server_identity();
+        for (output, expected_server_mismatch) in [
+            (SIDEBAR_SERVER_MISMATCH_SENTINEL, true),
+            (SIDEBAR_PANE_MISMATCH_SENTINEL, false),
+        ] {
+            let runner = SidebarGuardRunner::new(expected_server.clone(), "")
+                .with_mutation_output(format!("{output}\n"));
+            let guarded = GuardedSidebarTmuxRunner {
+                runner: &runner,
+                expected_server: &expected_server,
+                expected_pane: &pane,
+            };
+
+            let error = guarded.run(&["select-pane", "-t", "%1"]).unwrap_err();
+
+            assert_eq!(
+                matches!(
+                    error.downcast_ref::<SidebarGuardError>(),
+                    Some(SidebarGuardError::ServerIncarnationMismatch)
+                ),
+                expected_server_mismatch
+            );
+            let calls = runner.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0][0], "if-shell");
+            assert_ne!(calls[0][0], "select-pane");
+            assert!(calls[0][3].contains("select-pane"));
+        }
+    }
+
+    #[test]
+    fn sidebar_worker_treats_target_disappearance_as_pane_mismatch_without_retrying_raw_command() {
+        let pane = pane_instance("%1", 11);
+        let expected_server = server_identity();
+        let runner = SidebarGuardRunner::new(expected_server.clone(), "")
+            .with_mutation_error("tmux failed: can't find pane: %1");
+        let guarded = GuardedSidebarTmuxRunner {
+            runner: &runner,
+            expected_server: &expected_server,
+            expected_pane: &pane,
+        };
+
+        let error = guarded.run(&["select-pane", "-t", "%1"]).unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<SidebarGuardError>(),
+            Some(SidebarGuardError::PaneInstanceMismatch)
+        ));
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0], "if-shell");
+        assert_ne!(calls[0][0], "select-pane");
+    }
+
+    #[test]
+    fn sidebar_job_uses_one_shared_deadline_across_multiple_tmux_calls() {
+        let io = TimedTmuxRecorder::default();
+        let runner = JobBudgetTmuxRunner {
+            io: &io,
+            deadline: Instant::now() + Duration::from_millis(200),
+        };
+
+        runner.run(&["display-message", "-p", "one"]).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        runner.run(&["display-message", "-p", "two"]).unwrap();
+
+        let timeouts = io.timeouts.lock().unwrap();
+        assert_eq!(timeouts.len(), 2);
+        assert!(timeouts[0] <= Duration::from_millis(200));
+        assert!(timeouts[1] < timeouts[0]);
+        drop(timeouts);
+        let expired = JobBudgetTmuxRunner {
+            io: &io,
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+        assert!(expired.run(&["display-message", "-p", "late"]).is_err());
+        assert_eq!(io.timeouts.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -1411,369 +1442,5 @@ mod tests {
         );
         let removed = pane_removal_envelopes(&daemon, &previous, &BTreeSet::new(), true).unwrap();
         assert!(matches!(removed[0].event, PaneEvent::PaneRemoved { .. }));
-    }
-
-    #[derive(Default)]
-    struct MockWorkerIo {
-        panes: Mutex<Vec<PaneSnapshot>>,
-        captures: Mutex<BTreeMap<String, String>>,
-        jumps: Mutex<Vec<String>>,
-    }
-
-    impl WorkerIo for MockWorkerIo {
-        fn read_panes(&self) -> anyhow::Result<Vec<PaneSnapshot>> {
-            Ok(self.panes.lock().unwrap().clone())
-        }
-
-        fn capture_tail(&self, pane_id: &str) -> anyhow::Result<String> {
-            Ok(self
-                .captures
-                .lock()
-                .unwrap()
-                .get(pane_id)
-                .cloned()
-                .unwrap_or_default())
-        }
-
-        fn jump_to_pane(&self, pane_id: &str) -> anyhow::Result<()> {
-            self.jumps.lock().unwrap().push(pane_id.to_string());
-            Ok(())
-        }
-
-        fn preview_pane(&self, _pane_id: &str, _history_lines: u32) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn set_pane_option(&self, _pane_id: &str, _key: &str, _value: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn unset_pane_option(&self, _pane_id: &str, _key: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn set_session_option(
-            &self,
-            _session: &str,
-            _key: &str,
-            _value: &str,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn unset_session_option(&self, _session: &str, _key: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn set_window_option(&self, _window: &str, _key: &str, _value: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn unset_window_option(&self, _window: &str, _key: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn run_notify(
-            &self,
-            _command: &str,
-            _pane_id: &str,
-            _agent: &str,
-            _state: &str,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct MockGitRunner {
-        branch: String,
-        counts: String,
-        top_level: Option<String>,
-        git_dir: Option<String>,
-        common_dir: Option<String>,
-        superproject: Option<String>,
-    }
-
-    impl GitRunner for MockGitRunner {
-        fn run(&self, _cwd: &str, args: &[&str]) -> anyhow::Result<String> {
-            match args {
-                ["branch", "--show-current"] => Ok(self.branch.clone()),
-                ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"] => {
-                    Ok(self.counts.clone())
-                }
-                ["rev-parse", "--show-toplevel"] => self
-                    .top_level
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("not a repo")),
-                ["rev-parse", "--git-dir"] => self
-                    .git_dir
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("not a repo")),
-                ["rev-parse", "--git-common-dir"] => self
-                    .common_dir
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("not a repo")),
-                ["rev-parse", "--show-superproject-working-tree"] => {
-                    Ok(self.superproject.clone().unwrap_or_default())
-                }
-                _ => anyhow::bail!("unexpected git args: {args:?}"),
-            }
-        }
-
-        fn run_vw(&self, _cwd: &str, args: &[&str]) -> anyhow::Result<String> {
-            anyhow::bail!("unexpected vw args: {args:?}")
-        }
-    }
-
-    fn pane(pane_id: &str, agent: &str, status: &str) -> PaneSnapshot {
-        PaneSnapshot {
-            session: "main".to_string(),
-            window_id: "@1".to_string(),
-            pane_id: pane_id.to_string(),
-            current_path: "/tmp/app".to_string(),
-            current_command: agent.to_string(),
-            agent: agent.to_string(),
-            status: status.to_string(),
-            ..PaneSnapshot::default()
-        }
-    }
-
-    #[test]
-    fn tmux_worker_sends_panes_updated() {
-        let io = Arc::new(MockWorkerIo::default());
-        io.panes
-            .lock()
-            .unwrap()
-            .push(pane("%1", "codex", "running"));
-        let (tx, rx) = mpsc::channel();
-
-        poll_tmux_once(io, tx, 100).unwrap();
-
-        let DaemonEvent::PanesUpdated(panes) = rx.recv().unwrap() else {
-            panic!("expected panes updated");
-        };
-        assert_eq!(panes[0].pane_id, "%1");
-    }
-
-    #[test]
-    fn git_worker_merges_badges_without_blocking_tmux_poll() {
-        let panes = Arc::new(LatestPanes::default());
-        panes.store(vec![pane("%1", "codex", "running")]);
-        let (tx, rx) = mpsc::channel();
-        let git = Arc::new(MockGitRunner {
-            branch: "main\n".to_string(),
-            counts: "0\t1\n".to_string(),
-            top_level: Some("/tmp/app\n".to_string()),
-            git_dir: Some("/tmp/repo/.git/worktrees/app\n".to_string()),
-            common_dir: Some("/tmp/repo/.git\n".to_string()),
-            superproject: Some("\n".to_string()),
-        });
-
-        poll_git_once(git, panes, tx).unwrap();
-
-        let DaemonEvent::GitStatusUpdated { badges, worktrees } = rx.recv().unwrap() else {
-            panic!("expected git status updated");
-        };
-        assert_eq!(badges["/tmp/app"].branch, "main");
-        assert_eq!(worktrees["/tmp/app"].name, "app");
-    }
-
-    #[test]
-    fn tmux_worker_applies_capture_pane_detection() {
-        let io = Arc::new(MockWorkerIo::default());
-        let mut pane = pane("%1", "", "");
-        pane.current_command = "codex".to_string();
-        io.panes.lock().unwrap().push(pane);
-        io.captures.lock().unwrap().insert(
-            "%1".to_string(),
-            "? Allow command to run?\n  y) yes\n  n) no\n".to_string(),
-        );
-        let (tx, rx) = mpsc::channel();
-
-        poll_tmux_once(io, tx, 100).unwrap();
-
-        let DaemonEvent::PanesUpdated(panes) = rx.recv().unwrap() else {
-            panic!("expected panes updated");
-        };
-        assert_eq!(panes[0].status, "waiting");
-        assert_eq!(panes[0].wait_reason, "permission_prompt");
-    }
-
-    #[test]
-    fn tmux_worker_does_not_infer_running_from_non_empty_tail_without_hook_status() {
-        let io = Arc::new(MockWorkerIo::default());
-        let mut pane = pane("%1", "", "");
-        pane.current_command = "claude".to_string();
-        io.panes.lock().unwrap().push(pane);
-        io.captures
-            .lock()
-            .unwrap()
-            .insert("%1".to_string(), "Claude is working\n".to_string());
-        let (tx, rx) = mpsc::channel();
-
-        poll_tmux_once(io, tx, 100).unwrap();
-
-        let DaemonEvent::PanesUpdated(panes) = rx.recv().unwrap() else {
-            panic!("expected panes updated");
-        };
-        assert_eq!(panes[0].agent, "claude");
-        assert_eq!(panes[0].status, "");
-    }
-
-    #[test]
-    fn tmux_worker_detects_claude_permission_prompt_without_hook_options() {
-        let io = Arc::new(MockWorkerIo::default());
-        let mut pane = pane("%1", "", "");
-        pane.current_command = "claude".to_string();
-        io.panes.lock().unwrap().push(pane);
-        io.captures.lock().unwrap().insert(
-            "%1".to_string(),
-            "Claude needs your permission to use Bash\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n"
-                .to_string(),
-        );
-        let (tx, rx) = mpsc::channel();
-
-        poll_tmux_once(io, tx, 100).unwrap();
-
-        let DaemonEvent::PanesUpdated(panes) = rx.recv().unwrap() else {
-            panic!("expected panes updated");
-        };
-        assert_eq!(panes[0].agent, "claude");
-        assert_eq!(panes[0].status, "waiting");
-        assert_eq!(panes[0].wait_reason, "permission_prompt");
-    }
-
-    #[test]
-    fn running_status_without_wait_reason_uses_capture_prompt_detection() {
-        let io = MockWorkerIo::default();
-        let mut active = pane("%1", "codex", "running");
-        active.started_at = "990".to_string();
-        io.captures.lock().unwrap().insert(
-            "%1".to_string(),
-            "Question 1/1 (1 unanswered)\n今の気分に一番近いものはどれですか？\n› 1. 集中したい\n"
-                .to_string(),
-        );
-
-        let pane = apply_capture_detection(&io, active, 1_000, 30);
-
-        assert_eq!(pane.status, "waiting");
-        assert_eq!(pane.wait_reason, "codex_question_prompt");
-    }
-
-    #[test]
-    fn stale_running_is_demoted_in_snapshot_only() {
-        let io = Arc::new(MockWorkerIo::default());
-        let mut stale = pane("%1", "codex", "running");
-        stale.started_at = "100".to_string();
-        io.panes.lock().unwrap().push(stale);
-        let (tx, rx) = mpsc::channel();
-
-        poll_tmux_once(io, tx, 30).unwrap();
-
-        let DaemonEvent::PanesUpdated(panes) = rx.recv().unwrap() else {
-            panic!("expected panes updated");
-        };
-        assert_eq!(panes[0].status, "idle");
-    }
-
-    #[test]
-    fn stale_running_with_stable_non_empty_tail_is_demoted_to_idle() {
-        let io = MockWorkerIo::default();
-        let mut stale = pane("%1", "claude", "running");
-        stale.started_at = "100".to_string();
-        io.captures
-            .lock()
-            .unwrap()
-            .insert("%1".to_string(), "Claude is still working\n".to_string());
-
-        let pane = apply_capture_detection(&io, stale, 1_000, 30);
-
-        assert_eq!(pane.status, "idle");
-    }
-
-    #[test]
-    fn running_pane_with_changed_capture_tail_is_not_demoted_to_idle() {
-        let io = MockWorkerIo::default();
-        let mut active = pane("%1", "claude", "running");
-        active.started_at = "970".to_string();
-        let mut tracker = CaptureActivityTracker::default();
-        io.captures
-            .lock()
-            .unwrap()
-            .insert("%1".to_string(), "Working (1s)\n".to_string());
-        let pane = apply_capture_detection_with_tracker(&io, active.clone(), 990, 30, &mut tracker);
-        assert_eq!(pane.status, "running");
-
-        io.captures
-            .lock()
-            .unwrap()
-            .insert("%1".to_string(), "Working (40s)\n".to_string());
-        let pane = apply_capture_detection_with_tracker(&io, active, 1_000, 30, &mut tracker);
-
-        assert_eq!(pane.status, "running");
-    }
-
-    #[test]
-    fn running_pane_uses_started_at_over_stale_completed_at() {
-        let io = MockWorkerIo::default();
-        let mut active = pane("%1", "codex", "running");
-        active.started_at = "990".to_string();
-        active.completed_at = "100".to_string();
-        io.captures
-            .lock()
-            .unwrap()
-            .insert("%1".to_string(), "Codex is ready for input\n".to_string());
-
-        let pane = apply_capture_detection(&io, active, 1_000, 30);
-
-        assert_eq!(pane.status, "running");
-    }
-
-    #[test]
-    fn capture_activity_tracker_resets_when_started_at_changes() {
-        let io = MockWorkerIo::default();
-        let mut first = pane("%1", "codex", "running");
-        first.started_at = "100".to_string();
-        let mut tracker = CaptureActivityTracker::default();
-        io.captures
-            .lock()
-            .unwrap()
-            .insert("%1".to_string(), "same tail\n".to_string());
-        let first_result = apply_capture_detection_with_tracker(&io, first, 200, 30, &mut tracker);
-        assert_eq!(first_result.status, "idle");
-
-        let mut second = pane("%1", "codex", "running");
-        second.started_at = "990".to_string();
-        let second_result =
-            apply_capture_detection_with_tracker(&io, second, 1_000, 30, &mut tracker);
-
-        assert_eq!(second_result.status, "running");
-    }
-
-    #[test]
-    fn capture_activity_tracker_prunes_disappeared_panes() {
-        let io = MockWorkerIo::default();
-        let mut tracker = CaptureActivityTracker::default();
-        tracker.record_tail("%1", Some(100), 100, "tail\n");
-        tracker.record_tail("%2", Some(100), 100, "tail\n");
-
-        io.panes.lock().unwrap().push(pane("%2", "codex", "idle"));
-        read_panes_with_detection_tracked(&io, 30, &mut tracker).unwrap();
-
-        assert!(!tracker.panes.contains_key("%1"));
-        assert!(tracker.panes.contains_key("%2"));
-    }
-
-    #[test]
-    fn running_without_started_at_is_demoted_even_with_non_empty_tail() {
-        let io = MockWorkerIo::default();
-        let active = pane("%1", "codex", "running");
-        io.captures
-            .lock()
-            .unwrap()
-            .insert("%1".to_string(), "Codex is ready for input\n".to_string());
-
-        let pane = apply_capture_detection(&io, active, 1_000, 30);
-
-        assert_eq!(pane.status, "idle");
     }
 }

@@ -1,29 +1,26 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use serde_json::Value;
 
 use crate::hook::adapter::{
-    TypedAdapterContext, build_prompt_preview, claude_event_from_json,
-    claude_typed_event_from_json, codex_event_from_json_with_home,
-    codex_notify_event_from_arg_with_home, codex_typed_event_from_json_with_home,
-    typed_progress_event,
+    GenericEmitInput, TypedAdapterContext, build_prompt_preview, claude_typed_event_from_json,
+    codex_typed_event_from_json_with_home, generic_typed_event, typed_progress_event,
 };
 use crate::hook::origin::{
     HookOrigin, claude_hook_origin, codex_hook_origin_from_payload, find_codex_session_file,
 };
-use crate::hook::writer::{
-    ProgressEvent, apply_progress_event, resolve_pane, typed_progress_operations,
-    write_pane_options,
-};
+use crate::hook::writer::{ProgressEvent, typed_progress_operations};
 use crate::hook::{
     AgentEvent, AgentStatus, OptionUpdate, SubagentEntry, TaskItem, TaskItemStatus, TaskProgress,
-    WorktreeActivity, WorktreeActivityKind, derive_event_writes,
+    WorktreeActivity, WorktreeActivityKind,
 };
 use crate::pane_state::{
     AgentKind, AgentSessionId, PaneEvent, PaneEventEnvelope, PromptState, normalize_text,
@@ -31,16 +28,21 @@ use crate::pane_state::{
 use crate::tmux::TmuxRunner;
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // `Emit` mirrors the intentionally flat public CLI schema.
 pub(crate) enum HookCommand {
     Emit {
         #[arg(long)]
         agent: String,
+        #[arg(long = "session-id")]
+        session_id: String,
         #[arg(long)]
         status: Option<String>,
         #[arg(long)]
         prompt: Option<String>,
         #[arg(long = "prompt-source")]
         prompt_source: Option<String>,
+        #[arg(long = "clear-prompt")]
+        clear_prompt: bool,
         #[arg(long = "wait-reason")]
         wait_reason: Option<String>,
         #[arg(long)]
@@ -51,8 +53,12 @@ pub(crate) enum HookCommand {
         completed_at: Option<i64>,
         #[arg(long)]
         tasks: Option<String>,
+        #[arg(long = "clear-tasks")]
+        clear_tasks: bool,
         #[arg(long)]
         subagents: Option<String>,
+        #[arg(long = "clear-subagents")]
+        clear_subagents: bool,
     },
     Claude {
         event: String,
@@ -69,87 +75,383 @@ pub(crate) fn run_hook_command(
     env: &BTreeMap<String, String>,
     now_epoch: i64,
 ) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(2);
     match command {
         HookCommand::Emit {
             agent,
+            session_id,
             status,
             prompt,
             prompt_source,
+            clear_prompt,
             wait_reason,
             attention,
             started_at,
             completed_at,
             tasks,
+            clear_tasks,
             subagents,
+            clear_subagents,
         } => {
-            let event = AgentEvent {
-                clear_state: false,
-                agent,
-                status: status.as_deref().map(parse_agent_status).transpose()?,
-                prompt: prompt.map(OptionUpdate::Set),
-                prompt_source: prompt_source.map(OptionUpdate::Set),
-                wait_reason: wait_reason.map(OptionUpdate::Set),
-                attention: attention.then_some(true),
-                started_at,
-                completed_at,
-                tasks: tasks
-                    .as_deref()
-                    .map(parse_task_progress)
-                    .transpose()?
-                    .map(OptionUpdate::Set),
-                task_items: None,
-                subagents: subagents
-                    .as_deref()
-                    .map(parse_subagents_arg)
-                    .transpose()?
-                    .map(OptionUpdate::Set),
-                worktree_activity: None,
-            };
-            write_agent_event(runner, env, &event)
+            let (mut client, context) = typed_hook_context(runner, env, deadline, now_epoch)?;
+            let event = generic_typed_event(
+                GenericEmitInput {
+                    agent,
+                    session_id,
+                    status,
+                    prompt,
+                    prompt_source,
+                    clear_prompt,
+                    wait_reason,
+                    tasks: tasks
+                        .as_deref()
+                        .map(parse_task_progress)
+                        .transpose()?
+                        .map(canonical_task_progress)
+                        .transpose()?,
+                    clear_tasks,
+                    subagents: subagents
+                        .as_deref()
+                        .map(parse_subagents_arg)
+                        .transpose()?
+                        .map(canonical_subagents)
+                        .transpose()?,
+                    clear_subagents,
+                    attention,
+                    started_at,
+                    completed_at,
+                },
+                &context,
+            )?;
+            send_typed_hook_event(&mut client, event)
         }
         HookCommand::Claude { event } => {
-            if let Some(progress_event) = claude_progress_event_from_input(&event, input)? {
-                if let Some(pane) = resolve_pane(runner, env)? {
-                    apply_progress_event(runner, &pane, progress_event)?;
-                }
-                return Ok(());
-            }
-            let event = claude_event_from_json(&event, input, now_epoch)?;
-            write_agent_event(runner, env, &event)
+            let (mut client, context) = typed_hook_context(runner, env, deadline, now_epoch)?;
+            let event = claude_typed_event_from_input(&event, input, &context)?;
+            send_typed_hook_event(&mut client, event)
         }
         HookCommand::Codex { arg } => {
             let Some(arg) = arg else {
-                return Ok(());
+                bail!("InvalidRequest: Codex hook event is required");
             };
-            let codex_home = codex_home_from_env(env);
             if arg.trim_start().starts_with('{') {
-                let event =
-                    codex_notify_event_from_arg_with_home(&arg, now_epoch, codex_home.as_deref())?;
-                return write_agent_event(runner, env, &event);
+                bail!("UnsupportedLegacyNotify: Codex agent-turn-complete notify is not supported");
             }
-            if let Some(aux_event) =
-                codex_aux_event_from_input(&arg, input, now_epoch, codex_home.as_deref())?
-            {
-                match aux_event {
-                    CodexAuxEvent::Progress(progress_event) => {
-                        if let Some(pane) = resolve_pane(runner, env)? {
-                            apply_progress_event(runner, &pane, progress_event)?;
-                        }
-                    }
-                    CodexAuxEvent::Agent(event) => {
-                        write_agent_event(runner, env, &event)?;
-                    }
-                }
-                return Ok(());
-            }
-            let event =
-                codex_event_from_json_with_home(&arg, input, now_epoch, codex_home.as_deref())?;
-            write_agent_event(runner, env, &event)
+            let codex_home = codex_home_from_env(env);
+            let (mut client, context) = typed_hook_context(runner, env, deadline, now_epoch)?;
+            let event = codex_typed_event_from_input(&arg, input, &context, codex_home.as_deref())?;
+            send_typed_hook_event(&mut client, event)
         }
     }
 }
 
-#[allow(dead_code)] // Connected to the command entrypoint at the Phase 6 producer cutover.
+fn typed_hook_context(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    deadline: Instant,
+    observed_at: i64,
+) -> Result<(crate::daemon::protocol::v2::V2Client, TypedAdapterContext)> {
+    let pane_instance = crate::hook::writer::resolve_pane_instance(runner, env)?
+        .ok_or_else(|| anyhow::anyhow!("InvalidPaneInstance: hook has no target pane"))?;
+    let (incarnation, socket) =
+        crate::daemon::lifecycle::ensure_daemon_live_v2_until(runner, env, None, deadline)?;
+    let client = crate::daemon::protocol::v2::V2Client::connect_with_deadline(
+        &socket,
+        &incarnation.hash,
+        deadline,
+    )?;
+    let context = TypedAdapterContext {
+        daemon_instance_id: client.daemon_instance_id().clone(),
+        event_id: crate::pane_state::EventId::generate()?,
+        pane_instance,
+        observed_at,
+    };
+    Ok((client, context))
+}
+
+fn send_typed_hook_event(
+    client: &mut crate::daemon::protocol::v2::V2Client,
+    event: Option<PaneEventEnvelope>,
+) -> Result<()> {
+    let Some(envelope) = event else {
+        return Ok(());
+    };
+    let event_id = envelope.event_id.clone();
+    let response = client.request_with_stage(
+        &crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent {
+            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            envelope,
+        },
+    )?;
+    match response {
+        crate::daemon::protocol::v2::ServerMessage::PaneEventResult {
+            event_id: response_id,
+            ..
+        } if response_id == event_id => Ok(()),
+        crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
+            bail!("daemon returned {code:?}: {message}")
+        }
+        response => bail!("unexpected pane event response: {response:?}"),
+    }
+}
+
+fn canonical_task_progress(progress: TaskProgress) -> Result<crate::pane_state::TaskProgress> {
+    if progress.done < 0 || progress.total < 0 {
+        bail!("InvalidRequest: task progress cannot be negative");
+    }
+    let progress = crate::pane_state::TaskProgress {
+        done: progress.done as u64,
+        total: progress.total as u64,
+    };
+    if progress.done > progress.total {
+        bail!("InvalidRequest: task progress exceeds total");
+    }
+    Ok(progress)
+}
+
+fn canonical_subagents(
+    entries: Vec<SubagentEntry>,
+) -> Result<Vec<crate::pane_state::SubagentState>> {
+    let states = entries
+        .into_iter()
+        .map(|entry| {
+            let state = crate::pane_state::SubagentState {
+                agent_id: normalize_text(&entry.agent_id),
+                agent_type: normalize_text(&entry.agent_type),
+                display_name: entry
+                    .display_name
+                    .as_deref()
+                    .map(normalize_text)
+                    .filter(|value| !value.is_empty()),
+            };
+            Ok(state)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::pane_state::validate_subagents(&states)?;
+    Ok(states)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_view_hook_command(
+    event_kind: &str,
+    owner: &str,
+    protocol: u16,
+    hook_session: Option<&str>,
+    hook_window: Option<&str>,
+    hook_pane: Option<&str>,
+    hook_client: Option<&str>,
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    config: &crate::config::Config,
+) -> Result<()> {
+    use crate::pane_state::{SourceClientHint, ViewHookKind};
+
+    if owner != crate::daemon::view_hooks::HOOK_OWNER
+        || protocol != crate::daemon::view_hooks::HOOK_PROTOCOL
+    {
+        bail!("InvalidRequest: pane-state view hook ownership marker mismatch");
+    }
+    let hook_kind = match event_kind {
+        "window-pane-changed" => ViewHookKind::WindowPaneChanged,
+        "session-window-changed" => ViewHookKind::SessionWindowChanged,
+        "client-session-changed" => ViewHookKind::ClientSessionChanged,
+        "client-attached" => ViewHookKind::ClientAttached,
+        "client-detached" => ViewHookKind::ClientDetached,
+        _ => bail!("InvalidRequest: unknown pane-state view hook kind {event_kind}"),
+    };
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
+    let server_hash = incarnation.hash.clone();
+    let result = (|| -> Result<()> {
+        ensure_view_hook_deadline(deadline, "querying topology")?;
+        let topology_framing = crate::daemon::topology::QueryFraming::generate()?;
+        let topology_args = crate::daemon::topology::poll_query_args(&topology_framing);
+        let topology_refs = topology_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let topology_output = runner.run(&topology_refs)?;
+        ensure_view_hook_deadline(deadline, "parsing topology")?;
+        let topology = crate::daemon::topology::parse_topology(
+            &topology_output,
+            &topology_framing,
+            &incarnation.identity,
+        )?;
+        let witness_token = crate::pane_state::EventId::generate()?.as_str().to_string();
+        let witness_args = crate::daemon::view_hooks::client_view_query_args(&witness_token);
+        let witness_refs = witness_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let witness_output = runner.run(&witness_refs)?;
+        ensure_view_hook_deadline(deadline, "parsing client witnesses")?;
+        let witnesses = crate::daemon::view_hooks::parse_client_view_query(
+            &witness_output,
+            &witness_token,
+            &incarnation.identity,
+        )?;
+        let source_client = hook_client
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|pid| *pid > 0)
+                    .map(|client_pid| SourceClientHint { client_pid })
+                    .ok_or_else(|| anyhow::anyhow!("InvalidRequest: invalid hook client PID"))
+            })
+            .transpose()?;
+        let occurrence = foreground_occurrence(
+            hook_kind,
+            hook_session.filter(|value| !value.is_empty()),
+            hook_window.filter(|value| !value.is_empty()),
+            hook_pane.filter(|value| !value.is_empty()),
+            source_client.as_ref(),
+            &topology,
+            &witnesses,
+        )?;
+        ensure_view_hook_deadline(deadline, "ensuring pane-state daemon")?;
+        let (incarnation, socket) =
+            crate::daemon::lifecycle::ensure_daemon_live_v2_for_incarnation_until(
+                incarnation,
+                env,
+                None,
+                deadline,
+            )?;
+        let probe = crate::daemon::protocol::v2::V2Client::connect_with_deadline(
+            &socket,
+            &incarnation.hash,
+            deadline,
+        )?;
+        let built = crate::daemon::view_hooks::build_foreground_view_event(
+            probe.daemon_instance_id().clone(),
+            crate::pane_state::EventId::generate()?,
+            hook_kind,
+            occurrence,
+            source_client,
+            witnesses,
+            config.daemon.done_clear_on,
+        )?;
+        drop(probe);
+        crate::daemon::view_hooks::deliver_view_event(
+            &socket,
+            &incarnation.hash,
+            &built.event,
+            deadline,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        eprintln!("{error:#}");
+        log_view_hook_failure(env, &server_hash, &format!("{error:#}"));
+    }
+    result
+}
+
+fn ensure_view_hook_deadline(deadline: Instant, stage: &str) -> Result<()> {
+    if Instant::now() >= deadline {
+        bail!("pane-state view hook deadline exceeded while {stage}");
+    }
+    Ok(())
+}
+
+fn foreground_occurrence(
+    kind: crate::pane_state::ViewHookKind,
+    hook_session: Option<&str>,
+    hook_window: Option<&str>,
+    hook_pane: Option<&str>,
+    source_client: Option<&crate::pane_state::SourceClientHint>,
+    topology: &crate::daemon::topology::TopologySnapshot,
+    witnesses: &[crate::pane_state::ClientWitness],
+) -> Result<Option<crate::pane_state::ViewOccurrence>> {
+    use crate::pane_state::{ViewHookKind, ViewOccurrence};
+    if kind == ViewHookKind::ClientDetached {
+        return Ok(None);
+    }
+    let witness = source_client.and_then(|source| {
+        witnesses
+            .iter()
+            .find(|value| value.client_pid == source.client_pid)
+    });
+    let window_id = hook_window
+        .or_else(|| witness.map(|value| value.window_id.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("InvalidRequest: hook window is missing"))?;
+    let mut observed_panes = topology
+        .panes
+        .iter()
+        .filter(|pane| pane.window_id == window_id)
+        .map(|pane| pane.pane_instance.clone())
+        .collect::<Vec<_>>();
+    observed_panes.sort();
+    observed_panes.dedup();
+    let active_pane = hook_pane
+        .and_then(|pane_id| {
+            observed_panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .cloned()
+        })
+        .or_else(|| witness.map(|value| value.active_pane.clone()))
+        .or_else(|| {
+            topology
+                .panes
+                .iter()
+                .find(|pane| pane.window_id == window_id && pane.active)
+                .map(|pane| pane.pane_instance.clone())
+        })
+        .ok_or_else(|| anyhow::anyhow!("InvalidRequest: hook active pane is missing"))?;
+    let session_id = hook_session
+        .or_else(|| witness.map(|value| value.session_id.as_str()))
+        .or_else(|| {
+            topology
+                .panes
+                .iter()
+                .find(|pane| pane.window_id == window_id)
+                .and_then(|pane| pane.session_links.first())
+                .map(|link| link.session_id.as_str())
+        })
+        .ok_or_else(|| anyhow::anyhow!("InvalidRequest: hook session is missing"))?;
+    Ok(Some(ViewOccurrence {
+        session_id: session_id.to_string(),
+        window_id: window_id.to_string(),
+        active_pane,
+        observed_panes,
+    }))
+}
+
+fn log_view_hook_failure(env: &BTreeMap<String, String>, server_hash: &str, message: &str) {
+    let state_root = env
+        .get("XDG_STATE_HOME")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env.get("HOME")
+                .filter(|value| !value.trim().is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/vde-tmux-{}", unsafe { libc::geteuid() })));
+    let directory = state_root.join("vde-tmux").join(server_hash);
+    if fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
+    let path = directory.join("pane-state-hook.log");
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= 1024 * 1024) {
+        let _ = fs::remove_file(path.with_extension("log.3"));
+        let _ = fs::rename(path.with_extension("log.2"), path.with_extension("log.3"));
+        let _ = fs::rename(path.with_extension("log.1"), path.with_extension("log.2"));
+        let _ = fs::rename(&path, path.with_extension("log.1"));
+    }
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{} {message}", chrono_like_epoch());
+    }
+}
+
+fn chrono_like_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
+}
+
 pub(crate) fn claude_typed_event_from_input(
     event: &str,
     input: &str,
@@ -167,7 +469,6 @@ pub(crate) fn claude_typed_event_from_input(
     claude_typed_event_from_json(event, input, context)
 }
 
-#[allow(dead_code)] // Connected to the command entrypoint at the Phase 6 producer cutover.
 pub(crate) fn codex_typed_event_from_input(
     event: &str,
     input: &str,
@@ -214,7 +515,6 @@ pub(crate) fn codex_typed_event_from_input(
     codex_typed_event_from_json_with_home(event, input, context, codex_home)
 }
 
-#[allow(dead_code)] // Used by the typed adapters above during the Phase 6 producer cutover.
 fn required_payload_session(input: &str) -> Result<String> {
     let payload: Value = serde_json::from_str(input.trim())?;
     let session_id = payload
@@ -223,31 +523,6 @@ fn required_payload_session(input: &str) -> Result<String> {
         .map(str::to_string)
         .filter(|session_id| !session_id.trim().is_empty());
     session_id.ok_or_else(|| anyhow::anyhow!("InvalidRequest: hook payload requires session_id"))
-}
-
-fn write_agent_event(
-    runner: &dyn TmuxRunner,
-    env: &BTreeMap<String, String>,
-    event: &AgentEvent,
-) -> Result<()> {
-    let writes = derive_event_writes(event);
-    if writes.is_empty() {
-        return Ok(());
-    }
-    if let Some(pane) = resolve_pane(runner, env)? {
-        write_pane_options(runner, &pane, &writes)?;
-    }
-    Ok(())
-}
-
-fn parse_agent_status(raw: &str) -> Result<AgentStatus> {
-    match raw {
-        "running" => Ok(AgentStatus::Running),
-        "waiting" => Ok(AgentStatus::Waiting),
-        "idle" => Ok(AgentStatus::Idle),
-        "error" => Ok(AgentStatus::Error),
-        _ => bail!("unknown hook status: {raw}"),
-    }
 }
 
 fn parse_task_progress(raw: &str) -> Result<TaskProgress> {

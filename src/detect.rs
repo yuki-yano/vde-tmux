@@ -1,5 +1,3 @@
-use crate::hook::AgentStatus;
-
 // capture-pane may include deeper scrollback; only recent screen lines should drive waiting state.
 const WAIT_REASON_SCAN_TAIL_LINES: usize = 30;
 
@@ -120,26 +118,9 @@ fn consume_ascii_digits(input: &str) -> Option<&str> {
     (digit_count > 0).then_some(&input[digit_count..])
 }
 
-pub fn demote_stale_running(
-    status: Option<AgentStatus>,
-    last_activity_epoch: i64,
-    now_epoch: i64,
-    threshold_seconds: i64,
-) -> Option<AgentStatus> {
-    if status == Some(AgentStatus::Running)
-        && threshold_seconds >= 0
-        && now_epoch.saturating_sub(last_activity_epoch) > threshold_seconds
-    {
-        Some(AgentStatus::Idle)
-    } else {
-        status
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hook::AgentStatus;
 
     #[test]
     fn detects_codex_permission_prompt_from_screen_tail() {
@@ -212,13 +193,5 @@ mod tests {
         }
 
         assert_eq!(detect_codex_wait_reason(&text), None);
-    }
-
-    #[test]
-    fn stale_running_demotes_to_idle_for_display() {
-        let status = demote_stale_running(Some(AgentStatus::Running), 100, 200, 30);
-        assert_eq!(status, Some(AgentStatus::Idle));
-        let fresh = demote_stale_running(Some(AgentStatus::Running), 190, 200, 30);
-        assert_eq!(fresh, Some(AgentStatus::Running));
     }
 }

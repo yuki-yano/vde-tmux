@@ -105,14 +105,14 @@ pub fn indexed_hook_name(kind: ViewHookKind) -> String {
 pub fn install_command(kind: ViewHookKind) -> String {
     let name = hook_kind_arg(kind);
     format!(
-        "run-shell 'vt hooks pane-state-view {name} --owner {HOOK_OWNER} --protocol {HOOK_PROTOCOL}'"
+        "run-shell 'vt hooks pane-state-view {name} --owner {HOOK_OWNER} --protocol {HOOK_PROTOCOL} --hook-session=#{{hook_session}} --hook-window=#{{hook_window}} --hook-pane=#{{hook_pane}} --hook-client=#{{client_pid}}'"
     )
 }
 
 pub fn verified_command(kind: ViewHookKind) -> String {
     let name = hook_kind_arg(kind);
     format!(
-        "run-shell \"vt hooks pane-state-view {name} --owner {HOOK_OWNER} --protocol {HOOK_PROTOCOL}\""
+        "run-shell \"vt hooks pane-state-view {name} --owner {HOOK_OWNER} --protocol {HOOK_PROTOCOL} --hook-session=#{{hook_session}} --hook-window=#{{hook_window}} --hook-pane=#{{hook_pane}} --hook-client=#{{client_pid}}\""
     )
 }
 
@@ -608,7 +608,7 @@ pub fn build_foreground_view_event(
     done_clear_on: DoneClearOn,
 ) -> Result<BuiltForegroundViewEvent, ViewError> {
     validate_witnesses(&witnesses)?;
-    let mut event = ViewEvent {
+    let event = ViewEvent {
         daemon_instance_id,
         event_id,
         hook_kind,
@@ -640,9 +640,6 @@ pub fn build_foreground_view_event(
                 })
     });
     let unverified_occurrence = event.occurrence.is_some() && !occurrence_verified;
-    if !occurrence_verified {
-        event.occurrence = None;
-    }
     Ok(BuiltForegroundViewEvent {
         event,
         unverified_occurrence,
@@ -2143,7 +2140,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_builder_drops_unverified_occurrence_but_keeps_registry_witnesses() {
+    fn foreground_builder_keeps_unverified_occurrence_for_registry_only() {
         let target = pane("%1", 11);
         let occurrence = ViewOccurrence {
             session_id: "$1".to_string(),
@@ -2170,7 +2167,7 @@ mod tests {
         )
         .unwrap();
         assert!(built.unverified_occurrence);
-        assert!(built.event.occurrence.is_none());
+        assert!(built.event.occurrence.is_some());
         assert_eq!(built.event.witnesses.len(), 1);
     }
 

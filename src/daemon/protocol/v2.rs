@@ -341,7 +341,9 @@ fn write_client_message(
         if remaining.is_zero() {
             bail!("daemon request write deadline exceeded");
         }
-        writer.set_write_timeout(Some(remaining))?;
+        // Darwin rejects an all-zero timeval. A positive sub-millisecond Duration can round down
+        // to that representation, so use the same 1 ms socket-timeout quantum as v2 clients.
+        writer.set_write_timeout(Some(remaining.max(Duration::from_millis(1))))?;
         match writer.write(&frame[written..]) {
             Ok(0) => bail!("daemon closed the connection while reading the request"),
             Ok(count) => written += count,
@@ -369,7 +371,10 @@ fn read_server_message(
         if remaining.is_zero() {
             bail!("daemon response read deadline exceeded");
         }
-        reader.get_ref().set_read_timeout(Some(remaining))?;
+        // Darwin rejects an all-zero timeval after rounding very small positive durations.
+        reader
+            .get_ref()
+            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
         let chunk = match reader.fill_buf() {
             Ok(chunk) => chunk,
             Err(error)
@@ -490,6 +495,13 @@ pub struct ResolvedSnapshot {
 pub struct SessionStatusPresentation {
     pub session_id: String,
     pub session_name: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub attached: Option<bool>,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    pub active: bool,
     pub counts: BadgeStateCounts,
 }
 
@@ -498,6 +510,21 @@ pub struct SessionStatusPresentation {
 pub struct WindowStatusPresentation {
     pub window_id: String,
     pub window_name: String,
+    pub pane_count: usize,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    #[serde(default)]
+    pub window_index: Option<i64>,
+    pub active: bool,
+    pub last: bool,
+    #[serde(default)]
+    pub bell: Option<bool>,
+    #[serde(default)]
+    pub activity: Option<bool>,
+    #[serde(default)]
+    pub silence: Option<bool>,
+    #[serde(default)]
+    pub current_command: Option<String>,
     pub counts: BadgeStateCounts,
 }
 
@@ -505,6 +532,9 @@ pub struct WindowStatusPresentation {
 #[serde(deny_unknown_fields)]
 pub struct CategoryStatusPresentation {
     pub category: String,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    pub active: bool,
     pub counts: BadgeStateCounts,
 }
 
@@ -1107,11 +1137,39 @@ mod tests {
         };
         let status = StatusSnapshot {
             snapshot_revision: 1,
-            context: StatusContext::Global,
+            context: StatusContext::Session {
+                session_id: "$1".to_string(),
+            },
             summary: BadgeStateCounts::default(),
-            sessions: Vec::new(),
-            windows: Vec::new(),
-            categories: Vec::new(),
+            sessions: vec![SessionStatusPresentation {
+                session_id: "$1".to_string(),
+                session_name: "main".to_string(),
+                category: Some("work".to_string()),
+                attached: Some(true),
+                created_at: Some(123),
+                active: true,
+                counts: BadgeStateCounts::default(),
+            }],
+            windows: vec![WindowStatusPresentation {
+                window_id: "@1".to_string(),
+                window_name: "main".to_string(),
+                pane_count: 1,
+                session_ids: vec!["$1".to_string()],
+                window_index: Some(0),
+                active: true,
+                last: false,
+                bell: Some(false),
+                activity: Some(true),
+                silence: Some(false),
+                current_command: Some("zsh".to_string()),
+                counts: BadgeStateCounts::default(),
+            }],
+            categories: vec![CategoryStatusPresentation {
+                category: "work".to_string(),
+                session_ids: vec!["$1".to_string()],
+                active: true,
+                counts: BadgeStateCounts::default(),
+            }],
             attention: Vec::new(),
         };
         let descriptor = StoredStateDescriptor::Quarantined {
