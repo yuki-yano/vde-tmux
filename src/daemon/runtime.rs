@@ -2131,6 +2131,168 @@ mod tests {
         remove_canonical_sidebar_fixture(state, root);
     }
 
+    fn assert_continuous_display_state(state: &CanonicalCoordinatorState, expected: BadgeState) {
+        let resolved = state.resolved_snapshot();
+        let pane = resolved
+            .panes
+            .iter()
+            .find(|pane| pane.pane_instance.pane_id == "%1")
+            .expect("scenario pane is present");
+        assert_eq!(
+            pane.resolved.as_ref().map(|pane| pane.badge),
+            Some(expected)
+        );
+        assert_eq!(resolved.sidebar.counts.total, 1);
+        assert_eq!(resolved.sidebar.counts.blocked, 0);
+        assert_eq!(
+            resolved.sidebar.counts.working,
+            usize::from(expected == BadgeState::Working)
+        );
+        assert_eq!(
+            resolved.sidebar.counts.done,
+            usize::from(expected == BadgeState::Done)
+        );
+        assert_eq!(
+            resolved.sidebar.counts.idle,
+            usize::from(expected == BadgeState::Idle)
+        );
+        assert!(
+            resolved
+                .sidebar
+                .rows
+                .iter()
+                .any(|row| row.badge_state == Some(expected))
+        );
+        assert!(resolved.attention.is_empty());
+
+        let status = build_status_snapshot(
+            &resolved,
+            crate::daemon::protocol::v2::StatusContext::Global,
+            &state.status_metadata,
+        );
+        let expected_counts =
+            crate::daemon::session_badge::BadgeStateCounts::from_states([expected]);
+        assert_eq!(status.snapshot_revision, resolved.snapshot_revision);
+        assert_eq!(status.summary, expected_counts);
+        assert_eq!(
+            status
+                .sessions
+                .iter()
+                .find(|session| session.session_id == "$1")
+                .expect("scenario session is projected")
+                .counts,
+            expected_counts
+        );
+        assert_eq!(
+            status
+                .windows
+                .iter()
+                .find(|window| window.window_id == "@1")
+                .expect("scenario window is projected")
+                .counts,
+            expected_counts
+        );
+        assert_eq!(
+            status
+                .categories
+                .iter()
+                .find(|category| category.category == "work")
+                .expect("scenario category is projected")
+                .counts,
+            expected_counts
+        );
+    }
+
+    #[test]
+    fn done_focus_idle_focus_out_next_completion_is_consistent_across_all_surfaces() {
+        use crate::pane_state::{PaneEvent, StoredPaneRecord};
+
+        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
+        state.leased.runtime = CanonicalPaneStateRuntime::default();
+        state.status_metadata = StatusProjectionMetadata {
+            categories: BTreeSet::from(["work".to_string()]),
+            sessions: BTreeMap::from([(
+                "$1".to_string(),
+                SessionProjectionMetadata {
+                    category: Some("work".to_string()),
+                    attached: Some(true),
+                    created_at: Some(1),
+                },
+            )]),
+            windows: BTreeMap::new(),
+        };
+
+        apply_history_event(
+            &mut state,
+            "codex",
+            "scenario-session",
+            PaneEvent::BeginRun {
+                started_at: 10,
+                prompt: None,
+            },
+        );
+        assert_continuous_display_state(&state, BadgeState::Working);
+        apply_history_event(
+            &mut state,
+            "codex",
+            "scenario-session",
+            PaneEvent::CompleteRun { completed_at: 20 },
+        );
+        assert_continuous_display_state(&state, BadgeState::Done);
+
+        let pane = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let (state_id, agent_epoch, through_seq) = match state.leased.runtime.record(&pane).unwrap()
+        {
+            StoredPaneRecord::Active(current) => (
+                current.state_id.clone(),
+                current.agent_epoch,
+                current.completed_seq,
+            ),
+            other => panic!("expected active scenario state, got {other:?}"),
+        };
+        apply_history_event(
+            &mut state,
+            "codex",
+            "scenario-session",
+            PaneEvent::AcknowledgeView {
+                expected_state_id: state_id,
+                expected_agent_epoch: agent_epoch,
+                through_seq,
+            },
+        );
+        assert_continuous_display_state(&state, BadgeState::Idle);
+
+        let focus_out_revision = state.resolved_snapshot().snapshot_revision;
+        assert_continuous_display_state(&state, BadgeState::Idle);
+        assert_eq!(
+            state.resolved_snapshot().snapshot_revision,
+            focus_out_revision
+        );
+
+        apply_history_event(
+            &mut state,
+            "codex",
+            "scenario-session",
+            PaneEvent::BeginRun {
+                started_at: 30,
+                prompt: None,
+            },
+        );
+        assert_continuous_display_state(&state, BadgeState::Working);
+        apply_history_event(
+            &mut state,
+            "codex",
+            "scenario-session",
+            PaneEvent::CompleteRun { completed_at: 40 },
+        );
+        assert_continuous_display_state(&state, BadgeState::Done);
+
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
     #[test]
     fn status_snapshot_deduplicates_linked_panes_for_every_scope() {
         let snapshot = build_status_snapshot(

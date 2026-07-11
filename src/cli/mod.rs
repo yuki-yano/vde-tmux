@@ -188,6 +188,7 @@ enum SessionsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // Hidden view hook mirrors its bounded inline snapshot frame.
 enum HooksCommand {
     #[command(name = "on-client-session-changed")]
     OnClientSessionChanged {
@@ -205,8 +206,18 @@ enum HooksCommand {
         hook_session: Option<String>,
         #[arg(long = "hook-window")]
         hook_window: Option<String>,
-        #[arg(long = "hook-pane")]
-        hook_pane: Option<String>,
+        #[arg(long = "snapshot-session", hide = true, default_value = "")]
+        snapshot_session: String,
+        #[arg(long = "snapshot-window", hide = true, default_value = "")]
+        snapshot_window: String,
+        #[arg(long = "snapshot-pane", hide = true, default_value = "")]
+        snapshot_pane: String,
+        #[arg(long = "snapshot-pane-pid", hide = true, default_value = "")]
+        snapshot_pane_pid: String,
+        #[arg(long = "snapshot-panes", hide = true, default_value = "")]
+        snapshot_panes: String,
+        #[arg(long = "snapshot-clients", hide = true, default_value = "")]
+        snapshot_clients: String,
         #[arg(long = "hook-client")]
         hook_client: Option<String>,
     },
@@ -525,7 +536,12 @@ where
                     protocol,
                     hook_session,
                     hook_window,
-                    hook_pane,
+                    snapshot_session,
+                    snapshot_window,
+                    snapshot_pane,
+                    snapshot_pane_pid,
+                    snapshot_panes,
+                    snapshot_clients,
                     hook_client,
                 } => hook::run_view_hook_command(
                     &event_kind,
@@ -533,7 +549,12 @@ where
                     protocol,
                     hook_session.as_deref(),
                     hook_window.as_deref(),
-                    hook_pane.as_deref(),
+                    &snapshot_session,
+                    &snapshot_window,
+                    &snapshot_pane,
+                    &snapshot_pane_pid,
+                    &snapshot_panes,
+                    &snapshot_clients,
                     hook_client.as_deref(),
                     runner,
                     env,

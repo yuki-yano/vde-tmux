@@ -126,7 +126,6 @@ pub fn subscribe_v2(
     })?;
     tx.send(first)
         .map_err(|_| anyhow::anyhow!("sidebar snapshot receiver disconnected"))?;
-    subscription.clear_read_timeout()?;
     thread::spawn(move || {
         loop {
             match subscription.read_next_snapshot() {
@@ -155,7 +154,6 @@ fn request_v2_sidebar(
     let deadline = Instant::now() + V2_SIDEBAR_COMMAND_TIMEOUT;
     let mut stream = UnixStream::connect(socket)?;
     stream.set_write_timeout(Some(V2_SIDEBAR_COMMAND_TIMEOUT))?;
-    stream.set_read_timeout(Some(V2_SIDEBAR_COMMAND_TIMEOUT))?;
     write_v2_client_frame(
         &mut stream,
         &V2ClientMessage::Hello {
@@ -267,7 +265,6 @@ impl V2SnapshotSubscription {
     fn connect(socket: &Path, server_identity: &str) -> Result<Self> {
         let mut stream = UnixStream::connect(socket)?;
         stream.set_write_timeout(Some(V2_SUBSCRIBE_INITIAL_TIMEOUT))?;
-        stream.set_read_timeout(Some(V2_SUBSCRIBE_INITIAL_TIMEOUT))?;
         let deadline = Instant::now() + V2_SUBSCRIBE_INITIAL_TIMEOUT;
         write_v2_client_frame(
             &mut stream,
@@ -307,11 +304,6 @@ impl V2SnapshotSubscription {
             last_revision: None,
             initial_deadline: deadline,
         })
-    }
-
-    fn clear_read_timeout(&self) -> Result<()> {
-        self.reader.get_ref().set_read_timeout(None)?;
-        Ok(())
     }
 
     fn read_next_snapshot(&mut self) -> Result<Option<ResolvedSnapshot>> {
@@ -405,9 +397,7 @@ fn read_v2_server_frame(
             if remaining.is_zero() {
                 bail!("daemon response read deadline exceeded");
             }
-            reader
-                .get_ref()
-                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+            crate::daemon::protocol::v2::wait_for_unix_readable(reader.get_ref(), deadline)?;
         }
         let available = match reader.fill_buf() {
             Ok(available) => available,
@@ -823,9 +813,8 @@ mod tests {
                 .unwrap();
                 stream.write_all(b"\n").unwrap();
             }
-            // Keep the peer open until the client has cleared its finite initial timeout. Closing
-            // during that setsockopt is platform-racy on Darwin and is not representative of a
-            // persistent Subscribe connection.
+            // Keep the peer open until the client's finite initial poll/read completes. A real
+            // Subscribe peer remains connected while later snapshots are streamed.
             release_rx.recv().unwrap();
         });
         let (tx, rx) = std::sync::mpsc::channel();

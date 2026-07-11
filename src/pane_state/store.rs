@@ -1504,6 +1504,8 @@ fn event_can_create_record(current: Option<&StoredPaneRecord>, event: &PaneEvent
 mod tests {
     use std::collections::VecDeque;
 
+    use crate::daemon::session_badge::BadgeState;
+
     use super::*;
 
     const STATE_ID: &str = "00112233445566778899aabbccddeeff";
@@ -1654,6 +1656,200 @@ mod tests {
         assert_eq!(hydrated.snapshot_revision(), 0);
     }
 
+    fn restart_from(runtime: &CanonicalStateRuntime) -> CanonicalStateRuntime {
+        CanonicalStateRuntime::hydrate([RawPaneRecord {
+            pane_instance: pane(),
+            raw: runtime
+                .record(&pane())
+                .map(serialize_record)
+                .transpose()
+                .unwrap(),
+        }])
+    }
+
+    #[test]
+    fn restart_preserves_hidden_done_reconciles_visible_done_and_allows_next_done() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = FakeIo::default();
+        let mut clock = FakeClock::default();
+        apply_begin(&mut runtime, &mut io);
+        runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &envelope(PaneEvent::CompleteRun { completed_at: 2 }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+
+        let mut restarted = restart_from(&runtime);
+        let StoredPaneRecord::Active(hidden) = restarted.record(&pane()).unwrap() else {
+            panic!("expected active state");
+        };
+        assert_eq!(crate::pane_state::resolve_badge(hidden), BadgeState::Done);
+        assert_eq!(hidden.completed_seq, 1);
+        assert_eq!(hidden.acknowledged_seq, 0);
+
+        let acknowledge_visible = envelope(PaneEvent::AcknowledgeView {
+            expected_state_id: hidden.state_id.clone(),
+            expected_agent_epoch: hidden.agent_epoch,
+            through_seq: hidden.completed_seq,
+        });
+        let ViewBatchProgress::Complete(result) = restarted.apply_view_acknowledgement_batch(
+            &mut FakeIo::default(),
+            &mut clock,
+            &[acknowledge_visible],
+            DoneClearOn::Pane,
+        ) else {
+            panic!("expected initial reconciliation to complete");
+        };
+        assert_eq!(result.committed, 1);
+        let StoredPaneRecord::Active(visible) = restarted.record(&pane()).unwrap() else {
+            panic!("expected active state");
+        };
+        assert_eq!(crate::pane_state::resolve_badge(visible), BadgeState::Idle);
+
+        let mut restarted_again = restart_from(&restarted);
+        let StoredPaneRecord::Active(acknowledged) = restarted_again.record(&pane()).unwrap()
+        else {
+            panic!("expected active state");
+        };
+        assert_eq!(
+            crate::pane_state::resolve_badge(acknowledged),
+            BadgeState::Idle
+        );
+        assert_eq!(acknowledged.completed_seq, acknowledged.acknowledged_seq);
+        restarted_again
+            .apply_event(
+                &mut FakeIo::default(),
+                &mut clock,
+                &envelope(PaneEvent::BeginRun {
+                    started_at: 3,
+                    prompt: None,
+                }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        restarted_again
+            .apply_event(
+                &mut FakeIo::default(),
+                &mut clock,
+                &envelope(PaneEvent::CompleteRun { completed_at: 4 }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        let StoredPaneRecord::Active(next_done) = restarted_again.record(&pane()).unwrap() else {
+            panic!("expected active state");
+        };
+        assert_eq!(
+            crate::pane_state::resolve_badge(next_done),
+            BadgeState::Done
+        );
+        assert_eq!(next_done.completed_seq, 2);
+        assert_eq!(next_done.acknowledged_seq, 1);
+    }
+
+    #[test]
+    fn restart_hydrated_reset_rejects_delayed_complete_idle_and_progress() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = FakeIo::default();
+        apply_begin(&mut runtime, &mut io);
+        let expected = runtime.descriptor(&pane()).unwrap();
+        runtime
+            .reset(
+                &mut io,
+                &mut FakeClock::default(),
+                &pane(),
+                &expected,
+                10,
+                ResetTombstoneId::parse(STATE_ID).unwrap(),
+            )
+            .unwrap();
+        let delayed = [
+            PaneEvent::CompleteRun { completed_at: 11 },
+            PaneEvent::ExplicitStateReported {
+                report: ExplicitStateReport {
+                    observed_at: 11,
+                    lifecycle: Some(ReportedLifecycle::Idle),
+                    started_at: None,
+                    completed_at: Some(11),
+                    prompt: None,
+                    tasks: None,
+                    subagents: None,
+                    attention: false,
+                },
+            },
+            PaneEvent::ProgressUpdated {
+                observed_at: 11,
+                operations: vec![ProgressOperation::ClearPrompt],
+            },
+        ];
+        for event in delayed {
+            let mut restarted = restart_from(&runtime);
+            let descriptor = restarted.descriptor(&pane()).unwrap();
+            let mut event_io = FakeIo::default();
+            let result = restarted
+                .apply_event(
+                    &mut event_io,
+                    &mut FakeClock::default(),
+                    &envelope(event),
+                    &VisibilitySnapshot::default(),
+                    DoneClearOn::Pane,
+                )
+                .unwrap();
+            assert_eq!(result.outcome, ReductionOutcome::Noop);
+            assert_eq!(restarted.descriptor(&pane()), Some(descriptor));
+            assert!(event_io.writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn restart_first_capture_is_a_new_baseline_without_stale_completion() {
+        let mut runtime = CanonicalStateRuntime::default();
+        apply_begin(&mut runtime, &mut FakeIo::default());
+        let mut restarted = restart_from(&runtime);
+        let dispatched = restarted.freeze_observation_dispatch([pane()]).remove(0);
+        assert_eq!(dispatched.tracker.fingerprint, None);
+        assert_eq!(dispatched.tracker.last_change_at, None);
+        let StoredPaneRecord::Active(state_before_capture) = restarted.record(&pane()).unwrap()
+        else {
+            panic!("expected active state");
+        };
+        let capture = crate::daemon::workers::infer_capture(
+            Some(state_before_capture),
+            &dispatched.tracker,
+            "first tail after restart\n",
+            400,
+        );
+        assert_eq!(capture.inference, CaptureInference::NoChange);
+        let fingerprint = capture.observed_fingerprint.unwrap();
+        let result = restarted
+            .apply_event(
+                &mut FakeIo::default(),
+                &mut FakeClock::default(),
+                &envelope(PaneEvent::ObservationBatch {
+                    base: dispatched.base,
+                    tracker_generation: dispatched.tracker.generation,
+                    observed_at: 400,
+                    presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+                    capture: Some(capture),
+                }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        assert_eq!(result.outcome, ReductionOutcome::CanonicalChanged);
+        assert_eq!(restarted.tracker(&pane()).fingerprint, Some(fingerprint));
+        let StoredPaneRecord::Active(state) = restarted.record(&pane()).unwrap() else {
+            panic!("expected active state");
+        };
+        assert_eq!(crate::pane_state::resolve_badge(state), BadgeState::Working);
+        assert_eq!(state.completed_seq, 0);
+    }
+
     #[test]
     fn state_size_is_preflighted_before_store_io() {
         let mut runtime = CanonicalStateRuntime::default();
@@ -1721,7 +1917,17 @@ mod tests {
     fn blocked_notification_is_derived_in_draft_and_published_after_persist() {
         let mut runtime = CanonicalStateRuntime::default();
         apply_begin(&mut runtime, &mut FakeIo::default());
-        let transition_count = runtime.transitions().len();
+        let record_before = runtime.record(&pane()).cloned();
+        let tracker_before = runtime.tracker(&pane());
+        let transitions_before = runtime.transitions().clone();
+        let notifications_before = runtime.notification_jobs().clone();
+        let triage_before = runtime
+            .triage_entries()
+            .map(|(pane, badge)| (pane.clone(), badge))
+            .collect::<Vec<_>>();
+        let flashing_before = runtime.flashing_panes().cloned().collect::<Vec<_>>();
+        let diagnostics_before = runtime.diagnostics().len();
+        let revision_before = runtime.snapshot_revision();
         let expected_raw = runtime
             .record(&pane())
             .map(serialize_record)
@@ -1745,8 +1951,28 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, StoreError::PersistFailed(_)));
-        assert_eq!(runtime.transitions().len(), transition_count);
-        assert!(runtime.notification_jobs().is_empty());
+        assert_eq!(runtime.record(&pane()), record_before.as_ref());
+        assert_eq!(runtime.tracker(&pane()), tracker_before);
+        assert_eq!(runtime.transitions(), &transitions_before);
+        assert_eq!(runtime.notification_jobs(), &notifications_before);
+        assert_eq!(
+            runtime
+                .triage_entries()
+                .map(|(pane, badge)| (pane.clone(), badge))
+                .collect::<Vec<_>>(),
+            triage_before
+        );
+        assert_eq!(
+            runtime.flashing_panes().cloned().collect::<Vec<_>>(),
+            flashing_before
+        );
+        assert_eq!(runtime.snapshot_revision(), revision_before + 1);
+        assert_eq!(runtime.diagnostics().len(), diagnostics_before + 1);
+        assert_eq!(runtime.diagnostics().back().unwrap().pane_instance, pane());
+        assert_eq!(
+            runtime.diagnostics().back().unwrap().message,
+            "pane state write did not commit"
+        );
 
         runtime
             .apply_event(
@@ -1757,8 +1983,61 @@ mod tests {
                 DoneClearOn::Pane,
             )
             .unwrap();
-        assert_eq!(runtime.transitions().len(), transition_count + 1);
+        assert_eq!(runtime.transitions().len(), transitions_before.len() + 1);
         assert_eq!(runtime.notification_jobs().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_view_acknowledgement_is_idempotent_in_store() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = FakeIo::default();
+        let mut clock = FakeClock::default();
+        apply_begin(&mut runtime, &mut io);
+        runtime
+            .apply_event(
+                &mut io,
+                &mut clock,
+                &envelope(PaneEvent::CompleteRun { completed_at: 2 }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        let StoredPaneRecord::Active(state) = runtime.record(&pane()).unwrap() else {
+            panic!("expected active pane state");
+        };
+        let acknowledgement = envelope(PaneEvent::AcknowledgeView {
+            expected_state_id: state.state_id.clone(),
+            expected_agent_epoch: state.agent_epoch,
+            through_seq: state.completed_seq,
+        });
+
+        let ViewBatchProgress::Complete(first) = runtime.apply_view_acknowledgement_batch(
+            &mut io,
+            &mut clock,
+            std::slice::from_ref(&acknowledgement),
+            DoneClearOn::Pane,
+        ) else {
+            panic!("expected completed first view batch");
+        };
+        assert_eq!(first.committed, 1);
+        assert!(first.failed.is_empty());
+        let revision_after_first = runtime.snapshot_revision();
+        let record_after_first = runtime.record(&pane()).cloned();
+        let transitions_after_first = runtime.transitions().clone();
+
+        let ViewBatchProgress::Complete(duplicate) = runtime.apply_view_acknowledgement_batch(
+            &mut io,
+            &mut clock,
+            &[acknowledgement],
+            DoneClearOn::Pane,
+        ) else {
+            panic!("expected completed duplicate view batch");
+        };
+        assert_eq!(duplicate.committed, 0);
+        assert!(duplicate.failed.is_empty());
+        assert_eq!(duplicate.snapshot_revision, revision_after_first);
+        assert_eq!(runtime.record(&pane()), record_after_first.as_ref());
+        assert_eq!(runtime.transitions(), &transitions_after_first);
     }
 
     #[test]
@@ -2640,6 +2919,52 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, StoreError::StaleStateIdentity);
         assert!(reset_io.writes.is_empty());
+    }
+
+    #[test]
+    fn tmux_writer_pid_guard_rejects_reused_pane_as_invalid_instance() {
+        #[derive(Default)]
+        struct ReusedPaneRunner {
+            calls: std::cell::RefCell<Vec<Vec<String>>>,
+        }
+
+        impl TmuxRunner for ReusedPaneRunner {
+            fn run(&self, args: &[&str]) -> anyhow::Result<String> {
+                self.calls
+                    .borrow_mut()
+                    .push(args.iter().map(|arg| (*arg).to_string()).collect());
+                Ok(PANE_MISMATCH_SENTINEL.to_string())
+            }
+        }
+
+        let runner = ReusedPaneRunner::default();
+        let mut store_io = TmuxPaneStateStoreIo::new(&runner, 7_001, 1_234_567);
+        let mut runtime = CanonicalStateRuntime::default();
+        let error = runtime
+            .apply_event(
+                &mut store_io,
+                &mut FakeClock::default(),
+                &begin_event(),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap_err();
+
+        assert_eq!(error, StoreError::InvalidPaneInstance);
+        assert!(runtime.record(&pane()).is_none());
+        assert_eq!(runtime.snapshot_revision(), 0);
+        assert!(runtime.transitions().is_empty());
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0], "if-shell");
+        assert_eq!(
+            calls[0][2],
+            "#{&&:#{==:#{pid},7001},#{==:#{start_time},1234567}}"
+        );
+        assert!(calls[0][3].contains("if-shell -F -t %1"));
+        assert!(calls[0][3].contains("#{==:#{pane_pid},100}"));
+        assert!(calls[0][3].contains("set-option -p -t %1 @vde_pane_state"));
+        assert!(calls[0][3].contains(PANE_MISMATCH_SENTINEL));
     }
 
     #[test]

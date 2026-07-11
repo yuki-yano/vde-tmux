@@ -238,14 +238,20 @@ pub(crate) fn run_view_hook_command(
     protocol: u16,
     hook_session: Option<&str>,
     hook_window: Option<&str>,
-    hook_pane: Option<&str>,
+    snapshot_session: &str,
+    snapshot_window: &str,
+    snapshot_pane: &str,
+    snapshot_pane_pid: &str,
+    snapshot_panes: &str,
+    snapshot_clients: &str,
     hook_client: Option<&str>,
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
     config: &crate::config::Config,
 ) -> Result<()> {
-    use crate::pane_state::{SourceClientHint, ViewHookKind};
+    use crate::pane_state::ViewHookKind;
 
+    let deadline = Instant::now() + Duration::from_millis(500);
     if owner != crate::daemon::view_hooks::HOOK_OWNER
         || protocol != crate::daemon::view_hooks::HOOK_PROTOCOL
     {
@@ -259,51 +265,25 @@ pub(crate) fn run_view_hook_command(
         "client-detached" => ViewHookKind::ClientDetached,
         _ => bail!("InvalidRequest: unknown pane-state view hook kind {event_kind}"),
     };
-    let deadline = Instant::now() + Duration::from_millis(500);
     let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
     let server_hash = incarnation.hash.clone();
     let result = (|| -> Result<()> {
-        ensure_view_hook_deadline(deadline, "querying topology")?;
-        let topology_framing = crate::daemon::topology::QueryFraming::generate()?;
-        let topology_args = crate::daemon::topology::poll_query_args(&topology_framing);
-        let topology_refs = topology_args.iter().map(String::as_str).collect::<Vec<_>>();
-        let topology_output = runner.run(&topology_refs)?;
-        ensure_view_hook_deadline(deadline, "parsing topology")?;
-        let topology = crate::daemon::topology::parse_topology(
-            &topology_output,
-            &topology_framing,
-            &incarnation.identity,
-        )?;
-        let witness_token = crate::pane_state::EventId::generate()?.as_str().to_string();
-        let witness_args = crate::daemon::view_hooks::client_view_query_args(&witness_token);
-        let witness_refs = witness_args.iter().map(String::as_str).collect::<Vec<_>>();
-        let witness_output = runner.run(&witness_refs)?;
-        ensure_view_hook_deadline(deadline, "parsing client witnesses")?;
-        let witnesses = crate::daemon::view_hooks::parse_client_view_query(
-            &witness_output,
-            &witness_token,
-            &incarnation.identity,
-        )?;
-        let source_client = hook_client
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                value
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|pid| *pid > 0)
-                    .map(|client_pid| SourceClientHint { client_pid })
-                    .ok_or_else(|| anyhow::anyhow!("InvalidRequest: invalid hook client PID"))
-            })
-            .transpose()?;
-        let occurrence = foreground_occurrence(
+        ensure_view_hook_deadline(deadline, "resolving tmux server identity")?;
+        let snapshot = crate::daemon::view_hooks::parse_hook_view_snapshot(
             hook_kind,
-            hook_session.filter(|value| !value.is_empty()),
-            hook_window.filter(|value| !value.is_empty()),
-            hook_pane.filter(|value| !value.is_empty()),
-            source_client.as_ref(),
-            &topology,
-            &witnesses,
+            crate::daemon::view_hooks::HookViewSnapshotFrame {
+                hook_session: hook_session.unwrap_or_default(),
+                hook_window: hook_window.unwrap_or_default(),
+                session_id: snapshot_session,
+                window_id: snapshot_window,
+                pane_id: snapshot_pane,
+                pane_pid: snapshot_pane_pid,
+                panes: snapshot_panes,
+                clients: snapshot_clients,
+                hook_client: hook_client.unwrap_or_default(),
+            },
         )?;
+        ensure_view_hook_deadline(deadline, "parsing immutable hook snapshot")?;
         ensure_view_hook_deadline(deadline, "ensuring pane-state daemon")?;
         let (incarnation, socket) =
             crate::daemon::lifecycle::ensure_daemon_live_v2_for_incarnation_until(
@@ -321,9 +301,9 @@ pub(crate) fn run_view_hook_command(
             probe.daemon_instance_id().clone(),
             crate::pane_state::EventId::generate()?,
             hook_kind,
-            occurrence,
-            source_client,
-            witnesses,
+            snapshot.occurrence,
+            snapshot.source_client,
+            snapshot.witnesses,
             config.daemon.done_clear_on,
         )?;
         drop(probe);
@@ -347,70 +327,6 @@ fn ensure_view_hook_deadline(deadline: Instant, stage: &str) -> Result<()> {
         bail!("pane-state view hook deadline exceeded while {stage}");
     }
     Ok(())
-}
-
-fn foreground_occurrence(
-    kind: crate::pane_state::ViewHookKind,
-    hook_session: Option<&str>,
-    hook_window: Option<&str>,
-    hook_pane: Option<&str>,
-    source_client: Option<&crate::pane_state::SourceClientHint>,
-    topology: &crate::daemon::topology::TopologySnapshot,
-    witnesses: &[crate::pane_state::ClientWitness],
-) -> Result<Option<crate::pane_state::ViewOccurrence>> {
-    use crate::pane_state::{ViewHookKind, ViewOccurrence};
-    if kind == ViewHookKind::ClientDetached {
-        return Ok(None);
-    }
-    let witness = source_client.and_then(|source| {
-        witnesses
-            .iter()
-            .find(|value| value.client_pid == source.client_pid)
-    });
-    let window_id = hook_window
-        .or_else(|| witness.map(|value| value.window_id.as_str()))
-        .ok_or_else(|| anyhow::anyhow!("InvalidRequest: hook window is missing"))?;
-    let mut observed_panes = topology
-        .panes
-        .iter()
-        .filter(|pane| pane.window_id == window_id)
-        .map(|pane| pane.pane_instance.clone())
-        .collect::<Vec<_>>();
-    observed_panes.sort();
-    observed_panes.dedup();
-    let active_pane = hook_pane
-        .and_then(|pane_id| {
-            observed_panes
-                .iter()
-                .find(|pane| pane.pane_id == pane_id)
-                .cloned()
-        })
-        .or_else(|| witness.map(|value| value.active_pane.clone()))
-        .or_else(|| {
-            topology
-                .panes
-                .iter()
-                .find(|pane| pane.window_id == window_id && pane.active)
-                .map(|pane| pane.pane_instance.clone())
-        })
-        .ok_or_else(|| anyhow::anyhow!("InvalidRequest: hook active pane is missing"))?;
-    let session_id = hook_session
-        .or_else(|| witness.map(|value| value.session_id.as_str()))
-        .or_else(|| {
-            topology
-                .panes
-                .iter()
-                .find(|pane| pane.window_id == window_id)
-                .and_then(|pane| pane.session_links.first())
-                .map(|link| link.session_id.as_str())
-        })
-        .ok_or_else(|| anyhow::anyhow!("InvalidRequest: hook session is missing"))?;
-    Ok(Some(ViewOccurrence {
-        session_id: session_id.to_string(),
-        window_id: window_id.to_string(),
-        active_pane,
-        observed_panes,
-    }))
 }
 
 fn log_view_hook_failure(env: &BTreeMap<String, String>, server_hash: &str, message: &str) {

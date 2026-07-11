@@ -1,5 +1,8 @@
 use super::*;
 
+static SIDEBAR_SOCKET_COUNTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn spawn_sidebar_snapshot_server(
     sidebar: crate::daemon::SidebarFrame,
 ) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
@@ -8,10 +11,7 @@ fn spawn_sidebar_snapshot_server(
     let socket = std::env::temp_dir().join(format!(
         "vt2-cli-{}-{}.sock",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        SIDEBAR_SOCKET_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let handle = std::thread::spawn(move || {

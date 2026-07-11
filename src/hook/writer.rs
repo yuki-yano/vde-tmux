@@ -189,7 +189,9 @@ pub fn resolve_pane_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hook::{TaskItemStatus, TaskProgress};
+    use crate::hook::{
+        SubagentEntry, TaskItemStatus, TaskProgress, WorktreeActivity, WorktreeActivityKind,
+    };
     use crate::tmux::mock::MockTmuxRunner;
 
     fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -240,6 +242,10 @@ mod tests {
             vec![ProgressOperation::TaskCreated]
         );
         assert_eq!(
+            typed_progress_operations(ProgressEvent::TaskCompleted).unwrap(),
+            vec![ProgressOperation::TaskCompleted]
+        );
+        assert_eq!(
             typed_progress_operations(ProgressEvent::TaskItemCreated {
                 id: " task\n1 ".to_string(),
                 step: " implement\ttyped adapter ".to_string(),
@@ -249,6 +255,49 @@ mod tests {
                 id: "task 1".to_string(),
                 step: "implement typed adapter".to_string(),
             }]
+        );
+        assert_eq!(
+            typed_progress_operations(ProgressEvent::TaskItemUpdated {
+                id: " task\n1 ".to_string(),
+                status: TaskItemStatus::Completed,
+            })
+            .unwrap(),
+            vec![ProgressOperation::UpdateTaskItemStatus {
+                id: "task 1".to_string(),
+                status: CanonicalTaskItemStatus::Completed,
+            }]
+        );
+        assert_eq!(
+            typed_progress_operations(ProgressEvent::WorktreeActivity(WorktreeActivity {
+                kind: WorktreeActivityKind::VwExec,
+                name: " feature\nworktree ".to_string(),
+                path: " /tmp/feature\tworktree ".to_string(),
+                command: " cargo\ntest ".to_string(),
+                observed_at: 42,
+            }))
+            .unwrap(),
+            vec![ProgressOperation::SetWorktreeActivity(
+                CanonicalWorktreeActivity {
+                    kind: CanonicalWorktreeActivityKind::VwExec,
+                    name: "feature worktree".to_string(),
+                    path: "/tmp/feature worktree".to_string(),
+                    command: "cargo test".to_string(),
+                    observed_at: 42,
+                }
+            )]
+        );
+        assert_eq!(
+            typed_progress_operations(ProgressEvent::SubagentStart(SubagentEntry {
+                agent_id: " worker\n1 ".to_string(),
+                agent_type: " reviewer\t".to_string(),
+                display_name: Some(" Review\nAgent ".to_string()),
+            }))
+            .unwrap(),
+            vec![ProgressOperation::UpsertSubagent(SubagentState {
+                agent_id: "worker 1".to_string(),
+                agent_type: "reviewer".to_string(),
+                display_name: Some("Review Agent".to_string()),
+            })]
         );
         assert_eq!(
             typed_progress_operations(ProgressEvent::SubagentStop {

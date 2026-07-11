@@ -52,29 +52,44 @@ cargo install --git https://github.com/yuki-yano/vde-tmux vde-tmux
 `~/.tmux.conf` に次を書く。
 
 ```tmux
-set -g status-interval 1
+run-shell -b 'vt daemon ensure'
 set -g status-left-length 10000
-set -g status-left '#(vt statusline-category)#[fg=#8f8ba8] │ #[default]#(vt statusline-sessions --show-index)#[fg=#8f8ba8] │ #[default]#(vt statusline-windows)'
-set -g status-right '#(vt statusline-attention) #(vt statusline-summary)'
+set -g status-left '#{@vde_status_category}#[fg=#8f8ba8] │ #[default]#{@vde_status_sessions}#[fg=#8f8ba8] │ #[default]#{@vde_status_windows}'
+set -g status-right '#{@vde_status_attention} #{@vde_status_summary}'
+set -g pane-border-status bottom
+set -g pane-border-format '#{?#{@vde_status_pane},#{@vde_status_pane},#{pane_index} #{pane_current_command}}'
 setw -g window-status-format ''
 setw -g window-status-current-format ''
 set -g window-status-separator ''
 bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_range}'"
 ```
 
-- `statusline-category`：現在のカテゴリ（設定によっては他カテゴリも）
-- `statusline-sessions`：現在カテゴリのセッション一覧。各セッション名の前に agent 状態バッジが付く。`statusline.session_badge.mode: counts` では `▲ 2 ● 1 ○ 5` のように表示する
-- `statusline-windows`：現在 session の window 一覧。`statusline.windows` で整形する
-- `statusline-pane`：現在 pane の border label。`statusline.panes` で整形する
-- `statusline-summary`：全 agent の状態別カウント。例 `▲2 ●1`
-- `statusline-attention`：いま見えていない blocked agent の通知。例 `▲ session · perm 2m`
+- `@vde_status_category`：現在のカテゴリ（設定によっては他カテゴリも）
+- `@vde_status_sessions`：現在カテゴリのセッション一覧。各セッション名の前に agent 状態バッジが付く。`statusline.session_badge.mode: counts` では `▲ 2 ● 1 ○ 5` のように表示する
+- `@vde_status_windows`：現在 session の window 一覧。`statusline.windows` で整形する
+- `@vde_status_pane`：各 pane の border label。`statusline.panes` で整形する
+- `@vde_status_summary`：全 agent の状態別カウント。例 `▲2 ●1`
+- `@vde_status_attention`：いま見えていない blocked agent の通知。例 `▲ session · perm 2m`
 
 `statusline.sessions.badge_style: chip` を使うと、各 session セグメントの前に接続された chip として session badge を表示する。category/window の badge は `statusline.category.agent_badge` / `statusline.windows.agent_badge` で状態の集計方法を設定し、`statusline.category.badge_style` / `statusline.windows.badge_style` で見た目を設定する。inline 系の表示位置は `{badge}` placeholder で指定する。chip の色と左右 cap は `statusline.session_badge.chip` で設定する。
 
-`status-left-length` には十分大きい値を指定し、左セグメント側の人工的な長さ制限を外す。実際の表示上限は端末幅である。`statusline-windows` は tmux native の window list を置き換えるため、併用時は native の `window-status-*` format を空にする。
+`status-left-length` には十分大きい値を指定し、左セグメント側の人工的な長さ制限を外す。
+実際の表示上限は端末幅である。
+`@vde_status_windows` は tmux native の window list を置き換えるため、併用時は native の `window-status-*` format を空にする。
 
-表示への反映はおおむね `daemon.poll_ms + status-interval`（デフォルトで約 2 秒）以内に行われる。
-agent 状態を収集するバックグラウンドの daemon は自動起動するため、自分で起動する必要はない（手動制御用に `vt daemon` / `vt daemon stop` もある）。
+daemon は表示文字列を描画し、tmux option へ push する。
+tmux は status line の描画時に format 変数だけを展開するため、定期描画による process 起動は発生しない。
+pane の fallback は daemon が `@vde_status_pane` を初期化する前だけ使われ、初期化後は non-agent pane も daemon が描画する。
+
+category、session、window、attention の値は session scope である。
+tmux は各 client の attach 先 session に対して値を展開するため、別 session を表示する client は client 固有の `#()` job なしで別の context を受け取る。
+
+`run-shell -b 'vt daemon ensure'` は、OS 再起動後を含む新しい tmux server の cold start 経路である。
+config を reload して再実行しても二重起動しない。
+手動制御には `vt daemon`、`vt daemon stop`、`vt daemon restart` を使える。
+
+表示に関わる vde-tmux 設定を変更した場合は `vt daemon restart` が必要になる。
+tmux config の reload だけでは format 参照は変わっても、daemon の描画値は再構築されない。
 
 ### 2. エージェントを接続する
 
@@ -163,7 +178,9 @@ hook がなくても pane の実行コマンドからエージェントは検出
 }
 ```
 
-`notify = ["vt", "hook", "codex"]` は legacy turn-complete notification だけを報告するため、task / subagent / worktree activity の detail rows には不十分である。
+legacy の `notify = ["vt", "hook", "codex"]` 設定は削除する。
+legacy の `agent-turn-complete` 経路は未対応であり、`UnsupportedLegacyNotify` を返す。
+上記の `Stop` hook だけが Codex の完了を報告する経路である。
 `PostToolUse` hook により、vde-tmux は `update_plan` snapshot から collapsed の `done/total` counter と expanded task rows を表示し、認識できる `vw exec` Bash command を prompt 下の一時的な `vw exec <worktree_name>` row として表示する。
 `SubagentStart` / `SubagentStop` からは expanded の `Agent - ... #id` rows を表示する。
 Codex subagent は session metadata を解決できる場合、`Agent - Fermat #019f` のように Codex nickname を優先し、取れない場合は hook の `agent_type` を表示する。
@@ -173,8 +190,24 @@ detail row の色は `sidebar.colors` の `task_done`、`task_working`、`task_p
 **その他のエージェント**：汎用の低レベルコマンドで任意のエージェントから状態を報告できる。
 
 ```bash
-vt hook emit --agent myagent --status running --prompt "fix the build"
+vt hook emit --agent myagent --session-id run-42 \
+  --status running --prompt "fix the build" --prompt-source user
 ```
+
+すべての generic report で `--agent` と空でない安定した `--session-id` が必須になる。
+一つの agent session では同じ session ID を使い、agent session が切り替わったら新しい ID を使う。
+
+- `--status` は `running`、`waiting`、`idle`、`error` のいずれかを受け取る
+- `--prompt TEXT` には `--prompt-source SOURCE` が必要であり、prompt を消す場合は `--clear-prompt` を使う
+- `--status waiting` には `--wait-reason permission_prompt` または `--wait-reason 'other:TEXT'` が必要になる
+- `--started-at` は `--status running`、`--completed-at` と `--attention` は `--status idle` の場合だけ使える
+- `--tasks DONE/TOTAL` は task 進捗を置換し、たとえば `--tasks 2/5` と指定する
+  削除には `--clear-tasks` を使う
+- `--subagents 'ID:TYPE|ID:TYPE'` は subagent 集合を置換し、たとえば `--subagents 'worker-1:reviewer|worker-2:tester'` と指定する
+  削除には `--clear-subagents` を使う
+
+同じ field の Set と Clear は同時に指定できない。
+lifecycle も field 変更もない report は無視される。
 
 ### 3. サイドバーを開く
 
@@ -202,6 +235,26 @@ bind-key g run-shell "vt project selector --popup"
 | `○` | Idle | 作業なし、または確認済み |
 
 グリフと色は `badge.glyphs` と `badge.colors` で変更できる。
+
+### canonical pane state と acknowledgment
+
+daemon は pane lifecycle state の唯一の writer である。
+agent lifecycle、session identity、run/completion/acknowledgment sequence、prompt、task、subagent、worktree activity を pane scope の JSON option `@vde_pane_state` にまとめて保存する。
+status line と sidebar は同じ daemon snapshot の解決結果を使い、`@vde_status_pane` などの表示 option を状態として読み返さない。
+
+`Done` badge は、最新の完了 run が未確認であることを表す。
+acknowledgment は永続化され、すべての client で共有する pane-global state になる。
+eligible な通常 tmux client のどれか一つが必要な scope を表示すると、daemon は acknowledged sequence を進める。
+その pane または window から離れても `Idle` は `Done` に戻らず、次の run が完了したときだけ新しい `Done` になる。
+
+`daemon.done_clear_on` は acknowledgment の scope を選ぶ。
+
+- `pane` は active になった pane だけを確認済みにする
+- `window` は window を表示した時点で、その window に存在した agent pane を確認済みにする
+
+次の poll より短い focus 移動は、owned view hook が健全で、eligible な通常 client が表示を witness し、hook が 500 ms 以内に受理応答を得て、適用まで daemon が生存し、永続化に成功した場合に保証される。
+初回 hook install 前、hook collision 中、hook health が `Degraded` の間、daemon crash 後、response 喪失または deadline 超過時は best effort になる。
+定常 reconciliation は表示が続いている pane を確認済みにできるが、すでに終了した表示 occurrence は復元しない。
 
 ## サイドバー
 
@@ -330,7 +383,56 @@ notify:
 
 `path_patterns` とセッション名の `patterns` では `${ENV_VAR}` 展開が使える。
 
-`daemon.done_clear_on` は `Done` badge を確認済みにする条件を制御する。`window` は対象 pane を含む window を表示した時点で解除し、`pane` は対象 pane 自体に focus するまで保持する。
+`daemon.done_clear_on` は `Done` badge を確認済みにする条件を制御する。
+`window` は対象 pane を含む window を表示した時点で解除し、`pane` は対象 pane 自体に focus するまで保持する。
+
+### pane-state daemon と owned hook
+
+daemon は起動時に tmux hook index `70` の状態管理 hook 5 種類を install して検証し、canonical pane state を hydrate し、現在の view を reconcile し、すべての表示 option を初期化してから `Serving` へ進む。
+daemon phase と hook health は別の状態である。
+`Serving + Degraded` でも pane event、query、subscribe、poll reconciliation、status 出力は継続するが、上記の短時間 focus 保証は hook が再び健全になるまで外れる。
+
+`vt daemon stop` と daemon crash は owned hook を残す。
+残った hook は次の daemon が起動するまでの event を配送できる。
+owned な index `70` entry を削除するのは次の明示 command だけであり、foreign command は削除せずエラーにする。
+
+```bash
+vt pane-state hooks uninstall
+```
+
+pane state の保守は daemon 経由の command を使い、`@vde_pane_state` を直接 unset しない。
+
+```bash
+vt pane-state reset --target %42       # current state または quarantine state を reset tombstone へ置換
+vt pane-state cleanup-legacy --all     # 固定された legacy state 19 keys だけを削除
+```
+
+cleanup は daemon 起動時に自動実行されない。
+category、project path、sidebar marker、canonical な `@vde_pane_state`、表示用の `@vde_status_*` option は保持する。
+
+### legacy pane state からの移行
+
+この移行には互換期間がない。
+最初に専用 socket と一時 config を持つ scratch tmux server で手順を検証し、常用 tmux server を scratch 検証先にしない。
+cleanup は自動で戻せないため、常用 server の cutover は別の運用判断として扱う。
+
+常用 server を cutover する前に、対象 tmux socket、停止する daemon、再起動する agent session、固定された legacy key cleanup の影響を記録し、その対象への明示承認を得る。
+
+承認された対象 server ごとに、次の順で実行する。
+
+1. 旧 daemon を停止する。
+2. 新しい binary で daemon を起動し、protocol v2 と owned hook の post-verify を確認する。
+3. すべての `#(vt statusline-*)` と pane border command を上記の `#{@vde_status_*}` format 参照へ置き換え、`run-shell -b 'vt daemon ensure'` を追加して tmux config を reload する。
+4. Codex の legacy `notify` 設定を削除し、`Stop` hook だけを完了経路として残し、すべての agent session を再起動して新しい adapter から event を送る。
+5. controlled agent event を 1 件送り、pane option と daemon cache の full state version が一致し、daemon phase が `Serving` であることを確認する。
+6. 二つの通常 client を別 session へ attach し、session ごとの status context、badge、counts、pane border、sidebar が同じ canonical state と一致することを確認する。
+7. 手順 1 から 6 までが成功した場合だけ `vt pane-state cleanup-legacy --all` を実行する。
+8. すべての表示面を再確認し、legacy state option に依存していないことを確認する。
+   破棄が必要な state には `vt pane-state reset --target <pane-id>` を明示的に使う。
+
+controlled event または two-client 検証に失敗した場合は cleanup を実行せず、partial cutover として停止して報告する。
+cleanup の削除が一件でも失敗した場合も停止し、partial cutover として扱う。
+cleanup 後の自動 rollback はなく、旧 binary へ戻すには旧 hook の復元と agent session の再起動が必要になる。
 
 ### 推奨の status line 配色
 
@@ -395,12 +497,17 @@ statusline:
 
 ```tmux
 # ~/.tmux.conf
+run-shell -b 'vt daemon ensure'
 set -ga terminal-overrides ',*:Tc'
 set -g status-style 'bg=#1a1926,fg=#9591ad'
 set -g status-left-length 10000
+set -g status-left '#{@vde_status_category}#[fg=#8f8ba8] │ #[default]#{@vde_status_sessions}#[fg=#8f8ba8] │ #[default]#{@vde_status_windows}'
+set -g status-right '#{@vde_status_attention} #{@vde_status_summary}'
 setw -g window-status-format ''
 setw -g window-status-current-format ''
 set -g window-status-separator ''
+set -g pane-border-status bottom
+set -g pane-border-format '#{?#{@vde_status_pane},#{@vde_status_pane},#{pane_index} #{pane_current_command}}'
 bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_range}'"
 ```
 
@@ -410,11 +517,14 @@ hex 指定の色を使うには tmux の truecolor 設定（上記の `terminal-
 
 - 設定：`~/.config/vde/tmux/config.yml`
 - state：`$XDG_STATE_HOME/vde/tmux/state.json`（未設定なら `~/.local/state/vde/tmux/state.json`）
-- daemon socket：`$VDE_DAEMON_SOCKET` があればそれを使い、次に `$XDG_RUNTIME_DIR/vde-tmux/daemon.sock`、最後に `/tmp/vde-tmux-<uid>/daemon.sock`
+- daemon socket：canonical tmux socket path、server PID、server start time で namespace された `/tmp/vt-<uid>/v2/<tmux-incarnation-hash>.sock`
 
 ## 既知の制約
 
-- エージェント検出は hook が書いた状態を優先する。hook がない場合は pane の実行コマンド（`claude`、`codex`、`opencode`）から補完し、blocked の判定は表示中の pane 内容から許可プロンプトを認識できる範囲に限られる。
+- エージェント検出は agent hook が報告した event を優先する。agent hook がない場合は pane の実行コマンド（`claude`、`codex`、`opencode`）から補完し、blocked の判定は表示中の pane 内容から許可プロンプトを認識できる範囲に限られる。
+- daemon が crash すると、最後に push した status 値が残り、tmux は crash を即時検知しない。
+  次の agent hook または view hook が daemon を起動して表示を回復する。
+  該当 event がない場合は `vt daemon ensure` または `vt daemon restart` で明示的に回復する。
 - サイドバー preview を `Esc` で閉じる動作は `less` の `LESSKEYIN` 対応に依存する。古い `less` では `q` で閉じる必要がある。
 
 ## License

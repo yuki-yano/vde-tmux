@@ -609,6 +609,62 @@ mod tests {
     }
 
     #[test]
+    fn generic_typed_event_maps_task_and_subagent_field_updates() {
+        let envelope = generic_typed_event(
+            GenericEmitInput {
+                agent: "custom".to_string(),
+                session_id: "session".to_string(),
+                tasks: Some(CanonicalTaskProgress { done: 2, total: 3 }),
+                subagents: Some(vec![SubagentState {
+                    agent_id: " worker\n1 ".to_string(),
+                    agent_type: " reviewer\t".to_string(),
+                    display_name: Some(" Review\nAgent ".to_string()),
+                }]),
+                ..GenericEmitInput::default()
+            },
+            &typed_context(),
+        )
+        .unwrap()
+        .unwrap();
+        let PaneEvent::ExplicitStateReported { report } = envelope.event else {
+            panic!("expected explicit state report");
+        };
+        assert_eq!(
+            report.tasks,
+            Some(FieldUpdate::Set(CanonicalTaskProgress {
+                done: 2,
+                total: 3,
+            }))
+        );
+        assert_eq!(
+            report.subagents,
+            Some(FieldUpdate::Set(vec![SubagentState {
+                agent_id: "worker 1".to_string(),
+                agent_type: "reviewer".to_string(),
+                display_name: Some("Review Agent".to_string()),
+            }]))
+        );
+
+        let envelope = generic_typed_event(
+            GenericEmitInput {
+                agent: "custom".to_string(),
+                session_id: "session".to_string(),
+                clear_tasks: true,
+                clear_subagents: true,
+                ..GenericEmitInput::default()
+            },
+            &typed_context(),
+        )
+        .unwrap()
+        .unwrap();
+        let PaneEvent::ExplicitStateReported { report } = envelope.event else {
+            panic!("expected explicit state report");
+        };
+        assert_eq!(report.tasks, Some(FieldUpdate::Clear));
+        assert_eq!(report.subagents, Some(FieldUpdate::Clear));
+    }
+
+    #[test]
     fn semantic_empty_generic_report_skips_identity_validation() {
         let event = generic_typed_event(GenericEmitInput::default(), &typed_context()).unwrap();
         assert!(event.is_none());

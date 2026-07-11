@@ -70,7 +70,9 @@ impl V2Client {
     ) -> Result<Self> {
         let mut writer = connect_unix_with_deadline(socket, deadline)
             .with_context(|| format!("failed to connect to daemon socket {}", socket.display()))?;
-        let reader_stream = writer.try_clone()?;
+        let reader_stream = writer
+            .try_clone()
+            .context("failed to clone daemon socket for response reads")?;
         let mut reader = BufReader::new(reader_stream);
         write_client_message(
             &mut writer,
@@ -78,8 +80,10 @@ impl V2Client {
                 proto: PROTOCOL_VERSION,
             },
             deadline,
-        )?;
-        let response = read_server_message(&mut reader, deadline)?;
+        )
+        .context("failed to write v2 Hello frame")?;
+        let response = read_server_message(&mut reader, deadline)
+            .context("failed to read v2 HelloAck frame")?;
         let ServerMessage::HelloAck {
             proto,
             daemon_instance_id,
@@ -141,12 +145,12 @@ impl V2Client {
         write_client_message(&mut self.writer, message, self.deadline).map_err(|error| {
             V2RequestError {
                 stage: V2RequestFailureStage::BeforeFullWrite,
-                message: error.to_string(),
+                message: format!("failed to write v2 request frame: {error:#}"),
             }
         })?;
         read_server_message(&mut self.reader, self.deadline).map_err(|error| V2RequestError {
             stage: V2RequestFailureStage::AfterFullWrite,
-            message: error.to_string(),
+            message: format!("failed to read v2 response frame: {error:#}"),
         })
     }
 
@@ -219,6 +223,15 @@ fn connect_unix_with_deadline(socket: &Path, deadline: Instant) -> io::Result<Un
         ));
     }
     address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    // SAFETY: sun_path has been capacity-checked, both regions are valid, and they do not overlap.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path.as_ptr(),
+            address.sun_path.as_mut_ptr().cast::<u8>(),
+            path.len(),
+        );
+    }
+    let address_len = unix_socket_address_len(path.len());
     #[cfg(any(
         target_os = "aix",
         target_os = "dragonfly",
@@ -234,22 +247,19 @@ fn connect_unix_with_deadline(socket: &Path, deadline: Instant) -> io::Result<Un
         target_os = "watchos"
     ))]
     {
-        address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
-    }
-    // SAFETY: sun_path has been capacity-checked, both regions are valid, and they do not overlap.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            path.as_ptr(),
-            address.sun_path.as_mut_ptr().cast::<u8>(),
-            path.len(),
-        );
+        address.sun_len = u8::try_from(address_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "daemon socket address length exceeds platform limit",
+            )
+        })?;
     }
     // SAFETY: address points to an initialized sockaddr_un with a valid length.
     let connect_result = unsafe {
         libc::connect(
             fd.as_raw_fd(),
             (&raw const address).cast::<libc::sockaddr>(),
-            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            address_len as libc::socklen_t,
         )
     };
     if connect_result < 0 {
@@ -269,59 +279,113 @@ fn connect_unix_with_deadline(socket: &Path, deadline: Instant) -> io::Result<Un
     Ok(unsafe { UnixStream::from_raw_fd(fd.into_raw_fd()) })
 }
 
+fn unix_socket_address_len(path_len: usize) -> usize {
+    let path_offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    #[cfg(any(
+        target_os = "aix",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "hurd",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    ))]
+    {
+        path_offset + path_len
+    }
+    #[cfg(not(any(
+        target_os = "aix",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "hurd",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )))]
+    {
+        path_offset + path_len + 1
+    }
+}
+
 fn wait_for_unix_connect(fd: &OwnedFd, deadline: Instant) -> io::Result<()> {
+    wait_for_unix_event(
+        fd.as_raw_fd(),
+        libc::POLLOUT,
+        deadline,
+        "daemon connect deadline exceeded",
+    )?;
+    let mut socket_error: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: socket_error and length are valid output buffers for SO_ERROR.
+    if unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&raw mut socket_error).cast(),
+            &raw mut length,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if socket_error == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(socket_error))
+    }
+}
+
+pub(crate) fn wait_for_unix_readable(stream: &UnixStream, deadline: Instant) -> io::Result<()> {
+    wait_for_unix_event(
+        stream.as_raw_fd(),
+        libc::POLLIN,
+        deadline,
+        "daemon response read deadline exceeded",
+    )
+}
+
+fn wait_for_unix_event(
+    fd: libc::c_int,
+    events: libc::c_short,
+    deadline: Instant,
+    timeout_message: &'static str,
+) -> io::Result<()> {
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "daemon connect deadline exceeded",
-            ));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, timeout_message));
         };
         let timeout_ms = remaining
             .as_millis()
             .saturating_add(1)
             .min(i32::MAX as u128) as i32;
         let mut poll_fd = libc::pollfd {
-            fd: fd.as_raw_fd(),
-            events: libc::POLLOUT,
+            fd,
+            events,
             revents: 0,
         };
         // SAFETY: poll_fd points to one initialized pollfd for the duration of the call.
         let result = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_ms) };
         if result == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "daemon connect deadline exceeded",
-            ));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, timeout_message));
         }
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
+        if result > 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
-
-        let mut socket_error: libc::c_int = 0;
-        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: socket_error and length are valid output buffers for SO_ERROR.
-        if unsafe {
-            libc::getsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                (&raw mut socket_error).cast(),
-                &raw mut length,
-            )
-        } < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        return if socket_error == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::from_raw_os_error(socket_error))
-        };
     }
 }
 
@@ -343,7 +407,9 @@ fn write_client_message(
         }
         // Darwin rejects an all-zero timeval. A positive sub-millisecond Duration can round down
         // to that representation, so use the same 1 ms socket-timeout quantum as v2 clients.
-        writer.set_write_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+        writer
+            .set_write_timeout(Some(remaining.max(Duration::from_millis(1))))
+            .context("failed to set daemon request write timeout")?;
         match writer.write(&frame[written..]) {
             Ok(0) => bail!("daemon closed the connection while reading the request"),
             Ok(count) => written += count,
@@ -371,10 +437,8 @@ fn read_server_message(
         if remaining.is_zero() {
             bail!("daemon response read deadline exceeded");
         }
-        // Darwin rejects an all-zero timeval after rounding very small positive durations.
-        reader
-            .get_ref()
-            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+        wait_for_unix_readable(reader.get_ref(), deadline)
+            .context("failed to wait for daemon response readability")?;
         let chunk = match reader.fill_buf() {
             Ok(chunk) => chunk,
             Err(error)
@@ -1079,6 +1143,74 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn unix_connect_uses_pathname_sockaddr_length_for_repeated_connections() {
+        const CONNECTIONS: usize = 128;
+        let event_id = EventId::generate().unwrap();
+        let root = Path::new("/tmp").join(format!(
+            "v2c-{}-{}",
+            std::process::id(),
+            &event_id.as_str()[..8]
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let acceptor = std::thread::spawn(move || {
+            for _ in 0..CONNECTIONS {
+                let (stream, _) = listener.accept().unwrap();
+                drop(stream);
+            }
+        });
+
+        for _ in 0..CONNECTIONS {
+            let stream =
+                connect_unix_with_deadline(&socket, Instant::now() + Duration::from_secs(1))
+                    .unwrap();
+            drop(stream);
+        }
+        acceptor.join().unwrap();
+
+        let path_len = socket.as_os_str().as_bytes().len();
+        assert!(unix_socket_address_len(path_len) < std::mem::size_of::<libc::sockaddr_un>());
+        #[cfg(any(
+            target_os = "aix",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "haiku",
+            target_os = "hurd",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        ))]
+        assert_eq!(
+            unix_socket_address_len(path_len),
+            std::mem::offset_of!(libc::sockaddr_un, sun_path) + path_len
+        );
+        #[cfg(not(any(
+            target_os = "aix",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "haiku",
+            target_os = "hurd",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )))]
+        assert_eq!(
+            unix_socket_address_len(path_len),
+            std::mem::offset_of!(libc::sockaddr_un, sun_path) + path_len + 1
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

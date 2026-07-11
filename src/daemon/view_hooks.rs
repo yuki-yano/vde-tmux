@@ -26,6 +26,14 @@ pub const VIEW_HOOK_MAX_ATTEMPTS: u8 = 3;
 pub const FRESH_VISIBILITY_TIMEOUT: Duration = Duration::from_millis(250);
 pub const MAX_CLIENT_WITNESSES: usize = 64;
 
+const HOOK_PANE_FIELD: &str = "__vde_hook_pane_field_v2__";
+const HOOK_PANE_ROW: &str = "__vde_hook_pane_row_v2__";
+const HOOK_CLIENT_FIELD: &str = "__vde_hook_client_field_v2__";
+const HOOK_CLIENT_ROW: &str = "__vde_hook_client_row_v2__";
+const MAX_HOOK_PANE_FRAME_BYTES: usize = 64 * 1024;
+const MAX_HOOK_CLIENT_FRAME_BYTES: usize = 64 * 1024;
+const MAX_HOOK_CLIENT_FLAGS_BYTES: usize = 256;
+
 const HOOKS: [(ViewHookKind, &str); 5] = [
     (ViewHookKind::WindowPaneChanged, "window-pane-changed"),
     (ViewHookKind::SessionWindowChanged, "session-window-changed"),
@@ -103,17 +111,296 @@ pub fn indexed_hook_name(kind: ViewHookKind) -> String {
 }
 
 pub fn install_command(kind: ViewHookKind) -> String {
-    let name = hook_kind_arg(kind);
-    format!(
-        "run-shell 'vt hooks pane-state-view {name} --owner {HOOK_OWNER} --protocol {HOOK_PROTOCOL} --hook-session=#{{hook_session}} --hook-window=#{{hook_window}} --hook-pane=#{{hook_pane}} --hook-client=#{{client_pid}}'"
-    )
+    verified_command(kind)
 }
 
 pub fn verified_command(kind: ViewHookKind) -> String {
     let name = hook_kind_arg(kind);
+    let panes = hook_pane_loop_format();
+    let clients = hook_client_loop_format();
     format!(
-        "run-shell \"vt hooks pane-state-view {name} --owner {HOOK_OWNER} --protocol {HOOK_PROTOCOL} --hook-session=#{{hook_session}} --hook-window=#{{hook_window}} --hook-pane=#{{hook_pane}} --hook-client=#{{client_pid}}\""
+        "run-shell \"vt hooks pane-state-view {name} --owner {HOOK_OWNER} --protocol {HOOK_PROTOCOL} --hook-session='#{{hook_session}}' --hook-window='#{{hook_window}}' --snapshot-session='#{{session_id}}' --snapshot-window='#{{window_id}}' --snapshot-pane='#{{pane_id}}' --snapshot-pane-pid='#{{pane_pid}}' --snapshot-panes='{panes}' --snapshot-clients='{clients}' --hook-client='#{{client_pid}}'\""
     )
+}
+
+fn hook_pane_loop_format() -> String {
+    let row = format!("#{{pane_id}}{HOOK_PANE_FIELD}#{{pane_pid}}{HOOK_PANE_ROW}");
+    format!("#{{P:{row},{row}}}")
+}
+
+fn hook_client_loop_format() -> String {
+    let row = format!(
+        "#{{client_pid}}{HOOK_CLIENT_FIELD}#{{session_id}}{HOOK_CLIENT_FIELD}#{{window_id}}{HOOK_CLIENT_FIELD}#{{pane_id}}{HOOK_CLIENT_FIELD}#{{pane_pid}}{HOOK_CLIENT_FIELD}#{{client_control_mode}}{HOOK_CLIENT_FIELD}#{{client_flags}}{HOOK_CLIENT_ROW}"
+    );
+    let session_matches_client = "#{==:#{client_session},#{session_name}}";
+    let selected_session = format!("#{{?{session_matches_client},{row},}}");
+    let session_join = format!("#{{S:{selected_session}}}");
+    format!("#{{L:{session_join}}}")
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HookViewSnapshotFrame<'a> {
+    pub hook_session: &'a str,
+    pub hook_window: &'a str,
+    pub session_id: &'a str,
+    pub window_id: &'a str,
+    pub pane_id: &'a str,
+    pub pane_pid: &'a str,
+    pub panes: &'a str,
+    pub clients: &'a str,
+    pub hook_client: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedHookViewSnapshot {
+    pub occurrence: Option<ViewOccurrence>,
+    pub source_client: Option<SourceClientHint>,
+    pub witnesses: Vec<ClientWitness>,
+}
+
+pub fn parse_hook_view_snapshot(
+    kind: ViewHookKind,
+    frame: HookViewSnapshotFrame<'_>,
+) -> Result<ParsedHookViewSnapshot, ViewError> {
+    if frame.panes.len() > MAX_HOOK_PANE_FRAME_BYTES
+        || frame.clients.len() > MAX_HOOK_CLIENT_FRAME_BYTES
+    {
+        return Err(ViewError::InvalidEvent(
+            "hook snapshot frame exceeds byte limit".to_string(),
+        ));
+    }
+    let source_client = parse_source_client(frame.hook_client)?;
+    if matches!(
+        kind,
+        ViewHookKind::ClientSessionChanged
+            | ViewHookKind::ClientAttached
+            | ViewHookKind::ClientDetached
+    ) && source_client.is_none()
+    {
+        return Err(ViewError::InvalidEvent(
+            "view hook source client is missing".to_string(),
+        ));
+    }
+
+    let witnesses = parse_hook_client_rows(frame.clients)?;
+    let panes = parse_hook_pane_rows(frame.panes)?;
+    if kind == ViewHookKind::ClientDetached {
+        return Ok(ParsedHookViewSnapshot {
+            occurrence: None,
+            source_client,
+            witnesses,
+        });
+    }
+
+    let active_pane = PaneInstance {
+        pane_id: frame.pane_id.to_string(),
+        pane_pid: parse_positive_pid(frame.pane_pid, "snapshot pane PID")?,
+    };
+    active_pane
+        .validate()
+        .map_err(|error| ViewError::InvalidEvent(error.to_string()))?;
+    let (session_id, window_id) = occurrence_context(kind, frame)?;
+    let occurrence = ViewOccurrence {
+        session_id,
+        window_id,
+        active_pane,
+        observed_panes: panes,
+    };
+    validate_occurrence(&occurrence)?;
+    validate_window_view(&occurrence.active_pane, &occurrence.observed_panes)?;
+    validate_witness_membership(&occurrence, &witnesses)?;
+    Ok(ParsedHookViewSnapshot {
+        occurrence: Some(occurrence),
+        source_client,
+        witnesses,
+    })
+}
+
+fn occurrence_context(
+    kind: ViewHookKind,
+    frame: HookViewSnapshotFrame<'_>,
+) -> Result<(String, String), ViewError> {
+    let (session_id, window_id) = match kind {
+        ViewHookKind::WindowPaneChanged => {
+            require_matching_context(frame.window_id, frame.hook_window, "hook window")?;
+            (frame.session_id, frame.hook_window)
+        }
+        ViewHookKind::SessionWindowChanged => {
+            require_matching_context(frame.session_id, frame.hook_session, "hook session")?;
+            (frame.hook_session, frame.window_id)
+        }
+        ViewHookKind::ClientSessionChanged | ViewHookKind::ClientAttached => {
+            (frame.session_id, frame.window_id)
+        }
+        ViewHookKind::ClientDetached => unreachable!("detached hooks have no occurrence"),
+    };
+    validate_tmux_id(session_id, '$', "snapshot session")?;
+    validate_tmux_id(window_id, '@', "snapshot window")?;
+    Ok((session_id.to_string(), window_id.to_string()))
+}
+
+fn require_matching_context(direct: &str, hook: &str, field: &str) -> Result<(), ViewError> {
+    if direct.is_empty() || hook.is_empty() || direct != hook {
+        return Err(ViewError::InvalidEvent(format!(
+            "{field} does not match direct snapshot context"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_source_client(raw: &str) -> Result<Option<SourceClientHint>, ViewError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SourceClientHint {
+        client_pid: parse_positive_pid(raw, "hook client PID")?,
+    }))
+}
+
+fn parse_hook_pane_rows(raw: &str) -> Result<Vec<PaneInstance>, ViewError> {
+    let rows = parse_hook_rows(
+        raw,
+        HOOK_PANE_ROW,
+        crate::pane_state::MAX_VIEW_PANES,
+        "panes",
+    )?;
+    let mut panes = Vec::with_capacity(rows.len());
+    let mut pane_ids = BTreeSet::new();
+    let mut pane_pids = BTreeSet::new();
+    for row in rows {
+        let fields = row.split(HOOK_PANE_FIELD).collect::<Vec<_>>();
+        if fields.len() != 2 {
+            return Err(ViewError::InvalidEvent(
+                "hook pane row has an invalid field count".to_string(),
+            ));
+        }
+        let pane = PaneInstance {
+            pane_id: fields[0].to_string(),
+            pane_pid: parse_positive_pid(fields[1], "hook pane PID")?,
+        };
+        pane.validate()
+            .map_err(|error| ViewError::InvalidEvent(error.to_string()))?;
+        if !pane_ids.insert(pane.pane_id.clone()) || !pane_pids.insert(pane.pane_pid) {
+            return Err(ViewError::InvalidEvent(
+                "duplicate pane in hook snapshot".to_string(),
+            ));
+        }
+        panes.push(pane);
+    }
+    Ok(panes)
+}
+
+fn parse_hook_client_rows(raw: &str) -> Result<Vec<ClientWitness>, ViewError> {
+    let rows = parse_hook_rows(raw, HOOK_CLIENT_ROW, MAX_CLIENT_WITNESSES, "clients")?;
+    let mut witnesses = Vec::with_capacity(rows.len());
+    for row in rows {
+        let fields = row.split(HOOK_CLIENT_FIELD).collect::<Vec<_>>();
+        if fields.len() != 7 {
+            return Err(ViewError::InvalidEvent(
+                "hook client row has an invalid field count".to_string(),
+            ));
+        }
+        validate_tmux_id(fields[1], '$', "hook client session")?;
+        validate_tmux_id(fields[2], '@', "hook client window")?;
+        let active_pane = PaneInstance {
+            pane_id: fields[3].to_string(),
+            pane_pid: parse_positive_pid(fields[4], "hook client pane PID")?,
+        };
+        active_pane
+            .validate()
+            .map_err(|error| ViewError::InvalidEvent(error.to_string()))?;
+        let control_mode = match fields[5] {
+            "0" => false,
+            "1" => true,
+            _ => {
+                return Err(ViewError::InvalidEvent(
+                    "invalid hook client control mode".to_string(),
+                ));
+            }
+        };
+        let flags = parse_hook_client_flags(fields[6])?;
+        witnesses.push(ClientWitness {
+            client_pid: parse_positive_pid(fields[0], "hook client PID")?,
+            session_id: fields[1].to_string(),
+            window_id: fields[2].to_string(),
+            active_pane,
+            control_mode,
+            active_pane_flag: flags.contains("active-pane"),
+        });
+    }
+    validate_witnesses(&witnesses)?;
+    Ok(witnesses)
+}
+
+fn parse_hook_client_flags(raw: &str) -> Result<BTreeSet<&str>, ViewError> {
+    if raw.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    if raw.len() > MAX_HOOK_CLIENT_FLAGS_BYTES {
+        return Err(ViewError::InvalidEvent(
+            "hook client flags exceed byte limit".to_string(),
+        ));
+    }
+    let mut flags = BTreeSet::new();
+    for flag in raw.split(',') {
+        let plain = !flag.is_empty()
+            && flag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+        let pause_after = flag.strip_prefix("pause-after=").is_some_and(|seconds| {
+            !seconds.is_empty() && seconds.bytes().all(|byte| byte.is_ascii_digit())
+        });
+        if (!plain && !pause_after) || !flags.insert(flag) {
+            return Err(ViewError::InvalidEvent(
+                "invalid hook client flags".to_string(),
+            ));
+        }
+    }
+    Ok(flags)
+}
+
+fn parse_hook_rows<'a>(
+    mut raw: &'a str,
+    separator: &str,
+    maximum: usize,
+    label: &str,
+) -> Result<Vec<&'a str>, ViewError> {
+    let mut rows = Vec::new();
+    while !raw.is_empty() {
+        let Some(index) = raw.find(separator) else {
+            return Err(ViewError::InvalidEvent(format!(
+                "unterminated hook {label} row"
+            )));
+        };
+        if rows.len() == maximum {
+            return Err(ViewError::InvalidEvent(format!("too many hook {label}")));
+        }
+        rows.push(&raw[..index]);
+        raw = &raw[index + separator.len()..];
+    }
+    Ok(rows)
+}
+
+fn parse_positive_pid(raw: &str, field: &str) -> Result<u32, ViewError> {
+    raw.parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| ViewError::InvalidEvent(format!("invalid {field}")))
+}
+
+fn validate_witness_membership(
+    occurrence: &ViewOccurrence,
+    witnesses: &[ClientWitness],
+) -> Result<(), ViewError> {
+    if witnesses.iter().any(|witness| {
+        witness.window_id == occurrence.window_id
+            && !occurrence.observed_panes.contains(&witness.active_pane)
+    }) {
+        return Err(ViewError::InvalidEvent(
+            "hook client pane is not a member of the declared window".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn hook_query_args() -> Vec<String> {
@@ -1419,6 +1706,48 @@ mod tests {
         }
     }
 
+    fn hook_pane_rows(panes: &[PaneInstance]) -> String {
+        panes
+            .iter()
+            .map(|pane| {
+                format!(
+                    "{}{HOOK_PANE_FIELD}{}{HOOK_PANE_ROW}",
+                    pane.pane_id, pane.pane_pid
+                )
+            })
+            .collect()
+    }
+
+    fn hook_client_row(
+        client_pid: u32,
+        session_id: &str,
+        window_id: &str,
+        active_pane: &PaneInstance,
+        control_mode: bool,
+        flags: &str,
+    ) -> String {
+        format!(
+            "{client_pid}{HOOK_CLIENT_FIELD}{session_id}{HOOK_CLIENT_FIELD}{window_id}{HOOK_CLIENT_FIELD}{}{HOOK_CLIENT_FIELD}{}{HOOK_CLIENT_FIELD}{}{HOOK_CLIENT_FIELD}{flags}{HOOK_CLIENT_ROW}",
+            active_pane.pane_id,
+            active_pane.pane_pid,
+            u8::from(control_mode),
+        )
+    }
+
+    fn hook_snapshot_frame<'a>(panes: &'a str, clients: &'a str) -> HookViewSnapshotFrame<'a> {
+        HookViewSnapshotFrame {
+            hook_session: "",
+            hook_window: "@2",
+            session_id: "$1",
+            window_id: "@2",
+            pane_id: "%1",
+            pane_pid: "101",
+            panes,
+            clients,
+            hook_client: "10",
+        }
+    }
+
     fn state(pane_instance: PaneInstance, completed: u64, acknowledged: u64) -> PaneState {
         PaneState {
             schema_version: PANE_STATE_SCHEMA_VERSION,
@@ -1474,6 +1803,200 @@ mod tests {
         let error = install_hooks(&mock, &hook_identity()).unwrap_err();
         assert!(matches!(error, HookError::Collision { .. }));
         assert_eq!(mock.calls().len(), 1);
+    }
+
+    #[test]
+    fn installed_hook_freezes_direct_context_and_joins_client_sessions() {
+        let command = install_command(ViewHookKind::WindowPaneChanged);
+        let pane_row = format!("#{{pane_id}}{HOOK_PANE_FIELD}#{{pane_pid}}{HOOK_PANE_ROW}");
+        let client_row = format!(
+            "#{{client_pid}}{HOOK_CLIENT_FIELD}#{{session_id}}{HOOK_CLIENT_FIELD}#{{window_id}}{HOOK_CLIENT_FIELD}#{{pane_id}}{HOOK_CLIENT_FIELD}#{{pane_pid}}{HOOK_CLIENT_FIELD}#{{client_control_mode}}{HOOK_CLIENT_FIELD}#{{client_flags}}{HOOK_CLIENT_ROW}"
+        );
+        let session_matches_client = "#{==:#{client_session},#{session_name}}";
+        let selected_session = format!("#{{?{session_matches_client},{client_row},}}");
+        let session_join = format!("#{{S:{selected_session}}}");
+
+        assert_eq!(command, verified_command(ViewHookKind::WindowPaneChanged));
+        assert!(command.contains(&format!("#{{P:{pane_row},{pane_row}}}")));
+        assert!(command.contains(&format!("#{{L:{session_join}}}")));
+        assert!(command.contains("--snapshot-session='#{session_id}'"));
+        assert!(command.contains("--snapshot-pane='#{pane_id}'"));
+        assert!(command.contains("--snapshot-pane-pid='#{pane_pid}'"));
+        assert!(!command.contains("#{hook_pane}"));
+        assert!(!command.contains("--hook-pane="));
+    }
+
+    #[test]
+    fn hook_snapshot_preserves_rapid_focus_occurrence_and_linked_clients() {
+        let entered = pane("%1", 101);
+        let other = pane("%2", 202);
+        let pane_rows = hook_pane_rows(&[entered.clone(), other]);
+        let client_rows = [
+            hook_client_row(
+                10,
+                "$1",
+                "@2",
+                &entered,
+                false,
+                "attached,focused,UTF-8,pause-after=30,read-only",
+            ),
+            hook_client_row(20, "$9", "@2", &entered, true, "attached,control-mode"),
+            hook_client_row(30, "$9", "@2", &entered, false, "active-pane,attached"),
+        ]
+        .concat();
+
+        let parsed = parse_hook_view_snapshot(
+            ViewHookKind::WindowPaneChanged,
+            HookViewSnapshotFrame {
+                hook_session: "",
+                hook_window: "@2",
+                session_id: "$1",
+                window_id: "@2",
+                pane_id: "%1",
+                pane_pid: "101",
+                panes: &pane_rows,
+                clients: &client_rows,
+                hook_client: "10",
+            },
+        )
+        .unwrap();
+
+        let occurrence = parsed.occurrence.unwrap();
+        assert_eq!(occurrence.session_id, "$1");
+        assert_eq!(occurrence.window_id, "@2");
+        assert_eq!(occurrence.active_pane, entered);
+        assert_eq!(occurrence.observed_panes.len(), 2);
+        assert_eq!(parsed.witnesses[1].session_id, "$9");
+        assert!(parsed.witnesses[0].is_eligible());
+        assert!(!parsed.witnesses[1].is_eligible());
+        assert!(!parsed.witnesses[2].is_eligible());
+    }
+
+    #[test]
+    fn unmatched_unattached_client_does_not_invalidate_valid_witness() {
+        let active = pane("%1", 101);
+        let pane_rows = hook_pane_rows(std::slice::from_ref(&active));
+        // The outer L loop also contains one unattached control client. Its empty
+        // client_session matches no S row, so the nested conditional emits no frame row.
+        let attached_row =
+            hook_client_row(10, "$1", "@2", &active, false, "attached,focused,UTF-8");
+        let parsed = parse_hook_view_snapshot(
+            ViewHookKind::WindowPaneChanged,
+            HookViewSnapshotFrame {
+                hook_session: "",
+                hook_window: "@2",
+                session_id: "$1",
+                window_id: "@2",
+                pane_id: "%1",
+                pane_pid: "101",
+                panes: &pane_rows,
+                clients: &attached_row,
+                hook_client: "10",
+            },
+        )
+        .unwrap();
+        assert_eq!(parsed.witnesses.len(), 1);
+        assert!(parsed.witnesses[0].is_eligible());
+
+        let built = build_foreground_view_event(
+            DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            EventId::parse("102132435465768798a9bacbdcedfe0f").unwrap(),
+            ViewHookKind::WindowPaneChanged,
+            parsed.occurrence,
+            parsed.source_client,
+            parsed.witnesses,
+            DoneClearOn::Pane,
+        )
+        .unwrap();
+        assert!(!built.unverified_occurrence);
+    }
+
+    #[test]
+    fn detached_hook_accepts_clientless_snapshot_without_occurrence() {
+        let parsed = parse_hook_view_snapshot(
+            ViewHookKind::ClientDetached,
+            HookViewSnapshotFrame {
+                hook_session: "",
+                hook_window: "",
+                session_id: "",
+                window_id: "",
+                pane_id: "",
+                pane_pid: "",
+                panes: "",
+                clients: "",
+                hook_client: "44",
+            },
+        )
+        .unwrap();
+
+        assert!(parsed.occurrence.is_none());
+        assert!(parsed.witnesses.is_empty());
+        assert_eq!(parsed.source_client.unwrap().client_pid, 44);
+    }
+
+    #[test]
+    fn hook_snapshot_rejects_malformed_duplicate_membership_and_limits() {
+        let active = pane("%1", 101);
+        let valid_panes = hook_pane_rows(std::slice::from_ref(&active));
+        let malformed = format!("%1{HOOK_PANE_FIELD}101");
+        assert!(
+            parse_hook_view_snapshot(
+                ViewHookKind::WindowPaneChanged,
+                hook_snapshot_frame(&malformed, ""),
+            )
+            .is_err()
+        );
+
+        let duplicate = hook_pane_rows(&[active.clone(), active.clone()]);
+        assert!(
+            parse_hook_view_snapshot(
+                ViewHookKind::WindowPaneChanged,
+                hook_snapshot_frame(&duplicate, ""),
+            )
+            .is_err()
+        );
+
+        let missing = pane("%9", 909);
+        let unknown_client = hook_client_row(10, "$1", "@2", &missing, false, "read-only");
+        assert!(
+            parse_hook_view_snapshot(
+                ViewHookKind::WindowPaneChanged,
+                hook_snapshot_frame(&valid_panes, &unknown_client),
+            )
+            .is_err()
+        );
+
+        let too_many_panes = (1..=crate::pane_state::MAX_VIEW_PANES + 1)
+            .map(|index| pane(&format!("%{index}"), index as u32))
+            .collect::<Vec<_>>();
+        let too_many_panes = hook_pane_rows(&too_many_panes);
+        assert!(
+            parse_hook_view_snapshot(
+                ViewHookKind::WindowPaneChanged,
+                hook_snapshot_frame(&too_many_panes, ""),
+            )
+            .is_err()
+        );
+
+        let too_many_clients = (1..=MAX_CLIENT_WITNESSES + 1)
+            .map(|index| hook_client_row(index as u32, "$1", "@2", &active, false, "read-only"))
+            .collect::<String>();
+        assert!(
+            parse_hook_view_snapshot(
+                ViewHookKind::WindowPaneChanged,
+                hook_snapshot_frame(&valid_panes, &too_many_clients),
+            )
+            .is_err()
+        );
+
+        let oversized = "x".repeat(MAX_HOOK_PANE_FRAME_BYTES + 1);
+        assert!(
+            parse_hook_view_snapshot(
+                ViewHookKind::WindowPaneChanged,
+                hook_snapshot_frame(&oversized, ""),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1974,6 +2497,114 @@ mod tests {
             };
             assert_eq!(state.acknowledged_seq, state.completed_seq);
         }
+    }
+
+    #[test]
+    fn window_occurrence_never_acknowledges_pane_added_after_snapshot() {
+        let daemon = DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap();
+        let first = pane("%1", 11);
+        let second = pane("%2", 22);
+        let added_later = pane("%3", 33);
+        let mut runtime = crate::pane_state::CanonicalStateRuntime::default();
+        let mut io = MemoryStoreIo;
+        let mut clock = MemoryClock;
+        for pane_instance in [&first, &second, &added_later] {
+            for event in [
+                crate::pane_state::PaneEvent::BeginRun {
+                    started_at: 1,
+                    prompt: None,
+                },
+                crate::pane_state::PaneEvent::CompleteRun { completed_at: 2 },
+            ] {
+                runtime
+                    .apply_event(
+                        &mut io,
+                        &mut clock,
+                        &crate::pane_state::PaneEventEnvelope {
+                            daemon_instance_id: daemon.clone(),
+                            event_id: EventId::generate().unwrap(),
+                            pane_instance: pane_instance.clone(),
+                            agent: Some(AgentKind::parse("codex").unwrap()),
+                            agent_session_id: Some(
+                                crate::pane_state::AgentSessionId::parse("session").unwrap(),
+                            ),
+                            event,
+                        },
+                        &VisibilitySnapshot::default(),
+                        DoneClearOn::Window,
+                    )
+                    .unwrap();
+            }
+        }
+        let records = [&first, &second, &added_later]
+            .into_iter()
+            .map(|pane_instance| {
+                (
+                    pane_instance.clone(),
+                    runtime.record(pane_instance).unwrap().clone(),
+                )
+            })
+            .collect();
+        let witness = ClientWitness {
+            client_pid: 10,
+            session_id: "$1".to_string(),
+            window_id: "@1".to_string(),
+            active_pane: first.clone(),
+            control_mode: false,
+            active_pane_flag: false,
+        };
+        let immutable = event(
+            ViewOccurrence {
+                session_id: "$1".to_string(),
+                window_id: "@1".to_string(),
+                active_pane: first.clone(),
+                observed_panes: vec![first.clone(), second.clone()],
+            },
+            vec![witness],
+        );
+        let processed = process_view_event(
+            &mut ViewRegistry::default(),
+            &immutable,
+            ScopedViewRefresh::Window {
+                window_id: "@1".to_string(),
+                active_pane: added_later.clone(),
+                observed_panes: vec![first.clone(), second.clone(), added_later.clone()],
+            },
+            DoneClearOn::Window,
+            &records,
+        )
+        .unwrap();
+        assert_eq!(
+            processed
+                .acknowledgements
+                .iter()
+                .map(|envelope| envelope.pane_instance.clone())
+                .collect::<Vec<_>>(),
+            vec![first.clone(), second.clone()]
+        );
+
+        let crate::pane_state::ViewBatchProgress::Complete(result) = runtime
+            .apply_view_acknowledgement_batch(
+                &mut io,
+                &mut clock,
+                &processed.acknowledgements,
+                DoneClearOn::Window,
+            )
+        else {
+            panic!("expected completed immutable window batch");
+        };
+        assert_eq!(result.committed, 2);
+        for pane_instance in [&first, &second] {
+            let StoredPaneRecord::Active(state) = runtime.record(pane_instance).unwrap() else {
+                unreachable!();
+            };
+            assert_eq!(state.acknowledged_seq, state.completed_seq);
+        }
+        let StoredPaneRecord::Active(later_state) = runtime.record(&added_later).unwrap() else {
+            unreachable!();
+        };
+        assert_eq!(later_state.completed_seq, 1);
+        assert_eq!(later_state.acknowledged_seq, 0);
     }
 
     #[test]

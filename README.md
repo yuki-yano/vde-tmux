@@ -50,31 +50,36 @@ The examples below use `vt`.
 In `~/.tmux.conf`:
 
 ```tmux
-set -g status-interval 1
+run-shell -b 'vt daemon ensure'
 set -g status-left-length 10000
-set -g status-left '#(vt statusline-category)#[fg=#8f8ba8] │ #[default]#(vt statusline-sessions --show-index)#[fg=#8f8ba8] │ #[default]#(vt statusline-windows)'
-set -g status-right '#(vt statusline-attention) #(vt statusline-summary)'
+set -g status-left '#{@vde_status_category}#[fg=#8f8ba8] │ #[default]#{@vde_status_sessions}#[fg=#8f8ba8] │ #[default]#{@vde_status_windows}'
+set -g status-right '#{@vde_status_attention} #{@vde_status_summary}'
 set -g pane-border-status bottom
-set -g pane-border-format '#(vt statusline-pane --target #{pane_id})'
+set -g pane-border-format '#{?#{@vde_status_pane},#{@vde_status_pane},#{pane_index} #{pane_current_command}}'
 setw -g window-status-format ''
 setw -g window-status-current-format ''
 set -g window-status-separator ''
 bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_range}'"
 ```
 
-- `statusline-category` — the current category (and the other categories, depending on config)
-- `statusline-sessions` — sessions in the current category, each prefixed with an agent state badge. Set `statusline.session_badge.mode: counts` to show counts such as `▲ 2 ● 1 ○ 5`
-- `statusline-windows` — windows in the current session, formatted by `statusline.windows`
-- `statusline-pane` — the current pane border label, formatted by `statusline.panes`
-- `statusline-summary` — state counts across all agents, e.g. `▲2 ●1`
-- `statusline-attention` — blocked agents you cannot currently see, e.g. `▲ session · perm 2m`
+- `@vde_status_category` — the current category (and the other categories, depending on config)
+- `@vde_status_sessions` — sessions in the current category, each prefixed with an agent state badge. Set `statusline.session_badge.mode: counts` to show counts such as `▲ 2 ● 1 ○ 5`
+- `@vde_status_windows` — windows in the current session, formatted by `statusline.windows`
+- `@vde_status_pane` — each pane border label, formatted by `statusline.panes`
+- `@vde_status_summary` — state counts across all agents, e.g. `▲2 ●1`
+- `@vde_status_attention` — blocked agents you cannot currently see, e.g. `▲ session · perm 2m`
 
 Use `statusline.sessions.badge_style: chip` to render session badges as a connected chip before each session segment. Category and window badges use `statusline.category.agent_badge` / `statusline.windows.agent_badge` for state selection, `statusline.category.badge_style` / `statusline.windows.badge_style` for placement, and the `{badge}` placeholder for inline styles. The chip color and cap glyphs are configured under `statusline.session_badge.chip`.
 
-Set `status-left-length` to a large value to remove the artificial left segment cap; the terminal width remains the real display limit. `statusline-windows` replaces tmux's native window list, so the native `window-status-*` formats should be empty when using it.
+Set `status-left-length` to a large value to remove the artificial left segment cap; the terminal width remains the real display limit. `@vde_status_windows` replaces tmux's native window list, so the native `window-status-*` formats should be empty when using it.
 
-Status updates appear within roughly `daemon.poll_ms + status-interval` (about 2 seconds with the defaults).
-The background daemon that collects agent state is started automatically; you never need to launch it yourself (`vt daemon` / `vt daemon stop` / `vt daemon restart` exist for manual control).
+The daemon renders these values and pushes them into tmux options. tmux expands only format variables while drawing the status line, so periodic drawing does not start a process. The pane fallback is used only before the daemon has initialized `@vde_status_pane`; the daemon also renders non-agent panes after initialization.
+
+Category, session, window, and attention values are session-scoped. tmux expands them against the session each client is attached to, so clients viewing different sessions receive different context without a client-specific `#()` job.
+
+`run-shell -b 'vt daemon ensure'` is the cold-start path for a newly created tmux server, including the first start after an OS restart. It is idempotent when the config is reloaded. `vt daemon`, `vt daemon stop`, and `vt daemon restart` remain available for manual control.
+
+Changes to vde-tmux settings that affect rendered status content require `vt daemon restart`; reloading tmux configuration alone changes the format references but does not rebuild the daemon's rendered values.
 
 ### 2. Hook up your agents
 
@@ -163,7 +168,7 @@ The `PostToolUse` hook lets vde-tmux read Claude Code task tool events (`TaskCre
 }
 ```
 
-`notify = ["vt", "hook", "codex"]` only reports legacy turn-complete notifications; by itself it is not enough for task, subagent, or worktree activity detail rows.
+Remove the legacy `notify = ["vt", "hook", "codex"]` setting. The legacy `agent-turn-complete` route is unsupported and returns `UnsupportedLegacyNotify`; the `Stop` hook above is the only supported Codex completion route.
 The `PostToolUse` hooks let vde-tmux read `update_plan` snapshots for the collapsed `done/total` counter and expanded task rows, and detect recognized `vw exec` Bash commands as a temporary `vw exec <worktree_name>` row under the prompt.
 `SubagentStart` and `SubagentStop` add expanded `Agent - ... #id` rows.
 For Codex subagents, vde-tmux resolves the session metadata when possible and prefers the Codex nickname, such as `Agent - Fermat #019f`; otherwise it shows the hook `agent_type`.
@@ -173,8 +178,20 @@ Detail colors can be overridden under `sidebar.colors` with `task_done`, `task_w
 **Other agents** — anything can report its state through the generic low-level command:
 
 ```bash
-vt hook emit --agent myagent --status running --prompt "fix the build"
+vt hook emit --agent myagent --session-id run-42 \
+  --status running --prompt "fix the build" --prompt-source user
 ```
+
+`--agent` and a stable, non-empty `--session-id` are required on every generic report. Reuse that session ID for one agent session and choose a new one when the agent session changes.
+
+- `--status` accepts `running`, `waiting`, `idle`, or `error`.
+- `--prompt TEXT` requires `--prompt-source SOURCE`; use `--clear-prompt` instead of setting and clearing a prompt in the same report.
+- `--status waiting` requires `--wait-reason permission_prompt` or `--wait-reason 'other:TEXT'`.
+- `--started-at` is valid only with `--status running`; `--completed-at` and `--attention` are valid only with `--status idle`.
+- `--tasks DONE/TOTAL` replaces task progress, for example `--tasks 2/5`; `--clear-tasks` clears it.
+- `--subagents 'ID:TYPE|ID:TYPE'` replaces the subagent set, for example `--subagents 'worker-1:reviewer|worker-2:tester'`; `--clear-subagents` clears it.
+
+Set and clear forms for the same field are mutually exclusive. A report with no lifecycle or field change is ignored.
 
 ### 3. Open the sidebar
 
@@ -202,6 +219,19 @@ bind-key g run-shell "vt project selector --popup"
 | `○` | Idle | Nothing to do, or already acknowledged |
 
 Glyphs and colors are configurable via `badge.glyphs` and `badge.colors`.
+
+### Canonical pane state and acknowledgment
+
+The daemon is the only writer of pane lifecycle state. It stores the agent lifecycle, session identity, run/completion/acknowledgment sequences, prompt, tasks, subagents, and worktree activity together in the pane-scoped `@vde_pane_state` JSON option. The status line and sidebar consume the same resolved daemon snapshot; display options such as `@vde_status_pane` are output only and are never read back as state.
+
+A `Done` badge means that the latest completed run has not been acknowledged. Acknowledgment is persistent and pane-global: when one eligible regular tmux client views the required scope, the daemon advances the acknowledged sequence. Leaving that pane or window cannot turn `Idle` back into `Done`, and only a later run completion can create a new `Done`.
+
+`daemon.done_clear_on` selects the required scope:
+
+- `pane` acknowledges only the pane that becomes active.
+- `window` acknowledges all agent panes that were present in the window when it was viewed.
+
+Short focus changes that complete before the next poll are guaranteed when the owned view hooks are healthy, an eligible regular client witnesses the view, the hook receives an acceptance response within 500 ms, the daemon remains alive until application, and persistence succeeds. Before initial hook installation, during a hook collision or `Degraded` hook health, after a daemon crash, or after a response/deadline failure, recovery is best effort. The periodic reconciliation can acknowledge a pane that is still visible, but it cannot recreate a view that already ended.
 
 ## Sidebar
 
@@ -332,6 +362,44 @@ notify:
 
 `daemon.done_clear_on` controls when a `Done` badge is acknowledged. `window` clears it when the containing window is viewed; `pane` keeps it until that pane itself is focused.
 
+### Pane-state daemon and owned hooks
+
+During startup the daemon installs and verifies five state-management hooks at tmux hook index `70`, hydrates canonical pane state, reconciles current views, initializes all display options, and then enters `Serving`. The phase and hook health are independent. `Serving + Degraded` still accepts pane events and serves queries, subscriptions, polling reconciliation, and status output, but the short-focus guarantee above is suspended until all owned hooks verify as healthy again.
+
+`vt daemon stop` and daemon crashes deliberately leave the owned hooks installed so they can deliver startup events to the next daemon. Only the explicit command below removes owned index `70` entries; it refuses to remove foreign commands.
+
+```bash
+vt pane-state hooks uninstall
+```
+
+Use daemon-mediated maintenance commands for pane state. Do not unset `@vde_pane_state` directly.
+
+```bash
+vt pane-state reset --target %42       # replace current or quarantined state with a reset tombstone
+vt pane-state cleanup-legacy --all     # remove only the fixed legacy 19 state keys
+```
+
+Cleanup is never run automatically at daemon startup. It preserves category, project-path, sidebar-marker, canonical `@vde_pane_state`, and display `@vde_status_*` options.
+
+### Migration from legacy pane state
+
+This migration has no compatibility period. Rehearse it first on a scratch tmux server with a dedicated socket and temporary configuration; do not point the rehearsal at a regular tmux server. A regular server cutover is a separate operational decision because cleanup is not automatically reversible.
+
+Before a regular-server cutover, record the exact tmux socket, the daemon that will be stopped, the agent sessions that will be restarted, and the fixed legacy-key cleanup impact, then obtain explicit approval for that target.
+
+Use this order for each approved target server:
+
+1. Stop the old daemon.
+2. Start the new binary and verify protocol v2 plus owned-hook post-verification.
+3. Replace every `#(vt statusline-*)` and pane-border command with the `#{@vde_status_*}` format references shown above, add `run-shell -b 'vt daemon ensure'`, and reload the tmux configuration.
+4. Remove Codex's legacy `notify` setting, keep the `Stop` hook as the only completion route, and restart all agent sessions so they emit events through the new adapters.
+5. Send one controlled agent event and verify that the pane option and daemon cache have the same full state version and that the daemon phase is `Serving`.
+6. Attach two regular clients to different sessions and verify the session-specific status context, badge, counts, pane borders, and sidebar against the same canonical state.
+7. Only after steps 1–6 succeed, run `vt pane-state cleanup-legacy --all`.
+8. Recheck every display surface and confirm that no legacy state option is required. Use `vt pane-state reset --target <pane-id>` explicitly for a state that must be discarded.
+
+If the controlled event or two-client verification fails, do not run cleanup; stop and report a partial cutover. If any cleanup removal fails, also stop and treat the server as partially cut over. There is no automatic rollback after cleanup; returning to the old binary requires restoring its hooks and restarting agent sessions.
+
 ### Recommended status line colors
 
 A truecolor preset that keeps state glyphs readable on the bar and uses fills only for the current element:
@@ -412,14 +480,17 @@ statusline:
 
 ```tmux
 # ~/.tmux.conf
+run-shell -b 'vt daemon ensure'
 set -ga terminal-overrides ',*:Tc'
 set -g status-style 'bg=#1a1926,fg=#9591ad'
 set -g status-left-length 10000
+set -g status-left '#{@vde_status_category}#[fg=#8f8ba8] │ #[default]#{@vde_status_sessions}#[fg=#8f8ba8] │ #[default]#{@vde_status_windows}'
+set -g status-right '#{@vde_status_attention} #{@vde_status_summary}'
 setw -g window-status-format ''
 setw -g window-status-current-format ''
 set -g window-status-separator ''
 set -g pane-border-status bottom
-set -g pane-border-format '#(vt statusline-pane --target #{pane_id})'
+set -g pane-border-format '#{?#{@vde_status_pane},#{@vde_status_pane},#{pane_index} #{pane_current_command}}'
 bind-key -n MouseDown1Status run-shell "vt statusline-click '#{mouse_status_range}'"
 ```
 
@@ -431,11 +502,12 @@ Hex colors require tmux truecolor support (the `terminal-overrides` line above).
 
 - Config: `~/.config/vde/tmux/config.yml`
 - State: `$XDG_STATE_HOME/vde/tmux/state.json` (falls back to `~/.local/state/vde/tmux/state.json`)
-- Daemon socket: `$VDE_DAEMON_SOCKET` if set, else `$XDG_RUNTIME_DIR/vde-tmux/daemon.sock`, else `/tmp/vde-tmux-<uid>/daemon.sock`
+- Daemon socket: `/tmp/vt-<uid>/v2/<tmux-incarnation-hash>.sock`, namespaced by the canonical tmux socket path, server PID, and server start time
 
 ## Known limitations
 
-- Agent detection prefers hook-provided state; without hooks it falls back to the pane's running command (`claude`, `codex`, `opencode`) and can mark a pane as blocked only when a permission prompt is recognizable in the visible pane content.
+- Agent detection prefers hook-reported events; without agent hooks it falls back to the pane's running command (`claude`, `codex`, `opencode`) and can mark a pane as blocked only when a permission prompt is recognizable in the visible pane content.
+- If the daemon crashes, the last pushed status values remain frozen; tmux does not immediately detect the crash. The next agent hook or view hook starts a new daemon and refreshes the display. Use `vt daemon ensure` or `vt daemon restart` for explicit recovery when no such event occurs.
 - Closing the sidebar preview with `Esc` relies on `less` supporting `LESSKEYIN`; very old `less` versions may need `q` instead.
 
 ## License

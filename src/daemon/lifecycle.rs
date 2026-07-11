@@ -730,6 +730,58 @@ mod tests {
     }
 
     #[test]
+    fn distinct_server_incarnations_use_independent_socket_and_writer_lease_namespaces() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-independent-incarnations-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let first_hash = "1".repeat(64);
+        let second_hash = "2".repeat(64);
+        let first_socket =
+            crate::daemon::daemon_socket_path_for_incarnation(&BTreeMap::new(), None, &first_hash);
+        let second_socket =
+            crate::daemon::daemon_socket_path_for_incarnation(&BTreeMap::new(), None, &second_hash);
+        let first_namespace = crate::daemon::writer_lease_namespace(&first_hash);
+        let second_namespace = crate::daemon::writer_lease_namespace(&second_hash);
+        let first_test_namespace = root.join(
+            first_namespace
+                .strip_prefix("/")
+                .expect("runtime namespace is absolute"),
+        );
+        let second_test_namespace = root.join(
+            second_namespace
+                .strip_prefix("/")
+                .expect("runtime namespace is absolute"),
+        );
+        std::fs::create_dir_all(first_test_namespace.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second_test_namespace.parent().unwrap()).unwrap();
+
+        assert_ne!(first_socket, second_socket);
+        assert_ne!(first_namespace, second_namespace);
+        let first = super::try_acquire_writer_lease(&first_test_namespace)
+            .unwrap()
+            .expect("first server acquires its writer lease");
+        let second = super::try_acquire_writer_lease(&second_test_namespace)
+            .unwrap()
+            .expect("second server acquires an independent writer lease");
+        assert!(
+            super::try_acquire_writer_lease(&first_test_namespace)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            super::try_acquire_writer_lease(&second_test_namespace)
+                .unwrap()
+                .is_none()
+        );
+
+        drop((first, second));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn ensure_secure_socket_dir_creates_private_directory() {
         let dir = unique_dir("sec");
 

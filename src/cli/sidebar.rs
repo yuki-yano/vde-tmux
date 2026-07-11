@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 
 use crate::config::SidebarWidth;
@@ -93,11 +93,14 @@ where
 {
     match command {
         SidebarCommand::Attach { once } => {
-            let (server_identity, socket) = ensure_daemon(runner, env)?;
-            crate::sidebar::layout::attach(runner, env)?;
+            let (server_identity, socket) = ensure_daemon(runner, env)
+                .context("failed to ensure the pane-state daemon for sidebar attach")?;
+            crate::sidebar::layout::attach(runner, env)
+                .context("failed to mark the sidebar pane")?;
             try_seed_sidebar_selection_from_env(env, &socket, &server_identity);
             if once {
                 return crate::sidebar::once::render_once(&socket, &server_identity, config)
+                    .context("failed to query the one-shot sidebar snapshot")
                     .map(Some);
             }
             crate::sidebar::tui::run_live_tui(env, config, &socket, &server_identity)

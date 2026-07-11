@@ -167,6 +167,9 @@ fn reduce_explicit(
     })?;
 
     let was_reset = matches!(current, Some(StoredPaneRecord::Reset(_)));
+    if was_reset && is_completion(&envelope.event) {
+        return Ok(Reduction::unchanged(current));
+    }
     let mut state = match current {
         Some(StoredPaneRecord::Active(state)) => state.clone(),
         Some(StoredPaneRecord::Reset(_)) | None => {
@@ -174,9 +177,6 @@ fn reduce_explicit(
             else {
                 return Ok(Reduction::unchanged(current));
             };
-            if was_reset && is_completion(&envelope.event) {
-                return Ok(Reduction::unchanged(current));
-            }
             apply_initial_explicit_event(&mut state, &envelope.event, context.visibility)?;
             let completed_outside_capture = state.completed_seq > 0;
             let mut tracker = reset_tracker_for_state(context.tracker, &state)?;
@@ -1144,6 +1144,7 @@ mod tests {
     use crate::pane_state::resolve_badge;
 
     const STATE_ID: &str = "00112233445566778899aabbccddeeff";
+    const OTHER_STATE_ID: &str = "112233445566778899aabbccddeeff00";
     const EVENT_ID: &str = "102132435465768798a9bacbdcedfe0f";
     const DAEMON_ID: &str = "ffeeddccbbaa99887766554433221100";
 
@@ -1163,6 +1164,20 @@ mod tests {
             agent_session_id: Some(AgentSessionId::parse("session-1").unwrap()),
             event,
         }
+    }
+
+    fn explicit_envelope(agent: &str, session: &str, event: PaneEvent) -> PaneEventEnvelope {
+        let mut envelope = envelope(event);
+        envelope.agent = Some(AgentKind::parse(agent).unwrap());
+        envelope.agent_session_id = Some(AgentSessionId::parse(session).unwrap());
+        envelope
+    }
+
+    fn observation_envelope(event: PaneEvent) -> PaneEventEnvelope {
+        let mut envelope = envelope(event);
+        envelope.agent = None;
+        envelope.agent_session_id = None;
+        envelope
     }
 
     fn context<'a>(
@@ -1197,6 +1212,20 @@ mod tests {
         .unwrap()
     }
 
+    fn reduce_explicit_once(
+        current: Option<&StoredPaneRecord>,
+        agent: &str,
+        session: &str,
+        event: PaneEvent,
+        tracker: &CaptureTrackerSnapshot,
+    ) -> Result<Reduction, ReduceError> {
+        reduce(
+            current,
+            &explicit_envelope(agent, session, event),
+            context(tracker, &VisibilitySnapshot::default()),
+        )
+    }
+
     fn begin(current: Option<&StoredPaneRecord>, tracker: &CaptureTrackerSnapshot) -> Reduction {
         reduce_once(
             current,
@@ -1206,6 +1235,983 @@ mod tests {
             },
             tracker,
         )
+    }
+
+    fn progress(current: &Reduction, operations: Vec<ProgressOperation>) -> Reduction {
+        reduce_once(
+            current.record.as_ref(),
+            PaneEvent::ProgressUpdated {
+                observed_at: 20,
+                operations,
+            },
+            &current.tracker_delta.as_ref().unwrap().next,
+        )
+    }
+
+    fn reset_record() -> StoredPaneRecord {
+        StoredPaneRecord::Reset(ResetTombstone {
+            schema_version: PANE_STATE_SCHEMA_VERSION,
+            tombstone_id: ResetTombstoneId::parse(OTHER_STATE_ID).unwrap(),
+            pane_instance: pane(),
+            reset_at: 1,
+        })
+    }
+
+    fn observe(
+        current: Option<&StoredPaneRecord>,
+        tracker: &CaptureTrackerSnapshot,
+        presence: AgentPresenceObservation,
+        capture: Option<CaptureObservation>,
+        observed_at: i64,
+    ) -> Reduction {
+        let event = PaneEvent::ObservationBatch {
+            base: current.map(StoredPaneRecord::descriptor),
+            tracker_generation: tracker.generation,
+            observed_at,
+            presence,
+            capture,
+        };
+        reduce(
+            current,
+            &observation_envelope(event),
+            context(tracker, &VisibilitySnapshot::default()),
+        )
+        .unwrap()
+    }
+
+    fn discover(agent: &str) -> Reduction {
+        observe(
+            None,
+            &CaptureTrackerSnapshot::default(),
+            AgentPresenceObservation::Present(AgentKind::parse(agent).unwrap()),
+            None,
+            1,
+        )
+    }
+
+    fn report(lifecycle: Option<ReportedLifecycle>) -> PaneEvent {
+        PaneEvent::ExplicitStateReported {
+            report: ExplicitStateReport {
+                observed_at: 1,
+                lifecycle,
+                started_at: None,
+                completed_at: None,
+                prompt: None,
+                tasks: None,
+                subagents: None,
+                attention: false,
+            },
+        }
+    }
+
+    #[test]
+    fn initial_event_matrix_matches_missing_and_reset_rules() {
+        let mut completing_report = match report(Some(ReportedLifecycle::Idle)) {
+            PaneEvent::ExplicitStateReported { report } => report,
+            _ => unreachable!(),
+        };
+        completing_report.completed_at = Some(9);
+        let creating_events = vec![
+            (
+                "session",
+                PaneEvent::AgentSessionStarted {
+                    observed_at: 1,
+                    source: AgentSessionSource::Startup,
+                    resumed_prompt: None,
+                },
+                "idle",
+                0,
+            ),
+            (
+                "begin",
+                PaneEvent::BeginRun {
+                    started_at: 2,
+                    prompt: None,
+                },
+                "running",
+                0,
+            ),
+            (
+                "activity",
+                PaneEvent::ActivityObserved { observed_at: 3 },
+                "running",
+                0,
+            ),
+            (
+                "wait",
+                PaneEvent::WaitRequested {
+                    observed_at: 4,
+                    reason: WaitReason::PermissionPrompt,
+                },
+                "waiting",
+                0,
+            ),
+            (
+                "fail",
+                PaneEvent::FailRun {
+                    observed_at: 5,
+                    reason: Some("failed".to_string()),
+                },
+                "error",
+                0,
+            ),
+            (
+                "running report",
+                report(Some(ReportedLifecycle::Running)),
+                "running",
+                0,
+            ),
+            (
+                "waiting report",
+                report(Some(ReportedLifecycle::Waiting {
+                    reason: WaitReason::PermissionPrompt,
+                })),
+                "waiting",
+                0,
+            ),
+            (
+                "error report",
+                report(Some(ReportedLifecycle::Error { reason: None })),
+                "error",
+                0,
+            ),
+            (
+                "completion",
+                PaneEvent::CompleteRun { completed_at: 8 },
+                "idle",
+                1,
+            ),
+            (
+                "completing idle report",
+                PaneEvent::ExplicitStateReported {
+                    report: completing_report,
+                },
+                "idle",
+                1,
+            ),
+        ];
+
+        for (name, event, expected_lifecycle, expected_completed) in creating_events {
+            let tracker = CaptureTrackerSnapshot::default();
+            let missing =
+                reduce_explicit_once(None, "codex", "session-1", event.clone(), &tracker).unwrap();
+            let state = active(&missing);
+            assert_eq!(state.revision, 1, "{name}");
+            assert_eq!(state.agent_epoch, 1, "{name}");
+            assert!(state.agent_present, "{name}");
+            assert!(!state.scan_verified, "{name}");
+            assert!(!state.synthetic_completion_armed, "{name}");
+            assert_eq!(state.completed_seq, expected_completed, "{name}");
+            assert_eq!(
+                match state.lifecycle {
+                    LifecycleState::Idle => "idle",
+                    LifecycleState::Running => "running",
+                    LifecycleState::Waiting { .. } => "waiting",
+                    LifecycleState::Error { .. } => "error",
+                },
+                expected_lifecycle,
+                "{name}"
+            );
+
+            let reset = reset_record();
+            let after_reset =
+                reduce_explicit_once(Some(&reset), "codex", "session-1", event, &tracker).unwrap();
+            if expected_completed == 1 {
+                assert_eq!(after_reset.record, Some(reset), "{name}");
+                assert_eq!(after_reset.outcome, ReductionOutcome::Noop, "{name}");
+            } else {
+                assert!(
+                    matches!(after_reset.record, Some(StoredPaneRecord::Active(_))),
+                    "{name}"
+                );
+            }
+        }
+
+        let non_creating = vec![
+            PaneEvent::ProgressUpdated {
+                observed_at: 1,
+                operations: vec![ProgressOperation::ClearPrompt],
+            },
+            report(Some(ReportedLifecycle::Idle)),
+            report(None),
+        ];
+        for event in non_creating {
+            let tracker = CaptureTrackerSnapshot::default();
+            let missing =
+                reduce_explicit_once(None, "codex", "session-1", event.clone(), &tracker).unwrap();
+            assert_eq!(missing.record, None);
+            assert_eq!(missing.outcome, ReductionOutcome::Noop);
+            let reset = reset_record();
+            let after_reset =
+                reduce_explicit_once(Some(&reset), "codex", "session-1", event, &tracker).unwrap();
+            assert_eq!(after_reset.record, Some(reset));
+            assert_eq!(after_reset.outcome, ReductionOutcome::Noop);
+        }
+
+        let discovered = discover("codex");
+        assert!(active(&discovered).scan_verified);
+        assert!(active(&discovered).synthetic_completion_armed);
+        let reset = reset_record();
+        let reset_discovered = observe(
+            Some(&reset),
+            &CaptureTrackerSnapshot::default(),
+            AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+            None,
+            1,
+        );
+        assert!(active(&reset_discovered).scan_verified);
+        assert!(!active(&reset_discovered).synthetic_completion_armed);
+    }
+
+    #[test]
+    fn explicit_identity_decision_table_rows_are_applied_in_priority_order() {
+        let discovered = discover("codex");
+        let discovered_tracker = discovered.tracker_delta.as_ref().unwrap().next.clone();
+        let bound = reduce_explicit_once(
+            discovered.record.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::BeginRun {
+                started_at: 2,
+                prompt: None,
+            },
+            &discovered_tracker,
+        )
+        .unwrap();
+        let bound_tracker = bound.tracker_delta.as_ref().unwrap().next.clone();
+
+        // Row 1: AgentSessionStarted is authoritative even for a mismatched identity.
+        let authoritative = reduce_explicit_once(
+            bound.record.as_ref(),
+            "opencode",
+            "session-2",
+            PaneEvent::AgentSessionStarted {
+                observed_at: 3,
+                source: AgentSessionSource::Startup,
+                resumed_prompt: None,
+            },
+            &bound_tracker,
+        )
+        .unwrap();
+        assert_eq!(active(&authoritative).agent.as_str(), "opencode");
+        assert_eq!(active(&authoritative).agent_epoch, 2);
+        assert!(!active(&authoritative).scan_verified);
+
+        // Row 2: exact and present applies field-only progress normally.
+        let exact = reduce_explicit_once(
+            bound.record.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::ProgressUpdated {
+                observed_at: 3,
+                operations: vec![ProgressOperation::SetPrompt(PromptState {
+                    text: "exact".to_string(),
+                    source: "test".to_string(),
+                })],
+            },
+            &bound_tracker,
+        )
+        .unwrap();
+        assert_eq!(active(&exact).prompt.as_ref().unwrap().text, "exact");
+
+        let absent_once = observe(
+            bound.record.as_ref(),
+            &bound_tracker,
+            AgentPresenceObservation::Absent,
+            None,
+            4,
+        );
+        let absent = observe(
+            absent_once.record.as_ref(),
+            &absent_once.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Absent,
+            None,
+            5,
+        );
+        assert!(!active(&absent).agent_present);
+        let absent_tracker = absent.tracker_delta.as_ref().unwrap().next.clone();
+
+        // Row 3: exact and absent starts a new epoch only with epoch evidence.
+        let restarted = reduce_explicit_once(
+            absent.record.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::WaitRequested {
+                observed_at: 6,
+                reason: WaitReason::PermissionPrompt,
+            },
+            &absent_tracker,
+        )
+        .unwrap();
+        assert_eq!(active(&restarted).agent_epoch, 2);
+        assert!(matches!(
+            active(&restarted).lifecycle,
+            LifecycleState::Waiting { .. }
+        ));
+        assert!(!active(&restarted).scan_verified);
+        let late_completion = reduce_explicit_once(
+            absent.record.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::CompleteRun { completed_at: 6 },
+            &absent_tracker,
+        )
+        .unwrap();
+        assert!(!active(&late_completion).agent_present);
+        assert_eq!(active(&late_completion).agent_epoch, 1);
+        let absent_progress = reduce_explicit_once(
+            absent.record.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::ProgressUpdated {
+                observed_at: 6,
+                operations: vec![ProgressOperation::ClearTasks],
+            },
+            &absent_tracker,
+        );
+        assert_eq!(absent_progress.unwrap_err(), ReduceError::StaleAgentEvent);
+        assert_eq!(
+            reduce_explicit_once(
+                absent.record.as_ref(),
+                "codex",
+                "session-1",
+                report(Some(ReportedLifecycle::Idle)),
+                &absent_tracker,
+            )
+            .unwrap_err(),
+            ReduceError::StaleAgentEvent
+        );
+
+        // Row 4: an unbound present scan epoch binds only on epoch evidence or armed completion.
+        let unbound = discover("codex");
+        let unbound_tracker = unbound.tracker_delta.as_ref().unwrap().next.clone();
+        let bound_same_epoch = reduce_explicit_once(
+            unbound.record.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::ActivityObserved { observed_at: 2 },
+            &unbound_tracker,
+        )
+        .unwrap();
+        assert_eq!(active(&bound_same_epoch).agent_epoch, 1);
+        assert_eq!(
+            active(&bound_same_epoch)
+                .agent_session_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "session-1"
+        );
+        assert!(matches!(
+            active(&bound_same_epoch).lifecycle,
+            LifecycleState::Running
+        ));
+        let synthetic = reduce_explicit_once(
+            unbound.record.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::CompleteRun { completed_at: 2 },
+            &unbound_tracker,
+        )
+        .unwrap();
+        assert_eq!(active(&synthetic).completed_seq, 1);
+        assert!(active(&synthetic).agent_session_id.is_some());
+        let ignored_progress = reduce_explicit_once(
+            unbound.record.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::ProgressUpdated {
+                observed_at: 2,
+                operations: vec![ProgressOperation::TaskCreated],
+            },
+            &unbound_tracker,
+        )
+        .unwrap();
+        assert!(active(&ignored_progress).agent_session_id.is_none());
+        assert_eq!(active(&ignored_progress).tasks, TaskState::default());
+
+        // Row 5: unbound and absent requires epoch evidence.
+        let mut unbound_absent_record = unbound.record.clone().unwrap();
+        let StoredPaneRecord::Active(unbound_absent) = &mut unbound_absent_record else {
+            unreachable!();
+        };
+        unbound_absent.agent_present = false;
+        unbound_absent.synthetic_completion_armed = false;
+        let row5 = reduce_explicit_once(
+            Some(&unbound_absent_record),
+            "codex",
+            "session-1",
+            PaneEvent::FailRun {
+                observed_at: 3,
+                reason: Some("stopped".to_string()),
+            },
+            &unbound_tracker,
+        )
+        .unwrap();
+        assert_eq!(active(&row5).agent_epoch, 2);
+        assert!(matches!(
+            active(&row5).lifecycle,
+            LifecycleState::Error { .. }
+        ));
+        assert!(!active(&row5).scan_verified);
+        assert_eq!(
+            reduce_explicit_once(
+                Some(&unbound_absent_record),
+                "codex",
+                "session-1",
+                PaneEvent::CompleteRun { completed_at: 3 },
+                &unbound_tracker,
+            )
+            .unwrap_err(),
+            ReduceError::StaleAgentEvent
+        );
+
+        // Row 6: mismatched present is stale unless two matching scans authorize handover.
+        assert_eq!(
+            reduce_explicit_once(
+                bound.record.as_ref(),
+                "opencode",
+                "session-2",
+                PaneEvent::BeginRun {
+                    started_at: 7,
+                    prompt: None,
+                },
+                &bound_tracker,
+            )
+            .unwrap_err(),
+            ReduceError::StaleAgentEvent
+        );
+        let unverified_current = begin(None, &CaptureTrackerSnapshot::default());
+        assert!(!active(&unverified_current).scan_verified);
+        let replacement_once = observe(
+            unverified_current.record.as_ref(),
+            &unverified_current.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+            None,
+            7,
+        );
+        let replacement_twice = observe(
+            replacement_once.record.as_ref(),
+            &replacement_once.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+            None,
+            8,
+        );
+        assert!(active(&replacement_twice).agent_present);
+        assert_eq!(
+            replacement_twice
+                .tracker_delta
+                .as_ref()
+                .unwrap()
+                .next
+                .replacement_streak,
+            2
+        );
+        let handover = reduce_explicit_once(
+            replacement_twice.record.as_ref(),
+            "opencode",
+            "session-2",
+            PaneEvent::BeginRun {
+                started_at: 9,
+                prompt: None,
+            },
+            &replacement_twice.tracker_delta.as_ref().unwrap().next,
+        )
+        .unwrap();
+        assert_eq!(active(&handover).agent_epoch, 2);
+        assert_eq!(active(&handover).agent.as_str(), "opencode");
+        assert!(active(&handover).scan_verified);
+        assert!(matches!(
+            active(&handover).lifecycle,
+            LifecycleState::Running
+        ));
+
+        // Row 7: mismatched absent accepts only epoch evidence.
+        let row7 = reduce_explicit_once(
+            absent.record.as_ref(),
+            "opencode",
+            "session-2",
+            PaneEvent::BeginRun {
+                started_at: 8,
+                prompt: None,
+            },
+            &absent_tracker,
+        )
+        .unwrap();
+        assert_eq!(active(&row7).agent_epoch, 2);
+        assert_eq!(active(&row7).agent.as_str(), "opencode");
+        assert!(!active(&row7).scan_verified);
+        assert!(matches!(active(&row7).lifecycle, LifecycleState::Running));
+        let row7_report = reduce_explicit_once(
+            absent.record.as_ref(),
+            "opencode",
+            "session-2",
+            report(Some(ReportedLifecycle::Error {
+                reason: Some("reported".to_string()),
+            })),
+            &absent_tracker,
+        )
+        .unwrap();
+        assert_eq!(active(&row7_report).agent_epoch, 2);
+        assert!(matches!(
+            active(&row7_report).lifecycle,
+            LifecycleState::Error { .. }
+        ));
+        for stale in [
+            PaneEvent::CompleteRun { completed_at: 8 },
+            PaneEvent::ProgressUpdated {
+                observed_at: 8,
+                operations: vec![ProgressOperation::ClearTasks],
+            },
+        ] {
+            assert_eq!(
+                reduce_explicit_once(
+                    absent.record.as_ref(),
+                    "opencode",
+                    "session-2",
+                    stale,
+                    &absent_tracker,
+                )
+                .unwrap_err(),
+                ReduceError::StaleAgentEvent
+            );
+        }
+
+        let authoritative_tracker = authoritative.tracker_delta.as_ref().unwrap().next.clone();
+        assert_eq!(
+            reduce_explicit_once(
+                authoritative.record.as_ref(),
+                "codex",
+                "session-1",
+                PaneEvent::BeginRun {
+                    started_at: 9,
+                    prompt: None,
+                },
+                &authoritative_tracker,
+            )
+            .unwrap_err(),
+            ReduceError::StaleAgentEvent,
+            "a delayed BeginRun from the previous session must not rewind identity"
+        );
+    }
+
+    #[test]
+    fn presence_matrix_converges_only_after_confirmed_absence() {
+        let explicit = reduce_once(
+            None,
+            PaneEvent::AgentSessionStarted {
+                observed_at: 1,
+                source: AgentSessionSource::Startup,
+                resumed_prompt: None,
+            },
+            &CaptureTrackerSnapshot::default(),
+        );
+        assert!(!active(&explicit).scan_verified);
+        let verified = observe(
+            explicit.record.as_ref(),
+            &explicit.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+            None,
+            2,
+        );
+        assert!(active(&verified).scan_verified);
+        assert_eq!(active(&verified).agent_epoch, 1);
+
+        let first_other = observe(
+            verified.record.as_ref(),
+            &verified.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+            Some(CaptureObservation {
+                inference: CaptureInference::ActivityObserved,
+                observed_fingerprint: Some([1; 32]),
+            }),
+            3,
+        );
+        assert_eq!(active(&first_other).agent.as_str(), "codex");
+        assert!(active(&first_other).agent_present);
+        let first_tracker = &first_other.tracker_delta.as_ref().unwrap().next;
+        assert_eq!(first_tracker.absence_count, 1);
+        assert_eq!(first_tracker.replacement_streak, 1);
+        assert!(active(&first_other).started_at.is_none());
+
+        let confirmed = observe(
+            first_other.record.as_ref(),
+            first_tracker,
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+            None,
+            4,
+        );
+        assert_eq!(active(&confirmed).agent.as_str(), "codex");
+        assert!(!active(&confirmed).agent_present);
+        assert_eq!(active(&confirmed).agent_epoch, 1);
+        assert_eq!(
+            confirmed
+                .tracker_delta
+                .as_ref()
+                .unwrap()
+                .next
+                .replacement_streak,
+            2
+        );
+
+        let replacement = observe(
+            confirmed.record.as_ref(),
+            &confirmed.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+            Some(CaptureObservation {
+                inference: CaptureInference::ActivityObserved,
+                observed_fingerprint: Some([2; 32]),
+            }),
+            5,
+        );
+        assert_eq!(active(&replacement).agent.as_str(), "opencode");
+        assert_eq!(active(&replacement).agent_epoch, 2);
+        assert!(active(&replacement).agent_present);
+        assert!(active(&replacement).scan_verified);
+        assert!(!active(&replacement).synthetic_completion_armed);
+        assert!(matches!(
+            active(&replacement).lifecycle,
+            LifecycleState::Idle
+        ));
+        let replacement_tracker = &replacement.tracker_delta.as_ref().unwrap().next;
+        assert_eq!(replacement_tracker.absence_count, 0);
+        assert_eq!(replacement_tracker.replacement_kind, None);
+        assert_eq!(replacement_tracker.fingerprint, Some([2; 32]));
+
+        let rediscovered = observe(
+            confirmed.record.as_ref(),
+            &confirmed.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+            None,
+            5,
+        );
+        assert_eq!(active(&rediscovered).agent.as_str(), "codex");
+        assert_eq!(active(&rediscovered).agent_epoch, 2);
+        assert!(active(&rediscovered).agent_session_id.is_none());
+    }
+
+    #[test]
+    fn mixed_presence_sequences_follow_absence_and_replacement_tracker_table() {
+        fn run_sequence(sequence: Vec<AgentPresenceObservation>) -> Reduction {
+            let initial = discover("codex");
+            let mut current = initial.record;
+            let mut tracker = initial.tracker_delta.unwrap().next;
+            let mut last = None;
+            for (index, presence) in sequence.into_iter().enumerate() {
+                let result = observe(current.as_ref(), &tracker, presence, None, index as i64 + 2);
+                if let Some(delta) = &result.tracker_delta {
+                    tracker = delta.next.clone();
+                }
+                current = result.record.clone();
+                last = Some(result);
+            }
+            last.unwrap()
+        }
+
+        let absent_unknown_absent = run_sequence(vec![
+            AgentPresenceObservation::Absent,
+            AgentPresenceObservation::Unknown,
+            AgentPresenceObservation::Absent,
+        ]);
+        assert!(active(&absent_unknown_absent).agent_present);
+        let tracker = &absent_unknown_absent.tracker_delta.as_ref().unwrap().next;
+        assert_eq!(tracker.absence_count, 1);
+        assert_eq!(tracker.replacement_kind, None);
+
+        let other_unknown_other = run_sequence(vec![
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+            AgentPresenceObservation::Unknown,
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+        ]);
+        assert!(active(&other_unknown_other).agent_present);
+        let tracker = &other_unknown_other.tracker_delta.as_ref().unwrap().next;
+        assert_eq!(tracker.absence_count, 1);
+        assert_eq!(tracker.replacement_streak, 1);
+
+        let absent_then_other = run_sequence(vec![
+            AgentPresenceObservation::Absent,
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+        ]);
+        assert!(!active(&absent_then_other).agent_present);
+        let tracker = &absent_then_other.tracker_delta.as_ref().unwrap().next;
+        assert_eq!(tracker.absence_count, 0);
+        assert_eq!(tracker.replacement_streak, 1);
+
+        let other_then_absent = run_sequence(vec![
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+            AgentPresenceObservation::Absent,
+        ]);
+        assert!(!active(&other_then_absent).agent_present);
+        let tracker = &other_then_absent.tracker_delta.as_ref().unwrap().next;
+        assert_eq!(tracker.absence_count, 0);
+        assert_eq!(tracker.replacement_kind, None);
+
+        let unverified = reduce_once(
+            None,
+            PaneEvent::AgentSessionStarted {
+                observed_at: 1,
+                source: AgentSessionSource::Startup,
+                resumed_prompt: None,
+            },
+            &CaptureTrackerSnapshot::default(),
+        );
+        let first = observe(
+            unverified.record.as_ref(),
+            &unverified.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Absent,
+            None,
+            2,
+        );
+        let second = observe(
+            first.record.as_ref(),
+            &first.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Absent,
+            None,
+            3,
+        );
+        assert!(active(&second).agent_present);
+        assert_eq!(second.tracker_delta.as_ref().unwrap().next.absence_count, 0);
+    }
+
+    #[test]
+    fn explicit_activity_resets_presence_evidence_and_invalidates_old_poll() {
+        let initial = discover("codex");
+        let first_absence = observe(
+            initial.record.as_ref(),
+            &initial.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Absent,
+            None,
+            2,
+        );
+        let before_explicit = first_absence.tracker_delta.as_ref().unwrap().next.clone();
+        assert_eq!(before_explicit.absence_count, 1);
+        let old_base = first_absence.record.as_ref().unwrap().descriptor();
+        let progress = reduce_explicit_once(
+            first_absence.record.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::ProgressUpdated {
+                observed_at: 3,
+                operations: vec![ProgressOperation::ClearPrompt],
+            },
+            &before_explicit,
+        )
+        .unwrap();
+        let after_explicit = progress.tracker_delta.as_ref().unwrap().next.clone();
+        assert_eq!(after_explicit.absence_count, 0);
+        assert_eq!(after_explicit.replacement_kind, None);
+        assert!(after_explicit.generation > before_explicit.generation);
+
+        let stale_poll = PaneEvent::ObservationBatch {
+            base: Some(old_base),
+            tracker_generation: before_explicit.generation,
+            observed_at: 4,
+            presence: AgentPresenceObservation::Absent,
+            capture: None,
+        };
+        let rejected = reduce(
+            progress.record.as_ref(),
+            &observation_envelope(stale_poll),
+            context(&after_explicit, &VisibilitySnapshot::default()),
+        )
+        .unwrap();
+        assert_eq!(rejected.record, progress.record);
+        assert_eq!(rejected.tracker_delta, None);
+        assert_eq!(rejected.outcome, ReductionOutcome::Noop);
+
+        let next_absence = observe(
+            progress.record.as_ref(),
+            &after_explicit,
+            AgentPresenceObservation::Absent,
+            None,
+            5,
+        );
+        assert!(active(&next_absence).agent_present);
+        assert_eq!(
+            next_absence
+                .tracker_delta
+                .as_ref()
+                .unwrap()
+                .next
+                .absence_count,
+            1
+        );
+    }
+
+    #[test]
+    fn descriptor_and_tracker_boundaries_reject_stale_observations() {
+        let initial = discover("codex");
+        let initial_tracker = initial.tracker_delta.as_ref().unwrap().next.clone();
+        let old_descriptor = initial.record.as_ref().unwrap().descriptor();
+        let changed = reduce_explicit_once(
+            initial.record.as_ref(),
+            "codex",
+            "session-1",
+            PaneEvent::BeginRun {
+                started_at: 2,
+                prompt: None,
+            },
+            &initial_tracker,
+        )
+        .unwrap();
+        let changed_tracker = changed.tracker_delta.as_ref().unwrap().next.clone();
+        let stale_descriptor = PaneEvent::ObservationBatch {
+            base: Some(old_descriptor),
+            tracker_generation: changed_tracker.generation,
+            observed_at: 3,
+            presence: AgentPresenceObservation::Absent,
+            capture: None,
+        };
+        let rejected = reduce(
+            changed.record.as_ref(),
+            &observation_envelope(stale_descriptor),
+            context(&changed_tracker, &VisibilitySnapshot::default()),
+        )
+        .unwrap();
+        assert_eq!(rejected.outcome, ReductionOutcome::Noop);
+        assert_eq!(rejected.tracker_delta, None);
+
+        let stale_missing = PaneEvent::ObservationBatch {
+            base: None,
+            tracker_generation: changed_tracker.generation,
+            observed_at: 3,
+            presence: AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+            capture: None,
+        };
+        let rejected = reduce(
+            changed.record.as_ref(),
+            &observation_envelope(stale_missing),
+            context(&changed_tracker, &VisibilitySnapshot::default()),
+        )
+        .unwrap();
+        assert_eq!(rejected.record, changed.record);
+        assert_eq!(rejected.tracker_delta, None);
+
+        let stale_generation = PaneEvent::ObservationBatch {
+            base: changed.record.as_ref().map(StoredPaneRecord::descriptor),
+            tracker_generation: initial_tracker.generation,
+            observed_at: 3,
+            presence: AgentPresenceObservation::Absent,
+            capture: None,
+        };
+        let rejected = reduce(
+            changed.record.as_ref(),
+            &observation_envelope(stale_generation),
+            context(&changed_tracker, &VisibilitySnapshot::default()),
+        )
+        .unwrap();
+        assert_eq!(rejected.outcome, ReductionOutcome::Noop);
+        assert_eq!(rejected.tracker_delta, None);
+
+        let reset_a = reset_record();
+        let old_reset_descriptor = reset_a.descriptor();
+        let reset_b = StoredPaneRecord::Reset(ResetTombstone {
+            schema_version: PANE_STATE_SCHEMA_VERSION,
+            tombstone_id: ResetTombstoneId::parse(EVENT_ID).unwrap(),
+            pane_instance: pane(),
+            reset_at: 2,
+        });
+        let stale_reset = PaneEvent::ObservationBatch {
+            base: Some(old_reset_descriptor),
+            tracker_generation: 0,
+            observed_at: 3,
+            presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+            capture: None,
+        };
+        let rejected = reduce(
+            Some(&reset_b),
+            &observation_envelope(stale_reset),
+            context(
+                &CaptureTrackerSnapshot::default(),
+                &VisibilitySnapshot::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(rejected.record, Some(reset_b));
+        assert_eq!(rejected.tracker_delta, None);
+
+        let stale_active_to_reset = PaneEvent::ObservationBatch {
+            base: changed.record.as_ref().map(StoredPaneRecord::descriptor),
+            tracker_generation: 0,
+            observed_at: 3,
+            presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+            capture: None,
+        };
+        let rejected = reduce(
+            Some(&reset_record()),
+            &observation_envelope(stale_active_to_reset),
+            context(
+                &CaptureTrackerSnapshot::default(),
+                &VisibilitySnapshot::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(rejected.outcome, ReductionOutcome::Noop);
+        assert_eq!(rejected.tracker_delta, None);
+    }
+
+    #[test]
+    fn reset_recreation_and_new_epoch_clear_old_tracker_state() {
+        let reset = reset_record();
+        let dirty_tracker = CaptureTrackerSnapshot {
+            generation: 7,
+            epoch: Some((StateId::parse(OTHER_STATE_ID).unwrap(), 9)),
+            absence_count: 1,
+            replacement_kind: Some(AgentKind::parse("claude").unwrap()),
+            replacement_streak: 2,
+            fingerprint: Some([1; 32]),
+            last_change_at: Some(1),
+            rebaseline_pending: true,
+        };
+        let recreated = observe(
+            Some(&reset),
+            &dirty_tracker,
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+            Some(CaptureObservation {
+                inference: CaptureInference::ActivityObserved,
+                observed_fingerprint: Some([2; 32]),
+            }),
+            10,
+        );
+        let state = active(&recreated);
+        let tracker = &recreated.tracker_delta.as_ref().unwrap().next;
+        assert_eq!(
+            tracker.epoch,
+            Some((state.state_id.clone(), state.agent_epoch))
+        );
+        assert_eq!(tracker.generation, 8);
+        assert_eq!(tracker.absence_count, 0);
+        assert_eq!(tracker.replacement_kind, None);
+        assert_eq!(tracker.replacement_streak, 0);
+        assert_eq!(tracker.fingerprint, Some([2; 32]));
+        assert_eq!(tracker.last_change_at, Some(10));
+        assert!(!tracker.rebaseline_pending);
+        assert!(matches!(state.lifecycle, LifecycleState::Idle));
+
+        let mut dirty_again = tracker.clone();
+        dirty_again.absence_count = 1;
+        dirty_again.replacement_kind = Some(AgentKind::parse("claude").unwrap());
+        dirty_again.replacement_streak = 2;
+        dirty_again.fingerprint = Some([3; 32]);
+        let new_epoch = reduce_explicit_once(
+            recreated.record.as_ref(),
+            "claude",
+            "session-2",
+            PaneEvent::AgentSessionStarted {
+                observed_at: 11,
+                source: AgentSessionSource::Startup,
+                resumed_prompt: None,
+            },
+            &dirty_again,
+        )
+        .unwrap();
+        let tracker = &new_epoch.tracker_delta.as_ref().unwrap().next;
+        assert_eq!(tracker.absence_count, 0);
+        assert_eq!(tracker.replacement_kind, None);
+        assert_eq!(tracker.replacement_streak, 0);
+        assert_eq!(tracker.fingerprint, None);
+        assert_eq!(tracker.last_change_at, None);
+        assert!(!tracker.rebaseline_pending);
     }
 
     #[test]
@@ -1577,6 +2583,223 @@ mod tests {
     }
 
     #[test]
+    fn every_progress_operation_variant_has_the_specified_effect() {
+        let begun = begin(None, &CaptureTrackerSnapshot::default());
+
+        let prompted = progress(
+            &begun,
+            vec![ProgressOperation::SetPrompt(PromptState {
+                text: "prompt".to_string(),
+                source: "test".to_string(),
+            })],
+        );
+        assert_eq!(active(&prompted).prompt.as_ref().unwrap().text, "prompt");
+        let prompt_cleared = progress(&prompted, vec![ProgressOperation::ClearPrompt]);
+        assert!(active(&prompt_cleared).prompt.is_none());
+
+        let created = progress(&prompt_cleared, vec![ProgressOperation::TaskCreated]);
+        assert_eq!(
+            active(&created).tasks.progress,
+            TaskProgress { done: 0, total: 1 }
+        );
+        let completed = progress(&created, vec![ProgressOperation::TaskCompleted]);
+        assert_eq!(
+            active(&completed).tasks.progress,
+            TaskProgress { done: 1, total: 1 }
+        );
+
+        let replaced = progress(
+            &completed,
+            vec![ProgressOperation::ReplaceTasks {
+                progress: TaskProgress {
+                    done: 99,
+                    total: 100,
+                },
+                items: vec![
+                    TaskItemState {
+                        id: Some("one".to_string()),
+                        step: "first".to_string(),
+                        status: TaskItemStatus::Completed,
+                    },
+                    TaskItemState {
+                        id: Some("two".to_string()),
+                        step: "second".to_string(),
+                        status: TaskItemStatus::Pending,
+                    },
+                ],
+            }],
+        );
+        assert_eq!(
+            active(&replaced).tasks.progress,
+            TaskProgress { done: 1, total: 2 },
+            "non-empty items derive progress instead of trusting payload counts"
+        );
+        let upserted = progress(
+            &replaced,
+            vec![
+                ProgressOperation::UpsertTaskItem {
+                    id: "one".to_string(),
+                    step: "first revised".to_string(),
+                },
+                ProgressOperation::UpsertTaskItem {
+                    id: "three".to_string(),
+                    step: "third".to_string(),
+                },
+            ],
+        );
+        assert_eq!(active(&upserted).tasks.items.len(), 3);
+        assert_eq!(active(&upserted).tasks.items[0].step, "first revised");
+        assert_eq!(
+            active(&upserted).tasks.items[0].status,
+            TaskItemStatus::Pending
+        );
+        assert_eq!(
+            active(&upserted).tasks.progress,
+            TaskProgress { done: 0, total: 3 }
+        );
+        let status_updated = progress(
+            &upserted,
+            vec![ProgressOperation::UpdateTaskItemStatus {
+                id: "two".to_string(),
+                status: TaskItemStatus::Completed,
+            }],
+        );
+        assert_eq!(
+            active(&status_updated).tasks.progress,
+            TaskProgress { done: 1, total: 3 }
+        );
+        let tasks_cleared = progress(&status_updated, vec![ProgressOperation::ClearTasks]);
+        assert_eq!(active(&tasks_cleared).tasks, TaskState::default());
+
+        let subagent = SubagentState {
+            agent_id: "worker-1".to_string(),
+            agent_type: "review".to_string(),
+            display_name: Some("Reviewer".to_string()),
+        };
+        let subagent_upserted = progress(
+            &tasks_cleared,
+            vec![ProgressOperation::UpsertSubagent(subagent.clone())],
+        );
+        let mut revised_subagent = subagent;
+        revised_subagent.display_name = Some("Revised".to_string());
+        let subagent_revised = progress(
+            &subagent_upserted,
+            vec![ProgressOperation::UpsertSubagent(revised_subagent)],
+        );
+        assert_eq!(active(&subagent_revised).subagents.len(), 1);
+        assert_eq!(
+            active(&subagent_revised).subagents[0]
+                .display_name
+                .as_deref(),
+            Some("Revised")
+        );
+        let subagents_replaced = progress(
+            &subagent_revised,
+            vec![ProgressOperation::ReplaceSubagents(vec![
+                SubagentState {
+                    agent_id: "worker-2".to_string(),
+                    agent_type: "test".to_string(),
+                    display_name: None,
+                },
+                SubagentState {
+                    agent_id: "worker-3".to_string(),
+                    agent_type: "docs".to_string(),
+                    display_name: None,
+                },
+            ])],
+        );
+        assert_eq!(active(&subagents_replaced).subagents.len(), 2);
+        let subagent_removed = progress(
+            &subagents_replaced,
+            vec![ProgressOperation::RemoveSubagent {
+                agent_id: "worker-2".to_string(),
+            }],
+        );
+        assert_eq!(active(&subagent_removed).subagents.len(), 1);
+        assert_eq!(active(&subagent_removed).subagents[0].agent_id, "worker-3");
+        let subagents_cleared =
+            progress(&subagent_removed, vec![ProgressOperation::ClearSubagents]);
+        assert!(active(&subagents_cleared).subagents.is_empty());
+
+        let activity = WorktreeActivity {
+            kind: WorktreeActivityKind::VwExec,
+            name: "pane-state".to_string(),
+            path: "/tmp/pane-state".to_string(),
+            command: "cargo test".to_string(),
+            observed_at: 21,
+        };
+        let activity_set = progress(
+            &subagents_cleared,
+            vec![ProgressOperation::SetWorktreeActivity(activity.clone())],
+        );
+        assert_eq!(active(&activity_set).worktree_activity, Some(activity));
+        let activity_cleared = progress(
+            &activity_set,
+            vec![ProgressOperation::ClearWorktreeActivity],
+        );
+        assert!(active(&activity_cleared).worktree_activity.is_none());
+    }
+
+    #[test]
+    fn progress_batch_is_atomic_when_a_later_operation_is_invalid() {
+        let begun = begin(None, &CaptureTrackerSnapshot::default());
+        let before = begun.record.clone();
+        let error = reduce(
+            begun.record.as_ref(),
+            &envelope(PaneEvent::ProgressUpdated {
+                observed_at: 2,
+                operations: vec![
+                    ProgressOperation::TaskCreated,
+                    ProgressOperation::TaskCompleted,
+                    ProgressOperation::TaskCompleted,
+                ],
+            }),
+            context(
+                &begun.tracker_delta.as_ref().unwrap().next,
+                &VisibilitySnapshot::default(),
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReduceError::InvalidProgressOperation(_)));
+        assert_eq!(begun.record, before);
+    }
+
+    #[test]
+    fn opencode_capture_activity_starts_running_after_baseline() {
+        let baseline = observe(
+            None,
+            &CaptureTrackerSnapshot::default(),
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+            Some(CaptureObservation {
+                inference: CaptureInference::NoChange,
+                observed_fingerprint: Some([1; 32]),
+            }),
+            1,
+        );
+        assert!(matches!(active(&baseline).lifecycle, LifecycleState::Idle));
+        let activity = observe(
+            baseline.record.as_ref(),
+            &baseline.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
+            Some(CaptureObservation {
+                inference: CaptureInference::ActivityObserved,
+                observed_fingerprint: Some([2; 32]),
+            }),
+            2,
+        );
+        assert!(matches!(
+            active(&activity).lifecycle,
+            LifecycleState::Running
+        ));
+        assert_eq!(active(&activity).run_seq, 1);
+        assert_eq!(active(&activity).started_at, Some(2));
+        assert_eq!(
+            activity.tracker_delta.as_ref().unwrap().next.fingerprint,
+            Some([2; 32])
+        );
+    }
+
+    #[test]
     fn checked_counter_overflow_is_fatal() {
         let tracker = CaptureTrackerSnapshot::default();
         let begun = begin(None, &tracker);
@@ -1741,18 +2964,37 @@ mod tests {
     #[test]
     fn reset_rejects_delayed_completion() {
         let tracker = CaptureTrackerSnapshot::default();
-        let reset = StoredPaneRecord::Reset(ResetTombstone {
-            schema_version: PANE_STATE_SCHEMA_VERSION,
-            tombstone_id: ResetTombstoneId::parse(STATE_ID).unwrap(),
-            pane_instance: pane(),
-            reset_at: 1,
-        });
-        let result = reduce_once(
-            Some(&reset),
+        let reset = reset_record();
+        let visibility = VisibilitySnapshot::default();
+        for event in [
             PaneEvent::CompleteRun { completed_at: 2 },
-            &tracker,
-        );
-        assert_eq!(result.record, Some(reset));
+            PaneEvent::ExplicitStateReported {
+                report: ExplicitStateReport {
+                    observed_at: 2,
+                    lifecycle: Some(ReportedLifecycle::Idle),
+                    started_at: None,
+                    completed_at: Some(2),
+                    prompt: None,
+                    tasks: None,
+                    subagents: None,
+                    attention: false,
+                },
+            },
+        ] {
+            let result = reduce(
+                Some(&reset),
+                &envelope(event),
+                ReductionContext {
+                    done_clear_on: crate::config::DoneClearOn::Pane,
+                    visibility: &visibility,
+                    tracker: &tracker,
+                    new_state_id: None,
+                },
+            )
+            .expect("delayed completion after reset must not require a state ID");
+            assert_eq!(result.record, Some(reset.clone()));
+            assert_eq!(result.outcome, ReductionOutcome::Noop);
+        }
     }
 
     #[test]
@@ -1787,7 +3029,7 @@ mod tests {
     proptest! {
         #[test]
         fn valid_begin_complete_ack_sequences_preserve_invariants(
-            operations in prop::collection::vec(0_u8..3, 0..128),
+            operations in prop::collection::vec(0_u8..11, 0..128),
         ) {
             let mut current: Option<StoredPaneRecord> = None;
             let mut tracker = CaptureTrackerSnapshot::default();
@@ -1795,8 +3037,17 @@ mod tests {
                 let timestamp = index as i64 + 1;
                 let event = match operation {
                     0 => PaneEvent::BeginRun { started_at: timestamp, prompt: None },
-                    1 => PaneEvent::CompleteRun { completed_at: timestamp },
-                    _ => {
+                    1 => PaneEvent::ActivityObserved { observed_at: timestamp },
+                    2 => PaneEvent::WaitRequested {
+                        observed_at: timestamp,
+                        reason: WaitReason::PermissionPrompt,
+                    },
+                    3 => PaneEvent::FailRun {
+                        observed_at: timestamp,
+                        reason: Some("generated".to_string()),
+                    },
+                    4 => PaneEvent::CompleteRun { completed_at: timestamp },
+                    5 => {
                         let Some(StoredPaneRecord::Active(state)) = current.as_ref() else {
                             continue;
                         };
@@ -1805,8 +3056,39 @@ mod tests {
                             expected_agent_epoch: state.agent_epoch,
                             through_seq: state.completed_seq,
                         }
-                    }
+                    },
+                    6 => PaneEvent::ProgressUpdated {
+                        observed_at: timestamp,
+                        operations: vec![ProgressOperation::SetPrompt(PromptState {
+                            text: format!("prompt-{timestamp}"),
+                            source: "property".to_string(),
+                        })],
+                    },
+                    7 => PaneEvent::ProgressUpdated {
+                        observed_at: timestamp,
+                        operations: vec![
+                            ProgressOperation::ClearTasks,
+                            ProgressOperation::ClearSubagents,
+                            ProgressOperation::ClearWorktreeActivity,
+                        ],
+                    },
+                    8 => PaneEvent::AgentSessionStarted {
+                        observed_at: timestamp,
+                        source: AgentSessionSource::Startup,
+                        resumed_prompt: None,
+                    },
+                    9 => report(Some(ReportedLifecycle::Running)),
+                    _ => {
+                        let Some(StoredPaneRecord::Active(state)) = current.as_ref() else {
+                            continue;
+                        };
+                        PaneEvent::MarkDone {
+                            expected: state.version(),
+                            completed_at: timestamp,
+                        }
+                    },
                 };
+                let previous = current.clone();
                 let result = reduce(
                     current.as_ref(),
                     &envelope(event),
@@ -1819,6 +3101,18 @@ mod tests {
                 if let Some(StoredPaneRecord::Active(state)) = current.as_ref() {
                     prop_assert!(state.validate().is_ok());
                     prop_assert!(state.run_seq - state.completed_seq <= 1);
+                    if let Some(StoredPaneRecord::Active(previous)) = previous.as_ref() {
+                        if previous.state_id == state.state_id {
+                            prop_assert!(state.revision >= previous.revision);
+                        }
+                        if previous.state_id == state.state_id
+                            && previous.agent_epoch == state.agent_epoch
+                        {
+                            prop_assert!(state.run_seq >= previous.run_seq);
+                            prop_assert!(state.completed_seq >= previous.completed_seq);
+                            prop_assert!(state.acknowledged_seq >= previous.acknowledged_seq);
+                        }
+                    }
                 }
             }
         }
