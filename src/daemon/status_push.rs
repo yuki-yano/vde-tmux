@@ -1,5 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -11,6 +15,7 @@ pub const STATUS_PUSH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 pub const RENDER_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 pub const STATUS_PUSH_SERVER_MISMATCH_SENTINEL: &str = "__vde_status_push_server_mismatch__";
 const STATUS_PUSH_PANE_MISMATCH_PREFIX: &str = "__vde_status_push_pane_mismatch__";
+const STATUS_PUSH_BATCH_FILE_PREFIX: &str = ".status-push-batch-";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DisplayOptionKey {
@@ -293,11 +298,62 @@ pub trait DisplayBatchIo {
 
 pub struct SystemDisplayBatchIo<'a> {
     runner: &'a dyn crate::tmux::TmuxRunner,
+    batch_dir: &'a Path,
 }
 
 impl<'a> SystemDisplayBatchIo<'a> {
-    pub fn new(runner: &'a dyn crate::tmux::TmuxRunner) -> Self {
-        Self { runner }
+    pub fn new(runner: &'a dyn crate::tmux::TmuxRunner, batch_dir: &'a Path) -> Self {
+        Self { runner, batch_dir }
+    }
+}
+
+struct StatusPushBatchFile {
+    path: PathBuf,
+}
+
+impl StatusPushBatchFile {
+    fn create(batch_dir: &Path, commands: &[String]) -> Result<Self, String> {
+        crate::daemon::lifecycle::ensure_secure_socket_dir(batch_dir)
+            .map_err(|error| format!("failed to prepare status batch directory: {error:#}"))?;
+        let event_id = crate::pane_state::EventId::generate()
+            .map_err(|error| format!("failed to generate status batch ID: {error}"))?;
+        let path = batch_dir.join(format!(
+            "{STATUS_PUSH_BATCH_FILE_PREFIX}{}.conf",
+            event_id.as_str()
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| {
+                format!(
+                    "failed to create status batch file {}: {error}",
+                    path.display()
+                )
+            })?;
+        let batch_file = Self { path };
+        for command in commands {
+            writeln!(file, "{command}").map_err(|error| {
+                format!(
+                    "failed to write status batch file {}: {error}",
+                    batch_file.path.display()
+                )
+            })?;
+        }
+        file.flush().map_err(|error| {
+            format!(
+                "failed to flush status batch file {}: {error}",
+                batch_file.path.display()
+            )
+        })?;
+        Ok(batch_file)
+    }
+}
+
+impl Drop for StatusPushBatchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -312,12 +368,19 @@ impl DisplayBatchIo for SystemDisplayBatchIo<'_> {
             .writes
             .iter()
             .map(display_write_command)
-            .collect::<Vec<_>>()
-            .join(" ; ");
+            .collect::<Vec<_>>();
+        let command_file = match StatusPushBatchFile::create(self.batch_dir, &commands) {
+            Ok(file) => file,
+            Err(error) => return DisplayBatchIoOutcome::Failed(error),
+        };
+        let source_command = crate::pane_state::store::tmux_command_string(&[
+            "source-file".to_string(),
+            command_file.path.to_string_lossy().into_owned(),
+        ]);
         let guarded = crate::pane_state::store::server_guarded_command_args(
             batch.expected_server.pid,
             batch.expected_server.start_time,
-            commands,
+            source_command,
             STATUS_PUSH_SERVER_MISMATCH_SENTINEL,
         );
         let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
@@ -807,7 +870,8 @@ pub fn escape_external_display_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmux::mock::MockTmuxRunner;
+    use std::cell::RefCell;
+    use std::os::unix::fs::PermissionsExt;
 
     fn server() -> ServerIdentity {
         ServerIdentity {
@@ -1149,45 +1213,164 @@ mod tests {
         }));
     }
 
+    #[derive(Default)]
+    struct InspectBatchRunner {
+        batch_dir: PathBuf,
+        calls: RefCell<Vec<Vec<String>>>,
+        bodies: RefCell<Vec<String>>,
+        modes: RefCell<Vec<u32>>,
+        output: String,
+        fail: bool,
+    }
+
+    impl crate::tmux::TmuxRunner for InspectBatchRunner {
+        fn run(&self, args: &[&str]) -> anyhow::Result<String> {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|value| (*value).to_string()).collect());
+            let files = std::fs::read_dir(&self.batch_dir)?.collect::<Result<Vec<_>, _>>()?;
+            anyhow::ensure!(files.len() == 1, "expected exactly one status batch file");
+            let path = files[0].path();
+            self.modes
+                .borrow_mut()
+                .push(std::fs::metadata(&path)?.permissions().mode() & 0o777);
+            self.bodies
+                .borrow_mut()
+                .push(std::fs::read_to_string(path)?);
+            if self.fail {
+                anyhow::bail!("tmux failed after reading status batch")
+            }
+            Ok(self.output.clone())
+        }
+    }
+
+    fn unique_status_batch_dir() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "vde-tmux-status-batch-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
     #[test]
-    fn system_io_uses_one_server_guarded_process_and_pane_pid_guard() {
+    fn system_io_uses_one_file_backed_server_guarded_process_for_large_batch() {
+        let batch_dir = unique_status_batch_dir();
+        let mut writes = vec![DisplayOptionWrite {
+            key: DisplayOptionKey::GlobalSummary,
+            value: DisplayOptionValue::Set("summary".to_string()),
+        }];
+        writes.extend((1..=64).map(|pid| DisplayOptionWrite {
+            key: DisplayOptionKey::PaneStatus(pane(pid)),
+            value: DisplayOptionValue::Set(format!("#[fg=red]pane-{pid}-{}", "x".repeat(512))),
+        }));
         let batch = GuardedDisplayBatch {
             expected_server: server(),
-            writes: vec![
-                DisplayOptionWrite {
-                    key: DisplayOptionKey::GlobalSummary,
-                    value: DisplayOptionValue::Set("summary".to_string()),
-                },
-                DisplayOptionWrite {
-                    key: DisplayOptionKey::PaneStatus(pane(77)),
-                    value: DisplayOptionValue::Set("#[fg=red]pane".to_string()),
-                },
-            ],
+            writes,
         };
-        let commands = batch
-            .writes
-            .iter()
-            .map(display_write_command)
-            .collect::<Vec<_>>()
-            .join(" ; ");
-        assert!(commands.contains("pane_pid"));
-        assert!(commands.contains("77"));
-        let guarded = crate::pane_state::store::server_guarded_command_args(
-            42,
-            99,
-            commands,
-            STATUS_PUSH_SERVER_MISMATCH_SENTINEL,
-        );
-        let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
-        let mock = MockTmuxRunner::new();
-        mock.stub(&refs, "");
-        let mut io = SystemDisplayBatchIo::new(&mock);
+        let runner = InspectBatchRunner {
+            batch_dir: batch_dir.clone(),
+            ..InspectBatchRunner::default()
+        };
+        let mut io = SystemDisplayBatchIo::new(&runner, &batch_dir);
 
         assert_eq!(
             io.execute_guarded_batch(&batch),
             DisplayBatchIoOutcome::Succeeded
         );
-        assert_eq!(mock.calls().len(), 1);
+
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        let argv_bytes = calls[0].iter().map(String::len).sum::<usize>();
+        assert!(argv_bytes < 4 * 1024, "guarded argv was {argv_bytes} bytes");
+        let rendered_args = calls[0].join(" ");
+        assert!(rendered_args.contains("source-file"));
+        assert!(rendered_args.contains("#{pid}"));
+        assert!(rendered_args.contains("#{start_time}"));
+        assert!(!rendered_args.contains(&"x".repeat(512)));
+
+        let bodies = runner.bodies.borrow();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].len() > 40 * 1024);
+        assert_eq!(bodies[0].lines().count(), 65);
+        assert!(bodies[0].contains("pane_pid"));
+        assert!(bodies[0].contains("64"));
+        assert_eq!(runner.modes.borrow().as_slice(), &[0o600]);
+        assert_eq!(
+            std::fs::metadata(&batch_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(bodies);
+        drop(calls);
+
+        assert_eq!(std::fs::read_dir(&batch_dir).unwrap().count(), 0);
+        std::fs::remove_dir(batch_dir).unwrap();
+    }
+
+    #[test]
+    fn system_io_removes_batch_file_after_runner_failure() {
+        let batch_dir = unique_status_batch_dir();
+        let batch = GuardedDisplayBatch {
+            expected_server: server(),
+            writes: vec![DisplayOptionWrite {
+                key: DisplayOptionKey::GlobalSummary,
+                value: DisplayOptionValue::Set("summary".to_string()),
+            }],
+        };
+        let runner = InspectBatchRunner {
+            batch_dir: batch_dir.clone(),
+            fail: true,
+            ..InspectBatchRunner::default()
+        };
+        let mut io = SystemDisplayBatchIo::new(&runner, &batch_dir);
+
+        assert!(matches!(
+            io.execute_guarded_batch(&batch),
+            DisplayBatchIoOutcome::Failed(error) if error.contains("tmux failed")
+        ));
+        assert_eq!(std::fs::read_dir(&batch_dir).unwrap().count(), 0);
+        std::fs::remove_dir(batch_dir).unwrap();
+    }
+
+    #[test]
+    fn system_io_preserves_mismatch_classification_with_file_backed_batch() {
+        let batch = GuardedDisplayBatch {
+            expected_server: server(),
+            writes: vec![DisplayOptionWrite {
+                key: DisplayOptionKey::PaneStatus(pane(77)),
+                value: DisplayOptionValue::Set("pane".to_string()),
+            }],
+        };
+
+        let server_dir = unique_status_batch_dir();
+        let server_runner = InspectBatchRunner {
+            batch_dir: server_dir.clone(),
+            output: format!("{STATUS_PUSH_SERVER_MISMATCH_SENTINEL}\n"),
+            ..InspectBatchRunner::default()
+        };
+        let mut server_io = SystemDisplayBatchIo::new(&server_runner, &server_dir);
+        assert_eq!(
+            server_io.execute_guarded_batch(&batch),
+            DisplayBatchIoOutcome::ServerIncarnationMismatch
+        );
+        assert_eq!(std::fs::read_dir(&server_dir).unwrap().count(), 0);
+        std::fs::remove_dir(server_dir).unwrap();
+
+        let pane_dir = unique_status_batch_dir();
+        let pane_runner = InspectBatchRunner {
+            batch_dir: pane_dir.clone(),
+            output: format!("{}\n", pane_mismatch_sentinel(&pane(77))),
+            ..InspectBatchRunner::default()
+        };
+        let mut pane_io = SystemDisplayBatchIo::new(&pane_runner, &pane_dir);
+        assert_eq!(
+            pane_io.execute_guarded_batch(&batch),
+            DisplayBatchIoOutcome::PaneInstanceMismatch(pane(77))
+        );
+        assert_eq!(std::fs::read_dir(&pane_dir).unwrap().count(), 0);
+        std::fs::remove_dir(pane_dir).unwrap();
     }
 
     fn frame(

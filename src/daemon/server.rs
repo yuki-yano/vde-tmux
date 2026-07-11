@@ -1374,7 +1374,13 @@ impl ProductionV2Coordinator {
             return Ok(());
         };
         let runner = self.status_push_runner(Duration::from_secs(1));
-        let mut io = SystemDisplayBatchIo::new(&runner);
+        let batch_dir = crate::daemon::daemon_socket_path_for_incarnation(
+            &self.env,
+            None,
+            &self.incarnation.hash,
+        )
+        .with_extension("status-batches");
+        let mut io = SystemDisplayBatchIo::new(&runner, &batch_dir);
         let result = self
             .status_push
             .lock()

@@ -723,6 +723,46 @@ for surface in \
   run_vt $surface >/dev/null
 done
 
+# A production-sized topology must keep the status push argv small. The daemon writes every scope
+# through one guarded `source-file` tmux client process, even when the command body exceeds tmux's
+# direct command-length limit.
+: >"$TMUX_PROCESS_LOG"
+LARGE_WINDOWS=()
+LAST_LARGE_PANE=""
+LARGE_TARGET_PANES=58
+BASELINE_PANE_COUNT="$(tmux -L "$TMUX_SOCKET" list-panes -a -F '#{pane_id}' | sort -u | wc -l | tr -d ' ')"
+LARGE_WINDOW_COUNT="$((LARGE_TARGET_PANES - BASELINE_PANE_COUNT))"
+[[ "$LARGE_WINDOW_COUNT" -gt 0 ]]
+for index in $(seq 1 "$LARGE_WINDOW_COUNT"); do
+  large_window="$(tmux -L "$TMUX_SOCKET" new-window -d -P -F '#{window_id}' -t aux: \
+    -n "load-$index" "sleep 600")"
+  LARGE_WINDOWS+=("$large_window")
+  LAST_LARGE_PANE="$(tmux -L "$TMUX_SOCKET" display-message -p -t "$large_window" '#{pane_id}')"
+done
+[[ "$(tmux -L "$TMUX_SOCKET" list-panes -a -F '#{pane_id}' | sort -u | wc -l | tr -d ' ')" == "$LARGE_TARGET_PANES" ]]
+for _ in $(seq 1 120); do
+  LARGE_PANE_STATUS="$(tmux -L "$TMUX_SOCKET" show-options -pqv -t "$LAST_LARGE_PANE" \
+    @vde_status_pane 2>/dev/null || true)"
+  LARGE_WINDOWS_STATUS="$(tmux -L "$TMUX_SOCKET" show-options -qv -t aux \
+    @vde_status_windows 2>/dev/null || true)"
+  [[ -n "$LARGE_PANE_STATUS" && "$LARGE_WINDOWS_STATUS" == *"load-$LARGE_WINDOW_COUNT"* ]] && break
+  sleep 0.1
+done
+[[ -n "$LARGE_PANE_STATUS" && "$LARGE_WINDOWS_STATUS" == *"load-$LARGE_WINDOW_COUNT"* ]]
+STATUS_SOURCE_PROCESSES="$(grep -c 'status-batches.*source-file\|source-file.*status-batches' \
+  "$TMUX_PROCESS_LOG" || true)"
+[[ "$STATUS_SOURCE_PROCESSES" -ge 1 ]]
+if grep 'status-batches' "$TMUX_PROCESS_LOG" | grep -F '@vde_status_pane' >/dev/null; then
+  echo "file-backed status push leaked pane payload into tmux argv" >&2
+  exit 1
+fi
+STATUS_BATCH_DIR="$V2_SOCKET_ROOT/$SERVER_HASH.status-batches"
+[[ -d "$STATUS_BATCH_DIR" && "$(find "$STATUS_BATCH_DIR" -type f | wc -l | tr -d ' ')" == 0 ]]
+echo "large status projection ok: $LARGE_TARGET_PANES panes, guarded source-file, 1 process/batch"
+for large_window in "${LARGE_WINDOWS[@]}"; do
+  tmux -L "$TMUX_SOCKET" kill-window -t "$large_window"
+done
+
 sidebar_snapshot() {
   VT_PANE="$OTHER_PANE" run_vt sidebar attach --once | sed -E 's/[0-9]+s ago/<elapsed>/g'
 }
