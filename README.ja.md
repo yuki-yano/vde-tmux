@@ -2,128 +2,86 @@
 
 [English](./README.md) | **日本語**
 
-AI コーディングエージェントのための tmux state & UI マネージャ。
-vde-tmux は tmux サーバ上の Claude Code / Codex / opencode の pane をすべて追跡し、その状態を tmux の status line と専用サイドバーに表示する。
-あわせて、カテゴリベースのセッション管理と、fzf によるセッション/プロジェクト切替を提供する。
+vde-tmux は、tmux で動かしている AI コーディングエージェントの状態を一覧できるツールです。
+Claude Code、Codex、opencode の pane を追跡し、status line とサイドバーへ表示します。
 
 ![vde-tmux sidebar](https://github.com/user-attachments/assets/e912448f-b657-49d9-b175-39a0cbad04f2)
 
-## なぜ必要か
+## できること
 
-複数の AI コーディングエージェントを tmux のセッションをまたいで並行稼働させると、監視が問題になる。
-あるエージェントは許可待ちで止まり、別のエージェントは数分前に完了し、さらに別のエージェントはまだ作業中という状態は、各 pane を見に行かない限り分からない。
-vde-tmux はすべての agent pane を監視し、**いまどの pane が自分を必要としているか**を一目で答える。
+- 複数の tmux session にいるエージェントを `Blocked`、`Working`、`Done`、`Idle` に分類する
+- status line で、対応が必要なエージェントと作業中のエージェントを確認する
+- サイドバーから prompt、経過時間、task、subagent、worktree activity を確認する
+- サイドバーからエージェントの pane へ移動し、スクロールバックを preview する
+- session をカテゴリで整理し、キーボードやマウスで切り替える
+- エージェントが入力待ちになったとき、任意の通知コマンドを実行する
 
-## 機能
+## 必要なもの
 
-- **エージェント状態の追跡**：各 agent pane を 4 状態（`▲` Blocked（入力待ち）、`●` Working、`✓` Done（完了・未読）、`○` Idle）に分類する。
-- **status line セグメント**：セッションごとの状態バッジ付きセッション一覧、状態別カウント（`▲2 ●1`）、eligible な通常 client で厳密に focus されている pane 以外の blocked agent への注意喚起（`▲ session · perm 2m07s`）を表示する。
-  表示中でも focus されていない split は attention の対象に残る。
-- **エージェントサイドバー**：全 agent pane の状態、直近の prompt、経過時間を一覧する TUI pane。
-  Enter で pane へジャンプでき、スクロールバックの preview や出力のライブ表示もできる。
-- **セッションカテゴリ**：パスやセッション名のルールでセッションをカテゴリ（`work` / `private` など）に分類し、カテゴリ間およびカテゴリ内セッション間を巡回できる。
-- **セッション/プロジェクト切替**：fzf ベースのセッションマネージャと、ghq ベースのプロジェクトセレクタを tmux popup として使える。
-- **通知**：エージェントが blocked になった瞬間に任意のコマンド（`terminal-notifier` など）を実行できる。
-
-## 動作要件
-
-- **tmux** 3.2 以降（セッションマネージャ、プロジェクトセレクタ、サイドバー preview が popup を使う）
-- **Rust toolchain**（edition 2024。Rust 1.85 以降）：ソースからのビルドに必要
-- **fzf**：セッションマネージャとプロジェクトセレクタに必要
-- **ghq**：プロジェクトセレクタに必要
-- **git**：サイドバーの repository/branch バッジに使う
-- **less**：サイドバー preview のページャに使う
+- tmux 3.2 以降
+- 最新の stable Rust と Cargo（インストールに使用）
+- git（repository と branch の表示に使用）
+- lsof（daemon socket の検証に使用）
+- less（サイドバーの preview に使用）
+- fzf（session manager を使う場合）
+- ghq（project selector を使う場合）
 
 ## インストール
 
+crates.io からインストールします。
+
 ```bash
-cargo install --git https://github.com/yuki-yano/vde-tmux vde-tmux
+cargo install vde-tmux --locked
 ```
 
-同一の CLI を提供する 2 つのバイナリがインストールされる。
+`vt` と `vde-tmux` の二つのコマンドがインストールされます。
+以降は短い名前の `vt` を使います。
 
-- `vt`：常用の短縮名
-- `vde-tmux`：正式名
+```bash
+vt --version
+```
 
-以降の例では `vt` を使う。
+## 最初の設定
 
-## はじめかた
+### tmux に表示とキーバインドを追加する
 
-### 1. status line にセグメントを追加する
-
-`~/.tmux.conf` に次を書く。
+`~/.tmux.conf` に次の設定を追加します。
 
 ```tmux
 run-shell -b 'vt daemon ensure'
+
 set -g status-left-length 10000
 set -g status-left '#{@vde_status_category}#[fg=#8f8ba8] │ #[default]#{@vde_status_sessions}#[fg=#8f8ba8] │ #[default]#{@vde_status_windows}'
 set -g status-right '#{@vde_status_attention} #{@vde_status_summary}'
-set -g pane-border-status bottom
-set -g pane-border-format '#{?#{@vde_status_pane},#{@vde_status_pane},#{pane_index} #{pane_current_command}}'
+
 setw -g window-status-format ''
 setw -g window-status-current-format ''
 set -g window-status-separator ''
+
+set -g pane-border-status bottom
+set -g pane-border-format '#{?#{@vde_status_pane},#{@vde_status_pane},#{pane_index} #{pane_current_command}}'
+
 bind-key -n MouseDown1Status run-shell "vt statusline-click --client-name #{q:client_name} --session-id #{q:session_id} #{q:mouse_status_range}"
 bind-key -n M-h run-shell "vt session-cycle prev --client-name #{q:client_name} --session-id #{q:session_id}"
 bind-key -n M-l run-shell "vt session-cycle next --client-name #{q:client_name} --session-id #{q:session_id}"
-bind-key -n User0 run-shell "vt category prev --client-name #{q:client_name} --session-id #{q:session_id}"
-bind-key -n User1 run-shell "vt category next --client-name #{q:client_name} --session-id #{q:session_id}"
-bind-key -n M-1 run-shell "vt statusline-sessions --client-name #{q:client_name} --session-id #{q:session_id} switch 1"
-bind-key -n M-! run-shell "vt category use private --client-name #{q:client_name} --session-id #{q:session_id}"
-bind-key -n M-C run-shell "vt session new -c ~/ --client-name #{q:client_name} --session-id #{q:session_id}"
 bind-key -n M-e run-shell "vt sidebar focus-toggle --window #{q:window_id}"
 ```
 
-category/session を操作する対話的なbindingでは、呼び出し元clientとsource sessionの両方を必ずcaptureする。
-これにより、同じpaneを複数clientが表示していても操作対象を正しいclientに固定でき、scope省略時は別clientを誤って動かさずfail-closedになる。
-`q:` format modifierはcaptureした値をshell用にescapeする。
-sidebar操作は暗黙のcurrent windowに頼らず、安定したwindow IDを渡す。
+vde-tmux が `@vde_status_*` option を更新するため、status line の再描画ごとに外部プロセスは起動しません。
+上の設定は tmux 標準の window list を vde-tmux の表示へ置き換えます。
 
-- `@vde_status_category`：現在のカテゴリ（設定によっては他カテゴリも）
-- `@vde_status_sessions`：現在カテゴリのセッション一覧
-  各セッション名の前に agent 状態バッジが付く
-  `statusline.session_badge.mode: counts` では `▲ 2 ● 1 ○ 5` のように表示する
-- `@vde_status_windows`：現在 session の window 一覧。`statusline.windows` で整形する
-- `@vde_status_pane`：各 pane の border label。`statusline.panes` で整形する
-- `@vde_status_summary`：全 agent の状態別カウント。session ごとの描画予算で publish する。例 `▲2 ●1`
-- `@vde_status_attention`：eligible な通常 client で厳密に focus されている pane 以外の blocked agent を表示する。例 `▲ session · perm 2m07s`
-  表示中でも focus されていない split はこのセグメントに残る
+設定を読み込み直します。
 
-`statusline.sessions.badge_style: chip` を使うと、各 session セグメントの前に接続された chip として session badge を表示する。
-category と window の badge は `statusline.category.agent_badge` と `statusline.windows.agent_badge` で状態の集計方法を設定する。
-見た目は `statusline.category.badge_style` と `statusline.windows.badge_style` で設定する。
-inline 系の表示位置は `{badge}` placeholder で指定する。
-chip の色と左右 cap は `statusline.session_badge.chip` で設定する。
+```bash
+tmux source-file ~/.tmux.conf
+```
 
-`status-left-length` には十分大きい値を指定し、左セグメント側の人工的な長さ制限を外す。
-実際の表示上限は端末幅である。
-`@vde_status_windows` は tmux native の window list を置き換えるため、併用時は native の `window-status-*` format を空にする。
+複数の tmux client を使う場合、session や category を操作する binding には `--client-name` と `--session-id` の両方が必要です。
+上の例をそのまま使えば、操作対象が別の client へずれることはありません。
 
-session 一覧は表示順どおり常に全件を publish し、index と next/previous の全対象に stable target を持たせる。
-session を `+N` へ省略することはない。
-その他の status 内容には引き続き 80 cell を目安として使い、blocked attention、current category、current window を低優先度の peer より先に残す。
-全 session の表示によって合計が 80 cell を超えた場合は、実際の端末幅に従って tmux が表示領域を決める。
+### Claude Code の hook を設定する
 
-daemon は表示文字列を描画し、tmux option へ push する。
-tmux は status line の描画時に format 変数だけを展開するため、定期描画による process 起動は発生しない。
-pane の fallback は daemon が `@vde_status_pane` を初期化する前だけ使われ、初期化後は non-agent pane も daemon が描画する。
-
-summary、category、session、window、attention の値は session scope である。
-tmux は各 client の attach 先 session に対して値を展開するため、一つの混雑したsessionでsummaryが省略されても別sessionのsummaryは消えない。
-
-`run-shell -b 'vt daemon ensure'` は、OS 再起動後を含む新しい tmux server の cold start 経路である。
-config を reload して再実行しても二重起動しない。
-手動制御には後述の lifecycle command を使う。
-
-vde-tmux 設定の変更は `vt daemon reload` の後に反映される。
-tmux config の reload だけでは format 参照は変わっても、daemon の runtime state と描画値は再構築されない。
-config依存commandはdisk configをstrictに読み、daemonのactive config hashと比較する。invalidまたは不一致ならmutation前に停止し、`vt daemon reload`を案内する。
-
-### 2. エージェントを接続する
-
-hook がなくても pane の実行コマンドからエージェントは検出されるが、hook を設定すると状態遷移、prompt、時刻が正確になる。
-
-**Claude Code**：`~/.claude/settings.json` に追加する。
+`~/.claude/settings.json` の `hooks` に次の設定を追加します。
 
 ```json
 {
@@ -138,9 +96,12 @@ hook がなくても pane の実行コマンドからエージェントは検出
 }
 ```
 
-`PostToolUse` hook により、vde-tmux は Claude Code の task tool events（`TaskCreate` / `TaskUpdate`、および emit された場合の `TodoWrite` snapshot）から collapsed の `done/total` counter と expanded task rows を表示する。
+Claude Code を再起動すると、状態遷移と task の進捗が表示されます。
 
-**Codex**：`~/.codex/hooks.json`（または project-local な `.codex/hooks.json`）に追加し、Codex の `/hooks` で review / trust する。
+### Codex の hook を設定する
+
+`~/.codex/hooks.json` または project の `.codex/hooks.json` に次の設定を追加します。
+追加後、Codex の `/hooks` で内容を確認して承認します。
 
 ```json
 {
@@ -148,189 +109,119 @@ hook がなくても pane の実行コマンドからエージェントは検出
     "SessionStart": [
       {
         "matcher": "startup|resume|clear",
-        "hooks": [
-          { "type": "command", "command": "vt hook codex SessionStart" }
-        ]
+        "hooks": [{ "type": "command", "command": "vt hook codex SessionStart" }]
       }
     ],
     "UserPromptSubmit": [
-      {
-        "hooks": [
-          { "type": "command", "command": "vt hook codex UserPromptSubmit" }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "vt hook codex UserPromptSubmit" }] }
     ],
     "PermissionRequest": [
-      {
-        "hooks": [
-          { "type": "command", "command": "vt hook codex PermissionRequest" }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "vt hook codex PermissionRequest" }] }
     ],
     "PostToolUse": [
       {
         "matcher": "^update_plan$",
-        "hooks": [
-          { "type": "command", "command": "vt hook codex PostToolUse" }
-        ]
+        "hooks": [{ "type": "command", "command": "vt hook codex PostToolUse" }]
       },
       {
         "matcher": "^Bash$",
-        "hooks": [
-          { "type": "command", "command": "vt hook codex PostToolUse" }
-        ]
+        "hooks": [{ "type": "command", "command": "vt hook codex PostToolUse" }]
       }
     ],
     "SubagentStart": [
-      {
-        "hooks": [
-          { "type": "command", "command": "vt hook codex SubagentStart" }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "vt hook codex SubagentStart" }] }
     ],
     "SubagentStop": [
-      {
-        "hooks": [
-          { "type": "command", "command": "vt hook codex SubagentStop" }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "vt hook codex SubagentStop" }] }
     ],
     "Stop": [
-      {
-        "hooks": [
-          { "type": "command", "command": "vt hook codex Stop" }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "vt hook codex Stop" }] }
     ]
   }
 }
 ```
 
-legacy の `notify = ["vt", "hook", "codex"]` 設定は削除する。
-legacy の `agent-turn-complete` 経路は未対応であり、`UnsupportedLegacyNotify` を返す。
-上記の `Stop` hook だけが Codex の完了を報告する経路である。
-`PostToolUse` hook により、vde-tmux は `update_plan` snapshot から collapsed の `done/total` counter と expanded task rows を表示し、認識できる `vw exec` Bash command を prompt 下の一時的な `vw exec <worktree_name>` row として表示する。
-`SubagentStart` / `SubagentStop` からは expanded の `Agent - ... #id` rows を表示する。
-Codex subagent は session metadata を解決できる場合、`Agent - Fermat #019f` のように Codex nickname を優先し、取れない場合は hook の `agent_type` を表示する。
-pane が linked git worktree 上にある場合、expanded detail の先頭に `+ <worktree_name>` が表示される。この active worktree row は `vw exec` activity とは別物であり、従来の `session · pane_id` place row は表示しない。
-detail row の色は `sidebar.colors` の `task_done`、`task_working`、`task_pending`、`task_label`、`subagent_label`、`subagent_id`、`worktree`、`worktree_activity` で上書きできる。
+Codex を再起動すると、permission request、plan、subagent、worktree activity がサイドバーへ反映されます。
 
-**その他のエージェント**：汎用の低レベルコマンドで任意のエージェントから状態を報告できる。
+### 動作を確認する
+
+tmux 内で daemon の状態を確認します。
 
 ```bash
-vt hook emit --agent myagent --session-id run-42 \
-  --status running --prompt "fix the build" --prompt-source user
+vt daemon status
+vt daemon doctor
 ```
 
-すべての generic report で `--agent` と空でない安定した `--session-id` が必須になる。
-一つの agent session では同じ session ID を使い、agent session が切り替わったら新しい ID を使う。
-
-- `--status` は `running`、`waiting`、`idle`、`error` のいずれかを受け取る
-- `--prompt TEXT` には `--prompt-source SOURCE` が必要であり、prompt を消す場合は `--clear-prompt` を使う
-- `--status waiting` には `--wait-reason permission_prompt` または `--wait-reason 'other:TEXT'` が必要になる
-- `--started-at` は `--status running`、`--completed-at` と `--attention` は `--status idle` の場合だけ使える
-- `--tasks DONE/TOTAL` は task 進捗を置換し、たとえば `--tasks 2/5` と指定する
-  削除には `--clear-tasks` を使う
-- `--subagents 'ID:TYPE|ID:TYPE'` は subagent 集合を置換し、たとえば `--subagents 'worker-1:reviewer|worker-2:tester'` と指定する
-  削除には `--clear-subagents` を使う
-
-同じ field の Set と Clear は同時に指定できない。
-lifecycle も field 変更もない report は無視される。
-
-### 3. サイドバーを開く
+サイドバーを開きます。
 
 ```bash
-vt sidebar toggle
+vt sidebar open
 ```
 
-tmux バインドの例。
+hook を設定していないエージェントも、pane の実行コマンドから検出できる場合があります。
+ただし、prompt、完了時刻、入力待ちを正確に表示するには hook が必要です。
 
-```tmux
-bind-key e run-shell "vt sidebar focus-toggle"   # 開く → フォーカス → 閉じる
-bind-key b run-shell "vt sidebar focus"          # pane へジャンプした後にサイドバーへ戻る
-bind-key -n M-C run-shell "vt session new -c ~/"  # home で管理対象セッションを作る
-bind-key s run-shell "vt session-manager --popup"
-bind-key g run-shell "vt project selector --popup"
-```
+## 状態の読み方
 
-## エージェントの状態
-
-| バッジ | 状態 | 意味 |
+| 表示 | 状態 | 意味 |
 | --- | --- | --- |
-| `▲` | Blocked | エージェントが入力を待っている（許可プロンプト、質問） |
-| `●` | Working | エージェントが実行中 |
-| `✓` | Done | 完了したがまだ確認していない |
-| `○` | Idle | 作業なし、または確認済み |
+| `▲` | Blocked | 許可や回答など、利用者の入力を待っている |
+| `●` | Working | エージェントが作業している |
+| `✓` | Done | 作業が完了し、まだ確認されていない |
+| `○` | Idle | 作業がない、または完了を確認済み |
 
-グリフと色は `badge.glyphs` と `badge.colors` で変更できる。
+`Done` は、対象の pane または window を確認すると `Idle` になります。
+確認範囲は `daemon.done_clear_on` で変更できます。
 
-### canonical pane state と acknowledgment
+```yaml
+daemon:
+  done_clear_on: window # window | pane
+```
 
-daemon は pane lifecycle state の唯一の writer である。
-agent lifecycle、session identity、run/completion/acknowledgment sequence、prompt、task、subagent、worktree activity を pane scope の JSON option `@vde_pane_state` にまとめて保存する。
-status line と sidebar は同じ daemon snapshot の解決結果を使い、`@vde_status_pane` などの表示 option を状態として読み返さない。
-
-`Done` badge は、最新の完了 run が未確認であることを表す。
-acknowledgment は永続化され、すべての client と sidebar で共有する pane-global state になる。
-eligible な通常 tmux client のどれか一つが必要な scope を表示すると、daemon は acknowledged sequence を進める。
-その pane または window から離れても `Idle` は `Done` に戻らず、次の run が完了したときだけ新しい `Done` になる。
-
-`Blocked` attention と `Done` acknowledgment は別の状態である。
-attention セグメントから除外するのは、eligible な通常 client のいずれかが厳密に focus している pane だけである。
-別 split に表示されているだけの blocked pane は attention に残る。
-focus と visibility に関係なく、`Blocked` への遷移ごとに設定された外部通知 command を実行する。
-
-`daemon.done_clear_on` は acknowledgment の scope を選ぶ。
-
-- `pane` は active になった pane だけを確認済みにする
-- `window` は window を表示した時点で、その window に存在した agent pane を確認済みにする
-
-次の poll より短い focus 移動は、owned view hook が健全で、eligible な通常 client が表示を witness し、hook が 500 ms 以内に受理応答を得て、適用まで daemon が生存し、永続化に成功した場合に保証される。
-初回 hook install 前、hook collision 中、hook health が `Degraded` の間、daemon crash 後、response 喪失または deadline 超過時は best effort になる。
-定常 reconciliation は表示が続いている pane を確認済みにできるが、すでに終了した表示 occurrence は復元しない。
+確認状態は daemon の再起動後も保持され、すべての tmux client とサイドバーで共有されます。
 
 ## サイドバー
 
-サイドバーは現在の tmux window 内に開く TUI pane である。
-起動中の各 sidebar は、選択、展開状態、scroll、復帰先、一時的な接続状態と toast を instance-local に保持する。
-view mode と filter の変更は次に開く sidebar のdefaultとしてだけ保存し、すでに開いている別sidebarへは反映しない。
-non-agent paneから開いた場合は、同じstable tmux session IDに属する解決済みでfocus可能なagent行のうち、現在のtree/render順で最初の行を選択する。pane ID/PIDが直接一致するagentを最優先し、同sessionにagentがなければ未選択のままにする。
-agent pane をフラット、repository 別、カテゴリ別のいずれかでグルーピングして一覧し、各エージェントの状態、直近の prompt、経過時間（`42s`、`2m07s`、`12m`、`1h30m` など）を表示する。
-10分未満は秒精度を維持する。
-標準幅の閉じた agent 行は 2 行 digest で表示され、1 行目に状態、経過時間、task 進捗（`☑ done/total`）、実行中 subagent 数（`↳ n`）をまとめ、2 行目に prompt と必要に応じて `↩ permission` のような短縮 blocked 理由を表示する。
-行を展開すると prompt の全文と pane の場所が表示され、window レイアウトの変更にはサイドバーが自動で追従する。
-daemon の再起動中は最後に有効だった snapshot を保持し、degraded または reconnecting の状態を明示して、local interaction state を捨てずに再接続する。
-成功、警告・進行中、失敗の通知は既存の意味別colorを使い、文字markerを維持したままsidebar幅へ切り詰める。最狭railは3cellで、2桁以上の件数をstate glyph付きの`9+`として示す。
-
-### キーバインド
-
-| キー | 動作 |
-| --- | --- |
-| `j` / `k`、`↓` / `↑` | 下 / 上へ移動 |
-| `Enter` | 選択中の agent pane へジャンプ |
-| `Space` | 選択行の展開 / 折りたたみ |
-| `v`、`1` / `2` / `3` | 表示モードの循環 / 直接指定（Flat / ByRepo / ByCategory） |
-| `Tab` | フィルタの循環（all → needs action → working → done → idle。0 件のフィルタはスキップ） |
-| `n` / `N` | 次 / 前の要対応行へフォーカス |
-| `d` | 選択中の完了 run を確認済みにする（`Mark complete`） |
-| `J` / `K` | pin 行の並べ替え |
-| `p` | 選択 pane のスクロールバックを floating pane で preview（`less`） |
-| `e` | ライブ表示モードの切替 |
-| `q` / `Esc` | サイドバー TUI を閉じる |
-
-### サイドバーのコマンド
+サイドバーは現在の tmux window に開きます。
+デフォルトの表示モードはカテゴリ別です。
 
 ```bash
-vt sidebar open [--width 40|20%]   # 現在の window に開く
-vt sidebar toggle [--all]          # 開閉トグル（--all で全 window 一括）
-vt sidebar focus-toggle            # 未表示なら開く、非フォーカスならフォーカス、フォーカス中なら閉じる
-vt sidebar rail                    # 最小幅のレール表示に畳む
+vt sidebar open --width 40
+vt sidebar open --width 20%
+vt sidebar toggle
+vt sidebar toggle --all
+vt sidebar rail
 vt sidebar close
 ```
 
-## セッション、カテゴリ、プロジェクト
+`vt sidebar focus-toggle` は、サイドバーがなければ開き、表示中ならフォーカスし、フォーカス中なら閉じます。
+開閉状態はすべての session で共有されます。
 
-セッションは、プロジェクトのパスまたはセッション名のルールで**カテゴリ**（`work`、`private` など）に分類される。
+| キー | 動作 |
+| --- | --- |
+| `j` / `k`、`↓` / `↑` | 行を移動する |
+| `Enter` | 選択したエージェントの pane へ移動する |
+| `Space` | 選択行を開閉する |
+| `v` | 表示モードを切り替える |
+| `1` / `2` / `3` | Flat / ByRepo / ByCategory へ切り替える |
+| `Tab` | 状態フィルタを切り替える |
+| `n` / `N` | 次または前の要対応エージェントへ移動する |
+| `d` | 完了状態を確認済みにする |
+| `J` / `K` | 手動順序を変更する |
+| `p` | スクロールバックを preview する |
+| `e` | live output を切り替える |
+| `q` / `Esc` | サイドバーを閉じる |
+
+カーソル位置は `›` で示します。
+選択中のエージェントを開いた場合、カーソルは先頭行だけに表示され、背景色は展開内容全体へ適用されます。
+現在の session に属するエージェントには左端へ `▎` を表示します。
+
+表示モード、フィルタ、手動順序、開閉状態は保存されます。
+選択位置、scroll、通知メッセージはサイドバーごとの一時状態です。
+
+## session と category
+
+category を使うと、project path または session name で tmux session をまとめられます。
 
 ```yaml
 categories:
@@ -341,38 +232,37 @@ categories:
         - github.com/acme/*
 ```
 
-- `vt category next` / `vt category prev` / `vt category use <name>`：カテゴリを切り替え、各カテゴリで最後にいたsessionを記憶する。next/prevは、`mode: current`やcompact表示で隠れたものも含め、実在sessionを持つeffective category全体を巡回し、対象が2件未満ならerrorになる。clickは描画済みrangeだけを対象にする。複数clientのbindingでは、呼び出し元clientとsource sessionを固定するため `--client-name #{q:client_name} --session-id #{q:session_id}` を必ず渡す
-- `vt session-cycle next` / `vt session-cycle prev`：現在表示中のカテゴリ内の全sessionを巡回する。通常clientが1つなら追加引数は不要で、複数clientのbindingでは `--client-name` と `--session-id` を必ずcaptureする
-- `vt session new [-c <path>]`：管理対象の tmux セッションを作成し、project path / category metadata を初期化する
-- `vt session set-category <session> <category>`：セッションのカテゴリを手動で上書きする
-- `vt session-manager --popup`：セッション、window、pane の切替と kill ができる fzf UI
-- `vt project switch <path>` / `vt project selector --popup`：ghq 管理下のプロジェクトに対応するセッションを作成、または切り替える
+主なコマンドは次のとおりです。
 
-status line は大文字小文字を区別する Unicode の session name 順でセッションを並べ、同名の場合は安定した tmux session ID を tie-breaker に使う。
-数値 index はcommand実行時の最新published snapshotにおける位置であり、永続 ID ではない。
-session の rename または追加により index は移動する。
-category と session の巡回、数値切替、mouse range は、現在 session scope の status option に保存された安定 ID を解決する。
-対話的なcycle/switch commandは呼び出し元clientとsource sessionを同時に固定する。
-`TMUX_PANE`でclientを一意に特定し、`run-shell`が古いpaneを引き継いだ場合も通常clientが1つだけならそのclientを使う。
-複数clientのbindingは `--client-name #{q:client_name} --session-id #{q:session_id}` をcaptureし、明示したsource IDはそのclientと一致する必要がある。
-clientが曖昧、partial range、duplicate ID、current ID欠落、要求index欠落の場合はclientを切り替えずerrorを返す。
-
-session が存在しない設定済み category は表示しない。
-どの rule にも一致しない session は effective な uncategorized または default category から操作できる。
-
-## 設定
-
-設定ファイルは `~/.config/vde/tmux/config.yml`（`$XDG_CONFIG_HOME` を尊重する）。
-すべての項目にデフォルト値があり、設定ファイルがなくても動く。
-
-JSON Schema は `schemas/config.schema.json` にあり、`vt config schema` でも出力できる。
-YAML の language server を使う場合は、設定ファイルの先頭に次を置く。
-
-```yaml
-# yaml-language-server: $schema=/path/to/vde-tmux/schemas/config.schema.json
+```bash
+vt category next
+vt category prev
+vt category use work
+vt session-cycle next
+vt session-cycle prev
+vt session new -c ~/src/my-project
+vt session set-category my-session work
 ```
 
-出発点になる設定の例。
+fzf をインストールすると、session、window、pane を選ぶ popup を利用できます。
+
+```bash
+vt session-manager --popup
+```
+
+ghq を使っている場合は、project selector から session を作成または選択できます。
+
+```bash
+vt project selector --popup
+```
+
+## 設定ファイル
+
+設定ファイルは `$XDG_CONFIG_HOME/vde/tmux/config.yml` に置きます。
+`XDG_CONFIG_HOME` が未設定の場合は `~/.config/vde/tmux/config.yml` を使います。
+設定ファイルがなくてもデフォルト値で動作します。
+
+最初は必要な項目だけを指定してください。
 
 ```yaml
 categories:
@@ -383,41 +273,20 @@ categories:
         - github.com/acme/*
 
 daemon:
-  done_clear_on: window # window | pane
-
-statusline:
-  session_badge:
-    mode: rollup       # rollup | counts
-    chip:
-      bg: "#303047"
-      cap_left: ""
-      cap_right: ""
-  sessions:
-    badge_style: inline   # inline | plain | outer | chip
-  category:
-    format: "{badge}{category} "
-    badge_style: chip   # inline | plain | outer | chip
-    agent_badge:
-      enabled: true
-      mode: rollup        # rollup | counts
-  windows:
-    badge_style: inline   # inline | plain | outer | chip
-    current:
-      format: " {badge}{index}:{window} "
-    other:
-      format: " {badge}{index}:{window} "
-    agent_badge:
-      enabled: false
-      mode: rollup        # rollup | counts
-  summary:
-    enabled: true
+  done_clear_on: window
 
 sidebar:
-  width: "20%"            # 列数またはパーセント
+  width: "20%"
   min_width: 40
   live:
     enabled: true
     lines: 3
+
+statusline:
+  session_badge:
+    mode: rollup # rollup | counts
+  summary:
+    enabled: true
 
 badge:
   glyphs:
@@ -425,215 +294,125 @@ badge:
     working: "●"
     done: "✓"
     idle: "○"
+```
 
+設定を変更したら daemon を読み込み直します。
+
+```bash
+vt daemon reload
+```
+
+## 通知
+
+エージェントが `Blocked` へ移ったときに外部コマンドを実行できます。
+
+```yaml
 notify:
   enabled: true
-  # pane の focus と visibility に関係なく、blocked への遷移ごとに実行される。
-  # 環境変数 VDE_PANE_ID / VDE_AGENT / VDE_BADGE_STATE を受け取る。
   command: 'terminal-notifier -title vde-tmux -message "$VDE_AGENT $VDE_BADGE_STATE"'
 ```
 
-`path_patterns` とセッション名の `patterns` では `${ENV_VAR}` 展開が使える。
+通知コマンドには `VDE_PANE_ID`、`VDE_AGENT`、`VDE_BADGE_STATE` が渡されます。
 
-`daemon.done_clear_on` は `Done` badge を確認済みにする条件を制御する。
-`window` は対象 pane を含む window を表示した時点で解除し、`pane` は対象 pane 自体に focus するまで保持する。
+## その他のエージェントを接続する
 
-### pane-state daemon と owned hook
+Claude Code と Codex 以外のエージェントは、`vt hook emit` で状態を送れます。
+`--session-id` には一つのエージェント実行中に変わらないIDを指定します。
 
-daemon は起動時に tmux hook index `70` の状態管理 hook 5 種類を install して検証し、canonical pane state を hydrate し、現在の view を reconcile し、すべての表示 option を初期化してから `Serving` へ進む。
-daemon phase と hook health は別の状態である。
-`Serving + Degraded` でも pane event、query、subscribe、poll reconciliation、status 出力は継続するが、上記の短時間 focus 保証は hook が再び健全になるまで外れる。
+```bash
+vt hook emit \
+  --agent myagent \
+  --session-id run-42 \
+  --status running \
+  --prompt "fix the build" \
+  --prompt-source user
+```
 
-同じ tmux hook に独自処理を追加する場合は、`set-hook -g client-session-changed[0] '...'` のように `70` 以外の index を明示する。
-index なしの `set-hook` は hook 配列全体を置換するため、tmux config の reload 時に daemon 所有の `[70]` handler を削除してしまう。
+`--status` は `running`、`waiting`、`idle`、`error` を受け取ります。
+入力待ちを送る場合は理由も指定します。
 
-daemon lifecycle command は次の効果を持つ。
+```bash
+vt hook emit \
+  --agent myagent \
+  --session-id run-42 \
+  --status waiting \
+  --wait-reason permission_prompt
+```
 
-| command | 効果 |
+## daemon の操作
+
+通常は tmux 設定の `vt daemon ensure` だけで起動を管理できます。
+
+| コマンド | 用途 |
 | --- | --- |
-| `vt daemon ensure` | enabled の場合は冪等に `Serving` へ到達し、disabled の場合は状態を変えず成功する |
-| `vt daemon start` | 明示的に `Serving` へ到達し、disabled の間は error を返す |
-| `vt daemon stop` | owned hook と自動起動を残して一時停止するため、後続 event で再起動しうる |
-| `vt daemon stop --force` | 記録済み process、tmux incarnation、socket identity を再検証した場合だけ kill する |
-| `vt daemon disable` | server-wide disabled marker を先に設定し、owned hook を削除してから停止するため、event では再起動しない |
-| `vt daemon enable` | owned hook を install、verify し、`Serving` へ到達してから disabled marker を解除する。途中で失敗した場合は disabled marker、owned hook、起動直後の daemon を disabled 状態へ戻し、rollback が完了しなければ Degraded として診断可能な状態を残す |
-| `vt daemon reload` | config を strict に検証して stop と start を行う。invalid config なら現 daemon を維持し、新規 start が失敗した場合は rollback せず停止状態にする |
-| `vt daemon restart` | strict validation と新規 start 失敗後の rollback なしを含め、`reload` と完全に同じ動作をする alias |
-| `vt daemon status` | daemon を起動または変更せず、lifecycle と runtime health を読み取る |
-| `vt daemon doctor` | config、hook、projection、notification、status push、runtime path を read-only で診断する |
-| `vt daemon logs [daemon\|notification\|status-push\|pane-state-hook] --lines N` | private log の末尾を上限付きで読み、`N` は 1 から 500 の範囲に限定する |
+| `vt daemon ensure` | daemon が必要なら起動する |
+| `vt daemon reload` | 設定を検証して再起動する |
+| `vt daemon stop` | daemon を一時停止する |
+| `vt daemon disable` | 自動起動を無効にして停止する |
+| `vt daemon enable` | 自動起動を有効にして起動する |
+| `vt daemon status` | daemon と hook の状態を表示する |
+| `vt daemon doctor` | 設定、hook、表示、通知を診断する |
+| `vt daemon logs daemon --lines 100` | daemon log の末尾を表示する |
 
-`vt daemon stop` と daemon crash は owned hook を残す。
-残った hook は次の daemon が起動するまでの event を配送できる。
-自動再起動を抑止したままにする場合は `vt daemon disable` を使う。
-次の明示 command は desired daemon mode を変えずに owned な index `70` entry だけを削除し、foreign command は削除せず error にする。
+`stop` は自動起動を無効にしません。
+停止状態を維持したい場合は `disable` を使います。
 
-```bash
-vt pane-state hooks uninstall
-```
+## トラブルシュート
 
-pane state の保守は daemon 経由の command を使い、`@vde_pane_state` を直接 unset しない。
+### status line またはサイドバーが更新されない
+
+daemon の状態と診断結果を確認します。
 
 ```bash
-vt pane-state reset --target %42       # current state または quarantine state を reset tombstone へ置換
-vt pane-state cleanup-legacy --all --dry-run  # 固定された legacy key の影響を変更なしで報告
-vt pane-state cleanup-legacy --all            # 固定された legacy state 19 keys だけを削除
+vt daemon status
+vt daemon doctor
 ```
 
-cleanup は daemon 起動時に自動実行されない。
-category、project path、sidebar marker、canonical な `@vde_pane_state`、表示用の `@vde_status_*` option は保持する。
-dry-run と実変更はいずれも変更前件数、削除件数、残件数、scope 別件数、上限付き失敗件数を報告する。
-remaining または failure が 0 でない結果は成功ではなく partial cleanup として扱う。
+設定を変更した直後であれば、daemon を読み込み直します。
 
-### legacy pane state からの移行
-
-この移行には互換期間がない。
-最初に専用 socket と一時 config を持つ scratch tmux server で手順を検証し、常用 tmux server を scratch 検証先にしない。
-cleanup は自動で戻せないため、常用 server の cutover は別の運用判断として扱う。
-
-常用 server を cutover する前に、対象 tmux socket、停止する daemon、再起動する agent session、固定された legacy key cleanup の影響を記録し、その対象への明示承認を得る。
-
-承認された対象 server ごとに、次の順で実行する。
-
-1. 旧 binary がまだ install されている間に、その binary の `vt daemon stop` を実行して process の終了を確認する。
-   新 binary には v1 detector、migration helper、fallback、v1 stop 経路がない。
-2. すべての `#(vt statusline-*)` と pane border command を上記の `#{@vde_status_*}` format 参照へ置き換え、`run-shell -b 'vt daemon ensure'` を追加する。
-   新 daemon の startup preflight は、active な status surface に残る legacy の pull-based command を拒否する。
-3. binary を置き換え、tmux config を reload し、protocol v3 と owned hook の post-verify を確認する。
-4. Codex の legacy `notify` 設定を削除し、`Stop` hook だけを完了経路として残し、すべての agent session を再起動して新しい adapter から event を送る。
-5. controlled agent event を 1 件送り、pane option と daemon cache の full state version が一致し、daemon phase が `Serving` であることを確認する。
-6. 二つの通常 client を別 session へ attach し、session ごとの status context、badge、counts、pane border、sidebar が同じ canonical state と一致することを確認する。
-7. 手順 1 から 6 までが成功した場合だけ `vt pane-state cleanup-legacy --all` を実行する。
-8. すべての表示面を再確認し、legacy state option に依存していないことを確認する。
-   破棄が必要な state には `vt pane-state reset --target <pane-id>` を明示的に使う。
-
-controlled event または two-client 検証に失敗した場合は cleanup を実行せず、partial cutover として停止して報告する。
-cleanup の削除が一件でも失敗した場合も停止し、partial cutover として扱う。
-cleanup 後の自動 rollback はなく、旧 binary へ戻すには旧 hook の復元と agent session の再起動が必要になる。
-
-### 推奨の status line 配色
-
-状態グリフを常にバー地の上に置き、塗りをカレント要素だけに使う truecolor プリセット。
-
-```yaml
-# ~/.config/vde/tmux/config.yml
-statusline:
-  session_badge:
-    chip:
-      bg: "#303047"
-      cap_left: ""
-      cap_right: ""
-  category:
-    mode: list
-    format: "{badge}{category} {name} "
-    inactive_format: "{badge}{category} "
-    badge_style: chip
-    agent_badge:
-      enabled: true
-      mode: rollup
-    colors:
-      fg: "#ecebff"
-      bg: "#453f9e"
-    inactive_colors:
-      fg: "#9591ad"
-  sessions:
-    badge_style: outer   # inline | plain | outer | chip
-    current:
-      format: " {session} "
-      bold: true
-      colors:
-        fg: "#ecebff"
-        bg: "#453f9e"
-    other:
-      format: " {session} "
-      colors:
-        fg: "#9591ad"
-  windows:
-    separator: "#[fg=#8f8ba8]│#[default]"
-    badge_style: inline
-    agent_badge:
-      enabled: false
-      mode: rollup
-    current:
-      format: " {index}:{window} "
-      bold: false
-      colors:
-        fg: "#20233a"
-        bg: "#9d8cf5"
-      prefix: "#[fg=#9d8cf5]"
-      suffix: "#[fg=#9d8cf5,bg=default]#[default]"
-    other:
-      format: " {index}:{window} "
-      colors:
-        fg: "#9591ad"
-    bell:
-      fg: "#ff6b6b"
-    activity:
-      fg: "#ff6b6b"
-  panes:
-    current:
-      format: " {pane}  {detail} "
-      colors:
-        fg: "#e7e3f6"
-        bg: "#4a4a70"
-        outer_bg: "#1C1C1C"
-      prefix: "#[fg=#4a4a70,bg=#1C1C1C]"
-      suffix: "#[fg=#4a4a70,bg=#1C1C1C]#[default]"
-    other:
-      format: " {pane} #[fg=#9696CE]#[fg=#BDC4E3] {detail} "
-      colors:
-        fg: "#BDC4E3"
-        bg: "#373A56"
-        outer_bg: "#1C1C1C"
-      prefix: "#[fg=#373A56,bg=#1C1C1C]"
-      suffix: "#[fg=#373A56,bg=#1C1C1C]#[default]"
+```bash
+vt daemon reload
 ```
+
+### tmux の設定を読み込むと hook が壊れる
+
+vde-tmux は tmux hook の index `70` を使います。
+同じ hook に独自の処理を追加する場合は、別の index を明示してください。
 
 ```tmux
-# ~/.tmux.conf
-run-shell -b 'vt daemon ensure'
-set -ga terminal-overrides ',*:Tc'
-set -g status-style 'bg=#1a1926,fg=#9591ad'
-set -g status-left-length 10000
-set -g status-left '#{@vde_status_category}#[fg=#8f8ba8] │ #[default]#{@vde_status_sessions}#[fg=#8f8ba8] │ #[default]#{@vde_status_windows}'
-set -g status-right '#{@vde_status_attention} #{@vde_status_summary}'
-setw -g window-status-format ''
-setw -g window-status-current-format ''
-set -g window-status-separator ''
-set -g pane-border-status bottom
-set -g pane-border-format '#{?#{@vde_status_pane},#{@vde_status_pane},#{pane_index} #{pane_current_command}}'
-bind-key -n MouseDown1Status run-shell "vt statusline-click --client-name #{q:client_name} --session-id #{q:session_id} #{q:mouse_status_range}"
+set-hook -g client-session-changed[0] 'your-command'
 ```
 
-hex 指定の色を使うには tmux の truecolor 設定（上記の `terminal-overrides` 行）が必要になる。
-`statusline.panes.*.format` はpane幅に関係なくそのまま使われ、31/32列と63/64列の境界でも固定formatへ差し替えない。
+index を付けない `set-hook` は既存の hook 配列を置き換えます。
 
-## ファイルと実行時パス
+### 設定エラーを確認する
 
-- 設定：`~/.config/vde/tmux/config.yml`
-- sidebar preferences：`$XDG_STATE_HOME/vde/tmux/sidebar-state/`（未設定なら `~/.local/state/vde/tmux/sidebar-state/`）。`sidebar-order-v1.json` にmanual repository/chat orderとview mode/filterを、`sidebar-expansion-v1.json` に全session共通の開閉状態をCASとatomic saveで保存する。selection、scroll、return target、toast、接続状態は保存しない
-- incarnation ごとの lifecycle record と log：`$XDG_STATE_HOME/vde-tmux/<tmux-incarnation-hash>/`（未設定なら `~/.local/state` 配下。directory mode は `0700`、file mode は `0600`）
-- daemon socket：canonical tmux socket path、server PID、server start time で namespace された `/tmp/vt-<uid>/v2/<tmux-incarnation-hash>.sock`
-- sidebar instance ごとの control socket：tmux server と厳密な sidebar pane instance で namespace された `/tmp/vt-<uid>/v2/sidebar-control/` 配下の短い hash 名
+```bash
+vt daemon doctor
+vt daemon logs daemon --lines 100
+```
 
-## 任意のUI/UX preflight
+daemon の記録とlogは `$XDG_STATE_HOME/vde-tmux/` に保存されます。
+サイドバーの設定は `$XDG_STATE_HOME/vde/tmux/sidebar-state/` に保存されます。
 
-`scripts/preflight-ui-ux.sh` は通常CIの必須checkではなく、ローカルで任意に実行するtmux preflightである。`bash`、`cargo`、`tmux`、`python3`、`lsof`を必要とする。
+## 開発時の確認
 
-```sh
-cargo build
+```bash
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 scripts/preflight-ui-ux.sh
 ```
 
-summary、log、terminal capture、sandboxはrunごとに `target/preflight/<UTC-stamp>-<pid>-<random>/` へ保存する。別binaryを使う場合は`VDE_VT_BIN`を指定する。
+UI/UX preflight は専用の tmux server と一時ディレクトリを使います。
+通常の tmux server と設定ファイルは変更しません。
+結果は `target/preflight/` に保存されます。
 
 ## 既知の制約
 
-- エージェント検出は agent hook が報告した event を優先する。agent hook がない場合は pane の実行コマンド（`claude`、`codex`、`opencode`）から補完し、blocked の判定は表示中の pane 内容から許可プロンプトを認識できる範囲に限られる。
-- daemon が crash すると、最後に push した status 値が残り、tmux は crash を即時検知しない。
-  次の agent hook または view hook が daemon を起動して表示を回復する。
-  該当 event がない場合は `vt daemon ensure` または `vt daemon reload`（`restart` は alias）で明示的に回復する。
-- サイドバー preview を `Esc` で閉じる動作は `less` の `LESSKEYIN` 対応に依存する。古い `less` では `q` で閉じる必要がある。
+- hook がない場合、入力待ちの判定は pane に表示された内容から推測できる範囲に限られる
+- daemon が停止すると最後に描画した status option が残り、次の hook event または `vt daemon ensure` まで更新されない
+- 古い less では preview を `Esc` で閉じられない場合があるため、その場合は `q` を使う
 
 ## License
 
