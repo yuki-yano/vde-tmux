@@ -103,6 +103,7 @@ set -g status-left '#{@vde_status_category}#{@vde_status_sessions}#{@vde_status_
 set -g status-right '#{@vde_status_attention}#{@vde_status_summary}'
 set -g pane-border-status top
 set -g pane-border-format '#{@vde_status_pane}'
+set-hook -g 'client-session-changed[0]' 'run-shell "vt hooks on-client-session-changed '\''#{client_pid}'\'' '\''#{session_name}'\''"'
 set-hook -g 'window-pane-changed[71]' 'set-option -g @vde_smoke_user_hook preserved'
 run-shell -b 'env PATH="$HOOK_BIN_DIR:$ROOT/target/debug:$PATH" XDG_STATE_HOME="$STATE_HOME" XDG_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" "$BIN" daemon ensure'
 EOF
@@ -158,16 +159,16 @@ while True:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     s.connect(path)
-    s.sendall(b'{"op":"hello","proto":2}\n')
+    s.sendall(b'{"op":"hello","proto":3}\n')
     reader = s.makefile("rb")
     hello = json.loads(reader.readline())
-    assert hello["type"] == "hello_ack" and hello["proto"] == 2, hello
+    assert hello["type"] == "hello_ack" and hello["proto"] == 3, hello
     if hello["phase"] == "serving":
         break
     s.close()
     assert time.time() < deadline, hello
     time.sleep(0.1)
-s.sendall(b'{"op":"query_resolved_snapshot","proto":2}\n')
+s.sendall(b'{"op":"query_resolved_snapshot","proto":3}\n')
 reply = json.loads(reader.readline())
 assert reply["type"] == "resolved_snapshot_result", reply
 assert reply["snapshot"]["panes"] == [], reply
@@ -177,7 +178,7 @@ record_daemon_pid
 for hook in window-pane-changed session-window-changed client-session-changed client-attached client-detached; do
   tmux -L "$TMUX_SOCKET" show-hooks -g "${hook}[70]" | grep -F "${hook}[70]" >/dev/null
 done
-tmux -L "$TMUX_SOCKET" show-options -t main @vde_status_summary >/dev/null
+tmux -L "$TMUX_SOCKET" show-options -gqv @vde_status_summary >/dev/null
 echo "empty-topology hook install and display initialization ok"
 
 # A second zero-topology server runs concurrently with the first and must acquire an independent
@@ -212,7 +213,7 @@ for path in sys.argv[1:]:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.settimeout(5)
         client.connect(path)
-        client.sendall(b'{"op":"hello","proto":2}\n')
+        client.sendall(b'{"op":"hello","proto":3}\n')
         reply = json.loads(client.makefile("rb").readline())
         assert reply["type"] == "hello_ack", reply
         if reply["phase"] == "serving":
@@ -272,7 +273,7 @@ s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.settimeout(5)
 s.connect(path)
 reader = s.makefile("rb")
-s.sendall(b'{"op":"hello","proto":2}\n')
+s.sendall(b'{"op":"hello","proto":3}\n')
 hello = json.loads(reader.readline())
 assert hello["type"] == "hello_ack" and hello["phase"] == "serving", hello
 s.sendall(json.dumps(json.loads(raw), separators=(",", ":")).encode() + b"\n")
@@ -284,7 +285,7 @@ PY
 
 wait_for_topology() {
   for _ in $(seq 1 80); do
-    query_v2 '{"op":"query_resolved_snapshot","proto":2}'
+    query_v2 '{"op":"query_resolved_snapshot","proto":3}'
     if python3 - "$QUERY_JSON" "$AGENT_PANE" "$MAIN_SESSION_ID" "$AUX_SESSION_ID" 2>/dev/null <<'PY'
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -386,10 +387,133 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 [[ "$(tmux -L "$TMUX_SOCKET" list-clients -F '#{client_control_mode}' | grep -c '^0$')" -ge 2 ]]
-CLIENT_1="$(tmux -L "$TMUX_SOCKET" list-clients -F '#{client_name} #{session_name}' | awk '$2 == "main" { print $1; exit }')"
-CLIENT_2="$(tmux -L "$TMUX_SOCKET" list-clients -F '#{client_name} #{session_name}' | awk '$2 == "aux" { print $1; exit }')"
+CLIENT_FIELD_SEP=$'\037'
+client_for_session() {
+  local session_name="$1"
+  tmux -L "$TMUX_SOCKET" list-clients -F "#{client_name}${CLIENT_FIELD_SEP}#{client_session}" |
+    awk -F "$CLIENT_FIELD_SEP" -v session_name="$session_name" '$2 == session_name { print $1; found = 1; exit } END { exit !found }'
+}
+client_session_value() {
+  local client_name="$1"
+  local field="$2"
+  tmux -L "$TMUX_SOCKET" list-clients -F "#{client_name}${CLIENT_FIELD_SEP}${field}" |
+    awk -F "$CLIENT_FIELD_SEP" -v client_name="$client_name" '$1 == client_name { print $2; found = 1; exit } END { exit !found }'
+}
+
+CLIENT_1="$(client_for_session main)"
+CLIENT_2="$(client_for_session aux)"
 [[ -n "$CLIENT_1" && -n "$CLIENT_2" ]]
 tmux -L "$TMUX_SOCKET" select-window -t aux:own
+
+# Category mutations use one session snapshot, commit the target client switch first, and leave
+# remembered-session/topology/status work to the foreground hook path. Exercise three categories
+# on this isolated server so two rapid Next operations have an unambiguous two-category result.
+tmux -L "$TMUX_SOCKET" new-session -d -s category-fast -n work "sleep 600"
+CATEGORY_FAST_SESSION_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t category-fast '#{session_id}')"
+tmux -L "$TMUX_SOCKET" set-option -t main @vde_category_override category-a
+tmux -L "$TMUX_SOCKET" set-option -t aux @vde_category_override category-b
+tmux -L "$TMUX_SOCKET" set-option -t category-fast @vde_category_override category-c
+tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'
+CATEGORY_TIMINGS="$RUNTIME_DIR/category-timings.txt"
+: >"$CATEGORY_TIMINGS"
+
+run_category_action() {
+  local direction="$1"
+  local source_session
+  local switched_session
+  local started_ns
+  local switched_ns
+  local action_pid
+  local action_error="$RUNTIME_DIR/category-action-error.txt"
+  source_session="$(client_session_value "$CLIENT_1" '#{session_id}')"
+  started_ns="$(python3 -c 'import time; print(time.time_ns())')"
+  VT_PANE="$AGENT_PANE" run_vt category "$direction" \
+    --client-name "$CLIENT_1" --session-id "$source_session" \
+    > /dev/null 2>"$action_error" &
+  action_pid=$!
+  switched_session="$source_session"
+  for _ in $(seq 1 100); do
+    switched_session="$(client_session_value "$CLIENT_1" '#{session_id}')"
+    [[ "$switched_session" != "$source_session" ]] && break
+    sleep 0.005
+  done
+  switched_ns="$(python3 -c 'import time; print(time.time_ns())')"
+  if [[ "$switched_session" == "$source_session" ]]; then
+    echo "category client did not switch before the measurement deadline" >&2
+    cat "$action_error" >&2
+    wait "$action_pid" || true
+    return 1
+  fi
+  if ! wait "$action_pid"; then
+    cat "$action_error" >&2
+    return 1
+  fi
+  python3 - "$started_ns" "$switched_ns" >>"$CATEGORY_TIMINGS" <<'PY'
+import sys
+started_ns, switched_ns = map(int, sys.argv[1:])
+print((switched_ns - started_ns) / 1_000_000_000)
+PY
+}
+
+# Warm every relevant binary, daemon query, and tmux hook path before measuring.
+run_category_action next
+tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'
+HOOK_CALLS_BEFORE_CATEGORY="$(wc -l <"$HOOK_LOG")"
+for _ in $(seq 1 30); do
+  run_category_action next
+done
+[[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == main ]]
+[[ "$(client_session_value "$CLIENT_2" '#{client_session}')" == aux ]]
+
+run_category_action next
+[[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == aux ]]
+run_category_action next
+[[ "$(client_session_value "$CLIENT_1" '#{session_id}')" == "$CATEGORY_FAST_SESSION_ID" ]]
+run_category_action prev
+[[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == aux ]]
+[[ "$(client_session_value "$CLIENT_2" '#{client_session}')" == aux ]]
+
+HOOK_CALLS_AFTER_CATEGORY="$(wc -l <"$HOOK_LOG")"
+CATEGORY_HOOK_LOG="$(tail -n "$((HOOK_CALLS_AFTER_CATEGORY - HOOK_CALLS_BEFORE_CATEGORY))" "$HOOK_LOG")"
+[[ "$(grep -c 'pane-state-view client-session-changed' <<<"$CATEGORY_HOOK_LOG")" -ge 33 ]]
+if grep 'pane-state-view client-session-changed' <<<"$CATEGORY_HOOK_LOG" | grep -v 'status=0 '; then
+  echo "category owned hook failed before ViewQueued receipt" >&2
+  exit 1
+fi
+[[ "$(grep -c 'hooks on-client-session-changed' <<<"$CATEGORY_HOOK_LOG")" -ge 33 ]]
+if grep 'hooks on-client-session-changed' <<<"$CATEGORY_HOOK_LOG" | grep -v 'status=0 '; then
+  echo "category remembered-session hook failed" >&2
+  exit 1
+fi
+python3 - "$CATEGORY_TIMINGS" <<'PY'
+import math, sys
+
+durations = [float(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+# Exclude the initial warmup sample; the following 30 Next plus 3 order checks are measured.
+durations = durations[1:]
+assert len(durations) == 33, durations
+ordered = sorted(durations)
+p95 = ordered[math.ceil(len(ordered) * 0.95) - 1]
+assert p95 <= 0.150, (p95, ordered)
+print(f"category warm switch SLA ok: n={len(durations)} p95={p95 * 1000:.1f}ms max={ordered[-1] * 1000:.1f}ms")
+PY
+
+tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'
+tmux -L "$TMUX_SOCKET" set-option -u -t main @vde_category_override
+tmux -L "$TMUX_SOCKET" set-option -u -t aux @vde_category_override
+tmux -L "$TMUX_SOCKET" kill-session -t '=category-fast:'
+for category in category-a category-b category-c; do
+  key="$(python3 - "$CLIENT_1" "$category" <<'PY'
+import sys
+client, category = sys.argv[1:]
+print("@vde_client_" + client.encode().hex() + "_" + category)
+PY
+)"
+  tmux -L "$TMUX_SOCKET" set-option -gu "$key"
+done
+run_vt sessions refresh-category
+sleep 1
+echo "category consecutive order, multi-client pin, and foreground SLA ok"
 
 wait_badge() {
   wait_pane_badge "$AGENT_PANE" "$1"
@@ -399,7 +523,7 @@ wait_pane_badge() {
   local pane_id="$1"
   local expected="$2"
   for _ in $(seq 1 80); do
-    query_v2 '{"op":"query_resolved_snapshot","proto":2}'
+    query_v2 '{"op":"query_resolved_snapshot","proto":3}'
     if python3 - "$QUERY_JSON" "$pane_id" "$expected" 2>/dev/null <<'PY'
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -471,7 +595,7 @@ printf '\002O' >&7
 if ! wait_badge Idle; then
   echo "owned hook delivery log:" >&2
   cat "$HOOK_LOG" >&2 || true
-  query_v2 '{"op":"query_resolved_snapshot","proto":2}'
+  query_v2 '{"op":"query_resolved_snapshot","proto":3}'
   python3 - "$QUERY_JSON" <<'PY' >&2
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -589,6 +713,8 @@ durations = []
 for line in open(sys.argv[1], encoding="utf-8"):
     match = re.match(r"duration=([0-9]+(?:\.[0-9]+)?) status=([0-9]+) ", line)
     assert match, line
+    if " args= hooks pane-state-view " not in line:
+        continue
     assert match.group(2) == "0", line
     durations.append(float(match.group(1)))
 assert len(durations) >= 8, durations
@@ -620,9 +746,9 @@ def query(context):
     client.settimeout(5)
     client.connect(socket_path)
     reader = client.makefile("rb")
-    client.sendall(b'{"op":"hello","proto":2}\n')
+    client.sendall(b'{"op":"hello","proto":3}\n')
     assert json.loads(reader.readline())["type"] == "hello_ack"
-    request = {"op":"query_status_snapshot", "proto":2, "context":context}
+    request = {"op":"query_status_snapshot", "proto":3, "context":context}
     client.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
     response = json.loads(reader.readline())
     assert response["type"] == "status_snapshot_result", response
@@ -991,7 +1117,7 @@ import json, os, socket, sys, time
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.settimeout(5)
 s.connect(sys.argv[1])
-s.sendall(b'{"op":"hello","proto":2}\n')
+s.sendall(b'{"op":"hello","proto":3}\n')
 reader = s.makefile("rb")
 hello_line = reader.readline()
 assert hello_line, "old daemon closed before persistent Hello response"
@@ -1001,7 +1127,7 @@ print("hello_ack", flush=True)
 while not os.path.exists(sys.argv[5]):
     time.sleep(0.005)
 request = {
-    "op":"submit_pane_event", "proto":2,
+    "op":"submit_pane_event", "proto":3,
     "envelope": {
     "daemon_instance_id":hello["daemon_instance_id"],
     "event_id":"00112233445566778899aabbccddeeff",
@@ -1109,7 +1235,7 @@ while True:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     s.connect(sys.argv[1])
-    s.sendall(b'{"op":"hello","proto":2}\n')
+    s.sendall(b'{"op":"hello","proto":3}\n')
     reply = json.loads(s.makefile("rb").readline())
     assert reply["type"] == "hello_ack", reply
     if reply["phase"] == "serving":

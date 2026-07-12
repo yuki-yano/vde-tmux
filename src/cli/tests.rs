@@ -1337,7 +1337,61 @@ fn dispatch_category_use_switches_category() {
             .iter()
             .any(|call| { call == &vec!["switch-client", "-c", "abc", "-t", "=main:"] })
     );
+    assert_eq!(
+        mock.calls().last().unwrap(),
+        &["switch-client", "-c", "abc", "-t", "=main:"]
+    );
+    assert!(mock.calls().iter().all(|call| {
+        !matches!(
+            call.as_slice(),
+            [command, option, ..]
+                if command == "show-option" && option == "-gv"
+        ) && call.first().map(String::as_str) != Some("list-windows")
+    }));
     fixture.finish();
+}
+
+#[test]
+fn dispatch_client_session_changed_only_updates_memory() {
+    let mock = MockTmuxRunner::new();
+    let client_format = crate::session::client_pid_name_format();
+    mock.stub(
+        &["list-clients", "-F", &client_format],
+        "123\u{1f}abc\u{1f}/dev/ttys001\u{1f}0\n",
+    );
+    mock.stub(
+        &[
+            "show-option",
+            "-qv",
+            "-t",
+            "=main:",
+            crate::options::KEY_CATEGORY,
+        ],
+        "work\n",
+    );
+    mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
+
+    run_with(
+        ["vt", "hooks", "on-client-session-changed", "123", "main"],
+        &mock,
+        &env(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        mock.calls(),
+        vec![
+            vec!["list-clients", "-F", client_format.as_str()],
+            vec![
+                "show-option",
+                "-qv",
+                "-t",
+                "=main:",
+                crate::options::KEY_CATEGORY,
+            ],
+            vec!["set-option", "-g", "@vde_client_616263_work", "main"],
+        ]
+    );
 }
 
 #[test]

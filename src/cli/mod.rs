@@ -286,7 +286,7 @@ enum SessionsCommand {
 enum HooksCommand {
     #[command(name = "on-client-session-changed")]
     OnClientSessionChanged {
-        client_name: Option<String>,
+        client_pid: Option<u32>,
         session_name: Option<String>,
     },
     #[command(name = "pane-state-view", hide = true)]
@@ -920,20 +920,17 @@ where
         Command::Hooks { command } => {
             match command {
                 HooksCommand::OnClientSessionChanged {
-                    client_name,
+                    client_pid,
                     session_name,
                 } => {
-                    if client_name.is_some() != session_name.is_some() {
-                        bail!("client_name and session_name must be provided together");
+                    if client_pid.is_some() != session_name.is_some() {
+                        bail!("client_pid and session_name must be provided together");
                     }
-                    let config = require_active_config(runner, env)?;
                     crate::session::on_client_session_changed(
                         runner,
-                        &config,
-                        client_name.as_deref(),
+                        client_pid,
                         session_name.as_deref(),
                     )?;
-                    let _ = request_canonical_topology_refresh(runner, env);
                 }
                 HooksCommand::PaneStateView {
                     event_kind,
@@ -1095,13 +1092,16 @@ fn query_active_config_hash(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
 ) -> Result<String> {
-    let (incarnation, socket) =
-        crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, None)?;
+    let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
+    let socket = crate::daemon::daemon_socket_path_for_incarnation(env, None, &incarnation.hash);
     let mut client = crate::daemon::protocol::v2::V2Client::connect_with_timeout(
         &socket,
         &incarnation.hash,
         Duration::from_millis(500),
     )?;
+    if client.phase() != crate::daemon::protocol::v2::DaemonPhase::Serving {
+        bail!("daemon is not serving active configuration queries");
+    }
     match client.request(&crate::daemon::protocol::v2::ClientMessage::QueryHealth {
         proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
     })? {

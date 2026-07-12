@@ -132,7 +132,13 @@ pub fn cycle_statusline_category(
         Direction::Next => (current_index + 1) % targets.len(),
         Direction::Previous => (current_index + targets.len() - 1) % targets.len(),
     };
-    crate::session::use_category_for_client(runner, config, &targets[next], client_name)
+    crate::session::use_category_for_client_from_sessions(
+        runner,
+        config,
+        &sessions,
+        &targets[next],
+        client_name,
+    )
 }
 
 pub fn handle_statusline_click(
@@ -2902,6 +2908,54 @@ mod tests {
             mock.calls()
                 .iter()
                 .any(|call| { call == &["switch-client", "-c", "client", "-t", "=two:"] })
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| call.first().map(String::as_str) == Some("list-sessions"))
+                .count(),
+            1,
+            "one category cycle must use one authoritative session snapshot"
+        );
+        assert_eq!(
+            mock.calls().last().unwrap(),
+            &["switch-client", "-c", "client", "-t", "=two:"]
+        );
+    }
+
+    #[test]
+    fn consecutive_category_cycles_preserve_next_and_previous_order() {
+        let mock = MockTmuxRunner::new();
+        let format = crate::session::session_list_format();
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "one\u{1f}1\u{1f}100\u{1f}a\u{1f}\u{1f}\u{1f}$1\ntwo\u{1f}0\u{1f}101\u{1f}b\u{1f}\u{1f}\u{1f}$2\nthree\u{1f}0\u{1f}102\u{1f}c\u{1f}\u{1f}\u{1f}$3\n",
+        );
+        for category in ["a", "b", "c"] {
+            let key = crate::session::client_memory_key("client", category);
+            mock.stub(&["show-option", "-gqv", &key], "");
+        }
+        mock.stub(&["switch-client", "-c", "client", "-t", "=one:"], "");
+        mock.stub(&["switch-client", "-c", "client", "-t", "=two:"], "");
+        mock.stub(&["switch-client", "-c", "client", "-t", "=three:"], "");
+
+        let config = Config::default();
+        cycle_statusline_category(&mock, &config, "client", "$1", Direction::Next).unwrap();
+        cycle_statusline_category(&mock, &config, "client", "$2", Direction::Next).unwrap();
+        cycle_statusline_category(&mock, &config, "client", "$3", Direction::Previous).unwrap();
+
+        let switches = mock
+            .calls()
+            .into_iter()
+            .filter(|call| call.first().map(String::as_str) == Some("switch-client"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            switches,
+            vec![
+                vec!["switch-client", "-c", "client", "-t", "=two:"],
+                vec!["switch-client", "-c", "client", "-t", "=three:"],
+                vec!["switch-client", "-c", "client", "-t", "=two:"],
+            ]
         );
     }
 

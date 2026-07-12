@@ -9,7 +9,7 @@ use crate::category::{
 use crate::config::Config;
 use crate::options::{
     KEY_CATEGORY, KEY_CATEGORY_OVERRIDE, KEY_PROJECT_PATH, set_global_option, set_session_option,
-    show_global_option,
+    show_global_option, show_session_option,
 };
 use crate::tmux::TmuxRunner;
 
@@ -136,6 +136,47 @@ pub fn client_session_context_format() -> String {
         "#{client_control_mode}",
     ]
     .join(&FIELD_SEP.to_string())
+}
+
+pub fn client_pid_name_format() -> String {
+    [
+        "#{client_pid}",
+        "#{client_name}",
+        "#{client_tty}",
+        "#{client_control_mode}",
+    ]
+    .join(&FIELD_SEP.to_string())
+}
+
+pub fn regular_client_name_for_pid(runner: &dyn TmuxRunner, requested_pid: u32) -> Result<String> {
+    if requested_pid == 0 {
+        bail!("explicit tmux client PID must be positive");
+    }
+    let format = client_pid_name_format();
+    let output = runner.run(&["list-clients", "-F", &format])?;
+    let matches = output
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split(FIELD_SEP).collect::<Vec<_>>();
+            if fields.len() != 4
+                || fields[0].parse::<u32>().ok() != Some(requested_pid)
+                || fields[3] != "0"
+            {
+                return None;
+            }
+            let client_name = if fields[1].trim().is_empty() {
+                fields[2].trim()
+            } else {
+                fields[1].trim()
+            };
+            (!client_name.is_empty()).then(|| client_name.to_string())
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [client_name] => Ok(client_name.clone()),
+        [] => bail!("regular tmux client PID {requested_pid} is not attached"),
+        _ => bail!("tmux returned multiple regular clients for PID {requested_pid}"),
+    }
 }
 
 pub fn client_session_context_for_pane(
@@ -482,22 +523,30 @@ pub fn use_category_for_client(
     client: &str,
 ) -> Result<()> {
     let sessions = list_sessions(runner)?;
+    use_category_for_client_from_sessions(runner, config, &sessions, category, client)
+}
+
+pub(crate) fn use_category_for_client_from_sessions(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    sessions: &[SessionInfo],
+    category: &str,
+    client: &str,
+) -> Result<()> {
     if let Some(remembered) = remembered_session_for_client(runner, client, category)?
-        && let Some(remembered_session) = find_session(&sessions, &remembered)
+        && let Some(remembered_session) = find_session(sessions, &remembered)
         && resolve_category_for_session(config, remembered_session) == category
     {
-        switch_client_for_client(runner, client, &remembered)?;
-        return remember_session_for_client(runner, client, category, &remembered);
+        return switch_client_for_client(runner, client, &remembered);
     }
 
-    let Some(session) = sessions_in_category(config, &sessions, category)
+    let Some(session) = sessions_in_category(config, sessions, category)
         .first()
         .copied()
     else {
         bail!("no session in category: {category}");
     };
-    switch_client_for_client(runner, client, &session.name)?;
-    remember_session_for_client(runner, client, category, &session.name)
+    switch_client_for_client(runner, client, &session.name)
 }
 
 pub fn use_adjacent_category(
@@ -505,6 +554,7 @@ pub fn use_adjacent_category(
     config: &Config,
     direction: Direction,
 ) -> Result<()> {
+    let client = current_client_name(runner)?;
     let current = current_session_name(runner)?;
     let sessions = list_sessions(runner)?;
     let session = find_session(&sessions, &current)
@@ -512,7 +562,7 @@ pub fn use_adjacent_category(
     let current_category = resolve_category_for_session(config, session);
     let next_category = adjacent_category(config, &sessions, &current_category, direction)
         .ok_or_else(|| anyhow!("no categories available"))?;
-    use_category(runner, config, &next_category)
+    use_category_for_client_from_sessions(runner, config, &sessions, &next_category, &client)
 }
 
 pub fn cycle_session(runner: &dyn TmuxRunner, config: &Config, direction: Direction) -> Result<()> {
@@ -541,16 +591,19 @@ pub fn cycle_session(runner: &dyn TmuxRunner, config: &Config, direction: Direct
 
 pub fn on_client_session_changed(
     runner: &dyn TmuxRunner,
-    config: &Config,
-    client_name: Option<&str>,
+    client_pid: Option<u32>,
     session_name: Option<&str>,
 ) -> Result<()> {
-    match (client_name, session_name) {
-        (Some(client_name), Some(session_name)) => {
-            remember_client_session_for_session(runner, config, client_name, session_name)
-        }
-        _ => remember_current_client_session(runner, config),
-    }
+    let (client_name, session_name) = match (client_pid, session_name) {
+        (Some(client_pid), Some(session_name)) => (
+            regular_client_name_for_pid(runner, client_pid)?,
+            session_name.to_string(),
+        ),
+        _ => (current_client_name(runner)?, current_session_name(runner)?),
+    };
+    let target = exact_session_target(&session_name);
+    let category = show_session_option(runner, &target, KEY_CATEGORY)?.unwrap_or_default();
+    remember_session_for_client(runner, &client_name, &category, &session_name)
 }
 
 #[cfg(test)]
@@ -989,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn use_adjacent_category_switches_with_explicit_client() {
+    fn use_adjacent_category_switches_with_explicit_client_and_stops_after_switch() {
         let mock = MockTmuxRunner::new();
         let format = session_list_format();
         mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
@@ -1007,11 +1060,22 @@ mod tests {
 
         use_adjacent_category(&mock, &crate::config::Config::default(), Direction::Next).unwrap();
 
-        assert_eq!(mock.calls().len(), 7);
+        let calls = mock.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().map(String::as_str) == Some("list-sessions"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls.last().unwrap(),
+            &["switch-client", "-c", "abc", "-t", "=one:"]
+        );
     }
 
     #[test]
-    fn use_category_prefers_remembered_session() {
+    fn use_category_prefers_remembered_session_and_stops_after_switch() {
         let mock = MockTmuxRunner::new();
         let format = session_list_format();
         mock.stub(
@@ -1026,26 +1090,79 @@ mod tests {
         mock.stub(&["switch-client", "-c", "abc", "-t", "=sub:"], "");
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "sub"], "");
         use_category(&mock, &crate::config::Config::default(), "work").unwrap();
-        assert_eq!(mock.calls().len(), 5);
+        let calls = mock.calls();
+        assert_eq!(
+            calls.last().unwrap(),
+            &["switch-client", "-c", "abc", "-t", "=sub:"]
+        );
+        assert!(calls.iter().all(|call| {
+            !(call.first().map(String::as_str) == Some("set-option")
+                && call.get(2).map(String::as_str) == Some("@vde_client_616263_work"))
+        }));
     }
 
     #[test]
     fn hook_with_args_remembers_given_client_session() {
         let mock = MockTmuxRunner::new();
-        let format = session_list_format();
+        let format = client_pid_name_format();
         mock.stub(
-            &["list-sessions", "-F", &format],
-            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}$1\n",
+            &["list-clients", "-F", &format],
+            "123\u{1f}abc\u{1f}/dev/ttys001\u{1f}0\n",
+        );
+        mock.stub(
+            &["show-option", "-qv", "-t", "=main:", KEY_CATEGORY],
+            "work\n",
         );
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
-        on_client_session_changed(
-            &mock,
-            &crate::config::Config::default(),
-            Some("abc"),
-            Some("main"),
-        )
-        .unwrap();
-        assert_eq!(mock.calls().len(), 2);
+        on_client_session_changed(&mock, Some(123), Some("main")).unwrap();
+        assert_eq!(mock.calls().len(), 3);
+    }
+
+    #[test]
+    fn client_pid_resolution_is_exact_and_fail_closed() {
+        let format = client_pid_name_format();
+
+        let valid = MockTmuxRunner::new();
+        valid.stub(
+            &["list-clients", "-F", &format],
+            "122\u{1f}other\u{1f}/dev/ttys000\u{1f}0\n123\u{1f}\u{1f}/dev/ttys001\u{1f}0\n",
+        );
+        assert_eq!(
+            regular_client_name_for_pid(&valid, 123).unwrap(),
+            "/dev/ttys001"
+        );
+
+        let detached = MockTmuxRunner::new();
+        detached.stub(&["list-clients", "-F", &format], "");
+        assert!(
+            regular_client_name_for_pid(&detached, 123)
+                .unwrap_err()
+                .to_string()
+                .contains("not attached")
+        );
+
+        let control = MockTmuxRunner::new();
+        control.stub(
+            &["list-clients", "-F", &format],
+            "123\u{1f}control\u{1f}\u{1f}1\n",
+        );
+        assert!(regular_client_name_for_pid(&control, 123).is_err());
+
+        let duplicate = MockTmuxRunner::new();
+        duplicate.stub(
+            &["list-clients", "-F", &format],
+            "123\u{1f}one\u{1f}/dev/ttys001\u{1f}0\n123\u{1f}two\u{1f}/dev/ttys002\u{1f}0\n",
+        );
+        assert!(
+            regular_client_name_for_pid(&duplicate, 123)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple")
+        );
+
+        let invalid = MockTmuxRunner::new();
+        assert!(regular_client_name_for_pid(&invalid, 0).is_err());
+        assert!(invalid.calls().is_empty());
     }
 
     #[test]
