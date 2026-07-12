@@ -207,7 +207,7 @@ pub(crate) enum V2AcceptedMutation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum V2InternalMutation {
     PaneEvent(Box<crate::pane_state::PaneEventEnvelope>),
-    ObservationPollProjection(Box<ObservationPollProjection>),
+    ObservationBatch(Box<ObservationBatchPayload>),
     RefreshTopology,
     TargetedPaneRefresh {
         pane_id: String,
@@ -217,7 +217,6 @@ pub(crate) enum V2InternalMutation {
         badges: std::collections::BTreeMap<String, crate::git::GitBadge>,
         worktrees: std::collections::BTreeMap<String, crate::git::WorktreeInfo>,
     },
-    TriageProjection,
     DiagnosticProjection {
         pane_instance: Option<crate::pane_state::PaneInstance>,
         message: String,
@@ -240,6 +239,18 @@ pub(crate) struct ObservationPollProjection {
     observation_bases:
         BTreeMap<crate::pane_state::PaneInstance, Option<crate::pane_state::StoredStateDescriptor>>,
     view_base: crate::daemon::view_hooks::ViewRegistry,
+}
+
+/// One successful observation poll as a single sequenced mutation. Application
+/// order is fixed: projection, observation pane events, pane removals,
+/// diagnostics, then a trailing triage pass; the snapshot is published once
+/// after the whole batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservationBatchPayload {
+    projection: Box<ObservationPollProjection>,
+    observations: Vec<crate::pane_state::PaneEventEnvelope>,
+    removals: Vec<crate::pane_state::PaneEventEnvelope>,
+    diagnostics: Vec<(Option<crate::pane_state::PaneInstance>, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -636,11 +647,234 @@ struct PublishedResolvedSnapshot {
     terminal: bool,
 }
 
+/// Outcome of waiting on the snapshot stream: either a newer published
+/// snapshot or a keepalive deadline with the latest published revision.
+#[derive(Debug, Clone)]
+enum SnapshotWaitOutcome {
+    Published(PublishedResolvedSnapshot),
+    HeartbeatDue { snapshot_revision: u64 },
+}
+
+/// Interval without new content after which a subscription stream emits a
+/// small `Heartbeat` frame instead of re-sending the full snapshot.
+const V2_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy)]
 enum StatusPushTrigger {
     Snapshot,
     RenderClock,
     Flush,
+}
+
+/// One message pushed to a live subscriber. The mailbox keeps only the latest
+/// undelivered message per subscription, so a slow subscriber never queues
+/// intermediate frames.
+#[derive(Debug, Clone)]
+enum LivePush {
+    Result {
+        live_revision: u64,
+        captured_at_epoch_millis: u64,
+        body: Arc<String>,
+    },
+    Unavailable {
+        reason: crate::daemon::protocol::v2::LiveUnavailableReason,
+    },
+}
+
+#[derive(Debug, Default)]
+struct LiveMailbox {
+    slot: Mutex<(Option<LivePush>, bool)>,
+    ready: Condvar,
+}
+
+impl LiveMailbox {
+    fn push(&self, message: LivePush) {
+        let mut slot = self.slot.lock().expect("live mailbox lock poisoned");
+        slot.0 = Some(message);
+        drop(slot);
+        self.ready.notify_all();
+    }
+
+    fn close(&self) {
+        let mut slot = self.slot.lock().expect("live mailbox lock poisoned");
+        slot.1 = true;
+        drop(slot);
+        self.ready.notify_all();
+    }
+
+    #[cfg(test)]
+    fn wait(&self) -> Option<LivePush> {
+        let mut slot = self.slot.lock().expect("live mailbox lock poisoned");
+        loop {
+            if let Some(message) = slot.0.take() {
+                return Some(message);
+            }
+            if slot.1 {
+                return None;
+            }
+            slot = self
+                .ready
+                .wait(slot)
+                .expect("live mailbox lock poisoned while waiting");
+        }
+    }
+
+    fn wait_timeout(&self, timeout: Duration) -> LiveMailboxWait {
+        let mut slot = self.slot.lock().expect("live mailbox lock poisoned");
+        loop {
+            if let Some(message) = slot.0.take() {
+                return LiveMailboxWait::Message(message);
+            }
+            if slot.1 {
+                return LiveMailboxWait::Closed;
+            }
+            let (next, wait_timeout) = self
+                .ready
+                .wait_timeout(slot, timeout)
+                .expect("live mailbox lock poisoned while waiting");
+            slot = next;
+            if wait_timeout.timed_out() {
+                if let Some(message) = slot.0.take() {
+                    return LiveMailboxWait::Message(message);
+                }
+                if slot.1 {
+                    return LiveMailboxWait::Closed;
+                }
+                return LiveMailboxWait::TimedOut;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LiveMailboxWait {
+    Message(LivePush),
+    Closed,
+    TimedOut,
+}
+
+#[derive(Debug)]
+struct LiveSubscriptionEntry {
+    source_pane: crate::pane_state::PaneInstance,
+    target_pane: crate::pane_state::PaneInstance,
+    interval: Duration,
+    next_due_at: Option<Instant>,
+    last_delivered_revision: u64,
+    mailbox: Arc<LiveMailbox>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveBodyEntry {
+    live_revision: u64,
+    captured_at_epoch_millis: u64,
+    body: Arc<String>,
+}
+
+/// Memory-only registry of live preview demand. Entries are owned by their
+/// connection handler through a drop guard and are pruned when the source or
+/// target pane leaves the topology; nothing is persisted across restarts.
+#[derive(Debug, Default)]
+struct LiveRegistry {
+    entries: Mutex<BTreeMap<u64, LiveSubscriptionEntry>>,
+    next_subscription_id: AtomicU64,
+    live_revision: AtomicU64,
+    bodies: Mutex<BTreeMap<crate::pane_state::PaneInstance, LiveBodyEntry>>,
+}
+
+impl LiveRegistry {
+    fn register(
+        &self,
+        source_pane: crate::pane_state::PaneInstance,
+        target_pane: crate::pane_state::PaneInstance,
+        interval: Duration,
+    ) -> (u64, Arc<LiveMailbox>) {
+        let id = self.next_subscription_id.fetch_add(1, Ordering::SeqCst);
+        let mailbox = Arc::new(LiveMailbox::default());
+        // Serve the cached latest body immediately so a fresh subscriber does
+        // not wait a full interval for its first frame.
+        let mut last_delivered_revision = 0;
+        if let Some(cached) = self
+            .bodies
+            .lock()
+            .expect("live body cache lock poisoned")
+            .get(&target_pane)
+        {
+            last_delivered_revision = cached.live_revision;
+            mailbox.push(LivePush::Result {
+                live_revision: cached.live_revision,
+                captured_at_epoch_millis: cached.captured_at_epoch_millis,
+                body: cached.body.clone(),
+            });
+        }
+        self.entries
+            .lock()
+            .expect("live registry lock poisoned")
+            .insert(
+                id,
+                LiveSubscriptionEntry {
+                    source_pane,
+                    target_pane,
+                    interval,
+                    next_due_at: None,
+                    last_delivered_revision,
+                    mailbox: mailbox.clone(),
+                },
+            );
+        (id, mailbox)
+    }
+
+    fn remove(&self, id: u64) {
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .expect("live registry lock poisoned")
+            .remove(&id)
+        {
+            entry.mailbox.close();
+        }
+    }
+
+    fn close_all(&self) {
+        let entries =
+            std::mem::take(&mut *self.entries.lock().expect("live registry lock poisoned"));
+        for entry in entries.into_values() {
+            entry.mailbox.close();
+        }
+    }
+
+    /// Drops demand whose source or target pane no longer exists in the
+    /// observed topology, and forgets cached bodies for removed targets.
+    fn prune_missing_panes(&self, present: &BTreeSet<crate::pane_state::PaneInstance>) {
+        let mut entries = self.entries.lock().expect("live registry lock poisoned");
+        let removed = entries
+            .iter()
+            .filter(|(_, entry)| {
+                !present.contains(&entry.source_pane) || !present.contains(&entry.target_pane)
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in removed {
+            if let Some(entry) = entries.remove(&id) {
+                entry.mailbox.close();
+            }
+        }
+        drop(entries);
+        self.bodies
+            .lock()
+            .expect("live body cache lock poisoned")
+            .retain(|target, _| present.contains(target));
+    }
+}
+
+struct LiveSubscriptionGuard {
+    coordinator: Arc<ProductionV2Coordinator>,
+    id: u64,
+}
+
+impl Drop for LiveSubscriptionGuard {
+    fn drop(&mut self) {
+        self.coordinator.live.remove(self.id);
+    }
 }
 
 struct ProductionV2Coordinator {
@@ -678,6 +912,10 @@ struct ProductionV2Coordinator {
     config_hash: Mutex<String>,
     projection_updated_at_epoch_seconds: AtomicU64,
     notification_enabled: bool,
+    status_frame_builds: AtomicU64,
+    snapshot_builds: AtomicU64,
+    snapshot_publishes: AtomicU64,
+    live: LiveRegistry,
 }
 
 #[cfg(test)]
@@ -1063,6 +1301,10 @@ impl ProductionV2Coordinator {
             )),
             projection_updated_at_epoch_seconds: AtomicU64::new(epoch_seconds() as u64),
             notification_enabled,
+            status_frame_builds: AtomicU64::new(0),
+            snapshot_builds: AtomicU64::new(0),
+            snapshot_publishes: AtomicU64::new(0),
+            live: LiveRegistry::default(),
         })
     }
 
@@ -1582,11 +1824,34 @@ impl ProductionV2Coordinator {
     }
 
     fn publish_resolved_snapshot(&self) -> Result<PublishedResolvedSnapshot> {
+        self.snapshot_publishes.fetch_add(1, Ordering::SeqCst);
+        // Fast path: compare the cheap current revision against the published
+        // cache before building a full checked snapshot. Lock order stays
+        // state -> release -> snapshot_cache on every path.
+        let current_revision = {
+            let state = self.state.lock().expect("canonical state lock poisoned");
+            let state = state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("canonical state is not initialized"))?;
+            state.leased.runtime.snapshot_revision()
+        };
+        {
+            let cache = self
+                .snapshot_cache
+                .lock()
+                .expect("snapshot cache lock poisoned");
+            if let Some(published) = cache.as_ref()
+                && published.revision >= current_revision
+            {
+                return Ok(published.clone());
+            }
+        }
         let snapshot = {
             let state = self.state.lock().expect("canonical state lock poisoned");
             let state = state
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("canonical state is not initialized"))?;
+            self.snapshot_builds.fetch_add(1, Ordering::SeqCst);
             state.checked_resolved_snapshot()?
         };
         let revision = snapshot.snapshot_revision;
@@ -1645,7 +1910,14 @@ impl ProductionV2Coordinator {
         Ok(published)
     }
 
-    fn wait_for_snapshot_after(&self, revision: u64) -> Option<PublishedResolvedSnapshot> {
+    /// Waits until a snapshot newer than `revision` is published. When
+    /// `heartbeat_after` elapses without one, the subscriber gets a
+    /// `HeartbeatDue` outcome instead of a re-sent full snapshot.
+    fn wait_for_snapshot_after(
+        &self,
+        revision: u64,
+        heartbeat_after: Duration,
+    ) -> Option<SnapshotWaitOutcome> {
         let mut cache = self
             .snapshot_cache
             .lock()
@@ -1654,20 +1926,21 @@ impl ProductionV2Coordinator {
             if let Some(published) = cache.as_ref()
                 && published.revision > revision
             {
-                return Some(published.clone());
+                return Some(SnapshotWaitOutcome::Published(published.clone()));
             }
             if self.shutdown.load(Ordering::SeqCst) {
                 return None;
             }
             let (next, timeout) = self
                 .snapshot_changed
-                .wait_timeout(cache, Duration::from_secs(2))
+                .wait_timeout(cache, heartbeat_after)
                 .expect("snapshot cache lock poisoned while waiting");
             cache = next;
-            if timeout.timed_out()
-                && let Some(published) = cache.as_ref()
-            {
-                return Some(published.clone());
+            if timeout.timed_out() {
+                let snapshot_revision = cache
+                    .as_ref()
+                    .map_or(revision, |published| published.revision);
+                return Some(SnapshotWaitOutcome::HeartbeatDue { snapshot_revision });
             }
         }
     }
@@ -1688,6 +1961,15 @@ impl ProductionV2Coordinator {
                 .flush_coalesced(now)
                 .map_err(anyhow::Error::new)?,
             StatusPushTrigger::Snapshot | StatusPushTrigger::RenderClock => {
+                if matches!(trigger, StatusPushTrigger::RenderClock)
+                    && !self
+                        .status_push
+                        .lock()
+                        .expect("status push lock poisoned")
+                        .render_clock_due(now)
+                {
+                    return Ok(());
+                }
                 let (global, sessions, panes, config) = {
                     let state = self.state.lock().expect("canonical state lock poisoned");
                     let state = state
@@ -1710,6 +1992,7 @@ impl ProductionV2Coordinator {
                 let frame =
                     build_display_frame(&config, &global, &sessions, &panes, epoch_seconds())
                         .map_err(anyhow::Error::new)?;
+                self.status_frame_builds.fetch_add(1, Ordering::SeqCst);
                 let mut push = self.status_push.lock().expect("status push lock poisoned");
                 match trigger {
                     StatusPushTrigger::Snapshot => {
@@ -2162,6 +2445,24 @@ fn handle_v2_runtime_stream(
             return Ok(());
         }
     };
+    if let crate::daemon::protocol::v2::ClientMessage::SubscribeLive {
+        source_pane,
+        target_pane,
+        interval_ms,
+        ..
+    } = &message
+    {
+        let source_pane = source_pane.clone();
+        let target_pane = target_pane.clone();
+        let interval_ms = *interval_ms;
+        return handle_v2_live_subscription(
+            coordinator,
+            connection.into_stream(),
+            source_pane,
+            target_pane,
+            interval_ms,
+        );
+    }
     let subscribe = matches!(
         &message,
         crate::daemon::protocol::v2::ClientMessage::Subscribe { .. }
@@ -2197,22 +2498,61 @@ fn handle_v2_runtime_stream(
 
 fn stream_v2_subscription(
     coordinator: Arc<ProductionV2Coordinator>,
+    stream: UnixStream,
+    last_revision: u64,
+) -> Result<()> {
+    stream_v2_subscription_with_heartbeat_interval(
+        coordinator,
+        stream,
+        last_revision,
+        V2_STREAM_HEARTBEAT_INTERVAL,
+    )
+}
+
+fn stream_v2_subscription_with_heartbeat_interval(
+    coordinator: Arc<ProductionV2Coordinator>,
     mut stream: UnixStream,
     mut last_revision: u64,
+    heartbeat_interval: Duration,
 ) -> Result<()> {
-    while let Some(published) = coordinator.wait_for_snapshot_after(last_revision) {
-        if let Err(error) = write_v2_frame(&mut stream, &published.frame) {
-            let _ = coordinator.enqueue_internal(V2InternalMutation::DiagnosticProjection {
-                pane_instance: None,
-                message: format!(
-                    "subscriber_write_failed: after_revision={last_revision} error={error:?}"
-                ),
-            });
-            break;
-        }
-        last_revision = published.revision;
-        if published.terminal {
-            break;
+    let daemon_instance_id = coordinator
+        .router
+        .lock()
+        .expect("v2 router lock poisoned")
+        .daemon_instance_id()
+        .clone();
+    while let Some(outcome) = coordinator.wait_for_snapshot_after(last_revision, heartbeat_interval)
+    {
+        match outcome {
+            SnapshotWaitOutcome::Published(published) => {
+                if let Err(error) = write_v2_frame(&mut stream, &published.frame) {
+                    let _ =
+                        coordinator.enqueue_internal(V2InternalMutation::DiagnosticProjection {
+                            pane_instance: None,
+                            message: format!(
+                                "subscriber_write_failed: after_revision={last_revision} error={error:?}"
+                            ),
+                        });
+                    break;
+                }
+                last_revision = published.revision;
+                if published.terminal {
+                    break;
+                }
+            }
+            SnapshotWaitOutcome::HeartbeatDue { snapshot_revision } => {
+                let heartbeat = crate::daemon::protocol::v2::ServerMessage::Heartbeat {
+                    daemon_instance_id: daemon_instance_id.clone(),
+                    snapshot_revision,
+                };
+                let Ok(frame) = crate::daemon::protocol::v2::encode_response_frame(&heartbeat)
+                else {
+                    break;
+                };
+                if write_v2_frame(&mut stream, &frame).is_err() {
+                    break;
+                }
+            }
         }
     }
     Ok(())
@@ -2304,7 +2644,7 @@ fn mutation_changes_topology_targets(mutation: &V2SequencedMutation) -> bool {
             | crate::daemon::protocol::v2::ClientMessage::RefreshTopology { .. },
         )
         | V2AcceptedMutation::Internal(
-            V2InternalMutation::ObservationPollProjection(_)
+            V2InternalMutation::ObservationBatch(_)
             | V2InternalMutation::RefreshTopology
             | V2InternalMutation::TargetedPaneRefresh { .. },
         ) => true,
@@ -2324,15 +2664,12 @@ fn mutation_changes_topology_targets(mutation: &V2SequencedMutation) -> bool {
     }
 }
 
-fn start_canonical_observation_worker(coordinator: Arc<ProductionV2Coordinator>, poll: Duration) {
+fn start_canonical_observation_worker(
+    coordinator: Arc<ProductionV2Coordinator>,
+    poll: Duration,
+    capture: crate::daemon::workers::CaptureCoordinatorHandle,
+) {
     thread::spawn(move || {
-        let capture_io = crate::daemon::workers::SystemObservationWorkerIo::new(
-            coordinator
-                .env
-                .get("VDE_TMUX_SOCKET_NAME")
-                .cloned()
-                .filter(|value| !value.trim().is_empty()),
-        );
         let mut last_hook_check = Instant::now();
         while !coordinator.shutdown.load(Ordering::SeqCst) {
             let (dispatch, view_base) = {
@@ -2413,14 +2750,35 @@ fn start_canonical_observation_worker(coordinator: Arc<ProductionV2Coordinator>,
             projection.view_base = view_base;
             let processes =
                 crate::daemon::workers::read_agent_process_snapshot(Duration::from_secs(1));
-            match crate::daemon::workers::run_observation_poll(
-                &capture_io,
+            // Queue due (or imminently due) live targets before the blocking
+            // observation capture so both jobs share one tmux invocation.
+            let live_targets = collect_due_live_targets(
+                &coordinator,
+                Instant::now(),
+                crate::daemon::workers::CAPTURE_COALESCE_WINDOW,
+            );
+            let live_reply = (!live_targets.is_empty()).then(|| {
+                (
+                    live_targets.clone(),
+                    capture.request_live_sections(live_targets),
+                )
+            });
+            let poll_result = crate::daemon::workers::run_observation_poll(
+                &capture,
                 &dispatch,
                 &processes,
                 &daemon_instance_id,
-                &coordinator.incarnation.identity,
                 epoch_seconds(),
-            ) {
+            );
+            if let Some((targets, reply)) = live_reply {
+                let result = reply.recv().unwrap_or_else(|_| {
+                    Err(crate::daemon::workers::CaptureBatchError::Io(
+                        "capture coordinator dropped the reply".to_string(),
+                    ))
+                });
+                deliver_live_result(&coordinator, &targets, result);
+            }
+            match poll_result {
                 Ok(result) => {
                     let current = projection
                         .topology
@@ -2428,53 +2786,39 @@ fn start_canonical_observation_worker(coordinator: Arc<ProductionV2Coordinator>,
                         .iter()
                         .map(|pane| pane.pane_instance.clone())
                         .collect::<std::collections::BTreeSet<_>>();
-                    let _ = coordinator.enqueue_internal(
-                        V2InternalMutation::ObservationPollProjection(Box::new(projection)),
-                    );
-                    for envelope in result.envelopes {
-                        if !coordinator
-                            .enqueue_internal(V2InternalMutation::PaneEvent(Box::new(envelope)))
-                        {
-                            break;
-                        }
-                    }
-                    match crate::daemon::workers::pane_removal_envelopes(
+                    let first_pane = dispatch
+                        .first()
+                        .map(|snapshot| snapshot.pane_instance.clone());
+                    let mut diagnostics = Vec::new();
+                    let removals = match crate::daemon::workers::pane_removal_envelopes(
                         &daemon_instance_id,
                         &dispatch,
                         &current,
                         true,
                     ) {
-                        Ok(removals) => {
-                            for envelope in removals {
-                                if !coordinator.enqueue_internal(V2InternalMutation::PaneEvent(
-                                    Box::new(envelope),
-                                )) {
-                                    break;
-                                }
-                            }
-                        }
+                        Ok(removals) => removals,
                         Err(error) => {
-                            let _ = coordinator.enqueue_internal(
-                                V2InternalMutation::DiagnosticProjection {
-                                    pane_instance: dispatch
-                                        .first()
-                                        .map(|snapshot| snapshot.pane_instance.clone()),
-                                    message: format!("pane_removal_build_failed: {error}"),
-                                },
-                            );
+                            diagnostics.push((
+                                first_pane.clone(),
+                                format!("pane_removal_build_failed: {error}"),
+                            ));
+                            Vec::new()
                         }
-                    }
-                    for message in result.diagnostics {
-                        let _ = coordinator.enqueue_internal(
-                            V2InternalMutation::DiagnosticProjection {
-                                pane_instance: dispatch
-                                    .first()
-                                    .map(|snapshot| snapshot.pane_instance.clone()),
-                                message,
-                            },
-                        );
-                    }
-                    let _ = coordinator.enqueue_internal(V2InternalMutation::TriageProjection);
+                    };
+                    diagnostics.extend(
+                        result
+                            .diagnostics
+                            .into_iter()
+                            .map(|message| (first_pane.clone(), message)),
+                    );
+                    let _ = coordinator.enqueue_internal(V2InternalMutation::ObservationBatch(
+                        Box::new(ObservationBatchPayload {
+                            projection: Box::new(projection),
+                            observations: result.envelopes,
+                            removals,
+                            diagnostics,
+                        }),
+                    ));
                 }
                 Err(error) if error.requires_daemon_exit() => {
                     coordinator.fail_stop(error.to_string());
@@ -2531,9 +2875,14 @@ fn start_canonical_observation_worker(coordinator: Arc<ProductionV2Coordinator>,
     });
 }
 
-fn start_canonical_git_worker(coordinator: Arc<ProductionV2Coordinator>, poll: Duration) {
+fn start_canonical_git_worker(
+    coordinator: Arc<ProductionV2Coordinator>,
+    poll: Duration,
+    git_timeout: Duration,
+) {
     thread::spawn(move || {
-        let git = crate::daemon::workers::system_git_runner(Duration::from_millis(500));
+        let git = crate::daemon::workers::system_git_runner(git_timeout);
+        let mut poller = crate::git::GitPoller::new();
         while !coordinator.shutdown.load(Ordering::SeqCst) {
             let paths = coordinator
                 .state
@@ -2551,12 +2900,8 @@ fn start_canonical_git_worker(coordinator: Arc<ProductionV2Coordinator>, poll: D
                         .collect::<BTreeSet<_>>()
                 })
                 .unwrap_or_default();
-            let badges =
-                crate::git::collect_git_badges_for_paths(&git, paths.iter().map(String::as_str));
-            let worktrees = crate::git::collect_worktree_infos_for_paths(
-                &git,
-                paths.iter().map(String::as_str),
-            );
+            let (badges, worktrees) =
+                poller.poll(&git, paths.iter().map(String::as_str), Instant::now());
             let _ = coordinator
                 .enqueue_internal(V2InternalMutation::GitProjection { badges, worktrees });
             let started = Instant::now();
@@ -2565,6 +2910,319 @@ fn start_canonical_git_worker(coordinator: Arc<ProductionV2Coordinator>, poll: D
             }
         }
     });
+}
+
+const LIVE_SCHEDULER_MAX_SLEEP: Duration = Duration::from_millis(250);
+const LIVE_SCHEDULER_MIN_SLEEP: Duration = Duration::from_millis(10);
+
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A source sidebar is visible when at least one eligible attached client is
+/// looking at a window that contains the source pane.
+fn live_source_visible(
+    views: &crate::daemon::view_hooks::ViewRegistry,
+    source_pane: &crate::pane_state::PaneInstance,
+) -> bool {
+    let window_ids = views
+        .windows()
+        .iter()
+        .filter(|(_, view)| {
+            view.active_pane == *source_pane || view.observed_panes.contains(source_pane)
+        })
+        .map(|(window_id, _)| window_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if window_ids.is_empty() {
+        return false;
+    }
+    views
+        .clients()
+        .values()
+        .any(|witness| witness.is_eligible() && window_ids.contains(witness.window_id.as_str()))
+}
+
+fn start_live_preview_worker(
+    coordinator: Arc<ProductionV2Coordinator>,
+    capture: crate::daemon::workers::CaptureCoordinatorHandle,
+) {
+    thread::spawn(move || {
+        while !coordinator.shutdown.load(Ordering::SeqCst) {
+            let sleep_for = run_live_preview_tick(&coordinator, &capture, Instant::now());
+            thread::sleep(sleep_for);
+        }
+        coordinator.live.close_all();
+    });
+}
+
+/// Consumes every live subscription that is due within `horizon`, advances its
+/// deadline, reports hidden sources, and returns the deduplicated visible
+/// targets to capture. Passing the coalesce window as `horizon` lets the
+/// observation worker pull imminently-due targets onto its own invocation, so
+/// interval-aligned demand never needs an extra tmux process.
+fn collect_due_live_targets(
+    coordinator: &ProductionV2Coordinator,
+    now: Instant,
+    horizon: Duration,
+) -> Vec<crate::pane_state::PaneInstance> {
+    use crate::daemon::protocol::v2::LiveUnavailableReason;
+
+    let Some(views) = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned")
+        .as_ref()
+        .map(|state| state.views.clone())
+    else {
+        return Vec::new();
+    };
+    let mut due_targets = BTreeSet::new();
+    let mut entries = coordinator
+        .live
+        .entries
+        .lock()
+        .expect("live registry lock poisoned");
+    for entry in entries.values_mut() {
+        if let Some(due_at) = entry.next_due_at
+            && now + horizon < due_at
+        {
+            continue;
+        }
+        entry.next_due_at = Some(now + entry.interval);
+        if !live_source_visible(&views, &entry.source_pane) {
+            entry.mailbox.push(LivePush::Unavailable {
+                reason: LiveUnavailableReason::HiddenSource,
+            });
+            continue;
+        }
+        due_targets.insert(entry.target_pane.clone());
+    }
+    due_targets.into_iter().collect()
+}
+
+/// One live scheduler pass. In the aligned default configuration the
+/// observation worker consumes live demand first, so this pass only captures
+/// targets whose interval phase does not line up with an observation poll.
+/// Returns how long the scheduler should sleep.
+fn run_live_preview_tick(
+    coordinator: &ProductionV2Coordinator,
+    capture: &dyn crate::daemon::workers::CaptureSource,
+    now: Instant,
+) -> Duration {
+    let targets = collect_due_live_targets(coordinator, now, Duration::ZERO);
+    if !targets.is_empty() {
+        let result = capture.capture_live_sections(&targets);
+        deliver_live_result(coordinator, &targets, result);
+    }
+    let entries = coordinator
+        .live
+        .entries
+        .lock()
+        .expect("live registry lock poisoned");
+    if entries.is_empty() {
+        return LIVE_SCHEDULER_MAX_SLEEP;
+    }
+    let next_wakeup = entries.values().map(|entry| entry.next_due_at).min();
+    match next_wakeup {
+        Some(Some(at)) => at
+            .saturating_duration_since(Instant::now())
+            .clamp(LIVE_SCHEDULER_MIN_SLEEP, LIVE_SCHEDULER_MAX_SLEEP),
+        // A fresh subscription has no deadline yet and is due immediately.
+        Some(None) => LIVE_SCHEDULER_MIN_SLEEP,
+        None => LIVE_SCHEDULER_MAX_SLEEP,
+    }
+}
+
+fn deliver_live_result(
+    coordinator: &ProductionV2Coordinator,
+    targets: &[crate::pane_state::PaneInstance],
+    result: std::result::Result<
+        Vec<crate::daemon::workers::LiveCaptureSection>,
+        crate::daemon::workers::CaptureBatchError,
+    >,
+) {
+    use crate::daemon::protocol::v2::LiveUnavailableReason;
+    use crate::daemon::workers::{CaptureBatchError, LiveCaptureSection};
+
+    let sections = match result {
+        Ok(sections) if sections.len() == targets.len() => sections,
+        Ok(_) => vec![LiveCaptureSection::Malformed; targets.len()],
+        Err(
+            CaptureBatchError::IdentityMismatch { .. } | CaptureBatchError::InvalidIdentityHeader,
+        ) => {
+            coordinator.fail_stop("tmux server incarnation changed during live capture");
+            return;
+        }
+        Err(_) => vec![LiveCaptureSection::Malformed; targets.len()],
+    };
+    let captured_at_epoch_millis = epoch_millis();
+    for (target, section) in targets.iter().zip(sections) {
+        let push = match section {
+            LiveCaptureSection::Body(body) => {
+                let live_revision = coordinator
+                    .live
+                    .live_revision
+                    .fetch_add(1, Ordering::SeqCst)
+                    .saturating_add(1);
+                let body = Arc::new(body);
+                coordinator
+                    .live
+                    .bodies
+                    .lock()
+                    .expect("live body cache lock poisoned")
+                    .insert(
+                        target.clone(),
+                        LiveBodyEntry {
+                            live_revision,
+                            captured_at_epoch_millis,
+                            body: body.clone(),
+                        },
+                    );
+                LivePush::Result {
+                    live_revision,
+                    captured_at_epoch_millis,
+                    body,
+                }
+            }
+            LiveCaptureSection::PaneInstanceMismatch => LivePush::Unavailable {
+                reason: LiveUnavailableReason::PaneInstanceMismatch,
+            },
+            LiveCaptureSection::TargetMissing => LivePush::Unavailable {
+                reason: LiveUnavailableReason::TargetMissing,
+            },
+            LiveCaptureSection::Malformed => LivePush::Unavailable {
+                reason: LiveUnavailableReason::CaptureFailed,
+            },
+        };
+        let mut entries = coordinator
+            .live
+            .entries
+            .lock()
+            .expect("live registry lock poisoned");
+        for entry in entries
+            .values_mut()
+            .filter(|entry| entry.target_pane == *target)
+        {
+            if let LivePush::Result { live_revision, .. } = &push {
+                if *live_revision <= entry.last_delivered_revision {
+                    continue;
+                }
+                entry.last_delivered_revision = *live_revision;
+            }
+            entry.mailbox.push(push.clone());
+        }
+    }
+}
+
+fn handle_v2_live_subscription(
+    coordinator: Arc<ProductionV2Coordinator>,
+    mut stream: UnixStream,
+    source_pane: crate::pane_state::PaneInstance,
+    target_pane: crate::pane_state::PaneInstance,
+    interval_ms: u64,
+) -> Result<()> {
+    use crate::daemon::protocol::v2::{ErrorCode, LiveUnavailableReason, ServerMessage};
+
+    if interval_ms < crate::config::load::MIN_LIVE_INTERVAL_MS {
+        let _ = write_v2_response(
+            &mut stream,
+            &ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "live interval_ms must be at least {}, got {interval_ms}",
+                    crate::config::load::MIN_LIVE_INTERVAL_MS
+                ),
+                None,
+            ),
+        );
+        return Ok(());
+    }
+    if source_pane.validate().is_err() || target_pane.validate().is_err() {
+        let _ = write_v2_response(
+            &mut stream,
+            &ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                "live subscription panes must be valid pane instances",
+                None,
+            ),
+        );
+        return Ok(());
+    }
+    if coordinator.shutdown.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let (id, mailbox) = coordinator.live.register(
+        source_pane,
+        target_pane.clone(),
+        Duration::from_millis(interval_ms),
+    );
+    let _guard = LiveSubscriptionGuard {
+        coordinator: coordinator.clone(),
+        id,
+    };
+    let daemon_instance_id = coordinator
+        .router
+        .lock()
+        .expect("v2 router lock poisoned")
+        .daemon_instance_id()
+        .clone();
+    loop {
+        let push = match mailbox.wait_timeout(V2_STREAM_HEARTBEAT_INTERVAL) {
+            LiveMailboxWait::Message(push) => Some(push),
+            LiveMailboxWait::Closed => break,
+            // A quiet capture period still exercises the socket so a dead
+            // subscriber is detected and its demand cleaned up.
+            LiveMailboxWait::TimedOut => None,
+        };
+        let message = match push {
+            Some(LivePush::Result {
+                live_revision,
+                captured_at_epoch_millis,
+                body,
+            }) => ServerMessage::LivePreviewResult {
+                live_revision,
+                target_pane: target_pane.clone(),
+                captured_at_epoch_millis,
+                body: body.as_ref().clone(),
+            },
+            Some(LivePush::Unavailable { reason }) => ServerMessage::LivePreviewUnavailable {
+                target_pane: target_pane.clone(),
+                reason,
+            },
+            None => ServerMessage::Heartbeat {
+                daemon_instance_id: daemon_instance_id.clone(),
+                snapshot_revision: coordinator
+                    .snapshot_cache
+                    .lock()
+                    .expect("snapshot cache lock poisoned")
+                    .as_ref()
+                    .map_or(0, |published| published.revision),
+            },
+        };
+        let frame = match crate::daemon::protocol::v2::encode_response_frame(&message) {
+            Ok(frame) => frame,
+            Err(_) => {
+                // An over-sized body must not tear down the stream; deliver an
+                // explicit failure for this frame instead.
+                match crate::daemon::protocol::v2::encode_response_frame(
+                    &ServerMessage::LivePreviewUnavailable {
+                        target_pane: target_pane.clone(),
+                        reason: LiveUnavailableReason::CaptureFailed,
+                    },
+                ) {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                }
+            }
+        };
+        if write_v2_frame(&mut stream, &frame).is_err() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn start_status_push_worker(coordinator: Arc<ProductionV2Coordinator>) {
@@ -2774,26 +3432,11 @@ fn apply_production_mutation(
             | ClientMessage::QueryStatusSnapshot { .. }
             | ClientMessage::QueryPane { .. }
             | ClientMessage::QueryHealth { .. }
-            | ClientMessage::Subscribe { .. },
+            | ClientMessage::Subscribe { .. }
+            | ClientMessage::SubscribeLive { .. },
         ) => unreachable!("v2 router cannot sequence a read-only request"),
         V2AcceptedMutation::Internal(V2InternalMutation::TargetedPaneRefresh { pane_id }) => {
             targeted_pane_refresh_response(coordinator, &pane_id)
-        }
-        V2AcceptedMutation::Internal(V2InternalMutation::ObservationPollProjection(projection)) => {
-            match apply_observation_poll_projection(coordinator, *projection) {
-                Ok(revision) => {
-                    coordinator
-                        .projection_updated_at_epoch_seconds
-                        .store(epoch_seconds() as u64, Ordering::SeqCst);
-                    ServerMessage::SnapshotAck {
-                        event_id: crate::pane_state::EventId::generate()
-                            .expect("OS random source failed after daemon startup"),
-                        accepted_seq,
-                        snapshot_revision: revision,
-                    }
-                }
-                Err(error) => observation_poll_error_response(coordinator, error),
-            }
         }
         V2AcceptedMutation::Internal(V2InternalMutation::RefreshTopology) => {
             match refresh_full_topology(coordinator) {
@@ -2833,30 +3476,17 @@ fn apply_production_mutation(
         V2AcceptedMutation::Internal(V2InternalMutation::DiagnosticProjection {
             pane_instance,
             message,
-        }) => {
-            let mut state_guard = coordinator
-                .state
-                .lock()
-                .expect("canonical state lock poisoned");
-            let state = state_guard
-                .as_mut()
-                .expect("state initialized before diagnostic");
-            let result = if let Some(pane) = pane_instance {
-                state.leased.runtime.add_diagnostic(pane, message)
-            } else {
-                state
-                    .add_global_diagnostic(ErrorCode::InternalError, message)
-                    .map(|_| ())
-            };
-            if let Err(error) = result {
-                return production_store_error_response(coordinator, error, None);
-            }
-            ServerMessage::SnapshotAck {
+        }) => match apply_diagnostic_projection(coordinator, pane_instance, message) {
+            Ok(revision) => ServerMessage::SnapshotAck {
                 event_id: crate::pane_state::EventId::generate()
                     .expect("OS random source failed after daemon startup"),
                 accepted_seq,
-                snapshot_revision: state.leased.runtime.snapshot_revision(),
-            }
+                snapshot_revision: revision,
+            },
+            Err(error) => production_store_error_response(coordinator, error, None),
+        },
+        V2AcceptedMutation::Internal(V2InternalMutation::ObservationBatch(payload)) => {
+            apply_observation_batch(coordinator, accepted_seq, *payload)
         }
         V2AcceptedMutation::Internal(V2InternalMutation::FrameTooLargeProjection {
             rejected_revision,
@@ -2954,24 +3584,6 @@ fn apply_production_mutation(
                 event_id: completion.event_id,
                 accepted_seq,
                 snapshot_revision,
-            }
-        }
-        V2AcceptedMutation::Internal(V2InternalMutation::TriageProjection) => {
-            let mut state_guard = coordinator
-                .state
-                .lock()
-                .expect("canonical state lock poisoned");
-            let state = state_guard
-                .as_mut()
-                .expect("state initialized before triage projection");
-            if let Err(error) = state.leased.runtime.advance_poll_projection() {
-                return production_store_error_response(coordinator, error, None);
-            }
-            ServerMessage::SnapshotAck {
-                event_id: crate::pane_state::EventId::generate()
-                    .expect("OS random source failed after daemon startup"),
-                accepted_seq,
-                snapshot_revision: state.leased.runtime.snapshot_revision(),
             }
         }
         V2AcceptedMutation::Internal(V2InternalMutation::GitProjection { badges, worktrees }) => {
@@ -3242,6 +3854,121 @@ fn apply_external_pane_event(
     accepted_seq: u64,
     envelope: crate::pane_state::PaneEventEnvelope,
 ) -> crate::daemon::protocol::v2::ServerMessage {
+    apply_pane_event_mutation(coordinator, accepted_seq, envelope, false)
+}
+
+fn apply_diagnostic_projection(
+    coordinator: &ProductionV2Coordinator,
+    pane_instance: Option<crate::pane_state::PaneInstance>,
+    message: String,
+) -> Result<u64, crate::pane_state::store::StoreError> {
+    let mut state_guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let state = state_guard
+        .as_mut()
+        .expect("state initialized before diagnostic");
+    if let Some(pane) = pane_instance {
+        state.leased.runtime.add_diagnostic(pane, message)?;
+    } else {
+        state.add_global_diagnostic(
+            crate::daemon::protocol::v2::ErrorCode::InternalError,
+            message,
+        )?;
+    }
+    Ok(state.leased.runtime.snapshot_revision())
+}
+
+fn apply_triage_projection(
+    coordinator: &ProductionV2Coordinator,
+) -> Result<u64, crate::pane_state::store::StoreError> {
+    let mut state_guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let state = state_guard
+        .as_mut()
+        .expect("state initialized before triage projection");
+    state.leased.runtime.advance_poll_projection()?;
+    Ok(state.leased.runtime.snapshot_revision())
+}
+
+/// Applies one observation poll as a single sequenced mutation. Every stage
+/// reuses the standalone-mutation helpers, so reducer, persist, and read-back
+/// contracts are identical to the previous one-mutation-per-event queue; only
+/// the snapshot publish moves to the end of the batch.
+fn apply_observation_batch(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    payload: ObservationBatchPayload,
+) -> crate::daemon::protocol::v2::ServerMessage {
+    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+
+    let ObservationBatchPayload {
+        projection,
+        observations,
+        removals,
+        diagnostics,
+    } = payload;
+    if let Err(error) = apply_observation_poll_projection(coordinator, *projection) {
+        return observation_poll_error_response(coordinator, error);
+    }
+    for envelope in observations.into_iter().chain(removals) {
+        // Nonfatal per-pane failures keep processing the remaining panes, same
+        // as the standalone mutation queue did; fail-stop conditions raise the
+        // shutdown flag inside the helper and abort the rest of the batch.
+        let _ = apply_pane_event_mutation(coordinator, accepted_seq, envelope, true);
+        if coordinator.shutdown.load(Ordering::SeqCst) {
+            return ServerMessage::error(
+                ErrorCode::NotReady,
+                "daemon failed stop during observation batch",
+                None,
+            );
+        }
+    }
+    for (pane_instance, message) in diagnostics {
+        if let Err(error) = apply_diagnostic_projection(coordinator, pane_instance, message) {
+            return production_store_error_response(coordinator, error, None);
+        }
+    }
+    match apply_triage_projection(coordinator) {
+        Ok(revision) => {
+            coordinator
+                .projection_updated_at_epoch_seconds
+                .store(epoch_seconds() as u64, Ordering::SeqCst);
+            let present = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned")
+                .as_ref()
+                .map(|state| {
+                    state
+                        .topology
+                        .panes
+                        .iter()
+                        .map(|pane| pane.pane_instance.clone())
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            coordinator.live.prune_missing_panes(&present);
+            ServerMessage::SnapshotAck {
+                event_id: crate::pane_state::EventId::generate()
+                    .expect("OS random source failed after daemon startup"),
+                accepted_seq,
+                snapshot_revision: revision,
+            }
+        }
+        Err(error) => production_store_error_response(coordinator, error, None),
+    }
+}
+
+fn apply_pane_event_mutation(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    envelope: crate::pane_state::PaneEventEnvelope,
+    defer_full_preflight: bool,
+) -> crate::daemon::protocol::v2::ServerMessage {
     use crate::daemon::protocol::v2::{PaneApplyOutcome, ServerMessage};
     use crate::pane_state::store::{PendingResolution, StoreError};
 
@@ -3298,6 +4025,7 @@ fn apply_external_pane_event(
                 visibility_diagnostic.as_deref(),
                 revision_before,
                 result,
+                defer_full_preflight,
             )
         });
         (initial, revision_before)
@@ -3331,6 +4059,7 @@ fn apply_external_pane_event(
                         visibility_diagnostic.as_deref(),
                         revision_before,
                         result,
+                        defer_full_preflight,
                     )
                     .map(PendingResolution::Applied),
                     other => other,
@@ -3368,6 +4097,9 @@ fn apply_external_pane_event(
     }
 }
 
+/// `defer_full_preflight` is set on the observation-batch path: the per-pane
+/// persist/read-back contract still runs here, while the full resolved-snapshot
+/// preflight happens once when the batch publishes.
 fn finish_pane_event_projection(
     coordinator: &ProductionV2Coordinator,
     state: &mut super::runtime::CanonicalCoordinatorState,
@@ -3375,6 +4107,7 @@ fn finish_pane_event_projection(
     visibility_diagnostic: Option<&str>,
     revision_before: u64,
     mut result: crate::pane_state::store::ApplyResult,
+    defer_full_preflight: bool,
 ) -> Result<crate::pane_state::store::ApplyResult, crate::pane_state::store::StoreError> {
     let mut messages = visibility_diagnostic
         .into_iter()
@@ -3437,7 +4170,9 @@ fn finish_pane_event_projection(
         false,
         revision_before,
     )?;
-    let _ = state.checked_resolved_snapshot()?;
+    if !defer_full_preflight {
+        let _ = state.checked_resolved_snapshot()?;
+    }
     Ok(result)
 }
 
@@ -5052,14 +5787,27 @@ pub fn run_runtime_daemon_server(
     bootstrap_v2_runtime(&coordinator, leased, env, &config)?;
     start_v2_mutation_worker(coordinator.clone());
     start_sidebar_completion_forwarder(coordinator.clone());
+    let capture = crate::daemon::workers::start_capture_coordinator(
+        Arc::new(crate::daemon::workers::SystemObservationWorkerIo::new(
+            coordinator
+                .env
+                .get("VDE_TMUX_SOCKET_NAME")
+                .cloned()
+                .filter(|value| !value.trim().is_empty()),
+        )),
+        coordinator.incarnation.identity.clone(),
+    );
     start_canonical_observation_worker(
         coordinator.clone(),
         Duration::from_millis(config.daemon.poll_ms),
+        capture.clone(),
     );
     start_canonical_git_worker(
         coordinator.clone(),
         Duration::from_millis(config.daemon.git.poll_interval_ms),
+        Duration::from_millis(config.daemon.git.timeout_ms),
     );
+    start_live_preview_worker(coordinator.clone(), capture);
     start_status_push_worker(coordinator.clone());
 
     coordinator.wait_for_shutdown();
@@ -6502,8 +7250,8 @@ mod tests {
         for _ in 0..V2_MUTATION_QUEUE_CAPACITY {
             assert!(coordinator.enqueue_internal(V2InternalMutation::RefreshTopology));
         }
-        assert!(!coordinator.enqueue_internal(V2InternalMutation::TriageProjection));
-        assert!(!coordinator.enqueue_internal(V2InternalMutation::TriageProjection));
+        assert!(!coordinator.enqueue_internal(V2InternalMutation::RefreshTopology));
+        assert!(!coordinator.enqueue_internal(V2InternalMutation::RefreshTopology));
         assert_eq!(coordinator.mutation_queue_drops.load(Ordering::SeqCst), 2);
         assert_eq!(
             *coordinator.recent_error_code.lock().unwrap(),
@@ -6533,7 +7281,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_poll_burst_keeps_trailing_triage_at_supported_pane_counts() {
+    fn observation_poll_burst_enqueues_one_batch_mutation() {
         for pane_count in [63, 256, 512] {
             let root = std::env::temp_dir().join(format!(
                 "vde-observation-burst-{pane_count}-{}-{}",
@@ -6568,9 +7316,814 @@ mod tests {
                 .daemon_instance_id()
                 .clone();
 
+            let observations = (0..pane_count)
+                .map(|index| crate::pane_state::PaneEventEnvelope {
+                    daemon_instance_id: daemon_instance_id.clone(),
+                    event_id: crate::pane_state::EventId::generate().unwrap(),
+                    pane_instance: crate::pane_state::PaneInstance {
+                        pane_id: format!("%{index}"),
+                        pane_pid: 10_000 + index as u32,
+                    },
+                    agent: None,
+                    agent_session_id: None,
+                    event: crate::pane_state::PaneEvent::ObservationBatch {
+                        base: None,
+                        tracker_generation: 0,
+                        observed_at: 1,
+                        presence: crate::pane_state::AgentPresenceObservation::Unknown,
+                        capture: None,
+                    },
+                })
+                .collect::<Vec<_>>();
             assert!(
-                coordinator.enqueue_internal(V2InternalMutation::ObservationPollProjection(
-                    Box::new(ObservationPollProjection {
+                coordinator.enqueue_internal(V2InternalMutation::ObservationBatch(Box::new(
+                    ObservationBatchPayload {
+                        projection: Box::new(ObservationPollProjection {
+                            topology: crate::daemon::topology::TopologySnapshot {
+                                server_identity,
+                                panes: Vec::new(),
+                            },
+                            status_metadata:
+                                super::super::runtime::StatusProjectionMetadata::default(),
+                            witnesses: Vec::new(),
+                            observation_bases: BTreeMap::new(),
+                            view_base: crate::daemon::view_hooks::ViewRegistry::default(),
+                        }),
+                        observations,
+                        removals: Vec::new(),
+                        diagnostics: Vec::new(),
+                    }
+                ),))
+            );
+
+            // One successful poll is exactly one queued mutation regardless of
+            // pane count, and the payload preserves the per-pane events.
+            let queue = coordinator.queue.lock().unwrap();
+            assert_eq!(queue.items.len(), 1);
+            match queue.items.front().map(|item| &item.sequenced.mutation) {
+                Some(V2AcceptedMutation::Internal(V2InternalMutation::ObservationBatch(
+                    payload,
+                ))) => {
+                    assert_eq!(payload.observations.len(), pane_count);
+                    assert!(payload.removals.is_empty());
+                    assert!(payload.diagnostics.is_empty());
+                }
+                other => panic!("expected one observation batch, found {other:?}"),
+            }
+            drop(queue);
+
+            drop(coordinator);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn observation_batch_applies_all_stages_and_publishes_one_snapshot_build() {
+        for pane_count in [0usize, 1, 62] {
+            let root = std::env::temp_dir().join(format!(
+                "vde-batch-apply-{pane_count}-{}-{}",
+                std::process::id(),
+                crate::pane_state::EventId::generate().unwrap().as_str()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let server_identity = crate::daemon::topology::ServerIdentity {
+                pid: 1,
+                start_time: 2,
+            };
+            let coordinator = ProductionV2Coordinator::new(
+                crate::daemon::lifecycle::TmuxServerIncarnation {
+                    socket_path: root.join("tmux.sock"),
+                    identity: server_identity.clone(),
+                    hash: format!("batch-apply-{pane_count:0>52}"),
+                },
+                BTreeMap::new(),
+                crate::config::DoneClearOn::Pane,
+                None,
+            )
+            .unwrap();
+            coordinator
+                .router
+                .lock()
+                .unwrap()
+                .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+            let daemon_instance_id = coordinator
+                .router
+                .lock()
+                .unwrap()
+                .daemon_instance_id()
+                .clone();
+            let leased = super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(
+                &root.join("writer"),
+            )
+            .unwrap();
+            *coordinator.state.lock().unwrap() =
+                Some(super::super::runtime::CanonicalCoordinatorState::new(
+                    leased,
+                    crate::daemon::topology::TopologySnapshot {
+                        server_identity: server_identity.clone(),
+                        panes: Vec::new(),
+                    },
+                    crate::daemon::view_hooks::ViewRegistry::default(),
+                    crate::sidebar::state::SidebarOrderPreferences::default(),
+                ));
+
+            let observations = (0..pane_count)
+                .map(|index| crate::pane_state::PaneEventEnvelope {
+                    daemon_instance_id: daemon_instance_id.clone(),
+                    event_id: crate::pane_state::EventId::generate().unwrap(),
+                    pane_instance: crate::pane_state::PaneInstance {
+                        pane_id: format!("%{index}"),
+                        pane_pid: 10_000 + index as u32,
+                    },
+                    agent: None,
+                    agent_session_id: None,
+                    event: crate::pane_state::PaneEvent::ObservationBatch {
+                        base: None,
+                        tracker_generation: 0,
+                        observed_at: 1,
+                        presence: crate::pane_state::AgentPresenceObservation::Unknown,
+                        capture: None,
+                    },
+                })
+                .collect::<Vec<_>>();
+            let response = apply_production_mutation(
+                &coordinator,
+                V2SequencedMutation {
+                    accepted_seq: 1,
+                    mutation: V2AcceptedMutation::Internal(V2InternalMutation::ObservationBatch(
+                        Box::new(ObservationBatchPayload {
+                            projection: Box::new(ObservationPollProjection {
+                                topology: crate::daemon::topology::TopologySnapshot {
+                                    server_identity: server_identity.clone(),
+                                    panes: Vec::new(),
+                                },
+                                status_metadata:
+                                    super::super::runtime::StatusProjectionMetadata::default(),
+                                witnesses: Vec::new(),
+                                observation_bases: BTreeMap::new(),
+                                view_base: crate::daemon::view_hooks::ViewRegistry::default(),
+                            }),
+                            observations,
+                            removals: Vec::new(),
+                            diagnostics: vec![(None, "poll diagnostic".to_string())],
+                        }),
+                    )),
+                },
+            );
+            assert!(
+                matches!(
+                    response,
+                    crate::daemon::protocol::v2::ServerMessage::SnapshotAck { .. }
+                ),
+                "batch response for {pane_count} panes: {response:?}"
+            );
+            assert!(!coordinator.shutdown.load(Ordering::SeqCst));
+
+            // The worker publishes once per processed mutation; a whole poll is
+            // one mutation, so one publish and at most one snapshot build.
+            coordinator.publish_resolved_snapshot().unwrap();
+            assert_eq!(coordinator.snapshot_publishes.load(Ordering::SeqCst), 1);
+            assert!(coordinator.snapshot_builds.load(Ordering::SeqCst) <= 1);
+
+            drop(coordinator);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    struct MockLiveCaptureIo {
+        calls: Mutex<Vec<Vec<crate::pane_state::PaneInstance>>>,
+        mismatch_targets: BTreeSet<String>,
+    }
+
+    impl MockLiveCaptureIo {
+        fn new(_identity: crate::daemon::topology::ServerIdentity) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                mismatch_targets: BTreeSet::new(),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    impl crate::daemon::workers::CaptureSource for MockLiveCaptureIo {
+        fn capture_plain_tails(
+            &self,
+            _panes: &[crate::pane_state::PaneInstance],
+        ) -> std::result::Result<Vec<String>, crate::daemon::workers::CaptureBatchError> {
+            unreachable!("live scheduler tests never request plain tails")
+        }
+
+        fn capture_live_sections(
+            &self,
+            targets: &[crate::pane_state::PaneInstance],
+        ) -> std::result::Result<
+            Vec<crate::daemon::workers::LiveCaptureSection>,
+            crate::daemon::workers::CaptureBatchError,
+        > {
+            self.calls.lock().unwrap().push(targets.to_vec());
+            Ok(targets
+                .iter()
+                .map(|target| {
+                    if self.mismatch_targets.contains(&target.pane_id) {
+                        crate::daemon::workers::LiveCaptureSection::PaneInstanceMismatch
+                    } else {
+                        crate::daemon::workers::LiveCaptureSection::Body(format!(
+                            "body-{}\n",
+                            target.pane_id
+                        ))
+                    }
+                })
+                .collect())
+        }
+    }
+
+    fn live_views_showing(
+        source_pane: &crate::pane_state::PaneInstance,
+    ) -> crate::daemon::view_hooks::ViewRegistry {
+        let mut views = crate::daemon::view_hooks::ViewRegistry::default();
+        views
+            .reconcile(
+                &[crate::pane_state::ClientWitness {
+                    client_pid: 400,
+                    session_id: "$1".to_string(),
+                    window_id: "@1".to_string(),
+                    active_pane: source_pane.clone(),
+                    control_mode: false,
+                    active_pane_flag: false,
+                }],
+                &BTreeMap::from([("@1".to_string(), vec![source_pane.clone()])]),
+            )
+            .unwrap();
+        views
+    }
+
+    fn live_test_coordinator(
+        root: &std::path::Path,
+        hash: String,
+        views: crate::daemon::view_hooks::ViewRegistry,
+    ) -> ProductionV2Coordinator {
+        let server_identity = crate::daemon::topology::ServerIdentity {
+            pid: 1,
+            start_time: 2,
+        };
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: root.join("tmux.sock"),
+                identity: server_identity.clone(),
+                hash,
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        let leased =
+            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
+                .unwrap();
+        *coordinator.state.lock().unwrap() =
+            Some(super::super::runtime::CanonicalCoordinatorState::new(
+                leased,
+                crate::daemon::topology::TopologySnapshot {
+                    server_identity,
+                    panes: Vec::new(),
+                },
+                views,
+                crate::sidebar::state::SidebarOrderPreferences::default(),
+            ));
+        coordinator
+    }
+
+    #[test]
+    fn live_scheduler_dedupes_targets_into_one_capture_and_fans_out() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-live-dedupe-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = crate::pane_state::PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 900,
+        };
+        let target_a = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        let target_b = crate::pane_state::PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 200,
+        };
+        let coordinator = live_test_coordinator(
+            &root,
+            "live-dedupe".to_string(),
+            live_views_showing(&source),
+        );
+        let io = MockLiveCaptureIo::new(coordinator.incarnation.identity.clone());
+
+        let (_, mailbox_a1) =
+            coordinator
+                .live
+                .register(source.clone(), target_a.clone(), Duration::from_secs(2));
+        let (_, mailbox_a2) =
+            coordinator
+                .live
+                .register(source.clone(), target_a.clone(), Duration::from_secs(2));
+        let (_, mailbox_b) =
+            coordinator
+                .live
+                .register(source.clone(), target_b.clone(), Duration::from_secs(2));
+
+        run_live_preview_tick(&coordinator, &io, Instant::now());
+
+        // Two distinct targets shared by three subscribers produce exactly one
+        // capture request with one section per deduplicated target.
+        assert_eq!(io.call_count(), 1);
+        assert_eq!(io.calls.lock().unwrap()[0].len(), 2);
+        let a1 = mailbox_a1.wait().expect("first subscriber receives a body");
+        let a2 = mailbox_a2
+            .wait()
+            .expect("second subscriber receives a body");
+        match (&a1, &a2) {
+            (
+                LivePush::Result {
+                    live_revision: r1,
+                    body: b1,
+                    ..
+                },
+                LivePush::Result {
+                    live_revision: r2,
+                    body: b2,
+                    ..
+                },
+            ) => {
+                assert_eq!(r1, r2);
+                assert_eq!(b1, b2);
+            }
+            other => panic!("expected two results, found {other:?}"),
+        }
+        assert!(matches!(mailbox_b.wait(), Some(LivePush::Result { .. })));
+
+        // Nothing is due immediately after the tick, so no further capture runs.
+        run_live_preview_tick(&coordinator, &io, Instant::now());
+        assert_eq!(io.call_count(), 1);
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_scheduler_does_not_capture_hidden_sources() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-live-hidden-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = crate::pane_state::PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 900,
+        };
+        let target = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        // The registry views show a different pane, so the source is hidden.
+        let other = crate::pane_state::PaneInstance {
+            pane_id: "%8".to_string(),
+            pane_pid: 800,
+        };
+        let coordinator =
+            live_test_coordinator(&root, "live-hidden".to_string(), live_views_showing(&other));
+        let io = MockLiveCaptureIo::new(coordinator.incarnation.identity.clone());
+
+        let (_, mailbox) = coordinator
+            .live
+            .register(source, target, Duration::from_secs(2));
+
+        run_live_preview_tick(&coordinator, &io, Instant::now());
+
+        assert_eq!(io.call_count(), 0);
+        assert!(matches!(
+            mailbox.wait(),
+            Some(LivePush::Unavailable {
+                reason: crate::daemon::protocol::v2::LiveUnavailableReason::HiddenSource,
+            })
+        ));
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_pane_instance_mismatch_delivers_no_body() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-live-mismatch-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = crate::pane_state::PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 900,
+        };
+        let target = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        let coordinator = live_test_coordinator(
+            &root,
+            "live-mismatch".to_string(),
+            live_views_showing(&source),
+        );
+        let mut io = MockLiveCaptureIo::new(coordinator.incarnation.identity.clone());
+        io.mismatch_targets.insert("%1".to_string());
+
+        let (_, mailbox) = coordinator
+            .live
+            .register(source, target, Duration::from_secs(2));
+
+        run_live_preview_tick(&coordinator, &io, Instant::now());
+
+        assert!(matches!(
+            mailbox.wait(),
+            Some(LivePush::Unavailable {
+                reason: crate::daemon::protocol::v2::LiveUnavailableReason::PaneInstanceMismatch,
+            })
+        ));
+        assert!(coordinator.live.bodies.lock().unwrap().is_empty());
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn observation_piggyback_consumes_due_live_demand_before_the_scheduler_tick() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-live-piggyback-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = crate::pane_state::PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 900,
+        };
+        let target = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        let coordinator = live_test_coordinator(
+            &root,
+            "live-piggyback".to_string(),
+            live_views_showing(&source),
+        );
+        let io = MockLiveCaptureIo::new(coordinator.incarnation.identity.clone());
+        let (_, mailbox) =
+            coordinator
+                .live
+                .register(source, target.clone(), Duration::from_secs(2));
+
+        // The observation worker consumes the due demand ahead of its own
+        // capture, exactly as it does before a poll.
+        let now = Instant::now();
+        let targets = collect_due_live_targets(
+            &coordinator,
+            now,
+            crate::daemon::workers::CAPTURE_COALESCE_WINDOW,
+        );
+        assert_eq!(targets, vec![target]);
+        deliver_live_result(
+            &coordinator,
+            &targets,
+            Ok(vec![crate::daemon::workers::LiveCaptureSection::Body(
+                "from-observation\n".to_string(),
+            )]),
+        );
+        assert!(matches!(mailbox.wait(), Some(LivePush::Result { .. })));
+
+        // In the aligned default configuration the scheduler tick that follows
+        // finds no remaining due demand, so live preview needs no extra tmux
+        // process of its own.
+        run_live_preview_tick(&coordinator, &io, now + Duration::from_millis(5));
+        assert_eq!(io.call_count(), 0);
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_subscription_rejects_interval_below_minimum() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-live-interval-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let coordinator = Arc::new(live_test_coordinator(
+            &root,
+            "live-interval".to_string(),
+            crate::daemon::view_hooks::ViewRegistry::default(),
+        ));
+        let (server, client) = UnixStream::pair().unwrap();
+        let source = crate::pane_state::PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 900,
+        };
+        let target = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+
+        handle_v2_live_subscription(coordinator.clone(), server, source, target, 99).unwrap();
+
+        let mut response = String::new();
+        std::io::BufReader::new(client)
+            .read_line(&mut response)
+            .unwrap();
+        let message: crate::daemon::protocol::v2::ServerMessage =
+            serde_json::from_str(response.trim()).unwrap();
+        assert!(matches!(
+            message,
+            crate::daemon::protocol::v2::ServerMessage::Error {
+                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+                ..
+            }
+        ));
+        assert!(coordinator.live.entries.lock().unwrap().is_empty());
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_subscription_guard_removes_registry_entry_after_write_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-live-guard-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let coordinator = Arc::new(live_test_coordinator(
+            &root,
+            "live-guard".to_string(),
+            crate::daemon::view_hooks::ViewRegistry::default(),
+        ));
+        let (server, client) = UnixStream::pair().unwrap();
+        let source = crate::pane_state::PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 900,
+        };
+        let target = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        let handler = {
+            let coordinator = coordinator.clone();
+            thread::spawn(move || {
+                handle_v2_live_subscription(coordinator, server, source, target, 2000)
+            })
+        };
+        // Wait until the handler registered its demand, then sever the client.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while coordinator.live.entries.lock().unwrap().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "subscription was never registered"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(client);
+        coordinator
+            .live
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .for_each(|entry| {
+                entry.mailbox.push(LivePush::Unavailable {
+                    reason: crate::daemon::protocol::v2::LiveUnavailableReason::TargetMissing,
+                });
+            });
+
+        handler.join().unwrap().unwrap();
+        assert!(coordinator.live.entries.lock().unwrap().is_empty());
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_wait_timeout_yields_heartbeat_instead_of_full_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-heartbeat-wait-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let coordinator = live_test_coordinator(
+            &root,
+            "heartbeat-wait".to_string(),
+            crate::daemon::view_hooks::ViewRegistry::default(),
+        );
+        let published = coordinator.publish_resolved_snapshot().unwrap();
+
+        // With no newer revision, ten seconds of waiting yields only heartbeat
+        // outcomes; the cached full snapshot is never re-sent.
+        for _ in 0..5 {
+            let outcome = coordinator
+                .wait_for_snapshot_after(published.revision, Duration::from_millis(10))
+                .expect("wait must not observe a shutdown");
+            assert!(matches!(
+                outcome,
+                SnapshotWaitOutcome::HeartbeatDue { snapshot_revision }
+                    if snapshot_revision == published.revision
+            ));
+        }
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn idle_subscription_stream_sends_heartbeats_and_new_revisions_still_flow() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-heartbeat-stream-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let coordinator = Arc::new(live_test_coordinator(
+            &root,
+            "heartbeat-stream".to_string(),
+            crate::daemon::view_hooks::ViewRegistry::default(),
+        ));
+        let published = coordinator.publish_resolved_snapshot().unwrap();
+        let daemon_instance_id = coordinator
+            .router
+            .lock()
+            .unwrap()
+            .daemon_instance_id()
+            .clone();
+        let (server, client) = UnixStream::pair().unwrap();
+        let stream_worker = {
+            let coordinator = coordinator.clone();
+            let last_revision = published.revision;
+            thread::spawn(move || {
+                stream_v2_subscription_with_heartbeat_interval(
+                    coordinator,
+                    server,
+                    last_revision,
+                    Duration::from_millis(10),
+                )
+            })
+        };
+        let mut reader = std::io::BufReader::new(client.try_clone().unwrap());
+
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let first: crate::daemon::protocol::v2::ServerMessage =
+            serde_json::from_str(line.trim()).unwrap();
+        match first {
+            crate::daemon::protocol::v2::ServerMessage::Heartbeat {
+                daemon_instance_id: heartbeat_instance,
+                snapshot_revision,
+            } => {
+                assert_eq!(heartbeat_instance, daemon_instance_id);
+                assert_eq!(snapshot_revision, published.revision);
+            }
+            other => panic!("expected a heartbeat, received {other:?}"),
+        }
+
+        // A real revision bump still flows through as a full snapshot frame.
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .leased
+            .runtime
+            .mark_projection_changed()
+            .unwrap();
+        let newer = coordinator.publish_resolved_snapshot().unwrap();
+        assert_eq!(newer.revision, published.revision + 1);
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let message: crate::daemon::protocol::v2::ServerMessage =
+                serde_json::from_str(line.trim()).unwrap();
+            match message {
+                crate::daemon::protocol::v2::ServerMessage::Heartbeat { .. } => continue,
+                crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+                    snapshot_revision,
+                    ..
+                } => {
+                    assert_eq!(snapshot_revision, newer.revision);
+                    break;
+                }
+                other => panic!("unexpected subscription frame: {other:?}"),
+            }
+        }
+
+        drop(reader);
+        drop(client);
+        stream_worker.join().unwrap().unwrap();
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_mailbox_delivers_latest_only_and_close_ends_the_stream() {
+        let mailbox = LiveMailbox::default();
+        mailbox.push(LivePush::Unavailable {
+            reason: crate::daemon::protocol::v2::LiveUnavailableReason::TargetMissing,
+        });
+        mailbox.push(LivePush::Unavailable {
+            reason: crate::daemon::protocol::v2::LiveUnavailableReason::CaptureFailed,
+        });
+
+        // A slow subscriber only ever sees the newest undelivered message.
+        assert!(matches!(
+            mailbox.wait(),
+            Some(LivePush::Unavailable {
+                reason: crate::daemon::protocol::v2::LiveUnavailableReason::CaptureFailed,
+            })
+        ));
+
+        mailbox.close();
+        assert!(mailbox.wait().is_none());
+    }
+
+    #[test]
+    fn live_registry_prunes_demand_for_missing_panes() {
+        let registry = LiveRegistry::default();
+        let source = crate::pane_state::PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 900,
+        };
+        let target = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        let (_, mailbox) =
+            registry.register(source.clone(), target.clone(), Duration::from_secs(2));
+        registry.bodies.lock().unwrap().insert(
+            target.clone(),
+            LiveBodyEntry {
+                live_revision: 1,
+                captured_at_epoch_millis: 0,
+                body: Arc::new("body".to_string()),
+            },
+        );
+
+        // Both panes still present: demand survives.
+        registry.prune_missing_panes(&BTreeSet::from([source.clone(), target.clone()]));
+        assert_eq!(registry.entries.lock().unwrap().len(), 1);
+
+        // The target pane disappeared: demand and cached body are dropped and
+        // the subscriber stream is closed.
+        registry.prune_missing_panes(&BTreeSet::from([source]));
+        assert!(registry.entries.lock().unwrap().is_empty());
+        assert!(registry.bodies.lock().unwrap().is_empty());
+        assert!(mailbox.wait().is_none());
+    }
+
+    #[test]
+    fn observation_batch_keeps_sequence_order_with_following_mutations() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-batch-sequence-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let server_identity = crate::daemon::topology::ServerIdentity {
+            pid: 1,
+            start_time: 2,
+        };
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: root.join("tmux.sock"),
+                identity: server_identity.clone(),
+                hash: "a1".repeat(32),
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        coordinator
+            .router
+            .lock()
+            .unwrap()
+            .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+
+        assert!(
+            coordinator.enqueue_internal(V2InternalMutation::ObservationBatch(Box::new(
+                ObservationBatchPayload {
+                    projection: Box::new(ObservationPollProjection {
                         topology: crate::daemon::topology::TopologySnapshot {
                             server_identity,
                             panes: Vec::new(),
@@ -6579,53 +8132,44 @@ mod tests {
                         witnesses: Vec::new(),
                         observation_bases: BTreeMap::new(),
                         view_base: crate::daemon::view_hooks::ViewRegistry::default(),
-                    },)
-                ),)
-            );
-            for index in 0..pane_count {
-                assert!(
-                    coordinator.enqueue_internal(V2InternalMutation::PaneEvent(Box::new(
-                        crate::pane_state::PaneEventEnvelope {
-                            daemon_instance_id: daemon_instance_id.clone(),
-                            event_id: crate::pane_state::EventId::generate().unwrap(),
-                            pane_instance: crate::pane_state::PaneInstance {
-                                pane_id: format!("%{index}"),
-                                pane_pid: 10_000 + index as u32,
-                            },
-                            agent: None,
-                            agent_session_id: None,
-                            event: crate::pane_state::PaneEvent::ObservationBatch {
-                                base: None,
-                                tracker_generation: 0,
-                                observed_at: 1,
-                                presence: crate::pane_state::AgentPresenceObservation::Unknown,
-                                capture: None,
-                            },
-                        },
-                    )))
-                );
-            }
-            assert!(coordinator.enqueue_internal(V2InternalMutation::TriageProjection));
+                    }),
+                    observations: Vec::new(),
+                    removals: Vec::new(),
+                    diagnostics: Vec::new(),
+                }
+            ),))
+        );
+        assert!(
+            coordinator.enqueue_internal(V2InternalMutation::DiagnosticProjection {
+                pane_instance: None,
+                message: "after-batch".to_string(),
+            })
+        );
 
-            let queue = coordinator.queue.lock().unwrap();
-            assert_eq!(queue.items.len(), pane_count + 2);
-            assert!(matches!(
-                queue.items.front().map(|item| &item.sequenced.mutation),
-                Some(V2AcceptedMutation::Internal(
-                    V2InternalMutation::ObservationPollProjection(_)
-                ))
-            ));
-            assert!(matches!(
-                queue.items.back().map(|item| &item.sequenced.mutation),
-                Some(V2AcceptedMutation::Internal(
-                    V2InternalMutation::TriageProjection
-                ))
-            ));
-            drop(queue);
+        let queue = coordinator.queue.lock().unwrap();
+        assert_eq!(queue.items.len(), 2);
+        let sequences = queue
+            .items
+            .iter()
+            .map(|item| item.sequenced.accepted_seq)
+            .collect::<Vec<_>>();
+        assert!(sequences[0] < sequences[1]);
+        assert!(matches!(
+            queue.items.front().map(|item| &item.sequenced.mutation),
+            Some(V2AcceptedMutation::Internal(
+                V2InternalMutation::ObservationBatch(_)
+            ))
+        ));
+        assert!(matches!(
+            queue.items.back().map(|item| &item.sequenced.mutation),
+            Some(V2AcceptedMutation::Internal(
+                V2InternalMutation::DiagnosticProjection { .. }
+            ))
+        ));
+        drop(queue);
 
-            drop(coordinator);
-            std::fs::remove_dir_all(root).unwrap();
-        }
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6652,7 +8196,7 @@ mod tests {
             let coordinator = coordinator.clone();
             thread::spawn(move || {
                 started_tx.send(()).unwrap();
-                let result = coordinator.wait_for_snapshot_after(0);
+                let result = coordinator.wait_for_snapshot_after(0, Duration::from_secs(2));
                 done_tx.send(result).unwrap();
             })
         };
@@ -6749,6 +8293,123 @@ mod tests {
         let stale_publisher = coordinator.publish_resolved_snapshot().unwrap();
         assert_eq!(stale_publisher.revision, changed.revision);
         assert!(Arc::ptr_eq(&stale_publisher.frame, &changed.frame));
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn render_clock_trigger_skips_frame_build_before_due() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-render-clock-fastpath-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: root.join("tmux.sock"),
+                identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                hash: "d".repeat(64),
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        let leased =
+            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
+                .unwrap();
+        *coordinator.state.lock().unwrap() =
+            Some(super::super::runtime::CanonicalCoordinatorState::new(
+                leased,
+                crate::daemon::topology::TopologySnapshot {
+                    server_identity: crate::daemon::topology::ServerIdentity {
+                        pid: 1,
+                        start_time: 2,
+                    },
+                    panes: Vec::new(),
+                },
+                crate::daemon::view_hooks::ViewRegistry::default(),
+                crate::sidebar::state::SidebarOrderPreferences::default(),
+            ));
+
+        for _ in 0..10 {
+            coordinator
+                .drive_status_push(StatusPushTrigger::RenderClock)
+                .unwrap();
+        }
+
+        // Before the 500ms render deadline no render-clock trigger may build a
+        // display frame or a resolved snapshot.
+        assert_eq!(coordinator.status_frame_builds.load(Ordering::SeqCst), 0);
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publish_resolved_snapshot_skips_rebuild_for_unchanged_revision() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-publish-rebuild-baseline-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: root.join("tmux.sock"),
+                identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                hash: "f".repeat(64),
+            },
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        let leased =
+            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
+                .unwrap();
+        *coordinator.state.lock().unwrap() =
+            Some(super::super::runtime::CanonicalCoordinatorState::new(
+                leased,
+                crate::daemon::topology::TopologySnapshot {
+                    server_identity: crate::daemon::topology::ServerIdentity {
+                        pid: 1,
+                        start_time: 2,
+                    },
+                    panes: Vec::new(),
+                },
+                crate::daemon::view_hooks::ViewRegistry::default(),
+                crate::sidebar::state::SidebarOrderPreferences::default(),
+            ));
+
+        coordinator.publish_resolved_snapshot().unwrap();
+        coordinator.publish_resolved_snapshot().unwrap();
+
+        // The revision fast path serves the cached frame without rebuilding the
+        // checked snapshot when the revision has not changed.
+        assert_eq!(coordinator.snapshot_publishes.load(Ordering::SeqCst), 2);
+        assert_eq!(coordinator.snapshot_builds.load(Ordering::SeqCst), 1);
+
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .leased
+            .runtime
+            .mark_projection_changed()
+            .unwrap();
+        coordinator.publish_resolved_snapshot().unwrap();
+        assert_eq!(coordinator.snapshot_builds.load(Ordering::SeqCst), 2);
 
         drop(coordinator);
         std::fs::remove_dir_all(root).unwrap();
@@ -7805,7 +9466,7 @@ mod tests {
         let mut reader = V2FrameReader::new(server);
         client
             .write_all(
-                b"{\"op\":\"hello\",\"proto\":3}\n{\"op\":\"query_resolved_snapshot\",\"proto\":3}\n",
+                b"{\"op\":\"hello\",\"proto\":4}\n{\"op\":\"query_resolved_snapshot\",\"proto\":4}\n",
             )
             .unwrap();
         let frame = read_v2_request_frame(&mut reader).unwrap();

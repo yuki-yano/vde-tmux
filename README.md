@@ -383,6 +383,15 @@ For normal use, the `vt daemon ensure` line in the tmux configuration manages st
 `stop` does not disable automatic startup.
 Use `disable` when the daemon must remain stopped.
 
+### Daemon protocol version 4
+
+The daemon and all of its clients (sidebar, statusline, CLI) speak protocol version 4 and reject every other version; there is no compatibility adapter or fallback. After upgrading the binary, stop the old daemon with the previously installed binary (`vt daemon stop`), start the new one (`vt daemon ensure`), and restart every sidebar so all processes speak the same version. Running `vt daemon reload` with a new binary against an incompatible daemon fails with instructions instead of replacing it.
+
+Version 4 adds two message families:
+
+- `subscribe_live` opens a long-lived stream that previews exactly one fixed target pane per connection. The daemon deduplicates capture work across subscribers, skips targets whose source sidebar is not visible to any eligible attached client, verifies the target pane id and pid inside the same tmux command, and pushes latest-only `live_preview_result` / `live_preview_unavailable` frames. Requests with `interval_ms` below 100 are rejected, as is `sidebar.live.interval_ms` below 100 at config load.
+- `heartbeat` keeps idle subscription streams alive: instead of re-sending the full snapshot every two seconds, the daemon sends a small frame carrying its instance id and the latest published snapshot revision. Clients treat an instance change or a revision regression as a protocol error and reconnect.
+
 ## Troubleshooting
 
 ### The status line or sidebar does not update

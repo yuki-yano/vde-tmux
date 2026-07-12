@@ -30,21 +30,35 @@ pub fn parse_config_with_env(yaml: &str, env: &BTreeMap<String, String>) -> Load
     }
     let deserializer = serde_yaml_ng::Deserializer::from_str(yaml);
     match serde_path_to_error::deserialize::<_, Config>(deserializer) {
-        Ok(mut config) => match expand_config_patterns(&mut config, env) {
-            Ok(()) => LoadedConfig {
-                config,
-                warnings: Vec::new(),
-            },
-            Err(warning) => LoadedConfig {
-                config: Config::default(),
-                warnings: vec![warning],
-            },
-        },
+        Ok(mut config) => {
+            match expand_config_patterns(&mut config, env).and_then(|()| validate_config(&config)) {
+                Ok(()) => LoadedConfig {
+                    config,
+                    warnings: Vec::new(),
+                },
+                Err(warning) => LoadedConfig {
+                    config: Config::default(),
+                    warnings: vec![warning],
+                },
+            }
+        }
         Err(error) => LoadedConfig {
             config: Config::default(),
             warnings: vec![format!("invalid config (path: {}): {error}", error.path())],
         },
     }
+}
+
+pub const MIN_LIVE_INTERVAL_MS: u64 = 100;
+
+fn validate_config(config: &Config) -> Result<(), String> {
+    if config.sidebar.live.interval_ms < MIN_LIVE_INTERVAL_MS {
+        return Err(format!(
+            "invalid config (path: sidebar.live.interval_ms): must be at least {MIN_LIVE_INTERVAL_MS}, got {}",
+            config.sidebar.live.interval_ms
+        ));
+    }
+    Ok(())
 }
 
 fn expand_config_patterns(
@@ -222,6 +236,24 @@ mod tests {
         let loaded = parse_config("   \n");
         assert_eq!(loaded.config, Config::default());
         assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn live_interval_below_minimum_is_rejected_not_clamped() {
+        for interval in ["0", "99"] {
+            let loaded = parse_config(&format!("sidebar:\n  live:\n    interval_ms: {interval}\n"));
+            assert_eq!(loaded.config, Config::default());
+            assert_eq!(loaded.warnings.len(), 1);
+            assert!(
+                loaded.warnings[0].contains("sidebar.live.interval_ms"),
+                "{}",
+                loaded.warnings[0]
+            );
+        }
+
+        let valid = parse_config("sidebar:\n  live:\n    interval_ms: 100\n");
+        assert!(valid.warnings.is_empty());
+        assert_eq!(valid.config.sidebar.live.interval_ms, 100);
     }
 
     #[test]

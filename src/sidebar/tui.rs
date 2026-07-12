@@ -28,11 +28,11 @@ use crate::daemon::protocol::v2::ResolvedSnapshot;
 use crate::sidebar::client::{
     SubscriptionUpdate, send_sidebar_jump_v2, send_sidebar_mark_complete_v2, subscribe_v2,
 };
-use crate::sidebar::preview::{guarded_capture_pane_args, open_preview_floating_pane};
+use crate::sidebar::preview::open_preview_floating_pane;
 use crate::sidebar::render::{
-    HeaderAction, HeaderLayout, JumpRowAction, SidebarRenderTheme, build_footer_line,
-    build_header_layout_with_counts, display_width, header_hit_test, jump_row_action_at,
-    render_header_lines, render_lines_with_indices,
+    HeaderAction, HeaderLayout, JumpRowAction, RenderedLines, SidebarRenderTheme,
+    build_footer_line, build_header_layout_with_counts, display_width, header_hit_test,
+    jump_row_action_at, render_header_lines, render_lines_with_indices,
 };
 use crate::sidebar::state::{SidebarAction, SidebarState, StatusFilter};
 use crate::sidebar::tree::{
@@ -68,16 +68,14 @@ pub fn run_live_tui(
     let config_hash = crate::daemon::lifecycle::config_hash(config);
     subscribe_v2(socket, server_identity, &config_hash, tx)?;
     let theme = SidebarRenderTheme::from_app_config(config);
-    let (live_request_tx, live_request_rx) = mpsc::channel();
-    let (live_result_tx, live_result_rx) = mpsc::channel();
-    spawn_live_capture_worker(live_request_rx, live_result_tx);
+    let (live_update_tx, live_update_rx) = mpsc::channel();
     let runtime_config = RunLoopConfig {
         app: config,
         theme: &theme,
         preview_history_lines: config.sidebar.preview.history_lines,
         live: &config.sidebar.live,
-        live_capture_tx: &live_request_tx,
-        live_capture_rx: &live_result_rx,
+        live_update_tx: &live_update_tx,
+        live_update_rx: &live_update_rx,
     };
     let result = run_loop(
         &mut terminal,
@@ -130,6 +128,97 @@ impl Drop for TerminalRestoreGuard {
 #[cfg(test)]
 mod local_state_tests {
     use super::*;
+
+    #[test]
+    fn render_gate_draws_once_per_second_when_idle() {
+        let mut gate = RenderGate::new();
+
+        assert!(gate.take_draw_decision(100, true));
+        for _ in 0..20 {
+            assert!(!gate.take_draw_decision(100, true));
+        }
+        // The second boundary refreshes elapsed labels exactly once.
+        assert!(gate.take_draw_decision(101, true));
+        assert!(!gate.take_draw_decision(101, true));
+        gate.mark_dirty();
+        assert!(gate.take_draw_decision(101, true));
+        assert!(!gate.take_draw_decision(101, true));
+    }
+
+    #[test]
+    fn render_gate_placeholder_only_redraws_on_marked_changes() {
+        let mut gate = RenderGate::new();
+
+        // The connection placeholder is drawn once and has no elapsed labels,
+        // so second boundaries must not redraw it.
+        assert!(gate.take_draw_decision(100, false));
+        assert!(!gate.take_draw_decision(101, false));
+        assert!(!gate.take_draw_decision(102, false));
+        gate.mark_dirty();
+        assert!(gate.take_draw_decision(102, false));
+    }
+
+    #[test]
+    fn render_gate_toast_transitions_mark_dirty_once() {
+        let mut gate = RenderGate::new();
+        let _ = gate.take_draw_decision(100, true);
+
+        gate.note_toast(None);
+        assert!(!gate.take_draw_decision(100, true));
+        gate.note_toast(Some(Notice {
+            message: "saved",
+            level: NoticeLevel::Success,
+        }));
+        assert!(gate.take_draw_decision(100, true));
+        gate.note_toast(Some(Notice {
+            message: "saved",
+            level: NoticeLevel::Success,
+        }));
+        assert!(!gate.take_draw_decision(100, true));
+        gate.note_toast(None);
+        assert!(gate.take_draw_decision(100, true));
+    }
+
+    #[test]
+    fn nine_idle_sidebars_draw_at_most_ten_times_per_second() {
+        let mut gates = (0..9).map(|_| RenderGate::new()).collect::<Vec<_>>();
+        for gate in &mut gates {
+            assert!(gate.take_draw_decision(1000, true));
+        }
+
+        let mut draws = 0;
+        for tick in 0..20 {
+            let now = if tick < 10 { 1000 } else { 1001 };
+            for gate in &mut gates {
+                if gate.take_draw_decision(now, true) {
+                    draws += 1;
+                }
+            }
+        }
+
+        assert!(draws <= 10, "idle draws {draws} exceeded 10 per second");
+    }
+
+    #[test]
+    fn same_revision_snapshot_update_does_not_mark_dirty() {
+        let (tx, rx) = mpsc::channel();
+        let mut current = None;
+        let mut connection = ConnectionState::Connecting;
+
+        tx.send(SubscriptionUpdate::Connected(Box::new(snapshot(10))))
+            .unwrap();
+        assert!(drain_snapshot_updates(&rx, &mut current, &mut connection));
+
+        tx.send(SubscriptionUpdate::Connected(Box::new(snapshot(10))))
+            .unwrap();
+        assert!(!drain_snapshot_updates(&rx, &mut current, &mut connection));
+
+        let mut newer = snapshot(10);
+        newer.snapshot_revision = 11;
+        tx.send(SubscriptionUpdate::Connected(Box::new(newer)))
+            .unwrap();
+        assert!(drain_snapshot_updates(&rx, &mut current, &mut connection));
+    }
 
     fn pane(pane_pid: u32) -> crate::daemon::protocol::v2::PanePresentation {
         crate::daemon::protocol::v2::PanePresentation {
@@ -782,14 +871,21 @@ mod local_state_tests {
             server_identity: "test",
             runner: &runner,
             env: &env,
-            theme: &theme,
             preview_history_lines: 2000,
-            live_lines: 0,
             mark_complete_tx: &mouse_tx,
             source_pane: &source_pane,
         };
         let width = crossterm::terminal::size().unwrap_or((80, 24)).0;
         let header = build_header_layout_with_counts(&state, width, &theme, sidebar.counts);
+        let rendered =
+            render_lines_with_indices(&sidebar.rows, &sidebar.state, width as usize, &theme);
+        let frame = DrawnFrame {
+            header_rows: header.row_count(),
+            header,
+            rows_height: 24,
+            scroll: 0,
+            row_indices: rendered.row_indices.clone(),
+        };
         let mut mouse_state = state.clone();
         handle_left_click(
             &context,
@@ -797,10 +893,10 @@ mod local_state_tests {
             &mut mouse_state,
             &sidebar,
             &mut MarkCompleteUi::default(),
+            &frame,
             ClickPosition {
-                row: header.row_count(),
+                row: frame.header.row_count(),
                 column: (crate::sidebar::render::jump_row_action_start(&jump) + 8 + 11) as u16,
-                scroll: 0,
             },
         )
         .unwrap();
@@ -833,58 +929,14 @@ mod local_state_tests {
             &mut mouse_state,
             &sidebar,
             &mut MarkCompleteUi::default(),
+            &frame,
             ClickPosition {
-                row: header.row_count(),
+                row: frame.header.row_count(),
                 column: (crate::sidebar::render::jump_row_action_start(&jump) + 8 + 11) as u16,
-                scroll: 0,
             },
         )
         .unwrap();
         assert!(stale_mouse_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn live_capture_guards_pid_and_capture_in_one_tmux_command() {
-        let runner = crate::tmux::mock::MockTmuxRunner::new();
-        let pane = crate::pane_state::PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 10,
-        };
-        let args = guarded_capture_pane_args(&pane, &["-p", "-e"]);
-        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        runner.stub(&refs, "one\ntwo\n");
-
-        assert_eq!(capture_live_pane(&runner, &pane), "one\ntwo\n");
-
-        let calls = runner.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0][0], "if-shell");
-        assert_eq!(calls[0][3], "%1");
-        assert_eq!(calls[0][4], "#{==:#{pane_pid},10}");
-        assert!(calls[0][5].contains("capture-pane"));
-        assert!(calls[0][5].contains("%1"));
-    }
-
-    #[test]
-    fn live_capture_does_not_read_replacement_after_pane_id_reuse() {
-        let runner = crate::tmux::mock::MockTmuxRunner::new();
-        let stale = crate::pane_state::PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 10,
-        };
-        let args = guarded_capture_pane_args(&stale, &["-p", "-e"]);
-        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        // tmux takes this false branch when %1 now belongs to a different PID.
-        runner.stub(&refs, "");
-
-        assert!(capture_live_pane(&runner, &stale).is_empty());
-        assert_eq!(runner.calls().len(), 1);
-        assert!(
-            !runner
-                .calls()
-                .iter()
-                .any(|call| call.first().map(String::as_str) == Some("capture-pane"))
-        );
     }
 
     #[test]
@@ -900,17 +952,44 @@ mod local_state_tests {
         let mut live = LiveState {
             pane_instance: Some(current.clone()),
             requested_lines: 2,
-            capture_in_flight: true,
             ..LiveState::default()
         };
 
-        apply_live_capture_result(&mut live, &stale, "replacement\noutput\n");
+        assert!(!apply_live_capture_result(
+            &mut live,
+            &stale,
+            1,
+            "replacement\noutput\n"
+        ));
         assert!(live.lines.is_empty());
-        assert!(live.capture_in_flight);
 
-        apply_live_capture_result(&mut live, &current, "one\ntwo\nthree\n");
+        assert!(apply_live_capture_result(
+            &mut live,
+            &current,
+            2,
+            "one\ntwo\nthree\n"
+        ));
         assert_eq!(live.lines, vec!["two".to_string(), "three".to_string()]);
-        assert!(!live.capture_in_flight);
+    }
+
+    #[test]
+    fn live_result_drops_stale_revisions_after_target_change() {
+        let target = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 11,
+        };
+        let mut live = LiveState {
+            pane_instance: Some(target.clone()),
+            requested_lines: 3,
+            ..LiveState::default()
+        };
+
+        assert!(apply_live_capture_result(&mut live, &target, 5, "fresh\n"));
+        // A delayed result from before the current revision must not replace
+        // the newer body.
+        assert!(!apply_live_capture_result(&mut live, &target, 5, "stale\n"));
+        assert!(!apply_live_capture_result(&mut live, &target, 4, "older\n"));
+        assert_eq!(live.lines, vec!["fresh".to_string()]);
     }
 
     #[test]
@@ -1037,6 +1116,63 @@ impl ConnectionState {
     }
 }
 
+/// Decides whether a run-loop iteration projects the sidebar view and draws a frame.
+/// The gate stays clean until a visible change is reported; elapsed-time labels are
+/// refreshed once per second boundary instead of on every poll tick.
+#[derive(Debug)]
+struct RenderGate {
+    dirty: bool,
+    last_elapsed_second: Option<i64>,
+    last_toast: Option<(String, NoticeLevel)>,
+}
+
+impl RenderGate {
+    fn new() -> Self {
+        Self {
+            dirty: true,
+            last_elapsed_second: None,
+            last_toast: None,
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn mark_dirty_if(&mut self, changed: bool) {
+        if changed {
+            self.dirty = true;
+        }
+    }
+
+    fn note_toast(&mut self, notice: Option<Notice<'_>>) {
+        let current = notice.map(|notice| (notice.message.to_string(), notice.level));
+        if self.last_toast != current {
+            self.last_toast = current;
+            self.dirty = true;
+        }
+    }
+
+    fn take_draw_decision(&mut self, now_epoch_secs: i64, snapshot_visible: bool) -> bool {
+        if snapshot_visible && self.last_elapsed_second != Some(now_epoch_secs) {
+            self.last_elapsed_second = Some(now_epoch_secs);
+            self.dirty = true;
+        }
+        std::mem::take(&mut self.dirty)
+    }
+}
+
+/// Geometry and row mapping of the most recently drawn frame. Click hit-testing
+/// must use exactly what was drawn, so the run loop records it on every draw.
+#[derive(Debug, Clone)]
+struct DrawnFrame {
+    header: crate::sidebar::render::HeaderLayout,
+    header_rows: u16,
+    rows_height: u16,
+    scroll: usize,
+    row_indices: Vec<Option<usize>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum LiveMode {
     #[default]
@@ -1049,9 +1185,8 @@ struct LiveState {
     mode: LiveMode,
     pane_instance: Option<crate::pane_state::PaneInstance>,
     lines: Vec<String>,
-    last_capture: Option<Instant>,
     requested_lines: u16,
-    capture_in_flight: bool,
+    last_live_revision: u64,
     cut_markers: Vec<String>,
 }
 
@@ -1070,8 +1205,8 @@ pub struct RunLoopConfig<'a> {
     pub theme: &'a SidebarRenderTheme,
     pub preview_history_lines: u32,
     pub live: &'a SidebarLiveConfig,
-    pub live_capture_tx: &'a mpsc::Sender<crate::pane_state::PaneInstance>,
-    pub live_capture_rx: &'a mpsc::Receiver<(crate::pane_state::PaneInstance, String)>,
+    pub live_update_tx: &'a mpsc::Sender<crate::sidebar::client::LiveSubscriptionUpdate>,
+    pub live_update_rx: &'a mpsc::Receiver<crate::sidebar::client::LiveSubscriptionUpdate>,
 }
 
 struct RunLoopIo<'a> {
@@ -1448,8 +1583,13 @@ fn queue_mark_complete(
     }
 }
 
-fn drain_mark_complete_results(rx: &mpsc::Receiver<MarkCompleteResult>, ui: &mut MarkCompleteUi) {
+fn drain_mark_complete_results(
+    rx: &mpsc::Receiver<MarkCompleteResult>,
+    ui: &mut MarkCompleteUi,
+) -> bool {
+    let mut changed = false;
     while let Ok(result) = rx.try_recv() {
+        changed = true;
         ui.pending.remove(&result.pane_instance);
         let (message, level, duration) = match result.result {
             Ok(()) => (
@@ -1470,6 +1610,7 @@ fn drain_mark_complete_results(rx: &mpsc::Receiver<MarkCompleteResult>, ui: &mut
         };
         ui.set_toast(message, level, duration);
     }
+    changed
 }
 
 fn project_view(snapshot: &ResolvedSnapshot, config: &Config, state: &SidebarState) -> SidebarView {
@@ -1551,8 +1692,11 @@ fn run_loop<B: Backend>(
         cut_markers: live_config.cut_markers.clone(),
         ..LiveState::default()
     };
+    let mut render_gate = RenderGate::new();
+    let mut last_frame: Option<DrawnFrame> = None;
+    let mut live_subscription: Option<crate::sidebar::client::LiveSubscriptionHandle> = None;
     loop {
-        drain_snapshot_updates(rx, &mut current, &mut connection);
+        render_gate.mark_dirty_if(drain_snapshot_updates(rx, &mut current, &mut connection));
         if !initial_context_seeded && let Some(snapshot) = current.as_ref() {
             seed_persisted_sidebar_preferences(snapshot, &mut sidebar_state);
             last_queued_preferences = Some((sidebar_state.view_mode, sidebar_state.filter));
@@ -1576,10 +1720,11 @@ fn run_loop<B: Backend>(
             initial_context_seeded = true;
         }
         if let Some(snapshot) = current.as_ref() {
-            clear_stale_pane_selection(snapshot, &mut sidebar_state);
+            render_gate.mark_dirty_if(clear_stale_pane_selection(snapshot, &mut sidebar_state));
         }
-        drain_mark_complete_results(&mark_result_rx, &mut mark_ui);
+        render_gate.mark_dirty_if(drain_mark_complete_results(&mark_result_rx, &mut mark_ui));
         while let Ok(ReorderResult(result)) = reorder_result_rx.try_recv() {
+            render_gate.mark_dirty();
             let (message, level, duration) = match result {
                 Ok(()) => (
                     "order saved".to_string(),
@@ -1600,6 +1745,7 @@ fn run_loop<B: Backend>(
             mark_ui.set_toast(message, level, duration);
         }
         while let Ok(PreferenceResult(result)) = preference_result_rx.try_recv() {
+            render_gate.mark_dirty();
             if let Err(error) = result {
                 mark_ui.set_toast(
                     format!("preference save failed: {error}"),
@@ -1646,6 +1792,7 @@ fn run_loop<B: Backend>(
             last_expansion_view = Some(sidebar_state.collapsed.clone());
         }
         while let Ok(result) = expansion_result_rx.try_recv() {
+            render_gate.mark_dirty();
             let is_current = pending_expansions
                 .get(&result.row_id)
                 .is_some_and(|pending| pending.overridden == result.overridden);
@@ -1684,6 +1831,7 @@ fn run_loop<B: Backend>(
                 apply_expansion_snapshot(&mut sidebar_state, snapshot, &pending_expansions);
                 last_expansion_view = Some(sidebar_state.collapsed.clone());
                 last_expansion_version = Some(snapshot.sidebar_model.expansion.version);
+                render_gate.mark_dirty();
             }
         }
         let preferences = (sidebar_state.view_mode, sidebar_state.filter);
@@ -1706,78 +1854,111 @@ fn run_loop<B: Backend>(
             }
             last_queued_preferences = Some(preferences);
         }
-        drain_control_messages(control, current.as_ref(), config.app, &mut sidebar_state)?;
+        render_gate.mark_dirty_if(drain_control_messages(
+            control,
+            current.as_ref(),
+            config.app,
+            &mut sidebar_state,
+        )?);
+        render_gate.mark_dirty_if(drain_live_results(&mut live, config.live_update_rx));
         let context = ClickContext {
             socket,
             server_identity,
             runner,
             env,
-            theme,
             preview_history_lines,
-            live_lines: live.requested_lines,
             mark_complete_tx: &mark_request_tx,
             source_pane: sidebar_instance,
         };
-        if let Some(snapshot) = &current {
-            let mut sidebar = project_view(snapshot, config.app, &sidebar_state);
-            if sidebar.rows.is_empty() && matches!(connection, ConnectionState::Degraded(_)) {
-                if let Some((rows, counts)) = &last_known_rows {
-                    sidebar.rows = rows.clone();
-                    sidebar.counts = *counts;
+        render_gate.note_toast(mark_ui.notice());
+        let draw_this_loop = render_gate
+            .take_draw_decision(crate::sidebar::tree::now_epoch_secs(), current.is_some());
+        if draw_this_loop {
+            if let Some(snapshot) = &current {
+                let mut sidebar = project_view(snapshot, config.app, &sidebar_state);
+                if sidebar.rows.is_empty() && matches!(connection, ConnectionState::Degraded(_)) {
+                    if let Some((rows, counts)) = &last_known_rows {
+                        sidebar.rows = rows.clone();
+                        sidebar.counts = *counts;
+                    }
+                } else if !sidebar.rows.is_empty() {
+                    last_known_rows = Some((sidebar.rows.clone(), sidebar.counts));
+                } else if matches!(connection, ConnectionState::Connected) {
+                    last_known_rows = None;
                 }
-            } else if !sidebar.rows.is_empty() {
-                last_known_rows = Some((sidebar.rows.clone(), sidebar.counts));
-            } else if matches!(connection, ConnectionState::Connected) {
-                last_known_rows = None;
-            }
-            update_live_state(
-                snapshot,
-                &sidebar,
-                live_config,
-                &mut live,
-                config.live_capture_tx,
-                config.live_capture_rx,
-            );
-            let size = terminal.size()?;
-            let area = Rect::new(0, 0, size.width, size.height);
-            let header =
-                build_header_layout_with_counts(&sidebar.state, area.width, theme, sidebar.counts);
-            let areas = compute_areas(area, &header, live.requested_lines);
-            let rendered = render_lines_with_indices(
-                &sidebar.rows,
-                &sidebar.state,
-                area.width as usize,
-                theme,
-            );
-            let selected_row_index = sidebar
-                .state
-                .selection
-                .as_deref()
-                .and_then(|selection| sidebar.rows.iter().position(|row| row.id == selection));
-            let selection_range = selected_row_index
-                .and_then(|row_index| rendered_row_range(&rendered.row_indices, row_index));
-            sidebar_state.scroll = resolve_scroll_range(
-                sidebar_state.scroll,
-                selection_range,
-                rendered.lines.len(),
-                areas.rows_height as usize,
-            );
-            draw_snapshot_with_theme_and_scroll_live(
-                terminal,
-                snapshot,
-                &sidebar,
-                DrawOptions {
+                sync_live_target(snapshot, &sidebar, live_config, &mut live);
+                if live_subscription.as_ref().map(|handle| handle.target())
+                    != live.pane_instance.as_ref()
+                {
+                    if let Some(handle) = live_subscription.take() {
+                        handle.shutdown_and_join();
+                    }
+                    if let Some(target) = live.pane_instance.clone() {
+                        live_subscription = Some(crate::sidebar::client::spawn_live_subscription(
+                            socket.to_path_buf(),
+                            server_identity.to_string(),
+                            sidebar_instance.clone(),
+                            target,
+                            live_config.interval_ms,
+                            config.live_update_tx.clone(),
+                        ));
+                    }
+                }
+                let size = terminal.size()?;
+                let area = Rect::new(0, 0, size.width, size.height);
+                let header = build_header_layout_with_counts(
+                    &sidebar.state,
+                    area.width,
                     theme,
+                    sidebar.counts,
+                );
+                let areas = compute_areas(area, &header, live.requested_lines);
+                let rendered = render_lines_with_indices(
+                    &sidebar.rows,
+                    &sidebar.state,
+                    area.width as usize,
+                    theme,
+                );
+                let selected_row_index =
+                    sidebar.state.selection.as_deref().and_then(|selection| {
+                        sidebar.rows.iter().position(|row| row.id == selection)
+                    });
+                let selection_range = selected_row_index
+                    .and_then(|row_index| rendered_row_range(&rendered.row_indices, row_index));
+                sidebar_state.scroll = resolve_scroll_range(
+                    sidebar_state.scroll,
+                    selection_range,
+                    rendered.lines.len(),
+                    areas.rows_height as usize,
+                );
+                last_frame = Some(DrawnFrame {
+                    header,
+                    header_rows: areas.header_rows,
+                    rows_height: areas.rows_height,
                     scroll: sidebar_state.scroll,
-                    live: Some(&live),
-                    connection: &connection,
-                    toast: mark_ui.notice(),
-                },
-            )?;
-        } else {
-            draw_connection_placeholder(terminal, &connection)?;
+                    row_indices: rendered.row_indices.clone(),
+                });
+                draw_snapshot_with_theme_and_scroll_live(
+                    terminal,
+                    snapshot,
+                    &sidebar,
+                    DrawOptions {
+                        theme,
+                        scroll: sidebar_state.scroll,
+                        live: Some(&live),
+                        connection: &connection,
+                        toast: mark_ui.notice(),
+                        rendered: Some(&rendered),
+                    },
+                )?;
+            } else {
+                draw_connection_placeholder(terminal, &connection)?;
+                last_frame = None;
+            }
         }
         if event::poll(Duration::from_millis(50))? {
+            let state_before = sidebar_state.clone();
+            let live_mode_before = live.mode;
             match event::read()? {
                 Event::Key(key) => match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => return Ok(TuiExit::Quit),
@@ -1864,36 +2045,38 @@ fn run_loop<B: Backend>(
                     _ => {}
                 },
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(snapshot) = &current {
+                    if let (Some(snapshot), Some(frame)) = (&current, last_frame.as_ref()) {
                         let sidebar = project_view(snapshot, config.app, &sidebar_state);
-                        let scroll = sidebar_state.scroll;
                         handle_left_click(
                             &context,
                             snapshot,
                             &mut sidebar_state,
                             &sidebar,
                             &mut mark_ui,
+                            frame,
                             ClickPosition {
                                 row: mouse.row,
                                 column: mouse.column,
-                                scroll,
                             },
                         )?;
                     }
                 }
+                Event::Resize(_, _) => render_gate.mark_dirty(),
                 _ => {}
             }
+            render_gate
+                .mark_dirty_if(sidebar_state != state_before || live.mode != live_mode_before);
         }
     }
 }
 
-fn clear_stale_pane_selection(snapshot: &ResolvedSnapshot, state: &mut SidebarState) {
+fn clear_stale_pane_selection(snapshot: &ResolvedSnapshot, state: &mut SidebarState) -> bool {
     let Some(selected) = state
         .selection
         .as_deref()
         .and_then(crate::sidebar::tree::pane_instance_from_row_id)
     else {
-        return;
+        return false;
     };
     if !snapshot
         .panes
@@ -1902,7 +2085,9 @@ fn clear_stale_pane_selection(snapshot: &ResolvedSnapshot, state: &mut SidebarSt
     {
         state.selection = None;
         state.version = state.version.saturating_add(1);
+        return true;
     }
+    false
 }
 
 fn seed_initial_sidebar_context(
@@ -2162,8 +2347,12 @@ fn drain_control_messages(
     snapshot: Option<&ResolvedSnapshot>,
     config: &Config,
     state: &mut SidebarState,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut before: Option<SidebarState> = None;
     while let Some(message) = control.try_recv()? {
+        if before.is_none() {
+            before = Some(state.clone());
+        }
         match message {
             crate::sidebar::control::ControlMessage::Input { key } => {
                 if let Some(snapshot) = snapshot {
@@ -2182,7 +2371,7 @@ fn drain_control_messages(
             }
         }
     }
-    Ok(())
+    Ok(before.is_some_and(|before| before != *state))
 }
 
 fn apply_focus_message(
@@ -2227,29 +2416,43 @@ fn drain_snapshot_updates(
     rx: &mpsc::Receiver<SubscriptionUpdate>,
     current: &mut Option<ResolvedSnapshot>,
     connection: &mut ConnectionState,
-) {
+) -> bool {
+    let mut changed = false;
+    let set_connection = |connection: &mut ConnectionState, next: ConnectionState| {
+        if *connection != next {
+            *connection = next;
+            true
+        } else {
+            false
+        }
+    };
     loop {
         match rx.try_recv() {
-            Ok(SubscriptionUpdate::Connecting) => *connection = ConnectionState::Connecting,
+            Ok(SubscriptionUpdate::Connecting) => {
+                changed |= set_connection(connection, ConnectionState::Connecting);
+            }
             Ok(SubscriptionUpdate::Connected(snapshot)) => {
-                if let Some(message) = snapshot_degraded_message(&snapshot) {
-                    *current = Some(*snapshot);
-                    *connection = ConnectionState::Degraded(message);
-                } else {
-                    *current = Some(*snapshot);
-                    *connection = ConnectionState::Connected;
-                }
+                let next = match snapshot_degraded_message(&snapshot) {
+                    Some(message) => ConnectionState::Degraded(message),
+                    None => ConnectionState::Connected,
+                };
+                let revision_changed = current.as_ref().is_none_or(|previous| {
+                    previous.snapshot_revision != snapshot.snapshot_revision
+                });
+                *current = Some(*snapshot);
+                changed |= revision_changed;
+                changed |= set_connection(connection, next);
             }
             Ok(SubscriptionUpdate::Degraded(error)) => {
-                *connection = ConnectionState::Degraded(error);
+                changed |= set_connection(connection, ConnectionState::Degraded(error));
             }
             Ok(SubscriptionUpdate::Disconnected) => {
-                *connection = ConnectionState::Disconnected;
+                changed |= set_connection(connection, ConnectionState::Disconnected);
             }
-            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Empty) => return changed,
             Err(mpsc::TryRecvError::Disconnected) => {
-                *connection = ConnectionState::Disconnected;
-                return;
+                changed |= set_connection(connection, ConnectionState::Disconnected);
+                return changed;
             }
         }
     }
@@ -2263,23 +2466,45 @@ fn live_rows_requested(config: &SidebarLiveConfig) -> u16 {
     if config.enabled { config.lines } else { 0 }
 }
 
-fn update_live_state(
+fn drain_live_results(
+    live: &mut LiveState,
+    result_rx: &mpsc::Receiver<crate::sidebar::client::LiveSubscriptionUpdate>,
+) -> bool {
+    let mut changed = false;
+    while let Ok(update) = result_rx.try_recv() {
+        match update {
+            crate::sidebar::client::LiveSubscriptionUpdate::Body {
+                target,
+                live_revision,
+                body,
+            } => {
+                changed |= apply_live_capture_result(live, &target, live_revision, &body);
+            }
+            crate::sidebar::client::LiveSubscriptionUpdate::Unavailable { target } => {
+                if live.pane_instance.as_ref() == Some(&target) && !live.lines.is_empty() {
+                    live.lines.clear();
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Re-resolves the live preview target from the projected sidebar selection.
+/// Only runs on draw iterations: the selection cannot change without marking
+/// the render gate dirty first.
+fn sync_live_target(
     snapshot: &ResolvedSnapshot,
     sidebar: &SidebarView,
     config: &SidebarLiveConfig,
     live: &mut LiveState,
-    request_tx: &mpsc::Sender<crate::pane_state::PaneInstance>,
-    result_rx: &mpsc::Receiver<(crate::pane_state::PaneInstance, String)>,
 ) {
-    while let Ok((pane_instance, output)) = result_rx.try_recv() {
-        apply_live_capture_result(live, &pane_instance, &output);
-    }
     live.requested_lines = live_rows_requested(config);
     if live.requested_lines == 0 {
         live.pane_instance = None;
         live.lines.clear();
-        live.last_capture = None;
-        live.capture_in_flight = false;
+        live.last_live_revision = 0;
         return;
     }
     let selected = preview_pane_for_selection(sidebar).filter(|pane| {
@@ -2290,62 +2515,28 @@ fn update_live_state(
     });
     if live.pane_instance != selected {
         live.pane_instance = selected;
-        live.last_capture = None;
         live.lines.clear();
-        live.capture_in_flight = false;
-    }
-    let Some(pane_instance) = live.pane_instance.clone() else {
-        return;
-    };
-    let now = Instant::now();
-    let interval = Duration::from_millis(config.interval_ms);
-    let due = live
-        .last_capture
-        .map(|last| now.duration_since(last) >= interval)
-        .unwrap_or(true);
-    if !due {
-        return;
-    }
-    if live.capture_in_flight {
-        return;
-    }
-    if request_tx.send(pane_instance).is_ok() {
-        live.capture_in_flight = true;
-        live.last_capture = Some(now);
+        live.last_live_revision = 0;
     }
 }
 
 fn apply_live_capture_result(
     live: &mut LiveState,
     pane_instance: &crate::pane_state::PaneInstance,
+    live_revision: u64,
     output: &str,
-) {
+) -> bool {
     if live.pane_instance.as_ref() != Some(pane_instance) {
-        return;
+        return false;
     }
-    live.lines = extract_tail(output, live.requested_lines as usize, &live.cut_markers);
-    live.capture_in_flight = false;
-}
-
-fn spawn_live_capture_worker(
-    request_rx: mpsc::Receiver<crate::pane_state::PaneInstance>,
-    result_tx: mpsc::Sender<(crate::pane_state::PaneInstance, String)>,
-) {
-    std::thread::spawn(move || {
-        let runner = SystemTmuxRunner::from_env(Duration::from_millis(500));
-        while let Ok(pane_instance) = request_rx.recv() {
-            let output = capture_live_pane(&runner, &pane_instance);
-            if result_tx.send((pane_instance, output)).is_err() {
-                break;
-            }
-        }
-    });
-}
-
-fn capture_live_pane(runner: &dyn TmuxRunner, pane: &crate::pane_state::PaneInstance) -> String {
-    let args = guarded_capture_pane_args(pane, &["-p", "-e"]);
-    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    runner.run(&refs).unwrap_or_default()
+    if live_revision <= live.last_live_revision {
+        return false;
+    }
+    live.last_live_revision = live_revision;
+    let lines = extract_tail(output, live.requested_lines as usize, &live.cut_markers);
+    let changed = live.lines != lines;
+    live.lines = lines;
+    changed
 }
 
 fn resolve_current_window_id(
@@ -2454,6 +2645,7 @@ fn draw_snapshot_with_theme_and_scroll<B: Backend>(
             live: None,
             connection: &ConnectionState::Connected,
             toast: None,
+            rendered: None,
         },
     )
 }
@@ -2465,6 +2657,9 @@ struct DrawOptions<'a> {
     live: Option<&'a LiveState>,
     connection: &'a ConnectionState,
     toast: Option<Notice<'a>>,
+    /// Rows already rendered by the caller for scroll resolution; when present
+    /// the draw path reuses them instead of rendering the same rows again.
+    rendered: Option<&'a RenderedLines>,
 }
 
 fn draw_snapshot_with_theme_and_scroll_live<B: Backend>(
@@ -2514,6 +2709,7 @@ fn draw_snapshot_in_area(
         live,
         connection,
         toast,
+        rendered,
     } = options;
     let header = build_header_layout_with_counts(&sidebar.state, area.width, theme, sidebar.counts);
     let live_lines = live.map(|live| live.requested_lines).unwrap_or(0);
@@ -2547,13 +2743,25 @@ fn draw_snapshot_in_area(
             .map(ListItem::new)
             .collect::<Vec<_>>()
     } else {
-        let rendered =
-            render_lines_with_indices(&sidebar.rows, &sidebar.state, area.width as usize, theme);
+        let fallback;
+        let rendered = match rendered {
+            Some(rendered) => rendered,
+            None => {
+                fallback = render_lines_with_indices(
+                    &sidebar.rows,
+                    &sidebar.state,
+                    area.width as usize,
+                    theme,
+                );
+                &fallback
+            }
+        };
         rendered
             .lines
-            .into_iter()
+            .iter()
             .skip(scroll)
             .take(areas.rows_height as usize)
+            .cloned()
             .map(ListItem::new)
             .collect::<Vec<_>>()
     };
@@ -3025,9 +3233,7 @@ struct ClickContext<'a> {
     server_identity: &'a str,
     runner: &'a dyn TmuxRunner,
     env: &'a BTreeMap<String, String>,
-    theme: &'a SidebarRenderTheme,
     preview_history_lines: u32,
-    live_lines: u16,
     mark_complete_tx: &'a mpsc::Sender<MarkCompleteRequest>,
     source_pane: &'a crate::pane_state::PaneInstance,
 }
@@ -3036,7 +3242,6 @@ struct ClickContext<'a> {
 struct ClickPosition {
     row: u16,
     column: u16,
-    scroll: usize,
 }
 
 fn handle_left_click(
@@ -3045,18 +3250,13 @@ fn handle_left_click(
     state: &mut SidebarState,
     sidebar: &SidebarView,
     mark_ui: &mut MarkCompleteUi,
+    frame: &DrawnFrame,
     position: ClickPosition,
 ) -> Result<()> {
-    let ClickPosition {
-        row,
-        column,
-        scroll,
-    } = position;
-    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-    let header =
-        build_header_layout_with_counts(&sidebar.state, width, context.theme, sidebar.counts);
+    let ClickPosition { row, column } = position;
+    let header = &frame.header;
     if row < header.row_count() {
-        match header_hit_test(&header, row, column) {
+        match header_hit_test(header, row, column) {
             Some(HeaderAction::CycleViewMode) => apply_local_sidebar_key(state, sidebar, "v"),
             Some(HeaderAction::SetFilter(filter)) => {
                 apply_local_sidebar_key(state, sidebar, filter.key());
@@ -3065,18 +3265,15 @@ fn handle_left_click(
         }
         return Ok(());
     }
-    let areas = compute_areas(Rect::new(0, 0, width, height), &header, context.live_lines);
-    if row >= areas.header_rows + areas.rows_height {
+    if row >= frame.header_rows + frame.rows_height {
         return Ok(());
     }
-    let rendered =
-        render_lines_with_indices(&sidebar.rows, &sidebar.state, width as usize, context.theme);
     let Some(clicked) = row_for_click_with_indices(
         sidebar,
         row,
         header.row_count(),
-        scroll,
-        &rendered.row_indices,
+        frame.scroll,
+        &frame.row_indices,
     ) else {
         return Ok(());
     };

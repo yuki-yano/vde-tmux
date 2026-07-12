@@ -564,6 +564,12 @@ impl StatusPushState {
         self.next_clock_at
     }
 
+    /// Side-effect-free due check for the render clock. `next_clock_at` is only
+    /// ever advanced by `on_render_clock`.
+    pub fn render_clock_due(&self, now: Duration) -> bool {
+        !self.shutting_down && now >= self.next_clock_at
+    }
+
     pub fn on_snapshot_revision(
         &mut self,
         snapshot_revision: u64,
@@ -1608,6 +1614,33 @@ mod tests {
             panic!("expected a display batch, received {decision:?}");
         };
         batch
+    }
+
+    #[test]
+    fn render_clock_due_is_side_effect_free_and_only_on_render_clock_advances_the_deadline() {
+        let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
+
+        assert!(!state.render_clock_due(Duration::from_millis(499)));
+        assert!(state.render_clock_due(Duration::from_millis(500)));
+        // The predicate never advances the deadline.
+        assert!(state.render_clock_due(Duration::from_millis(500)));
+        assert_eq!(state.next_clock_at(), Duration::from_millis(500));
+
+        let _ = state
+            .on_render_clock(
+                Duration::from_millis(500),
+                frame("summary", "attention", pane(7), "pane"),
+            )
+            .unwrap();
+        assert_eq!(state.next_clock_at(), Duration::from_millis(1000));
+        assert!(!state.render_clock_due(Duration::from_millis(999)));
+        assert!(state.render_clock_due(Duration::from_millis(1000)));
+
+        let _ = state
+            .request_shutdown(Duration::from_millis(1000), "down".to_string())
+            .unwrap();
+        // While shutting down the render clock is never due.
+        assert!(!state.render_clock_due(Duration::from_millis(5000)));
     }
 
     #[derive(Default)]
