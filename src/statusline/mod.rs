@@ -461,6 +461,7 @@ fn render_structured_summary(config: &Config, mut counts: BadgeStateCounts) -> S
             (BadgeState::Idle, counts.idle),
         ],
         &config.badge,
+        &config.statusline.summary.format,
     )
 }
 
@@ -1874,9 +1875,9 @@ mod tests {
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
 
         assert_eq!(rendered.snapshot_revision, 41);
-        assert!(rendered.summary.contains("▲1"), "{}", rendered.summary);
-        assert!(rendered.summary.contains("●2"), "{}", rendered.summary);
-        assert!(rendered.summary.contains("○1"), "{}", rendered.summary);
+        assert!(rendered.summary.contains("▲ 1"), "{}", rendered.summary);
+        assert!(rendered.summary.contains("● 2"), "{}", rendered.summary);
+        assert!(rendered.summary.contains("○ 1"), "{}", rendered.summary);
         assert!(
             rendered.sessions.contains("1|main|"),
             "{}",
@@ -2208,6 +2209,83 @@ mod tests {
                 rendered.sessions
             );
         }
+    }
+
+    #[test]
+    fn summary_default_format_and_custom_format_preserve_token_separator() {
+        let mut config = Config::default();
+        let counts = BadgeStateCounts {
+            blocked: 1,
+            working: 1,
+            done: 1,
+            idle: 1,
+        };
+
+        let default_summary = render_structured_summary(&config, counts);
+        assert_eq!(
+            default_summary,
+            "#[fg=#ff6b6b]▲ 1#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6]✓ 1#[default] #[fg=#a8a8b2]○ 1#[default]"
+        );
+        assert_eq!(tmux_display_width(&default_summary), 15);
+
+        config.statusline.summary.format = "{count}{badge}".to_string();
+        let custom_summary = render_structured_summary(&config, counts);
+        assert_eq!(
+            custom_summary,
+            "#[fg=#ff6b6b]1▲#[default] #[fg=#4fd08a]1●#[default] #[fg=#45cbe6]1✓#[default] #[fg=#a8a8b2]1○#[default]"
+        );
+        assert_eq!(tmux_display_width(&custom_summary), 11);
+    }
+
+    #[test]
+    fn default_summary_width_is_counted_at_the_eighty_cell_budget_boundary() {
+        let config = Config::default();
+        let summary = render_structured_summary(
+            &config,
+            BadgeStateCounts {
+                blocked: 1,
+                working: 1,
+                done: 1,
+                idle: 1,
+            },
+        );
+        let mut category_tokens = [StatusToken {
+            rendered: "c".repeat(65),
+            compact: String::new(),
+            current: true,
+        }];
+        let category_included = [true];
+
+        assert_eq!(
+            status_projection_width(
+                &summary,
+                &category_tokens,
+                &category_included,
+                &[],
+                &[],
+                &[],
+                &[],
+                "",
+                &config,
+            ),
+            STATUS_OPTION_CELL_BUDGET
+        );
+
+        category_tokens[0].rendered.push('c');
+        assert_eq!(
+            status_projection_width(
+                &summary,
+                &category_tokens,
+                &category_included,
+                &[],
+                &[],
+                &[],
+                &[],
+                "",
+                &config,
+            ),
+            STATUS_OPTION_CELL_BUDGET + 1
+        );
     }
 
     #[test]

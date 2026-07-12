@@ -796,7 +796,7 @@ wait_display_options() {
     sessions="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_status_sessions 2>/dev/null || true)"
     windows="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_status_windows 2>/dev/null || true)"
     pane="$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_status_pane 2>/dev/null || true)"
-    [[ "$summary" == *'✓1'* && -n "$sessions" && -n "$windows" && -n "$pane" ]] && return 0
+    [[ "$summary" == *'✓ 1'* && -n "$sessions" && -n "$windows" && -n "$pane" ]] && return 0
     sleep 0.1
   done
   return 1
@@ -826,7 +826,7 @@ grep -F main <<<"$MAIN_SESSIONS" >/dev/null
 grep -F aux <<<"$MAIN_SESSIONS" >/dev/null
 SUMMARY_VALUE="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_status_summary)"
 echo "display summary: $SUMMARY_VALUE"
-grep -F '✓1' <<<"$SUMMARY_VALUE" >/dev/null
+grep -F '✓ 1' <<<"$SUMMARY_VALUE" >/dev/null
 CLIENT_ATTACHMENTS="$(tmux -L "$TMUX_SOCKET" list-clients -F '#{client_name} #{client_session}')"
 grep -F "$CLIENT_1 main" <<<"$CLIENT_ATTACHMENTS" >/dev/null
 grep -F "$CLIENT_2 aux" <<<"$CLIENT_ATTACHMENTS" >/dev/null

@@ -43,6 +43,7 @@ pub struct SidebarModel {
 pub fn render_summary(
     counts: &[(BadgeState, usize)],
     badge: &crate::config::BadgeConfig,
+    format: &str,
 ) -> String {
     counts
         .iter()
@@ -55,7 +56,9 @@ pub fn render_summary(
                 BadgeState::Done => &badge.colors.done,
                 BadgeState::Idle => &badge.colors.idle,
             };
-            format!("#[fg={color}]{glyph}{count}#[default]")
+            let count = count.to_string();
+            let token = format.replace("{badge}", glyph).replace("{count}", &count);
+            format!("#[fg={color}]{token}#[default]")
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -93,8 +96,27 @@ mod tests {
             (BadgeState::Idle, 3),
         ];
         assert_eq!(
-            render_summary(&counts, &badge),
-            "#[fg=#ff6b6b]▲2#[default] #[fg=#4fd08a]●1#[default] #[fg=#a8a8b2]○3#[default]"
+            render_summary(&counts, &badge, "{badge} {count}"),
+            "#[fg=#ff6b6b]▲ 2#[default] #[fg=#4fd08a]● 1#[default] #[fg=#a8a8b2]○ 3#[default]"
+        );
+    }
+
+    #[test]
+    fn render_summary_applies_custom_format_to_each_colored_token() {
+        let badge = crate::config::BadgeConfig::default();
+        let counts = [(BadgeState::Working, 12), (BadgeState::Done, 3)];
+
+        assert_eq!(
+            render_summary(&counts, &badge, "{badge}: {count}"),
+            "#[fg=#4fd08a]●: 12#[default] #[fg=#45cbe6]✓: 3#[default]"
+        );
+        assert_eq!(
+            render_summary(&counts, &badge, "{badge}{count}"),
+            "#[fg=#4fd08a]●12#[default] #[fg=#45cbe6]✓3#[default]"
+        );
+        assert_eq!(
+            render_summary(&counts, &badge, "{count}{badge}"),
+            "#[fg=#4fd08a]12●#[default] #[fg=#45cbe6]3✓#[default]"
         );
     }
 }
