@@ -32,6 +32,18 @@ pub enum Direction {
     Previous,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientSessionContext {
+    pub client_name: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientSessionRow {
+    context: ClientSessionContext,
+    pane_id: String,
+}
+
 pub fn session_list_format() -> String {
     [
         "#{session_name}",
@@ -102,6 +114,160 @@ pub fn current_session_name(runner: &dyn TmuxRunner) -> Result<String> {
         .run(&["display-message", "-p", "#{session_name}"])?
         .trim()
         .to_string())
+}
+
+pub fn current_session_id(runner: &dyn TmuxRunner) -> Result<String> {
+    let session_id = runner
+        .run(&["display-message", "-p", "#{session_id}"])?
+        .trim()
+        .to_string();
+    if !valid_session_id(&session_id) {
+        return Err(anyhow!("tmux did not return a valid current session ID"));
+    }
+    Ok(session_id)
+}
+
+pub fn client_session_context_format() -> String {
+    [
+        "#{client_name}",
+        "#{client_tty}",
+        "#{session_id}",
+        "#{pane_id}",
+        "#{client_control_mode}",
+    ]
+    .join(&FIELD_SEP.to_string())
+}
+
+pub fn client_session_context_for_pane(
+    runner: &dyn TmuxRunner,
+    pane_id: &str,
+    requested_client_name: Option<&str>,
+) -> Result<ClientSessionContext> {
+    let valid_pane = pane_id.strip_prefix('%').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    if !valid_pane {
+        return Err(anyhow!("invalid invoking tmux pane ID: {pane_id}"));
+    }
+    let rows = regular_client_session_rows(runner)?;
+    let mut matches = rows
+        .iter()
+        .filter(|row| {
+            row.pane_id == pane_id
+                && requested_client_name
+                    .is_none_or(|requested| requested == row.context.client_name)
+        })
+        .map(|row| row.context.clone())
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.client_name
+            .cmp(&right.client_name)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    matches.dedup();
+    match matches.as_slice() {
+        [context] => Ok(context.clone()),
+        [] => {
+            if requested_client_name.is_none() {
+                // A stale TMUX_PANE inherited by run-shell is safe to ignore only when the
+                // server has exactly one regular client. Multiple clients must fail closed
+                // and capture --client-name in the binding instead.
+                let mut all_clients = rows.into_iter().map(|row| row.context).collect::<Vec<_>>();
+                all_clients.sort_by(|left, right| {
+                    left.client_name
+                        .cmp(&right.client_name)
+                        .then_with(|| left.session_id.cmp(&right.session_id))
+                });
+                all_clients.dedup();
+                if let [context] = all_clients.as_slice() {
+                    return Ok(context.clone());
+                }
+            }
+            match requested_client_name {
+                Some(client_name) => Err(anyhow!(
+                    "regular tmux client {client_name} is not displaying invoking pane {pane_id}"
+                )),
+                None => Err(anyhow!(
+                    "invoking pane {pane_id} does not identify one regular tmux client; capture --client-name in the tmux binding"
+                )),
+            }
+        }
+        _ => Err(anyhow!(
+            "multiple tmux clients are displaying invoking pane {pane_id}; capture --client-name in the tmux binding"
+        )),
+    }
+}
+
+pub fn client_session_context_for_client(
+    runner: &dyn TmuxRunner,
+    requested_client_name: &str,
+) -> Result<ClientSessionContext> {
+    if requested_client_name.trim().is_empty() {
+        return Err(anyhow!("explicit tmux client name must not be empty"));
+    }
+    let mut matches = regular_client_session_rows(runner)?
+        .into_iter()
+        .filter(|row| row.context.client_name == requested_client_name)
+        .map(|row| row.context)
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.client_name
+            .cmp(&right.client_name)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    matches.dedup();
+    match matches.as_slice() {
+        [context] => Ok(context.clone()),
+        [] => Err(anyhow!(
+            "regular tmux client {requested_client_name} is not attached"
+        )),
+        _ => Err(anyhow!(
+            "tmux returned multiple contexts for client {requested_client_name}"
+        )),
+    }
+}
+
+fn regular_client_session_rows(runner: &dyn TmuxRunner) -> Result<Vec<ClientSessionRow>> {
+    let format = client_session_context_format();
+    let output = runner.run(&["list-clients", "-F", &format])?;
+    Ok(output
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split(FIELD_SEP).collect::<Vec<_>>();
+            if fields.len() != 5 || fields[4] != "0" {
+                return None;
+            }
+            let client_name = if fields[0].trim().is_empty() {
+                fields[1].trim()
+            } else {
+                fields[0].trim()
+            };
+            let session_id = fields[2].trim();
+            let pane_id = fields[3].trim();
+            if client_name.is_empty() || !valid_session_id(session_id) || !valid_pane_id(pane_id) {
+                return None;
+            }
+            Some(ClientSessionRow {
+                context: ClientSessionContext {
+                    client_name: client_name.to_string(),
+                    session_id: session_id.to_string(),
+                },
+                pane_id: pane_id.to_string(),
+            })
+        })
+        .collect())
+}
+
+fn valid_pane_id(pane_id: &str) -> bool {
+    pane_id.strip_prefix('%').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn valid_session_id(session_id: &str) -> bool {
+    session_id.strip_prefix('$').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 pub fn switch_client(runner: &dyn TmuxRunner, session: &str) -> Result<()> {
@@ -206,6 +372,16 @@ pub fn create_session(
     cwd: Option<&str>,
 ) -> Result<String> {
     let client = current_client_name(runner)?;
+    create_session_for_client(runner, config, env, cwd, &client)
+}
+
+pub fn create_session_for_client(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&str>,
+    client: &str,
+) -> Result<String> {
     if client.trim().is_empty() {
         bail!("no tmux client available for session creation");
     }
@@ -221,7 +397,7 @@ pub fn create_session(
     };
     let category = resolve_dynamic_category_for_session(config, &session);
     set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
-    switch_client_for_client(runner, &client, &session_name)?;
+    switch_client_for_client(runner, client, &session_name)?;
     if !window_id.is_empty() {
         crate::sidebar::layout::open_if_auto_all_enabled(
             runner,
@@ -232,7 +408,7 @@ pub fn create_session(
         )?;
     }
     if !category.is_empty() {
-        remember_session_for_client(runner, &client, &category, &session_name)?;
+        remember_session_for_client(runner, client, &category, &session_name)?;
     }
     Ok(session_name)
 }
@@ -296,12 +472,22 @@ pub fn refresh_session_categories(runner: &dyn TmuxRunner, config: &Config) -> R
 
 pub fn use_category(runner: &dyn TmuxRunner, config: &Config, category: &str) -> Result<()> {
     let client = current_client_name(runner)?;
+    use_category_for_client(runner, config, category, &client)
+}
+
+pub fn use_category_for_client(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    category: &str,
+    client: &str,
+) -> Result<()> {
     let sessions = list_sessions(runner)?;
-    if let Some(remembered) = remembered_session_for_client(runner, &client, category)?
-        && find_session(&sessions, &remembered).is_some()
+    if let Some(remembered) = remembered_session_for_client(runner, client, category)?
+        && let Some(remembered_session) = find_session(&sessions, &remembered)
+        && resolve_category_for_session(config, remembered_session) == category
     {
-        switch_client_for_client(runner, &client, &remembered)?;
-        return remember_session_for_client(runner, &client, category, &remembered);
+        switch_client_for_client(runner, client, &remembered)?;
+        return remember_session_for_client(runner, client, category, &remembered);
     }
 
     let Some(session) = sessions_in_category(config, &sessions, category)
@@ -310,8 +496,8 @@ pub fn use_category(runner: &dyn TmuxRunner, config: &Config, category: &str) ->
     else {
         bail!("no session in category: {category}");
     };
-    switch_client_for_client(runner, &client, &session.name)?;
-    remember_session_for_client(runner, &client, category, &session.name)
+    switch_client_for_client(runner, client, &session.name)?;
+    remember_session_for_client(runner, client, category, &session.name)
 }
 
 pub fn use_adjacent_category(
@@ -410,8 +596,115 @@ mod tests {
             "client-1\t/dev/ttys001\n",
         );
         mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+        mock.stub(&["display-message", "-p", "#{session_id}"], "$3\n");
         assert_eq!(current_client_name(&mock).unwrap(), "client-1");
         assert_eq!(current_session_name(&mock).unwrap(), "main");
+        assert_eq!(current_session_id(&mock).unwrap(), "$3");
+    }
+
+    #[test]
+    fn current_session_id_rejects_non_stable_tmux_targets() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(&["display-message", "-p", "#{session_id}"], "main\n");
+
+        assert!(
+            current_session_id(&mock)
+                .unwrap_err()
+                .to_string()
+                .contains("valid current session ID")
+        );
+    }
+
+    #[test]
+    fn client_session_context_pins_one_regular_client_and_source_session_in_one_query() {
+        let mock = MockTmuxRunner::new();
+        let format = client_session_context_format();
+        let sep = FIELD_SEP;
+        mock.stub(
+            &["list-clients", "-F", &format],
+            &format!(
+                "one{sep}/dev/ttys001{sep}$1{sep}%1{sep}0\n\
+                 two{sep}/dev/ttys002{sep}$2{sep}%2{sep}0\n\
+                 control{sep}{sep}$3{sep}%1{sep}1\n"
+            ),
+        );
+
+        assert_eq!(
+            client_session_context_for_pane(&mock, "%1", None).unwrap(),
+            ClientSessionContext {
+                client_name: "one".to_string(),
+                session_id: "$1".to_string(),
+            }
+        );
+        assert_eq!(mock.calls().len(), 1);
+    }
+
+    #[test]
+    fn client_session_context_uses_the_only_regular_client_when_run_shell_keeps_a_stale_pane() {
+        let mock = MockTmuxRunner::new();
+        let format = client_session_context_format();
+        let sep = FIELD_SEP;
+        mock.stub(
+            &["list-clients", "-F", &format],
+            &format!("one{sep}/dev/ttys001{sep}$1{sep}%1{sep}0\n"),
+        );
+
+        assert_eq!(
+            client_session_context_for_pane(&mock, "%999", None).unwrap(),
+            ClientSessionContext {
+                client_name: "one".to_string(),
+                session_id: "$1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn client_session_context_fails_closed_when_the_invoking_pane_is_ambiguous() {
+        let mock = MockTmuxRunner::new();
+        let format = client_session_context_format();
+        let sep = FIELD_SEP;
+        mock.stub(
+            &["list-clients", "-F", &format],
+            &format!(
+                "one{sep}/dev/ttys001{sep}$1{sep}%1{sep}0\n\
+                 two{sep}/dev/ttys002{sep}$2{sep}%1{sep}0\n"
+            ),
+        );
+
+        assert!(
+            client_session_context_for_pane(&mock, "%1", None)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple tmux clients")
+        );
+        assert!(
+            client_session_context_for_pane(&mock, "%9", None)
+                .unwrap_err()
+                .to_string()
+                .contains("does not identify one regular tmux client")
+        );
+    }
+
+    #[test]
+    fn client_session_context_uses_an_explicit_client_when_the_pane_is_shared() {
+        let mock = MockTmuxRunner::new();
+        let format = client_session_context_format();
+        let sep = FIELD_SEP;
+        mock.stub(
+            &["list-clients", "-F", &format],
+            &format!(
+                "one{sep}/dev/ttys001{sep}$1{sep}%1{sep}0\n\
+                 two{sep}/dev/ttys002{sep}$2{sep}%1{sep}0\n"
+            ),
+        );
+
+        assert_eq!(
+            client_session_context_for_pane(&mock, "%1", Some("two")).unwrap(),
+            ClientSessionContext {
+                client_name: "two".to_string(),
+                session_id: "$2".to_string(),
+            }
+        );
     }
 
     #[test]

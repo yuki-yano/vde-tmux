@@ -27,8 +27,8 @@ impl RepoId {
 #[serde(rename_all = "snake_case")]
 pub enum ViewMode {
     Flat,
-    #[default]
     ByRepo,
+    #[default]
     ByCategory,
 }
 
@@ -43,21 +43,64 @@ pub enum StatusFilter {
     IdleOnly,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SidebarState {
     pub version: u64,
-    #[serde(default)]
     pub view_mode: ViewMode,
-    #[serde(default)]
     pub filter: StatusFilter,
-    #[serde(default)]
     pub selection: Option<String>,
-    #[serde(default)]
     pub collapsed: BTreeSet<String>,
+    pub scroll: usize,
+    pub return_target: Option<crate::pane_state::PaneInstance>,
+}
+
+pub const SIDEBAR_ORDER_SCHEMA_VERSION: u32 = 1;
+pub const SIDEBAR_EXPANSION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SidebarExpansionPreferences {
+    pub schema_version: u32,
+    pub version: u64,
+    pub overrides: BTreeSet<String>,
+}
+
+impl Default for SidebarExpansionPreferences {
+    fn default() -> Self {
+        Self {
+            schema_version: SIDEBAR_EXPANSION_SCHEMA_VERSION,
+            version: 0,
+            overrides: BTreeSet::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SidebarOrderPreferences {
+    pub schema_version: u32,
+    pub version: u64,
     #[serde(default)]
     pub manual_order: Vec<RepoId>,
     #[serde(default)]
     pub manual_chat_order: Vec<String>,
+    #[serde(default)]
+    pub view_mode: ViewMode,
+    #[serde(default)]
+    pub filter: StatusFilter,
+}
+
+impl Default for SidebarOrderPreferences {
+    fn default() -> Self {
+        Self {
+            schema_version: SIDEBAR_ORDER_SCHEMA_VERSION,
+            version: 0,
+            manual_order: Vec::new(),
+            manual_chat_order: Vec::new(),
+            view_mode: ViewMode::default(),
+            filter: StatusFilter::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,8 +122,6 @@ pub enum SidebarAction {
     SetViewMode(ViewMode),
     CycleViewMode,
     ToggleFilter,
-    ReorderUp(RepoId),
-    ReorderDown(RepoId),
 }
 
 impl SidebarState {
@@ -112,8 +153,6 @@ impl SidebarState {
                 self.bump();
                 true
             }
-            SidebarAction::ReorderUp(repo) => self.manual_move_up(&repo),
-            SidebarAction::ReorderDown(repo) => self.manual_move_down(&repo),
         }
     }
 
@@ -154,13 +193,29 @@ impl SidebarState {
         true
     }
 
+    fn bump(&mut self) {
+        self.version += 1;
+    }
+}
+
+impl SidebarOrderPreferences {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != SIDEBAR_ORDER_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported sidebar order schema version {}",
+                self.schema_version
+            ));
+        }
+        Ok(())
+    }
+
     pub fn manual_insert(&mut self, repo: RepoId, index: usize) -> bool {
         if self.manual_order.contains(&repo) {
             return false;
         }
         let index = index.min(self.manual_order.len());
         self.manual_order.insert(index, repo);
-        self.bump();
+        self.version += 1;
         true
     }
 
@@ -172,7 +227,7 @@ impl SidebarState {
             return false;
         }
         self.manual_order.swap(index, index - 1);
-        self.bump();
+        self.version += 1;
         true
     }
 
@@ -184,7 +239,7 @@ impl SidebarState {
             return false;
         }
         self.manual_order.swap(index, index + 1);
-        self.bump();
+        self.version += 1;
         true
     }
 
@@ -195,7 +250,7 @@ impl SidebarState {
         }
         let index = index.min(self.manual_chat_order.len());
         self.manual_chat_order.insert(index, pane_id);
-        self.bump();
+        self.version += 1;
         true
     }
 
@@ -211,7 +266,7 @@ impl SidebarState {
             return false;
         }
         self.manual_chat_order.swap(index, index - 1);
-        self.bump();
+        self.version += 1;
         true
     }
 
@@ -227,10 +282,93 @@ impl SidebarState {
             return false;
         }
         self.manual_chat_order.swap(index, index + 1);
-        self.bump();
+        self.version += 1;
         true
     }
 
+    pub fn replace_manual_order(
+        &mut self,
+        expected_version: u64,
+        manual_order: Vec<RepoId>,
+        manual_chat_order: Vec<String>,
+    ) -> Result<bool, u64> {
+        if self.version != expected_version {
+            return Err(self.version);
+        }
+        if self.manual_order == manual_order && self.manual_chat_order == manual_chat_order {
+            return Ok(false);
+        }
+        let Some(next_version) = self.version.checked_add(1) else {
+            return Err(self.version);
+        };
+        self.manual_order = manual_order;
+        self.manual_chat_order = manual_chat_order;
+        self.version = next_version;
+        Ok(true)
+    }
+
+    pub fn replace_view_preferences(
+        &mut self,
+        expected_version: u64,
+        view_mode: ViewMode,
+        filter: StatusFilter,
+    ) -> Result<bool, u64> {
+        if self.version != expected_version {
+            return Err(self.version);
+        }
+        if self.view_mode == view_mode && self.filter == filter {
+            return Ok(false);
+        }
+        let Some(next_version) = self.version.checked_add(1) else {
+            return Err(self.version);
+        };
+        self.view_mode = view_mode;
+        self.filter = filter;
+        self.version = next_version;
+        Ok(true)
+    }
+}
+
+impl SidebarExpansionPreferences {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != SIDEBAR_EXPANSION_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported sidebar expansion schema version {}",
+                self.schema_version
+            ));
+        }
+        if self.overrides.iter().any(|row_id| row_id.trim().is_empty()) {
+            return Err("sidebar expansion row ID must not be empty".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn set_override(
+        &mut self,
+        expected_version: u64,
+        row_id: String,
+        overridden: bool,
+    ) -> Result<bool, u64> {
+        if self.version != expected_version {
+            return Err(self.version);
+        }
+        if self.overrides.contains(&row_id) == overridden {
+            return Ok(false);
+        }
+        let Some(next_version) = self.version.checked_add(1) else {
+            return Err(self.version);
+        };
+        if overridden {
+            self.overrides.insert(row_id);
+        } else {
+            self.overrides.remove(&row_id);
+        }
+        self.version = next_version;
+        Ok(true)
+    }
+}
+
+impl SidebarState {
     fn move_selection(&mut self, rows: &[SidebarRowRef], direction: Direction) -> bool {
         if rows.is_empty() {
             return false;
@@ -252,10 +390,6 @@ impl SidebarState {
         self.selection = Some(next_id);
         self.bump();
         true
-    }
-
-    fn bump(&mut self) {
-        self.version += 1;
     }
 }
 
@@ -287,6 +421,16 @@ impl StatusFilter {
             StatusFilter::WorkingOnly => "working",
             StatusFilter::DoneOnly => "done",
             StatusFilter::IdleOnly => "idle",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StatusFilter::All => "All",
+            StatusFilter::AttentionOnly => "Needs action",
+            StatusFilter::WorkingOnly => "Working",
+            StatusFilter::DoneOnly => "Done",
+            StatusFilter::IdleOnly => "Idle",
         }
     }
 }
@@ -325,32 +469,30 @@ mod tests {
     #[test]
     fn state_switches_view_mode() {
         let mut state = SidebarState::default();
-        state.apply(SidebarAction::SetViewMode(ViewMode::ByCategory), &[]);
         assert_eq!(state.view_mode, ViewMode::ByCategory);
+        state.apply(SidebarAction::SetViewMode(ViewMode::Flat), &[]);
+        assert_eq!(state.view_mode, ViewMode::Flat);
         assert_eq!(state.version, 1);
     }
 
     #[test]
-    fn state_persists_filter_and_manual_order() {
-        let state = SidebarState {
-            filter: StatusFilter::AttentionOnly,
+    fn preferences_serialize_view_and_filter_without_instance_local_state() {
+        let state = SidebarOrderPreferences {
             manual_order: vec![RepoId::new("misc", "app")],
-            ..SidebarState::default()
+            view_mode: ViewMode::ByCategory,
+            filter: StatusFilter::DoneOnly,
+            ..SidebarOrderPreferences::default()
         };
 
         let json = serde_json::to_string(&state).unwrap();
 
-        assert!(json.contains(r#""filter":"attention_only""#));
         assert!(json.contains(r#""manual_order""#));
-    }
-
-    #[test]
-    fn old_state_json_filter_value_still_loads() {
-        let state: SidebarState =
-            serde_json::from_str(r#"{"version":7,"filter":"attention_only"}"#).unwrap();
-
-        assert_eq!(state.filter, StatusFilter::AttentionOnly);
-        assert_eq!(state.version, 7);
+        assert!(json.contains(r#""view_mode":"by_category""#));
+        assert!(json.contains(r#""filter":"done_only""#));
+        assert!(!json.contains("selection"));
+        assert!(!json.contains("collapsed"));
+        assert!(!json.contains("scroll"));
+        assert!(!json.contains("return_target"));
     }
 
     #[test]
@@ -413,7 +555,7 @@ mod tests {
 
     #[test]
     fn manual_reorder_moves_existing_repos_only() {
-        let mut state = SidebarState::default();
+        let mut state = SidebarOrderPreferences::default();
         state.manual_insert(RepoId::new("misc", "a"), 0);
         state.manual_insert(RepoId::new("misc", "b"), 1);
         let version = state.version;
@@ -430,7 +572,7 @@ mod tests {
 
     #[test]
     fn manual_chat_reorder_moves_existing_chats_only() {
-        let mut state = SidebarState::default();
+        let mut state = SidebarOrderPreferences::default();
         state.manual_chat_insert("%1", 0);
         state.manual_chat_insert("%2", 1);
         let version = state.version;
@@ -440,5 +582,43 @@ mod tests {
         assert_eq!(state.version, version + 1);
         assert!(!state.manual_chat_move_up("%2"));
         assert!(!state.manual_chat_move_down("%9"));
+    }
+
+    #[test]
+    fn expansion_override_is_versioned_and_idempotent() {
+        let mut state = SidebarExpansionPreferences::default();
+
+        assert!(
+            state
+                .set_override(0, "repo::misc::app".to_string(), true)
+                .unwrap()
+        );
+        assert_eq!(state.version, 1);
+        assert!(
+            !state
+                .set_override(1, "repo::misc::app".to_string(), true)
+                .unwrap()
+        );
+        assert!(
+            state
+                .set_override(1, "repo::misc::app".to_string(), false)
+                .unwrap()
+        );
+        assert_eq!(state.version, 2);
+        assert!(state.overrides.is_empty());
+    }
+
+    #[test]
+    fn expansion_override_does_not_mutate_when_version_cannot_advance() {
+        let mut state = SidebarExpansionPreferences {
+            version: u64::MAX,
+            ..SidebarExpansionPreferences::default()
+        };
+
+        assert_eq!(
+            state.set_override(u64::MAX, "repo::misc::app".to_string(), true),
+            Err(u64::MAX)
+        );
+        assert!(state.overrides.is_empty());
     }
 }

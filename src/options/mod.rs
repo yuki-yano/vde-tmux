@@ -84,6 +84,22 @@ pub fn show_global_option(runner: &dyn TmuxRunner, key: &str) -> Result<Option<S
     }
 }
 
+pub fn show_session_option(
+    runner: &dyn TmuxRunner,
+    session_id: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    let value = runner
+        .run(&["show-option", "-qv", "-t", session_id, key])?
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +220,21 @@ mod tests {
         mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "\n");
         let value = show_global_option(&mock, "@vde_client_616263_work").unwrap();
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn show_session_option_preserves_rendered_leading_space() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["show-option", "-qv", "-t", "$1", KEY_STATUS_SESSIONS],
+            " #[range=user|session:$1] main #[norange]\n",
+        );
+
+        let value = show_session_option(&mock, "$1", KEY_STATUS_SESSIONS).unwrap();
+
+        assert_eq!(
+            value.as_deref(),
+            Some(" #[range=user|session:$1] main #[norange]")
+        );
     }
 }

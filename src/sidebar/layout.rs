@@ -9,10 +9,12 @@ use crate::tmux::TmuxRunner;
 
 pub const SIDEBAR_PANE_FORMAT: &str = "#{pane_id}\t#{@vde_sidebar}\t#{pane_width}";
 pub(crate) const ENV_SELECTION_PANE: &str = "VDE_TMUX_SELECTION_PANE";
+pub(crate) const ENV_SELECTION_PANE_PID: &str = "VDE_TMUX_SELECTION_PANE_PID";
 pub(crate) const ENV_SELECTION_SESSION: &str = "VDE_TMUX_SELECTION_SESSION";
-const RAIL_WIDTH: u16 = 2;
+const RAIL_WIDTH: u16 = 3;
 const AFTER_NEW_WINDOW_HOOK: &str = "after-new-window[90]";
 const PANE_EXIT_HOOK: &str = "pane-exited[90]";
+pub(crate) const SOURCE_CLIENT_MISMATCH_SENTINEL: &str = "__vde_source_client_mismatch__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SidebarPane {
@@ -23,14 +25,24 @@ struct SidebarPane {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SidebarAttachContext {
     pub pane: Option<String>,
+    pub pane_pid: Option<u32>,
     pub session: Option<String>,
 }
 
 impl SidebarAttachContext {
-    pub(crate) fn new(pane: Option<String>, session: Option<String>) -> Option<Self> {
+    pub(crate) fn new(
+        pane: Option<String>,
+        pane_pid: Option<u32>,
+        session: Option<String>,
+    ) -> Option<Self> {
         let pane = normalize_context_value(pane);
         let session = normalize_context_value(session);
-        (pane.is_some() || session.is_some()).then_some(Self { pane, session })
+        let pane_pid = pane.as_ref().and(pane_pid);
+        (pane.is_some() || session.is_some()).then_some(Self {
+            pane,
+            pane_pid,
+            session,
+        })
     }
 }
 
@@ -182,6 +194,33 @@ pub fn focus_toggle(
     focus_toggle_with_attach_context(runner, target, self_exe, width, min_width, None)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExistingSidebarFocusToggle {
+    Missing,
+    Focused,
+    Closed,
+}
+
+pub(crate) fn focus_toggle_existing(
+    runner: &dyn TmuxRunner,
+    target: &str,
+) -> Result<ExistingSidebarFocusToggle> {
+    let Some(sidebar) = find_sidebar_pane(runner, target)? else {
+        return Ok(ExistingSidebarFocusToggle::Missing);
+    };
+    let active = runner
+        .run(&["display-message", "-p", "-t", target, "#{pane_id}"])?
+        .trim()
+        .to_string();
+    if active == sidebar.pane_id {
+        close_sidebar_pane(runner, target, &sidebar)?;
+        Ok(ExistingSidebarFocusToggle::Closed)
+    } else {
+        runner.run(&["select-pane", "-t", &sidebar.pane_id])?;
+        Ok(ExistingSidebarFocusToggle::Focused)
+    }
+}
+
 pub(crate) fn focus_toggle_with_attach_context(
     runner: &dyn TmuxRunner,
     target: &str,
@@ -190,19 +229,10 @@ pub(crate) fn focus_toggle_with_attach_context(
     min_width: u16,
     attach_context: Option<&SidebarAttachContext>,
 ) -> Result<()> {
-    let Some(sidebar) = find_sidebar_pane(runner, target)? else {
-        return open_unchecked(runner, target, self_exe, width, min_width, attach_context);
-    };
-    let active = runner
-        .run(&["display-message", "-p", "-t", target, "#{pane_id}"])?
-        .trim()
-        .to_string();
-    if active == sidebar.pane_id {
-        close_sidebar_pane(runner, target, &sidebar)
-    } else {
-        runner.run(&["select-pane", "-t", &sidebar.pane_id])?;
-        Ok(())
+    if focus_toggle_existing(runner, target)? == ExistingSidebarFocusToggle::Missing {
+        open_unchecked(runner, target, self_exe, width, min_width, attach_context)?;
     }
+    Ok(())
 }
 
 pub fn rail(
@@ -231,25 +261,91 @@ pub fn rail(
 }
 
 pub fn jump_to_pane(runner: &dyn TmuxRunner, pane_id: &str) -> Result<()> {
+    jump_to_pane_with_client(runner, pane_id, None, None)
+}
+
+pub fn jump_to_pane_for_client(
+    runner: &dyn TmuxRunner,
+    pane: &crate::pane_state::PaneInstance,
+    client_pid: u32,
+    source_pane: &crate::pane_state::PaneInstance,
+) -> Result<()> {
+    jump_to_pane_with_client(
+        runner,
+        &pane.pane_id,
+        Some(pane.pane_pid),
+        Some((client_pid, source_pane)),
+    )
+}
+
+fn jump_to_pane_with_client(
+    runner: &dyn TmuxRunner,
+    pane_id: &str,
+    pane_pid: Option<u32>,
+    client: Option<(u32, &crate::pane_state::PaneInstance)>,
+) -> Result<()> {
     const FIELD_SEP: char = '\u{1f}';
-    let format = ["#{session_name}", "#{window_id}", "#{pane_id}"].join(&FIELD_SEP.to_string());
+    let format =
+        ["#{session_id}", "#{window_id}", "#{pane_id}", "#{pane_pid}"].join(&FIELD_SEP.to_string());
     let output = runner.run(&["list-panes", "-a", "-F", &format])?;
-    let (session, window_id) = output
+    let (session_id, window_id) = output
         .lines()
         .filter_map(|line| {
             let mut fields = line.split(FIELD_SEP);
-            let session = fields.next()?;
+            let session_id = fields.next()?;
             let window_id = fields.next()?;
             let candidate_pane_id = fields.next()?;
-            (fields.next().is_none() && candidate_pane_id == pane_id)
-                .then_some((session, window_id))
+            let candidate_pane_pid = fields.next()?.parse::<u32>().ok()?;
+            (fields.next().is_none()
+                && candidate_pane_id == pane_id
+                && pane_pid.is_none_or(|expected| candidate_pane_pid == expected))
+            .then_some((session_id, window_id))
         })
         .next()
         .with_context(|| format!("pane not found: {pane_id}"))?;
-    let target = crate::session::exact_session_target(session);
-    runner.run(&["switch-client", "-t", &target])?;
-    runner.run(&["select-window", "-t", window_id])?;
-    runner.run(&["select-pane", "-t", pane_id])?;
+    let target = format!("{session_id}:{window_id}.{pane_id}");
+    if let Some((client_pid, source_pane)) = client {
+        let clients = runner.run(&["list-clients", "-F", "#{client_pid}\u{1f}#{client_name}"])?;
+        let mut names = clients.lines().filter_map(|line| {
+            let (pid, name) = line.split_once(FIELD_SEP)?;
+            (pid.parse::<u32>().ok() == Some(client_pid) && !name.is_empty()).then_some(name)
+        });
+        let client = names
+            .next()
+            .with_context(|| format!("tmux client not found: {client_pid}"))?;
+        if names.next().is_some() {
+            anyhow::bail!("multiple tmux clients matched PID {client_pid}");
+        }
+        let source_guard = format!(
+            "#{{&&:#{{==:#{{pane_id}},{}}},#{{==:#{{pane_pid}},{}}}}}",
+            source_pane.pane_id, source_pane.pane_pid
+        );
+        let switch = crate::pane_state::store::tmux_command_string(&[
+            "switch-client".to_string(),
+            "-c".to_string(),
+            client.to_string(),
+            "-t".to_string(),
+            target.clone(),
+        ]);
+        let mismatch = format!("display-message -p '{SOURCE_CLIENT_MISMATCH_SENTINEL}'");
+        let output = runner.run(&[
+            "if-shell",
+            "-F",
+            "-t",
+            client,
+            &source_guard,
+            &switch,
+            &mismatch,
+        ])?;
+        if output
+            .lines()
+            .any(|line| line.trim() == SOURCE_CLIENT_MISMATCH_SENTINEL)
+        {
+            anyhow::bail!(SOURCE_CLIENT_MISMATCH_SENTINEL);
+        }
+    } else {
+        runner.run(&["switch-client", "-t", &target])?;
+    }
     Ok(())
 }
 
@@ -927,6 +1023,9 @@ fn attach_shell_command(
         if let Some(pane) = context.pane.as_deref() {
             env.push(format!("{ENV_SELECTION_PANE}={}", shell_quote(pane)));
         }
+        if let Some(pane_pid) = context.pane_pid {
+            env.push(format!("{ENV_SELECTION_PANE_PID}={pane_pid}"));
+        }
         if let Some(session) = context.session.as_deref() {
             env.push(format!("{ENV_SELECTION_SESSION}={}", shell_quote(session)));
         }
@@ -1013,12 +1112,13 @@ mod tests {
     fn attach_shell_command_propagates_selection_context() {
         let context = SidebarAttachContext {
             pane: Some("%1".to_string()),
+            pane_pid: Some(42),
             session: Some("main".to_string()),
         };
 
         assert_eq!(
             attach_shell_command(&exe(), Some("scratch"), Some(&context)),
-            "VDE_TMUX_SOCKET_NAME='scratch' VDE_TMUX_SELECTION_PANE='%1' VDE_TMUX_SELECTION_SESSION='main' '/tmp/vt' sidebar attach"
+            "VDE_TMUX_SOCKET_NAME='scratch' VDE_TMUX_SELECTION_PANE='%1' VDE_TMUX_SELECTION_PANE_PID=42 VDE_TMUX_SELECTION_SESSION='main' '/tmp/vt' sidebar attach"
         );
     }
 
@@ -1569,7 +1669,7 @@ mod tests {
             &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
             "%9\t1\t40\n",
         );
-        mock.stub(&["resize-pane", "-t", "%9", "-x", "2"], "");
+        mock.stub(&["resize-pane", "-t", "%9", "-x", "3"], "");
 
         rail(&mock, "@1", SidebarWidth::Columns(40), 40).unwrap();
 
@@ -1581,7 +1681,7 @@ mod tests {
         let mock = MockTmuxRunner::new();
         mock.stub(
             &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%9\t1\t2\n",
+            "%9\t1\t3\n",
         );
         mock.stub(
             &[
@@ -1984,17 +2084,98 @@ mod tests {
     #[test]
     fn jump_to_pane_switches_session_window_and_pane() {
         let mock = MockTmuxRunner::new();
-        let format = ["#{session_name}", "#{window_id}", "#{pane_id}"].join("\u{1f}");
+        let format = ["#{session_id}", "#{window_id}", "#{pane_id}", "#{pane_pid}"].join("\u{1f}");
         mock.stub(
             &["list-panes", "-a", "-F", &format],
-            "main\u{1f}@1\u{1f}%1\n",
+            "$1\u{1f}@1\u{1f}%1\u{1f}101\n",
         );
-        mock.stub(&["switch-client", "-t", "=main:"], "");
-        mock.stub(&["select-window", "-t", "@1"], "");
-        mock.stub(&["select-pane", "-t", "%1"], "");
+        mock.stub(&["switch-client", "-t", "$1:@1.%1"], "");
 
         jump_to_pane(&mock, "%1").unwrap();
 
-        assert_eq!(mock.calls().len(), 4);
+        assert_eq!(mock.calls().len(), 2);
+        assert_eq!(
+            mock.calls()[1],
+            vec![
+                "switch-client".to_string(),
+                "-t".to_string(),
+                "$1:@1.%1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn jump_to_pane_for_client_never_switches_an_implicit_client() {
+        let mock = MockTmuxRunner::new();
+        let format = ["#{session_id}", "#{window_id}", "#{pane_id}", "#{pane_pid}"].join("\u{1f}");
+        mock.stub(
+            &["list-panes", "-a", "-F", &format],
+            "$1\u{1f}@1\u{1f}%1\u{1f}101\n",
+        );
+        mock.stub(
+            &["list-clients", "-F", "#{client_pid}\u{1f}#{client_name}"],
+            "10\u{1f}/dev/ttys001\n20\u{1f}/dev/ttys002\n",
+        );
+        let source = crate::pane_state::PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 909,
+        };
+        let target = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let source_guard = "#{&&:#{==:#{pane_id},%9},#{==:#{pane_pid},909}}";
+        let switch = crate::pane_state::store::tmux_command_string(&[
+            "switch-client".to_string(),
+            "-c".to_string(),
+            "/dev/ttys002".to_string(),
+            "-t".to_string(),
+            "$1:@1.%1".to_string(),
+        ]);
+        let mismatch = format!("display-message -p '{SOURCE_CLIENT_MISMATCH_SENTINEL}'");
+        mock.stub(
+            &[
+                "if-shell",
+                "-F",
+                "-t",
+                "/dev/ttys002",
+                source_guard,
+                &switch,
+                &mismatch,
+            ],
+            "",
+        );
+        jump_to_pane_for_client(&mock, &target, 20, &source).unwrap();
+
+        assert!(
+            !mock
+                .calls()
+                .iter()
+                .any(|call| { call.first().map(String::as_str) == Some("switch-client") })
+        );
+        assert_eq!(mock.calls().len(), 3);
+    }
+
+    #[test]
+    fn jump_to_pane_for_client_rejects_reused_target_pane_id_before_mutation() {
+        let mock = MockTmuxRunner::new();
+        let format = ["#{session_id}", "#{window_id}", "#{pane_id}", "#{pane_pid}"].join("\u{1f}");
+        mock.stub(
+            &["list-panes", "-a", "-F", &format],
+            "$1\u{1f}@1\u{1f}%1\u{1f}202\n",
+        );
+        let target = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let source = crate::pane_state::PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 909,
+        };
+
+        let error = jump_to_pane_for_client(&mock, &target, 20, &source).unwrap_err();
+
+        assert!(error.to_string().contains("pane not found: %1"));
+        assert_eq!(mock.calls().len(), 1);
     }
 }

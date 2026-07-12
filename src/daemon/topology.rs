@@ -6,11 +6,11 @@ use crate::daemon::protocol::v2::SessionLinkPresentation;
 use crate::pane_state::{EventId, PaneInstance};
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
-pub const TOPOLOGY_FIELD_COUNT: usize = 12;
-pub const MAX_TOPOLOGY_ROWS: usize = 64;
+pub const TOPOLOGY_FIELD_COUNT: usize = 13;
+pub const MAX_TMUX_QUERY_OUTPUT_BYTES: usize = crate::pane_state::MAX_RESPONSE_FRAME_BYTES;
 pub const TARGETED_REFRESH_TIMEOUT: Duration = Duration::from_millis(100);
 
-const STATUS_SESSION_FIELD_COUNT: usize = 6;
+const STATUS_SESSION_FIELD_COUNT: usize = 8;
 const STATUS_WINDOW_FIELD_COUNT: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +93,7 @@ impl QueryFraming {
             "#{pane_pid}",
             "#{pane_current_path}",
             "#{pane_current_command}",
+            "#{pane_width}",
             "#{pane_active}",
         ];
         format!("{}{}", FIELDS.join(&self.field), self.row)
@@ -107,6 +108,8 @@ impl QueryFraming {
             "#{session_id}",
             "#{session_name}",
             "#{@vde_category}",
+            "#{@vde_project_path}",
+            "#{@vde_category_override}",
             "#{session_attached}",
             "#{session_created}",
         ];
@@ -144,6 +147,7 @@ pub struct TopologyPane {
     pub window_name: String,
     pub current_path: String,
     pub current_command: String,
+    pub pane_width: u16,
     pub active: bool,
 }
 
@@ -158,6 +162,8 @@ pub struct StatusSessionMetadata {
     pub session_id: String,
     pub session_name: String,
     pub category: Option<String>,
+    pub project_path: String,
+    pub category_override: String,
     pub attached: bool,
     pub created_at: i64,
 }
@@ -185,7 +191,10 @@ pub enum TopologyError {
         actual: ServerIdentity,
     },
     InvalidRow(String),
-    TooManyRows(usize),
+    OutputTooLarge {
+        actual: usize,
+        limit: usize,
+    },
     InvalidPaneId(String),
     Query(String),
     Deadline,
@@ -208,7 +217,10 @@ impl fmt::Display for TopologyError {
                 "tmux server identity mismatch: expected {}:{}, received {}:{}",
                 expected.pid, expected.start_time, actual.pid, actual.start_time
             ),
-            Self::TooManyRows(count) => write!(formatter, "topology has too many rows: {count}"),
+            Self::OutputTooLarge { actual, limit } => write!(
+                formatter,
+                "tmux query output exceeds byte limit: {actual} bytes > {limit} bytes"
+            ),
             Self::InvalidPaneId(pane_id) => write!(formatter, "invalid pane ID {pane_id:?}"),
             Self::Query(message) => formatter.write_str(message),
             Self::Deadline => formatter.write_str("targeted pane refresh deadline exceeded"),
@@ -238,7 +250,8 @@ impl TargetedRefreshIo for SystemTargetedRefreshIo {
                 SystemTmuxRunner::with_socket_name(socket_name.clone(), Some(timeout))
             }
             None => SystemTmuxRunner::with_timeout(timeout),
-        };
+        }
+        .with_max_output_bytes(MAX_TMUX_QUERY_OUTPUT_BYTES);
         let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
         runner
             .run(&refs)
@@ -508,8 +521,10 @@ pub fn parse_status_metadata(
                     session_id: fields[1].to_string(),
                     session_name: fields[2].to_string(),
                     category: (!fields[3].is_empty()).then(|| fields[3].to_string()),
-                    attached: parse_attached(fields[4])?,
-                    created_at: parse_i64(fields[5], "session created at")?,
+                    project_path: fields[4].to_string(),
+                    category_override: fields[5].to_string(),
+                    attached: parse_attached(fields[6])?,
+                    created_at: parse_i64(fields[7], "session created at")?,
                 };
                 if sessions
                     .insert(metadata.session_id.clone(), metadata.clone())
@@ -597,7 +612,12 @@ pub fn parse_topology(
             .ok()
             .filter(|pid| *pid > 0)
             .ok_or_else(|| TopologyError::InvalidRow("invalid pane PID".to_string()))?;
-        let active = parse_bool(fields[11], "pane active")?;
+        let pane_width = fields[11]
+            .parse::<u16>()
+            .ok()
+            .filter(|width| *width > 0)
+            .ok_or_else(|| TopologyError::InvalidRow("invalid pane width".to_string()))?;
+        let active = parse_bool(fields[12], "pane active")?;
         let pane_instance = PaneInstance {
             pane_id: fields[7].to_string(),
             pane_pid,
@@ -625,6 +645,7 @@ pub fn parse_topology(
             window_name: fields[6].to_string(),
             current_path: fields[9].to_string(),
             current_command: fields[10].to_string(),
+            pane_width,
             active,
         };
         match panes.get_mut(&pane_instance) {
@@ -633,6 +654,7 @@ pub fn parse_topology(
                     || existing.window_name != pane.window_name
                     || existing.current_path != pane.current_path
                     || existing.current_command != pane.current_command
+                    || existing.pane_width != pane.pane_width
                     || existing.active != pane.active
                 {
                     return Err(TopologyError::InvalidRow(format!(
@@ -702,6 +724,7 @@ fn parse_envelope<'a>(
             .map_err(|_| TopologyError::InvalidFraming("invalid server start time".to_string()))?,
     };
     verify_identity(identity.clone(), expected_identity)?;
+    ensure_query_output_size(output)?;
     let mut rows = Vec::new();
     for chunk in chunks {
         let chunk = chunk.strip_prefix('\n').unwrap_or(chunk);
@@ -712,11 +735,18 @@ fn parse_envelope<'a>(
             continue;
         }
         rows.push(chunk);
-        if rows.len() > MAX_TOPOLOGY_ROWS {
-            return Err(TopologyError::TooManyRows(rows.len()));
-        }
     }
     Ok((identity, rows))
+}
+
+pub(crate) fn ensure_query_output_size(output: &str) -> Result<(), TopologyError> {
+    if output.len() > MAX_TMUX_QUERY_OUTPUT_BYTES {
+        return Err(TopologyError::OutputTooLarge {
+            actual: output.len(),
+            limit: MAX_TMUX_QUERY_OUTPUT_BYTES,
+        });
+    }
+    Ok(())
 }
 
 fn verify_identity(actual: ServerIdentity, expected: &ServerIdentity) -> Result<(), TopologyError> {
@@ -837,6 +867,20 @@ mod tests {
         output
     }
 
+    fn owned_output(rows: &[Vec<String>]) -> String {
+        let framing = framing();
+        let mut output = format!(
+            "{}{}123{}456{}\n",
+            framing.header, framing.field, framing.field, framing.row
+        );
+        for fields in rows {
+            output.push_str(&fields.join(&framing.field));
+            output.push_str(&framing.row);
+            output.push('\n');
+        }
+        output
+    }
+
     fn status_metadata_output(rows: &[Vec<String>]) -> String {
         let framing = framing();
         let mut output = format!(
@@ -863,6 +907,8 @@ mod tests {
             session_id.to_string(),
             session_name.to_string(),
             category.to_string(),
+            "/repo".to_string(),
+            String::new(),
             attached.to_string(),
             created_at.to_string(),
         ]
@@ -932,6 +978,8 @@ mod tests {
                     session_id: "$1".to_string(),
                     session_name: "alpha\tteam".to_string(),
                     category: Some("work".to_string()),
+                    project_path: "/repo".to_string(),
+                    category_override: String::new(),
                     attached: true,
                     created_at: 100,
                 },
@@ -939,6 +987,8 @@ mod tests {
                     session_id: "$2".to_string(),
                     session_name: "beta\nteam".to_string(),
                     category: None,
+                    project_path: "/repo".to_string(),
+                    category_override: String::new(),
                     attached: false,
                     created_at: 200,
                 },
@@ -1036,26 +1086,23 @@ mod tests {
     }
 
     #[test]
-    fn status_metadata_row_limit_is_all_or_nothing() {
-        let rows = std::iter::repeat_n(
-            status_window_row("@2", "0", "0", "0"),
-            MAX_TOPOLOGY_ROWS + 1,
-        )
-        .collect::<Vec<_>>();
-        assert!(matches!(
-            parse_status_metadata(&status_metadata_output(&rows), &framing(), &identity()),
-            Err(TopologyError::TooManyRows(_))
-        ));
+    fn status_metadata_accepts_more_than_sixty_four_rows() {
+        let rows = (1..=128)
+            .map(|index| status_window_row(&format!("@{index}"), "0", "0", "0"))
+            .collect::<Vec<_>>();
+        let snapshot =
+            parse_status_metadata(&status_metadata_output(&rows), &framing(), &identity()).unwrap();
+        assert_eq!(snapshot.windows.len(), 128);
     }
 
     #[test]
     fn linked_window_rows_are_deduplicated_into_session_links() {
         let rows = vec![
             vec![
-                "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "1",
+                "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "80", "1",
             ],
             vec![
-                "$2", "beta", "@2", "4", "0", "1", "main", "%3", "99", "/tmp", "zsh", "1",
+                "$2", "beta", "@2", "4", "0", "1", "main", "%3", "99", "/tmp", "zsh", "80", "1",
             ],
         ];
         let snapshot = parse_topology(&output(&rows), &framing(), &identity()).unwrap();
@@ -1079,6 +1126,7 @@ mod tests {
             "99",
             "/tmp/line\none",
             "zsh\tinteractive",
+            "80",
             "1",
         ]];
         let snapshot = parse_topology(&output(&rows), &framing(), &identity()).unwrap();
@@ -1089,6 +1137,20 @@ mod tests {
         assert_eq!(snapshot.panes[0].window_name, "main\twork");
         assert_eq!(snapshot.panes[0].current_path, "/tmp/line\none");
         assert_eq!(snapshot.panes[0].current_command, "zsh\tinteractive");
+        assert_eq!(snapshot.panes[0].pane_width, 80);
+    }
+
+    #[test]
+    fn pane_width_must_be_a_positive_u16() {
+        for width in ["", "0", "-1", "65536", "wide"] {
+            let row = vec![
+                "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", width, "1",
+            ];
+            assert!(matches!(
+                parse_topology(&output(&[row]), &framing(), &identity()),
+                Err(TopologyError::InvalidRow(_))
+            ));
+        }
     }
 
     #[test]
@@ -1105,6 +1167,23 @@ mod tests {
         assert_eq!(
             parse_session_count(&sessions, &framing(), &identity()).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn session_count_accepts_more_than_sixty_four_sessions() {
+        let framing = framing();
+        let mut output = format!(
+            "{}{}123{}456{}\n",
+            framing.header, framing.field, framing.field, framing.row
+        );
+        for index in 1..=128 {
+            output.push_str(&format!("{}${index}{}\n", framing.session, framing.row));
+        }
+
+        assert_eq!(
+            parse_session_count(&output, &framing, &identity()).unwrap(),
+            128
         );
     }
 
@@ -1128,6 +1207,7 @@ mod tests {
             "99",
             "/tmp",
             "zsh",
+            "80",
             &format!("1{}collision", framing().row),
         ]]);
         assert!(parse_topology(&collision, &framing(), &identity()).is_err());
@@ -1142,7 +1222,7 @@ mod tests {
         ));
 
         let truncated = output(&[vec![
-            "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "1",
+            "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "80", "1",
         ]]);
         let suffix = format!("{}\n", framing().row);
         let truncated = format!("{}\n", truncated.strip_suffix(&suffix).unwrap());
@@ -1159,23 +1239,36 @@ mod tests {
     }
 
     #[test]
-    fn row_limit_is_all_or_nothing() {
-        let row = vec![
-            "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "1",
-        ];
-        let rows = std::iter::repeat_n(row, MAX_TOPOLOGY_ROWS + 1).collect::<Vec<_>>();
-        assert!(matches!(
-            parse_topology(&output(&rows), &framing(), &identity()),
-            Err(TopologyError::TooManyRows(_))
-        ));
+    fn topology_accepts_hundreds_of_unique_panes() {
+        let rows = (1..=512)
+            .map(|index| {
+                vec![
+                    "$1".to_string(),
+                    "alpha".to_string(),
+                    "@2".to_string(),
+                    "1".to_string(),
+                    "1".to_string(),
+                    "0".to_string(),
+                    "main".to_string(),
+                    format!("%{index}"),
+                    index.to_string(),
+                    "/tmp".to_string(),
+                    "zsh".to_string(),
+                    "80".to_string(),
+                    "1".to_string(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let snapshot = parse_topology(&owned_output(&rows), &framing(), &identity()).unwrap();
+        assert_eq!(snapshot.panes.len(), 512);
     }
 
     #[test]
-    fn identity_mismatch_precedes_row_limit_failure() {
-        let row = vec![
-            "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "1",
-        ];
-        let rows = std::iter::repeat_n(row, MAX_TOPOLOGY_ROWS + 1).collect::<Vec<_>>();
+    fn identity_mismatch_precedes_output_size_failure() {
+        let huge_path = "x".repeat(MAX_TMUX_QUERY_OUTPUT_BYTES);
+        let rows = vec![vec![
+            "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", &huge_path, "zsh", "80", "1",
+        ]];
         let wrong = ServerIdentity {
             pid: 999,
             start_time: 456,
@@ -1183,6 +1276,39 @@ mod tests {
         assert!(matches!(
             parse_topology(&output(&rows), &framing(), &wrong),
             Err(TopologyError::IdentityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn query_output_byte_limit_is_inclusive() {
+        let base = output(&[vec![
+            "$1", "", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "80", "1",
+        ]]);
+        let padding = MAX_TMUX_QUERY_OUTPUT_BYTES - base.len();
+        let at_limit = output(&[vec![
+            "$1",
+            &"x".repeat(padding),
+            "@2",
+            "1",
+            "1",
+            "0",
+            "main",
+            "%3",
+            "99",
+            "/tmp",
+            "zsh",
+            "80",
+            "1",
+        ]]);
+        assert_eq!(at_limit.len(), MAX_TMUX_QUERY_OUTPUT_BYTES);
+        assert!(parse_topology(&at_limit, &framing(), &identity()).is_ok());
+
+        let over_limit = format!("x{at_limit}");
+        assert!(matches!(
+            ensure_query_output_size(&over_limit),
+            Err(TopologyError::OutputTooLarge { actual, limit })
+                if actual == MAX_TMUX_QUERY_OUTPUT_BYTES + 1
+                    && limit == MAX_TMUX_QUERY_OUTPUT_BYTES
         ));
     }
 
@@ -1203,6 +1329,24 @@ mod tests {
                 Err(TopologyError::InvalidRow(_))
             ));
         }
+    }
+
+    #[test]
+    fn hydrate_accepts_more_than_sixty_four_unique_panes() {
+        let framing = framing();
+        let mut output = format!(
+            "{}{}123{}456{}\n",
+            framing.header, framing.field, framing.field, framing.row
+        );
+        for index in 1..=128 {
+            output.push_str(&format!(
+                "%{index}{}{index}{}{}\n",
+                framing.field, framing.field, framing.row
+            ));
+        }
+
+        let records = parse_hydrate_records(&output, &framing, &identity()).unwrap();
+        assert_eq!(records.len(), 128);
     }
 
     #[test]
@@ -1234,10 +1378,10 @@ mod tests {
         );
         let pane_rows = vec![
             vec![
-                "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "1",
+                "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "80", "1",
             ],
             vec![
-                "$2", "beta", "@2", "4", "0", "1", "main", "%3", "99", "/tmp", "zsh", "1",
+                "$2", "beta", "@2", "4", "0", "1", "main", "%3", "99", "/tmp", "zsh", "80", "1",
             ],
         ];
         let io = FakeRefreshIo {

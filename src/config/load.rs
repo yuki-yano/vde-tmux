@@ -134,6 +134,15 @@ pub fn load_config(env: &BTreeMap<String, String>) -> LoadedConfig {
     }
 }
 
+pub fn load_config_strict(env: &BTreeMap<String, String>) -> Result<Config, String> {
+    let loaded = load_config(env);
+    if loaded.warnings.is_empty() {
+        Ok(loaded.config)
+    } else {
+        Err(loaded.warnings.join("; "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +229,24 @@ mod tests {
         let loaded = load_config(&env(&[("HOME", "/nonexistent-home-for-vde-tmux-test")]));
         assert_eq!(loaded.config, Config::default());
         assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn strict_load_rejects_invalid_config_instead_of_falling_back() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-config-strict-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        let config = root.join("vde/tmux/config.yml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "daemon:\n  poll_ms: invalid\n").unwrap();
+
+        let error =
+            load_config_strict(&env(&[("XDG_CONFIG_HOME", root.to_str().unwrap())])).unwrap_err();
+
+        assert!(error.contains("daemon.poll_ms"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

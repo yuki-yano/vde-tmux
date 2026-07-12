@@ -8,14 +8,13 @@ pub mod topology;
 pub mod view_hooks;
 pub mod workers;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::session_badge::{BadgeState, glyph_for_state};
-use crate::sidebar::state::SidebarState;
-use crate::sidebar::tree::{BadgeCounts, SidebarRow};
+use crate::sidebar::state::{SidebarExpansionPreferences, SidebarOrderPreferences};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransitionEvent {
@@ -26,12 +25,19 @@ pub struct TransitionEvent {
     pub at_epoch: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SidebarFrame {
-    pub state: SidebarState,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SidebarModel {
+    pub order: SidebarOrderPreferences,
+    pub expansion: SidebarExpansionPreferences,
+    pub active_sessions: BTreeSet<String>,
     #[serde(default)]
-    pub counts: BadgeCounts,
-    pub rows: Vec<SidebarRow>,
+    pub git: BTreeMap<String, crate::git::GitBadge>,
+    #[serde(default)]
+    pub worktrees: BTreeMap<String, crate::git::WorktreeInfo>,
+    #[serde(default)]
+    pub needs_action: BTreeSet<crate::pane_state::PaneInstance>,
+    #[serde(default)]
+    pub flashing: BTreeSet<crate::pane_state::PaneInstance>,
 }
 
 pub fn render_summary(

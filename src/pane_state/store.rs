@@ -491,11 +491,13 @@ pub enum ViewBatchProgress {
 pub struct CanonicalStateRuntime {
     records: BTreeMap<PaneInstance, StoredPaneRecord>,
     quarantined: BTreeMap<PaneInstance, QuarantinedPaneRecord>,
+    quarantine_observed_total: u64,
     uninitialized_raw: BTreeMap<PaneInstance, String>,
     trackers: BTreeMap<PaneInstance, CaptureTrackerSnapshot>,
     diagnostics: VecDeque<PaneStateDiagnostic>,
     transitions: VecDeque<CanonicalTransition>,
     notification_jobs: VecDeque<CanonicalNotification>,
+    notification_queue_drops: u64,
     triage: BTreeMap<PaneInstance, crate::daemon::session_badge::BadgeState>,
     triage_calm_polls: BTreeMap<PaneInstance, u8>,
     flash: BTreeMap<PaneInstance, u8>,
@@ -531,6 +533,8 @@ impl CanonicalStateRuntime {
                 }
                 LoadedPaneRecord::Quarantined(record) => {
                     runtime.quarantined.insert(pane, record);
+                    runtime.quarantine_observed_total =
+                        runtime.quarantine_observed_total.saturating_add(1);
                 }
             }
         }
@@ -561,6 +565,14 @@ impl CanonicalStateRuntime {
 
     pub fn quarantined(&self, pane: &PaneInstance) -> Option<&QuarantinedPaneRecord> {
         self.quarantined.get(pane)
+    }
+
+    pub fn quarantine_count(&self) -> usize {
+        self.quarantined.len()
+    }
+
+    pub fn quarantine_observed_total(&self) -> u64 {
+        self.quarantine_observed_total
     }
 
     pub fn tracker(&self, pane: &PaneInstance) -> CaptureTrackerSnapshot {
@@ -615,6 +627,10 @@ impl CanonicalStateRuntime {
 
     pub fn drain_notification_jobs(&mut self) -> Vec<CanonicalNotification> {
         self.notification_jobs.drain(..).collect()
+    }
+
+    pub fn notification_queue_drops(&self) -> u64 {
+        self.notification_queue_drops
     }
 
     pub fn advance_poll_projection(&mut self) -> Result<bool, StoreError> {
@@ -1271,9 +1287,14 @@ impl CanonicalStateRuntime {
                 draft.records.remove(&transaction.pane);
                 draft.trackers.remove(&transaction.pane);
                 draft.uninitialized_raw.remove(&transaction.pane);
-                draft
+                let newly_observed = draft
                     .quarantined
-                    .insert(transaction.pane.clone(), quarantined.clone());
+                    .insert(transaction.pane.clone(), quarantined.clone())
+                    .is_none();
+                if newly_observed {
+                    draft.quarantine_observed_total =
+                        draft.quarantine_observed_total.saturating_add(1);
+                }
                 draft.push_diagnostic(transaction.pane, quarantined.error.message.clone())?;
                 *self = draft;
                 Err(StoreError::ExternalWriter(quarantined.error))
@@ -1372,6 +1393,14 @@ impl CanonicalStateRuntime {
                 });
                 while self.notification_jobs.len() > 64 {
                     self.notification_jobs.pop_front();
+                    self.notification_queue_drops = self.notification_queue_drops.saturating_add(1);
+                    self.diagnostics.push_back(PaneStateDiagnostic {
+                        pane_instance: pane.clone(),
+                        message: "notification_queue_overflow: dropped_oldest".to_string(),
+                    });
+                    while self.diagnostics.len() > MAX_DIAGNOSTICS {
+                        self.diagnostics.pop_front();
+                    }
                 }
             }
         }
@@ -1682,7 +1711,7 @@ mod tests {
             pane_id: "%2".to_string(),
             pane_pid: 200,
         };
-        let runtime = CanonicalStateRuntime::hydrate([
+        let mut runtime = CanonicalStateRuntime::hydrate([
             RawPaneRecord {
                 pane_instance: pane(),
                 raw: Some("not json".to_string()),
@@ -1693,7 +1722,17 @@ mod tests {
             },
         ]);
         assert!(runtime.quarantined(&pane()).is_some());
+        assert_eq!(runtime.quarantine_count(), 1);
+        assert_eq!(runtime.quarantine_observed_total(), 1);
         assert!(!runtime.is_fail_stopped());
+        let expected = runtime.descriptor(&pane());
+        assert!(
+            runtime
+                .remove_absent_pane(&pane(), expected.as_ref())
+                .unwrap()
+        );
+        assert_eq!(runtime.quarantine_count(), 0);
+        assert_eq!(runtime.quarantine_observed_total(), 1);
     }
 
     #[test]
@@ -1950,6 +1989,99 @@ mod tests {
         };
         assert_eq!(crate::pane_state::resolve_badge(state), BadgeState::Working);
         assert_eq!(state.completed_seq, 0);
+    }
+
+    #[test]
+    fn restart_capture_changes_do_not_replace_hydrated_idle_state_with_a_new_run() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = FakeIo::default();
+        runtime
+            .apply_event(
+                &mut io,
+                &mut FakeClock::default(),
+                &envelope(PaneEvent::BeginRun {
+                    started_at: 10,
+                    prompt: Some(PromptState {
+                        text: "preserved prompt".to_string(),
+                        source: "user".to_string(),
+                    }),
+                }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        runtime
+            .apply_event(
+                &mut io,
+                &mut FakeClock::default(),
+                &envelope(PaneEvent::ProgressUpdated {
+                    observed_at: 11,
+                    operations: vec![ProgressOperation::ReplaceTasks {
+                        progress: TaskProgress { done: 0, total: 1 },
+                        items: vec![TaskItemState {
+                            id: Some("task-1".to_string()),
+                            step: "preserved task".to_string(),
+                            status: TaskItemStatus::Pending,
+                        }],
+                    }],
+                }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        runtime
+            .apply_event(
+                &mut io,
+                &mut FakeClock::default(),
+                &envelope(PaneEvent::CompleteRun { completed_at: 12 }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+
+        let mut restarted = restart_from(&runtime);
+        for (observed_at, tail) in [(20, "restart baseline\n"), (21, "changed after restart\n")] {
+            let dispatched = restarted.freeze_observation_dispatch([pane()]).remove(0);
+            let StoredPaneRecord::Active(state) = restarted.record(&pane()).unwrap() else {
+                panic!("expected active state");
+            };
+            let capture = crate::daemon::workers::infer_capture(
+                Some(state),
+                &dispatched.tracker,
+                tail,
+                observed_at,
+            );
+            restarted
+                .apply_event(
+                    &mut FakeIo::default(),
+                    &mut FakeClock::default(),
+                    &envelope(PaneEvent::ObservationBatch {
+                        base: dispatched.base,
+                        tracker_generation: dispatched.tracker.generation,
+                        observed_at,
+                        presence: AgentPresenceObservation::Present(
+                            AgentKind::parse("codex").unwrap(),
+                        ),
+                        capture: Some(capture),
+                    }),
+                    &VisibilitySnapshot::default(),
+                    DoneClearOn::Pane,
+                )
+                .unwrap();
+        }
+
+        let StoredPaneRecord::Active(state) = restarted.record(&pane()).unwrap() else {
+            panic!("expected active state");
+        };
+        assert!(matches!(state.lifecycle, LifecycleState::Idle));
+        assert_eq!(state.run_seq, state.completed_seq);
+        assert_eq!(state.started_at, Some(10));
+        assert_eq!(state.completed_at, Some(12));
+        assert_eq!(
+            state.prompt.as_ref().map(|prompt| prompt.text.as_str()),
+            Some("preserved prompt")
+        );
+        assert_eq!(state.tasks.items[0].step, "preserved task");
     }
 
     #[test]
@@ -2259,11 +2391,14 @@ mod tests {
     }
 
     #[test]
-    fn notifications_are_emitted_only_when_badge_changes_to_blocked() {
+    fn notifications_are_emitted_on_blocked_transition_even_when_pane_is_focused() {
         let mut runtime = CanonicalStateRuntime::default();
         let mut io = FakeIo::default();
         apply_begin(&mut runtime, &mut io);
-        let visibility = VisibilitySnapshot::default();
+        let visibility = VisibilitySnapshot {
+            pane_visible_to_eligible_client: true,
+            ..VisibilitySnapshot::default()
+        };
         let mut clock = FakeClock::default();
 
         let waiting = envelope(PaneEvent::WaitRequested {
@@ -2327,6 +2462,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(runtime.notification_jobs().len(), 2);
+    }
+
+    #[test]
+    fn notification_queue_overflow_is_bounded_counted_and_diagnosed() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = FakeIo::default();
+        apply_begin(&mut runtime, &mut io);
+        let visibility = VisibilitySnapshot {
+            pane_visible_to_eligible_client: true,
+            ..VisibilitySnapshot::default()
+        };
+        let mut clock = FakeClock::default();
+
+        for index in 0..66_i64 {
+            runtime
+                .apply_event(
+                    &mut io,
+                    &mut clock,
+                    &envelope(PaneEvent::WaitRequested {
+                        observed_at: 10 + index * 2,
+                        reason: WaitReason::Other("input".to_string()),
+                    }),
+                    &visibility,
+                    DoneClearOn::Pane,
+                )
+                .unwrap();
+            runtime
+                .apply_event(
+                    &mut io,
+                    &mut clock,
+                    &envelope(PaneEvent::ActivityObserved {
+                        observed_at: 11 + index * 2,
+                    }),
+                    &visibility,
+                    DoneClearOn::Pane,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(runtime.notification_jobs().len(), 64);
+        assert_eq!(runtime.notification_queue_drops(), 2);
+        assert!(runtime.diagnostics().iter().any(|diagnostic| {
+            diagnostic.message == "notification_queue_overflow: dropped_oldest"
+        }));
     }
 
     #[test]

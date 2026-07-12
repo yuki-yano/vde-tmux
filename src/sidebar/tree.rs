@@ -9,8 +9,11 @@ use crate::config::Config;
 use crate::daemon::session_badge::BadgeState;
 use crate::git::WorktreeInfo;
 use crate::hook::{RollupLevel, TaskItem, TaskItemStatus, WorktreeActivity};
+use crate::pane_state::PaneInstance;
 use crate::session::SessionInfo;
-use crate::sidebar::state::{SidebarRowRef, SidebarState, StatusFilter, ViewMode};
+use crate::sidebar::state::{
+    SidebarOrderPreferences, SidebarRowRef, SidebarState, StatusFilter, ViewMode,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SidebarRowKind {
@@ -84,6 +87,7 @@ impl BadgeCounts {
 
 #[derive(Debug, Clone)]
 struct AgentPane {
+    pane_instance: PaneInstance,
     pane_id: String,
     repo: String,
     category: String,
@@ -108,17 +112,44 @@ struct AgentPane {
 pub struct RowBuildContext {
     pub git: BTreeMap<String, crate::git::GitBadge>,
     pub worktrees: BTreeMap<String, crate::git::WorktreeInfo>,
-    pub triage: BTreeSet<String>,
-    pub flash: BTreeSet<String>,
+    pub triage: BTreeSet<PaneInstance>,
+    pub flash: BTreeSet<PaneInstance>,
+    pub active_sessions: BTreeSet<String>,
     pub now: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SidebarProjection {
+    pub rows: Vec<SidebarRow>,
+    pub counts: BadgeCounts,
+}
+
+pub fn project_sidebar(
+    config: &Config,
+    panes: &[crate::daemon::protocol::v2::PanePresentation],
+    model: &crate::daemon::SidebarModel,
+    state: &SidebarState,
+    now: i64,
+) -> SidebarProjection {
+    let context = RowBuildContext {
+        git: model.git.clone(),
+        worktrees: model.worktrees.clone(),
+        triage: model.needs_action.clone(),
+        flash: model.flashing.clone(),
+        active_sessions: model.active_sessions.clone(),
+        now,
+    };
+    let (rows, counts) =
+        build_rows_from_presentations(config, panes, state, &model.order, &context);
+    SidebarProjection { rows, counts }
 }
 
 pub fn build_rows_from_presentations(
     config: &Config,
     panes: &[crate::daemon::protocol::v2::PanePresentation],
     state: &SidebarState,
+    order: &SidebarOrderPreferences,
     ctx: &RowBuildContext,
-    visible_panes: &BTreeSet<String>,
 ) -> (Vec<SidebarRow>, BadgeCounts) {
     let mut groups: BTreeMap<(String, String), Vec<AgentPane>> = BTreeMap::new();
     for pane in panes {
@@ -185,6 +216,7 @@ pub fn build_rows_from_presentations(
             .entry((category.clone(), repo.clone()))
             .or_default()
             .push(AgentPane {
+                pane_instance: pane.pane_instance.clone(),
                 pane_id: pane.pane_instance.pane_id.clone(),
                 repo,
                 category,
@@ -212,20 +244,24 @@ pub fn build_rows_from_presentations(
                 rollup,
                 badge_state: resolved.badge,
                 repo_path: pane.current_path.clone(),
-                flash: ctx.flash.contains(&pane.pane_instance.pane_id),
-                active: visible_panes.contains(&pane.pane_instance.pane_id),
+                flash: ctx.flash.contains(&pane.pane_instance),
+                active: pane
+                    .session_links
+                    .iter()
+                    .any(|link| ctx.active_sessions.contains(&link.session_id)),
             });
     }
-    build_rows_from_groups(groups, state, ctx)
+    build_rows_from_groups(groups, state, order, ctx)
 }
 
 fn build_rows_from_groups(
     mut groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
+    order: &SidebarOrderPreferences,
     ctx: &RowBuildContext,
 ) -> (Vec<SidebarRow>, BadgeCounts) {
     for panes in groups.values_mut() {
-        order_agent_panes(panes, state);
+        order_agent_panes(panes, order);
     }
     let group_metas = groups
         .iter()
@@ -235,14 +271,14 @@ fn build_rows_from_groups(
     for panes in groups.values_mut() {
         let mut index = 0;
         while index < panes.len() {
-            if ctx.triage.contains(&panes[index].pane_id) {
+            if ctx.triage.contains(&panes[index].pane_instance) {
                 triage_panes.push(panes.remove(index));
             } else {
                 index += 1;
             }
         }
     }
-    order_agent_panes(&mut triage_panes, state);
+    order_agent_panes(&mut triage_panes, order);
     let counts = badge_counts_from_agent_panes(
         groups
             .values()
@@ -258,8 +294,10 @@ fn build_rows_from_groups(
     let mut rows = triage_zone_rows(&triage_panes, state, ctx.now);
     let mut fleet_rows = match state.view_mode {
         ViewMode::Flat => flat_rows(groups, state, ctx.now),
-        ViewMode::ByRepo => repo_rows(groups, state, 0, &ctx.git, ctx.now, &group_metas),
-        ViewMode::ByCategory => category_rows(groups, state, &ctx.git, ctx.now, &group_metas),
+        ViewMode::ByRepo => repo_rows(groups, state, order, 0, &ctx.git, ctx.now, &group_metas),
+        ViewMode::ByCategory => {
+            category_rows(groups, state, order, &ctx.git, ctx.now, &group_metas)
+        }
     };
     rows.append(&mut fleet_rows);
     (rows, counts)
@@ -267,12 +305,12 @@ fn build_rows_from_groups(
 
 fn badge_counts_from_agent_panes<'a>(
     panes: impl IntoIterator<Item = &'a AgentPane>,
-    triage: &BTreeSet<String>,
+    triage: &BTreeSet<PaneInstance>,
 ) -> BadgeCounts {
     let mut counts = BadgeCounts::default();
     for pane in panes {
         counts.total += 1;
-        if pane_matches_attention_filter(pane) || triage.contains(&pane.pane_id) {
+        if pane_matches_attention_filter(pane) || triage.contains(&pane.pane_instance) {
             counts.attention += 1;
         }
         match pane.badge_state {
@@ -297,13 +335,27 @@ pub fn row_refs(rows: &[SidebarRow]) -> Vec<SidebarRowRef> {
         .collect()
 }
 
-pub(crate) fn chat_row_id(pane_id: &str) -> String {
-    format!("chat::{pane_id}")
+pub(crate) fn chat_row_id(pane: &PaneInstance) -> String {
+    format!("chat::{}::{}", pane.pane_id, pane.pane_pid)
+}
+
+pub(crate) fn pane_instance_from_row_id(id: &str) -> Option<PaneInstance> {
+    let rest = id
+        .strip_prefix("chat::")
+        .or_else(|| id.strip_prefix("jump::"))
+        .or_else(|| id.strip_prefix("detail::"))?;
+    let mut fields = rest.split("::");
+    let pane_id = fields.next()?.to_string();
+    let pane_pid = fields.next()?.parse().ok()?;
+    let pane = PaneInstance { pane_id, pane_pid };
+    pane.validate().ok()?;
+    Some(pane)
 }
 
 fn category_rows(
     groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
+    order: &SidebarOrderPreferences,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
     metas: &BTreeMap<(String, String), RowMeta>,
@@ -345,7 +397,7 @@ fn category_rows(
             }),
         });
         if expanded {
-            rows.extend(repo_rows_from_map(repos, state, 1, git, now, metas));
+            rows.extend(repo_rows_from_map(repos, state, order, 1, git, now, metas));
         }
     }
     rows
@@ -354,6 +406,7 @@ fn category_rows(
 fn repo_rows(
     groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
+    order: &SidebarOrderPreferences,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
@@ -363,12 +416,13 @@ fn repo_rows(
     for ((category, repo), panes) in groups {
         repos.insert((category, repo), panes);
     }
-    repo_rows_from_keyed_map(repos, state, depth, git, now, metas)
+    repo_rows_from_keyed_map(repos, state, order, depth, git, now, metas)
 }
 
 fn repo_rows_from_map(
     repos: BTreeMap<String, Vec<AgentPane>>,
     state: &SidebarState,
+    order: &SidebarOrderPreferences,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
@@ -384,12 +438,13 @@ fn repo_rows_from_map(
             ((category, repo), panes)
         })
         .collect();
-    repo_rows_from_keyed_map(keyed, state, depth, git, now, metas)
+    repo_rows_from_keyed_map(keyed, state, order, depth, git, now, metas)
 }
 
 fn repo_rows_from_keyed_map(
     repos: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
+    order: &SidebarOrderPreferences,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
@@ -397,7 +452,7 @@ fn repo_rows_from_keyed_map(
 ) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
     let mut groups = repos.into_values().collect::<Vec<_>>();
-    order_repo_groups(&mut groups, state);
+    order_repo_groups(&mut groups, order);
     for panes in groups {
         let Some(first) = panes.first() else {
             continue;
@@ -451,7 +506,7 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
         meta: None,
     }];
     for pane in panes {
-        let id = format!("chat::{}", pane.pane_id);
+        let id = chat_row_id(&pane.pane_instance);
         let expanded = state.is_expanded_with_default(&id, false);
         let origin = format!("{}/{}", pane.category, pane.repo);
         let mut meta = chat_meta(pane, now);
@@ -501,7 +556,7 @@ fn push_chat_row(
     now: i64,
     rows: &mut Vec<SidebarRow>,
 ) {
-    let id = format!("chat::{}", pane.pane_id);
+    let id = chat_row_id(&pane.pane_instance);
     let expanded = state.is_expanded_with_default(&id, false);
     let meta = chat_meta(pane, now);
     let label = if expanded {
@@ -530,7 +585,10 @@ fn push_chat_row(
 
 fn detail_row(pane: &AgentPane, depth: usize, suffix: &str, label: String) -> SidebarRow {
     SidebarRow {
-        id: format!("detail::{}::{suffix}", pane.pane_id),
+        id: format!(
+            "detail::{}::{}::{suffix}",
+            pane.pane_id, pane.pane_instance.pane_pid
+        ),
         kind: SidebarRowKind::Detail,
         depth,
         label,
@@ -593,7 +651,7 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
         }
     }
     rows.push(SidebarRow {
-        id: format!("jump::{}", pane.pane_id),
+        id: format!("jump::{}::{}", pane.pane_id, pane.pane_instance.pane_pid),
         kind: SidebarRowKind::Jump,
         depth,
         label: "jump".to_string(),
@@ -707,13 +765,13 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
     }
 }
 
-fn group_meta(panes: &[AgentPane], triage: &BTreeSet<String>) -> RowMeta {
+fn group_meta(panes: &[AgentPane], triage: &BTreeSet<PaneInstance>) -> RowMeta {
     RowMeta {
         attention_count: Some(
             panes
                 .iter()
                 .filter(|pane| {
-                    pane_matches_attention_filter(pane) || triage.contains(&pane.pane_id)
+                    pane_matches_attention_filter(pane) || triage.contains(&pane.pane_instance)
                 })
                 .count(),
         ),
@@ -727,6 +785,9 @@ pub fn humanize_secs(secs: i64) -> String {
         return format!("{secs}s");
     }
     let minutes = secs / 60;
+    if minutes < 10 {
+        return format!("{minutes}m{:02}s", secs % 60);
+    }
     if minutes < 60 {
         return format!("{minutes}m");
     }
@@ -774,7 +835,7 @@ fn chat_label(pane: &AgentPane) -> String {
     } else {
         format!("{agent} ({})", pane.pane_id)
     };
-    if let Some((done, total)) = parse_tasks(&pane.tasks) {
+    if let Some((done, total)) = parse_tasks(&pane.tasks).filter(|(_, total)| *total > 0) {
         format!("{base} {done}/{total}")
     } else {
         base
@@ -800,12 +861,12 @@ fn pane_matches_attention_filter(pane: &AgentPane) -> bool {
     pane.badge_state == BadgeState::Blocked
 }
 
-fn order_repo_groups(groups: &mut [Vec<AgentPane>], state: &SidebarState) {
+fn order_repo_groups(groups: &mut [Vec<AgentPane>], order: &SidebarOrderPreferences) {
     let position = |panes: &Vec<AgentPane>| -> usize {
         let Some(first) = panes.first() else {
             return usize::MAX;
         };
-        state
+        order
             .manual_order
             .iter()
             .position(|repo| repo.category == first.category && repo.repo == first.repo)
@@ -828,17 +889,17 @@ pub(crate) fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn order_agent_panes(panes: &mut [AgentPane], state: &SidebarState) {
-    panes.sort_by(|left, right| compare_agent_panes(left, right, state));
+fn order_agent_panes(panes: &mut [AgentPane], order: &SidebarOrderPreferences) {
+    panes.sort_by(|left, right| compare_agent_panes(left, right, order));
 }
 
 fn compare_agent_panes(
     left: &AgentPane,
     right: &AgentPane,
-    state: &SidebarState,
+    order: &SidebarOrderPreferences,
 ) -> std::cmp::Ordering {
     let manual_position = |pane: &AgentPane| {
-        state
+        order
             .manual_chat_order
             .iter()
             .position(|pane_id| pane_id == &pane.pane_id)
@@ -953,6 +1014,10 @@ mod tests {
 
     fn agent_pane(badge_state: BadgeState, completed_at: &str) -> AgentPane {
         AgentPane {
+            pane_instance: PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 1,
+            },
             pane_id: "%1".to_string(),
             repo: "repo".to_string(),
             category: "misc".to_string(),
@@ -977,8 +1042,11 @@ mod tests {
     #[test]
     fn humanize_secs_formats_by_magnitude() {
         assert_eq!(humanize_secs(0), "0s");
-        assert_eq!(humanize_secs(45), "45s");
-        assert_eq!(humanize_secs(60), "1m");
+        assert_eq!(humanize_secs(30), "30s");
+        assert_eq!(humanize_secs(60), "1m00s");
+        assert_eq!(humanize_secs(127), "2m07s");
+        assert_eq!(humanize_secs(599), "9m59s");
+        assert_eq!(humanize_secs(600), "10m");
         assert_eq!(humanize_secs(12 * 60 + 30), "12m");
         assert_eq!(humanize_secs(90 * 60), "1h30m");
         assert_eq!(humanize_secs(10 * 3600), "10h");
@@ -1058,12 +1126,178 @@ mod tests {
             &Config::default(),
             &[],
             &SidebarState::default(),
+            &SidebarOrderPreferences::default(),
             &RowBuildContext::default(),
-            &BTreeSet::new(),
         );
 
         assert!(rows.is_empty());
         assert_eq!(counts, BadgeCounts::default());
+    }
+
+    #[test]
+    fn grouping_sort_and_triage_follow_the_canonical_tree_order() {
+        let mut blocked = agent_pane(BadgeState::Blocked, "");
+        blocked.pane_instance = PaneInstance {
+            pane_id: "%3".to_string(),
+            pane_pid: 3,
+        };
+        blocked.pane_id = "%3".to_string();
+        blocked.repo = "zeta".to_string();
+        blocked.rollup = RollupLevel::Permission;
+
+        let mut running = agent_pane(BadgeState::Working, "");
+        running.pane_instance = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 2,
+        };
+        running.pane_id = "%2".to_string();
+        running.repo = "alpha".to_string();
+        running.rollup = RollupLevel::Running;
+
+        let mut idle = agent_pane(BadgeState::Idle, "");
+        idle.pane_instance = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 1,
+        };
+        idle.pane_id = "%1".to_string();
+        idle.repo = "alpha".to_string();
+
+        let groups = BTreeMap::from([
+            (
+                ("misc".to_string(), "zeta".to_string()),
+                vec![blocked.clone()],
+            ),
+            (
+                ("misc".to_string(), "alpha".to_string()),
+                vec![idle, running],
+            ),
+        ]);
+        let context = RowBuildContext {
+            triage: BTreeSet::from([blocked.pane_instance.clone()]),
+            now: 100,
+            ..RowBuildContext::default()
+        };
+
+        let (rows, counts) = build_rows_from_groups(
+            groups,
+            &SidebarState::default(),
+            &SidebarOrderPreferences::default(),
+            &context,
+        );
+
+        assert_eq!(rows[0].kind, SidebarRowKind::Zone);
+        assert_eq!(rows[1].id, chat_row_id(&blocked.pane_instance));
+        let repo_labels = rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Repo)
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(repo_labels, vec!["alpha"]);
+        let alpha_chats = rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Chat && row.id != rows[1].id)
+            .map(|row| row.pane_id.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(alpha_chats, vec!["%2", "%1"]);
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.attention, 1);
+    }
+
+    #[test]
+    fn pure_projection_advances_elapsed_boundary_without_snapshot_revision_change() {
+        use crate::pane_state::{
+            AgentKind, LifecycleState, PANE_STATE_SCHEMA_VERSION, PaneState, PromptState, StateId,
+            TaskState,
+        };
+
+        let pane_instance = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let canonical = PaneState {
+            schema_version: PANE_STATE_SCHEMA_VERSION,
+            state_id: StateId::parse("00112233445566778899aabbccddeeff").unwrap(),
+            revision: 1,
+            pane_instance: pane_instance.clone(),
+            agent: AgentKind::parse("codex").unwrap(),
+            agent_session_id: None,
+            agent_epoch: 1,
+            agent_present: true,
+            scan_verified: true,
+            synthetic_completion_armed: false,
+            lifecycle: LifecycleState::Running,
+            run_seq: 1,
+            completed_seq: 0,
+            acknowledged_seq: 0,
+            started_at: Some(1_000),
+            completed_at: None,
+            prompt: Some(PromptState {
+                text: "working".to_string(),
+                source: "test".to_string(),
+            }),
+            tasks: TaskState::default(),
+            subagents: Vec::new(),
+            worktree_activity: None,
+        };
+        let pane = crate::daemon::protocol::v2::PanePresentation {
+            pane_instance: pane_instance.clone(),
+            session_links: vec![crate::daemon::protocol::v2::SessionLinkPresentation {
+                session_id: "$1".to_string(),
+                session_name: "main".to_string(),
+                window_index: 0,
+                window_active: true,
+                window_last: false,
+            }],
+            window_id: "@1".to_string(),
+            window_name: "main".to_string(),
+            current_path: "/tmp/app".to_string(),
+            current_command: "codex".to_string(),
+            pane_width: 80,
+            active: true,
+            stored: Some(crate::pane_state::StoredStateDescriptor::Canonical {
+                version: canonical.version(),
+            }),
+            resolved: Some(crate::pane_state::ResolvedPaneState {
+                canonical,
+                window_id: "@1".to_string(),
+                pane_id: "%1".to_string(),
+                current_path: "/tmp/app".to_string(),
+                badge: BadgeState::Working,
+            }),
+            diagnostic: None,
+        };
+        let snapshot = crate::daemon::protocol::v2::ResolvedSnapshot {
+            snapshot_revision: 7,
+            panes: vec![pane],
+            sidebar_model: crate::daemon::SidebarModel::default(),
+            attention: Vec::new(),
+            events: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let state = SidebarState::default();
+
+        let before = project_sidebar(
+            &Config::default(),
+            &snapshot.panes,
+            &snapshot.sidebar_model,
+            &state,
+            1_059,
+        );
+        let after = project_sidebar(
+            &Config::default(),
+            &snapshot.panes,
+            &snapshot.sidebar_model,
+            &state,
+            1_060,
+        );
+        let before_text = crate::sidebar::render::render_rows(&before.rows, &state, 36);
+        let after_text = crate::sidebar::render::render_rows(&after.rows, &state, 36);
+
+        assert!(before_text.contains("59s"), "{before_text}");
+        assert!(after_text.contains("running 1m 00s"), "{after_text}");
+        assert_eq!(snapshot.snapshot_revision, 7);
+        assert_eq!(serde_json::to_vec(&snapshot).unwrap(), encoded);
     }
 
     #[test]
@@ -1078,5 +1312,12 @@ mod tests {
             chat_sort_bucket(&blocked_with_history),
             ChatSortBucket::NeedsAttention
         );
+    }
+
+    #[test]
+    fn chat_label_omits_empty_task_progress() {
+        let pane = agent_pane(BadgeState::Working, "");
+
+        assert_eq!(chat_label(&pane), "Codex (%1)");
     }
 }

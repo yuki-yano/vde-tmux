@@ -1,15 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::config::Config;
-use crate::daemon::session_badge::BadgeState;
-use crate::daemon::{SidebarFrame, TransitionEvent};
+use crate::daemon::{SidebarModel, TransitionEvent};
 use crate::git::{GitBadge, WorktreeInfo};
 pub use crate::pane_state::CanonicalStateRuntime as CanonicalPaneStateRuntime;
-use crate::sidebar::input::{SidebarCommand, SidebarInputAction, activate_selected};
-use crate::sidebar::state::{RepoId, SidebarAction, SidebarState};
-use crate::sidebar::tree::{
-    RowBuildContext, SidebarRow, SidebarRowKind, chat_row_id, now_epoch_secs, row_refs,
-};
+use crate::sidebar::state::SidebarOrderPreferences;
+use crate::sidebar::tree::now_epoch_secs;
 
 const EVENT_CAP: usize = crate::pane_state::store::MAX_DIAGNOSTICS;
 
@@ -57,7 +53,10 @@ pub(crate) struct StatusProjectionMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SessionProjectionMetadata {
-    pub category: Option<String>,
+    pub session_name: String,
+    pub stored_category: Option<String>,
+    pub project_path: String,
+    pub category_override: String,
     pub attached: Option<bool>,
     pub created_at: Option<i64>,
 }
@@ -71,22 +70,19 @@ pub(crate) struct WindowProjectionMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CanonicalSidebarEffect {
-    JumpPane(String),
-    PreviewPane { pane_id: String, history_lines: u32 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CanonicalSidebarMutationResult {
-    pub snapshot_revision: u64,
-    pub state_changed: bool,
-    pub effect: Option<CanonicalSidebarEffect>,
+    JumpPane {
+        pane_instance: crate::pane_state::PaneInstance,
+        client_pid: u32,
+        source_pane: crate::pane_state::PaneInstance,
+    },
 }
 
 pub(crate) struct CanonicalCoordinatorState {
     pub leased: LeasedCanonicalPaneStateRuntime,
     pub topology: crate::daemon::topology::TopologySnapshot,
     pub views: crate::daemon::view_hooks::ViewRegistry,
-    pub ui_state: SidebarState,
+    pub sidebar_order: SidebarOrderPreferences,
+    pub sidebar_expansion: crate::sidebar::state::SidebarExpansionPreferences,
     pub hook_health: crate::daemon::protocol::v2::HookHealth,
     pub hook_diagnostic: Option<crate::daemon::protocol::v2::DaemonDiagnostic>,
     pub global_diagnostics: VecDeque<crate::daemon::protocol::v2::DaemonDiagnostic>,
@@ -101,13 +97,14 @@ impl CanonicalCoordinatorState {
         leased: LeasedCanonicalPaneStateRuntime,
         topology: crate::daemon::topology::TopologySnapshot,
         views: crate::daemon::view_hooks::ViewRegistry,
-        ui_state: SidebarState,
+        sidebar_order: SidebarOrderPreferences,
     ) -> Self {
         Self {
             leased,
             topology,
             views,
-            ui_state,
+            sidebar_order,
+            sidebar_expansion: crate::sidebar::state::SidebarExpansionPreferences::default(),
             hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
             hook_diagnostic: None,
             global_diagnostics: VecDeque::new(),
@@ -142,7 +139,6 @@ impl CanonicalCoordinatorState {
             &self.topology,
             hook_diagnostic.as_ref(),
             &self.global_diagnostics,
-            &self.ui_state,
         );
         preflight_resolved_snapshot(&snapshot)?;
         self.leased.runtime = runtime;
@@ -173,7 +169,6 @@ impl CanonicalCoordinatorState {
             &self.topology,
             self.hook_diagnostic.as_ref(),
             &diagnostics,
-            &self.ui_state,
         );
         preflight_resolved_snapshot(&snapshot)?;
         self.leased.runtime = runtime;
@@ -249,7 +244,6 @@ impl CanonicalCoordinatorState {
             &topology,
             self.hook_diagnostic.as_ref(),
             &self.global_diagnostics,
-            &self.ui_state,
         );
         preflight_resolved_snapshot(&snapshot)?;
         self.leased.runtime = runtime;
@@ -265,32 +259,6 @@ impl CanonicalCoordinatorState {
         if self.git_badges == git_badges && self.worktrees == worktrees {
             return Ok(false);
         }
-        let now = now_epoch_secs();
-        let current = self.resolved_snapshot_with_git_at(
-            &self.leased.runtime,
-            &self.topology,
-            self.hook_diagnostic.as_ref(),
-            &self.global_diagnostics,
-            &self.ui_state,
-            &self.git_badges,
-            &self.worktrees,
-            now,
-        );
-        let candidate = self.resolved_snapshot_with_git_at(
-            &self.leased.runtime,
-            &self.topology,
-            self.hook_diagnostic.as_ref(),
-            &self.global_diagnostics,
-            &self.ui_state,
-            &git_badges,
-            &worktrees,
-            now,
-        );
-        if current.sidebar == candidate.sidebar {
-            self.git_badges = git_badges;
-            self.worktrees = worktrees;
-            return Ok(false);
-        }
         let mut runtime = self.leased.runtime.clone();
         runtime.mark_projection_changed()?;
         let snapshot = self.resolved_snapshot_with_git_at(
@@ -298,10 +266,9 @@ impl CanonicalCoordinatorState {
             &self.topology,
             self.hook_diagnostic.as_ref(),
             &self.global_diagnostics,
-            &self.ui_state,
             &git_badges,
             &worktrees,
-            now,
+            now_epoch_secs(),
         );
         preflight_resolved_snapshot(&snapshot)?;
         self.leased.runtime = runtime;
@@ -316,7 +283,6 @@ impl CanonicalCoordinatorState {
             &self.topology,
             self.hook_diagnostic.as_ref(),
             &self.global_diagnostics,
-            &self.ui_state,
         )
     }
 
@@ -334,14 +300,12 @@ impl CanonicalCoordinatorState {
         topology_snapshot: &crate::daemon::topology::TopologySnapshot,
         hook_diagnostic: Option<&crate::daemon::protocol::v2::DaemonDiagnostic>,
         global_diagnostics: &VecDeque<crate::daemon::protocol::v2::DaemonDiagnostic>,
-        ui_state: &SidebarState,
     ) -> crate::daemon::protocol::v2::ResolvedSnapshot {
         self.resolved_snapshot_with_git_from(
             runtime,
             topology_snapshot,
             hook_diagnostic,
             global_diagnostics,
-            ui_state,
             &self.git_badges,
             &self.worktrees,
         )
@@ -354,7 +318,6 @@ impl CanonicalCoordinatorState {
         topology_snapshot: &crate::daemon::topology::TopologySnapshot,
         hook_diagnostic: Option<&crate::daemon::protocol::v2::DaemonDiagnostic>,
         global_diagnostics: &VecDeque<crate::daemon::protocol::v2::DaemonDiagnostic>,
-        ui_state: &SidebarState,
         git_badges: &BTreeMap<String, GitBadge>,
         worktrees: &BTreeMap<String, WorktreeInfo>,
     ) -> crate::daemon::protocol::v2::ResolvedSnapshot {
@@ -363,7 +326,6 @@ impl CanonicalCoordinatorState {
             topology_snapshot,
             hook_diagnostic,
             global_diagnostics,
-            ui_state,
             git_badges,
             worktrees,
             now_epoch_secs(),
@@ -377,7 +339,6 @@ impl CanonicalCoordinatorState {
         topology_snapshot: &crate::daemon::topology::TopologySnapshot,
         hook_diagnostic: Option<&crate::daemon::protocol::v2::DaemonDiagnostic>,
         global_diagnostics: &VecDeque<crate::daemon::protocol::v2::DaemonDiagnostic>,
-        ui_state: &SidebarState,
         git_badges: &BTreeMap<String, GitBadge>,
         worktrees: &BTreeMap<String, WorktreeInfo>,
         now: i64,
@@ -395,15 +356,6 @@ impl CanonicalCoordinatorState {
             .values()
             .filter(|witness| witness.is_eligible())
             .map(|witness| witness.active_pane.clone())
-            .collect::<BTreeSet<_>>();
-        let current_instances = topology_snapshot
-            .panes
-            .iter()
-            .map(|pane| pane.pane_instance.clone())
-            .collect::<BTreeSet<_>>();
-        let visible_panes = visible_instances
-            .intersection(&current_instances)
-            .map(|pane| pane.pane_id.clone())
             .collect::<BTreeSet<_>>();
         let triage = runtime
             .triage_entries()
@@ -464,6 +416,7 @@ impl CanonicalCoordinatorState {
                 window_name: topology.window_name.clone(),
                 current_path: topology.current_path.clone(),
                 current_command: topology.current_command.clone(),
+                pane_width: topology.pane_width,
                 active: topology.active,
                 stored,
                 resolved,
@@ -492,26 +445,6 @@ impl CanonicalCoordinatorState {
             diagnostics.drain(..diagnostics.len() - crate::pane_state::store::MAX_DIAGNOSTICS);
         }
         let snapshot_revision = runtime.snapshot_revision();
-        let row_context = RowBuildContext {
-            git: git_badges.clone(),
-            worktrees: worktrees.clone(),
-            triage: runtime
-                .triage_panes()
-                .map(|pane| pane.pane_id.clone())
-                .collect(),
-            flash: runtime
-                .flashing_panes()
-                .map(|pane| pane.pane_id.clone())
-                .collect(),
-            now,
-        };
-        let (rows, counts) = crate::sidebar::tree::build_rows_from_presentations(
-            &self.projection_config,
-            &panes,
-            ui_state,
-            &row_context,
-            &visible_panes,
-        );
         let events = runtime
             .transitions()
             .iter()
@@ -538,10 +471,20 @@ impl CanonicalCoordinatorState {
         ResolvedSnapshot {
             snapshot_revision,
             panes,
-            sidebar: SidebarFrame {
-                state: ui_state.clone(),
-                counts,
-                rows,
+            sidebar_model: SidebarModel {
+                order: self.sidebar_order.clone(),
+                expansion: self.sidebar_expansion.clone(),
+                active_sessions: self
+                    .views
+                    .clients()
+                    .values()
+                    .filter(|witness| witness.is_eligible())
+                    .map(|witness| witness.session_id.clone())
+                    .collect(),
+                git: git_badges.clone(),
+                worktrees: worktrees.clone(),
+                needs_action: runtime.triage_panes().cloned().collect(),
+                flashing: runtime.flashing_panes().cloned().collect(),
             },
             attention,
             events,
@@ -563,7 +506,12 @@ impl CanonicalCoordinatorState {
         &self,
         context: crate::daemon::protocol::v2::StatusContext,
     ) -> crate::daemon::protocol::v2::StatusSnapshot {
-        build_status_snapshot(&self.resolved_snapshot(), context, &self.status_metadata)
+        build_status_snapshot(
+            &self.resolved_snapshot(),
+            context,
+            &self.status_metadata,
+            &self.projection_config,
+        )
     }
 
     pub fn display_projection(
@@ -578,6 +526,7 @@ impl CanonicalCoordinatorState {
             &resolved,
             crate::daemon::protocol::v2::StatusContext::Global,
             &self.status_metadata,
+            &self.projection_config,
         );
         let sessions = self
             .status_metadata
@@ -590,315 +539,64 @@ impl CanonicalCoordinatorState {
                         session_id: session_id.clone(),
                     },
                     &self.status_metadata,
+                    &self.projection_config,
                 )
             })
             .collect();
         (global, sessions, resolved.panes)
     }
 
-    pub fn apply_sidebar_key(
+    pub fn replace_sidebar_order_preferences(
         &mut self,
-        key: &str,
-    ) -> Result<CanonicalSidebarMutationResult, crate::pane_state::StoreError> {
-        let Some(action) = crate::sidebar::input::parse_key(key) else {
-            return Ok(self.sidebar_mutation_result(false, None));
-        };
-        let snapshot = self.resolved_snapshot();
-        let rows = &snapshot.sidebar.rows;
-        let row_refs = row_refs(rows);
-        let mut ui_state = self.ui_state.clone();
-        let effect = match action {
-            SidebarInputAction::MoveNext => {
-                ui_state.apply(SidebarAction::MoveNext, &row_refs);
-                None
-            }
-            SidebarInputAction::MovePrevious => {
-                ui_state.apply(SidebarAction::MovePrevious, &row_refs);
-                None
-            }
-            SidebarInputAction::ToggleExpand => {
-                ui_state.apply(SidebarAction::ToggleExpand, &row_refs);
-                None
-            }
-            SidebarInputAction::SetViewMode(view_mode) => {
-                ui_state.apply(SidebarAction::SetViewMode(view_mode), &row_refs);
-                None
-            }
-            SidebarInputAction::CycleViewMode => {
-                ui_state.apply(SidebarAction::CycleViewMode, &row_refs);
-                None
-            }
-            SidebarInputAction::SetFilter(filter) => {
-                if snapshot.sidebar.counts.filter_is_available(filter) {
-                    ui_state.set_filter(filter);
-                }
-                None
-            }
-            SidebarInputAction::ToggleFilter => {
-                let filter = next_available_filter(ui_state.filter, snapshot.sidebar.counts);
-                ui_state.set_filter(filter);
-                None
-            }
-            SidebarInputAction::ToggleRow(row_id) => {
-                if let Some(rest) = row_id
-                    .strip_prefix("detail::")
-                    .or_else(|| row_id.strip_prefix("meta::"))
-                {
-                    let pane_id = rest
-                        .split_once("::")
-                        .map(|(pane_id, _)| pane_id)
-                        .unwrap_or(rest);
-                    let chat_id = chat_row_id(pane_id);
-                    ui_state.selection = Some(chat_id.clone());
-                    ui_state.toggle_expanded(&chat_id);
-                } else {
-                    ui_state.selection = Some(row_id.clone());
-                    ui_state.toggle_expanded(&row_id);
-                }
-                None
-            }
-            SidebarInputAction::FocusNextAttention => {
-                Self::focus_sidebar_attention(&mut ui_state, rows, true);
-                None
-            }
-            SidebarInputAction::FocusPreviousAttention => {
-                Self::focus_sidebar_attention(&mut ui_state, rows, false);
-                None
-            }
-            SidebarInputAction::ReorderUp => {
-                Self::reorder_sidebar(&mut ui_state, rows, true);
-                None
-            }
-            SidebarInputAction::ReorderDown => {
-                Self::reorder_sidebar(&mut ui_state, rows, false);
-                None
-            }
-            SidebarInputAction::Activate => {
-                match activate_selected(ui_state.selection.as_deref(), rows) {
-                    Some(SidebarCommand::JumpPane(pane_id)) => {
-                        Some(CanonicalSidebarEffect::JumpPane(pane_id))
-                    }
-                    Some(SidebarCommand::ToggleExpand(row_id)) => {
-                        ui_state.selection = Some(row_id);
-                        ui_state.apply(SidebarAction::ToggleExpand, &row_refs);
-                        None
-                    }
-                    Some(SidebarCommand::PreviewPane(pane_id)) => {
-                        Some(CanonicalSidebarEffect::PreviewPane {
-                            pane_id,
-                            history_lines: self.projection_config.sidebar.preview.history_lines,
-                        })
-                    }
-                    None => None,
-                }
-            }
-        };
-        self.commit_sidebar_ui(ui_state, effect)
-    }
-
-    pub fn select_sidebar_context(
-        &mut self,
-        pane_id: Option<&str>,
-        session_id: Option<&str>,
-    ) -> Result<CanonicalSidebarMutationResult, crate::pane_state::StoreError> {
-        if pane_id.is_none() && session_id.is_none() {
-            return Ok(self.sidebar_mutation_result(false, None));
-        }
-        let snapshot = self.resolved_snapshot();
-        let mut expanded_ui = snapshot.sidebar.state.clone();
-        expanded_ui.collapsed.clear();
-        let expanded = self.resolved_snapshot_from(
-            &self.leased.runtime,
-            &self.topology,
-            self.hook_diagnostic.as_ref(),
-            &self.global_diagnostics,
-            &expanded_ui,
-        );
-        let selection = pane_id
-            .and_then(|pane_id| Self::selection_for_sidebar_pane(&snapshot, &expanded, pane_id))
-            .or_else(|| {
-                let session_id = session_id?;
-                snapshot
-                    .panes
-                    .iter()
-                    .filter(|pane| {
-                        pane.resolved.is_some()
-                            && pane
-                                .session_links
-                                .iter()
-                                .any(|link| link.session_id == session_id)
-                    })
-                    .find_map(|pane| {
-                        Self::selection_for_sidebar_pane(
-                            &snapshot,
-                            &expanded,
-                            &pane.pane_instance.pane_id,
-                        )
-                    })
-            });
-        let Some(selection) = selection else {
-            return Ok(self.sidebar_mutation_result(false, None));
-        };
-        if self.ui_state.selection.as_deref() == Some(selection.as_str()) {
-            return Ok(self.sidebar_mutation_result(false, None));
-        }
-        let mut ui_state = self.ui_state.clone();
-        ui_state.selection = Some(selection);
-        ui_state.version = ui_state.version.checked_add(1).ok_or(
-            crate::pane_state::StoreError::CounterOverflow("sidebar state version"),
-        )?;
-        self.commit_sidebar_ui(ui_state, None)
-    }
-
-    fn focus_sidebar_attention(ui_state: &mut SidebarState, rows: &[SidebarRow], forward: bool) {
-        let blocked = rows
-            .iter()
-            .filter(|row| {
-                row.kind == SidebarRowKind::Chat && row.badge_state == Some(BadgeState::Blocked)
-            })
-            .map(|row| row.id.as_str())
-            .collect::<Vec<_>>();
-        if blocked.is_empty() {
-            return;
-        }
-        let current = ui_state
-            .selection
-            .as_deref()
-            .and_then(|id| blocked.iter().position(|blocked_id| *blocked_id == id));
-        let next = match (current, forward) {
-            (None, true) => 0,
-            (None, false) => blocked.len() - 1,
-            (Some(index), true) => (index + 1) % blocked.len(),
-            (Some(index), false) => (index + blocked.len() - 1) % blocked.len(),
-        };
-        let next_id = blocked[next].to_string();
-        if ui_state.selection.as_deref() != Some(next_id.as_str()) {
-            ui_state.selection = Some(next_id);
-            ui_state.version += 1;
-        }
-    }
-
-    fn reorder_sidebar(ui_state: &mut SidebarState, rows: &[SidebarRow], up: bool) {
-        let selection = ui_state.selection.as_deref();
-        let selected = selection.and_then(|selection| rows.iter().find(|row| row.id == selection));
-        if let Some(pane_id) = selected
-            .filter(|row| row.kind == SidebarRowKind::Chat)
-            .and_then(|row| row.pane_id.clone())
-        {
-            for pane_id in rows
-                .iter()
-                .filter(|row| row.kind == SidebarRowKind::Chat)
-                .filter_map(|row| row.pane_id.as_deref())
-            {
-                if !ui_state
-                    .manual_chat_order
-                    .iter()
-                    .any(|existing| existing == pane_id)
-                {
-                    ui_state.manual_chat_order.push(pane_id.to_string());
-                    ui_state.version += 1;
-                }
-            }
-            if up {
-                ui_state.manual_chat_move_up(&pane_id);
-            } else {
-                ui_state.manual_chat_move_down(&pane_id);
-            }
-            return;
-        }
-        let Some(repo) = selected
-            .filter(|row| row.kind == SidebarRowKind::Repo)
-            .and_then(|row| RepoId::from_row_id(&row.id))
-        else {
-            return;
-        };
-        for repo in rows
-            .iter()
-            .filter(|row| row.kind == SidebarRowKind::Repo)
-            .filter_map(|row| RepoId::from_row_id(&row.id))
-        {
-            if !ui_state.manual_order.contains(&repo) {
-                ui_state.manual_order.push(repo);
-                ui_state.version += 1;
-            }
-        }
-        if up {
-            ui_state.apply(SidebarAction::ReorderUp(repo), &[]);
-        } else {
-            ui_state.apply(SidebarAction::ReorderDown(repo), &[]);
-        }
-    }
-
-    fn selection_for_sidebar_pane(
-        snapshot: &crate::daemon::protocol::v2::ResolvedSnapshot,
-        expanded: &crate::daemon::protocol::v2::ResolvedSnapshot,
-        pane_id: &str,
-    ) -> Option<String> {
-        snapshot
-            .panes
-            .iter()
-            .find(|pane| pane.pane_instance.pane_id == pane_id && pane.resolved.is_some())?;
-        if let Some(row) =
-            snapshot.sidebar.rows.iter().find(|row| {
-                row.kind == SidebarRowKind::Chat && row.pane_id.as_deref() == Some(pane_id)
-            })
-        {
-            return Some(row.id.clone());
-        }
-        let chat_index = expanded.sidebar.rows.iter().position(|row| {
-            row.kind == SidebarRowKind::Chat && row.pane_id.as_deref() == Some(pane_id)
-        })?;
-        let mut depth = expanded.sidebar.rows[chat_index].depth;
-        for row in expanded.sidebar.rows[..chat_index].iter().rev() {
-            if row.depth >= depth {
-                continue;
-            }
-            depth = row.depth;
-            if snapshot
-                .sidebar
-                .rows
-                .iter()
-                .any(|visible| visible.id == row.id)
-            {
-                return Some(row.id.clone());
-            }
-        }
-        None
-    }
-
-    fn commit_sidebar_ui(
-        &mut self,
-        ui_state: SidebarState,
-        effect: Option<CanonicalSidebarEffect>,
-    ) -> Result<CanonicalSidebarMutationResult, crate::pane_state::StoreError> {
-        if ui_state == self.ui_state {
-            return Ok(self.sidebar_mutation_result(false, effect));
+        order: SidebarOrderPreferences,
+    ) -> Result<bool, crate::pane_state::StoreError> {
+        order
+            .validate()
+            .map_err(crate::pane_state::StoreError::Random)?;
+        if self.sidebar_order == order {
+            return Ok(false);
         }
         let mut runtime = self.leased.runtime.clone();
         runtime.mark_projection_changed()?;
+        let previous = std::mem::replace(&mut self.sidebar_order, order);
         let snapshot = self.resolved_snapshot_from(
             &runtime,
             &self.topology,
             self.hook_diagnostic.as_ref(),
             &self.global_diagnostics,
-            &ui_state,
         );
+        self.sidebar_order = previous;
         preflight_resolved_snapshot(&snapshot)?;
         self.leased.runtime = runtime;
-        self.ui_state = ui_state;
-        Ok(self.sidebar_mutation_result(true, effect))
+        self.sidebar_order = snapshot.sidebar_model.order;
+        Ok(true)
     }
 
-    fn sidebar_mutation_result(
-        &self,
-        state_changed: bool,
-        effect: Option<CanonicalSidebarEffect>,
-    ) -> CanonicalSidebarMutationResult {
-        CanonicalSidebarMutationResult {
-            snapshot_revision: self.leased.runtime.snapshot_revision(),
-            state_changed,
-            effect,
+    pub fn replace_sidebar_expansion_preferences(
+        &mut self,
+        expansion: crate::sidebar::state::SidebarExpansionPreferences,
+    ) -> Result<bool, crate::pane_state::StoreError> {
+        expansion
+            .validate()
+            .map_err(crate::pane_state::StoreError::Random)?;
+        if self.sidebar_expansion == expansion {
+            return Ok(false);
         }
+        let mut runtime = self.leased.runtime.clone();
+        runtime.mark_projection_changed()?;
+        let previous = std::mem::replace(&mut self.sidebar_expansion, expansion);
+        let snapshot = self.resolved_snapshot_from(
+            &runtime,
+            &self.topology,
+            self.hook_diagnostic.as_ref(),
+            &self.global_diagnostics,
+        );
+        if let Err(error) = preflight_resolved_snapshot(&snapshot) {
+            self.sidebar_expansion = previous;
+            return Err(error);
+        }
+        self.leased.runtime = runtime;
+        Ok(true)
     }
 
     pub fn replace_status_metadata(
@@ -915,13 +613,13 @@ impl CanonicalCoordinatorState {
             &self.topology,
             self.hook_diagnostic.as_ref(),
             &self.global_diagnostics,
-            &self.ui_state,
         );
         preflight_resolved_snapshot(&resolved)?;
         let status = build_status_snapshot(
             &resolved,
             crate::daemon::protocol::v2::StatusContext::Global,
             &metadata,
+            &self.projection_config,
         );
         preflight_status_snapshot(&status)?;
         self.leased.runtime = runtime;
@@ -941,6 +639,7 @@ pub(crate) fn build_status_snapshot(
     resolved: &crate::daemon::protocol::v2::ResolvedSnapshot,
     context: crate::daemon::protocol::v2::StatusContext,
     metadata: &StatusProjectionMetadata,
+    config: &Config,
 ) -> crate::daemon::protocol::v2::StatusSnapshot {
     use crate::daemon::protocol::v2::{
         CategoryStatusPresentation, SessionStatusPresentation, StatusContext, StatusSnapshot,
@@ -989,10 +688,41 @@ pub(crate) fn build_status_snapshot(
         }
     }
 
-    for session_id in metadata.sessions.keys() {
-        session_names.entry(session_id.clone()).or_default();
+    for (session_id, session) in &metadata.sessions {
+        session_names
+            .entry(session_id.clone())
+            .or_insert_with(|| session.session_name.clone());
         session_panes.entry(session_id.clone()).or_default();
     }
+
+    let effective_categories = session_names
+        .iter()
+        .map(|(session_id, topology_name)| {
+            let projection = metadata.sessions.get(session_id);
+            let session = crate::session::SessionInfo {
+                name: projection
+                    .map(|session| session.session_name.as_str())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(topology_name)
+                    .to_string(),
+                category: projection
+                    .and_then(|session| session.stored_category.clone())
+                    .unwrap_or_default(),
+                project_path: projection
+                    .map(|session| session.project_path.clone())
+                    .unwrap_or_default(),
+                category_override: projection
+                    .map(|session| session.category_override.clone())
+                    .unwrap_or_default(),
+                id: session_id.clone(),
+                ..crate::session::SessionInfo::default()
+            };
+            (
+                session_id.clone(),
+                crate::category::resolve_category_for_session(config, &session),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let summary =
         crate::daemon::session_badge::BadgeStateCounts::from_states(pane_badges.values().copied());
@@ -1009,19 +739,22 @@ pub(crate) fn build_status_snapshot(
         StatusContext::Global => None,
         StatusContext::Session { session_id } => Some(session_id.as_str()),
     };
-    let active_category = active_session_id
-        .and_then(|session_id| metadata.sessions.get(session_id))
-        .and_then(|session| session.category.as_deref());
+    let active_category = active_session_id.map(|session_id| {
+        effective_categories
+            .get(session_id)
+            .map(String::as_str)
+            .unwrap_or_default()
+    });
 
     let mut sessions = session_names
         .into_iter()
         .filter(|(session_id, _)| match active_category {
             Some(category) => {
-                metadata
-                    .sessions
+                effective_categories
                     .get(session_id)
-                    .and_then(|session| session.category.as_deref())
-                    == Some(category)
+                    .map(String::as_str)
+                    .unwrap_or_default()
+                    == category
             }
             None => true,
         })
@@ -1030,7 +763,12 @@ pub(crate) fn build_status_snapshot(
             SessionStatusPresentation {
                 counts: counts_for(session_panes.get(&session_id)),
                 active: active_session_id == Some(session_id.as_str()),
-                category: session_metadata.and_then(|session| session.category.clone()),
+                category: Some(
+                    effective_categories
+                        .get(&session_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
                 attached: session_metadata.and_then(|session| session.attached),
                 created_at: session_metadata.and_then(|session| session.created_at),
                 session_id,
@@ -1096,22 +834,22 @@ pub(crate) fn build_status_snapshot(
             .then_with(|| left.window_id.cmp(&right.window_id))
     });
 
-    let mut category_names = metadata.categories.clone();
-    category_names.extend(
-        metadata
-            .sessions
-            .values()
-            .filter_map(|session| session.category.clone()),
-    );
+    let category_names = effective_categories
+        .values()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut categories = category_names
         .into_iter()
         .map(|category| {
             let mut category_panes = BTreeSet::new();
-            let mut session_ids = metadata
-                .sessions
-                .iter()
-                .filter_map(|(session_id, session)| {
-                    (session.category.as_deref() == Some(category.as_str()))
+            let mut session_ids = effective_categories
+                .keys()
+                .filter_map(|session_id| {
+                    (effective_categories
+                        .get(session_id)
+                        .map(String::as_str)
+                        .unwrap_or_default()
+                        == category)
                         .then_some(session_id.clone())
                 })
                 .collect::<Vec<_>>();
@@ -1129,7 +867,28 @@ pub(crate) fn build_status_snapshot(
             }
         })
         .collect::<Vec<_>>();
-    categories.sort_by(|left, right| left.category.cmp(&right.category));
+    categories.sort_by(|left, right| {
+        left.category
+            .is_empty()
+            .cmp(&right.category.is_empty())
+            .then_with(|| {
+                config
+                    .categories
+                    .order
+                    .get(&left.category)
+                    .copied()
+                    .unwrap_or(i64::MAX)
+                    .cmp(
+                        &config
+                            .categories
+                            .order
+                            .get(&right.category)
+                            .copied()
+                            .unwrap_or(i64::MAX),
+                    )
+            })
+            .then_with(|| left.category.cmp(&right.category))
+    });
 
     StatusSnapshot {
         snapshot_revision: resolved.snapshot_revision,
@@ -1146,6 +905,12 @@ fn preflight_resolved_snapshot(
     snapshot: &crate::daemon::protocol::v2::ResolvedSnapshot,
 ) -> Result<(), crate::pane_state::StoreError> {
     for pane in &snapshot.panes {
+        if pane.pane_width == 0 {
+            return Err(crate::pane_state::StoreError::FailStop(format!(
+                "projection invariant violated for {}: pane width must be positive",
+                pane.pane_instance.pane_id
+            )));
+        }
         if let (
             Some(crate::pane_state::StoredStateDescriptor::Canonical { version }),
             Some(resolved),
@@ -1226,23 +991,12 @@ fn preflight_status_snapshot(
     Ok(())
 }
 
-fn next_available_filter(
-    current: crate::sidebar::state::StatusFilter,
-    counts: crate::sidebar::tree::BadgeCounts,
-) -> crate::sidebar::state::StatusFilter {
-    let mut next = current.next();
-    while !counts.filter_is_available(next) {
-        next = next.next();
-    }
-    next
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::DoneClearOn;
+    use crate::daemon::session_badge::BadgeState;
     use crate::sidebar::state::SidebarState;
-    use crate::sidebar::tree::BadgeCounts;
     use std::time::Duration;
 
     #[test]
@@ -1290,7 +1044,7 @@ mod tests {
                 panes: Vec::new(),
             },
             crate::daemon::view_hooks::ViewRegistry::default(),
-            SidebarState::default(),
+            SidebarOrderPreferences::default(),
         );
 
         assert!(
@@ -1408,6 +1162,7 @@ mod tests {
             window_name: window_name.to_string(),
             current_path: "/tmp".to_string(),
             current_command: if resolved.is_some() { "codex" } else { "zsh" }.to_string(),
+            pane_width: 80,
             active,
             stored: resolved.as_ref().map(|resolved| {
                 crate::pane_state::StoredStateDescriptor::Canonical {
@@ -1419,9 +1174,7 @@ mod tests {
         }
     }
 
-    fn canonical_sidebar_fixture(
-        ui_state: SidebarState,
-    ) -> (CanonicalCoordinatorState, std::path::PathBuf) {
+    fn canonical_sidebar_fixture() -> (CanonicalCoordinatorState, std::path::PathBuf) {
         use crate::pane_state::{
             AgentKind, LifecycleState, PANE_STATE_SCHEMA_VERSION, PaneInstance, PaneState,
             PromptState, RawPaneRecord, StateId, StoredPaneRecord, TaskState, WaitReason,
@@ -1498,6 +1251,7 @@ mod tests {
                 } else {
                     "codex".to_string()
                 },
+                pane_width: 80,
                 active: true,
             }
         };
@@ -1517,7 +1271,7 @@ mod tests {
                 leased,
                 topology,
                 crate::daemon::view_hooks::ViewRegistry::default(),
-                ui_state,
+                SidebarOrderPreferences::default(),
             ),
             root,
         )
@@ -1645,7 +1399,7 @@ mod tests {
     fn resolved_history_keeps_discarded_completion_under_the_old_agent_and_time() {
         use crate::pane_state::{AgentSessionSource, PaneEvent, StoredPaneRecord};
 
-        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
+        let (mut state, root) = canonical_sidebar_fixture();
         state.leased.runtime = CanonicalPaneStateRuntime::default();
         apply_history_event(
             &mut state,
@@ -1697,7 +1451,7 @@ mod tests {
     fn resolved_history_keeps_same_agent_previous_session_completion_time() {
         use crate::pane_state::{AgentSessionSource, PaneEvent, StoredPaneRecord};
 
-        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
+        let (mut state, root) = canonical_sidebar_fixture();
         state.leased.runtime = CanonicalPaneStateRuntime::default();
         apply_history_event(
             &mut state,
@@ -1755,7 +1509,7 @@ mod tests {
     fn resolved_history_retains_the_latest_256_transitions() {
         use crate::pane_state::{AgentSessionSource, PaneEvent};
 
-        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
+        let (mut state, root) = canonical_sidebar_fixture();
         state.leased.runtime = CanonicalPaneStateRuntime::default();
         for observed_at in 1..=257 {
             apply_history_event(
@@ -1781,7 +1535,7 @@ mod tests {
 
     #[test]
     fn canonical_git_projection_is_atomic_and_changes_revision_only_for_new_values() {
-        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
+        let (mut state, root) = canonical_sidebar_fixture();
         let badges = BTreeMap::from([(
             "/tmp/alpha".to_string(),
             GitBadge {
@@ -1796,11 +1550,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(state.leased.runtime.snapshot_revision(), 1);
-        assert!(state.resolved_snapshot().sidebar.rows.iter().any(|row| {
-            row.git
-                .as_ref()
-                .is_some_and(|git| git.branch == "main" && git.ahead == 1)
-        }));
+        assert_eq!(state.resolved_snapshot().sidebar_model.git, badges);
         assert!(
             !state
                 .replace_git_projection(badges.clone(), BTreeMap::new())
@@ -1818,12 +1568,12 @@ mod tests {
             },
         );
         assert!(
-            !state
+            state
                 .replace_git_projection(cache_only.clone(), BTreeMap::new())
                 .unwrap()
         );
         assert_eq!(state.git_badges, cache_only);
-        assert_eq!(state.leased.runtime.snapshot_revision(), 1);
+        assert_eq!(state.leased.runtime.snapshot_revision(), 2);
 
         let oversized = BTreeMap::from([(
             "/tmp/alpha".to_string(),
@@ -1839,7 +1589,15 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(state.git_badges, oversized);
-        assert_eq!(state.leased.runtime.snapshot_revision(), 2);
+        assert_eq!(state.leased.runtime.snapshot_revision(), 3);
+        let message = crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+            snapshot_revision: 3,
+            snapshot: state.resolved_snapshot(),
+        };
+        assert!(
+            serde_json::to_vec(&message).unwrap().len()
+                > crate::pane_state::MAX_RESPONSE_FRAME_BYTES
+        );
         remove_canonical_sidebar_fixture(state, root);
     }
 
@@ -1847,8 +1605,16 @@ mod tests {
     fn canonical_attention_is_sorted_and_uses_full_pane_identity_for_visibility() {
         use crate::pane_state::{ClientWitness, PaneInstance, WaitReason};
 
-        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
+        let (mut state, root) = canonical_sidebar_fixture();
         state.leased.runtime = CanonicalPaneStateRuntime::default();
+        let second = state
+            .topology
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_instance.pane_id == "%2")
+            .unwrap();
+        second.window_id = "@1".to_string();
+        second.session_links = vec![status_link("$1", "main", 0, true)];
         let now = now_epoch_secs();
         apply_waiting_state(
             &mut state,
@@ -1907,17 +1673,14 @@ mod tests {
                 .iter()
                 .any(|entry| entry.pane_instance.pane_id == "%1")
         );
-        assert!(
-            stale_snapshot
-                .sidebar
-                .rows
-                .iter()
-                .all(|row| { row.pane_id.as_deref() != Some("%1") || !row.active })
-        );
 
         let current = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 101,
+        };
+        let non_focus_split = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 102,
         };
         state
             .views
@@ -1930,7 +1693,7 @@ mod tests {
                     control_mode: false,
                     active_pane_flag: false,
                 }],
-                &BTreeMap::from([("@1".to_string(), vec![current])]),
+                &BTreeMap::from([("@1".to_string(), vec![current, non_focus_split])]),
             )
             .unwrap();
         assert!(
@@ -1940,144 +1703,51 @@ mod tests {
                 .iter()
                 .all(|entry| entry.pane_instance.pane_id != "%1")
         );
-        remove_canonical_sidebar_fixture(state, root);
-    }
-
-    #[test]
-    fn canonical_sidebar_key_changes_state_and_revision_once_while_noop_is_stable() {
-        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
-        let result = state.apply_sidebar_key("j").unwrap();
-        assert!(result.state_changed);
-        assert_eq!(result.snapshot_revision, 1);
-        assert_eq!(result.effect, None);
-        assert_eq!(state.resolved_snapshot().snapshot_revision, 1);
-        assert!(state.ui_state.selection.is_some());
-
-        let before = state.ui_state.clone();
-        let result = state.apply_sidebar_key("unknown").unwrap();
-        assert!(!result.state_changed);
-        assert_eq!(result.snapshot_revision, 1);
-        assert_eq!(state.ui_state, before);
-        remove_canonical_sidebar_fixture(state, root);
-    }
-
-    #[test]
-    fn canonical_sidebar_activate_returns_typed_jump_and_preview_without_revision_change() {
-        let jump_ui = SidebarState {
-            selection: Some("chat::%1".to_string()),
-            ..SidebarState::default()
-        };
-        let (mut jump, jump_root) = canonical_sidebar_fixture(jump_ui);
-        let result = jump.apply_sidebar_key("enter").unwrap();
-        assert_eq!(
-            result.effect,
-            Some(CanonicalSidebarEffect::JumpPane("%1".to_string()))
-        );
-        assert!(!result.state_changed);
-        assert_eq!(result.snapshot_revision, 0);
-        remove_canonical_sidebar_fixture(jump, jump_root);
-
-        let preview_ui = SidebarState {
-            selection: Some("detail::%1::prompt".to_string()),
-            collapsed: BTreeSet::from(["chat::%1".to_string()]),
-            ..SidebarState::default()
-        };
-        let (mut preview, preview_root) = canonical_sidebar_fixture(preview_ui);
-        let result = preview.apply_sidebar_key("enter").unwrap();
-        assert_eq!(
-            result.effect,
-            Some(CanonicalSidebarEffect::PreviewPane {
-                pane_id: "%1".to_string(),
-                history_lines: preview.projection_config.sidebar.preview.history_lines,
-            })
-        );
-        assert!(!result.state_changed);
-        assert_eq!(result.snapshot_revision, 0);
-        remove_canonical_sidebar_fixture(preview, preview_root);
-    }
-
-    #[test]
-    fn canonical_sidebar_attention_and_reorder_use_resolved_sidebar_rows() {
-        let (mut attention, attention_root) = canonical_sidebar_fixture(SidebarState::default());
-        attention.apply_sidebar_key("n").unwrap();
-        assert_eq!(attention.ui_state.selection.as_deref(), Some("chat::%1"));
-        attention.apply_sidebar_key("n").unwrap();
-        assert_eq!(attention.ui_state.selection.as_deref(), Some("chat::%2"));
-        assert_eq!(attention.leased.runtime.snapshot_revision(), 2);
-        remove_canonical_sidebar_fixture(attention, attention_root);
-
-        let reorder_ui = SidebarState {
-            selection: Some("repo::misc::beta".to_string()),
-            ..SidebarState::default()
-        };
-        let (mut reorder, reorder_root) = canonical_sidebar_fixture(reorder_ui);
-        let result = reorder.apply_sidebar_key("K").unwrap();
-        assert!(result.state_changed);
-        assert_eq!(result.snapshot_revision, 1);
-        assert_eq!(
-            reorder.ui_state.manual_order,
-            vec![RepoId::new("misc", "beta"), RepoId::new("misc", "alpha")]
-        );
-        remove_canonical_sidebar_fixture(reorder, reorder_root);
-    }
-
-    #[test]
-    fn canonical_select_context_uses_pane_and_structured_session_ids() {
-        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
-        let result = state
-            .select_sidebar_context(Some("%2"), Some("$1"))
-            .unwrap();
-        assert!(result.state_changed);
-        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%2"));
-
-        let result = state
-            .select_sidebar_context(Some("%shell"), Some("$1"))
-            .unwrap();
-        assert!(result.state_changed);
-        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
-
-        let before_revision = state.leased.runtime.snapshot_revision();
-        let result = state
-            .select_sidebar_context(Some("%shell"), Some("main"))
-            .unwrap();
-        assert!(!result.state_changed);
-        assert_eq!(result.snapshot_revision, before_revision);
-        assert_eq!(state.ui_state.selection.as_deref(), Some("chat::%1"));
-        remove_canonical_sidebar_fixture(state, root);
-    }
-
-    #[test]
-    fn canonical_select_context_uses_visible_group_for_collapsed_chat() {
-        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
-        state.apply_sidebar_key("toggle:repo::misc::alpha").unwrap();
-        state.apply_sidebar_key("j").unwrap();
         assert!(
-            !state
+            state
                 .resolved_snapshot()
-                .sidebar
-                .rows
+                .attention
                 .iter()
-                .any(|row| row.id == "chat::%1")
-        );
-        let result = state.select_sidebar_context(Some("%1"), None).unwrap();
-        assert!(result.state_changed);
-        assert_eq!(
-            state.ui_state.selection.as_deref(),
-            Some("repo::misc::alpha")
+                .any(|entry| entry.pane_instance.pane_id == "%2"),
+            "a blocked non-focus split in the same window remains attention-worthy"
         );
         remove_canonical_sidebar_fixture(state, root);
     }
 
     #[test]
-    fn oversized_sidebar_projection_commits_for_typed_frame_too_large_publish() {
-        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
-        let key = format!(
-            "toggle:{}",
-            "x".repeat(crate::pane_state::MAX_RESPONSE_FRAME_BYTES)
+    fn resolved_snapshot_tracks_the_session_of_each_eligible_client() {
+        use crate::pane_state::ClientWitness;
+
+        let (mut state, root) = canonical_sidebar_fixture();
+        let pane = state.topology.panes[0].pane_instance.clone();
+        let window_id = state.topology.panes[0].window_id.clone();
+        let window_panes = BTreeMap::from([(window_id.clone(), vec![pane.clone()])]);
+        let witness = |session_id: &str| ClientWitness {
+            client_pid: 10,
+            session_id: session_id.to_string(),
+            window_id: window_id.clone(),
+            active_pane: pane.clone(),
+            control_mode: false,
+            active_pane_flag: false,
+        };
+
+        state
+            .views
+            .reconcile(&[witness("$1")], &window_panes)
+            .unwrap();
+        assert_eq!(
+            state.resolved_snapshot().sidebar_model.active_sessions,
+            BTreeSet::from(["$1".to_string()])
         );
-        let result = state.apply_sidebar_key(&key).unwrap();
-        assert!(result.state_changed);
-        assert_eq!(state.leased.runtime.snapshot_revision(), 1);
+
+        state
+            .views
+            .reconcile(&[witness("$2")], &window_panes)
+            .unwrap();
+        assert_eq!(
+            state.resolved_snapshot().sidebar_model.active_sessions,
+            BTreeSet::from(["$2".to_string()])
+        );
         remove_canonical_sidebar_fixture(state, root);
     }
 
@@ -2115,11 +1785,7 @@ mod tests {
         crate::daemon::protocol::v2::ResolvedSnapshot {
             snapshot_revision: 42,
             panes: vec![first.clone(), second, non_agent],
-            sidebar: SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts::default(),
-                rows: Vec::new(),
-            },
+            sidebar_model: SidebarModel::default(),
             attention: vec![crate::daemon::protocol::v2::AttentionEntry {
                 pane_instance: first.pane_instance,
                 session_name: "main".to_string(),
@@ -2136,6 +1802,11 @@ mod tests {
     fn resolved_snapshot_preflight_requires_full_canonical_version_match() {
         let valid = status_resolved_snapshot();
         preflight_resolved_snapshot(&valid).unwrap();
+
+        let mut zero_width = valid.clone();
+        zero_width.panes[0].pane_width = 0;
+        let error = preflight_resolved_snapshot(&zero_width).unwrap_err();
+        assert!(error.to_string().contains("pane width must be positive"));
 
         for changed_field in ["state_id", "agent_epoch", "revision"] {
             let mut mismatched = valid.clone();
@@ -2164,7 +1835,7 @@ mod tests {
 
     #[test]
     fn checked_snapshot_rejects_unresolved_present_canonical_state() {
-        let (state, root) = canonical_sidebar_fixture(SidebarState::default());
+        let (state, root) = canonical_sidebar_fixture();
         state.checked_resolved_snapshot().unwrap();
         let mut invalid = state.resolved_snapshot();
         invalid.panes[0].resolved = None;
@@ -2184,17 +1855,21 @@ mod tests {
                 (
                     "$1".to_string(),
                     SessionProjectionMetadata {
-                        category: Some("work".to_string()),
+                        session_name: "main".to_string(),
+                        stored_category: Some("work".to_string()),
                         attached: Some(true),
                         created_at: Some(10),
+                        ..SessionProjectionMetadata::default()
                     },
                 ),
                 (
                     "$2".to_string(),
                     SessionProjectionMetadata {
-                        category: Some("work".to_string()),
+                        session_name: "mirror".to_string(),
+                        stored_category: Some("work".to_string()),
                         attached: Some(false),
                         created_at: Some(20),
+                        ..SessionProjectionMetadata::default()
                     },
                 ),
             ]),
@@ -2211,7 +1886,7 @@ mod tests {
 
     #[test]
     fn display_projection_builds_every_surface_from_one_resolved_revision() {
-        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
+        let (mut state, root) = canonical_sidebar_fixture();
         state.status_metadata = StatusProjectionMetadata {
             sessions: BTreeMap::from([
                 ("$2".to_string(), SessionProjectionMetadata::default()),
@@ -2255,23 +1930,29 @@ mod tests {
             pane.resolved.as_ref().map(|pane| pane.badge),
             Some(expected)
         );
-        assert_eq!(resolved.sidebar.counts.total, 1);
-        assert_eq!(resolved.sidebar.counts.blocked, 0);
+        let projection = crate::sidebar::tree::project_sidebar(
+            &state.projection_config,
+            &resolved.panes,
+            &resolved.sidebar_model,
+            &SidebarState::default(),
+            now_epoch_secs(),
+        );
+        assert_eq!(projection.counts.total, 1);
+        assert_eq!(projection.counts.blocked, 0);
         assert_eq!(
-            resolved.sidebar.counts.working,
+            projection.counts.working,
             usize::from(expected == BadgeState::Working)
         );
         assert_eq!(
-            resolved.sidebar.counts.done,
+            projection.counts.done,
             usize::from(expected == BadgeState::Done)
         );
         assert_eq!(
-            resolved.sidebar.counts.idle,
+            projection.counts.idle,
             usize::from(expected == BadgeState::Idle)
         );
         assert!(
-            resolved
-                .sidebar
+            projection
                 .rows
                 .iter()
                 .any(|row| row.badge_state == Some(expected))
@@ -2282,6 +1963,7 @@ mod tests {
             &resolved,
             crate::daemon::protocol::v2::StatusContext::Global,
             &state.status_metadata,
+            &state.projection_config,
         );
         let expected_counts =
             crate::daemon::session_badge::BadgeStateCounts::from_states([expected]);
@@ -2320,16 +2002,18 @@ mod tests {
     fn done_focus_idle_focus_out_next_completion_is_consistent_across_all_surfaces() {
         use crate::pane_state::{PaneEvent, StoredPaneRecord};
 
-        let (mut state, root) = canonical_sidebar_fixture(SidebarState::default());
+        let (mut state, root) = canonical_sidebar_fixture();
         state.leased.runtime = CanonicalPaneStateRuntime::default();
         state.status_metadata = StatusProjectionMetadata {
             categories: BTreeSet::from(["work".to_string()]),
             sessions: BTreeMap::from([(
                 "$1".to_string(),
                 SessionProjectionMetadata {
-                    category: Some("work".to_string()),
+                    session_name: "main".to_string(),
+                    stored_category: Some("work".to_string()),
                     attached: Some(true),
                     created_at: Some(1),
+                    ..SessionProjectionMetadata::default()
                 },
             )]),
             windows: BTreeMap::new(),
@@ -2412,6 +2096,7 @@ mod tests {
             &status_resolved_snapshot(),
             crate::daemon::protocol::v2::StatusContext::Global,
             &status_metadata(),
+            &Config::default(),
         );
 
         assert_eq!(snapshot.snapshot_revision, 42);
@@ -2464,13 +2149,121 @@ mod tests {
         assert_eq!(work.counts.blocked, 1);
         assert_eq!(work.counts.working, 1);
         assert_eq!(work.counts.total(), 2);
-        let empty = snapshot
-            .categories
-            .iter()
-            .find(|category| category.category == "empty")
-            .unwrap();
-        assert_eq!(empty.counts.total(), 0);
+        assert!(
+            snapshot
+                .categories
+                .iter()
+                .all(|category| category.category != "empty")
+        );
         assert_eq!(snapshot.attention, status_resolved_snapshot().attention);
+    }
+
+    #[test]
+    fn status_snapshot_orders_sessions_by_case_sensitive_unicode_name() {
+        let mut resolved = status_resolved_snapshot();
+        resolved.panes.clear();
+        resolved.attention.clear();
+        let names = ["a2", "日本", "a10", "a", "A"];
+        let metadata = StatusProjectionMetadata {
+            sessions: names
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    (
+                        format!("${}", index + 1),
+                        SessionProjectionMetadata {
+                            session_name: name.to_string(),
+                            stored_category: Some("work".to_string()),
+                            ..SessionProjectionMetadata::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..StatusProjectionMetadata::default()
+        };
+
+        let snapshot = build_status_snapshot(
+            &resolved,
+            crate::daemon::protocol::v2::StatusContext::Global,
+            &metadata,
+            &Config::default(),
+        );
+
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .map(|session| session.session_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "a", "a10", "a2", "日本"]
+        );
+    }
+
+    #[test]
+    fn effective_category_filters_current_sessions_and_omits_config_only_empty_category() {
+        let mut resolved = status_resolved_snapshot();
+        resolved.panes.clear();
+        resolved.attention.clear();
+        let mut config = Config::default();
+        config
+            .categories
+            .order
+            .insert("empty-config-only".to_string(), 0);
+        config.categories.default_category = Some("misc".to_string());
+        let metadata = StatusProjectionMetadata {
+            categories: BTreeSet::from(["empty-config-only".to_string()]),
+            sessions: BTreeMap::from([
+                (
+                    "$1".to_string(),
+                    SessionProjectionMetadata {
+                        session_name: "private".to_string(),
+                        stored_category: Some("stale".to_string()),
+                        project_path: "/repo".to_string(),
+                        category_override: "private".to_string(),
+                        ..SessionProjectionMetadata::default()
+                    },
+                ),
+                (
+                    "$2".to_string(),
+                    SessionProjectionMetadata {
+                        session_name: "uncategorized".to_string(),
+                        ..SessionProjectionMetadata::default()
+                    },
+                ),
+            ]),
+            ..StatusProjectionMetadata::default()
+        };
+
+        let snapshot = build_status_snapshot(
+            &resolved,
+            crate::daemon::protocol::v2::StatusContext::Session {
+                session_id: "$1".to_string(),
+            },
+            &metadata,
+            &config,
+        );
+
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].session_id, "$1");
+        assert_eq!(snapshot.sessions[0].category.as_deref(), Some("private"));
+        assert!(
+            snapshot
+                .categories
+                .iter()
+                .all(|category| category.category != "empty-config-only")
+        );
+        assert!(
+            snapshot
+                .categories
+                .iter()
+                .any(|category| { category.category == "private" && category.active })
+        );
+        assert!(
+            snapshot
+                .categories
+                .iter()
+                .any(|category| { category.category == "misc" && !category.active })
+        );
     }
 
     #[test]
@@ -2481,6 +2274,7 @@ mod tests {
                 session_id: "$1".to_string(),
             },
             &status_metadata(),
+            &Config::default(),
         );
 
         assert_eq!(snapshot.snapshot_revision, 42);
@@ -2520,15 +2314,19 @@ mod tests {
                 session_id: "$1".to_string(),
             },
             &StatusProjectionMetadata::default(),
+            &Config::default(),
         );
 
         assert_eq!(snapshot.summary.total(), 2);
         assert!(snapshot.sessions.iter().all(|session| {
-            session.category.is_none() && session.attached.is_none() && session.created_at.is_none()
+            session.category.as_deref() == Some("")
+                && session.attached.is_none()
+                && session.created_at.is_none()
         }));
         assert!(snapshot.windows.iter().all(|window| {
             window.bell.is_none() && window.activity.is_none() && window.silence.is_none()
         }));
-        assert!(snapshot.categories.is_empty());
+        assert_eq!(snapshot.categories.len(), 1);
+        assert_eq!(snapshot.categories[0].category, "");
     }
 }

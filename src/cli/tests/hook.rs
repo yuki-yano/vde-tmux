@@ -1,5 +1,46 @@
 use super::*;
 
+fn os_args(values: &[&str]) -> Vec<std::ffi::OsString> {
+    values.iter().map(std::ffi::OsString::from).collect()
+}
+
+#[test]
+fn generic_emit_and_hook_help_do_not_read_stdin() {
+    assert!(!agent_hook_requires_stdin(&os_args(&[
+        "vt",
+        "hook",
+        "emit",
+        "--agent",
+        "generic",
+        "--session-id",
+        "run-1",
+        "--status",
+        "running",
+    ])));
+    assert!(!agent_hook_requires_stdin(&os_args(&[
+        "vt", "hook", "--help",
+    ])));
+    assert!(!agent_hook_requires_stdin(&os_args(&[
+        "vt", "hook", "codex", "--help",
+    ])));
+}
+
+#[test]
+fn payload_hooks_read_stdin_but_legacy_codex_notify_does_not() {
+    assert!(agent_hook_requires_stdin(&os_args(&[
+        "vt", "hook", "claude", "Stop",
+    ])));
+    assert!(agent_hook_requires_stdin(&os_args(&[
+        "vt", "hook", "codex", "Stop",
+    ])));
+    assert!(!agent_hook_requires_stdin(&os_args(&[
+        "vt",
+        "hook",
+        "codex",
+        r#"{"type":"agent-turn-complete"}"#,
+    ])));
+}
+
 #[test]
 fn agent_hook_stdin_deadline_bounds_partial_unclosed_input() {
     use std::os::unix::net::UnixStream;

@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::config::load::load_config;
 use crate::session::Direction;
@@ -30,6 +30,8 @@ enum Command {
     StatuslineCategory {
         #[arg(long = "session-id")]
         session_id: Option<String>,
+        #[arg(long = "client-name")]
+        client_name: Option<String>,
         #[command(subcommand)]
         command: Option<StatuslineCategoryCommand>,
     },
@@ -44,6 +46,8 @@ enum Command {
     StatuslineSessions {
         #[arg(long = "session-id")]
         session_id: Option<String>,
+        #[arg(long = "client-name")]
+        client_name: Option<String>,
         #[arg(long = "show-index")]
         show_index: bool,
         #[command(subcommand)]
@@ -62,7 +66,16 @@ enum Command {
         target: String,
     },
     #[command(name = "statusline-click")]
-    StatuslineClick { range: Option<String> },
+    StatuslineClick {
+        #[command(flatten)]
+        scope: ClientActionScope,
+        range: Option<String>,
+    },
+    /// Run or control the pane-state daemon for the current tmux server.
+    #[command(
+        long_about = "Run or control the pane-state daemon for the current tmux server.\n\nWith no subcommand this is the internal foreground server entry point. For normal use, use `daemon ensure`, `daemon stop`, or `daemon reload` (`daemon restart` is an alias for `reload`).",
+        after_help = "Examples:\n  vt daemon ensure\n  vt daemon status\n  vt daemon stop\n  vt daemon reload"
+    )]
     Daemon {
         #[arg(long, hide = true)]
         socket: Option<String>,
@@ -106,7 +119,11 @@ enum Command {
         #[command(subcommand)]
         command: HooksCommand,
     },
-    #[command(name = "pane-state")]
+    /// Inspect or maintain canonical pane state for the current tmux server.
+    #[command(
+        name = "pane-state",
+        after_help = "Examples:\n  vt pane-state reset --target %42\n  vt pane-state cleanup-legacy --all\n  vt pane-state hooks uninstall"
+    )]
     PaneState {
         #[command(subcommand)]
         command: PaneStateCommand,
@@ -126,6 +143,10 @@ enum Command {
         #[command(subcommand)]
         command: Option<SessionManagerCommand>,
     },
+    /// Accept typed lifecycle and progress events from agent integrations.
+    #[command(
+        after_help = "Examples:\n  vt hook emit --agent myagent --session-id run-42 --status running\n  vt hook claude Stop\n  vt hook codex Stop"
+    )]
     Hook {
         #[command(subcommand)]
         command: hook::HookCommand,
@@ -154,22 +175,92 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
+    /// Start if enabled; when disabled, succeed without changing state.
     Ensure,
-    Stop,
+    /// Explicitly start the daemon; disabled mode is an error.
+    Start,
+    /// Stop temporarily while leaving automatic startup enabled.
+    Stop {
+        /// Signal only after revalidating the recorded process and socket identity.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove owned hooks, stop the daemon, and suppress automatic startup.
+    Disable,
+    /// Install owned hooks, reach Serving, then re-enable automatic startup.
+    Enable,
+    /// Alias for reload: strictly validate config, stop, and start without rollback.
     Restart,
+    /// Strictly validate config and restart without rollback on startup failure.
+    Reload,
+    /// Report lifecycle and runtime health without changing daemon state.
+    Status,
+    /// Diagnose config, hooks, projection, notifications, and runtime paths read-only.
+    Doctor,
+    /// Read a bounded tail from one private per-incarnation log.
+    Logs {
+        #[arg(value_enum, default_value_t = DaemonLogKind::Daemon)]
+        log: DaemonLogKind,
+        #[arg(long, default_value_t = 100, value_parser = parse_log_lines)]
+        lines: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DaemonLogKind {
+    Daemon,
+    Notification,
+    StatusPush,
+    PaneStateHook,
+}
+
+fn parse_log_lines(value: &str) -> std::result::Result<usize, String> {
+    let lines = value
+        .parse::<usize>()
+        .map_err(|_| "lines must be an integer between 1 and 500".to_string())?;
+    if !(1..=500).contains(&lines) {
+        return Err("lines must be between 1 and 500".to_string());
+    }
+    Ok(lines)
 }
 
 #[derive(Debug, Subcommand)]
 enum CategoryCommand {
-    Next,
-    Prev,
-    Use { name: String },
+    Next {
+        #[command(flatten)]
+        scope: ClientActionScope,
+    },
+    Prev {
+        #[command(flatten)]
+        scope: ClientActionScope,
+    },
+    Use {
+        name: String,
+        #[command(flatten)]
+        scope: ClientActionScope,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum SessionCycleCommand {
-    Next,
-    Prev,
+    Next {
+        #[command(flatten)]
+        scope: ClientActionScope,
+    },
+    Prev {
+        #[command(flatten)]
+        scope: ClientActionScope,
+    },
+}
+
+#[derive(Debug, Default, Args)]
+struct ClientActionScope {
+    /// tmux client captured by the invoking binding; required when clients share a pane.
+    #[arg(long = "client-name")]
+    client_name: Option<String>,
+    /// Source tmux session captured by the invoking binding.
+    #[arg(long = "session-id")]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -177,6 +268,8 @@ enum SessionCommand {
     New {
         #[arg(short = 'c', long = "cwd")]
         cwd: Option<String>,
+        #[command(flatten)]
+        scope: ClientActionScope,
     },
     #[command(name = "set-category")]
     SetCategory { session: String, category: String },
@@ -226,15 +319,26 @@ enum HooksCommand {
 
 #[derive(Debug, Subcommand)]
 enum PaneStateCommand {
-    #[command(name = "cleanup-legacy")]
+    /// Remove only the fixed legacy pane, window, and session option keys.
+    #[command(
+        name = "cleanup-legacy",
+        long_about = "Remove only the fixed 19 legacy pane-state option keys from the current tmux server. Canonical @vde_pane_state, display @vde_status_* options, category metadata, project paths, and sidebar markers are preserved."
+    )]
     CleanupLegacy {
+        /// Confirm that every pane, window, and session in this tmux server is in scope.
         #[arg(long, required = true)]
         all: bool,
-    },
-    Reset {
+        /// Report existing legacy options by scope without removing them.
         #[arg(long)]
+        dry_run: bool,
+    },
+    /// Replace current or quarantined canonical state with a guarded reset tombstone.
+    Reset {
+        /// Stable tmux pane ID, for example %42.
+        #[arg(long, value_name = "PANE_ID")]
         target: String,
     },
+    /// Maintain the tmux hooks owned by the pane-state daemon.
     Hooks {
         #[command(subcommand)]
         command: PaneStateHooksCommand,
@@ -243,6 +347,7 @@ enum PaneStateCommand {
 
 #[derive(Debug, Subcommand)]
 enum PaneStateHooksCommand {
+    /// Remove only owned index 70 pane-state hooks; foreign hooks are preserved.
     Uninstall,
 }
 
@@ -281,7 +386,9 @@ pub fn run() -> ExitCode {
     } else {
         Duration::from_secs(3)
     };
-    let agent_hook_deadline = is_agent_hook.then(|| Instant::now() + Duration::from_secs(2));
+    let reads_agent_hook_stdin = agent_hook_requires_stdin(&args);
+    let agent_hook_deadline =
+        reads_agent_hook_stdin.then(|| Instant::now() + Duration::from_secs(2));
     let input = match agent_hook_deadline {
         Some(deadline) => match read_agent_hook_input_until(deadline) {
             Ok(input) => input,
@@ -310,6 +417,25 @@ pub fn run() -> ExitCode {
             eprintln!("{error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn agent_hook_requires_stdin(args: &[OsString]) -> bool {
+    if args.get(1).and_then(|arg| arg.to_str()) != Some("hook")
+        || args
+            .iter()
+            .skip(2)
+            .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
+    {
+        return false;
+    }
+    match args.get(2).and_then(|arg| arg.to_str()) {
+        Some("claude") => args.get(3).is_some(),
+        Some("codex") => args
+            .get(3)
+            .and_then(|arg| arg.to_str())
+            .is_some_and(|event| !event.trim_start().starts_with('{')),
+        _ => false,
     }
 }
 
@@ -474,10 +600,24 @@ where
     match cli.command {
         Command::StatuslineCategory {
             session_id,
+            client_name,
             command,
         } => match command {
             Some(StatuslineCategoryCommand::Switch { index }) => {
-                crate::statusline::switch_statusline_category(runner, &config, cli_index(index))?;
+                let context = action_session_context(
+                    runner,
+                    env,
+                    client_name.as_deref(),
+                    session_id.as_deref(),
+                )?;
+                let config = require_active_config(runner, env)?;
+                crate::statusline::switch_statusline_category(
+                    runner,
+                    &config,
+                    &context.client_name,
+                    &context.session_id,
+                    cli_index(index)?,
+                )?;
                 Ok(None)
             }
             None => Ok(Some(
@@ -494,11 +634,23 @@ where
         },
         Command::StatuslineSessions {
             session_id,
+            client_name,
             show_index,
             command,
         } => match command {
             Some(StatuslineSessionsCommand::Switch { index }) => {
-                crate::statusline::switch_statusline_session(runner, &config, cli_index(index))?;
+                let context = action_session_context(
+                    runner,
+                    env,
+                    client_name.as_deref(),
+                    session_id.as_deref(),
+                )?;
+                crate::statusline::switch_statusline_session(
+                    runner,
+                    &context.client_name,
+                    &context.session_id,
+                    cli_index(index)?,
+                )?;
                 Ok(None)
             }
             None => {
@@ -542,8 +694,35 @@ where
         Command::StatuslinePane { target } => Ok(Some(daemon::statusline_pane(
             runner, env, &config, &target,
         )?)),
-        Command::StatuslineClick { range } => {
-            crate::statusline::handle_statusline_click(runner, &config, range.as_deref())?;
+        Command::StatuslineClick { scope, range } => {
+            let needs_client = range.as_deref().map(str::trim).is_some_and(|range| {
+                range.starts_with("session:")
+                    || range.starts_with("category:")
+                    || range.starts_with("category-current:")
+                    || range.starts_with('$')
+            });
+            let context = needs_client
+                .then(|| {
+                    action_session_context(
+                        runner,
+                        env,
+                        scope.client_name.as_deref(),
+                        scope.session_id.as_deref(),
+                    )
+                })
+                .transpose()?;
+            let category_click = range.as_deref().map(str::trim).is_some_and(|range| {
+                range.starts_with("category:") || range.starts_with("category-current:")
+            });
+            let guarded_config = category_click
+                .then(|| require_active_config(runner, env))
+                .transpose()?;
+            crate::statusline::handle_statusline_click(
+                runner,
+                guarded_config.as_ref().unwrap_or(&config),
+                context.as_ref().map(|context| context.client_name.as_str()),
+                range.as_deref(),
+            )?;
             Ok(None)
         }
         Command::StatuslineSummary => Ok(Some(daemon::statusline_summary(runner, env, &config)?)),
@@ -580,8 +759,19 @@ where
                 Some(DaemonCommand::Ensure) => {
                     daemon::ensure_daemon(runner, env, socket.as_deref())
                 }
-                Some(DaemonCommand::Stop) => daemon::stop_daemon(runner, env, None),
+                Some(DaemonCommand::Start) => daemon::start_daemon(runner, env, None),
+                Some(DaemonCommand::Stop { force }) => {
+                    daemon::stop_daemon(runner, env, None, force)
+                }
+                Some(DaemonCommand::Disable) => daemon::disable_daemon(runner, env, None),
+                Some(DaemonCommand::Enable) => daemon::enable_daemon(runner, env, None),
                 Some(DaemonCommand::Restart) => daemon::restart_daemon(runner, env, None),
+                Some(DaemonCommand::Reload) => daemon::reload_daemon(runner, env, None),
+                Some(DaemonCommand::Status) => daemon::status_daemon(runner, env, None),
+                Some(DaemonCommand::Doctor) => daemon::doctor_daemon(runner, env, None),
+                Some(DaemonCommand::Logs { log, lines }) => {
+                    daemon::tail_daemon_log(runner, env, log, lines)
+                }
                 None => daemon::run_daemon(
                     runner,
                     env,
@@ -596,36 +786,120 @@ where
         Command::Config { command } => match command {
             ConfigCommand::Schema => daemon::config_schema(),
         },
-        Command::Sidebar { command } => sidebar::run_sidebar_command(command, runner, env, &config),
+        Command::Sidebar { command } => {
+            let guarded_config = command
+                .requires_active_config()
+                .then(|| require_active_config(runner, env))
+                .transpose()?;
+            sidebar::run_sidebar_command(
+                command,
+                runner,
+                env,
+                guarded_config.as_ref().unwrap_or(&config),
+            )
+        }
         Command::Category { command } => {
             match command {
-                CategoryCommand::Next => {
-                    crate::session::use_adjacent_category(runner, &config, Direction::Next)?;
+                CategoryCommand::Next { scope } => {
+                    let context = action_session_context(
+                        runner,
+                        env,
+                        scope.client_name.as_deref(),
+                        scope.session_id.as_deref(),
+                    )?;
+                    let config = require_active_config(runner, env)?;
+                    crate::statusline::cycle_statusline_category(
+                        runner,
+                        &config,
+                        &context.client_name,
+                        &context.session_id,
+                        Direction::Next,
+                    )?;
                 }
-                CategoryCommand::Prev => {
-                    crate::session::use_adjacent_category(runner, &config, Direction::Previous)?;
+                CategoryCommand::Prev { scope } => {
+                    let context = action_session_context(
+                        runner,
+                        env,
+                        scope.client_name.as_deref(),
+                        scope.session_id.as_deref(),
+                    )?;
+                    let config = require_active_config(runner, env)?;
+                    crate::statusline::cycle_statusline_category(
+                        runner,
+                        &config,
+                        &context.client_name,
+                        &context.session_id,
+                        Direction::Previous,
+                    )?;
                 }
-                CategoryCommand::Use { name } => {
-                    crate::session::use_category(runner, &config, &name)?;
+                CategoryCommand::Use { name, scope } => {
+                    let context = action_session_context(
+                        runner,
+                        env,
+                        scope.client_name.as_deref(),
+                        scope.session_id.as_deref(),
+                    )?;
+                    let config = require_active_config(runner, env)?;
+                    crate::session::use_category_for_client(
+                        runner,
+                        &config,
+                        &name,
+                        &context.client_name,
+                    )?;
                 }
             }
             Ok(None)
         }
         Command::SessionCycle { command } => {
             match command {
-                SessionCycleCommand::Next => {
-                    crate::session::cycle_session(runner, &config, Direction::Next)?;
+                SessionCycleCommand::Next { scope } => {
+                    let context = action_session_context(
+                        runner,
+                        env,
+                        scope.client_name.as_deref(),
+                        scope.session_id.as_deref(),
+                    )?;
+                    crate::statusline::cycle_statusline_session(
+                        runner,
+                        &context.client_name,
+                        &context.session_id,
+                        Direction::Next,
+                    )?;
                 }
-                SessionCycleCommand::Prev => {
-                    crate::session::cycle_session(runner, &config, Direction::Previous)?;
+                SessionCycleCommand::Prev { scope } => {
+                    let context = action_session_context(
+                        runner,
+                        env,
+                        scope.client_name.as_deref(),
+                        scope.session_id.as_deref(),
+                    )?;
+                    crate::statusline::cycle_statusline_session(
+                        runner,
+                        &context.client_name,
+                        &context.session_id,
+                        Direction::Previous,
+                    )?;
                 }
             }
             Ok(None)
         }
         Command::Session { command } => {
             match command {
-                SessionCommand::New { cwd } => {
-                    crate::session::create_session(runner, &config, env, cwd.as_deref())?;
+                SessionCommand::New { cwd, scope } => {
+                    let context = action_session_context(
+                        runner,
+                        env,
+                        scope.client_name.as_deref(),
+                        scope.session_id.as_deref(),
+                    )?;
+                    let config = require_active_config(runner, env)?;
+                    crate::session::create_session_for_client(
+                        runner,
+                        &config,
+                        env,
+                        cwd.as_deref(),
+                        &context.client_name,
+                    )?;
                     let _ = request_canonical_topology_refresh(runner, env);
                 }
                 SessionCommand::SetCategory { session, category } => {
@@ -637,6 +911,7 @@ where
         Command::Sessions { command } => {
             match command {
                 SessionsCommand::RefreshCategory => {
+                    let config = require_active_config(runner, env)?;
                     crate::session::refresh_session_categories(runner, &config)?;
                 }
             }
@@ -651,6 +926,7 @@ where
                     if client_name.is_some() != session_name.is_some() {
                         bail!("client_name and session_name must be provided together");
                     }
+                    let config = require_active_config(runner, env)?;
                     crate::session::on_client_session_changed(
                         runner,
                         &config,
@@ -693,11 +969,11 @@ where
             Ok(None)
         }
         Command::PaneState { command } => match command {
-            PaneStateCommand::CleanupLegacy { all } => {
+            PaneStateCommand::CleanupLegacy { all, dry_run } => {
                 if !all {
                     bail!("--all is required");
                 }
-                daemon::cleanup_legacy_state(runner, env)
+                daemon::cleanup_legacy_state(runner, env, dry_run)
             }
             PaneStateCommand::Reset { target } => daemon::reset_pane_state(runner, env, &target),
             PaneStateCommand::Hooks {
@@ -707,6 +983,7 @@ where
         Command::Project { command } => {
             match command {
                 ProjectCommand::Switch { path } => {
+                    let config = require_active_config(runner, env)?;
                     crate::project::switch_project(runner, &config, &path)?;
                 }
                 ProjectCommand::Selector { popup } => {
@@ -717,6 +994,7 @@ where
                             &std::env::current_exe()?.display().to_string(),
                         )?;
                     } else {
+                        let config = require_active_config(runner, env)?;
                         crate::project::run_project_selector(runner, &config, env)?;
                     }
                 }
@@ -780,6 +1058,63 @@ where
     }
 }
 
+fn require_active_config(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<crate::config::Config> {
+    let config = crate::config::load::load_config_strict(env).map_err(|error| {
+        anyhow::anyhow!(
+            "config-dependent operation refused: {error}; fix the config and run `vt daemon reload`"
+        )
+    })?;
+    let disk_hash = crate::daemon::lifecycle::config_hash(&config);
+    let active_hash = query_active_config_hash(runner, env).map_err(|error| {
+        anyhow::anyhow!(
+            "config-dependent operation refused: daemon active config is unavailable ({error:#}); run `vt daemon reload`"
+        )
+    })?;
+    verify_active_config_hash(&disk_hash, &active_hash)?;
+    Ok(config)
+}
+
+fn verify_active_config_hash(disk_hash: &str, active_hash: &str) -> Result<()> {
+    if active_hash.trim().is_empty() {
+        bail!(
+            "config-dependent operation refused: daemon active config hash is empty; run `vt daemon reload`"
+        );
+    }
+    if active_hash != disk_hash {
+        bail!(
+            "config-dependent operation refused: disk config does not match the daemon active config; run `vt daemon reload`"
+        );
+    }
+    Ok(())
+}
+
+fn query_active_config_hash(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<String> {
+    let (incarnation, socket) =
+        crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, None)?;
+    let mut client = crate::daemon::protocol::v2::V2Client::connect_with_timeout(
+        &socket,
+        &incarnation.hash,
+        Duration::from_millis(500),
+    )?;
+    match client.request(&crate::daemon::protocol::v2::ClientMessage::QueryHealth {
+        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+    })? {
+        crate::daemon::protocol::v2::ServerMessage::HealthResult { health } => {
+            Ok(health.config_hash)
+        }
+        crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
+            bail!("daemon query failed ({code:?}): {message}")
+        }
+        other => bail!("unexpected daemon health response: {other:?}"),
+    }
+}
+
 fn should_wrap_session_manager_in_popup(env: &BTreeMap<String, String>) -> bool {
     env.get("TMUX")
         .or_else(|| env.get("TMUX_PANE"))
@@ -803,8 +1138,43 @@ fn request_canonical_topology_refresh(
     crate::sidebar::client::request_topology_refresh_v2(&socket, &incarnation.hash)
 }
 
-fn cli_index(index: usize) -> usize {
-    index.saturating_sub(1)
+fn action_session_context(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    requested_client_name: Option<&str>,
+    requested_session_id: Option<&str>,
+) -> Result<crate::session::ClientSessionContext> {
+    let context = match requested_client_name {
+        Some(client_name) => {
+            crate::session::client_session_context_for_client(runner, client_name)?
+        }
+        None => {
+            let pane_id = env
+                .get("TMUX_PANE")
+                .map(String::as_str)
+                .filter(|pane_id| !pane_id.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("TMUX_PANE is required when --client-name is omitted")
+                })?;
+            crate::session::client_session_context_for_pane(runner, pane_id, None)?
+        }
+    };
+    if let Some(requested) = requested_session_id
+        && requested != context.session_id
+    {
+        anyhow::bail!(
+            "requested source session {requested} does not match invoking client {} session {}",
+            context.client_name,
+            context.session_id
+        );
+    }
+    Ok(context)
+}
+
+fn cli_index(index: usize) -> Result<usize> {
+    index
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("statusline index must be 1 or greater"))
 }
 
 fn now_epoch() -> i64 {

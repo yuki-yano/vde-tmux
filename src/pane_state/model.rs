@@ -936,6 +936,7 @@ fn validate_tmux_entity_id(value: &str, prefix: char, field: &str) -> Result<(),
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VisibilitySnapshot {
     pub pane_visible_to_eligible_client: bool,
+    pub window_visible_to_eligible_client: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

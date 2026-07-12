@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -30,40 +29,63 @@ use crate::tmux::TmuxRunner;
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)] // `Emit` mirrors the intentionally flat public CLI schema.
 pub(crate) enum HookCommand {
+    /// Emit a typed state update without reading stdin.
+    #[command(
+        long_about = "Emit a typed state update for the agent running in the current tmux pane. This command does not read stdin.",
+        after_help = "Examples:\n  vt hook emit --agent myagent --session-id run-42 --status running\n  vt hook emit --agent myagent --session-id run-42 --status waiting --wait-reason permission_prompt\n  vt hook emit --agent myagent --session-id run-42 --status idle --completed-at 1700000000"
+    )]
     Emit {
-        #[arg(long)]
+        /// Stable agent kind or integration name.
+        #[arg(long, value_name = "NAME")]
         agent: String,
-        #[arg(long = "session-id")]
+        /// Stable ID for this agent session or run.
+        #[arg(long = "session-id", value_name = "ID")]
         session_id: String,
-        #[arg(long)]
+        /// Lifecycle state: running, waiting, idle, or error.
+        #[arg(long, value_name = "STATE")]
         status: Option<String>,
-        #[arg(long)]
+        /// Current prompt text; requires --prompt-source.
+        #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
-        #[arg(long = "prompt-source")]
+        /// Source label for --prompt.
+        #[arg(long = "prompt-source", value_name = "SOURCE")]
         prompt_source: Option<String>,
+        /// Clear the current prompt instead of setting one.
         #[arg(long = "clear-prompt")]
         clear_prompt: bool,
-        #[arg(long = "wait-reason")]
+        /// Waiting reason: permission_prompt or other:TEXT.
+        #[arg(long = "wait-reason", value_name = "REASON")]
         wait_reason: Option<String>,
+        /// Mark an idle completion as requiring attention.
         #[arg(long)]
         attention: bool,
-        #[arg(long = "started-at")]
+        /// Run start time as Unix epoch seconds; valid with running.
+        #[arg(long = "started-at", value_name = "EPOCH")]
         started_at: Option<i64>,
-        #[arg(long = "completed-at")]
+        /// Completion time as Unix epoch seconds; valid with idle.
+        #[arg(long = "completed-at", value_name = "EPOCH")]
         completed_at: Option<i64>,
-        #[arg(long)]
+        /// Replace task progress using DONE/TOTAL.
+        #[arg(long, value_name = "DONE/TOTAL")]
         tasks: Option<String>,
+        /// Clear task progress and task rows.
         #[arg(long = "clear-tasks")]
         clear_tasks: bool,
-        #[arg(long)]
+        /// Replace subagents using ID:TYPE|ID:TYPE.
+        #[arg(long, value_name = "ENTRIES")]
         subagents: Option<String>,
+        /// Clear the current subagent set.
         #[arg(long = "clear-subagents")]
         clear_subagents: bool,
     },
+    /// Read a Claude Code hook payload from stdin and submit its typed event.
     Claude {
+        /// Claude Code hook event name, for example Stop.
         event: String,
     },
+    /// Read a Codex hook payload from stdin and submit its typed event.
     Codex {
+        /// Codex hook event name, for example Stop.
         arg: Option<String>,
     },
 }
@@ -93,7 +115,8 @@ pub(crate) fn run_hook_command(
             subagents,
             clear_subagents,
         } => {
-            let (mut client, context) = typed_hook_context(runner, env, deadline, now_epoch)?;
+            let (mut client, context, server_hash) =
+                typed_hook_context(runner, env, deadline, now_epoch)?;
             let event = generic_typed_event(
                 GenericEmitInput {
                     agent,
@@ -123,12 +146,13 @@ pub(crate) fn run_hook_command(
                 },
                 &context,
             )?;
-            send_typed_hook_event(&mut client, event)
+            send_typed_hook_event_observed(&mut client, event, env, &server_hash)
         }
         HookCommand::Claude { event } => {
-            let (mut client, context) = typed_hook_context(runner, env, deadline, now_epoch)?;
+            let (mut client, context, server_hash) =
+                typed_hook_context(runner, env, deadline, now_epoch)?;
             let event = claude_typed_event_from_input(&event, input, &context)?;
-            send_typed_hook_event(&mut client, event)
+            send_typed_hook_event_observed(&mut client, event, env, &server_hash)
         }
         HookCommand::Codex { arg } => {
             let Some(arg) = arg else {
@@ -138,9 +162,10 @@ pub(crate) fn run_hook_command(
                 bail!("UnsupportedLegacyNotify: Codex agent-turn-complete notify is not supported");
             }
             let codex_home = codex_home_from_env(env);
-            let (mut client, context) = typed_hook_context(runner, env, deadline, now_epoch)?;
+            let (mut client, context, server_hash) =
+                typed_hook_context(runner, env, deadline, now_epoch)?;
             let event = codex_typed_event_from_input(&arg, input, &context, codex_home.as_deref())?;
-            send_typed_hook_event(&mut client, event)
+            send_typed_hook_event_observed(&mut client, event, env, &server_hash)
         }
     }
 }
@@ -150,23 +175,85 @@ fn typed_hook_context(
     env: &BTreeMap<String, String>,
     deadline: Instant,
     observed_at: i64,
-) -> Result<(crate::daemon::protocol::v2::V2Client, TypedAdapterContext)> {
+) -> Result<(
+    crate::daemon::protocol::v2::V2Client,
+    TypedAdapterContext,
+    String,
+)> {
     let pane_instance = crate::hook::writer::resolve_pane_instance(runner, env)?
         .ok_or_else(|| anyhow::anyhow!("InvalidPaneInstance: hook has no target pane"))?;
-    let (incarnation, socket) =
-        crate::daemon::lifecycle::ensure_daemon_live_v2_until(runner, env, None, deadline)?;
-    let client = crate::daemon::protocol::v2::V2Client::connect_with_deadline(
-        &socket,
-        &incarnation.hash,
-        deadline,
-    )?;
+    if crate::daemon::lifecycle::tmux_desired_mode(runner, env)?
+        == crate::daemon::lifecycle::DesiredMode::Disabled
+    {
+        bail!("daemon is disabled for the current tmux server");
+    }
+    let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
+    let server_hash = incarnation.hash.clone();
+    let delivery = (|| -> Result<_> {
+        let (incarnation, socket) =
+            crate::daemon::lifecycle::ensure_daemon_live_v2_for_incarnation_until(
+                incarnation,
+                env,
+                None,
+                deadline,
+            )?;
+        let client = crate::daemon::protocol::v2::V2Client::connect_with_deadline(
+            &socket,
+            &incarnation.hash,
+            deadline,
+        )?;
+        Ok(client)
+    })();
+    let client = delivery.inspect_err(|error| {
+        record_agent_hook_delivery(env, &server_hash, error);
+    })?;
     let context = TypedAdapterContext {
         daemon_instance_id: client.daemon_instance_id().clone(),
         event_id: crate::pane_state::EventId::generate()?,
         pane_instance,
         observed_at,
     };
-    Ok((client, context))
+    Ok((client, context, server_hash))
+}
+
+fn send_typed_hook_event_observed(
+    client: &mut crate::daemon::protocol::v2::V2Client,
+    event: Option<PaneEventEnvelope>,
+    env: &BTreeMap<String, String>,
+    server_hash: &str,
+) -> Result<()> {
+    match send_typed_hook_event(client, event) {
+        Ok(()) => {
+            let _ = crate::daemon::lifecycle::record_hook_delivery_recovered(env, server_hash);
+            Ok(())
+        }
+        Err(error) => {
+            record_agent_hook_delivery(env, server_hash, &error);
+            Err(error)
+        }
+    }
+}
+
+fn record_agent_hook_delivery(
+    env: &BTreeMap<String, String>,
+    server_hash: &str,
+    error: &anyhow::Error,
+) {
+    let message = error.to_string();
+    let code = if message.contains("deadline") || message.contains("timed out") {
+        "agent_hook_timeout"
+    } else if message.contains("QueueFull") || message.contains("queue") {
+        "agent_hook_queue_full"
+    } else {
+        "agent_hook_delivery_failed"
+    };
+    let _ = crate::daemon::lifecycle::record_hook_delivery_failure(env, server_hash, code);
+    let _ = crate::daemon::lifecycle::append_incarnation_log(
+        env,
+        server_hash,
+        "pane-state-hook.log",
+        &format!("agent hook delivery failed: {code}"),
+    );
 }
 
 fn send_typed_hook_event(
@@ -317,6 +404,9 @@ pub(crate) fn run_view_hook_command(
                 Err(error) => return Err(error),
             }
         };
+        // View events carry only the immutable tmux snapshot. The daemon applies
+        // its active `done_clear_on` policy while processing the event, so disk
+        // config drift must not stop pane/window/client registry synchronization.
         let built = crate::daemon::view_hooks::build_foreground_view_event(
             probe.daemon_instance_id().clone(),
             event_id,
@@ -341,6 +431,8 @@ pub(crate) fn run_view_hook_command(
     if let Err(error) = &result {
         eprintln!("{error:#}");
         log_view_hook_failure(env, &server_hash, &format!("{error:#}"));
+    } else {
+        let _ = crate::daemon::lifecycle::record_hook_delivery_recovered(env, &server_hash);
     }
     result
 }
@@ -353,42 +445,18 @@ fn ensure_view_hook_deadline(deadline: Instant, stage: &str) -> Result<()> {
 }
 
 fn log_view_hook_failure(env: &BTreeMap<String, String>, server_hash: &str, message: &str) {
-    let state_root = env
-        .get("XDG_STATE_HOME")
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env.get("HOME")
-                .filter(|value| !value.trim().is_empty())
-                .map(|home| PathBuf::from(home).join(".local/state"))
-        })
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/vde-tmux-{}", unsafe { libc::geteuid() })));
-    let directory = state_root.join("vde-tmux").join(server_hash);
-    if fs::create_dir_all(&directory).is_err() {
-        return;
-    }
-    let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
-    let path = directory.join("pane-state-hook.log");
-    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= 1024 * 1024) {
-        let _ = fs::remove_file(path.with_extension("log.3"));
-        let _ = fs::rename(path.with_extension("log.2"), path.with_extension("log.3"));
-        let _ = fs::rename(path.with_extension("log.1"), path.with_extension("log.2"));
-        let _ = fs::rename(&path, path.with_extension("log.1"));
-    }
-    if let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        let _ = writeln!(file, "{} {message}", chrono_like_epoch());
-    }
-}
-
-fn chrono_like_epoch() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64)
+    let code = if message.contains("deadline") || message.contains("timed out") {
+        "hook_delivery_timeout"
+    } else {
+        "hook_delivery_failed"
+    };
+    let _ = crate::daemon::lifecycle::record_hook_delivery_failure(env, server_hash, code);
+    let _ = crate::daemon::lifecycle::append_incarnation_log(
+        env,
+        server_hash,
+        "pane-state-hook.log",
+        message,
+    );
 }
 
 pub(crate) fn claude_typed_event_from_input(

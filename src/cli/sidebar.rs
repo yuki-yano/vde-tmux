@@ -7,7 +7,8 @@ use clap::Subcommand;
 use crate::config::SidebarWidth;
 use crate::tmux::TmuxRunner;
 
-const SELECTION_CONTEXT_FORMAT: &str = "#{pane_id}\u{1f}#{session_name}";
+const SELECTION_CONTEXT_FORMAT: &str = "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{session_id}";
+const SIDEBAR_CONTROL_FORMAT: &str = "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{@vde_sidebar}";
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SidebarCommand {
@@ -72,6 +73,19 @@ pub(crate) enum SidebarCommand {
     },
 }
 
+impl SidebarCommand {
+    pub(crate) fn requires_active_config(&self) -> bool {
+        matches!(
+            self,
+            Self::Attach { .. }
+                | Self::Open { .. }
+                | Self::Toggle { .. }
+                | Self::Rail { .. }
+                | Self::LayoutApplied { .. }
+        )
+    }
+}
+
 pub(crate) fn run_sidebar_command(
     command: SidebarCommand,
     runner: &dyn TmuxRunner,
@@ -97,7 +111,6 @@ where
                 .context("failed to ensure the pane-state daemon for sidebar attach")?;
             crate::sidebar::layout::attach(runner, env)
                 .context("failed to mark the sidebar pane")?;
-            try_seed_sidebar_selection_from_env(env, &socket, &server_identity);
             if once {
                 return crate::sidebar::once::render_once(&socket, &server_identity, config)
                     .context("failed to query the one-shot sidebar snapshot")
@@ -106,8 +119,14 @@ where
             crate::sidebar::tui::run_live_tui(env, config, &socket, &server_identity)
         }
         SidebarCommand::Input { key } => {
-            let (server_identity, socket) = ensure_daemon(runner, env)?;
-            crate::sidebar::client::send_sidebar_key_v2(&socket, &server_identity, &key)?;
+            let (server_identity, _socket) = ensure_daemon(runner, env)?;
+            let sidebar = crate::sidebar::control::resolve_current_pane_instance(runner, env)
+                .context("sidebar input requires the invoking sidebar pane instance")?;
+            crate::sidebar::control::send(
+                &server_identity,
+                &sidebar,
+                &crate::sidebar::control::ControlMessage::Input { key },
+            )?;
             Ok(None)
         }
         SidebarCommand::Open {
@@ -115,13 +134,12 @@ where
             width,
             delay_ms,
         } => {
-            let (server_identity, socket) = ensure_daemon(runner, env)?;
+            let (_server_identity, _socket) = ensure_daemon(runner, env)?;
             if let Some(delay_ms) = delay_ms.filter(|value| *value > 0) {
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
             let target = resolve_window_target(runner, window)?;
             let selection_context = resolve_selection_context(runner, env).ok();
-            try_seed_sidebar_selection(selection_context.as_ref(), &socket, &server_identity);
             let attach_context = selection_context.as_ref().and_then(to_attach_context);
             crate::sidebar::layout::open_with_attach_context(
                 runner,
@@ -134,12 +152,12 @@ where
             Ok(None)
         }
         SidebarCommand::Toggle { all, window, width } => {
-            let (server_identity, socket) = ensure_daemon(runner, env)?;
+            let (server_identity, _socket) = ensure_daemon(runner, env)?;
             if all && window.is_some() {
                 bail!("--all and --window cannot be used together");
             }
             let selection_context = resolve_selection_context(runner, env).ok();
-            try_seed_sidebar_selection(selection_context.as_ref(), &socket, &server_identity);
+            try_send_sidebar_focus(runner, &server_identity, selection_context.as_ref(), None);
             let attach_context = selection_context.as_ref().and_then(to_attach_context);
             if all {
                 crate::sidebar::layout::toggle_all_with_attach_context(
@@ -163,19 +181,9 @@ where
             Ok(None)
         }
         SidebarCommand::FocusToggle { window, width } => {
-            let (server_identity, socket) = ensure_daemon(runner, env)?;
-            let target = resolve_window_target(runner, window)?;
-            let selection_context = resolve_selection_context(runner, env).ok();
-            try_seed_sidebar_selection(selection_context.as_ref(), &socket, &server_identity);
-            let attach_context = selection_context.as_ref().and_then(to_attach_context);
-            crate::sidebar::layout::focus_toggle_with_attach_context(
-                runner,
-                &target,
-                &std::env::current_exe()?,
-                width.unwrap_or(config.sidebar.width),
-                config.sidebar.min_width,
-                attach_context.as_ref(),
-            )?;
+            run_focus_toggle_command(runner, env, window, width, || {
+                super::require_active_config(runner, env)
+            })?;
             Ok(None)
         }
         SidebarCommand::Close { window } => {
@@ -212,18 +220,72 @@ where
         }
         SidebarCommand::Jump { pane } => {
             let (server_identity, socket) = ensure_daemon(runner, env)?;
-            crate::sidebar::client::send_sidebar_jump_v2(&socket, &server_identity, &pane)?;
+            let pane_instance = crate::sidebar::control::resolve_pane_instance(runner, &pane)?;
+            let source_pane = crate::sidebar::control::resolve_current_pane_instance(runner, env)?;
+            crate::sidebar::client::send_sidebar_jump_v2(
+                &socket,
+                &server_identity,
+                pane_instance,
+                source_pane,
+            )?;
             Ok(None)
         }
         SidebarCommand::Focus { window } => {
-            let (server_identity, socket) = ensure_daemon(runner, env)?;
+            let (server_identity, _socket) = ensure_daemon(runner, env)?;
             let target = resolve_window_target(runner, window)?;
             let selection_context = resolve_selection_context(runner, env).ok();
-            try_seed_sidebar_selection(selection_context.as_ref(), &socket, &server_identity);
+            try_send_sidebar_focus(
+                runner,
+                &server_identity,
+                selection_context.as_ref(),
+                Some(&target),
+            );
             crate::sidebar::layout::focus(runner, &target)?;
             Ok(None)
         }
     }
+}
+
+pub(crate) fn run_focus_toggle_command<F>(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    window: Option<String>,
+    width: Option<SidebarWidth>,
+    load_active_config: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<crate::config::Config>,
+{
+    let target = resolve_window_target(runner, window)?;
+    let selection_context = resolve_selection_context(runner, env).ok();
+    match crate::sidebar::layout::focus_toggle_existing(runner, &target)? {
+        crate::sidebar::layout::ExistingSidebarFocusToggle::Focused => {
+            if let Ok(incarnation) =
+                crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)
+            {
+                try_send_sidebar_focus(
+                    runner,
+                    &incarnation.hash,
+                    selection_context.as_ref(),
+                    Some(&target),
+                );
+            }
+        }
+        crate::sidebar::layout::ExistingSidebarFocusToggle::Closed => {}
+        crate::sidebar::layout::ExistingSidebarFocusToggle::Missing => {
+            let config = load_active_config()?;
+            let attach_context = selection_context.as_ref().and_then(to_attach_context);
+            crate::sidebar::layout::open_with_attach_context(
+                runner,
+                &target,
+                &std::env::current_exe()?,
+                width.unwrap_or(config.sidebar.width),
+                config.sidebar.min_width,
+                attach_context.as_ref(),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_sidebar_daemon_started(
@@ -242,50 +304,46 @@ fn parse_sidebar_width(value: &str) -> std::result::Result<SidebarWidth, String>
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SidebarSelectionContext {
     pane: Option<String>,
+    pane_pid: Option<u32>,
     session: Option<String>,
 }
 
-fn try_seed_sidebar_selection(
-    context: Option<&SidebarSelectionContext>,
-    socket: &std::path::Path,
+fn try_send_sidebar_focus(
+    runner: &dyn TmuxRunner,
     server_identity: &str,
+    context: Option<&SidebarSelectionContext>,
+    window: Option<&str>,
 ) {
     let Some(context) = context else {
         return;
     };
-    if context.pane.is_none() && context.session.is_none() {
+    let (Some(pane_id), Some(pane_pid)) = (&context.pane, context.pane_pid) else {
         return;
-    }
-    let _ = crate::sidebar::client::send_sidebar_select_context_v2(
-        socket,
-        server_identity,
-        context.pane.as_deref(),
-        context.session.as_deref(),
-    );
-}
-
-fn try_seed_sidebar_selection_from_env(
-    env: &BTreeMap<String, String>,
-    socket: &std::path::Path,
-    server_identity: &str,
-) {
-    let context = SidebarSelectionContext {
-        pane: normalize_context_field(
-            env.get(crate::sidebar::layout::ENV_SELECTION_PANE)
-                .map(String::as_str),
-        ),
-        session: normalize_context_field(
-            env.get(crate::sidebar::layout::ENV_SELECTION_SESSION)
-                .map(String::as_str),
-        ),
     };
-    try_seed_sidebar_selection(Some(&context), socket, server_identity);
+    let Ok(sidebar) = resolve_sidebar_instance(runner, window) else {
+        return;
+    };
+    let _ = crate::sidebar::control::send(
+        server_identity,
+        &sidebar,
+        &crate::sidebar::control::ControlMessage::Focus {
+            pane_instance: crate::pane_state::PaneInstance {
+                pane_id: pane_id.clone(),
+                pane_pid,
+            },
+            session_id: context.session.clone().unwrap_or_default(),
+        },
+    );
 }
 
 fn to_attach_context(
     context: &SidebarSelectionContext,
 ) -> Option<crate::sidebar::layout::SidebarAttachContext> {
-    crate::sidebar::layout::SidebarAttachContext::new(context.pane.clone(), context.session.clone())
+    crate::sidebar::layout::SidebarAttachContext::new(
+        context.pane.clone(),
+        context.pane_pid,
+        context.session.clone(),
+    )
 }
 
 fn resolve_selection_context(
@@ -309,7 +367,39 @@ fn parse_selection_context(raw: &str) -> SidebarSelectionContext {
     let mut fields = raw.split('\u{1f}');
     SidebarSelectionContext {
         pane: normalize_context_field(fields.next()),
+        pane_pid: fields.next().and_then(|value| value.parse().ok()),
         session: normalize_context_field(fields.next()),
+    }
+}
+
+fn resolve_sidebar_instance(
+    runner: &dyn TmuxRunner,
+    window: Option<&str>,
+) -> Result<crate::pane_state::PaneInstance> {
+    let mut args = vec!["list-panes"];
+    if let Some(window) = window {
+        args.extend(["-t", window]);
+    }
+    args.extend(["-F", SIDEBAR_CONTROL_FORMAT]);
+    let output = runner.run(&args)?;
+    let mut candidates = output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\u{1f}');
+            let pane_id = fields.next()?;
+            let pane_pid = fields.next()?.parse().ok()?;
+            (fields.next()? == "1").then_some(crate::pane_state::PaneInstance {
+                pane_id: pane_id.to_string(),
+                pane_pid,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [sidebar] => Ok(sidebar.clone()),
+        [] => bail!("sidebar pane is not running"),
+        _ => bail!("multiple sidebar panes matched the requested window"),
     }
 }
 

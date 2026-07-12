@@ -13,6 +13,15 @@ pub trait TmuxRunner {
 }
 
 pub fn run_command(program: &str, args: &[&str], timeout: Option<Duration>) -> Result<String> {
+    run_command_with_output_limit(program, args, timeout, None)
+}
+
+pub fn run_command_with_output_limit(
+    program: &str,
+    args: &[&str],
+    timeout: Option<Duration>,
+    max_stdout_bytes: Option<usize>,
+) -> Result<String> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -21,8 +30,14 @@ pub fn run_command(program: &str, args: &[&str], timeout: Option<Duration>) -> R
         .spawn()
         .with_context(|| format!("failed to spawn {program}"))?;
 
-    let mut stdout = child.stdout.take().map(read_pipe_in_background);
-    let mut stderr = child.stderr.take().map(read_pipe_in_background);
+    let mut stdout = child
+        .stdout
+        .take()
+        .map(|stdout| read_pipe_in_background(stdout, max_stdout_bytes));
+    let mut stderr = child
+        .stderr
+        .take()
+        .map(|stderr| read_pipe_in_background(stderr, None));
 
     let status = match timeout {
         None => child
@@ -45,28 +60,56 @@ pub fn run_command(program: &str, args: &[&str], timeout: Option<Duration>) -> R
     };
 
     let stdout = collect_pipe_output(stdout.take());
+    if stdout.exceeded {
+        bail!(
+            "{program} stdout exceeded byte limit: {actual} bytes > {limit} bytes",
+            actual = stdout.total_bytes,
+            limit = max_stdout_bytes.unwrap_or(usize::MAX),
+        );
+    }
+    let stdout = String::from_utf8_lossy(&stdout.bytes).into_owned();
     if status.success() {
         return Ok(stdout);
     }
     let stderr = collect_pipe_output(stderr.take());
+    let stderr = String::from_utf8_lossy(&stderr.bytes);
     bail!(
         "{program} {args:?} failed (exit: {code:?}): {stderr}",
         code = status.code()
     )
 }
 
-fn read_pipe_in_background<R>(mut pipe: R) -> thread::JoinHandle<String>
+#[derive(Debug, Default)]
+struct CapturedPipe {
+    bytes: Vec<u8>,
+    total_bytes: usize,
+    exceeded: bool,
+}
+
+fn read_pipe_in_background<R>(mut pipe: R, limit: Option<usize>) -> thread::JoinHandle<CapturedPipe>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        let mut output = String::new();
-        let _ = pipe.read_to_string(&mut output);
+        let mut output = CapturedPipe::default();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            output.total_bytes = output.total_bytes.saturating_add(read);
+            let keep = limit
+                .map(|limit| limit.saturating_sub(output.bytes.len()).min(read))
+                .unwrap_or(read);
+            output.bytes.extend_from_slice(&chunk[..keep]);
+            output.exceeded |= limit.is_some_and(|limit| output.total_bytes > limit);
+        }
         output
     })
 }
 
-fn collect_pipe_output(handle: Option<thread::JoinHandle<String>>) -> String {
+fn collect_pipe_output(handle: Option<thread::JoinHandle<CapturedPipe>>) -> CapturedPipe {
     handle
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default()
@@ -76,6 +119,7 @@ fn collect_pipe_output(handle: Option<thread::JoinHandle<String>>) -> String {
 pub struct SystemTmuxRunner {
     timeout: Option<Duration>,
     socket_name: Option<String>,
+    max_output_bytes: Option<usize>,
 }
 
 impl SystemTmuxRunner {
@@ -87,6 +131,7 @@ impl SystemTmuxRunner {
         Self {
             timeout: Some(timeout),
             socket_name: None,
+            max_output_bytes: None,
         }
     }
 
@@ -94,6 +139,7 @@ impl SystemTmuxRunner {
         Self {
             timeout,
             socket_name: Some(socket_name.into()),
+            max_output_bytes: None,
         }
     }
 
@@ -105,13 +151,18 @@ impl SystemTmuxRunner {
             _ => Self::with_timeout(timeout),
         }
     }
+
+    pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = Some(max_output_bytes);
+        self
+    }
 }
 
 impl TmuxRunner for SystemTmuxRunner {
     fn run(&self, args: &[&str]) -> Result<String> {
         let owned_args = tmux_args(self.socket_name.as_deref(), args);
         let refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-        run_command("tmux", &refs, self.timeout)
+        run_command_with_output_limit("tmux", &refs, self.timeout, self.max_output_bytes)
     }
 }
 
@@ -149,6 +200,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(out.len(), 2048 * 64);
+    }
+
+    #[test]
+    fn bounded_capture_drains_but_does_not_retain_oversized_stdout() {
+        let started = std::time::Instant::now();
+        let error = run_command_with_output_limit(
+            "/bin/sh",
+            &[
+                "-c",
+                "i=0; while [ $i -lt 4096 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i + 1)); done",
+            ],
+            Some(Duration::from_secs(2)),
+            Some(1024),
+        )
+        .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("stdout exceeded byte limit"));
+        assert!(error.to_string().contains("262144 bytes > 1024 bytes"));
     }
 
     #[test]

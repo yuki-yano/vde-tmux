@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -8,9 +8,10 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::daemon::topology::ServerIdentity;
@@ -18,6 +19,159 @@ use crate::tmux::TmuxRunner;
 
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_RUNTIME_LOG_BYTES: u64 = 1024 * 1024;
+const MAX_RUNTIME_LOG_LINE_BYTES: usize = 8 * 1024;
+const LIFECYCLE_RECORD_VERSION: u16 = 1;
+const LIFECYCLE_RECORD_FILE: &str = "lifecycle.json";
+pub const DISABLED_SERVER_OPTION: &str = "@vde_daemon_disabled";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum DesiredMode {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum LifecycleHealth {
+    Stable,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonProcessIdentity {
+    pub pid: u32,
+    pub start_token: String,
+    pub daemon_instance_id: String,
+    pub socket_device: u64,
+    pub socket_inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationProcessIdentity {
+    pub process_group_id: i32,
+    pub leader_start_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleRecord {
+    pub version: u16,
+    pub server_identity: String,
+    pub desired_mode: DesiredMode,
+    pub generation: u64,
+    pub health: LifecycleHealth,
+    pub last_transition_error: Option<String>,
+    pub process: Option<DaemonProcessIdentity>,
+    pub active_notification: Option<NotificationProcessIdentity>,
+    pub hook_delivery_failures: u64,
+    pub hook_delivery_degraded: bool,
+    pub last_hook_error_code: Option<String>,
+    pub status_push_failures: u64,
+    pub status_push_degraded: bool,
+    pub last_status_push_error: Option<String>,
+    pub last_status_push_error_at_epoch_seconds: Option<u64>,
+    pub quarantine_observed_total: u64,
+    pub updated_at_epoch_seconds: u64,
+}
+
+impl LifecycleRecord {
+    pub fn initial(server_identity: impl Into<String>) -> Self {
+        Self {
+            version: LIFECYCLE_RECORD_VERSION,
+            server_identity: server_identity.into(),
+            desired_mode: DesiredMode::Enabled,
+            generation: 0,
+            health: LifecycleHealth::Stable,
+            last_transition_error: None,
+            process: None,
+            active_notification: None,
+            hook_delivery_failures: 0,
+            hook_delivery_degraded: false,
+            last_hook_error_code: None,
+            status_push_failures: 0,
+            status_push_degraded: false,
+            last_status_push_error: None,
+            last_status_push_error_at_epoch_seconds: None,
+            quarantine_observed_total: 0,
+            updated_at_epoch_seconds: epoch_seconds(),
+        }
+    }
+
+    pub fn begin_transition(&mut self, desired_mode: DesiredMode) -> Result<()> {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("lifecycle generation overflow"))?;
+        self.desired_mode = desired_mode;
+        self.health = LifecycleHealth::Stable;
+        self.last_transition_error = None;
+        self.updated_at_epoch_seconds = epoch_seconds();
+        Ok(())
+    }
+
+    pub fn degrade(&mut self, error: impl Into<String>) {
+        self.health = LifecycleHealth::Degraded;
+        self.last_transition_error = Some(bounded_log_message(&error.into()));
+        self.updated_at_epoch_seconds = epoch_seconds();
+    }
+}
+
+pub fn record_hook_delivery_failure(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+    code: &str,
+) -> Result<()> {
+    update_lifecycle_record(env, incarnation_hash, |record| {
+        record.hook_delivery_failures = record.hook_delivery_failures.saturating_add(1);
+        record.hook_delivery_degraded = true;
+        record.last_hook_error_code = Some(code.chars().take(128).collect());
+        Ok(())
+    })
+}
+
+pub fn record_hook_delivery_recovered(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+) -> Result<()> {
+    if !read_lifecycle_record(env, incarnation_hash)?.hook_delivery_degraded {
+        return Ok(());
+    }
+    update_lifecycle_record(env, incarnation_hash, |record| {
+        record.hook_delivery_degraded = false;
+        Ok(())
+    })
+}
+
+pub fn record_status_push_failure(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+    message: &str,
+) -> Result<()> {
+    update_lifecycle_record(env, incarnation_hash, |record| {
+        record.status_push_failures = record.status_push_failures.saturating_add(1);
+        record.status_push_degraded = true;
+        record.last_status_push_error = Some(bounded_log_message(message));
+        record.last_status_push_error_at_epoch_seconds = Some(epoch_seconds());
+        Ok(())
+    })
+}
+
+pub fn record_status_push_recovered(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+) -> Result<()> {
+    if !read_lifecycle_record(env, incarnation_hash)?.status_push_degraded {
+        return Ok(());
+    }
+    update_lifecycle_record(env, incarnation_hash, |record| {
+        record.status_push_degraded = false;
+        Ok(())
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxServerIncarnation {
@@ -99,6 +253,60 @@ impl TmuxServerIncarnation {
     }
 }
 
+pub fn tmux_desired_mode(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<DesiredMode> {
+    let incarnation = TmuxServerIncarnation::resolve(runner, env)?;
+    let value = match runner.run(&["show-option", "-gqv", DISABLED_SERVER_OPTION]) {
+        Ok(value) => value,
+        #[cfg(test)]
+        Err(error) if error.to_string().contains("no stub registered") => String::new(),
+        Err(error) => return Err(error),
+    };
+    incarnation.verify(runner, env)?;
+    Ok(if value.trim() == "1" {
+        DesiredMode::Disabled
+    } else {
+        DesiredMode::Enabled
+    })
+}
+
+pub fn set_tmux_desired_mode(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    desired_mode: DesiredMode,
+) -> Result<()> {
+    const SERVER_MISMATCH: &str = "__vde_daemon_mode_server_mismatch__";
+    let incarnation = TmuxServerIncarnation::resolve(runner, env)?;
+    let command = match desired_mode {
+        DesiredMode::Disabled => vec![
+            "set-option".to_string(),
+            "-g".to_string(),
+            DISABLED_SERVER_OPTION.to_string(),
+            "1".to_string(),
+        ],
+        DesiredMode::Enabled => vec![
+            "set-option".to_string(),
+            "-gu".to_string(),
+            DISABLED_SERVER_OPTION.to_string(),
+        ],
+    };
+    let guarded = crate::pane_state::store::server_guarded_command_args(
+        incarnation.identity.pid,
+        incarnation.identity.start_time,
+        crate::pane_state::store::tmux_command_string(&command),
+        SERVER_MISMATCH,
+    );
+    let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = runner.run(&refs)?;
+    if output.lines().any(|line| line.trim() == SERVER_MISMATCH) {
+        bail!("tmux server incarnation changed while updating daemon mode");
+    }
+    incarnation.verify(runner, env)?;
+    Ok(())
+}
+
 /// Ensure the daemon socket directory is private and owned by the current user.
 ///
 /// This rejects symlinks and loose permissions, but it is still a best-effort
@@ -139,6 +347,698 @@ pub fn ensure_secure_socket_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn incarnation_log_directory(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+) -> PathBuf {
+    let state_root = env
+        .get("XDG_STATE_HOME")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env.get("HOME")
+                .filter(|value| !value.trim().is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/vde-tmux-{}", unsafe { libc::geteuid() })));
+    state_root.join("vde-tmux").join(incarnation_hash)
+}
+
+pub fn incarnation_log_path(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+    file_name: &str,
+) -> PathBuf {
+    incarnation_log_directory(env, incarnation_hash).join(file_name)
+}
+
+pub fn append_incarnation_log(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+    file_name: &str,
+    message: &str,
+) -> Result<PathBuf> {
+    if file_name.is_empty() || file_name.contains('/') || file_name == "." || file_name == ".." {
+        bail!("invalid incarnation log file name");
+    }
+    let directory = incarnation_log_directory(env, incarnation_hash);
+    ensure_private_log_directory(&directory)?;
+    let path = directory.join(file_name);
+    rotate_runtime_log_if_needed(&path)?;
+    let mut file = open_secure_runtime_log(&path)?;
+    use std::io::Write as _;
+    let message = bounded_log_message(message);
+    writeln!(file, "{} {message}", epoch_seconds())?;
+    Ok(path)
+}
+
+pub fn read_incarnation_log_tail(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+    file_name: &str,
+    lines: usize,
+) -> Result<String> {
+    if lines == 0 || lines > 500 {
+        bail!("log tail lines must be between 1 and 500");
+    }
+    if file_name.is_empty() || file_name.contains('/') || file_name == "." || file_name == ".." {
+        bail!("invalid incarnation log file name");
+    }
+    let path = incarnation_log_path(env, incarnation_hash, file_name);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to stat {}", path.display()));
+        }
+    };
+    validate_private_directory_read_only(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("log path has no parent"))?,
+    )?;
+    validate_private_regular_file(&path, &metadata, 0o600)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    validate_private_regular_file(&path, &file.metadata()?, 0o600)?;
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    const MAX_TAIL_BYTES: u64 = 256 * 1024;
+    let length = metadata.len();
+    let offset = length.saturating_sub(MAX_TAIL_BYTES);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::with_capacity((length - offset) as usize);
+    file.take(MAX_TAIL_BYTES).read_to_end(&mut bytes)?;
+    if offset > 0
+        && let Some(newline) = bytes.iter().position(|byte| *byte == b'\n')
+    {
+        bytes.drain(..=newline);
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(text
+        .lines()
+        .rev()
+        .take(lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+pub fn lifecycle_record_path(env: &BTreeMap<String, String>, incarnation_hash: &str) -> PathBuf {
+    incarnation_log_path(env, incarnation_hash, LIFECYCLE_RECORD_FILE)
+}
+
+/// Read lifecycle state without creating directories, locks, or marker files.
+pub fn read_lifecycle_record(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+) -> Result<LifecycleRecord> {
+    let path = lifecycle_record_path(env, incarnation_hash);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LifecycleRecord::initial(incarnation_hash));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to stat {}", path.display()));
+        }
+    };
+    validate_private_directory_read_only(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("lifecycle record has no parent"))?,
+    )?;
+    validate_private_regular_file(&path, &metadata, 0o600)?;
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("failed to read lifecycle record {}", path.display()))?;
+    let record: LifecycleRecord = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid lifecycle record {}", path.display()))?;
+    validate_lifecycle_record(&record, incarnation_hash)?;
+    Ok(record)
+}
+
+pub fn update_lifecycle_record<T>(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+    update: impl FnOnce(&mut LifecycleRecord) -> Result<T>,
+) -> Result<T> {
+    let directory = incarnation_log_directory(env, incarnation_hash);
+    ensure_private_log_directory(&directory)?;
+    let lock_path = directory.join("lifecycle.lock");
+    let lock = loop {
+        if let Some(lock) = try_lock_file(&lock_path)? {
+            break lock;
+        }
+        thread::sleep(DAEMON_START_POLL_INTERVAL);
+    };
+    let mut record = read_lifecycle_record(env, incarnation_hash)?;
+    let result = update(&mut record)?;
+    record.updated_at_epoch_seconds = epoch_seconds();
+    write_lifecycle_record_atomic(env, &record)?;
+    drop(lock);
+    Ok(result)
+}
+
+pub fn write_lifecycle_record_atomic(
+    env: &BTreeMap<String, String>,
+    record: &LifecycleRecord,
+) -> Result<()> {
+    validate_lifecycle_record(record, &record.server_identity)?;
+    let directory = incarnation_log_directory(env, &record.server_identity);
+    ensure_private_log_directory(&directory)?;
+    let path = directory.join(LIFECYCLE_RECORD_FILE);
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        validate_private_regular_file(&path, &metadata, 0o600)?;
+    }
+    let temporary = directory.join(format!(
+        ".lifecycle.{}.{:x}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    let write_result = (|| -> Result<()> {
+        use std::io::Write as _;
+        serde_json::to_writer(&mut file, record)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+        File::open(&directory)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn validate_lifecycle_record(record: &LifecycleRecord, incarnation_hash: &str) -> Result<()> {
+    if record.version != LIFECYCLE_RECORD_VERSION {
+        bail!("unsupported lifecycle record version {}", record.version);
+    }
+    if record.server_identity != incarnation_hash {
+        bail!(
+            "lifecycle record server mismatch: expected {incarnation_hash}, received {}",
+            record.server_identity
+        );
+    }
+    if let Some(process) = &record.process {
+        if process.pid == 0 {
+            bail!("lifecycle record contains PID 0");
+        }
+        crate::pane_state::DaemonInstanceId::parse(process.daemon_instance_id.clone())
+            .context("lifecycle record contains invalid daemon instance ID")?;
+        if process.start_token.trim().is_empty() {
+            bail!("lifecycle record contains an empty process start token");
+        }
+    }
+    if let Some(notification) = &record.active_notification
+        && (notification.process_group_id <= 0 || notification.leader_start_token.trim().is_empty())
+    {
+        bail!("lifecycle record contains invalid notification process identity");
+    }
+    Ok(())
+}
+
+fn validate_private_regular_file(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    required_mode: u32,
+) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("private state is not a regular file: {}", path.display());
+    }
+    let uid = unsafe { libc::geteuid() };
+    if metadata.uid() != uid {
+        bail!(
+            "private state owner mismatch for {}: expected uid {}, got {}",
+            path.display(),
+            uid,
+            metadata.uid()
+        );
+    }
+    if metadata.permissions().mode() & 0o777 != required_mode {
+        bail!(
+            "private state mode mismatch for {}: expected {:o}, got {:o}",
+            path.display(),
+            required_mode,
+            metadata.permissions().mode() & 0o777
+        );
+    }
+    Ok(())
+}
+
+fn validate_private_directory_read_only(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat private state directory {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "private state directory is not a directory: {}",
+            path.display()
+        );
+    }
+    let uid = unsafe { libc::geteuid() };
+    if metadata.uid() != uid || metadata.permissions().mode() & 0o777 != 0o700 {
+        bail!(
+            "private state directory is not owned mode 0700: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+pub fn process_start_token(pid: u32) -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .with_context(|| format!("failed to read process identity for PID {pid}"))?;
+        let after_name = stat
+            .rfind(") ")
+            .map(|index| &stat[index + 2..])
+            .ok_or_else(|| anyhow::anyhow!("invalid /proc stat for PID {pid}"))?;
+        let start = after_name
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| anyhow::anyhow!("missing process start time for PID {pid}"))?;
+        return Ok(start.to_string());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = Command::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .output()
+            .with_context(|| format!("failed to inspect process identity for PID {pid}"))?;
+        if !output.status.success() {
+            bail!("process PID {pid} is not available");
+        }
+        let token = String::from_utf8(output.stdout)
+            .context("process start identity was not UTF-8")?
+            .trim()
+            .to_string();
+        if token.is_empty() {
+            bail!("process PID {pid} has no start identity");
+        }
+        Ok(token)
+    }
+}
+
+pub fn process_identity_is_alive(identity: &DaemonProcessIdentity) -> bool {
+    process_start_token(identity.pid).is_ok_and(|token| token == identity.start_token)
+        && !process_is_zombie(identity.pid)
+}
+
+pub fn terminate_active_notification(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+) -> Result<bool> {
+    let record = read_lifecycle_record(env, incarnation_hash)?;
+    let Some(identity) = record.active_notification else {
+        return Ok(false);
+    };
+    let leader_pid = u32::try_from(identity.process_group_id)
+        .context("notification process group ID does not fit a PID")?;
+    match process_start_token(leader_pid) {
+        Ok(start_token) if start_token == identity.leader_start_token => {}
+        Ok(_) => bail!(
+            "refusing to signal notification process group {}: leader identity changed",
+            identity.process_group_id
+        ),
+        Err(_) => {
+            update_lifecycle_record(env, incarnation_hash, |record| {
+                if record.active_notification.as_ref() == Some(&identity) {
+                    record.active_notification = None;
+                }
+                Ok(())
+            })?;
+            return Ok(false);
+        }
+    }
+    if unsafe { libc::kill(identity.process_group_id, libc::SIGSTOP) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to suspend notification process group leader {}",
+                identity.process_group_id
+            )
+        });
+    }
+    if !process_start_token(leader_pid)
+        .is_ok_and(|start_token| start_token == identity.leader_start_token)
+    {
+        let _ = unsafe { libc::kill(identity.process_group_id, libc::SIGCONT) };
+        bail!(
+            "refusing to signal notification process group {}: leader identity changed after suspension",
+            identity.process_group_id
+        );
+    }
+    if unsafe { libc::kill(-identity.process_group_id, libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            let _ = unsafe { libc::kill(identity.process_group_id, libc::SIGCONT) };
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to signal notification process group {}",
+                    identity.process_group_id
+                )
+            });
+        }
+    }
+    update_lifecycle_record(env, incarnation_hash, |record| {
+        if record.active_notification.as_ref() == Some(&identity) {
+            record.active_notification = None;
+        }
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+fn process_is_zombie(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rfind(") ").map(|index| stat[index + 2..].to_string()))
+            .and_then(|after_name| after_name.split_whitespace().next().map(str::to_string))
+            .is_some_and(|state| state == "Z");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .starts_with('Z')
+            })
+    }
+}
+
+pub fn daemon_process_identity(
+    socket: &Path,
+    daemon_instance_id: &crate::pane_state::DaemonInstanceId,
+) -> Result<DaemonProcessIdentity> {
+    let pid = std::process::id();
+    let metadata = std::fs::symlink_metadata(socket)
+        .with_context(|| format!("failed to stat daemon socket {}", socket.display()))?;
+    if !metadata.file_type().is_socket() || metadata.file_type().is_symlink() {
+        bail!("daemon socket identity is not a Unix socket");
+    }
+    Ok(DaemonProcessIdentity {
+        pid,
+        start_token: process_start_token(pid)?,
+        daemon_instance_id: daemon_instance_id.as_str().to_string(),
+        socket_device: metadata.dev(),
+        socket_inode: metadata.ino(),
+    })
+}
+
+pub fn verify_force_stop_identity(
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+    socket: &Path,
+    expected: &DaemonProcessIdentity,
+) -> Result<()> {
+    let current_record = read_lifecycle_record(env, incarnation_hash)?;
+    let current = current_record
+        .process
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("lifecycle record has no daemon process identity"))?;
+    if current != expected {
+        bail!("daemon process identity changed before force-stop");
+    }
+    let metadata = std::fs::symlink_metadata(socket)
+        .with_context(|| format!("failed to stat daemon socket {}", socket.display()))?;
+    if !metadata.file_type().is_socket()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.dev() != current.socket_device
+        || metadata.ino() != current.socket_inode
+    {
+        bail!("daemon socket identity changed before force-stop");
+    }
+    let start_token = process_start_token(current.pid)?;
+    if start_token != current.start_token {
+        bail!("daemon PID start identity changed before force-stop");
+    }
+    crate::pane_state::DaemonInstanceId::parse(current.daemon_instance_id.clone())
+        .context("daemon instance identity is invalid")?;
+    Ok(())
+}
+
+pub fn remove_force_stopped_socket(socket: &Path, expected: &DaemonProcessIdentity) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to stat daemon socket {}", socket.display()));
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.dev() != expected.socket_device
+        || metadata.ino() != expected.socket_inode
+    {
+        bail!(
+            "refusing to remove replaced daemon socket {}",
+            socket.display()
+        );
+    }
+    std::fs::remove_file(socket)
+        .with_context(|| format!("failed to remove daemon socket {}", socket.display()))?;
+    if let Some(parent) = socket.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+pub fn config_hash(config: &crate::config::Config) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{config:#?}").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn inspect_legacy_pull_formats(runner: &dyn TmuxRunner) -> Result<Vec<String>> {
+    const GLOBAL_OPTIONS: [&str; 5] = [
+        "status-left",
+        "status-right",
+        "window-status-format",
+        "window-status-current-format",
+        "pane-border-format",
+    ];
+    let mut legacy = Vec::new();
+    for option in GLOBAL_OPTIONS {
+        let value = run_format_preflight_query(runner, &["show-option", "-gv", option])?;
+        if contains_legacy_statusline_command(&value) {
+            legacy.push(format!("global:{option}"));
+        }
+    }
+    let sessions = bounded_tmux_targets(&run_format_preflight_query(
+        runner,
+        &["list-sessions", "-F", "#{session_id}"],
+    )?)?;
+    let has_sessions = !sessions.is_empty();
+    for session in sessions {
+        for option in [
+            "status-left",
+            "status-right",
+            "window-status-format",
+            "window-status-current-format",
+        ] {
+            let value = run_format_preflight_query(
+                runner,
+                &["show-option", "-qv", "-t", &session, option],
+            )?;
+            if contains_legacy_statusline_command(&value) {
+                legacy.push(format!("session:{session}:{option}"));
+            }
+        }
+    }
+    if !has_sessions {
+        return Ok(legacy);
+    }
+    let windows = bounded_tmux_targets(&run_format_preflight_query(
+        runner,
+        &["list-windows", "-a", "-F", "#{window_id}"],
+    )?)?;
+    for window in windows {
+        let option = "pane-border-format";
+        let value =
+            run_format_preflight_query(runner, &["show-option", "-wqv", "-t", &window, option])?;
+        if contains_legacy_statusline_command(&value) {
+            legacy.push(format!("window:{window}:{option}"));
+        }
+    }
+    Ok(legacy)
+}
+
+fn run_format_preflight_query(runner: &dyn TmuxRunner, args: &[&str]) -> Result<String> {
+    match runner.run(args) {
+        Ok(output) => Ok(output),
+        #[cfg(test)]
+        Err(error) if error.to_string().contains("no stub registered") => Ok(String::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn bounded_tmux_targets(output: &str) -> Result<Vec<String>> {
+    const MAX_TARGETS: usize = 4096;
+    let targets = output
+        .lines()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if targets.len() > MAX_TARGETS {
+        bail!("tmux format preflight target count exceeds {MAX_TARGETS}");
+    }
+    Ok(targets.into_iter().collect())
+}
+
+fn contains_legacy_statusline_command(value: &str) -> bool {
+    let mut rest = value;
+    while let Some(start) = rest.find("#(") {
+        let command = &rest[start + 2..];
+        let Some(end) = command.find(')') else {
+            return false;
+        };
+        let words = command[..end].split_whitespace().collect::<Vec<_>>();
+        if let Some(index) = words.iter().position(|word| {
+            Path::new(word.trim_matches(['\'', '"']))
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| matches!(name, "vt" | "vde-tmux"))
+        }) && words
+            .get(index + 1)
+            .is_some_and(|command| command.trim_matches(['\'', '"']).starts_with("statusline-"))
+        {
+            return true;
+        }
+        rest = &command[end + 1..];
+    }
+    false
+}
+
+fn ensure_private_log_directory(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "runtime log path is not a private directory: {}",
+            path.display()
+        );
+    }
+    let uid = unsafe { libc::geteuid() };
+    if metadata.uid() != uid {
+        bail!(
+            "runtime log directory owner mismatch for {}: expected uid {}, got {}",
+            path.display(),
+            uid,
+            metadata.uid()
+        );
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to chmod {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn rotate_runtime_log_if_needed(path: &Path) -> Result<()> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    validate_runtime_log_metadata(path, &metadata)?;
+    if metadata.len() < MAX_RUNTIME_LOG_BYTES {
+        return Ok(());
+    }
+    let rotated = path.with_extension(format!(
+        "{}.1",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("log")
+    ));
+    if let Ok(rotated_metadata) = std::fs::symlink_metadata(&rotated) {
+        validate_runtime_log_metadata(&rotated, &rotated_metadata)?;
+        std::fs::remove_file(&rotated)
+            .with_context(|| format!("failed to remove {}", rotated.display()))?;
+    }
+    std::fs::rename(path, &rotated)
+        .with_context(|| format!("failed to rotate {}", path.display()))?;
+    Ok(())
+}
+
+fn open_secure_runtime_log(path: &Path) -> Result<File> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        validate_runtime_log_metadata(path, &metadata)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open runtime log {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat runtime log {}", path.display()))?;
+    validate_runtime_log_metadata(path, &metadata)?;
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to chmod runtime log {}", path.display()))?;
+    }
+    Ok(file)
+}
+
+fn validate_runtime_log_metadata(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("runtime log is not a regular file: {}", path.display());
+    }
+    let uid = unsafe { libc::geteuid() };
+    if metadata.uid() != uid {
+        bail!(
+            "runtime log owner mismatch for {}: expected uid {}, got {}",
+            path.display(),
+            uid,
+            metadata.uid()
+        );
+    }
+    Ok(())
+}
+
+fn bounded_log_message(message: &str) -> String {
+    let sanitized = message.replace(['\r', '\n'], "\\n");
+    if sanitized.len() <= MAX_RUNTIME_LOG_LINE_BYTES {
+        return sanitized;
+    }
+    let mut end = MAX_RUNTIME_LOG_LINE_BYTES;
+    while !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &sanitized[..end])
+}
+
+fn epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 pub fn probe_v2_daemon(
     socket: &Path,
     expected_server_identity: &str,
@@ -148,25 +1048,37 @@ pub fn probe_v2_daemon(
         expected_server_identity,
         Instant::now() + Duration::from_millis(150),
     )
+    .ok()
+    .flatten()
 }
 
 fn probe_v2_daemon_until(
     socket: &Path,
     expected_server_identity: &str,
     deadline: Instant,
-) -> Option<crate::daemon::protocol::v2::DaemonPhase> {
+) -> Result<Option<crate::daemon::protocol::v2::DaemonPhase>> {
     if deadline <= Instant::now() {
-        return None;
+        return Ok(None);
     }
-    crate::daemon::protocol::v2::V2Client::connect_with_timeout(
+    match crate::daemon::protocol::v2::V2Client::connect_with_timeout(
         socket,
         expected_server_identity,
         deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(150)),
+    ) {
+        Ok(client) => Ok(Some(client.phase())),
+        Err(error) if crate::daemon::protocol::v2::is_protocol_version_mismatch(&error) => {
+            Err(incompatible_daemon_error(error))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn incompatible_daemon_error(error: anyhow::Error) -> anyhow::Error {
+    error.context(
+        "incompatible daemon is already running; stop it with the previously installed binary before replacing or starting this version",
     )
-    .ok()
-    .map(|client| client.phase())
 }
 
 pub fn ensure_daemon_live_v2(
@@ -189,7 +1101,18 @@ pub fn ensure_daemon_live_v2_until(
     deadline: Instant,
 ) -> Result<(TmuxServerIncarnation, PathBuf)> {
     ensure_deadline_remaining(deadline, "resolving tmux server incarnation")?;
+    if tmux_desired_mode(runner, env)? == DesiredMode::Disabled {
+        bail!("daemon is disabled for the current tmux server");
+    }
     let incarnation = TmuxServerIncarnation::resolve(runner, env)?;
+    let legacy_formats = inspect_legacy_pull_formats(runner)?;
+    if !legacy_formats.is_empty() {
+        bail!(
+            "legacy pull-based status commands remain in {}; migrate to zero-process daemon push formats",
+            legacy_formats.join(", ")
+        );
+    }
+    incarnation.verify(runner, env)?;
     ensure_daemon_live_v2_for_incarnation_until(incarnation, env, explicit_socket, deadline)
 }
 
@@ -199,10 +1122,31 @@ pub fn ensure_daemon_live_v2_for_incarnation_until(
     explicit_socket: Option<&str>,
     deadline: Instant,
 ) -> Result<(TmuxServerIncarnation, PathBuf)> {
+    ensure_daemon_live_v2_for_incarnation_until_mode(
+        incarnation,
+        env,
+        explicit_socket,
+        deadline,
+        true,
+    )
+}
+
+fn ensure_daemon_live_v2_for_incarnation_until_mode(
+    incarnation: TmuxServerIncarnation,
+    env: &BTreeMap<String, String>,
+    explicit_socket: Option<&str>,
+    deadline: Instant,
+    honor_disabled: bool,
+) -> Result<(TmuxServerIncarnation, PathBuf)> {
     ensure_deadline_remaining(deadline, "checking daemon liveness")?;
+    if honor_disabled
+        && read_lifecycle_record(env, &incarnation.hash)?.desired_mode == DesiredMode::Disabled
+    {
+        bail!("daemon is disabled for tmux server {}", incarnation.hash);
+    }
     let socket =
         crate::daemon::daemon_socket_path_for_incarnation(env, explicit_socket, &incarnation.hash);
-    if probe_v2_daemon_until(&socket, &incarnation.hash, deadline).is_some() {
+    if probe_v2_daemon_until(&socket, &incarnation.hash, deadline)?.is_some() {
         return Ok((incarnation, socket));
     }
     if let Some(parent) = socket.parent().filter(|path| !path.as_os_str().is_empty()) {
@@ -211,14 +1155,14 @@ pub fn ensure_daemon_live_v2_for_incarnation_until(
     }
     ensure_deadline_remaining(deadline, "acquiring daemon start lock")?;
     let _start_lock = acquire_daemon_start_lock_until(&socket, deadline)?;
-    if probe_v2_daemon_until(&socket, &incarnation.hash, deadline).is_some() {
+    if probe_v2_daemon_until(&socket, &incarnation.hash, deadline)?.is_some() {
         return Ok((incarnation, socket));
     }
     ensure_deadline_remaining(deadline, "acquiring daemon instance lock")?;
     let stale_guard = try_acquire_daemon_instance_lock(&socket)?;
     if stale_guard.is_none() {
         loop {
-            if probe_v2_daemon_until(&socket, &incarnation.hash, deadline).is_some() {
+            if probe_v2_daemon_until(&socket, &incarnation.hash, deadline)?.is_some() {
                 return Ok((incarnation, socket));
             }
             if Instant::now() >= deadline {
@@ -238,6 +1182,7 @@ pub fn ensure_daemon_live_v2_for_incarnation_until(
     }
     drop(stale_guard);
     ensure_deadline_remaining(deadline, "spawning daemon")?;
+    let startup_generation = read_lifecycle_record(env, &incarnation.hash)?.generation;
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     let mut command = Command::new(&exe);
     command
@@ -264,26 +1209,175 @@ pub fn ensure_daemon_live_v2_for_incarnation_until(
         });
     }
     ensure_deadline_remaining(deadline, "spawning daemon")?;
-    command.spawn().with_context(|| {
-        format!(
-            "failed to spawn v2 daemon {} --socket {}",
+    let mut child = command.spawn().map_err(|error| {
+        let message = format!(
+            "failed to spawn v2 daemon {} --socket {}: {error}",
             exe.display(),
             socket.display()
-        )
+        );
+        let _ = append_incarnation_log(
+            env,
+            &incarnation.hash,
+            "daemon.log",
+            &format!("daemon startup failed: {message}"),
+        );
+        anyhow::Error::new(error).context(message)
     })?;
+    let child_start_token = match process_start_token(child.id()) {
+        Ok(token) => token,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("failed to record spawned daemon process identity");
+        }
+    };
     loop {
-        if probe_v2_daemon_until(&socket, &incarnation.hash, deadline).is_some() {
+        if probe_v2_daemon_until(&socket, &incarnation.hash, deadline)?.is_some() {
             return Ok((incarnation, socket));
         }
-        if Instant::now() >= deadline {
+        if let Some(status) = child.try_wait()? {
+            let log_path = incarnation_log_path(env, &incarnation.hash, "daemon.log");
+            if let Ok(record) = read_lifecycle_record(env, &incarnation.hash)
+                && let Some(error) = startup_failure_for_generation(&record, startup_generation)
+            {
+                bail!(
+                    "v2 daemon exited before becoming live: {error}; see {}",
+                    log_path.display()
+                );
+            }
             bail!(
-                "v2 daemon did not become live at {} before the caller deadline ({:?} maximum)",
+                "v2 daemon exited with status {status} before becoming live; see {}",
+                log_path.display()
+            );
+        }
+        if Instant::now() >= deadline {
+            let log_path = incarnation_log_path(env, &incarnation.hash, "daemon.log");
+            terminate_timed_out_spawn(
+                &mut child,
+                &child_start_token,
+                env,
+                &incarnation.hash,
+                &socket,
+            );
+            bail!(
+                "v2 daemon did not become live at {} before the caller deadline ({:?} maximum); see {}",
                 socket.display(),
-                DAEMON_START_TIMEOUT
+                DAEMON_START_TIMEOUT,
+                log_path.display()
             );
         }
         sleep_with_deadline(deadline);
     }
+}
+
+fn terminate_timed_out_spawn(
+    child: &mut std::process::Child,
+    expected_start_token: &str,
+    env: &BTreeMap<String, String>,
+    incarnation_hash: &str,
+    socket: &Path,
+) {
+    if !process_start_token(child.id()).is_ok_and(|token| token == expected_start_token) {
+        return;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Ok(record) = read_lifecycle_record(env, incarnation_hash)
+        && let Some(process) = record.process
+        && process.pid == child.id()
+        && process.start_token == expected_start_token
+    {
+        let _ = remove_force_stopped_socket(socket, &process);
+    }
+    let _ = update_lifecycle_record(env, incarnation_hash, |record| {
+        if record.process.as_ref().is_some_and(|process| {
+            process.pid == child.id() && process.start_token == expected_start_token
+        }) {
+            record.process = None;
+        }
+        record.degrade("daemon startup timed out and the spawned process was terminated");
+        Ok(())
+    });
+}
+
+pub fn start_daemon_serving_v2_while_disabled(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    explicit_socket: Option<&str>,
+) -> Result<(TmuxServerIncarnation, PathBuf)> {
+    let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+    let incarnation = TmuxServerIncarnation::resolve(runner, env)?;
+    let legacy_formats = inspect_legacy_pull_formats(runner)?;
+    if !legacy_formats.is_empty() {
+        bail!(
+            "legacy pull-based status commands remain in {}; migrate to zero-process daemon push formats",
+            legacy_formats.join(", ")
+        );
+    }
+    incarnation.verify(runner, env)?;
+    let (incarnation, socket) = ensure_daemon_live_v2_for_incarnation_until_mode(
+        incarnation,
+        env,
+        explicit_socket,
+        deadline,
+        false,
+    )?;
+    let startup_generation = read_lifecycle_record(env, &incarnation.hash)?.generation;
+    loop {
+        if probe_v2_daemon_until(&socket, &incarnation.hash, deadline)?
+            == Some(crate::daemon::protocol::v2::DaemonPhase::Serving)
+        {
+            return Ok((incarnation, socket));
+        }
+        if let Ok(record) = read_lifecycle_record(env, &incarnation.hash)
+            && let Some(error) = startup_failure_for_generation(&record, startup_generation)
+        {
+            bail!("v2 daemon exited before Serving: {error}");
+        }
+        if Instant::now() >= deadline {
+            terminate_recorded_startup(runner, env, &incarnation, &socket);
+            bail!("v2 daemon did not enter Serving before the enable deadline");
+        }
+        sleep_with_deadline(deadline);
+    }
+}
+
+fn terminate_recorded_startup(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    incarnation: &TmuxServerIncarnation,
+    socket: &Path,
+) {
+    if incarnation.verify(runner, env).is_err() {
+        return;
+    }
+    let Ok(record) = read_lifecycle_record(env, &incarnation.hash) else {
+        return;
+    };
+    let Some(process) = record.process else {
+        return;
+    };
+    if verify_force_stop_identity(env, &incarnation.hash, socket, &process).is_err() {
+        return;
+    }
+    if unsafe { libc::kill(process.pid as i32, libc::SIGKILL) } != 0 {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_identity_is_alive(&process) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    if process_identity_is_alive(&process) {
+        return;
+    }
+    let _ = remove_force_stopped_socket(socket, &process);
+    let _ = update_lifecycle_record(env, &incarnation.hash, |record| {
+        if record.process.as_ref() == Some(&process) {
+            record.process = None;
+        }
+        record.degrade("daemon did not enter Serving and was terminated");
+        Ok(())
+    });
 }
 
 pub fn ensure_daemon_serving_v2(
@@ -303,17 +1397,34 @@ pub fn ensure_daemon_serving_v2_until(
 ) -> Result<(TmuxServerIncarnation, PathBuf)> {
     let (incarnation, socket) =
         ensure_daemon_live_v2_until(runner, env, explicit_socket, deadline)?;
+    let startup_generation = read_lifecycle_record(env, &incarnation.hash)?.generation;
     loop {
-        if probe_v2_daemon_until(&socket, &incarnation.hash, deadline)
+        if probe_v2_daemon_until(&socket, &incarnation.hash, deadline)?
             == Some(crate::daemon::protocol::v2::DaemonPhase::Serving)
         {
             return Ok((incarnation, socket));
+        }
+        if let Ok(record) = read_lifecycle_record(env, &incarnation.hash)
+            && let Some(error) = startup_failure_for_generation(&record, startup_generation)
+        {
+            bail!("v2 daemon exited before Serving: {error}");
         }
         if Instant::now() >= deadline {
             bail!("v2 daemon did not enter Serving before the caller deadline");
         }
         sleep_with_deadline(deadline);
     }
+}
+
+fn startup_failure_for_generation(
+    record: &LifecycleRecord,
+    expected_generation: u64,
+) -> Option<&str> {
+    (record.generation == expected_generation
+        && record.health == LifecycleHealth::Degraded
+        && record.process.is_none())
+    .then_some(record.last_transition_error.as_deref())
+    .flatten()
 }
 
 #[derive(Debug)]
@@ -487,23 +1598,31 @@ fn try_lock_file(path: &Path) -> Result<Option<DaemonFileLock>> {
 }
 
 fn open_lock_file(path: &Path) -> Result<File> {
-    OpenOptions::new()
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        validate_private_regular_file(path, &metadata, 0o600)?;
+    }
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .with_context(|| format!("failed to open lock file {}", path.display()))
+        .with_context(|| format!("failed to open lock file {}", path.display()))?;
+    validate_private_regular_file(path, &file.metadata()?, 0o600)?;
+    Ok(file)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
+    use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -515,6 +1634,36 @@ mod tests {
     fn unique_dir(label: &str) -> PathBuf {
         let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
         PathBuf::from(format!("/tmp/vt-{label}-{}-{counter}", std::process::id()))
+    }
+
+    #[test]
+    fn startup_failure_is_scoped_to_the_current_stopped_generation() {
+        let mut record = super::LifecycleRecord::initial("server");
+        record.generation = 7;
+        record.degrade("daemon runtime exited with error: topology failure");
+
+        assert_eq!(
+            super::startup_failure_for_generation(&record, 7),
+            Some("daemon runtime exited with error: topology failure")
+        );
+        assert_eq!(super::startup_failure_for_generation(&record, 6), None);
+
+        record.process = Some(super::DaemonProcessIdentity {
+            pid: 42,
+            start_token: "token".to_string(),
+            daemon_instance_id: "00112233445566778899aabbccddeeff".to_string(),
+            socket_device: 1,
+            socket_inode: 2,
+        });
+        assert_eq!(super::startup_failure_for_generation(&record, 7), None);
+
+        record.process = None;
+        record.health = super::LifecycleHealth::Stable;
+        assert_eq!(super::startup_failure_for_generation(&record, 7), None);
+
+        record.health = super::LifecycleHealth::Degraded;
+        record.last_transition_error = None;
+        assert_eq!(super::startup_failure_for_generation(&record, 7), None);
     }
 
     #[test]
@@ -595,12 +1744,14 @@ mod tests {
                 serde_json::from_str(request.trim()).unwrap();
             assert_eq!(
                 hello,
-                crate::daemon::protocol::v2::ClientMessage::Hello { proto: 2 }
+                crate::daemon::protocol::v2::ClientMessage::Hello {
+                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION
+                }
             );
             serde_json::to_writer(
                 &mut stream,
                 &crate::daemon::protocol::v2::ServerMessage::HelloAck {
-                    proto: 2,
+                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
                     daemon_instance_id: crate::pane_state::DaemonInstanceId::parse(
                         "00112233445566778899aabbccddeeff",
                     )
@@ -619,11 +1770,94 @@ mod tests {
                 &socket,
                 "server-hash",
                 Instant::now() + Duration::from_secs(2),
-            ),
+            )
+            .unwrap(),
             Some(crate::daemon::protocol::v2::DaemonPhase::InstallingHooks)
         );
         server.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ensure_fails_immediately_for_an_incompatible_live_daemon() {
+        let state_root = unique_dir("incompatible-daemon-state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "incompatible-daemon-{}-{}",
+                    std::process::id(),
+                    TEST_DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
+                )
+                .as_bytes()
+            )
+        );
+        let incarnation = super::TmuxServerIncarnation {
+            socket_path: state_root.join("tmux.sock"),
+            identity: crate::daemon::topology::ServerIdentity {
+                pid: 10,
+                start_time: 20,
+            },
+            hash: hash.clone(),
+        };
+        let env = BTreeMap::from([(
+            "XDG_STATE_HOME".to_string(),
+            state_root.to_string_lossy().into_owned(),
+        )]);
+        let socket = crate::daemon::daemon_socket_path_for_incarnation(&env, None, &hash);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let hello: crate::daemon::protocol::v2::ClientMessage =
+                serde_json::from_str(request.trim()).unwrap();
+            assert_eq!(
+                hello,
+                crate::daemon::protocol::v2::ClientMessage::Hello {
+                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION
+                }
+            );
+            serde_json::to_writer(
+                &mut stream,
+                &crate::daemon::protocol::v2::ServerMessage::error(
+                    crate::daemon::protocol::v2::ErrorCode::UnsupportedProtocol,
+                    "protocol version 2 is required",
+                    None,
+                ),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+
+        let started = Instant::now();
+        let error = super::ensure_daemon_live_v2_for_incarnation_until(
+            incarnation,
+            &env,
+            None,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(1), "{error:#}");
+        assert!(
+            error.to_string().contains("incompatible daemon"),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("previously installed binary"),
+            "{error:#}"
+        );
+        assert!(crate::daemon::protocol::v2::is_protocol_version_mismatch(
+            &error
+        ));
+        server.join().unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::remove_dir_all(state_root).unwrap();
     }
 
     #[test]
@@ -803,5 +2037,499 @@ mod tests {
         assert!(error.to_string().contains("insecure socket dir mode"));
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn incarnation_log_is_private_bounded_and_single_line() {
+        let root = unique_dir("incarnation-log");
+        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+        let hash = "a".repeat(64);
+
+        let path = super::append_incarnation_log(
+            &env,
+            &hash,
+            "daemon.log",
+            &format!(
+                "failure\n{}",
+                "x".repeat(super::MAX_RUNTIME_LOG_LINE_BYTES * 2)
+            ),
+        )
+        .unwrap();
+
+        let directory_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains("failure\\n"));
+        assert!(contents.len() < super::MAX_RUNTIME_LOG_LINE_BYTES + 64);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incarnation_log_rejects_symlink_target() {
+        let root = unique_dir("incarnation-log-symlink");
+        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+        let hash = "b".repeat(64);
+        let directory = super::incarnation_log_directory(&env, &hash);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = root.join("target");
+        std::fs::write(&target, "sentinel").unwrap();
+        std::os::unix::fs::symlink(&target, directory.join("daemon.log")).unwrap();
+
+        let error =
+            super::append_incarnation_log(&env, &hash, "daemon.log", "must not follow symlink")
+                .unwrap_err();
+
+        assert!(error.to_string().contains("regular file"));
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "sentinel");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_record_is_private_atomic_and_read_only_when_absent() {
+        let root = unique_dir("lifecycle-record");
+        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+        let hash = "c".repeat(64);
+
+        let absent = super::read_lifecycle_record(&env, &hash).unwrap();
+        assert_eq!(absent.desired_mode, super::DesiredMode::Enabled);
+        assert!(
+            !root.exists(),
+            "read-only lookup must not create state paths"
+        );
+
+        super::update_lifecycle_record(&env, &hash, |record| {
+            record.begin_transition(super::DesiredMode::Disabled)
+        })
+        .unwrap();
+        let path = super::lifecycle_record_path(&env, &hash);
+        let stored = super::read_lifecycle_record(&env, &hash).unwrap();
+        assert_eq!(stored.desired_mode, super::DesiredMode::Disabled);
+        assert_eq!(stored.generation, 1);
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tmux_disabled_marker_is_authoritative_across_different_state_environments() {
+        let root = unique_dir("disabled-marker");
+        std::fs::create_dir_all(&root).unwrap();
+        let tmux_socket = root.join("tmux.sock");
+        let listener = UnixListener::bind(&tmux_socket).unwrap();
+        let mock = crate::tmux::mock::MockTmuxRunner::new();
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "#{pid}\t#{start_time}\t#{socket_path}",
+            ],
+            &format!("123\t456\t{}\n", tmux_socket.display()),
+        );
+        mock.stub(
+            &["show-option", "-gqv", super::DISABLED_SERVER_OPTION],
+            "1\n",
+        );
+        let first = BTreeMap::from([
+            (
+                "TMUX".to_string(),
+                format!("{},123,0", tmux_socket.display()),
+            ),
+            (
+                "XDG_STATE_HOME".to_string(),
+                root.join("a").display().to_string(),
+            ),
+        ]);
+        let second = BTreeMap::from([
+            (
+                "TMUX".to_string(),
+                format!("{},123,0", tmux_socket.display()),
+            ),
+            (
+                "XDG_STATE_HOME".to_string(),
+                root.join("b").display().to_string(),
+            ),
+        ]);
+
+        assert_eq!(
+            super::tmux_desired_mode(&mock, &first).unwrap(),
+            super::DesiredMode::Disabled
+        );
+        assert_eq!(
+            super::tmux_desired_mode(&mock, &second).unwrap(),
+            super::DesiredMode::Disabled
+        );
+        assert!(!root.join("a").exists());
+        assert!(!root.join("b").exists());
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_pull_format_detection_is_specific_to_vt_statusline_commands() {
+        assert!(super::contains_legacy_statusline_command(
+            "left #(vt statusline-summary) right"
+        ));
+        assert!(super::contains_legacy_statusline_command(
+            "#(/usr/local/bin/vde-tmux statusline-pane --pane-id %1)"
+        ));
+        assert!(!super::contains_legacy_statusline_command(
+            "#[fg=red] statusline-summary"
+        ));
+        assert!(!super::contains_legacy_statusline_command(
+            "#(other-tool statusline-summary)"
+        ));
+        assert!(!super::contains_legacy_statusline_command(
+            "#(vt project selector)"
+        ));
+    }
+
+    #[test]
+    fn legacy_pull_format_inspection_reports_session_and_window_scope() {
+        let mock = crate::tmux::mock::MockTmuxRunner::new();
+        mock.stub(&["list-sessions", "-F", "#{session_id}"], "$1\n");
+        mock.stub(&["list-windows", "-a", "-F", "#{window_id}"], "@1\n");
+        mock.stub(
+            &["show-option", "-qv", "-t", "$1", "status-right"],
+            "#(vt statusline-summary)\n",
+        );
+        mock.stub(
+            &["show-option", "-wqv", "-t", "@1", "pane-border-format"],
+            "#(/opt/vt statusline-pane --pane-id %1)\n",
+        );
+
+        let findings = super::inspect_legacy_pull_formats(&mock).unwrap();
+
+        assert!(findings.contains(&"session:$1:status-right".to_string()));
+        assert!(findings.contains(&"window:@1:pane-border-format".to_string()));
+        assert_eq!(findings.len(), 2);
+        assert!(mock.calls().iter().all(|args| {
+            !args
+                .iter()
+                .any(|argument| argument == "pane-active-border-format")
+        }));
+    }
+
+    #[test]
+    fn legacy_pull_format_inspection_skips_window_query_on_empty_server() {
+        let mock = crate::tmux::mock::MockTmuxRunner::new();
+        mock.stub(&["list-sessions", "-F", "#{session_id}"], "");
+
+        assert!(
+            super::inspect_legacy_pull_formats(&mock)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            mock.calls()
+                .iter()
+                .all(|args| args.first().map(String::as_str) != Some("list-windows"))
+        );
+    }
+
+    #[test]
+    fn ensure_rejects_legacy_pull_format_before_socket_or_spawn_work() {
+        let root = unique_dir("legacy-preflight-ensure");
+        std::fs::create_dir_all(&root).unwrap();
+        let tmux_socket = root.join("tmux.sock");
+        let listener = UnixListener::bind(&tmux_socket).unwrap();
+        let mock = crate::tmux::mock::MockTmuxRunner::new();
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "#{pid}\t#{start_time}\t#{socket_path}",
+            ],
+            &format!("123\t456\t{}\n", tmux_socket.display()),
+        );
+        mock.stub(&["show-option", "-gqv", super::DISABLED_SERVER_OPTION], "");
+        mock.stub(
+            &["show-option", "-gv", "status-left"],
+            "#(vt statusline-summary)\n",
+        );
+        let env = BTreeMap::from([
+            (
+                "TMUX".to_string(),
+                format!("{},123,0", tmux_socket.display()),
+            ),
+            (
+                "XDG_RUNTIME_DIR".to_string(),
+                root.join("runtime").display().to_string(),
+            ),
+        ]);
+
+        let error = super::ensure_daemon_live_v2_until(
+            &mock,
+            &env,
+            None,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("global:status-left"));
+        assert!(!root.join("runtime").exists());
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn log_tail_is_read_only_bounded_and_rejects_invalid_line_count() {
+        let root = unique_dir("log-tail");
+        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+        let hash = "f".repeat(64);
+        for line in ["one", "two", "three"] {
+            super::append_incarnation_log(&env, &hash, "daemon.log", line).unwrap();
+        }
+
+        let tail = super::read_incarnation_log_tail(&env, &hash, "daemon.log", 2).unwrap();
+
+        assert_eq!(tail.lines().count(), 2);
+        assert!(tail.contains("two"));
+        assert!(tail.contains("three"));
+        assert!(super::read_incarnation_log_tail(&env, &hash, "daemon.log", 501).is_err());
+        let missing =
+            super::read_incarnation_log_tail(&env, &hash, "notification.log", 10).unwrap();
+        assert!(missing.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operational_health_retains_counters_and_clears_current_degraded_state() {
+        let root = unique_dir("operational-health");
+        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+        let hash = "8".repeat(64);
+
+        super::record_hook_delivery_failure(&env, &hash, "hook_delivery_timeout").unwrap();
+        super::record_hook_delivery_recovered(&env, &hash).unwrap();
+        super::record_status_push_failure(&env, &hash, "batch failed\nprivate detail").unwrap();
+        super::record_status_push_failure(&env, &hash, "retry failed").unwrap();
+        super::record_status_push_recovered(&env, &hash).unwrap();
+
+        let record = super::read_lifecycle_record(&env, &hash).unwrap();
+        assert_eq!(record.hook_delivery_failures, 1);
+        assert!(!record.hook_delivery_degraded);
+        assert_eq!(
+            record.last_hook_error_code.as_deref(),
+            Some("hook_delivery_timeout")
+        );
+        assert_eq!(record.status_push_failures, 2);
+        assert!(!record.status_push_degraded);
+        assert_eq!(
+            record.last_status_push_error.as_deref(),
+            Some("retry failed")
+        );
+        assert!(record.last_status_push_error_at_epoch_seconds.is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminating_active_notification_kills_its_descendant_group_and_clears_record() {
+        let root = unique_dir("notification-shutdown");
+        std::fs::create_dir_all(&root).unwrap();
+        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+        let hash = "9".repeat(64);
+        let pid_file = root.join("descendant.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "sleep 30 & echo $! > '{}'; wait",
+                pid_file.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut leader = command.spawn().unwrap();
+        let identity = super::NotificationProcessIdentity {
+            process_group_id: leader.id() as i32,
+            leader_start_token: super::process_start_token(leader.id()).unwrap(),
+        };
+        super::update_lifecycle_record(&env, &hash, |record| {
+            record.active_notification = Some(identity.clone());
+            Ok(())
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let descendant = loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = contents.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "descendant PID was not written");
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(super::terminate_active_notification(&env, &hash).unwrap());
+        assert!(!leader.wait().unwrap().success());
+        let exit_deadline = Instant::now() + Duration::from_secs(1);
+        while super::process_start_token(descendant).is_ok() {
+            assert!(
+                Instant::now() < exit_deadline,
+                "notification descendant survived daemon shutdown"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            super::read_lifecycle_record(&env, &hash)
+                .unwrap()
+                .active_notification
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_record_rejects_symlink_without_overwriting_target() {
+        let root = unique_dir("lifecycle-record-symlink");
+        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+        let hash = "d".repeat(64);
+        let directory = super::incarnation_log_directory(&env, &hash);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = root.join("target");
+        std::fs::write(&target, "sentinel").unwrap();
+        std::os::unix::fs::symlink(&target, super::lifecycle_record_path(&env, &hash)).unwrap();
+
+        let error = super::update_lifecycle_record(&env, &hash, |_| Ok(())).unwrap_err();
+
+        assert!(error.to_string().contains("regular file"));
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "sentinel");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn force_stop_identity_rejects_process_start_token_mismatch() {
+        let root = unique_dir("force-stop-identity");
+        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+        let hash = "e".repeat(64);
+        let socket = root.join("daemon.sock");
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let metadata = std::fs::metadata(&socket).unwrap();
+        let expected = super::DaemonProcessIdentity {
+            pid: std::process::id(),
+            start_token: "wrong-start-token".to_string(),
+            daemon_instance_id: "00112233445566778899aabbccddeeff".to_string(),
+            socket_device: metadata.dev(),
+            socket_inode: metadata.ino(),
+        };
+        super::update_lifecycle_record(&env, &hash, |record| {
+            record.process = Some(expected.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        let error = super::verify_force_stop_identity(&env, &hash, &socket, &expected).unwrap_err();
+
+        assert!(error.to_string().contains("start identity changed"));
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn force_stop_socket_cleanup_rejects_replacement() {
+        let root = unique_dir("force-stop-replaced-socket");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("daemon.sock");
+        let first = UnixListener::bind(&socket).unwrap();
+        let metadata = std::fs::metadata(&socket).unwrap();
+        let expected = super::DaemonProcessIdentity {
+            pid: std::process::id(),
+            start_token: super::process_start_token(std::process::id()).unwrap(),
+            daemon_instance_id: "00112233445566778899aabbccddeeff".to_string(),
+            socket_device: metadata.dev(),
+            socket_inode: metadata.ino(),
+        };
+        std::fs::remove_file(&socket).unwrap();
+        let replacement = UnixListener::bind(&socket).unwrap();
+
+        let error = super::remove_force_stopped_socket(&socket, &expected).unwrap_err();
+
+        assert!(error.to_string().contains("replaced"));
+        assert!(socket.exists());
+        drop((first, replacement));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_timeout_terminates_spawn_and_removes_only_its_recorded_socket() {
+        let root = unique_dir("startup-timeout");
+        std::fs::create_dir_all(&root).unwrap();
+        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+        let hash = "f".repeat(64);
+        let socket = root.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let metadata = std::fs::metadata(&socket).unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let start_token = super::process_start_token(child.id()).unwrap();
+        let process = super::DaemonProcessIdentity {
+            pid: child.id(),
+            start_token: start_token.clone(),
+            daemon_instance_id: "00112233445566778899aabbccddeeff".to_string(),
+            socket_device: metadata.dev(),
+            socket_inode: metadata.ino(),
+        };
+        super::update_lifecycle_record(&env, &hash, |record| {
+            record.process = Some(process);
+            Ok(())
+        })
+        .unwrap();
+
+        super::terminate_timed_out_spawn(&mut child, &start_token, &env, &hash, &socket);
+
+        assert!(super::process_start_token(child.id()).is_err());
+        assert!(!socket.exists());
+        let record = super::read_lifecycle_record(&env, &hash).unwrap();
+        assert!(record.process.is_none());
+        assert_eq!(record.health, super::LifecycleHealth::Degraded);
+        assert!(
+            record
+                .last_transition_error
+                .as_deref()
+                .is_some_and(|error| error.contains("startup timed out"))
+        );
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

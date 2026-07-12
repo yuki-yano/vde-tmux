@@ -10,15 +10,51 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::session_badge::{BadgeState, BadgeStateCounts};
-use crate::daemon::{SidebarFrame, TransitionEvent};
+use crate::daemon::{SidebarModel, TransitionEvent};
 use crate::pane_state::{
     DaemonInstanceId, EventId, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
     PaneEventEnvelope, PaneInstance, PaneStateLoadError, ResolvedPaneState, StateVersion,
     StoredStateDescriptor, ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolVersionMismatch {
+    pub requested: u16,
+    pub received: Option<u16>,
+    pub detail: String,
+}
+
+impl std::fmt::Display for ProtocolVersionMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.received {
+            Some(received) => write!(
+                formatter,
+                "daemon protocol mismatch: client requires {}, daemon returned {received}",
+                self.requested
+            ),
+            None => write!(
+                formatter,
+                "daemon protocol mismatch: client requires {} ({})",
+                self.requested, self.detail
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProtocolVersionMismatch {}
+
+pub fn is_protocol_version_mismatch(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|source| source.downcast_ref::<ProtocolVersionMismatch>().is_some())
+}
+
+pub fn protocol_requirement_message() -> String {
+    format!("protocol version {PROTOCOL_VERSION} is required")
+}
 
 pub struct V2Client {
     writer: UnixStream,
@@ -84,18 +120,39 @@ impl V2Client {
         .context("failed to write v2 Hello frame")?;
         let response = read_server_message(&mut reader, deadline)
             .context("failed to read v2 HelloAck frame")?;
-        let ServerMessage::HelloAck {
-            proto,
-            daemon_instance_id,
-            server_identity,
-            phase,
-            hook_health,
-        } = response
-        else {
-            return server_response_error("HelloAck", response);
+        let (proto, daemon_instance_id, server_identity, phase, hook_health) = match response {
+            ServerMessage::HelloAck {
+                proto,
+                daemon_instance_id,
+                server_identity,
+                phase,
+                hook_health,
+            } => (
+                proto,
+                daemon_instance_id,
+                server_identity,
+                phase,
+                hook_health,
+            ),
+            ServerMessage::Error {
+                code: ErrorCode::UnsupportedProtocol,
+                message,
+                ..
+            } => {
+                return Err(anyhow::Error::new(ProtocolVersionMismatch {
+                    requested: PROTOCOL_VERSION,
+                    received: None,
+                    detail: message,
+                }));
+            }
+            response => return server_response_error("HelloAck", response),
         };
         if proto != PROTOCOL_VERSION {
-            bail!("daemon returned unsupported protocol version {proto}");
+            return Err(anyhow::Error::new(ProtocolVersionMismatch {
+                requested: PROTOCOL_VERSION,
+                received: Some(proto),
+                detail: String::new(),
+            }));
         }
         if server_identity != expected_server_identity {
             bail!(
@@ -493,6 +550,29 @@ pub enum HookHealth {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonHealth {
+    pub config_hash: String,
+    pub projection_revision: u64,
+    pub projection_updated_at_epoch_seconds: u64,
+    pub notification_enabled: bool,
+    pub notification_failures: u64,
+    pub notification_queue_drops: u64,
+    pub notification_degraded: bool,
+    pub last_notification_error_code: Option<String>,
+    pub current_quarantine_count: u64,
+    pub quarantine_observed_total: u64,
+    pub recent_error_code: Option<ErrorCode>,
+    pub hook_delivery_failures: u64,
+    pub hook_delivery_degraded: bool,
+    pub last_hook_error_code: Option<String>,
+    pub status_push_failures: u64,
+    pub status_push_degraded: bool,
+    pub last_status_push_error: Option<String>,
+    pub last_status_push_error_at_epoch_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum StatusContext {
     Global,
@@ -518,6 +598,7 @@ pub struct PanePresentation {
     pub window_name: String,
     pub current_path: String,
     pub current_command: String,
+    pub pane_width: u16,
     pub active: bool,
     pub stored: Option<StoredStateDescriptor>,
     pub resolved: Option<ResolvedPaneState>,
@@ -548,7 +629,7 @@ pub struct DaemonDiagnostic {
 pub struct ResolvedSnapshot {
     pub snapshot_revision: u64,
     pub panes: Vec<PanePresentation>,
-    pub sidebar: SidebarFrame,
+    pub sidebar_model: SidebarModel,
     pub attention: Vec<AttentionEntry>,
     pub events: Vec<TransitionEvent>,
     pub diagnostics: Vec<DaemonDiagnostic>,
@@ -622,19 +703,28 @@ pub struct StatusSnapshot {
     deny_unknown_fields
 )]
 pub enum SidebarCommand {
-    Key {
-        key: String,
-    },
     JumpPane {
-        pane_id: String,
+        pane_instance: PaneInstance,
+        source_pane: PaneInstance,
     },
-    MarkDone {
+    MarkComplete {
         pane_instance: PaneInstance,
         expected: StateVersion,
     },
-    SelectContext {
-        pane_id: Option<String>,
-        session_id: Option<String>,
+    UpdateManualOrder {
+        expected_version: u64,
+        manual_order: Vec<crate::sidebar::state::RepoId>,
+        manual_chat_order: Vec<String>,
+    },
+    UpdateViewPreferences {
+        expected_version: u64,
+        view_mode: crate::sidebar::state::ViewMode,
+        filter: crate::sidebar::state::StatusFilter,
+    },
+    SetExpansionOverride {
+        expected_version: u64,
+        row_id: String,
+        overridden: bool,
     },
 }
 
@@ -655,6 +745,9 @@ pub enum ClientMessage {
     QueryPane {
         proto: u16,
         pane_id: String,
+    },
+    QueryHealth {
+        proto: u16,
     },
     Subscribe {
         proto: u16,
@@ -694,6 +787,7 @@ pub enum ClientMessage {
         proto: u16,
         daemon_instance_id: DaemonInstanceId,
         event_id: EventId,
+        dry_run: bool,
     },
     UninstallHooks {
         proto: u16,
@@ -714,6 +808,7 @@ impl ClientMessage {
             | Self::QueryResolvedSnapshot { proto }
             | Self::QueryStatusSnapshot { proto, .. }
             | Self::QueryPane { proto, .. }
+            | Self::QueryHealth { proto }
             | Self::Subscribe { proto }
             | Self::SubmitPaneEvent { proto, .. }
             | Self::SubmitViewEvent { proto, .. }
@@ -781,6 +876,7 @@ impl ClientMessage {
             Self::QueryResolvedSnapshot { .. }
                 | Self::QueryStatusSnapshot { .. }
                 | Self::QueryPane { .. }
+                | Self::QueryHealth { .. }
                 | Self::Subscribe { .. }
         )
     }
@@ -837,6 +933,14 @@ pub struct LegacyCleanupFailure {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyCleanupScopeCounts {
+    pub pane: u64,
+    pub window: u64,
+    pub session: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ErrorCode {
@@ -890,6 +994,9 @@ pub enum ServerMessage {
         snapshot_revision: u64,
         pane: PanePresentation,
     },
+    HealthResult {
+        health: DaemonHealth,
+    },
     PaneEventResult {
         event_id: EventId,
         accepted_seq: u64,
@@ -917,9 +1024,15 @@ pub enum ServerMessage {
     CleanupLegacyResult {
         event_id: EventId,
         accepted_seq: u64,
+        dry_run: bool,
         attempted: u64,
         removed: u64,
+        remaining: u64,
+        scope_counts: LegacyCleanupScopeCounts,
+        remaining_scope_counts: LegacyCleanupScopeCounts,
         failed: Vec<LegacyCleanupFailure>,
+        failed_total: u64,
+        failed_omitted: u64,
         snapshot_revision: u64,
     },
     HooksUninstalled {
@@ -971,7 +1084,7 @@ pub fn decode_request_frame(frame: &[u8]) -> Result<ClientMessage, ServerMessage
     {
         return Err(ServerMessage::error(
             ErrorCode::UnsupportedProtocol,
-            "protocol version 2 is required",
+            protocol_requirement_message(),
             None,
         ));
     }
@@ -1017,6 +1130,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn client_classifies_an_old_daemon_handshake_as_a_protocol_mismatch() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let event_id = EventId::generate().unwrap();
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/vt-pm-{}-{}",
+            std::process::id(),
+            &event_id.as_str()[..8]
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let hello: ClientMessage = serde_json::from_str(request.trim()).unwrap();
+            assert_eq!(
+                hello,
+                ClientMessage::Hello {
+                    proto: PROTOCOL_VERSION
+                }
+            );
+            serde_json::to_writer(
+                &mut stream,
+                &ServerMessage::error(
+                    ErrorCode::UnsupportedProtocol,
+                    "protocol version 2 is required",
+                    None,
+                ),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+
+        let error = V2Client::connect_with_timeout(&socket, "server", Duration::from_secs(1))
+            .err()
+            .expect("old daemon handshake must be rejected");
+
+        assert!(is_protocol_version_mismatch(&error), "{error:#}");
+        assert!(error.to_string().contains("client requires 3"));
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn pane_event() -> ClientMessage {
         ClientMessage::SubmitPaneEvent {
             proto: PROTOCOL_VERSION,
@@ -1038,20 +1200,29 @@ mod tests {
     fn every_client_message_roundtrips() {
         let state_id = StateId::parse("00112233445566778899aabbccddeeff").unwrap();
         let messages = vec![
-            ClientMessage::Hello { proto: 2 },
-            ClientMessage::QueryResolvedSnapshot { proto: 2 },
+            ClientMessage::Hello {
+                proto: PROTOCOL_VERSION,
+            },
+            ClientMessage::QueryResolvedSnapshot {
+                proto: PROTOCOL_VERSION,
+            },
             ClientMessage::QueryStatusSnapshot {
-                proto: 2,
+                proto: PROTOCOL_VERSION,
                 context: StatusContext::Global,
             },
             ClientMessage::QueryPane {
-                proto: 2,
+                proto: PROTOCOL_VERSION,
                 pane_id: "%1".to_string(),
             },
-            ClientMessage::Subscribe { proto: 2 },
+            ClientMessage::QueryHealth {
+                proto: PROTOCOL_VERSION,
+            },
+            ClientMessage::Subscribe {
+                proto: PROTOCOL_VERSION,
+            },
             pane_event(),
             ClientMessage::SubmitViewEvent {
-                proto: 2,
+                proto: PROTOCOL_VERSION,
                 event: ViewEvent {
                     daemon_instance_id: daemon_id(),
                     event_id: event_id(),
@@ -1062,10 +1233,10 @@ mod tests {
                 },
             },
             ClientMessage::SidebarCommand {
-                proto: 2,
+                proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
-                command: SidebarCommand::MarkDone {
+                command: SidebarCommand::MarkComplete {
                     pane_instance: pane(),
                     expected: StateVersion {
                         state_id,
@@ -1074,18 +1245,38 @@ mod tests {
                     },
                 },
             },
+            ClientMessage::SidebarCommand {
+                proto: PROTOCOL_VERSION,
+                daemon_instance_id: daemon_id(),
+                event_id: event_id(),
+                command: SidebarCommand::UpdateViewPreferences {
+                    expected_version: 3,
+                    view_mode: crate::sidebar::state::ViewMode::ByCategory,
+                    filter: crate::sidebar::state::StatusFilter::DoneOnly,
+                },
+            },
+            ClientMessage::SidebarCommand {
+                proto: PROTOCOL_VERSION,
+                daemon_instance_id: daemon_id(),
+                event_id: event_id(),
+                command: SidebarCommand::SetExpansionOverride {
+                    expected_version: 4,
+                    row_id: "repo::misc::app".to_string(),
+                    overridden: true,
+                },
+            },
             ClientMessage::RefreshPanes {
-                proto: 2,
+                proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
             },
             ClientMessage::RefreshTopology {
-                proto: 2,
+                proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
             },
             ClientMessage::ResetPaneState {
-                proto: 2,
+                proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
                 pane_instance: pane(),
@@ -1094,17 +1285,18 @@ mod tests {
                 },
             },
             ClientMessage::CleanupLegacyState {
-                proto: 2,
+                proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
+                dry_run: false,
             },
             ClientMessage::UninstallHooks {
-                proto: 2,
+                proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
             },
             ClientMessage::Shutdown {
-                proto: 2,
+                proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
             },
@@ -1117,7 +1309,7 @@ mod tests {
 
     #[test]
     fn unknown_fields_and_oversized_frames_are_rejected() {
-        let json = br#"{"op":"hello","proto":2,"unknown":true}"#;
+        let json = br#"{"op":"hello","proto":3,"unknown":true}"#;
         assert!(matches!(
             decode_request_frame(json),
             Err(ServerMessage::Error {
@@ -1249,20 +1441,22 @@ mod tests {
             window_name: "main".to_string(),
             current_path: "/tmp".to_string(),
             current_command: "zsh".to_string(),
+            pane_width: 80,
             active: true,
             stored: None,
             resolved: None,
             diagnostic: None,
         };
-        let sidebar = SidebarFrame {
-            state: crate::sidebar::state::SidebarState::default(),
-            counts: crate::sidebar::tree::BadgeCounts::default(),
-            rows: Vec::new(),
-        };
+        let pane_json = serde_json::to_value(&pane_presentation).unwrap();
+        assert_eq!(pane_json["pane_width"], 80);
+        assert_eq!(
+            serde_json::from_value::<PanePresentation>(pane_json).unwrap(),
+            pane_presentation
+        );
         let resolved = ResolvedSnapshot {
             snapshot_revision: 1,
             panes: vec![pane_presentation.clone()],
-            sidebar,
+            sidebar_model: crate::daemon::SidebarModel::default(),
             attention: Vec::new(),
             events: Vec::new(),
             diagnostics: Vec::new(),
@@ -1309,7 +1503,7 @@ mod tests {
         };
         let messages = vec![
             ServerMessage::HelloAck {
-                proto: 2,
+                proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 server_identity: "server".to_string(),
                 phase: DaemonPhase::Serving,
@@ -1326,6 +1520,28 @@ mod tests {
             ServerMessage::PaneResult {
                 snapshot_revision: 1,
                 pane: pane_presentation,
+            },
+            ServerMessage::HealthResult {
+                health: DaemonHealth {
+                    config_hash: "hash".to_string(),
+                    projection_revision: 1,
+                    projection_updated_at_epoch_seconds: 2,
+                    notification_enabled: true,
+                    notification_failures: 0,
+                    notification_queue_drops: 0,
+                    notification_degraded: false,
+                    last_notification_error_code: None,
+                    current_quarantine_count: 0,
+                    quarantine_observed_total: 0,
+                    recent_error_code: None,
+                    hook_delivery_failures: 0,
+                    hook_delivery_degraded: false,
+                    last_hook_error_code: None,
+                    status_push_failures: 0,
+                    status_push_degraded: false,
+                    last_status_push_error: None,
+                    last_status_push_error_at_epoch_seconds: None,
+                },
             },
             ServerMessage::PaneEventResult {
                 event_id: event_id(),
@@ -1356,9 +1572,15 @@ mod tests {
             ServerMessage::CleanupLegacyResult {
                 event_id: event_id(),
                 accepted_seq: 4,
+                dry_run: false,
                 attempted: 0,
                 removed: 0,
+                remaining: 0,
+                scope_counts: LegacyCleanupScopeCounts::default(),
+                remaining_scope_counts: LegacyCleanupScopeCounts::default(),
                 failed: Vec::new(),
+                failed_total: 0,
+                failed_omitted: 0,
                 snapshot_revision: 1,
             },
             ServerMessage::HooksUninstalled {

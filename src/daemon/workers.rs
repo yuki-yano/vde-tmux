@@ -12,7 +12,6 @@ use crate::daemon::topology::ServerIdentity;
 use crate::detect::detect_codex_wait_reason;
 use crate::git::SystemGitRunner;
 use crate::pane_state::ObservationDispatchSnapshot;
-use crate::sidebar::layout::jump_to_pane;
 use crate::tmux::SystemTmuxRunner;
 use crate::tmux::TmuxRunner;
 use crate::{
@@ -643,6 +642,7 @@ const SIDEBAR_JOB_TIMEOUT: Duration = Duration::from_secs(2);
 pub enum SidebarTmuxError {
     ServerIncarnationMismatch,
     PaneInstanceMismatch(String),
+    SourceClientMismatch,
     Command(anyhow::Error),
 }
 
@@ -653,6 +653,12 @@ impl std::fmt::Display for SidebarTmuxError {
             Self::PaneInstanceMismatch(pane_id) => {
                 write!(formatter, "pane instance changed: {pane_id}")
             }
+            Self::SourceClientMismatch => {
+                write!(
+                    formatter,
+                    "source sidebar is no longer focused by the tmux client"
+                )
+            }
             Self::Command(error) => write!(formatter, "tmux command failed: {error:#}"),
         }
     }
@@ -662,7 +668,9 @@ impl std::error::Error for SidebarTmuxError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Command(error) => Some(error.as_ref()),
-            Self::ServerIncarnationMismatch | Self::PaneInstanceMismatch(_) => None,
+            Self::ServerIncarnationMismatch
+            | Self::PaneInstanceMismatch(_)
+            | Self::SourceClientMismatch => None,
         }
     }
 }
@@ -697,7 +705,7 @@ impl GuardedSidebarTmuxRunner<'_> {
     fn is_read(args: &[&str]) -> bool {
         matches!(
             args.first().copied(),
-            Some("display-message" | "list-panes")
+            Some("display-message" | "list-panes" | "list-clients")
         )
     }
 
@@ -801,11 +809,18 @@ fn classify_sidebar_error(error: anyhow::Error, pane: &PaneInstance) -> SidebarT
 
 fn is_missing_pane_error(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
-    message.contains("can't find pane") || message.contains("no such pane")
+    message.contains("can't find pane")
+        || message.contains("no such pane")
+        || message.contains("pane not found")
 }
 
 pub trait WorkerIo: Send + Sync + 'static {
-    fn jump_to_pane(&self, pane: &PaneInstance) -> std::result::Result<(), SidebarTmuxError>;
+    fn jump_to_pane(
+        &self,
+        pane: &PaneInstance,
+        client_pid: u32,
+        source_pane: &PaneInstance,
+    ) -> std::result::Result<(), SidebarTmuxError>;
     fn preview_pane(
         &self,
         pane: &PaneInstance,
@@ -865,7 +880,12 @@ impl SystemWorkerIo {
 }
 
 impl WorkerIo for SystemWorkerIo {
-    fn jump_to_pane(&self, pane: &PaneInstance) -> std::result::Result<(), SidebarTmuxError> {
+    fn jump_to_pane(
+        &self,
+        pane: &PaneInstance,
+        client_pid: u32,
+        source_pane: &PaneInstance,
+    ) -> std::result::Result<(), SidebarTmuxError> {
         let budgeted = JobBudgetTmuxRunner {
             io: &self.io,
             deadline: Instant::now() + SIDEBAR_JOB_TIMEOUT,
@@ -875,7 +895,17 @@ impl WorkerIo for SystemWorkerIo {
             expected_server: &self.expected_server,
             expected_pane: pane,
         };
-        jump_to_pane(&guarded, &pane.pane_id).map_err(|error| classify_sidebar_error(error, pane))
+        crate::sidebar::layout::jump_to_pane_for_client(&guarded, pane, client_pid, source_pane)
+            .map_err(|error| {
+                if error
+                    .to_string()
+                    .contains(crate::sidebar::layout::SOURCE_CLIENT_MISMATCH_SENTINEL)
+                {
+                    SidebarTmuxError::SourceClientMismatch
+                } else {
+                    classify_sidebar_error(error, pane)
+                }
+            })
     }
 
     fn preview_pane(
@@ -893,13 +923,8 @@ impl WorkerIo for SystemWorkerIo {
             expected_server: &self.expected_server,
             expected_pane: pane,
         };
-        crate::sidebar::preview::open_preview_floating_pane(
-            &guarded,
-            &env,
-            &pane.pane_id,
-            history_lines,
-        )
-        .map_err(|error| classify_sidebar_error(error, pane))
+        crate::sidebar::preview::open_preview_floating_pane(&guarded, &env, pane, history_lines)
+            .map_err(|error| classify_sidebar_error(error, pane))
     }
 }
 
@@ -977,6 +1002,7 @@ mod tests {
     struct SidebarGuardRunner {
         actual_server: ServerIdentity,
         read_body: String,
+        client_read_body: Option<String>,
         mutation_output: String,
         mutation_error: Option<String>,
         calls: Mutex<Vec<Vec<String>>>,
@@ -987,6 +1013,7 @@ mod tests {
             Self {
                 actual_server,
                 read_body: read_body.into(),
+                client_read_body: None,
                 mutation_output: String::new(),
                 mutation_error: None,
                 calls: Mutex::new(Vec::new()),
@@ -995,6 +1022,11 @@ mod tests {
 
         fn with_mutation_output(mut self, output: impl Into<String>) -> Self {
             self.mutation_output = output.into();
+            self
+        }
+
+        fn with_client_read_body(mut self, output: impl Into<String>) -> Self {
+            self.client_read_body = Some(output.into());
             self
         }
 
@@ -1018,7 +1050,12 @@ mod tests {
                 let identity = args[2]
                     .replace("#{pid}", &self.actual_server.pid.to_string())
                     .replace("#{start_time}", &self.actual_server.start_time.to_string());
-                return Ok(format!("{identity}\n{}", self.read_body));
+                let body = if args.contains(&"list-clients") {
+                    self.client_read_body.as_ref().unwrap_or(&self.read_body)
+                } else {
+                    &self.read_body
+                };
+                return Ok(format!("{identity}\n{body}"));
             }
             if let Some(error) = &self.mutation_error {
                 anyhow::bail!(error.clone());
@@ -1088,8 +1125,8 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_worker_wraps_reads_and_each_jump_mutation_in_server_and_pane_guards() {
-        let runner = SidebarGuardRunner::new(server_identity(), "main\u{1f}@1\u{1f}%1\n");
+    fn sidebar_worker_wraps_atomic_jump_in_server_and_target_pane_guards() {
+        let runner = SidebarGuardRunner::new(server_identity(), "$1\u{1f}@1\u{1f}%1\u{1f}11\n");
         let pane = pane_instance("%1", 11);
         let guarded = GuardedSidebarTmuxRunner {
             runner: &runner,
@@ -1097,21 +1134,50 @@ mod tests {
             expected_pane: &pane,
         };
 
-        jump_to_pane(&guarded, "%1").unwrap();
+        crate::sidebar::layout::jump_to_pane(&guarded, "%1").unwrap();
 
         let calls = runner.calls();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 2);
         assert_eq!(calls[0][0], "display-message");
         assert_eq!(calls[0][3], ";");
-        for call in &calls[1..] {
-            assert_eq!(call[0], "if-shell");
-            assert!(call[2].contains("#{pid},4242"), "{call:?}");
-            assert!(call[2].contains("#{start_time},99"), "{call:?}");
-            assert!(call[3].contains("#{pane_pid},11"), "{call:?}");
-        }
+        assert_eq!(calls[1][0], "if-shell");
+        assert!(calls[1][2].contains("#{pid},4242"), "{:?}", calls[1]);
+        assert!(calls[1][2].contains("#{start_time},99"), "{:?}", calls[1]);
+        assert!(calls[1][3].contains("#{pane_pid},11"), "{:?}", calls[1]);
         assert!(calls[1][3].contains("switch-client"));
-        assert!(calls[2][3].contains("select-window"));
-        assert!(calls[3][3].contains("select-pane"));
+        assert!(calls[1][3].contains("$1:@1.%1"));
+        assert!(!calls[1][3].contains("select-window"));
+        assert!(!calls[1][3].contains("select-pane"));
+    }
+
+    #[test]
+    fn sidebar_worker_checks_target_and_source_instances_in_one_atomic_jump_mutation() {
+        let runner = SidebarGuardRunner::new(server_identity(), "$1\u{1f}@1\u{1f}%1\u{1f}11\n")
+            .with_client_read_body("20\u{1f}/dev/ttys002\n");
+        let target = pane_instance("%1", 11);
+        let source = pane_instance("%9", 909);
+        let expected_server = server_identity();
+        let guarded = GuardedSidebarTmuxRunner {
+            runner: &runner,
+            expected_server: &expected_server,
+            expected_pane: &target,
+        };
+
+        crate::sidebar::layout::jump_to_pane_for_client(&guarded, &target, 20, &source).unwrap();
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0][0], "display-message");
+        assert_eq!(calls[1][0], "display-message");
+        assert_eq!(calls[2][0], "if-shell");
+        let guarded_command = &calls[2][3];
+        assert!(guarded_command.contains("#{pane_pid},11"), "{calls:?}");
+        assert!(guarded_command.contains("#{pane_id},%9"), "{calls:?}");
+        assert!(guarded_command.contains("#{pane_pid},909"), "{calls:?}");
+        assert!(guarded_command.contains("switch-client"), "{calls:?}");
+        assert!(guarded_command.contains("$1:@1.%1"), "{calls:?}");
+        assert!(!guarded_command.contains("select-window"), "{calls:?}");
+        assert!(!guarded_command.contains("select-pane"), "{calls:?}");
     }
 
     #[test]
@@ -1131,7 +1197,7 @@ mod tests {
             expected_pane: &pane,
         };
 
-        let error = jump_to_pane(&guarded, "%1").unwrap_err();
+        let error = crate::sidebar::layout::jump_to_pane(&guarded, "%1").unwrap_err();
 
         assert!(matches!(
             error.downcast_ref::<SidebarGuardError>(),

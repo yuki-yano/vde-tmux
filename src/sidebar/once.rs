@@ -15,48 +15,37 @@ fn render_snapshot(snapshot: &ResolvedSnapshot, config: &Config) -> String {
         SidebarWidth::Columns(width) => width,
         SidebarWidth::Percent(_) => config.sidebar.min_width,
     };
-    crate::sidebar::render::render_rows(
-        &snapshot.sidebar.rows,
-        &snapshot.sidebar.state,
-        width as usize,
-    )
+    let state = crate::sidebar::state::SidebarState::default();
+    let projection = crate::sidebar::tree::project_sidebar(
+        config,
+        &snapshot.panes,
+        &snapshot.sidebar_model,
+        &state,
+        crate::sidebar::tree::now_epoch_secs(),
+    );
+    let rendered = crate::sidebar::render::render_rows(&projection.rows, &state, width as usize);
+    if !rendered.is_empty() {
+        return rendered;
+    }
+    if let Some(message) = crate::sidebar::current_degraded_message(snapshot) {
+        return format!("Degraded: {message}");
+    }
+    if state.filter == crate::sidebar::state::StatusFilter::All {
+        "No agents detected".to_string()
+    } else {
+        format!("No matching agents\nFilter: {}", state.filter.label())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::SidebarFrame;
-    use crate::hook::RollupLevel;
-    use crate::sidebar::state::SidebarState;
-    use crate::sidebar::tree::{BadgeCounts, SidebarRow, SidebarRowKind};
-
     #[test]
-    fn render_snapshot_uses_canonical_sidebar_frame_without_tmux_reparse() {
+    fn render_snapshot_projects_sidebar_model_without_tmux_reparse() {
         let snapshot = ResolvedSnapshot {
             snapshot_revision: 7,
             panes: Vec::new(),
-            sidebar: SidebarFrame {
-                state: SidebarState::default(),
-                counts: BadgeCounts {
-                    total: 1,
-                    working: 1,
-                    ..BadgeCounts::default()
-                },
-                rows: vec![SidebarRow {
-                    id: "chat::%1".to_string(),
-                    kind: SidebarRowKind::Chat,
-                    depth: 0,
-                    label: "codex (%1)".to_string(),
-                    chat_count: 1,
-                    rollup: RollupLevel::Running,
-                    badge_state: None,
-                    expanded: true,
-                    pane_id: Some("%1".to_string()),
-                    git: None,
-                    active: false,
-                    meta: None,
-                }],
-            },
+            sidebar_model: crate::daemon::SidebarModel::default(),
             attention: Vec::new(),
             events: Vec::new(),
             diagnostics: Vec::new(),
@@ -64,6 +53,28 @@ mod tests {
 
         let rendered = render_snapshot(&snapshot, &Config::default());
 
-        assert!(rendered.contains("Codex"), "{rendered}");
+        assert_eq!(rendered, "No agents detected");
+    }
+
+    #[test]
+    fn historical_global_diagnostic_does_not_hide_the_empty_state() {
+        let snapshot = ResolvedSnapshot {
+            snapshot_revision: 7,
+            panes: Vec::new(),
+            sidebar_model: crate::daemon::SidebarModel::default(),
+            attention: Vec::new(),
+            events: Vec::new(),
+            diagnostics: vec![crate::daemon::protocol::v2::DaemonDiagnostic {
+                code: crate::daemon::protocol::v2::ErrorCode::PersistFailed,
+                message: "historical write failure".to_string(),
+                pane_instance: None,
+                event_id: None,
+            }],
+        };
+
+        assert_eq!(
+            render_snapshot(&snapshot, &Config::default()),
+            "No agents detected"
+        );
     }
 }

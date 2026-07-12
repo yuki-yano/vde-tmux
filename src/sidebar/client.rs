@@ -18,31 +18,25 @@ use crate::pane_state::{
 const V2_SIDEBAR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const V2_SUBSCRIBE_INITIAL_TIMEOUT: Duration = Duration::from_millis(500);
 
-pub fn send_sidebar_key_v2(socket: &Path, server_identity: &str, key: &str) -> Result<()> {
-    request_v2_sidebar(
-        socket,
-        server_identity,
-        V2SidebarCommand::Key {
-            key: key.to_string(),
-        },
-        V2SidebarResponse::SnapshotAck,
-    )?;
-    Ok(())
-}
-
-pub fn send_sidebar_jump_v2(socket: &Path, server_identity: &str, pane_id: &str) -> Result<()> {
+pub fn send_sidebar_jump_v2(
+    socket: &Path,
+    server_identity: &str,
+    pane_instance: PaneInstance,
+    source_pane: PaneInstance,
+) -> Result<()> {
     request_v2_sidebar(
         socket,
         server_identity,
         V2SidebarCommand::JumpPane {
-            pane_id: pane_id.to_string(),
+            pane_instance,
+            source_pane,
         },
         V2SidebarResponse::SnapshotAck,
     )?;
     Ok(())
 }
 
-pub fn send_sidebar_mark_done_v2(
+pub fn send_sidebar_mark_complete_v2(
     socket: &Path,
     server_identity: &str,
     pane_instance: PaneInstance,
@@ -51,7 +45,7 @@ pub fn send_sidebar_mark_done_v2(
     request_v2_sidebar(
         socket,
         server_identity,
-        V2SidebarCommand::MarkDone {
+        V2SidebarCommand::MarkComplete {
             pane_instance,
             expected,
         },
@@ -60,22 +54,63 @@ pub fn send_sidebar_mark_done_v2(
     Ok(())
 }
 
-pub fn send_sidebar_select_context_v2(
+pub fn send_sidebar_update_manual_order_v2(
     socket: &Path,
     server_identity: &str,
-    pane_id: Option<&str>,
-    session_id: Option<&str>,
+    expected_version: u64,
+    manual_order: Vec<crate::sidebar::state::RepoId>,
+    manual_chat_order: Vec<String>,
 ) -> Result<()> {
     request_v2_sidebar(
         socket,
         server_identity,
-        V2SidebarCommand::SelectContext {
-            pane_id: pane_id.map(ToOwned::to_owned),
-            session_id: session_id.map(ToOwned::to_owned),
+        V2SidebarCommand::UpdateManualOrder {
+            expected_version,
+            manual_order,
+            manual_chat_order,
         },
         V2SidebarResponse::SnapshotAck,
     )?;
     Ok(())
+}
+
+pub fn send_sidebar_update_view_preferences_v2(
+    socket: &Path,
+    server_identity: &str,
+    expected_version: u64,
+    view_mode: crate::sidebar::state::ViewMode,
+    filter: crate::sidebar::state::StatusFilter,
+) -> Result<()> {
+    request_v2_sidebar(
+        socket,
+        server_identity,
+        V2SidebarCommand::UpdateViewPreferences {
+            expected_version,
+            view_mode,
+            filter,
+        },
+        V2SidebarResponse::SnapshotAck,
+    )?;
+    Ok(())
+}
+
+pub fn send_sidebar_set_expansion_override_v2(
+    socket: &Path,
+    server_identity: &str,
+    expected_version: u64,
+    row_id: String,
+    overridden: bool,
+) -> Result<u64> {
+    request_v2_sidebar(
+        socket,
+        server_identity,
+        V2SidebarCommand::SetExpansionOverride {
+            expected_version,
+            row_id,
+            overridden,
+        },
+        V2SidebarResponse::SnapshotAck,
+    )
 }
 
 pub fn request_topology_refresh_v2(socket: &Path, server_identity: &str) -> Result<()> {
@@ -115,31 +150,96 @@ pub fn query_resolved_snapshot_v2(
     }
 }
 
+#[derive(Debug)]
+pub enum SubscriptionUpdate {
+    Connecting,
+    Connected(Box<ResolvedSnapshot>),
+    Degraded(String),
+    Disconnected,
+}
+
 pub fn subscribe_v2(
     socket: &Path,
     server_identity: &str,
-    tx: Sender<ResolvedSnapshot>,
+    expected_config_hash: &str,
+    tx: Sender<SubscriptionUpdate>,
 ) -> Result<()> {
-    let mut subscription = V2SnapshotSubscription::connect(socket, server_identity)?;
-    let first = subscription.read_initial_snapshot()?.ok_or_else(|| {
-        anyhow::anyhow!("daemon closed the subscription before the initial snapshot")
-    })?;
-    tx.send(first)
-        .map_err(|_| anyhow::anyhow!("sidebar snapshot receiver disconnected"))?;
+    let socket = socket.to_path_buf();
+    let server_identity = server_identity.to_string();
+    let expected_config_hash = expected_config_hash.to_string();
     thread::spawn(move || {
+        let mut backoff = Duration::from_millis(100);
         loop {
-            match subscription.read_next_snapshot() {
-                Ok(Some(snapshot)) => {
-                    if tx.send(snapshot).is_err() {
+            if tx.send(SubscriptionUpdate::Connecting).is_err() {
+                return;
+            }
+            let mut subscription = match V2SnapshotSubscription::connect(
+                &socket,
+                &server_identity,
+                &expected_config_hash,
+            )
+            .and_then(|mut subscription| {
+                let first = subscription.read_initial_snapshot()?.ok_or_else(|| {
+                    anyhow::anyhow!("daemon closed the subscription before the initial snapshot")
+                })?;
+                Ok((subscription, first))
+            }) {
+                Ok((subscription, first)) => {
+                    if tx
+                        .send(SubscriptionUpdate::Connected(Box::new(first)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let Some(message) = subscription.initial_degraded.clone()
+                        && tx.send(SubscriptionUpdate::Degraded(message)).is_err()
+                    {
+                        return;
+                    }
+                    subscription
+                }
+                Err(error) => {
+                    if tx
+                        .send(SubscriptionUpdate::Degraded(error.to_string()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(2));
+                    continue;
+                }
+            };
+            backoff = Duration::from_millis(100);
+            loop {
+                match subscription.read_next_snapshot() {
+                    Ok(Some(snapshot)) => {
+                        if tx
+                            .send(SubscriptionUpdate::Connected(Box::new(snapshot)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        if tx.send(SubscriptionUpdate::Disconnected).is_err() {
+                            return;
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        if tx
+                            .send(SubscriptionUpdate::Degraded(error.to_string()))
+                            .is_err()
+                        {
+                            return;
+                        }
                         break;
                     }
                 }
-                Ok(None) => break,
-                Err(error) => {
-                    eprintln!("[vde-tmux] v2 sidebar subscribe error: {error:#}");
-                    break;
-                }
             }
+            thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_secs(2));
         }
     });
     Ok(())
@@ -259,10 +359,12 @@ struct V2SnapshotSubscription {
     reader: BufReader<UnixStream>,
     last_revision: Option<u64>,
     initial_deadline: Instant,
+    initial_degraded: Option<String>,
 }
 
 impl V2SnapshotSubscription {
-    fn connect(socket: &Path, server_identity: &str) -> Result<Self> {
+    fn connect(socket: &Path, server_identity: &str, expected_config_hash: &str) -> Result<Self> {
+        verify_active_config_hash(socket, server_identity, expected_config_hash)?;
         let mut stream = UnixStream::connect(socket)?;
         stream.set_write_timeout(Some(V2_SUBSCRIBE_INITIAL_TIMEOUT))?;
         let deadline = Instant::now() + V2_SUBSCRIBE_INITIAL_TIMEOUT;
@@ -279,6 +381,8 @@ impl V2SnapshotSubscription {
         let V2ServerMessage::HelloAck {
             proto,
             server_identity: actual_server_identity,
+            phase,
+            hook_health,
             ..
         } = hello
         else {
@@ -303,6 +407,9 @@ impl V2SnapshotSubscription {
             reader,
             last_revision: None,
             initial_deadline: deadline,
+            initial_degraded: (phase != crate::daemon::protocol::v2::DaemonPhase::Serving
+                || hook_health != crate::daemon::protocol::v2::HookHealth::Healthy)
+                .then(|| format!("daemon health is {phase:?}/{hook_health:?}")),
         })
     }
 
@@ -350,6 +457,25 @@ impl V2SnapshotSubscription {
             }
         }
     }
+}
+
+fn verify_active_config_hash(
+    socket: &Path,
+    server_identity: &str,
+    expected_config_hash: &str,
+) -> Result<()> {
+    let mut client =
+        V2Client::connect_with_timeout(socket, server_identity, V2_SUBSCRIBE_INITIAL_TIMEOUT)?;
+    let response = client.request(&V2ClientMessage::QueryHealth {
+        proto: PROTOCOL_VERSION,
+    })?;
+    let V2ServerMessage::HealthResult { health } = response else {
+        return v2_server_error("HealthResult", response);
+    };
+    if health.config_hash.trim().is_empty() || health.config_hash != expected_config_hash {
+        bail!("sidebar config does not match the daemon active config; run `vt daemon reload`");
+    }
+    Ok(())
 }
 
 fn write_v2_client_frame(
@@ -466,23 +592,102 @@ mod tests {
         stream.write_all(b"\n").unwrap();
     }
 
+    fn accept_config_guard(listener: &UnixListener, server_identity: &str, config_hash: &str) {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+            V2ClientMessage::Hello { .. }
+        ));
+        write_hello_ack(&mut stream, server_identity);
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+            V2ClientMessage::QueryHealth { .. }
+        ));
+        serde_json::to_writer(
+            &mut stream,
+            &V2ServerMessage::HealthResult {
+                health: crate::daemon::protocol::v2::DaemonHealth {
+                    config_hash: config_hash.to_string(),
+                    projection_revision: 1,
+                    projection_updated_at_epoch_seconds: 2,
+                    notification_enabled: true,
+                    notification_failures: 0,
+                    notification_queue_drops: 0,
+                    notification_degraded: false,
+                    last_notification_error_code: None,
+                    current_quarantine_count: 0,
+                    quarantine_observed_total: 0,
+                    recent_error_code: None,
+                    hook_delivery_failures: 0,
+                    hook_delivery_degraded: false,
+                    last_hook_error_code: None,
+                    status_push_failures: 0,
+                    status_push_degraded: false,
+                    last_status_push_error: None,
+                    last_status_push_error_at_epoch_seconds: None,
+                },
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+    }
+
+    fn accept_subscription(listener: &UnixListener, server_identity: &str) -> UnixStream {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+            V2ClientMessage::Hello { .. }
+        ));
+        write_hello_ack(&mut stream, server_identity);
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+            V2ClientMessage::Subscribe { .. }
+        ));
+        stream
+    }
+
+    fn accept_guarded_subscription(
+        listener: &UnixListener,
+        server_identity: &str,
+        config_hash: &str,
+    ) -> UnixStream {
+        accept_config_guard(listener, server_identity, config_hash);
+        accept_subscription(listener, server_identity)
+    }
+
     fn empty_resolved_snapshot(revision: u64) -> ResolvedSnapshot {
         ResolvedSnapshot {
             snapshot_revision: revision,
             panes: Vec::new(),
-            sidebar: crate::daemon::SidebarFrame {
-                state: crate::sidebar::state::SidebarState::default(),
-                counts: crate::sidebar::tree::BadgeCounts::default(),
-                rows: Vec::new(),
-            },
+            sidebar_model: crate::daemon::SidebarModel::default(),
             attention: Vec::new(),
             events: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
 
+    fn recv_connected(rx: &std::sync::mpsc::Receiver<SubscriptionUpdate>) -> ResolvedSnapshot {
+        loop {
+            if let SubscriptionUpdate::Connected(snapshot) =
+                rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            {
+                return *snapshot;
+            }
+        }
+    }
+
     #[test]
-    fn v2_mark_done_handshakes_and_sends_full_state_version() {
+    fn v2_mark_complete_handshakes_and_sends_full_state_version() {
         let socket = unique_socket_path("vde-tmux-v2-mark-done");
         let listener = UnixListener::bind(&socket).unwrap();
         let daemon_instance_id =
@@ -534,7 +739,7 @@ mod tests {
             assert_eq!(daemon_instance_id, daemon_for_server);
             assert_eq!(
                 command,
-                V2SidebarCommand::MarkDone {
+                V2SidebarCommand::MarkComplete {
                     pane_instance: PaneInstance {
                         pane_id: "%7".to_string(),
                         pane_pid: 4242,
@@ -556,7 +761,7 @@ mod tests {
             stream.write_all(b"\n").unwrap();
         });
 
-        send_sidebar_mark_done_v2(
+        send_sidebar_mark_complete_v2(
             &socket,
             "scratch",
             PaneInstance {
@@ -608,7 +813,19 @@ mod tests {
             assert_eq!(read, 0, "mutation must not follow a mismatched HelloAck");
         });
 
-        let error = send_sidebar_key_v2(&socket, "expected", "down").unwrap_err();
+        let error = send_sidebar_jump_v2(
+            &socket,
+            "expected",
+            PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 1,
+            },
+            PaneInstance {
+                pane_id: "%9".to_string(),
+                pane_pid: 9,
+            },
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("server identity mismatch"));
 
         handle.join().unwrap();
@@ -616,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_sidebar_helpers_encode_all_four_commands() {
+    fn v2_sidebar_helpers_encode_all_commands() {
         let socket = unique_socket_path("vt2-cmds");
         let listener = UnixListener::bind(&socket).unwrap();
         let expected_version = StateVersion {
@@ -626,22 +843,37 @@ mod tests {
             revision: 8,
         };
         let expected_commands = vec![
-            V2SidebarCommand::Key {
-                key: "down".to_string(),
-            },
             V2SidebarCommand::JumpPane {
-                pane_id: "%3".to_string(),
+                pane_instance: PaneInstance {
+                    pane_id: "%3".to_string(),
+                    pane_pid: 303,
+                },
+                source_pane: PaneInstance {
+                    pane_id: "%9".to_string(),
+                    pane_pid: 909,
+                },
             },
-            V2SidebarCommand::MarkDone {
+            V2SidebarCommand::MarkComplete {
                 pane_instance: PaneInstance {
                     pane_id: "%3".to_string(),
                     pane_pid: 303,
                 },
                 expected: expected_version.clone(),
             },
-            V2SidebarCommand::SelectContext {
-                pane_id: Some("%3".to_string()),
-                session_id: Some("$1".to_string()),
+            V2SidebarCommand::UpdateManualOrder {
+                expected_version: 7,
+                manual_order: vec![crate::sidebar::state::RepoId::new("misc", "app")],
+                manual_chat_order: vec!["%3".to_string()],
+            },
+            V2SidebarCommand::UpdateViewPreferences {
+                expected_version: 8,
+                view_mode: crate::sidebar::state::ViewMode::ByCategory,
+                filter: crate::sidebar::state::StatusFilter::DoneOnly,
+            },
+            V2SidebarCommand::SetExpansionOverride {
+                expected_version: 2,
+                row_id: "repo::misc::app".to_string(),
+                overridden: true,
             },
         ];
         let expected_for_server = expected_commands.clone();
@@ -671,7 +903,7 @@ mod tests {
                 };
                 assert_eq!(daemon_instance_id, self::daemon_instance_id());
                 assert_eq!(command, expected);
-                let response = if matches!(command, V2SidebarCommand::MarkDone { .. }) {
+                let response = if matches!(command, V2SidebarCommand::MarkComplete { .. }) {
                     V2ServerMessage::PaneEventResult {
                         event_id,
                         accepted_seq: 1,
@@ -691,9 +923,20 @@ mod tests {
             }
         });
 
-        send_sidebar_key_v2(&socket, "scratch", "down").unwrap();
-        send_sidebar_jump_v2(&socket, "scratch", "%3").unwrap();
-        send_sidebar_mark_done_v2(
+        send_sidebar_jump_v2(
+            &socket,
+            "scratch",
+            PaneInstance {
+                pane_id: "%3".to_string(),
+                pane_pid: 303,
+            },
+            PaneInstance {
+                pane_id: "%9".to_string(),
+                pane_pid: 909,
+            },
+        )
+        .unwrap();
+        send_sidebar_mark_complete_v2(
             &socket,
             "scratch",
             PaneInstance {
@@ -703,7 +946,33 @@ mod tests {
             expected_version,
         )
         .unwrap();
-        send_sidebar_select_context_v2(&socket, "scratch", Some("%3"), Some("$1")).unwrap();
+        send_sidebar_update_manual_order_v2(
+            &socket,
+            "scratch",
+            7,
+            vec![crate::sidebar::state::RepoId::new("misc", "app")],
+            vec!["%3".to_string()],
+        )
+        .unwrap();
+        send_sidebar_update_view_preferences_v2(
+            &socket,
+            "scratch",
+            8,
+            crate::sidebar::state::ViewMode::ByCategory,
+            crate::sidebar::state::StatusFilter::DoneOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            send_sidebar_set_expansion_override_v2(
+                &socket,
+                "scratch",
+                2,
+                "repo::misc::app".to_string(),
+                true,
+            )
+            .unwrap(),
+            2
+        );
 
         handle.join().unwrap();
         std::fs::remove_file(socket).unwrap();
@@ -772,7 +1041,19 @@ mod tests {
             stream.write_all(b"\n").unwrap();
         });
 
-        let error = send_sidebar_key_v2(&socket, "scratch", "down").unwrap_err();
+        let error = send_sidebar_jump_v2(
+            &socket,
+            "scratch",
+            PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 1,
+            },
+            PaneInstance {
+                pane_id: "%9".to_string(),
+                pane_pid: 9,
+            },
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("response event ID mismatch"));
 
         handle.join().unwrap();
@@ -785,23 +1066,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert!(matches!(
-                serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
-                V2ClientMessage::Hello { .. }
-            ));
-            write_hello_ack(&mut stream, "scratch");
-            line.clear();
-            reader.read_line(&mut line).unwrap();
-            assert_eq!(
-                serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
-                V2ClientMessage::Subscribe {
-                    proto: PROTOCOL_VERSION
-                }
-            );
+            let mut stream = accept_guarded_subscription(&listener, "scratch", "hash");
             for revision in [1, 1, 0, 2] {
                 serde_json::to_writer(
                     &mut stream,
@@ -819,23 +1084,12 @@ mod tests {
         });
         let (tx, rx) = std::sync::mpsc::channel();
 
-        subscribe_v2(&socket, "scratch", tx).unwrap();
-        release_tx.send(()).unwrap();
+        subscribe_v2(&socket, "scratch", "hash", tx).unwrap();
 
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .snapshot_revision,
-            1
-        );
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .snapshot_revision,
-            2
-        );
+        assert_eq!(recv_connected(&rx).snapshot_revision, 1);
+        assert_eq!(recv_connected(&rx).snapshot_revision, 2);
+        release_tx.send(()).unwrap();
         handle.join().unwrap();
-        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
         std::fs::remove_file(socket).unwrap();
     }
 
@@ -844,13 +1098,7 @@ mod tests {
         let socket = unique_socket_path("vt2-sub-rev");
         let listener = UnixListener::bind(&socket).unwrap();
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            write_hello_ack(&mut stream, "scratch");
-            line.clear();
-            reader.read_line(&mut line).unwrap();
+            let mut stream = accept_guarded_subscription(&listener, "scratch", "hash");
             serde_json::to_writer(
                 &mut stream,
                 &V2ServerMessage::ResolvedSnapshotResult {
@@ -861,11 +1109,161 @@ mod tests {
             .unwrap();
             stream.write_all(b"\n").unwrap();
         });
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
 
-        let error = subscribe_v2(&socket, "scratch", tx).unwrap_err();
-        assert!(error.to_string().contains("snapshot revision mismatch"));
+        subscribe_v2(&socket, "scratch", "hash", tx).unwrap();
+        let degraded = loop {
+            if let SubscriptionUpdate::Degraded(error) =
+                rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            {
+                break error;
+            }
+        };
+        assert!(degraded.contains("snapshot revision mismatch"));
 
+        handle.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn v2_subscription_reconnects_after_peer_is_killed() {
+        let socket = unique_socket_path("vt2-sub-reconnect");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (kill_first_tx, kill_first_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            for revision in [1, 2] {
+                let mut stream = accept_guarded_subscription(&listener, "scratch", "hash");
+                serde_json::to_writer(
+                    &mut stream,
+                    &V2ServerMessage::ResolvedSnapshotResult {
+                        snapshot_revision: revision,
+                        snapshot: empty_resolved_snapshot(revision),
+                    },
+                )
+                .unwrap();
+                stream.write_all(b"\n").unwrap();
+                if revision == 1 {
+                    kill_first_rx.recv().unwrap();
+                } else {
+                    release_rx.recv().unwrap();
+                }
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        subscribe_v2(&socket, "scratch", "hash", tx).unwrap();
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SubscriptionUpdate::Connecting
+        ));
+        let first = match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            SubscriptionUpdate::Connected(snapshot) => snapshot,
+            update => panic!("expected first connected update, got {update:?}"),
+        };
+        assert_eq!(first.snapshot_revision, 1);
+
+        kill_first_tx.send(()).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SubscriptionUpdate::Disconnected
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SubscriptionUpdate::Connecting
+        ));
+        let second = match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            SubscriptionUpdate::Connected(snapshot) => snapshot,
+            update => panic!("expected reconnected update, got {update:?}"),
+        };
+        assert_eq!(second.snapshot_revision, 2);
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn v2_subscription_keeps_an_idle_peer_without_a_protocol_heartbeat() {
+        let socket = unique_socket_path("vt2-sub-idle");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut stream = accept_guarded_subscription(&listener, "scratch", "hash");
+            serde_json::to_writer(
+                &mut stream,
+                &V2ServerMessage::ResolvedSnapshotResult {
+                    snapshot_revision: 1,
+                    snapshot: empty_resolved_snapshot(1),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            release_rx.recv().unwrap();
+        });
+        let mut subscription = V2SnapshotSubscription::connect(&socket, "scratch", "hash").unwrap();
+        assert!(subscription.read_initial_snapshot().unwrap().is_some());
+        assert_eq!(subscription.reader.get_ref().read_timeout().unwrap(), None);
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn v2_subscription_rejects_config_hash_mismatch_before_subscribing() {
+        let socket = unique_socket_path("vt2-sub-config-mismatch");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            write_hello_ack(&mut stream, "scratch");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+                V2ClientMessage::QueryHealth { .. }
+            ));
+            serde_json::to_writer(
+                &mut stream,
+                &V2ServerMessage::HealthResult {
+                    health: crate::daemon::protocol::v2::DaemonHealth {
+                        config_hash: "active".to_string(),
+                        projection_revision: 1,
+                        projection_updated_at_epoch_seconds: 1,
+                        notification_enabled: false,
+                        notification_failures: 0,
+                        notification_queue_drops: 0,
+                        notification_degraded: false,
+                        last_notification_error_code: None,
+                        current_quarantine_count: 0,
+                        quarantine_observed_total: 0,
+                        recent_error_code: None,
+                        hook_delivery_failures: 0,
+                        hook_delivery_degraded: false,
+                        last_hook_error_code: None,
+                        status_push_failures: 0,
+                        status_push_degraded: false,
+                        last_status_push_error: None,
+                        last_status_push_error_at_epoch_seconds: None,
+                    },
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.is_empty(), "mismatched config must not subscribe");
+        });
+
+        let error = match V2SnapshotSubscription::connect(&socket, "scratch", "disk") {
+            Ok(_) => panic!("mismatched config unexpectedly subscribed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("vt daemon reload"));
         handle.join().unwrap();
         std::fs::remove_file(socket).unwrap();
     }
@@ -902,7 +1300,19 @@ mod tests {
         });
         let started = Instant::now();
 
-        send_sidebar_key_v2(&socket, "scratch", "down").unwrap();
+        send_sidebar_jump_v2(
+            &socket,
+            "scratch",
+            PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 1,
+            },
+            PaneInstance {
+                pane_id: "%9".to_string(),
+                pane_pid: 9,
+            },
+        )
+        .unwrap();
 
         assert!(started.elapsed() >= V2_SUBSCRIBE_INITIAL_TIMEOUT);
         handle.join().unwrap();

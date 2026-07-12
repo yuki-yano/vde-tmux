@@ -11,15 +11,16 @@ use crate::daemon::protocol::v2::{PanePresentation, StatusContext, StatusSnapsho
 use crate::daemon::topology::ServerIdentity;
 use crate::pane_state::PaneInstance;
 
-pub const STATUS_PUSH_MIN_INTERVAL: Duration = Duration::from_secs(1);
-pub const RENDER_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
+pub const STATUS_PUSH_MIN_INTERVAL: Duration = Duration::from_millis(500);
+pub const RENDER_CLOCK_INTERVAL: Duration = Duration::from_millis(500);
 pub const STATUS_PUSH_SERVER_MISMATCH_SENTINEL: &str = "__vde_status_push_server_mismatch__";
 const STATUS_PUSH_PANE_MISMATCH_PREFIX: &str = "__vde_status_push_pane_mismatch__";
 const STATUS_PUSH_BATCH_FILE_PREFIX: &str = ".status-push-batch-";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DisplayOptionKey {
-    GlobalSummary,
+    LegacyGlobalSummary,
+    SessionSummary { session_id: String },
     SessionCategory { session_id: String },
     SessionSessions { session_id: String },
     SessionWindows { session_id: String },
@@ -30,7 +31,9 @@ pub enum DisplayOptionKey {
 impl DisplayOptionKey {
     pub fn option_name(&self) -> &'static str {
         match self {
-            Self::GlobalSummary => crate::options::KEY_STATUS_SUMMARY,
+            Self::LegacyGlobalSummary | Self::SessionSummary { .. } => {
+                crate::options::KEY_STATUS_SUMMARY
+            }
             Self::SessionCategory { .. } => crate::options::KEY_STATUS_CATEGORY,
             Self::SessionSessions { .. } => crate::options::KEY_STATUS_SESSIONS,
             Self::SessionWindows { .. } => crate::options::KEY_STATUS_WINDOWS,
@@ -41,8 +44,9 @@ impl DisplayOptionKey {
 
     pub fn scope(&self) -> DisplayOptionScope<'_> {
         match self {
-            Self::GlobalSummary => DisplayOptionScope::Global,
-            Self::SessionCategory { session_id }
+            Self::LegacyGlobalSummary => DisplayOptionScope::Global,
+            Self::SessionSummary { session_id }
+            | Self::SessionCategory { session_id }
             | Self::SessionSessions { session_id }
             | Self::SessionWindows { session_id }
             | Self::SessionAttention { session_id } => DisplayOptionScope::Session { session_id },
@@ -67,7 +71,10 @@ pub enum DisplayOptionValue {
 impl DisplayOptionValue {
     fn validate(&self, key: &DisplayOptionKey) -> Result<(), StatusPushError> {
         let Self::Set(value) = self else {
-            return if matches!(key, DisplayOptionKey::SessionAttention { .. }) {
+            return if matches!(
+                key,
+                DisplayOptionKey::LegacyGlobalSummary | DisplayOptionKey::SessionAttention { .. }
+            ) {
                 Ok(())
             } else {
                 Err(StatusPushError::InvalidDisplayValue(format!(
@@ -124,11 +131,9 @@ pub fn build_display_frame(
     }
 
     let mut values = BTreeMap::new();
-    let global = crate::statusline::render_structured_status_snapshot(config, global_snapshot);
-    values.insert(
-        DisplayOptionKey::GlobalSummary,
-        DisplayOptionValue::Set(global.summary),
-    );
+    crate::statusline::render_structured_status_snapshot(config, global_snapshot)
+        .map_err(|error| StatusPushError::InvalidDisplaySnapshot(error.to_string()))?;
+    let mut rendered_sessions = Vec::with_capacity(session_snapshots.len());
 
     for snapshot in session_snapshots {
         if snapshot.snapshot_revision != global_snapshot.snapshot_revision {
@@ -142,8 +147,44 @@ pub fn build_display_frame(
                 "session display snapshot must use session context".to_string(),
             ));
         };
-        let rendered = crate::statusline::render_structured_status_snapshot(config, snapshot);
+        let mut budget_snapshot = snapshot.clone();
+        budget_snapshot.summary = global_snapshot.summary;
+        let rendered =
+            crate::statusline::render_structured_status_snapshot(config, &budget_snapshot)
+                .map_err(|error| StatusPushError::InvalidDisplaySnapshot(error.to_string()))?;
+        rendered_sessions.push((session_id.clone(), rendered));
+    }
+
+    values.insert(
+        DisplayOptionKey::LegacyGlobalSummary,
+        DisplayOptionValue::Unset,
+    );
+
+    for (session_id, rendered) in rendered_sessions {
+        // The ordered session action model is deliberately complete and may exceed the visual
+        // target. Keep the intrinsic guard for the remaining status content only; tmux clips the
+        // full session list to the actual terminal width without replacing targets with `+N`.
+        let bounded_status_width = [
+            &rendered.summary,
+            &rendered.category,
+            &rendered.windows,
+            &rendered.attention,
+        ]
+        .into_iter()
+        .map(|segment| crate::statusline::structured_status_display_width(segment))
+        .sum::<usize>();
+        if bounded_status_width > crate::statusline::STATUS_OPTION_CELL_BUDGET {
+            return Err(StatusPushError::InvalidDisplaySnapshot(format!(
+                "session {session_id} non-session status projection exceeds the 80-cell budget"
+            )));
+        }
         let session_values = [
+            (
+                DisplayOptionKey::SessionSummary {
+                    session_id: session_id.clone(),
+                },
+                rendered.summary,
+            ),
             (
                 DisplayOptionKey::SessionCategory {
                     session_id: session_id.clone(),
@@ -570,8 +611,8 @@ impl StatusPushState {
         self.prepare_if_due(now)
     }
 
-    /// Flushes a render trigger that was coalesced by the 1Hz limiter. This never retries a
-    /// failed batch by itself; failures remain dirty until a later revision or render-clock tick.
+    /// Flushes a render trigger coalesced by the bounded push-rate limiter, including a bounded
+    /// retry after a temporary write failure.
     pub fn flush_coalesced(
         &mut self,
         now: Duration,
@@ -592,8 +633,9 @@ impl StatusPushState {
         panes: &BTreeSet<PaneInstance>,
     ) {
         let keep = |key: &DisplayOptionKey| match key {
-            DisplayOptionKey::GlobalSummary => true,
-            DisplayOptionKey::SessionCategory { session_id }
+            DisplayOptionKey::LegacyGlobalSummary => true,
+            DisplayOptionKey::SessionSummary { session_id }
+            | DisplayOptionKey::SessionCategory { session_id }
             | DisplayOptionKey::SessionSessions { session_id }
             | DisplayOptionKey::SessionWindows { session_id }
             | DisplayOptionKey::SessionAttention { session_id } => sessions.contains(session_id),
@@ -609,11 +651,24 @@ impl StatusPushState {
         now: Duration,
         marker: String,
     ) -> Result<StatusPushDecision, StatusPushError> {
-        let marker = DisplayOptionValue::Set(marker);
-        marker.validate(&DisplayOptionKey::GlobalSummary)?;
         self.shutting_down = true;
-        self.desired.insert(DisplayOptionKey::GlobalSummary, marker);
-        self.dirty.insert(DisplayOptionKey::GlobalSummary);
+        self.desired.insert(
+            DisplayOptionKey::LegacyGlobalSummary,
+            DisplayOptionValue::Unset,
+        );
+        self.dirty.insert(DisplayOptionKey::LegacyGlobalSummary);
+
+        let summaries = self
+            .desired
+            .keys()
+            .filter(|key| matches!(key, DisplayOptionKey::SessionSummary { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in summaries {
+            self.desired
+                .insert(key.clone(), DisplayOptionValue::Set(marker.clone()));
+            self.dirty.insert(key);
+        }
 
         let attention = self
             .desired
@@ -628,7 +683,9 @@ impl StatusPushState {
         self.dirty.retain(|key| {
             matches!(
                 key,
-                DisplayOptionKey::GlobalSummary | DisplayOptionKey::SessionAttention { .. }
+                DisplayOptionKey::LegacyGlobalSummary
+                    | DisplayOptionKey::SessionSummary { .. }
+                    | DisplayOptionKey::SessionAttention { .. }
             )
         });
         self.pending_coalesced_trigger = true;
@@ -653,7 +710,9 @@ impl StatusPushState {
             if self.shutting_down
                 && !matches!(
                     key,
-                    DisplayOptionKey::GlobalSummary | DisplayOptionKey::SessionAttention { .. }
+                    DisplayOptionKey::LegacyGlobalSummary
+                        | DisplayOptionKey::SessionSummary { .. }
+                        | DisplayOptionKey::SessionAttention { .. }
                 )
             {
                 continue;
@@ -668,7 +727,7 @@ impl StatusPushState {
                 self.dirty.insert(key);
             }
         }
-        if self.shutting_down && !succeeded && !self.dirty.is_empty() {
+        if !succeeded && !self.dirty.is_empty() {
             self.pending_coalesced_trigger = true;
         }
         Ok(())
@@ -727,7 +786,9 @@ impl StatusPushState {
             .filter_map(|(key, value)| {
                 let terminal_key = matches!(
                     key,
-                    DisplayOptionKey::GlobalSummary | DisplayOptionKey::SessionAttention { .. }
+                    DisplayOptionKey::LegacyGlobalSummary
+                        | DisplayOptionKey::SessionSummary { .. }
+                        | DisplayOptionKey::SessionAttention { .. }
                 );
                 ((!self.shutting_down || terminal_key)
                     && (self.dirty.contains(key) || self.last_successful.get(key) != Some(value)))
@@ -808,8 +869,9 @@ impl StatusPushState {
 
 fn validate_key(key: &DisplayOptionKey) -> Result<(), StatusPushError> {
     match key {
-        DisplayOptionKey::GlobalSummary => Ok(()),
-        DisplayOptionKey::SessionCategory { session_id }
+        DisplayOptionKey::LegacyGlobalSummary => Ok(()),
+        DisplayOptionKey::SessionSummary { session_id }
+        | DisplayOptionKey::SessionCategory { session_id }
         | DisplayOptionKey::SessionSessions { session_id }
         | DisplayOptionKey::SessionWindows { session_id }
         | DisplayOptionKey::SessionAttention { session_id } => {
@@ -980,6 +1042,7 @@ mod tests {
             window_name: "editor".to_string(),
             current_path: "/tmp/#work".to_string(),
             current_command: "codex#[fg=red]".to_string(),
+            pane_width: 80,
             active: true,
             stored: None,
             resolved: Some(ResolvedPaneState {
@@ -1027,6 +1090,7 @@ mod tests {
             window_name: "editor".to_string(),
             current_path: "/tmp/#{path}\t".to_string(),
             current_command: "zsh#[fg=red]\n".to_string(),
+            pane_width: 80,
             active: false,
             stored: None,
             resolved: None,
@@ -1052,13 +1116,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(frame.values().len(), 11);
-        assert!(matches!(
-            frame.values().get(&DisplayOptionKey::GlobalSummary),
-            Some(DisplayOptionValue::Set(value)) if value.contains("▲1") && value.contains("●1") && value.contains("○1")
-        ));
+        assert_eq!(frame.values().len(), 13);
+        assert_eq!(
+            frame.values().get(&DisplayOptionKey::LegacyGlobalSummary),
+            Some(&DisplayOptionValue::Unset)
+        );
         for session_id in ["$1", "$2"] {
             for key in [
+                DisplayOptionKey::SessionSummary {
+                    session_id: session_id.to_string(),
+                },
                 DisplayOptionKey::SessionCategory {
                     session_id: session_id.to_string(),
                 },
@@ -1077,6 +1144,32 @@ mod tests {
                     "missing {key:?}"
                 );
             }
+            let non_session_width = [
+                DisplayOptionKey::SessionSummary {
+                    session_id: session_id.to_string(),
+                },
+                DisplayOptionKey::SessionCategory {
+                    session_id: session_id.to_string(),
+                },
+                DisplayOptionKey::SessionWindows {
+                    session_id: session_id.to_string(),
+                },
+                DisplayOptionKey::SessionAttention {
+                    session_id: session_id.to_string(),
+                },
+            ]
+            .into_iter()
+            .map(|key| match frame.values().get(&key).unwrap() {
+                DisplayOptionValue::Set(value) => {
+                    crate::statusline::structured_status_display_width(value)
+                }
+                DisplayOptionValue::Unset => 0,
+            })
+            .sum::<usize>();
+            assert!(
+                non_session_width <= 80,
+                "{session_id} used {non_session_width} non-session status cells"
+            );
         }
         let sessions = frame
             .values()
@@ -1095,7 +1188,9 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(windows, DisplayOptionValue::Set(value) if value.contains("editor##{pane_id}|nvim##[fg=red]")),
+            matches!(windows, DisplayOptionValue::Set(value)
+                if value.contains("range=user|window:@1")
+                    && (value.contains("editor##{pane_id}|nvim##[fg=red]") || value.contains("@1"))),
             "{windows:?}"
         );
         let attention = frame
@@ -1105,7 +1200,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(attention, DisplayOptionValue::Set(value) if value.contains("dev##(unsafe)") && value.contains("1m")),
+            matches!(attention, DisplayOptionValue::Set(value) if value.contains("dev##(unsafe)") && value.contains("1m01s")),
             "{attention:?}"
         );
         let pane_value = frame
@@ -1113,7 +1208,7 @@ mod tests {
             .get(&DisplayOptionKey::PaneStatus(pane.pane_instance))
             .unwrap();
         assert!(
-            matches!(pane_value, DisplayOptionValue::Set(value) if !value.is_empty() && value != "0" && value.contains("1m")),
+            matches!(pane_value, DisplayOptionValue::Set(value) if !value.is_empty() && value != "0" && value.contains("1m01s")),
             "{pane_value:?}"
         );
         let non_agent_value = frame
@@ -1123,6 +1218,86 @@ mod tests {
         assert!(
             matches!(non_agent_value, DisplayOptionValue::Set(value) if value.contains("zsh##[fg=red] ")),
             "{non_agent_value:?}"
+        );
+    }
+
+    #[test]
+    fn frame_builder_publishes_every_session_even_when_the_option_exceeds_80_cells() {
+        use crate::daemon::protocol::v2::SessionStatusPresentation;
+        use crate::daemon::session_badge::BadgeStateCounts;
+
+        let config = Config::default();
+        let global = global_snapshot(9);
+        let mut session = session_snapshot("$6", 9, 0);
+        session.sessions = (1..=12)
+            .map(|index| SessionStatusPresentation {
+                session_id: format!("${index}"),
+                session_name: format!("session-{index}-{}", "x".repeat(16)),
+                category: Some("work".to_string()),
+                attached: None,
+                created_at: None,
+                active: index == 6,
+                counts: BadgeStateCounts::default(),
+            })
+            .collect();
+
+        let frame = build_display_frame(&config, &global, &[session], &[], 0).unwrap();
+        let value = frame
+            .values()
+            .get(&DisplayOptionKey::SessionSessions {
+                session_id: "$6".to_string(),
+            })
+            .unwrap();
+        let DisplayOptionValue::Set(value) = value else {
+            panic!("session option was unexpectedly unset");
+        };
+
+        assert_eq!(value.matches("range=user|session:").count(), 12, "{value}");
+        assert!(!value.contains(" +"), "{value}");
+        assert!(crate::statusline::structured_status_display_width(value) > 80);
+    }
+
+    #[test]
+    fn summary_budget_is_scoped_to_each_session() {
+        let mut config = Config::default();
+        config.badge.glyphs.blocked = "B".repeat(60);
+        let mut global = global_snapshot(11);
+        global.summary = crate::daemon::session_badge::BadgeStateCounts {
+            blocked: 1,
+            ..crate::daemon::session_badge::BadgeStateCounts::default()
+        };
+        let crowded = session_snapshot("$1", 11, 90);
+        let roomy = StatusSnapshot {
+            snapshot_revision: 11,
+            context: StatusContext::Session {
+                session_id: "$2".to_string(),
+            },
+            summary: crate::daemon::session_badge::BadgeStateCounts::default(),
+            sessions: Vec::new(),
+            windows: Vec::new(),
+            categories: Vec::new(),
+            attention: Vec::new(),
+        };
+
+        let frame = build_display_frame(&config, &global, &[crowded, roomy], &[], 90).unwrap();
+        let crowded_summary = frame
+            .values()
+            .get(&DisplayOptionKey::SessionSummary {
+                session_id: "$1".to_string(),
+            })
+            .unwrap();
+        let roomy_summary = frame
+            .values()
+            .get(&DisplayOptionKey::SessionSummary {
+                session_id: "$2".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(crowded_summary, &DisplayOptionValue::Set(String::new()));
+        assert!(matches!(roomy_summary, DisplayOptionValue::Set(value) if !value.is_empty()));
+        assert_eq!(
+            frame.values().get(&DisplayOptionKey::LegacyGlobalSummary),
+            Some(&DisplayOptionValue::Unset)
         );
     }
 
@@ -1161,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn thirty_second_clock_rebuild_updates_only_time_bearing_options() {
+    fn one_second_clock_rebuild_updates_only_time_bearing_options() {
         let config = Config::default();
         let global = global_snapshot(7);
         let pane = pane_presentation();
@@ -1184,14 +1359,14 @@ mod tests {
         let clock_frame = build_display_frame(
             &config,
             &global,
-            &[session_snapshot("$1", 7, 89)],
+            &[session_snapshot("$1", 7, 60)],
             &[pane],
-            89,
+            60,
         )
         .unwrap();
         let tick = take_batch(
             state
-                .on_render_clock(Duration::from_secs(30), clock_frame)
+                .on_render_clock(Duration::from_secs(1), clock_frame)
                 .unwrap(),
         );
 
@@ -1209,7 +1384,7 @@ mod tests {
                 .any(|write| matches!(write.key, DisplayOptionKey::PaneStatus(_)))
         );
         assert!(tick.guarded.writes.iter().all(|write| {
-            matches!(&write.value, DisplayOptionValue::Set(value) if value.contains("1m"))
+            matches!(&write.value, DisplayOptionValue::Set(value) if value.contains("1m00s"))
         }));
     }
 
@@ -1245,13 +1420,15 @@ mod tests {
     }
 
     fn unique_status_batch_dir() -> PathBuf {
+        static NEXT_DIR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_DIR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "vde-tmux-status-batch-{}-{nanos}",
-            std::process::id()
+            "vde-tmux-status-batch-{}-{nanos}-{sequence}",
+            std::process::id(),
         ))
     }
 
@@ -1259,7 +1436,9 @@ mod tests {
     fn system_io_uses_one_file_backed_server_guarded_process_for_large_batch() {
         let batch_dir = unique_status_batch_dir();
         let mut writes = vec![DisplayOptionWrite {
-            key: DisplayOptionKey::GlobalSummary,
+            key: DisplayOptionKey::SessionSummary {
+                session_id: "$1".to_string(),
+            },
             value: DisplayOptionValue::Set("summary".to_string()),
         }];
         writes.extend((1..=64).map(|pid| DisplayOptionWrite {
@@ -1297,6 +1476,7 @@ mod tests {
         assert_eq!(bodies[0].lines().count(), 65);
         assert!(bodies[0].contains("pane_pid"));
         assert!(bodies[0].contains("64"));
+        assert!(bodies[0].contains("'set-option' '-t' '$1' '@vde_status_summary' 'summary'"));
         assert_eq!(runner.modes.borrow().as_slice(), &[0o600]);
         assert_eq!(
             std::fs::metadata(&batch_dir).unwrap().permissions().mode() & 0o777,
@@ -1315,7 +1495,9 @@ mod tests {
         let batch = GuardedDisplayBatch {
             expected_server: server(),
             writes: vec![DisplayOptionWrite {
-                key: DisplayOptionKey::GlobalSummary,
+                key: DisplayOptionKey::SessionSummary {
+                    session_id: "$1".to_string(),
+                },
                 value: DisplayOptionValue::Set("summary".to_string()),
             }],
         };
@@ -1381,7 +1563,13 @@ mod tests {
     ) -> DisplayFrame {
         DisplayFrame::new(BTreeMap::from([
             (
-                DisplayOptionKey::GlobalSummary,
+                DisplayOptionKey::LegacyGlobalSummary,
+                DisplayOptionValue::Unset,
+            ),
+            (
+                DisplayOptionKey::SessionSummary {
+                    session_id: "$1".to_string(),
+                },
                 DisplayOptionValue::Set(summary.to_string()),
             ),
             (
@@ -1483,7 +1671,7 @@ mod tests {
         );
         assert_eq!(state.last_snapshot_revision(), Some(1));
         assert_eq!(batch.guarded.expected_server, server());
-        assert_eq!(batch.guarded.writes.len(), 6);
+        assert_eq!(batch.guarded.writes.len(), 7);
         assert!(batch.guarded.contains_mixed_scopes());
 
         let mut io = FakeIo::default();
@@ -1497,7 +1685,7 @@ mod tests {
     }
 
     #[test]
-    fn one_hz_limit_coalesces_latest_render() {
+    fn half_second_limit_coalesces_latest_render() {
         let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
         let first = take_batch(
             state
@@ -1510,21 +1698,21 @@ mod tests {
             state
                 .on_snapshot_revision(
                     2,
-                    Duration::from_millis(500),
+                    Duration::from_millis(250),
                     frame("two", "", pane(10), "pane")
                 )
                 .unwrap(),
             StatusPushDecision::Coalesced {
-                ready_at: Duration::from_secs(1)
+                ready_at: Duration::from_millis(500)
             }
         );
         assert_eq!(
-            state.flush_coalesced(Duration::from_millis(999)).unwrap(),
+            state.flush_coalesced(Duration::from_millis(499)).unwrap(),
             StatusPushDecision::Coalesced {
-                ready_at: Duration::from_secs(1)
+                ready_at: Duration::from_millis(500)
             }
         );
-        let second = take_batch(state.flush_coalesced(Duration::from_secs(1)).unwrap());
+        let second = take_batch(state.flush_coalesced(Duration::from_millis(500)).unwrap());
         assert_eq!(second.guarded.writes.len(), 1);
         assert_eq!(
             second.guarded.writes[0].value,
@@ -1568,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_batch_stays_dirty_without_an_independent_retry() {
+    fn failed_batch_retries_independently_within_two_seconds() {
         let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
         let first = take_batch(
             state
@@ -1583,19 +1771,48 @@ mod tests {
             state.execute_prepared(&first, &mut io).unwrap(),
             BatchExecution::Failed("tmux failed")
         );
-        assert_eq!(state.dirty().len(), 6);
+        assert_eq!(state.dirty().len(), 7);
         assert!(state.last_successful().is_empty());
         assert_eq!(
-            state.flush_coalesced(Duration::from_secs(5)).unwrap(),
-            StatusPushDecision::NoChanges
+            state.flush_coalesced(Duration::from_millis(499)).unwrap(),
+            StatusPushDecision::Coalesced {
+                ready_at: Duration::from_millis(500)
+            }
         );
 
-        let retry = take_batch(
+        let retry = take_batch(state.flush_coalesced(Duration::from_millis(500)).unwrap());
+        assert_eq!(retry.guarded.writes.len(), 7);
+        io.fail = false;
+        assert_eq!(
+            state.execute_prepared(&retry, &mut io).unwrap(),
+            BatchExecution::Committed
+        );
+        assert!(state.dirty().is_empty());
+        assert_eq!(io.calls.len(), 2);
+    }
+
+    #[test]
+    fn failed_batch_retry_does_not_regenerate_a_removed_pane_target() {
+        let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
+        let removed = pane(10);
+        let first = take_batch(
             state
-                .on_render_clock(Duration::from_secs(30), frame("sum", "", pane(10), "pane"))
+                .on_snapshot_revision(1, Duration::ZERO, frame("sum", "", removed.clone(), "pane"))
                 .unwrap(),
         );
-        assert_eq!(retry.guarded.writes.len(), 6);
+        state.complete_batch(first.id, false).unwrap();
+        state.pane_removed(&removed);
+
+        let retry = take_batch(state.flush_coalesced(Duration::from_secs(1)).unwrap());
+
+        assert!(retry.guarded.writes.iter().all(|write| {
+            !matches!(&write.key, DisplayOptionKey::PaneStatus(pane) if pane == &removed)
+        }));
+        assert!(
+            !state
+                .desired()
+                .contains_key(&DisplayOptionKey::PaneStatus(removed))
+        );
     }
 
     #[test]
@@ -1696,13 +1913,13 @@ mod tests {
             BatchExecution::ServerIncarnationMismatch
         );
         assert!(state.last_successful().is_empty());
-        assert_eq!(state.dirty().len(), 6);
+        assert_eq!(state.dirty().len(), 7);
     }
 
     #[test]
     fn clock_rerenders_only_changed_values_and_equal_revision_is_not_a_trigger() {
         let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
-        let initial_frame = frame("sum", "0m", pane(10), "pane 0m");
+        let initial_frame = frame("sum", "0s", pane(10), "pane 0s");
         let first = take_batch(
             state
                 .on_snapshot_revision(7, Duration::ZERO, initial_frame.clone())
@@ -1711,13 +1928,13 @@ mod tests {
         state.complete_batch(first.id, true).unwrap();
         assert_eq!(
             state
-                .on_snapshot_revision(7, Duration::from_secs(5), initial_frame.clone())
+                .on_snapshot_revision(7, Duration::from_millis(500), initial_frame.clone())
                 .unwrap(),
             StatusPushDecision::Ignored
         );
         assert_eq!(
             state
-                .on_render_clock(Duration::from_secs(29), initial_frame)
+                .on_render_clock(Duration::from_millis(499), initial_frame)
                 .unwrap(),
             StatusPushDecision::Ignored
         );
@@ -1725,8 +1942,8 @@ mod tests {
         let tick = take_batch(
             state
                 .on_render_clock(
-                    Duration::from_secs(30),
-                    frame("sum", "1m", pane(10), "pane 1m"),
+                    Duration::from_millis(500),
+                    frame("sum", "1s", pane(10), "pane 1s"),
                 )
                 .unwrap(),
         );
@@ -1743,6 +1960,74 @@ mod tests {
                 .iter()
                 .any(|write| matches!(write.key, DisplayOptionKey::PaneStatus(_)))
         );
+    }
+
+    #[test]
+    fn half_second_clock_keeps_integer_seconds_contiguous_across_a_snapshot_write() {
+        let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
+        let initial = frame("sum", "0s", pane(10), "pane 0s");
+        let first = take_batch(
+            state
+                .on_snapshot_revision(1, Duration::ZERO, initial.clone())
+                .unwrap(),
+        );
+        state.complete_batch(first.id, true).unwrap();
+
+        assert_eq!(
+            state
+                .on_render_clock(Duration::from_millis(500), initial)
+                .unwrap(),
+            StatusPushDecision::NoChanges
+        );
+
+        let snapshot = take_batch(
+            state
+                .on_snapshot_revision(
+                    2,
+                    Duration::from_millis(750),
+                    frame("sum 2", "0s", pane(10), "pane 0s"),
+                )
+                .unwrap(),
+        );
+        state.complete_batch(snapshot.id, true).unwrap();
+
+        assert_eq!(
+            state
+                .on_render_clock(
+                    Duration::from_secs(1),
+                    frame("sum 2", "1s", pane(10), "pane 1s"),
+                )
+                .unwrap(),
+            StatusPushDecision::Coalesced {
+                ready_at: Duration::from_millis(1_250)
+            }
+        );
+        let one_second = take_batch(state.flush_coalesced(Duration::from_millis(1_250)).unwrap());
+        assert!(one_second.guarded.writes.iter().all(|write| {
+            matches!(&write.value, DisplayOptionValue::Set(value) if value.contains("1s"))
+        }));
+        state.complete_batch(one_second.id, true).unwrap();
+
+        assert_eq!(
+            state
+                .on_render_clock(
+                    Duration::from_millis(1_500),
+                    frame("sum 2", "1s", pane(10), "pane 1s"),
+                )
+                .unwrap(),
+            StatusPushDecision::NoChanges
+        );
+        let two_seconds = take_batch(
+            state
+                .on_render_clock(
+                    Duration::from_secs(2),
+                    frame("sum 2", "2s", pane(10), "pane 2s"),
+                )
+                .unwrap(),
+        );
+        assert!(two_seconds.guarded.writes.iter().all(|write| {
+            matches!(&write.value, DisplayOptionValue::Set(value) if value.contains("2s"))
+        }));
     }
 
     #[test]
@@ -1815,9 +2100,9 @@ mod tests {
                 .request_shutdown(Duration::from_secs(1), "stopped".to_string())
                 .unwrap(),
         );
-        assert_eq!(shutdown.guarded.writes.len(), 2);
+        assert_eq!(shutdown.guarded.writes.len(), 3);
         assert!(shutdown.guarded.writes.iter().any(|write| {
-            write.key == DisplayOptionKey::GlobalSummary
+            matches!(write.key, DisplayOptionKey::SessionSummary { .. })
                 && write.value == DisplayOptionValue::Set("stopped".to_string())
         }));
         assert!(shutdown.guarded.writes.iter().any(|write| {
@@ -1850,10 +2135,12 @@ mod tests {
                 .request_shutdown(Duration::from_secs(1), "stopped".to_string())
                 .unwrap(),
         );
-        assert_eq!(shutdown.guarded.writes.len(), 2);
+        assert_eq!(shutdown.guarded.writes.len(), 3);
         assert!(shutdown.guarded.writes.iter().all(|write| matches!(
             write.key,
-            DisplayOptionKey::GlobalSummary | DisplayOptionKey::SessionAttention { .. }
+            DisplayOptionKey::LegacyGlobalSummary
+                | DisplayOptionKey::SessionSummary { .. }
+                | DisplayOptionKey::SessionAttention { .. }
         )));
     }
 
@@ -1882,11 +2169,11 @@ mod tests {
         assert_eq!(
             state.flush_coalesced(Duration::from_secs(1)).unwrap(),
             StatusPushDecision::Coalesced {
-                ready_at: Duration::from_secs(2)
+                ready_at: Duration::from_millis(1_500)
             }
         );
-        let retry = take_batch(state.flush_coalesced(Duration::from_secs(2)).unwrap());
-        assert_eq!(retry.guarded.writes.len(), 2);
+        let retry = take_batch(state.flush_coalesced(Duration::from_millis(1_500)).unwrap());
+        assert_eq!(retry.guarded.writes.len(), 3);
     }
 
     #[test]
@@ -1905,10 +2192,12 @@ mod tests {
         );
         state.complete_batch(first.id, false).unwrap();
         let shutdown = take_batch(state.flush_coalesced(Duration::from_secs(1)).unwrap());
-        assert_eq!(shutdown.guarded.writes.len(), 2);
+        assert_eq!(shutdown.guarded.writes.len(), 3);
         assert!(shutdown.guarded.writes.iter().all(|write| matches!(
             write.key,
-            DisplayOptionKey::GlobalSummary | DisplayOptionKey::SessionAttention { .. }
+            DisplayOptionKey::LegacyGlobalSummary
+                | DisplayOptionKey::SessionSummary { .. }
+                | DisplayOptionKey::SessionAttention { .. }
         )));
     }
 }

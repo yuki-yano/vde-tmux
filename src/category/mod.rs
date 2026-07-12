@@ -93,16 +93,38 @@ pub fn sessions_in_category<'a>(
         .collect()
 }
 
+pub fn sorted_effective_categories(config: &Config, sessions: &[SessionInfo]) -> Vec<String> {
+    let mut categories = sessions
+        .iter()
+        .map(|session| resolve_category_for_session(config, session))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    categories.sort_by(|left, right| {
+        let left_order = config
+            .categories
+            .order
+            .get(left)
+            .copied()
+            .unwrap_or(i64::MAX);
+        let right_order = config
+            .categories
+            .order
+            .get(right)
+            .copied()
+            .unwrap_or(i64::MAX);
+        left_order.cmp(&right_order).then_with(|| left.cmp(right))
+    });
+    categories
+}
+
 pub fn adjacent_category(
     config: &Config,
     sessions: &[SessionInfo],
     current_category: &str,
     direction: Direction,
 ) -> Option<String> {
-    let categories = sorted_categories(config, sessions)
-        .into_iter()
-        .filter(|category| !sessions_in_category(config, sessions, category).is_empty())
-        .collect::<Vec<_>>();
+    let categories = sorted_effective_categories(config, sessions);
     if categories.is_empty() {
         return None;
     }

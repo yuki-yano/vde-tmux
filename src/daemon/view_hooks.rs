@@ -1104,11 +1104,20 @@ fn acknowledgement_envelopes(
         .collect()
 }
 
-pub fn visibility_snapshot(pane: &PaneInstance, witnesses: &[ClientWitness]) -> VisibilitySnapshot {
+pub fn visibility_snapshot(
+    pane: &PaneInstance,
+    window_id: Option<&str>,
+    witnesses: &[ClientWitness],
+) -> VisibilitySnapshot {
     VisibilitySnapshot {
         pane_visible_to_eligible_client: witnesses
             .iter()
             .any(|witness| witness.is_eligible() && witness.active_pane == *pane),
+        window_visible_to_eligible_client: window_id.is_some_and(|window_id| {
+            witnesses
+                .iter()
+                .any(|witness| witness.is_eligible() && witness.window_id == window_id)
+        }),
     }
 }
 
@@ -1483,11 +1492,12 @@ impl FreshVisibilityIo for SystemFreshVisibilityIo {
 pub fn query_fresh_visibility(
     io: &dyn FreshVisibilityIo,
     pane: &PaneInstance,
+    window_id: Option<&str>,
 ) -> Result<VisibilitySnapshot, FreshVisibilityError> {
     let witnesses = io.query_witnesses(FRESH_VISIBILITY_TIMEOUT)?;
     validate_witnesses(&witnesses)
         .map_err(|error| FreshVisibilityError::Parse(error.to_string()))?;
-    Ok(visibility_snapshot(pane, &witnesses))
+    Ok(visibility_snapshot(pane, window_id, &witnesses))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1499,8 +1509,9 @@ pub struct CompletionVisibility {
 pub fn completion_visibility(
     io: &dyn FreshVisibilityIo,
     pane: &PaneInstance,
+    window_id: Option<&str>,
 ) -> Result<CompletionVisibility, FreshVisibilityError> {
-    match query_fresh_visibility(io, pane) {
+    match query_fresh_visibility(io, pane, window_id) {
         Ok(snapshot) => Ok(CompletionVisibility {
             snapshot,
             diagnostic: None,
@@ -2346,15 +2357,18 @@ mod tests {
                 witnesses: Ok(vec![witness]),
             },
             &target,
+            Some("@1"),
         )
         .unwrap();
         assert!(visible.pane_visible_to_eligible_client);
+        assert!(visible.window_visible_to_eligible_client);
         assert!(
             query_fresh_visibility(
                 &MockFreshVisibility {
                     witnesses: Err(FreshVisibilityError::Query("timeout".to_string())),
                 },
                 &target,
+                Some("@1"),
             )
             .is_err()
         );
@@ -2364,10 +2378,57 @@ mod tests {
                 witnesses: Err(FreshVisibilityError::Query("timeout".to_string())),
             },
             &target,
+            Some("@1"),
         )
         .unwrap();
         assert!(!unavailable.snapshot.pane_visible_to_eligible_client);
         assert!(unavailable.diagnostic.is_some());
+    }
+
+    #[test]
+    fn visibility_distinguishes_pane_and_window_scope_for_eligible_clients() {
+        let target = pane("%1", 11);
+        let other_split = pane("%2", 22);
+        let replacement = pane("%1", 33);
+        let eligible_same_window = ClientWitness {
+            client_pid: 10,
+            session_id: "$1".to_string(),
+            window_id: "@1".to_string(),
+            active_pane: other_split,
+            control_mode: false,
+            active_pane_flag: false,
+        };
+        let control_on_target = ClientWitness {
+            client_pid: 20,
+            session_id: "$2".to_string(),
+            window_id: "@1".to_string(),
+            active_pane: target.clone(),
+            control_mode: true,
+            active_pane_flag: false,
+        };
+
+        let visible = visibility_snapshot(
+            &target,
+            Some("@1"),
+            &[eligible_same_window, control_on_target],
+        );
+        assert!(!visible.pane_visible_to_eligible_client);
+        assert!(visible.window_visible_to_eligible_client);
+
+        let reused = visibility_snapshot(
+            &target,
+            None,
+            &[ClientWitness {
+                client_pid: 30,
+                session_id: "$1".to_string(),
+                window_id: "@1".to_string(),
+                active_pane: replacement,
+                control_mode: false,
+                active_pane_flag: false,
+            }],
+        );
+        assert!(!reused.pane_visible_to_eligible_client);
+        assert!(!reused.window_visible_to_eligible_client);
     }
 
     #[test]
@@ -2876,15 +2937,26 @@ mod tests {
             crate::pane_state::DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
             crate::pane_state::EventId::parse("102132435465768798a9bacbdcedfe0f").unwrap(),
             ViewHookKind::WindowPaneChanged,
+            Some(occurrence.clone()),
+            Some(SourceClientHint { client_pid: 10 }),
+            vec![witness.clone()],
+            DoneClearOn::Pane,
+        )
+        .unwrap();
+        let window_policy = build_foreground_view_event(
+            crate::pane_state::DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            crate::pane_state::EventId::parse("102132435465768798a9bacbdcedfe0f").unwrap(),
+            ViewHookKind::WindowPaneChanged,
             Some(occurrence),
             Some(SourceClientHint { client_pid: 10 }),
             vec![witness],
-            DoneClearOn::Pane,
+            DoneClearOn::Window,
         )
         .unwrap();
         assert!(built.unverified_occurrence);
         assert!(built.event.occurrence.is_some());
         assert_eq!(built.event.witnesses.len(), 1);
+        assert_eq!(built.event, window_policy.event);
     }
 
     #[test]

@@ -177,7 +177,12 @@ fn reduce_explicit(
             else {
                 return Ok(Reduction::unchanged(current));
             };
-            apply_initial_explicit_event(&mut state, &envelope.event, context.visibility)?;
+            apply_initial_explicit_event(
+                &mut state,
+                &envelope.event,
+                context.visibility,
+                context.done_clear_on,
+            )?;
             let completed_outside_capture = state.completed_seq > 0;
             let mut tracker = reset_tracker_for_state(context.tracker, &state)?;
             tracker.rebaseline_pending = completed_outside_capture;
@@ -206,7 +211,12 @@ fn reduce_explicit(
     let completed_before = state.completed_seq;
     match identity {
         ExistingIdentity::ExactPresent => {
-            apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+            apply_regular_explicit_event(
+                &mut state,
+                &envelope.event,
+                context.visibility,
+                context.done_clear_on,
+            )?;
         }
         ExistingIdentity::ExactAbsent => {
             if epoch_evidence {
@@ -216,9 +226,19 @@ fn reduce_explicit(
                     Some(session.clone()),
                     EpochSource::Explicit,
                 )?;
-                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+                apply_regular_explicit_event(
+                    &mut state,
+                    &envelope.event,
+                    context.visibility,
+                    context.done_clear_on,
+                )?;
             } else if completion {
-                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+                apply_regular_explicit_event(
+                    &mut state,
+                    &envelope.event,
+                    context.visibility,
+                    context.done_clear_on,
+                )?;
                 state.agent_present = false;
                 state.scan_verified = true;
             } else {
@@ -228,7 +248,12 @@ fn reduce_explicit(
         ExistingIdentity::UnboundPresent => {
             if epoch_evidence || (completion && state.synthetic_completion_armed) {
                 state.agent_session_id = Some(session.clone());
-                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+                apply_regular_explicit_event(
+                    &mut state,
+                    &envelope.event,
+                    context.visibility,
+                    context.done_clear_on,
+                )?;
             }
         }
         ExistingIdentity::UnboundAbsent => {
@@ -239,7 +264,12 @@ fn reduce_explicit(
                     Some(session.clone()),
                     EpochSource::Explicit,
                 )?;
-                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+                apply_regular_explicit_event(
+                    &mut state,
+                    &envelope.event,
+                    context.visibility,
+                    context.done_clear_on,
+                )?;
             } else {
                 return Err(ReduceError::StaleAgentEvent);
             }
@@ -258,7 +288,12 @@ fn reduce_explicit(
                 Some(session.clone()),
                 EpochSource::ProcessVerifiedExplicitHandover,
             )?;
-            apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+            apply_regular_explicit_event(
+                &mut state,
+                &envelope.event,
+                context.visibility,
+                context.done_clear_on,
+            )?;
         }
         ExistingIdentity::MismatchAbsent => {
             if !epoch_evidence {
@@ -270,7 +305,12 @@ fn reduce_explicit(
                 Some(session.clone()),
                 EpochSource::Explicit,
             )?;
-            apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+            apply_regular_explicit_event(
+                &mut state,
+                &envelope.event,
+                context.visibility,
+                context.done_clear_on,
+            )?;
         }
     }
 
@@ -364,7 +404,12 @@ fn reduce_observation(
                     .checked_add(1)
                     .ok_or(ReduceError::CounterOverflow("absence"))?;
                 if tracker.absence_count >= 2 {
-                    confirm_absent(&mut state, *observed_at, context.visibility)?;
+                    confirm_absent(
+                        &mut state,
+                        *observed_at,
+                        context.visibility,
+                        context.done_clear_on,
+                    )?;
                     tracker.absence_count = 0;
                 }
             }
@@ -381,6 +426,7 @@ fn reduce_observation(
                     &mut tracker,
                     *observed_at,
                     context.visibility,
+                    context.done_clear_on,
                 )?;
             } else {
                 begin_agent_epoch(
@@ -404,7 +450,12 @@ fn reduce_observation(
                         .checked_add(1)
                         .ok_or(ReduceError::CounterOverflow("absence"))?;
                     if tracker.absence_count >= 2 {
-                        confirm_absent(&mut state, *observed_at, context.visibility)?;
+                        confirm_absent(
+                            &mut state,
+                            *observed_at,
+                            context.visibility,
+                            context.done_clear_on,
+                        )?;
                         tracker.absence_count = 0;
                     }
                 }
@@ -499,11 +550,12 @@ fn apply_initial_explicit_event(
     state: &mut PaneState,
     event: &PaneEvent,
     visibility: &VisibilitySnapshot,
+    done_clear_on: crate::config::DoneClearOn,
 ) -> Result<(), ReduceError> {
     match event {
         PaneEvent::AgentSessionStarted { .. } => apply_agent_session_started(state, event),
         PaneEvent::CompleteRun { completed_at } => {
-            complete_run(state, *completed_at, visibility, true)
+            complete_run(state, *completed_at, visibility, done_clear_on, true)
         }
         PaneEvent::ExplicitStateReported { report }
             if matches!(report.lifecycle, Some(ReportedLifecycle::Idle)) =>
@@ -512,11 +564,12 @@ fn apply_initial_explicit_event(
                 state,
                 report.completed_at.unwrap_or(report.observed_at),
                 visibility,
+                done_clear_on,
                 true,
             )?;
             apply_report_fields(state, report)
         }
-        _ => apply_regular_explicit_event(state, event, visibility),
+        _ => apply_regular_explicit_event(state, event, visibility, done_clear_on),
     }
 }
 
@@ -524,6 +577,7 @@ fn apply_regular_explicit_event(
     state: &mut PaneState,
     event: &PaneEvent,
     visibility: &VisibilitySnapshot,
+    done_clear_on: crate::config::DoneClearOn,
 ) -> Result<(), ReduceError> {
     match event {
         PaneEvent::AgentSessionStarted { .. } => apply_agent_session_started(state, event),
@@ -534,7 +588,7 @@ fn apply_regular_explicit_event(
             reason,
         } => wait_requested(state, *observed_at, reason.clone()),
         PaneEvent::CompleteRun { completed_at } => {
-            complete_run(state, *completed_at, visibility, false)
+            complete_run(state, *completed_at, visibility, done_clear_on, false)
         }
         PaneEvent::FailRun {
             observed_at,
@@ -542,7 +596,7 @@ fn apply_regular_explicit_event(
         } => fail_run(state, *observed_at, reason.clone()),
         PaneEvent::ProgressUpdated { operations, .. } => apply_progress(state, operations),
         PaneEvent::ExplicitStateReported { report } => {
-            apply_explicit_report(state, report, visibility)
+            apply_explicit_report(state, report, visibility, done_clear_on)
         }
         _ => Err(ReduceError::InvalidRequest(
             "event is not an explicit agent event".to_string(),
@@ -574,6 +628,7 @@ fn apply_explicit_report(
     state: &mut PaneState,
     report: &ExplicitStateReport,
     visibility: &VisibilitySnapshot,
+    done_clear_on: crate::config::DoneClearOn,
 ) -> Result<(), ReduceError> {
     match &report.lifecycle {
         Some(ReportedLifecycle::Running) => {
@@ -593,6 +648,7 @@ fn apply_explicit_report(
                 state,
                 report.completed_at.unwrap_or(report.observed_at),
                 visibility,
+                done_clear_on,
                 false,
             )?;
         }
@@ -803,6 +859,7 @@ fn complete_run(
     state: &mut PaneState,
     completed_at: i64,
     visibility: &VisibilitySnapshot,
+    done_clear_on: crate::config::DoneClearOn,
     allow_unarmed_synthetic: bool,
 ) -> Result<(), ReduceError> {
     if state.run_seq == 0 {
@@ -820,7 +877,11 @@ fn complete_run(
     state.synthetic_completion_armed = false;
     state.subagents.clear();
     state.worktree_activity = None;
-    if visibility.pane_visible_to_eligible_client {
+    let visible = match done_clear_on {
+        crate::config::DoneClearOn::Pane => visibility.pane_visible_to_eligible_client,
+        crate::config::DoneClearOn::Window => visibility.window_visible_to_eligible_client,
+    };
+    if visible {
         state.acknowledged_seq = state.completed_seq;
     }
     Ok(())
@@ -848,9 +909,10 @@ fn confirm_absent(
     state: &mut PaneState,
     observed_at: i64,
     visibility: &VisibilitySnapshot,
+    done_clear_on: crate::config::DoneClearOn,
 ) -> Result<(), ReduceError> {
     if state.run_seq > state.completed_seq {
-        complete_run(state, observed_at, visibility, false)?;
+        complete_run(state, observed_at, visibility, done_clear_on, false)?;
     }
     state.agent_present = false;
     state.scan_verified = true;
@@ -1029,6 +1091,7 @@ fn apply_capture(
     tracker: &mut CaptureTrackerSnapshot,
     observed_at: i64,
     visibility: &VisibilitySnapshot,
+    done_clear_on: crate::config::DoneClearOn,
 ) -> Result<(), ReduceError> {
     let Some(capture) = capture else {
         return Ok(());
@@ -1048,13 +1111,13 @@ fn apply_capture(
             wait_requested(state, observed_at, reason.clone())?;
         }
         CaptureInference::ActivityObserved => {
-            if tracker.fingerprint.is_some() {
+            if tracker.fingerprint.is_some() && state.run_seq > state.completed_seq {
                 activity_observed(state, observed_at)?;
             }
         }
         CaptureInference::StaleRunCompleted => {
             if matches!(state.lifecycle, LifecycleState::Running) {
-                complete_run(state, observed_at, visibility, false)?;
+                complete_run(state, observed_at, visibility, done_clear_on, false)?;
             }
         }
         CaptureInference::NoChange => {}
@@ -2501,6 +2564,7 @@ mod tests {
         let begun = begin(None, &tracker);
         let visible = VisibilitySnapshot {
             pane_visible_to_eligible_client: true,
+            ..VisibilitySnapshot::default()
         };
         let result = reduce(
             begun.record.as_ref(),
@@ -2510,6 +2574,46 @@ mod tests {
         .unwrap();
         assert_eq!(active(&result).acknowledged_seq, 1);
         assert_eq!(resolve_badge(active(&result)), BadgeState::Idle);
+    }
+
+    #[test]
+    fn completion_uses_configured_visibility_scope_before_publication() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let begun = begin(None, &tracker);
+        let begun_tracker = begun.tracker_delta.as_ref().unwrap().next.clone();
+        let other_split_visible = VisibilitySnapshot {
+            pane_visible_to_eligible_client: false,
+            window_visible_to_eligible_client: true,
+        };
+        let event = envelope(PaneEvent::CompleteRun { completed_at: 20 });
+
+        let window = reduce(
+            begun.record.as_ref(),
+            &event,
+            ReductionContext {
+                done_clear_on: crate::config::DoneClearOn::Window,
+                visibility: &other_split_visible,
+                tracker: &begun_tracker,
+                new_state_id: Some(StateId::parse(STATE_ID).unwrap()),
+            },
+        )
+        .unwrap();
+        assert_eq!(active(&window).acknowledged_seq, 1);
+        assert_eq!(resolve_badge(active(&window)), BadgeState::Idle);
+
+        let pane = reduce(
+            begun.record.as_ref(),
+            &event,
+            ReductionContext {
+                done_clear_on: crate::config::DoneClearOn::Pane,
+                visibility: &other_split_visible,
+                tracker: &begun_tracker,
+                new_state_id: Some(StateId::parse(STATE_ID).unwrap()),
+            },
+        )
+        .unwrap();
+        assert_eq!(active(&pane).acknowledged_seq, 0);
+        assert_eq!(resolve_badge(active(&pane)), BadgeState::Done);
     }
 
     #[test]
@@ -2932,7 +3036,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_capture_activity_starts_running_after_baseline() {
+    fn capture_activity_does_not_start_a_run_for_an_idle_discovery() {
         let baseline = observe(
             None,
             &CaptureTrackerSnapshot::default(),
@@ -2944,8 +3048,14 @@ mod tests {
             1,
         );
         assert!(matches!(active(&baseline).lifecycle, LifecycleState::Idle));
+        let mut idle = active(&baseline).clone();
+        idle.prompt = Some(PromptState {
+            text: "preserved prompt".to_string(),
+            source: "user".to_string(),
+        });
+        let idle = StoredPaneRecord::Active(idle);
         let activity = observe(
-            baseline.record.as_ref(),
+            Some(&idle),
             &baseline.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
             Some(CaptureObservation {
@@ -2954,12 +3064,16 @@ mod tests {
             }),
             2,
         );
-        assert!(matches!(
-            active(&activity).lifecycle,
-            LifecycleState::Running
-        ));
-        assert_eq!(active(&activity).run_seq, 1);
-        assert_eq!(active(&activity).started_at, Some(2));
+        assert!(matches!(active(&activity).lifecycle, LifecycleState::Idle));
+        assert_eq!(active(&activity).run_seq, 0);
+        assert_eq!(active(&activity).started_at, None);
+        assert_eq!(
+            active(&activity)
+                .prompt
+                .as_ref()
+                .map(|prompt| prompt.text.as_str()),
+            Some("preserved prompt")
+        );
         assert_eq!(
             activity.tracker_delta.as_ref().unwrap().next.fingerprint,
             Some([2; 32])

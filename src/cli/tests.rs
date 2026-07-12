@@ -1,6 +1,9 @@
 use super::*;
 use crate::tmux::mock::MockTmuxRunner;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static V2_QUERY_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn env() -> BTreeMap<String, String> {
     BTreeMap::new()
@@ -8,6 +11,42 @@ fn env() -> BTreeMap<String, String> {
 
 fn tmux_env() -> BTreeMap<String, String> {
     BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())])
+}
+
+fn stub_action_client(mock: &MockTmuxRunner, client: &str, session_id: &str) {
+    let format = crate::session::client_session_context_format();
+    let sep = '\u{1f}';
+    mock.stub(
+        &["list-clients", "-F", &format],
+        &format!("{client}{sep}/dev/ttys001{sep}{session_id}{sep}%1{sep}0\n"),
+    );
+}
+
+fn stub_shared_action_clients(mock: &MockTmuxRunner) {
+    let format = crate::session::client_session_context_format();
+    let sep = '\u{1f}';
+    mock.stub(
+        &["list-clients", "-F", &format],
+        &format!(
+            "client-1{sep}/dev/ttys001{sep}$9{sep}%1{sep}0\n\
+             client-2{sep}/dev/ttys002{sep}$2{sep}%1{sep}0\n"
+        ),
+    );
+}
+
+fn stub_category_switch(mock: &MockTmuxRunner, client: &str, category: &str, target_session: &str) {
+    let format = crate::session::session_list_format();
+    mock.stub(
+        &["list-sessions", "-F", &format],
+        "a\u{1f}1\u{1f}100\u{1f}alpha\u{1f}\u{1f}\u{1f}$1\n\
+         b\u{1f}1\u{1f}90\u{1f}beta\u{1f}\u{1f}\u{1f}$2\n\
+         c\u{1f}1\u{1f}80\u{1f}gamma\u{1f}\u{1f}\u{1f}$3\n",
+    );
+    let memory_key = crate::session::client_memory_key(client, category);
+    mock.stub(&["show-option", "-gqv", &memory_key], "");
+    let exact_target = crate::session::exact_session_target(target_session);
+    mock.stub(&["switch-client", "-c", client, "-t", &exact_target], "");
+    mock.stub(&["set-option", "-g", &memory_key, target_session], "");
 }
 
 struct V2QueryFixture {
@@ -22,7 +61,11 @@ struct V2QueryFixture {
 impl V2QueryFixture {
     fn finish(self) {
         self.server.join().unwrap();
-        std::fs::remove_file(&self.daemon_socket).unwrap();
+        if let Err(error) = std::fs::remove_file(&self.daemon_socket)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("failed to remove fixture socket: {error}");
+        }
         drop(self.tmux_listener);
         std::fs::remove_dir_all(self.root).unwrap();
     }
@@ -35,12 +78,13 @@ fn spawn_v2_query_fixture(
     use std::io::{BufRead, Write};
 
     let root = std::env::temp_dir().join(format!(
-        "vde-cli-status-v2-{}-{}",
+        "v2q-{:x}-{:x}-{:x}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        V2_QUERY_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&root).unwrap();
     let tmux_socket = root.join("tmux.sock");
@@ -112,6 +156,160 @@ fn spawn_v2_query_fixture(
             assert!(line.is_empty());
             break;
         }
+    });
+    V2QueryFixture {
+        mock,
+        env,
+        daemon_socket,
+        root,
+        tmux_listener,
+        server,
+    }
+}
+
+fn spawn_active_config_guard_fixture() -> V2QueryFixture {
+    let config_hash = crate::daemon::lifecycle::config_hash(&crate::config::Config::default());
+    let response = crate::daemon::protocol::v2::ServerMessage::HealthResult {
+        health: crate::daemon::protocol::v2::DaemonHealth {
+            config_hash,
+            projection_revision: 1,
+            projection_updated_at_epoch_seconds: 1,
+            notification_enabled: false,
+            notification_failures: 0,
+            notification_queue_drops: 0,
+            notification_degraded: false,
+            last_notification_error_code: None,
+            current_quarantine_count: 0,
+            quarantine_observed_total: 0,
+            recent_error_code: None,
+            hook_delivery_failures: 0,
+            hook_delivery_degraded: false,
+            last_hook_error_code: None,
+            status_push_failures: 0,
+            status_push_degraded: false,
+            last_status_push_error: None,
+            last_status_push_error_at_epoch_seconds: None,
+        },
+    };
+    let mut fixture = spawn_v2_query_fixture(
+        crate::daemon::protocol::v2::ClientMessage::QueryHealth {
+            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+        },
+        response,
+    );
+    fixture.env.insert(
+        "HOME".to_string(),
+        fixture.root.join("home").display().to_string(),
+    );
+    fixture
+}
+
+fn spawn_v2_handshake_fixture() -> V2QueryFixture {
+    use std::io::{BufRead, Write};
+
+    let root = std::env::temp_dir().join(format!(
+        "vde-ds-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let tmux_socket = root.join("tmux.sock");
+    let tmux_listener = std::os::unix::net::UnixListener::bind(&tmux_socket).unwrap();
+    let mock = MockTmuxRunner::new();
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "#{pid}\t#{start_time}\t#{socket_path}",
+        ],
+        &format!("321\t654\t{}\n", tmux_socket.display()),
+    );
+    let env = BTreeMap::from([
+        (
+            "TMUX".to_string(),
+            format!("{},321,0", tmux_socket.display()),
+        ),
+        (
+            "XDG_STATE_HOME".to_string(),
+            root.join("state").display().to_string(),
+        ),
+    ]);
+    let incarnation =
+        crate::daemon::lifecycle::TmuxServerIncarnation::resolve(&mock, &env).unwrap();
+    let daemon_socket =
+        crate::daemon::daemon_socket_path_for_incarnation(&env, None, &incarnation.hash);
+    std::fs::create_dir_all(daemon_socket.parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&daemon_socket).unwrap();
+    let server_identity = incarnation.hash;
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::daemon::protocol::v2::ClientMessage>(line.trim())
+                .unwrap(),
+            crate::daemon::protocol::v2::ClientMessage::Hello {
+                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            }
+        );
+        serde_json::to_writer(
+            &mut stream,
+            &crate::daemon::protocol::v2::ServerMessage::HelloAck {
+                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                daemon_instance_id: crate::pane_state::DaemonInstanceId::parse(
+                    "ffeeddccbbaa99887766554433221100",
+                )
+                .unwrap(),
+                server_identity,
+                phase: crate::daemon::protocol::v2::DaemonPhase::Serving,
+                hook_health: crate::daemon::protocol::v2::HookHealth::Degraded,
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::daemon::protocol::v2::ClientMessage>(line.trim())
+                .unwrap(),
+            crate::daemon::protocol::v2::ClientMessage::QueryHealth {
+                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            }
+        );
+        serde_json::to_writer(
+            &mut stream,
+            &crate::daemon::protocol::v2::ServerMessage::HealthResult {
+                health: crate::daemon::protocol::v2::DaemonHealth {
+                    config_hash: "test-config".to_string(),
+                    projection_revision: 7,
+                    projection_updated_at_epoch_seconds: 1,
+                    notification_enabled: false,
+                    notification_failures: 0,
+                    notification_queue_drops: 0,
+                    notification_degraded: false,
+                    last_notification_error_code: None,
+                    current_quarantine_count: 0,
+                    quarantine_observed_total: 0,
+                    recent_error_code: None,
+                    hook_delivery_failures: 0,
+                    hook_delivery_degraded: false,
+                    last_hook_error_code: None,
+                    status_push_failures: 0,
+                    status_push_degraded: false,
+                    last_status_push_error: None,
+                    last_status_push_error_at_epoch_seconds: None,
+                },
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.is_empty(), "status sent a mutating request: {line}");
     });
     V2QueryFixture {
         mock,
@@ -243,6 +441,7 @@ fn pane_query_fixture(pane_id: &str) -> V2QueryFixture {
         window_name: "main".to_string(),
         current_path: "/tmp".to_string(),
         current_command: "node".to_string(),
+        pane_width: 80,
         active: true,
         stored: None,
         resolved: Some(ResolvedPaneState {
@@ -398,6 +597,7 @@ fn spawn_v2_reset_fixture(pane_id: &str) -> V2QueryFixture {
                         window_name: "main".to_string(),
                         current_path: "/tmp".to_string(),
                         current_command: "node".to_string(),
+                        pane_width: 80,
                         active: true,
                         stored: Some(expected.clone()),
                         resolved: None,
@@ -491,10 +691,24 @@ fn pane_state_commands_use_the_documented_command_tree() {
     assert!(matches!(
         cleanup.command,
         Command::PaneState {
-            command: PaneStateCommand::CleanupLegacy { all: true }
+            command: PaneStateCommand::CleanupLegacy {
+                all: true,
+                dry_run: false,
+            }
         }
     ));
     assert!(Cli::try_parse_from(["vt", "pane-state", "cleanup-legacy"]).is_err());
+    assert!(matches!(
+        Cli::try_parse_from(["vt", "pane-state", "cleanup-legacy", "--all", "--dry-run",])
+            .unwrap()
+            .command,
+        Command::PaneState {
+            command: PaneStateCommand::CleanupLegacy {
+                all: true,
+                dry_run: true,
+            }
+        }
+    ));
 
     let reset = Cli::try_parse_from(["vt", "pane-state", "reset", "--target", "%31"])
         .expect("reset command should parse");
@@ -516,6 +730,27 @@ fn pane_state_commands_use_the_documented_command_tree() {
             }
         }
     ));
+}
+
+#[test]
+fn daemon_lifecycle_commands_parse_with_force_scoped_to_stop() {
+    for command in [
+        "ensure", "start", "disable", "enable", "status", "doctor", "reload", "logs",
+    ] {
+        Cli::try_parse_from(["vt", "daemon", command])
+            .unwrap_or_else(|error| panic!("daemon {command} must parse: {error}"));
+    }
+    assert!(matches!(
+        Cli::try_parse_from(["vt", "daemon", "stop", "--force"])
+            .unwrap()
+            .command,
+        Command::Daemon {
+            command: Some(DaemonCommand::Stop { force: true }),
+            ..
+        }
+    ));
+    assert!(Cli::try_parse_from(["vt", "daemon", "start", "--force"]).is_err());
+    assert!(Cli::try_parse_from(["vt", "daemon", "logs", "--lines", "501"]).is_err());
 }
 
 #[test]
@@ -573,22 +808,376 @@ fn dispatch_statusline_sessions_show_index_overrides_config() {
 }
 
 #[test]
-fn dispatch_statusline_sessions_switch_missing_index_is_noop() {
+fn daemon_status_reports_handshake_without_sending_a_mutation() {
+    let fixture = spawn_v2_handshake_fixture();
+
+    let output = run_with(["vt", "daemon", "status"], &fixture.mock, &fixture.env)
+        .unwrap()
+        .unwrap();
+
+    assert!(output.contains("daemon: running"));
+    assert!(output.contains("phase: Serving"));
+    assert!(output.contains("hooks: Degraded"));
+    assert!(output.contains("daemon.log"));
+    fixture.finish();
+}
+
+#[test]
+fn dispatch_statusline_sessions_switch_missing_index_is_an_error_without_wrong_target() {
     let mock = MockTmuxRunner::new();
-    let format = crate::session::session_list_format();
+    stub_action_client(&mock, "client-1", "$1");
     mock.stub(
-        &["list-sessions", "-F", &format],
-        "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
+        &[
+            "show-option",
+            "-qv",
+            "-t",
+            "$1",
+            crate::options::KEY_STATUS_SESSIONS,
+        ],
+        "#[range=user|session:$1] main #[norange]",
     );
-    mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
 
-    run_with(["vt", "statusline-sessions", "switch", "2"], &mock, &env()).unwrap();
+    let error = run_with(
+        [
+            "vt",
+            "statusline-sessions",
+            "--session-id",
+            "$1",
+            "switch",
+            "2",
+        ],
+        &mock,
+        &tmux_env(),
+    )
+    .unwrap_err();
 
+    assert!(error.to_string().contains("no longer available"));
     assert!(
         mock.calls()
             .iter()
             .all(|call| call.first().map(String::as_str) != Some("switch-client"))
     );
+}
+
+#[test]
+fn dispatch_session_cycle_resolves_current_session_id_for_existing_key_bindings() {
+    let rendered = (1..=6)
+        .map(|index| format!("#[range=user|session:${index}] session-{index} #[norange]"))
+        .collect::<String>();
+    for (command, expected) in [("next", "$4"), ("prev", "$2")] {
+        let mock = MockTmuxRunner::new();
+        stub_action_client(&mock, "client-1", "$3");
+        mock.stub(
+            &[
+                "show-option",
+                "-qv",
+                "-t",
+                "$3",
+                crate::options::KEY_STATUS_SESSIONS,
+            ],
+            &rendered,
+        );
+        mock.stub(&["switch-client", "-c", "client-1", "-t", expected], "");
+
+        run_with(["vt", "session-cycle", command], &mock, &tmux_env()).unwrap();
+
+        assert!(mock.calls().iter().any(|call| {
+            call == &vec![
+                "switch-client".to_string(),
+                "-c".to_string(),
+                "client-1".to_string(),
+                "-t".to_string(),
+                expected.to_string(),
+            ]
+        }));
+    }
+}
+
+#[test]
+fn dispatch_session_cycle_uses_the_explicit_client_when_a_pane_is_shared() {
+    let mock = MockTmuxRunner::new();
+    let format = crate::session::client_session_context_format();
+    let sep = '\u{1f}';
+    mock.stub(
+        &["list-clients", "-F", &format],
+        &format!(
+            "client-1{sep}/dev/ttys001{sep}$1{sep}%1{sep}0\n\
+             client-2{sep}/dev/ttys002{sep}$2{sep}%1{sep}0\n"
+        ),
+    );
+    mock.stub(
+        &[
+            "show-option",
+            "-qv",
+            "-t",
+            "$2",
+            crate::options::KEY_STATUS_SESSIONS,
+        ],
+        "#[range=user|session:$1] one #[norange]#[range=user|session:$2] two #[norange]#[range=user|session:$3] three #[norange]",
+    );
+    mock.stub(&["switch-client", "-c", "client-2", "-t", "$3"], "");
+
+    run_with(
+        [
+            "vt",
+            "session-cycle",
+            "next",
+            "--client-name",
+            "client-2",
+            "--session-id",
+            "$2",
+        ],
+        &mock,
+        &tmux_env(),
+    )
+    .unwrap();
+
+    assert!(mock.calls().iter().any(|call| {
+        call == &vec![
+            "switch-client".to_string(),
+            "-c".to_string(),
+            "client-2".to_string(),
+            "-t".to_string(),
+            "$3".to_string(),
+        ]
+    }));
+}
+
+#[test]
+fn dispatch_statusline_session_switch_uses_explicit_scope_when_a_pane_is_shared() {
+    let mock = MockTmuxRunner::new();
+    stub_shared_action_clients(&mock);
+    mock.stub(
+        &[
+            "show-option",
+            "-qv",
+            "-t",
+            "$2",
+            crate::options::KEY_STATUS_SESSIONS,
+        ],
+        "#[range=user|session:$1] one #[norange]\
+         #[range=user|session:$2] two #[norange]\
+         #[range=user|session:$3] three #[norange]",
+    );
+    mock.stub(&["switch-client", "-c", "client-2", "-t", "$3"], "");
+
+    run_with(
+        [
+            "vt",
+            "statusline-sessions",
+            "--client-name",
+            "client-2",
+            "--session-id",
+            "$2",
+            "switch",
+            "3",
+        ],
+        &mock,
+        &tmux_env(),
+    )
+    .unwrap();
+
+    assert!(mock.calls().iter().any(|call| {
+        call == &vec![
+            "switch-client".to_string(),
+            "-c".to_string(),
+            "client-2".to_string(),
+            "-t".to_string(),
+            "$3".to_string(),
+        ]
+    }));
+}
+
+#[test]
+fn dispatch_session_actions_fail_closed_when_shared_pane_scope_is_omitted() {
+    for args in [
+        vec!["vt", "session-cycle", "next"],
+        vec!["vt", "session-cycle", "prev"],
+        vec!["vt", "statusline-sessions", "switch", "1"],
+    ] {
+        let mock = MockTmuxRunner::new();
+        stub_shared_action_clients(&mock);
+
+        let error = run_with(args, &mock, &tmux_env()).unwrap_err();
+
+        assert!(error.to_string().contains("multiple tmux clients"));
+        assert!(mock.calls().iter().all(|call| !matches!(
+            call.first().map(String::as_str),
+            Some("show-option" | "switch-client")
+        )));
+    }
+}
+
+#[test]
+fn dispatch_category_cycle_uses_explicit_scope_when_a_pane_is_shared() {
+    let alpha = crate::statusline::encode_category_key("alpha").unwrap();
+    let beta = crate::statusline::encode_category_key("beta").unwrap();
+    let gamma = crate::statusline::encode_category_key("gamma").unwrap();
+    let rendered = format!(
+        "#[range=user|category:{alpha}] alpha #[norange]\
+         #[range=user|category-current:{beta}] beta #[norange]\
+         #[range=user|category:{gamma}] gamma #[norange]"
+    );
+
+    for (command, target_category, target_session) in
+        [("next", "gamma", "c"), ("prev", "alpha", "a")]
+    {
+        let mut fixture = spawn_active_config_guard_fixture();
+        fixture
+            .env
+            .insert("TMUX_PANE".to_string(), "%1".to_string());
+        let mock = &fixture.mock;
+        stub_shared_action_clients(mock);
+        mock.stub(
+            &[
+                "show-option",
+                "-qv",
+                "-t",
+                "$2",
+                crate::options::KEY_STATUS_CATEGORY,
+            ],
+            &rendered,
+        );
+        stub_category_switch(mock, "client-2", target_category, target_session);
+
+        run_with(
+            [
+                "vt",
+                "category",
+                command,
+                "--client-name",
+                "client-2",
+                "--session-id",
+                "$2",
+            ],
+            mock,
+            &fixture.env,
+        )
+        .unwrap();
+
+        let exact_target = crate::session::exact_session_target(target_session);
+        assert!(mock.calls().iter().any(|call| {
+            call == &vec![
+                "switch-client".to_string(),
+                "-c".to_string(),
+                "client-2".to_string(),
+                "-t".to_string(),
+                exact_target.clone(),
+            ]
+        }));
+        fixture.finish();
+    }
+}
+
+#[test]
+fn dispatch_category_click_uses_explicit_scope_when_a_pane_is_shared() {
+    let mut fixture = spawn_active_config_guard_fixture();
+    fixture
+        .env
+        .insert("TMUX_PANE".to_string(), "%1".to_string());
+    let mock = &fixture.mock;
+    stub_shared_action_clients(mock);
+    stub_category_switch(mock, "client-2", "alpha", "a");
+    let alpha = crate::statusline::encode_category_key("alpha").unwrap();
+
+    run_with(
+        [
+            "vt",
+            "statusline-click",
+            "--client-name",
+            "client-2",
+            "--session-id",
+            "$2",
+            &format!("category:{alpha}"),
+        ],
+        mock,
+        &fixture.env,
+    )
+    .unwrap();
+
+    assert!(mock.calls().iter().any(|call| {
+        call == &vec![
+            "switch-client".to_string(),
+            "-c".to_string(),
+            "client-2".to_string(),
+            "-t".to_string(),
+            "=a:".to_string(),
+        ]
+    }));
+    fixture.finish();
+}
+
+#[test]
+fn dispatch_category_actions_fail_closed_when_shared_pane_scope_is_omitted() {
+    for args in [
+        vec!["vt", "category", "next"],
+        vec!["vt", "category", "prev"],
+        vec!["vt", "statusline-click", "category:YWxwaGE"],
+    ] {
+        let mock = MockTmuxRunner::new();
+        stub_shared_action_clients(&mock);
+
+        let error = run_with(args, &mock, &tmux_env()).unwrap_err();
+
+        assert!(error.to_string().contains("multiple tmux clients"));
+        assert!(mock.calls().iter().all(|call| !matches!(
+            call.first().map(String::as_str),
+            Some("show-option" | "list-sessions" | "switch-client" | "set-option")
+        )));
+    }
+}
+
+#[test]
+fn dispatch_statusline_session_switch_resolves_current_session_id() {
+    let mock = MockTmuxRunner::new();
+    stub_action_client(&mock, "client-1", "$3");
+    mock.stub(
+        &[
+            "show-option",
+            "-qv",
+            "-t",
+            "$3",
+            crate::options::KEY_STATUS_SESSIONS,
+        ],
+        "#[range=user|session:$1] one #[norange]#[range=user|session:$2] two #[norange]",
+    );
+    mock.stub(&["switch-client", "-c", "client-1", "-t", "$2"], "");
+
+    run_with(
+        ["vt", "statusline-sessions", "switch", "2"],
+        &mock,
+        &tmux_env(),
+    )
+    .unwrap();
+
+    assert!(mock.calls().iter().any(|call| {
+        call == &vec![
+            "switch-client".to_string(),
+            "-c".to_string(),
+            "client-1".to_string(),
+            "-t".to_string(),
+            "$2".to_string(),
+        ]
+    }));
+}
+
+#[test]
+fn session_action_rejects_an_explicit_source_that_differs_from_the_pinned_client() {
+    let mock = MockTmuxRunner::new();
+    stub_action_client(&mock, "client-1", "$3");
+
+    let error = run_with(
+        ["vt", "session-cycle", "next", "--session-id", "$2"],
+        &mock,
+        &tmux_env(),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("does not match invoking client"));
+    assert!(mock.calls().iter().all(|call| !matches!(
+        call.first().map(String::as_str),
+        Some("show-option" | "switch-client")
+    )));
 }
 
 #[test]
@@ -667,43 +1256,52 @@ fn dispatch_statusline_click_routes_window_range() {
 #[test]
 fn dispatch_statusline_click_routes_session_range() {
     let mock = MockTmuxRunner::new();
-    mock.stub(&["switch-client", "-t", "$2"], "");
+    stub_action_client(&mock, "client-1", "$1");
+    mock.stub(&["switch-client", "-c", "client-1", "-t", "$2"], "");
 
-    run_with(["vt", "statusline-click", "session:$2"], &mock, &env()).unwrap();
+    run_with(["vt", "statusline-click", "session:$2"], &mock, &tmux_env()).unwrap();
 
-    assert_eq!(
-        mock.calls(),
-        vec![vec![
+    assert!(mock.calls().iter().any(|call| {
+        call == &vec![
             "switch-client".to_string(),
+            "-c".to_string(),
+            "client-1".to_string(),
             "-t".to_string(),
-            "$2".to_string()
-        ]]
-    );
+            "$2".to_string(),
+        ]
+    }));
 }
 
 #[test]
-fn dispatch_statusline_click_routes_category_index() {
-    let mock = MockTmuxRunner::new();
+fn dispatch_statusline_click_routes_stable_category_target() {
+    let mut fixture = spawn_active_config_guard_fixture();
+    fixture
+        .env
+        .insert("TMUX_PANE".to_string(), "%1".to_string());
+    let mock = &fixture.mock;
+    stub_action_client(mock, "abc", "$1");
     let format = crate::session::session_list_format();
     mock.stub(
         &["list-sessions", "-F", &format],
         "a\u{1f}1\u{1f}100\u{1f}alpha\u{1f}\u{1f}\u{1f}$1\nb\u{1f}1\u{1f}100\u{1f}beta\u{1f}\u{1f}\u{1f}$2\n",
     );
-    mock.stub(
-        &["display-message", "-p", "#{client_name}\t#{client_tty}"],
-        "abc\t/dev/ttys001\n",
-    );
     mock.stub(&["show-option", "-gqv", "@vde_client_616263_beta"], "");
     mock.stub(&["switch-client", "-c", "abc", "-t", "=b:"], "");
     mock.stub(&["set-option", "-g", "@vde_client_616263_beta", "b"], "");
 
-    run_with(["vt", "statusline-click", "2"], &mock, &env()).unwrap();
+    run_with(
+        ["vt", "statusline-click", "category:YmV0YQ"],
+        mock,
+        &fixture.env,
+    )
+    .unwrap();
 
     assert!(
         mock.calls()
             .iter()
             .any(|call| call == &vec!["switch-client", "-c", "abc", "-t", "=b:"])
     );
+    fixture.finish();
 }
 
 #[test]
@@ -719,12 +1317,13 @@ fn dispatch_statusline_click_ignores_empty_zero_and_unknown_ranges() {
 
 #[test]
 fn dispatch_category_use_switches_category() {
-    let mock = MockTmuxRunner::new();
+    let mut fixture = spawn_active_config_guard_fixture();
+    fixture
+        .env
+        .insert("TMUX_PANE".to_string(), "%1".to_string());
+    let mock = &fixture.mock;
+    stub_action_client(mock, "abc", "$1");
     let format = crate::session::session_list_format();
-    mock.stub(
-        &["display-message", "-p", "#{client_name}\t#{client_tty}"],
-        "abc\t/dev/ttys001\n",
-    );
     mock.stub(
         &["list-sessions", "-F", &format],
         "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}$1\n",
@@ -732,17 +1331,23 @@ fn dispatch_category_use_switches_category() {
     mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "");
     mock.stub(&["switch-client", "-c", "abc", "-t", "=main:"], "");
     mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
-    run_with(["vt", "category", "use", "work"], &mock, &env()).unwrap();
-    assert_eq!(mock.calls().len(), 5);
+    run_with(["vt", "category", "use", "work"], mock, &fixture.env).unwrap();
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|call| { call == &vec!["switch-client", "-c", "abc", "-t", "=main:"] })
+    );
+    fixture.finish();
 }
 
 #[test]
 fn dispatch_session_new_creates_managed_session() {
-    let mock = MockTmuxRunner::new();
-    mock.stub(
-        &["display-message", "-p", "#{client_name}\t#{client_tty}"],
-        "abc\t/dev/ttys001\n",
-    );
+    let mut fixture = spawn_active_config_guard_fixture();
+    fixture
+        .env
+        .insert("TMUX_PANE".to_string(), "%1".to_string());
+    let mock = &fixture.mock;
+    stub_action_client(mock, "abc", "$1");
     mock.stub(
         &[
             "new-session",
@@ -775,9 +1380,107 @@ fn dispatch_session_new_creates_managed_session() {
         "after-new-window[90] \n",
     );
 
-    run_with(["vt", "session", "new", "-c", "/tmp/repo"], &mock, &env()).unwrap();
+    run_with(
+        ["vt", "session", "new", "-c", "/tmp/repo"],
+        mock,
+        &fixture.env,
+    )
+    .unwrap();
 
-    assert_eq!(mock.calls().len(), 6);
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|call| { call.first().map(String::as_str) == Some("new-session") })
+    );
+    fixture.finish();
+}
+
+#[test]
+fn dispatch_session_new_fails_closed_when_shared_pane_scope_is_omitted() {
+    let mock = MockTmuxRunner::new();
+    stub_shared_action_clients(&mock);
+
+    let error = run_with(
+        ["vt", "session", "new", "-c", "/tmp/repo"],
+        &mock,
+        &tmux_env(),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("multiple tmux clients"));
+    assert!(mock.calls().iter().all(|call| !matches!(
+        call.first().map(String::as_str),
+        Some("new-session" | "switch-client")
+    )));
+}
+
+#[test]
+fn dispatch_session_new_uses_explicit_scope_when_a_pane_is_shared() {
+    let mut fixture = spawn_active_config_guard_fixture();
+    fixture
+        .env
+        .insert("TMUX_PANE".to_string(), "%1".to_string());
+    let mock = &fixture.mock;
+    stub_shared_action_clients(mock);
+    mock.stub(
+        &[
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{session_name}\u{1f}#{window_id}",
+            "-c",
+            "/tmp/repo",
+        ],
+        "repo\u{1f}@9\n",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-t",
+            "repo",
+            crate::options::KEY_PROJECT_PATH,
+            "/tmp/repo",
+        ],
+        "",
+    );
+    mock.stub(
+        &["set-option", "-t", "repo", crate::options::KEY_CATEGORY, ""],
+        "",
+    );
+    mock.stub(&["switch-client", "-c", "client-2", "-t", "=repo:"], "");
+    mock.stub(
+        &["show-hooks", "-g", "after-new-window[90]"],
+        "after-new-window[90] \n",
+    );
+
+    run_with(
+        [
+            "vt",
+            "session",
+            "new",
+            "-c",
+            "/tmp/repo",
+            "--client-name",
+            "client-2",
+            "--session-id",
+            "$2",
+        ],
+        mock,
+        &fixture.env,
+    )
+    .unwrap();
+
+    assert!(mock.calls().iter().any(|call| {
+        call == &vec![
+            "switch-client".to_string(),
+            "-c".to_string(),
+            "client-2".to_string(),
+            "-t".to_string(),
+            "=repo:".to_string(),
+        ]
+    }));
+    fixture.finish();
 }
 
 #[test]
@@ -974,6 +1677,48 @@ fn dispatch_session_manager_renders_preview() {
 }
 
 #[test]
+fn config_hash_guard_rejects_empty_and_mismatched_active_hashes_with_reload_guidance() {
+    assert!(super::verify_active_config_hash("same", "same").is_ok());
+    for active in ["", "different"] {
+        let error = super::verify_active_config_hash("disk", active).unwrap_err();
+        assert!(error.to_string().contains("vt daemon reload"));
+    }
+}
+
+#[test]
+fn invalid_config_blocks_category_mutation_before_daemon_or_session_queries() {
+    let root = std::env::temp_dir().join(format!(
+        "vde-invalid-config-{}-{}",
+        std::process::id(),
+        V2_QUERY_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let config_dir = root.join("vde/tmux");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.yml"),
+        "daemon:\n  poll_ms: [broken\n",
+    )
+    .unwrap();
+    let env = BTreeMap::from([
+        ("XDG_CONFIG_HOME".to_string(), root.display().to_string()),
+        ("TMUX_PANE".to_string(), "%1".to_string()),
+    ]);
+    let mock = MockTmuxRunner::new();
+    stub_action_client(&mock, "abc", "$1");
+
+    let error = run_with(["vt", "category", "use", "work"], &mock, &env).unwrap_err();
+
+    assert!(error.to_string().contains("vt daemon reload"));
+    assert!(mock.calls().iter().all(|call| {
+        !matches!(
+            call.first().map(String::as_str),
+            Some("list-sessions" | "switch-client" | "set-option" | "display-message")
+        )
+    }));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn dispatch_statusline_summary_renders_v2_status_snapshot() {
     let fixture = status_query_fixture(crate::daemon::protocol::v2::StatusContext::Global);
     let output = run_with(["vt", "statusline-summary"], &fixture.mock, &fixture.env).unwrap();
@@ -995,7 +1740,7 @@ fn dispatch_statusline_attention_renders_v2_session_snapshot() {
     .unwrap();
 
     let text = output.unwrap();
-    assert!(text.contains("▲ main · perm 2m"), "{text}");
+    assert!(text.contains("▲ main · perm 2m00s"), "{text}");
     fixture.finish();
 }
 
@@ -1085,4 +1830,16 @@ fn config_warning_is_written_to_stderr_without_polluting_statusline_stdout() {
     assert!(!output.contains("invalid config"));
     fixture.finish();
     std::fs::remove_dir_all(config_home).unwrap();
+}
+
+#[test]
+fn statusline_cli_index_rejects_zero_instead_of_aliasing_the_first_item() {
+    assert_eq!(super::cli_index(1).unwrap(), 0);
+    assert_eq!(super::cli_index(2).unwrap(), 1);
+    assert!(
+        super::cli_index(0)
+            .unwrap_err()
+            .to_string()
+            .contains("1 or greater")
+    );
 }
