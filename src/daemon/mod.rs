@@ -47,7 +47,6 @@ pub fn render_summary(
 ) -> String {
     counts
         .iter()
-        .filter(|(_, count)| *count > 0)
         .map(|(state, count)| {
             let glyph = glyph_for_state(*state, &badge.glyphs);
             let color = match state {
@@ -87,7 +86,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_summary_counts_states_with_markup_and_omits_zero() {
+    fn render_summary_counts_states_with_markup_and_includes_zero() {
         let badge = crate::config::BadgeConfig::default();
         let counts = [
             (BadgeState::Blocked, 2),
@@ -97,7 +96,7 @@ mod tests {
         ];
         assert_eq!(
             render_summary(&counts, &badge, "{badge} {count}"),
-            "#[fg=#ff6b6b]▲ 2#[default] #[fg=#4fd08a]● 1#[default] #[fg=#a8a8b2]○ 3#[default]"
+            "#[fg=#ff6b6b]▲ 2#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6]✓ 0#[default] #[fg=#a8a8b2]○ 3#[default]"
         );
     }
 

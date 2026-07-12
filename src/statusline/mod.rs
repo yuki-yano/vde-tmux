@@ -446,20 +446,23 @@ pub fn render_structured_pane_status(
     tmux_style_segment(style, &body)
 }
 
-fn render_structured_summary(config: &Config, mut counts: BadgeStateCounts) -> String {
+fn render_structured_summary(config: &Config, counts: BadgeStateCounts) -> String {
     if !config.statusline.summary.enabled {
         return String::new();
     }
-    if config.statusline.summary.hide_idle {
-        counts.idle = 0;
-    }
+    let state_counts = [
+        (BadgeState::Blocked, counts.blocked),
+        (BadgeState::Working, counts.working),
+        (BadgeState::Done, counts.done),
+        (BadgeState::Idle, counts.idle),
+    ];
+    let visible_counts = if config.statusline.summary.hide_idle {
+        &state_counts[..3]
+    } else {
+        &state_counts[..]
+    };
     crate::daemon::render_summary(
-        &[
-            (BadgeState::Blocked, counts.blocked),
-            (BadgeState::Working, counts.working),
-            (BadgeState::Done, counts.done),
-            (BadgeState::Idle, counts.idle),
-        ],
+        visible_counts,
         &config.badge,
         &config.statusline.summary.format,
     )
@@ -2235,6 +2238,36 @@ mod tests {
             "#[fg=#ff6b6b]1▲#[default] #[fg=#4fd08a]1●#[default] #[fg=#45cbe6]1✓#[default] #[fg=#a8a8b2]1○#[default]"
         );
         assert_eq!(tmux_display_width(&custom_summary), 11);
+    }
+
+    #[test]
+    fn summary_includes_zero_states_and_keeps_single_digit_width_stable() {
+        let mut config = Config::default();
+        let empty_summary = render_structured_summary(&config, BadgeStateCounts::default());
+        assert_eq!(
+            empty_summary,
+            "#[fg=#ff6b6b]▲ 0#[default] #[fg=#4fd08a]● 0#[default] #[fg=#45cbe6]✓ 0#[default] #[fg=#a8a8b2]○ 0#[default]"
+        );
+
+        let mixed_summary = render_structured_summary(
+            &config,
+            BadgeStateCounts {
+                blocked: 0,
+                working: 1,
+                done: 0,
+                idle: 9,
+            },
+        );
+        assert_eq!(tmux_display_width(&empty_summary), 15);
+        assert_eq!(tmux_display_width(&mixed_summary), 15);
+
+        config.statusline.summary.hide_idle = true;
+        let without_idle = render_structured_summary(&config, BadgeStateCounts::default());
+        assert_eq!(
+            without_idle,
+            "#[fg=#ff6b6b]▲ 0#[default] #[fg=#4fd08a]● 0#[default] #[fg=#45cbe6]✓ 0#[default]"
+        );
+        assert_eq!(tmux_display_width(&without_idle), 11);
     }
 
     #[test]

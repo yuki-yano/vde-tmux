@@ -316,7 +316,9 @@ badge:
 `statusline.summary.format` は、状態ごとの色を付ける前に各tokenへ適用されます。
 placeholderは `{badge}` と `{count}` です。
 `{badge}{count}`、`{badge}: {count}`、`{count}{badge}` のような形式も利用できます。
-デフォルトは `{badge} {count}` で、`● 1 ✓ 1 ○ 9` のように表示します。
+デフォルトは `{badge} {count}` で、`▲ 0 ● 1 ✓ 1 ○ 9` のように表示します。
+件数が0の状態も表示するため、各状態の件数が1桁であればsummaryの表示幅は変わりません。
+`hide_idle: true` の場合はIdle token自体を省略します。
 状態token間のseparatorは1個の空白で固定です。
 
 `session_manager.kill` はKill Serverがclean shutdownで使う待機時間を設定します。

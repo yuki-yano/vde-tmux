@@ -313,7 +313,9 @@ badge:
 
 `statusline.summary.format` is applied to each state token before its state color is added.
 It supports `{badge}` and `{count}`, including formats such as `{badge}{count}`, `{badge}: {count}`, and `{count}{badge}`.
-The default is `{badge} {count}`, producing output such as `● 1 ✓ 1 ○ 9`.
+The default is `{badge} {count}`, producing output such as `▲ 0 ● 1 ✓ 1 ○ 9`.
+Zero-count states remain visible so the summary width stays stable while counts remain single-digit.
+Set `hide_idle: true` to omit the idle token entirely.
 The separator between state tokens remains one space.
 
 `session_manager.kill` controls the clean shutdown waits used by Kill Server.

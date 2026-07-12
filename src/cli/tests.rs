@@ -1776,7 +1776,13 @@ fn invalid_config_blocks_category_mutation_before_daemon_or_session_queries() {
 fn dispatch_statusline_summary_renders_v2_status_snapshot() {
     let fixture = status_query_fixture(crate::daemon::protocol::v2::StatusContext::Global);
     let output = run_with(["vt", "statusline-summary"], &fixture.mock, &fixture.env).unwrap();
-    assert_eq!(output, Some("#[fg=#4fd08a]● 1#[default]".to_string()));
+    assert_eq!(
+        output,
+        Some(
+            "#[fg=#ff6b6b]▲ 0#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6]✓ 0#[default] #[fg=#a8a8b2]○ 0#[default]"
+                .to_string()
+        )
+    );
     fixture.finish();
 }
 
