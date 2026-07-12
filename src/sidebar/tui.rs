@@ -244,6 +244,36 @@ mod local_state_tests {
     }
 
     #[test]
+    fn filter_cycles_in_both_directions_and_skips_empty_filters() {
+        let mut state = SidebarState::default();
+        let view = SidebarView {
+            counts: BadgeCounts {
+                total: 6,
+                attention: 0,
+                blocked: 0,
+                working: 2,
+                done: 0,
+                idle: 4,
+            },
+            ..SidebarView::default()
+        };
+
+        apply_local_sidebar_key(&mut state, &view, "tab");
+        assert_eq!(state.filter, StatusFilter::WorkingOnly);
+        apply_local_sidebar_key(&mut state, &view, "tab");
+        assert_eq!(state.filter, StatusFilter::IdleOnly);
+        apply_local_sidebar_key(&mut state, &view, "tab");
+        assert_eq!(state.filter, StatusFilter::All);
+
+        apply_local_sidebar_key(&mut state, &view, "backtab");
+        assert_eq!(state.filter, StatusFilter::IdleOnly);
+        apply_local_sidebar_key(&mut state, &view, "backtab");
+        assert_eq!(state.filter, StatusFilter::WorkingOnly);
+        apply_local_sidebar_key(&mut state, &view, "backtab");
+        assert_eq!(state.filter, StatusFilter::All);
+    }
+
+    #[test]
     fn focus_message_rejects_reused_pane_id_with_different_pid() {
         let snapshot = snapshot(10);
         let mut state = SidebarState::default();
@@ -1800,13 +1830,14 @@ fn run_loop<B: Backend>(
                             }
                         }
                     }
-                    KeyCode::Down | KeyCode::Up | KeyCode::Tab => {
+                    KeyCode::Down | KeyCode::Up | KeyCode::Tab | KeyCode::BackTab => {
                         if let Some(snapshot) = &current {
                             let sidebar = project_view(snapshot, config.app, &sidebar_state);
                             let key = match key.code {
                                 KeyCode::Down => "down",
                                 KeyCode::Up => "up",
                                 KeyCode::Tab => "tab",
+                                KeyCode::BackTab => "backtab",
                                 _ => unreachable!(),
                             };
                             apply_local_sidebar_key(&mut sidebar_state, &sidebar, key);
@@ -2020,10 +2051,19 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
                 state.set_filter(filter);
             }
         }
-        SidebarInputAction::ToggleFilter => {
-            let mut filter = state.filter.next();
+        SidebarInputAction::CycleFilterForward | SidebarInputAction::CycleFilterBackward => {
+            let forward = matches!(action, SidebarInputAction::CycleFilterForward);
+            let mut filter = if forward {
+                state.filter.next()
+            } else {
+                state.filter.previous()
+            };
             while !sidebar.counts.filter_is_available(filter) {
-                filter = filter.next();
+                filter = if forward {
+                    filter.next()
+                } else {
+                    filter.previous()
+                };
             }
             state.set_filter(filter);
         }
@@ -2617,7 +2657,10 @@ fn empty_rows_placeholder_lines(
             Style::default().fg(theme.detail),
         )),
         Line::from(Span::styled(
-            format!("Filter: {} · tab: next · ≡ all: reset", filter.label()),
+            format!(
+                "Filter: {} · tab: next · S-tab: previous · ≡ all: reset",
+                filter.label()
+            ),
             Style::default()
                 .fg(theme.marker)
                 .add_modifier(Modifier::DIM),
@@ -3015,7 +3058,6 @@ fn handle_left_click(
     if row < header.row_count() {
         match header_hit_test(&header, row, column) {
             Some(HeaderAction::CycleViewMode) => apply_local_sidebar_key(state, sidebar, "v"),
-            Some(HeaderAction::ToggleFilter) => apply_local_sidebar_key(state, sidebar, "tab"),
             Some(HeaderAction::SetFilter(filter)) => {
                 apply_local_sidebar_key(state, sidebar, filter.key());
             }

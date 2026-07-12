@@ -121,7 +121,8 @@ pub enum SidebarAction {
     ToggleExpand,
     SetViewMode(ViewMode),
     CycleViewMode,
-    ToggleFilter,
+    CycleFilterForward,
+    CycleFilterBackward,
 }
 
 impl SidebarState {
@@ -148,8 +149,13 @@ impl SidebarState {
                 self.bump();
                 true
             }
-            SidebarAction::ToggleFilter => {
+            SidebarAction::CycleFilterForward => {
                 self.filter = self.filter.next();
+                self.bump();
+                true
+            }
+            SidebarAction::CycleFilterBackward => {
+                self.filter = self.filter.previous();
                 self.bump();
                 true
             }
@@ -414,6 +420,16 @@ impl StatusFilter {
         }
     }
 
+    pub fn previous(self) -> Self {
+        match self {
+            StatusFilter::All => StatusFilter::IdleOnly,
+            StatusFilter::AttentionOnly => StatusFilter::All,
+            StatusFilter::WorkingOnly => StatusFilter::AttentionOnly,
+            StatusFilter::DoneOnly => StatusFilter::WorkingOnly,
+            StatusFilter::IdleOnly => StatusFilter::DoneOnly,
+        }
+    }
+
     pub fn key(self) -> &'static str {
         match self {
             StatusFilter::All => "all",
@@ -509,16 +525,19 @@ mod tests {
         assert!(state.apply(SidebarAction::CycleViewMode, &[]));
         assert_eq!(state.view_mode, ViewMode::Flat);
 
-        assert!(state.apply(SidebarAction::ToggleFilter, &[]));
+        assert!(state.apply(SidebarAction::CycleFilterForward, &[]));
         assert_eq!(state.filter, StatusFilter::AttentionOnly);
-        assert!(state.apply(SidebarAction::ToggleFilter, &[]));
+        assert!(state.apply(SidebarAction::CycleFilterForward, &[]));
         assert_eq!(state.filter, StatusFilter::WorkingOnly);
-        assert!(state.apply(SidebarAction::ToggleFilter, &[]));
+        assert!(state.apply(SidebarAction::CycleFilterForward, &[]));
         assert_eq!(state.filter, StatusFilter::DoneOnly);
-        assert!(state.apply(SidebarAction::ToggleFilter, &[]));
+        assert!(state.apply(SidebarAction::CycleFilterForward, &[]));
         assert_eq!(state.filter, StatusFilter::IdleOnly);
-        assert!(state.apply(SidebarAction::ToggleFilter, &[]));
+        assert!(state.apply(SidebarAction::CycleFilterForward, &[]));
         assert_eq!(state.filter, StatusFilter::All);
+
+        assert!(state.apply(SidebarAction::CycleFilterBackward, &[]));
+        assert_eq!(state.filter, StatusFilter::IdleOnly);
     }
 
     #[test]
@@ -539,6 +558,29 @@ mod tests {
                 StatusFilter::WorkingOnly,
                 StatusFilter::DoneOnly,
                 StatusFilter::IdleOnly,
+                StatusFilter::All,
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_cycles_backward_through_all_states() {
+        let mut filter = StatusFilter::All;
+        let mut seen = Vec::new();
+
+        for _ in 0..6 {
+            seen.push(filter);
+            filter = filter.previous();
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                StatusFilter::All,
+                StatusFilter::IdleOnly,
+                StatusFilter::DoneOnly,
+                StatusFilter::WorkingOnly,
+                StatusFilter::AttentionOnly,
                 StatusFilter::All,
             ]
         );

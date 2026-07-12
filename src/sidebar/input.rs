@@ -10,7 +10,8 @@ pub enum SidebarInputAction {
     SetViewMode(ViewMode),
     CycleViewMode,
     SetFilter(StatusFilter),
-    ToggleFilter,
+    CycleFilterForward,
+    CycleFilterBackward,
     ToggleRow(String),
     FocusNextAttention,
     FocusPreviousAttention,
@@ -35,7 +36,8 @@ pub fn parse_key(key: &str) -> Option<SidebarInputAction> {
         "enter" | "\n" => Some(SidebarInputAction::Activate),
         "space" => Some(SidebarInputAction::ToggleExpand),
         "v" => Some(SidebarInputAction::CycleViewMode),
-        "tab" => Some(SidebarInputAction::ToggleFilter),
+        "tab" => Some(SidebarInputAction::CycleFilterForward),
+        "backtab" => Some(SidebarInputAction::CycleFilterBackward),
         "n" => Some(SidebarInputAction::FocusNextAttention),
         "N" => Some(SidebarInputAction::FocusPreviousAttention),
         "J" => Some(SidebarInputAction::ReorderDown),
@@ -96,7 +98,14 @@ mod tests {
         assert_eq!(parse_key("k"), Some(SidebarInputAction::MovePrevious));
         assert_eq!(parse_key("enter"), Some(SidebarInputAction::Activate));
         assert_eq!(parse_key("v"), Some(SidebarInputAction::CycleViewMode));
-        assert_eq!(parse_key("tab"), Some(SidebarInputAction::ToggleFilter));
+        assert_eq!(
+            parse_key("tab"),
+            Some(SidebarInputAction::CycleFilterForward)
+        );
+        assert_eq!(
+            parse_key("backtab"),
+            Some(SidebarInputAction::CycleFilterBackward)
+        );
         assert_eq!(parse_key("J"), Some(SidebarInputAction::ReorderDown));
         assert_eq!(parse_key("K"), Some(SidebarInputAction::ReorderUp));
         assert_eq!(parse_key("h"), None);
