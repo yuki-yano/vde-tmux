@@ -181,6 +181,15 @@ pub struct TmuxServerIncarnation {
 }
 
 impl TmuxServerIncarnation {
+    pub fn resolve_from_runner(runner: &dyn TmuxRunner) -> Result<Self> {
+        let output = runner.run(&[
+            "display-message",
+            "-p",
+            "#{pid}\t#{start_time}\t#{socket_path}",
+        ])?;
+        Self::from_display_output(&output)
+    }
+
     pub fn resolve(runner: &dyn TmuxRunner, env: &BTreeMap<String, String>) -> Result<Self> {
         let tmux = env
             .get("TMUX")
@@ -191,11 +200,20 @@ impl TmuxServerIncarnation {
             .next()
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("TMUX has an invalid server socket path"))?;
-        let output = runner.run(&[
-            "display-message",
-            "-p",
-            "#{pid}\t#{start_time}\t#{socket_path}",
-        ])?;
+        let actual = Self::resolve_from_runner(runner)?;
+        let socket_path = std::fs::canonicalize(socket_path)
+            .with_context(|| format!("failed to canonicalize tmux socket path {socket_path}"))?;
+        if actual.socket_path != socket_path {
+            bail!(
+                "tmux runner targets {}, but TMUX identifies {}",
+                actual.socket_path.display(),
+                socket_path.display()
+            );
+        }
+        Ok(actual)
+    }
+
+    fn from_display_output(output: &str) -> Result<Self> {
         let mut fields = output.trim_end().split('\t');
         let pid = fields
             .next()
@@ -213,18 +231,9 @@ impl TmuxServerIncarnation {
         if fields.next().is_some() {
             bail!("tmux returned an invalid server incarnation");
         }
-        let socket_path = std::fs::canonicalize(socket_path)
-            .with_context(|| format!("failed to canonicalize tmux socket path {socket_path}"))?;
-        let reported_socket = std::fs::canonicalize(reported_socket).with_context(|| {
+        let socket_path = std::fs::canonicalize(reported_socket).with_context(|| {
             format!("failed to canonicalize reported tmux socket path {reported_socket}")
         })?;
-        if reported_socket != socket_path {
-            bail!(
-                "tmux runner targets {}, but TMUX identifies {}",
-                reported_socket.display(),
-                socket_path.display()
-            );
-        }
         let identity = ServerIdentity { pid, start_time };
         let mut hasher = Sha256::new();
         hasher.update(socket_path.as_os_str().as_bytes());
@@ -242,6 +251,18 @@ impl TmuxServerIncarnation {
 
     pub fn verify(&self, runner: &dyn TmuxRunner, env: &BTreeMap<String, String>) -> Result<()> {
         let actual = Self::resolve(runner, env)?;
+        if actual != *self {
+            bail!(
+                "tmux server incarnation mismatch: expected {}, received {}",
+                self.hash,
+                actual.hash
+            );
+        }
+        Ok(())
+    }
+
+    pub fn verify_from_runner(&self, runner: &dyn TmuxRunner) -> Result<()> {
+        let actual = Self::resolve_from_runner(runner)?;
         if actual != *self {
             bail!(
                 "tmux server incarnation mismatch: expected {}, received {}",
@@ -277,8 +298,16 @@ pub fn set_tmux_desired_mode(
     env: &BTreeMap<String, String>,
     desired_mode: DesiredMode,
 ) -> Result<()> {
-    const SERVER_MISMATCH: &str = "__vde_daemon_mode_server_mismatch__";
     let incarnation = TmuxServerIncarnation::resolve(runner, env)?;
+    set_tmux_desired_mode_for_incarnation(runner, &incarnation, desired_mode)
+}
+
+pub(crate) fn set_tmux_desired_mode_for_incarnation(
+    runner: &dyn TmuxRunner,
+    incarnation: &TmuxServerIncarnation,
+    desired_mode: DesiredMode,
+) -> Result<()> {
+    const SERVER_MISMATCH: &str = "__vde_daemon_mode_server_mismatch__";
     let command = match desired_mode {
         DesiredMode::Disabled => vec![
             "set-option".to_string(),
@@ -303,7 +332,7 @@ pub fn set_tmux_desired_mode(
     if output.lines().any(|line| line.trim() == SERVER_MISMATCH) {
         bail!("tmux server incarnation changed while updating daemon mode");
     }
-    incarnation.verify(runner, env)?;
+    incarnation.verify_from_runner(runner)?;
     Ok(())
 }
 

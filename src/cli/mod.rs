@@ -1013,19 +1013,23 @@ where
                     runner, action, name, env,
                 )?));
             }
-            match (popup, command) {
+            let outcome = match (popup, command) {
                 (true, None) => crate::session_manager::run_interactive(runner)?,
                 (false, Some(SessionManagerCommand::KillWindow { target })) => {
                     crate::session_manager::kill_window(runner, &target)?;
+                    crate::session_manager::SessionManagerOutcome::Done
                 }
                 (false, Some(SessionManagerCommand::KillPane { target })) => {
                     crate::session_manager::kill_pane(runner, &target)?;
+                    crate::session_manager::SessionManagerOutcome::Done
                 }
                 (true, Some(SessionManagerCommand::KillWindow { target })) => {
                     crate::session_manager::kill_window(runner, &target)?;
+                    crate::session_manager::SessionManagerOutcome::Done
                 }
                 (true, Some(SessionManagerCommand::KillPane { target })) => {
                     crate::session_manager::kill_pane(runner, &target)?;
+                    crate::session_manager::SessionManagerOutcome::Done
                 }
                 (false, None) => {
                     if should_wrap_session_manager_in_popup(env) {
@@ -1034,10 +1038,21 @@ where
                             &config.popup,
                             &std::env::current_exe()?.display().to_string(),
                         )?;
+                        crate::session_manager::SessionManagerOutcome::Done
                     } else {
-                        crate::session_manager::run_interactive_outside_tmux(runner, env)?;
+                        crate::session_manager::run_interactive_outside_tmux(runner, env)?
                     }
                 }
+            };
+            if outcome == crate::session_manager::SessionManagerOutcome::KillServer {
+                let mut ops = crate::session_manager::kill_server::SystemKillServerOps::new(
+                    runner,
+                    |incarnation| daemon::disable_daemon_for_server(runner, env, incarnation),
+                );
+                crate::session_manager::kill_server::clean_kill_server(
+                    &mut ops,
+                    &config.session_manager.kill,
+                )?;
             }
             Ok(None)
         }

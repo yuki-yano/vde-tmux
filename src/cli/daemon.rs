@@ -770,14 +770,31 @@ pub(crate) fn disable_daemon(
     socket: Option<&str>,
 ) -> Result<Option<String>> {
     let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
+    disable_daemon_for_incarnation(runner, env, socket, &incarnation)
+}
+
+pub(crate) fn disable_daemon_for_server(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
+) -> Result<()> {
+    disable_daemon_for_incarnation(runner, env, None, incarnation).map(|_| ())
+}
+
+fn disable_daemon_for_incarnation(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    socket: Option<&str>,
+    incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
+) -> Result<Option<String>> {
     let socket_path =
         crate::daemon::daemon_socket_path_for_incarnation(env, socket, &incarnation.hash);
     let outcome = execute_disabled_transition(
         false,
         || {
-            crate::daemon::lifecycle::set_tmux_desired_mode(
+            crate::daemon::lifecycle::set_tmux_desired_mode_for_incarnation(
                 runner,
-                env,
+                incarnation,
                 crate::daemon::lifecycle::DesiredMode::Disabled,
             )
             .context("failed to set disabled server marker")?;
@@ -791,7 +808,7 @@ pub(crate) fn disable_daemon(
                 .map_err(anyhow::Error::new)
                 .context("owned hook removal failed")
         },
-        || shutdown_daemon_for_disabled_transition(runner, env, &incarnation, &socket_path),
+        || shutdown_daemon_for_disabled_transition(runner, env, incarnation, &socket_path),
     );
     if outcome.is_complete() {
         return Ok(Some("daemon disabled".to_string()));

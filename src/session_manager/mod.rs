@@ -13,10 +13,18 @@ use crate::window::{list_windows, list_windows_for_target};
 use anyhow::{Context, Result};
 use unicode_width::UnicodeWidthStr;
 
+pub mod kill_server;
+
 const FIELD_SEP: char = '\t';
 const ACTIVE_ACTIVITY_THRESHOLD_SECONDS: i64 = 60 * 60;
 const PREVIEW_BOX_FALLBACK_WIDTH: usize = 76;
 const PREVIEW_BOX_MIN_WIDTH: usize = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionManagerOutcome {
+    Done,
+    KillServer,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManagerEntry {
@@ -154,7 +162,7 @@ pub fn open_popup(runner: &dyn TmuxRunner, popup: &PopupConfig, exe: &str) -> Re
     Ok(())
 }
 
-pub fn run_interactive(runner: &dyn TmuxRunner) -> Result<()> {
+pub fn run_interactive(runner: &dyn TmuxRunner) -> Result<SessionManagerOutcome> {
     let mut io = SystemSessionManagerIo;
     run_interactive_with_io(runner, &mut io)
 }
@@ -162,7 +170,7 @@ pub fn run_interactive(runner: &dyn TmuxRunner) -> Result<()> {
 pub fn run_interactive_outside_tmux(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
-) -> Result<()> {
+) -> Result<SessionManagerOutcome> {
     let mut io = SystemSessionManagerIo;
     let mut attach = SystemSessionAttachIo::from_env(env);
     run_interactive_outside_tmux_with_io(runner, &mut io, &mut attach)
@@ -171,12 +179,12 @@ pub fn run_interactive_outside_tmux(
 pub fn run_interactive_with_io(
     runner: &dyn TmuxRunner,
     io: &mut dyn SessionManagerIo,
-) -> Result<()> {
+) -> Result<SessionManagerOutcome> {
     ensure_tmux_server(runner)?;
     let entries = build_entries(runner)?;
     let rows = entries.iter().map(render_entry).collect::<Vec<_>>();
     let Some(selected) = io.choose(&rows)? else {
-        return Ok(());
+        return Ok(SessionManagerOutcome::Done);
     };
     run_selection(runner, &selected)
 }
@@ -185,12 +193,12 @@ fn run_interactive_outside_tmux_with_io(
     runner: &dyn TmuxRunner,
     io: &mut dyn SessionManagerIo,
     attach: &mut dyn SessionAttachIo,
-) -> Result<()> {
+) -> Result<SessionManagerOutcome> {
     ensure_tmux_server(runner)?;
     let entries = build_entries(runner)?;
     let rows = entries.iter().map(render_entry).collect::<Vec<_>>();
     let Some(selected) = io.choose(&rows)? else {
-        return Ok(());
+        return Ok(SessionManagerOutcome::Done);
     };
     run_selection_outside_tmux(runner, &selected, attach)
 }
@@ -304,6 +312,18 @@ fn build_entries(runner: &dyn TmuxRunner) -> Result<Vec<ManagerEntry>> {
             });
         }
     }
+    rows.push(SelectorRow {
+        action: "server".to_string(),
+        name: String::new(),
+        session: String::new(),
+        target: String::new(),
+        columns: vec![
+            format!("  {} {}", red("✕"), bold("tmux server")),
+            cyan("tmux kill-server"),
+            String::new(),
+            String::new(),
+        ],
+    });
     Ok(render_selector_rows(&rows))
 }
 
@@ -375,7 +395,9 @@ fn parse_selected_entry(row: &str) -> Option<ManagerEntry> {
         return None;
     }
     let action = fields[0];
-    if !matches!(action, "session" | "window") || fields[1].is_empty() {
+    if !matches!(action, "session" | "window" | "server")
+        || (!matches!(action, "server") && fields[1].is_empty())
+    {
         return None;
     }
     Some(ManagerEntry {
@@ -387,17 +409,26 @@ fn parse_selected_entry(row: &str) -> Option<ManagerEntry> {
     })
 }
 
-fn run_selection(runner: &dyn TmuxRunner, selected: &str) -> Result<()> {
+fn run_selection(runner: &dyn TmuxRunner, selected: &str) -> Result<SessionManagerOutcome> {
     let (key, entries) = parse_selection_output(selected);
     match key.as_str() {
         "ctrl-q" => return kill_selection(runner, &entries),
-        "ctrl-t" => return create_and_switch_session(runner),
-        "ctrl-r" => return rename_selection(runner, entries.first()),
+        "ctrl-t" => {
+            create_and_switch_session(runner)?;
+            return Ok(SessionManagerOutcome::Done);
+        }
+        "ctrl-r" => {
+            rename_selection(runner, entries.first())?;
+            return Ok(SessionManagerOutcome::Done);
+        }
         _ => {}
     }
     let Some(entry) = entries.first() else {
-        return Ok(());
+        return Ok(SessionManagerOutcome::Done);
     };
+    if entry.action == "server" {
+        return Ok(SessionManagerOutcome::Done);
+    }
     let session = if entry.session.is_empty() {
         &entry.name
     } else {
@@ -408,24 +439,33 @@ fn run_selection(runner: &dyn TmuxRunner, selected: &str) -> Result<()> {
     if entry.action == "window" && !entry.target.is_empty() {
         runner.run(&["select-window", "-t", &entry.target])?;
     }
-    Ok(())
+    Ok(SessionManagerOutcome::Done)
 }
 
 fn run_selection_outside_tmux(
     runner: &dyn TmuxRunner,
     selected: &str,
     attach: &mut dyn SessionAttachIo,
-) -> Result<()> {
+) -> Result<SessionManagerOutcome> {
     let (key, entries) = parse_selection_output(selected);
     match key.as_str() {
         "ctrl-q" => return kill_selection(runner, &entries),
-        "ctrl-t" => return create_and_attach_session(runner, attach),
-        "ctrl-r" => return rename_selection(runner, entries.first()),
+        "ctrl-t" => {
+            create_and_attach_session(runner, attach)?;
+            return Ok(SessionManagerOutcome::Done);
+        }
+        "ctrl-r" => {
+            rename_selection(runner, entries.first())?;
+            return Ok(SessionManagerOutcome::Done);
+        }
         _ => {}
     }
     let Some(entry) = entries.first() else {
-        return Ok(());
+        return Ok(SessionManagerOutcome::Done);
     };
+    if entry.action == "server" {
+        return Ok(SessionManagerOutcome::Done);
+    }
     let session = if entry.session.is_empty() {
         &entry.name
     } else {
@@ -436,7 +476,8 @@ fn run_selection_outside_tmux(
     } else {
         exact_session_target(session)
     };
-    attach.attach_session(&target)
+    attach.attach_session(&target)?;
+    Ok(SessionManagerOutcome::Done)
 }
 
 fn parse_selection_output(output: &str) -> (String, Vec<ManagerEntry>) {
@@ -462,7 +503,13 @@ fn parse_selection_output(output: &str) -> (String, Vec<ManagerEntry>) {
     )
 }
 
-fn kill_selection(runner: &dyn TmuxRunner, entries: &[ManagerEntry]) -> Result<()> {
+fn kill_selection(
+    runner: &dyn TmuxRunner,
+    entries: &[ManagerEntry],
+) -> Result<SessionManagerOutcome> {
+    if entries.iter().any(|entry| entry.action == "server") {
+        return Ok(SessionManagerOutcome::KillServer);
+    }
     let session_targets = entries
         .iter()
         .filter_map(|entry| {
@@ -501,7 +548,7 @@ fn kill_selection(runner: &dyn TmuxRunner, entries: &[ManagerEntry]) -> Result<(
             _ => {}
         }
     }
-    Ok(())
+    Ok(SessionManagerOutcome::Done)
 }
 
 fn create_and_switch_session(runner: &dyn TmuxRunner) -> Result<()> {
@@ -559,8 +606,20 @@ pub fn render_preview(
     match action {
         "session" => render_session_preview(runner, name, env),
         "window" => render_window_preview(runner, name, env),
+        "server" => Ok(render_server_preview(env)),
         _ => Ok("Preview not available".to_string()),
     }
+}
+
+fn render_server_preview(env: &BTreeMap<String, String>) -> String {
+    let mut lines = render_header_box("tmux server", env);
+    lines.push(String::new());
+    lines.push("Ctrl-Q runs Kill Server.".to_string());
+    lines.push("All tmux sessions will be terminated.".to_string());
+    lines.push("Each pane process is asked to shut down gracefully.".to_string());
+    lines.push("The vde daemon is stopped before the tmux server.".to_string());
+    lines.push("Remaining process groups receive SIGTERM, then SIGKILL if needed.".to_string());
+    lines.join("\n")
 }
 
 fn render_session_preview(
@@ -975,6 +1034,10 @@ fn gray(text: impl AsRef<str>) -> String {
     ansi("90", text)
 }
 
+fn red(text: impl AsRef<str>) -> String {
+    ansi("31", text)
+}
+
 fn strip_ansi(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -1098,6 +1161,138 @@ mod tests {
             session, index, id, name, panes, active, "0", "0", "0", "0", command,
         ]
         .join("\u{1f}")
+    }
+
+    fn server_entry() -> ManagerEntry {
+        ManagerEntry {
+            action: "server".to_string(),
+            name: String::new(),
+            session: String::new(),
+            target: String::new(),
+            display: "✕ tmux server | tmux kill-server".to_string(),
+        }
+    }
+
+    #[test]
+    fn server_row_is_always_the_last_selector_entry() {
+        let mock = MockTmuxRunner::new();
+        let session_format = crate::session::session_list_format();
+        let window_format = crate::window::window_list_format();
+        mock.stub(&["list-sessions", "-F", &session_format], "");
+        mock.stub(&["list-windows", "-a", "-F", &window_format], "");
+
+        let entries = build_entries(&mock).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries.last().map(|entry| entry.action.as_str()),
+            Some("server")
+        );
+        assert!(entries[0].display.contains("tmux kill-server"));
+    }
+
+    #[test]
+    fn server_row_with_blank_name_and_target_parses() {
+        let rendered = render_entry(&server_entry());
+        assert_eq!(parse_selected_entry(&rendered), Some(server_entry()));
+    }
+
+    #[test]
+    fn server_enter_and_ctrl_r_are_noops() {
+        for selected in [
+            render_entry(&server_entry()),
+            format!("ctrl-r\n{}", render_entry(&server_entry())),
+        ] {
+            let mock = MockTmuxRunner::new();
+            assert_eq!(
+                run_selection(&mock, &selected).unwrap(),
+                SessionManagerOutcome::Done
+            );
+            assert!(mock.calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn server_ctrl_q_returns_kill_server_outcome() {
+        let mock = MockTmuxRunner::new();
+        let selected = format!("ctrl-q\n{}", render_entry(&server_entry()));
+        assert_eq!(
+            run_selection(&mock, &selected).unwrap(),
+            SessionManagerOutcome::KillServer
+        );
+        assert!(mock.calls().is_empty());
+    }
+
+    #[test]
+    fn popup_and_outside_interactive_paths_propagate_kill_server_outcome() {
+        let mock = MockTmuxRunner::new();
+        let session_format = crate::session::session_list_format();
+        let window_format = crate::window::window_list_format();
+        mock.stub(&["has-session"], "");
+        mock.stub(&["list-sessions", "-F", &session_format], "");
+        mock.stub(&["list-windows", "-a", "-F", &window_format], "");
+        let selection = format!("ctrl-q\n{}", render_entry(&server_entry()));
+
+        let mut popup_io = MockSessionManagerIo {
+            selection: Some(selection.clone()),
+            seen_rows: Vec::new(),
+        };
+        assert_eq!(
+            run_interactive_with_io(&mock, &mut popup_io).unwrap(),
+            SessionManagerOutcome::KillServer
+        );
+
+        let mut outside_io = MockSessionManagerIo {
+            selection: Some(selection),
+            seen_rows: Vec::new(),
+        };
+        let mut attach = MockSessionAttachIo::default();
+        assert_eq!(
+            run_interactive_outside_tmux_with_io(&mock, &mut outside_io, &mut attach).unwrap(),
+            SessionManagerOutcome::KillServer
+        );
+        assert!(attach.targets.is_empty());
+    }
+
+    #[test]
+    fn server_wins_multi_select_without_killing_individual_entries() {
+        let mock = MockTmuxRunner::new();
+        let session = ManagerEntry {
+            action: "session".to_string(),
+            name: "main".to_string(),
+            session: "main".to_string(),
+            target: String::new(),
+            display: "main".to_string(),
+        };
+        let selected = format!(
+            "ctrl-q\n{}\n{}",
+            render_entry(&session),
+            render_entry(&server_entry())
+        );
+        assert_eq!(
+            run_selection(&mock, &selected).unwrap(),
+            SessionManagerOutcome::KillServer
+        );
+        assert!(mock.calls().is_empty());
+    }
+
+    #[test]
+    fn server_preview_explains_destructive_shutdown_sequence() {
+        let preview =
+            render_preview(&MockTmuxRunner::new(), "server", "", &BTreeMap::new()).unwrap();
+        for expected in [
+            "tmux server",
+            "Ctrl-Q",
+            "All tmux sessions",
+            "gracefully",
+            "vde daemon",
+            "SIGTERM",
+            "SIGKILL",
+        ] {
+            assert!(
+                preview.contains(expected),
+                "missing {expected:?}: {preview}"
+            );
+        }
     }
 
     #[test]
