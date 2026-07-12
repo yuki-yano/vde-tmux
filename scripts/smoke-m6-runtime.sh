@@ -891,7 +891,10 @@ for large_window in "${LARGE_WINDOWS[@]}"; do
 done
 
 sidebar_snapshot() {
-  VT_PANE="$OTHER_PANE" run_vt sidebar attach --once | sed -E 's/[0-9]+s ago/<elapsed>/g'
+  VT_PANE="$OTHER_PANE" run_vt sidebar attach --once |
+    sed -E \
+      -e 's/[0-9]+s ago/<elapsed>/g' \
+      -e 's/ +done <elapsed>/ done <elapsed>/g'
 }
 
 echo "checking sidebar snapshot surface"
