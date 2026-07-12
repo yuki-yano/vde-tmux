@@ -630,7 +630,7 @@ pub fn process_start_token(pid: u32) -> Result<String> {
             .split_whitespace()
             .nth(19)
             .ok_or_else(|| anyhow::anyhow!("missing process start time for PID {pid}"))?;
-        return Ok(start.to_string());
+        Ok(start.to_string())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -724,11 +724,11 @@ pub fn terminate_active_notification(
 fn process_is_zombie(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        return std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
             .and_then(|stat| stat.rfind(") ").map(|index| stat[index + 2..].to_string()))
             .and_then(|after_name| after_name.split_whitespace().next().map(str::to_string))
-            .is_some_and(|state| state == "Z");
+            .is_some_and(|state| state == "Z")
     }
     #[cfg(not(target_os = "linux"))]
     {
