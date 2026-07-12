@@ -205,6 +205,7 @@ vt sidebar close
 | `v` | 表示モードを切り替える |
 | `1` / `2` / `3` | Flat / ByRepo / ByCategory へ切り替える |
 | `Tab` | 状態フィルタを切り替える |
+| `Shift+Tab` | 状態フィルタを逆方向に切り替える |
 | `n` / `N` | 次または前の要対応エージェントへ移動する |
 | `d` | 完了状態を確認済みにする |
 | `J` / `K` | 手動順序を変更する |
@@ -218,6 +219,7 @@ vt sidebar close
 
 表示モード、フィルタ、手動順序、開閉状態は保存されます。
 選択位置、scroll、通知メッセージはサイドバーごとの一時状態です。
+順方向と逆方向のどちらでも、対象が0件の状態はスキップします。
 
 ## session と category
 
@@ -249,6 +251,13 @@ fzf をインストールすると、session、window、pane を選ぶ popup を
 ```bash
 vt session-manager --popup
 ```
+
+selector の最下部には `✕ tmux server | tmux kill-server` が常に表示されます。
+preview には終了手順が表示され、Kill Server は `Ctrl-Q` でのみ開始します。
+この行で `Enter` または `Ctrl-R` を押しても何も実行しません。
+Kill Server は vde daemon を無効化して停止し、全paneへ `Ctrl-C` を送り、残ったpaneのprocess groupへ `SIGTERM` を送ります。
+それでも残ったprocess groupだけを `SIGKILL` した後、process cleanupが成功した場合に限ってtmux serverを終了します。
+cleanupに失敗した場合はtmux serverを残し、途中まで実行した処理を含むエラーを返します。
 
 ghq を使っている場合は、project selector から session を作成または選択できます。
 
@@ -287,6 +296,14 @@ statusline:
     mode: rollup # rollup | counts
   summary:
     enabled: true
+    hide_idle: false
+    format: "{badge} {count}"
+
+session_manager:
+  kill:
+    send_ctrl_c: true
+    term_wait_ms: 300
+    kill_wait_ms: 300
 
 badge:
   glyphs:
@@ -295,6 +312,16 @@ badge:
     done: "✓"
     idle: "○"
 ```
+
+`statusline.summary.format` は、状態ごとの色を付ける前に各tokenへ適用されます。
+placeholderは `{badge}` と `{count}` です。
+`{badge}{count}`、`{badge}: {count}`、`{count}{badge}` のような形式も利用できます。
+デフォルトは `{badge} {count}` で、`● 1 ✓ 1 ○ 9` のように表示します。
+状態token間のseparatorは1個の空白で固定です。
+
+`session_manager.kill` はKill Serverがclean shutdownで使う待機時間を設定します。
+`send_ctrl_c` はpaneへ最初の割り込みを送るかを指定します。
+`term_wait_ms` は `SIGTERM` の前後、`kill_wait_ms` は `SIGKILL` の後に待機する時間です。
 
 設定を変更したら daemon を読み込み直します。
 

@@ -205,6 +205,7 @@ Expansion state is shared across sessions.
 | `v` | Cycle the view mode |
 | `1` / `2` / `3` | Select Flat / ByRepo / ByCategory |
 | `Tab` | Cycle the state filter |
+| `Shift+Tab` | Cycle the state filter backward |
 | `n` / `N` | Move to the next or previous agent that needs attention |
 | `d` | Acknowledge the completed run |
 | `J` / `K` | Change manual ordering |
@@ -218,6 +219,7 @@ Agents belonging to the active session have a `▎` marker on the left.
 
 View mode, filter, manual order, and expansion state are persisted.
 Selection, scrolling, and transient messages remain local to each sidebar instance.
+Forward and backward filter cycling both skip states with zero matching agents.
 
 ## Sessions and categories
 
@@ -249,6 +251,11 @@ With fzf installed, open a popup for switching or removing sessions, windows, an
 ```bash
 vt session-manager --popup
 ```
+
+The final selector row is always `✕ tmux server | tmux kill-server`.
+Its preview explains the shutdown sequence, and only `Ctrl-Q` starts Kill Server; `Enter` and `Ctrl-R` do nothing on this row.
+Kill Server disables and stops the vde daemon, sends `Ctrl-C` to every pane, sends `SIGTERM` to the remaining pane process groups, escalates surviving groups to `SIGKILL`, and terminates the tmux server only after process cleanup succeeds.
+If cleanup fails, the tmux server remains running and the error includes the partial cleanup state.
 
 With ghq installed, create or select a session from the project selector:
 
@@ -287,6 +294,14 @@ statusline:
     mode: rollup # rollup | counts
   summary:
     enabled: true
+    hide_idle: false
+    format: "{badge} {count}"
+
+session_manager:
+  kill:
+    send_ctrl_c: true
+    term_wait_ms: 300
+    kill_wait_ms: 300
 
 badge:
   glyphs:
@@ -295,6 +310,14 @@ badge:
     done: "✓"
     idle: "○"
 ```
+
+`statusline.summary.format` is applied to each state token before its state color is added.
+It supports `{badge}` and `{count}`, including formats such as `{badge}{count}`, `{badge}: {count}`, and `{count}{badge}`.
+The default is `{badge} {count}`, producing output such as `● 1 ✓ 1 ○ 9`.
+The separator between state tokens remains one space.
+
+`session_manager.kill` controls the clean shutdown waits used by Kill Server.
+`send_ctrl_c` controls the initial pane interrupt, `term_wait_ms` is used before and after `SIGTERM`, and `kill_wait_ms` is used after `SIGKILL`.
 
 Reload the daemon after changing the file:
 
