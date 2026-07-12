@@ -305,58 +305,58 @@ fn build_header_title_line(
     theme: &SidebarRenderTheme,
     counts: BadgeCounts,
 ) -> HeaderLine {
+    let mode_body = format_header_mode_body(state.view_mode, theme);
+    let mode_text = format!("{}{}", theme.header_prefix, mode_body);
+    let mode_suffix = theme.header_suffix.as_str();
     let count_text = format!(" {}", counts.total);
     let task_label = if counts.total == 1 { "task" } else { "tasks" };
     let total_label_text = format!(" {task_label} ");
+    let total_suffix = header_total_suffix(theme);
+    let full_text = format!("{mode_text}{mode_suffix}{count_text}{total_label_text}{total_suffix}");
+    let include_total = display_width(&full_text) <= width;
+    let text = if include_total {
+        full_text
+    } else {
+        truncate_display(&mode_text, width)
+    };
+
     let total_bg = theme.header_total_bg.unwrap_or(theme.active_bg);
-    let mut pieces = vec![
-        (
+    let mut pieces = vec![(
+        mode_text,
+        mode_segment_style(theme),
+        Some(HeaderAction::CycleViewMode),
+    )];
+    if include_total {
+        if !mode_suffix.is_empty() {
+            pieces.push((
+                mode_suffix.to_string(),
+                Style::default().fg(mode_bg(theme)).bg(total_bg),
+                None,
+            ));
+        }
+        pieces.push((
             count_text,
             Style::default()
                 .fg(Color::Reset)
                 .bg(total_bg)
                 .add_modifier(Modifier::BOLD),
             None,
-        ),
-        (
+        ));
+        pieces.push((
             total_label_text,
             Style::default()
                 .fg(theme.header_total_fg.unwrap_or(theme.detail))
                 .bg(total_bg),
             None,
-        ),
-    ];
-    let count_width = pieces
-        .iter()
-        .map(|(piece, _, _)| display_width(piece))
-        .sum::<usize>();
-
-    if count_width < width {
-        let available = width - count_width;
-        let full_mode = header_mode_pieces(state.view_mode, theme, true);
-        let compact_mode = header_mode_pieces(state.view_mode, theme, false);
-        let mode = [full_mode, compact_mode]
-            .into_iter()
-            .find(|candidate| header_pieces_width(candidate) <= available);
-        let mode_width = mode
-            .as_ref()
-            .map(|pieces| header_pieces_width(pieces))
-            .unwrap_or(0);
-        let filler_width = available - mode_width;
-        if filler_width > 0 {
-            let filler_style = theme
-                .header_outer_bg
-                .map(|bg| Style::default().bg(bg))
-                .unwrap_or_default();
-            pieces.push((" ".repeat(filler_width), filler_style, None));
-        }
-        if let Some(mode) = mode {
-            pieces.extend(mode);
+        ));
+        if !total_suffix.is_empty() {
+            pieces.push((
+                total_suffix.to_string(),
+                Style::default().fg(total_bg),
+                None,
+            ));
         }
     }
-
-    let full_text: String = pieces.iter().map(|(piece, _, _)| piece.as_str()).collect();
-    let text = truncate_display(&full_text, width);
 
     let mut segments = Vec::new();
     let mut start = 0;
@@ -375,17 +375,9 @@ fn build_header_title_line(
     HeaderLine { text, segments }
 }
 
-fn format_header_mode_body_with_padding(
-    view_mode: ViewMode,
-    theme: &SidebarRenderTheme,
-    padded: bool,
-) -> String {
+fn format_header_mode_body(view_mode: ViewMode, theme: &SidebarRenderTheme) -> String {
     let mode = view_mode_label(view_mode);
-    let mode_padded = if padded {
-        view_mode_label_padded(view_mode)
-    } else {
-        mode.to_string()
-    };
+    let mode_padded = view_mode_label_padded(view_mode);
     let label = format!("≣ {mode_padded}");
     theme
         .header_format
@@ -394,43 +386,8 @@ fn format_header_mode_body_with_padding(
         .replace("{mode}", mode)
 }
 
-type HeaderPiece = (String, Style, Option<HeaderAction>);
-
-fn header_mode_pieces(
-    view_mode: ViewMode,
-    theme: &SidebarRenderTheme,
-    padded: bool,
-) -> Vec<HeaderPiece> {
-    let mut pieces = Vec::new();
-    let mode_text = format!(
-        "{}{}",
-        theme.header_prefix,
-        format_header_mode_body_with_padding(view_mode, theme, padded)
-    );
-    pieces.push((
-        mode_text,
-        mode_segment_style(theme),
-        Some(HeaderAction::CycleViewMode),
-    ));
-    if !theme.header_suffix.is_empty() {
-        let mut suffix_style = Style::default().fg(mode_bg(theme));
-        if let Some(outer_bg) = theme.header_outer_bg {
-            suffix_style = suffix_style.bg(outer_bg);
-        }
-        pieces.push((
-            theme.header_suffix.clone(),
-            suffix_style,
-            Some(HeaderAction::CycleViewMode),
-        ));
-    }
-    pieces
-}
-
-fn header_pieces_width(pieces: &[HeaderPiece]) -> usize {
-    pieces
-        .iter()
-        .map(|(piece, _, _)| display_width(piece))
-        .sum()
+fn header_total_suffix(theme: &SidebarRenderTheme) -> &str {
+    theme.header_suffix.as_str()
 }
 
 #[derive(Clone, Copy)]
@@ -2585,40 +2542,33 @@ mod tests {
         assert_eq!(mode_style.fg, Some(Color::Indexed(16)));
         assert_eq!(mode_style.bg, Some(Color::Indexed(147)));
         assert!(mode_style.add_modifier.contains(Modifier::BOLD));
-        let title = &build_header_layout(&state, 80).lines[0].text;
-        assert!(title.starts_with(" 0 tasks "), "{title:?}");
-        assert!(title.ends_with(" ≣ Repository \u{e0b0}"), "{title:?}");
-        assert_eq!(display_width(title), 80);
+        assert_eq!(
+            build_header_layout(&state, 80).lines[0].text,
+            format!(" ≣ Repository \u{e0b0} 0 tasks \u{e0b0}")
+        );
     }
 
     #[test]
     fn header_filter_positions_are_stable_across_view_modes() {
-        let lines_for = |view_mode: ViewMode| {
+        let text_for = |view_mode: ViewMode| {
             let state = SidebarState {
                 view_mode,
                 ..SidebarState::default()
             };
-            build_header_layout(&state, 80).lines
+            build_header_layout(&state, 80).lines[1].text.clone()
         };
-        let flat = lines_for(ViewMode::Flat);
-        let repo = lines_for(ViewMode::ByRepo);
-        let category = lines_for(ViewMode::ByCategory);
+        let flat = text_for(ViewMode::Flat);
+        let repo = text_for(ViewMode::ByRepo);
+        let category = text_for(ViewMode::ByCategory);
 
+        assert_eq!(flat.find('≡'), repo.find('≡'), "{flat:?} vs {repo:?}");
         assert_eq!(
-            flat[0].text.find('≣'),
-            repo[0].text.find('≣'),
-            "{:?} vs {:?}",
-            flat[0].text,
-            repo[0].text
+            repo.find('≡'),
+            category.find('≡'),
+            "{repo:?} vs {category:?}"
         );
-        assert_eq!(repo[0].text.find('≣'), category[0].text.find('≣'));
-        assert_eq!(flat[1].text.find('≡'), repo[1].text.find('≡'));
-        assert_eq!(repo[1].text.find('≡'), category[1].text.find('≡'));
-        assert_eq!(display_width(&flat[1].text), display_width(&repo[1].text));
-        assert_eq!(
-            display_width(&repo[1].text),
-            display_width(&category[1].text)
-        );
+        assert_eq!(display_width(&flat), display_width(&repo));
+        assert_eq!(display_width(&repo), display_width(&category));
     }
 
     #[test]
@@ -2932,9 +2882,10 @@ mod tests {
         );
 
         assert_eq!(header.row_count(), 2);
-        assert!(header.lines[0].text.starts_with(" 7 tasks "));
-        assert!(header.lines[0].text.ends_with(" ≣ Category   \u{e0b0}"));
-        assert_eq!(display_width(&header.lines[0].text), 80);
+        assert_eq!(
+            header.lines[0].text,
+            format!(" ≣ Category   \u{e0b0} 7 tasks \u{e0b0}")
+        );
         assert_eq!(
             header.lines[1].text,
             " ≡ all 7  ▲ needs action 2  ● 1  ✓ 0  ○ 5 "
@@ -2956,8 +2907,10 @@ mod tests {
             counts,
         );
 
-        assert!(header.lines[0].text.starts_with(" 1 task "));
-        assert!(header.lines[0].text.ends_with(" ≣ Category   \u{e0b0}"));
+        assert_eq!(
+            header.lines[0].text,
+            format!(" ≣ Category   \u{e0b0} 1 task \u{e0b0}")
+        );
     }
 
     #[test]
@@ -2975,23 +2928,11 @@ mod tests {
             rich_header_counts(),
         );
 
-        let mode_range = header.lines[0]
-            .segments
-            .iter()
-            .find(|segment| segment.action == Some(HeaderAction::CycleViewMode))
-            .unwrap()
-            .range
-            .clone();
-        assert_eq!(header_hit_test(&header, 0, 2), None);
-        assert_eq!(header_hit_test(&header, 0, mode_range.start - 1), None);
         assert_eq!(
-            header_hit_test(&header, 0, mode_range.start),
+            header_hit_test(&header, 0, 2),
             Some(HeaderAction::CycleViewMode)
         );
-        assert_eq!(
-            header_hit_test(&header, 0, 79),
-            Some(HeaderAction::CycleViewMode)
-        );
+        assert_eq!(header_hit_test(&header, 0, 14), None);
         assert_eq!(
             header_hit_test(&header, 1, 1),
             Some(HeaderAction::SetFilter(StatusFilter::All))
@@ -3142,7 +3083,7 @@ badge:
     }
 
     #[test]
-    fn custom_header_suffix_is_rendered_after_right_aligned_mode_segment() {
+    fn custom_header_suffix_is_rendered_after_total_segment() {
         let config = serde_yaml_ng::from_str::<crate::config::Config>(
             r##"
 sidebar:
@@ -3161,7 +3102,7 @@ sidebar:
         );
 
         assert!(
-            header.lines[0].text.ends_with("≣ Category   "),
+            header.lines[0].text.ends_with("7 tasks "),
             "{:?}",
             header.lines[0].text
         );
@@ -3261,13 +3202,11 @@ sidebar:
 
         assert_eq!(theme.header_suffix, "");
         assert!(!header.lines[0].text.contains('\u{e0b0}'));
-        assert!(header.lines[0].text.starts_with(" 7 tasks "));
-        assert!(header.lines[0].text.ends_with(" ≣ Category   "));
-        assert_eq!(display_width(&header.lines[0].text), 80);
+        assert_eq!(header.lines[0].text, " ≣ Category    7 tasks ");
     }
 
     #[test]
-    fn header_width_fallback_prioritizes_total_then_compacts_or_omits_mode() {
+    fn header_width_fallback_drops_total_before_truncating_mode() {
         let state = SidebarState {
             view_mode: ViewMode::ByCategory,
             ..SidebarState::default()
@@ -3279,8 +3218,8 @@ sidebar:
             &SidebarRenderTheme::default(),
             rich_header_counts(),
         );
-        assert_eq!(compact.lines[0].text, " 7 tasks    ");
-        assert!(!compact.lines[0].text.contains('≣'));
+        assert_eq!(compact.lines[0].text, " ≣ Category…");
+        assert!(!compact.lines[0].text.contains("tasks"));
 
         let narrow = build_header_layout_with_counts(
             &state,
@@ -3289,21 +3228,11 @@ sidebar:
             rich_header_counts(),
         );
         assert!(display_width(&narrow.lines[0].text) <= 6);
-        assert!(narrow.lines[0].text.starts_with(" 7"));
-        assert!(narrow.lines[0].text.ends_with('…'));
-
-        let flat = SidebarState {
-            view_mode: ViewMode::Flat,
-            ..SidebarState::default()
-        };
-        let compact_mode = build_header_layout_with_counts(
-            &flat,
-            18,
-            &SidebarRenderTheme::default(),
-            rich_header_counts(),
+        assert!(
+            narrow.lines[0].text.ends_with('…'),
+            "{:?}",
+            narrow.lines[0].text
         );
-        assert!(compact_mode.lines[0].text.starts_with(" 7 tasks "));
-        assert!(compact_mode.lines[0].text.ends_with(" ≣ Flat \u{e0b0}"));
     }
 
     #[test]
@@ -3338,19 +3267,13 @@ sidebar:
         let mode = style_for_segment(&header, 0, "≣ Category");
         let suffix = style_for_segment(&header, 0, "]");
 
-        assert!(header.lines[0].text.starts_with(" 7 tasks "));
-        assert!(header.lines[0].text.ends_with("[ ≣ Category   ]"));
+        assert_eq!(header.lines[0].text, "[ ≣ Category   ] 7 tasks ]");
         assert_eq!(mode.fg, Some(Color::White));
         assert_eq!(mode.bg, Some(Color::Indexed(24)));
         assert!(mode.add_modifier.contains(Modifier::BOLD));
         assert_eq!(suffix.fg, Some(Color::Indexed(24)));
         assert_eq!(suffix.bg, Some(Color::Indexed(235)));
-        assert!(
-            lines[0]
-                .spans
-                .iter()
-                .any(|span| span.content.contains('≣') && span.style == mode)
-        );
+        assert_eq!(lines[0].spans[0].style, mode);
     }
 
     #[test]
