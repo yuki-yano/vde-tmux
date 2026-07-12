@@ -177,7 +177,7 @@ record_daemon_pid
 for hook in window-pane-changed session-window-changed client-session-changed client-attached client-detached; do
   tmux -L "$TMUX_SOCKET" show-hooks -g "${hook}[70]" | grep -F "${hook}[70]" >/dev/null
 done
-tmux -L "$TMUX_SOCKET" show-options -g @vde_status_summary >/dev/null
+tmux -L "$TMUX_SOCKET" show-options -t main @vde_status_summary >/dev/null
 echo "empty-topology hook install and display initialization ok"
 
 # A second zero-topology server runs concurrently with the first and must acquire an independent
@@ -666,7 +666,7 @@ grep -F '#{@vde_status_' <<<"$STATUS_LEFT$STATUS_RIGHT$PANE_BORDER" >/dev/null
 wait_display_options() {
   for _ in $(seq 1 80); do
     local summary sessions windows pane
-    summary="$(tmux -L "$TMUX_SOCKET" show-options -gv @vde_status_summary 2>/dev/null || true)"
+    summary="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_status_summary 2>/dev/null || true)"
     sessions="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_status_sessions 2>/dev/null || true)"
     windows="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_status_windows 2>/dev/null || true)"
     pane="$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_status_pane 2>/dev/null || true)"
@@ -698,7 +698,7 @@ MAIN_SESSIONS="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_status_sess
 echo "display main sessions: $MAIN_SESSIONS"
 grep -F main <<<"$MAIN_SESSIONS" >/dev/null
 grep -F aux <<<"$MAIN_SESSIONS" >/dev/null
-SUMMARY_VALUE="$(tmux -L "$TMUX_SOCKET" show-options -gv @vde_status_summary)"
+SUMMARY_VALUE="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_status_summary)"
 echo "display summary: $SUMMARY_VALUE"
 grep -F '✓1' <<<"$SUMMARY_VALUE" >/dev/null
 CLIENT_ATTACHMENTS="$(tmux -L "$TMUX_SOCKET" list-clients -F '#{client_name} #{client_session}')"
@@ -745,10 +745,11 @@ for _ in $(seq 1 120); do
     @vde_status_pane 2>/dev/null || true)"
   LARGE_WINDOWS_STATUS="$(tmux -L "$TMUX_SOCKET" show-options -qv -t aux \
     @vde_status_windows 2>/dev/null || true)"
-  [[ -n "$LARGE_PANE_STATUS" && "$LARGE_WINDOWS_STATUS" == *"load-$LARGE_WINDOW_COUNT"* ]] && break
+  [[ -n "$LARGE_PANE_STATUS" && "$LARGE_WINDOWS_STATUS" == *'+'* ]] && break
   sleep 0.1
 done
-[[ -n "$LARGE_PANE_STATUS" && "$LARGE_WINDOWS_STATUS" == *"load-$LARGE_WINDOW_COUNT"* ]]
+[[ -n "$LARGE_PANE_STATUS" && "$LARGE_WINDOWS_STATUS" == *'+'* ]]
+[[ "$LARGE_WINDOWS_STATUS" != *"load-$LARGE_WINDOW_COUNT"* ]]
 STATUS_SOURCE_PROCESSES="$(grep -c 'status-batches.*source-file\|source-file.*status-batches' \
   "$TMUX_PROCESS_LOG" || true)"
 [[ "$STATUS_SOURCE_PROCESSES" -ge 1 ]]
@@ -776,10 +777,8 @@ SIDEBAR_BEFORE="$(sidebar_snapshot)"
 # Restart must hydrate canonical state and reproduce every display surface and sidebar projection.
 capture_display_surface() {
   local value
-  value="$(tmux -L "$TMUX_SOCKET" show-options -gv @vde_status_summary 2>/dev/null || true)"
-  printf '%s\037' "$value"
   for session in main aux; do
-    for option in @vde_status_category @vde_status_sessions @vde_status_windows @vde_status_attention; do
+    for option in @vde_status_summary @vde_status_category @vde_status_sessions @vde_status_windows @vde_status_attention; do
       value="$(tmux -L "$TMUX_SOCKET" show-options -v -t "$session" "$option" 2>/dev/null || true)"
       printf '%s\037' "$value"
     done
@@ -790,12 +789,21 @@ capture_display_surface() {
   done
 }
 
+capture_stable_display_surface() {
+  capture_display_surface | python3 -c '
+import re, sys
+value = sys.stdin.read()
+duration = r"(?<![A-Za-z0-9])(?:[0-9]+d|[0-9]+h[0-9]+m|[0-9]+m(?:[0-9]{2}s)?|[0-9]+s)(?![A-Za-z0-9])"
+sys.stdout.write(re.sub(duration, "<elapsed>", value))
+'
+}
+
 sleep 2
-DISPLAY_BEFORE="$(capture_display_surface)"
+DISPLAY_BEFORE="$(capture_stable_display_surface)"
 run_vt daemon restart >/dev/null
 record_daemon_pid
 for _ in $(seq 1 80); do
-  DISPLAY_AFTER="$(capture_display_surface)"
+  DISPLAY_AFTER="$(capture_stable_display_surface)"
   [[ "$DISPLAY_AFTER" == "$DISPLAY_BEFORE" ]] && break
   sleep 0.1
 done
@@ -953,7 +961,10 @@ for key in "${WINDOW_LEGACY_KEYS[@]}"; do
   [[ -z "$(tmux -L "$TMUX_SOCKET" show-options -wv -t "$WINDOW_ID" "$key" 2>/dev/null || true)" ]]
 done
 [[ "$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_pane_state)" == "$CANONICAL_BEFORE" ]]
-[[ "$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_status_pane)" == "$DISPLAY_PANE_BEFORE" ]]
+DISPLAY_PANE_AFTER="$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_status_pane)"
+# Cleanup preserves the display option itself, while the live daemon may legitimately refresh its
+# rendered value from the unchanged canonical state during this assertion window.
+[[ -n "$DISPLAY_PANE_BEFORE" && -n "$DISPLAY_PANE_AFTER" && "$DISPLAY_PANE_AFTER" == *"$AGENT_PANE"* ]]
 [[ "$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_sidebar)" == 1 ]]
 [[ "$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_category)" == smoke-category ]]
 
