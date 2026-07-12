@@ -19,7 +19,7 @@ use crate::tmux::TmuxRunner;
 static SHUTDOWN_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
 const V2_BOOTSTRAP_FIFO_CAPACITY: usize = 64;
-const V2_MUTATION_QUEUE_CAPACITY: usize = 64;
+const V2_MUTATION_QUEUE_CAPACITY: usize = 1024;
 pub const V2_FRAME_START_TIMEOUT: Duration = Duration::from_secs(2);
 pub const V2_FRAME_BODY_TIMEOUT: Duration = Duration::from_millis(100);
 pub const V2_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -663,6 +663,8 @@ struct ProductionV2Coordinator {
     notification_health: Arc<NotificationHealthCounters>,
     notification_queue_drops: AtomicU64,
     notification_internal_drops_reported: AtomicU64,
+    mutation_queue_drops: AtomicU64,
+    mutation_queue_drop_logged: AtomicBool,
     recent_error_code: Mutex<Option<crate::daemon::protocol::v2::ErrorCode>>,
     quarantine_base_total: u64,
     quarantine_runtime_baseline: AtomicU64,
@@ -1044,6 +1046,8 @@ impl ProductionV2Coordinator {
             notification_health,
             notification_queue_drops: AtomicU64::new(0),
             notification_internal_drops_reported: AtomicU64::new(0),
+            mutation_queue_drops: AtomicU64::new(0),
+            mutation_queue_drop_logged: AtomicBool::new(false),
             recent_error_code: Mutex::new(None),
             quarantine_base_total,
             quarantine_runtime_baseline: AtomicU64::new(0),
@@ -1515,6 +1519,9 @@ impl ProductionV2Coordinator {
         }
         let queue = self.queue.lock().expect("v2 queue lock poisoned");
         if queue.items.len() + usize::from(queue.in_flight) >= V2_MUTATION_QUEUE_CAPACITY {
+            drop(queue);
+            drop(router);
+            self.note_mutation_queue_drop();
             return false;
         }
         drop(queue);
@@ -1538,6 +1545,24 @@ impl ProductionV2Coordinator {
                 false
             }
             V2Route::DroppedInternal | V2Route::Response(_) | V2Route::Query(_) => false,
+        }
+    }
+
+    fn note_mutation_queue_drop(&self) {
+        use crate::daemon::protocol::v2::ErrorCode;
+
+        let total_drops = self
+            .mutation_queue_drops
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        *self
+            .recent_error_code
+            .lock()
+            .expect("recent error code lock poisoned") = Some(ErrorCode::QueueFull);
+        if !self.mutation_queue_drop_logged.swap(true, Ordering::SeqCst) {
+            self.log_daemon_error(&format!(
+                "sequenced mutation queue full: dropped internal mutation (capacity={V2_MUTATION_QUEUE_CAPACITY}, total_drops={total_drops})"
+            ));
         }
     }
 
@@ -6439,6 +6464,168 @@ mod tests {
         ));
         coordinator.mark_shutdown_ready();
         assert!(coordinator.shutdown_ready.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mutation_queue_capacity_records_internal_drops_in_health_and_log() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-mutation-queue-capacity-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let env = BTreeMap::from([(
+            "XDG_STATE_HOME".to_string(),
+            root.to_string_lossy().into_owned(),
+        )]);
+        let hash = "mutation-queue-capacity";
+        let coordinator = ProductionV2Coordinator::new(
+            crate::daemon::lifecycle::TmuxServerIncarnation {
+                socket_path: root.join("tmux.sock"),
+                identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                hash: hash.to_string(),
+            },
+            env.clone(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap();
+        coordinator
+            .router
+            .lock()
+            .unwrap()
+            .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+
+        for _ in 0..V2_MUTATION_QUEUE_CAPACITY {
+            assert!(coordinator.enqueue_internal(V2InternalMutation::RefreshTopology));
+        }
+        assert!(!coordinator.enqueue_internal(V2InternalMutation::TriageProjection));
+        assert!(!coordinator.enqueue_internal(V2InternalMutation::TriageProjection));
+        assert_eq!(coordinator.mutation_queue_drops.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *coordinator.recent_error_code.lock().unwrap(),
+            Some(crate::daemon::protocol::v2::ErrorCode::QueueFull)
+        );
+        assert!(matches!(
+            coordinator.query(crate::daemon::protocol::v2::ClientMessage::QueryHealth {
+                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            }),
+            crate::daemon::protocol::v2::ServerMessage::HealthResult {
+                health: crate::daemon::protocol::v2::DaemonHealth {
+                    recent_error_code: Some(crate::daemon::protocol::v2::ErrorCode::QueueFull),
+                    ..
+                }
+            }
+        ));
+        let log = crate::daemon::lifecycle::read_incarnation_log_tail(&env, hash, "daemon.log", 10)
+            .unwrap();
+        assert_eq!(
+            log.matches("sequenced mutation queue full: dropped internal mutation")
+                .count(),
+            1
+        );
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn observation_poll_burst_keeps_trailing_triage_at_supported_pane_counts() {
+        for pane_count in [63, 256, 512] {
+            let root = std::env::temp_dir().join(format!(
+                "vde-observation-burst-{pane_count}-{}-{}",
+                std::process::id(),
+                crate::pane_state::EventId::generate().unwrap().as_str()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let server_identity = crate::daemon::topology::ServerIdentity {
+                pid: 1,
+                start_time: 2,
+            };
+            let coordinator = ProductionV2Coordinator::new(
+                crate::daemon::lifecycle::TmuxServerIncarnation {
+                    socket_path: root.join("tmux.sock"),
+                    identity: server_identity.clone(),
+                    hash: format!("observation-burst-{pane_count}"),
+                },
+                BTreeMap::new(),
+                crate::config::DoneClearOn::Pane,
+                None,
+            )
+            .unwrap();
+            coordinator
+                .router
+                .lock()
+                .unwrap()
+                .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+            let daemon_instance_id = coordinator
+                .router
+                .lock()
+                .unwrap()
+                .daemon_instance_id()
+                .clone();
+
+            assert!(
+                coordinator.enqueue_internal(V2InternalMutation::ObservationPollProjection(
+                    Box::new(ObservationPollProjection {
+                        topology: crate::daemon::topology::TopologySnapshot {
+                            server_identity,
+                            panes: Vec::new(),
+                        },
+                        status_metadata: super::super::runtime::StatusProjectionMetadata::default(),
+                        witnesses: Vec::new(),
+                        observation_bases: BTreeMap::new(),
+                        view_base: crate::daemon::view_hooks::ViewRegistry::default(),
+                    },)
+                ),)
+            );
+            for index in 0..pane_count {
+                assert!(
+                    coordinator.enqueue_internal(V2InternalMutation::PaneEvent(Box::new(
+                        crate::pane_state::PaneEventEnvelope {
+                            daemon_instance_id: daemon_instance_id.clone(),
+                            event_id: crate::pane_state::EventId::generate().unwrap(),
+                            pane_instance: crate::pane_state::PaneInstance {
+                                pane_id: format!("%{index}"),
+                                pane_pid: 10_000 + index as u32,
+                            },
+                            agent: None,
+                            agent_session_id: None,
+                            event: crate::pane_state::PaneEvent::ObservationBatch {
+                                base: None,
+                                tracker_generation: 0,
+                                observed_at: 1,
+                                presence: crate::pane_state::AgentPresenceObservation::Unknown,
+                                capture: None,
+                            },
+                        },
+                    )))
+                );
+            }
+            assert!(coordinator.enqueue_internal(V2InternalMutation::TriageProjection));
+
+            let queue = coordinator.queue.lock().unwrap();
+            assert_eq!(queue.items.len(), pane_count + 2);
+            assert!(matches!(
+                queue.items.front().map(|item| &item.sequenced.mutation),
+                Some(V2AcceptedMutation::Internal(
+                    V2InternalMutation::ObservationPollProjection(_)
+                ))
+            ));
+            assert!(matches!(
+                queue.items.back().map(|item| &item.sequenced.mutation),
+                Some(V2AcceptedMutation::Internal(
+                    V2InternalMutation::TriageProjection
+                ))
+            ));
+            drop(queue);
+
+            drop(coordinator);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
