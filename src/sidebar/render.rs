@@ -2587,10 +2587,7 @@ mod tests {
         assert!(mode_style.add_modifier.contains(Modifier::BOLD));
         let title = &build_header_layout(&state, 80).lines[0].text;
         assert!(title.starts_with(" 0 tasks "), "{title:?}");
-        assert!(
-            title.ends_with(&format!(" ≣ Repository \u{e0b0}")),
-            "{title:?}"
-        );
+        assert!(title.ends_with(" ≣ Repository \u{e0b0}"), "{title:?}");
         assert_eq!(display_width(title), 80);
     }
 
@@ -2936,11 +2933,7 @@ mod tests {
 
         assert_eq!(header.row_count(), 2);
         assert!(header.lines[0].text.starts_with(" 7 tasks "));
-        assert!(
-            header.lines[0]
-                .text
-                .ends_with(&format!(" ≣ Category   \u{e0b0}"))
-        );
+        assert!(header.lines[0].text.ends_with(" ≣ Category   \u{e0b0}"));
         assert_eq!(display_width(&header.lines[0].text), 80);
         assert_eq!(
             header.lines[1].text,
@@ -2964,11 +2957,7 @@ mod tests {
         );
 
         assert!(header.lines[0].text.starts_with(" 1 task "));
-        assert!(
-            header.lines[0]
-                .text
-                .ends_with(&format!(" ≣ Category   \u{e0b0}"))
-        );
+        assert!(header.lines[0].text.ends_with(" ≣ Category   \u{e0b0}"));
     }
 
     #[test]
@@ -3314,11 +3303,7 @@ sidebar:
             rich_header_counts(),
         );
         assert!(compact_mode.lines[0].text.starts_with(" 7 tasks "));
-        assert!(
-            compact_mode.lines[0]
-                .text
-                .ends_with(&format!(" ≣ Flat \u{e0b0}"))
-        );
+        assert!(compact_mode.lines[0].text.ends_with(" ≣ Flat \u{e0b0}"));
     }
 
     #[test]
