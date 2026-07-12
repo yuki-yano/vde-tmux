@@ -183,7 +183,7 @@ Acknowledgment survives daemon restarts and is shared by every tmux client and s
 
 ## Sidebar
 
-The sidebar opens in the current tmux window and defaults to category grouping.
+The sidebar opens focused in the current tmux window and defaults to category grouping.
 
 ```bash
 vt sidebar open --width 40
@@ -195,6 +195,7 @@ vt sidebar close
 ```
 
 `vt sidebar focus-toggle` opens a missing sidebar, focuses an existing sidebar, and closes it when it already has focus.
+Single-window `open` and `toggle` operations focus the sidebar; automatic and `--all` opens remain detached.
 Expansion state is shared across sessions.
 
 | Key | Action |

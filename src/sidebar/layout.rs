@@ -22,6 +22,12 @@ struct SidebarPane {
     width: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarOpenMode {
+    Focused,
+    Detached,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SidebarAttachContext {
     pub pane: Option<String>,
@@ -80,10 +86,19 @@ pub(crate) fn open_with_attach_context(
     min_width: u16,
     attach_context: Option<&SidebarAttachContext>,
 ) -> Result<()> {
-    if find_sidebar_pane(runner, target)?.is_some() {
+    if let Some(sidebar) = find_sidebar_pane(runner, target)? {
+        runner.run(&["select-pane", "-t", &sidebar.pane_id])?;
         return Ok(());
     }
-    open_unchecked(runner, target, self_exe, width, min_width, attach_context)
+    open_unchecked(
+        runner,
+        target,
+        self_exe,
+        width,
+        min_width,
+        attach_context,
+        SidebarOpenMode::Focused,
+    )
 }
 
 pub fn open_if_auto_all_enabled(
@@ -96,7 +111,18 @@ pub fn open_if_auto_all_enabled(
     if !auto_all_enabled(runner)? {
         return Ok(());
     }
-    open(runner, target, self_exe, width, min_width)
+    if find_sidebar_pane(runner, target)?.is_some() {
+        return Ok(());
+    }
+    open_unchecked(
+        runner,
+        target,
+        self_exe,
+        width,
+        min_width,
+        None,
+        SidebarOpenMode::Detached,
+    )
 }
 
 pub fn close(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
@@ -141,7 +167,15 @@ pub(crate) fn toggle_with_attach_context(
     if let Some(sidebar) = find_sidebar_pane(runner, target)? {
         close_sidebar_pane(runner, target, &sidebar)
     } else {
-        open_unchecked(runner, target, self_exe, width, min_width, attach_context)
+        open_unchecked(
+            runner,
+            target,
+            self_exe,
+            width,
+            min_width,
+            attach_context,
+            SidebarOpenMode::Focused,
+        )
     }
 }
 
@@ -176,7 +210,15 @@ pub(crate) fn toggle_all_with_attach_context(
     } else {
         for (window, sidebar) in sidebars {
             if sidebar.is_none() {
-                open_unchecked(runner, &window, self_exe, width, min_width, attach_context)?;
+                open_unchecked(
+                    runner,
+                    &window,
+                    self_exe,
+                    width,
+                    min_width,
+                    attach_context,
+                    SidebarOpenMode::Detached,
+                )?;
             }
         }
         install_auto_hooks(runner, self_exe, width)?;
@@ -230,7 +272,15 @@ pub(crate) fn focus_toggle_with_attach_context(
     attach_context: Option<&SidebarAttachContext>,
 ) -> Result<()> {
     if focus_toggle_existing(runner, target)? == ExistingSidebarFocusToggle::Missing {
-        open_unchecked(runner, target, self_exe, width, min_width, attach_context)?;
+        open_unchecked(
+            runner,
+            target,
+            self_exe,
+            width,
+            min_width,
+            attach_context,
+            SidebarOpenMode::Focused,
+        )?;
     }
     Ok(())
 }
@@ -370,7 +420,15 @@ pub fn layout_applied(
     if let Some(sidebar) = find_sidebar_pane(runner, target)? {
         return reconcile_existing_sidebar(runner, &panes, &sidebar);
     }
-    open_unchecked(runner, target, self_exe, width, min_width, None)
+    open_unchecked(
+        runner,
+        target,
+        self_exe,
+        width,
+        min_width,
+        None,
+        SidebarOpenMode::Detached,
+    )
 }
 
 pub fn layout_changed(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
@@ -406,6 +464,7 @@ fn open_unchecked(
     width: SidebarWidth,
     min_width: u16,
     attach_context: Option<&SidebarAttachContext>,
+    mode: SidebarOpenMode,
 ) -> Result<()> {
     let layout = capture_window_layout(runner, target)?;
     let width = resolve_width(&layout, width, min_width)?;
@@ -413,16 +472,13 @@ fn open_unchecked(
         .ok()
         .filter(|value| !value.trim().is_empty());
     let command = attach_shell_command(self_exe, socket_name.as_deref(), attach_context);
-    runner.run(&[
-        "split-window",
-        "-d",
-        "-t",
-        target,
-        "-hbf",
-        "-l",
-        &width.to_string(),
-        &command,
-    ])?;
+    let width = width.to_string();
+    let mut args = vec!["split-window"];
+    if mode == SidebarOpenMode::Detached {
+        args.push("-d");
+    }
+    args.extend(["-t", target, "-hbf", "-l", &width, &command]);
+    runner.run(&args)?;
     Ok(())
 }
 
@@ -1173,7 +1229,6 @@ mod tests {
         mock.stub(
             &[
                 "split-window",
-                "-d",
                 "-t",
                 "@1",
                 "-hbf",
@@ -1196,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn open_splits_sidebar_detached_without_stealing_focus() {
+    fn open_splits_sidebar_as_the_focused_pane() {
         let mock = MockTmuxRunner::new();
         mock.stub(
             &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
@@ -1216,7 +1271,6 @@ mod tests {
         mock.stub(
             &[
                 "split-window",
-                "-d",
                 "-t",
                 "@1",
                 "-hbf",
@@ -1231,7 +1285,6 @@ mod tests {
 
         assert!(mock.calls().contains(&vec![
             "split-window".to_string(),
-            "-d".to_string(),
             "-t".to_string(),
             "@1".to_string(),
             "-hbf".to_string(),
@@ -1239,6 +1292,36 @@ mod tests {
             "40".to_string(),
             "'/tmp/vt' sidebar attach".to_string(),
         ]));
+    }
+
+    #[test]
+    fn open_focuses_an_existing_sidebar() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t80\n%9\t1\t40\n",
+        );
+        mock.stub(&["select-pane", "-t", "%9"], "");
+
+        open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            vec![
+                vec![
+                    "list-panes".to_string(),
+                    "-t".to_string(),
+                    "@1".to_string(),
+                    "-F".to_string(),
+                    SIDEBAR_PANE_FORMAT.to_string(),
+                ],
+                vec![
+                    "select-pane".to_string(),
+                    "-t".to_string(),
+                    "%9".to_string(),
+                ],
+            ]
+        );
     }
 
     #[test]
@@ -1262,7 +1345,6 @@ mod tests {
         mock.stub(
             &[
                 "split-window",
-                "-d",
                 "-t",
                 "@1",
                 "-hbf",
@@ -1285,7 +1367,6 @@ mod tests {
         let calls = mock.calls();
         assert!(calls.contains(&vec![
             "split-window".to_string(),
-            "-d".to_string(),
             "-t".to_string(),
             "@1".to_string(),
             "-hbf".to_string(),
@@ -1295,7 +1376,6 @@ mod tests {
         ]));
         assert!(!calls.contains(&vec![
             "split-window".to_string(),
-            "-d".to_string(),
             "-t".to_string(),
             "@1".to_string(),
             "-hbf".to_string(),
@@ -1369,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_toggle_opens_sidebar_when_missing() {
+    fn focus_toggle_opens_missing_sidebar_as_the_focused_pane() {
         let mock = MockTmuxRunner::new();
         mock.stub(
             &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
@@ -1389,7 +1469,6 @@ mod tests {
         mock.stub(
             &[
                 "split-window",
-                "-d",
                 "-t",
                 "@1",
                 "-hbf",
@@ -1402,7 +1481,12 @@ mod tests {
 
         focus_toggle(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
-        assert_eq!(mock.calls().len(), 3);
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().any(|call| {
+            call.first().map(String::as_str) == Some("split-window")
+                && !call.iter().any(|argument| argument == "-d")
+        }));
     }
 
     #[test]
@@ -1426,7 +1510,6 @@ mod tests {
         mock.stub(
             &[
                 "split-window",
-                "-d",
                 "-t",
                 "@1",
                 "-hbf",
@@ -1504,7 +1587,6 @@ mod tests {
         mock.stub(
             &[
                 "split-window",
-                "-d",
                 "-t",
                 "@1",
                 "-hbf",
@@ -2079,6 +2161,45 @@ mod tests {
         toggle(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
 
         assert_eq!(mock.calls().len(), 4);
+    }
+
+    #[test]
+    fn toggle_opens_sidebar_as_the_focused_pane() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(
+            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
+            "%1\t\t80\n",
+        );
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "@1",
+                "-F",
+                "#{window_layout}",
+            ],
+            "layout-before\n",
+        );
+        mock.stub(
+            &[
+                "split-window",
+                "-t",
+                "@1",
+                "-hbf",
+                "-l",
+                "32",
+                "'/tmp/vt' sidebar attach",
+            ],
+            "",
+        );
+
+        toggle(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
+
+        assert!(mock.calls().iter().any(|call| {
+            call.first().map(String::as_str) == Some("split-window")
+                && !call.iter().any(|argument| argument == "-d")
+        }));
     }
 
     #[test]

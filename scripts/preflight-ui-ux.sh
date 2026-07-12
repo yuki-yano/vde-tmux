@@ -677,6 +677,9 @@ VT_PANE="$S2_AGENT" run_vt sidebar open --window "$S2_WINDOW" --width 35
 SIDEBAR_1="$(wait_sidebar "$S1_WINDOW")"
 SIDEBAR_2="$(wait_sidebar "$S2_WINDOW")"
 printf '%s\n%s\n' "$SIDEBAR_1" "$SIDEBAR_2" >"$ARTIFACT_DIR/sidebar-panes.txt"
+[[ "$(tmux_cmd display-message -p -t "$S1_WINDOW" '#{pane_id}')" == "$SIDEBAR_1" ]]
+[[ "$(tmux_cmd display-message -p -t "$S2_WINDOW" '#{pane_id}')" == "$SIDEBAR_2" ]]
+record sidebar-open-focus PASS-explicit-open-selects-created-sidebar
 
 REVISION_BEFORE_LOCAL="$(stable_snapshot_revision)"
 capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-before.txt"
@@ -734,7 +737,6 @@ VT_PANE="$S1_AGENT" run_vt sidebar focus-toggle --window "$S1_WINDOW"
 VT_PANE="$S1_AGENT" run_vt sidebar open --window "$S1_WINDOW" --width 35
 SIDEBAR_1="$(wait_sidebar "$S1_WINDOW")"
 printf 'reopened %s\n' "$SIDEBAR_1" >>"$ARTIFACT_DIR/sidebar-panes.txt"
-VT_PANE="$S1_AGENT" run_vt sidebar focus --window "$S1_WINDOW"
 for _ in $(seq 1 60); do
   [[ "$(client_field "$CLIENT_1" pane_id)" == "$SIDEBAR_1" ]] && break
   sleep 0.05

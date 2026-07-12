@@ -178,16 +178,7 @@ fn dispatch_sidebar_open_uses_layout_operations() {
         "layout-before\n",
     );
     mock.stub(
-        &[
-            "split-window",
-            "-d",
-            "-t",
-            "@1",
-            "-hbf",
-            "-l",
-            "40",
-            &command,
-        ],
+        &["split-window", "-t", "@1", "-hbf", "-l", "40", &command],
         "",
     );
     mock.stub(
@@ -406,16 +397,7 @@ fn dispatch_sidebar_open_accepts_percent_width() {
         &format!("{layout}\n"),
     );
     mock.stub(
-        &[
-            "split-window",
-            "-d",
-            "-t",
-            "@1",
-            "-hbf",
-            "-l",
-            "64",
-            &command,
-        ],
+        &["split-window", "-t", "@1", "-hbf", "-l", "64", &command],
         "",
     );
 
@@ -829,16 +811,7 @@ fn focus_toggle_loads_active_config_only_when_opening_a_missing_sidebar() {
     let exe = std::env::current_exe().unwrap();
     let command = sidebar_attach_command_for_selection_test(&exe);
     mock.stub(
-        &[
-            "split-window",
-            "-d",
-            "-t",
-            "@1",
-            "-hbf",
-            "-l",
-            "52",
-            &command,
-        ],
+        &["split-window", "-t", "@1", "-hbf", "-l", "52", &command],
         "",
     );
     let config_loaded = std::cell::Cell::new(0_u8);
@@ -860,7 +833,6 @@ fn focus_toggle_loads_active_config_only_when_opening_a_missing_sidebar() {
     assert_eq!(config_loaded.get(), 1);
     assert!(mock.calls().contains(&vec![
         "split-window".to_string(),
-        "-d".to_string(),
         "-t".to_string(),
         "@1".to_string(),
         "-hbf".to_string(),
