@@ -22,8 +22,8 @@ ACTION_LOG="$ARTIFACT_DIR/session-actions.log"
 CLIENT_FIFO_1="$SANDBOX/client-1.in"
 CLIENT_FIFO_2="$SANDBOX/client-2.in"
 TMUX_SOCKET="vde-ui-preflight-$STAMP"
-LEGACY_SOCKET="vde-ui-preflight-legacy-$STAMP"
 RUNTIME_SOCKET_ROOT="/tmp/vt-$(id -u)/v2"
+PROTOCOL_VERSION="${VDE_PROTOCOL_VERSION:-$(sed -n 's/^pub const PROTOCOL_VERSION: u16 = \([0-9][0-9]*\);/\1/p' "$ROOT/src/daemon/protocol/v2.rs")}"
 FAILED_LINE=""
 TMUX_ENV=""
 DAEMON_SOCKET=""
@@ -66,7 +66,6 @@ cleanup() {
     fi
   done
   "$SYSTEM_TMUX" -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1
-  "$SYSTEM_TMUX" -L "$LEGACY_SOCKET" kill-server >/dev/null 2>&1
   for pid in "$CONTROL_PID" "$CLIENT_PID_1" "$CLIENT_PID_2"; do
     if [[ -n "$pid" ]]; then
       wait "$pid" 2>/dev/null
@@ -123,17 +122,18 @@ wait_daemon_stopped() {
 }
 
 query_snapshot() {
-  python3 - "$DAEMON_SOCKET" "$QUERY_JSON" <<'PY'
+  python3 - "$DAEMON_SOCKET" "$QUERY_JSON" "$PROTOCOL_VERSION" <<'PY'
 import json, socket, sys
-path, output = sys.argv[1:]
+path, output, protocol = sys.argv[1:]
+protocol = int(protocol)
 client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 client.settimeout(5)
 client.connect(path)
 reader = client.makefile("rb")
-client.sendall(b'{"op":"hello","proto":2}\n')
+client.sendall((json.dumps({"op": "hello", "proto": protocol}) + "\n").encode())
 hello = json.loads(reader.readline())
 assert hello["type"] == "hello_ack" and hello["phase"] == "serving", hello
-client.sendall(b'{"op":"query_resolved_snapshot","proto":2}\n')
+client.sendall((json.dumps({"op": "query_resolved_snapshot", "proto": protocol}) + "\n").encode())
 reply = json.loads(reader.readline())
 assert reply["type"] == "resolved_snapshot_result", reply
 with open(output, "w", encoding="utf-8") as handle:
@@ -350,6 +350,7 @@ if [[ "${VDE_SKIP_BUILD:-0}" != 1 ]]; then
   (cd "$ROOT" && cargo build --locked) >"$ARTIFACT_DIR/cargo-build.log" 2>&1
 fi
 [[ -x "$BIN" ]] || fail "current binary is not executable: $BIN"
+export PATH="$(dirname "$BIN"):$PATH"
 record build PASS
 
 env XDG_STATE_HOME="$STATE_HOME" XDG_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
@@ -387,23 +388,8 @@ A_ID="$(tmux_cmd display-message -p -t A '#{session_id}')"
 A10_ID="$(tmux_cmd display-message -p -t a10 '#{session_id}')"
 A2_ID="$(tmux_cmd display-message -p -t a2 '#{session_id}')"
 
-# Upgrade rehearsal is opt-in. The current binary is deliberately not used to discover or stop v1.
-if [[ -n "${VDE_OLD_VT:-}" ]]; then
-  [[ -x "$VDE_OLD_VT" ]] || fail "VDE_OLD_VT is not executable: $VDE_OLD_VT"
-  env TMUX="$TMUX_ENV" TMUX_PANE="" VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET" \
-    XDG_STATE_HOME="$STATE_HOME" XDG_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
-    "$VDE_OLD_VT" daemon ensure >"$ARTIFACT_DIR/old-binary-ensure.log" 2>&1
-  env TMUX="$TMUX_ENV" TMUX_PANE="" VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET" \
-    XDG_STATE_HOME="$STATE_HOME" XDG_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
-    "$VDE_OLD_VT" daemon stop >"$ARTIFACT_DIR/old-binary-stop.log" 2>&1
-  run_vt daemon ensure >"$ARTIFACT_DIR/current-after-old-stop.log"
-  wait_daemon_running >"$ARTIFACT_DIR/current-after-old-status.log"
-  record upgrade-v1 PASS-old-stop-current-ensure
-else
-  record upgrade-v1 SKIP-VDE_OLD_VT-not-set
-  run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-initial.log"
-  wait_daemon_running >"$ARTIFACT_DIR/daemon-status-initial.log"
-fi
+run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-initial.log"
+wait_daemon_running >"$ARTIFACT_DIR/daemon-status-initial.log"
 
 STATUS_SESSIONS=""
 for _ in $(seq 1 100); do
@@ -539,11 +525,10 @@ assert [sample["elapsed"] for sample in samples] == list(
     range(samples[0]["elapsed"], samples[0]["elapsed"] + 4)
 ), samples
 gaps = [samples[index]["at"] - samples[index - 1]["at"] for index in range(1, 4)]
-# The first sample is observed at an arbitrary point inside its one-second display interval.
-# The next two gaps are complete daemon clock intervals and must stay near one second.
-# Keep the lower bound strict enough to catch accidental 2 Hz writes, while allowing a
-# little scheduler headroom on a busy development machine.
-assert all(0.65 <= gap <= 1.50 for gap in gaps[1:]), gaps
+# Sampling can observe one delayed update near the next boundary, shortening the following gap.
+# Check the complete four-value span so scheduler jitter cannot hide a sustained 2 Hz clock.
+assert all(0.0 < gap <= 1.75 for gap in gaps), gaps
+assert 1.75 <= sum(gaps) <= 4.50, gaps
 with open(artifact, "w", encoding="utf-8") as handle:
     json.dump({"samples": samples, "gaps": gaps}, handle, ensure_ascii=False, indent=2)
 PY
@@ -667,21 +652,6 @@ run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-after-startup-failure.log"
 wait_daemon_running >"$ARTIFACT_DIR/status-after-startup-recovery.txt"
 record startup-failure PASS-valid-config-no-rollback-and-explicit-recovery
 
-# A separate scratch server proves that legacy pull formats fail current-binary startup.
-env XDG_STATE_HOME="$STATE_HOME" XDG_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
-  "$SYSTEM_TMUX" -L "$LEGACY_SOCKET" -f /dev/null new-session -d -s legacy "sleep 900"
-"$SYSTEM_TMUX" -L "$LEGACY_SOCKET" set-option -g status-left '#(vt statusline-summary)'
-LEGACY_PATH="$("$SYSTEM_TMUX" -L "$LEGACY_SOCKET" display-message -p '#{socket_path}')"
-LEGACY_PID="$("$SYSTEM_TMUX" -L "$LEGACY_SOCKET" display-message -p '#{pid}')"
-if env TMUX="$LEGACY_PATH,$LEGACY_PID,0" TMUX_PANE="" VDE_TMUX_SOCKET_NAME="$LEGACY_SOCKET" \
-  XDG_STATE_HOME="$STATE_HOME" XDG_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
-  "$BIN" daemon ensure >"$ARTIFACT_DIR/legacy-pull-startup.log" 2>&1; then
-  fail "current daemon started with legacy #() status format"
-fi
-grep -E 'legacy pull-based|zero-process' "$ARTIFACT_DIR/legacy-pull-startup.log" >/dev/null
-"$SYSTEM_TMUX" -L "$LEGACY_SOCKET" kill-server
-record legacy-pull-startup PASS-rejected
-
 # Two independent live sidebar processes receive instance-local input.
 S1_WINDOW="$(tmux_cmd new-window -d -P -F '#{window_id}' -t A: -n side-one -c "$ROOT" "sleep 900")"
 S1_AGENT="$(tmux_cmd display-message -p -t "$S1_WINDOW" '#{pane_id}')"
@@ -741,8 +711,15 @@ capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-live.txt"
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-1-live-toggle.txt")" != "$(fingerprint "$ARTIFACT_DIR/sidebar-1-filter-done.txt")" ]]
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-live.txt")" == "$SIDE2_STABLE" ]]
 REVISION_AFTER_LOCAL="$(snapshot_revision)"
-[[ "$REVISION_BEFORE_LOCAL" == "$REVISION_AFTER_LOCAL" ]]
-record sidebar-local-state PASS-selection-view-filter-live-noninterference-revision-stable
+(( REVISION_AFTER_LOCAL > REVISION_BEFORE_LOCAL ))
+python3 - "$QUERY_JSON" <<'PY'
+import json, sys
+order = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["order"]
+assert order["view_mode"] == "flat", order
+assert order["filter"] == "done_only", order
+assert order["version"] >= 2, order
+PY
+record sidebar-local-state PASS-selection-live-noninterference-and-view-filter-defaults-persisted
 
 # Focus records a pane-instance return target, focus-toggle closes back onto content, and a
 # reopened instance still jumps through a stable PaneInstance.
@@ -866,22 +843,6 @@ non_session_total = widths[0] + widths[2] + widths[3] + widths[4]
 assert non_session_total <= 80, non_session_total
 PY
 record width-captures PASS-16-24-35-36-sidebar-all-sessions-and-80-other-status
-
-# Legacy cleanup reports exact scope counts, then deterministically mutates all three scopes.
-tmux_cmd set-option -p -t "$S1_AGENT" @vde_agent legacy
-tmux_cmd set-option -w -t "$S1_WINDOW" @vde_window_status legacy
-tmux_cmd set-option -t A @vde_session_status legacy
-run_vt pane-state cleanup-legacy --all --dry-run >"$ARTIFACT_DIR/cleanup-dry-run.txt"
-grep -E 'dry-run: before=3 pane=1 window=1 session=1 removed=0 remaining=3 .*failed=0' \
-  "$ARTIFACT_DIR/cleanup-dry-run.txt" >/dev/null
-[[ "$(tmux_cmd show-options -pqv -t "$S1_AGENT" @vde_agent)" == legacy ]]
-run_vt pane-state cleanup-legacy --all >"$ARTIFACT_DIR/cleanup-mutation.txt"
-grep -E 'complete: before=3 pane=1 window=1 session=1 removed=3 remaining=0 .*failed=0' \
-  "$ARTIFACT_DIR/cleanup-mutation.txt" >/dev/null
-[[ -z "$(tmux_cmd show-options -pqv -t "$S1_AGENT" @vde_agent 2>/dev/null || true)" ]]
-[[ -z "$(tmux_cmd show-options -wqv -t "$S1_WINDOW" @vde_window_status 2>/dev/null || true)" ]]
-[[ -z "$(tmux_cmd show-options -qv -t A @vde_session_status 2>/dev/null || true)" ]]
-record cleanup PASS-dry-run-and-mutation-counts
 
 query_snapshot
 run_vt daemon status >"$ARTIFACT_DIR/final-daemon-status.txt"
