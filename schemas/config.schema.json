@@ -134,6 +134,32 @@
       },
       "type": "object"
     },
+    "session_manager": {
+      "additionalProperties": false,
+      "properties": {
+        "kill": {
+          "additionalProperties": false,
+          "properties": {
+            "kill_wait_ms": {
+              "default": 300,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "send_ctrl_c": {
+              "default": true,
+              "type": "boolean"
+            },
+            "term_wait_ms": {
+              "default": 300,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
     "sidebar": {
       "additionalProperties": true,
       "properties": {
@@ -453,9 +479,18 @@
           "type": "object"
         },
         "summary": {
-          "additionalProperties": true,
+          "additionalProperties": false,
           "properties": {
             "enabled": {
+              "default": true,
+              "type": "boolean"
+            },
+            "format": {
+              "default": "{badge} {count}",
+              "type": "string"
+            },
+            "hide_idle": {
+              "default": false,
               "type": "boolean"
             }
           },

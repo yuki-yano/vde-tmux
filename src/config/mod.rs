@@ -16,6 +16,31 @@ pub struct Config {
     pub badge: BadgeConfig,
     pub notify: NotifyConfig,
     pub popup: PopupConfig,
+    pub session_manager: SessionManagerConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionManagerConfig {
+    pub kill: SessionManagerKillConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionManagerKillConfig {
+    pub send_ctrl_c: bool,
+    pub term_wait_ms: u64,
+    pub kill_wait_ms: u64,
+}
+
+impl Default for SessionManagerKillConfig {
+    fn default() -> Self {
+        Self {
+            send_ctrl_c: true,
+            term_wait_ms: 300,
+            kill_wait_ms: 300,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -274,6 +299,7 @@ impl Default for StatuslineCategoryConfig {
 pub struct SummaryConfig {
     pub enabled: bool,
     pub hide_idle: bool,
+    pub format: String,
 }
 
 impl Default for SummaryConfig {
@@ -281,6 +307,7 @@ impl Default for SummaryConfig {
         Self {
             enabled: true,
             hide_idle: false,
+            format: "{badge} {count}".to_string(),
         }
     }
 }
@@ -668,6 +695,8 @@ mod tests {
         let config: Config = serde_yaml_ng::from_str("").unwrap_or_default();
         assert_eq!(config, Config::default());
         assert!(config.statusline.summary.enabled);
+        assert!(!config.statusline.summary.hide_idle);
+        assert_eq!(config.statusline.summary.format, "{badge} {count}");
         assert_eq!(config.daemon.poll_ms, 1000);
         assert_eq!(config.daemon.done_clear_on, DoneClearOn::Window);
         assert_eq!(config.daemon.git.timeout_ms, 500);
@@ -675,7 +704,48 @@ mod tests {
         assert_eq!(config.sidebar.min_width, 40);
         assert_eq!(config.popup.width, "50%");
         assert_eq!(config.popup.height, "50%");
+        assert!(config.session_manager.kill.send_ctrl_c);
+        assert_eq!(config.session_manager.kill.term_wait_ms, 300);
+        assert_eq!(config.session_manager.kill.kill_wait_ms, 300);
         assert_eq!(config.statusline.category.mode, "list");
+    }
+
+    #[test]
+    fn session_manager_kill_config_parses_overrides_and_rejects_unknown_fields() {
+        let config: Config = serde_yaml_ng::from_str(
+            "session_manager:\n  kill:\n    send_ctrl_c: false\n    term_wait_ms: 125\n    kill_wait_ms: 250\n",
+        )
+        .unwrap();
+        assert!(!config.session_manager.kill.send_ctrl_c);
+        assert_eq!(config.session_manager.kill.term_wait_ms, 125);
+        assert_eq!(config.session_manager.kill.kill_wait_ms, 250);
+
+        let error =
+            serde_yaml_ng::from_str::<Config>("session_manager:\n  kill:\n    unexpected: true\n")
+                .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn statusline_summary_format_defaults_and_can_be_overridden() {
+        let defaulted = serde_yaml_ng::from_str::<Config>(
+            "statusline:\n  summary:\n    enabled: false\n    hide_idle: true\n",
+        )
+        .unwrap();
+        assert!(!defaulted.statusline.summary.enabled);
+        assert!(defaulted.statusline.summary.hide_idle);
+        assert_eq!(defaulted.statusline.summary.format, "{badge} {count}");
+
+        let overridden = serde_yaml_ng::from_str::<Config>(
+            "statusline:\n  summary:\n    format: \"{count}{badge}\"\n",
+        )
+        .unwrap();
+        assert_eq!(overridden.statusline.summary.format, "{count}{badge}");
+
+        let unknown =
+            serde_yaml_ng::from_str::<Config>("statusline:\n  summary:\n    separator: \" | \"\n")
+                .unwrap_err();
+        assert!(unknown.to_string().contains("unknown field `separator`"));
     }
 
     #[test]

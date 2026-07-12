@@ -65,15 +65,32 @@ pub fn config_schema() -> Value {
                     "height": { "type": "string" }
                 }
             },
+            "session_manager": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "kill": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "send_ctrl_c": { "type": "boolean", "default": true },
+                            "term_wait_ms": { "type": "integer", "minimum": 0, "default": 300 },
+                            "kill_wait_ms": { "type": "integer", "minimum": 0, "default": 300 }
+                        }
+                    }
+                }
+            },
             "statusline": {
                 "type": "object",
                 "additionalProperties": true,
                 "properties": {
                     "summary": {
                         "type": "object",
-                        "additionalProperties": true,
+                        "additionalProperties": false,
                         "properties": {
-                            "enabled": { "type": "boolean" }
+                            "enabled": { "type": "boolean", "default": true },
+                            "hide_idle": { "type": "boolean", "default": false },
+                            "format": { "type": "string", "default": "{badge} {count}" }
                         }
                     },
                     "sessions": {
@@ -553,6 +570,16 @@ mod tests {
             schema["properties"]["statusline"]["properties"]["summary"]["properties"]["enabled"]["type"],
             "boolean"
         );
+        let summary = &schema["properties"]["statusline"]["properties"]["summary"]["properties"];
+        assert_eq!(
+            schema["properties"]["statusline"]["properties"]["summary"]["additionalProperties"],
+            false
+        );
+        assert_eq!(summary["enabled"]["default"], true);
+        assert_eq!(summary["hide_idle"]["type"], "boolean");
+        assert_eq!(summary["hide_idle"]["default"], false);
+        assert_eq!(summary["format"]["type"], "string");
+        assert_eq!(summary["format"]["default"], "{badge} {count}");
         assert_eq!(
             schema["properties"]["statusline"]["properties"]["category"]["properties"]["inactive_format"]
                 ["type"],
