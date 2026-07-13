@@ -45,12 +45,9 @@ pub fn switch_statusline_session(
         crate::options::KEY_STATUS_SESSIONS,
         "session:",
     )?;
-    let target = targets.get(index).ok_or_else(|| {
-        anyhow!(
-            "displayed session index {} is no longer available; wait for the status line to redraw",
-            index + 1
-        )
-    })?;
+    let Some(target) = targets.get(index) else {
+        return Ok(());
+    };
     validate_tmux_target(target, '$', "session")?;
     runner.run(&["switch-client", "-c", client_name, "-t", target])?;
     Ok(())
@@ -2963,7 +2960,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_session_index_returns_error_without_switching() {
+    fn stale_session_index_succeeds_without_switching() {
         let mock = MockTmuxRunner::new();
         mock.stub(
             &[
@@ -2976,9 +2973,8 @@ mod tests {
             "#[range=user|session:$1] alpha #[norange]\n",
         );
 
-        let error = switch_statusline_session(&mock, "client", "$1", 1).unwrap_err();
+        switch_statusline_session(&mock, "client", "$1", 1).unwrap();
 
-        assert!(error.to_string().contains("no longer available"));
         assert!(
             mock.calls()
                 .iter()

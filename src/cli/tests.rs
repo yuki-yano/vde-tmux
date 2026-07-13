@@ -823,7 +823,7 @@ fn daemon_status_reports_handshake_without_sending_a_mutation() {
 }
 
 #[test]
-fn dispatch_statusline_sessions_switch_missing_index_is_an_error_without_wrong_target() {
+fn dispatch_statusline_sessions_switch_missing_index_succeeds_without_wrong_target() {
     let mock = MockTmuxRunner::new();
     stub_action_client(&mock, "client-1", "$1");
     mock.stub(
@@ -837,7 +837,7 @@ fn dispatch_statusline_sessions_switch_missing_index_is_an_error_without_wrong_t
         "#[range=user|session:$1] main #[norange]",
     );
 
-    let error = run_with(
+    let output = run_with(
         [
             "vt",
             "statusline-sessions",
@@ -849,9 +849,9 @@ fn dispatch_statusline_sessions_switch_missing_index_is_an_error_without_wrong_t
         &mock,
         &tmux_env(),
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(error.to_string().contains("no longer available"));
+    assert!(output.is_none());
     assert!(
         mock.calls()
             .iter()
