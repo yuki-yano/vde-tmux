@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
+use sha2::{Digest, Sha256};
 
 use crate::config::{
     AgentBadgeConfig, BadgeConfig, BadgeGlyphs, BadgeStyle, Config, SegmentColors, SegmentStyle,
@@ -18,6 +19,12 @@ use crate::tmux::TmuxRunner;
 use crate::window::select_window;
 
 pub(crate) const STATUS_OPTION_CELL_BUDGET: usize = 80;
+const CATEGORY_RANGE_PREFIX: &str = "c:";
+const CURRENT_CATEGORY_RANGE_PREFIX: &str = "C:";
+// tmux stores `range=user|X` names in a 16-byte buffer, so X is limited to 15 bytes.
+// A 9-byte digest becomes 12 base64url bytes and leaves one byte of headroom after the prefix.
+const CATEGORY_TARGET_DIGEST_BYTES: usize = 9;
+const TMUX_USER_RANGE_NAME_MAX_BYTES: usize = 15;
 
 #[derive(Debug)]
 struct StatusToken {
@@ -99,8 +106,15 @@ pub fn switch_statusline_category(
                 index + 1
             )
         })?;
-    let category = decode_category_key(target)?;
-    crate::session::use_category_for_client(runner, config, &category, client_name)
+    let sessions = crate::session::list_sessions(runner)?;
+    let category = resolve_category_target(config, &sessions, target)?;
+    crate::session::use_category_for_client_from_sessions(
+        runner,
+        config,
+        &sessions,
+        &category,
+        client_name,
+    )
 }
 
 pub fn cycle_statusline_category(
@@ -163,17 +177,15 @@ pub fn handle_statusline_click(
         runner.run(&["switch-client", "-c", client_name, "-t", target])?;
         return Ok(());
     }
-    if let Some(target) = range.strip_prefix("category:") {
-        let category = decode_category_key(target)?;
+    if let Some(target) = range.strip_prefix(CATEGORY_RANGE_PREFIX) {
         let client_name = client_name
             .ok_or_else(|| anyhow!("category click is missing an invoking tmux client"))?;
-        return crate::session::use_category_for_client(runner, config, &category, client_name);
+        return switch_category_target(runner, config, client_name, target);
     }
-    if let Some(target) = range.strip_prefix("category-current:") {
-        let category = decode_category_key(target)?;
+    if let Some(target) = range.strip_prefix(CURRENT_CATEGORY_RANGE_PREFIX) {
         let client_name = client_name
             .ok_or_else(|| anyhow!("category click is missing an invoking tmux client"))?;
-        return crate::session::use_category_for_client(runner, config, &category, client_name);
+        return switch_category_target(runner, config, client_name, target);
     }
     if range.starts_with('$') {
         validate_tmux_target(range, '$', "session")?;
@@ -185,26 +197,63 @@ pub fn handle_statusline_click(
     Ok(())
 }
 
-pub fn encode_category_key(category: &str) -> Result<String> {
+pub(crate) fn category_target_key(category: &str) -> Result<String> {
     if category.len() > 256 {
         return Err(anyhow!("category key exceeds 256 UTF-8 bytes"));
     }
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(category.as_bytes()))
+    let digest = Sha256::digest(category.as_bytes());
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(&digest[..CATEGORY_TARGET_DIGEST_BYTES]))
 }
 
-pub fn decode_category_key(encoded: &str) -> Result<String> {
+fn validate_category_target(target: &str) -> Result<()> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
+        .decode(target)
         .map_err(|error| anyhow!("invalid category target encoding: {error}"))?;
-    if bytes.len() > 256 {
-        return Err(anyhow!("category key exceeds 256 UTF-8 bytes"));
+    if bytes.len() != CATEGORY_TARGET_DIGEST_BYTES
+        || base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes) != target
+    {
+        return Err(anyhow!("invalid category target encoding"));
     }
-    if base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes) != encoded {
-        return Err(anyhow!(
-            "category target encoding is not canonical base64url"
-        ));
+    Ok(())
+}
+
+fn resolve_category_target(
+    config: &Config,
+    sessions: &[crate::session::SessionInfo],
+    target: &str,
+) -> Result<String> {
+    validate_category_target(target)?;
+    let matches = crate::category::sorted_effective_categories(config, sessions)
+        .into_iter()
+        .filter(|category| category_target_key(category).is_ok_and(|candidate| candidate == target))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [category] => Ok(category.clone()),
+        [] => Err(anyhow!(
+            "displayed category target is no longer available; wait for the status line to redraw"
+        )),
+        _ => Err(anyhow!(
+            "category target collision; rename one of the colliding categories"
+        )),
     }
-    String::from_utf8(bytes).map_err(|error| anyhow!("category target is not UTF-8: {error}"))
+}
+
+fn switch_category_target(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    client_name: &str,
+    target: &str,
+) -> Result<()> {
+    let sessions = crate::session::list_sessions(runner)?;
+    let category = resolve_category_target(config, &sessions, target)?;
+    crate::session::use_category_for_client_from_sessions(
+        runner,
+        config,
+        &sessions,
+        &category,
+        client_name,
+    )
 }
 
 fn displayed_targets(
@@ -250,7 +299,7 @@ fn displayed_category_targets(
     let mut targets = Vec::new();
     let mut current = None;
     for range in top_level_user_ranges(&rendered)? {
-        if let Some(target) = range.strip_prefix("category-current:") {
+        if let Some(target) = range.strip_prefix(CURRENT_CATEGORY_RANGE_PREFIX) {
             if targets.iter().any(|existing| existing == target) {
                 return Err(anyhow!(
                     "{option} contains duplicate category targets; wait for redraw"
@@ -262,7 +311,7 @@ fn displayed_category_targets(
                 ));
             }
             targets.push(target.to_string());
-        } else if let Some(target) = range.strip_prefix("category:") {
+        } else if let Some(target) = range.strip_prefix(CATEGORY_RANGE_PREFIX) {
             if targets.iter().any(|existing| existing == target) {
                 return Err(anyhow!(
                     "{option} contains duplicate category targets; wait for redraw"
@@ -646,6 +695,7 @@ fn structured_category_tokens(
     if config.statusline.category.mode == "current" {
         categories.retain(|category| category.active);
     }
+    let mut seen_targets = std::collections::BTreeSet::new();
     categories
         .into_iter()
         .enumerate()
@@ -700,12 +750,18 @@ fn structured_category_tokens(
             } else {
                 tmux_style_category(&config.statusline.category, &body, active)
             };
-            let target = encode_category_key(&category.category)?;
+            let target = category_target_key(&category.category)?;
+            if !seen_targets.insert(target.clone()) {
+                return Err(anyhow!(
+                    "category target collision; rename one of the colliding categories"
+                ));
+            }
             let range = if active {
-                format!("category-current:{target}")
+                format!("{CURRENT_CATEGORY_RANGE_PREFIX}{target}")
             } else {
-                format!("category:{target}")
+                format!("{CATEGORY_RANGE_PREFIX}{target}")
             };
+            debug_assert!(range.len() <= TMUX_USER_RANGE_NAME_MAX_BYTES);
             let compact_label = format!("cat:{}", index + 1);
             Ok(StatusToken {
                 compact: format!("#[range=user|{range}]{compact_label}#[norange]"),
@@ -1908,8 +1964,8 @@ mod tests {
         );
         assert!(
             rendered.category.contains(&format!(
-                "range=user|category-current:{}",
-                encode_category_key("work").unwrap()
+                "range=user|C:{}",
+                category_target_key("work").unwrap()
             )),
             "{}",
             rendered.category
@@ -2201,7 +2257,7 @@ mod tests {
             "{}",
             rendered.category
         );
-        assert!(rendered.category.contains("range=user|category-current:"));
+        assert!(rendered.category.contains("range=user|C:"));
         assert!(rendered.attention.contains('▲'), "{}", rendered.attention);
         for label in ["日本語セッション0🚀", "編集ウィンドウ0🪟", "カテゴリ0🚀"]
         {
@@ -2383,7 +2439,7 @@ mod tests {
             "{}",
             rendered.attention
         );
-        assert!(rendered.category.contains("category-current:"));
+        assert!(rendered.category.contains("range=user|C:"));
         assert!(rendered.sessions.contains("range=user|session:$1"));
         assert!(rendered.windows.contains("range=user|window:@1"));
         let total = [
@@ -2448,7 +2504,7 @@ mod tests {
         assert!(rendered.sessions.contains(&"界🚀".repeat(100)));
         assert!(rendered.windows.contains("range=user|window:@77"));
         assert!(rendered.windows.contains("@77"));
-        assert!(rendered.category.contains("range=user|category-current:"));
+        assert!(rendered.category.contains("range=user|C:"));
         assert!(rendered.category.contains("cat:"));
         assert!(tmux_display_width(&rendered.sessions) > 80);
         for option in [&rendered.windows, &rendered.category] {
@@ -2630,8 +2686,8 @@ mod tests {
         assert!(tokens[0].compact.contains("cat:1"));
         assert!(tokens[1].compact.contains("cat:2"));
         assert_ne!(tokens[0].compact, tokens[1].compact);
-        assert!(tokens[0].compact.contains("category-current:"));
-        assert!(tokens[1].compact.contains("category-current:"));
+        assert!(tokens[0].compact.contains("range=user|C:"));
+        assert!(tokens[1].compact.contains("range=user|C:"));
     }
 
     #[test]
@@ -2933,8 +2989,8 @@ mod tests {
     #[test]
     fn category_cycle_origin_comes_only_from_the_published_display_model() {
         let mock = MockTmuxRunner::new();
-        let work = encode_category_key("work").unwrap();
-        let personal = encode_category_key("personal").unwrap();
+        let work = category_target_key("work").unwrap();
+        let personal = category_target_key("personal").unwrap();
         mock.stub(
             &[
                 "show-option",
@@ -2944,7 +3000,7 @@ mod tests {
                 crate::options::KEY_STATUS_CATEGORY,
             ],
             &format!(
-                "#[range=user|category:{personal}] personal #[norange]#[range=user|category-current:{work}] work #[norange]\n"
+                "#[range=user|c:{personal}] personal #[norange]#[range=user|C:{work}] work #[norange]\n"
             ),
         );
 
@@ -2962,7 +3018,7 @@ mod tests {
     #[test]
     fn category_cycle_rejects_a_display_without_one_active_target() {
         let mock = MockTmuxRunner::new();
-        let work = encode_category_key("work").unwrap();
+        let work = category_target_key("work").unwrap();
         mock.stub(
             &[
                 "show-option",
@@ -2971,7 +3027,7 @@ mod tests {
                 "$1",
                 crate::options::KEY_STATUS_CATEGORY,
             ],
-            &format!("#[range=user|category:{work}] work #[norange]\n"),
+            &format!("#[range=user|c:{work}] work #[norange]\n"),
         );
 
         let error = displayed_category_targets(&mock, "$1").unwrap_err();
@@ -2979,7 +3035,7 @@ mod tests {
         assert!(error.to_string().contains("no active category"));
 
         let mock = MockTmuxRunner::new();
-        let personal = encode_category_key("personal").unwrap();
+        let personal = category_target_key("personal").unwrap();
         mock.stub(
             &[
                 "show-option",
@@ -2989,7 +3045,7 @@ mod tests {
                 crate::options::KEY_STATUS_CATEGORY,
             ],
             &format!(
-                "#[range=user|category-current:{work}] one #[norange]#[range=user|category-current:{personal}] two #[norange]\n"
+                "#[range=user|C:{work}] one #[norange]#[range=user|C:{personal}] two #[norange]\n"
             ),
         );
         let error = displayed_category_targets(&mock, "$1").unwrap_err();
@@ -3092,20 +3148,26 @@ mod tests {
     }
 
     #[test]
-    fn category_target_round_trips_special_utf8_and_uncategorized() {
-        for category in ["", "work space:|#日本語"] {
-            let encoded = encode_category_key(category).unwrap();
-            assert_eq!(decode_category_key(&encoded).unwrap(), category);
+    fn category_target_is_fixed_length_for_special_utf8_and_uncategorized() {
+        for category in ["", "public", "work space:|#日本語"] {
+            let encoded = category_target_key(category).unwrap();
+            assert_eq!(encoded.len(), 12);
+            validate_category_target(&encoded).unwrap();
             assert!(
                 encoded
                     .bytes()
                     .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') })
             );
+            assert!(
+                format!("{CATEGORY_RANGE_PREFIX}{encoded}").len() <= TMUX_USER_RANGE_NAME_MAX_BYTES
+            );
+            assert!(
+                format!("{CURRENT_CATEGORY_RANGE_PREFIX}{encoded}").len()
+                    <= TMUX_USER_RANGE_NAME_MAX_BYTES
+            );
         }
-        assert!(encode_category_key(&"x".repeat(257)).is_err());
-        let oversized = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("x".repeat(257));
-        assert!(decode_category_key(&oversized).is_err());
-        assert!(decode_category_key("QR").is_err());
+        assert!(category_target_key(&"x".repeat(257)).is_err());
+        assert!(validate_category_target("QR").is_err());
     }
 
     #[test]

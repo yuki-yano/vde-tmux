@@ -1010,13 +1010,13 @@ fn dispatch_session_actions_fail_closed_when_shared_pane_scope_is_omitted() {
 
 #[test]
 fn dispatch_category_cycle_uses_explicit_scope_when_a_pane_is_shared() {
-    let alpha = crate::statusline::encode_category_key("alpha").unwrap();
-    let beta = crate::statusline::encode_category_key("beta").unwrap();
-    let gamma = crate::statusline::encode_category_key("gamma").unwrap();
+    let alpha = crate::statusline::category_target_key("alpha").unwrap();
+    let beta = crate::statusline::category_target_key("beta").unwrap();
+    let gamma = crate::statusline::category_target_key("gamma").unwrap();
     let rendered = format!(
-        "#[range=user|category:{alpha}] alpha #[norange]\
-         #[range=user|category-current:{beta}] beta #[norange]\
-         #[range=user|category:{gamma}] gamma #[norange]"
+        "#[range=user|c:{alpha}] alpha #[norange]\
+         #[range=user|C:{beta}] beta #[norange]\
+         #[range=user|c:{gamma}] gamma #[norange]"
     );
 
     for (command, target_category, target_session) in
@@ -1078,7 +1078,7 @@ fn dispatch_category_click_uses_explicit_scope_when_a_pane_is_shared() {
     let mock = &fixture.mock;
     stub_shared_action_clients(mock);
     stub_category_switch(mock, "client-2", "alpha", "a");
-    let alpha = crate::statusline::encode_category_key("alpha").unwrap();
+    let alpha = crate::statusline::category_target_key("alpha").unwrap();
 
     run_with(
         [
@@ -1088,7 +1088,7 @@ fn dispatch_category_click_uses_explicit_scope_when_a_pane_is_shared() {
             "client-2",
             "--session-id",
             "$2",
-            &format!("category:{alpha}"),
+            &format!("c:{alpha}"),
         ],
         mock,
         &fixture.env,
@@ -1109,10 +1109,12 @@ fn dispatch_category_click_uses_explicit_scope_when_a_pane_is_shared() {
 
 #[test]
 fn dispatch_category_actions_fail_closed_when_shared_pane_scope_is_omitted() {
+    let alpha = crate::statusline::category_target_key("alpha").unwrap();
+    let click = format!("c:{alpha}");
     for args in [
         vec!["vt", "category", "next"],
         vec!["vt", "category", "prev"],
-        vec!["vt", "statusline-click", "category:YWxwaGE"],
+        vec!["vt", "statusline-click", click.as_str()],
     ] {
         let mock = MockTmuxRunner::new();
         stub_shared_action_clients(&mock);
@@ -1273,35 +1275,39 @@ fn dispatch_statusline_click_routes_session_range() {
 }
 
 #[test]
-fn dispatch_statusline_click_routes_stable_category_target() {
-    let mut fixture = spawn_active_config_guard_fixture();
-    fixture
-        .env
-        .insert("TMUX_PANE".to_string(), "%1".to_string());
-    let mock = &fixture.mock;
-    stub_action_client(mock, "abc", "$1");
-    let format = crate::session::session_list_format();
-    mock.stub(
-        &["list-sessions", "-F", &format],
-        "a\u{1f}1\u{1f}100\u{1f}alpha\u{1f}\u{1f}\u{1f}$1\nb\u{1f}1\u{1f}100\u{1f}beta\u{1f}\u{1f}\u{1f}$2\n",
-    );
-    mock.stub(&["show-option", "-gqv", "@vde_client_616263_beta"], "");
-    mock.stub(&["switch-client", "-c", "abc", "-t", "=b:"], "");
-    mock.stub(&["set-option", "-g", "@vde_client_616263_beta", "b"], "");
+fn dispatch_statusline_click_routes_active_and_inactive_category_targets() {
+    for prefix in ["c:", "C:"] {
+        let mut fixture = spawn_active_config_guard_fixture();
+        fixture
+            .env
+            .insert("TMUX_PANE".to_string(), "%1".to_string());
+        let mock = &fixture.mock;
+        stub_action_client(mock, "abc", "$1");
+        let format = crate::session::session_list_format();
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "a\u{1f}1\u{1f}100\u{1f}alpha\u{1f}\u{1f}\u{1f}$1\nb\u{1f}1\u{1f}100\u{1f}beta\u{1f}\u{1f}\u{1f}$2\n",
+        );
+        mock.stub(&["show-option", "-gqv", "@vde_client_616263_beta"], "");
+        mock.stub(&["switch-client", "-c", "abc", "-t", "=b:"], "");
+        mock.stub(&["set-option", "-g", "@vde_client_616263_beta", "b"], "");
 
-    run_with(
-        ["vt", "statusline-click", "category:YmV0YQ"],
-        mock,
-        &fixture.env,
-    )
-    .unwrap();
+        let beta = crate::statusline::category_target_key("beta").unwrap();
+        let range = format!("{prefix}{beta}");
+        run_with(
+            ["vt", "statusline-click", range.as_str()],
+            mock,
+            &fixture.env,
+        )
+        .unwrap();
 
-    assert!(
-        mock.calls()
-            .iter()
-            .any(|call| call == &vec!["switch-client", "-c", "abc", "-t", "=b:"])
-    );
-    fixture.finish();
+        assert!(
+            mock.calls()
+                .iter()
+                .any(|call| call == &vec!["switch-client", "-c", "abc", "-t", "=b:"])
+        );
+        fixture.finish();
+    }
 }
 
 #[test]

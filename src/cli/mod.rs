@@ -697,8 +697,8 @@ where
         Command::StatuslineClick { scope, range } => {
             let needs_client = range.as_deref().map(str::trim).is_some_and(|range| {
                 range.starts_with("session:")
-                    || range.starts_with("category:")
-                    || range.starts_with("category-current:")
+                    || range.starts_with("c:")
+                    || range.starts_with("C:")
                     || range.starts_with('$')
             });
             let context = needs_client
@@ -711,9 +711,10 @@ where
                     )
                 })
                 .transpose()?;
-            let category_click = range.as_deref().map(str::trim).is_some_and(|range| {
-                range.starts_with("category:") || range.starts_with("category-current:")
-            });
+            let category_click = range
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|range| range.starts_with("c:") || range.starts_with("C:"));
             let guarded_config = category_click
                 .then(|| require_active_config(runner, env))
                 .transpose()?;
