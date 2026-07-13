@@ -161,6 +161,11 @@ vt sidebar open
 
 vde-tmux can discover some agents from the command running in a pane without hooks.
 Hooks are still required for accurate prompts, completion times, and waiting states.
+The daemon stops recurring observation captures for an agent epoch after accepting its
+`SessionStart` hook. Non-agent panes are not captured, while process-detected agents without an
+accepted `SessionStart` keep using pane output as a fallback. This does not disable the sidebar's
+on-demand live preview. The trust marker is daemon-local, so an existing agent uses fallback
+captures after a daemon restart until its next `SessionStart`.
 
 ## Agent states
 

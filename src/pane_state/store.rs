@@ -1948,6 +1948,28 @@ mod tests {
     }
 
     #[test]
+    fn restart_requires_a_new_session_start_before_hooks_are_authoritative_again() {
+        let mut runtime = CanonicalStateRuntime::default();
+        runtime
+            .apply_event(
+                &mut FakeIo::default(),
+                &mut FakeClock::default(),
+                &envelope(PaneEvent::AgentSessionStarted {
+                    observed_at: 1,
+                    source: AgentSessionSource::Startup,
+                    resumed_prompt: None,
+                }),
+                &VisibilitySnapshot::default(),
+                DoneClearOn::Pane,
+            )
+            .unwrap();
+        assert!(runtime.tracker(&pane()).hook_authoritative);
+
+        let restarted = restart_from(&runtime);
+        assert!(!restarted.tracker(&pane()).hook_authoritative);
+    }
+
+    #[test]
     fn restart_first_capture_is_a_new_baseline_without_stale_completion() {
         let mut runtime = CanonicalStateRuntime::default();
         apply_begin(&mut runtime, &mut FakeIo::default());

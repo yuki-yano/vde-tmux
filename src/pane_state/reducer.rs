@@ -185,6 +185,8 @@ fn reduce_explicit(
             )?;
             let completed_outside_capture = state.completed_seq > 0;
             let mut tracker = reset_tracker_for_state(context.tracker, &state)?;
+            tracker.hook_authoritative =
+                matches!(envelope.event, PaneEvent::AgentSessionStarted { .. });
             tracker.rebaseline_pending = completed_outside_capture;
             bump_tracker(&mut tracker)?;
             return finish_state_reduction(current, state, tracker, Some(context.tracker));
@@ -200,6 +202,7 @@ fn reduce_explicit(
         )?;
         apply_agent_session_started(&mut state, &envelope.event)?;
         let mut tracker = reset_tracker_for_state(context.tracker, &state)?;
+        tracker.hook_authoritative = true;
         bump_tracker(&mut tracker)?;
         return finish_state_reduction(current, state, tracker, Some(context.tracker));
     }
@@ -1146,6 +1149,7 @@ fn reset_tracker_for_state(
     Ok(CaptureTrackerSnapshot {
         generation: tracker.generation,
         epoch: Some((state.state_id.clone(), state.agent_epoch)),
+        hook_authoritative: false,
         absence_count: 0,
         replacement_kind: None,
         replacement_streak: 0,
@@ -1466,6 +1470,16 @@ mod tests {
             assert!(!state.synthetic_completion_armed, "{name}");
             assert_eq!(state.completed_seq, expected_completed, "{name}");
             assert_eq!(
+                missing
+                    .tracker_delta
+                    .as_ref()
+                    .unwrap()
+                    .next
+                    .hook_authoritative,
+                name == "session",
+                "{name}"
+            );
+            assert_eq!(
                 match state.lifecycle {
                     LifecycleState::Idle => "idle",
                     LifecycleState::Running => "running",
@@ -1485,6 +1499,16 @@ mod tests {
             } else {
                 assert!(
                     matches!(after_reset.record, Some(StoredPaneRecord::Active(_))),
+                    "{name}"
+                );
+                assert_eq!(
+                    after_reset
+                        .tracker_delta
+                        .as_ref()
+                        .unwrap()
+                        .next
+                        .hook_authoritative,
+                    name == "session",
                     "{name}"
                 );
             }
@@ -1524,6 +1548,69 @@ mod tests {
         );
         assert!(active(&reset_discovered).scan_verified);
         assert!(!active(&reset_discovered).synthetic_completion_armed);
+    }
+
+    #[test]
+    fn session_start_authority_survives_same_epoch_and_resets_for_process_epoch() {
+        let started = reduce_once(
+            None,
+            PaneEvent::AgentSessionStarted {
+                observed_at: 1,
+                source: AgentSessionSource::Startup,
+                resumed_prompt: None,
+            },
+            &CaptureTrackerSnapshot::default(),
+        );
+        let started_tracker = started.tracker_delta.as_ref().unwrap().next.clone();
+        assert!(started_tracker.hook_authoritative);
+
+        let begun = begin(started.record.as_ref(), &started_tracker);
+        let begun_tracker = begun.tracker_delta.as_ref().unwrap().next.clone();
+        assert!(begun_tracker.hook_authoritative);
+
+        let verified = observe(
+            begun.record.as_ref(),
+            &begun_tracker,
+            AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+            None,
+            11,
+        );
+        let verified_tracker = verified.tracker_delta.as_ref().unwrap().next.clone();
+        assert!(verified_tracker.hook_authoritative);
+
+        let absent_once = observe(
+            verified.record.as_ref(),
+            &verified_tracker,
+            AgentPresenceObservation::Absent,
+            None,
+            12,
+        );
+        let absent_once_tracker = absent_once.tracker_delta.as_ref().unwrap().next.clone();
+        let absent = observe(
+            absent_once.record.as_ref(),
+            &absent_once_tracker,
+            AgentPresenceObservation::Absent,
+            None,
+            13,
+        );
+        assert!(!active(&absent).agent_present);
+
+        let process_epoch = observe(
+            absent.record.as_ref(),
+            &absent.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+            None,
+            14,
+        );
+        assert!(active(&process_epoch).agent_present);
+        assert!(
+            !process_epoch
+                .tracker_delta
+                .as_ref()
+                .unwrap()
+                .next
+                .hook_authoritative
+        );
     }
 
     #[test]
@@ -2386,6 +2473,7 @@ mod tests {
         let dirty_tracker = CaptureTrackerSnapshot {
             generation: 7,
             epoch: Some((StateId::parse(OTHER_STATE_ID).unwrap(), 9)),
+            hook_authoritative: true,
             absence_count: 1,
             replacement_kind: Some(AgentKind::parse("claude").unwrap()),
             replacement_streak: 2,
@@ -2413,6 +2501,7 @@ mod tests {
         assert_eq!(tracker.absence_count, 0);
         assert_eq!(tracker.replacement_kind, None);
         assert_eq!(tracker.replacement_streak, 0);
+        assert!(!tracker.hook_authoritative);
         assert_eq!(tracker.fingerprint, Some([2; 32]));
         assert_eq!(tracker.last_change_at, Some(10));
         assert!(!tracker.rebaseline_pending);
@@ -2439,6 +2528,7 @@ mod tests {
         assert_eq!(tracker.absence_count, 0);
         assert_eq!(tracker.replacement_kind, None);
         assert_eq!(tracker.replacement_streak, 0);
+        assert!(tracker.hook_authoritative);
         assert_eq!(tracker.fingerprint, None);
         assert_eq!(tracker.last_change_at, None);
         assert!(!tracker.rebaseline_pending);

@@ -943,6 +943,7 @@ pub struct VisibilitySnapshot {
 pub struct CaptureTrackerSnapshot {
     pub generation: u64,
     pub epoch: Option<(StateId, u64)>,
+    pub hook_authoritative: bool,
     pub absence_count: u8,
     pub replacement_kind: Option<AgentKind>,
     pub replacement_streak: u8,

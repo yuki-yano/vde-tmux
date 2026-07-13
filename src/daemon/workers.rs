@@ -1010,53 +1010,86 @@ pub fn run_observation_poll(
     daemon_instance_id: &DaemonInstanceId,
     observed_at: i64,
 ) -> std::result::Result<ObservationPollResult, ObservationPollError> {
-    let panes = dispatch
+    let mut diagnostics = Vec::new();
+    let observations = dispatch
         .iter()
-        .map(|snapshot| snapshot.pane_instance.clone())
+        .map(|snapshot| {
+            if matches!(
+                snapshot.base,
+                Some(StoredStateDescriptor::Quarantined { .. })
+            ) {
+                diagnostics.push(format!(
+                    "quarantined_observation_skipped: {}",
+                    snapshot.pane_instance.pane_id
+                ));
+                return None;
+            }
+            let detection = processes.detect_from_pid_tree(snapshot.pane_instance.pane_pid);
+            if detection.complete && detection.agents.len() > 1 {
+                diagnostics.push(format!(
+                    "ambiguous_agent_processes: {}",
+                    snapshot.pane_instance.pane_id
+                ));
+            }
+            Some(classify_presence(
+                snapshot.state.as_ref(),
+                &detection.agents,
+                detection.complete,
+            ))
+        })
         .collect::<Vec<_>>();
-    let (tails, mut diagnostics) = match source.capture_plain_tails(&panes) {
-        Ok(tails) => (Some(tails), Vec::new()),
-        Err(error @ CaptureBatchError::InvalidIdentityHeader)
-        | Err(error @ CaptureBatchError::IdentityMismatch { .. }) => {
-            return Err(ObservationPollError::UnverifiedServerIdentity(error));
+    let capture_indices = observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, presence)| {
+            presence
+                .as_ref()
+                .is_some_and(|presence| needs_fallback_capture(&dispatch[index], presence))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let capture_panes = capture_indices
+        .iter()
+        .map(|index| dispatch[*index].pane_instance.clone())
+        .collect::<Vec<_>>();
+    let mut tails_by_index = vec![None; dispatch.len()];
+    if !capture_panes.is_empty() {
+        match source.capture_plain_tails(&capture_panes) {
+            Ok(tails) => {
+                if tails.len() == capture_indices.len() {
+                    for (index, tail) in capture_indices.into_iter().zip(tails) {
+                        tails_by_index[index] = Some(tail);
+                    }
+                } else {
+                    diagnostics.push(format!(
+                        "capture_batch_discarded: {}",
+                        CaptureBatchError::DelimiterMismatch {
+                            expected: capture_indices.len(),
+                            actual: tails.len(),
+                        }
+                    ));
+                }
+            }
+            Err(error @ CaptureBatchError::InvalidIdentityHeader)
+            | Err(error @ CaptureBatchError::IdentityMismatch { .. }) => {
+                return Err(ObservationPollError::UnverifiedServerIdentity(error));
+            }
+            Err(error) => diagnostics.push(format!("capture_batch_discarded: {error}")),
         }
-        Err(error) => (None, vec![format!("capture_batch_discarded: {error}")]),
-    };
+    }
     let mut envelopes = Vec::new();
-    for (index, snapshot) in dispatch.iter().enumerate() {
-        if matches!(
-            snapshot.base,
-            Some(StoredStateDescriptor::Quarantined { .. })
-        ) {
-            diagnostics.push(format!(
-                "quarantined_observation_skipped: {}",
-                snapshot.pane_instance.pane_id
-            ));
+    for (index, (snapshot, presence)) in dispatch.iter().zip(observations).enumerate() {
+        let Some(presence) = presence else {
             continue;
-        }
-        let detection = processes.detect_from_pid_tree(snapshot.pane_instance.pane_pid);
-        let presence = classify_presence(
-            snapshot.state.as_ref(),
-            &detection.agents,
-            detection.complete,
-        );
-        if detection.complete && detection.agents.len() > 1 {
-            diagnostics.push(format!(
-                "ambiguous_agent_processes: {}",
-                snapshot.pane_instance.pane_id
-            ));
-        }
-        let capture = tails
-            .as_ref()
-            .and_then(|tails| tails.get(index))
-            .map(|tail| {
-                infer_capture(
-                    snapshot.state.as_ref(),
-                    &snapshot.tracker,
-                    tail,
-                    observed_at,
-                )
-            });
+        };
+        let capture = tails_by_index[index].as_deref().map(|tail| {
+            infer_capture(
+                snapshot.state.as_ref(),
+                &snapshot.tracker,
+                tail,
+                observed_at,
+            )
+        });
         envelopes.push(
             observation_envelope(
                 daemon_instance_id.clone(),
@@ -1073,6 +1106,29 @@ pub fn run_observation_poll(
     Ok(ObservationPollResult {
         envelopes,
         diagnostics,
+    })
+}
+
+fn needs_fallback_capture(
+    snapshot: &ObservationDispatchSnapshot,
+    presence: &AgentPresenceObservation,
+) -> bool {
+    let AgentPresenceObservation::Present(observed_agent) = presence else {
+        return false;
+    };
+    snapshot.state.as_ref().is_none_or(|state| {
+        let tracker_matches_epoch =
+            snapshot
+                .tracker
+                .epoch
+                .as_ref()
+                .is_some_and(|(state_id, agent_epoch)| {
+                    state_id == &state.state_id && *agent_epoch == state.agent_epoch
+                });
+        !state.agent_present
+            || &state.agent != observed_agent
+            || !tracker_matches_epoch
+            || !snapshot.tracker.hook_authoritative
     })
 }
 
@@ -1642,15 +1698,17 @@ mod tests {
 
     struct MockCaptureSource {
         plain_calls: Mutex<usize>,
+        requested_panes: Mutex<Vec<Vec<PaneInstance>>>,
         tails: Vec<String>,
     }
 
     impl CaptureSource for MockCaptureSource {
         fn capture_plain_tails(
             &self,
-            _panes: &[PaneInstance],
+            panes: &[PaneInstance],
         ) -> std::result::Result<Vec<String>, CaptureBatchError> {
             *self.plain_calls.lock().unwrap() += 1;
+            self.requested_panes.lock().unwrap().push(panes.to_vec());
             Ok(self.tails.clone())
         }
 
@@ -2383,6 +2441,7 @@ mod tests {
         }];
         let source = MockCaptureSource {
             plain_calls: Mutex::new(0),
+            requested_panes: Mutex::new(Vec::new()),
             tails: vec!["after\n".to_string()],
         };
         let processes = AgentProcessSnapshot::parse("11 1 opencode\n", true);
@@ -2395,6 +2454,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(*source.plain_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *source.requested_panes.lock().unwrap(),
+            vec![vec![pane_instance("%1", 11)]]
+        );
         let PaneEvent::ObservationBatch {
             presence, capture, ..
         } = &result.envelopes[0].event
@@ -2409,6 +2472,178 @@ mod tests {
             capture.as_ref().unwrap().inference,
             CaptureInference::ActivityObserved
         );
+    }
+
+    #[test]
+    fn observation_poll_captures_only_process_detected_agents_without_session_start() {
+        let mut hook_managed = canonical_state("codex");
+        hook_managed.pane_instance = pane_instance("%2", 22);
+        hook_managed.agent_session_id =
+            Some(crate::pane_state::AgentSessionId::parse("codex-session").unwrap());
+        let mut fallback = canonical_state("opencode");
+        fallback.pane_instance = pane_instance("%3", 33);
+        fallback.agent_session_id =
+            Some(crate::pane_state::AgentSessionId::parse("other-hook-session").unwrap());
+        let dispatch = vec![
+            ObservationDispatchSnapshot {
+                pane_instance: pane_instance("%1", 11),
+                base: None,
+                tracker: CaptureTrackerSnapshot::default(),
+                state: None,
+            },
+            ObservationDispatchSnapshot {
+                pane_instance: hook_managed.pane_instance.clone(),
+                base: Some(StoredStateDescriptor::Canonical {
+                    version: hook_managed.version(),
+                }),
+                tracker: CaptureTrackerSnapshot {
+                    epoch: Some((hook_managed.state_id.clone(), hook_managed.agent_epoch)),
+                    hook_authoritative: true,
+                    ..CaptureTrackerSnapshot::default()
+                },
+                state: Some(hook_managed),
+            },
+            ObservationDispatchSnapshot {
+                pane_instance: fallback.pane_instance.clone(),
+                base: Some(StoredStateDescriptor::Canonical {
+                    version: fallback.version(),
+                }),
+                tracker: CaptureTrackerSnapshot::default(),
+                state: Some(fallback),
+            },
+        ];
+        let source = MockCaptureSource {
+            plain_calls: Mutex::new(0),
+            requested_panes: Mutex::new(Vec::new()),
+            tails: vec!["fallback tail\n".to_string()],
+        };
+        let processes = AgentProcessSnapshot::parse("11 1 zsh\n22 1 codex\n33 1 opencode\n", true);
+
+        let result = run_observation_poll(
+            &source,
+            &dispatch,
+            &processes,
+            &DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            200,
+        )
+        .unwrap();
+
+        assert_eq!(*source.plain_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *source.requested_panes.lock().unwrap(),
+            vec![vec![pane_instance("%3", 33)]]
+        );
+        assert_eq!(result.envelopes.len(), 3);
+        let captures = result
+            .envelopes
+            .iter()
+            .map(|envelope| match &envelope.event {
+                PaneEvent::ObservationBatch { capture, .. } => capture.is_some(),
+                _ => panic!("expected observation batch"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(captures, vec![false, false, true]);
+    }
+
+    #[test]
+    fn observation_poll_skips_capture_when_only_non_agents_and_hook_sessions_exist() {
+        let mut hook_managed = canonical_state("codex");
+        hook_managed.pane_instance = pane_instance("%2", 22);
+        hook_managed.agent_session_id =
+            Some(crate::pane_state::AgentSessionId::parse("codex-session").unwrap());
+        let dispatch = vec![
+            ObservationDispatchSnapshot {
+                pane_instance: pane_instance("%1", 11),
+                base: None,
+                tracker: CaptureTrackerSnapshot::default(),
+                state: None,
+            },
+            ObservationDispatchSnapshot {
+                pane_instance: hook_managed.pane_instance.clone(),
+                base: Some(StoredStateDescriptor::Canonical {
+                    version: hook_managed.version(),
+                }),
+                tracker: CaptureTrackerSnapshot {
+                    epoch: Some((hook_managed.state_id.clone(), hook_managed.agent_epoch)),
+                    hook_authoritative: true,
+                    ..CaptureTrackerSnapshot::default()
+                },
+                state: Some(hook_managed),
+            },
+        ];
+        let source = MockCaptureSource {
+            plain_calls: Mutex::new(0),
+            requested_panes: Mutex::new(Vec::new()),
+            tails: Vec::new(),
+        };
+        let processes = AgentProcessSnapshot::parse("11 1 zsh\n22 1 codex\n", true);
+
+        let result = run_observation_poll(
+            &source,
+            &dispatch,
+            &processes,
+            &DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            200,
+        )
+        .unwrap();
+
+        assert_eq!(*source.plain_calls.lock().unwrap(), 0);
+        assert!(source.requested_panes.lock().unwrap().is_empty());
+        assert_eq!(result.envelopes.len(), 2);
+        assert!(result.envelopes.iter().all(|envelope| {
+            matches!(
+                &envelope.event,
+                PaneEvent::ObservationBatch { capture: None, .. }
+            )
+        }));
+    }
+
+    #[test]
+    fn observation_poll_discards_sparse_capture_when_tail_count_mismatches() {
+        let mut first = canonical_state("codex");
+        first.pane_instance = pane_instance("%1", 11);
+        let mut second = canonical_state("opencode");
+        second.pane_instance = pane_instance("%2", 22);
+        let dispatch = [first, second]
+            .into_iter()
+            .map(|state| ObservationDispatchSnapshot {
+                pane_instance: state.pane_instance.clone(),
+                base: Some(StoredStateDescriptor::Canonical {
+                    version: state.version(),
+                }),
+                tracker: CaptureTrackerSnapshot::default(),
+                state: Some(state),
+            })
+            .collect::<Vec<_>>();
+        let source = MockCaptureSource {
+            plain_calls: Mutex::new(0),
+            requested_panes: Mutex::new(Vec::new()),
+            tails: vec!["only one tail\n".to_string()],
+        };
+        let processes = AgentProcessSnapshot::parse("11 1 codex\n22 1 opencode\n", true);
+
+        let result = run_observation_poll(
+            &source,
+            &dispatch,
+            &processes,
+            &DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            200,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *source.requested_panes.lock().unwrap(),
+            vec![vec![pane_instance("%1", 11), pane_instance("%2", 22)]]
+        );
+        assert!(result.envelopes.iter().all(|envelope| {
+            matches!(
+                &envelope.event,
+                PaneEvent::ObservationBatch { capture: None, .. }
+            )
+        }));
+        assert!(result.diagnostics.iter().any(|message| {
+            message.contains("capture delimiter count mismatch: expected 2, received 1")
+        }));
     }
 
     #[test]
