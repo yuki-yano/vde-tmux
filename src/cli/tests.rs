@@ -1216,7 +1216,7 @@ fn dispatch_statusline_pane_prints_pane_segment() {
 
     assert!(output.contains("%1"), "{output}");
     assert!(output.contains("Codex"), "{output}");
-    assert!(output.contains("running"), "{output}");
+    assert!(output.contains("Running"), "{output}");
     assert!(output.contains("#[fg=#4fd08a]●"), "{output}");
     fixture.finish();
 }
@@ -1785,7 +1785,7 @@ fn dispatch_statusline_summary_renders_v2_status_snapshot() {
     assert_eq!(
         output,
         Some(
-            "#[fg=#ff6b6b]▲ 0#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6]✓ 0#[default] #[fg=#a8a8b2]○ 0#[default]"
+            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2,dim]○ 0#[default]"
                 .to_string()
         )
     );

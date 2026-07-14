@@ -55,9 +55,10 @@ pub fn render_summary(
                 BadgeState::Done => &badge.colors.done,
                 BadgeState::Idle => &badge.colors.idle,
             };
+            let dim = if *count == 0 { ",dim" } else { "" };
             let count = count.to_string();
             let token = format.replace("{badge}", glyph).replace("{count}", &count);
-            format!("#[fg={color}]{token}#[default]")
+            format!("#[fg={color}{dim}]{token}#[default]")
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -96,7 +97,7 @@ mod tests {
         ];
         assert_eq!(
             render_summary(&counts, &badge, "{badge} {count}"),
-            "#[fg=#ff6b6b]▲ 2#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6]✓ 0#[default] #[fg=#a8a8b2]○ 3#[default]"
+            "#[fg=#ff6b6b]▲ 2#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2]○ 3#[default]"
         );
     }
 

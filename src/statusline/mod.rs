@@ -453,9 +453,9 @@ pub fn render_structured_pane_status(
                     &pane.stored,
                     Some(crate::pane_state::StoredStateDescriptor::Quarantined { .. })
                 ) {
-                ("?".to_string(), "invalid state".to_string())
+                ("?".to_string(), "Invalid state".to_string())
             } else {
-                ("—".to_string(), "no state".to_string())
+                ("—".to_string(), "No state".to_string())
             };
             (
                 "(no agent)".to_string(),
@@ -1248,13 +1248,13 @@ fn structured_pane_status_label(
     badge: BadgeState,
 ) -> &'static str {
     if badge == BadgeState::Done {
-        return "done";
+        return "Done";
     }
     match state.lifecycle {
-        crate::pane_state::LifecycleState::Idle => "idle",
-        crate::pane_state::LifecycleState::Running => "running",
-        crate::pane_state::LifecycleState::Waiting { .. } => "waiting",
-        crate::pane_state::LifecycleState::Error { .. } => "error",
+        crate::pane_state::LifecycleState::Idle => "Idle",
+        crate::pane_state::LifecycleState::Running => "Running",
+        crate::pane_state::LifecycleState::Waiting { .. } => "Waiting",
+        crate::pane_state::LifecycleState::Error { .. } => "Error",
     }
 }
 
@@ -1506,9 +1506,14 @@ fn render_chip_agent_segment(
     }
 
     let chip_body = chip_badge_body(badge, state, separate_badge, badge_config);
+    let chip_bg = style
+        .colors
+        .bg
+        .as_deref()
+        .unwrap_or(chip_config.bg.as_str());
     let chip_start = format!(
-        "#[fg={}]{}#[bg={}] {chip_body} ",
-        chip_config.bg, chip_config.cap_left, chip_config.bg
+        "#[fg={chip_bg}]{}#[bg={chip_bg}] {chip_body} ",
+        chip_config.cap_left
     );
     if let Some(segment_bg) = &style.colors.bg {
         return format!(
@@ -1538,12 +1543,12 @@ fn render_chip_category_segment(
     let chip_config = &config.statusline.session_badge.chip;
     let counts_mode = config.statusline.category.agent_badge.mode == SessionBadgeMode::Counts;
     let chip_body = chip_badge_body(badge, state, counts_mode, &config.badge);
-    let chip_start = format!(
-        "#[fg={}]{}#[bg={}] {chip_body} ",
-        chip_config.bg, chip_config.cap_left, chip_config.bg
-    );
     let colors = category_colors(&config.statusline.category, active);
     let segment_bg = colors.bg.as_deref().unwrap_or(chip_config.bg.as_str());
+    let chip_start = format!(
+        "#[fg={segment_bg}]{}#[bg={segment_bg}] {chip_body} ",
+        chip_config.cap_left
+    );
     let styled = tmux_style_category_body_with_bg(
         &config.statusline.category,
         body,
@@ -1556,8 +1561,8 @@ fn render_chip_category_segment(
             .to_string()
     } else {
         format!(
-            "#[fg={},bg=default]{}#[default] ",
-            chip_config.bg, chip_config.cap_right
+            "#[fg={segment_bg},bg=default]{}#[default] ",
+            chip_config.cap_right
         )
     };
     format!("{chip_start}#[bg={segment_bg}]{styled}{suffix}")
@@ -2048,12 +2053,54 @@ mod tests {
         let rendered = render_structured_pane_status(&config, &pane, 180);
 
         assert!(rendered.contains("%7|Codex|"), "{rendered}");
-        assert!(rendered.contains("waiting"), "{rendered}");
+        assert!(rendered.contains("Waiting"), "{rendered}");
         assert!(rendered.matches("2m00s").count() >= 2, "{rendered}");
         assert!(
             rendered.contains(&config.badge.colors.blocked),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn pane_state_labels_start_with_uppercase_letters() {
+        let cases = [
+            (
+                crate::pane_state::LifecycleState::Running,
+                BadgeState::Working,
+                "Running",
+            ),
+            (
+                crate::pane_state::LifecycleState::Waiting {
+                    reason: crate::pane_state::WaitReason::PermissionPrompt,
+                },
+                BadgeState::Blocked,
+                "Waiting",
+            ),
+            (
+                crate::pane_state::LifecycleState::Error { reason: None },
+                BadgeState::Blocked,
+                "Error",
+            ),
+            (
+                crate::pane_state::LifecycleState::Running,
+                BadgeState::Done,
+                "Done",
+            ),
+            (
+                crate::pane_state::LifecycleState::Idle,
+                BadgeState::Idle,
+                "Idle",
+            ),
+        ];
+
+        for (lifecycle, badge, expected) in cases {
+            let pane = structured_pane("codex", "/tmp", true, Some((lifecycle, badge)));
+            let resolved = pane.resolved.expect("resolved pane");
+            assert_eq!(
+                structured_pane_status_label(&resolved.canonical, badge),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2100,7 +2147,7 @@ mod tests {
             pane.pane_width = width;
             let rendered = render_structured_pane_status(&config, &pane, 30);
             assert!(
-                rendered.contains("CUSTOM:(unnamed):(no agent):no state:(empty):(empty)"),
+                rendered.contains("CUSTOM:(unnamed):(no agent):No state:(empty):(empty)"),
                 "width {width}: {rendered}"
             );
         }
@@ -2124,10 +2171,10 @@ mod tests {
         let rendered = render_structured_pane_status(&config, &pane, 30);
 
         assert!(
-            rendered.contains("(no agent)|?|invalid state|(empty)|zsh"),
+            rendered.contains("(no agent)|?|Invalid state|(empty)|zsh"),
             "{rendered}"
         );
-        assert!(!rendered.contains("idle"), "{rendered}");
+        assert!(!rendered.contains("Idle"), "{rendered}");
     }
 
     #[test]
@@ -2299,7 +2346,7 @@ mod tests {
         let empty_summary = render_structured_summary(&config, BadgeStateCounts::default());
         assert_eq!(
             empty_summary,
-            "#[fg=#ff6b6b]▲ 0#[default] #[fg=#4fd08a]● 0#[default] #[fg=#45cbe6]✓ 0#[default] #[fg=#a8a8b2]○ 0#[default]"
+            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#4fd08a,dim]● 0#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2,dim]○ 0#[default]"
         );
 
         let mixed_summary = render_structured_summary(
@@ -2311,6 +2358,10 @@ mod tests {
                 idle: 9,
             },
         );
+        assert_eq!(
+            mixed_summary,
+            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2]○ 9#[default]"
+        );
         assert_eq!(tmux_display_width(&empty_summary), 15);
         assert_eq!(tmux_display_width(&mixed_summary), 15);
 
@@ -2318,7 +2369,7 @@ mod tests {
         let without_idle = render_structured_summary(&config, BadgeStateCounts::default());
         assert_eq!(
             without_idle,
-            "#[fg=#ff6b6b]▲ 0#[default] #[fg=#4fd08a]● 0#[default] #[fg=#45cbe6]✓ 0#[default]"
+            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#4fd08a,dim]● 0#[default] #[fg=#45cbe6,dim]✓ 0#[default]"
         );
         assert_eq!(tmux_display_width(&without_idle), 11);
     }
