@@ -166,6 +166,9 @@
         "colors": {
           "additionalProperties": true,
           "properties": {
+            "action_icon": {
+              "type": "string"
+            },
             "badge_blocked": {
               "type": "string"
             },

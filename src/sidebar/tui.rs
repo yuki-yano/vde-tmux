@@ -883,6 +883,7 @@ mod local_state_tests {
             header_rows: header.row_count(),
             header,
             rows_height: 24,
+            width,
             scroll: 0,
             row_indices: rendered.row_indices.clone(),
         };
@@ -896,7 +897,10 @@ mod local_state_tests {
             &frame,
             ClickPosition {
                 row: frame.header.row_count(),
-                column: (crate::sidebar::render::jump_row_action_start(&jump) + 8 + 11) as u16,
+                column: crate::sidebar::render::jump_row_action_column(
+                    &jump,
+                    JumpRowAction::MarkDone,
+                ) as u16,
             },
         )
         .unwrap();
@@ -932,7 +936,10 @@ mod local_state_tests {
             &frame,
             ClickPosition {
                 row: frame.header.row_count(),
-                column: (crate::sidebar::render::jump_row_action_start(&jump) + 8 + 11) as u16,
+                column: crate::sidebar::render::jump_row_action_column(
+                    &jump,
+                    JumpRowAction::MarkDone,
+                ) as u16,
             },
         )
         .unwrap();
@@ -1169,6 +1176,7 @@ struct DrawnFrame {
     header: crate::sidebar::render::HeaderLayout,
     header_rows: u16,
     rows_height: u16,
+    width: u16,
     scroll: usize,
     row_indices: Vec<Option<usize>>,
 }
@@ -1935,6 +1943,7 @@ fn run_loop<B: Backend>(
                     header,
                     header_rows: areas.header_rows,
                     rows_height: areas.rows_height,
+                    width: area.width,
                     scroll: sidebar_state.scroll,
                     row_indices: rendered.row_indices.clone(),
                 });
@@ -2866,7 +2875,7 @@ fn empty_rows_placeholder_lines(
         )),
         Line::from(Span::styled(
             format!(
-                "Filter: {} · tab: next · S-tab: previous · ≡ all: reset",
+                "Filter: {} · tab: next · S-tab: previous · ≡: reset",
                 filter.label()
             ),
             Style::default()
@@ -3279,7 +3288,7 @@ fn handle_left_click(
     };
     if clicked.kind == SidebarRowKind::Jump {
         let clicked_pane = crate::sidebar::tree::pane_instance_from_row_id(&clicked.id);
-        match jump_row_action_at(clicked, column) {
+        match jump_row_action_at(clicked, column, frame.width) {
             Some(JumpRowAction::Jump) => {
                 if let Some(pane_instance) = clicked_pane.clone().filter(|selected| {
                     snapshot

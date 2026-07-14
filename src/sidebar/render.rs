@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRenderTheme {
     pub selection_bg: Color,
+    pub action_icon: Color,
     pub header_active_bg: Option<Color>,
     pub header_active_fg: Option<Color>,
     pub header_chip_fg: Option<Color>,
@@ -59,6 +60,7 @@ impl Default for SidebarRenderTheme {
     fn default() -> Self {
         Self {
             selection_bg: Color::Rgb(0x30, 0x30, 0x34),
+            action_icon: Color::Indexed(73),
             header_active_bg: None,
             header_active_fg: None,
             header_chip_fg: None,
@@ -67,7 +69,7 @@ impl Default for SidebarRenderTheme {
             header_total_fg: None,
             header_active_bold: false,
             header_badge_fg: Color::Indexed(16),
-            header_format: " {label} ".to_string(),
+            header_format: " {label} ▾ ".to_string(),
             header_prefix: String::new(),
             header_suffix: POWERLINE_ARROW.to_string(),
             header_outer_bg: Some(Color::Indexed(235)),
@@ -85,7 +87,7 @@ impl Default for SidebarRenderTheme {
             header_mode: Color::Indexed(147),
             active_bg: Color::Indexed(235),
             active_bar: Color::Indexed(147),
-            repo: Color::Blue,
+            repo: Color::LightCyan,
             branch: Color::Indexed(73),
             live: Color::Magenta,
             task_done: Color::Indexed(220),
@@ -106,6 +108,7 @@ impl SidebarRenderTheme {
         Self {
             selection_bg: parse_color(config.selection_bg.as_deref())
                 .unwrap_or(default.selection_bg),
+            action_icon: parse_color(config.action_icon.as_deref()).unwrap_or(default.action_icon),
             header_active_bg: parse_color(config.header_active_bg.as_deref()),
             header_active_fg: parse_color(config.header_active_fg.as_deref()),
             header_chip_fg: parse_color(config.header_chip_fg.as_deref()),
@@ -290,14 +293,32 @@ pub fn build_header_layout_with_counts(
         return HeaderLayout::default();
     }
 
+    let section = build_header_section_line(width as usize, theme);
     let title = build_header_title_line(state, width as usize, theme, counts);
     let chips = build_header_chip_line(state, width as usize, theme, counts);
     HeaderLayout {
-        lines: vec![title, chips],
+        lines: vec![section, title, chips],
     }
 }
 
 const POWERLINE_ARROW: &str = "\u{e0b0}";
+
+fn build_header_section_line(width: usize, theme: &SidebarRenderTheme) -> HeaderLine {
+    let text = truncate_display(" SIDEBAR", width);
+    let range = 0..display_width(&text) as u16;
+    HeaderLine {
+        text,
+        segments: vec![HeaderSegment {
+            range,
+            action: None,
+            style: Some(
+                Style::default()
+                    .fg(theme.category)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        }],
+    }
+}
 
 fn build_header_title_line(
     state: &SidebarState,
@@ -306,12 +327,19 @@ fn build_header_title_line(
     counts: BadgeCounts,
 ) -> HeaderLine {
     let mode_body = format_header_mode_body(state.view_mode, theme);
-    let mode_text = format!("{}{}", theme.header_prefix, mode_body);
+    let mode_prefix = theme.header_prefix.as_str();
+    let mode_text = format!("{mode_prefix}{mode_body}");
     let mode_suffix = theme.header_suffix.as_str();
     let count_text = format!(" {}", counts.total);
     let task_label = if counts.total == 1 { "task" } else { "tasks" };
     let total_label_text = format!(" {task_label} ");
-    let total_suffix = header_total_suffix(theme);
+    let total_bg = theme.header_total_bg.unwrap_or(theme.active_bg);
+    let total_flat = total_bg == Color::Reset;
+    let total_suffix = if total_flat {
+        ""
+    } else {
+        header_total_suffix(theme)
+    };
     let full_text = format!("{mode_text}{mode_suffix}{count_text}{total_label_text}{total_suffix}");
     let include_total = display_width(&full_text) <= width;
     let text = if include_total {
@@ -320,35 +348,39 @@ fn build_header_title_line(
         truncate_display(&mode_text, width)
     };
 
-    let total_bg = theme.header_total_bg.unwrap_or(theme.active_bg);
-    let mut pieces = vec![(
-        mode_text,
+    let mut pieces = Vec::new();
+    if !mode_prefix.is_empty() {
+        pieces.push((
+            mode_prefix.to_string(),
+            Style::default().fg(mode_bg(theme)),
+            Some(HeaderAction::CycleViewMode),
+        ));
+    }
+    pieces.push((
+        mode_body,
         mode_segment_style(theme),
         Some(HeaderAction::CycleViewMode),
-    )];
+    ));
     if include_total {
         if !mode_suffix.is_empty() {
-            pieces.push((
-                mode_suffix.to_string(),
-                Style::default().fg(mode_bg(theme)).bg(total_bg),
-                None,
-            ));
+            let mut suffix_style = Style::default().fg(mode_bg(theme));
+            if !total_flat {
+                suffix_style = suffix_style.bg(total_bg);
+            }
+            pieces.push((mode_suffix.to_string(), suffix_style, None));
         }
-        pieces.push((
-            count_text,
-            Style::default()
-                .fg(Color::Reset)
-                .bg(total_bg)
-                .add_modifier(Modifier::BOLD),
-            None,
-        ));
-        pieces.push((
-            total_label_text,
-            Style::default()
-                .fg(theme.header_total_fg.unwrap_or(theme.detail))
-                .bg(total_bg),
-            None,
-        ));
+        let mut count_style = Style::default()
+            .fg(Color::Reset)
+            .add_modifier(Modifier::BOLD);
+        if !total_flat {
+            count_style = count_style.bg(total_bg);
+        }
+        pieces.push((count_text, count_style, None));
+        let mut label_style = Style::default().fg(theme.header_total_fg.unwrap_or(theme.detail));
+        if !total_flat {
+            label_style = label_style.bg(total_bg);
+        }
+        pieces.push((total_label_text, label_style, None));
         if !total_suffix.is_empty() {
             pieces.push((
                 total_suffix.to_string(),
@@ -444,19 +476,19 @@ fn build_header_chip_line(
         if caps_enabled && index > 0 {
             pieces.push((" ".to_string(), None, None));
         }
-        let bg = chip_bg(theme, active, spec.count, spec.badge_state);
+        let bg = chip_bg(theme, active, spec.count);
         match bg {
             Some(bg) if caps_enabled => {
                 let cap = Style::default().fg(bg);
                 if !theme.header_chip_prefix.is_empty() {
                     pieces.push((theme.header_chip_prefix.clone(), Some(cap), action));
                 }
-                pieces.push((chip_label(theme, spec), Some(style), action));
+                push_chip_label_pieces(&mut pieces, theme, spec, active, style, action);
                 if !theme.header_chip_suffix.is_empty() {
                     pieces.push((theme.header_chip_suffix.clone(), Some(cap), action));
                 }
             }
-            _ => pieces.push((chip_label(theme, spec), Some(style), action)),
+            _ => push_chip_label_pieces(&mut pieces, theme, spec, active, style, action),
         }
     }
 
@@ -481,14 +513,9 @@ fn build_header_chip_line(
     HeaderLine { text, segments }
 }
 
-fn chip_bg(
-    theme: &SidebarRenderTheme,
-    active: bool,
-    count: usize,
-    badge_state: Option<BadgeState>,
-) -> Option<Color> {
+fn chip_bg(theme: &SidebarRenderTheme, active: bool, count: usize) -> Option<Color> {
     if active {
-        Some(chip_color(theme, badge_state))
+        Some(filter_bg(theme))
     } else if count > 0 {
         Some(theme.active_bg)
     } else {
@@ -496,22 +523,46 @@ fn chip_bg(
     }
 }
 
-fn chip_label(theme: &SidebarRenderTheme, spec: HeaderChipSpec) -> String {
-    if spec.filter == StatusFilter::All {
-        format!(" ≡ all {} ", spec.count)
-    } else if spec.filter == StatusFilter::AttentionOnly {
-        let glyph = spec
-            .badge_state
-            .map(|state| theme.badge_glyph(state))
-            .unwrap_or("?");
-        format!(" {glyph} needs action {} ", spec.count)
+fn push_chip_label_pieces(
+    pieces: &mut Vec<(String, Option<Style>, Option<HeaderAction>)>,
+    theme: &SidebarRenderTheme,
+    spec: HeaderChipSpec,
+    active: bool,
+    text_style: Style,
+    action: Option<HeaderAction>,
+) {
+    let Some(state) = spec.badge_state else {
+        pieces.push((format!(" ≡ {} ", spec.count), Some(text_style), action));
+        return;
+    };
+
+    pieces.push((" ".to_string(), Some(text_style), action));
+    pieces.push((
+        theme.badge_glyph(state).to_string(),
+        Some(chip_badge_style(theme, active, state, spec.count)),
+        action,
+    ));
+    pieces.push((format!(" {} ", spec.count), Some(text_style), action));
+}
+
+fn chip_badge_style(
+    theme: &SidebarRenderTheme,
+    active: bool,
+    state: BadgeState,
+    count: usize,
+) -> Style {
+    let mut style = Style::default().fg(theme.badge_color(state));
+    if active {
+        style = style.bg(filter_bg(theme));
+        if header_bold(theme) {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+    } else if count == 0 {
+        style = style.add_modifier(Modifier::DIM);
     } else {
-        let glyph = spec
-            .badge_state
-            .map(|state| theme.badge_glyph(state))
-            .unwrap_or("?");
-        format!(" {} {} ", glyph, spec.count)
+        style = style.bg(theme.active_bg);
     }
+    style
 }
 
 fn chip_style(
@@ -523,25 +574,22 @@ fn chip_style(
     if active {
         let mut style = Style::default()
             .fg(theme.header_chip_fg.unwrap_or_else(|| mode_fg(theme)))
-            .bg(chip_color(theme, badge_state));
+            .bg(filter_bg(theme));
         if header_bold(theme) {
             style = style.add_modifier(Modifier::BOLD);
         }
         return style;
     }
     if count == 0 {
-        return Style::default().fg(theme.detail);
+        return Style::default()
+            .fg(theme.detail)
+            .add_modifier(Modifier::DIM);
     }
-    Style::default()
-        .fg(chip_color(theme, badge_state))
-        .bg(theme.active_bg)
-}
-
-fn chip_color(theme: &SidebarRenderTheme, badge_state: Option<BadgeState>) -> Color {
-    match badge_state {
+    let fg = match badge_state {
         Some(state) => theme.badge_color(state),
-        None => filter_bg(theme),
-    }
+        None => theme.header_chip_fg.unwrap_or_else(|| mode_fg(theme)),
+    };
+    Style::default().fg(fg).bg(theme.active_bg)
 }
 
 pub fn header_hit_test(layout: &HeaderLayout, row: u16, column: u16) -> Option<HeaderAction> {
@@ -605,7 +653,11 @@ pub fn build_footer_line(width: usize) -> Line<'static> {
 }
 
 fn mode_segment_style(theme: &SidebarRenderTheme) -> Style {
-    let mut style = Style::default().fg(mode_fg(theme)).bg(mode_bg(theme));
+    let mut style = Style::default().fg(mode_fg(theme));
+    let background = mode_bg(theme);
+    if background != Color::Reset {
+        style = style.bg(background);
+    }
     if header_bold(theme) {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -880,7 +932,7 @@ fn render_row_line(
         .saturating_sub(git_width)
         .saturating_sub(right_reserved);
     let label_source = match row.kind {
-        SidebarRowKind::Category => format!("◆ {}", row.label),
+        SidebarRowKind::Category => row.label.clone(),
         SidebarRowKind::Jump => JUMP_ROW_LABEL.to_string(),
         SidebarRowKind::Chat => chat_display_label(row),
         _ => row.label.clone(),
@@ -1011,16 +1063,10 @@ fn row_leading_marker_span(
     theme: &SidebarRenderTheme,
 ) -> Span<'static> {
     let (marker, style) = match (row.active, selected) {
-        (true, true) => (
-            "›",
+        (_, true) => (
+            "▎",
             Style::default()
-                .fg(theme.toggle)
-                .add_modifier(Modifier::BOLD),
-        ),
-        (false, true) => (
-            "›",
-            Style::default()
-                .fg(theme.toggle)
+                .fg(theme.active_bar)
                 .add_modifier(Modifier::BOLD),
         ),
         (true, false) => ("▎", Style::default().fg(theme.active_bar)),
@@ -1523,10 +1569,10 @@ fn right_label(row: &SidebarRow) -> Option<String> {
                 return expanded_chat_right_label(row);
             }
             match row.rollup {
-                RollupLevel::Error => Some("err".to_string()),
-                RollupLevel::Permission => Some("perm".to_string()),
-                RollupLevel::Waiting => Some("wait".to_string()),
-                RollupLevel::Background => Some("bg".to_string()),
+                RollupLevel::Error => Some("Err".to_string()),
+                RollupLevel::Permission => Some("Perm".to_string()),
+                RollupLevel::Waiting => Some("Wait".to_string()),
+                RollupLevel::Background => Some("Bg".to_string()),
                 RollupLevel::Running => row
                     .meta
                     .as_ref()
@@ -1775,13 +1821,13 @@ fn expanded_chat_state_label(row: &SidebarRow) -> Option<String> {
     let badge_state = row.badge_state?;
     let mut state = match badge_state {
         BadgeState::Blocked => match row.rollup {
-            RollupLevel::Error => "error",
-            RollupLevel::Permission | RollupLevel::Waiting => "waiting",
-            _ => "blocked",
+            RollupLevel::Error => "Error",
+            RollupLevel::Permission | RollupLevel::Waiting => "Waiting",
+            _ => "Blocked",
         },
-        BadgeState::Working => "running",
-        BadgeState::Done => "done",
-        BadgeState::Idle => "idle",
+        BadgeState::Working => "Running",
+        BadgeState::Done => "Done",
+        BadgeState::Idle => "Idle",
     }
     .to_string();
 
@@ -1854,29 +1900,27 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
     }
 }
 
-const JUMP_ROW_LABEL: &str = "[↗ Jump][⌕ Preview][✓ Mark complete]";
-const ACTION_JUMP_GLYPH: Color = Color::Indexed(73);
-const ACTION_PREVIEW_GLYPH: Color = ACTION_JUMP_GLYPH;
+const JUMP_ACTION_LABEL: &str = "↗ Jump";
+const PREVIEW_ACTION_LABEL: &str = "⌕ Preview";
+const MARK_DONE_ACTION_LABEL: &str = "✓ Complete";
+const ACTION_SEPARATOR: &str = " · ";
+const JUMP_ROW_LABEL: &str = "↗ Jump · ⌕ Preview · ✓ Complete";
 
 fn jump_action_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'static>> {
     if label != JUMP_ROW_LABEL {
         return action_label_spans(label, theme);
     }
-    let bracket = Style::default().fg(theme.marker);
+    let separator = Style::default().fg(theme.marker);
     let text = Style::default().fg(theme.detail);
     vec![
-        Span::styled("[".to_string(), bracket),
-        Span::styled("↗".to_string(), Style::default().fg(ACTION_JUMP_GLYPH)),
+        Span::styled("↗".to_string(), Style::default().fg(theme.action_icon)),
         Span::styled(" Jump".to_string(), text),
-        Span::styled("]".to_string(), bracket),
-        Span::styled("[".to_string(), bracket),
-        Span::styled("⌕".to_string(), Style::default().fg(ACTION_PREVIEW_GLYPH)),
+        Span::styled(ACTION_SEPARATOR.to_string(), separator),
+        Span::styled("⌕".to_string(), Style::default().fg(theme.action_icon)),
         Span::styled(" Preview".to_string(), text),
-        Span::styled("]".to_string(), bracket),
-        Span::styled("[".to_string(), bracket),
+        Span::styled(ACTION_SEPARATOR.to_string(), separator),
         Span::styled("✓".to_string(), Style::default().fg(theme.badge_done)),
-        Span::styled(" Mark complete".to_string(), text),
-        Span::styled("]".to_string(), bracket),
+        Span::styled(" Complete".to_string(), text),
     ]
 }
 
@@ -1897,14 +1941,14 @@ fn action_label_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'stat
                 flush_text(&mut spans, &mut text);
                 spans.push(Span::styled(
                     ch.to_string(),
-                    Style::default().fg(ACTION_JUMP_GLYPH),
+                    Style::default().fg(theme.action_icon),
                 ));
             }
             '⌕' => {
                 flush_text(&mut spans, &mut text);
                 spans.push(Span::styled(
                     ch.to_string(),
-                    Style::default().fg(ACTION_PREVIEW_GLYPH),
+                    Style::default().fg(theme.action_icon),
                 ));
             }
             '✓' => {
@@ -1914,7 +1958,7 @@ fn action_label_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'stat
                     Style::default().fg(theme.badge_done),
                 ));
             }
-            '[' | ']' => {
+            '·' => {
                 flush_text(&mut spans, &mut text);
                 spans.push(Span::styled(
                     ch.to_string(),
@@ -1928,22 +1972,26 @@ fn action_label_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'stat
     spans
 }
 
-pub fn jump_row_action_at(row: &SidebarRow, column: u16) -> Option<JumpRowAction> {
+pub fn jump_row_action_at(
+    row: &SidebarRow,
+    column: u16,
+    rendered_width: u16,
+) -> Option<JumpRowAction> {
     if row.kind != SidebarRowKind::Jump {
         return None;
     }
-    let jump_start = jump_row_action_start(row);
-    let jump_end = jump_start + 8;
-    let preview_start = jump_end;
-    let preview_end = preview_start + 11;
-    let mark_done_start = preview_end;
-    let mark_done_end = mark_done_start + 17;
     let column = column as usize;
-    if (jump_start..jump_end).contains(&column) {
+    // Every rendered row reserves its final cell as padding. At narrow widths the
+    // action label is truncated, so the full label's hit area must not extend into
+    // cells where no action was drawn.
+    if column >= usize::from(rendered_width).saturating_sub(1) {
+        return None;
+    }
+    if jump_row_action_range(row, JumpRowAction::Jump).contains(&column) {
         Some(JumpRowAction::Jump)
-    } else if (preview_start..preview_end).contains(&column) {
+    } else if jump_row_action_range(row, JumpRowAction::Preview).contains(&column) {
         Some(JumpRowAction::Preview)
-    } else if (mark_done_start..mark_done_end).contains(&column) {
+    } else if jump_row_action_range(row, JumpRowAction::MarkDone).contains(&column) {
         Some(JumpRowAction::MarkDone)
     } else {
         None
@@ -1952,6 +2000,25 @@ pub fn jump_row_action_at(row: &SidebarRow, column: u16) -> Option<JumpRowAction
 
 pub fn jump_row_action_start(row: &SidebarRow) -> usize {
     3 + 2 * row.depth
+}
+
+pub fn jump_row_action_column(row: &SidebarRow, action: JumpRowAction) -> usize {
+    jump_row_action_range(row, action).start
+}
+
+fn jump_row_action_range(row: &SidebarRow, action: JumpRowAction) -> std::ops::Range<usize> {
+    let jump_start = jump_row_action_start(row);
+    let jump_end = jump_start + display_width(JUMP_ACTION_LABEL);
+    let preview_start = jump_end + display_width(ACTION_SEPARATOR);
+    let preview_end = preview_start + display_width(PREVIEW_ACTION_LABEL);
+    let mark_done_start = preview_end + display_width(ACTION_SEPARATOR);
+    let mark_done_end = mark_done_start + display_width(MARK_DONE_ACTION_LABEL);
+
+    match action {
+        JumpRowAction::Jump => jump_start..jump_end,
+        JumpRowAction::Preview => preview_start..preview_end,
+        JumpRowAction::MarkDone => mark_done_start..mark_done_end,
+    }
 }
 
 fn line_to_string(line: Line<'_>) -> String {
@@ -2111,15 +2178,21 @@ mod tests {
     #[test]
     fn active_colors_are_configurable() {
         let config = crate::config::SidebarColorsConfig {
+            action_icon: Some("#74c7ec".to_string()),
             active_bg: Some("235".to_string()),
             active_bar: Some("magenta".to_string()),
             ..Default::default()
         };
         let theme = SidebarRenderTheme::from_config(&config);
 
+        assert_eq!(theme.action_icon, Color::Rgb(0x74, 0xc7, 0xec));
         assert_eq!(theme.active_bg, Color::Indexed(235));
         assert_eq!(theme.active_bar, Color::Magenta);
         assert_eq!(SidebarRenderTheme::default().active_bg, Color::Indexed(235));
+        assert_eq!(
+            SidebarRenderTheme::default().action_icon,
+            Color::Indexed(73)
+        );
         assert_eq!(
             SidebarRenderTheme::default().active_bar,
             Color::Indexed(147)
@@ -2239,7 +2312,7 @@ mod tests {
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 8);
 
-        assert_eq!(rendered, " ▲ perm ");
+        assert_eq!(rendered, " ▲ Perm ");
     }
 
     #[test]
@@ -2379,7 +2452,7 @@ mod tests {
         let rendered = render_rows(&rows, &state, 40);
 
         assert!(rendered.contains(" ▾ app"));
-        assert!(rendered.contains("›   ▾ Codex %1"));
+        assert!(rendered.contains("▎   ▾ Codex %1"));
     }
 
     #[test]
@@ -2487,7 +2560,7 @@ mod tests {
             lines[0]
                 .spans
                 .iter()
-                .any(|span| span.content.trim() == "◆ misc"
+                .any(|span| span.content.trim() == "misc"
                     && span.style.fg == Some(Color::Indexed(215))
                     && span.style.add_modifier.contains(Modifier::BOLD)),
             "{:?}",
@@ -2527,7 +2600,7 @@ mod tests {
         );
 
         assert_eq!(row_style(&category, &theme).fg, Some(Color::Indexed(215)));
-        assert_eq!(row_style(&repo, &theme).fg, Some(Color::Blue));
+        assert_eq!(row_style(&repo, &theme).fg, Some(Color::LightCyan));
     }
 
     #[test]
@@ -2543,9 +2616,45 @@ mod tests {
         assert_eq!(mode_style.bg, Some(Color::Indexed(147)));
         assert!(mode_style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(
-            build_header_layout(&state, 80).lines[0].text,
-            format!(" ≣ Repository \u{e0b0} 0 tasks \u{e0b0}")
+            build_header_layout(&state, 80).lines[1].text,
+            format!(" ≣ Repository ▾ \u{e0b0} 0 tasks \u{e0b0}")
         );
+    }
+
+    #[test]
+    fn reset_header_background_keeps_mode_and_section_foreground_only() {
+        let config = serde_yaml_ng::from_str::<crate::config::Config>(
+            r##"
+sidebar:
+  header:
+    prefix: ""
+    suffix: ""
+    bold: true
+    colors:
+      fg: "#b4befe"
+      bg: reset
+  colors:
+    category: "#cba6f7"
+"##,
+        )
+        .unwrap();
+        let theme = SidebarRenderTheme::from_sidebar_config(&config.sidebar);
+        let header = build_header_layout_with_counts(
+            &SidebarState::default(),
+            80,
+            &theme,
+            rich_header_counts(),
+        );
+
+        let section = style_for_segment(&header, 0, "SIDEBAR");
+        assert_eq!(section.fg, Some(Color::Rgb(0xcb, 0xa6, 0xf7)));
+        assert_eq!(section.bg, None);
+        assert!(section.add_modifier.contains(Modifier::BOLD));
+
+        let mode = style_for_segment(&header, 1, "≣ Category");
+        assert_eq!(mode.fg, Some(Color::Rgb(0xb4, 0xbe, 0xfe)));
+        assert_eq!(mode.bg, None);
+        assert!(mode.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -2555,7 +2664,7 @@ mod tests {
                 view_mode,
                 ..SidebarState::default()
             };
-            build_header_layout(&state, 80).lines[1].text.clone()
+            build_header_layout(&state, 80).lines[2].text.clone()
         };
         let flat = text_for(ViewMode::Flat);
         let repo = text_for(ViewMode::ByRepo);
@@ -2572,7 +2681,7 @@ mod tests {
     }
 
     #[test]
-    fn category_row_label_has_diamond_prefix_in_standard_tier() {
+    fn category_row_label_omits_diamond_in_every_tier() {
         let category = row(
             "category::dev",
             SidebarRowKind::Category,
@@ -2588,7 +2697,8 @@ mod tests {
         );
         let dense = render_rows(&[category], &SidebarState::default(), 30);
 
-        assert!(standard.contains("▾ ◆ dev"), "{standard:?}");
+        assert!(standard.contains("▾ dev"), "{standard:?}");
+        assert!(!standard.contains("◆"), "{standard:?}");
         assert!(!dense.contains("◆"), "{dense:?}");
     }
 
@@ -2608,7 +2718,7 @@ mod tests {
 
         let rendered = render_rows(&[category], &SidebarState::default(), 40);
 
-        assert!(rendered.contains("▾ ◆ dev ─"), "{rendered:?}");
+        assert!(rendered.contains("▾ dev ─"), "{rendered:?}");
         assert!(rendered.contains("─ ▲1 "), "{rendered:?}");
     }
 
@@ -2681,7 +2791,7 @@ mod tests {
         assert_eq!(selected_lines[1].style.bg, Some(theme.selection_bg));
         assert_eq!(
             line_to_string(selected_lines[0].clone()).chars().next(),
-            Some('›')
+            Some('▎')
         );
         assert_eq!(
             line_to_string(selected_lines[1].clone()).chars().next(),
@@ -2735,7 +2845,7 @@ mod tests {
         assert_eq!(lines[1].style.bg, Some(theme.selection_bg));
         assert_eq!(lines[2].style.bg, Some(theme.selection_bg));
         assert_eq!(lines[3].style.bg, None);
-        assert_eq!(line_to_string(lines[0].clone()).chars().next(), Some('›'));
+        assert_eq!(line_to_string(lines[0].clone()).chars().next(), Some('▎'));
         assert_eq!(line_to_string(lines[1].clone()).chars().next(), Some(' '));
         assert_eq!(line_to_string(lines[2].clone()).chars().next(), Some(' '));
     }
@@ -2753,11 +2863,14 @@ mod tests {
         let rendered = render_rows(std::slice::from_ref(&jump), &SidebarState::default(), 80);
 
         assert!(
-            rendered.starts_with("     └ [↗ Jump][⌕ Preview][✓ Mark complete]"),
+            rendered.starts_with("     └ ↗ Jump · ⌕ Preview · ✓ Complete"),
             "{rendered:?}"
         );
 
-        let theme = SidebarRenderTheme::default();
+        let theme = SidebarRenderTheme {
+            action_icon: Color::Rgb(0x74, 0xc7, 0xec),
+            ..SidebarRenderTheme::default()
+        };
         let lines = render_lines(&[jump], &SidebarState::default(), 80, &theme);
         let style_of = |needle: &str| {
             lines[0]
@@ -2767,19 +2880,22 @@ mod tests {
                 .unwrap_or_else(|| panic!("span {needle:?} not found: {:?}", lines[0]))
                 .style
         };
-        assert_eq!(style_of("↗").fg, Some(Color::Indexed(73)));
-        assert_eq!(style_of("⌕").fg, Some(Color::Indexed(73)));
+        assert_eq!(style_of("↗").fg, Some(theme.action_icon));
+        assert_eq!(style_of("⌕").fg, Some(theme.action_icon));
         assert_eq!(style_of("✓").fg, Some(theme.badge_done));
         assert_eq!(style_of(" Jump").fg, Some(theme.detail));
         assert_eq!(style_of(" Preview").fg, Some(theme.detail));
-        assert_eq!(style_of(" Mark complete").fg, Some(theme.detail));
-        assert_eq!(style_of("[").fg, Some(theme.marker));
+        assert_eq!(style_of(" Complete").fg, Some(theme.detail));
+        assert_eq!(style_of(ACTION_SEPARATOR).fg, Some(theme.marker));
     }
 
     #[test]
     fn truncated_jump_row_keeps_preview_icon_color() {
-        let theme = SidebarRenderTheme::default();
-        let spans = jump_action_spans("[↗ Jump][⌕ Preview][✓ Mark…", &theme);
+        let theme = SidebarRenderTheme {
+            action_icon: Color::Rgb(0x74, 0xc7, 0xec),
+            ..SidebarRenderTheme::default()
+        };
+        let spans = jump_action_spans("↗ Jump · ⌕ Preview · ✓ Com…", &theme);
         let style_of = |needle: &str| {
             spans
                 .iter()
@@ -2788,9 +2904,10 @@ mod tests {
                 .style
         };
 
-        assert_eq!(style_of("↗").fg, Some(Color::Indexed(73)));
-        assert_eq!(style_of("⌕").fg, Some(Color::Indexed(73)));
+        assert_eq!(style_of("↗").fg, Some(theme.action_icon));
+        assert_eq!(style_of("⌕").fg, Some(theme.action_icon));
         assert_eq!(style_of("✓").fg, Some(theme.badge_done));
+        assert_eq!(style_of("·").fg, Some(theme.marker));
     }
 
     #[test]
@@ -2804,16 +2921,39 @@ mod tests {
         );
 
         // " " + indent(4) + "└ " => actions start at 7.
-        // "[↗ Jump]"(7..15) + "[⌕ Preview]"(15..26) + "[✓ Mark complete]"(26..43)
-        assert_eq!(jump_row_action_at(&jump, 6), None);
-        assert_eq!(jump_row_action_at(&jump, 7), Some(JumpRowAction::Jump));
-        assert_eq!(jump_row_action_at(&jump, 14), Some(JumpRowAction::Jump));
-        assert_eq!(jump_row_action_at(&jump, 15), Some(JumpRowAction::Preview));
-        assert_eq!(jump_row_action_at(&jump, 25), Some(JumpRowAction::Preview));
-        assert_eq!(jump_row_action_at(&jump, 26), Some(JumpRowAction::MarkDone));
-        assert_eq!(jump_row_action_at(&jump, 38), Some(JumpRowAction::MarkDone));
-        assert_eq!(jump_row_action_at(&jump, 42), Some(JumpRowAction::MarkDone));
-        assert_eq!(jump_row_action_at(&jump, 43), None);
+        // "↗ Jump"(7..13) · "⌕ Preview"(16..25) · "✓ Complete"(28..38)
+        assert_eq!(jump_row_action_at(&jump, 6, 80), None);
+        assert_eq!(jump_row_action_at(&jump, 7, 80), Some(JumpRowAction::Jump));
+        assert_eq!(jump_row_action_at(&jump, 12, 80), Some(JumpRowAction::Jump));
+        assert_eq!(jump_row_action_at(&jump, 13, 80), None);
+        assert_eq!(jump_row_action_at(&jump, 15, 80), None);
+        assert_eq!(
+            jump_row_action_at(&jump, 16, 80),
+            Some(JumpRowAction::Preview)
+        );
+        assert_eq!(
+            jump_row_action_at(&jump, 24, 80),
+            Some(JumpRowAction::Preview)
+        );
+        assert_eq!(jump_row_action_at(&jump, 25, 80), None);
+        assert_eq!(jump_row_action_at(&jump, 27, 80), None);
+        assert_eq!(
+            jump_row_action_at(&jump, 28, 80),
+            Some(JumpRowAction::MarkDone)
+        );
+        assert_eq!(
+            jump_row_action_at(&jump, 37, 80),
+            Some(JumpRowAction::MarkDone)
+        );
+        assert_eq!(jump_row_action_at(&jump, 38, 80), None);
+
+        // Standard tier starts at width 36. Column 35 is the row's padding,
+        // although the untruncated Complete label would extend through 37.
+        assert_eq!(
+            jump_row_action_at(&jump, 34, 36),
+            Some(JumpRowAction::MarkDone)
+        );
+        assert_eq!(jump_row_action_at(&jump, 35, 36), None);
     }
 
     #[test]
@@ -2866,6 +3006,18 @@ mod tests {
             .expect("segment style")
     }
 
+    fn style_after_segment(layout: &HeaderLayout, row: usize, needle: &str) -> Style {
+        let line = &layout.lines[row];
+        let index = line
+            .segments
+            .iter()
+            .position(|segment| segment_text(line, segment) == needle)
+            .unwrap_or_else(|| panic!("segment {needle:?} not found in {:?}", line.segments));
+        line.segments[index + 1]
+            .style
+            .expect("following segment style")
+    }
+
     #[test]
     fn header_layout_uses_powerline_title_and_filter_chip_rows() {
         let state = SidebarState {
@@ -2881,15 +3033,21 @@ mod tests {
             rich_header_counts(),
         );
 
-        assert_eq!(header.row_count(), 2);
-        assert_eq!(
-            header.lines[0].text,
-            format!(" ≣ Category   \u{e0b0} 7 tasks \u{e0b0}")
-        );
+        assert_eq!(header.row_count(), 3);
+        assert_eq!(header.lines[0].text, " SIDEBAR");
         assert_eq!(
             header.lines[1].text,
-            " ≡ all 7  ▲ needs action 2  ● 1  ✓ 0  ○ 5 "
+            format!(" ≣ Category   ▾ \u{e0b0} 7 tasks \u{e0b0}")
         );
+        assert_eq!(header.lines[2].text, " ≡ 7  ▲ 2  ● 1  ✓ 0  ○ 5 ");
+        let section = style_for_segment(&header, 0, "SIDEBAR");
+        assert_eq!(section.fg, Some(SidebarRenderTheme::default().category));
+        assert!(section.add_modifier.contains(Modifier::BOLD));
+        let total = style_for_segment(&header, 1, " 7");
+        assert_eq!(total.fg, Some(Color::Reset));
+        assert!(total.add_modifier.contains(Modifier::BOLD));
+        let task_label = style_for_segment(&header, 1, " tasks ");
+        assert_eq!(task_label.fg, Some(SidebarRenderTheme::default().detail));
     }
 
     #[test]
@@ -2908,8 +3066,8 @@ mod tests {
         );
 
         assert_eq!(
-            header.lines[0].text,
-            format!(" ≣ Category   \u{e0b0} 1 task \u{e0b0}")
+            header.lines[1].text,
+            format!(" ≣ Category   ▾ \u{e0b0} 1 task \u{e0b0}")
         );
     }
 
@@ -2928,26 +3086,27 @@ mod tests {
             rich_header_counts(),
         );
 
+        assert_eq!(header_hit_test(&header, 0, 2), None);
         assert_eq!(
-            header_hit_test(&header, 0, 2),
+            header_hit_test(&header, 1, 2),
             Some(HeaderAction::CycleViewMode)
         );
-        assert_eq!(header_hit_test(&header, 0, 14), None);
+        assert_eq!(header_hit_test(&header, 1, 18), None);
         assert_eq!(
-            header_hit_test(&header, 1, 1),
+            header_hit_test(&header, 2, 1),
             Some(HeaderAction::SetFilter(StatusFilter::All))
         );
         assert_eq!(
-            header_hit_test(&header, 1, 10),
+            header_hit_test(&header, 2, 6),
             Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
         );
         assert_eq!(
-            header_hit_test(&header, 1, 28),
+            header_hit_test(&header, 2, 11),
             Some(HeaderAction::SetFilter(StatusFilter::WorkingOnly))
         );
-        assert_eq!(header_hit_test(&header, 1, 33), None);
+        assert_eq!(header_hit_test(&header, 2, 16), None);
         assert_eq!(
-            header_hit_test(&header, 1, 38),
+            header_hit_test(&header, 2, 21),
             Some(HeaderAction::SetFilter(StatusFilter::IdleOnly))
         );
     }
@@ -2971,12 +3130,12 @@ mod tests {
             build_header_layout_with_counts(&state, 80, &SidebarRenderTheme::default(), counts);
 
         assert!(
-            header.lines[1].text.contains("▲ needs action 2"),
+            header.lines[2].text.contains("▲ 2"),
             "{:?}",
-            header.lines[1].text
+            header.lines[2].text
         );
         assert_eq!(
-            header_hit_test(&header, 1, 10),
+            header_hit_test(&header, 2, 6),
             Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
         );
     }
@@ -3002,10 +3161,13 @@ mod tests {
 
         let header = build_header_layout_with_counts(&state, 80, &theme, counts);
 
-        let active = style_for_segment(&header, 1, "▲ needs action 1");
-        assert_eq!(active.fg, Some(Color::Rgb(0x19, 0x16, 0x27)));
-        assert_eq!(active.bg, Some(theme.badge_blocked));
-        assert!(!active.add_modifier.contains(Modifier::BOLD));
+        let badge = style_for_segment(&header, 2, "▲");
+        assert_eq!(badge.fg, Some(theme.badge_blocked));
+        assert_eq!(badge.bg, Some(theme.header_mode));
+        let active_text = style_after_segment(&header, 2, "▲");
+        assert_eq!(active_text.fg, Some(Color::Rgb(0x19, 0x16, 0x27)));
+        assert_eq!(active_text.bg, Some(theme.header_mode));
+        assert!(!active_text.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -3030,10 +3192,13 @@ mod tests {
 
         let header = build_header_layout_with_counts(&state, 80, &theme, counts);
 
-        let active = style_for_segment(&header, 1, "▲ needs action 1");
-        assert_eq!(active.fg, Some(Color::Rgb(0x23, 0x23, 0x32)));
-        assert_eq!(active.bg, Some(theme.badge_blocked));
-        let mode = style_for_segment(&header, 0, "≣");
+        let badge = style_for_segment(&header, 2, "▲");
+        assert_eq!(badge.fg, Some(theme.badge_blocked));
+        assert_eq!(badge.bg, Some(theme.header_mode));
+        let active_text = style_after_segment(&header, 2, "▲");
+        assert_eq!(active_text.fg, Some(Color::Rgb(0x23, 0x23, 0x32)));
+        assert_eq!(active_text.bg, Some(theme.header_mode));
+        let mode = style_for_segment(&header, 1, "≣");
         assert_eq!(mode.fg, Some(Color::Rgb(0x98, 0xb2, 0xf6)));
     }
 
@@ -3051,7 +3216,7 @@ mod tests {
 
         let header = build_header_layout_with_counts(&state, 80, &theme, rich_header_counts());
 
-        let active = style_for_segment(&header, 1, "≡ all 7");
+        let active = style_for_segment(&header, 2, "≡ 7");
         assert_eq!(active.bg, Some(Color::Rgb(0xee, 0xee, 0xf4)));
     }
 
@@ -3071,14 +3236,14 @@ badge:
         let header = build_header_layout_with_counts(&state, 80, &theme, rich_header_counts());
 
         assert!(
-            header.lines[1].text.contains("W 1"),
+            header.lines[2].text.contains("W 1"),
             "{:?}",
-            header.lines[1].text
+            header.lines[2].text
         );
         assert!(
-            !header.lines[1].text.contains("● 1"),
+            !header.lines[2].text.contains("● 1"),
             "{:?}",
-            header.lines[1].text
+            header.lines[2].text
         );
     }
 
@@ -3102,9 +3267,9 @@ sidebar:
         );
 
         assert!(
-            header.lines[0].text.ends_with("7 tasks "),
+            header.lines[1].text.ends_with("7 tasks "),
             "{:?}",
-            header.lines[0].text
+            header.lines[1].text
         );
     }
 
@@ -3126,21 +3291,26 @@ sidebar:
         let state = SidebarState::default();
 
         let header = build_header_layout_with_counts(&state, 80, &theme, counts);
-        let line = &header.lines[1];
+        let line = &header.lines[2];
 
         assert_eq!(
             line.text,
-            "\u{e0b6} ≡ all 3 \u{e0b4} \u{e0b6} ▲ needs action 1 \u{e0b4}  ● 0   ✓ 0  \u{e0b6} ○ 2 \u{e0b4}"
+            "\u{e0b6} ≡ 3 \u{e0b4} \u{e0b6} ▲ 1 \u{e0b4}  ● 0   ✓ 0  \u{e0b6} ○ 2 \u{e0b4}"
         );
-        let cap = style_for_segment(&header, 1, "\u{e0b6}");
+        let cap = style_for_segment(&header, 2, "\u{e0b6}");
         assert_eq!(cap.fg, Some(theme.header_mode));
         assert_eq!(
-            header_hit_test(&header, 1, 0),
+            header_hit_test(&header, 2, 0),
             Some(HeaderAction::SetFilter(StatusFilter::All))
         );
-        let zero = style_for_segment(&header, 1, "● 0");
-        assert_eq!(zero.fg, Some(theme.detail));
-        assert_eq!(zero.bg, None);
+        let zero_badge = style_for_segment(&header, 2, "●");
+        assert_eq!(zero_badge.fg, Some(theme.badge_working));
+        assert_eq!(zero_badge.bg, None);
+        assert!(zero_badge.add_modifier.contains(Modifier::DIM));
+        let zero_count = style_after_segment(&header, 2, "●");
+        assert_eq!(zero_count.fg, Some(theme.detail));
+        assert_eq!(zero_count.bg, None);
+        assert!(zero_count.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
@@ -3162,24 +3332,33 @@ sidebar:
 
         let header = build_header_layout_with_counts(&state, 80, &theme, counts);
 
-        let mode = style_for_segment(&header, 0, "≣ Category");
+        let mode = style_for_segment(&header, 1, "≣ Category");
         assert_eq!(mode.fg, Some(Color::Indexed(16)));
         assert_eq!(mode.bg, Some(theme.header_mode));
         assert!(mode.add_modifier.contains(Modifier::BOLD));
 
-        let active = style_for_segment(&header, 1, "▲ needs action 0");
-        assert_eq!(active.fg, Some(Color::Indexed(16)));
-        assert_eq!(active.bg, Some(theme.badge_blocked));
-        assert!(active.add_modifier.contains(Modifier::BOLD));
+        let active_badge = style_for_segment(&header, 2, "▲");
+        assert_eq!(active_badge.fg, Some(theme.badge_blocked));
+        assert_eq!(active_badge.bg, Some(theme.header_mode));
+        assert!(active_badge.add_modifier.contains(Modifier::BOLD));
+        let active_count = style_after_segment(&header, 2, "▲");
+        assert_eq!(active_count.fg, Some(Color::Indexed(16)));
+        assert_eq!(active_count.bg, Some(theme.header_mode));
+        assert!(active_count.add_modifier.contains(Modifier::BOLD));
 
-        let working = style_for_segment(&header, 1, "● 2");
+        let working = style_for_segment(&header, 2, "●");
         assert_eq!(working.fg, Some(theme.badge_working));
         assert_eq!(working.bg, Some(theme.active_bg));
 
-        let done = style_for_segment(&header, 1, "✓ 0");
-        assert_eq!(done.fg, Some(theme.detail));
-        assert_eq!(done.bg, None);
-        assert!(!done.add_modifier.contains(Modifier::BOLD));
+        let done_badge = style_for_segment(&header, 2, "✓");
+        assert_eq!(done_badge.fg, Some(theme.badge_done));
+        assert_eq!(done_badge.bg, None);
+        assert!(done_badge.add_modifier.contains(Modifier::DIM));
+        let done_count = style_after_segment(&header, 2, "✓");
+        assert_eq!(done_count.fg, Some(theme.detail));
+        assert_eq!(done_count.bg, None);
+        assert!(done_count.add_modifier.contains(Modifier::DIM));
+        assert!(!done_count.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -3201,8 +3380,8 @@ sidebar:
         );
 
         assert_eq!(theme.header_suffix, "");
-        assert!(!header.lines[0].text.contains('\u{e0b0}'));
-        assert_eq!(header.lines[0].text, " ≣ Category    7 tasks ");
+        assert!(!header.lines[1].text.contains('\u{e0b0}'));
+        assert_eq!(header.lines[1].text, " ≣ Category   ▾  7 tasks ");
     }
 
     #[test]
@@ -3218,8 +3397,8 @@ sidebar:
             &SidebarRenderTheme::default(),
             rich_header_counts(),
         );
-        assert_eq!(compact.lines[0].text, " ≣ Category…");
-        assert!(!compact.lines[0].text.contains("tasks"));
+        assert_eq!(compact.lines[1].text, " ≣ Category…");
+        assert!(!compact.lines[1].text.contains("tasks"));
 
         let narrow = build_header_layout_with_counts(
             &state,
@@ -3227,11 +3406,11 @@ sidebar:
             &SidebarRenderTheme::default(),
             rich_header_counts(),
         );
-        assert!(display_width(&narrow.lines[0].text) <= 6);
+        assert!(display_width(&narrow.lines[1].text) <= 6);
         assert!(
-            narrow.lines[0].text.ends_with('…'),
+            narrow.lines[1].text.ends_with('…'),
             "{:?}",
-            narrow.lines[0].text
+            narrow.lines[1].text
         );
     }
 
@@ -3264,16 +3443,20 @@ sidebar:
 
         let header = build_header_layout_with_counts(&state, 80, &theme, rich_header_counts());
         let lines = render_header_lines(&header, &theme);
-        let mode = style_for_segment(&header, 0, "≣ Category");
-        let suffix = style_for_segment(&header, 0, "]");
+        let mode = style_for_segment(&header, 1, "≣ Category");
+        let suffix = style_for_segment(&header, 1, "]");
 
-        assert_eq!(header.lines[0].text, "[ ≣ Category   ] 7 tasks ]");
+        assert_eq!(header.lines[1].text, "[ ≣ Category   ] 7 tasks ]");
         assert_eq!(mode.fg, Some(Color::White));
         assert_eq!(mode.bg, Some(Color::Indexed(24)));
         assert!(mode.add_modifier.contains(Modifier::BOLD));
         assert_eq!(suffix.fg, Some(Color::Indexed(24)));
         assert_eq!(suffix.bg, Some(Color::Indexed(235)));
-        assert_eq!(lines[0].spans[0].style, mode);
+        assert_eq!(
+            lines[1].spans[0].style,
+            Style::default().fg(Color::Indexed(24))
+        );
+        assert_eq!(lines[1].spans[1].style, mode);
     }
 
     #[test]
@@ -3290,7 +3473,7 @@ sidebar:
         let rendered = render_rows(&[chat], &SidebarState::default(), 80);
 
         assert!(rendered.contains("● Codex (%1)"), "{rendered}");
-        assert!(!rendered.contains("[running]"), "{rendered}");
+        assert!(!rendered.contains("[Running]"), "{rendered}");
     }
 
     #[test]
@@ -3368,7 +3551,7 @@ sidebar:
         assert!(
             chat_spans
                 .iter()
-                .any(|span| span.content.as_ref() == "running 13m 00s"
+                .any(|span| span.content.as_ref() == "Running 13m 00s"
                     && span.style.fg == Some(Color::Green)
                     && !span.style.add_modifier.contains(Modifier::DIM)),
             "{chat_spans:?}"
@@ -3528,7 +3711,7 @@ sidebar:
         });
         let theme = SidebarRenderTheme::default();
 
-        assert_eq!(right_label(&chat).as_deref(), Some("running 12m 00s"));
+        assert_eq!(right_label(&chat).as_deref(), Some("Running 12m 00s"));
         assert_eq!(
             right_style(&chat, &theme).fg,
             Some(theme.badge_color(BadgeState::Working))
@@ -3547,15 +3730,33 @@ sidebar:
         assert!(
             !chat_spans
                 .iter()
-                .any(|span| span.content.as_ref() == "running"),
+                .any(|span| span.content.as_ref() == "Running"),
             "{chat_spans:?}"
         );
         assert_span_fg(
             chat_spans,
-            "running 12m 00s",
+            "Running 12m 00s",
             theme.badge_color(BadgeState::Working),
         );
-        assert!(line_to_string(lines[0].clone()).ends_with("running 12m 00s "));
+        assert!(line_to_string(lines[0].clone()).ends_with("Running 12m 00s "));
+    }
+
+    #[test]
+    fn sidebar_state_labels_start_with_uppercase_letters() {
+        let cases = [
+            (BadgeState::Blocked, RollupLevel::Error, "Error"),
+            (BadgeState::Blocked, RollupLevel::Permission, "Waiting"),
+            (BadgeState::Blocked, RollupLevel::Background, "Blocked"),
+            (BadgeState::Working, RollupLevel::Running, "Running"),
+            (BadgeState::Done, RollupLevel::Idle, "Done"),
+            (BadgeState::Idle, RollupLevel::Idle, "Idle"),
+        ];
+
+        for (badge, rollup, expected) in cases {
+            let mut chat = row("chat::%1", SidebarRowKind::Chat, 0, "codex", rollup);
+            chat.badge_state = Some(badge);
+            assert_eq!(expanded_chat_state_label(&chat).as_deref(), Some(expected));
+        }
     }
 
     #[test]
@@ -3579,17 +3780,17 @@ sidebar:
 
         assert_eq!(
             right_label(&chat).as_deref(),
-            Some("waiting (permission_prompt) 2m 00s")
+            Some("Waiting (permission_prompt) 2m 00s")
         );
         let lines = render_lines(&[chat], &SidebarState::default(), 60, &theme);
         let chat_spans = &lines[0].spans;
 
         assert_span_fg(
             chat_spans,
-            "waiting (permission_prompt) 2m 00s",
+            "Waiting (permission_prompt) 2m 00s",
             theme.badge_color(BadgeState::Blocked),
         );
-        assert!(line_to_string(lines[0].clone()).ends_with("waiting (permission_prompt) 2m 00s "));
+        assert!(line_to_string(lines[0].clone()).ends_with("Waiting (permission_prompt) 2m 00s "));
     }
 
     #[test]
@@ -3610,14 +3811,14 @@ sidebar:
         });
         let theme = SidebarRenderTheme::default();
 
-        assert_eq!(right_label(&chat).as_deref(), Some("idle 13m ago"));
+        assert_eq!(right_label(&chat).as_deref(), Some("Idle 13m ago"));
         assert_eq!(
             right_style(&chat, &theme).fg,
             Some(theme.badge_color(BadgeState::Idle))
         );
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 32);
-        assert!(rendered.ends_with("idle 13m ago "), "{rendered:?}");
+        assert!(rendered.ends_with("Idle 13m ago "), "{rendered:?}");
     }
 
     #[test]
@@ -3638,7 +3839,7 @@ sidebar:
         });
         let theme = SidebarRenderTheme::default();
 
-        assert_eq!(right_label(&chat).as_deref(), Some("done 13m ago"));
+        assert_eq!(right_label(&chat).as_deref(), Some("Done 13m ago"));
         assert_eq!(
             right_style(&chat, &theme).fg,
             Some(theme.badge_color(BadgeState::Done))
@@ -3647,7 +3848,7 @@ sidebar:
         let lines = render_lines(&[chat], &SidebarState::default(), 32, &theme);
         assert_span_fg(
             &lines[0].spans,
-            "done 13m ago",
+            "Done 13m ago",
             theme.badge_color(BadgeState::Done),
         );
     }
@@ -3675,7 +3876,7 @@ sidebar:
         let spans = &lines[0].spans;
         assert!(
             spans.iter().any(|span| span.content.as_ref() == "app"
-                && span.style.fg == Some(Color::Blue)
+                && span.style.fg == Some(Color::LightCyan)
                 && span.style.add_modifier.contains(Modifier::BOLD)),
             "{spans:?}"
         );
@@ -3848,7 +4049,7 @@ badge:
     }
 
     #[test]
-    fn selected_rows_have_a_non_color_marker_and_horizontal_padding() {
+    fn selected_rows_have_an_active_bar_marker_and_horizontal_padding() {
         let rows = vec![row(
             "repo::misc::app",
             SidebarRowKind::Repo,
@@ -3861,12 +4062,12 @@ badge:
             ..SidebarState::default()
         };
         let rendered = render_rows(&rows, &state, 40);
-        assert!(rendered.starts_with("›▾ app"), "{rendered:?}");
+        assert!(rendered.starts_with("▎▾ app"), "{rendered:?}");
         assert_eq!(display_width(&rendered), 40, "{rendered:?}");
     }
 
     #[test]
-    fn selected_chat_has_a_non_color_marker_in_every_width_tier() {
+    fn selected_chat_has_an_active_bar_marker_in_every_width_tier() {
         let mut chat = row(
             "chat::%1",
             SidebarRowKind::Chat,
@@ -3882,7 +4083,7 @@ badge:
 
         for width in [2, 8, 30, 40] {
             let rendered = render_rows(std::slice::from_ref(&chat), &state, width);
-            assert!(rendered.contains('›'), "{width}: {rendered:?}");
+            assert!(rendered.contains('▎'), "{width}: {rendered:?}");
         }
     }
 
@@ -3923,33 +4124,33 @@ badge:
                     rendered.iter().all(|line| display_width(line) <= width),
                     "{label:?} width={width}: {rendered:?}"
                 );
-                assert!(rendered.iter().any(|line| line.contains('›')));
+                assert!(rendered.iter().any(|line| line.contains('▎')));
                 let expected = match (label, width) {
-                    ("Codex: fix sidebar", 16) => vec!["›● 1m30s        "],
-                    ("Codex: fix sidebar", 24) => vec!["›● Codex       f… 1m30s "],
+                    ("Codex: fix sidebar", 16) => vec!["▎● 1m30s        "],
+                    ("Codex: fix sidebar", 24) => vec!["▎● Codex       f… 1m30s "],
                     ("Codex: fix sidebar", 35) => {
-                        vec!["›● Codex       fix sidebar   1m30s "]
+                        vec!["▎● Codex       fix sidebar   1m30s "]
                     }
                     ("Codex: fix sidebar", 36) => vec![
-                        "› ▸ ● Codex          running 1m 30s ",
+                        "▎ ▸ ● Codex          Running 1m 30s ",
                         "     fix sidebar                    ",
                     ],
-                    ("Codex: 修正確認", 16) => vec!["›● 1m30s        "],
-                    ("Codex: 修正確認", 24) => vec!["›● Codex       …  1m30s "],
+                    ("Codex: 修正確認", 16) => vec!["▎● 1m30s        "],
+                    ("Codex: 修正確認", 24) => vec!["▎● Codex       …  1m30s "],
                     ("Codex: 修正確認", 35) => {
-                        vec!["›● Codex       修正確認      1m30s "]
+                        vec!["▎● Codex       修正確認      1m30s "]
                     }
                     ("Codex: 修正確認", 36) => vec![
-                        "› ▸ ● Codex          running 1m 30s ",
+                        "▎ ▸ ● Codex          Running 1m 30s ",
                         "     修正確認                       ",
                     ],
-                    ("Codex: fix 🧭✨", 16) => vec!["›● 1m30s        "],
-                    ("Codex: fix 🧭✨", 24) => vec!["›● Codex       f… 1m30s "],
+                    ("Codex: fix 🧭✨", 16) => vec!["▎● 1m30s        "],
+                    ("Codex: fix 🧭✨", 24) => vec!["▎● Codex       f… 1m30s "],
                     ("Codex: fix 🧭✨", 35) => {
-                        vec!["›● Codex       fix 🧭✨      1m30s "]
+                        vec!["▎● Codex       fix 🧭✨      1m30s "]
                     }
                     ("Codex: fix 🧭✨", 36) => vec![
-                        "› ▸ ● Codex          running 1m 30s ",
+                        "▎ ▸ ● Codex          Running 1m 30s ",
                         "     fix 🧭✨                       ",
                     ],
                     _ => unreachable!(),
@@ -4011,7 +4212,7 @@ badge:
         assert_eq!(text.len(), 2);
         assert!(text[0].contains("▸ ▲ Codex"), "{text:?}");
         assert!(
-            text[0].ends_with("waiting (permission_prompt) 2m 07s · ☑ 2/5 · ↳ 2 "),
+            text[0].ends_with("Waiting (permission_prompt) 2m 07s · ☑ 2/5 · ↳ 2 "),
             "{text:?}"
         );
         assert!(
@@ -4023,7 +4224,7 @@ badge:
         assert_span_fg(&rendered.lines[0].spans, "↳ 2", theme.subagent_label);
         assert_span_fg(
             &rendered.lines[0].spans,
-            "waiting (permission_prompt) 2m 07s",
+            "Waiting (permission_prompt) 2m 07s",
             theme.badge_color(BadgeState::Blocked),
         );
         assert!(
@@ -4142,12 +4343,12 @@ badge:
                 .iter()
                 .all(|line| { line.style.bg == Some(SidebarRenderTheme::default().selection_bg) })
         );
-        assert_eq!(line_to_string(lines[0].clone()).chars().next(), Some('›'));
+        assert_eq!(line_to_string(lines[0].clone()).chars().next(), Some('▎'));
         assert_eq!(line_to_string(lines[1].clone()).chars().next(), Some(' '));
-        assert!(line_to_string(lines[0].clone()).ends_with("running 8m 42s "));
+        assert!(line_to_string(lines[0].clone()).ends_with("Running 8m 42s "));
         assert_span_fg(
             &lines[0].spans,
-            "running 8m 42s",
+            "Running 8m 42s",
             SidebarRenderTheme::default().badge_color(BadgeState::Working),
         );
     }
@@ -4175,7 +4376,7 @@ badge:
 
         assert_span_fg(
             &lines[0].spans,
-            "done 13m ago",
+            "Done 13m ago",
             theme.badge_color(BadgeState::Done),
         );
     }
@@ -4343,7 +4544,7 @@ badge:
 
         chat.expanded = true;
 
-        assert_eq!(right_label(&chat).as_deref(), Some("running 13m 00s"));
+        assert_eq!(right_label(&chat).as_deref(), Some("Running 13m 00s"));
         assert_eq!(
             right_style(&chat, &SidebarRenderTheme::default()).fg,
             Some(SidebarRenderTheme::default().badge_color(BadgeState::Working))
@@ -4363,7 +4564,7 @@ badge:
         chat.expanded = false;
         let rendered = render_rows(&[chat], &SidebarState::default(), 24);
         assert!(rendered.contains('…'), "{rendered:?}");
-        assert!(rendered.ends_with("perm "), "{rendered:?}");
+        assert!(rendered.ends_with("Perm "), "{rendered:?}");
         assert_eq!(display_width(&rendered), 24, "{rendered:?}");
     }
 

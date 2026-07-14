@@ -1295,7 +1295,7 @@ mod tests {
         let after_text = crate::sidebar::render::render_rows(&after.rows, &state, 36);
 
         assert!(before_text.contains("59s"), "{before_text}");
-        assert!(after_text.contains("running 1m 00s"), "{after_text}");
+        assert!(after_text.contains("Running 1m 00s"), "{after_text}");
         assert_eq!(snapshot.snapshot_revision, 7);
         assert_eq!(serde_json::to_vec(&snapshot).unwrap(), encoded);
     }
