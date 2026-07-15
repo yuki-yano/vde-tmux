@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRenderTheme {
     pub selection_bg: Color,
+    pub selection_bar: Color,
     pub action_icon: Color,
     pub header_active_bg: Option<Color>,
     pub header_active_fg: Option<Color>,
@@ -60,6 +61,7 @@ impl Default for SidebarRenderTheme {
     fn default() -> Self {
         Self {
             selection_bg: Color::Rgb(0x30, 0x30, 0x34),
+            selection_bar: Color::Indexed(229),
             action_icon: Color::Indexed(73),
             header_active_bg: None,
             header_active_fg: None,
@@ -108,6 +110,8 @@ impl SidebarRenderTheme {
         Self {
             selection_bg: parse_color(config.selection_bg.as_deref())
                 .unwrap_or(default.selection_bg),
+            selection_bar: parse_color(config.selection_bar.as_deref())
+                .unwrap_or(default.selection_bar),
             action_icon: parse_color(config.action_icon.as_deref()).unwrap_or(default.action_icon),
             header_active_bg: parse_color(config.header_active_bg.as_deref()),
             header_active_fg: parse_color(config.header_active_fg.as_deref()),
@@ -1066,7 +1070,7 @@ fn row_leading_marker_span(
         (_, true) => (
             "▎",
             Style::default()
-                .fg(theme.active_bar)
+                .fg(theme.selection_bar)
                 .add_modifier(Modifier::BOLD),
         ),
         (true, false) => ("▎", Style::default().fg(theme.active_bar)),
@@ -1416,16 +1420,20 @@ fn render_micro_lines(
         let glyph = theme.badge_glyph(badge_state);
         let right = right_label(row).unwrap_or_default();
         let selected = state.selection.as_deref() == Some(row.id.as_str());
-        let leading = row_leading_marker_span(row, selected, theme).content;
+        let marker = row_leading_marker_span(row, selected, theme);
         let text = if right.is_empty() {
-            format!("{leading}{glyph}")
+            glyph.to_string()
         } else {
-            format!("{leading}{glyph} {right}")
+            format!("{glyph} {right}")
         };
-        let mut line = Line::from(Span::styled(
-            pad_to_width(truncate_display(&text, width), width),
-            badge_style(theme.badge_color(badge_state), row),
-        ));
+        let body = pad_to_width(
+            truncate_display(&text, width.saturating_sub(1)),
+            width.saturating_sub(1),
+        );
+        let mut line = Line::from(vec![
+            marker,
+            Span::styled(body, badge_style(theme.badge_color(badge_state), row)),
+        ]);
         if selected {
             line = line.style(
                 Style::default()
@@ -2176,9 +2184,10 @@ mod tests {
     }
 
     #[test]
-    fn active_colors_are_configurable() {
+    fn selection_and_active_colors_are_configurable() {
         let config = crate::config::SidebarColorsConfig {
             action_icon: Some("#74c7ec".to_string()),
+            selection_bar: Some("#f2d98f".to_string()),
             active_bg: Some("235".to_string()),
             active_bar: Some("magenta".to_string()),
             ..Default::default()
@@ -2186,6 +2195,7 @@ mod tests {
         let theme = SidebarRenderTheme::from_config(&config);
 
         assert_eq!(theme.action_icon, Color::Rgb(0x74, 0xc7, 0xec));
+        assert_eq!(theme.selection_bar, Color::Rgb(0xf2, 0xd9, 0x8f));
         assert_eq!(theme.active_bg, Color::Indexed(235));
         assert_eq!(theme.active_bar, Color::Magenta);
         assert_eq!(SidebarRenderTheme::default().active_bg, Color::Indexed(235));
@@ -2196,6 +2206,10 @@ mod tests {
         assert_eq!(
             SidebarRenderTheme::default().active_bar,
             Color::Indexed(147)
+        );
+        assert_eq!(
+            SidebarRenderTheme::default().selection_bar,
+            Color::Indexed(229)
         );
     }
 
@@ -2789,6 +2803,11 @@ sidebar:
         let selected_lines = render_lines(&[chat], &selected, 40, &theme);
         assert_eq!(selected_lines[0].style.bg, Some(theme.selection_bg));
         assert_eq!(selected_lines[1].style.bg, Some(theme.selection_bg));
+        assert_eq!(
+            selected_lines[0].spans[0].style.fg,
+            Some(theme.selection_bar)
+        );
+        assert_ne!(theme.selection_bar, theme.active_bar);
         assert_eq!(
             line_to_string(selected_lines[0].clone()).chars().next(),
             Some('▎')
@@ -4049,7 +4068,7 @@ badge:
     }
 
     #[test]
-    fn selected_rows_have_an_active_bar_marker_and_horizontal_padding() {
+    fn selected_rows_have_a_selection_bar_marker_and_horizontal_padding() {
         let rows = vec![row(
             "repo::misc::app",
             SidebarRowKind::Repo,
@@ -4067,7 +4086,7 @@ badge:
     }
 
     #[test]
-    fn selected_chat_has_an_active_bar_marker_in_every_width_tier() {
+    fn selected_chat_has_a_selection_bar_marker_in_every_width_tier() {
         let mut chat = row(
             "chat::%1",
             SidebarRowKind::Chat,
@@ -4084,6 +4103,19 @@ badge:
         for width in [2, 8, 30, 40] {
             let rendered = render_rows(std::slice::from_ref(&chat), &state, width);
             assert!(rendered.contains('▎'), "{width}: {rendered:?}");
+            let lines = render_lines(
+                std::slice::from_ref(&chat),
+                &state,
+                width,
+                &SidebarRenderTheme::default(),
+            );
+            assert!(
+                lines.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.content == "▎"
+                        && span.style.fg == Some(SidebarRenderTheme::default().selection_bar)
+                }),
+                "{width}: {lines:?}"
+            );
         }
     }
 

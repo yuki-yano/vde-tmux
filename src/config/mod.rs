@@ -519,6 +519,7 @@ impl Default for SidebarPreviewConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SidebarColorsConfig {
     pub selection_bg: Option<String>,
+    pub selection_bar: Option<String>,
     pub action_icon: Option<String>,
     pub badge_blocked: Option<String>,
     pub badge_working: Option<String>,
@@ -812,11 +813,12 @@ mod tests {
     #[test]
     fn sidebar_colors_accept_ui_color_keys_and_reject_state_color_keys() {
         let config = serde_yaml_ng::from_str::<Config>(
-            "sidebar:\n  colors:\n    selection_bg: \"237\"\n    action_icon: \"73\"\n    header_active_bg: \"24\"\n    header_filter_bg: \"255\"\n",
+            "sidebar:\n  colors:\n    selection_bg: \"237\"\n    selection_bar: \"229\"\n    action_icon: \"73\"\n    header_active_bg: \"24\"\n    header_filter_bg: \"255\"\n",
         )
         .unwrap();
 
         assert_eq!(config.sidebar.colors.selection_bg.as_deref(), Some("237"));
+        assert_eq!(config.sidebar.colors.selection_bar.as_deref(), Some("229"));
         assert_eq!(config.sidebar.colors.action_icon.as_deref(), Some("73"));
         assert_eq!(
             config.sidebar.colors.header_active_bg.as_deref(),

@@ -190,6 +190,9 @@
             "header_filter_bg": {
               "type": "string"
             },
+            "selection_bar": {
+              "type": "string"
+            },
             "selection_bg": {
               "type": "string"
             },
