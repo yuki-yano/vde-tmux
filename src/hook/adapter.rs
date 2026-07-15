@@ -7,10 +7,10 @@ use serde_json::Value;
 
 use crate::hook::origin::{HookOrigin, claude_hook_origin, codex_hook_origin_from_payload};
 use crate::pane_state::{
-    AgentKind, AgentSessionId, AgentSessionSource, DaemonInstanceId, EventId, ExplicitStateReport,
-    FieldUpdate, PaneEvent, PaneEventEnvelope, PaneInstance, ProgressOperation, PromptState,
-    ReportedLifecycle, SubagentState, TaskProgress as CanonicalTaskProgress, WaitReason,
-    normalize_text, validate_subagents,
+    AgentKind, AgentSessionId, AgentSessionSource, BODY_MAX_BYTES, DaemonInstanceId, EventId,
+    ExplicitStateReport, FieldUpdate, PaneEvent, PaneEventEnvelope, PaneInstance,
+    ProgressOperation, PromptState, ReportedLifecycle, SubagentState,
+    TaskProgress as CanonicalTaskProgress, WaitReason, normalize_text, validate_subagents,
 };
 
 #[derive(Debug, Clone)]
@@ -390,7 +390,15 @@ pub fn build_prompt_preview(raw: &str) -> Option<String> {
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect::<String>();
-    let preview = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if preview.len() > BODY_MAX_BYTES {
+        let mut end = BODY_MAX_BYTES;
+        while !preview.is_char_boundary(end) {
+            end -= 1;
+        }
+        preview.truncate(end);
+        preview.truncate(preview.trim_end().len());
+    }
     if preview.is_empty() {
         None
     } else {
@@ -494,6 +502,42 @@ mod tests {
             assert_eq!(envelope.agent_session_id.unwrap().as_str(), "session-1");
             assert_eq!(envelope.event, expected);
         }
+    }
+
+    #[test]
+    fn claude_user_prompt_submit_truncates_large_task_notification() {
+        let prompt = format!(
+            "<task-notification>{}</task-notification>",
+            "x".repeat(BODY_MAX_BYTES)
+        );
+        let payload = serde_json::json!({
+            "session_id": "session-1",
+            "prompt": prompt,
+        })
+        .to_string();
+
+        let envelope = claude_typed_event_from_json("UserPromptSubmit", &payload, &typed_context())
+            .unwrap()
+            .unwrap();
+        let PaneEvent::BeginRun {
+            prompt: Some(prompt),
+            ..
+        } = envelope.event
+        else {
+            panic!("expected begin-run prompt");
+        };
+
+        assert_eq!(prompt.text.len(), BODY_MAX_BYTES);
+        prompt.validate().unwrap();
+    }
+
+    #[test]
+    fn prompt_preview_truncates_at_utf8_boundary() {
+        let preview = build_prompt_preview(&"界".repeat(BODY_MAX_BYTES)).unwrap();
+
+        assert!(preview.len() <= BODY_MAX_BYTES);
+        assert_eq!(preview.len(), BODY_MAX_BYTES - 1);
+        assert!(preview.chars().all(|character| character == '界'));
     }
 
     #[test]
