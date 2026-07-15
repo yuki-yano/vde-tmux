@@ -64,32 +64,47 @@ pub fn run_live_tui(
     let sidebar_instance = crate::sidebar::control::resolve_current_pane_instance(&runner, env)?;
     let control =
         crate::sidebar::control::ControlListener::bind(server_identity, &sidebar_instance)?;
-    let (tx, rx) = mpsc::channel();
-    let config_hash = crate::daemon::lifecycle::config_hash(config);
-    subscribe_v2(socket, server_identity, &config_hash, tx)?;
-    let theme = SidebarRenderTheme::from_app_config(config);
-    let (live_update_tx, live_update_rx) = mpsc::channel();
-    let runtime_config = RunLoopConfig {
-        app: config,
-        theme: &theme,
-        preview_history_lines: config.sidebar.preview.history_lines,
-        live: &config.sidebar.live,
-        live_update_tx: &live_update_tx,
-        live_update_rx: &live_update_rx,
+    let mut active_config = config.clone();
+    let result = loop {
+        let (tx, rx) = mpsc::channel();
+        let config_hash = crate::daemon::lifecycle::config_hash(&active_config);
+        subscribe_v2(socket, server_identity, &config_hash, tx)?;
+        let theme = SidebarRenderTheme::from_app_config(&active_config);
+        let (live_update_tx, live_update_rx) = mpsc::channel();
+        let runtime_config = RunLoopConfig {
+            app: &active_config,
+            theme: &theme,
+            preview_history_lines: active_config.sidebar.preview.history_lines,
+            live: &active_config.sidebar.live,
+            live_update_tx: &live_update_tx,
+            live_update_rx: &live_update_rx,
+        };
+        match run_loop(
+            &mut terminal,
+            RunLoopIo {
+                socket,
+                server_identity,
+                snapshots: &rx,
+                runner: &runner,
+                env,
+                sidebar_instance: &sidebar_instance,
+                control: &control,
+            },
+            runtime_config,
+        ) {
+            Ok(TuiExit::ConfigChanged { active_config_hash }) => {
+                let reloaded = crate::config::load::load_config_strict(env).map_err(|error| {
+                    anyhow::anyhow!("failed to reload sidebar config after daemon reload: {error}")
+                })?;
+                let reloaded_hash = crate::daemon::lifecycle::config_hash(&reloaded);
+                if reloaded_hash != active_config_hash {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                active_config = reloaded;
+            }
+            result => break result,
+        }
     };
-    let result = run_loop(
-        &mut terminal,
-        RunLoopIo {
-            socket,
-            server_identity,
-            snapshots: &rx,
-            runner: &runner,
-            env,
-            sidebar_instance: &sidebar_instance,
-            control: &control,
-        },
-        runtime_config,
-    );
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -107,8 +122,8 @@ pub fn run_live_tui(
                 "[vde-tmux] daemon への接続が終了しました。daemon を再起動して attach し直してください。"
             );
         }
+        TuiExit::ConfigChanged { .. } => unreachable!("config reload is handled in the TUI loop"),
     }
-    let _ = config;
     Ok(None)
 }
 
@@ -218,6 +233,26 @@ mod local_state_tests {
         tx.send(SubscriptionUpdate::Connected(Box::new(newer)))
             .unwrap();
         assert!(drain_snapshot_updates(&rx, &mut current, &mut connection));
+    }
+
+    #[test]
+    fn config_change_update_requests_tui_reinitialization() {
+        let (tx, rx) = mpsc::channel();
+        let mut current = Some(snapshot(10));
+        let mut connection = ConnectionState::Connected;
+
+        tx.send(SubscriptionUpdate::ConfigChanged {
+            active_config_hash: "new-config".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+
+        assert!(drain_snapshot_updates(&rx, &mut current, &mut connection));
+        assert_eq!(
+            connection,
+            ConnectionState::ConfigChanged("new-config".to_string())
+        );
+        assert_eq!(current.unwrap().snapshot_revision, 9);
     }
 
     fn pane(pane_pid: u32) -> crate::daemon::protocol::v2::PanePresentation {
@@ -1086,10 +1121,11 @@ fn restore_terminal_after_panic<W: Write>(writer: &mut W) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiExit {
     Quit,
     Disconnected,
+    ConfigChanged { active_config_hash: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1097,6 +1133,7 @@ enum ConnectionState {
     #[default]
     Connecting,
     Connected,
+    ConfigChanged(String),
     Degraded(String),
     Disconnected,
 }
@@ -1106,6 +1143,7 @@ impl ConnectionState {
         match self {
             Self::Connecting => Some("connecting"),
             Self::Connected => None,
+            Self::ConfigChanged(_) => Some("reloading config"),
             Self::Degraded(_) => Some("degraded"),
             Self::Disconnected => Some("disconnected · reconnecting"),
         }
@@ -1115,7 +1153,7 @@ impl ConnectionState {
         self.label().map(|message| Notice {
             message,
             level: match self {
-                Self::Connecting => NoticeLevel::Progress,
+                Self::Connecting | Self::ConfigChanged(_) => NoticeLevel::Progress,
                 Self::Degraded(_) | Self::Disconnected => NoticeLevel::Failure,
                 Self::Connected => NoticeLevel::Success,
             },
@@ -1705,6 +1743,11 @@ fn run_loop<B: Backend>(
     let mut live_subscription: Option<crate::sidebar::client::LiveSubscriptionHandle> = None;
     loop {
         render_gate.mark_dirty_if(drain_snapshot_updates(rx, &mut current, &mut connection));
+        if let ConnectionState::ConfigChanged(active_config_hash) = &connection {
+            return Ok(TuiExit::ConfigChanged {
+                active_config_hash: active_config_hash.clone(),
+            });
+        }
         if !initial_context_seeded && let Some(snapshot) = current.as_ref() {
             seed_persisted_sidebar_preferences(snapshot, &mut sidebar_state);
             last_queued_preferences = Some((sidebar_state.view_mode, sidebar_state.filter));
@@ -2452,6 +2495,13 @@ fn drain_snapshot_updates(
                 changed |= revision_changed;
                 changed |= set_connection(connection, next);
             }
+            Ok(SubscriptionUpdate::ConfigChanged { active_config_hash }) => {
+                changed |= set_connection(
+                    connection,
+                    ConnectionState::ConfigChanged(active_config_hash),
+                );
+                return changed;
+            }
             Ok(SubscriptionUpdate::Degraded(error)) => {
                 changed |= set_connection(connection, ConnectionState::Degraded(error));
             }
@@ -2697,6 +2747,7 @@ fn draw_connection_placeholder<B: Backend>(
         let message = match connection {
             ConnectionState::Connecting => "connecting to daemon...",
             ConnectionState::Connected => "connected",
+            ConnectionState::ConfigChanged(_) => "reloading sidebar config...",
             ConnectionState::Degraded(_) => "daemon degraded; reconnecting...",
             ConnectionState::Disconnected => "daemon disconnected; reconnecting...",
         };
@@ -2839,6 +2890,7 @@ fn connection_empty_lines(
     let message = match connection {
         ConnectionState::Connected => return None,
         ConnectionState::Connecting => "Connecting to daemon".to_string(),
+        ConnectionState::ConfigChanged(_) => "Reloading sidebar config".to_string(),
         ConnectionState::Disconnected => "Daemon disconnected; reconnecting".to_string(),
         ConnectionState::Degraded(message) => format!("Degraded: {message}"),
     };

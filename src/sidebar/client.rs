@@ -376,9 +376,23 @@ pub fn query_resolved_snapshot_v2(
 pub enum SubscriptionUpdate {
     Connecting,
     Connected(Box<ResolvedSnapshot>),
+    ConfigChanged { active_config_hash: String },
     Degraded(String),
     Disconnected,
 }
+
+#[derive(Debug)]
+struct SidebarConfigMismatch {
+    active_config_hash: String,
+}
+
+impl std::fmt::Display for SidebarConfigMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("sidebar config does not match the daemon active config")
+    }
+}
+
+impl std::error::Error for SidebarConfigMismatch {}
 
 pub fn subscribe_v2(
     socket: &Path,
@@ -421,6 +435,12 @@ pub fn subscribe_v2(
                     subscription
                 }
                 Err(error) => {
+                    if let Some(mismatch) = error.downcast_ref::<SidebarConfigMismatch>() {
+                        let _ = tx.send(SubscriptionUpdate::ConfigChanged {
+                            active_config_hash: mismatch.active_config_hash.clone(),
+                        });
+                        return;
+                    }
                     if tx
                         .send(SubscriptionUpdate::Degraded(error.to_string()))
                         .is_err()
@@ -719,8 +739,14 @@ fn verify_active_config_hash(
     let V2ServerMessage::HealthResult { health } = response else {
         return v2_server_error("HealthResult", response);
     };
-    if health.config_hash.trim().is_empty() || health.config_hash != expected_config_hash {
-        bail!("sidebar config does not match the daemon active config; run `vt daemon reload`");
+    if health.config_hash.trim().is_empty() {
+        bail!("daemon active config hash is empty");
+    }
+    if health.config_hash != expected_config_hash {
+        return Err(SidebarConfigMismatch {
+            active_config_hash: health.config_hash,
+        }
+        .into());
     }
     Ok(())
 }
@@ -1706,7 +1732,34 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("vt daemon reload"));
+        let mismatch = error
+            .downcast_ref::<SidebarConfigMismatch>()
+            .expect("config mismatch must remain distinguishable from transport errors");
+        assert_eq!(mismatch.active_config_hash, "active");
+        handle.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn v2_subscribe_reports_active_config_change_without_retrying_stale_config() {
+        let socket = unique_socket_path("vt2-sub-config-changed");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handle = thread::spawn(move || {
+            accept_config_guard(&listener, "scratch", "active");
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        subscribe_v2(&socket, "scratch", "stale", tx).unwrap();
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SubscriptionUpdate::Connecting
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SubscriptionUpdate::ConfigChanged { active_config_hash } if active_config_hash == "active"
+        ));
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
         handle.join().unwrap();
         std::fs::remove_file(socket).unwrap();
     }
