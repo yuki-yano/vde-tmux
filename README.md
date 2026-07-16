@@ -3,13 +3,13 @@
 **English** | [日本語](./README.ja.md)
 
 vde-tmux shows the state of AI coding agents running in tmux.
-It tracks Claude Code, Codex, and opencode panes and renders their state in the status line and a dedicated sidebar.
+It tracks Claude Code, Codex, and opencode panes and renders their state in the tmux status line and a dedicated sidebar.
 
 ![vde-tmux sidebar](https://github.com/user-attachments/assets/e912448f-b657-49d9-b175-39a0cbad04f2)
 
-## What it does
+## Features
 
-- Classifies agents across tmux sessions as `Blocked`, `Working`, `Done`, or `Idle`
+- Classifies agents across all tmux sessions as `Blocked`, `Working`, `Done`, or `Idle`
 - Shows agents that need attention directly in the tmux status line
 - Displays prompts, elapsed time, tasks, subagents, and worktree activity in a sidebar
 - Jumps to agent panes and previews their scrollback from the sidebar
@@ -20,34 +20,25 @@ It tracks Claude Code, Codex, and opencode panes and renders their state in the 
 
 - tmux 3.2 or later
 - The latest stable Rust and Cargo for installation
-- git for repository and branch metadata
-- lsof for daemon socket validation
-- less for sidebar previews
-- fzf for the optional session manager
-- ghq for the optional project selector
+- git, lsof, and less on `PATH`
+- Optional: fzf for the session manager, ghq for the project selector
 
 ## Installation
-
-Install vde-tmux from crates.io:
 
 ```bash
 cargo install vde-tmux --locked
 ```
 
-The package installs two equivalent commands:
-
-- `vt`, the short name used throughout this README
-- `vde-tmux`, the full package name
-
-Verify the installation:
+The package installs two equivalent commands: `vt` and `vde-tmux`.
+This README uses the short name `vt`.
 
 ```bash
 vt --version
 ```
 
-## Initial setup
+## Setup
 
-### Add the status line and key bindings
+### 1. tmux configuration
 
 Add the following to `~/.tmux.conf`:
 
@@ -63,7 +54,8 @@ setw -g window-status-current-format ''
 set -g window-status-separator ''
 
 set -g pane-border-status bottom
-set -g pane-border-format '#{?#{@vde_status_pane},#{@vde_status_pane},#{pane_index} #{pane_current_command}}'
+set -g @vde_status_now_format '%s'
+set -g pane-border-format '#{?#{@vde_status_pane},#{E:@vde_status_pane},#{pane_index} #{pane_current_command}}'
 
 bind-key -n MouseDown1Status run-shell "vt statusline-click --client-name #{q:client_name} --session-id #{q:session_id} #{q:mouse_status_range}"
 bind-key -n M-h run-shell "vt session-cycle prev --client-name #{q:client_name} --session-id #{q:session_id}"
@@ -71,8 +63,13 @@ bind-key -n M-l run-shell "vt session-cycle next --client-name #{q:client_name} 
 bind-key -n M-e run-shell "vt sidebar focus-toggle --window #{q:window_id}"
 ```
 
-vde-tmux pushes rendered text into `@vde_status_*` options, so tmux does not start a process on every status redraw.
-The configuration above replaces tmux's native window list with the vde-tmux session and window segments.
+Notes:
+
+- `vt daemon ensure` starts the daemon on demand.
+- vde-tmux pushes rendered text into the `@vde_status_*` options, so tmux does not start a process on every status redraw.
+- `@vde_status_now_format` is required for the elapsed time shown on pane borders.
+- The `window-status-*` settings replace tmux's native window list with the vde-tmux session and window segments.
+- `--client-name` and `--session-id` keep session and category bindings scoped to the client that triggered them, which matters when multiple tmux clients are attached.
 
 Reload the configuration:
 
@@ -80,10 +77,7 @@ Reload the configuration:
 tmux source-file ~/.tmux.conf
 ```
 
-Session and category bindings need both `--client-name` and `--session-id` when multiple tmux clients are attached.
-The example above includes the required scope and will not move a different client accidentally.
-
-### Configure Claude Code hooks
+### 2. Claude Code hooks
 
 Add these hooks to `~/.claude/settings.json`:
 
@@ -103,7 +97,7 @@ Add these hooks to `~/.claude/settings.json`:
 Restart Claude Code after saving the file.
 Its lifecycle and task progress will then appear in vde-tmux.
 
-### Configure Codex hooks
+### 3. Codex hooks
 
 Add these hooks to `~/.codex/hooks.json` or the project-local `.codex/hooks.json`.
 Review and trust the hooks with Codex `/hooks` after saving the file.
@@ -149,7 +143,7 @@ Review and trust the hooks with Codex `/hooks` after saving the file.
 Restart Codex after saving the file.
 Permission requests, plans, subagents, and worktree activity will then appear in the sidebar.
 
-### Verify the setup
+### 4. Verify
 
 Run these commands inside tmux:
 
@@ -159,13 +153,8 @@ vt daemon doctor
 vt sidebar open
 ```
 
-vde-tmux can discover some agents from the command running in a pane without hooks.
+vde-tmux can detect Claude Code, Codex, and opencode from the command running in a pane even without hooks.
 Hooks are still required for accurate prompts, completion times, and waiting states.
-The daemon stops recurring observation captures for an agent epoch after accepting its
-`SessionStart` hook. Non-agent panes are not captured, while process-detected agents without an
-accepted `SessionStart` keep using pane output as a fallback. This does not disable the sidebar's
-on-demand live preview. The trust marker is daemon-local, so an existing agent uses fallback
-captures after a daemon restart until its next `SessionStart`.
 
 ## Agent states
 
@@ -188,7 +177,7 @@ Acknowledgment survives daemon restarts and is shared by every tmux client and s
 
 ## Sidebar
 
-The sidebar opens focused in the current tmux window and defaults to category grouping.
+The sidebar opens in the current tmux window and groups agents by category by default.
 
 ```bash
 vt sidebar open --width 40
@@ -199,9 +188,7 @@ vt sidebar rail
 vt sidebar close
 ```
 
-`vt sidebar focus-toggle` opens a missing sidebar, focuses an existing sidebar, and closes it when it already has focus.
-Single-window `open` and `toggle` operations focus the sidebar; automatic and `--all` opens remain detached.
-Expansion state is shared across sessions.
+`vt sidebar focus-toggle` opens a missing sidebar, focuses a visible one, and closes it when it already has focus.
 
 | Key | Action |
 | --- | --- |
@@ -210,26 +197,21 @@ Expansion state is shared across sessions.
 | `Space` | Expand or collapse the selected row |
 | `v` | Cycle the view mode |
 | `1` / `2` / `3` | Select Flat / ByRepo / ByCategory |
-| `Tab` | Cycle the state filter |
-| `Shift+Tab` | Cycle the state filter backward |
+| `Tab` / `Shift+Tab` | Cycle the state filter |
 | `n` / `N` | Move to the next or previous agent that needs attention |
 | `d` | Acknowledge the completed run |
 | `J` / `K` | Change manual ordering |
 | `p` | Preview pane scrollback |
-| `e` | Toggle live output |
+| `e` | Switch the live panel between output and events |
 | `q` / `Esc` | Close the sidebar |
 
-The cursor is always rendered as `›`.
-When an expanded agent is selected, only its first line shows the cursor while the selection background covers the full expanded content.
 Agents belonging to the active session have a `▎` marker on the left.
-
-View mode, filter, manual order, and expansion state are persisted.
-Selection, scrolling, and transient messages remain local to each sidebar instance.
-Forward and backward filter cycling both skip states with zero matching agents.
+View mode, filter, manual order, and expansion state are persisted and shared across sidebars.
+Selection and scrolling remain local to each sidebar instance.
 
 ## Sessions and categories
 
-Categories group tmux sessions by project path or session name.
+Categories group tmux sessions by project path or session name:
 
 ```yaml
 categories:
@@ -238,6 +220,10 @@ categories:
     - category: work
       path_patterns:
         - github.com/acme/*
+  session_name_rules:
+    - category: scratch
+      patterns:
+        - tmp-*
 ```
 
 Common commands:
@@ -258,10 +244,8 @@ With fzf installed, open a popup for switching or removing sessions, windows, an
 vt session-manager --popup
 ```
 
-The final selector row is always `✕ tmux server | tmux kill-server`.
-Its preview explains the shutdown sequence, and only `Ctrl-Q` starts Kill Server; `Enter` and `Ctrl-R` do nothing on this row.
-Kill Server disables and stops the vde daemon, sends `Ctrl-C` to every pane, sends `SIGTERM` to the remaining pane process groups, escalates surviving groups to `SIGKILL`, and terminates the tmux server only after process cleanup succeeds.
-If cleanup fails, the tmux server remains running and the error includes the partial cleanup state.
+The final selector row is `✕ tmux server | tmux kill-server`.
+It responds only to `Ctrl-Q` and shuts down the whole tmux server after stopping the vde daemon and cleaning up the remaining pane processes.
 
 With ghq installed, create or select a session from the project selector:
 
@@ -273,18 +257,11 @@ vt project selector --popup
 
 The configuration file is `$XDG_CONFIG_HOME/vde/tmux/config.yml`.
 When `XDG_CONFIG_HOME` is unset, vde-tmux uses `~/.config/vde/tmux/config.yml`.
-Every setting has a default, so the file is optional.
+Every setting has a default, so the file is optional; start with only the settings you need.
 
-Start with only the settings you need:
+Together with the `categories` section shown above, the commonly used settings are:
 
 ```yaml
-categories:
-  default_category: misc
-  rules:
-    - category: work
-      path_patterns:
-        - github.com/acme/*
-
 daemon:
   done_clear_on: window
 
@@ -303,12 +280,6 @@ statusline:
     hide_idle: false
     format: "{badge} {count}"
 
-session_manager:
-  kill:
-    send_ctrl_c: true
-    term_wait_ms: 300
-    kill_wait_ms: 300
-
 badge:
   glyphs:
     blocked: "▲"
@@ -317,15 +288,10 @@ badge:
     idle: "○"
 ```
 
-`statusline.summary.format` is applied to each state token before its state color is added.
-It supports `{badge}` and `{count}`, including formats such as `{badge}{count}`, `{badge}: {count}`, and `{count}{badge}`.
-The default is `{badge} {count}`, producing output such as `▲ 0 ● 1 ✓ 1 ○ 9`.
-Zero-count states remain visible so the summary width stays stable while counts remain single-digit.
-Set `hide_idle: true` to omit the idle token entirely.
-The separator between state tokens remains one space.
+`statusline.summary.format` supports the `{badge}` and `{count}` placeholders, such as `{badge}{count}` or `{badge}: {count}`.
+Zero-count states remain visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
 
-`session_manager.kill` controls the clean shutdown waits used by Kill Server.
-`send_ctrl_c` controls the initial pane interrupt, `term_wait_ms` is used before and after `SIGTERM`, and `kill_wait_ms` is used after `SIGKILL`.
+The full schema is available with `vt config schema`.
 
 Reload the daemon after changing the file:
 
@@ -340,7 +306,7 @@ Run an external command whenever an agent enters `Blocked`:
 ```yaml
 notify:
   enabled: true
-  command: 'terminal-notifier -title vde-tmux -message "$VDE_AGENT $VDE_BADGE_STATE"'
+  command: 'terminal-notifier -title vde-tmux -message "$VDE_AGENT needs attention"'
 ```
 
 The command receives `VDE_PANE_ID`, `VDE_AGENT`, and `VDE_BADGE_STATE`.
@@ -388,29 +354,28 @@ For normal use, the `vt daemon ensure` line in the tmux configuration manages st
 `stop` does not disable automatic startup.
 Use `disable` when the daemon must remain stopped.
 
-### Daemon protocol version 4
+## Upgrading
 
-The daemon and all of its clients (sidebar, statusline, CLI) speak protocol version 4 and reject every other version; there is no compatibility adapter or fallback. After upgrading the binary, stop the old daemon with the previously installed binary (`vt daemon stop`), start the new one (`vt daemon ensure`), and restart every sidebar so all processes speak the same version. Running `vt daemon reload` with a new binary against an incompatible daemon fails with instructions instead of replacing it.
+The daemon and its clients (sidebar, status line, CLI) must run the same version; there is no cross-version compatibility.
+Stop the daemon before replacing the binary, then start the new one and reopen any sidebars:
 
-Version 4 adds two message families:
+```bash
+vt daemon stop
+cargo install vde-tmux --locked
+vt daemon ensure
+```
 
-- `subscribe_live` opens a long-lived stream that previews exactly one fixed target pane per connection. The daemon deduplicates capture work across subscribers, skips targets whose source sidebar is not visible to any eligible attached client, verifies the target pane id and pid inside the same tmux command, and pushes latest-only `live_preview_result` / `live_preview_unavailable` frames. Requests with `interval_ms` below 100 are rejected, as is `sidebar.live.interval_ms` below 100 at config load.
-- `heartbeat` keeps idle subscription streams alive: instead of re-sending the full snapshot every two seconds, the daemon sends a small frame carrying its instance id and the latest published snapshot revision. Clients treat an instance change or a revision regression as a protocol error and reconnect.
+If the binary was replaced while the old daemon was still running, `vt daemon stop --force` stops it.
 
 ## Troubleshooting
 
 ### The status line or sidebar does not update
 
-Inspect daemon health:
+Inspect daemon health, and reload after configuration changes:
 
 ```bash
 vt daemon status
 vt daemon doctor
-```
-
-Reload after changing vde-tmux configuration:
-
-```bash
 vt daemon reload
 ```
 
@@ -434,19 +399,6 @@ vt daemon logs daemon --lines 100
 
 Daemon records and logs are stored below `$XDG_STATE_HOME/vde-tmux/`.
 Sidebar preferences are stored below `$XDG_STATE_HOME/vde/tmux/sidebar-state/`.
-
-## Development checks
-
-```bash
-cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-scripts/preflight-ui-ux.sh
-```
-
-The UI/UX preflight uses a dedicated tmux server and temporary directories.
-It does not modify the regular tmux server or user configuration.
-Artifacts are written below `target/preflight/`.
 
 ## Known limitations
 
