@@ -62,13 +62,9 @@ pub(crate) fn statusline_pane(
         proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
         pane_id: pane_id.to_string(),
     })? {
-        crate::daemon::protocol::v2::ServerMessage::PaneResult { pane, .. } => {
-            Ok(crate::statusline::render_structured_pane_status(
-                config,
-                &pane,
-                crate::sidebar::tree::now_epoch_secs(),
-            ))
-        }
+        crate::daemon::protocol::v2::ServerMessage::PaneResult { pane, .. } => Ok(
+            crate::statusline::render_structured_pane_status(config, &pane),
+        ),
         crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
             bail!("daemon query failed ({code:?}): {message}")
         }

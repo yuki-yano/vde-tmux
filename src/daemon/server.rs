@@ -662,7 +662,6 @@ const V2_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Copy)]
 enum StatusPushTrigger {
     Snapshot,
-    RenderClock,
     Flush,
 }
 
@@ -1960,16 +1959,7 @@ impl ProductionV2Coordinator {
                 .expect("status push lock poisoned")
                 .flush_coalesced(now)
                 .map_err(anyhow::Error::new)?,
-            StatusPushTrigger::Snapshot | StatusPushTrigger::RenderClock => {
-                if matches!(trigger, StatusPushTrigger::RenderClock)
-                    && !self
-                        .status_push
-                        .lock()
-                        .expect("status push lock poisoned")
-                        .render_clock_due(now)
-                {
-                    return Ok(());
-                }
+            StatusPushTrigger::Snapshot => {
                 let (global, sessions, panes, config) = {
                     let state = self.state.lock().expect("canonical state lock poisoned");
                     let state = state
@@ -1989,16 +1979,14 @@ impl ProductionV2Coordinator {
                     let (global, sessions, panes) = state.display_projection();
                     (global, sessions, panes, state.projection_config.clone())
                 };
-                let frame =
-                    build_display_frame(&config, &global, &sessions, &panes, epoch_seconds())
-                        .map_err(anyhow::Error::new)?;
+                let frame = build_display_frame(&config, &global, &sessions, &panes)
+                    .map_err(anyhow::Error::new)?;
                 self.status_frame_builds.fetch_add(1, Ordering::SeqCst);
                 let mut push = self.status_push.lock().expect("status push lock poisoned");
                 match trigger {
                     StatusPushTrigger::Snapshot => {
                         push.on_snapshot_revision(global.snapshot_revision, now, frame)
                     }
-                    StatusPushTrigger::RenderClock => push.on_render_clock(now, frame),
                     StatusPushTrigger::Flush => unreachable!(),
                 }
                 .map_err(anyhow::Error::new)?
@@ -3228,11 +3216,7 @@ fn handle_v2_live_subscription(
 fn start_status_push_worker(coordinator: Arc<ProductionV2Coordinator>) {
     thread::spawn(move || {
         while !coordinator.shutdown.load(Ordering::SeqCst) {
-            for trigger in [
-                StatusPushTrigger::Snapshot,
-                StatusPushTrigger::RenderClock,
-                StatusPushTrigger::Flush,
-            ] {
+            for trigger in [StatusPushTrigger::Snapshot, StatusPushTrigger::Flush] {
                 if let Err(error) = coordinator.drive_status_push(trigger) {
                     if coordinator.shutdown.load(Ordering::SeqCst) {
                         return;
@@ -8293,59 +8277,6 @@ mod tests {
         let stale_publisher = coordinator.publish_resolved_snapshot().unwrap();
         assert_eq!(stale_publisher.revision, changed.revision);
         assert!(Arc::ptr_eq(&stale_publisher.frame, &changed.frame));
-
-        drop(coordinator);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn render_clock_trigger_skips_frame_build_before_due() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-render-clock-fastpath-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: root.join("tmux.sock"),
-                identity: crate::daemon::topology::ServerIdentity {
-                    pid: 1,
-                    start_time: 2,
-                },
-                hash: "d".repeat(64),
-            },
-            BTreeMap::new(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
-        let leased =
-            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
-                .unwrap();
-        *coordinator.state.lock().unwrap() =
-            Some(super::super::runtime::CanonicalCoordinatorState::new(
-                leased,
-                crate::daemon::topology::TopologySnapshot {
-                    server_identity: crate::daemon::topology::ServerIdentity {
-                        pid: 1,
-                        start_time: 2,
-                    },
-                    panes: Vec::new(),
-                },
-                crate::daemon::view_hooks::ViewRegistry::default(),
-                crate::sidebar::state::SidebarOrderPreferences::default(),
-            ));
-
-        for _ in 0..10 {
-            coordinator
-                .drive_status_push(StatusPushTrigger::RenderClock)
-                .unwrap();
-        }
-
-        // Before the 500ms render deadline no render-clock trigger may build a
-        // display frame or a resolved snapshot.
-        assert_eq!(coordinator.status_frame_builds.load(Ordering::SeqCst), 0);
 
         drop(coordinator);
         std::fs::remove_dir_all(root).unwrap();

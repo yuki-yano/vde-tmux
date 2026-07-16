@@ -1806,7 +1806,8 @@ fn dispatch_statusline_attention_renders_v2_session_snapshot() {
     .unwrap();
 
     let text = output.unwrap();
-    assert!(text.contains("▲ main · perm 2m00s"), "{text}");
+    assert!(text.contains("▲ main · perm"), "{text}");
+    assert!(!text.contains("2m00s"), "{text}");
     fixture.finish();
 }
 

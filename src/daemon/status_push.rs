@@ -12,7 +12,6 @@ use crate::daemon::topology::ServerIdentity;
 use crate::pane_state::PaneInstance;
 
 pub const STATUS_PUSH_MIN_INTERVAL: Duration = Duration::from_millis(500);
-pub const RENDER_CLOCK_INTERVAL: Duration = Duration::from_millis(500);
 pub const STATUS_PUSH_SERVER_MISMATCH_SENTINEL: &str = "__vde_status_push_server_mismatch__";
 const STATUS_PUSH_PANE_MISMATCH_PREFIX: &str = "__vde_status_push_pane_mismatch__";
 const STATUS_PUSH_BATCH_FILE_PREFIX: &str = ".status-push-batch-";
@@ -115,14 +114,11 @@ impl DisplayFrame {
 }
 
 /// Renders one complete display projection without querying tmux or reading display options.
-/// Callers rebuild the status snapshots at each revision or render-clock trigger so elapsed
-/// attention time advances independently of the canonical snapshot revision.
 pub fn build_display_frame(
     config: &Config,
     global_snapshot: &StatusSnapshot,
     session_snapshots: &[StatusSnapshot],
     panes: &[PanePresentation],
-    now_epoch: i64,
 ) -> Result<DisplayFrame, StatusPushError> {
     if global_snapshot.context != StatusContext::Global {
         return Err(StatusPushError::InvalidDisplaySnapshot(
@@ -222,7 +218,7 @@ pub fn build_display_frame(
     for pane in panes {
         let key = DisplayOptionKey::PaneStatus(pane.pane_instance.clone());
         let value = DisplayOptionValue::Set(crate::statusline::render_structured_pane_status(
-            config, pane, now_epoch,
+            config, pane,
         ));
         if values.insert(key, value).is_some() {
             return Err(StatusPushError::InvalidDisplaySnapshot(format!(
@@ -516,7 +512,6 @@ pub struct StatusPushState {
     dirty: BTreeSet<DisplayOptionKey>,
     last_successful: BTreeMap<DisplayOptionKey, DisplayOptionValue>,
     last_snapshot_revision: Option<u64>,
-    next_clock_at: Duration,
     last_attempt_at: Option<Duration>,
     pending_coalesced_trigger: bool,
     shutting_down: bool,
@@ -527,7 +522,7 @@ pub struct StatusPushState {
 impl StatusPushState {
     pub fn new(
         expected_server: ServerIdentity,
-        started_at: Duration,
+        _started_at: Duration,
     ) -> Result<Self, StatusPushError> {
         Ok(Self {
             expected_server,
@@ -535,7 +530,6 @@ impl StatusPushState {
             dirty: BTreeSet::new(),
             last_successful: BTreeMap::new(),
             last_snapshot_revision: None,
-            next_clock_at: checked_add(started_at, RENDER_CLOCK_INTERVAL)?,
             last_attempt_at: None,
             pending_coalesced_trigger: false,
             shutting_down: false,
@@ -560,16 +554,6 @@ impl StatusPushState {
         self.last_snapshot_revision
     }
 
-    pub fn next_clock_at(&self) -> Duration {
-        self.next_clock_at
-    }
-
-    /// Side-effect-free due check for the render clock. `next_clock_at` is only
-    /// ever advanced by `on_render_clock`.
-    pub fn render_clock_due(&self, now: Duration) -> bool {
-        !self.shutting_down && now >= self.next_clock_at
-    }
-
     pub fn on_snapshot_revision(
         &mut self,
         snapshot_revision: u64,
@@ -592,27 +576,6 @@ impl StatusPushState {
         }
         self.accept_rendered_frame(frame)?;
         self.last_snapshot_revision = Some(snapshot_revision);
-        self.pending_coalesced_trigger = true;
-        self.prepare_if_due(now)
-    }
-
-    pub fn on_render_clock(
-        &mut self,
-        now: Duration,
-        frame: DisplayFrame,
-    ) -> Result<StatusPushDecision, StatusPushError> {
-        if self.shutting_down {
-            return Ok(StatusPushDecision::Ignored);
-        }
-        if now < self.next_clock_at {
-            return Ok(StatusPushDecision::Ignored);
-        }
-        let mut next_clock_at = self.next_clock_at;
-        while next_clock_at <= now {
-            next_clock_at = checked_add(next_clock_at, RENDER_CLOCK_INTERVAL)?;
-        }
-        self.accept_rendered_frame(frame)?;
-        self.next_clock_at = next_clock_at;
         self.pending_coalesced_trigger = true;
         self.prepare_if_due(now)
     }
@@ -1118,7 +1081,6 @@ mod tests {
             &global,
             &sessions,
             &[pane.clone(), non_agent.clone()],
-            61,
         )
         .unwrap();
 
@@ -1206,7 +1168,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(attention, DisplayOptionValue::Set(value) if value.contains("dev##(unsafe)") && value.contains("1m01s")),
+            matches!(attention, DisplayOptionValue::Set(value) if value.contains("dev##(unsafe)") && value.contains("perm") && !value.contains("1m01s")),
             "{attention:?}"
         );
         let pane_value = frame
@@ -1214,7 +1176,7 @@ mod tests {
             .get(&DisplayOptionKey::PaneStatus(pane.pane_instance))
             .unwrap();
         assert!(
-            matches!(pane_value, DisplayOptionValue::Set(value) if !value.is_empty() && value != "0" && value.contains("1m01s")),
+            matches!(pane_value, DisplayOptionValue::Set(value) if !value.is_empty() && value != "0" && value.contains("Waiting") && !value.contains("1m01s")),
             "{pane_value:?}"
         );
         let non_agent_value = frame
@@ -1247,7 +1209,7 @@ mod tests {
             })
             .collect();
 
-        let frame = build_display_frame(&config, &global, &[session], &[], 0).unwrap();
+        let frame = build_display_frame(&config, &global, &[session], &[]).unwrap();
         let value = frame
             .values()
             .get(&DisplayOptionKey::SessionSessions {
@@ -1285,7 +1247,7 @@ mod tests {
             attention: Vec::new(),
         };
 
-        let frame = build_display_frame(&config, &global, &[crowded, roomy], &[], 90).unwrap();
+        let frame = build_display_frame(&config, &global, &[crowded, roomy], &[]).unwrap();
         let crowded_summary = frame
             .values()
             .get(&DisplayOptionKey::SessionSummary {
@@ -1315,13 +1277,13 @@ mod tests {
             session_id: "$1".to_string(),
         };
         assert!(matches!(
-            build_display_frame(&config, &wrong_global, &[], &[], 0),
+            build_display_frame(&config, &wrong_global, &[], &[]),
             Err(StatusPushError::InvalidDisplaySnapshot(_))
         ));
 
         let global = global_snapshot(1);
         assert!(matches!(
-            build_display_frame(&config, &global, &[session_snapshot("$1", 2, 0)], &[], 0,),
+            build_display_frame(&config, &global, &[session_snapshot("$1", 2, 0)], &[]),
             Err(StatusPushError::InvalidDisplaySnapshot(_))
         ));
         assert!(matches!(
@@ -1330,19 +1292,18 @@ mod tests {
                 &global,
                 &[session_snapshot("$1", 1, 0), session_snapshot("$1", 1, 0),],
                 &[],
-                0,
             ),
             Err(StatusPushError::InvalidDisplaySnapshot(_))
         ));
         let pane = pane_presentation();
         assert!(matches!(
-            build_display_frame(&config, &global, &[], &[pane.clone(), pane], 0),
+            build_display_frame(&config, &global, &[], &[pane.clone(), pane]),
             Err(StatusPushError::InvalidDisplaySnapshot(_))
         ));
     }
 
     #[test]
-    fn one_second_clock_rebuild_updates_only_time_bearing_options() {
+    fn display_frame_is_independent_of_elapsed_time_only_changes() {
         let config = Config::default();
         let global = global_snapshot(7);
         let pane = pane_presentation();
@@ -1351,47 +1312,13 @@ mod tests {
             &global,
             &[session_snapshot("$1", 7, 59)],
             std::slice::from_ref(&pane),
-            59,
         )
         .unwrap();
-        let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
-        let first = take_batch(
-            state
-                .on_snapshot_revision(7, Duration::ZERO, initial)
-                .unwrap(),
-        );
-        state.complete_batch(first.id, true).unwrap();
+        let later =
+            build_display_frame(&config, &global, &[session_snapshot("$1", 7, 60)], &[pane])
+                .unwrap();
 
-        let clock_frame = build_display_frame(
-            &config,
-            &global,
-            &[session_snapshot("$1", 7, 60)],
-            &[pane],
-            60,
-        )
-        .unwrap();
-        let tick = take_batch(
-            state
-                .on_render_clock(Duration::from_secs(1), clock_frame)
-                .unwrap(),
-        );
-
-        assert_eq!(tick.guarded.writes.len(), 2);
-        assert!(
-            tick.guarded
-                .writes
-                .iter()
-                .any(|write| matches!(write.key, DisplayOptionKey::SessionAttention { .. }))
-        );
-        assert!(
-            tick.guarded
-                .writes
-                .iter()
-                .any(|write| matches!(write.key, DisplayOptionKey::PaneStatus(_)))
-        );
-        assert!(tick.guarded.writes.iter().all(|write| {
-            matches!(&write.value, DisplayOptionValue::Set(value) if value.contains("1m00s"))
-        }));
+        assert_eq!(initial, later);
     }
 
     #[derive(Default)]
@@ -1614,33 +1541,6 @@ mod tests {
             panic!("expected a display batch, received {decision:?}");
         };
         batch
-    }
-
-    #[test]
-    fn render_clock_due_is_side_effect_free_and_only_on_render_clock_advances_the_deadline() {
-        let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
-
-        assert!(!state.render_clock_due(Duration::from_millis(499)));
-        assert!(state.render_clock_due(Duration::from_millis(500)));
-        // The predicate never advances the deadline.
-        assert!(state.render_clock_due(Duration::from_millis(500)));
-        assert_eq!(state.next_clock_at(), Duration::from_millis(500));
-
-        let _ = state
-            .on_render_clock(
-                Duration::from_millis(500),
-                frame("summary", "attention", pane(7), "pane"),
-            )
-            .unwrap();
-        assert_eq!(state.next_clock_at(), Duration::from_millis(1000));
-        assert!(!state.render_clock_due(Duration::from_millis(999)));
-        assert!(state.render_clock_due(Duration::from_millis(1000)));
-
-        let _ = state
-            .request_shutdown(Duration::from_millis(1000), "down".to_string())
-            .unwrap();
-        // While shutting down the render clock is never due.
-        assert!(!state.render_clock_due(Duration::from_millis(5000)));
     }
 
     #[derive(Default)]
@@ -1950,117 +1850,30 @@ mod tests {
     }
 
     #[test]
-    fn clock_rerenders_only_changed_values_and_equal_revision_is_not_a_trigger() {
+    fn equal_revision_and_elapsed_time_do_not_execute_another_batch() {
         let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
-        let initial_frame = frame("sum", "0s", pane(10), "pane 0s");
+        let initial_frame = frame("sum", "attention", pane(10), "pane");
         let first = take_batch(
             state
                 .on_snapshot_revision(7, Duration::ZERO, initial_frame.clone())
                 .unwrap(),
         );
-        state.complete_batch(first.id, true).unwrap();
+        let mut io = FakeIo::default();
+        assert_eq!(
+            state.execute_prepared(&first, &mut io).unwrap(),
+            BatchExecution::Committed
+        );
         assert_eq!(
             state
-                .on_snapshot_revision(7, Duration::from_millis(500), initial_frame.clone())
+                .on_snapshot_revision(7, Duration::from_secs(60), initial_frame)
                 .unwrap(),
             StatusPushDecision::Ignored
         );
         assert_eq!(
-            state
-                .on_render_clock(Duration::from_millis(499), initial_frame)
-                .unwrap(),
-            StatusPushDecision::Ignored
-        );
-
-        let tick = take_batch(
-            state
-                .on_render_clock(
-                    Duration::from_millis(500),
-                    frame("sum", "1s", pane(10), "pane 1s"),
-                )
-                .unwrap(),
-        );
-        assert_eq!(tick.guarded.writes.len(), 2);
-        assert!(
-            tick.guarded
-                .writes
-                .iter()
-                .any(|write| matches!(write.key, DisplayOptionKey::SessionAttention { .. }))
-        );
-        assert!(
-            tick.guarded
-                .writes
-                .iter()
-                .any(|write| matches!(write.key, DisplayOptionKey::PaneStatus(_)))
-        );
-    }
-
-    #[test]
-    fn half_second_clock_keeps_integer_seconds_contiguous_across_a_snapshot_write() {
-        let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
-        let initial = frame("sum", "0s", pane(10), "pane 0s");
-        let first = take_batch(
-            state
-                .on_snapshot_revision(1, Duration::ZERO, initial.clone())
-                .unwrap(),
-        );
-        state.complete_batch(first.id, true).unwrap();
-
-        assert_eq!(
-            state
-                .on_render_clock(Duration::from_millis(500), initial)
-                .unwrap(),
+            state.flush_coalesced(Duration::from_secs(60)).unwrap(),
             StatusPushDecision::NoChanges
         );
-
-        let snapshot = take_batch(
-            state
-                .on_snapshot_revision(
-                    2,
-                    Duration::from_millis(750),
-                    frame("sum 2", "0s", pane(10), "pane 0s"),
-                )
-                .unwrap(),
-        );
-        state.complete_batch(snapshot.id, true).unwrap();
-
-        assert_eq!(
-            state
-                .on_render_clock(
-                    Duration::from_secs(1),
-                    frame("sum 2", "1s", pane(10), "pane 1s"),
-                )
-                .unwrap(),
-            StatusPushDecision::Coalesced {
-                ready_at: Duration::from_millis(1_250)
-            }
-        );
-        let one_second = take_batch(state.flush_coalesced(Duration::from_millis(1_250)).unwrap());
-        assert!(one_second.guarded.writes.iter().all(|write| {
-            matches!(&write.value, DisplayOptionValue::Set(value) if value.contains("1s"))
-        }));
-        state.complete_batch(one_second.id, true).unwrap();
-
-        assert_eq!(
-            state
-                .on_render_clock(
-                    Duration::from_millis(1_500),
-                    frame("sum 2", "1s", pane(10), "pane 1s"),
-                )
-                .unwrap(),
-            StatusPushDecision::NoChanges
-        );
-        let two_seconds = take_batch(
-            state
-                .on_render_clock(
-                    Duration::from_secs(2),
-                    frame("sum 2", "2s", pane(10), "pane 2s"),
-                )
-                .unwrap(),
-        );
-        assert!(two_seconds.guarded.writes.iter().all(|write| {
-            matches!(&write.value, DisplayOptionValue::Set(value) if value.contains("2s"))
-        }));
+        assert_eq!(io.calls.len(), 1);
     }
 
     #[test]

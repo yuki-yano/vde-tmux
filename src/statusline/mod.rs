@@ -19,6 +19,7 @@ use crate::tmux::TmuxRunner;
 use crate::window::select_window;
 
 pub(crate) const STATUS_OPTION_CELL_BUDGET: usize = 80;
+const STATUS_NOW_FORMAT_OPTION: &str = "@vde_status_now_format";
 const CATEGORY_RANGE_PREFIX: &str = "c:";
 const CURRENT_CATEGORY_RANGE_PREFIX: &str = "C:";
 // tmux stores `range=user|X` names in a 16-byte buffer, so X is limited to 15 bytes.
@@ -400,11 +401,7 @@ pub fn render_structured_status_snapshot(
     render_bounded_status_snapshot(config, snapshot)
 }
 
-pub fn render_structured_pane_status(
-    config: &Config,
-    pane: &PanePresentation,
-    now_epoch: i64,
-) -> String {
+pub fn render_structured_pane_status(config: &Config, pane: &PanePresentation) -> String {
     let style = if pane.active {
         &config.statusline.panes.current
     } else {
@@ -433,8 +430,7 @@ pub fn render_structured_pane_status(
             let status_label = structured_pane_status_label(&resolved.canonical, badge_state);
             let status =
                 structured_pane_status_fragment(config, status_label, badge_state, &text_fg);
-            let time_label =
-                structured_pane_time_label(&resolved.canonical, badge_state, now_epoch);
+            let time_label = structured_pane_time_label(&resolved.canonical, badge_state);
             let time =
                 structured_pane_time_fragment(config, time_label.as_deref(), badge_state, &text_fg);
             let detail = structured_pane_detail(
@@ -489,7 +485,7 @@ pub fn render_structured_pane_status(
             ("{detail}", detail.as_str()),
         ],
     );
-    tmux_style_segment(style, &body)
+    escape_tmux_secondary_expansion_percent(&tmux_style_segment(style, &body))
 }
 
 fn render_structured_summary(config: &Config, counts: BadgeStateCounts) -> String {
@@ -1216,7 +1212,6 @@ fn structured_attention_variants(
         Some(_) => "err",
         None => "err",
     };
-    let elapsed = format_bounded_duration(entry.elapsed_seconds);
     let more = entries.len().saturating_sub(1);
     let suffix = if more > 0 {
         format!(" +{more}")
@@ -1224,7 +1219,7 @@ fn structured_attention_variants(
         String::new()
     };
     let inner = format!(
-        "▲ {} · {reason} {elapsed}{suffix}",
+        "▲ {} · {reason}{suffix}",
         structured_external_text(&entry.session_name)
     );
     (
@@ -1275,41 +1270,34 @@ fn structured_pane_status_fragment(
 fn structured_pane_time_label(
     state: &crate::pane_state::PaneState,
     badge: BadgeState,
-    now_epoch: i64,
 ) -> Option<String> {
     let (epoch, suffix) = match badge {
         BadgeState::Done | BadgeState::Idle => (state.completed_at?, " ago"),
         BadgeState::Blocked | BadgeState::Working => (state.started_at?, ""),
     };
-    Some(format!(
-        "{}{suffix}",
-        format_bounded_duration(now_epoch.saturating_sub(epoch))
-    ))
+    Some(format!("{}{suffix}", tmux_bounded_duration(epoch)))
 }
 
-/// Compact elapsed time shared by statusline attention and pane-border state.
-pub(crate) fn format_bounded_duration(seconds: i64) -> String {
-    let seconds = seconds.max(0);
-    if seconds < 60 {
-        return format!("{seconds}s");
-    }
-    let minutes = seconds / 60;
-    if minutes < 10 {
-        return format!("{minutes}m{:02}s", seconds % 60);
-    }
-    if minutes < 60 {
-        return format!("{minutes}m");
-    }
-    let hours = minutes / 60;
-    if hours < 24 {
-        let remaining_minutes = minutes % 60;
-        return if remaining_minutes == 0 {
-            format!("{hours}h")
-        } else {
-            format!("{hours}h{remaining_minutes}m")
-        };
-    }
-    format!("{}d", hours / 24)
+/// Builds the former compact elapsed-time presentation as a tmux format.
+///
+/// The pane status option is written only when semantic state changes. tmux evaluates this
+/// expression while drawing the visible pane border, so elapsed seconds advance without a
+/// periodic `set-option -p` against every pane in the server.
+fn tmux_bounded_duration(epoch: i64) -> String {
+    let epoch = epoch.max(0);
+    let now = format!("#{{T:{STATUS_NOW_FORMAT_OPTION}}}");
+    let elapsed = format!("#{{?#{{e|<:{now},{epoch}}},0,#{{e|-:{now},{epoch}}}}}");
+    let minutes = format!("#{{e|/:{elapsed},60}}");
+    let seconds = format!("#{{e|m:{elapsed},60}}");
+    let padded_seconds = format!("#{{?#{{e|<:{seconds},10}},0,}}{seconds}");
+    let hours = format!("#{{e|/:{elapsed},3600}}");
+    let remaining_minutes = format!("#{{e|m:{minutes},60}}");
+    let hour_label = format!("{hours}h#{{?#{{e|==:{remaining_minutes},0}},,{remaining_minutes}m}}");
+    let days = format!("#{{e|/:{elapsed},86400}}");
+
+    format!(
+        "#{{?#{{e|<:{elapsed},60}},{elapsed}s,#{{?#{{e|<:{elapsed},600}},{minutes}m{padded_seconds}s,#{{?#{{e|<:{elapsed},3600}},{minutes}m,#{{?#{{e|<:{elapsed},86400}},{hour_label},{days}d}}}}}}}}"
+    )
 }
 
 fn join_bounded_tokens(rendered: Vec<String>, omitted: usize, separator: &str) -> String {
@@ -1425,6 +1413,14 @@ fn structured_external_text(raw: &str) -> String {
         }
     }
     escaped
+}
+
+/// Escapes literal percent signs for `#{E:@vde_status_pane}`.
+///
+/// tmux treats a single `%` as strftime syntax during the secondary expansion. Pane IDs are
+/// native tmux values such as `%7`, so the option must contain `%%7` to display `%7` after `E:`.
+fn escape_tmux_secondary_expansion_percent(raw: &str) -> String {
+    raw.replace('%', "%%")
 }
 
 fn normalize_tmux_color(raw: &str) -> String {
@@ -1973,7 +1969,7 @@ mod tests {
             rendered.category
         );
         assert!(
-            rendered.attention.contains("▲ main · perm 2m05s"),
+            rendered.attention.contains("▲ main · perm"),
             "{}",
             rendered.attention
         );
@@ -2034,7 +2030,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_pane_uses_resolved_badge_and_second_precision_clock() {
+    fn structured_pane_uses_resolved_badge_with_dynamic_elapsed_time() {
         let mut config = Config::default();
         config.statusline.panes.current.format =
             "{pane}|{agent}|{badge}|{status}|{time}|{detail}".to_string();
@@ -2050,15 +2046,33 @@ mod tests {
             )),
         );
 
-        let rendered = render_structured_pane_status(&config, &pane, 180);
+        let rendered = render_structured_pane_status(&config, &pane);
 
-        assert!(rendered.contains("%7|Codex|"), "{rendered}");
+        assert!(rendered.contains("%%7|Codex|"), "{rendered}");
         assert!(rendered.contains("Waiting"), "{rendered}");
-        assert!(rendered.matches("2m00s").count() >= 2, "{rendered}");
+        assert!(rendered.matches(STATUS_NOW_FORMAT_OPTION).count() >= 2);
+        assert!(rendered.matches(",60}").count() >= 2, "{rendered}");
+        assert!(!rendered.contains("2m00s"), "{rendered}");
         assert!(
             rendered.contains(&config.badge.colors.blocked),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn dynamic_duration_embeds_epoch_and_old_display_thresholds() {
+        let rendered = tmux_bounded_duration(123);
+
+        assert!(rendered.contains(STATUS_NOW_FORMAT_OPTION), "{rendered}");
+        assert!(rendered.contains(",123}"), "{rendered}");
+        for threshold in [60, 600, 3_600, 86_400] {
+            assert!(rendered.contains(&format!(",{threshold}}}")), "{rendered}");
+        }
+        assert!(rendered.contains("m"), "{rendered}");
+        assert!(rendered.contains("s"), "{rendered}");
+        assert!(rendered.contains("h"), "{rendered}");
+        assert!(rendered.contains("d"), "{rendered}");
+        assert!(!rendered.chars().any(char::is_control));
     }
 
     #[test]
@@ -2109,24 +2123,12 @@ mod tests {
         config.statusline.panes.other.format = "{process}|{path}|{detail}".to_string();
         let pane = structured_pane("zsh#[fg=red]\n{path}", "/tmp/#{process}\t", false, None);
 
-        let rendered = render_structured_pane_status(&config, &pane, 180);
+        let rendered = render_structured_pane_status(&config, &pane);
 
         assert!(
             rendered.contains("zsh##[fg=red] {path}|/tmp/##{process} |zsh##[fg=red] {path}"),
             "{rendered}"
         );
-    }
-
-    #[test]
-    fn bounded_duration_preserves_seconds_below_ten_minutes() {
-        assert_eq!(format_bounded_duration(-1), "0s");
-        assert_eq!(format_bounded_duration(30), "30s");
-        assert_eq!(format_bounded_duration(90), "1m30s");
-        assert_eq!(format_bounded_duration(599), "9m59s");
-        assert_eq!(format_bounded_duration(600), "10m");
-        assert_eq!(format_bounded_duration(720), "12m");
-        assert_eq!(format_bounded_duration(5_400), "1h30m");
-        assert_eq!(format_bounded_duration(172_800), "2d");
     }
 
     #[test]
@@ -2145,7 +2147,7 @@ mod tests {
 
         for width in [31, 32, 63, 64] {
             pane.pane_width = width;
-            let rendered = render_structured_pane_status(&config, &pane, 30);
+            let rendered = render_structured_pane_status(&config, &pane);
             assert!(
                 rendered.contains("CUSTOM:(unnamed):(no agent):No state:(empty):(empty)"),
                 "width {width}: {rendered}"
@@ -2168,7 +2170,7 @@ mod tests {
             message: "invalid custom state".to_string(),
         });
 
-        let rendered = render_structured_pane_status(&config, &pane, 30);
+        let rendered = render_structured_pane_status(&config, &pane);
 
         assert!(
             rendered.contains("(no agent)|?|Invalid state|(empty)|zsh"),
@@ -2708,7 +2710,8 @@ mod tests {
         assert!(!rendered.summary.is_empty(), "{rendered:?}");
         assert!(rendered.category.contains("work"), "{rendered:?}");
         assert!(rendered.windows.contains("editor"), "{rendered:?}");
-        assert!(rendered.attention.contains("review · perm 1m30s"));
+        assert!(rendered.attention.contains("review · perm"));
+        assert!(!rendered.attention.contains("1m30s"));
     }
 
     #[test]

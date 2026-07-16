@@ -1054,6 +1054,12 @@ mod tests {
         assert_eq!(humanize_secs(48 * 3600), "2d");
         assert_eq!(humanize_secs(100 * 3600), "4d");
         assert_eq!(humanize_secs(-5), "0s");
+        assert_eq!(humanize_secs_full(0), "0s");
+        assert_eq!(humanize_secs_full(59), "59s");
+        assert_eq!(humanize_secs_full(60), "1m 00s");
+        assert_eq!(humanize_secs_full(127), "2m 07s");
+        assert_eq!(humanize_secs_full(3_600), "1h 00m 00s");
+        assert_eq!(humanize_secs_full(5_527), "1h 32m 07s");
     }
 
     #[test]
