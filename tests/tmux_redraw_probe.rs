@@ -74,14 +74,15 @@ impl ProbeServer {
             ws_ypixel: 0,
         };
         // SAFETY: openpty initializes both file descriptors on success and only
-        // reads the supplied winsize value.
+        // reads the supplied winsize value. A raw pointer is passed because the
+        // winsize parameter is *mut on macOS but *const on Linux.
         let result = unsafe {
             libc::openpty(
                 &mut master_fd,
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                &raw mut size,
             )
         };
         assert_eq!(result, 0, "openpty failed: {}", io::Error::last_os_error());
