@@ -735,6 +735,10 @@ pub enum PaneEvent {
     ActivityObserved {
         observed_at: i64,
     },
+    ActivityAndProgressObserved {
+        observed_at: i64,
+        operations: Vec<ProgressOperation>,
+    },
     WaitRequested {
         observed_at: i64,
         reason: WaitReason,
@@ -781,6 +785,7 @@ impl PaneEvent {
             Self::AgentSessionStarted { .. }
                 | Self::BeginRun { .. }
                 | Self::ActivityObserved { .. }
+                | Self::ActivityAndProgressObserved { .. }
                 | Self::WaitRequested { .. }
                 | Self::CompleteRun { .. }
                 | Self::FailRun { .. }

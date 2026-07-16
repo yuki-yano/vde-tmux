@@ -165,6 +165,9 @@ pub fn codex_typed_event_from_json_with_home(
                 .map(|text| prompt_state(text, "user"))
                 .transpose()?,
         },
+        "PreToolUse" | "PostToolUse" => PaneEvent::ActivityObserved {
+            observed_at: context.observed_at,
+        },
         "PermissionRequest" => PaneEvent::WaitRequested {
             observed_at: context.observed_at,
             reason: WaitReason::PermissionPrompt,
@@ -371,7 +374,12 @@ fn is_guarded_claude_lifecycle_event(event: &str) -> bool {
 fn is_guarded_codex_lifecycle_event(event: &str) -> bool {
     matches!(
         event,
-        "UserPromptSubmit" | "SessionStart" | "Stop" | "PermissionRequest"
+        "UserPromptSubmit"
+            | "SessionStart"
+            | "Stop"
+            | "PermissionRequest"
+            | "PreToolUse"
+            | "PostToolUse"
     )
 }
 
@@ -543,6 +551,16 @@ mod tests {
     #[test]
     fn codex_typed_fixture_maps_supported_lifecycle_events() {
         let fixtures = [
+            (
+                "PreToolUse",
+                r#"{"session_id":"session-2","tool_name":"exec"}"#,
+                PaneEvent::ActivityObserved { observed_at: 123 },
+            ),
+            (
+                "PostToolUse",
+                r#"{"session_id":"session-2","tool_name":"wait"}"#,
+                PaneEvent::ActivityObserved { observed_at: 123 },
+            ),
             (
                 "UserPromptSubmit",
                 r#"{"session_id":"session-2","prompt":"do it"}"#,

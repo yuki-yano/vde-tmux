@@ -586,6 +586,13 @@ fn apply_regular_explicit_event(
         PaneEvent::AgentSessionStarted { .. } => apply_agent_session_started(state, event),
         PaneEvent::BeginRun { started_at, prompt } => begin_run(state, *started_at, prompt.clone()),
         PaneEvent::ActivityObserved { observed_at } => activity_observed(state, *observed_at),
+        PaneEvent::ActivityAndProgressObserved {
+            observed_at,
+            operations,
+        } => {
+            activity_observed(state, *observed_at)?;
+            apply_progress(state, operations)
+        }
         PaneEvent::WaitRequested {
             observed_at,
             reason,
@@ -719,6 +726,7 @@ fn is_epoch_start_evidence(event: &PaneEvent) -> bool {
         PaneEvent::AgentSessionStarted { .. }
             | PaneEvent::BeginRun { .. }
             | PaneEvent::ActivityObserved { .. }
+            | PaneEvent::ActivityAndProgressObserved { .. }
             | PaneEvent::WaitRequested { .. }
             | PaneEvent::FailRun { .. }
     ) || matches!(
@@ -3123,6 +3131,33 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, ReduceError::InvalidProgressOperation(_)));
         assert_eq!(begun.record, before);
+    }
+
+    #[test]
+    fn activity_and_progress_restarts_completed_run_atomically() {
+        let begun = begin(None, &CaptureTrackerSnapshot::default());
+        let completed = reduce_once(
+            begun.record.as_ref(),
+            PaneEvent::CompleteRun { completed_at: 20 },
+            &begun.tracker_delta.as_ref().unwrap().next,
+        );
+        assert!(matches!(active(&completed).lifecycle, LifecycleState::Idle));
+
+        let resumed = reduce_once(
+            completed.record.as_ref(),
+            PaneEvent::ActivityAndProgressObserved {
+                observed_at: 30,
+                operations: vec![ProgressOperation::TaskCreated],
+            },
+            &completed.tracker_delta.as_ref().unwrap().next,
+        );
+
+        let state = active(&resumed);
+        assert!(matches!(state.lifecycle, LifecycleState::Running));
+        assert_eq!(state.run_seq, 2);
+        assert_eq!(state.completed_seq, 1);
+        assert_eq!(state.started_at, Some(30));
+        assert_eq!(state.tasks.progress.total, 1);
     }
 
     #[test]

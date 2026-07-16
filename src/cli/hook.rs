@@ -490,6 +490,14 @@ pub(crate) fn codex_typed_event_from_input(
     {
         let session_id = required_payload_session(input)?;
         return match aux_event {
+            CodexAuxEvent::ActivityAndProgress(progress_event) => Ok(Some(context.envelope(
+                AgentKind::parse("codex")?,
+                AgentSessionId::parse(session_id)?,
+                PaneEvent::ActivityAndProgressObserved {
+                    observed_at: context.observed_at,
+                    operations: typed_progress_operations(progress_event)?,
+                },
+            ))),
             CodexAuxEvent::Progress(progress_event) => Ok(Some(typed_progress_event(
                 "codex",
                 session_id,
@@ -723,6 +731,7 @@ fn claude_task_status_from_str(raw: &str) -> Option<TaskItemStatus> {
 
 #[allow(clippy::large_enum_variant)]
 enum CodexAuxEvent {
+    ActivityAndProgress(ProgressEvent),
     Progress(ProgressEvent),
     Agent(AgentEvent),
 }
@@ -749,7 +758,12 @@ fn codex_aux_event_from_input(
             {
                 return Ok(None);
             }
-            codex_post_tool_use_event(&payload, now_epoch)
+            Ok(
+                codex_post_tool_use_event(&payload, now_epoch)?.map(|event| match event {
+                    CodexAuxEvent::Progress(event) => CodexAuxEvent::ActivityAndProgress(event),
+                    other => other,
+                }),
+            )
         }
         "SubagentStart" => Ok(codex_subagent_start_event_with_home(&payload, codex_home)?
             .map(CodexAuxEvent::Progress)),
@@ -1062,6 +1076,62 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("UnsupportedLegacyNotify"));
+    }
+
+    #[test]
+    fn codex_post_tool_progress_also_reports_lifecycle_activity() {
+        let envelope = codex_typed_event_from_input(
+            "PostToolUse",
+            r#"{"session_id":"codex-session","tool_name":"update_plan","tool_input":{"plan":[{"step":"ship it","status":"in_progress"}]}}"#,
+            &typed_context(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            envelope.event,
+            PaneEvent::ActivityAndProgressObserved {
+                observed_at: 123,
+                operations: vec![ProgressOperation::ReplaceTasks {
+                    progress: crate::pane_state::TaskProgress { done: 0, total: 1 },
+                    items: vec![crate::pane_state::TaskItemState {
+                        id: None,
+                        step: "ship it".to_string(),
+                        status: crate::pane_state::TaskItemStatus::InProgress,
+                    }],
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn codex_subagent_tool_activity_does_not_update_parent_lifecycle() {
+        let root = unique_temp_dir("codex-subagent-tool-activity");
+        let sessions = root.join("sessions").join("2026").join("07").join("16");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("rollout-parent-session.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"parent-session","thread_source":"root"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            sessions.join("rollout-subagent-session.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"subagent-session","thread_source":"subagent","parent_thread_id":"parent-session"}}"#,
+        )
+        .unwrap();
+        let payload =
+            r#"{"session_id":"parent-session","agent_id":"subagent-session","tool_name":"exec"}"#;
+
+        for hook in ["PreToolUse", "PostToolUse"] {
+            assert!(
+                codex_typed_event_from_input(hook, payload, &typed_context(), Some(&root))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {

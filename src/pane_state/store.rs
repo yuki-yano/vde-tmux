@@ -1537,6 +1537,7 @@ fn transition_at_epoch(event: &PaneEvent, current: Option<&StoredPaneRecord>) ->
     match event {
         PaneEvent::AgentSessionStarted { observed_at, .. }
         | PaneEvent::ActivityObserved { observed_at }
+        | PaneEvent::ActivityAndProgressObserved { observed_at, .. }
         | PaneEvent::WaitRequested { observed_at, .. }
         | PaneEvent::FailRun { observed_at, .. }
         | PaneEvent::ProgressUpdated { observed_at, .. }
@@ -1565,6 +1566,7 @@ fn event_can_create_record(current: Option<&StoredPaneRecord>, event: &PaneEvent
         PaneEvent::AgentSessionStarted { .. }
         | PaneEvent::BeginRun { .. }
         | PaneEvent::ActivityObserved { .. }
+        | PaneEvent::ActivityAndProgressObserved { .. }
         | PaneEvent::WaitRequested { .. }
         | PaneEvent::FailRun { .. } => true,
         PaneEvent::CompleteRun { .. } if missing => true,
