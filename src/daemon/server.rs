@@ -2221,13 +2221,7 @@ impl ProductionV2Coordinator {
             .lock()
             .expect("canonical state lock poisoned")
             .as_ref()
-            .is_some_and(|state| {
-                state
-                    .resolved_snapshot()
-                    .panes
-                    .iter()
-                    .any(|pane| pane.pane_instance == expected_pane)
-            });
+            .is_some_and(|state| state.contains_pane(&expected_pane));
         if !exists {
             return Err(crate::daemon::protocol::v2::ErrorCode::StaleSelection);
         }
@@ -2877,16 +2871,7 @@ fn start_canonical_git_worker(
                 .lock()
                 .expect("canonical state lock poisoned")
                 .as_ref()
-                .map(|state| {
-                    state
-                        .resolved_snapshot()
-                        .panes
-                        .into_iter()
-                        .filter(|pane| pane.resolved.is_some())
-                        .map(|pane| pane.current_path)
-                        .filter(|path| !path.trim().is_empty())
-                        .collect::<BTreeSet<_>>()
-                })
+                .map(|state| state.git_polling_paths())
                 .unwrap_or_default();
             let (badges, worktrees) =
                 poller.poll(&git, paths.iter().map(String::as_str), Instant::now());

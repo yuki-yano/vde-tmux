@@ -215,6 +215,35 @@ impl CanonicalCoordinatorState {
         self.leased.runtime.records_snapshot()
     }
 
+    /// Distinct non-empty pane paths that carry a resolved agent, used to drive
+    /// git polling without building the full resolved snapshot. Mirrors the
+    /// `resolved.is_some()` filter in `resolved_snapshot_with_git_at`.
+    pub fn git_polling_paths(&self) -> BTreeSet<String> {
+        use crate::pane_state::StoredPaneRecord;
+        self.topology
+            .panes
+            .iter()
+            .filter(|topology| {
+                matches!(
+                    self.leased.runtime.record(&topology.pane_instance),
+                    Some(StoredPaneRecord::Active(state))
+                        if state.agent_present || state.completed_seq > state.acknowledged_seq
+                )
+            })
+            .map(|topology| topology.current_path.clone())
+            .filter(|path| !path.trim().is_empty())
+            .collect()
+    }
+
+    /// Whether the canonical topology currently contains `pane_instance`,
+    /// without building the full resolved snapshot.
+    pub fn contains_pane(&self, pane_instance: &crate::pane_state::PaneInstance) -> bool {
+        self.topology
+            .panes
+            .iter()
+            .any(|pane| &pane.pane_instance == pane_instance)
+    }
+
     pub fn window_panes(&self) -> BTreeMap<String, Vec<crate::pane_state::PaneInstance>> {
         let mut windows = BTreeMap::<String, Vec<crate::pane_state::PaneInstance>>::new();
         for pane in &self.topology.panes {
@@ -1283,6 +1312,39 @@ mod tests {
     ) {
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_polling_paths_match_resolved_snapshot_resolved_filter() {
+        let (state, root) = canonical_sidebar_fixture();
+        let expected: std::collections::BTreeSet<String> = state
+            .resolved_snapshot()
+            .panes
+            .into_iter()
+            .filter(|pane| pane.resolved.is_some())
+            .map(|pane| pane.current_path)
+            .filter(|path| !path.trim().is_empty())
+            .collect();
+        assert_eq!(state.git_polling_paths(), expected);
+        // The fixture has resolved agent panes (%1, %2) and a plain shell pane.
+        assert!(expected.contains("/tmp/alpha"));
+        assert!(expected.contains("/tmp/beta"));
+        assert!(!expected.contains("/tmp/shell"));
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    #[test]
+    fn contains_pane_matches_resolved_snapshot_membership() {
+        let (state, root) = canonical_sidebar_fixture();
+        assert!(state.contains_pane(&crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        }));
+        assert!(!state.contains_pane(&crate::pane_state::PaneInstance {
+            pane_id: "%missing".to_string(),
+            pane_pid: 999,
+        }));
+        remove_canonical_sidebar_fixture(state, root);
     }
 
     struct ImmediatePaneStateIo;
