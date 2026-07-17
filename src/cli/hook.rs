@@ -908,9 +908,10 @@ fn resolve_vw_target_path(binary: &str, target: &str) -> Option<String> {
 }
 
 fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
-    // Run in a fresh process group so the whole tree can be killed on timeout;
-    // a descendant that inherits stdout would otherwise keep the pipe open and
-    // block the reader join past the deadline.
+    // Run in a fresh process group so the whole tree can be killed; a descendant
+    // that inherits stdout would otherwise keep the pipe open and block the
+    // reader join. The group is killed before the leader is reaped, so the pgid
+    // cannot be reused (see crate::proc).
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -918,37 +919,18 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Option<V
         .process_group(0)
         .spawn()
         .ok()?;
-    let pgid = child.id() as i32;
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut buffer = Vec::new();
         let _ = stdout.read_to_end(&mut buffer);
         buffer
     });
-    let deadline = Instant::now() + timeout;
-    let mut succeeded = false;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                succeeded = status.success();
-                break;
-            }
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    // Kill the whole group (SIGKILL to -pgid) so any descendant holding stdout
-    // dies and the reader observes EOF, bounding the join on every path.
-    unsafe {
-        libc::kill(-pgid, libc::SIGKILL);
-    }
-    let _ = child.wait();
+    let status = crate::proc::await_exit_then_kill_group(&mut child, timeout);
     let stdout = reader.join().ok()?;
-    succeeded.then_some(stdout)
+    match status {
+        Some(status) if status.success() => Some(stdout),
+        _ => None,
+    }
 }
 
 fn path_basename(raw: &str) -> Option<String> {
@@ -1187,6 +1169,15 @@ mod tests {
     }
 
     #[test]
+    fn claude_task_update_without_status_is_none() {
+        let payload = serde_json::json!({
+            "tool_name": "TaskUpdate",
+            "tool_input": {"taskId": "t1"}
+        });
+        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+    }
+
+    #[test]
     fn parse_vw_exec_command_extracts_binary_and_target() {
         assert_eq!(
             parse_vw_exec_command("vw exec /abs/path -- cargo test"),
@@ -1235,14 +1226,15 @@ mod tests {
     }
 
     #[test]
-    fn run_command_with_timeout_does_not_block_on_lingering_grandchild() {
-        // The parent exits immediately but backgrounds a child that inherits
-        // stdout; without a process-group kill the reader join would block
-        // until the grandchild exits.
+    fn run_command_with_timeout_preserves_output_despite_lingering_grandchild() {
+        // The parent writes its output, then backgrounds a descendant that
+        // inherits stdout and outlives it. The parent's bytes must still be
+        // returned, and the call must not block on the descendant.
         let mut command = Command::new("sh");
-        command.args(["-c", "sleep 3 & exit 0"]);
+        command.args(["-c", "printf PARENT; sleep 5 &"]);
         let start = Instant::now();
-        let _ = run_command_with_timeout(command, Duration::from_secs(10));
+        let out = run_command_with_timeout(command, Duration::from_secs(10));
+        assert_eq!(out.as_deref(), Some(b"PARENT".as_slice()));
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "must not block on a descendant that inherited stdout"
