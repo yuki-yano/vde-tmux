@@ -204,11 +204,17 @@ impl ObservationWorkerIo for SystemObservationWorkerIo {
                 Ok(None) => {}
                 Err(error) => {
                     terminate_child_bounded(child, Duration::from_millis(100));
+                    // Killing the child sends EOF to the pipes; join the readers
+                    // instead of detaching them.
+                    join_capture_reader(stdout);
+                    join_capture_reader(stderr);
                     return Err(error.into());
                 }
             }
             if Instant::now() >= deadline {
                 terminate_child_bounded(child, Duration::from_millis(100));
+                join_capture_reader(stdout);
+                join_capture_reader(stderr);
                 anyhow::bail!("tmux capture batch timed out after {:?}", self.timeout);
             }
             thread::sleep(Duration::from_millis(5));
@@ -226,6 +232,12 @@ impl ObservationWorkerIo for SystemObservationWorkerIo {
             stdout: String::from_utf8(stdout)?,
             stderr: String::from_utf8(stderr)?,
         })
+    }
+}
+
+fn join_capture_reader(reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>) {
+    if let Some(handle) = reader {
+        let _ = handle.join();
     }
 }
 
