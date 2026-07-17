@@ -1140,6 +1140,53 @@ mod tests {
     }
 
     #[test]
+    fn claude_task_create_without_output_is_none() {
+        let payload = serde_json::json!({
+            "tool_name": "TaskCreate",
+            "tool_input": {"subject": "s"}
+        });
+        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+    }
+
+    #[test]
+    fn claude_task_create_without_id_is_none() {
+        let payload = serde_json::json!({
+            "tool_name": "TaskCreate",
+            "tool_input": {"subject": "s"},
+            "tool_response": {"task": {"subject": "x"}}
+        });
+        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+    }
+
+    #[test]
+    fn claude_task_create_without_any_subject_is_none() {
+        let payload = serde_json::json!({
+            "tool_name": "TaskCreate",
+            "tool_input": {},
+            "tool_response": {"task": {"id": "t1"}}
+        });
+        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+    }
+
+    #[test]
+    fn claude_task_update_without_task_id_is_none() {
+        let payload = serde_json::json!({
+            "tool_name": "TaskUpdate",
+            "tool_input": {"status": "completed"}
+        });
+        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+    }
+
+    #[test]
+    fn claude_task_update_with_invalid_status_is_none() {
+        let payload = serde_json::json!({
+            "tool_name": "TaskUpdate",
+            "tool_input": {"taskId": "t1", "status": "bogus"}
+        });
+        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+    }
+
+    #[test]
     fn parse_vw_exec_command_extracts_binary_and_target() {
         assert_eq!(
             parse_vw_exec_command("vw exec /abs/path -- cargo test"),
