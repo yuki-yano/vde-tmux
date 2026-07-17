@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::process::Child;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -201,62 +200,32 @@ impl ObservationWorkerIo for SystemObservationWorkerIo {
                 stderr.read_to_end(&mut bytes).map(|_| bytes)
             })
         });
-        let deadline = Instant::now() + self.timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {}
-                Err(error) => {
-                    terminate_child_bounded(child, Duration::from_millis(100));
-                    // Killing the child sends EOF to the pipes; join the readers
-                    // instead of detaching them.
-                    join_capture_reader(stdout);
-                    join_capture_reader(stderr);
-                    return Err(error.into());
-                }
-            }
-            if Instant::now() >= deadline {
-                terminate_child_bounded(child, Duration::from_millis(100));
-                join_capture_reader(stdout);
-                join_capture_reader(stderr);
-                anyhow::bail!("tmux capture batch timed out after {:?}", self.timeout);
-            }
-            thread::sleep(Duration::from_millis(5));
-        };
-        let stdout = stdout
-            .ok_or_else(|| anyhow::anyhow!("capture stdout was not piped"))?
-            .join()
-            .map_err(|_| anyhow::anyhow!("capture stdout reader panicked"))??;
-        let stderr = stderr
-            .ok_or_else(|| anyhow::anyhow!("capture stderr was not piped"))?
-            .join()
-            .map_err(|_| anyhow::anyhow!("capture stderr reader panicked"))??;
+        // On every path, kill the whole process group before reaping the child
+        // so a descendant holding the capture pipes dies and the readers reach
+        // EOF; the reads are then always joined, never detached.
+        let status = crate::proc::await_exit_then_kill_group(&mut child, self.timeout);
+        let stdout = collect_capture_reader("stdout", stdout);
+        let stderr = collect_capture_reader("stderr", stderr);
+        let status = status.ok_or_else(|| {
+            anyhow::anyhow!("tmux capture batch timed out after {:?}", self.timeout)
+        })?;
         Ok(CaptureBatchOutput {
             exit_code: status.code(),
-            stdout: String::from_utf8(stdout)?,
-            stderr: String::from_utf8(stderr)?,
+            stdout: String::from_utf8(stdout?)?,
+            stderr: String::from_utf8(stderr?)?,
         })
     }
 }
 
-fn join_capture_reader(reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>) {
-    if let Some(handle) = reader {
-        let _ = handle.join();
-    }
-}
-
-fn terminate_child_bounded(mut child: Child, timeout: Duration) {
-    // SIGKILL the whole process group (the child spawns in its own group) so a
-    // descendant holding the capture pipes dies too and the readers see EOF.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    let _ = child.kill();
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(child.wait());
-    });
-    let _ = receiver.recv_timeout(timeout);
+fn collect_capture_reader(
+    label: &str,
+    reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>> {
+    reader
+        .ok_or_else(|| anyhow::anyhow!("capture {label} was not piped"))?
+        .join()
+        .map_err(|_| anyhow::anyhow!("capture {label} reader panicked"))?
+        .map_err(Into::into)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1485,47 +1454,7 @@ pub fn system_git_runner(timeout: Duration) -> SystemGitRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::{Command, Stdio};
     use std::sync::Mutex;
-
-    #[test]
-    fn terminate_child_bounded_kills_the_whole_process_group() {
-        use std::os::unix::process::CommandExt;
-
-        // The parent stays alive while a long-lived descendant runs in the same
-        // group; killing only the parent would leave the descendant holding the
-        // capture pipe open. terminate_child_bounded must take down the group.
-        let child = Command::new("sh")
-            .args(["-c", "sleep 30 & wait"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pgid = child.id() as i32;
-        // Let sh actually fork the backgrounded descendant before terminating,
-        // otherwise killing sh alone would trivially empty the group.
-        thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            unsafe { libc::kill(-pgid, 0) },
-            0,
-            "descendant should be running before termination"
-        );
-        terminate_child_bounded(child, Duration::from_millis(200));
-
-        let start = Instant::now();
-        loop {
-            // kill(-pgid, 0) fails once every process in the group is gone.
-            if unsafe { libc::kill(-pgid, 0) } == -1 {
-                break;
-            }
-            assert!(
-                start.elapsed() < Duration::from_secs(3),
-                "descendant survived group termination"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
 
     #[test]
     fn git_worker_runner_receives_configured_timeout() {
@@ -1810,23 +1739,6 @@ mod tests {
             pid: 4242,
             start_time: 99,
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bounded_child_termination_does_not_block_the_poll_worker() {
-        let child = Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let started = Instant::now();
-
-        terminate_child_bounded(child, Duration::from_millis(100));
-
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     fn pane_instance(id: &str, pid: u32) -> PaneInstance {
