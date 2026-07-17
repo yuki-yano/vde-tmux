@@ -1910,3 +1910,47 @@ fn statusline_cli_index_rejects_zero_instead_of_aliasing_the_first_item() {
             .contains("1 or greater")
     );
 }
+
+#[test]
+fn agent_hook_stdin_returns_partial_input_when_deadline_hits_before_eof() {
+    use std::fs::File;
+    use std::os::fd::FromRawFd;
+    use std::time::{Duration, Instant};
+
+    let mut fds = [0_i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    let payload = b"{\"event\":\"Stop\"}";
+    assert_eq!(
+        unsafe {
+            libc::write(
+                write_fd,
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+            )
+        },
+        payload.len() as isize
+    );
+    // Keep write_fd open so the reader never observes EOF; only the deadline ends the read.
+    let mut reader = unsafe { File::from_raw_fd(read_fd) };
+    let deadline = Instant::now() + Duration::from_millis(150);
+    let result = super::read_agent_hook_input_from_until(&mut reader, deadline).unwrap();
+    assert_eq!(result, "{\"event\":\"Stop\"}");
+    unsafe { libc::close(write_fd) };
+}
+
+#[test]
+fn agent_hook_stdin_errors_when_no_bytes_arrive_before_deadline() {
+    use std::fs::File;
+    use std::os::fd::FromRawFd;
+    use std::time::{Duration, Instant};
+
+    let mut fds = [0_i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    let mut reader = unsafe { File::from_raw_fd(read_fd) };
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let error = super::read_agent_hook_input_from_until(&mut reader, deadline).unwrap_err();
+    assert!(error.to_string().contains("deadline exceeded"));
+    unsafe { libc::close(write_fd) };
+}

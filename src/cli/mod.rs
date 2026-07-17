@@ -454,27 +454,45 @@ where
 {
     let mut bytes = Vec::new();
     loop {
-        if !wait_for_input(input.as_raw_fd(), deadline)? {
-            return String::from_utf8(bytes)
-                .map_err(|error| anyhow::anyhow!("agent hook stdin is not UTF-8: {error}"));
+        match wait_for_input(input.as_raw_fd(), deadline)? {
+            PollOutcome::Ready => {}
+            PollOutcome::Closed => return finish_agent_hook_input(bytes),
+            PollOutcome::TimedOut => {
+                if bytes.is_empty() {
+                    bail!("agent hook 2s deadline exceeded while reading stdin");
+                }
+                // Keep whatever fully arrived; a slow sender that never closes
+                // stdin must not discard an already-complete payload.
+                return finish_agent_hook_input(bytes);
+            }
         }
         let mut chunk = [0_u8; 8192];
         let read = input.read(&mut chunk)?;
         if read == 0 {
-            return String::from_utf8(bytes)
-                .map_err(|error| anyhow::anyhow!("agent hook stdin is not UTF-8: {error}"));
+            return finish_agent_hook_input(bytes);
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
 }
 
-fn wait_for_input(fd: RawFd, deadline: Instant) -> Result<bool> {
+fn finish_agent_hook_input(bytes: Vec<u8>) -> Result<String> {
+    String::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("agent hook stdin is not UTF-8: {error}"))
+}
+
+enum PollOutcome {
+    Ready,
+    Closed,
+    TimedOut,
+}
+
+fn wait_for_input(fd: RawFd, deadline: Instant) -> Result<PollOutcome> {
     if fd < 0 {
-        return Ok(false);
+        return Ok(PollOutcome::Closed);
     }
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            bail!("agent hook 2s deadline exceeded while reading stdin");
+            return Ok(PollOutcome::TimedOut);
         };
         let timeout_ms = remaining
             .as_millis()
@@ -488,7 +506,7 @@ fn wait_for_input(fd: RawFd, deadline: Instant) -> Result<bool> {
         // SAFETY: poll_fd points to one initialized descriptor for the duration of the call.
         let result = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_ms) };
         if result == 0 {
-            bail!("agent hook 2s deadline exceeded while reading stdin");
+            return Ok(PollOutcome::TimedOut);
         }
         if result < 0 {
             let error = std::io::Error::last_os_error();
@@ -498,9 +516,9 @@ fn wait_for_input(fd: RawFd, deadline: Instant) -> Result<bool> {
             return Err(error.into());
         }
         if poll_fd.revents & libc::POLLNVAL != 0 {
-            return Ok(false);
+            return Ok(PollOutcome::Closed);
         }
-        return Ok(true);
+        return Ok(PollOutcome::Ready);
     }
 }
 
