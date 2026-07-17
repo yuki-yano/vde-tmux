@@ -2046,6 +2046,7 @@ fn parse_color(raw: Option<&str>) -> Option<Color> {
     }
     if let Some(hex) = raw.strip_prefix('#')
         && hex.len() == 6
+        && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
         let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
@@ -2116,6 +2117,19 @@ mod tests {
     use crate::hook::RollupLevel;
     use crate::sidebar::state::SidebarState;
     use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
+
+    #[test]
+    fn parse_color_accepts_valid_hex() {
+        assert_eq!(parse_color(Some("#ff8800")), Some(Color::Rgb(255, 136, 0)));
+    }
+
+    #[test]
+    fn parse_color_rejects_non_ascii_six_byte_hex_without_panicking() {
+        // "#あXYZ" is 6 bytes but only 4 chars; byte-index slicing would panic.
+        assert_eq!(parse_color(Some("#\u{3042}XYZ")), None);
+        // Valid byte length but non-hex ASCII stays None as before.
+        assert_eq!(parse_color(Some("#gggggg")), None);
+    }
 
     fn row(
         id: &str,
