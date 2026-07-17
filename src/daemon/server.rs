@@ -8632,7 +8632,11 @@ mod tests {
 
         drop(state);
         drop(coordinator);
-        std::fs::remove_dir_all(root).unwrap();
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to remove test directory: {error}"),
+        }
     }
 
     #[test]
