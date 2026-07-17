@@ -1052,6 +1052,45 @@ mod tests {
     }
 
     #[test]
+    fn repo_label_uses_sanitized_session_name_when_path_has_no_segment() {
+        let label = repo_label_from_values("/", "ses\u{1b}sion");
+        assert!(!label.chars().any(|ch| ch.is_control()));
+        assert_eq!(label, "ses sion");
+    }
+
+    #[test]
+    fn repo_label_normalizes_unit_separator() {
+        assert_eq!(repo_label_from_values("/work/a\u{1f}b", "session"), "a b");
+    }
+
+    #[test]
+    fn category_label_strips_control_chars() {
+        use crate::config::SessionNameRule;
+        let mut config = Config::default();
+        config.categories.session_name_rules.push(SessionNameRule {
+            category: "wo\u{1b}rk".to_string(),
+            patterns: vec!["proj-*".to_string()],
+        });
+        let label = category_for_values(&config, "proj-a", "/tmp/x", "repo");
+        assert!(!label.chars().any(|ch| ch.is_control()));
+        assert_eq!(label, "wo rk");
+    }
+
+    #[test]
+    fn category_label_falls_back_to_misc_when_all_control_chars() {
+        use crate::config::SessionNameRule;
+        let mut config = Config::default();
+        config.categories.session_name_rules.push(SessionNameRule {
+            category: "\u{1b}\u{7}".to_string(),
+            patterns: vec!["proj-*".to_string()],
+        });
+        assert_eq!(
+            category_for_values(&config, "proj-a", "/tmp/x", "repo"),
+            "misc"
+        );
+    }
+
+    #[test]
     fn humanize_secs_formats_by_magnitude() {
         assert_eq!(humanize_secs(0), "0s");
         assert_eq!(humanize_secs(30), "30s");
