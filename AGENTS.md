@@ -12,7 +12,7 @@ These live in `scripts/` and all run against an isolated `tmux -L <scratch>` ser
 
 - `scripts/smoke-m6-runtime.sh`: runtime-contract smoke test. Confirms the current UI/UX contract (session ordering, category resolution, multi-client attention, Blocked notifications, statusline content, two-sidebar interaction state, and the daemon lifecycle) in one isolated run. Run it before a release and after changes to statusline, sidebar, or daemon behavior.
 - `scripts/preflight-ui-ux.sh`: multi-client UI/UX preflight against a scratch server. Run it when changing statusline or sidebar rendering.
-- `scripts/test-kill-server-isolated.sh`: exercises the session-manager kill-server / tmux-server shutdown path in isolation.
+- `scripts/test-kill-server-isolated.sh`: exercises the session-manager kill-server / tmux-server shutdown path in isolation. Run it when changing the session manager, the kill-server flow, or daemon/tmux shutdown handling.
 
 These scripts are not run in CI; execute them locally.
 
