@@ -247,6 +247,12 @@ fn ensure_secure_state_parent(path: &Path) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    let runtime_root = crate::runtime_dir::per_user_runtime_root();
+    if parent.starts_with(&runtime_root) {
+        // The world-writable /tmp fallback needs the shared root validated too,
+        // not just the sidebar-state leaf.
+        return crate::runtime_dir::ensure_secure_dir_chain(&runtime_root, parent);
+    }
     match std::fs::symlink_metadata(parent) {
         Ok(metadata) => validate_private_state_dir(parent, &metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

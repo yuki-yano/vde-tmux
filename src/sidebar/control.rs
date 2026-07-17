@@ -189,31 +189,7 @@ fn runtime_root() -> PathBuf {
 }
 
 fn ensure_secure_socket_dir(path: &Path) -> Result<()> {
-    let parent = path.parent().context("control directory has no parent")?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => verify_secure_socket_dir(path, &metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(path)
-                .with_context(|| format!("failed to create {}", path.display()))?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-            let metadata = std::fs::symlink_metadata(path)?;
-            verify_secure_socket_dir(path, &metadata)
-        }
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
-    }
-}
-
-fn verify_secure_socket_dir(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o777 != 0o700
-    {
-        bail!("insecure sidebar control directory: {}", path.display());
-    }
-    Ok(())
+    crate::runtime_dir::ensure_secure_runtime_dir(path)
 }
 
 #[cfg(test)]
@@ -267,11 +243,19 @@ mod tests {
     }
 
     #[test]
-    fn secure_socket_dir_rejects_loose_mode_and_symlink() {
+    fn secure_socket_dir_tightens_loose_mode_and_rejects_symlink() {
         let loose = unique_path("vt-sidebar-loose");
         std::fs::create_dir(&loose).unwrap();
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(ensure_secure_socket_dir(&loose).is_err());
+        ensure_secure_socket_dir(&loose).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(&loose)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         std::fs::remove_dir(&loose).unwrap();
 
         let target = unique_path("vt-sidebar-target");
