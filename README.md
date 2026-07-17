@@ -199,7 +199,7 @@ vt sidebar close
 | `1` / `2` / `3` | Select Flat / ByRepo / ByCategory |
 | `Tab` / `Shift+Tab` | Cycle the state filter |
 | `n` / `N` | Move to the next or previous agent that needs attention |
-| `d` | Acknowledge the completed run |
+| `d` | Mark the selected run as complete |
 | `J` / `K` | Change manual ordering |
 | `p` | Preview pane scrollback |
 | `e` | Switch the live panel between output and events |
