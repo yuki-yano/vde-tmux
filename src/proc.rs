@@ -16,30 +16,50 @@ use std::time::{Duration, Instant};
 /// Poll whether `pid` has terminated, without reaping it (`WNOWAIT`), so the
 /// process — and therefore its process group id — stays valid for a following
 /// group kill. `Ok(true)` once the child has exited, `Ok(false)` while it is
-/// still running, `Err` on a real `waitid` failure (`EINTR` is retried).
+/// still running or when the call was interrupted (`EINTR`), `Err` on any other
+/// `waitid` failure. `EINTR` is reported as "not yet exited" rather than retried
+/// in place so the caller's deadline still governs the wait.
 fn child_exited_without_reaping(pid: i32) -> Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // WEXITED: report terminated children. WNOWAIT: leave it reapable.
+    // WNOHANG: return immediately if it has not terminated yet.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if rc == 0 {
+        // With WNOHANG, si_signo stays 0 while the child is still running and is
+        // set to SIGCHLD once it has terminated.
+        return Ok(info.si_signo != 0);
+    }
+    let error = Error::last_os_error();
+    if error.kind() == ErrorKind::Interrupted {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+/// Poll `check` until it reports exit (`Ok(true)`), the `deadline` passes
+/// (`Ok(false)`), or it fails (`Err`). Bounded by `deadline` regardless of how
+/// often `check` reports "not yet".
+fn poll_until_exit_or_deadline(
+    deadline: Instant,
+    mut check: impl FnMut() -> Result<bool>,
+) -> Result<bool> {
     loop {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // WEXITED: report terminated children. WNOWAIT: leave it reapable.
-        // WNOHANG: return immediately if it has not terminated yet.
-        let rc = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-            )
-        };
-        if rc == 0 {
-            // With WNOHANG, si_signo stays 0 while the child is still running
-            // and is set to SIGCHLD once it has terminated.
-            return Ok(info.si_signo != 0);
+        match check() {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => return Err(error),
         }
-        let error = Error::last_os_error();
-        if error.kind() == ErrorKind::Interrupted {
-            continue;
+        if Instant::now() >= deadline {
+            return Ok(false);
         }
-        return Err(error);
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -66,18 +86,9 @@ pub fn await_exit_then_kill_group(
     timeout: Duration,
 ) -> Result<Option<ExitStatus>> {
     let pid = child.id() as i32;
-    let deadline = Instant::now() + timeout;
-    let outcome = loop {
-        match child_exited_without_reaping(pid) {
-            Ok(true) => break Ok(true),
-            Ok(false) => {}
-            Err(error) => break Err(error),
-        }
-        if Instant::now() >= deadline {
-            break Ok(false);
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
+    let outcome = poll_until_exit_or_deadline(Instant::now() + timeout, || {
+        child_exited_without_reaping(pid)
+    });
     // The leader is still present here (a zombie if it exited, alive on
     // timeout), so its pgid is valid.
     kill_process_group(pid);
@@ -104,6 +115,25 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap()
+    }
+
+    #[test]
+    fn poll_loop_is_bounded_when_exit_is_never_reported() {
+        // A child that always reports "not exited" (e.g. a continuous EINTR
+        // stream mapped to Ok(false)) must still stop at the deadline.
+        let start = Instant::now();
+        let outcome =
+            poll_until_exit_or_deadline(start + Duration::from_millis(50), || Ok(false)).unwrap();
+        assert!(!outcome, "must time out to Ok(false), not loop forever");
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn poll_loop_surfaces_check_errors() {
+        let result = poll_until_exit_or_deadline(Instant::now() + Duration::from_secs(5), || {
+            Err(Error::from(ErrorKind::Other))
+        });
+        assert!(result.is_err());
     }
 
     #[test]
