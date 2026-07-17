@@ -1012,6 +1012,115 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn claude_todo_write_maps_to_task_snapshot() {
+        let payload = serde_json::json!({
+            "tool_name": "TodoWrite",
+            "tool_input": {
+                "todos": [
+                    {"content": "a", "status": "completed"},
+                    {"content": "b", "status": "in_progress"},
+                    {"content": "c", "status": "pending"},
+                ]
+            }
+        });
+        let event = claude_post_tool_use_event(&payload).unwrap().unwrap();
+        let ProgressEvent::TaskSnapshot { progress, items } = event else {
+            panic!("expected task snapshot");
+        };
+        assert_eq!(progress.done, 1);
+        assert_eq!(progress.total, 3);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].step, "a");
+        assert_eq!(items[0].status, TaskItemStatus::Completed);
+    }
+
+    #[test]
+    fn claude_todo_write_without_todos_is_none() {
+        let payload = serde_json::json!({"tool_name": "TodoWrite", "tool_input": {}});
+        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+    }
+
+    #[test]
+    fn claude_task_create_prefers_output_subject_over_input() {
+        let payload = serde_json::json!({
+            "tool_name": "TaskCreate",
+            "tool_input": {"subject": "fallback subject"},
+            "tool_response": {"task": {"id": "task-1", "subject": "real subject"}}
+        });
+        let ProgressEvent::TaskItemCreated { id, step } =
+            claude_post_tool_use_event(&payload).unwrap().unwrap()
+        else {
+            panic!("expected task item created");
+        };
+        assert_eq!(id, "task-1");
+        assert_eq!(step, "real subject");
+    }
+
+    #[test]
+    fn claude_task_create_falls_back_to_input_subject() {
+        let payload = serde_json::json!({
+            "tool_name": "TaskCreate",
+            "tool_input": {"subject": "fallback subject"},
+            "tool_response": {"task": {"id": "task-2"}}
+        });
+        let ProgressEvent::TaskItemCreated { id, step } =
+            claude_post_tool_use_event(&payload).unwrap().unwrap()
+        else {
+            panic!("expected task item created");
+        };
+        assert_eq!(id, "task-2");
+        assert_eq!(step, "fallback subject");
+    }
+
+    #[test]
+    fn claude_task_update_maps_status() {
+        let payload = serde_json::json!({
+            "tool_name": "TaskUpdate",
+            "tool_input": {"taskId": "task-3", "status": "completed"}
+        });
+        let ProgressEvent::TaskItemUpdated { id, status } =
+            claude_post_tool_use_event(&payload).unwrap().unwrap()
+        else {
+            panic!("expected task item updated");
+        };
+        assert_eq!(id, "task-3");
+        assert_eq!(status, TaskItemStatus::Completed);
+    }
+
+    #[test]
+    fn claude_post_tool_use_ignores_unknown_tool() {
+        let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {}});
+        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_vw_exec_command_extracts_binary_and_target() {
+        assert_eq!(
+            parse_vw_exec_command("vw exec /abs/path -- cargo test"),
+            Some(("vw", "/abs/path"))
+        );
+        assert_eq!(
+            parse_vw_exec_command("vde-worktree exec feature -- ls"),
+            Some(("vde-worktree", "feature"))
+        );
+    }
+
+    #[test]
+    fn parse_vw_exec_command_rejects_non_matching_forms() {
+        assert_eq!(parse_vw_exec_command("vw exec target"), None);
+        assert_eq!(parse_vw_exec_command("git exec target -- ls"), None);
+        assert_eq!(parse_vw_exec_command("vw run target -- ls"), None);
+        assert_eq!(parse_vw_exec_command("vw exec target xx ls"), None);
+    }
+
+    #[test]
+    fn resolve_vw_exec_target_uses_absolute_path_without_subprocess() {
+        let (name, path) = resolve_vw_exec_target("vw", "/abs/work/repo").unwrap();
+        assert_eq!(name, "repo");
+        assert_eq!(path, "/abs/work/repo");
+    }
+
     fn typed_context() -> TypedAdapterContext {
         TypedAdapterContext {
             daemon_instance_id: DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100")
