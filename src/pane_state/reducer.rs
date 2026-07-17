@@ -873,6 +873,11 @@ fn complete_run(
     done_clear_on: crate::config::DoneClearOn,
     allow_unarmed_synthetic: bool,
 ) -> Result<(), ReduceError> {
+    // Parent agents can stop their turn while background subagents are still active.
+    // Keep the aggregate pane run open until a later stop follows the last subagent exit.
+    if !state.subagents.is_empty() {
+        return Ok(());
+    }
     if state.run_seq == 0 {
         if !state.synthetic_completion_armed && !allow_unarmed_synthetic {
             return Ok(());
@@ -2581,6 +2586,74 @@ mod tests {
         );
         assert_eq!(active(&second_done).run_seq, 2);
         assert_eq!(resolve_badge(active(&second_done)), BadgeState::Done);
+    }
+
+    #[test]
+    fn completion_is_deferred_while_subagents_are_active() {
+        let begun = begin(None, &CaptureTrackerSnapshot::default());
+        let subagents_started = progress(
+            &begun,
+            vec![
+                ProgressOperation::UpsertSubagent(SubagentState {
+                    agent_id: "worker-1".to_string(),
+                    agent_type: "review".to_string(),
+                    display_name: None,
+                }),
+                ProgressOperation::UpsertSubagent(SubagentState {
+                    agent_id: "worker-2".to_string(),
+                    agent_type: "test".to_string(),
+                    display_name: None,
+                }),
+            ],
+        );
+
+        let first_parent_stop = reduce_once(
+            subagents_started.record.as_ref(),
+            PaneEvent::CompleteRun { completed_at: 30 },
+            &subagents_started.tracker_delta.as_ref().unwrap().next,
+        );
+        let state = active(&first_parent_stop);
+        assert!(matches!(state.lifecycle, LifecycleState::Running));
+        assert_eq!(resolve_badge(state), BadgeState::Working);
+        assert_eq!(state.run_seq, 1);
+        assert_eq!(state.completed_seq, 0);
+        assert_eq!(state.completed_at, None);
+        assert_eq!(state.subagents.len(), 2);
+
+        let one_subagent_left = progress(
+            &first_parent_stop,
+            vec![ProgressOperation::RemoveSubagent {
+                agent_id: "worker-1".to_string(),
+            }],
+        );
+        let second_parent_stop = reduce_once(
+            one_subagent_left.record.as_ref(),
+            PaneEvent::CompleteRun { completed_at: 40 },
+            &one_subagent_left.tracker_delta.as_ref().unwrap().next,
+        );
+        assert!(matches!(
+            active(&second_parent_stop).lifecycle,
+            LifecycleState::Running
+        ));
+        assert_eq!(active(&second_parent_stop).subagents.len(), 1);
+
+        let all_subagents_done = progress(
+            &second_parent_stop,
+            vec![ProgressOperation::RemoveSubagent {
+                agent_id: "worker-2".to_string(),
+            }],
+        );
+        let final_parent_stop = reduce_once(
+            all_subagents_done.record.as_ref(),
+            PaneEvent::CompleteRun { completed_at: 50 },
+            &all_subagents_done.tracker_delta.as_ref().unwrap().next,
+        );
+        let state = active(&final_parent_stop);
+        assert!(matches!(state.lifecycle, LifecycleState::Idle));
+        assert_eq!(resolve_badge(state), BadgeState::Done);
+        assert_eq!(state.completed_seq, 1);
+        assert_eq!(state.completed_at, Some(50));
+        assert!(state.subagents.is_empty());
     }
 
     #[test]
