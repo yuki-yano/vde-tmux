@@ -53,6 +53,36 @@ pub fn ensure_secure_runtime_dir(path: &Path) -> Result<()> {
     }
 }
 
+/// Outcome of validating one existing directory in the chain against the
+/// current euid. Kept as a pure decision so every branch is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum DirVerdict {
+    Ok,
+    Tighten,
+    Reject(&'static str),
+}
+
+fn classify_dir(is_symlink: bool, is_dir: bool, uid: u32, mode: u32, euid: u32) -> DirVerdict {
+    if is_symlink {
+        return DirVerdict::Reject("runtime dir must not be a symlink");
+    }
+    if !is_dir {
+        return DirVerdict::Reject("runtime path is not a directory");
+    }
+    if uid != euid {
+        // A directory owned by another user under world-writable /tmp is an
+        // attacker pre-creating our runtime path. Never adopt it.
+        return DirVerdict::Reject("runtime dir owner mismatch");
+    }
+    if mode & 0o777 != 0o700 {
+        // We own it; tighten permissions left loose by an older version or the
+        // umask. The per-level ownership check above still guards each child, so
+        // adopting our own directory here does not widen the trust boundary.
+        return DirVerdict::Tighten;
+    }
+    DirVerdict::Ok
+}
+
 fn create_and_verify_dir(path: &Path) -> Result<()> {
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
@@ -63,29 +93,20 @@ fn create_and_verify_dir(path: &Path) -> Result<()> {
     }
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to stat {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!("runtime dir must not be a symlink: {}", path.display());
-    }
-    if !metadata.is_dir() {
-        bail!("runtime path is not a directory: {}", path.display());
-    }
     let euid = unsafe { libc::geteuid() };
-    if metadata.uid() != euid {
-        // A directory owned by another user under world-writable /tmp is an
-        // attacker pre-creating our runtime path. Never adopt it.
-        bail!(
-            "runtime dir owner mismatch for {}: expected uid {}, got {}",
-            path.display(),
-            euid,
-            metadata.uid()
-        );
-    }
-    if metadata.permissions().mode() & 0o777 != 0o700 {
-        // We own it; tighten permissions left loose by an older version or the
-        // umask. The per-level ownership check above still guards each child, so
-        // adopting our own directory here does not widen the trust boundary.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to secure {}", path.display()))?;
+    match classify_dir(
+        metadata.file_type().is_symlink(),
+        metadata.is_dir(),
+        metadata.uid(),
+        metadata.permissions().mode(),
+        euid,
+    ) {
+        DirVerdict::Ok => {}
+        DirVerdict::Tighten => {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("failed to secure {}", path.display()))?;
+        }
+        DirVerdict::Reject(reason) => bail!("{reason}: {}", path.display()),
     }
     Ok(())
 }
@@ -126,6 +147,65 @@ mod tests {
         assert!(result.is_err(), "symlinked root must be rejected");
         let _ = std::fs::remove_file(&root);
         let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn classify_dir_covers_every_branch() {
+        let euid = 1000;
+        assert_eq!(
+            classify_dir(true, true, euid, 0o700, euid),
+            DirVerdict::Reject("runtime dir must not be a symlink")
+        );
+        assert_eq!(
+            classify_dir(false, false, euid, 0o700, euid),
+            DirVerdict::Reject("runtime path is not a directory")
+        );
+        assert_eq!(
+            classify_dir(false, true, euid + 1, 0o700, euid),
+            DirVerdict::Reject("runtime dir owner mismatch")
+        );
+        assert_eq!(
+            classify_dir(false, true, euid, 0o755, euid),
+            DirVerdict::Tighten
+        );
+        assert_eq!(classify_dir(false, true, euid, 0o700, euid), DirVerdict::Ok);
+    }
+
+    #[test]
+    fn rejects_symlinked_intermediate() {
+        let root = unique_root();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = unique_root();
+        std::fs::create_dir_all(&target).unwrap();
+        // root/v2 is a symlink instead of a real directory.
+        symlink(&target, root.join("v2")).unwrap();
+        let leaf = root.join("v2").join("sidebar-control");
+        assert!(ensure_secure_dir_chain(&root, &leaf).is_err());
+        let _ = std::fs::remove_file(root.join("v2"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn rejects_regular_file_in_chain() {
+        let root = unique_root();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(root.join("v2"), b"not a dir").unwrap();
+        let leaf = root.join("v2");
+        assert!(ensure_secure_dir_chain(&root, &leaf).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reuses_existing_valid_chain_idempotently() {
+        let root = unique_root();
+        let leaf = root.join("v2").join("sidebar-control");
+        ensure_secure_dir_chain(&root, &leaf).unwrap();
+        // A second call over the already-created chain must still succeed.
+        ensure_secure_dir_chain(&root, &leaf).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
