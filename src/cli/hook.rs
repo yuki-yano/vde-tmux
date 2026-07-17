@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -885,15 +885,15 @@ fn resolve_vw_exec_target(binary: &str, target: &str) -> Option<(String, String)
     resolve_vw_target_path(binary, target).map(|path| (target.to_string(), path))
 }
 
+/// Bound on the `vw path` probe. Worktree activity is a best-effort display
+/// detail, so a stalled `vw` must never block the hook indefinitely.
+const VW_PATH_TIMEOUT: Duration = Duration::from_millis(300);
+
 fn resolve_vw_target_path(binary: &str, target: &str) -> Option<String> {
-    let output = Command::new(binary)
-        .args(["path", target, "--json"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut command = Command::new(binary);
+    command.args(["path", target, "--json"]);
+    let stdout = run_command_with_timeout(command, VW_PATH_TIMEOUT)?;
+    let stdout = String::from_utf8_lossy(&stdout);
     if let Ok(value) = serde_json::from_str::<Value>(&stdout) {
         if let Some(path) = value.get("path").and_then(Value::as_str) {
             return Some(path.to_string());
@@ -904,6 +904,43 @@ fn resolve_vw_target_path(binary: &str, target: &str) -> Option<String> {
     }
     let path = stdout.trim();
     (!path.is_empty()).then(|| path.to_string())
+}
+
+fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout.read_to_end(&mut buffer);
+        buffer
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let stdout = reader.join().ok()?;
+    status.success().then_some(stdout)
 }
 
 fn path_basename(raw: &str) -> Option<String> {
@@ -1119,6 +1156,27 @@ mod tests {
         let (name, path) = resolve_vw_exec_target("vw", "/abs/work/repo").unwrap();
         assert_eq!(name, "repo");
         assert_eq!(path, "/abs/work/repo");
+    }
+
+    #[test]
+    fn run_command_with_timeout_returns_stdout_on_success() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf hello"]);
+        let out = run_command_with_timeout(command, Duration::from_secs(5)).unwrap();
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn run_command_with_timeout_kills_slow_command() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5"]);
+        let start = Instant::now();
+        let out = run_command_with_timeout(command, Duration::from_millis(100));
+        assert!(out.is_none());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must not block for the full sleep"
+        );
     }
 
     fn typed_context() -> TypedAdapterContext {
