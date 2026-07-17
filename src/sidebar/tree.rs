@@ -964,16 +964,14 @@ fn category_for_values(config: &Config, session_name: &str, path: &str, repo: &s
         ..SessionInfo::default()
     };
     let category = resolve_category_for_session(config, &session);
-    if category.is_empty() {
+    let category = if category.is_empty() {
         "misc".to_string()
     } else {
         category
-    }
-    .replace('\u{1f}', " ")
-    .trim()
-    .to_string()
-    .if_empty("misc")
-    .unwrap_or_else(|| repo.to_string())
+    };
+    sanitize_detail_label(&category)
+        .if_empty("misc")
+        .unwrap_or_else(|| repo.to_string())
 }
 
 fn repo_label_from_values(path: &str, session_name: &str) -> String {
@@ -982,11 +980,11 @@ fn repo_label_from_values(path: &str, session_name: &str) -> String {
         .rsplit('/')
         .find(|segment| !segment.is_empty())
         .unwrap_or(session_name);
-    let repo = repo.trim();
+    let repo = sanitize_detail_label(repo);
     if repo.is_empty() {
         "repo".to_string()
     } else {
-        repo.replace('\u{1f}', " ")
+        repo
     }
 }
 
@@ -1037,6 +1035,20 @@ mod tests {
             flash: false,
             active: false,
         }
+    }
+
+    #[test]
+    fn repo_label_strips_control_chars_from_directory_name() {
+        // A malicious directory name embedding a terminal escape must not reach the label.
+        let label = repo_label_from_values("/work/re\u{1b}[31mpo", "session");
+        assert!(!label.chars().any(|ch| ch.is_control()));
+        assert_eq!(label, "re [31mpo");
+    }
+
+    #[test]
+    fn repo_label_falls_back_when_segment_is_all_control_chars() {
+        let label = repo_label_from_values("/work/\u{1b}\u{7}", "session");
+        assert_eq!(label, "repo");
     }
 
     #[test]
