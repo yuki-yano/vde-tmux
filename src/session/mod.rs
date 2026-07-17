@@ -9,7 +9,7 @@ use crate::category::{
 use crate::config::Config;
 use crate::options::{
     KEY_CATEGORY, KEY_CATEGORY_OVERRIDE, KEY_PROJECT_PATH, set_global_option, set_session_option,
-    show_global_option, show_session_option,
+    show_global_option,
 };
 use crate::tmux::TmuxRunner;
 
@@ -591,6 +591,7 @@ pub fn cycle_session(runner: &dyn TmuxRunner, config: &Config, direction: Direct
 
 pub fn on_client_session_changed(
     runner: &dyn TmuxRunner,
+    config: &Config,
     client_pid: Option<u32>,
     session_name: Option<&str>,
 ) -> Result<()> {
@@ -601,9 +602,7 @@ pub fn on_client_session_changed(
         ),
         _ => (current_client_name(runner)?, current_session_name(runner)?),
     };
-    let target = exact_session_target(&session_name);
-    let category = show_session_option(runner, &target, KEY_CATEGORY)?.unwrap_or_default();
-    remember_session_for_client(runner, &client_name, &category, &session_name)
+    remember_client_session_for_session(runner, config, &client_name, &session_name)
 }
 
 #[cfg(test)]
@@ -1104,18 +1103,62 @@ mod tests {
     #[test]
     fn hook_with_args_remembers_given_client_session() {
         let mock = MockTmuxRunner::new();
-        let format = client_pid_name_format();
+        let client_format = client_pid_name_format();
+        let session_format = session_list_format();
         mock.stub(
-            &["list-clients", "-F", &format],
+            &["list-clients", "-F", &client_format],
             "123\u{1f}abc\u{1f}/dev/ttys001\u{1f}0\n",
         );
         mock.stub(
-            &["show-option", "-qv", "-t", "=main:", KEY_CATEGORY],
-            "work\n",
+            &["list-sessions", "-F", &session_format],
+            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}$1\n",
         );
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
-        on_client_session_changed(&mock, Some(123), Some("main")).unwrap();
+        on_client_session_changed(
+            &mock,
+            &crate::config::Config::default(),
+            Some(123),
+            Some("main"),
+        )
+        .unwrap();
         assert_eq!(mock.calls().len(), 3);
+    }
+
+    #[test]
+    fn hook_resolves_session_name_rule_when_stored_category_is_empty() {
+        let mock = MockTmuxRunner::new();
+        let client_format = client_pid_name_format();
+        let session_format = session_list_format();
+        mock.stub(
+            &["list-clients", "-F", &client_format],
+            "123\u{1f}abc\u{1f}/dev/ttys001\u{1f}0\n",
+        );
+        mock.stub(
+            &["list-sessions", "-F", &session_format],
+            "dotfiles\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
+        );
+        mock.stub(
+            &["set-option", "-g", "@vde_client_616263_private", "dotfiles"],
+            "",
+        );
+        let mut config = crate::config::Config::default();
+        config
+            .categories
+            .session_name_rules
+            .push(crate::config::SessionNameRule {
+                category: "private".to_string(),
+                patterns: vec!["dotfiles".to_string()],
+            });
+
+        on_client_session_changed(&mock, &config, Some(123), Some("dotfiles")).unwrap();
+
+        assert_eq!(
+            mock.calls().last().unwrap(),
+            &["set-option", "-g", "@vde_client_616263_private", "dotfiles",]
+        );
+        assert!(mock.calls().iter().all(|call| {
+            call.as_slice() != ["set-option", "-g", "@vde_client_616263_", "dotfiles"]
+        }));
     }
 
     #[test]

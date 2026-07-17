@@ -927,8 +927,10 @@ where
                     if client_pid.is_some() != session_name.is_some() {
                         bail!("client_pid and session_name must be provided together");
                     }
+                    let config = require_active_config(runner, env)?;
                     crate::session::on_client_session_changed(
                         runner,
+                        &config,
                         client_pid,
                         session_name.as_deref(),
                     )?;

@@ -1359,45 +1359,45 @@ fn dispatch_category_use_switches_category() {
 
 #[test]
 fn dispatch_client_session_changed_only_updates_memory() {
-    let mock = MockTmuxRunner::new();
+    let fixture = spawn_active_config_guard_fixture();
+    let mock = &fixture.mock;
     let client_format = crate::session::client_pid_name_format();
+    let session_format = crate::session::session_list_format();
     mock.stub(
         &["list-clients", "-F", &client_format],
         "123\u{1f}abc\u{1f}/dev/ttys001\u{1f}0\n",
     );
     mock.stub(
-        &[
-            "show-option",
-            "-qv",
-            "-t",
-            "=main:",
-            crate::options::KEY_CATEGORY,
-        ],
-        "work\n",
+        &["list-sessions", "-F", &session_format],
+        "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}$1\n",
     );
     mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
 
     run_with(
         ["vt", "hooks", "on-client-session-changed", "123", "main"],
-        &mock,
-        &env(),
+        mock,
+        &fixture.env,
     )
     .unwrap();
 
-    assert_eq!(
-        mock.calls(),
-        vec![
-            vec!["list-clients", "-F", client_format.as_str()],
-            vec![
-                "show-option",
-                "-qv",
-                "-t",
-                "=main:",
-                crate::options::KEY_CATEGORY,
-            ],
-            vec!["set-option", "-g", "@vde_client_616263_work", "main"],
-        ]
+    let calls = mock.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &["list-sessions", "-F", session_format.as_str()])
     );
+    assert_eq!(
+        calls.last().unwrap(),
+        &["set-option", "-g", "@vde_client_616263_work", "main"]
+    );
+    assert!(calls.iter().all(|call| {
+        !matches!(
+            call.as_slice(),
+            [command, quiet_value, ..]
+                if command == "show-option" && quiet_value == "-qv"
+        )
+    }));
+    fixture.finish();
 }
 
 #[test]
