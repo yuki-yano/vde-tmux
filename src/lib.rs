@@ -8,6 +8,7 @@ pub mod git;
 pub mod hook;
 pub mod options;
 pub mod pane_state;
+pub mod proc;
 pub mod project;
 pub mod runtime_dir;
 pub mod session;
