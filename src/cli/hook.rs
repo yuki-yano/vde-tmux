@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -907,12 +908,17 @@ fn resolve_vw_target_path(binary: &str, target: &str) -> Option<String> {
 }
 
 fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
+    // Run in a fresh process group so the whole tree can be killed on timeout;
+    // a descendant that inherits stdout would otherwise keep the pipe open and
+    // block the reader join past the deadline.
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .ok()?;
+    let pgid = child.id() as i32;
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut buffer = Vec::new();
@@ -920,27 +926,29 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Option<V
         buffer
     });
     let deadline = Instant::now() + timeout;
-    let status = loop {
+    let mut succeeded = false;
+    loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return None;
+            Ok(Some(status)) => {
+                succeeded = status.success();
+                break;
             }
+            Ok(None) => {}
+            Err(_) => break,
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return None;
+            break;
         }
         std::thread::sleep(Duration::from_millis(5));
-    };
+    }
+    // Kill the whole group (SIGKILL to -pgid) so any descendant holding stdout
+    // dies and the reader observes EOF, bounding the join on every path.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+    let _ = child.wait();
     let stdout = reader.join().ok()?;
-    status.success().then_some(stdout)
+    succeeded.then_some(stdout)
 }
 
 fn path_basename(raw: &str) -> Option<String> {
@@ -1176,6 +1184,21 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "must not block for the full sleep"
+        );
+    }
+
+    #[test]
+    fn run_command_with_timeout_does_not_block_on_lingering_grandchild() {
+        // The parent exits immediately but backgrounds a child that inherits
+        // stdout; without a process-group kill the reader join would block
+        // until the grandchild exits.
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 3 & exit 0"]);
+        let start = Instant::now();
+        let _ = run_command_with_timeout(command, Duration::from_secs(10));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must not block on a descendant that inherited stdout"
         );
     }
 
