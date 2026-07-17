@@ -204,9 +204,11 @@ impl ObservationWorkerIo for SystemObservationWorkerIo {
         // so a descendant holding the capture pipes dies and the readers reach
         // EOF; the reads are then always joined, never detached.
         let status = crate::proc::await_exit_then_kill_group(&mut child, self.timeout);
+        // Join both readers before propagating any error so no thread is left
+        // detached on the error path.
         let stdout = collect_capture_reader("stdout", stdout);
         let stderr = collect_capture_reader("stderr", stderr);
-        let status = status.ok_or_else(|| {
+        let status = status?.ok_or_else(|| {
             anyhow::anyhow!("tmux capture batch timed out after {:?}", self.timeout)
         })?;
         Ok(CaptureBatchOutput {

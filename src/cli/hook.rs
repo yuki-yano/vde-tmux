@@ -928,7 +928,8 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Option<V
     let status = crate::proc::await_exit_then_kill_group(&mut child, timeout);
     let stdout = reader.join().ok()?;
     match status {
-        Some(status) if status.success() => Some(stdout),
+        // Worktree activity is best-effort: a timeout or a wait error just skips it.
+        Ok(Some(status)) if status.success() => Some(stdout),
         _ => None,
     }
 }

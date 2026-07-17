@@ -1,33 +1,46 @@
-//! Bounded subprocess termination that also reaps descendants.
+//! Bounded subprocess termination that terminates descendants and reaps the
+//! group leader.
 //!
 //! A child spawned in its own process group can leave a descendant that
 //! inherited its stdout/stderr; the reader threads then block until that
 //! descendant exits. Killing only the group leader does not help, and killing
 //! the group *after* reaping the leader risks signalling a reused pgid. These
 //! helpers detect the leader's exit without reaping it (so the pgid stays
-//! valid), kill the whole group, and only then reap.
+//! valid), kill the whole group (which terminates the descendants; init reaps
+//! them), and only then reap the leader.
 
+use std::io::{Error, ErrorKind, Result};
 use std::process::{Child, ExitStatus};
 use std::time::{Duration, Instant};
 
 /// Poll whether `pid` has terminated, without reaping it (`WNOWAIT`), so the
 /// process — and therefore its process group id — stays valid for a following
-/// group kill. Returns true once the child has exited.
-fn child_exited_without_reaping(pid: i32) -> bool {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // WEXITED: report terminated children. WNOWAIT: leave it reapable.
-    // WNOHANG: return immediately if it has not terminated yet.
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-        )
-    };
-    // With WNOHANG, si_signo stays 0 while the child is still running and is set
-    // to SIGCHLD once it has terminated.
-    rc == 0 && info.si_signo != 0
+/// group kill. `Ok(true)` once the child has exited, `Ok(false)` while it is
+/// still running, `Err` on a real `waitid` failure (`EINTR` is retried).
+fn child_exited_without_reaping(pid: i32) -> Result<bool> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // WEXITED: report terminated children. WNOWAIT: leave it reapable.
+        // WNOHANG: return immediately if it has not terminated yet.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc == 0 {
+            // With WNOHANG, si_signo stays 0 while the child is still running
+            // and is set to SIGCHLD once it has terminated.
+            return Ok(info.si_signo != 0);
+        }
+        let error = Error::last_os_error();
+        if error.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
 }
 
 /// SIGKILL the whole process group led by `pgid`. Only call this while the
@@ -42,30 +55,38 @@ fn kill_process_group(pgid: i32) {
 
 /// Wait up to `timeout` for `child` (which must have been spawned in its own
 /// process group) to exit on its own, then SIGKILL the whole group and reap the
-/// leader. Returns the exit status if the child exited before the timeout, or
-/// `None` if it had to be killed.
+/// leader. `Ok(Some(status))` if the child exited before the timeout,
+/// `Ok(None)` if it had to be killed, `Err` on a `waitid`/`wait` failure.
 ///
 /// The group kill happens before the leader is reaped, so any descendant that
-/// inherited the child's pipes is terminated and the pgid cannot be reused.
-pub fn await_exit_then_kill_group(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+/// inherited the child's pipes is terminated and the pgid cannot be reused. The
+/// group is always killed and the leader always reaped, even on error.
+pub fn await_exit_then_kill_group(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<Option<ExitStatus>> {
     let pid = child.id() as i32;
     let deadline = Instant::now() + timeout;
-    let mut exited = false;
-    loop {
-        if child_exited_without_reaping(pid) {
-            exited = true;
-            break;
+    let outcome = loop {
+        match child_exited_without_reaping(pid) {
+            Ok(true) => break Ok(true),
+            Ok(false) => {}
+            Err(error) => break Err(error),
         }
         if Instant::now() >= deadline {
-            break;
+            break Ok(false);
         }
         std::thread::sleep(Duration::from_millis(5));
-    }
+    };
     // The leader is still present here (a zombie if it exited, alive on
     // timeout), so its pgid is valid.
     kill_process_group(pid);
-    let status = child.wait().ok();
-    if exited { status } else { None }
+    let reaped = child.wait();
+    match outcome {
+        // Surface the original waitid error, but only after reaping the leader.
+        Err(error) => Err(error),
+        Ok(exited) => Ok(exited.then_some(reaped?)),
+    }
 }
 
 #[cfg(test)]
@@ -88,7 +109,7 @@ mod tests {
     #[test]
     fn reports_natural_exit_status() {
         let mut child = spawn_group("exit 0");
-        let status = await_exit_then_kill_group(&mut child, Duration::from_secs(5));
+        let status = await_exit_then_kill_group(&mut child, Duration::from_secs(5)).unwrap();
         assert!(status.is_some());
         assert!(status.unwrap().success());
     }
@@ -96,7 +117,7 @@ mod tests {
     #[test]
     fn reports_failure_exit_status() {
         let mut child = spawn_group("exit 3");
-        let status = await_exit_then_kill_group(&mut child, Duration::from_secs(5));
+        let status = await_exit_then_kill_group(&mut child, Duration::from_secs(5)).unwrap();
         assert_eq!(status.and_then(|status| status.code()), Some(3));
     }
 
@@ -145,7 +166,7 @@ mod tests {
         }
 
         let start = Instant::now();
-        let status = await_exit_then_kill_group(&mut child, Duration::from_secs(10));
+        let status = await_exit_then_kill_group(&mut child, Duration::from_secs(10)).unwrap();
         let output = reader.join().unwrap();
 
         assert!(status.is_some_and(|status| status.success()));
@@ -170,7 +191,7 @@ mod tests {
         let mut child = spawn_group("sleep 30 & wait");
         let pgid = child.id() as i32;
         let start = Instant::now();
-        let status = await_exit_then_kill_group(&mut child, Duration::from_millis(100));
+        let status = await_exit_then_kill_group(&mut child, Duration::from_millis(100)).unwrap();
         assert!(
             status.is_none(),
             "timed-out run must not report an exit status"
