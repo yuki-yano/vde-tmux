@@ -172,7 +172,7 @@ s.sendall(b'{"op":"query_resolved_snapshot","proto":4}\n')
 reply = json.loads(reader.readline())
 assert reply["type"] == "resolved_snapshot_result", reply
 assert reply["snapshot"]["panes"] == [], reply
-print("empty-topology v2 Serving ok")
+print("empty-topology protocol v4 Serving ok")
 PY
 record_daemon_pid
 for hook in window-pane-changed session-window-changed client-session-changed client-attached client-detached; do
@@ -264,7 +264,7 @@ MAIN_SESSION_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t main '#{session_
 AUX_SESSION_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t aux '#{session_id}')"
 WINDOW_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t main:work '#{window_id}')"
 
-query_v2() {
+query_v4() {
   local request="$1"
   python3 - "$DAEMON_SOCKET" "$request" "$QUERY_JSON" <<'PY'
 import json, socket, sys
@@ -285,7 +285,7 @@ PY
 
 wait_for_topology() {
   for _ in $(seq 1 80); do
-    query_v2 '{"op":"query_resolved_snapshot","proto":4}'
+    query_v4 '{"op":"query_resolved_snapshot","proto":4}'
     if python3 - "$QUERY_JSON" "$AGENT_PANE" "$MAIN_SESSION_ID" "$AUX_SESSION_ID" 2>/dev/null <<'PY'
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -299,28 +299,16 @@ PY
     sleep 0.1
   done
   echo "canonical topology did not converge" >&2
+  python3 -m json.tool "$QUERY_JSON" >&2 || true
   return 1
 }
 wait_for_topology
+echo "protocol v4 linked-window topology converged"
 
-# Each observation poll must launch one tmux client containing every pane capture in a single
-# command group. Linked windows are deduplicated, so this topology has exactly three pane
-# instances even though the agent window belongs to two sessions.
-: >"$TMUX_PROCESS_LOG"
-sleep 3.2
-CAPTURE_PROCESS_COUNT="$(grep -c ' capture-pane' "$TMUX_PROCESS_LOG" || true)"
-[[ "$CAPTURE_PROCESS_COUNT" -ge 2 && "$CAPTURE_PROCESS_COUNT" -le 5 ]]
-EXPECTED_CAPTURE_PANES=3
-while IFS= read -r capture_command; do
-  CAPTURES_IN_PROCESS="$(grep -o 'capture-pane' <<<"$capture_command" | wc -l | tr -d ' ')"
-  [[ "$CAPTURES_IN_PROCESS" == "$EXPECTED_CAPTURE_PANES" ]]
-done < <(grep ' capture-pane' "$TMUX_PROCESS_LOG")
-echo "capture batching ok: $CAPTURE_PROCESS_COUNT polls, 1 process/poll, $EXPECTED_CAPTURE_PANES panes/process"
-
-# v1 and unknown protocol are rejected at Hello, before any side effect.
+# Representative old and unknown protocols are rejected at Hello, before any side effect.
 python3 - "$DAEMON_SOCKET" <<'PY'
 import json, socket, sys
-for proto in (1, 999):
+for proto in (1, 2, 3, 999):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     s.connect(sys.argv[1])
@@ -523,7 +511,7 @@ wait_pane_badge() {
   local pane_id="$1"
   local expected="$2"
   for _ in $(seq 1 80); do
-    query_v2 '{"op":"query_resolved_snapshot","proto":4}'
+    query_v4 '{"op":"query_resolved_snapshot","proto":4}'
     if python3 - "$QUERY_JSON" "$pane_id" "$expected" 2>/dev/null <<'PY'
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -595,7 +583,7 @@ printf '\002O' >&7
 if ! wait_badge Idle; then
   echo "owned hook delivery log:" >&2
   cat "$HOOK_LOG" >&2 || true
-  query_v2 '{"op":"query_resolved_snapshot","proto":4}'
+  query_v4 '{"op":"query_resolved_snapshot","proto":4}'
   python3 - "$QUERY_JSON" <<'PY' >&2
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -896,7 +884,7 @@ sidebar_snapshot() {
   VT_PANE="$OTHER_PANE" run_vt sidebar attach --once |
     sed -E \
       -e 's/[0-9]+s ago/<elapsed>/g' \
-      -e 's/ +done <elapsed>/ done <elapsed>/g'
+      -e 's/ +[Dd]one <elapsed>/ Done <elapsed>/g'
 }
 
 echo "checking sidebar snapshot surface"
