@@ -22,6 +22,7 @@ pub(crate) const STATUS_OPTION_CELL_BUDGET: usize = 80;
 const STATUS_NOW_FORMAT_OPTION: &str = "@vde_status_now_format";
 const CATEGORY_RANGE_PREFIX: &str = "c:";
 const CURRENT_CATEGORY_RANGE_PREFIX: &str = "C:";
+pub(crate) const ATTENTION_RANGE_PREFIX: &str = "p:";
 // tmux stores `range=user|X` names in a 16-byte buffer, so X is limited to 15 bytes.
 // A 9-byte digest becomes 12 base64url bytes and leaves one byte of headroom after the prefix.
 const CATEGORY_TARGET_DIGEST_BYTES: usize = 9;
@@ -202,6 +203,33 @@ pub(crate) fn category_target_key(category: &str) -> Result<String> {
     let digest = Sha256::digest(category.as_bytes());
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(&digest[..CATEGORY_TARGET_DIGEST_BYTES]))
+}
+
+pub(crate) fn attention_target_key(pane: &crate::pane_state::PaneInstance) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(pane.pane_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(pane.pane_pid.to_be_bytes());
+    let digest = hasher.finalize();
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(&digest[..CATEGORY_TARGET_DIGEST_BYTES]);
+    let target = format!("{ATTENTION_RANGE_PREFIX}{encoded}");
+    debug_assert!(target.len() <= TMUX_USER_RANGE_NAME_MAX_BYTES);
+    target
+}
+
+pub(crate) fn resolve_attention_target(
+    entries: &[crate::daemon::protocol::v2::AttentionEntry],
+    target: &str,
+) -> Result<crate::pane_state::PaneInstance> {
+    let entry = primary_attention_entry(entries)
+        .ok_or_else(|| anyhow!("displayed attention target is no longer available"))?;
+    if attention_target_key(&entry.pane_instance) != target {
+        return Err(anyhow!(
+            "displayed attention target is stale; wait for the status line to redraw"
+        ));
+    }
+    Ok(entry.pane_instance.clone())
 }
 
 fn validate_category_target(target: &str) -> Result<()> {
@@ -1201,16 +1229,14 @@ fn structured_attention_variants(
     config: &Config,
     entries: &[crate::daemon::protocol::v2::AttentionEntry],
 ) -> (String, String) {
-    let mut entries = entries.iter().collect::<Vec<_>>();
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.elapsed_seconds));
-    let Some(entry) = entries.first() else {
+    let Some(entry) = primary_attention_entry(entries) else {
         return (String::new(), String::new());
     };
     let reason = match entry.reason.as_deref() {
-        Some(reason) if reason.to_ascii_lowercase().contains("permission") => "perm",
-        Some(reason) if reason.starts_with("Other(") => "wait",
-        Some(_) => "err",
-        None => "err",
+        Some(reason) if reason.to_ascii_lowercase().contains("permission") => None,
+        Some(reason) if reason.starts_with("Other(") => Some("wait"),
+        Some(_) => Some("err"),
+        None => Some("err"),
     };
     let more = entries.len().saturating_sub(1);
     let suffix = if more > 0 {
@@ -1218,14 +1244,31 @@ fn structured_attention_variants(
     } else {
         String::new()
     };
-    let inner = format!(
-        "▲ {} · {reason}{suffix}",
-        structured_external_text(&entry.session_name)
-    );
+    let session_name = structured_external_text(&entry.session_name);
+    let inner = match reason {
+        Some(reason) => format!("▲ {session_name} · {reason}{suffix}"),
+        None => format!("▲ {session_name}{suffix}"),
+    };
+    let target = attention_target_key(&entry.pane_instance);
     (
-        render_attention_segment(&config.statusline.attention, &inner),
-        format!("▲ blocked{suffix}"),
+        format!(
+            "#[range=user|{target}]{}#[norange]",
+            render_attention_segment(&config.statusline.attention, &inner)
+        ),
+        format!("#[range=user|{target}]▲ blocked{suffix}#[norange]"),
     )
+}
+
+fn primary_attention_entry(
+    entries: &[crate::daemon::protocol::v2::AttentionEntry],
+) -> Option<&crate::daemon::protocol::v2::AttentionEntry> {
+    let mut primary = entries.first()?;
+    for entry in &entries[1..] {
+        if entry.elapsed_seconds > primary.elapsed_seconds {
+            primary = entry;
+        }
+    }
+    Some(primary)
 }
 
 fn structured_pane_badge(config: &Config, state: BadgeState, text_fg: &str) -> String {
@@ -1969,9 +2012,21 @@ mod tests {
             rendered.category
         );
         assert!(
-            rendered.attention.contains("▲ main · perm"),
+            rendered.attention.contains("▲ main"),
             "{}",
             rendered.attention
+        );
+        assert!(
+            !rendered.attention.contains("perm"),
+            "{}",
+            rendered.attention
+        );
+        assert_eq!(
+            top_level_user_ranges(&rendered.attention).unwrap(),
+            vec![attention_target_key(&crate::pane_state::PaneInstance {
+                pane_id: "%7".to_string(),
+                pane_pid: 700,
+            })]
         );
     }
 
@@ -2710,7 +2765,8 @@ mod tests {
         assert!(!rendered.summary.is_empty(), "{rendered:?}");
         assert!(rendered.category.contains("work"), "{rendered:?}");
         assert!(rendered.windows.contains("editor"), "{rendered:?}");
-        assert!(rendered.attention.contains("review · perm"));
+        assert!(rendered.attention.contains("▲ review"));
+        assert!(!rendered.attention.contains("perm"));
         assert!(!rendered.attention.contains("1m30s"));
     }
 
@@ -2792,8 +2848,75 @@ mod tests {
 
         let rendered = render_structured_attention(&config, &entries);
 
-        assert_eq!(rendered, "▲ blocked");
+        assert_eq!(
+            rendered,
+            format!(
+                "#[range=user|{}]▲ blocked#[norange]",
+                attention_target_key(&entries[0].pane_instance)
+            )
+        );
         assert!(tmux_display_width(&rendered) <= 80);
+    }
+
+    #[test]
+    fn attention_target_tracks_the_oldest_pane_and_fails_closed_when_stale() {
+        let newer = crate::daemon::protocol::v2::AttentionEntry {
+            pane_instance: crate::pane_state::PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 101,
+            },
+            session_name: "newer".to_string(),
+            badge: BadgeState::Blocked,
+            reason: Some("permission_prompt".to_string()),
+            elapsed_seconds: 10,
+        };
+        let older = crate::daemon::protocol::v2::AttentionEntry {
+            pane_instance: crate::pane_state::PaneInstance {
+                pane_id: "%2".to_string(),
+                pane_pid: 202,
+            },
+            session_name: "older".to_string(),
+            badge: BadgeState::Blocked,
+            reason: Some("Other(wait)".to_string()),
+            elapsed_seconds: 20,
+        };
+        let entries = vec![newer, older.clone()];
+        let target = attention_target_key(&older.pane_instance);
+
+        assert!(target.starts_with(ATTENTION_RANGE_PREFIX));
+        assert!(target.len() <= TMUX_USER_RANGE_NAME_MAX_BYTES);
+        assert_eq!(
+            resolve_attention_target(&entries, &target).unwrap(),
+            older.pane_instance
+        );
+        assert!(resolve_attention_target(&entries, "p:stale").is_err());
+    }
+
+    #[test]
+    fn attention_hides_permission_reason_but_keeps_other_wait_and_error_reasons() {
+        let config = Config::default();
+        let mut entry = crate::daemon::protocol::v2::AttentionEntry {
+            pane_instance: crate::pane_state::PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 101,
+            },
+            session_name: "main".to_string(),
+            badge: BadgeState::Blocked,
+            reason: Some("permission_prompt".to_string()),
+            elapsed_seconds: 10,
+        };
+
+        let permission = render_structured_attention(&config, std::slice::from_ref(&entry));
+        assert!(permission.contains("▲ main"), "{permission}");
+        assert!(!permission.contains("perm"), "{permission}");
+
+        entry.reason = Some("Other(wait)".to_string());
+        let waiting = render_structured_attention(&config, std::slice::from_ref(&entry));
+        assert!(waiting.contains("▲ main · wait"), "{waiting}");
+
+        entry.reason = Some("error".to_string());
+        let error = render_structured_attention(&config, std::slice::from_ref(&entry));
+        assert!(error.contains("▲ main · err"), "{error}");
     }
 
     #[test]

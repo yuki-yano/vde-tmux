@@ -240,6 +240,18 @@ wait_client_session() {
   return 1
 }
 
+wait_client_pane() {
+  local client="$1"
+  local expected="$2"
+  for _ in $(seq 1 60); do
+    if [[ "$(client_field "$client" pane_id || true)" == "$expected" ]]; then
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
 wait_sidebar() {
   local window="$1"
   local pane=""
@@ -498,42 +510,16 @@ VT_PANE="$A_PANE" run_vt hook emit --agent generic --session-id attention-prefli
 wait_badge "$A_PANE" Blocked
 wait_notification_count 1
 wait_attention "$A_PANE" present >"$ARTIFACT_DIR/attention-visible-nonfocus.txt"
-grep -E '[0-9]+(m[0-9]{2})?s' "$ARTIFACT_DIR/attention-visible-nonfocus.txt" >/dev/null
-ELAPSED_REVISION_BEFORE="$(stable_snapshot_revision)"
-python3 - "$SYSTEM_TMUX" "$TMUX_SOCKET" "$ARTIFACT_DIR/elapsed-clock.txt" <<'PY'
-import json, re, subprocess, sys, time
-
-tmux, socket_name, artifact = sys.argv[1:]
-deadline = time.monotonic() + 5.5
-samples = []
-last = None
-while time.monotonic() < deadline and len(samples) < 4:
-    rendered = subprocess.check_output(
-        [tmux, "-L", socket_name, "show-options", "-qv", "-t", "A", "@vde_status_attention"],
-        text=True,
-    ).rstrip("\n")
-    matches = re.findall(r"(?<![0-9])([0-9]+)s(?![A-Za-z])", rendered)
-    assert matches, rendered
-    elapsed = int(matches[-1])
-    if elapsed != last:
-        samples.append({"at": time.monotonic(), "elapsed": elapsed, "rendered": rendered})
-        last = elapsed
-    time.sleep(0.05)
-
-assert len(samples) == 4, samples
-assert [sample["elapsed"] for sample in samples] == list(
-    range(samples[0]["elapsed"], samples[0]["elapsed"] + 4)
-), samples
-gaps = [samples[index]["at"] - samples[index - 1]["at"] for index in range(1, 4)]
-# Sampling can observe one delayed update near the next boundary, shortening the following gap.
-# Check the complete four-value span so scheduler jitter cannot hide a sustained 2 Hz clock.
-assert all(0.0 < gap <= 1.75 for gap in gaps), gaps
-assert 1.75 <= sum(gaps) <= 4.50, gaps
-with open(artifact, "w", encoding="utf-8") as handle:
-    json.dump({"samples": samples, "gaps": gaps}, handle, ensure_ascii=False, indent=2)
-PY
-[[ "$(snapshot_revision)" == "$ELAPSED_REVISION_BEFORE" ]]
-record elapsed-clock PASS-four-consecutive-values-and-two-full-1Hz-gaps-without-snapshot-revision
+grep -F '▲ A' "$ARTIFACT_DIR/attention-visible-nonfocus.txt" >/dev/null
+if grep -F 'perm' "$ARTIFACT_DIR/attention-visible-nonfocus.txt" >/dev/null; then
+  fail "permission attention unexpectedly includes the perm label"
+fi
+ATTENTION_RANGE="$(sed -n 's/.*range=user|\([^]]*\).*/\1/p' "$ARTIFACT_DIR/attention-visible-nonfocus.txt")"
+[[ "$ATTENTION_RANGE" == p:* ]]
+run_vt statusline-click --client-name "$CLIENT_1" --session-id "$A_ID" "$ATTENTION_RANGE"
+wait_client_pane "$CLIENT_1" "$A_PANE"
+wait_attention "$A_PANE" absent >"$ARTIFACT_DIR/attention-click-exact-focus.txt"
+record attention-click PASS-range-hides-perm-and-jumps-exact-pane-for-invoking-client
 
 tmux_cmd select-pane -t "$A_PANE"
 wait_attention "$A_PANE" absent >"$ARTIFACT_DIR/attention-exact-focus.txt"

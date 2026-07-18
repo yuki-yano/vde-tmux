@@ -29,6 +29,22 @@ pub(crate) fn statusline_attention(
     Ok(statusline_session_segments(runner, env, config, session_id)?.attention)
 }
 
+pub(crate) fn statusline_attention_target(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    session_id: &str,
+    target: &str,
+) -> Result<crate::pane_state::PaneInstance> {
+    let snapshot = status_snapshot(
+        runner,
+        env,
+        crate::daemon::protocol::v2::StatusContext::Session {
+            session_id: session_id.to_string(),
+        },
+    )?;
+    crate::statusline::resolve_attention_target(&snapshot.attention, target)
+}
+
 pub(crate) fn statusline_session_segments(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
@@ -78,6 +94,15 @@ fn status_segments(
     config: &crate::config::Config,
     context: crate::daemon::protocol::v2::StatusContext,
 ) -> Result<crate::statusline::StructuredStatusSegments> {
+    let snapshot = status_snapshot(runner, env, context)?;
+    crate::statusline::render_structured_status_snapshot(config, &snapshot)
+}
+
+fn status_snapshot(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    context: crate::daemon::protocol::v2::StatusContext,
+) -> Result<crate::daemon::protocol::v2::StatusSnapshot> {
     let (incarnation, socket) =
         crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, None)?;
     let mut client = crate::daemon::protocol::v2::V2Client::connect_with_timeout(
@@ -92,7 +117,7 @@ fn status_segments(
         },
     )? {
         crate::daemon::protocol::v2::ServerMessage::StatusSnapshotResult { snapshot, .. } => {
-            crate::statusline::render_structured_status_snapshot(config, &snapshot)
+            Ok(snapshot)
         }
         crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
             bail!("daemon query failed ({code:?}): {message}")

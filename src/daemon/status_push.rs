@@ -1168,7 +1168,11 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(attention, DisplayOptionValue::Set(value) if value.contains("dev##(unsafe)") && value.contains("perm") && !value.contains("1m01s")),
+            matches!(attention, DisplayOptionValue::Set(value)
+                if value.contains("range=user|p:")
+                    && value.contains("dev##(unsafe)")
+                    && !value.contains("perm")
+                    && !value.contains("1m01s")),
             "{attention:?}"
         );
         let pane_value = frame

@@ -1275,6 +1275,71 @@ fn dispatch_statusline_click_routes_session_range() {
 }
 
 #[test]
+fn dispatch_statusline_click_routes_attention_range_to_exact_pane_for_invoking_client() {
+    let fixture = status_query_fixture(crate::daemon::protocol::v2::StatusContext::Session {
+        session_id: "$1".to_string(),
+    });
+    stub_action_client(&fixture.mock, "client-1", "$1");
+    let pane = crate::pane_state::PaneInstance {
+        pane_id: "%1".to_string(),
+        pane_pid: 101,
+    };
+    let range = crate::statusline::attention_target_key(&pane);
+    let format = ["#{session_id}", "#{window_id}", "#{pane_id}", "#{pane_pid}"].join("\u{1f}");
+    fixture.mock.stub(
+        &["list-panes", "-a", "-F", &format],
+        "$2\u{1f}@9\u{1f}%1\u{1f}101\n",
+    );
+    let exact_target = "$2:@9.%1";
+    let pane_guard = "#{==:#{pane_pid},101}";
+    let switch = crate::pane_state::store::tmux_command_string(&[
+        "switch-client".to_string(),
+        "-c".to_string(),
+        "client-1".to_string(),
+        "-t".to_string(),
+        exact_target.to_string(),
+    ]);
+    let mismatch = "display-message -p '__vde_target_pane_mismatch__'";
+    fixture.mock.stub(
+        &[
+            "if-shell",
+            "-F",
+            "-t",
+            exact_target,
+            pane_guard,
+            &switch,
+            mismatch,
+        ],
+        "",
+    );
+
+    run_with(
+        [
+            "vt",
+            "statusline-click",
+            "--client-name",
+            "client-1",
+            "--session-id",
+            "$1",
+            range.as_str(),
+        ],
+        &fixture.mock,
+        &fixture.env,
+    )
+    .unwrap();
+
+    assert!(fixture.mock.calls().iter().any(|call| {
+        call.first().map(String::as_str) == Some("if-shell")
+            && call
+                .iter()
+                .any(|argument| argument.contains("switch-client"))
+            && call.iter().any(|argument| argument.contains("client-1"))
+            && call.iter().any(|argument| argument.contains(exact_target))
+    }));
+    fixture.finish();
+}
+
+#[test]
 fn dispatch_statusline_click_routes_active_and_inactive_category_targets() {
     for prefix in ["c:", "C:"] {
         let mut fixture = spawn_active_config_guard_fixture();
@@ -1806,7 +1871,9 @@ fn dispatch_statusline_attention_renders_v2_session_snapshot() {
     .unwrap();
 
     let text = output.unwrap();
-    assert!(text.contains("▲ main · perm"), "{text}");
+    assert!(text.contains("▲ main"), "{text}");
+    assert!(!text.contains("perm"), "{text}");
+    assert!(text.contains("#[range=user|p:"), "{text}");
     assert!(!text.contains("2m00s"), "{text}");
     fixture.finish();
 }

@@ -717,6 +717,7 @@ where
                 range.starts_with("session:")
                     || range.starts_with("c:")
                     || range.starts_with("C:")
+                    || range.starts_with(crate::statusline::ATTENTION_RANGE_PREFIX)
                     || range.starts_with('$')
             });
             let context = needs_client
@@ -729,6 +730,24 @@ where
                     )
                 })
                 .transpose()?;
+            let attention_click = range
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|range| range.starts_with(crate::statusline::ATTENTION_RANGE_PREFIX));
+            if attention_click {
+                let context = context.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("attention click is missing an invoking tmux client")
+                })?;
+                let range = range.as_deref().map(str::trim).unwrap_or_default();
+                let pane =
+                    daemon::statusline_attention_target(runner, env, &context.session_id, range)?;
+                crate::sidebar::layout::jump_to_pane_for_named_client(
+                    runner,
+                    &pane,
+                    &context.client_name,
+                )?;
+                return Ok(None);
+            }
             let category_click = range
                 .as_deref()
                 .map(str::trim)
