@@ -208,11 +208,20 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "reader must not block on the lingering grandchild"
         );
-        assert_eq!(
-            unsafe { libc::kill(-pgid, 0) },
-            -1,
-            "the whole group must be gone"
-        );
+        // The killed descendant can remain visible briefly while init reaps
+        // it, so wait for the process group to disappear instead of racing
+        // that cleanup.
+        let killed_by = Instant::now();
+        loop {
+            if unsafe { libc::kill(-pgid, 0) } == -1 {
+                break;
+            }
+            assert!(
+                killed_by.elapsed() < Duration::from_secs(3),
+                "the whole group must be gone"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = std::fs::remove_file(&flag);
     }
 
