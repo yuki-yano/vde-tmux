@@ -7,8 +7,8 @@ use crate::config::{
     SessionBadgeChipConfig, SessionBadgeMode, StatuslineCategoryConfig,
 };
 use crate::daemon::protocol::v2::{
-    CategoryStatusPresentation, PanePresentation, SessionStatusPresentation, StatusSnapshot,
-    WindowStatusPresentation,
+    CategoryStatusPresentation, PanePresentation, SessionStatusPresentation, StatusContext,
+    StatusSnapshot, WindowStatusPresentation,
 };
 use crate::daemon::session_badge::{
     BadgeState, BadgeStateCounts, agent_badge_value_from_counts, badge_value_from_counts,
@@ -538,7 +538,6 @@ fn render_structured_summary(config: &Config, counts: BadgeStateCounts) -> Strin
     )
 }
 
-#[cfg(test)]
 fn render_structured_sessions(config: &Config, sessions: &[SessionStatusPresentation]) -> String {
     let tokens = sessions
         .iter()
@@ -550,6 +549,13 @@ fn render_structured_sessions(config: &Config, sessions: &[SessionStatusPresenta
         .map(|token| token.rendered)
         .collect::<Vec<_>>()
         .join(&config.statusline.sessions.separator)
+}
+
+pub(crate) fn sessions_display_width(
+    config: &Config,
+    sessions: &[SessionStatusPresentation],
+) -> usize {
+    tmux_display_width(&render_structured_sessions(config, sessions))
 }
 
 fn render_session_token(
@@ -1034,12 +1040,18 @@ fn render_bounded_status_snapshot(
     }
 
     let category = render_selected_status_tokens(&category_tokens, &category_included, "");
-    let sessions = render_selected_sessions(
+    let mut sessions = render_selected_sessions(
         config,
         &snapshot.sessions,
         &session_tokens,
         &session_included,
     );
+    if config.statusline.sessions.fixed_width
+        && matches!(snapshot.context, StatusContext::Session { .. })
+        && let Some(session_zone_width) = snapshot.session_zone_width
+    {
+        sessions = pad_session_zone(sessions, session_zone_width);
+    }
     let windows = render_selected_status_tokens(
         &window_tokens,
         &window_included,
@@ -1166,6 +1178,21 @@ fn render_selected_sessions(
         rendered,
         sessions.len().saturating_sub(displayed_index),
         &config.statusline.sessions.separator,
+    )
+}
+
+fn pad_session_zone(rendered: String, target_width: usize) -> String {
+    let padding = target_width.saturating_sub(tmux_display_width(&rendered));
+    if padding == 0 {
+        return rendered;
+    }
+    let left = padding / 2;
+    let right = padding - left;
+    format!(
+        "#[default]{}{}#[default]{}",
+        " ".repeat(left),
+        rendered,
+        " ".repeat(right)
     )
 }
 
@@ -1922,6 +1949,7 @@ mod tests {
                 done: 0,
                 idle: 1,
             },
+            session_zone_width: None,
             sessions: vec![SessionStatusPresentation {
                 session_id: "$1".to_string(),
                 session_name: "main".to_string(),
@@ -2041,6 +2069,7 @@ mod tests {
                 session_id: "$1".to_string(),
             },
             summary: BadgeStateCounts::default(),
+            session_zone_width: None,
             sessions: vec![SessionStatusPresentation {
                 session_id: "$1".to_string(),
                 session_name: "dev#[fg=red]\n{index}".to_string(),
@@ -2193,6 +2222,67 @@ mod tests {
     }
 
     #[test]
+    fn session_zone_padding_is_balanced_and_puts_an_odd_cell_on_the_right() {
+        assert_eq!(
+            pad_session_zone("abc".to_string(), 7),
+            "#[default]  abc#[default]  "
+        );
+        assert_eq!(
+            pad_session_zone("abc".to_string(), 8),
+            "#[default]  abc#[default]   "
+        );
+    }
+
+    #[test]
+    fn global_status_context_does_not_pad_the_session_zone() {
+        let mut config = Config::default();
+        config.statusline.sessions.fixed_width = true;
+        let sessions = vec![status_session("$1", "main", false)];
+        let snapshot = StatusSnapshot {
+            snapshot_revision: 1,
+            context: StatusContext::Global,
+            summary: BadgeStateCounts::default(),
+            session_zone_width: Some(40),
+            sessions: sessions.clone(),
+            windows: Vec::new(),
+            categories: Vec::new(),
+            attention: Vec::new(),
+        };
+
+        let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
+
+        assert_eq!(
+            rendered.sessions,
+            render_structured_sessions(&config, &sessions)
+        );
+    }
+
+    #[test]
+    fn disabled_fixed_width_ignores_the_snapshot_session_zone_width() {
+        let config = Config::default();
+        let sessions = vec![status_session("$1", "main", true)];
+        let snapshot = StatusSnapshot {
+            snapshot_revision: 1,
+            context: StatusContext::Session {
+                session_id: "$1".to_string(),
+            },
+            summary: BadgeStateCounts::default(),
+            session_zone_width: Some(40),
+            sessions: sessions.clone(),
+            windows: Vec::new(),
+            categories: Vec::new(),
+            attention: Vec::new(),
+        };
+
+        let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
+
+        assert_eq!(
+            rendered.sessions,
+            render_structured_sessions(&config, &sessions)
+        );
+    }
+
+    #[test]
     fn pane_border_always_uses_configured_format_at_width_boundaries() {
         let mut config = Config::default();
         config.statusline.panes.current.format =
@@ -2300,6 +2390,7 @@ mod tests {
                 session_id: "$6".to_string(),
             },
             summary: BadgeStateCounts::default(),
+            session_zone_width: None,
             sessions,
             windows,
             categories,
@@ -2495,6 +2586,7 @@ mod tests {
                 blocked: 1,
                 ..BadgeStateCounts::default()
             },
+            session_zone_width: None,
             sessions: vec![SessionStatusPresentation {
                 session_id: "$1".to_string(),
                 session_name: "main".to_string(),
@@ -2572,6 +2664,7 @@ mod tests {
                 session_id: "$42".to_string(),
             },
             summary: BadgeStateCounts::default(),
+            session_zone_width: None,
             sessions: vec![SessionStatusPresentation {
                 session_id: "$42".to_string(),
                 session_name: "界🚀".repeat(100),
@@ -2634,6 +2727,7 @@ mod tests {
                 blocked: 1,
                 ..BadgeStateCounts::default()
             },
+            session_zone_width: None,
             sessions: vec![
                 SessionStatusPresentation {
                     session_id: "$42".to_string(),
@@ -2716,6 +2810,7 @@ mod tests {
                 working: 1,
                 ..BadgeStateCounts::default()
             },
+            session_zone_width: None,
             sessions: (1..=8)
                 .map(|index| SessionStatusPresentation {
                     session_id: format!("${index}"),
@@ -3349,6 +3444,7 @@ mod tests {
             snapshot_revision: 1,
             context: crate::daemon::protocol::v2::StatusContext::Global,
             summary: BadgeStateCounts::default(),
+            session_zone_width: None,
             sessions: Vec::new(),
             windows: Vec::new(),
             categories: vec![CategoryStatusPresentation {

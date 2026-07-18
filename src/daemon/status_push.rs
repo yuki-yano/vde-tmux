@@ -928,6 +928,7 @@ mod tests {
                 done: 0,
                 idle: 1,
             },
+            session_zone_width: None,
             sessions: Vec::new(),
             windows: Vec::new(),
             categories: Vec::new(),
@@ -948,6 +949,7 @@ mod tests {
                 session_id: session_id.to_string(),
             },
             summary: BadgeStateCounts::default(),
+            session_zone_width: None,
             sessions: vec![SessionStatusPresentation {
                 session_id: session_id.to_string(),
                 session_name: "dev#[fg=red]\n".to_string(),
@@ -1245,6 +1247,7 @@ mod tests {
                 session_id: "$2".to_string(),
             },
             summary: crate::daemon::session_badge::BadgeStateCounts::default(),
+            session_zone_width: None,
             sessions: Vec::new(),
             windows: Vec::new(),
             categories: Vec::new(),

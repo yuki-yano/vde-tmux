@@ -775,18 +775,8 @@ pub(crate) fn build_status_snapshot(
             .unwrap_or_default()
     });
 
-    let mut sessions = session_names
+    let mut all_sessions = session_names
         .into_iter()
-        .filter(|(session_id, _)| match active_category {
-            Some(category) => {
-                effective_categories
-                    .get(session_id)
-                    .map(String::as_str)
-                    .unwrap_or_default()
-                    == category
-            }
-            None => true,
-        })
         .map(|(session_id, session_name)| {
             let session_metadata = metadata.sessions.get(&session_id);
             SessionStatusPresentation {
@@ -805,11 +795,35 @@ pub(crate) fn build_status_snapshot(
             }
         })
         .collect::<Vec<_>>();
-    sessions.sort_by(|left, right| {
+    all_sessions.sort_by(|left, right| {
         left.session_name
             .cmp(&right.session_name)
             .then_with(|| left.session_id.cmp(&right.session_id))
     });
+    let (sessions, session_zone_width) = match active_category {
+        Some(active_category) => {
+            let mut sessions_by_category =
+                BTreeMap::<String, Vec<SessionStatusPresentation>>::new();
+            for session in all_sessions {
+                sessions_by_category
+                    .entry(session.category.clone().unwrap_or_default())
+                    .or_default()
+                    .push(session);
+            }
+            let session_zone_width = config.statusline.sessions.fixed_width.then(|| {
+                sessions_by_category
+                    .values()
+                    .map(|sessions| crate::statusline::sessions_display_width(config, sessions))
+                    .max()
+                    .unwrap_or(0)
+            });
+            let sessions = sessions_by_category
+                .remove(active_category)
+                .unwrap_or_default();
+            (sessions, session_zone_width)
+        }
+        None => (all_sessions, None),
+    };
 
     let mut window_presentations = windows
         .into_iter()
@@ -923,6 +937,7 @@ pub(crate) fn build_status_snapshot(
         snapshot_revision: resolved.snapshot_revision,
         context,
         summary,
+        session_zone_width,
         sessions,
         windows: window_presentations,
         categories,
@@ -2325,6 +2340,92 @@ mod tests {
                 .categories
                 .iter()
                 .any(|category| { category.category == "misc" && !category.active })
+        );
+    }
+
+    #[test]
+    fn fixed_session_zone_width_stabilizes_rendering_across_active_categories() {
+        let mut resolved = status_resolved_snapshot();
+        resolved.panes.clear();
+        resolved.attention.clear();
+        let metadata = StatusProjectionMetadata {
+            sessions: BTreeMap::from([
+                (
+                    "$1".to_string(),
+                    SessionProjectionMetadata {
+                        session_name: "a".to_string(),
+                        stored_category: Some("short".to_string()),
+                        ..SessionProjectionMetadata::default()
+                    },
+                ),
+                (
+                    "$2".to_string(),
+                    SessionProjectionMetadata {
+                        session_name: "much-longer-session".to_string(),
+                        stored_category: Some("long".to_string()),
+                        ..SessionProjectionMetadata::default()
+                    },
+                ),
+                (
+                    "$3".to_string(),
+                    SessionProjectionMetadata {
+                        session_name: "peer".to_string(),
+                        stored_category: Some("long".to_string()),
+                        ..SessionProjectionMetadata::default()
+                    },
+                ),
+            ]),
+            ..StatusProjectionMetadata::default()
+        };
+        let mut config = Config::default();
+        config.statusline.sessions.fixed_width = true;
+        config.statusline.sessions.separator = " | ".to_string();
+
+        let short = build_status_snapshot(
+            &resolved,
+            crate::daemon::protocol::v2::StatusContext::Session {
+                session_id: "$1".to_string(),
+            },
+            &metadata,
+            &config,
+        );
+        let long = build_status_snapshot(
+            &resolved,
+            crate::daemon::protocol::v2::StatusContext::Session {
+                session_id: "$2".to_string(),
+            },
+            &metadata,
+            &config,
+        );
+
+        assert_eq!(
+            short
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["$1"]
+        );
+        assert_eq!(
+            long.sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["$2", "$3"]
+        );
+        assert_eq!(short.session_zone_width, long.session_zone_width);
+        let short_rendered =
+            crate::statusline::render_structured_status_snapshot(&config, &short).unwrap();
+        let long_rendered =
+            crate::statusline::render_structured_status_snapshot(&config, &long).unwrap();
+        let expected_width = short.session_zone_width.unwrap();
+        assert_eq!(
+            crate::statusline::structured_status_display_width(&short_rendered.sessions),
+            expected_width
+        );
+        assert_eq!(
+            crate::statusline::structured_status_display_width(&long_rendered.sessions),
+            expected_width
         );
     }
 

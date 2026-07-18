@@ -106,6 +106,7 @@ pub struct StatuslineConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct StatuslineSessionsConfig {
     pub show_index: bool,
+    pub fixed_width: bool,
     pub current: SegmentStyle,
     pub other: SegmentStyle,
     pub badge_style: BadgeStyle,
@@ -116,6 +117,7 @@ impl Default for StatuslineSessionsConfig {
     fn default() -> Self {
         Self {
             show_index: false,
+            fixed_width: false,
             current: SegmentStyle {
                 bold: true,
                 ..SegmentStyle::default()
@@ -1226,6 +1228,7 @@ statusline:
 statusline:
   sessions:
     badge_style: chip
+    fixed_width: true
   session_badge:
     chip:
       bg: "#30304a"
@@ -1236,9 +1239,17 @@ statusline:
         .unwrap();
 
         assert_eq!(config.statusline.sessions.badge_style, BadgeStyle::Chip);
+        assert!(config.statusline.sessions.fixed_width);
         assert_eq!(config.statusline.session_badge.chip.bg, "#30304a");
         assert_eq!(config.statusline.session_badge.chip.cap_left, "<");
         assert_eq!(config.statusline.session_badge.chip.cap_right, ">");
+    }
+
+    #[test]
+    fn statusline_sessions_fixed_width_defaults_to_false() {
+        let config = Config::default();
+
+        assert!(!config.statusline.sessions.fixed_width);
     }
 
     #[test]

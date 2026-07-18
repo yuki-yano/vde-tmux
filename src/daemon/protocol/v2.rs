@@ -689,6 +689,8 @@ pub struct StatusSnapshot {
     pub snapshot_revision: u64,
     pub context: StatusContext,
     pub summary: BadgeStateCounts,
+    #[serde(default)]
+    pub session_zone_width: Option<usize>,
     pub sessions: Vec<SessionStatusPresentation>,
     pub windows: Vec<WindowStatusPresentation>,
     pub categories: Vec<CategoryStatusPresentation>,
@@ -1511,6 +1513,7 @@ mod tests {
                 session_id: "$1".to_string(),
             },
             summary: BadgeStateCounts::default(),
+            session_zone_width: None,
             sessions: vec![SessionStatusPresentation {
                 session_id: "$1".to_string(),
                 session_name: "main".to_string(),

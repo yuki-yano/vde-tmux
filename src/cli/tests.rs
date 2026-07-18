@@ -337,6 +337,7 @@ fn status_snapshot(
             working: 1,
             ..BadgeStateCounts::default()
         },
+        session_zone_width: None,
         sessions: vec![SessionStatusPresentation {
             session_id: "$1".to_string(),
             session_name: "main".to_string(),
@@ -1919,6 +1920,10 @@ fn dispatch_config_schema_prints_json_schema() {
         Some("https://json-schema.org/draft/2020-12/schema")
     );
     assert!(schema["properties"].get("sidebar").is_some());
+    assert_eq!(
+        schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["fixed_width"]["type"],
+        "boolean"
+    );
 }
 
 #[test]

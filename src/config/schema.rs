@@ -97,6 +97,7 @@ pub fn config_schema() -> Value {
                         "type": "object",
                         "additionalProperties": true,
                         "properties": {
+                            "fixed_width": { "type": "boolean", "default": false },
                             "badge_style": {
                                 "type": "string",
                                 "enum": ["inline", "plain", "outer", "chip"]
@@ -639,5 +640,14 @@ mod tests {
                 ["format"]["type"],
             "string"
         );
+    }
+
+    #[test]
+    fn schema_contains_statusline_sessions_fixed_width() {
+        let sessions =
+            &config_schema()["properties"]["statusline"]["properties"]["sessions"]["properties"];
+
+        assert_eq!(sessions["fixed_width"]["type"], "boolean");
+        assert_eq!(sessions["fixed_width"]["default"], false);
     }
 }

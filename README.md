@@ -273,6 +273,8 @@ sidebar:
     lines: 3
 
 statusline:
+  sessions:
+    fixed_width: true
   session_badge:
     mode: rollup # rollup | counts
   summary:
@@ -290,6 +292,8 @@ badge:
 
 `statusline.summary.format` supports the `{badge}` and `{count}` placeholders, such as `{badge}{count}` or `{badge}: {count}`.
 Zero-count states remain visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
+
+`statusline.sessions.fixed_width: true` pads the active category's session segment to the widest category, which keeps a centered status block stable when switching categories. Widths for inactive categories use the `other` session style; if `current.format` and `other.format` have different visual widths, the fixed width may differ by a few cells.
 
 The full schema is available with `vt config schema`.
 

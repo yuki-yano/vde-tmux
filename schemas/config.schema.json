@@ -469,6 +469,10 @@
         "sessions": {
           "additionalProperties": true,
           "properties": {
+            "fixed_width": {
+              "default": false,
+              "type": "boolean"
+            },
             "badge_style": {
               "enum": [
                 "inline",
