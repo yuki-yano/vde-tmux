@@ -103,6 +103,13 @@ pub struct DisplayFrame {
     values: BTreeMap<DisplayOptionKey, DisplayOptionValue>,
 }
 
+fn rendered_status_left_width(rendered: &crate::statusline::StructuredStatusSegments) -> usize {
+    [&rendered.category, &rendered.sessions, &rendered.windows]
+        .into_iter()
+        .map(|segment| crate::statusline::structured_status_display_width(segment))
+        .sum()
+}
+
 impl DisplayFrame {
     pub fn new(values: BTreeMap<DisplayOptionKey, DisplayOptionValue>) -> Self {
         Self { values }
@@ -151,12 +158,20 @@ pub fn build_display_frame(
         rendered_sessions.push((session_id.clone(), rendered));
     }
 
+    let fixed_status_left_width = config.statusline.sessions.fixed_width.then(|| {
+        rendered_sessions
+            .iter()
+            .map(|(_, rendered)| rendered_status_left_width(rendered))
+            .max()
+            .unwrap_or(0)
+    });
+
     values.insert(
         DisplayOptionKey::LegacyGlobalSummary,
         DisplayOptionValue::Unset,
     );
 
-    for (session_id, rendered) in rendered_sessions {
+    for (session_id, mut rendered) in rendered_sessions {
         // The ordered session action model is deliberately complete and may exceed the visual
         // target. Keep the intrinsic guard for the remaining status content only; tmux clips the
         // full session list to the actual terminal width without replacing targets with `+N`.
@@ -173,6 +188,13 @@ pub fn build_display_frame(
             return Err(StatusPushError::InvalidDisplaySnapshot(format!(
                 "session {session_id} non-session status projection exceeds the 80-cell budget"
             )));
+        }
+        if let Some(target_width) = fixed_status_left_width {
+            let padding = target_width.saturating_sub(rendered_status_left_width(&rendered));
+            if padding > 0 {
+                rendered.windows.push_str("#[default]");
+                rendered.windows.push_str(&" ".repeat(padding));
+            }
         }
         let session_values = [
             (
@@ -1191,6 +1213,43 @@ mod tests {
             matches!(non_agent_value, DisplayOptionValue::Set(value) if value.contains("zsh##[fg=red] ")),
             "{non_agent_value:?}"
         );
+    }
+
+    #[test]
+    fn fixed_width_stabilizes_session_and_window_width_across_process_names() {
+        let mut config = Config::default();
+        config.statusline.sessions.fixed_width = true;
+        config.statusline.windows.current.format = " {command} ".to_string();
+        let global = global_snapshot(9);
+        let mut short = session_snapshot("$1", 9, 0);
+        short.windows[0].current_command = Some("zsh".to_string());
+        let mut long = session_snapshot("$2", 9, 0);
+        long.windows[0].current_command = Some("cargo-watch".to_string());
+
+        let frame = build_display_frame(&config, &global, &[short, long], &[]).unwrap();
+        let status_left_width = |session_id: &str| {
+            [
+                DisplayOptionKey::SessionCategory {
+                    session_id: session_id.to_string(),
+                },
+                DisplayOptionKey::SessionSessions {
+                    session_id: session_id.to_string(),
+                },
+                DisplayOptionKey::SessionWindows {
+                    session_id: session_id.to_string(),
+                },
+            ]
+            .into_iter()
+            .map(|key| match frame.values().get(&key).unwrap() {
+                DisplayOptionValue::Set(value) => {
+                    crate::statusline::structured_status_display_width(value)
+                }
+                DisplayOptionValue::Unset => 0,
+            })
+            .sum::<usize>()
+        };
+
+        assert_eq!(status_left_width("$1"), status_left_width("$2"));
     }
 
     #[test]

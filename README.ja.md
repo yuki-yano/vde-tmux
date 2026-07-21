@@ -276,6 +276,8 @@ sidebar:
     lines: 3
 
 statusline:
+  sessions:
+    fixed_width: true
   session_badge:
     mode: rollup # rollup | counts
   summary:
@@ -294,6 +296,10 @@ badge:
 `statusline.summary.format` では `{badge}` と `{count}` の placeholder を使えます（`{badge}{count}`、`{badge}: {count}` など）。
 件数が 0 の状態も表示するため、summary の表示幅は安定します。
 Idle を表示したくない場合は `hide_idle: true` を指定します。
+
+`statusline.sessions.fixed_width: true` を指定すると、active category の session 領域を最も広い category に合わせ、category、session、window を合わせた領域も全 session で同じ幅に揃えます。
+window 名やプロセス名の長さが異なる session を切り替えても、中央寄せした status block の位置がずれません。
+inactive category の幅には session の `other` style を使うため、`current.format` と `other.format` の表示幅が異なる場合は数セルの差が生じることがあります。
 
 設定全体のスキーマは `vt config schema` で確認できます。
 

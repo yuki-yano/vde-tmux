@@ -298,7 +298,7 @@ badge:
 `statusline.summary.format` supports the `{badge}` and `{count}` placeholders, such as `{badge}{count}` or `{badge}: {count}`.
 Zero-count states remain visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
 
-`statusline.sessions.fixed_width: true` pads the active category's session segment to the widest category, which keeps a centered status block stable when switching categories. Widths for inactive categories use the `other` session style; if `current.format` and `other.format` have different visual widths, the fixed width may differ by a few cells.
+`statusline.sessions.fixed_width: true` pads the active category's session segment to the widest category and keeps the combined category/session/window area at the same width across sessions. This keeps a centered status block stable when switching between sessions whose window names or process names have different lengths. Widths for inactive categories use the `other` session style; if `current.format` and `other.format` have different visual widths, the fixed width may differ by a few cells.
 
 The full schema is available with `vt config schema`.
 
