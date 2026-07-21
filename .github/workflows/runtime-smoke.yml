@@ -23,27 +23,31 @@ jobs:
         with:
           shared-key: runtime-smoke
 
-      - name: Detect tmux version
-        id: tmux
+      - name: Install tmux 3.7b
+        env:
+          TMUX_VERSION: 3.7b
+          TMUX_SHA256: 87f2e99e3b685973f2ca002ffd6ed7e51a5744f7009daae5a15670b6d532db96
         shell: bash
         run: |
           set -euo pipefail
-          tmux_version="$(tmux -V | awk '{print $2}')"
-          echo "tmux version: $tmux_version"
-          if printf '%s\n%s\n' "3.7" "$tmux_version" | sort -CV; then
-            echo "supports_redraw_probe=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "supports_redraw_probe=false" >> "$GITHUB_OUTPUT"
-            echo "tmux $tmux_version is older than 3.7; ignored redraw probes will be skipped"
-          fi
+          sudo apt-get update
+          sudo apt-get install --yes bison build-essential libevent-dev libncurses-dev pkg-config
+          archive="$RUNNER_TEMP/tmux-$TMUX_VERSION.tar.gz"
+          curl --fail --location --silent --show-error \
+            "https://github.com/tmux/tmux/releases/download/$TMUX_VERSION/tmux-$TMUX_VERSION.tar.gz" \
+            --output "$archive"
+          echo "$TMUX_SHA256  $archive" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/tmux-$TMUX_VERSION"
+          ./configure --prefix="$RUNNER_TEMP/tmux"
+          make --jobs="$(nproc)"
+          make install
+          echo "$RUNNER_TEMP/tmux/bin" >> "$GITHUB_PATH"
 
-      - name: Run ignored tmux redraw probes
-        if: steps.tmux.outputs.supports_redraw_probe == 'true'
-        run: cargo test --locked -- --ignored
-
-      - name: Record ignored probe skip
-        if: steps.tmux.outputs.supports_redraw_probe != 'true'
-        run: echo "SKIP ignored tmux redraw probes because tmux 3.7+ is required"
+      - name: Verify tmux version and run ignored redraw probes
+        run: |
+          test "$(tmux -V)" = "tmux 3.7b"
+          cargo test --locked -- --ignored
 
       - name: Run isolated runtime smoke
         run: scripts/smoke-m6-runtime.sh

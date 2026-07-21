@@ -24,6 +24,12 @@ HOOK_LOG="$RUNTIME_DIR/hook-delivery.log"
 TMUX_PROCESS_LOG="$RUNTIME_DIR/tmux-process.log"
 SYSTEM_TMUX="$(command -v tmux)"
 
+# The smoke validates Unicode status glyphs even when the host locale is unset. tmux 3.4 otherwise
+# sanitizes those glyphs for command clients before storing the rendered status options.
+tmux() {
+  "$SYSTEM_TMUX" -u "$@"
+}
+
 cleanup() {
   set +e
   local cleanup_pids="${CLIENT_PID_1:-} ${CLIENT_PID_2:-} ${CLIENT_PID_3:-} ${CONTROL_PID:-} ${HOOK_CLI_PID:-}"
@@ -83,7 +89,7 @@ cat >"$HOOK_BIN_DIR/tmux" <<EOF
 #!/usr/bin/env bash
 printf -v rendered ' %q' "\$@"
 printf '%s\n' "\$rendered" >>"$TMUX_PROCESS_LOG"
-exec "$SYSTEM_TMUX" "\$@"
+exec "$SYSTEM_TMUX" -u "\$@"
 EOF
 chmod +x "$HOOK_BIN_DIR/tmux"
 : >"$TMUX_PROCESS_LOG"
@@ -375,7 +381,9 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 [[ "$(tmux -L "$TMUX_SOCKET" list-clients -F '#{client_control_mode}' | grep -c '^0$')" -ge 2 ]]
-CLIENT_FIELD_SEP=$'\037'
+# tmux 3.4 strips control characters embedded in format strings, so use a printable separator for
+# the GitHub Actions runner as well as newer local tmux versions.
+CLIENT_FIELD_SEP="__vde_smoke_client_field__"
 client_for_session() {
   local session_name="$1"
   tmux -L "$TMUX_SOCKET" list-clients -F "#{client_name}${CLIENT_FIELD_SEP}#{client_session}" |
@@ -875,7 +883,12 @@ assert record["worktree_activity"]["name"] == "snapshot", record
 json.dump(record, open(output, "w", encoding="utf-8"), sort_keys=True)
 PY
 SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v1.json"
-[[ -f "$SNAPSHOT_FILE" && "$(stat -f '%Lp' "$SNAPSHOT_FILE")" == 600 ]]
+python3 - "$SNAPSHOT_FILE" <<'PY'
+import os, stat, sys
+
+path = sys.argv[1]
+assert stat.S_IMODE(os.stat(path).st_mode) == 0o600, oct(stat.S_IMODE(os.stat(path).st_mode))
+PY
 SIDEBAR_BEFORE="$(sidebar_snapshot)"
 [[ -n "$SIDEBAR_BEFORE" ]]
 
@@ -1338,9 +1351,36 @@ wait "$OLD_MUTATION_PID"
 cat "$OLD_MUTATION_RESULT"
 grep -F 'hello_ack' "$OLD_MUTATION_RESULT" >/dev/null
 grep -F 'mutation_response=' "$OLD_MUTATION_RESULT" >/dev/null
-if ! grep -Eq 'tmux server (incarnation changed|identity mismatch)|mutation_response=eof_after_fail_stop|"type": "pane_event_result"' "$OLD_MUTATION_RESULT"; then
+if ! grep -Eq 'tmux server (incarnation changed|identity mismatch)|mutation_response=eof_after_fail_stop|"type": "pane_event_result"|"code": "invalid_request".*"message": "request frame start deadline exceeded: [^"]*".*"type": "error"' "$OLD_MUTATION_RESULT"; then
   echo "old daemon did not report a recognized isolated-or-fail-stop outcome" >&2
   exit 1
+fi
+if kill -0 "$OLD_DAEMON_PID" 2>/dev/null; then
+  python3 - "$OLD_DAEMON_SOCKET" <<'PY'
+import json, socket, sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(5)
+try:
+    client.connect(sys.argv[1])
+except OSError:
+    raise SystemExit(0)
+reader = client.makefile("rb")
+client.sendall(b'{"op":"hello","proto":4}\n')
+hello_line = reader.readline()
+if not hello_line:
+    raise SystemExit(0)
+hello = json.loads(hello_line)
+assert hello["type"] == "hello_ack", hello
+request = {
+    "op": "refresh_topology",
+    "proto": 4,
+    "daemon_instance_id": hello["daemon_instance_id"],
+    "event_id": "ffeeddccbbaa99887766554433221100",
+}
+client.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+reader.readline()
+PY
 fi
 for _ in $(seq 1 100); do
   ! kill -0 "$OLD_DAEMON_PID" 2>/dev/null && break
