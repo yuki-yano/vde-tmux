@@ -1,12 +1,12 @@
 [package]
 name = "vde-tmux"
-version = "0.2.15"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 authors = ["Yuki Yano"]
 repository = "https://github.com/yuki-yano/vde-tmux"
 description = "tmux state & UI manager: session/category, statusline, agent sidebar"
-exclude = ["AGENTS.md", "CLAUDE.md"]
+exclude = ["AGENTS.md", "CLAUDE.md", "tmp/"]
 
 [[bin]]
 name = "vt"
