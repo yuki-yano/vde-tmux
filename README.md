@@ -149,7 +149,6 @@ Run these commands inside tmux:
 
 ```bash
 vt daemon status
-vt daemon doctor
 vt sidebar open
 ```
 
@@ -174,6 +173,11 @@ daemon:
 ```
 
 Acknowledgment survives daemon restarts and is shared by every tmux client and sidebar.
+The tmux view hook freezes the visible pane/window at hook time, so a brief focus followed by an
+immediate move still acknowledges the `Done` state that was seen. The hook returns after the daemon
+queues this event. If the daemon stops after queue acceptance but before applying it, that one
+acknowledgment is best-effort and is not replayed; the badge remains `Done` until the next focus or
+a later completion-time visibility check acknowledges it.
 
 ## Sidebar
 
@@ -235,8 +239,9 @@ vt category use work
 vt session-cycle next
 vt session-cycle prev
 vt session new -c ~/src/my-project
-vt session set-category my-session work
 ```
+
+Categories are derived only from these config rules and the session/project metadata. `@vde_category` is a derived, write-only mirror for external tmux formats; changing it manually does not affect vde-tmux. Renaming a session matched by `session_name_rules` updates the runtime category immediately, while the mirror may keep its previous value until the next `vt daemon reload`.
 
 With fzf installed, open a popup for switching or removing sessions, windows, and panes:
 
@@ -352,11 +357,25 @@ For normal use, the `vt daemon ensure` line in the tmux configuration manages st
 | `vt daemon disable` | Stop and disable automatic startup |
 | `vt daemon enable` | Enable automatic startup and start |
 | `vt daemon status` | Show daemon and hook health |
-| `vt daemon doctor` | Diagnose configuration, hooks, display output, and notifications |
-| `vt daemon logs daemon --lines 100` | Show the end of the daemon log |
 
 `stop` does not disable automatic startup.
 Use `disable` when the daemon must remain stopped.
+
+### Pane-state persistence
+
+The daemon stores one private full-state snapshot per tmux server incarnation under
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v1.json`. A daemon restart restores the
+prompt, task progress and items, subagents, worktree activity, lifecycle, timestamps, agent
+identity, and Done/acknowledgement state for panes whose pane ID and PID still match.
+
+If this snapshot is corrupt or insecure, daemon startup stops instead of repairing it or falling
+back. `vt daemon status` reports the snapshot path in `last_transition_error`; remove that file only when you
+intend to reset all saved pane state for that tmux server, then run `vt daemon ensure`.
+
+The first upgrade from a version that stored pane state in tmux options does not migrate that old
+state, so pane details reset once. Perform that upgrade only while all agents are idle and there is
+no Done or Blocked state that must be retained. Snapshots for other tmux server incarnations are not
+removed automatically.
 
 ## Upgrading
 
@@ -379,7 +398,6 @@ Inspect daemon health, and reload after configuration changes:
 
 ```bash
 vt daemon status
-vt daemon doctor
 vt daemon reload
 ```
 
@@ -397,12 +415,18 @@ An unindexed `set-hook` replaces the existing hook array.
 ### Inspect configuration errors
 
 ```bash
-vt daemon doctor
-vt daemon logs daemon --lines 100
+vt daemon reload
+vt daemon status
 ```
 
-Daemon records and logs are stored below `$XDG_STATE_HOME/vde-tmux/`.
-Sidebar preferences are stored below `$XDG_STATE_HOME/vde/tmux/sidebar-state/`.
+Each tmux server incarnation has one operational log at
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/daemon.log`. Notification, status-push, and hook
+delivery errors use distinct prefixes in that file.
+Sidebar order, default view/filter, and row expansion are stored atomically below
+`$XDG_STATE_HOME/vde/tmux/sidebar-state/`, isolated by tmux socket. Order and expansion
+updates are shared live by sidebars on the same tmux server. View/filter changes stay local
+to an open sidebar and become the default for sidebars opened later. Selection, scrolling,
+live mode, and the return target remain instance-local and are not persisted.
 
 ## Known limitations
 

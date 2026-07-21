@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use crate::daemon::protocol::v2::{
+    ClientMessage, DaemonPhase, ErrorCode, HookHealth, LiveUnavailableReason, ServerMessage,
+};
+use crate::pane_state::{DaemonInstanceId, EventId, PaneEvent, PaneEventEnvelope, PaneInstance};
 use crate::tmux::TmuxRunner;
 
 static SHUTDOWN_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
@@ -47,7 +51,7 @@ impl V2FrameReader {
 #[allow(clippy::result_large_err)]
 pub fn read_v2_request_frame(
     connection: &mut V2FrameReader,
-) -> std::result::Result<Vec<u8>, crate::daemon::protocol::v2::ServerMessage> {
+) -> std::result::Result<Vec<u8>, ServerMessage> {
     use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
     use crate::pane_state::MAX_REQUEST_FRAME_BYTES;
 
@@ -125,8 +129,8 @@ fn request_frame_body_bytes(buffered: usize, take: usize, newline_terminated: bo
 #[allow(clippy::result_large_err)]
 pub fn write_v2_response(
     stream: &mut UnixStream,
-    message: &crate::daemon::protocol::v2::ServerMessage,
-) -> std::result::Result<(), crate::daemon::protocol::v2::ServerMessage> {
+    message: &ServerMessage,
+) -> std::result::Result<(), ServerMessage> {
     use crate::daemon::protocol::v2::{ErrorCode, ServerMessage, encode_response_frame};
 
     let frame = match encode_response_frame(message) {
@@ -143,10 +147,7 @@ pub fn write_v2_response(
 }
 
 #[allow(clippy::result_large_err)]
-fn write_v2_frame(
-    stream: &mut UnixStream,
-    frame: &[u8],
-) -> std::result::Result<(), crate::daemon::protocol::v2::ServerMessage> {
+fn write_v2_frame(stream: &mut UnixStream, frame: &[u8]) -> std::result::Result<(), ServerMessage> {
     use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
 
     let deadline = std::time::Instant::now() + V2_RESPONSE_WRITE_TIMEOUT;
@@ -200,32 +201,35 @@ pub(crate) struct V2SequencedMutation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum V2AcceptedMutation {
-    External(crate::daemon::protocol::v2::ClientMessage),
+    External(ClientMessage),
     Internal(V2InternalMutation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum V2InternalMutation {
-    PaneEvent(Box<crate::pane_state::PaneEventEnvelope>),
+    PaneEvent(Box<PaneEventEnvelope>),
     ObservationBatch(Box<ObservationBatchPayload>),
     RefreshTopology,
     TargetedPaneRefresh {
         pane_id: String,
     },
     ReconcileViews,
+    CurrentViewsReplacement {
+        witnesses: Vec<crate::pane_state::ClientWitness>,
+    },
     GitProjection {
         badges: std::collections::BTreeMap<String, crate::git::GitBadge>,
         worktrees: std::collections::BTreeMap<String, crate::git::WorktreeInfo>,
     },
     DiagnosticProjection {
-        pane_instance: Option<crate::pane_state::PaneInstance>,
+        pane_instance: Option<PaneInstance>,
         message: String,
     },
     FrameTooLargeProjection {
         rejected_revision: u64,
     },
     HookHealthProjection {
-        health: crate::daemon::protocol::v2::HookHealth,
+        health: HookHealth,
         diagnostic: Option<String>,
     },
     SidebarEffectCompleted(SidebarEffectCompletion),
@@ -236,9 +240,8 @@ pub(crate) struct ObservationPollProjection {
     topology: crate::daemon::topology::TopologySnapshot,
     status_metadata: super::runtime::StatusProjectionMetadata,
     witnesses: Vec<crate::pane_state::ClientWitness>,
-    observation_bases:
-        BTreeMap<crate::pane_state::PaneInstance, Option<crate::pane_state::StoredStateDescriptor>>,
-    view_base: crate::daemon::view_hooks::ViewRegistry,
+    observation_bases: BTreeMap<PaneInstance, Option<crate::pane_state::StoredStateDescriptor>>,
+    view_base: crate::daemon::view_hooks::CurrentClientViews,
 }
 
 /// One successful observation poll as a single sequenced mutation. Application
@@ -248,17 +251,17 @@ pub(crate) struct ObservationPollProjection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObservationBatchPayload {
     projection: Box<ObservationPollProjection>,
-    observations: Vec<crate::pane_state::PaneEventEnvelope>,
-    removals: Vec<crate::pane_state::PaneEventEnvelope>,
-    diagnostics: Vec<(Option<crate::pane_state::PaneInstance>, String)>,
+    observations: Vec<PaneEventEnvelope>,
+    removals: Vec<PaneEventEnvelope>,
+    diagnostics: Vec<(Option<PaneInstance>, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum V2Route {
-    Response(crate::daemon::protocol::v2::ServerMessage),
-    Fatal(crate::daemon::protocol::v2::ServerMessage),
-    Query(crate::daemon::protocol::v2::ClientMessage),
+    Response(ServerMessage),
+    Fatal(ServerMessage),
+    Query(ClientMessage),
     Mutation(V2SequencedMutation),
     Queued { accepted_seq: u64 },
     DroppedInternal,
@@ -266,57 +269,54 @@ pub(crate) enum V2Route {
 
 #[derive(Debug, Clone)]
 pub struct V2Router {
-    daemon_instance_id: crate::pane_state::DaemonInstanceId,
+    daemon_instance_id: DaemonInstanceId,
     server_identity: String,
-    phase: crate::daemon::protocol::v2::DaemonPhase,
-    hook_health: crate::daemon::protocol::v2::HookHealth,
+    phase: DaemonPhase,
+    hook_health: HookHealth,
     next_accepted_seq: u64,
     bootstrap_fifo: std::collections::VecDeque<V2SequencedMutation>,
     fatal: bool,
 }
 
 impl V2Router {
-    pub fn new(
-        daemon_instance_id: crate::pane_state::DaemonInstanceId,
-        server_identity: impl Into<String>,
-    ) -> Self {
+    pub fn new(daemon_instance_id: DaemonInstanceId, server_identity: impl Into<String>) -> Self {
         Self {
             daemon_instance_id,
             server_identity: server_identity.into(),
-            phase: crate::daemon::protocol::v2::DaemonPhase::InstallingHooks,
-            hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
+            phase: DaemonPhase::InstallingHooks,
+            hook_health: HookHealth::Healthy,
             next_accepted_seq: 1,
             bootstrap_fifo: std::collections::VecDeque::new(),
             fatal: false,
         }
     }
 
-    pub fn phase(&self) -> crate::daemon::protocol::v2::DaemonPhase {
+    pub fn phase(&self) -> DaemonPhase {
         self.phase
     }
 
-    pub fn daemon_instance_id(&self) -> &crate::pane_state::DaemonInstanceId {
+    pub fn daemon_instance_id(&self) -> &DaemonInstanceId {
         &self.daemon_instance_id
     }
 
     #[cfg(test)]
-    pub fn set_phase(&mut self, phase: crate::daemon::protocol::v2::DaemonPhase) {
+    pub fn set_phase(&mut self, phase: DaemonPhase) {
         self.phase = phase;
     }
 
     pub fn begin_hydration(&mut self) -> Result<(), &'static str> {
-        if self.phase != crate::daemon::protocol::v2::DaemonPhase::InstallingHooks {
+        if self.phase != DaemonPhase::InstallingHooks {
             return Err("daemon may enter hydration only after hook installation");
         }
-        self.phase = crate::daemon::protocol::v2::DaemonPhase::Hydrating;
+        self.phase = DaemonPhase::Hydrating;
         Ok(())
     }
 
-    pub fn set_hook_health(&mut self, health: crate::daemon::protocol::v2::HookHealth) {
+    pub fn set_hook_health(&mut self, health: HookHealth) {
         self.hook_health = health;
     }
 
-    pub fn hook_health(&self) -> crate::daemon::protocol::v2::HookHealth {
+    pub fn hook_health(&self) -> HookHealth {
         self.hook_health
     }
 
@@ -331,7 +331,7 @@ impl V2Router {
     pub(crate) fn route(
         &mut self,
         connection: &mut V2ConnectionState,
-        message: crate::daemon::protocol::v2::ClientMessage,
+        message: ClientMessage,
     ) -> V2Route {
         use crate::daemon::protocol::v2::{
             ClientMessage as V2ClientMessage, ErrorCode, PROTOCOL_VERSION,
@@ -399,7 +399,7 @@ impl V2Router {
         }
 
         if message.is_query() {
-            if self.phase != crate::daemon::protocol::v2::DaemonPhase::Serving {
+            if self.phase != DaemonPhase::Serving {
                 return V2Route::Response(V2ServerMessage::error(
                     ErrorCode::NotReady,
                     format!("daemon phase is {:?}", self.phase),
@@ -415,7 +415,7 @@ impl V2Router {
                 None,
             ));
         }
-        if self.phase != crate::daemon::protocol::v2::DaemonPhase::Serving
+        if self.phase != DaemonPhase::Serving
             && self.bootstrap_fifo.len() >= V2_BOOTSTRAP_FIFO_CAPACITY
         {
             return V2Route::Response(V2ServerMessage::error(
@@ -441,7 +441,7 @@ impl V2Router {
             accepted_seq,
             mutation: V2AcceptedMutation::External(message),
         };
-        if self.phase == crate::daemon::protocol::v2::DaemonPhase::Serving {
+        if self.phase == DaemonPhase::Serving {
             return V2Route::Mutation(mutation);
         }
         self.bootstrap_fifo.push_back(mutation);
@@ -462,29 +462,27 @@ impl V2Router {
     ) -> Result<(), E> {
         assert_eq!(
             self.phase,
-            crate::daemon::protocol::v2::DaemonPhase::Hydrating,
+            DaemonPhase::Hydrating,
             "bootstrap may finish only from Hydrating"
         );
         let queued = self.bootstrap_fifo.drain(..).collect();
         apply_fifo_and_reconcile(queued)?;
-        self.phase = crate::daemon::protocol::v2::DaemonPhase::Serving;
+        self.phase = DaemonPhase::Serving;
         Ok(())
     }
 
     pub(crate) fn take_bootstrap_fifo(&mut self) -> Vec<V2SequencedMutation> {
         assert_ne!(
             self.phase,
-            crate::daemon::protocol::v2::DaemonPhase::Serving,
+            DaemonPhase::Serving,
             "Serving router has no bootstrap FIFO"
         );
         self.bootstrap_fifo.drain(..).collect()
     }
 
     pub(crate) fn enter_serving_if_bootstrap_empty(&mut self) -> bool {
-        if self.phase == crate::daemon::protocol::v2::DaemonPhase::Hydrating
-            && self.bootstrap_fifo.is_empty()
-        {
-            self.phase = crate::daemon::protocol::v2::DaemonPhase::Serving;
+        if self.phase == DaemonPhase::Hydrating && self.bootstrap_fifo.is_empty() {
+            self.phase = DaemonPhase::Serving;
             true
         } else {
             false
@@ -501,7 +499,7 @@ impl V2Router {
                 None,
             ));
         }
-        if self.phase != crate::daemon::protocol::v2::DaemonPhase::Serving
+        if self.phase != DaemonPhase::Serving
             && self.bootstrap_fifo.len() >= V2_BOOTSTRAP_FIFO_CAPACITY
         {
             return V2Route::DroppedInternal;
@@ -520,7 +518,7 @@ impl V2Router {
             accepted_seq,
             mutation: V2AcceptedMutation::Internal(mutation),
         };
-        if self.phase == crate::daemon::protocol::v2::DaemonPhase::Serving {
+        if self.phase == DaemonPhase::Serving {
             V2Route::Mutation(mutation)
         } else {
             self.bootstrap_fifo.push_back(mutation);
@@ -549,9 +547,7 @@ impl V2Router {
 }
 
 #[allow(clippy::result_large_err)]
-fn validate_v2_origin(
-    message: &crate::daemon::protocol::v2::ClientMessage,
-) -> std::result::Result<(), crate::daemon::protocol::v2::ServerMessage> {
+fn validate_v2_origin(message: &ClientMessage) -> std::result::Result<(), ServerMessage> {
     use crate::daemon::protocol::v2::{ClientMessage, ErrorCode, ServerMessage};
     match message {
         ClientMessage::SubmitPaneEvent { envelope, .. } if !envelope.event.is_external() => {
@@ -584,18 +580,11 @@ struct NotificationWorkerJob {
     agent: String,
 }
 
-#[derive(Debug, Default)]
-struct NotificationHealthCounters {
-    failures: AtomicU64,
-    degraded: AtomicBool,
-    last_error_code: Mutex<Option<String>>,
-}
-
 struct SidebarTmuxJob {
     effect: super::runtime::CanonicalSidebarEffect,
-    expected_pane: crate::pane_state::PaneInstance,
+    expected_pane: PaneInstance,
     original_accepted_seq: u64,
-    event_id: crate::pane_state::EventId,
+    event_id: EventId,
     snapshot_revision: u64,
 }
 
@@ -603,11 +592,11 @@ fn enqueue_sidebar_tmux_job(
     tx: &SyncSender<SidebarTmuxJob>,
     deferred_responses: &Mutex<BTreeSet<u64>>,
     job: SidebarTmuxJob,
-) -> std::result::Result<(), crate::daemon::protocol::v2::ErrorCode> {
+) -> std::result::Result<(), ErrorCode> {
     let original_accepted_seq = job.original_accepted_seq;
     tx.try_send(job).map_err(|error| match error {
-        TrySendError::Full(_) => crate::daemon::protocol::v2::ErrorCode::QueueFull,
-        TrySendError::Disconnected(_) => crate::daemon::protocol::v2::ErrorCode::InternalError,
+        TrySendError::Full(_) => ErrorCode::QueueFull,
+        TrySendError::Disconnected(_) => ErrorCode::InternalError,
     })?;
     deferred_responses
         .lock()
@@ -619,7 +608,7 @@ fn enqueue_sidebar_tmux_job(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SidebarEffectCompletion {
     original_accepted_seq: u64,
-    event_id: crate::pane_state::EventId,
+    event_id: EventId,
     snapshot_revision: u64,
     result: SidebarEffectResult,
 }
@@ -643,7 +632,7 @@ struct ProductionQueue {
 struct PublishedResolvedSnapshot {
     revision: u64,
     frame: Arc<Vec<u8>>,
-    message: Arc<crate::daemon::protocol::v2::ServerMessage>,
+    message: Arc<ServerMessage>,
     terminal: bool,
 }
 
@@ -676,7 +665,7 @@ enum LivePush {
         body: Arc<String>,
     },
     Unavailable {
-        reason: crate::daemon::protocol::v2::LiveUnavailableReason,
+        reason: LiveUnavailableReason,
     },
 }
 
@@ -754,8 +743,8 @@ enum LiveMailboxWait {
 
 #[derive(Debug)]
 struct LiveSubscriptionEntry {
-    source_pane: crate::pane_state::PaneInstance,
-    target_pane: crate::pane_state::PaneInstance,
+    source_pane: PaneInstance,
+    target_pane: PaneInstance,
     interval: Duration,
     next_due_at: Option<Instant>,
     last_delivered_revision: u64,
@@ -777,14 +766,14 @@ struct LiveRegistry {
     entries: Mutex<BTreeMap<u64, LiveSubscriptionEntry>>,
     next_subscription_id: AtomicU64,
     live_revision: AtomicU64,
-    bodies: Mutex<BTreeMap<crate::pane_state::PaneInstance, LiveBodyEntry>>,
+    bodies: Mutex<BTreeMap<PaneInstance, LiveBodyEntry>>,
 }
 
 impl LiveRegistry {
     fn register(
         &self,
-        source_pane: crate::pane_state::PaneInstance,
-        target_pane: crate::pane_state::PaneInstance,
+        source_pane: PaneInstance,
+        target_pane: PaneInstance,
         interval: Duration,
     ) -> (u64, Arc<LiveMailbox>) {
         let id = self.next_subscription_id.fetch_add(1, Ordering::SeqCst);
@@ -843,7 +832,7 @@ impl LiveRegistry {
 
     /// Drops demand whose source or target pane no longer exists in the
     /// observed topology, and forgets cached bodies for removed targets.
-    fn prune_missing_panes(&self, present: &BTreeSet<crate::pane_state::PaneInstance>) {
+    fn prune_missing_panes(&self, present: &BTreeSet<PaneInstance>) {
         let mut entries = self.entries.lock().expect("live registry lock poisoned");
         let removed = entries
             .iter()
@@ -883,7 +872,7 @@ struct ProductionV2Coordinator {
     queue_ready: Condvar,
     snapshot_cache: Mutex<Option<PublishedResolvedSnapshot>>,
     snapshot_changed: Condvar,
-    waiters: Mutex<BTreeMap<u64, Sender<crate::daemon::protocol::v2::ServerMessage>>>,
+    waiters: Mutex<BTreeMap<u64, Sender<ServerMessage>>>,
     deferred_responses: Mutex<BTreeSet<u64>>,
     shutdown: AtomicBool,
     shutdown_ready: AtomicBool,
@@ -893,33 +882,20 @@ struct ProductionV2Coordinator {
     notification_tx: Option<SyncSender<NotificationWorkerJob>>,
     notification_shutdown: Arc<AtomicBool>,
     notification_process_lock: Arc<Mutex<()>>,
-    notification_health: Arc<NotificationHealthCounters>,
-    notification_queue_drops: AtomicU64,
-    notification_internal_drops_reported: AtomicU64,
-    mutation_queue_drops: AtomicU64,
-    mutation_queue_drop_logged: AtomicBool,
-    recent_error_code: Mutex<Option<crate::daemon::protocol::v2::ErrorCode>>,
-    quarantine_base_total: u64,
-    quarantine_runtime_baseline: AtomicU64,
-    quarantine_persisted_total: AtomicU64,
     sidebar_tmux_tx: SyncSender<SidebarTmuxJob>,
     sidebar_completion_rx: Mutex<Option<mpsc::Receiver<SidebarEffectCompletion>>>,
     status_push: Mutex<crate::daemon::status_push::StatusPushState>,
     status_push_driver: Mutex<()>,
-    status_push_log: Mutex<()>,
     status_push_started: Instant,
     config_hash: Mutex<String>,
-    projection_updated_at_epoch_seconds: AtomicU64,
-    notification_enabled: bool,
-    status_frame_builds: AtomicU64,
-    snapshot_builds: AtomicU64,
-    snapshot_publishes: AtomicU64,
+    current_view_refresh_generation: AtomicU64,
+    current_view_refresh_running: AtomicBool,
     live: LiveRegistry,
 }
 
 #[cfg(test)]
 fn start_notification_worker(command: String) -> SyncSender<NotificationWorkerJob> {
-    start_notification_worker_with_timeout_and_log(command, Duration::from_secs(2), None, None)
+    start_notification_worker_with_timeout_and_log(command, Duration::from_secs(2), None)
 }
 
 fn start_sidebar_tmux_worker(
@@ -982,13 +958,11 @@ fn start_notification_worker_with_timeout_and_log(
     command: String,
     timeout: Duration,
     log_context: Option<(std::collections::BTreeMap<String, String>, String)>,
-    health: Option<Arc<NotificationHealthCounters>>,
 ) -> SyncSender<NotificationWorkerJob> {
     start_notification_worker_with_control(
         command,
         timeout,
         log_context,
-        health,
         Arc::new(AtomicBool::new(false)),
         Arc::new(Mutex::new(())),
     )
@@ -998,7 +972,6 @@ fn start_notification_worker_with_control(
     command: String,
     timeout: Duration,
     log_context: Option<(std::collections::BTreeMap<String, String>, String)>,
-    health: Option<Arc<NotificationHealthCounters>>,
     shutdown: Arc<AtomicBool>,
     process_lock: Arc<Mutex<()>>,
 ) -> SyncSender<NotificationWorkerJob> {
@@ -1033,7 +1006,6 @@ fn start_notification_worker_with_control(
             let mut child = match child {
                 Ok(child) => child,
                 Err(error) => {
-                    note_notification_failure(health.as_ref(), "spawn_failed");
                     log_notification_failure(
                         log_context.as_ref(),
                         &format!(
@@ -1052,7 +1024,6 @@ fn start_notification_worker_with_control(
                     },
                     Err(error) => {
                         terminate_notification_process_group(&mut child);
-                        note_notification_failure(health.as_ref(), "identity_failed");
                         log_notification_failure(
                             log_context.as_ref(),
                             &format!(
@@ -1068,7 +1039,6 @@ fn start_notification_worker_with_control(
                 Some(notification_identity.clone()),
             ) {
                 terminate_notification_process_group(&mut child);
-                note_notification_failure(health.as_ref(), "identity_persist_failed");
                 log_notification_failure(
                     log_context.as_ref(),
                     &format!(
@@ -1088,7 +1058,6 @@ fn start_notification_worker_with_control(
                 match try_wait_notification_process_group(&mut child) {
                     Ok(Some(status)) => {
                         if !status.success() {
-                            note_notification_failure(health.as_ref(), "nonzero_exit");
                             log_notification_failure(
                                 log_context.as_ref(),
                                 &format!(
@@ -1096,8 +1065,6 @@ fn start_notification_worker_with_control(
                                     job.pane_id
                                 ),
                             );
-                        } else if let Some(health) = &health {
-                            health.degraded.store(false, Ordering::SeqCst);
                         }
                         break;
                     }
@@ -1106,7 +1073,6 @@ fn start_notification_worker_with_control(
                     }
                     Ok(None) => {
                         terminate_notification_process_group(&mut child);
-                        note_notification_failure(health.as_ref(), "timeout");
                         log_notification_failure(
                             log_context.as_ref(),
                             &format!(
@@ -1118,7 +1084,6 @@ fn start_notification_worker_with_control(
                     }
                     Err(error) => {
                         terminate_notification_process_group(&mut child);
-                        note_notification_failure(health.as_ref(), "wait_failed");
                         log_notification_failure(
                             log_context.as_ref(),
                             &format!(
@@ -1167,18 +1132,6 @@ fn clear_active_notification(
     });
 }
 
-fn note_notification_failure(health: Option<&Arc<NotificationHealthCounters>>, code: &str) {
-    let Some(health) = health else {
-        return;
-    };
-    health.failures.fetch_add(1, Ordering::SeqCst);
-    health.degraded.store(true, Ordering::SeqCst);
-    *health
-        .last_error_code
-        .lock()
-        .expect("notification health lock poisoned") = Some(code.to_string());
-}
-
 fn log_notification_failure(
     context: Option<&(std::collections::BTreeMap<String, String>, String)>,
     message: &str,
@@ -1187,11 +1140,10 @@ fn log_notification_failure(
         eprintln!("[vde-tmux] {message}");
         return;
     };
-    if crate::daemon::lifecycle::append_incarnation_log(
+    if crate::daemon::lifecycle::append_daemon_log(
         env,
         incarnation_hash,
-        "notification.log",
-        message,
+        &format!("notification: {message}"),
     )
     .is_err()
     {
@@ -1236,11 +1188,6 @@ impl ProductionV2Coordinator {
         done_clear_on: crate::config::DoneClearOn,
         notification_command: Option<String>,
     ) -> Result<Self> {
-        let notification_enabled = notification_command.is_some();
-        let quarantine_base_total =
-            crate::daemon::lifecycle::read_lifecycle_record(&env, &incarnation.hash)?
-                .quarantine_observed_total;
-        let notification_health = Arc::new(NotificationHealthCounters::default());
         let notification_shutdown = Arc::new(AtomicBool::new(false));
         let notification_process_lock = Arc::new(Mutex::new(()));
         let notification_tx = notification_command.map(|command| {
@@ -1248,7 +1195,6 @@ impl ProductionV2Coordinator {
                 command,
                 Duration::from_secs(2),
                 Some((env.clone(), incarnation.hash.clone())),
-                Some(notification_health.clone()),
                 notification_shutdown.clone(),
                 notification_process_lock.clone(),
             )
@@ -1262,7 +1208,7 @@ impl ProductionV2Coordinator {
         .map_err(|error| anyhow::anyhow!("failed to initialize status push state: {error}"))?;
         Ok(Self {
             router: Mutex::new(V2Router::new(
-                crate::pane_state::DaemonInstanceId::generate()?,
+                DaemonInstanceId::generate()?,
                 incarnation.hash.clone(),
             )),
             state: Mutex::new(None),
@@ -1280,29 +1226,16 @@ impl ProductionV2Coordinator {
             notification_tx,
             notification_shutdown,
             notification_process_lock,
-            notification_health,
-            notification_queue_drops: AtomicU64::new(0),
-            notification_internal_drops_reported: AtomicU64::new(0),
-            mutation_queue_drops: AtomicU64::new(0),
-            mutation_queue_drop_logged: AtomicBool::new(false),
-            recent_error_code: Mutex::new(None),
-            quarantine_base_total,
-            quarantine_runtime_baseline: AtomicU64::new(0),
-            quarantine_persisted_total: AtomicU64::new(quarantine_base_total),
             sidebar_tmux_tx,
             sidebar_completion_rx: Mutex::new(Some(sidebar_completion_rx)),
             status_push: Mutex::new(status_push),
             status_push_driver: Mutex::new(()),
-            status_push_log: Mutex::new(()),
             status_push_started: Instant::now(),
             config_hash: Mutex::new(crate::daemon::lifecycle::config_hash(
                 &crate::config::Config::default(),
             )),
-            projection_updated_at_epoch_seconds: AtomicU64::new(epoch_seconds() as u64),
-            notification_enabled,
-            status_frame_builds: AtomicU64::new(0),
-            snapshot_builds: AtomicU64::new(0),
-            snapshot_publishes: AtomicU64::new(0),
+            current_view_refresh_generation: AtomicU64::new(0),
+            current_view_refresh_running: AtomicBool::new(false),
             live: LiveRegistry::default(),
         })
     }
@@ -1312,65 +1245,68 @@ impl ProductionV2Coordinator {
             crate::daemon::lifecycle::config_hash(config);
     }
 
-    fn note_error_response(&self, response: &crate::daemon::protocol::v2::ServerMessage) {
-        if let crate::daemon::protocol::v2::ServerMessage::Error { code, .. } = response {
-            *self
-                .recent_error_code
-                .lock()
-                .expect("recent error code lock poisoned") = Some(code.clone());
-        }
-    }
-
-    fn sync_quarantine_summary(&self) {
-        let runtime_observed = self
-            .state
-            .lock()
-            .expect("canonical state lock poisoned")
-            .as_ref()
-            .map_or(0, |state| state.leased.runtime.quarantine_observed_total());
-        let observed = cumulative_quarantine_total(
-            self.quarantine_base_total,
-            self.quarantine_runtime_baseline.load(Ordering::SeqCst),
-            runtime_observed,
-        );
-        let previous = self
-            .quarantine_persisted_total
-            .swap(observed, Ordering::SeqCst);
-        if observed == previous {
+    fn schedule_current_view_refresh(self: &Arc<Self>) {
+        self.current_view_refresh_generation
+            .fetch_add(1, Ordering::SeqCst);
+        if self
+            .current_view_refresh_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return;
         }
-        if crate::daemon::lifecycle::update_lifecycle_record(
-            &self.env,
-            &self.incarnation.hash,
-            |record| {
-                record.quarantine_observed_total = observed;
-                Ok(())
-            },
-        )
-        .is_err()
-        {
-            self.quarantine_persisted_total
-                .store(previous, Ordering::SeqCst);
-        }
-    }
-
-    fn establish_quarantine_baseline(&self) {
-        let runtime_observed = self
-            .state
-            .lock()
-            .expect("canonical state lock poisoned")
-            .as_ref()
-            .map_or(0, |state| state.leased.runtime.quarantine_observed_total());
-        self.quarantine_runtime_baseline
-            .store(runtime_observed, Ordering::SeqCst);
+        let coordinator = self.clone();
+        thread::spawn(move || {
+            loop {
+                let generation = coordinator
+                    .current_view_refresh_generation
+                    .load(Ordering::SeqCst);
+                match query_client_witnesses(&coordinator, Duration::from_millis(100)) {
+                    Ok(witnesses) => {
+                        let _ = coordinator.enqueue_internal(
+                            V2InternalMutation::CurrentViewsReplacement { witnesses },
+                        );
+                    }
+                    Err(error) if error.requires_daemon_exit() => {
+                        coordinator.fail_stop(error.to_string());
+                        coordinator
+                            .current_view_refresh_running
+                            .store(false, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(_) => {}
+                }
+                if coordinator
+                    .current_view_refresh_generation
+                    .load(Ordering::SeqCst)
+                    != generation
+                {
+                    continue;
+                }
+                coordinator
+                    .current_view_refresh_running
+                    .store(false, Ordering::SeqCst);
+                if coordinator
+                    .current_view_refresh_generation
+                    .load(Ordering::SeqCst)
+                    == generation
+                    || coordinator
+                        .current_view_refresh_running
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                {
+                    return;
+                }
+            }
+        });
     }
 
     fn route_external(
         &self,
         connection: &mut V2ConnectionState,
-        message: crate::daemon::protocol::v2::ClientMessage,
+        message: ClientMessage,
         raw_frame_bytes: usize,
-    ) -> crate::daemon::protocol::v2::ServerMessage {
+    ) -> ServerMessage {
         use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
 
         if self.shutdown.load(Ordering::SeqCst) {
@@ -1388,9 +1324,7 @@ impl ProductionV2Coordinator {
                 message.event_id().cloned(),
             );
         }
-        if router.phase() == crate::daemon::protocol::v2::DaemonPhase::Serving
-            && message.is_mutation()
-        {
+        if router.phase() == DaemonPhase::Serving && message.is_mutation() {
             let queue = self.queue.lock().expect("v2 queue lock poisoned");
             if queue.items.len() + usize::from(queue.in_flight) >= V2_MUTATION_QUEUE_CAPACITY {
                 return ServerMessage::error(
@@ -1414,9 +1348,7 @@ impl ProductionV2Coordinator {
             V2Route::Mutation(sequenced) => {
                 let view = matches!(
                     sequenced.mutation,
-                    V2AcceptedMutation::External(
-                        crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent { .. }
-                    )
+                    V2AcceptedMutation::External(ClientMessage::SubmitViewEvent { .. })
                 );
                 let accepted_seq = sequenced.accepted_seq;
                 let event_id = match &sequenced.mutation {
@@ -1466,8 +1398,8 @@ impl ProductionV2Coordinator {
     fn route_subscription(
         &self,
         connection: &mut V2ConnectionState,
-        message: crate::daemon::protocol::v2::ClientMessage,
-    ) -> Result<PublishedResolvedSnapshot, crate::daemon::protocol::v2::ServerMessage> {
+        message: ClientMessage,
+    ) -> Result<PublishedResolvedSnapshot, ServerMessage> {
         use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
 
         if self.shutdown.load(Ordering::SeqCst) {
@@ -1480,7 +1412,7 @@ impl ProductionV2Coordinator {
         let mut router = self.router.lock().expect("v2 router lock poisoned");
         let route = router.route(connection, message);
         match route {
-            V2Route::Query(crate::daemon::protocol::v2::ClientMessage::Subscribe { .. }) => {
+            V2Route::Query(ClientMessage::Subscribe { .. }) => {
                 drop(router);
                 if self
                     .state
@@ -1516,7 +1448,7 @@ impl ProductionV2Coordinator {
         &self,
         sequenced: V2SequencedMutation,
         raw_frame_bytes: usize,
-    ) -> mpsc::Receiver<crate::daemon::protocol::v2::ServerMessage> {
+    ) -> mpsc::Receiver<ServerMessage> {
         let (sender, receiver) = mpsc::channel();
         self.waiters
             .lock()
@@ -1550,10 +1482,7 @@ impl ProductionV2Coordinator {
         self.queue_ready.notify_one();
     }
 
-    fn query(
-        &self,
-        message: crate::daemon::protocol::v2::ClientMessage,
-    ) -> crate::daemon::protocol::v2::ServerMessage {
+    fn query(&self, message: ClientMessage) -> ServerMessage {
         use crate::daemon::protocol::v2::{ClientMessage, ErrorCode, ServerMessage};
 
         match message {
@@ -1596,13 +1525,6 @@ impl ProductionV2Coordinator {
                             pane,
                         };
                     }
-                    if state.leased.runtime.sequenced_mutations_paused() {
-                        return ServerMessage::error(
-                            ErrorCode::NotReady,
-                            "pane refresh is paused while persistence is recovering",
-                            None,
-                        );
-                    }
                 }
                 self.enqueue_internal_and_wait(V2InternalMutation::TargetedPaneRefresh { pane_id })
             }
@@ -1617,92 +1539,20 @@ impl ProductionV2Coordinator {
                     snapshot,
                 }
             }
-            ClientMessage::QueryHealth { .. } => {
-                let (revision, quarantine_count, internal_notification_drops) = self
-                    .state
-                    .lock()
-                    .expect("canonical state lock poisoned")
-                    .as_ref()
-                    .map_or((0, 0, 0), |state| {
-                        (
-                            state.leased.runtime.snapshot_revision(),
-                            state.leased.runtime.quarantine_count() as u64,
-                            state.leased.runtime.notification_queue_drops(),
-                        )
-                    });
-                let lifecycle = match crate::daemon::lifecycle::read_lifecycle_record(
-                    &self.env,
-                    &self.incarnation.hash,
-                ) {
-                    Ok(record) => record,
-                    Err(error) => {
-                        return ServerMessage::error(
-                            ErrorCode::InternalError,
-                            format!("failed to read lifecycle health: {error}"),
-                            None,
-                        );
-                    }
-                };
-                ServerMessage::HealthResult {
-                    health: crate::daemon::protocol::v2::DaemonHealth {
-                        config_hash: self
-                            .config_hash
-                            .lock()
-                            .expect("config hash lock poisoned")
-                            .clone(),
-                        projection_revision: revision,
-                        projection_updated_at_epoch_seconds: self
-                            .projection_updated_at_epoch_seconds
-                            .load(Ordering::SeqCst),
-                        notification_enabled: self.notification_enabled,
-                        notification_failures: self
-                            .notification_health
-                            .failures
-                            .load(Ordering::SeqCst),
-                        notification_queue_drops: self
-                            .notification_queue_drops
-                            .load(Ordering::SeqCst)
-                            .saturating_add(internal_notification_drops),
-                        notification_degraded: self
-                            .notification_health
-                            .degraded
-                            .load(Ordering::SeqCst),
-                        last_notification_error_code: self
-                            .notification_health
-                            .last_error_code
-                            .lock()
-                            .expect("notification health lock poisoned")
-                            .clone(),
-                        current_quarantine_count: quarantine_count,
-                        quarantine_observed_total: lifecycle.quarantine_observed_total,
-                        recent_error_code: self
-                            .recent_error_code
-                            .lock()
-                            .expect("recent error code lock poisoned")
-                            .clone()
-                            .or_else(|| {
-                                (lifecycle.quarantine_observed_total > 0)
-                                    .then_some(ErrorCode::StateLoadError)
-                            }),
-                        hook_delivery_failures: lifecycle.hook_delivery_failures,
-                        hook_delivery_degraded: lifecycle.hook_delivery_degraded,
-                        last_hook_error_code: lifecycle.last_hook_error_code,
-                        status_push_failures: lifecycle.status_push_failures,
-                        status_push_degraded: lifecycle.status_push_degraded,
-                        last_status_push_error: lifecycle.last_status_push_error,
-                        last_status_push_error_at_epoch_seconds: lifecycle
-                            .last_status_push_error_at_epoch_seconds,
-                    },
-                }
-            }
+            ClientMessage::QueryRuntimeInfo { .. } => ServerMessage::RuntimeInfoResult {
+                info: crate::daemon::protocol::v2::RuntimeInfo {
+                    config_hash: self
+                        .config_hash
+                        .lock()
+                        .expect("config hash lock poisoned")
+                        .clone(),
+                },
+            },
             _ => ServerMessage::error(ErrorCode::InvalidRequest, "unsupported query", None),
         }
     }
 
-    fn enqueue_internal_and_wait(
-        &self,
-        mutation: V2InternalMutation,
-    ) -> crate::daemon::protocol::v2::ServerMessage {
+    fn enqueue_internal_and_wait(&self, mutation: V2InternalMutation) -> ServerMessage {
         use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
 
         if self.shutdown.load(Ordering::SeqCst) {
@@ -1790,24 +1640,12 @@ impl ProductionV2Coordinator {
     }
 
     fn note_mutation_queue_drop(&self) {
-        use crate::daemon::protocol::v2::ErrorCode;
-
-        let total_drops = self
-            .mutation_queue_drops
-            .fetch_add(1, Ordering::SeqCst)
-            .saturating_add(1);
-        *self
-            .recent_error_code
-            .lock()
-            .expect("recent error code lock poisoned") = Some(ErrorCode::QueueFull);
-        if !self.mutation_queue_drop_logged.swap(true, Ordering::SeqCst) {
-            self.log_daemon_error(&format!(
-                "sequenced mutation queue full: dropped internal mutation (capacity={V2_MUTATION_QUEUE_CAPACITY}, total_drops={total_drops})"
-            ));
-        }
+        self.log_daemon_error(&format!(
+            "sequenced mutation queue full: dropped internal mutation (capacity={V2_MUTATION_QUEUE_CAPACITY})"
+        ));
     }
 
-    fn complete(&self, accepted_seq: u64, response: crate::daemon::protocol::v2::ServerMessage) {
+    fn complete(&self, accepted_seq: u64, response: ServerMessage) {
         if let Some(waiter) = self
             .waiters
             .lock()
@@ -1823,7 +1661,6 @@ impl ProductionV2Coordinator {
     }
 
     fn publish_resolved_snapshot(&self) -> Result<PublishedResolvedSnapshot> {
-        self.snapshot_publishes.fetch_add(1, Ordering::SeqCst);
         // Fast path: compare the cheap current revision against the published
         // cache before building a full checked snapshot. Lock order stays
         // state -> release -> snapshot_cache on every path.
@@ -1850,7 +1687,6 @@ impl ProductionV2Coordinator {
             let state = state
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("canonical state is not initialized"))?;
-            self.snapshot_builds.fetch_add(1, Ordering::SeqCst);
             state.checked_resolved_snapshot()?
         };
         let revision = snapshot.snapshot_revision;
@@ -1863,7 +1699,7 @@ impl ProductionV2Coordinator {
         {
             return Ok(published.clone());
         }
-        let candidate = crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+        let candidate = ServerMessage::ResolvedSnapshotResult {
             snapshot_revision: revision,
             snapshot,
         };
@@ -1871,8 +1707,8 @@ impl ProductionV2Coordinator {
             match crate::daemon::protocol::v2::encode_response_frame(&candidate) {
                 Ok(frame) => (candidate, frame, false),
                 Err(
-                    error @ crate::daemon::protocol::v2::ServerMessage::Error {
-                        code: crate::daemon::protocol::v2::ErrorCode::FrameTooLarge,
+                    error @ ServerMessage::Error {
+                        code: ErrorCode::FrameTooLarge,
                         ..
                     },
                 ) => {
@@ -1897,8 +1733,6 @@ impl ProductionV2Coordinator {
             terminal,
         };
         *cache = Some(published.clone());
-        self.projection_updated_at_epoch_seconds
-            .store(epoch_seconds() as u64, Ordering::SeqCst);
         drop(cache);
         self.snapshot_changed.notify_all();
         if terminal {
@@ -1981,7 +1815,6 @@ impl ProductionV2Coordinator {
                 };
                 let frame = build_display_frame(&config, &global, &sessions, &panes)
                     .map_err(anyhow::Error::new)?;
-                self.status_frame_builds.fetch_add(1, Ordering::SeqCst);
                 let mut push = self.status_push.lock().expect("status push lock poisoned");
                 match trigger {
                     StatusPushTrigger::Snapshot => {
@@ -2021,13 +1854,7 @@ impl ProductionV2Coordinator {
             .execute_prepared(&prepared, &mut io)
             .map_err(anyhow::Error::new)?;
         match result {
-            BatchExecution::Committed => {
-                let _ = crate::daemon::lifecycle::record_status_push_recovered(
-                    &self.env,
-                    &self.incarnation.hash,
-                );
-                Ok(())
-            }
+            BatchExecution::Committed => Ok(()),
             BatchExecution::Failed(error) => {
                 self.log_status_push_error(&format!("status display batch failed: {error}"));
                 Ok(())
@@ -2170,20 +1997,10 @@ impl ProductionV2Coordinator {
     }
 
     fn log_status_push_error(&self, message: &str) {
-        let _log = self
-            .status_push_log
-            .lock()
-            .expect("status push log lock poisoned");
-        let _ = crate::daemon::lifecycle::record_status_push_failure(
+        if crate::daemon::lifecycle::append_daemon_log(
             &self.env,
             &self.incarnation.hash,
-            message,
-        );
-        if crate::daemon::lifecycle::append_incarnation_log(
-            &self.env,
-            &self.incarnation.hash,
-            "status-push.log",
-            message,
+            &format!("status_push: {message}"),
         )
         .is_err()
         {
@@ -2192,13 +2009,8 @@ impl ProductionV2Coordinator {
     }
 
     fn log_daemon_error(&self, message: &str) {
-        if crate::daemon::lifecycle::append_incarnation_log(
-            &self.env,
-            &self.incarnation.hash,
-            "daemon.log",
-            message,
-        )
-        .is_err()
+        if crate::daemon::lifecycle::append_daemon_log(&self.env, &self.incarnation.hash, message)
+            .is_err()
         {
             eprintln!("[vde-tmux] {message}");
         }
@@ -2208,9 +2020,9 @@ impl ProductionV2Coordinator {
         &self,
         effect: super::runtime::CanonicalSidebarEffect,
         original_accepted_seq: u64,
-        event_id: crate::pane_state::EventId,
+        event_id: EventId,
         snapshot_revision: u64,
-    ) -> std::result::Result<(), crate::daemon::protocol::v2::ErrorCode> {
+    ) -> std::result::Result<(), ErrorCode> {
         let expected_pane = match &effect {
             super::runtime::CanonicalSidebarEffect::JumpPane { pane_instance, .. } => {
                 pane_instance.clone()
@@ -2223,7 +2035,7 @@ impl ProductionV2Coordinator {
             .as_ref()
             .is_some_and(|state| state.contains_pane(&expected_pane));
         if !exists {
-            return Err(crate::daemon::protocol::v2::ErrorCode::StaleSelection);
+            return Err(ErrorCode::StaleSelection);
         }
         enqueue_sidebar_tmux_job(
             &self.sidebar_tmux_tx,
@@ -2277,8 +2089,8 @@ impl ProductionV2Coordinator {
             .clear();
         let waiters = std::mem::take(&mut *self.waiters.lock().expect("v2 waiter lock poisoned"));
         for (_, waiter) in waiters {
-            let _ = waiter.send(crate::daemon::protocol::v2::ServerMessage::error(
-                crate::daemon::protocol::v2::ErrorCode::InternalError,
+            let _ = waiter.send(ServerMessage::error(
+                ErrorCode::InternalError,
                 format!("daemon fail-stopped: {message}"),
                 None,
             ));
@@ -2326,8 +2138,8 @@ impl ProductionV2Coordinator {
         }
         drop(waiters);
         for (_, waiter) in abandoned {
-            let _ = waiter.send(crate::daemon::protocol::v2::ServerMessage::error(
-                crate::daemon::protocol::v2::ErrorCode::NotReady,
+            let _ = waiter.send(ServerMessage::error(
+                ErrorCode::NotReady,
                 "daemon is shutting down",
                 None,
             ));
@@ -2375,10 +2187,6 @@ impl ProductionV2Coordinator {
     }
 }
 
-fn cumulative_quarantine_total(base: u64, runtime_baseline: u64, runtime_observed: u64) -> u64 {
-    base.saturating_add(runtime_observed.saturating_sub(runtime_baseline))
-}
-
 fn handle_v2_runtime_stream(
     coordinator: Arc<ProductionV2Coordinator>,
     stream: UnixStream,
@@ -2399,17 +2207,14 @@ fn handle_v2_runtime_stream(
             return Ok(());
         }
     };
-    let track_error = message.is_mutation();
+    let refresh_current_views = matches!(&message, ClientMessage::SubmitViewEvent { .. });
     let response = coordinator.route_external(&mut connection_state, message, frame.len());
-    if track_error {
-        coordinator.note_error_response(&response);
-    }
     write_v2_response(connection.stream_mut(), &response)
         .map_err(|error| anyhow::anyhow!("failed to write v2 handshake: {error:?}"))?;
-    if !matches!(
-        response,
-        crate::daemon::protocol::v2::ServerMessage::HelloAck { .. }
-    ) {
+    if refresh_current_views && matches!(response, ServerMessage::ViewQueued { .. }) {
+        coordinator.schedule_current_view_refresh();
+    }
+    if !matches!(response, ServerMessage::HelloAck { .. }) {
         return Ok(());
     }
 
@@ -2427,7 +2232,7 @@ fn handle_v2_runtime_stream(
             return Ok(());
         }
     };
-    if let crate::daemon::protocol::v2::ClientMessage::SubscribeLive {
+    if let ClientMessage::SubscribeLive {
         source_pane,
         target_pane,
         interval_ms,
@@ -2445,10 +2250,7 @@ fn handle_v2_runtime_stream(
             interval_ms,
         );
     }
-    let subscribe = matches!(
-        &message,
-        crate::daemon::protocol::v2::ClientMessage::Subscribe { .. }
-    );
+    let subscribe = matches!(&message, ClientMessage::Subscribe { .. });
     if subscribe {
         let published = match coordinator.route_subscription(&mut connection_state, message) {
             Ok(published) => published,
@@ -2469,12 +2271,14 @@ fn handle_v2_runtime_stream(
         }
         return stream_v2_subscription(coordinator, connection.into_stream(), published.revision);
     }
-    let track_error = message.is_mutation();
+    let refresh_current_views = matches!(&message, ClientMessage::SubmitViewEvent { .. });
     let response = coordinator.route_external(&mut connection_state, message, frame.len());
-    if track_error {
-        coordinator.note_error_response(&response);
+    if write_v2_response(connection.stream_mut(), &response).is_ok()
+        && refresh_current_views
+        && matches!(response, ServerMessage::ViewQueued { .. })
+    {
+        coordinator.schedule_current_view_refresh();
     }
-    let _ = write_v2_response(connection.stream_mut(), &response);
     Ok(())
 }
 
@@ -2523,7 +2327,7 @@ fn stream_v2_subscription_with_heartbeat_interval(
                 }
             }
             SnapshotWaitOutcome::HeartbeatDue { snapshot_revision } => {
-                let heartbeat = crate::daemon::protocol::v2::ServerMessage::Heartbeat {
+                let heartbeat = ServerMessage::Heartbeat {
                     daemon_instance_id: daemon_instance_id.clone(),
                     snapshot_revision,
                 };
@@ -2564,9 +2368,7 @@ fn start_v2_mutation_worker(coordinator: Arc<ProductionV2Coordinator>) {
             let accepted_seq = mutation.sequenced.accepted_seq;
             let graceful_shutdown = matches!(
                 &mutation.sequenced.mutation,
-                V2AcceptedMutation::External(
-                    crate::daemon::protocol::v2::ClientMessage::Shutdown { .. }
-                )
+                V2AcceptedMutation::External(ClientMessage::Shutdown { .. })
             );
             let changes_topology_targets = mutation_changes_topology_targets(&mutation.sequenced);
             let status_driver = changes_topology_targets.then(|| {
@@ -2576,7 +2378,6 @@ fn start_v2_mutation_worker(coordinator: Arc<ProductionV2Coordinator>) {
                     .expect("status push driver lock poisoned")
             });
             let response = apply_production_mutation(&coordinator, mutation.sequenced);
-            coordinator.sync_quarantine_summary();
             if changes_topology_targets {
                 coordinator.sync_status_push_topology_targets_locked();
             }
@@ -2621,27 +2422,18 @@ fn start_sidebar_completion_forwarder(coordinator: Arc<ProductionV2Coordinator>)
 
 fn mutation_changes_topology_targets(mutation: &V2SequencedMutation) -> bool {
     match &mutation.mutation {
-        V2AcceptedMutation::External(
-            crate::daemon::protocol::v2::ClientMessage::RefreshPanes { .. }
-            | crate::daemon::protocol::v2::ClientMessage::RefreshTopology { .. },
-        )
+        V2AcceptedMutation::External(ClientMessage::RefreshTopology { .. })
         | V2AcceptedMutation::Internal(
             V2InternalMutation::ObservationBatch(_)
             | V2InternalMutation::RefreshTopology
             | V2InternalMutation::TargetedPaneRefresh { .. },
         ) => true,
-        V2AcceptedMutation::External(
-            crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent { envelope, .. },
-        ) => {
-            matches!(
-                envelope.event,
-                crate::pane_state::PaneEvent::PaneRemoved { .. }
-            )
+        V2AcceptedMutation::External(ClientMessage::SubmitPaneEvent { envelope, .. }) => {
+            matches!(envelope.event, PaneEvent::PaneRemoved { .. })
         }
-        V2AcceptedMutation::Internal(V2InternalMutation::PaneEvent(envelope)) => matches!(
-            envelope.event,
-            crate::pane_state::PaneEvent::PaneRemoved { .. }
-        ),
+        V2AcceptedMutation::Internal(V2InternalMutation::PaneEvent(envelope)) => {
+            matches!(envelope.event, PaneEvent::PaneRemoved { .. })
+        }
         _ => false,
     }
 }
@@ -2823,12 +2615,6 @@ fn start_canonical_observation_worker(
                     &coordinator.incarnation.identity,
                 ) {
                     Ok(health) => {
-                        if health == crate::daemon::protocol::v2::HookHealth::Healthy {
-                            let _ = crate::daemon::lifecycle::record_hook_delivery_recovered(
-                                &coordinator.env,
-                                &coordinator.incarnation.hash,
-                            );
-                        }
                         let _ = coordinator.enqueue_internal(
                             V2InternalMutation::HookHealthProjection {
                                 health,
@@ -2844,7 +2630,7 @@ fn start_canonical_observation_worker(
                     Err(error) => {
                         let _ = coordinator.enqueue_internal(
                             V2InternalMutation::HookHealthProjection {
-                                health: crate::daemon::protocol::v2::HookHealth::Degraded,
+                                health: HookHealth::Degraded,
                                 diagnostic: Some(format!("hook_health_degraded: {error}")),
                             },
                         );
@@ -2898,8 +2684,8 @@ fn epoch_millis() -> u64 {
 /// A source sidebar is visible when at least one eligible attached client is
 /// looking at a window that contains the source pane.
 fn live_source_visible(
-    views: &crate::daemon::view_hooks::ViewRegistry,
-    source_pane: &crate::pane_state::PaneInstance,
+    views: &crate::daemon::view_hooks::CurrentClientViews,
+    source_pane: &PaneInstance,
 ) -> bool {
     let window_ids = views
         .windows()
@@ -2940,8 +2726,8 @@ fn collect_due_live_targets(
     coordinator: &ProductionV2Coordinator,
     now: Instant,
     horizon: Duration,
-) -> Vec<crate::pane_state::PaneInstance> {
-    use crate::daemon::protocol::v2::LiveUnavailableReason;
+) -> Vec<PaneInstance> {
+    use LiveUnavailableReason;
 
     let Some(views) = coordinator
         .state
@@ -3011,14 +2797,14 @@ fn run_live_preview_tick(
 
 fn deliver_live_result(
     coordinator: &ProductionV2Coordinator,
-    targets: &[crate::pane_state::PaneInstance],
+    targets: &[PaneInstance],
     result: std::result::Result<
         Vec<crate::daemon::workers::LiveCaptureSection>,
         crate::daemon::workers::CaptureBatchError,
     >,
 ) {
-    use crate::daemon::protocol::v2::LiveUnavailableReason;
     use crate::daemon::workers::{CaptureBatchError, LiveCaptureSection};
+    use LiveUnavailableReason;
 
     let sections = match result {
         Ok(sections) if sections.len() == targets.len() => sections,
@@ -3093,8 +2879,8 @@ fn deliver_live_result(
 fn handle_v2_live_subscription(
     coordinator: Arc<ProductionV2Coordinator>,
     mut stream: UnixStream,
-    source_pane: crate::pane_state::PaneInstance,
-    target_pane: crate::pane_state::PaneInstance,
+    source_pane: PaneInstance,
+    target_pane: PaneInstance,
     interval_ms: u64,
 ) -> Result<()> {
     use crate::daemon::protocol::v2::{ErrorCode, LiveUnavailableReason, ServerMessage};
@@ -3219,7 +3005,7 @@ fn start_status_push_worker(coordinator: Arc<ProductionV2Coordinator>) {
 fn apply_production_mutation(
     coordinator: &ProductionV2Coordinator,
     sequenced: V2SequencedMutation,
-) -> crate::daemon::protocol::v2::ServerMessage {
+) -> ServerMessage {
     use crate::daemon::protocol::v2::{ClientMessage, ErrorCode, ServerMessage};
 
     let accepted_seq = sequenced.accepted_seq;
@@ -3230,8 +3016,7 @@ fn apply_production_mutation(
         V2AcceptedMutation::External(ClientMessage::SubmitViewEvent { event, .. }) => {
             apply_external_view_event(coordinator, accepted_seq, event)
         }
-        V2AcceptedMutation::External(ClientMessage::RefreshPanes { event_id, .. })
-        | V2AcceptedMutation::External(ClientMessage::RefreshTopology { event_id, .. }) => {
+        V2AcceptedMutation::External(ClientMessage::RefreshTopology { event_id, .. }) => {
             match refresh_full_topology(coordinator) {
                 Ok(revision) => ServerMessage::SnapshotAck {
                     event_id,
@@ -3241,17 +3026,6 @@ fn apply_production_mutation(
                 Err(error) => production_store_error_response(coordinator, error, Some(event_id)),
             }
         }
-        V2AcceptedMutation::External(ClientMessage::ResetPaneState {
-            event_id,
-            pane_instance,
-            expected,
-            ..
-        }) => apply_reset(coordinator, accepted_seq, event_id, pane_instance, expected),
-        V2AcceptedMutation::External(ClientMessage::CleanupLegacyState {
-            event_id,
-            dry_run,
-            ..
-        }) => apply_legacy_cleanup(coordinator, accepted_seq, event_id, dry_run),
         V2AcceptedMutation::External(ClientMessage::SidebarCommand {
             event_id, command, ..
         }) => match command {
@@ -3259,7 +3033,7 @@ fn apply_production_mutation(
                 pane_instance,
                 expected,
             } => {
-                let envelope = crate::pane_state::PaneEventEnvelope {
+                let envelope = PaneEventEnvelope {
                     daemon_instance_id: coordinator
                         .router
                         .lock()
@@ -3270,7 +3044,7 @@ fn apply_production_mutation(
                     pane_instance,
                     agent: None,
                     agent_session_id: None,
-                    event: crate::pane_state::PaneEvent::MarkDone {
+                    event: PaneEvent::MarkDone {
                         expected,
                         completed_at: epoch_seconds(),
                     },
@@ -3334,60 +3108,10 @@ fn apply_production_mutation(
                     }
                 }
             }
-            crate::daemon::protocol::v2::SidebarCommand::UpdateManualOrder {
-                expected_version,
-                manual_order,
-                manual_chat_order,
-            } => apply_sidebar_order_command(
-                coordinator,
-                accepted_seq,
-                event_id,
-                expected_version,
-                manual_order,
-                manual_chat_order,
-            ),
-            crate::daemon::protocol::v2::SidebarCommand::UpdateViewPreferences {
-                expected_version,
-                view_mode,
-                filter,
-            } => apply_sidebar_view_preferences_command(
-                coordinator,
-                accepted_seq,
-                event_id,
-                expected_version,
-                view_mode,
-                filter,
-            ),
-            crate::daemon::protocol::v2::SidebarCommand::SetExpansionOverride {
-                expected_version,
-                row_id,
-                overridden,
-            } => apply_sidebar_expansion_command(
-                coordinator,
-                accepted_seq,
-                event_id,
-                expected_version,
-                row_id,
-                overridden,
-            ),
-        },
-        V2AcceptedMutation::External(ClientMessage::UninstallHooks { event_id, .. }) => {
-            let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
-            match crate::daemon::view_hooks::uninstall_hooks(
-                &runner,
-                &coordinator.incarnation.identity,
-            ) {
-                Ok(()) => ServerMessage::HooksUninstalled {
-                    event_id,
-                    accepted_seq,
-                },
-                Err(error) => ServerMessage::error(
-                    ErrorCode::HookCollision,
-                    error.to_string(),
-                    Some(event_id),
-                ),
+            crate::daemon::protocol::v2::SidebarCommand::PreferenceIntent { intent } => {
+                apply_sidebar_preference_intent(coordinator, accepted_seq, event_id, intent)
             }
-        }
+        },
         V2AcceptedMutation::External(ClientMessage::Shutdown { event_id, .. }) => {
             coordinator.begin_graceful_shutdown(accepted_seq);
             ServerMessage::ShutdownAccepted {
@@ -3400,7 +3124,7 @@ fn apply_production_mutation(
             | ClientMessage::QueryResolvedSnapshot { .. }
             | ClientMessage::QueryStatusSnapshot { .. }
             | ClientMessage::QueryPane { .. }
-            | ClientMessage::QueryHealth { .. }
+            | ClientMessage::QueryRuntimeInfo { .. }
             | ClientMessage::Subscribe { .. }
             | ClientMessage::SubscribeLive { .. },
         ) => unreachable!("v2 router cannot sequence a read-only request"),
@@ -3410,7 +3134,7 @@ fn apply_production_mutation(
         V2AcceptedMutation::Internal(V2InternalMutation::RefreshTopology) => {
             match refresh_full_topology(coordinator) {
                 Ok(revision) => ServerMessage::SnapshotAck {
-                    event_id: crate::pane_state::EventId::generate()
+                    event_id: EventId::generate()
                         .expect("OS random source failed after daemon startup"),
                     accepted_seq,
                     snapshot_revision: revision,
@@ -3428,7 +3152,28 @@ fn apply_production_mutation(
                         .as_ref()
                         .map_or(0, |state| state.leased.runtime.snapshot_revision());
                     ServerMessage::SnapshotAck {
-                        event_id: crate::pane_state::EventId::generate()
+                        event_id: EventId::generate()
+                            .expect("OS random source failed after daemon startup"),
+                        accepted_seq,
+                        snapshot_revision: revision,
+                    }
+                }
+                Err(error) => {
+                    ServerMessage::error(ErrorCode::InternalError, error.to_string(), None)
+                }
+            }
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::CurrentViewsReplacement { witnesses }) => {
+            match reconcile_views_with_witnesses(coordinator, &witnesses, None, None) {
+                Ok(()) => {
+                    let revision = coordinator
+                        .state
+                        .lock()
+                        .expect("canonical state lock poisoned")
+                        .as_ref()
+                        .map_or(0, |state| state.leased.runtime.snapshot_revision());
+                    ServerMessage::SnapshotAck {
+                        event_id: EventId::generate()
                             .expect("OS random source failed after daemon startup"),
                         accepted_seq,
                         snapshot_revision: revision,
@@ -3447,7 +3192,7 @@ fn apply_production_mutation(
             message,
         }) => match apply_diagnostic_projection(coordinator, pane_instance, message) {
             Ok(revision) => ServerMessage::SnapshotAck {
-                event_id: crate::pane_state::EventId::generate()
+                event_id: EventId::generate()
                     .expect("OS random source failed after daemon startup"),
                 accepted_seq,
                 snapshot_revision: revision,
@@ -3471,7 +3216,7 @@ fn apply_production_mutation(
                 return production_store_error_response(coordinator, error, None);
             }
             ServerMessage::SnapshotAck {
-                event_id: crate::pane_state::EventId::generate()
+                event_id: EventId::generate()
                     .expect("OS random source failed after daemon startup"),
                 accepted_seq,
                 snapshot_revision: state.leased.runtime.snapshot_revision(),
@@ -3497,7 +3242,7 @@ fn apply_production_mutation(
                 .expect("v2 router lock poisoned")
                 .set_hook_health(health);
             ServerMessage::SnapshotAck {
-                event_id: crate::pane_state::EventId::generate()
+                event_id: EventId::generate()
                     .expect("OS random source failed after daemon startup"),
                 accepted_seq,
                 snapshot_revision: state.leased.runtime.snapshot_revision(),
@@ -3567,7 +3312,7 @@ fn apply_production_mutation(
                 return production_store_error_response(coordinator, error, None);
             }
             ServerMessage::SnapshotAck {
-                event_id: crate::pane_state::EventId::generate()
+                event_id: EventId::generate()
                     .expect("OS random source failed after daemon startup"),
                 accepted_seq,
                 snapshot_revision: state.leased.runtime.snapshot_revision(),
@@ -3592,8 +3337,8 @@ fn apply_production_mutation(
 }
 
 fn unique_eligible_client_pid(
-    views: &crate::daemon::view_hooks::ViewRegistry,
-    source_pane: &crate::pane_state::PaneInstance,
+    views: &crate::daemon::view_hooks::CurrentClientViews,
+    source_pane: &PaneInstance,
 ) -> std::result::Result<u32, usize> {
     let clients = views
         .clients()
@@ -3608,227 +3353,77 @@ fn unique_eligible_client_pid(
     }
 }
 
-fn apply_sidebar_order_command(
+fn apply_sidebar_preference_intent(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
-    event_id: crate::pane_state::EventId,
-    expected_version: u64,
-    manual_order: Vec<crate::sidebar::state::RepoId>,
-    manual_chat_order: Vec<String>,
-) -> crate::daemon::protocol::v2::ServerMessage {
-    let path = crate::sidebar::store::state_path(&coordinator.env);
-    apply_sidebar_preferences_result(
-        coordinator,
-        accepted_seq,
-        event_id,
-        expected_version,
-        crate::sidebar::store::compare_and_swap_order(
-            &path,
-            expected_version,
-            manual_order,
-            manual_chat_order,
-        ),
-    )
-}
-
-fn apply_sidebar_view_preferences_command(
-    coordinator: &ProductionV2Coordinator,
-    accepted_seq: u64,
-    event_id: crate::pane_state::EventId,
-    expected_version: u64,
-    view_mode: crate::sidebar::state::ViewMode,
-    filter: crate::sidebar::state::StatusFilter,
-) -> crate::daemon::protocol::v2::ServerMessage {
-    let path = crate::sidebar::store::state_path(&coordinator.env);
-    apply_sidebar_preferences_result(
-        coordinator,
-        accepted_seq,
-        event_id,
-        expected_version,
-        crate::sidebar::store::compare_and_swap_view_preferences(
-            &path,
-            expected_version,
-            view_mode,
-            filter,
-        ),
-    )
-}
-
-fn apply_sidebar_expansion_command(
-    coordinator: &ProductionV2Coordinator,
-    accepted_seq: u64,
-    event_id: crate::pane_state::EventId,
-    expected_version: u64,
-    row_id: String,
-    overridden: bool,
-) -> crate::daemon::protocol::v2::ServerMessage {
-    let path = crate::sidebar::store::expansion_state_path(&coordinator.env);
-    apply_sidebar_expansion_result(
-        coordinator,
-        accepted_seq,
-        event_id,
-        expected_version,
-        crate::sidebar::store::compare_and_swap_expansion_override(
-            &path,
-            expected_version,
-            row_id,
-            overridden,
-        ),
-    )
-}
-
-fn apply_sidebar_expansion_result(
-    coordinator: &ProductionV2Coordinator,
-    accepted_seq: u64,
-    event_id: crate::pane_state::EventId,
-    expected_version: u64,
-    result: std::result::Result<
-        crate::sidebar::state::SidebarExpansionPreferences,
-        crate::sidebar::store::OrderUpdateError,
-    >,
-) -> crate::daemon::protocol::v2::ServerMessage {
+    event_id: EventId,
+    intent: crate::sidebar::state::SidebarPreferenceIntent,
+) -> ServerMessage {
     use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
-    let path = crate::sidebar::store::expansion_state_path(&coordinator.env);
-    let candidate = match result {
-        Ok(candidate) => candidate,
-        Err(crate::sidebar::store::OrderUpdateError::Busy) => {
-            return ServerMessage::error(
-                ErrorCode::QueueFull,
-                "sidebar expansion state is being updated by another tmux server",
-                Some(event_id),
-            );
-        }
-        Err(crate::sidebar::store::OrderUpdateError::Stale { current_version }) => {
-            if let Ok(persisted) = crate::sidebar::store::load_expansion_state(&path) {
-                let mut state_guard = coordinator
-                    .state
-                    .lock()
-                    .expect("canonical state lock poisoned");
-                if let Some(state) = state_guard.as_mut()
-                    && let Err(error) = state.replace_sidebar_expansion_preferences(persisted)
-                {
-                    return production_store_error_response(coordinator, error, Some(event_id));
-                }
-            }
-            return ServerMessage::error(
-                ErrorCode::StaleStateIdentity,
-                format!(
-                    "sidebar expansion version is stale: expected {expected_version}, current {current_version}"
-                ),
-                Some(event_id),
-            );
-        }
-        Err(crate::sidebar::store::OrderUpdateError::Storage(error)) => {
-            let message = format!("sidebar expansion persistence failed: {error:#}");
-            coordinator.log_daemon_error(&message);
-            return ServerMessage::error(ErrorCode::PersistFailed, message, Some(event_id));
-        }
-    };
-    let snapshot_revision = {
-        let mut state_guard = coordinator
-            .state
-            .lock()
-            .expect("canonical state lock poisoned");
-        let state = state_guard
-            .as_mut()
-            .expect("state initialized before sidebar expansion command");
-        if let Err(error) = state.replace_sidebar_expansion_preferences(candidate) {
-            return production_store_error_response(coordinator, error, Some(event_id));
-        }
-        state.leased.runtime.snapshot_revision()
-    };
-    ServerMessage::SnapshotAck {
-        event_id,
-        accepted_seq,
-        snapshot_revision,
+    let mut state_guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let state = state_guard
+        .as_mut()
+        .expect("state initialized before sidebar preference intent");
+    if !state.sidebar_intent_dedupe.accept(event_id.clone()) {
+        return ServerMessage::SnapshotAck {
+            event_id,
+            accepted_seq,
+            snapshot_revision: state.leased.runtime.snapshot_revision(),
+        };
     }
-}
-
-fn apply_sidebar_preferences_result(
-    coordinator: &ProductionV2Coordinator,
-    accepted_seq: u64,
-    event_id: crate::pane_state::EventId,
-    expected_version: u64,
-    result: std::result::Result<
-        crate::sidebar::state::SidebarOrderPreferences,
-        crate::sidebar::store::OrderUpdateError,
-    >,
-) -> crate::daemon::protocol::v2::ServerMessage {
-    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
-    let path = crate::sidebar::store::state_path(&coordinator.env);
-    let candidate = match result {
-        Ok(candidate) => candidate,
-        Err(crate::sidebar::store::OrderUpdateError::Busy) => {
-            return ServerMessage::error(
-                ErrorCode::QueueFull,
-                "sidebar preferences are being updated by another tmux server",
-                Some(event_id),
-            );
-        }
-        Err(crate::sidebar::store::OrderUpdateError::Stale { current_version }) => {
-            if let Ok(persisted) = crate::sidebar::store::load_state(&path) {
-                let mut state_guard = coordinator
-                    .state
-                    .lock()
-                    .expect("canonical state lock poisoned");
-                if let Some(state) = state_guard.as_mut()
-                    && let Err(error) = state.replace_sidebar_order_preferences(persisted)
-                {
-                    return production_store_error_response(coordinator, error, Some(event_id));
-                }
-            }
-            return ServerMessage::error(
-                ErrorCode::StaleStateIdentity,
-                format!(
-                    "sidebar preference version is stale: expected {expected_version}, current {current_version}"
-                ),
-                Some(event_id),
-            );
-        }
-        Err(crate::sidebar::store::OrderUpdateError::Storage(error)) => {
-            let message = format!("sidebar preference persistence failed: {error:#}");
-            coordinator.log_daemon_error(&message);
-            let mut state_guard = coordinator
-                .state
-                .lock()
-                .expect("canonical state lock poisoned");
-            if let Some(state) = state_guard.as_mut() {
-                let _ = state.add_global_diagnostic(ErrorCode::PersistFailed, message.clone());
-            }
-            return ServerMessage::error(ErrorCode::PersistFailed, message, Some(event_id));
-        }
-    };
-    let snapshot_revision = {
-        let mut state_guard = coordinator
-            .state
-            .lock()
-            .expect("canonical state lock poisoned");
-        let state = state_guard
-            .as_mut()
-            .expect("state initialized before sidebar command");
-        if let Err(error) = state.replace_sidebar_order_preferences(candidate) {
-            return production_store_error_response(coordinator, error, Some(event_id));
-        }
-        state.leased.runtime.snapshot_revision()
-    };
+    let snapshot = state.resolved_snapshot();
+    let projection = crate::sidebar::tree::project_sidebar(
+        &state.projection_config,
+        &snapshot.panes,
+        &snapshot.sidebar_model,
+        &crate::sidebar::state::SidebarState::default(),
+        crate::sidebar::tree::now_epoch_secs(),
+    );
+    let known_rows = projection
+        .rows
+        .into_iter()
+        .map(|row| row.id)
+        .collect::<BTreeSet<_>>();
+    let mut candidate = state.sidebar_preferences.clone();
+    if !candidate.apply_intent(&intent, &known_rows) {
+        return ServerMessage::SnapshotAck {
+            event_id,
+            accepted_seq,
+            snapshot_revision: state.leased.runtime.snapshot_revision(),
+        };
+    }
+    let path =
+        crate::sidebar::store::state_path(&coordinator.env, &coordinator.incarnation.socket_path);
+    if let Err(error) = crate::sidebar::store::save_state(&path, &candidate) {
+        let message = format!("sidebar preference persistence failed: {error:#}");
+        coordinator.log_daemon_error(&message);
+        let _ = state.add_global_diagnostic(ErrorCode::PersistFailed, message.clone());
+        return ServerMessage::error(ErrorCode::PersistFailed, message, Some(event_id));
+    }
+    if let Err(error) = state.replace_sidebar_preferences(candidate) {
+        return production_store_error_response(coordinator, error, Some(event_id));
+    }
     ServerMessage::SnapshotAck {
         event_id,
         accepted_seq,
-        snapshot_revision,
+        snapshot_revision: state.leased.runtime.snapshot_revision(),
     }
 }
 
 fn apply_external_pane_event(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
-    envelope: crate::pane_state::PaneEventEnvelope,
-) -> crate::daemon::protocol::v2::ServerMessage {
+    envelope: PaneEventEnvelope,
+) -> ServerMessage {
     apply_pane_event_mutation(coordinator, accepted_seq, envelope, false)
 }
 
 fn apply_diagnostic_projection(
     coordinator: &ProductionV2Coordinator,
-    pane_instance: Option<crate::pane_state::PaneInstance>,
+    pane_instance: Option<PaneInstance>,
     message: String,
 ) -> Result<u64, crate::pane_state::store::StoreError> {
     let mut state_guard = coordinator
@@ -3841,10 +3436,7 @@ fn apply_diagnostic_projection(
     if let Some(pane) = pane_instance {
         state.leased.runtime.add_diagnostic(pane, message)?;
     } else {
-        state.add_global_diagnostic(
-            crate::daemon::protocol::v2::ErrorCode::InternalError,
-            message,
-        )?;
+        state.add_global_diagnostic(ErrorCode::InternalError, message)?;
     }
     Ok(state.leased.runtime.snapshot_revision())
 }
@@ -3871,7 +3463,7 @@ fn apply_observation_batch(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
     payload: ObservationBatchPayload,
-) -> crate::daemon::protocol::v2::ServerMessage {
+) -> ServerMessage {
     use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
 
     let ObservationBatchPayload {
@@ -3903,9 +3495,6 @@ fn apply_observation_batch(
     }
     match apply_triage_projection(coordinator) {
         Ok(revision) => {
-            coordinator
-                .projection_updated_at_epoch_seconds
-                .store(epoch_seconds() as u64, Ordering::SeqCst);
             let present = coordinator
                 .state
                 .lock()
@@ -3922,7 +3511,7 @@ fn apply_observation_batch(
                 .unwrap_or_default();
             coordinator.live.prune_missing_panes(&present);
             ServerMessage::SnapshotAck {
-                event_id: crate::pane_state::EventId::generate()
+                event_id: EventId::generate()
                     .expect("OS random source failed after daemon startup"),
                 accepted_seq,
                 snapshot_revision: revision,
@@ -3935,14 +3524,13 @@ fn apply_observation_batch(
 fn apply_pane_event_mutation(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
-    envelope: crate::pane_state::PaneEventEnvelope,
+    envelope: PaneEventEnvelope,
     defer_full_preflight: bool,
-) -> crate::daemon::protocol::v2::ServerMessage {
+) -> ServerMessage {
     use crate::daemon::protocol::v2::{PaneApplyOutcome, ServerMessage};
-    use crate::pane_state::store::{PendingResolution, StoreError};
 
     let event_id = envelope.event_id.clone();
-    if let crate::pane_state::PaneEvent::PaneRemoved { expected } = &envelope.event {
+    if let PaneEvent::PaneRemoved { expected } = &envelope.event {
         return apply_pane_removal(
             coordinator,
             accepted_seq,
@@ -3959,89 +3547,35 @@ fn apply_pane_event_mutation(
                 return production_store_error_response(coordinator, error, Some(event_id));
             }
         };
-    let mut clock = crate::pane_state::store::SystemRecoveryClock::start();
-    let (initial, revision_before) = {
+    let result = {
         let mut state_guard = coordinator
             .state
             .lock()
             .expect("canonical state lock poisoned");
         let Some(state) = state_guard.as_mut() else {
-            return crate::daemon::protocol::v2::ServerMessage::error(
-                crate::daemon::protocol::v2::ErrorCode::NotReady,
+            return ServerMessage::error(
+                ErrorCode::NotReady,
                 "daemon is hydrating",
                 Some(event_id),
             );
         };
-        let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
-        let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
-            &runner,
-            coordinator.incarnation.identity.pid,
-            coordinator.incarnation.identity.start_time,
-        );
+        let mut io = pane_snapshot_store(coordinator);
         let revision_before = state.leased.runtime.snapshot_revision();
-        let initial = state.leased.runtime.apply_event(
-            &mut io,
-            &mut clock,
-            &envelope,
-            &visibility,
-            coordinator.done_clear_on,
-        );
-        let initial = initial.and_then(|result| {
-            finish_pane_event_projection(
-                coordinator,
-                state,
-                &envelope.pane_instance,
-                visibility_diagnostic.as_deref(),
-                revision_before,
-                result,
-                defer_full_preflight,
-            )
-        });
-        (initial, revision_before)
-    };
-    let result = match initial {
-        Ok(result) => Ok(result),
-        Err(StoreError::PersistPending) => loop {
-            thread::sleep(crate::pane_state::store::STORE_RECOVERY_RETRY_INTERVAL);
-            let resolved = {
-                let mut state_guard = coordinator
-                    .state
-                    .lock()
-                    .expect("canonical state lock poisoned");
-                let state = state_guard
-                    .as_mut()
-                    .expect("state initialized before recovery");
-                let timeout = bounded_recovery_timeout(
-                    state.leased.runtime.pending_recovery_remaining(&clock),
-                );
-                let runner = crate::tmux::SystemTmuxRunner::from_env(timeout);
-                let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
-                    &runner,
-                    coordinator.incarnation.identity.pid,
-                    coordinator.incarnation.identity.start_time,
-                );
-                match state.leased.runtime.resolve_pending(&mut io, &clock) {
-                    Ok(PendingResolution::Applied(result)) => finish_pane_event_projection(
-                        coordinator,
-                        state,
-                        &envelope.pane_instance,
-                        visibility_diagnostic.as_deref(),
-                        revision_before,
-                        result,
-                        defer_full_preflight,
-                    )
-                    .map(PendingResolution::Applied),
-                    other => other,
-                }
-            };
-            match resolved {
-                Ok(PendingResolution::StillPending) => continue,
-                Ok(PendingResolution::Applied(result)) => break Ok(result),
-                Ok(PendingResolution::Reset(_)) => unreachable!("pane event cannot resolve reset"),
-                Err(error) => break Err(error),
-            }
-        },
-        Err(error) => Err(error),
+        state
+            .leased
+            .runtime
+            .apply_event(&mut io, &envelope, &visibility, coordinator.done_clear_on)
+            .and_then(|result| {
+                finish_pane_event_projection(
+                    coordinator,
+                    state,
+                    &envelope.pane_instance,
+                    visibility_diagnostic.as_deref(),
+                    revision_before,
+                    result,
+                    defer_full_preflight,
+                )
+            })
     };
     match result {
         Ok(result) => ServerMessage::PaneEventResult {
@@ -4066,13 +3600,22 @@ fn apply_pane_event_mutation(
     }
 }
 
+fn pane_snapshot_store(
+    coordinator: &ProductionV2Coordinator,
+) -> crate::pane_state::snapshot::FilePaneSnapshotStore {
+    crate::pane_state::snapshot::FilePaneSnapshotStore::new(
+        crate::pane_state::snapshot::snapshot_path(&coordinator.env, &coordinator.incarnation.hash),
+        coordinator.incarnation.identity.clone(),
+    )
+}
+
 /// `defer_full_preflight` is set on the observation-batch path: the per-pane
 /// persist/read-back contract still runs here, while the full resolved-snapshot
 /// preflight happens once when the batch publishes.
 fn finish_pane_event_projection(
     coordinator: &ProductionV2Coordinator,
     state: &mut super::runtime::CanonicalCoordinatorState,
-    pane: &crate::pane_state::PaneInstance,
+    pane: &PaneInstance,
     visibility_diagnostic: Option<&str>,
     revision_before: u64,
     mut result: crate::pane_state::store::ApplyResult,
@@ -4082,21 +3625,9 @@ fn finish_pane_event_projection(
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let internal_drops = state.leased.runtime.notification_queue_drops();
-    let reported = coordinator
-        .notification_internal_drops_reported
-        .swap(internal_drops, Ordering::SeqCst);
-    if internal_drops > reported {
-        coordinator.log_daemon_error(&format!(
-            "notification queue overflow dropped {} oldest job(s)",
-            internal_drops - reported
-        ));
-    }
     for notification in state.leased.runtime.drain_notification_jobs() {
         let agent = match state.leased.runtime.record(&notification.pane_instance) {
-            Some(crate::pane_state::StoredPaneRecord::Active(active))
-                if active.version() == notification.state_version =>
-            {
+            Some(active) if active.version() == notification.state_version => {
                 active.agent.as_str().to_string()
             }
             _ => {
@@ -4115,22 +3646,24 @@ fn finish_pane_event_projection(
             agent,
         };
         if let Err(error) = sender.try_send(job) {
-            coordinator
-                .notification_queue_drops
-                .fetch_add(1, Ordering::SeqCst);
             let reason = match error {
                 TrySendError::Full(_) => "queue_full",
                 TrySendError::Disconnected(_) => "worker_disconnected",
             };
-            note_notification_failure(Some(&coordinator.notification_health), reason);
             messages.push(format!(
                 "notification_dispatch_failed: pane={} reason={reason}",
                 notification.pane_instance.pane_id
             ));
-            coordinator.log_daemon_error(&format!(
-                "notification dispatch failed for pane {}: {reason}",
-                notification.pane_instance.pane_id
-            ));
+            log_notification_failure(
+                Some(&(
+                    coordinator.env.clone(),
+                    coordinator.incarnation.hash.clone(),
+                )),
+                &format!(
+                    "notification dispatch failed for pane {}: {reason}",
+                    notification.pane_instance.pane_id
+                ),
+            );
         }
     }
     result.snapshot_revision = state.leased.runtime.finish_sequenced_projection(
@@ -4148,10 +3681,10 @@ fn finish_pane_event_projection(
 fn apply_pane_removal(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
-    event_id: crate::pane_state::EventId,
-    pane: crate::pane_state::PaneInstance,
+    event_id: EventId,
+    pane: PaneInstance,
     expected: Option<crate::pane_state::StoredStateDescriptor>,
-) -> crate::daemon::protocol::v2::ServerMessage {
+) -> ServerMessage {
     use crate::daemon::protocol::v2::{PaneApplyOutcome, ServerMessage};
     let topology = match query_full_topology(coordinator, Duration::from_millis(100)) {
         Ok(topology) => topology,
@@ -4160,7 +3693,7 @@ fn apply_pane_removal(
                 coordinator.fail_stop(error.to_string());
             }
             return ServerMessage::error(
-                crate::daemon::protocol::v2::ErrorCode::InternalError,
+                ErrorCode::InternalError,
                 error.to_string(),
                 Some(event_id),
             );
@@ -4190,18 +3723,16 @@ fn apply_pane_removal(
                 .leased
                 .runtime
                 .record(&pane)
-                .and_then(|record| match record {
-                    crate::pane_state::StoredPaneRecord::Active(state) => Some(state.version()),
-                    crate::pane_state::StoredPaneRecord::Reset(_) => None,
-                }),
+                .map(|state| state.version()),
             snapshot_revision: state.leased.runtime.snapshot_revision(),
             outcome: PaneApplyOutcome::Noop,
         };
     }
+    let mut io = pane_snapshot_store(coordinator);
     let removed = match state
         .leased
         .runtime
-        .remove_absent_pane(&pane, expected.as_ref())
+        .remove_absent_pane(&mut io, &pane, expected.as_ref())
     {
         Ok(removed) => removed,
         Err(error) => {
@@ -4229,14 +3760,13 @@ fn apply_pane_removal(
 
 fn completion_visibility_for_event(
     coordinator: &ProductionV2Coordinator,
-    envelope: &crate::pane_state::PaneEventEnvelope,
+    envelope: &PaneEventEnvelope,
 ) -> Result<
     (crate::pane_state::VisibilitySnapshot, Option<String>),
     crate::pane_state::store::StoreError,
 > {
     use crate::pane_state::{
         AgentPresenceObservation, CaptureInference, LifecycleState, PaneEvent, ReportedLifecycle,
-        StoredPaneRecord,
     };
 
     let (current, tracker) = {
@@ -4247,10 +3777,7 @@ fn completion_visibility_for_event(
         let state = state_guard.as_ref();
         let current = state
             .and_then(|state| state.leased.runtime.record(&envelope.pane_instance))
-            .and_then(|record| match record {
-                StoredPaneRecord::Active(state) => Some(state.clone()),
-                StoredPaneRecord::Reset(_) => None,
-            });
+            .cloned();
         let tracker = state
             .map(|state| state.leased.runtime.tracker(&envelope.pane_instance))
             .unwrap_or_default();
@@ -4346,7 +3873,7 @@ fn completion_visibility_for_event(
 
 fn completion_window_id<'a>(
     topology: &'a crate::daemon::topology::TopologySnapshot,
-    pane: &crate::pane_state::PaneInstance,
+    pane: &PaneInstance,
 ) -> Option<&'a str> {
     topology
         .panes
@@ -4359,21 +3886,10 @@ fn apply_external_view_event(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
     event: crate::pane_state::ViewEvent,
-) -> crate::daemon::protocol::v2::ServerMessage {
-    use crate::daemon::protocol::v2::{
-        ErrorCode, PaneMutationFailure, ServerMessage, ViewApplyResult,
-    };
-    use crate::pane_state::store::{ViewBatchApplyResult, ViewBatchProgress};
+) -> ServerMessage {
+    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
 
     let event_id = event.event_id.clone();
-    let scoped_refresh = match scoped_view_refresh(coordinator, &event) {
-        Ok(refresh) => refresh,
-        Err(error) if error.1 => {
-            coordinator.fail_stop(error.0.clone());
-            return ServerMessage::error(ErrorCode::InternalError, error.0, Some(event_id));
-        }
-        Err(_) => crate::daemon::view_hooks::ScopedViewRefresh::QueryFailed,
-    };
     let mut state_guard = coordinator
         .state
         .lock()
@@ -4383,11 +3899,8 @@ fn apply_external_view_event(
     };
     let records = state.records_snapshot();
     let revision_before = state.leased.runtime.snapshot_revision();
-    let mut next_views = state.views.clone();
     let processing = match crate::daemon::view_hooks::process_view_event(
-        &mut next_views,
         &event,
-        scoped_refresh,
         coordinator.done_clear_on,
         &records,
     ) {
@@ -4400,803 +3913,50 @@ fn apply_external_view_event(
             );
         }
     };
-    let diagnostic_pane = event
-        .occurrence
-        .as_ref()
-        .map(|occurrence| occurrence.active_pane.clone())
-        .or_else(|| {
-            state
-                .topology
-                .panes
-                .first()
-                .map(|pane| pane.pane_instance.clone())
-        });
-    let registry_changed = processing.registry_changed;
-    let diagnostics = processing.diagnostics;
+
+    let diagnostic_pane = event.active_pane.as_ref().cloned().or_else(|| {
+        state
+            .topology
+            .panes
+            .first()
+            .map(|pane| pane.pane_instance.clone())
+    });
+
     if processing.acknowledgements.is_empty() {
-        state.views = next_views;
-        let revision = match state.leased.runtime.finish_sequenced_projection(
+        if let Err(error) = state.leased.runtime.finish_sequenced_projection(
             diagnostic_pane.as_ref(),
-            diagnostics,
-            registry_changed,
+            std::iter::empty(),
+            false,
             revision_before,
         ) {
-            Ok(revision) => revision,
-            Err(error) => {
-                return production_store_error_response(coordinator, error, Some(event_id));
-            }
-        };
-        let result = if revision == revision_before {
-            ViewApplyResult::Noop {
-                snapshot_revision: revision,
-            }
-        } else {
-            ViewApplyResult::TopologyOnly {
-                snapshot_revision: revision,
-            }
-        };
-        return ServerMessage::ViewResult {
+            return production_store_error_response(coordinator, error, Some(event_id));
+        }
+        return ServerMessage::ViewQueued {
             event_id,
             accepted_seq,
-            result,
         };
     }
-    let mut clock = crate::pane_state::store::SystemRecoveryClock::start();
-    let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
-    let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
-        &runner,
-        coordinator.incarnation.identity.pid,
-        coordinator.incarnation.identity.start_time,
-    );
-    let mut progress = state.leased.runtime.apply_view_acknowledgement_batch(
+
+    let mut io = pane_snapshot_store(coordinator);
+    if let Err(error) = state.leased.runtime.apply_view_acknowledgements(
         &mut io,
-        &mut clock,
         &processing.acknowledgements,
         coordinator.done_clear_on,
-    );
-    loop {
-        match progress {
-            ViewBatchProgress::Complete(mut result) => {
-                let state = state_guard
-                    .as_mut()
-                    .expect("state initialized after view batch");
-                state.views = next_views;
-                result.snapshot_revision = match state.leased.runtime.finish_sequenced_projection(
-                    diagnostic_pane.as_ref(),
-                    diagnostics,
-                    registry_changed,
-                    revision_before,
-                ) {
-                    Ok(revision) => revision,
-                    Err(error) => {
-                        return production_store_error_response(coordinator, error, Some(event_id));
-                    }
-                };
-                return ServerMessage::ViewResult {
-                    event_id,
-                    accepted_seq,
-                    result: view_result(result),
-                };
-            }
-            ViewBatchProgress::Pending(continuation) => {
-                drop(state_guard);
-                thread::sleep(crate::pane_state::store::STORE_RECOVERY_RETRY_INTERVAL);
-                state_guard = coordinator
-                    .state
-                    .lock()
-                    .expect("canonical state lock poisoned");
-                let state = state_guard
-                    .as_mut()
-                    .expect("state initialized during view recovery");
-                let timeout =
-                    bounded_recovery_timeout(continuation.pending_recovery_remaining(&clock));
-                let runner = crate::tmux::SystemTmuxRunner::from_env(timeout);
-                let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
-                    &runner,
-                    coordinator.incarnation.identity.pid,
-                    coordinator.incarnation.identity.start_time,
-                );
-                progress = state.leased.runtime.resume_view_acknowledgement_batch(
-                    &mut io,
-                    &mut clock,
-                    continuation,
-                );
-            }
-            ViewBatchProgress::Blocked(error) => {
-                return production_store_error_response(coordinator, error, Some(event_id));
-            }
-            ViewBatchProgress::Fatal(error) => {
-                coordinator.fail_stop(error.to_string());
-                return production_store_error_response(coordinator, error, Some(event_id));
-            }
-        }
+    ) {
+        coordinator.fail_stop(error.to_string());
+        return production_store_error_response(coordinator, error, Some(event_id));
     }
-
-    fn view_result(result: ViewBatchApplyResult) -> ViewApplyResult {
-        if result.failed.is_empty() {
-            if result.committed == 0 {
-                ViewApplyResult::Noop {
-                    snapshot_revision: result.snapshot_revision,
-                }
-            } else {
-                ViewApplyResult::Committed {
-                    snapshot_revision: result.snapshot_revision,
-                    panes: result.committed,
-                }
-            }
-        } else {
-            ViewApplyResult::Partial {
-                snapshot_revision: result.snapshot_revision,
-                committed: result.committed,
-                failed: result
-                    .failed
-                    .into_iter()
-                    .map(|failure| PaneMutationFailure {
-                        pane_instance: failure.pane_instance,
-                        code: store_error_code(&failure.error),
-                        message: failure.error.to_string(),
-                    })
-                    .collect(),
-            }
-        }
+    if let Err(error) = state.leased.runtime.finish_sequenced_projection(
+        diagnostic_pane.as_ref(),
+        std::iter::empty(),
+        false,
+        revision_before,
+    ) {
+        return production_store_error_response(coordinator, error, Some(event_id));
     }
-}
-
-fn scoped_view_refresh(
-    coordinator: &ProductionV2Coordinator,
-    event: &crate::pane_state::ViewEvent,
-) -> std::result::Result<crate::daemon::view_hooks::ScopedViewRefresh, (String, bool)> {
-    use crate::daemon::view_hooks::ScopedViewRefresh;
-    use crate::pane_state::ViewHookKind;
-
-    let deadline = Instant::now() + Duration::from_millis(100);
-    let topology = query_full_topology(coordinator, scoped_view_refresh_remaining(deadline)?)
-        .map_err(|error| (error.to_string(), error.requires_daemon_exit()))?;
-    let witnesses = query_client_witnesses(coordinator, scoped_view_refresh_remaining(deadline)?)
-        .map_err(|error| (error.to_string(), error.requires_daemon_exit()))?;
-    let occurrence = event.occurrence.as_ref();
-    let window_id = occurrence.map(|value| value.window_id.as_str());
-    let window = window_id.and_then(|window_id| {
-        let panes = topology
-            .panes
-            .iter()
-            .filter(|pane| pane.window_id == window_id)
-            .map(|pane| pane.pane_instance.clone())
-            .collect::<Vec<_>>();
-        let active = topology
-            .panes
-            .iter()
-            .find(|pane| pane.window_id == window_id && pane.active)
-            .map(|pane| pane.pane_instance.clone());
-        active.map(|active_pane| (window_id.to_string(), active_pane, panes))
-    });
-    match event.hook_kind {
-        ViewHookKind::WindowPaneChanged => window
-            .map(
-                |(window_id, active_pane, observed_panes)| ScopedViewRefresh::Window {
-                    window_id,
-                    active_pane,
-                    observed_panes,
-                },
-            )
-            .ok_or_else(|| ("view window is no longer present".to_string(), false)),
-        ViewHookKind::SessionWindowChanged => {
-            let session_id = occurrence
-                .map(|value| value.session_id.clone())
-                .ok_or_else(|| ("view session occurrence is missing".to_string(), false))?;
-            let current_window = topology.panes.iter().find_map(|pane| {
-                pane.session_links
-                    .iter()
-                    .any(|link| link.session_id == session_id && link.window_active)
-                    .then(|| pane.window_id.clone())
-            });
-            let current_window = current_window
-                .ok_or_else(|| ("view session is no longer present".to_string(), false))?;
-            let observed_panes = topology
-                .panes
-                .iter()
-                .filter(|pane| pane.window_id == current_window)
-                .map(|pane| pane.pane_instance.clone())
-                .collect::<Vec<_>>();
-            let active_pane = topology
-                .panes
-                .iter()
-                .find(|pane| pane.window_id == current_window && pane.active)
-                .map(|pane| pane.pane_instance.clone())
-                .ok_or_else(|| ("view session active pane is missing".to_string(), false))?;
-            Ok(ScopedViewRefresh::Session {
-                session_id,
-                window_id: current_window,
-                active_pane,
-                observed_panes,
-            })
-        }
-        ViewHookKind::ClientSessionChanged | ViewHookKind::ClientAttached => {
-            let client_pid = event
-                .source_client
-                .as_ref()
-                .map(|source| source.client_pid)
-                .ok_or_else(|| ("view source client is missing".to_string(), false))?;
-            let witness = witnesses
-                .into_iter()
-                .find(|witness| witness.client_pid == client_pid)
-                .ok_or_else(|| ("view source client is no longer present".to_string(), false))?;
-            let observed_panes = topology
-                .panes
-                .iter()
-                .filter(|pane| pane.window_id == witness.window_id)
-                .map(|pane| pane.pane_instance.clone())
-                .collect();
-            Ok(ScopedViewRefresh::Client {
-                witness,
-                observed_panes,
-            })
-        }
-        ViewHookKind::ClientDetached => {
-            let client_pid = event
-                .source_client
-                .as_ref()
-                .map(|source| source.client_pid)
-                .ok_or_else(|| ("detached client PID is missing".to_string(), false))?;
-            if let Some(witness) = witnesses
-                .into_iter()
-                .find(|value| value.client_pid == client_pid)
-            {
-                let observed_panes = topology
-                    .panes
-                    .iter()
-                    .filter(|pane| pane.window_id == witness.window_id)
-                    .map(|pane| pane.pane_instance.clone())
-                    .collect();
-                Ok(ScopedViewRefresh::Client {
-                    witness,
-                    observed_panes,
-                })
-            } else {
-                Ok(ScopedViewRefresh::ClientAbsent { client_pid })
-            }
-        }
-    }
-}
-
-fn scoped_view_refresh_remaining(
-    deadline: Instant,
-) -> std::result::Result<Duration, (String, bool)> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| ("scoped view refresh deadline exceeded".to_string(), false))
-}
-
-fn apply_reset(
-    coordinator: &ProductionV2Coordinator,
-    accepted_seq: u64,
-    event_id: crate::pane_state::EventId,
-    pane: crate::pane_state::PaneInstance,
-    expected: crate::pane_state::StoredStateDescriptor,
-) -> crate::daemon::protocol::v2::ServerMessage {
-    use crate::daemon::protocol::v2::{ResetOutcome, ServerMessage};
-    use crate::pane_state::store::{PendingResolution, StoreError};
-
-    let previous = expected.clone();
-    let tombstone_id = match crate::pane_state::ResetTombstoneId::generate() {
-        Ok(value) => value,
-        Err(error) => {
-            return production_store_error_response(
-                coordinator,
-                StoreError::Random(error.to_string()),
-                Some(event_id),
-            );
-        }
-    };
-    let mut clock = crate::pane_state::store::SystemRecoveryClock::start();
-    let initial = {
-        let mut state_guard = coordinator
-            .state
-            .lock()
-            .expect("canonical state lock poisoned");
-        let Some(state) = state_guard.as_mut() else {
-            return crate::daemon::protocol::v2::ServerMessage::error(
-                crate::daemon::protocol::v2::ErrorCode::NotReady,
-                "daemon is hydrating",
-                Some(event_id),
-            );
-        };
-        let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
-        let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
-            &runner,
-            coordinator.incarnation.identity.pid,
-            coordinator.incarnation.identity.start_time,
-        );
-        state.leased.runtime.reset(
-            &mut io,
-            &mut clock,
-            &pane,
-            &expected,
-            epoch_seconds(),
-            tombstone_id,
-        )
-    };
-    let current = match initial {
-        Ok(current) => Ok(current),
-        Err(StoreError::PersistPending) => loop {
-            thread::sleep(crate::pane_state::store::STORE_RECOVERY_RETRY_INTERVAL);
-            let resolution = {
-                let mut state_guard = coordinator
-                    .state
-                    .lock()
-                    .expect("canonical state lock poisoned");
-                let state = state_guard
-                    .as_mut()
-                    .expect("state initialized during reset recovery");
-                let timeout = bounded_recovery_timeout(
-                    state.leased.runtime.pending_recovery_remaining(&clock),
-                );
-                let runner = crate::tmux::SystemTmuxRunner::from_env(timeout);
-                let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
-                    &runner,
-                    coordinator.incarnation.identity.pid,
-                    coordinator.incarnation.identity.start_time,
-                );
-                state.leased.runtime.resolve_pending(&mut io, &clock)
-            };
-            match resolution {
-                Ok(PendingResolution::StillPending) => continue,
-                Ok(PendingResolution::Reset(current)) => break Ok(current),
-                Ok(PendingResolution::Applied(_)) => {
-                    unreachable!("reset cannot resolve pane event")
-                }
-                Err(error) => break Err(error),
-            }
-        },
-        Err(error) => Err(error),
-    };
-    match current {
-        Ok(current) => {
-            let revision = coordinator
-                .state
-                .lock()
-                .expect("canonical state lock poisoned")
-                .as_ref()
-                .expect("state initialized after reset")
-                .leased
-                .runtime
-                .snapshot_revision();
-            ServerMessage::ResetResult {
-                event_id,
-                accepted_seq,
-                previous: previous.clone(),
-                current: current.clone(),
-                outcome: if current == previous {
-                    ResetOutcome::AlreadyReset
-                } else {
-                    ResetOutcome::Replaced
-                },
-                snapshot_revision: revision,
-            }
-        }
-        Err(error) => {
-            if error.requires_daemon_exit() {
-                coordinator.fail_stop(error.to_string());
-            }
-            production_store_error_response(coordinator, error, Some(event_id))
-        }
-    }
-}
-
-const LEGACY_CLEANUP_SERVER_MISMATCH_SENTINEL: &str = "__vde_legacy_cleanup_server_mismatch__";
-const LEGACY_CLEANUP_PANE_MISMATCH_PREFIX: &str = "__vde_legacy_cleanup_pane_mismatch__";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LegacyCleanupItem {
-    scope: &'static str,
-    target: String,
-    option: &'static str,
-    pane_pid: Option<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LegacyCleanupOutcome {
-    attempted: u64,
-    removed: u64,
-    failed: Vec<crate::daemon::protocol::v2::LegacyCleanupFailure>,
-    server_mismatch: bool,
-}
-
-fn legacy_cleanup_items(
-    topology: &crate::daemon::topology::TopologySnapshot,
-) -> Vec<LegacyCleanupItem> {
-    use crate::options::{
-        LEGACY_PANE_OPTION_KEYS, LEGACY_SESSION_OPTION_KEYS, LEGACY_WINDOW_OPTION_KEYS,
-    };
-
-    let mut panes = topology
-        .panes
-        .iter()
-        .map(|pane| pane.pane_instance.clone())
-        .collect::<Vec<_>>();
-    panes.sort();
-    panes.dedup();
-    let sessions = topology
-        .panes
-        .iter()
-        .flat_map(|pane| {
-            pane.session_links
-                .iter()
-                .map(|link| link.session_id.clone())
-        })
-        .collect::<BTreeSet<_>>();
-    let windows = topology
-        .panes
-        .iter()
-        .map(|pane| pane.window_id.clone())
-        .collect::<BTreeSet<_>>();
-
-    panes
-        .into_iter()
-        .flat_map(|pane| {
-            LEGACY_PANE_OPTION_KEYS
-                .iter()
-                .copied()
-                .map(move |option| LegacyCleanupItem {
-                    scope: "pane",
-                    target: pane.pane_id.clone(),
-                    option,
-                    pane_pid: Some(pane.pane_pid),
-                })
-        })
-        .chain(sessions.into_iter().flat_map(|target| {
-            LEGACY_SESSION_OPTION_KEYS
-                .iter()
-                .copied()
-                .map(move |option| LegacyCleanupItem {
-                    scope: "session",
-                    target: target.clone(),
-                    option,
-                    pane_pid: None,
-                })
-        }))
-        .chain(windows.into_iter().flat_map(|target| {
-            LEGACY_WINDOW_OPTION_KEYS
-                .iter()
-                .copied()
-                .map(move |option| LegacyCleanupItem {
-                    scope: "window",
-                    target: target.clone(),
-                    option,
-                    pane_pid: None,
-                })
-        }))
-        .collect()
-}
-
-fn inspect_existing_legacy_cleanup_items(
-    runner: &dyn crate::tmux::TmuxRunner,
-    candidates: &[LegacyCleanupItem],
-) -> (
-    Vec<LegacyCleanupItem>,
-    Vec<crate::daemon::protocol::v2::LegacyCleanupFailure>,
-) {
-    let mut existing = Vec::new();
-    let mut failed = Vec::new();
-    let mut groups = BTreeMap::<(&str, &str), Vec<&LegacyCleanupItem>>::new();
-    for item in candidates {
-        groups
-            .entry((item.scope, item.target.as_str()))
-            .or_default()
-            .push(item);
-    }
-    for ((scope, target), items) in groups {
-        let mut args = vec!["show-option"];
-        match scope {
-            "pane" => args.push("-pq"),
-            "window" => args.push("-wq"),
-            "session" => args.push("-q"),
-            _ => unreachable!("legacy cleanup scope is fixed"),
-        }
-        args.extend(["-t", target]);
-        match runner.run(&args) {
-            Ok(output) => {
-                let present = output
-                    .lines()
-                    .filter_map(|line| line.split_whitespace().next())
-                    .collect::<BTreeSet<_>>();
-                existing.extend(
-                    items
-                        .into_iter()
-                        .filter(|item| present.contains(item.option))
-                        .cloned(),
-                );
-            }
-            Err(error) => {
-                let message = format!(
-                    "legacy option inspection failed: {}",
-                    error.to_string().chars().take(256).collect::<String>()
-                );
-                failed.extend(items.into_iter().map(|item| {
-                    crate::daemon::protocol::v2::LegacyCleanupFailure {
-                        scope: item.scope.to_string(),
-                        target: item.target.clone(),
-                        option: item.option.to_string(),
-                        message: message.clone(),
-                    }
-                }));
-            }
-        }
-    }
-    (existing, failed)
-}
-
-fn legacy_cleanup_scope_counts(
-    items: &[LegacyCleanupItem],
-) -> crate::daemon::protocol::v2::LegacyCleanupScopeCounts {
-    let mut counts = crate::daemon::protocol::v2::LegacyCleanupScopeCounts::default();
-    for item in items {
-        match item.scope {
-            "pane" => counts.pane = counts.pane.saturating_add(1),
-            "window" => counts.window = counts.window.saturating_add(1),
-            "session" => counts.session = counts.session.saturating_add(1),
-            _ => unreachable!("legacy cleanup scope is fixed"),
-        }
-    }
-    counts
-}
-
-fn bound_legacy_cleanup_failures(
-    mut failed: Vec<crate::daemon::protocol::v2::LegacyCleanupFailure>,
-) -> (
-    Vec<crate::daemon::protocol::v2::LegacyCleanupFailure>,
-    u64,
-    u64,
-) {
-    const MAX_REPORTED_CLEANUP_FAILURES: usize = 256;
-    let total = failed.len() as u64;
-    failed.truncate(MAX_REPORTED_CLEANUP_FAILURES);
-    let omitted = total.saturating_sub(failed.len() as u64);
-    (failed, total, omitted)
-}
-
-fn legacy_cleanup_command(item: &LegacyCleanupItem, index: usize) -> String {
-    let mut unset = vec!["set-option".to_string()];
-    match item.scope {
-        "pane" => unset.extend(["-p".to_string(), "-u".to_string()]),
-        "session" => unset.push("-u".to_string()),
-        "window" => unset.extend(["-w".to_string(), "-u".to_string()]),
-        _ => unreachable!("legacy cleanup scope is fixed"),
-    }
-    unset.extend([
-        "-t".to_string(),
-        item.target.clone(),
-        item.option.to_string(),
-    ]);
-    let unset = crate::pane_state::store::tmux_command_string(&unset);
-    let Some(pane_pid) = item.pane_pid else {
-        return unset;
-    };
-    crate::pane_state::store::tmux_command_string(&[
-        "if-shell".to_string(),
-        "-F".to_string(),
-        "-t".to_string(),
-        item.target.clone(),
-        format!("#{{==:#{{pane_pid}},{pane_pid}}}"),
-        unset,
-        format!("display-message -p '{LEGACY_CLEANUP_PANE_MISMATCH_PREFIX}:{index}'"),
-    ])
-}
-
-fn execute_legacy_cleanup(
-    runner: &dyn crate::tmux::TmuxRunner,
-    expected_server: &crate::daemon::topology::ServerIdentity,
-    items: &[LegacyCleanupItem],
-) -> LegacyCleanupOutcome {
-    let attempted = u64::try_from(items.len()).unwrap_or(u64::MAX);
-    if items.is_empty() {
-        return LegacyCleanupOutcome {
-            attempted,
-            removed: 0,
-            failed: Vec::new(),
-            server_mismatch: false,
-        };
-    }
-    let command = items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| legacy_cleanup_command(item, index))
-        .collect::<Vec<_>>()
-        .join(" ; ");
-    let guarded = crate::pane_state::store::server_guarded_command_args(
-        expected_server.pid,
-        expected_server.start_time,
-        command,
-        LEGACY_CLEANUP_SERVER_MISMATCH_SENTINEL,
-    );
-    let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
-    match runner.run(&refs) {
-        Ok(output)
-            if output
-                .lines()
-                .any(|line| line.trim() == LEGACY_CLEANUP_SERVER_MISMATCH_SENTINEL) =>
-        {
-            LegacyCleanupOutcome {
-                attempted,
-                removed: 0,
-                failed: Vec::new(),
-                server_mismatch: true,
-            }
-        }
-        Ok(output) => {
-            let mismatches = output
-                .lines()
-                .filter_map(|line| {
-                    line.trim()
-                        .strip_prefix(&format!("{LEGACY_CLEANUP_PANE_MISMATCH_PREFIX}:"))
-                        .and_then(|index| index.parse::<usize>().ok())
-                })
-                .collect::<BTreeSet<_>>();
-            let failed = mismatches
-                .into_iter()
-                .filter_map(|index| items.get(index))
-                .map(|item| crate::daemon::protocol::v2::LegacyCleanupFailure {
-                    scope: item.scope.to_string(),
-                    target: item.target.clone(),
-                    option: item.option.to_string(),
-                    message: "pane instance changed before cleanup".to_string(),
-                })
-                .collect::<Vec<_>>();
-            LegacyCleanupOutcome {
-                attempted,
-                removed: attempted.saturating_sub(failed.len() as u64),
-                failed,
-                server_mismatch: false,
-            }
-        }
-        Err(error) => {
-            let detail = error.to_string().chars().take(256).collect::<String>();
-            let message = format!("tmux legacy cleanup batch failed: {detail}");
-            LegacyCleanupOutcome {
-                attempted,
-                removed: 0,
-                failed: items
-                    .iter()
-                    .map(|item| crate::daemon::protocol::v2::LegacyCleanupFailure {
-                        scope: item.scope.to_string(),
-                        target: item.target.clone(),
-                        option: item.option.to_string(),
-                        message: message.clone(),
-                    })
-                    .collect(),
-                server_mismatch: false,
-            }
-        }
-    }
-}
-
-fn apply_legacy_cleanup(
-    coordinator: &ProductionV2Coordinator,
-    accepted_seq: u64,
-    event_id: crate::pane_state::EventId,
-    dry_run: bool,
-) -> crate::daemon::protocol::v2::ServerMessage {
-    use crate::daemon::protocol::v2::ServerMessage;
-
-    let topology = match query_full_topology(coordinator, Duration::from_secs(1)) {
-        Ok(topology) => topology,
-        Err(error) => {
-            if error.requires_daemon_exit() {
-                coordinator.fail_stop(error.to_string());
-            }
-            return ServerMessage::error(
-                crate::daemon::protocol::v2::ErrorCode::InternalError,
-                error.to_string(),
-                Some(event_id),
-            );
-        }
-    };
-    let candidates = legacy_cleanup_items(&topology);
-    let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
-    if let Err(error) = coordinator.incarnation.verify(&runner, &coordinator.env) {
-        coordinator.fail_stop("tmux server incarnation changed before legacy cleanup inspection");
-        return ServerMessage::error(
-            crate::daemon::protocol::v2::ErrorCode::InternalError,
-            error.to_string(),
-            Some(event_id),
-        );
-    }
-    let (items, mut inspection_failures) =
-        inspect_existing_legacy_cleanup_items(&runner, &candidates);
-    if let Err(error) = coordinator.incarnation.verify(&runner, &coordinator.env) {
-        coordinator.fail_stop("tmux server incarnation changed during legacy cleanup inspection");
-        return ServerMessage::error(
-            crate::daemon::protocol::v2::ErrorCode::InternalError,
-            error.to_string(),
-            Some(event_id),
-        );
-    }
-    let mut outcome = if dry_run {
-        LegacyCleanupOutcome {
-            attempted: items.len() as u64,
-            removed: 0,
-            failed: std::mem::take(&mut inspection_failures),
-            server_mismatch: false,
-        }
-    } else {
-        execute_legacy_cleanup(&runner, &coordinator.incarnation.identity, &items)
-    };
-    if !dry_run {
-        outcome.failed.extend(inspection_failures);
-    }
-    if outcome.server_mismatch {
-        coordinator.fail_stop("tmux server incarnation changed during legacy cleanup");
-        return ServerMessage::error(
-            crate::daemon::protocol::v2::ErrorCode::InternalError,
-            "tmux server incarnation changed during legacy cleanup",
-            Some(event_id),
-        );
-    }
-    let remaining_items = if dry_run {
-        items.clone()
-    } else {
-        let (remaining, post_inspection_failures) =
-            inspect_existing_legacy_cleanup_items(&runner, &items);
-        outcome.failed.extend(post_inspection_failures);
-        if let Err(error) = coordinator.incarnation.verify(&runner, &coordinator.env) {
-            coordinator
-                .fail_stop("tmux server incarnation changed during legacy cleanup verification");
-            return ServerMessage::error(
-                crate::daemon::protocol::v2::ErrorCode::InternalError,
-                error.to_string(),
-                Some(event_id),
-            );
-        }
-        let already_failed = outcome
-            .failed
-            .iter()
-            .map(|failure| {
-                (
-                    failure.scope.clone(),
-                    failure.target.clone(),
-                    failure.option.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        outcome.failed.extend(remaining.iter().filter_map(|item| {
-            let key = (
-                item.scope.to_string(),
-                item.target.clone(),
-                item.option.to_string(),
-            );
-            (!already_failed.contains(&key)).then(|| {
-                crate::daemon::protocol::v2::LegacyCleanupFailure {
-                    scope: key.0,
-                    target: key.1,
-                    option: key.2,
-                    message: "legacy option remained after cleanup".to_string(),
-                }
-            })
-        }));
-        outcome.removed = (items.len() as u64).saturating_sub(remaining.len() as u64);
-        remaining
-    };
-    let snapshot_revision = coordinator
-        .state
-        .lock()
-        .expect("canonical state lock poisoned")
-        .as_ref()
-        .map_or(0, |state| state.leased.runtime.snapshot_revision());
-    let (failed, failed_total, failed_omitted) = bound_legacy_cleanup_failures(outcome.failed);
-    ServerMessage::CleanupLegacyResult {
+    ServerMessage::ViewQueued {
         event_id,
         accepted_seq,
-        dry_run,
-        attempted: outcome.attempted,
-        removed: outcome.removed,
-        remaining: remaining_items.len() as u64,
-        scope_counts: legacy_cleanup_scope_counts(&items),
-        remaining_scope_counts: legacy_cleanup_scope_counts(&remaining_items),
-        failed,
-        failed_total,
-        failed_omitted,
-        snapshot_revision,
     }
 }
 
@@ -5378,7 +4138,7 @@ fn parse_observation_poll_projection(
         status_metadata: status_projection_metadata(status),
         witnesses,
         observation_bases: BTreeMap::new(),
-        view_base: crate::daemon::view_hooks::ViewRegistry::default(),
+        view_base: crate::daemon::view_hooks::CurrentClientViews::default(),
     })
 }
 
@@ -5426,16 +4186,11 @@ fn status_projection_metadata(
 ) -> super::runtime::StatusProjectionMetadata {
     let mut metadata = super::runtime::StatusProjectionMetadata::default();
     for session in snapshot.sessions {
-        if let Some(category) = session.category.clone() {
-            metadata.categories.insert(category);
-        }
         metadata.sessions.insert(
             session.session_id,
             super::runtime::SessionProjectionMetadata {
                 session_name: session.session_name,
-                stored_category: session.category,
                 project_path: session.project_path,
-                category_override: session.category_override,
                 attached: Some(session.attached),
                 created_at: Some(session.created_at),
             },
@@ -5459,7 +4214,7 @@ fn query_client_witnesses(
     timeout: Duration,
 ) -> Result<Vec<crate::pane_state::ClientWitness>, crate::daemon::view_hooks::FreshVisibilityError>
 {
-    let token = crate::pane_state::EventId::generate()
+    let token = EventId::generate()
         .map_err(|error| crate::daemon::view_hooks::FreshVisibilityError::Query(error.to_string()))?
         .as_str()
         .to_string();
@@ -5529,21 +4284,17 @@ fn apply_observation_poll_projection(
 fn observation_poll_error_response(
     coordinator: &ProductionV2Coordinator,
     error: anyhow::Error,
-) -> crate::daemon::protocol::v2::ServerMessage {
+) -> ServerMessage {
     match error.downcast::<crate::pane_state::store::StoreError>() {
         Ok(store_error) => production_store_error_response(coordinator, store_error, None),
-        Err(error) => crate::daemon::protocol::v2::ServerMessage::error(
-            crate::daemon::protocol::v2::ErrorCode::InternalError,
-            error.to_string(),
-            None,
-        ),
+        Err(error) => ServerMessage::error(ErrorCode::InternalError, error.to_string(), None),
     }
 }
 
 fn targeted_pane_refresh_response(
     coordinator: &ProductionV2Coordinator,
     pane_id: &str,
-) -> crate::daemon::protocol::v2::ServerMessage {
+) -> ServerMessage {
     let io = crate::daemon::topology::SystemTargetedRefreshIo::new(
         coordinator
             .env
@@ -5563,7 +4314,7 @@ fn targeted_pane_refresh_outcome_response(
         crate::daemon::topology::TargetedRefreshOutcome,
         crate::daemon::topology::TopologyError,
     >,
-) -> crate::daemon::protocol::v2::ServerMessage {
+) -> ServerMessage {
     use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
 
     match outcome {
@@ -5632,19 +4383,15 @@ fn targeted_pane_refresh_outcome_response(
     }
 }
 
-fn store_error_code(
-    error: &crate::pane_state::store::StoreError,
-) -> crate::daemon::protocol::v2::ErrorCode {
-    use crate::daemon::protocol::v2::ErrorCode;
+fn store_error_code(error: &crate::pane_state::store::StoreError) -> ErrorCode {
     use crate::pane_state::reducer::ReduceError;
     use crate::pane_state::store::StoreError;
+    use ErrorCode;
     match error {
         StoreError::StateTooLarge => ErrorCode::StateTooLarge,
-        StoreError::StateLoad(_) | StoreError::ExternalWriter(_) => ErrorCode::StateLoadError,
         StoreError::InvalidPaneInstance => ErrorCode::InvalidPaneInstance,
         StoreError::StaleStateIdentity => ErrorCode::StaleStateIdentity,
         StoreError::WriterLeaseHeld => ErrorCode::WriterLeaseHeld,
-        StoreError::PersistPending => ErrorCode::NotReady,
         StoreError::PersistFailed(_) => ErrorCode::PersistFailed,
         StoreError::FailStop(_) | StoreError::CounterOverflow(_) | StoreError::Random(_) => {
             ErrorCode::InternalError
@@ -5666,20 +4413,16 @@ fn store_error_code(
 
 fn store_error_response(
     error: crate::pane_state::store::StoreError,
-    event_id: Option<crate::pane_state::EventId>,
-) -> crate::daemon::protocol::v2::ServerMessage {
-    crate::daemon::protocol::v2::ServerMessage::error(
-        store_error_code(&error),
-        error.to_string(),
-        event_id,
-    )
+    event_id: Option<EventId>,
+) -> ServerMessage {
+    ServerMessage::error(store_error_code(&error), error.to_string(), event_id)
 }
 
 fn production_store_error_response(
     coordinator: &ProductionV2Coordinator,
     error: crate::pane_state::store::StoreError,
-    event_id: Option<crate::pane_state::EventId>,
-) -> crate::daemon::protocol::v2::ServerMessage {
+    event_id: Option<EventId>,
+) -> ServerMessage {
     if error.requires_daemon_exit() {
         coordinator.fail_stop(error.to_string());
     }
@@ -5690,13 +4433,6 @@ fn epoch_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs() as i64)
-}
-
-fn bounded_recovery_timeout(remaining: Option<Duration>) -> Duration {
-    remaining
-        .unwrap_or(Duration::from_secs(3))
-        .min(Duration::from_secs(3))
-        .max(Duration::from_millis(1))
 }
 
 pub fn run_runtime_daemon_server(
@@ -5989,9 +4725,8 @@ fn bootstrap_v2_runtime(
         &session_framing,
         &coordinator.incarnation.identity,
     )?;
-    let (records, topology, witnesses) = if session_count == 0 {
+    let (topology, witnesses) = if session_count == 0 {
         (
-            Vec::new(),
             crate::daemon::topology::TopologySnapshot {
                 server_identity: coordinator.incarnation.identity.clone(),
                 panes: Vec::new(),
@@ -5999,22 +4734,38 @@ fn bootstrap_v2_runtime(
             Vec::new(),
         )
     } else {
-        let hydrate_framing = crate::daemon::topology::QueryFraming::generate()?;
-        let hydrate_args = crate::daemon::topology::hydrate_query_args(&hydrate_framing);
-        let hydrate_refs = hydrate_args.iter().map(String::as_str).collect::<Vec<_>>();
-        let hydrate_output = runner.run(&hydrate_refs)?;
-        let records = crate::daemon::topology::parse_hydrate_records(
-            &hydrate_output,
-            &hydrate_framing,
-            &coordinator.incarnation.identity,
-        )?;
         let topology = query_full_topology(coordinator, Duration::from_secs(1))?;
         let witnesses = query_client_witnesses(coordinator, Duration::from_secs(1))?;
-        (records, topology, witnesses)
+        (topology, witnesses)
     };
-    leased.hydrate(records);
-    let mut views = crate::daemon::view_hooks::ViewRegistry::default();
-    let mut window_panes = BTreeMap::<String, Vec<crate::pane_state::PaneInstance>>::new();
+    let snapshot_path =
+        crate::pane_state::snapshot::snapshot_path(env, &coordinator.incarnation.hash);
+    let mut records = crate::pane_state::snapshot::load_snapshot(
+        &snapshot_path,
+        &coordinator.incarnation.identity,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "pane snapshot {} is invalid: {error}; remove {} to reset all pane state",
+            snapshot_path.display(),
+            snapshot_path.display()
+        )
+    })?;
+    let record_count = records.len();
+    crate::pane_state::snapshot::retain_topology_records(
+        &mut records,
+        topology.panes.iter().map(|pane| pane.pane_instance.clone()),
+    );
+    if records.len() != record_count {
+        crate::pane_state::snapshot::save_snapshot(
+            &snapshot_path,
+            &coordinator.incarnation.identity,
+            &records,
+        )?;
+    }
+    leased.hydrate(records)?;
+    let mut views = crate::daemon::view_hooks::CurrentClientViews::default();
+    let mut window_panes = BTreeMap::<String, Vec<PaneInstance>>::new();
     for pane in &topology.panes {
         window_panes
             .entry(pane.window_id.clone())
@@ -6025,20 +4776,20 @@ fn bootstrap_v2_runtime(
         .reconcile(&witnesses, &window_panes)
         .map_err(|error| anyhow::anyhow!("failed to build initial view registry: {error}"))?;
     let status_metadata = query_status_projection_metadata(coordinator, Duration::from_secs(1))?;
-    let state_path = crate::sidebar::store::state_path(env);
-    let sidebar_order = crate::sidebar::store::load_state(&state_path)?;
-    let expansion_path = crate::sidebar::store::expansion_state_path(env);
-    let sidebar_expansion = crate::sidebar::store::load_expansion_state(&expansion_path)?;
-    let mut canonical =
-        super::runtime::CanonicalCoordinatorState::new(leased, topology, views, sidebar_order);
-    canonical.sidebar_expansion = sidebar_expansion;
+    let state_path = crate::sidebar::store::state_path(env, &coordinator.incarnation.socket_path);
+    let sidebar_preferences = crate::sidebar::store::load_state(&state_path)?;
+    let mut canonical = super::runtime::CanonicalCoordinatorState::new(
+        leased,
+        topology,
+        views,
+        sidebar_preferences,
+    );
     canonical.status_metadata = status_metadata;
     canonical.projection_config = config.clone();
     *coordinator
         .state
         .lock()
         .expect("canonical state lock poisoned") = Some(canonical);
-    coordinator.establish_quarantine_baseline();
 
     let mut initial_reconciliation_queued = false;
     loop {
@@ -6104,13 +4855,10 @@ fn initial_view_reconciliation(coordinator: &ProductionV2Coordinator) -> Result<
 fn reconcile_views_with_witnesses(
     coordinator: &ProductionV2Coordinator,
     witnesses: &[crate::pane_state::ClientWitness],
-    observation_bases: Option<
-        &BTreeMap<
-            crate::pane_state::PaneInstance,
-            Option<crate::pane_state::StoredStateDescriptor>,
-        >,
+    _observation_bases: Option<
+        &BTreeMap<PaneInstance, Option<crate::pane_state::StoredStateDescriptor>>,
     >,
-    view_base: Option<&crate::daemon::view_hooks::ViewRegistry>,
+    view_base: Option<&crate::daemon::view_hooks::CurrentClientViews>,
 ) -> Result<()> {
     let mut state_guard = coordinator
         .state
@@ -6123,128 +4871,28 @@ fn reconcile_views_with_witnesses(
         return Ok(());
     }
     let window_panes = state.window_panes();
-    let records = records_at_observation_base(state.records_snapshot(), observation_bases);
     let revision_before = state.leased.runtime.snapshot_revision();
     let mut next_views = state.views.clone();
-    let result = crate::daemon::view_hooks::reconcile_current_views(
+    let registry_changed = crate::daemon::view_hooks::reconcile_current_views(
         &mut next_views,
-        coordinator
-            .router
-            .lock()
-            .expect("v2 router lock poisoned")
-            .daemon_instance_id(),
         witnesses,
         &window_panes,
-        coordinator.done_clear_on,
-        &records,
     )?;
-    let registry_changed = result.registry_changed;
-    if result.acknowledgements.is_empty() {
-        state.views = next_views;
-        state.leased.runtime.finish_sequenced_projection(
-            None,
-            std::iter::empty(),
-            registry_changed,
-            revision_before,
-        )?;
-        return Ok(());
-    }
-    let mut clock = crate::pane_state::store::SystemRecoveryClock::start();
-    let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
-    let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
-        &runner,
-        coordinator.incarnation.identity.pid,
-        coordinator.incarnation.identity.start_time,
-    );
-    let progress = state.leased.runtime.apply_view_acknowledgement_batch(
-        &mut io,
-        &mut clock,
-        &result.acknowledgements,
-        coordinator.done_clear_on,
-    );
-    match progress {
-        crate::pane_state::store::ViewBatchProgress::Complete(_) => {
-            let state = state_guard
-                .as_mut()
-                .expect("state initialized after reconciliation");
-            state.views = next_views;
-            state.leased.runtime.finish_sequenced_projection(
-                None,
-                std::iter::empty(),
-                registry_changed,
-                revision_before,
-            )?;
-            Ok(())
-        }
-        crate::pane_state::store::ViewBatchProgress::Pending(mut continuation) => loop {
-            drop(state_guard);
-            thread::sleep(crate::pane_state::store::STORE_RECOVERY_RETRY_INTERVAL);
-            state_guard = coordinator
-                .state
-                .lock()
-                .expect("canonical state lock poisoned");
-            let state = state_guard
-                .as_mut()
-                .expect("state initialized during reconciliation");
-            let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
-            let mut io = crate::pane_state::store::TmuxPaneStateStoreIo::new(
-                &runner,
-                coordinator.incarnation.identity.pid,
-                coordinator.incarnation.identity.start_time,
-            );
-            match state.leased.runtime.resume_view_acknowledgement_batch(
-                &mut io,
-                &mut clock,
-                continuation,
-            ) {
-                crate::pane_state::store::ViewBatchProgress::Complete(_) => {
-                    state.views = next_views;
-                    state.leased.runtime.finish_sequenced_projection(
-                        None,
-                        std::iter::empty(),
-                        registry_changed,
-                        revision_before,
-                    )?;
-                    break Ok(());
-                }
-                crate::pane_state::store::ViewBatchProgress::Pending(next) => continuation = next,
-                crate::pane_state::store::ViewBatchProgress::Blocked(error)
-                | crate::pane_state::store::ViewBatchProgress::Fatal(error) => {
-                    break Err(anyhow::Error::new(error));
-                }
-            }
-        },
-        crate::pane_state::store::ViewBatchProgress::Blocked(error)
-        | crate::pane_state::store::ViewBatchProgress::Fatal(error) => {
-            Err(anyhow::Error::new(error))
-        }
-    }
+    state.views = next_views;
+    state.leased.runtime.finish_sequenced_projection(
+        None,
+        std::iter::empty(),
+        registry_changed,
+        revision_before,
+    )?;
+    Ok(())
 }
 
 fn observation_view_base_matches(
-    current: &crate::daemon::view_hooks::ViewRegistry,
-    observation_base: Option<&crate::daemon::view_hooks::ViewRegistry>,
+    current: &crate::daemon::view_hooks::CurrentClientViews,
+    observation_base: Option<&crate::daemon::view_hooks::CurrentClientViews>,
 ) -> bool {
     observation_base.is_none_or(|base| current == base)
-}
-
-fn records_at_observation_base(
-    mut records: BTreeMap<crate::pane_state::PaneInstance, crate::pane_state::StoredPaneRecord>,
-    observation_bases: Option<
-        &BTreeMap<
-            crate::pane_state::PaneInstance,
-            Option<crate::pane_state::StoredStateDescriptor>,
-        >,
-    >,
-) -> BTreeMap<crate::pane_state::PaneInstance, crate::pane_state::StoredPaneRecord> {
-    if let Some(observation_bases) = observation_bases {
-        records.retain(|pane, record| {
-            observation_bases
-                .get(pane)
-                .is_some_and(|base| base.as_ref() == Some(&record.descriptor()))
-        });
-    }
-    records
 }
 
 fn bind_daemon_listener(
@@ -6345,15 +4993,74 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::protocol::v2::PROTOCOL_VERSION;
     const V2_EVENT_ID: &str = "102132435465768798a9bacbdcedfe0f";
     const V2_DAEMON_ID: &str = "ffeeddccbbaa99887766554433221100";
     const POLL_TOKEN: &str = "00112233445566778899aabbccddeeff";
+
+    fn test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "vde-{label}-{}-{}",
+            std::process::id(),
+            EventId::generate().unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn test_incarnation(
+        root: &Path,
+        hash: impl Into<String>,
+    ) -> crate::daemon::lifecycle::TmuxServerIncarnation {
+        crate::daemon::lifecycle::TmuxServerIncarnation {
+            socket_path: root.join("tmux.sock"),
+            identity: crate::daemon::topology::ServerIdentity {
+                pid: 1,
+                start_time: 2,
+            },
+            hash: hash.into(),
+        }
+    }
+
+    fn test_coordinator(root: &Path, hash: impl Into<String>) -> ProductionV2Coordinator {
+        ProductionV2Coordinator::new(
+            test_incarnation(root, hash),
+            BTreeMap::new(),
+            crate::config::DoneClearOn::Pane,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn detached_test_coordinator(hash: impl Into<String>) -> ProductionV2Coordinator {
+        test_coordinator(Path::new("/tmp/vde-test"), hash)
+    }
+
+    fn install_test_state(
+        coordinator: &ProductionV2Coordinator,
+        root: &Path,
+        views: crate::daemon::view_hooks::CurrentClientViews,
+    ) {
+        let leased =
+            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
+                .unwrap();
+        *coordinator.state.lock().unwrap() =
+            Some(super::super::runtime::CanonicalCoordinatorState::new(
+                leased,
+                crate::daemon::topology::TopologySnapshot {
+                    server_identity: coordinator.incarnation.identity.clone(),
+                    panes: Vec::new(),
+                },
+                views,
+                crate::sidebar::state::SidebarPreferences::default(),
+            ));
+    }
 
     #[test]
     fn runtime_cleanup_removes_owned_socket_and_process_record_on_early_return() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let event_id = crate::pane_state::EventId::generate().unwrap();
+        let event_id = EventId::generate().unwrap();
         let root = PathBuf::from(format!(
             "/tmp/vrc-{}-{}",
             std::process::id(),
@@ -6404,7 +5111,7 @@ mod tests {
     fn post_bind_initialization_failure_removes_socket_and_releases_instance_lock() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let event_id = crate::pane_state::EventId::generate().unwrap();
+        let event_id = EventId::generate().unwrap();
         let root = PathBuf::from(format!(
             "/tmp/vpb-{}-{}",
             std::process::id(),
@@ -6470,7 +5177,7 @@ mod tests {
 
     #[test]
     fn bound_socket_cleanup_preserves_replacement_socket() {
-        let event_id = crate::pane_state::EventId::generate().unwrap();
+        let event_id = EventId::generate().unwrap();
         let root = PathBuf::from(format!(
             "/tmp/vbs-{}-{}",
             std::process::id(),
@@ -6484,7 +5191,7 @@ mod tests {
         let replacement_listener = UnixListener::bind(&socket).unwrap();
         let replacement_identity = crate::daemon::lifecycle::daemon_process_identity(
             &socket,
-            &crate::pane_state::DaemonInstanceId::parse(V2_DAEMON_ID.to_string()).unwrap(),
+            &DaemonInstanceId::parse(V2_DAEMON_ID.to_string()).unwrap(),
         )
         .unwrap();
 
@@ -6660,7 +5367,7 @@ mod tests {
         assert_eq!(
             completion_window_id(
                 &projection.topology,
-                &crate::pane_state::PaneInstance {
+                &PaneInstance {
                     pane_id: "%1".to_string(),
                     pane_pid: 100,
                 },
@@ -6670,7 +5377,7 @@ mod tests {
         assert_eq!(
             completion_window_id(
                 &projection.topology,
-                &crate::pane_state::PaneInstance {
+                &PaneInstance {
                     pane_id: "%1".to_string(),
                     pane_pid: 101,
                 },
@@ -6680,50 +5387,12 @@ mod tests {
     }
 
     #[test]
-    fn stale_poll_view_and_state_bases_block_reconciliation_inputs() {
-        let pane = crate::pane_state::PaneInstance {
+    fn stale_poll_view_base_blocks_full_replacement() {
+        let pane = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
-        let state = |revision, completed_seq| {
-            crate::pane_state::StoredPaneRecord::Active(crate::pane_state::PaneState {
-                schema_version: crate::pane_state::PANE_STATE_SCHEMA_VERSION,
-                state_id: crate::pane_state::StateId::parse(POLL_TOKEN).unwrap(),
-                revision,
-                pane_instance: pane.clone(),
-                agent: crate::pane_state::AgentKind::parse("codex").unwrap(),
-                agent_session_id: None,
-                agent_epoch: 1,
-                agent_present: true,
-                scan_verified: true,
-                synthetic_completion_armed: false,
-                lifecycle: crate::pane_state::LifecycleState::Idle,
-                run_seq: completed_seq,
-                completed_seq,
-                acknowledged_seq: 0,
-                started_at: Some(1),
-                completed_at: Some(2),
-                prompt: None,
-                tasks: crate::pane_state::TaskState::default(),
-                subagents: Vec::new(),
-                worktree_activity: None,
-            })
-        };
-        let observed = state(3, 1);
-        let newer = state(4, 2);
-        let bases = BTreeMap::from([(pane.clone(), Some(observed.descriptor()))]);
-
-        assert_eq!(
-            records_at_observation_base(BTreeMap::from([(pane.clone(), observed)]), Some(&bases),)
-                .len(),
-            1
-        );
-        assert!(
-            records_at_observation_base(BTreeMap::from([(pane.clone(), newer)]), Some(&bases))
-                .is_empty()
-        );
-
-        let view_base = crate::daemon::view_hooks::ViewRegistry::default();
+        let view_base = crate::daemon::view_hooks::CurrentClientViews::default();
         let mut current = view_base.clone();
         current
             .reconcile(
@@ -6741,23 +5410,21 @@ mod tests {
         assert!(!observation_view_base_matches(&current, Some(&view_base)));
     }
 
-    fn v2_daemon_id() -> crate::pane_state::DaemonInstanceId {
-        crate::pane_state::DaemonInstanceId::parse(V2_DAEMON_ID).unwrap()
+    fn v2_daemon_id() -> DaemonInstanceId {
+        DaemonInstanceId::parse(V2_DAEMON_ID).unwrap()
     }
 
-    fn v2_event_id() -> crate::pane_state::EventId {
-        crate::pane_state::EventId::parse(V2_EVENT_ID).unwrap()
+    fn v2_event_id() -> EventId {
+        EventId::parse(V2_EVENT_ID).unwrap()
     }
 
-    fn v2_pane_event(
-        event: crate::pane_state::PaneEvent,
-    ) -> crate::daemon::protocol::v2::ClientMessage {
-        crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent {
-            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-            envelope: crate::pane_state::PaneEventEnvelope {
+    fn v2_pane_event(event: PaneEvent) -> ClientMessage {
+        ClientMessage::SubmitPaneEvent {
+            proto: PROTOCOL_VERSION,
+            envelope: PaneEventEnvelope {
                 daemon_instance_id: v2_daemon_id(),
                 event_id: v2_event_id(),
-                pane_instance: crate::pane_state::PaneInstance {
+                pane_instance: PaneInstance {
                     pane_id: "%1".to_string(),
                     pane_pid: 100,
                 },
@@ -6770,8 +5437,8 @@ mod tests {
         }
     }
 
-    fn v2_begin() -> crate::daemon::protocol::v2::ClientMessage {
-        v2_pane_event(crate::pane_state::PaneEvent::BeginRun {
+    fn v2_begin() -> ClientMessage {
+        v2_pane_event(PaneEvent::BeginRun {
             started_at: 1,
             prompt: None,
         })
@@ -6780,14 +5447,14 @@ mod tests {
     fn v2_handshake(router: &mut V2Router, connection: &mut V2ConnectionState) {
         let route = router.route(
             connection,
-            crate::daemon::protocol::v2::ClientMessage::Hello {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            ClientMessage::Hello {
+                proto: PROTOCOL_VERSION,
             },
         );
         assert!(matches!(
             route,
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::HelloAck {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            V2Route::Response(ServerMessage::HelloAck {
+                proto: PROTOCOL_VERSION,
                 ..
             })
         ));
@@ -6795,12 +5462,7 @@ mod tests {
 
     #[test]
     fn canonical_notification_worker_exports_blocked_environment() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-notification-worker-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_root("notification-worker");
         let output = root.join("env.txt");
         let command = format!(
             "printf '%s|%s|%s' \"$VDE_PANE_ID\" \"$VDE_AGENT\" \"$VDE_BADGE_STATE\" > '{}'",
@@ -6829,20 +5491,13 @@ mod tests {
 
     #[test]
     fn canonical_notification_timeout_kills_descendant_processes() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-notification-timeout-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_root("notification-timeout");
         let pid_file = root.join("child.pid");
         let command = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
-        let health = Arc::new(NotificationHealthCounters::default());
         let sender = start_notification_worker_with_timeout_and_log(
             command,
             Duration::from_millis(100),
             None,
-            Some(health.clone()),
         );
         sender
             .try_send(NotificationWorkerJob {
@@ -6876,33 +5531,17 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(health.failures.load(Ordering::SeqCst), 1);
-        assert!(health.degraded.load(Ordering::SeqCst));
-        assert_eq!(
-            health.last_error_code.lock().unwrap().as_deref(),
-            Some("timeout")
-        );
         drop(sender);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn canonical_notification_successful_leader_exit_kills_background_descendants() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-notification-background-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_root("notification-background");
         let pid_file = root.join("child.pid");
         let command = format!("sleep 30 & echo $! > '{}'", pid_file.display());
-        let health = Arc::new(NotificationHealthCounters::default());
-        let sender = start_notification_worker_with_timeout_and_log(
-            command,
-            Duration::from_secs(2),
-            None,
-            Some(health.clone()),
-        );
+        let sender =
+            start_notification_worker_with_timeout_and_log(command, Duration::from_secs(2), None);
         sender
             .try_send(NotificationWorkerJob {
                 pane_id: "%7".to_string(),
@@ -6930,8 +5569,6 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(health.failures.load(Ordering::SeqCst), 0);
-        assert!(!health.degraded.load(Ordering::SeqCst));
         drop(sender);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -6940,19 +5577,13 @@ mod tests {
     fn canonical_notification_failure_is_written_to_private_incarnation_log() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root = std::env::temp_dir().join(format!(
-            "vde-notification-log-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
+        let root = test_root("notification-log");
         let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
         let hash = "c".repeat(64);
-        let health = Arc::new(NotificationHealthCounters::default());
         let sender = start_notification_worker_with_timeout_and_log(
             "exit 7".to_string(),
             Duration::from_secs(1),
             Some((env.clone(), hash.clone())),
-            Some(health.clone()),
         );
         sender
             .try_send(NotificationWorkerJob {
@@ -6960,21 +5591,16 @@ mod tests {
                 agent: "codex".to_string(),
             })
             .unwrap();
-        let path = crate::daemon::lifecycle::incarnation_log_path(&env, &hash, "notification.log");
+        let path = crate::daemon::lifecycle::daemon_log_path(&env, &hash);
         let deadline = Instant::now() + Duration::from_secs(1);
         while !path.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
 
         let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("notification:"));
         assert!(contents.contains("exited with status"));
         assert!(contents.contains("pane %7"));
-        assert_eq!(health.failures.load(Ordering::SeqCst), 1);
-        assert!(health.degraded.load(Ordering::SeqCst));
-        assert_eq!(
-            health.last_error_code.lock().unwrap().as_deref(),
-            Some("nonzero_exit")
-        );
         assert_eq!(
             std::fs::metadata(path.parent().unwrap())
                 .unwrap()
@@ -7002,21 +5628,34 @@ mod tests {
     }
 
     #[test]
-    fn production_fail_stop_marks_router_and_releases_waiters() {
+    fn status_push_failure_uses_the_shared_daemon_log() {
+        let root = test_root("status-push-log");
+        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+        let hash = "d".repeat(64);
         let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: "/tmp/vde-test-tmux.sock".into(),
-                identity: crate::daemon::topology::ServerIdentity {
-                    pid: 1,
-                    start_time: 2,
-                },
-                hash: "a".repeat(64),
-            },
-            BTreeMap::new(),
+            test_incarnation(&root, hash.clone()),
+            env.clone(),
             crate::config::DoneClearOn::Pane,
             None,
         )
         .unwrap();
+
+        coordinator.log_status_push_error("test failure");
+
+        let contents =
+            std::fs::read_to_string(crate::daemon::lifecycle::daemon_log_path(&env, &hash))
+                .unwrap();
+        assert!(contents.contains("status_push: test failure"));
+        for dedicated in ["notification.log", "status-push.log", "pane-state-hook.log"] {
+            assert!(!root.join("vde-tmux").join(&hash).join(dedicated).exists());
+        }
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn production_fail_stop_marks_router_and_releases_waiters() {
+        let coordinator = detached_test_coordinator("a".repeat(64));
         let (sender, receiver) = mpsc::channel();
         coordinator.waiters.lock().unwrap().insert(1, sender);
 
@@ -7027,8 +5666,8 @@ mod tests {
         assert!(coordinator.shutdown_ready.load(Ordering::SeqCst));
         assert!(matches!(
             receiver.recv_timeout(Duration::from_millis(100)).unwrap(),
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::InternalError,
+            ServerMessage::Error {
+                code: ErrorCode::InternalError,
                 ..
             }
         ));
@@ -7036,20 +5675,7 @@ mod tests {
 
     #[test]
     fn observation_poll_store_fail_stop_reaches_coordinator() {
-        let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: "/tmp/vde-test-tmux.sock".into(),
-                identity: crate::daemon::topology::ServerIdentity {
-                    pid: 1,
-                    start_time: 2,
-                },
-                hash: "b".repeat(64),
-            },
-            BTreeMap::new(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
+        let coordinator = detached_test_coordinator("b".repeat(64));
 
         let response = observation_poll_error_response(
             &coordinator,
@@ -7061,8 +5687,8 @@ mod tests {
         assert!(coordinator.router.lock().unwrap().is_fatal());
         assert!(matches!(
             response,
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::InternalError,
+            ServerMessage::Error {
+                code: ErrorCode::InternalError,
                 ..
             }
         ));
@@ -7070,32 +5696,19 @@ mod tests {
 
     #[test]
     fn disconnected_mutation_waiter_enqueues_sequenced_diagnostic() {
-        let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: "/tmp/vde-test-tmux.sock".into(),
-                identity: crate::daemon::topology::ServerIdentity {
-                    pid: 1,
-                    start_time: 2,
-                },
-                hash: "d".repeat(64),
-            },
-            BTreeMap::new(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
+        let coordinator = detached_test_coordinator("d".repeat(64));
         coordinator
             .router
             .lock()
             .unwrap()
-            .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+            .set_phase(DaemonPhase::Serving);
         let (sender, receiver) = mpsc::channel();
         drop(receiver);
         coordinator.waiters.lock().unwrap().insert(3, sender);
 
         coordinator.complete(
             3,
-            crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+            ServerMessage::SnapshotAck {
                 event_id: v2_event_id(),
                 accepted_seq: 3,
                 snapshot_revision: 0,
@@ -7116,20 +5729,7 @@ mod tests {
 
     #[test]
     fn graceful_shutdown_releases_later_waiters_and_keeps_current_response() {
-        let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: "/tmp/vde-test-tmux.sock".into(),
-                identity: crate::daemon::topology::ServerIdentity {
-                    pid: 1,
-                    start_time: 2,
-                },
-                hash: "b".repeat(64),
-            },
-            BTreeMap::new(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
+        let coordinator = detached_test_coordinator("b".repeat(64));
         let (current_tx, current_rx) = mpsc::channel();
         let (later_tx, later_rx) = mpsc::channel();
         coordinator
@@ -7143,23 +5743,23 @@ mod tests {
 
         assert!(matches!(
             later_rx.recv_timeout(Duration::from_millis(100)).unwrap(),
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::NotReady,
+            ServerMessage::Error {
+                code: ErrorCode::NotReady,
                 ..
             }
         ));
         assert!(current_rx.try_recv().is_err());
         let response = coordinator.route_external(
             &mut V2ConnectionState::default(),
-            crate::daemon::protocol::v2::ClientMessage::Hello {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            ClientMessage::Hello {
+                proto: PROTOCOL_VERSION,
             },
             0,
         );
         assert!(matches!(
             response,
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::NotReady,
+            ServerMessage::Error {
+                code: ErrorCode::NotReady,
                 ..
             }
         ));
@@ -7167,14 +5767,14 @@ mod tests {
         assert!(current_rx.try_recv().is_err());
         coordinator.complete(
             4,
-            crate::daemon::protocol::v2::ServerMessage::ShutdownAccepted {
+            ServerMessage::ShutdownAccepted {
                 event_id: v2_event_id(),
                 accepted_seq: 4,
             },
         );
         assert!(matches!(
             current_rx.recv_timeout(Duration::from_millis(100)).unwrap(),
-            crate::daemon::protocol::v2::ServerMessage::ShutdownAccepted {
+            ServerMessage::ShutdownAccepted {
                 accepted_seq: 4,
                 ..
             }
@@ -7184,27 +5784,15 @@ mod tests {
     }
 
     #[test]
-    fn mutation_queue_capacity_records_internal_drops_in_health_and_log() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-mutation-queue-capacity-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+    fn mutation_queue_capacity_logs_each_internal_drop() {
+        let root = test_root("mutation-queue-capacity");
         let env = BTreeMap::from([(
             "XDG_STATE_HOME".to_string(),
             root.to_string_lossy().into_owned(),
         )]);
         let hash = "mutation-queue-capacity";
         let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: root.join("tmux.sock"),
-                identity: crate::daemon::topology::ServerIdentity {
-                    pid: 1,
-                    start_time: 2,
-                },
-                hash: hash.to_string(),
-            },
+            test_incarnation(&root, hash),
             env.clone(),
             crate::config::DoneClearOn::Pane,
             None,
@@ -7214,35 +5802,19 @@ mod tests {
             .router
             .lock()
             .unwrap()
-            .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+            .set_phase(DaemonPhase::Serving);
 
         for _ in 0..V2_MUTATION_QUEUE_CAPACITY {
             assert!(coordinator.enqueue_internal(V2InternalMutation::RefreshTopology));
         }
         assert!(!coordinator.enqueue_internal(V2InternalMutation::RefreshTopology));
         assert!(!coordinator.enqueue_internal(V2InternalMutation::RefreshTopology));
-        assert_eq!(coordinator.mutation_queue_drops.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            *coordinator.recent_error_code.lock().unwrap(),
-            Some(crate::daemon::protocol::v2::ErrorCode::QueueFull)
-        );
-        assert!(matches!(
-            coordinator.query(crate::daemon::protocol::v2::ClientMessage::QueryHealth {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-            }),
-            crate::daemon::protocol::v2::ServerMessage::HealthResult {
-                health: crate::daemon::protocol::v2::DaemonHealth {
-                    recent_error_code: Some(crate::daemon::protocol::v2::ErrorCode::QueueFull),
-                    ..
-                }
-            }
-        ));
-        let log = crate::daemon::lifecycle::read_incarnation_log_tail(&env, hash, "daemon.log", 10)
-            .unwrap();
+        let log =
+            std::fs::read_to_string(crate::daemon::lifecycle::daemon_log_path(&env, hash)).unwrap();
         assert_eq!(
             log.matches("sequenced mutation queue full: dropped internal mutation")
                 .count(),
-            1
+            2
         );
 
         drop(coordinator);
@@ -7252,32 +5824,17 @@ mod tests {
     #[test]
     fn observation_poll_burst_enqueues_one_batch_mutation() {
         for pane_count in [63, 256, 512] {
-            let root = std::env::temp_dir().join(format!(
-                "vde-observation-burst-{pane_count}-{}-{}",
-                std::process::id(),
-                crate::pane_state::EventId::generate().unwrap().as_str()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
+            let root = test_root(&format!("observation-burst-{pane_count}"));
             let server_identity = crate::daemon::topology::ServerIdentity {
                 pid: 1,
                 start_time: 2,
             };
-            let coordinator = ProductionV2Coordinator::new(
-                crate::daemon::lifecycle::TmuxServerIncarnation {
-                    socket_path: root.join("tmux.sock"),
-                    identity: server_identity.clone(),
-                    hash: format!("observation-burst-{pane_count}"),
-                },
-                BTreeMap::new(),
-                crate::config::DoneClearOn::Pane,
-                None,
-            )
-            .unwrap();
+            let coordinator = test_coordinator(&root, format!("observation-burst-{pane_count}"));
             coordinator
                 .router
                 .lock()
                 .unwrap()
-                .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+                .set_phase(DaemonPhase::Serving);
             let daemon_instance_id = coordinator
                 .router
                 .lock()
@@ -7286,16 +5843,16 @@ mod tests {
                 .clone();
 
             let observations = (0..pane_count)
-                .map(|index| crate::pane_state::PaneEventEnvelope {
+                .map(|index| PaneEventEnvelope {
                     daemon_instance_id: daemon_instance_id.clone(),
-                    event_id: crate::pane_state::EventId::generate().unwrap(),
-                    pane_instance: crate::pane_state::PaneInstance {
+                    event_id: EventId::generate().unwrap(),
+                    pane_instance: PaneInstance {
                         pane_id: format!("%{index}"),
                         pane_pid: 10_000 + index as u32,
                     },
                     agent: None,
                     agent_session_id: None,
-                    event: crate::pane_state::PaneEvent::ObservationBatch {
+                    event: PaneEvent::ObservationBatch {
                         base: None,
                         tracker_generation: 0,
                         observed_at: 1,
@@ -7316,7 +5873,7 @@ mod tests {
                                 super::super::runtime::StatusProjectionMetadata::default(),
                             witnesses: Vec::new(),
                             observation_bases: BTreeMap::new(),
-                            view_base: crate::daemon::view_hooks::ViewRegistry::default(),
+                            view_base: crate::daemon::view_hooks::CurrentClientViews::default(),
                         }),
                         observations,
                         removals: Vec::new(),
@@ -7349,32 +5906,17 @@ mod tests {
     #[test]
     fn observation_batch_applies_all_stages_and_publishes_one_snapshot_build() {
         for pane_count in [0usize, 1, 62] {
-            let root = std::env::temp_dir().join(format!(
-                "vde-batch-apply-{pane_count}-{}-{}",
-                std::process::id(),
-                crate::pane_state::EventId::generate().unwrap().as_str()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
+            let root = test_root(&format!("batch-apply-{pane_count}"));
             let server_identity = crate::daemon::topology::ServerIdentity {
                 pid: 1,
                 start_time: 2,
             };
-            let coordinator = ProductionV2Coordinator::new(
-                crate::daemon::lifecycle::TmuxServerIncarnation {
-                    socket_path: root.join("tmux.sock"),
-                    identity: server_identity.clone(),
-                    hash: format!("batch-apply-{pane_count:0>52}"),
-                },
-                BTreeMap::new(),
-                crate::config::DoneClearOn::Pane,
-                None,
-            )
-            .unwrap();
+            let coordinator = test_coordinator(&root, format!("batch-apply-{pane_count:0>52}"));
             coordinator
                 .router
                 .lock()
                 .unwrap()
-                .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+                .set_phase(DaemonPhase::Serving);
             let daemon_instance_id = coordinator
                 .router
                 .lock()
@@ -7392,21 +5934,21 @@ mod tests {
                         server_identity: server_identity.clone(),
                         panes: Vec::new(),
                     },
-                    crate::daemon::view_hooks::ViewRegistry::default(),
-                    crate::sidebar::state::SidebarOrderPreferences::default(),
+                    crate::daemon::view_hooks::CurrentClientViews::default(),
+                    crate::sidebar::state::SidebarPreferences::default(),
                 ));
 
             let observations = (0..pane_count)
-                .map(|index| crate::pane_state::PaneEventEnvelope {
+                .map(|index| PaneEventEnvelope {
                     daemon_instance_id: daemon_instance_id.clone(),
-                    event_id: crate::pane_state::EventId::generate().unwrap(),
-                    pane_instance: crate::pane_state::PaneInstance {
+                    event_id: EventId::generate().unwrap(),
+                    pane_instance: PaneInstance {
                         pane_id: format!("%{index}"),
                         pane_pid: 10_000 + index as u32,
                     },
                     agent: None,
                     agent_session_id: None,
-                    event: crate::pane_state::PaneEvent::ObservationBatch {
+                    event: PaneEvent::ObservationBatch {
                         base: None,
                         tracker_generation: 0,
                         observed_at: 1,
@@ -7430,7 +5972,7 @@ mod tests {
                                     super::super::runtime::StatusProjectionMetadata::default(),
                                 witnesses: Vec::new(),
                                 observation_bases: BTreeMap::new(),
-                                view_base: crate::daemon::view_hooks::ViewRegistry::default(),
+                                view_base: crate::daemon::view_hooks::CurrentClientViews::default(),
                             }),
                             observations,
                             removals: Vec::new(),
@@ -7439,20 +5981,16 @@ mod tests {
                     )),
                 },
             );
-            assert!(
-                matches!(
-                    response,
-                    crate::daemon::protocol::v2::ServerMessage::SnapshotAck { .. }
-                ),
-                "batch response for {pane_count} panes: {response:?}"
-            );
+            let ServerMessage::SnapshotAck {
+                snapshot_revision, ..
+            } = response
+            else {
+                panic!("batch response for {pane_count} panes: {response:?}");
+            };
             assert!(!coordinator.shutdown.load(Ordering::SeqCst));
 
-            // The worker publishes once per processed mutation; a whole poll is
-            // one mutation, so one publish and at most one snapshot build.
-            coordinator.publish_resolved_snapshot().unwrap();
-            assert_eq!(coordinator.snapshot_publishes.load(Ordering::SeqCst), 1);
-            assert!(coordinator.snapshot_builds.load(Ordering::SeqCst) <= 1);
+            let published = coordinator.publish_resolved_snapshot().unwrap();
+            assert_eq!(published.revision, snapshot_revision);
 
             drop(coordinator);
             std::fs::remove_dir_all(root).unwrap();
@@ -7460,7 +5998,7 @@ mod tests {
     }
 
     struct MockLiveCaptureIo {
-        calls: Mutex<Vec<Vec<crate::pane_state::PaneInstance>>>,
+        calls: Mutex<Vec<Vec<PaneInstance>>>,
         mismatch_targets: BTreeSet<String>,
     }
 
@@ -7480,14 +6018,14 @@ mod tests {
     impl crate::daemon::workers::CaptureSource for MockLiveCaptureIo {
         fn capture_plain_tails(
             &self,
-            _panes: &[crate::pane_state::PaneInstance],
+            _panes: &[PaneInstance],
         ) -> std::result::Result<Vec<String>, crate::daemon::workers::CaptureBatchError> {
             unreachable!("live scheduler tests never request plain tails")
         }
 
         fn capture_live_sections(
             &self,
-            targets: &[crate::pane_state::PaneInstance],
+            targets: &[PaneInstance],
         ) -> std::result::Result<
             Vec<crate::daemon::workers::LiveCaptureSection>,
             crate::daemon::workers::CaptureBatchError,
@@ -7510,9 +6048,9 @@ mod tests {
     }
 
     fn live_views_showing(
-        source_pane: &crate::pane_state::PaneInstance,
-    ) -> crate::daemon::view_hooks::ViewRegistry {
-        let mut views = crate::daemon::view_hooks::ViewRegistry::default();
+        source_pane: &PaneInstance,
+    ) -> crate::daemon::view_hooks::CurrentClientViews {
+        let mut views = crate::daemon::view_hooks::CurrentClientViews::default();
         views
             .reconcile(
                 &[crate::pane_state::ClientWitness {
@@ -7532,19 +6070,28 @@ mod tests {
     fn live_test_coordinator(
         root: &std::path::Path,
         hash: String,
-        views: crate::daemon::view_hooks::ViewRegistry,
+        views: crate::daemon::view_hooks::CurrentClientViews,
     ) -> ProductionV2Coordinator {
+        let coordinator = test_coordinator(root, hash);
+        install_test_state(&coordinator, root, views);
+        coordinator
+    }
+
+    #[test]
+    fn sidebar_preference_intents_commit_serially_and_dedupe_event_ids() {
+        let root = test_root("sidebar-intents");
+        let env = BTreeMap::from([(
+            "XDG_STATE_HOME".to_string(),
+            root.to_string_lossy().into_owned(),
+        )]);
+        let socket_path = root.join("tmux.sock");
         let server_identity = crate::daemon::topology::ServerIdentity {
             pid: 1,
             start_time: 2,
         };
         let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: root.join("tmux.sock"),
-                identity: server_identity.clone(),
-                hash,
-            },
-            BTreeMap::new(),
+            test_incarnation(&root, "sidebar-intents"),
+            env.clone(),
             crate::config::DoneClearOn::Pane,
             None,
         )
@@ -7559,29 +6106,85 @@ mod tests {
                     server_identity,
                     panes: Vec::new(),
                 },
-                views,
-                crate::sidebar::state::SidebarOrderPreferences::default(),
+                crate::daemon::view_hooks::CurrentClientViews::default(),
+                crate::sidebar::state::SidebarPreferences::default(),
             ));
-        coordinator
+        let first_event = EventId::generate().unwrap();
+        let second_event = EventId::generate().unwrap();
+
+        let first = apply_sidebar_preference_intent(
+            &coordinator,
+            1,
+            first_event.clone(),
+            crate::sidebar::state::SidebarPreferenceIntent::SetDefaultFilter {
+                filter: crate::sidebar::state::StatusFilter::DoneOnly,
+            },
+        );
+        let second = apply_sidebar_preference_intent(
+            &coordinator,
+            2,
+            second_event,
+            crate::sidebar::state::SidebarPreferenceIntent::SetDefaultViewMode {
+                view_mode: crate::sidebar::state::ViewMode::Flat,
+            },
+        );
+        let duplicate = apply_sidebar_preference_intent(
+            &coordinator,
+            3,
+            first_event,
+            crate::sidebar::state::SidebarPreferenceIntent::SetDefaultFilter {
+                filter: crate::sidebar::state::StatusFilter::All,
+            },
+        );
+
+        assert!(matches!(
+            first,
+            ServerMessage::SnapshotAck {
+                snapshot_revision: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            second,
+            ServerMessage::SnapshotAck {
+                snapshot_revision: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            duplicate,
+            ServerMessage::SnapshotAck {
+                snapshot_revision: 2,
+                ..
+            }
+        ));
+        let persisted = crate::sidebar::store::load_state(&crate::sidebar::store::state_path(
+            &env,
+            &socket_path,
+        ))
+        .unwrap();
+        assert_eq!(
+            persisted.filter,
+            crate::sidebar::state::StatusFilter::DoneOnly
+        );
+        assert_eq!(persisted.view_mode, crate::sidebar::state::ViewMode::Flat);
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn live_scheduler_dedupes_targets_into_one_capture_and_fans_out() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-live-dedupe-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let source = crate::pane_state::PaneInstance {
+        let root = test_root("live-dedupe");
+        let source = PaneInstance {
             pane_id: "%9".to_string(),
             pane_pid: 900,
         };
-        let target_a = crate::pane_state::PaneInstance {
+        let target_a = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
-        let target_b = crate::pane_state::PaneInstance {
+        let target_b = PaneInstance {
             pane_id: "%2".to_string(),
             pane_pid: 200,
         };
@@ -7645,22 +6248,17 @@ mod tests {
 
     #[test]
     fn live_scheduler_does_not_capture_hidden_sources() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-live-hidden-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let source = crate::pane_state::PaneInstance {
+        let root = test_root("live-hidden");
+        let source = PaneInstance {
             pane_id: "%9".to_string(),
             pane_pid: 900,
         };
-        let target = crate::pane_state::PaneInstance {
+        let target = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
         // The registry views show a different pane, so the source is hidden.
-        let other = crate::pane_state::PaneInstance {
+        let other = PaneInstance {
             pane_id: "%8".to_string(),
             pane_pid: 800,
         };
@@ -7678,7 +6276,7 @@ mod tests {
         assert!(matches!(
             mailbox.wait(),
             Some(LivePush::Unavailable {
-                reason: crate::daemon::protocol::v2::LiveUnavailableReason::HiddenSource,
+                reason: LiveUnavailableReason::HiddenSource,
             })
         ));
 
@@ -7688,17 +6286,12 @@ mod tests {
 
     #[test]
     fn live_pane_instance_mismatch_delivers_no_body() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-live-mismatch-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let source = crate::pane_state::PaneInstance {
+        let root = test_root("live-mismatch");
+        let source = PaneInstance {
             pane_id: "%9".to_string(),
             pane_pid: 900,
         };
-        let target = crate::pane_state::PaneInstance {
+        let target = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
@@ -7719,7 +6312,7 @@ mod tests {
         assert!(matches!(
             mailbox.wait(),
             Some(LivePush::Unavailable {
-                reason: crate::daemon::protocol::v2::LiveUnavailableReason::PaneInstanceMismatch,
+                reason: LiveUnavailableReason::PaneInstanceMismatch,
             })
         ));
         assert!(coordinator.live.bodies.lock().unwrap().is_empty());
@@ -7730,17 +6323,12 @@ mod tests {
 
     #[test]
     fn observation_piggyback_consumes_due_live_demand_before_the_scheduler_tick() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-live-piggyback-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let source = crate::pane_state::PaneInstance {
+        let root = test_root("live-piggyback");
+        let source = PaneInstance {
             pane_id: "%9".to_string(),
             pane_pid: 900,
         };
-        let target = crate::pane_state::PaneInstance {
+        let target = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
@@ -7785,23 +6373,18 @@ mod tests {
 
     #[test]
     fn live_subscription_rejects_interval_below_minimum() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-live-interval-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_root("live-interval");
         let coordinator = Arc::new(live_test_coordinator(
             &root,
             "live-interval".to_string(),
-            crate::daemon::view_hooks::ViewRegistry::default(),
+            crate::daemon::view_hooks::CurrentClientViews::default(),
         ));
         let (server, client) = UnixStream::pair().unwrap();
-        let source = crate::pane_state::PaneInstance {
+        let source = PaneInstance {
             pane_id: "%9".to_string(),
             pane_pid: 900,
         };
-        let target = crate::pane_state::PaneInstance {
+        let target = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
@@ -7812,12 +6395,11 @@ mod tests {
         std::io::BufReader::new(client)
             .read_line(&mut response)
             .unwrap();
-        let message: crate::daemon::protocol::v2::ServerMessage =
-            serde_json::from_str(response.trim()).unwrap();
+        let message: ServerMessage = serde_json::from_str(response.trim()).unwrap();
         assert!(matches!(
             message,
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+            ServerMessage::Error {
+                code: ErrorCode::InvalidRequest,
                 ..
             }
         ));
@@ -7829,23 +6411,18 @@ mod tests {
 
     #[test]
     fn live_subscription_guard_removes_registry_entry_after_write_failure() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-live-guard-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_root("live-guard");
         let coordinator = Arc::new(live_test_coordinator(
             &root,
             "live-guard".to_string(),
-            crate::daemon::view_hooks::ViewRegistry::default(),
+            crate::daemon::view_hooks::CurrentClientViews::default(),
         ));
         let (server, client) = UnixStream::pair().unwrap();
-        let source = crate::pane_state::PaneInstance {
+        let source = PaneInstance {
             pane_id: "%9".to_string(),
             pane_pid: 900,
         };
-        let target = crate::pane_state::PaneInstance {
+        let target = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
@@ -7873,7 +6450,7 @@ mod tests {
             .values()
             .for_each(|entry| {
                 entry.mailbox.push(LivePush::Unavailable {
-                    reason: crate::daemon::protocol::v2::LiveUnavailableReason::TargetMissing,
+                    reason: LiveUnavailableReason::TargetMissing,
                 });
             });
 
@@ -7886,16 +6463,11 @@ mod tests {
 
     #[test]
     fn snapshot_wait_timeout_yields_heartbeat_instead_of_full_snapshot() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-heartbeat-wait-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_root("heartbeat-wait");
         let coordinator = live_test_coordinator(
             &root,
             "heartbeat-wait".to_string(),
-            crate::daemon::view_hooks::ViewRegistry::default(),
+            crate::daemon::view_hooks::CurrentClientViews::default(),
         );
         let published = coordinator.publish_resolved_snapshot().unwrap();
 
@@ -7918,16 +6490,11 @@ mod tests {
 
     #[test]
     fn idle_subscription_stream_sends_heartbeats_and_new_revisions_still_flow() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-heartbeat-stream-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_root("heartbeat-stream");
         let coordinator = Arc::new(live_test_coordinator(
             &root,
             "heartbeat-stream".to_string(),
-            crate::daemon::view_hooks::ViewRegistry::default(),
+            crate::daemon::view_hooks::CurrentClientViews::default(),
         ));
         let published = coordinator.publish_resolved_snapshot().unwrap();
         let daemon_instance_id = coordinator
@@ -7953,10 +6520,9 @@ mod tests {
 
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
-        let first: crate::daemon::protocol::v2::ServerMessage =
-            serde_json::from_str(line.trim()).unwrap();
+        let first: ServerMessage = serde_json::from_str(line.trim()).unwrap();
         match first {
-            crate::daemon::protocol::v2::ServerMessage::Heartbeat {
+            ServerMessage::Heartbeat {
                 daemon_instance_id: heartbeat_instance,
                 snapshot_revision,
             } => {
@@ -7982,13 +6548,11 @@ mod tests {
         loop {
             line.clear();
             reader.read_line(&mut line).unwrap();
-            let message: crate::daemon::protocol::v2::ServerMessage =
-                serde_json::from_str(line.trim()).unwrap();
+            let message: ServerMessage = serde_json::from_str(line.trim()).unwrap();
             match message {
-                crate::daemon::protocol::v2::ServerMessage::Heartbeat { .. } => continue,
-                crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
-                    snapshot_revision,
-                    ..
+                ServerMessage::Heartbeat { .. } => continue,
+                ServerMessage::ResolvedSnapshotResult {
+                    snapshot_revision, ..
                 } => {
                     assert_eq!(snapshot_revision, newer.revision);
                     break;
@@ -8008,17 +6572,17 @@ mod tests {
     fn live_mailbox_delivers_latest_only_and_close_ends_the_stream() {
         let mailbox = LiveMailbox::default();
         mailbox.push(LivePush::Unavailable {
-            reason: crate::daemon::protocol::v2::LiveUnavailableReason::TargetMissing,
+            reason: LiveUnavailableReason::TargetMissing,
         });
         mailbox.push(LivePush::Unavailable {
-            reason: crate::daemon::protocol::v2::LiveUnavailableReason::CaptureFailed,
+            reason: LiveUnavailableReason::CaptureFailed,
         });
 
         // A slow subscriber only ever sees the newest undelivered message.
         assert!(matches!(
             mailbox.wait(),
             Some(LivePush::Unavailable {
-                reason: crate::daemon::protocol::v2::LiveUnavailableReason::CaptureFailed,
+                reason: LiveUnavailableReason::CaptureFailed,
             })
         ));
 
@@ -8029,11 +6593,11 @@ mod tests {
     #[test]
     fn live_registry_prunes_demand_for_missing_panes() {
         let registry = LiveRegistry::default();
-        let source = crate::pane_state::PaneInstance {
+        let source = PaneInstance {
             pane_id: "%9".to_string(),
             pane_pid: 900,
         };
-        let target = crate::pane_state::PaneInstance {
+        let target = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
@@ -8062,32 +6626,17 @@ mod tests {
 
     #[test]
     fn observation_batch_keeps_sequence_order_with_following_mutations() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-batch-sequence-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_root("batch-sequence");
         let server_identity = crate::daemon::topology::ServerIdentity {
             pid: 1,
             start_time: 2,
         };
-        let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: root.join("tmux.sock"),
-                identity: server_identity.clone(),
-                hash: "a1".repeat(32),
-            },
-            BTreeMap::new(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
+        let coordinator = test_coordinator(&root, "a1".repeat(32));
         coordinator
             .router
             .lock()
             .unwrap()
-            .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+            .set_phase(DaemonPhase::Serving);
 
         assert!(
             coordinator.enqueue_internal(V2InternalMutation::ObservationBatch(Box::new(
@@ -8100,7 +6649,7 @@ mod tests {
                         status_metadata: super::super::runtime::StatusProjectionMetadata::default(),
                         witnesses: Vec::new(),
                         observation_bases: BTreeMap::new(),
-                        view_base: crate::daemon::view_hooks::ViewRegistry::default(),
+                        view_base: crate::daemon::view_hooks::CurrentClientViews::default(),
                     }),
                     observations: Vec::new(),
                     removals: Vec::new(),
@@ -8143,22 +6692,7 @@ mod tests {
 
     #[test]
     fn snapshot_waiter_cannot_miss_shutdown_notification() {
-        let coordinator = Arc::new(
-            ProductionV2Coordinator::new(
-                crate::daemon::lifecycle::TmuxServerIncarnation {
-                    socket_path: "/tmp/vde-test-tmux.sock".into(),
-                    identity: crate::daemon::topology::ServerIdentity {
-                        pid: 1,
-                        start_time: 2,
-                    },
-                    hash: "e".repeat(64),
-                },
-                BTreeMap::new(),
-                crate::config::DoneClearOn::Pane,
-                None,
-            )
-            .unwrap(),
-        );
+        let coordinator = Arc::new(detached_test_coordinator("e".repeat(64)));
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let waiter = {
@@ -8184,52 +6718,21 @@ mod tests {
 
     #[test]
     fn published_snapshot_frame_is_shared_and_replaced_only_for_new_revision() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-published-snapshot-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: root.join("tmux.sock"),
-                identity: crate::daemon::topology::ServerIdentity {
-                    pid: 1,
-                    start_time: 2,
-                },
-                hash: "c".repeat(64),
-            },
-            BTreeMap::new(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
-        let leased =
-            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
-                .unwrap();
-        *coordinator.state.lock().unwrap() =
-            Some(super::super::runtime::CanonicalCoordinatorState::new(
-                leased,
-                crate::daemon::topology::TopologySnapshot {
-                    server_identity: crate::daemon::topology::ServerIdentity {
-                        pid: 1,
-                        start_time: 2,
-                    },
-                    panes: Vec::new(),
-                },
-                crate::daemon::view_hooks::ViewRegistry::default(),
-                crate::sidebar::state::SidebarOrderPreferences::default(),
-            ));
+        let root = test_root("published-snapshot");
+        let coordinator = test_coordinator(&root, "c".repeat(64));
+        install_test_state(
+            &coordinator,
+            &root,
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+        );
 
         let first = coordinator.publish_resolved_snapshot().unwrap();
         assert!(matches!(
-            coordinator.query(
-                crate::daemon::protocol::v2::ClientMessage::QueryStatusSnapshot {
-                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-                    context: crate::daemon::protocol::v2::StatusContext::Global,
-                }
-            ),
-            crate::daemon::protocol::v2::ServerMessage::StatusSnapshotResult {
+            coordinator.query(ClientMessage::QueryStatusSnapshot {
+                proto: PROTOCOL_VERSION,
+                context: crate::daemon::protocol::v2::StatusContext::Global,
+            }),
+            ServerMessage::StatusSnapshotResult {
                 snapshot_revision: 0,
                 ..
             }
@@ -8269,50 +6772,20 @@ mod tests {
 
     #[test]
     fn publish_resolved_snapshot_skips_rebuild_for_unchanged_revision() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-publish-rebuild-baseline-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: root.join("tmux.sock"),
-                identity: crate::daemon::topology::ServerIdentity {
-                    pid: 1,
-                    start_time: 2,
-                },
-                hash: "f".repeat(64),
-            },
-            BTreeMap::new(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
-        let leased =
-            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
-                .unwrap();
-        *coordinator.state.lock().unwrap() =
-            Some(super::super::runtime::CanonicalCoordinatorState::new(
-                leased,
-                crate::daemon::topology::TopologySnapshot {
-                    server_identity: crate::daemon::topology::ServerIdentity {
-                        pid: 1,
-                        start_time: 2,
-                    },
-                    panes: Vec::new(),
-                },
-                crate::daemon::view_hooks::ViewRegistry::default(),
-                crate::sidebar::state::SidebarOrderPreferences::default(),
-            ));
+        let root = test_root("publish-rebuild-baseline");
+        let coordinator = test_coordinator(&root, "f".repeat(64));
+        install_test_state(
+            &coordinator,
+            &root,
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+        );
 
-        coordinator.publish_resolved_snapshot().unwrap();
-        coordinator.publish_resolved_snapshot().unwrap();
+        let first = coordinator.publish_resolved_snapshot().unwrap();
+        let cached = coordinator.publish_resolved_snapshot().unwrap();
 
         // The revision fast path serves the cached frame without rebuilding the
         // checked snapshot when the revision has not changed.
-        assert_eq!(coordinator.snapshot_publishes.load(Ordering::SeqCst), 2);
-        assert_eq!(coordinator.snapshot_builds.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&first.frame, &cached.frame));
 
         coordinator
             .state
@@ -8324,8 +6797,8 @@ mod tests {
             .runtime
             .mark_projection_changed()
             .unwrap();
-        coordinator.publish_resolved_snapshot().unwrap();
-        assert_eq!(coordinator.snapshot_builds.load(Ordering::SeqCst), 2);
+        let changed = coordinator.publish_resolved_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&first.frame, &changed.frame));
 
         drop(coordinator);
         std::fs::remove_dir_all(root).unwrap();
@@ -8337,60 +6810,30 @@ mod tests {
             crate::daemon::topology::TopologyError,
         >,
     ) -> (
-        crate::daemon::protocol::v2::ServerMessage,
+        ServerMessage,
         Vec<crate::daemon::protocol::v2::DaemonDiagnostic>,
     ) {
-        let root = std::env::temp_dir().join(format!(
-            "vde-query-pane-refresh-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let coordinator = Arc::new(
-            ProductionV2Coordinator::new(
-                crate::daemon::lifecycle::TmuxServerIncarnation {
-                    socket_path: root.join("tmux.sock"),
-                    identity: crate::daemon::topology::ServerIdentity {
-                        pid: 1,
-                        start_time: 2,
-                    },
-                    hash: "9".repeat(64),
-                },
-                BTreeMap::new(),
-                crate::config::DoneClearOn::Pane,
-                None,
-            )
-            .unwrap(),
-        );
+        let root = test_root("query-pane-refresh");
+        let coordinator = Arc::new(test_coordinator(&root, "9".repeat(64)));
         coordinator
             .router
             .lock()
             .unwrap()
-            .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
-        let leased =
-            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
-                .unwrap();
-        *coordinator.state.lock().unwrap() =
-            Some(super::super::runtime::CanonicalCoordinatorState::new(
-                leased,
-                crate::daemon::topology::TopologySnapshot {
-                    server_identity: coordinator.incarnation.identity.clone(),
-                    panes: Vec::new(),
-                },
-                crate::daemon::view_hooks::ViewRegistry::default(),
-                crate::sidebar::state::SidebarOrderPreferences::default(),
-            ));
+            .set_phase(DaemonPhase::Serving);
+        install_test_state(
+            &coordinator,
+            &root,
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+        );
 
         let (result_tx, result_rx) = mpsc::channel();
         let query_coordinator = coordinator.clone();
         let query = thread::spawn(move || {
             result_tx
-                .send(query_coordinator.query(
-                    crate::daemon::protocol::v2::ClientMessage::QueryPane {
-                        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-                        pane_id: "%7".to_string(),
-                    },
-                ))
+                .send(query_coordinator.query(ClientMessage::QueryPane {
+                    proto: PROTOCOL_VERSION,
+                    pane_id: "%7".to_string(),
+                }))
                 .unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -8434,7 +6877,7 @@ mod tests {
         let (response, diagnostics) = query_pane_cache_miss_with_refresh_outcome(Ok(
             crate::daemon::topology::TargetedRefreshOutcome::Found(
                 crate::daemon::topology::TopologyPane {
-                    pane_instance: crate::pane_state::PaneInstance {
+                    pane_instance: PaneInstance {
                         pane_id: "%7".to_string(),
                         pane_pid: 700,
                     },
@@ -8451,9 +6894,9 @@ mod tests {
         assert!(diagnostics.is_empty());
         assert!(matches!(
             response,
-            crate::daemon::protocol::v2::ServerMessage::PaneResult {
+            ServerMessage::PaneResult {
                 pane: crate::daemon::protocol::v2::PanePresentation {
-                    pane_instance: crate::pane_state::PaneInstance {
+                    pane_instance: PaneInstance {
                         pane_id,
                         pane_pid: 700,
                     },
@@ -8471,8 +6914,8 @@ mod tests {
                 crate::daemon::topology::TargetedRefreshOutcome::NotFound,
             ))
             .0,
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::PaneNotFound,
+            ServerMessage::Error {
+                code: ErrorCode::PaneNotFound,
                 ..
             }
         ));
@@ -8485,16 +6928,13 @@ mod tests {
         let (response, diagnostics) = query_pane_cache_miss_with_refresh_outcome(Err(failure));
         assert!(matches!(
             response,
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::InternalError,
+            ServerMessage::Error {
+                code: ErrorCode::InternalError,
                 ..
             }
         ));
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(
-            diagnostics[0].code,
-            crate::daemon::protocol::v2::ErrorCode::InternalError
-        );
+        assert_eq!(diagnostics[0].code, ErrorCode::InternalError);
         assert!(diagnostics[0].message.contains("tmux query failed"));
     }
 
@@ -8505,8 +6945,8 @@ mod tests {
         ));
         assert!(matches!(
             response,
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::InternalError,
+            ServerMessage::Error {
+                code: ErrorCode::InternalError,
                 ..
             }
         ));
@@ -8516,31 +6956,13 @@ mod tests {
 
     #[test]
     fn oversized_resolved_snapshot_commits_and_queues_frame_too_large_diagnostic() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-frame-too-large-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: root.join("tmux.sock"),
-                identity: crate::daemon::topology::ServerIdentity {
-                    pid: 1,
-                    start_time: 2,
-                },
-                hash: "f".repeat(64),
-            },
-            BTreeMap::new(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
+        let root = test_root("frame-too-large");
+        let coordinator = test_coordinator(&root, "f".repeat(64));
         coordinator
             .router
             .lock()
             .unwrap()
-            .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+            .set_phase(DaemonPhase::Serving);
         let leased =
             super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
                 .unwrap();
@@ -8553,8 +6975,8 @@ mod tests {
                 },
                 panes: Vec::new(),
             },
-            crate::daemon::view_hooks::ViewRegistry::default(),
-            crate::sidebar::state::SidebarOrderPreferences::default(),
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+            crate::sidebar::state::SidebarPreferences::default(),
         );
         state
             .replace_topology(crate::daemon::topology::TopologySnapshot {
@@ -8563,7 +6985,7 @@ mod tests {
                     start_time: 2,
                 },
                 panes: vec![crate::daemon::topology::TopologyPane {
-                    pane_instance: crate::pane_state::PaneInstance {
+                    pane_instance: PaneInstance {
                         pane_id: "%1".to_string(),
                         pane_pid: 101,
                     },
@@ -8584,8 +7006,8 @@ mod tests {
         assert!(published.terminal);
         assert!(matches!(
             published.message.as_ref(),
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::FrameTooLarge,
+            ServerMessage::Error {
+                code: ErrorCode::FrameTooLarge,
                 ..
             }
         ));
@@ -8599,7 +7021,7 @@ mod tests {
         let response = apply_production_mutation(&coordinator, mutation.sequenced);
         assert!(matches!(
             response,
-            crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+            ServerMessage::SnapshotAck {
                 snapshot_revision: 2,
                 ..
             }
@@ -8611,8 +7033,7 @@ mod tests {
                 .unwrap()
                 .global_diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code
-                    == crate::daemon::protocol::v2::ErrorCode::FrameTooLarge)
+                .any(|diagnostic| diagnostic.code == ErrorCode::FrameTooLarge)
         );
 
         drop(state);
@@ -8626,27 +7047,8 @@ mod tests {
 
     #[test]
     fn terminal_subscription_frame_is_written_once_then_stream_closes() {
-        let coordinator = Arc::new(
-            ProductionV2Coordinator::new(
-                crate::daemon::lifecycle::TmuxServerIncarnation {
-                    socket_path: "/tmp/vde-test-tmux.sock".into(),
-                    identity: crate::daemon::topology::ServerIdentity {
-                        pid: 1,
-                        start_time: 2,
-                    },
-                    hash: "a".repeat(64),
-                },
-                BTreeMap::new(),
-                crate::config::DoneClearOn::Pane,
-                None,
-            )
-            .unwrap(),
-        );
-        let message = crate::daemon::protocol::v2::ServerMessage::error(
-            crate::daemon::protocol::v2::ErrorCode::FrameTooLarge,
-            "too large",
-            None,
-        );
+        let coordinator = Arc::new(detached_test_coordinator("a".repeat(64)));
+        let message = ServerMessage::error(ErrorCode::FrameTooLarge, "too large", None);
         let frame = crate::daemon::protocol::v2::encode_response_frame(&message).unwrap();
         *coordinator.snapshot_cache.lock().unwrap() = Some(PublishedResolvedSnapshot {
             revision: 2,
@@ -8666,9 +7068,9 @@ mod tests {
         let frames = raw.lines().collect::<Vec<_>>();
         assert_eq!(frames.len(), 1);
         assert!(matches!(
-            serde_json::from_str::<crate::daemon::protocol::v2::ServerMessage>(frames[0]).unwrap(),
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::FrameTooLarge,
+            serde_json::from_str::<ServerMessage>(frames[0]).unwrap(),
+            ServerMessage::Error {
+                code: ErrorCode::FrameTooLarge,
                 ..
             }
         ));
@@ -8680,18 +7082,15 @@ mod tests {
         let mut connection = V2ConnectionState::default();
         assert!(matches!(
             router.route(&mut connection, v2_begin()),
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+            V2Route::Response(ServerMessage::Error {
+                code: ErrorCode::InvalidRequest,
                 ..
             })
         ));
         assert!(matches!(
-            router.route(
-                &mut connection,
-                crate::daemon::protocol::v2::ClientMessage::Hello { proto: 1 },
-            ),
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::UnsupportedProtocol,
+            router.route(&mut connection, ClientMessage::Hello { proto: 1 },),
+            V2Route::Response(ServerMessage::Error {
+                code: ErrorCode::UnsupportedProtocol,
                 ..
             })
         ));
@@ -8699,10 +7098,10 @@ mod tests {
         assert!(matches!(
             router.route(
                 &mut connection,
-                crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot { proto: 1 },
+                ClientMessage::QueryResolvedSnapshot { proto: 1 },
             ),
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::UnsupportedProtocol,
+            V2Route::Response(ServerMessage::Error {
+                code: ErrorCode::UnsupportedProtocol,
                 ..
             })
         ));
@@ -8711,14 +7110,14 @@ mod tests {
     #[test]
     fn v2_read_only_query_does_not_consume_accepted_sequence() {
         let mut router = V2Router::new(v2_daemon_id(), "server");
-        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        router.set_phase(DaemonPhase::Serving);
         let mut connection = V2ConnectionState::default();
         v2_handshake(&mut router, &mut connection);
         assert!(matches!(
             router.route(
                 &mut connection,
-                crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot {
-                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                ClientMessage::QueryResolvedSnapshot {
+                    proto: PROTOCOL_VERSION,
                 },
             ),
             V2Route::Query(_)
@@ -8726,8 +7125,8 @@ mod tests {
         assert!(matches!(
             router.route(
                 &mut connection,
-                crate::daemon::protocol::v2::ClientMessage::QueryHealth {
-                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                ClientMessage::QueryRuntimeInfo {
+                    proto: PROTOCOL_VERSION,
                 },
             ),
             V2Route::Query(_)
@@ -8741,7 +7140,7 @@ mod tests {
     #[test]
     fn v2_internal_and_external_mutations_share_one_accepted_sequence() {
         let mut router = V2Router::new(v2_daemon_id(), "server");
-        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        router.set_phase(DaemonPhase::Serving);
         let mut connection = V2ConnectionState::default();
         v2_handshake(&mut router, &mut connection);
         let V2Route::Mutation(external) = router.route(&mut connection, v2_begin()) else {
@@ -8772,53 +7171,49 @@ mod tests {
     #[test]
     fn v2_serving_with_degraded_hooks_continues_queries_and_canonical_mutations() {
         let mut router = V2Router::new(v2_daemon_id(), "server");
-        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
-        router.set_hook_health(crate::daemon::protocol::v2::HookHealth::Degraded);
+        router.set_phase(DaemonPhase::Serving);
+        router.set_hook_health(HookHealth::Degraded);
         let mut connection = V2ConnectionState::default();
 
         let hello = router.route(
             &mut connection,
-            crate::daemon::protocol::v2::ClientMessage::Hello {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            ClientMessage::Hello {
+                proto: PROTOCOL_VERSION,
             },
         );
         assert!(matches!(
             hello,
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::HelloAck {
-                phase: crate::daemon::protocol::v2::DaemonPhase::Serving,
-                hook_health: crate::daemon::protocol::v2::HookHealth::Degraded,
+            V2Route::Response(ServerMessage::HelloAck {
+                phase: DaemonPhase::Serving,
+                hook_health: HookHealth::Degraded,
                 ..
             })
         ));
         assert!(matches!(
             router.route(
                 &mut connection,
-                crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot {
-                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                ClientMessage::QueryResolvedSnapshot {
+                    proto: PROTOCOL_VERSION,
                 },
             ),
-            V2Route::Query(
-                crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot { .. }
-            )
+            V2Route::Query(ClientMessage::QueryResolvedSnapshot { .. })
         ));
         assert!(matches!(
             router.route(&mut connection, v2_begin()),
             V2Route::Mutation(V2SequencedMutation {
                 accepted_seq: 1,
-                mutation: V2AcceptedMutation::External(
-                    crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent { .. }
-                ),
+                mutation: V2AcceptedMutation::External(ClientMessage::SubmitPaneEvent { .. }),
             })
         ));
     }
 
     #[test]
     fn sidebar_jump_requires_one_eligible_client_for_source_pane() {
-        let source = crate::pane_state::PaneInstance {
+        let source = PaneInstance {
             pane_id: "%9".to_string(),
             pane_pid: 909,
         };
-        let mut views = crate::daemon::view_hooks::ViewRegistry::default();
+        let mut views = crate::daemon::view_hooks::CurrentClientViews::default();
         assert_eq!(unique_eligible_client_pid(&views, &source), Err(0));
 
         let witness = |client_pid| crate::pane_state::ClientWitness {
@@ -8849,19 +7244,19 @@ mod tests {
     #[test]
     fn sidebar_worker_completion_reenters_the_shared_sequence_after_external_command() {
         let mut router = V2Router::new(v2_daemon_id(), "server");
-        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        router.set_phase(DaemonPhase::Serving);
         let mut connection = V2ConnectionState::default();
         v2_handshake(&mut router, &mut connection);
-        let command = crate::daemon::protocol::v2::ClientMessage::SidebarCommand {
-            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+        let command = ClientMessage::SidebarCommand {
+            proto: PROTOCOL_VERSION,
             daemon_instance_id: v2_daemon_id(),
             event_id: v2_event_id(),
             command: crate::daemon::protocol::v2::SidebarCommand::JumpPane {
-                pane_instance: crate::pane_state::PaneInstance {
+                pane_instance: PaneInstance {
                     pane_id: "%1".to_string(),
                     pane_pid: 101,
                 },
-                source_pane: crate::pane_state::PaneInstance {
+                source_pane: PaneInstance {
                     pane_id: "%9".to_string(),
                     pane_pid: 909,
                 },
@@ -8905,17 +7300,17 @@ mod tests {
             &deferred,
             SidebarTmuxJob {
                 effect: super::super::runtime::CanonicalSidebarEffect::JumpPane {
-                    pane_instance: crate::pane_state::PaneInstance {
+                    pane_instance: PaneInstance {
                         pane_id: "%1".to_string(),
                         pane_pid: 101,
                     },
                     client_pid: 10,
-                    source_pane: crate::pane_state::PaneInstance {
+                    source_pane: PaneInstance {
                         pane_id: "%9".to_string(),
                         pane_pid: 909,
                     },
                 },
-                expected_pane: crate::pane_state::PaneInstance {
+                expected_pane: PaneInstance {
                     pane_id: "%1".to_string(),
                     pane_pid: 100,
                 },
@@ -8928,20 +7323,7 @@ mod tests {
         assert!(deferred.lock().unwrap().contains(&1));
         let pending = job_rx.try_recv().expect("job is queued without waiting");
 
-        let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: "/tmp/vde-test-tmux.sock".into(),
-                identity: crate::daemon::topology::ServerIdentity {
-                    pid: 1,
-                    start_time: 2,
-                },
-                hash: "0".repeat(64),
-            },
-            BTreeMap::new(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
+        let coordinator = detached_test_coordinator("0".repeat(64));
         coordinator
             .deferred_responses
             .lock()
@@ -8968,14 +7350,14 @@ mod tests {
 
         assert!(matches!(
             internal_response,
-            crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+            ServerMessage::SnapshotAck {
                 accepted_seq: 2,
                 ..
             }
         ));
         assert!(matches!(
             waiter_rx.recv_timeout(Duration::from_millis(100)).unwrap(),
-            crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+            ServerMessage::SnapshotAck {
                 accepted_seq: 1,
                 snapshot_revision: 7,
                 ..
@@ -8986,37 +7368,24 @@ mod tests {
 
     #[test]
     fn waiterless_view_queue_completion_does_not_emit_disconnected_diagnostic() {
-        let coordinator = ProductionV2Coordinator::new(
-            crate::daemon::lifecycle::TmuxServerIncarnation {
-                socket_path: "/tmp/vde-test-tmux.sock".into(),
-                identity: crate::daemon::topology::ServerIdentity {
-                    pid: 1,
-                    start_time: 2,
-                },
-                hash: "f".repeat(64),
-            },
-            BTreeMap::new(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
+        let coordinator = detached_test_coordinator("f".repeat(64));
         coordinator
             .router
             .lock()
             .unwrap()
-            .set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+            .set_phase(DaemonPhase::Serving);
         let mut connection = V2ConnectionState::default();
         assert!(matches!(
             coordinator.route_external(
                 &mut connection,
-                crate::daemon::protocol::v2::ClientMessage::Hello {
-                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                ClientMessage::Hello {
+                    proto: PROTOCOL_VERSION,
                 },
                 0,
             ),
-            crate::daemon::protocol::v2::ServerMessage::HelloAck { .. }
+            ServerMessage::HelloAck { .. }
         ));
-        let pane = crate::pane_state::PaneInstance {
+        let pane = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
@@ -9028,27 +7397,25 @@ mod tests {
             .clone();
         let response = coordinator.route_external(
             &mut connection,
-            crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            ClientMessage::SubmitViewEvent {
+                proto: PROTOCOL_VERSION,
                 event: crate::pane_state::ViewEvent {
                     daemon_instance_id,
                     event_id: v2_event_id(),
                     hook_kind: crate::pane_state::ViewHookKind::WindowPaneChanged,
-                    occurrence: Some(crate::pane_state::ViewOccurrence {
-                        session_id: "$1".to_string(),
-                        window_id: "@1".to_string(),
-                        active_pane: pane.clone(),
-                        observed_panes: vec![pane],
-                    }),
-                    source_client: None,
-                    witnesses: Vec::new(),
+                    active_pane: Some(pane.clone()),
+                    window_panes: vec![pane],
+                    visibility: crate::pane_state::ViewVisibilityProof {
+                        pane_visible: false,
+                        window_visible: false,
+                    },
                 },
             },
             128,
         );
         assert!(matches!(
             response,
-            crate::daemon::protocol::v2::ServerMessage::ViewQueued {
+            ServerMessage::ViewQueued {
                 accepted_seq: 1,
                 ..
             }
@@ -9058,14 +7425,12 @@ mod tests {
         assert_eq!(queued.sequenced.accepted_seq, 1);
         assert!(matches!(
             queued.sequenced.mutation,
-            V2AcceptedMutation::External(
-                crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent { .. }
-            )
+            V2AcceptedMutation::External(ClientMessage::SubmitViewEvent { .. })
         ));
 
         coordinator.complete(
             1,
-            crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+            ServerMessage::SnapshotAck {
                 event_id: v2_event_id(),
                 accepted_seq: 1,
                 snapshot_revision: 0,
@@ -9079,7 +7444,7 @@ mod tests {
     #[test]
     fn v2_bootstrap_fifo_preserves_order_and_rejects_overflow_without_consuming_seq() {
         let mut router = V2Router::new(v2_daemon_id(), "server");
-        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Hydrating);
+        router.set_phase(DaemonPhase::Hydrating);
         let mut connection = V2ConnectionState::default();
         v2_handshake(&mut router, &mut connection);
         for expected in 1..=V2_BOOTSTRAP_FIFO_CAPACITY as u64 {
@@ -9092,8 +7457,8 @@ mod tests {
         }
         assert!(matches!(
             router.route(&mut connection, v2_begin()),
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::QueueFull,
+            V2Route::Response(ServerMessage::Error {
+                code: ErrorCode::QueueFull,
                 ..
             })
         ));
@@ -9123,32 +7488,30 @@ mod tests {
     #[test]
     fn restart_owned_hook_view_event_keeps_fifo_order_during_bootstrap() {
         let mut router = V2Router::new(v2_daemon_id(), "server");
-        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Hydrating);
+        router.set_phase(DaemonPhase::Hydrating);
         let mut connection = V2ConnectionState::default();
         v2_handshake(&mut router, &mut connection);
-        let pane = crate::pane_state::PaneInstance {
+        let pane = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
-        let owned_hook_event = crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent {
-            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+        let owned_hook_event = ClientMessage::SubmitViewEvent {
+            proto: PROTOCOL_VERSION,
             event: crate::pane_state::ViewEvent {
                 daemon_instance_id: v2_daemon_id(),
                 event_id: v2_event_id(),
                 hook_kind: crate::pane_state::ViewHookKind::WindowPaneChanged,
-                occurrence: Some(crate::pane_state::ViewOccurrence {
-                    session_id: "$1".to_string(),
-                    window_id: "@1".to_string(),
-                    active_pane: pane.clone(),
-                    observed_panes: vec![pane],
-                }),
-                source_client: None,
-                witnesses: Vec::new(),
+                active_pane: Some(pane.clone()),
+                window_panes: vec![pane],
+                visibility: crate::pane_state::ViewVisibilityProof {
+                    pane_visible: false,
+                    window_visible: false,
+                },
             },
         };
         assert!(matches!(
             router.route(&mut connection, owned_hook_event),
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::ViewQueued {
+            V2Route::Response(ServerMessage::ViewQueued {
                 accepted_seq: 1,
                 ..
             })
@@ -9168,26 +7531,12 @@ mod tests {
         );
         assert!(matches!(
             queued[0].mutation,
-            V2AcceptedMutation::External(
-                crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent { .. }
-            )
+            V2AcceptedMutation::External(ClientMessage::SubmitViewEvent { .. })
         ));
         assert!(matches!(
             queued[1].mutation,
-            V2AcceptedMutation::External(
-                crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent { .. }
-            )
+            V2AcceptedMutation::External(ClientMessage::SubmitPaneEvent { .. })
         ));
-    }
-
-    #[test]
-    fn restart_hydration_reads_canonical_state_without_legacy_attention() {
-        let framing =
-            crate::daemon::topology::QueryFraming::from_token("00112233445566778899aabbccddeeff")
-                .unwrap();
-        let args = crate::daemon::topology::hydrate_query_args(&framing);
-        assert!(args.iter().any(|arg| arg.contains("@vde_pane_state")));
-        assert!(args.iter().all(|arg| !arg.contains("@vde_attention")));
     }
 
     #[test]
@@ -9205,19 +7554,16 @@ mod tests {
             Err("initial reconciliation failed")
         });
         assert_eq!(result, Err("initial reconciliation failed"));
-        assert_eq!(
-            router.phase(),
-            crate::daemon::protocol::v2::DaemonPhase::Hydrating
-        );
+        assert_eq!(router.phase(), DaemonPhase::Hydrating);
         assert!(matches!(
             router.route(
                 &mut connection,
-                crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot {
-                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                ClientMessage::QueryResolvedSnapshot {
+                    proto: PROTOCOL_VERSION,
                 },
             ),
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::NotReady,
+            V2Route::Response(ServerMessage::Error {
+                code: ErrorCode::NotReady,
                 ..
             })
         ));
@@ -9226,26 +7572,24 @@ mod tests {
     #[test]
     fn v2_rejects_stale_instance_and_internal_event_origins() {
         let mut router = V2Router::new(v2_daemon_id(), "server");
-        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        router.set_phase(DaemonPhase::Serving);
         let mut connection = V2ConnectionState::default();
         v2_handshake(&mut router, &mut connection);
         let mut stale = v2_begin();
-        let crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent { envelope, .. } =
-            &mut stale
-        else {
+        let ClientMessage::SubmitPaneEvent { envelope, .. } = &mut stale else {
             unreachable!();
         };
         envelope.daemon_instance_id =
-            crate::pane_state::DaemonInstanceId::parse("00112233445566778899aabbccddeeff").unwrap();
+            DaemonInstanceId::parse("00112233445566778899aabbccddeeff").unwrap();
         assert!(matches!(
             router.route(&mut connection, stale),
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::StaleDaemonInstance,
+            V2Route::Response(ServerMessage::Error {
+                code: ErrorCode::StaleDaemonInstance,
                 ..
             })
         ));
         let internal_events = [
-            crate::pane_state::PaneEvent::AcknowledgeView {
+            PaneEvent::AcknowledgeView {
                 expected_state_id: crate::pane_state::StateId::parse(
                     "00112233445566778899aabbccddeeff",
                 )
@@ -9253,20 +7597,20 @@ mod tests {
                 expected_agent_epoch: 1,
                 through_seq: 1,
             },
-            crate::pane_state::PaneEvent::ObservationBatch {
+            PaneEvent::ObservationBatch {
                 base: None,
                 tracker_generation: 0,
                 observed_at: 1,
                 presence: crate::pane_state::AgentPresenceObservation::Unknown,
                 capture: None,
             },
-            crate::pane_state::PaneEvent::PaneRemoved { expected: None },
+            PaneEvent::PaneRemoved { expected: None },
         ];
         for internal_event in internal_events {
             assert!(matches!(
                 router.route(&mut connection, v2_pane_event(internal_event)),
-                V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
-                    code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+                V2Route::Response(ServerMessage::Error {
+                    code: ErrorCode::InvalidRequest,
                     ..
                 })
             ));
@@ -9276,67 +7620,62 @@ mod tests {
     #[test]
     fn v2_rejects_invalid_view_before_consuming_accepted_sequence() {
         let mut router = V2Router::new(v2_daemon_id(), "server");
-        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        router.set_phase(DaemonPhase::Serving);
         let mut connection = V2ConnectionState::default();
         v2_handshake(&mut router, &mut connection);
-        let pane = crate::pane_state::PaneInstance {
+        let pane = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
-        let invalid = crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent {
-            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+        let invalid = ClientMessage::SubmitViewEvent {
+            proto: PROTOCOL_VERSION,
             event: crate::pane_state::ViewEvent {
                 daemon_instance_id: v2_daemon_id(),
                 event_id: v2_event_id(),
                 hook_kind: crate::pane_state::ViewHookKind::WindowPaneChanged,
-                occurrence: Some(crate::pane_state::ViewOccurrence {
-                    session_id: "$1".to_string(),
-                    window_id: "@1".to_string(),
-                    active_pane: pane.clone(),
-                    observed_panes: vec![
-                        pane,
-                        crate::pane_state::PaneInstance {
-                            pane_id: "invalid".to_string(),
-                            pane_pid: 0,
-                        },
-                    ],
-                }),
-                source_client: Some(crate::pane_state::SourceClientHint { client_pid: 10 }),
-                witnesses: Vec::new(),
+                active_pane: Some(pane.clone()),
+                window_panes: vec![
+                    pane,
+                    PaneInstance {
+                        pane_id: "invalid".to_string(),
+                        pane_pid: 0,
+                    },
+                ],
+                visibility: crate::pane_state::ViewVisibilityProof {
+                    pane_visible: false,
+                    window_visible: false,
+                },
             },
         };
         assert!(matches!(
             router.route(&mut connection, invalid),
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+            V2Route::Response(ServerMessage::Error {
+                code: ErrorCode::InvalidRequest,
                 ..
             })
         ));
-        let detached_pane = crate::pane_state::PaneInstance {
+        let detached_pane = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 100,
         };
-        let detached_with_occurrence =
-            crate::daemon::protocol::v2::ClientMessage::SubmitViewEvent {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-                event: crate::pane_state::ViewEvent {
-                    daemon_instance_id: v2_daemon_id(),
-                    event_id: v2_event_id(),
-                    hook_kind: crate::pane_state::ViewHookKind::ClientDetached,
-                    occurrence: Some(crate::pane_state::ViewOccurrence {
-                        session_id: "$1".to_string(),
-                        window_id: "@1".to_string(),
-                        active_pane: detached_pane.clone(),
-                        observed_panes: vec![detached_pane],
-                    }),
-                    source_client: Some(crate::pane_state::SourceClientHint { client_pid: 10 }),
-                    witnesses: Vec::new(),
+        let detached_with_occurrence = ClientMessage::SubmitViewEvent {
+            proto: PROTOCOL_VERSION,
+            event: crate::pane_state::ViewEvent {
+                daemon_instance_id: v2_daemon_id(),
+                event_id: v2_event_id(),
+                hook_kind: crate::pane_state::ViewHookKind::ClientDetached,
+                active_pane: Some(detached_pane.clone()),
+                window_panes: vec![detached_pane],
+                visibility: crate::pane_state::ViewVisibilityProof {
+                    pane_visible: false,
+                    window_visible: false,
                 },
-            };
+            },
+        };
         assert!(matches!(
             router.route(&mut connection, detached_with_occurrence),
-            V2Route::Response(crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+            V2Route::Response(ServerMessage::Error {
+                code: ErrorCode::InvalidRequest,
                 ..
             })
         ));
@@ -9349,14 +7688,14 @@ mod tests {
     #[test]
     fn v2_accepted_sequence_overflow_is_internal_error() {
         let mut router = V2Router::new(v2_daemon_id(), "server");
-        router.set_phase(crate::daemon::protocol::v2::DaemonPhase::Serving);
+        router.set_phase(DaemonPhase::Serving);
         router.set_next_accepted_seq(u64::MAX);
         let mut connection = V2ConnectionState::default();
         v2_handshake(&mut router, &mut connection);
         assert!(matches!(
             router.route(&mut connection, v2_begin()),
-            V2Route::Fatal(crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::InternalError,
+            V2Route::Fatal(ServerMessage::Error {
+                code: ErrorCode::InternalError,
                 ..
             })
         ));
@@ -9373,8 +7712,8 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
             error,
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::InvalidRequest,
+            ServerMessage::Error {
+                code: ErrorCode::InvalidRequest,
                 ..
             }
         ));
@@ -9392,28 +7731,23 @@ mod tests {
         let frame = read_v2_request_frame(&mut reader).unwrap();
         assert_eq!(
             crate::daemon::protocol::v2::decode_request_frame(&frame).unwrap(),
-            crate::daemon::protocol::v2::ClientMessage::Hello {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            ClientMessage::Hello {
+                proto: PROTOCOL_VERSION,
             }
         );
         let second = read_v2_request_frame(&mut reader).unwrap();
         assert_eq!(
             crate::daemon::protocol::v2::decode_request_frame(&second).unwrap(),
-            crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            ClientMessage::QueryResolvedSnapshot {
+                proto: PROTOCOL_VERSION,
             }
         );
-        let response = crate::daemon::protocol::v2::ServerMessage::error(
-            crate::daemon::protocol::v2::ErrorCode::NotReady,
-            "not ready",
-            None,
-        );
+        let response = ServerMessage::error(ErrorCode::NotReady, "not ready", None);
         write_v2_response(reader.stream_mut(), &response).unwrap();
         let mut line = String::new();
         BufReader::new(client).read_line(&mut line).unwrap();
         assert_eq!(
-            serde_json::from_str::<crate::daemon::protocol::v2::ServerMessage>(line.trim())
-                .unwrap(),
+            serde_json::from_str::<ServerMessage>(line.trim()).unwrap(),
             response
         );
     }
@@ -9433,8 +7767,8 @@ mod tests {
     #[test]
     fn v2_oversized_response_writes_typed_error_on_same_stream() {
         let (mut server, client) = UnixStream::pair().unwrap();
-        let oversized = crate::daemon::protocol::v2::ServerMessage::error(
-            crate::daemon::protocol::v2::ErrorCode::InternalError,
+        let oversized = ServerMessage::error(
+            ErrorCode::InternalError,
             "x".repeat(crate::pane_state::MAX_RESPONSE_FRAME_BYTES),
             None,
         );
@@ -9442,10 +7776,9 @@ mod tests {
         let mut line = String::new();
         BufReader::new(client).read_line(&mut line).unwrap();
         assert!(matches!(
-            serde_json::from_str::<crate::daemon::protocol::v2::ServerMessage>(line.trim())
-                .unwrap(),
-            crate::daemon::protocol::v2::ServerMessage::Error {
-                code: crate::daemon::protocol::v2::ErrorCode::FrameTooLarge,
+            serde_json::from_str::<ServerMessage>(line.trim()).unwrap(),
+            ServerMessage::Error {
+                code: ErrorCode::FrameTooLarge,
                 ..
             }
         ));
@@ -9464,270 +7797,12 @@ mod tests {
     }
 
     #[test]
-    fn scoped_view_refresh_uses_one_shared_deadline() {
-        let deadline = Instant::now() + Duration::from_millis(100);
-        let first = scoped_view_refresh_remaining(deadline).unwrap();
-        let second = scoped_view_refresh_remaining(deadline).unwrap();
-        assert!(second <= first);
-        assert!(second <= Duration::from_millis(100));
-        assert!(scoped_view_refresh_remaining(Instant::now() - Duration::from_millis(1)).is_err());
-    }
-
-    #[test]
-    fn quarantine_total_does_not_double_count_restart_hydration() {
-        assert_eq!(cumulative_quarantine_total(1, 1, 1), 1);
-        assert_eq!(cumulative_quarantine_total(1, 1, 2), 2);
-        assert_eq!(cumulative_quarantine_total(2, 1, 1), 2);
-    }
-
-    fn legacy_cleanup_topology() -> crate::daemon::topology::TopologySnapshot {
-        let link = crate::daemon::protocol::v2::SessionLinkPresentation {
-            session_id: "$1".to_string(),
-            session_name: "main".to_string(),
-            window_index: 1,
-            window_active: true,
-            window_last: false,
-        };
-        crate::daemon::topology::TopologySnapshot {
-            server_identity: crate::daemon::topology::ServerIdentity {
-                pid: 123,
-                start_time: 456,
-            },
-            panes: [
-                crate::pane_state::PaneInstance {
-                    pane_id: "%2".to_string(),
-                    pane_pid: 102,
-                },
-                crate::pane_state::PaneInstance {
-                    pane_id: "%1".to_string(),
-                    pane_pid: 101,
-                },
-            ]
-            .into_iter()
-            .map(|pane_instance| crate::daemon::topology::TopologyPane {
-                pane_instance,
-                session_links: vec![link.clone()],
-                window_id: "@1".to_string(),
-                window_name: "main".to_string(),
-                current_path: "/tmp".to_string(),
-                current_command: "zsh".to_string(),
-                pane_width: 80,
-                active: true,
-            })
-            .collect(),
-        }
-    }
-
-    #[test]
-    fn legacy_cleanup_uses_only_fixed_keys_and_deduplicates_linked_targets() {
-        let items = legacy_cleanup_items(&legacy_cleanup_topology());
-
-        assert_eq!(items.len(), 32);
-        assert_eq!(items.iter().filter(|item| item.scope == "pane").count(), 26);
-        assert_eq!(
-            items.iter().filter(|item| item.scope == "session").count(),
-            3
-        );
-        assert_eq!(
-            items.iter().filter(|item| item.scope == "window").count(),
-            3
-        );
-        let options = items
-            .iter()
-            .map(|item| item.option)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(options.len(), 19);
-        assert!(!options.contains(crate::options::KEY_PANE_STATE));
-        assert!(!options.contains(crate::options::KEY_STATUS_PANE));
-        assert!(!options.contains(crate::options::KEY_SIDEBAR_MARKER));
-    }
-
-    #[derive(Default)]
-    struct LegacyCleanupRunner {
-        output: String,
-        fail: bool,
-        calls: std::cell::RefCell<Vec<Vec<String>>>,
-    }
-
-    impl crate::tmux::TmuxRunner for LegacyCleanupRunner {
-        fn run(&self, args: &[&str]) -> anyhow::Result<String> {
-            self.calls
-                .borrow_mut()
-                .push(args.iter().map(|arg| (*arg).to_string()).collect());
-            if self.fail {
-                anyhow::bail!("tmux cleanup failed");
-            }
-            Ok(self.output.clone())
-        }
-    }
-
-    #[test]
-    fn legacy_cleanup_inspection_counts_present_empty_value_and_scope() {
-        let topology = legacy_cleanup_topology();
-        let candidates = legacy_cleanup_items(&topology)
-            .into_iter()
-            .filter(|item| item.scope == "pane" && item.option == "@vde_agent")
-            .collect::<Vec<_>>();
-        let runner = LegacyCleanupRunner {
-            output: "@vde_agent \n".to_string(),
-            ..LegacyCleanupRunner::default()
-        };
-
-        let (existing, failed) = inspect_existing_legacy_cleanup_items(&runner, &candidates);
-        let counts = legacy_cleanup_scope_counts(&existing);
-
-        assert_eq!(existing.len(), candidates.len());
-        assert!(failed.is_empty());
-        assert_eq!(counts.pane, 2);
-        assert_eq!(counts.window, 0);
-        assert_eq!(counts.session, 0);
-    }
-
-    #[test]
-    fn legacy_cleanup_failure_report_is_bounded_with_omitted_count() {
-        let failures = (0..300)
-            .map(|index| crate::daemon::protocol::v2::LegacyCleanupFailure {
-                scope: "pane".to_string(),
-                target: format!("%{index}"),
-                option: "@vde_agent".to_string(),
-                message: "remained".to_string(),
-            })
-            .collect();
-
-        let (reported, total, omitted) = bound_legacy_cleanup_failures(failures);
-
-        assert_eq!(reported.len(), 256);
-        assert_eq!(total, 300);
-        assert_eq!(omitted, 44);
-    }
-
-    #[test]
-    fn legacy_cleanup_is_one_server_guarded_batch_with_per_pane_pid_guards() {
-        let topology = legacy_cleanup_topology();
-        let items = legacy_cleanup_items(&topology);
-        let runner = LegacyCleanupRunner::default();
-
-        let outcome = execute_legacy_cleanup(&runner, &topology.server_identity, &items);
-
-        assert_eq!(outcome.attempted, 32);
-        assert_eq!(outcome.removed, 32);
-        assert!(outcome.failed.is_empty());
-        let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0][0], "if-shell");
-        assert!(calls[0][2].contains("#{pid},123"));
-        assert!(calls[0][2].contains("#{start_time},456"));
-        assert!(calls[0][3].contains("#{pane_pid},101"));
-        assert!(calls[0][3].contains("#{pane_pid},102"));
-        for option in crate::options::LEGACY_PANE_OPTION_KEYS
-            .iter()
-            .chain(crate::options::LEGACY_SESSION_OPTION_KEYS)
-            .chain(crate::options::LEGACY_WINDOW_OPTION_KEYS)
-        {
-            assert!(calls[0][3].contains(option), "missing {option}");
-        }
-    }
-
-    #[test]
-    fn legacy_cleanup_reports_pane_instance_mismatch_without_counting_removal() {
-        let topology = legacy_cleanup_topology();
-        let items = legacy_cleanup_items(&topology);
-        let runner = LegacyCleanupRunner {
-            output: format!("{LEGACY_CLEANUP_PANE_MISMATCH_PREFIX}:0\n"),
-            ..LegacyCleanupRunner::default()
-        };
-
-        let outcome = execute_legacy_cleanup(&runner, &topology.server_identity, &items);
-
-        assert_eq!(outcome.attempted, 32);
-        assert_eq!(outcome.removed, 31);
-        assert_eq!(outcome.failed.len(), 1);
-        assert_eq!(outcome.failed[0].scope, "pane");
-        assert_eq!(outcome.failed[0].target, "%1");
-        assert_eq!(outcome.failed[0].option, "@vde_agent");
-    }
-
-    #[test]
-    fn legacy_cleanup_server_mismatch_is_terminal_and_removes_nothing() {
-        let topology = legacy_cleanup_topology();
-        let items = legacy_cleanup_items(&topology);
-        let runner = LegacyCleanupRunner {
-            output: format!("{LEGACY_CLEANUP_SERVER_MISMATCH_SENTINEL}\n"),
-            ..LegacyCleanupRunner::default()
-        };
-
-        let outcome = execute_legacy_cleanup(&runner, &topology.server_identity, &items);
-
-        assert!(outcome.server_mismatch);
-        assert_eq!(outcome.removed, 0);
-        assert!(outcome.failed.is_empty());
-    }
-
-    #[test]
-    fn legacy_cleanup_empty_topology_is_a_zero_attempt_noop() {
-        let topology = crate::daemon::topology::TopologySnapshot {
-            server_identity: crate::daemon::topology::ServerIdentity {
-                pid: 123,
-                start_time: 456,
-            },
-            panes: Vec::new(),
-        };
-        let runner = LegacyCleanupRunner::default();
-
-        let outcome = execute_legacy_cleanup(
-            &runner,
-            &topology.server_identity,
-            &legacy_cleanup_items(&topology),
-        );
-
-        assert_eq!(outcome.attempted, 0);
-        assert_eq!(outcome.removed, 0);
-        assert!(outcome.failed.is_empty());
-        assert!(runner.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn legacy_cleanup_batch_failure_is_typed_for_each_attempt() {
-        let topology = legacy_cleanup_topology();
-        let items = legacy_cleanup_items(&topology);
-        let runner = LegacyCleanupRunner {
-            fail: true,
-            ..LegacyCleanupRunner::default()
-        };
-
-        let outcome = execute_legacy_cleanup(&runner, &topology.server_identity, &items);
-
-        assert_eq!(outcome.attempted, 32);
-        assert_eq!(outcome.removed, 0);
-        assert_eq!(outcome.failed.len(), 32);
-        assert!(
-            outcome.failed.iter().all(|failure| failure.message
-                == "tmux legacy cleanup batch failed: tmux cleanup failed")
-        );
-    }
-
-    #[test]
     fn shutdown_forwarder_stops_v2_coordinator() {
         use std::io::Write;
         use std::os::unix::net::UnixStream;
 
         let (mut signal_writer, signal_reader) = UnixStream::pair().unwrap();
-        let coordinator = Arc::new(
-            ProductionV2Coordinator::new(
-                crate::daemon::lifecycle::TmuxServerIncarnation {
-                    socket_path: "/tmp/vde-test-tmux.sock".into(),
-                    identity: crate::daemon::topology::ServerIdentity {
-                        pid: 1,
-                        start_time: 2,
-                    },
-                    hash: "1".repeat(64),
-                },
-                BTreeMap::new(),
-                crate::config::DoneClearOn::Pane,
-                None,
-            )
-            .unwrap(),
-        );
+        let coordinator = Arc::new(detached_test_coordinator("1".repeat(64)));
         spawn_shutdown_forwarder(signal_reader, coordinator.clone());
         let (done_tx, done_rx) = mpsc::channel();
         let waiter = {

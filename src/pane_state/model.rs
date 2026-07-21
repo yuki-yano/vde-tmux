@@ -97,7 +97,6 @@ macro_rules! random_id_type {
 }
 
 random_id_type!(StateId, "state ID");
-random_id_type!(ResetTombstoneId, "reset tombstone ID");
 random_id_type!(EventId, "event ID");
 random_id_type!(DaemonInstanceId, "daemon instance ID");
 
@@ -529,77 +528,9 @@ pub fn validate_subagents(subagents: &[SubagentState]) -> Result<(), ModelError>
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResetTombstone {
-    pub schema_version: u16,
-    pub tombstone_id: ResetTombstoneId,
-    pub pane_instance: PaneInstance,
-    pub reset_at: i64,
-}
-
-impl ResetTombstone {
-    pub fn validate(&self) -> Result<(), ModelError> {
-        if self.schema_version != PANE_STATE_SCHEMA_VERSION || self.reset_at < 0 {
-            return Err(ModelError("invalid reset tombstone".to_string()));
-        }
-        self.pane_instance.validate()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "record_type",
-    content = "record",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-#[allow(clippy::large_enum_variant)]
-pub enum StoredPaneRecord {
-    Active(PaneState),
-    Reset(ResetTombstone),
-}
-
-impl StoredPaneRecord {
-    pub fn descriptor(&self) -> StoredStateDescriptor {
-        match self {
-            Self::Active(state) => StoredStateDescriptor::Canonical {
-                version: state.version(),
-            },
-            Self::Reset(tombstone) => StoredStateDescriptor::Reset {
-                tombstone_id: tombstone.tombstone_id.clone(),
-            },
-        }
-    }
-
-    pub fn pane_instance(&self) -> &PaneInstance {
-        match self {
-            Self::Active(state) => &state.pane_instance,
-            Self::Reset(tombstone) => &tombstone.pane_instance,
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), ModelError> {
-        match self {
-            Self::Active(state) => state.validate(),
-            Self::Reset(tombstone) => tombstone.validate(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StoredStateDescriptor {
     Canonical { version: StateVersion },
-    Quarantined { quarantine_id: String },
-    Reset { tombstone_id: ResetTombstoneId },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PaneStateLoadError {
-    pub pane_instance: PaneInstance,
-    pub quarantine_id: String,
-    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -823,21 +754,6 @@ pub enum ViewHookKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ViewOccurrence {
-    pub session_id: String,
-    pub window_id: String,
-    pub active_pane: PaneInstance,
-    pub observed_panes: Vec<PaneInstance>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceClientHint {
-    pub client_pid: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientWitness {
     pub client_pid: u32,
     pub session_id: String,
@@ -855,86 +771,62 @@ impl ClientWitness {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ViewVisibilityProof {
+    pub pane_visible: bool,
+    pub window_visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ViewEvent {
     pub daemon_instance_id: DaemonInstanceId,
     pub event_id: EventId,
     pub hook_kind: ViewHookKind,
-    pub occurrence: Option<ViewOccurrence>,
-    pub source_client: Option<SourceClientHint>,
-    pub witnesses: Vec<ClientWitness>,
+    pub active_pane: Option<PaneInstance>,
+    pub window_panes: Vec<PaneInstance>,
+    pub visibility: ViewVisibilityProof,
 }
 
 impl ViewEvent {
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.hook_kind == ViewHookKind::ClientDetached && self.occurrence.is_some() {
-            return Err(ModelError(
-                "client-detached event cannot contain a view occurrence".to_string(),
-            ));
-        }
-        if matches!(
-            self.hook_kind,
-            ViewHookKind::ClientSessionChanged
-                | ViewHookKind::ClientAttached
-                | ViewHookKind::ClientDetached
-        ) && self.source_client.is_none()
-        {
-            return Err(ModelError(
-                "client view hook requires source_client".to_string(),
-            ));
-        }
-        if self.witnesses.len() > MAX_VIEW_WITNESSES {
-            return Err(ModelError("too many client witnesses".to_string()));
-        }
-        let mut witness_pids = BTreeSet::new();
-        for witness in &self.witnesses {
-            if witness.client_pid == 0 || !witness_pids.insert(witness.client_pid) {
-                return Err(ModelError("duplicate client witness".to_string()));
-            }
-            validate_tmux_entity_id(&witness.session_id, '$', "witness session")?;
-            validate_tmux_entity_id(&witness.window_id, '@', "witness window")?;
-            witness.active_pane.validate()?;
-        }
-        if self
-            .source_client
-            .as_ref()
-            .is_some_and(|source| source.client_pid == 0)
-        {
-            return Err(ModelError("invalid source client PID".to_string()));
-        }
-        if let Some(occurrence) = &self.occurrence {
-            validate_tmux_entity_id(&occurrence.session_id, '$', "occurrence session")?;
-            validate_tmux_entity_id(&occurrence.window_id, '@', "occurrence window")?;
-            if occurrence.observed_panes.len() > MAX_VIEW_PANES {
-                return Err(ModelError("too many panes in view occurrence".to_string()));
-            }
-            for pane in &occurrence.observed_panes {
-                pane.validate()?;
-            }
-            let panes = occurrence.observed_panes.iter().collect::<BTreeSet<_>>();
-            if panes.len() != occurrence.observed_panes.len()
-                || !panes.contains(&occurrence.active_pane)
+        if self.hook_kind == ViewHookKind::ClientDetached {
+            if self.active_pane.is_some()
+                || !self.window_panes.is_empty()
+                || self.visibility.pane_visible
+                || self.visibility.window_visible
             {
-                return Err(ModelError("invalid panes in view occurrence".to_string()));
-            }
-            if self.witnesses.iter().any(|witness| {
-                witness.window_id == occurrence.window_id && !panes.contains(&witness.active_pane)
-            }) {
                 return Err(ModelError(
-                    "client witness active pane is not in the declared window".to_string(),
+                    "client-detached event cannot contain visibility proof".to_string(),
                 ));
             }
+            return Ok(());
+        }
+        let active_pane = self
+            .active_pane
+            .as_ref()
+            .ok_or_else(|| ModelError("view event active pane is missing".to_string()))?;
+        active_pane.validate()?;
+        if self.window_panes.len() > MAX_VIEW_PANES {
+            return Err(ModelError("too many panes in view event".to_string()));
+        }
+        let mut panes = BTreeSet::new();
+        for pane in &self.window_panes {
+            pane.validate()?;
+            if !panes.insert(pane) {
+                return Err(ModelError("duplicate pane in view event".to_string()));
+            }
+        }
+        if !panes.contains(active_pane) {
+            return Err(ModelError(
+                "active pane is not in the view event window".to_string(),
+            ));
+        }
+        if self.visibility.pane_visible && !self.visibility.window_visible {
+            return Err(ModelError(
+                "pane visibility requires window visibility".to_string(),
+            ));
         }
         Ok(())
-    }
-}
-
-fn validate_tmux_entity_id(value: &str, prefix: char, field: &str) -> Result<(), ModelError> {
-    if value.strip_prefix(prefix).is_some_and(|digits| {
-        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-    }) {
-        Ok(())
-    } else {
-        Err(ModelError(format!("invalid {field} ID")))
     }
 }
 
@@ -1026,14 +918,9 @@ mod tests {
 
     #[test]
     fn unknown_storage_fields_are_rejected() {
-        let record = StoredPaneRecord::Active(valid_state());
-        let mut value = serde_json::to_value(record).unwrap();
-        value["record"]["unknown"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<StoredPaneRecord>(value).is_err());
-
-        let mut value = serde_json::to_value(StoredPaneRecord::Active(valid_state())).unwrap();
+        let mut value = serde_json::to_value(valid_state()).unwrap();
         value["unknown"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<StoredPaneRecord>(value).is_err());
+        assert!(serde_json::from_value::<PaneState>(value).is_err());
 
         let descriptor = StoredStateDescriptor::Canonical {
             version: valid_state().version(),
@@ -1087,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn view_occurrence_rejects_duplicates_and_ineligible_flags_are_explicit() {
+    fn view_event_rejects_duplicate_window_panes() {
         let pane = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 42,
@@ -1097,23 +984,13 @@ mod tests {
                 .unwrap(),
             event_id: EventId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
             hook_kind: ViewHookKind::WindowPaneChanged,
-            occurrence: Some(ViewOccurrence {
-                session_id: "$1".to_string(),
-                window_id: "@1".to_string(),
-                active_pane: pane.clone(),
-                observed_panes: vec![pane.clone(), pane.clone()],
-            }),
-            source_client: None,
-            witnesses: vec![ClientWitness {
-                client_pid: 10,
-                session_id: "$1".to_string(),
-                window_id: "@1".to_string(),
-                active_pane: pane,
-                control_mode: true,
-                active_pane_flag: false,
-            }],
+            active_pane: Some(pane.clone()),
+            window_panes: vec![pane.clone(), pane],
+            visibility: ViewVisibilityProof {
+                pane_visible: false,
+                window_visible: false,
+            },
         };
-        assert!(!event.witnesses[0].is_eligible());
         assert!(event.validate().is_err());
     }
 }

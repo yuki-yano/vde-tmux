@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 
 use crate::config::load::load_config;
 use crate::session::Direction;
@@ -111,22 +111,9 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
-    Sessions {
-        #[command(subcommand)]
-        command: SessionsCommand,
-    },
     Hooks {
         #[command(subcommand)]
         command: HooksCommand,
-    },
-    /// Inspect or maintain canonical pane state for the current tmux server.
-    #[command(
-        name = "pane-state",
-        after_help = "Examples:\n  vt pane-state reset --target %42\n  vt pane-state cleanup-legacy --all\n  vt pane-state hooks uninstall"
-    )]
-    PaneState {
-        #[command(subcommand)]
-        command: PaneStateCommand,
     },
     Project {
         #[command(subcommand)]
@@ -195,33 +182,6 @@ enum DaemonCommand {
     Reload,
     /// Report lifecycle and runtime health without changing daemon state.
     Status,
-    /// Diagnose config, hooks, projection, notifications, and runtime paths read-only.
-    Doctor,
-    /// Read a bounded tail from one private per-incarnation log.
-    Logs {
-        #[arg(value_enum, default_value_t = DaemonLogKind::Daemon)]
-        log: DaemonLogKind,
-        #[arg(long, default_value_t = 100, value_parser = parse_log_lines)]
-        lines: usize,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum DaemonLogKind {
-    Daemon,
-    Notification,
-    StatusPush,
-    PaneStateHook,
-}
-
-fn parse_log_lines(value: &str) -> std::result::Result<usize, String> {
-    let lines = value
-        .parse::<usize>()
-        .map_err(|_| "lines must be an integer between 1 and 500".to_string())?;
-    if !(1..=500).contains(&lines) {
-        return Err("lines must be between 1 and 500".to_string());
-    }
-    Ok(lines)
 }
 
 #[derive(Debug, Subcommand)]
@@ -271,14 +231,6 @@ enum SessionCommand {
         #[command(flatten)]
         scope: ClientActionScope,
     },
-    #[command(name = "set-category")]
-    SetCategory { session: String, category: String },
-}
-
-#[derive(Debug, Subcommand)]
-enum SessionsCommand {
-    #[command(name = "refresh-category")]
-    RefreshCategory,
 }
 
 #[derive(Debug, Subcommand)]
@@ -312,43 +264,7 @@ enum HooksCommand {
         snapshot_panes: String,
         #[arg(long = "snapshot-clients", hide = true, default_value = "")]
         snapshot_clients: String,
-        #[arg(long = "hook-client")]
-        hook_client: Option<String>,
     },
-}
-
-#[derive(Debug, Subcommand)]
-enum PaneStateCommand {
-    /// Remove only the fixed legacy pane, window, and session option keys.
-    #[command(
-        name = "cleanup-legacy",
-        long_about = "Remove only the fixed 19 legacy pane-state option keys from the current tmux server. Canonical @vde_pane_state, display @vde_status_* options, category metadata, project paths, and sidebar markers are preserved."
-    )]
-    CleanupLegacy {
-        /// Confirm that every pane, window, and session in this tmux server is in scope.
-        #[arg(long, required = true)]
-        all: bool,
-        /// Report existing legacy options by scope without removing them.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Replace current or quarantined canonical state with a guarded reset tombstone.
-    Reset {
-        /// Stable tmux pane ID, for example %42.
-        #[arg(long, value_name = "PANE_ID")]
-        target: String,
-    },
-    /// Maintain the tmux hooks owned by the pane-state daemon.
-    Hooks {
-        #[command(subcommand)]
-        command: PaneStateHooksCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum PaneStateHooksCommand {
-    /// Remove only owned index 70 pane-state hooks; foreign hooks are preserved.
-    Uninstall,
 }
 
 #[derive(Debug, Subcommand)]
@@ -803,13 +719,21 @@ where
                 }
                 Some(DaemonCommand::Disable) => daemon::disable_daemon(runner, env, None),
                 Some(DaemonCommand::Enable) => daemon::enable_daemon(runner, env, None),
-                Some(DaemonCommand::Restart) => daemon::restart_daemon(runner, env, None),
-                Some(DaemonCommand::Reload) => daemon::reload_daemon(runner, env, None),
-                Some(DaemonCommand::Status) => daemon::status_daemon(runner, env, None),
-                Some(DaemonCommand::Doctor) => daemon::doctor_daemon(runner, env, None),
-                Some(DaemonCommand::Logs { log, lines }) => {
-                    daemon::tail_daemon_log(runner, env, log, lines)
+                Some(DaemonCommand::Restart) => {
+                    let result = daemon::restart_daemon(runner, env, None)?;
+                    let config =
+                        crate::config::load::load_config_strict(env).map_err(anyhow::Error::msg)?;
+                    crate::session::sync_session_category_mirrors(runner, &config)?;
+                    Ok(result)
                 }
+                Some(DaemonCommand::Reload) => {
+                    let result = daemon::reload_daemon(runner, env, None)?;
+                    let config =
+                        crate::config::load::load_config_strict(env).map_err(anyhow::Error::msg)?;
+                    crate::session::sync_session_category_mirrors(runner, &config)?;
+                    Ok(result)
+                }
+                Some(DaemonCommand::Status) => daemon::status_daemon(runner, env, None),
                 None => daemon::run_daemon(
                     runner,
                     env,
@@ -940,18 +864,6 @@ where
                     )?;
                     let _ = request_canonical_topology_refresh(runner, env);
                 }
-                SessionCommand::SetCategory { session, category } => {
-                    crate::session::set_session_category_override(runner, &session, &category)?;
-                }
-            }
-            Ok(None)
-        }
-        Command::Sessions { command } => {
-            match command {
-                SessionsCommand::RefreshCategory => {
-                    let config = require_active_config(runner, env)?;
-                    crate::session::refresh_session_categories(runner, &config)?;
-                }
             }
             Ok(None)
         }
@@ -984,7 +896,6 @@ where
                     snapshot_pane_pid,
                     snapshot_panes,
                     snapshot_clients,
-                    hook_client,
                 } => hook::run_view_hook_command(
                     &event_kind,
                     &owner,
@@ -997,26 +908,12 @@ where
                     &snapshot_pane_pid,
                     &snapshot_panes,
                     &snapshot_clients,
-                    hook_client.as_deref(),
                     runner,
                     env,
-                    &config,
                 )?,
             }
             Ok(None)
         }
-        Command::PaneState { command } => match command {
-            PaneStateCommand::CleanupLegacy { all, dry_run } => {
-                if !all {
-                    bail!("--all is required");
-                }
-                daemon::cleanup_legacy_state(runner, env, dry_run)
-            }
-            PaneStateCommand::Reset { target } => daemon::reset_pane_state(runner, env, &target),
-            PaneStateCommand::Hooks {
-                command: PaneStateHooksCommand::Uninstall,
-            } => daemon::uninstall_pane_state_hooks(runner, env),
-        },
         Command::Project { command } => {
             match command {
                 ProjectCommand::Switch { path } => {
@@ -1054,7 +951,7 @@ where
                 )?));
             }
             let outcome = match (popup, command) {
-                (true, None) => crate::session_manager::run_interactive(runner)?,
+                (true, None) => crate::session_manager::run_interactive(runner, env)?,
                 (false, Some(SessionManagerCommand::KillWindow { target })) => {
                     crate::session_manager::kill_window(runner, &target)?;
                     crate::session_manager::SessionManagerOutcome::Done
@@ -1157,11 +1054,13 @@ fn query_active_config_hash(
     if client.phase() != crate::daemon::protocol::v2::DaemonPhase::Serving {
         bail!("daemon is not serving active configuration queries");
     }
-    match client.request(&crate::daemon::protocol::v2::ClientMessage::QueryHealth {
-        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-    })? {
-        crate::daemon::protocol::v2::ServerMessage::HealthResult { health } => {
-            Ok(health.config_hash)
+    match client.request(
+        &crate::daemon::protocol::v2::ClientMessage::QueryRuntimeInfo {
+            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+        },
+    )? {
+        crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult { info } => {
+            Ok(info.config_hash)
         }
         crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
             bail!("daemon query failed ({code:?}): {message}")

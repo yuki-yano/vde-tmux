@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -54,32 +54,12 @@ pub struct SidebarState {
     pub return_target: Option<crate::pane_state::PaneInstance>,
 }
 
-pub const SIDEBAR_ORDER_SCHEMA_VERSION: u32 = 1;
-pub const SIDEBAR_EXPANSION_SCHEMA_VERSION: u32 = 1;
+pub const SIDEBAR_PREFERENCES_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SidebarExpansionPreferences {
+pub struct SidebarPreferences {
     pub schema_version: u32,
-    pub version: u64,
-    pub overrides: BTreeSet<String>,
-}
-
-impl Default for SidebarExpansionPreferences {
-    fn default() -> Self {
-        Self {
-            schema_version: SIDEBAR_EXPANSION_SCHEMA_VERSION,
-            version: 0,
-            overrides: BTreeSet::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SidebarOrderPreferences {
-    pub schema_version: u32,
-    pub version: u64,
     #[serde(default)]
     pub manual_order: Vec<RepoId>,
     #[serde(default)]
@@ -88,19 +68,64 @@ pub struct SidebarOrderPreferences {
     pub view_mode: ViewMode,
     #[serde(default)]
     pub filter: StatusFilter,
+    #[serde(default)]
+    pub expansion_overrides: BTreeSet<String>,
 }
 
-impl Default for SidebarOrderPreferences {
+impl Default for SidebarPreferences {
     fn default() -> Self {
         Self {
-            schema_version: SIDEBAR_ORDER_SCHEMA_VERSION,
-            version: 0,
+            schema_version: SIDEBAR_PREFERENCES_SCHEMA_VERSION,
             manual_order: Vec::new(),
             manual_chat_order: Vec::new(),
             view_mode: ViewMode::default(),
             filter: StatusFilter::default(),
+            expansion_overrides: BTreeSet::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoveDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum SidebarPreferenceIntent {
+    MoveRepo {
+        repo: RepoId,
+        neighbor: RepoId,
+        direction: MoveDirection,
+    },
+    MoveChat {
+        pane_id: String,
+        neighbor_pane_id: String,
+        direction: MoveDirection,
+    },
+    SetDefaultViewMode {
+        view_mode: ViewMode,
+    },
+    SetDefaultFilter {
+        filter: StatusFilter,
+    },
+    SetExpanded {
+        row_id: String,
+        expanded: bool,
+    },
+}
+
+#[derive(Debug, Default)]
+pub struct SidebarIntentDedupe {
+    order: VecDeque<crate::pane_state::EventId>,
+    seen: BTreeSet<crate::pane_state::EventId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,173 +229,150 @@ impl SidebarState {
     }
 }
 
-impl SidebarOrderPreferences {
+impl SidebarPreferences {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != SIDEBAR_ORDER_SCHEMA_VERSION {
+        if self.schema_version != SIDEBAR_PREFERENCES_SCHEMA_VERSION {
             return Err(format!(
-                "unsupported sidebar order schema version {}",
+                "unsupported sidebar preferences schema version {}",
                 self.schema_version
             ));
         }
-        Ok(())
-    }
-
-    pub fn manual_insert(&mut self, repo: RepoId, index: usize) -> bool {
-        if self.manual_order.contains(&repo) {
-            return false;
-        }
-        let index = index.min(self.manual_order.len());
-        self.manual_order.insert(index, repo);
-        self.version += 1;
-        true
-    }
-
-    pub fn manual_move_up(&mut self, repo: &RepoId) -> bool {
-        let Some(index) = self.manual_order.iter().position(|item| item == repo) else {
-            return false;
-        };
-        if index == 0 {
-            return false;
-        }
-        self.manual_order.swap(index, index - 1);
-        self.version += 1;
-        true
-    }
-
-    pub fn manual_move_down(&mut self, repo: &RepoId) -> bool {
-        let Some(index) = self.manual_order.iter().position(|item| item == repo) else {
-            return false;
-        };
-        if index + 1 >= self.manual_order.len() {
-            return false;
-        }
-        self.manual_order.swap(index, index + 1);
-        self.version += 1;
-        true
-    }
-
-    pub fn manual_chat_insert(&mut self, pane_id: impl Into<String>, index: usize) -> bool {
-        let pane_id = pane_id.into();
-        if self.manual_chat_order.contains(&pane_id) {
-            return false;
-        }
-        let index = index.min(self.manual_chat_order.len());
-        self.manual_chat_order.insert(index, pane_id);
-        self.version += 1;
-        true
-    }
-
-    pub fn manual_chat_move_up(&mut self, pane_id: &str) -> bool {
-        let Some(index) = self
-            .manual_chat_order
+        if self
+            .expansion_overrides
             .iter()
-            .position(|item| item == pane_id)
-        else {
-            return false;
-        };
-        if index == 0 {
-            return false;
-        }
-        self.manual_chat_order.swap(index, index - 1);
-        self.version += 1;
-        true
-    }
-
-    pub fn manual_chat_move_down(&mut self, pane_id: &str) -> bool {
-        let Some(index) = self
-            .manual_chat_order
-            .iter()
-            .position(|item| item == pane_id)
-        else {
-            return false;
-        };
-        if index + 1 >= self.manual_chat_order.len() {
-            return false;
-        }
-        self.manual_chat_order.swap(index, index + 1);
-        self.version += 1;
-        true
-    }
-
-    pub fn replace_manual_order(
-        &mut self,
-        expected_version: u64,
-        manual_order: Vec<RepoId>,
-        manual_chat_order: Vec<String>,
-    ) -> Result<bool, u64> {
-        if self.version != expected_version {
-            return Err(self.version);
-        }
-        if self.manual_order == manual_order && self.manual_chat_order == manual_chat_order {
-            return Ok(false);
-        }
-        let Some(next_version) = self.version.checked_add(1) else {
-            return Err(self.version);
-        };
-        self.manual_order = manual_order;
-        self.manual_chat_order = manual_chat_order;
-        self.version = next_version;
-        Ok(true)
-    }
-
-    pub fn replace_view_preferences(
-        &mut self,
-        expected_version: u64,
-        view_mode: ViewMode,
-        filter: StatusFilter,
-    ) -> Result<bool, u64> {
-        if self.version != expected_version {
-            return Err(self.version);
-        }
-        if self.view_mode == view_mode && self.filter == filter {
-            return Ok(false);
-        }
-        let Some(next_version) = self.version.checked_add(1) else {
-            return Err(self.version);
-        };
-        self.view_mode = view_mode;
-        self.filter = filter;
-        self.version = next_version;
-        Ok(true)
-    }
-}
-
-impl SidebarExpansionPreferences {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != SIDEBAR_EXPANSION_SCHEMA_VERSION {
-            return Err(format!(
-                "unsupported sidebar expansion schema version {}",
-                self.schema_version
-            ));
-        }
-        if self.overrides.iter().any(|row_id| row_id.trim().is_empty()) {
+            .any(|row_id| row_id.trim().is_empty())
+        {
             return Err("sidebar expansion row ID must not be empty".to_string());
         }
         Ok(())
     }
 
-    pub fn set_override(
+    pub fn apply_intent(
         &mut self,
-        expected_version: u64,
-        row_id: String,
-        overridden: bool,
-    ) -> Result<bool, u64> {
-        if self.version != expected_version {
-            return Err(self.version);
+        intent: &SidebarPreferenceIntent,
+        known_rows: &BTreeSet<String>,
+    ) -> bool {
+        match intent {
+            SidebarPreferenceIntent::MoveRepo {
+                repo,
+                neighbor,
+                direction,
+            } => {
+                let row = format!("repo::{}::{}", repo.category, repo.repo);
+                let neighbor_row = format!("repo::{}::{}", neighbor.category, neighbor.repo);
+                if !known_rows.contains(&row) || !known_rows.contains(&neighbor_row) {
+                    return false;
+                }
+                move_relative(&mut self.manual_order, repo, neighbor, *direction)
+            }
+            SidebarPreferenceIntent::MoveChat {
+                pane_id,
+                neighbor_pane_id,
+                direction,
+            } => {
+                if !known_rows
+                    .iter()
+                    .any(|row_id| chat_row_matches(row_id, pane_id))
+                    || !known_rows
+                        .iter()
+                        .any(|row_id| chat_row_matches(row_id, neighbor_pane_id))
+                {
+                    return false;
+                }
+                move_relative(
+                    &mut self.manual_chat_order,
+                    pane_id,
+                    neighbor_pane_id,
+                    *direction,
+                )
+            }
+            SidebarPreferenceIntent::SetDefaultViewMode { view_mode } => {
+                if self.view_mode == *view_mode {
+                    return false;
+                }
+                self.view_mode = *view_mode;
+                true
+            }
+            SidebarPreferenceIntent::SetDefaultFilter { filter } => {
+                if self.filter == *filter {
+                    return false;
+                }
+                self.filter = *filter;
+                true
+            }
+            SidebarPreferenceIntent::SetExpanded { row_id, expanded } => {
+                if !known_rows.contains(row_id) {
+                    return false;
+                }
+                let default_open = !row_id.starts_with("chat::");
+                let overridden = default_open != *expanded;
+                if self.expansion_overrides.contains(row_id) == overridden {
+                    return false;
+                }
+                if overridden {
+                    self.expansion_overrides.insert(row_id.clone());
+                } else {
+                    self.expansion_overrides.remove(row_id);
+                }
+                true
+            }
         }
-        if self.overrides.contains(&row_id) == overridden {
-            return Ok(false);
-        }
-        let Some(next_version) = self.version.checked_add(1) else {
-            return Err(self.version);
+    }
+}
+
+fn chat_row_matches(row_id: &str, pane_id: &str) -> bool {
+    row_id
+        .strip_prefix("chat::")
+        .and_then(|rest| rest.split_once("::"))
+        .is_some_and(|(candidate, _)| candidate == pane_id)
+}
+
+fn move_relative<T: Clone + Eq>(
+    order: &mut Vec<T>,
+    item: &T,
+    neighbor: &T,
+    direction: MoveDirection,
+) -> bool {
+    if item == neighbor {
+        return false;
+    }
+    let before = order.clone();
+    order.retain(|entry| entry != item);
+    if let Some(neighbor_index) = order.iter().position(|entry| entry == neighbor) {
+        let insert_at = match direction {
+            MoveDirection::Up => neighbor_index,
+            MoveDirection::Down => neighbor_index + 1,
         };
-        if overridden {
-            self.overrides.insert(row_id);
-        } else {
-            self.overrides.remove(&row_id);
+        order.insert(insert_at, item.clone());
+    } else {
+        match direction {
+            MoveDirection::Up => {
+                order.push(item.clone());
+                order.push(neighbor.clone());
+            }
+            MoveDirection::Down => {
+                order.push(neighbor.clone());
+                order.push(item.clone());
+            }
         }
-        self.version = next_version;
-        Ok(true)
+    }
+    *order != before
+}
+
+impl SidebarIntentDedupe {
+    const CAPACITY: usize = 256;
+
+    pub fn accept(&mut self, event_id: crate::pane_state::EventId) -> bool {
+        if !self.seen.insert(event_id.clone()) {
+            return false;
+        }
+        self.order.push_back(event_id);
+        if self.order.len() > Self::CAPACITY
+            && let Some(expired) = self.order.pop_front()
+        {
+            self.seen.remove(&expired);
+        }
+        true
     }
 }
 
@@ -493,11 +495,12 @@ mod tests {
 
     #[test]
     fn preferences_serialize_view_and_filter_without_instance_local_state() {
-        let state = SidebarOrderPreferences {
+        let state = SidebarPreferences {
             manual_order: vec![RepoId::new("misc", "app")],
             view_mode: ViewMode::ByCategory,
             filter: StatusFilter::DoneOnly,
-            ..SidebarOrderPreferences::default()
+            expansion_overrides: BTreeSet::from(["repo::misc::app".to_string()]),
+            ..SidebarPreferences::default()
         };
 
         let json = serde_json::to_string(&state).unwrap();
@@ -506,7 +509,7 @@ mod tests {
         assert!(json.contains(r#""view_mode":"by_category""#));
         assert!(json.contains(r#""filter":"done_only""#));
         assert!(!json.contains("selection"));
-        assert!(!json.contains("collapsed"));
+        assert!(json.contains("expansion_overrides"));
         assert!(!json.contains("scroll"));
         assert!(!json.contains("return_target"));
     }
@@ -596,71 +599,159 @@ mod tests {
     }
 
     #[test]
-    fn manual_reorder_moves_existing_repos_only() {
-        let mut state = SidebarOrderPreferences::default();
-        state.manual_insert(RepoId::new("misc", "a"), 0);
-        state.manual_insert(RepoId::new("misc", "b"), 1);
-        let version = state.version;
+    fn preference_intent_reorders_known_repos_only() {
+        let a = RepoId::new("misc", "a");
+        let b = RepoId::new("misc", "b");
+        let mut state = SidebarPreferences {
+            manual_order: vec![a.clone(), b.clone()],
+            ..SidebarPreferences::default()
+        };
+        let known = BTreeSet::from(["repo::misc::a".to_string(), "repo::misc::b".to_string()]);
 
-        assert!(state.manual_move_up(&RepoId::new("misc", "b")));
+        assert!(state.apply_intent(
+            &SidebarPreferenceIntent::MoveRepo {
+                repo: b.clone(),
+                neighbor: a.clone(),
+                direction: MoveDirection::Up,
+            },
+            &known,
+        ));
         assert_eq!(
             state.manual_order,
             vec![RepoId::new("misc", "b"), RepoId::new("misc", "a")]
         );
-        assert_eq!(state.version, version + 1);
-        assert!(!state.manual_move_up(&RepoId::new("misc", "b")));
-        assert!(!state.manual_move_down(&RepoId::new("misc", "missing")));
+        assert!(!state.apply_intent(
+            &SidebarPreferenceIntent::MoveRepo {
+                repo: RepoId::new("misc", "missing"),
+                neighbor: a,
+                direction: MoveDirection::Up,
+            },
+            &known,
+        ));
     }
 
     #[test]
-    fn manual_chat_reorder_moves_existing_chats_only() {
-        let mut state = SidebarOrderPreferences::default();
-        state.manual_chat_insert("%1", 0);
-        state.manual_chat_insert("%2", 1);
-        let version = state.version;
-
-        assert!(state.manual_chat_move_up("%2"));
-        assert_eq!(state.manual_chat_order, vec!["%2", "%1"]);
-        assert_eq!(state.version, version + 1);
-        assert!(!state.manual_chat_move_up("%2"));
-        assert!(!state.manual_chat_move_down("%9"));
-    }
-
-    #[test]
-    fn expansion_override_is_versioned_and_idempotent() {
-        let mut state = SidebarExpansionPreferences::default();
-
-        assert!(
-            state
-                .set_override(0, "repo::misc::app".to_string(), true)
-                .unwrap()
-        );
-        assert_eq!(state.version, 1);
-        assert!(
-            !state
-                .set_override(1, "repo::misc::app".to_string(), true)
-                .unwrap()
-        );
-        assert!(
-            state
-                .set_override(1, "repo::misc::app".to_string(), false)
-                .unwrap()
-        );
-        assert_eq!(state.version, 2);
-        assert!(state.overrides.is_empty());
-    }
-
-    #[test]
-    fn expansion_override_does_not_mutate_when_version_cannot_advance() {
-        let mut state = SidebarExpansionPreferences {
-            version: u64::MAX,
-            ..SidebarExpansionPreferences::default()
+    fn preference_intent_reorder_preserves_prior_relative_changes_and_boundaries() {
+        let a = RepoId::new("misc", "a");
+        let b = RepoId::new("misc", "b");
+        let c = RepoId::new("misc", "c");
+        let known = BTreeSet::from([
+            "repo::misc::a".to_string(),
+            "repo::misc::b".to_string(),
+            "repo::misc::c".to_string(),
+        ]);
+        let mut state = SidebarPreferences {
+            manual_order: vec![a.clone(), b.clone(), c.clone()],
+            ..SidebarPreferences::default()
         };
 
-        assert_eq!(
-            state.set_override(u64::MAX, "repo::misc::app".to_string(), true),
-            Err(u64::MAX)
-        );
-        assert!(state.overrides.is_empty());
+        assert!(state.apply_intent(
+            &SidebarPreferenceIntent::MoveRepo {
+                repo: c.clone(),
+                neighbor: b.clone(),
+                direction: MoveDirection::Up,
+            },
+            &known,
+        ));
+        assert!(state.apply_intent(
+            &SidebarPreferenceIntent::MoveRepo {
+                repo: a.clone(),
+                neighbor: c.clone(),
+                direction: MoveDirection::Down,
+            },
+            &known,
+        ));
+        assert_eq!(state.manual_order, vec![c, a, b]);
+        let before = state.clone();
+        assert!(!state.apply_intent(
+            &SidebarPreferenceIntent::MoveRepo {
+                repo: RepoId::new("misc", "a"),
+                neighbor: RepoId::new("misc", "a"),
+                direction: MoveDirection::Up,
+            },
+            &known,
+        ));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn preference_intent_reorders_known_chats_only() {
+        let mut state = SidebarPreferences {
+            manual_chat_order: vec!["%1".to_string(), "%2".to_string()],
+            ..SidebarPreferences::default()
+        };
+        let known = BTreeSet::from(["chat::%1::10".to_string(), "chat::%2::20".to_string()]);
+
+        assert!(state.apply_intent(
+            &SidebarPreferenceIntent::MoveChat {
+                pane_id: "%2".to_string(),
+                neighbor_pane_id: "%1".to_string(),
+                direction: MoveDirection::Up,
+            },
+            &known,
+        ));
+        assert_eq!(state.manual_chat_order, vec!["%2", "%1"]);
+    }
+
+    #[test]
+    fn absolute_expansion_intent_is_idempotent() {
+        let mut state = SidebarPreferences::default();
+        let known = BTreeSet::from(["repo::misc::app".to_string()]);
+        let collapse = SidebarPreferenceIntent::SetExpanded {
+            row_id: "repo::misc::app".to_string(),
+            expanded: false,
+        };
+
+        assert!(state.apply_intent(&collapse, &known));
+        assert!(!state.apply_intent(&collapse, &known));
+        assert!(state.expansion_overrides.contains("repo::misc::app"));
+    }
+
+    #[test]
+    fn absolute_expansion_intents_from_multiple_sidebars_converge() {
+        let mut state = SidebarPreferences::default();
+        let row_id = "chat::%1::10";
+        let known = BTreeSet::from([row_id.to_string()]);
+
+        assert!(state.apply_intent(
+            &SidebarPreferenceIntent::SetExpanded {
+                row_id: row_id.to_string(),
+                expanded: true,
+            },
+            &known,
+        ));
+        assert!(!state.apply_intent(
+            &SidebarPreferenceIntent::SetExpanded {
+                row_id: row_id.to_string(),
+                expanded: true,
+            },
+            &known,
+        ));
+        assert!(state.apply_intent(
+            &SidebarPreferenceIntent::SetExpanded {
+                row_id: row_id.to_string(),
+                expanded: false,
+            },
+            &known,
+        ));
+        assert!(state.expansion_overrides.is_empty());
+    }
+
+    #[test]
+    fn intent_dedupe_is_bounded_and_rejects_duplicates() {
+        let mut dedupe = SidebarIntentDedupe::default();
+        let event = crate::pane_state::EventId::parse("00000000000000000000000000000001").unwrap();
+
+        assert!(dedupe.accept(event.clone()));
+        assert!(!dedupe.accept(event));
+        for sequence in 2..=258 {
+            assert!(
+                dedupe
+                    .accept(crate::pane_state::EventId::parse(format!("{sequence:032x}")).unwrap())
+            );
+        }
+        assert!(dedupe.accept(
+            crate::pane_state::EventId::parse("00000000000000000000000000000001").unwrap()
+        ));
     }
 }

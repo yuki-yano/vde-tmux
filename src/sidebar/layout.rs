@@ -1198,6 +1198,64 @@ mod tests {
         PathBuf::from("/tmp/vt")
     }
 
+    fn stub_sidebar_panes(mock: &MockTmuxRunner, target: &str, output: &str) {
+        mock.stub(
+            &["list-panes", "-t", target, "-F", SIDEBAR_PANE_FORMAT],
+            output,
+        );
+    }
+
+    fn stub_window_layout(mock: &MockTmuxRunner, target: &str, output: &str) {
+        mock.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "-F",
+                "#{window_layout}",
+            ],
+            output,
+        );
+    }
+
+    fn stub_split(mock: &MockTmuxRunner, target: &str, width: &str) {
+        mock.stub(
+            &[
+                "split-window",
+                "-t",
+                target,
+                "-hbf",
+                "-l",
+                width,
+                "'/tmp/vt' sidebar attach",
+            ],
+            "",
+        );
+    }
+
+    fn stub_detached_split(mock: &MockTmuxRunner, target: &str, width: &str) {
+        mock.stub(
+            &[
+                "split-window",
+                "-d",
+                "-t",
+                target,
+                "-hbf",
+                "-l",
+                width,
+                "'/tmp/vt' sidebar attach",
+            ],
+            "",
+        );
+    }
+
+    fn called(mock: &MockTmuxRunner, expected: &[&str]) -> bool {
+        mock.calls()
+            .iter()
+            .any(|call| call.iter().map(String::as_str).eq(expected.iter().copied()))
+    }
+
     #[test]
     fn attach_shell_command_propagates_tmux_socket_name() {
         assert_eq!(
@@ -1257,33 +1315,9 @@ mod tests {
     #[test]
     fn open_splits_sidebar_pane_without_saving_baseline() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            "layout-before\n",
-        );
-        mock.stub(
-            &[
-                "split-window",
-                "-t",
-                "@1",
-                "-hbf",
-                "-l",
-                "40",
-                "'/tmp/vt' sidebar attach",
-            ],
-            "",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n");
+        stub_window_layout(&mock, "@1", "layout-before\n");
+        stub_split(&mock, "@1", "40");
 
         open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
@@ -1299,22 +1333,14 @@ mod tests {
     #[test]
     fn open_splits_sidebar_as_the_focused_pane() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            "layout-before\n",
-        );
-        mock.stub(
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n");
+        stub_window_layout(&mock, "@1", "layout-before\n");
+        stub_split(&mock, "@1", "40");
+
+        open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        assert!(called(
+            &mock,
             &[
                 "split-window",
                 "-t",
@@ -1322,31 +1348,15 @@ mod tests {
                 "-hbf",
                 "-l",
                 "40",
-                "'/tmp/vt' sidebar attach",
-            ],
-            "",
-        );
-
-        open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
-
-        assert!(mock.calls().contains(&vec![
-            "split-window".to_string(),
-            "-t".to_string(),
-            "@1".to_string(),
-            "-hbf".to_string(),
-            "-l".to_string(),
-            "40".to_string(),
-            "'/tmp/vt' sidebar attach".to_string(),
-        ]));
+                "'/tmp/vt' sidebar attach"
+            ]
+        ));
     }
 
     #[test]
     fn open_focuses_an_existing_sidebar() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n%9\t1\t40\n",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n%9\t1\t40\n");
         mock.stub(&["select-pane", "-t", "%9"], "");
 
         open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
@@ -1373,33 +1383,9 @@ mod tests {
     #[test]
     fn open_resolves_percent_width_from_layout_width() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t640\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            "5969,80x24,0,0,1\n",
-        );
-        mock.stub(
-            &[
-                "split-window",
-                "-t",
-                "@1",
-                "-hbf",
-                "-l",
-                "40",
-                "'/tmp/vt' sidebar attach",
-            ],
-            "",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t640\n");
+        stub_window_layout(&mock, "@1", "5969,80x24,0,0,1\n");
+        stub_split(&mock, "@1", "40");
 
         open(
             &mock,
@@ -1410,34 +1396,36 @@ mod tests {
         )
         .unwrap();
 
-        let calls = mock.calls();
-        assert!(calls.contains(&vec![
-            "split-window".to_string(),
-            "-t".to_string(),
-            "@1".to_string(),
-            "-hbf".to_string(),
-            "-l".to_string(),
-            "40".to_string(),
-            "'/tmp/vt' sidebar attach".to_string(),
-        ]));
-        assert!(!calls.contains(&vec![
-            "split-window".to_string(),
-            "-t".to_string(),
-            "@1".to_string(),
-            "-hbf".to_string(),
-            "-l".to_string(),
-            "64".to_string(),
-            "'/tmp/vt' sidebar attach".to_string(),
-        ]));
+        assert!(called(
+            &mock,
+            &[
+                "split-window",
+                "-t",
+                "@1",
+                "-hbf",
+                "-l",
+                "40",
+                "'/tmp/vt' sidebar attach"
+            ]
+        ));
+        assert!(!called(
+            &mock,
+            &[
+                "split-window",
+                "-t",
+                "@1",
+                "-hbf",
+                "-l",
+                "64",
+                "'/tmp/vt' sidebar attach"
+            ]
+        ));
     }
 
     #[test]
     fn focus_toggle_focuses_sidebar_when_not_active() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n%2\t1\t40\n",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n%2\t1\t40\n");
         mock.stub(&["display-message", "-p", "-t", "@1", "#{pane_id}"], "%1\n");
         mock.stub(&["select-pane", "-t", "%2"], "");
 
@@ -1460,33 +1448,16 @@ mod tests {
         let mock = MockTmuxRunner::new();
         let layout = "e565,120x40,0,0{20x40,0,0,2,99x40,21,0,1}";
         let content_layout = "aafe,120x40,0,0,1";
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n%2\t1\t40\n",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n%2\t1\t40\n");
         mock.stub(&["display-message", "-p", "-t", "@1", "#{pane_id}"], "%2\n");
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            &format!("{layout}\n"),
-        );
+        stub_window_layout(&mock, "@1", &format!("{layout}\n"));
         mock.stub(&["kill-pane", "-t", "%2"], "");
         mock.stub(&["select-layout", "-t", "@1", content_layout], "");
 
         focus_toggle(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
         let calls = mock.calls();
-        assert!(calls.contains(&vec![
-            "kill-pane".to_string(),
-            "-t".to_string(),
-            "%2".to_string()
-        ]));
+        assert!(called(&mock, &["kill-pane", "-t", "%2"]));
         assert!(
             !calls
                 .iter()
@@ -1497,33 +1468,9 @@ mod tests {
     #[test]
     fn focus_toggle_opens_missing_sidebar_as_the_focused_pane() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            "layout-before\n",
-        );
-        mock.stub(
-            &[
-                "split-window",
-                "-t",
-                "@1",
-                "-hbf",
-                "-l",
-                "40",
-                "'/tmp/vt' sidebar attach",
-            ],
-            "",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n");
+        stub_window_layout(&mock, "@1", "layout-before\n");
+        stub_split(&mock, "@1", "40");
 
         focus_toggle(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
@@ -1538,33 +1485,9 @@ mod tests {
     #[test]
     fn open_ignores_stale_baseline_options() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n%2\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            "layout-current\n",
-        );
-        mock.stub(
-            &[
-                "split-window",
-                "-t",
-                "@1",
-                "-hbf",
-                "-l",
-                "40",
-                "'/tmp/vt' sidebar attach",
-            ],
-            "",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n%2\t\t80\n");
+        stub_window_layout(&mock, "@1", "layout-current\n");
+        stub_split(&mock, "@1", "40");
 
         open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
@@ -1615,33 +1538,9 @@ mod tests {
     #[test]
     fn open_does_not_clear_stale_baseline_options() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n%2\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            "layout-current\n",
-        );
-        mock.stub(
-            &[
-                "split-window",
-                "-t",
-                "@1",
-                "-hbf",
-                "-l",
-                "40",
-                "'/tmp/vt' sidebar attach",
-            ],
-            "",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n%2\t\t80\n");
+        stub_window_layout(&mock, "@1", "layout-current\n");
+        stub_split(&mock, "@1", "40");
 
         open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
@@ -1690,21 +1589,8 @@ mod tests {
         let layout =
             "ccd0,120x40,0,0{20x40,0,0,9,65x40,21,0[65x29,21,0,1,65x10,21,30,2],33x40,87,0,3}";
         let content_layout = "c0cd,120x40,0,0{79x40,0,0[79x29,0,0,1,79x10,0,30,2],40x40,80,0,3}";
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%9\t1\t40\n%1\t\t80\n%2\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            &format!("{layout}\n"),
-        );
+        stub_sidebar_panes(&mock, "@1", "%9\t1\t40\n%1\t\t80\n%2\t\t80\n");
+        stub_window_layout(&mock, "@1", &format!("{layout}\n"));
         mock.stub(&["kill-pane", "-t", "%9"], "");
         mock.stub(&["select-layout", "-t", "@1", content_layout], "");
 
@@ -1718,41 +1604,23 @@ mod tests {
         let mock = MockTmuxRunner::new();
         let layout = "e581,120x40,0,0{20x40,0,0,9,99x40,21,0,1}";
         let content_layout = "aafe,120x40,0,0,1";
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%9\t1\t40\n%1\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            &format!("{layout}\n"),
-        );
+        stub_sidebar_panes(&mock, "@1", "%9\t1\t40\n%1\t\t80\n");
+        stub_window_layout(&mock, "@1", &format!("{layout}\n"));
         mock.stub(&["kill-pane", "-t", "%9"], "");
         mock.stub(&["select-layout", "-t", "@1", content_layout], "");
 
         close(&mock, "@1").unwrap();
 
-        assert!(mock.calls().contains(&vec![
-            "select-layout".to_string(),
-            "-t".to_string(),
-            "@1".to_string(),
-            content_layout.to_string(),
-        ]));
+        assert!(called(
+            &mock,
+            &["select-layout", "-t", "@1", content_layout]
+        ));
     }
 
     #[test]
     fn close_is_noop_when_sidebar_pane_already_gone() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n%2\t\t80\n",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n%2\t\t80\n");
 
         close(&mock, "@1").unwrap();
 
@@ -1763,21 +1631,8 @@ mod tests {
     fn close_errors_when_current_layout_does_not_contain_sidebar_pane() {
         let mock = MockTmuxRunner::new();
         let layout_without_marker = "aafe,120x40,0,0,1";
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%9\t1\t40\n%1\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            &format!("{layout_without_marker}\n"),
-        );
+        stub_sidebar_panes(&mock, "@1", "%9\t1\t40\n%1\t\t80\n");
+        stub_window_layout(&mock, "@1", &format!("{layout_without_marker}\n"));
 
         let err = close(&mock, "@1").unwrap_err();
 
@@ -1793,10 +1648,7 @@ mod tests {
     #[test]
     fn rail_toggles_sidebar_width() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%9\t1\t40\n",
-        );
+        stub_sidebar_panes(&mock, "@1", "%9\t1\t40\n");
         mock.stub(&["resize-pane", "-t", "%9", "-x", "3"], "");
 
         rail(&mock, "@1", SidebarWidth::Columns(40), 40).unwrap();
@@ -1807,21 +1659,8 @@ mod tests {
     #[test]
     fn rail_resolves_percent_width_when_restoring_normal_width() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%9\t1\t3\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            "abcd,640x132,0,0,9\n",
-        );
+        stub_sidebar_panes(&mock, "@1", "%9\t1\t3\n");
+        stub_window_layout(&mock, "@1", "abcd,640x132,0,0,9\n");
         mock.stub(&["resize-pane", "-t", "%9", "-x", "64"], "");
 
         rail(&mock, "@1", SidebarWidth::Percent(10), 40).unwrap();
@@ -1833,63 +1672,12 @@ mod tests {
     fn toggle_all_opens_all_windows_when_none_are_open() {
         let mock = MockTmuxRunner::new();
         mock.stub(&["list-windows", "-a", "-F", "#{window_id}"], "@1\n@2\n");
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            "layout-one\n",
-        );
-        mock.stub(
-            &[
-                "split-window",
-                "-d",
-                "-t",
-                "@1",
-                "-hbf",
-                "-l",
-                "40",
-                "'/tmp/vt' sidebar attach",
-            ],
-            "",
-        );
-
-        mock.stub(
-            &["list-panes", "-t", "@2", "-F", SIDEBAR_PANE_FORMAT],
-            "%2\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@2",
-                "-F",
-                "#{window_layout}",
-            ],
-            "layout-two\n",
-        );
-        mock.stub(
-            &[
-                "split-window",
-                "-d",
-                "-t",
-                "@2",
-                "-hbf",
-                "-l",
-                "40",
-                "'/tmp/vt' sidebar attach",
-            ],
-            "",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n");
+        stub_window_layout(&mock, "@1", "layout-one\n");
+        stub_detached_split(&mock, "@1", "40");
+        stub_sidebar_panes(&mock, "@2", "%2\t\t80\n");
+        stub_window_layout(&mock, "@2", "layout-two\n");
+        stub_detached_split(&mock, "@2", "40");
         mock.stub(
             &[
                 "set-hook",
@@ -1923,38 +1711,10 @@ mod tests {
     fn toggle_all_opens_missing_windows_without_closing_existing_sidebars() {
         let mock = MockTmuxRunner::new();
         mock.stub(&["list-windows", "-a", "-F", "#{window_id}"], "@1\n@2\n");
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            "layout-one\n",
-        );
-        mock.stub(
-            &[
-                "split-window",
-                "-d",
-                "-t",
-                "@1",
-                "-hbf",
-                "-l",
-                "40",
-                "'/tmp/vt' sidebar attach",
-            ],
-            "",
-        );
-        mock.stub(
-            &["list-panes", "-t", "@2", "-F", SIDEBAR_PANE_FORMAT],
-            "%9\t1\t40\n%2\t\t80\n",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n");
+        stub_window_layout(&mock, "@1", "layout-one\n");
+        stub_detached_split(&mock, "@1", "40");
+        stub_sidebar_panes(&mock, "@2", "%9\t1\t40\n%2\t\t80\n");
         mock.stub(
             &[
                 "set-hook",
@@ -2008,21 +1768,8 @@ mod tests {
                 ),
                 _ => unreachable!(),
             };
-            mock.stub(
-                &["list-panes", "-t", window, "-F", SIDEBAR_PANE_FORMAT],
-                &format!("{sidebar}\t1\t40\n{pane}\t\t80\n"),
-            );
-            mock.stub(
-                &[
-                    "display-message",
-                    "-p",
-                    "-t",
-                    window,
-                    "-F",
-                    "#{window_layout}",
-                ],
-                &format!("{layout}\n"),
-            );
+            stub_sidebar_panes(&mock, window, &format!("{sidebar}\t1\t40\n{pane}\t\t80\n"));
+            stub_window_layout(&mock, window, &format!("{layout}\n"));
             mock.stub(&["kill-pane", "-t", sidebar], "");
             mock.stub(&["select-layout", "-t", window, content_layout], "");
         }
@@ -2039,50 +1786,17 @@ mod tests {
                 .count(),
             2
         );
-        assert!(calls.contains(&vec![
-            "set-hook".to_string(),
-            "-gu".to_string(),
-            "after-new-window[90]".to_string(),
-        ]));
-        assert!(calls.contains(&vec![
-            "set-hook".to_string(),
-            "-gu".to_string(),
-            "pane-exited[90]".to_string(),
-        ]));
+        assert!(called(&mock, &["set-hook", "-gu", "after-new-window[90]"]));
+        assert!(called(&mock, &["set-hook", "-gu", "pane-exited[90]"]));
     }
 
     #[test]
     fn layout_applied_opens_when_sidebar_is_absent() {
         let mock = MockTmuxRunner::new();
         mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            "layout-before\n",
-        );
-        mock.stub(
-            &[
-                "split-window",
-                "-d",
-                "-t",
-                "@1",
-                "-hbf",
-                "-l",
-                "32",
-                "'/tmp/vt' sidebar attach",
-            ],
-            "",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n");
+        stub_window_layout(&mock, "@1", "layout-before\n");
+        stub_detached_split(&mock, "@1", "32");
 
         layout_applied(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
 
@@ -2093,20 +1807,13 @@ mod tests {
     fn layout_applied_closes_window_when_only_sidebar_remains() {
         let mock = MockTmuxRunner::new();
         mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%9\n");
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%9\t1\t40\n",
-        );
+        stub_sidebar_panes(&mock, "@1", "%9\t1\t40\n");
         mock.stub(&["kill-pane", "-t", "%9"], "");
 
         layout_applied(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
 
         let calls = mock.calls();
-        assert!(calls.contains(&vec![
-            "kill-pane".to_string(),
-            "-t".to_string(),
-            "%9".to_string()
-        ]));
+        assert!(called(&mock, &["kill-pane", "-t", "%9"]));
         assert!(
             !calls
                 .iter()
@@ -2119,20 +1826,13 @@ mod tests {
     fn layout_changed_closes_window_when_only_sidebar_remains() {
         let mock = MockTmuxRunner::new();
         mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%9\n");
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%9\t1\t40\n",
-        );
+        stub_sidebar_panes(&mock, "@1", "%9\t1\t40\n");
         mock.stub(&["kill-pane", "-t", "%9"], "");
 
         layout_changed(&mock, "@1").unwrap();
 
         let calls = mock.calls();
-        assert!(calls.contains(&vec![
-            "kill-pane".to_string(),
-            "-t".to_string(),
-            "%9".to_string()
-        ]));
+        assert!(called(&mock, &["kill-pane", "-t", "%9"]));
         assert!(
             !calls
                 .iter()
@@ -2145,10 +1845,7 @@ mod tests {
     fn layout_changed_does_not_open_when_sidebar_is_absent() {
         let mock = MockTmuxRunner::new();
         mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n");
 
         layout_changed(&mock, "@1").unwrap();
 
@@ -2159,10 +1856,7 @@ mod tests {
     fn layout_applied_keeps_existing_sidebar_when_non_sidebar_pane_remains() {
         let mock = MockTmuxRunner::new();
         mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n%9\n");
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n%9\t1\t40\n",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n%9\t1\t40\n");
 
         layout_applied(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
 
@@ -2186,21 +1880,8 @@ mod tests {
         let mock = MockTmuxRunner::new();
         let layout = "e581,120x40,0,0{20x40,0,0,9,99x40,21,0,1}";
         let content_layout = "aafe,120x40,0,0,1";
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%9\t1\t40\n%1\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            &format!("{layout}\n"),
-        );
+        stub_sidebar_panes(&mock, "@1", "%9\t1\t40\n%1\t\t80\n");
+        stub_window_layout(&mock, "@1", &format!("{layout}\n"));
         mock.stub(&["kill-pane", "-t", "%9"], "");
         mock.stub(&["select-layout", "-t", "@1", content_layout], "");
 
@@ -2212,33 +1893,9 @@ mod tests {
     #[test]
     fn toggle_opens_sidebar_as_the_focused_pane() {
         let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["list-panes", "-t", "@1", "-F", SIDEBAR_PANE_FORMAT],
-            "%1\t\t80\n",
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "@1",
-                "-F",
-                "#{window_layout}",
-            ],
-            "layout-before\n",
-        );
-        mock.stub(
-            &[
-                "split-window",
-                "-t",
-                "@1",
-                "-hbf",
-                "-l",
-                "32",
-                "'/tmp/vt' sidebar attach",
-            ],
-            "",
-        );
+        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n");
+        stub_window_layout(&mock, "@1", "layout-before\n");
+        stub_split(&mock, "@1", "32");
 
         toggle(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
 

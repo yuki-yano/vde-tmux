@@ -4,170 +4,39 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use sha2::{Digest, Sha256};
 
-use crate::sidebar::state::{SidebarExpansionPreferences, SidebarOrderPreferences};
+use crate::sidebar::state::SidebarPreferences;
 
-#[derive(Debug)]
-pub enum OrderUpdateError {
-    Busy,
-    Stale { current_version: u64 },
-    Storage(anyhow::Error),
-}
-
-impl std::fmt::Display for OrderUpdateError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Busy => formatter.write_str("sidebar order is locked by another process"),
-            Self::Stale { current_version } => {
-                write!(
-                    formatter,
-                    "sidebar order version is stale: current {current_version}"
-                )
-            }
-            Self::Storage(error) => {
-                write!(formatter, "sidebar order persistence failed: {error:#}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for OrderUpdateError {}
-
-pub fn compare_and_swap_order(
-    path: &Path,
-    expected_version: u64,
-    manual_order: Vec<crate::sidebar::state::RepoId>,
-    manual_chat_order: Vec<String>,
-) -> std::result::Result<SidebarOrderPreferences, OrderUpdateError> {
-    ensure_secure_state_parent(path).map_err(OrderUpdateError::Storage)?;
-    let _lock = crate::daemon::lifecycle::try_acquire_writer_lease(path)
-        .map_err(OrderUpdateError::Storage)?
-        .ok_or(OrderUpdateError::Busy)?;
-    let mut current = load_state(path).map_err(OrderUpdateError::Storage)?;
-    if current.version != expected_version {
-        return Err(OrderUpdateError::Stale {
-            current_version: current.version,
-        });
-    }
-    let changed = current
-        .replace_manual_order(expected_version, manual_order, manual_chat_order)
-        .map_err(|current_version| OrderUpdateError::Stale { current_version })?;
-    if changed {
-        save_state(path, &current).map_err(OrderUpdateError::Storage)?;
-    }
-    Ok(current)
-}
-
-pub fn compare_and_swap_view_preferences(
-    path: &Path,
-    expected_version: u64,
-    view_mode: crate::sidebar::state::ViewMode,
-    filter: crate::sidebar::state::StatusFilter,
-) -> std::result::Result<SidebarOrderPreferences, OrderUpdateError> {
-    ensure_secure_state_parent(path).map_err(OrderUpdateError::Storage)?;
-    let _lock = crate::daemon::lifecycle::try_acquire_writer_lease(path)
-        .map_err(OrderUpdateError::Storage)?
-        .ok_or(OrderUpdateError::Busy)?;
-    let mut current = load_state(path).map_err(OrderUpdateError::Storage)?;
-    if current.version != expected_version {
-        return Err(OrderUpdateError::Stale {
-            current_version: current.version,
-        });
-    }
-    let changed = current
-        .replace_view_preferences(expected_version, view_mode, filter)
-        .map_err(|current_version| OrderUpdateError::Stale { current_version })?;
-    if changed {
-        save_state(path, &current).map_err(OrderUpdateError::Storage)?;
-    }
-    Ok(current)
-}
-
-pub fn compare_and_swap_expansion_override(
-    path: &Path,
-    expected_version: u64,
-    row_id: String,
-    overridden: bool,
-) -> std::result::Result<SidebarExpansionPreferences, OrderUpdateError> {
-    ensure_secure_state_parent(path).map_err(OrderUpdateError::Storage)?;
-    let _lock = crate::daemon::lifecycle::try_acquire_writer_lease(path)
-        .map_err(OrderUpdateError::Storage)?
-        .ok_or(OrderUpdateError::Busy)?;
-    let mut current = load_expansion_state(path).map_err(OrderUpdateError::Storage)?;
-    if current.version != expected_version {
-        return Err(OrderUpdateError::Stale {
-            current_version: current.version,
-        });
-    }
-    let changed = current
-        .set_override(expected_version, row_id, overridden)
-        .map_err(|current_version| OrderUpdateError::Stale { current_version })?;
-    if changed {
-        save_expansion_state(path, &current).map_err(OrderUpdateError::Storage)?;
-    }
-    Ok(current)
-}
-
-pub fn encode_state(state: &SidebarOrderPreferences) -> Result<String> {
+pub fn encode_state(state: &SidebarPreferences) -> Result<String> {
     Ok(serde_json::to_string_pretty(state)?)
 }
 
-pub fn decode_state(raw: &str) -> Result<SidebarOrderPreferences> {
-    let state = serde_json::from_str::<SidebarOrderPreferences>(raw)?;
+pub fn decode_state(raw: &str) -> Result<SidebarPreferences> {
+    let state = serde_json::from_str::<SidebarPreferences>(raw)?;
     state.validate().map_err(anyhow::Error::msg)?;
     Ok(state)
 }
 
-pub fn encode_expansion_state(state: &SidebarExpansionPreferences) -> Result<String> {
-    Ok(serde_json::to_string_pretty(state)?)
-}
-
-pub fn decode_expansion_state(raw: &str) -> Result<SidebarExpansionPreferences> {
-    let state = serde_json::from_str::<SidebarExpansionPreferences>(raw)?;
-    state.validate().map_err(anyhow::Error::msg)?;
-    Ok(state)
-}
-
-pub fn load_state(path: &std::path::Path) -> Result<SidebarOrderPreferences> {
+pub fn load_state(path: &std::path::Path) -> Result<SidebarPreferences> {
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         validate_private_state_file(path, &metadata)?;
     }
     match std::fs::read_to_string(path) {
         Ok(raw) => decode_state(&raw),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(SidebarOrderPreferences::default())
+            Ok(SidebarPreferences::default())
         }
         Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
     }
 }
 
-pub fn load_expansion_state(path: &Path) -> Result<SidebarExpansionPreferences> {
-    if let Ok(metadata) = std::fs::symlink_metadata(path) {
-        validate_private_state_file(path, &metadata)?;
-    }
-    match std::fs::read_to_string(path) {
-        Ok(raw) => decode_expansion_state(&raw),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(SidebarExpansionPreferences::default())
-        }
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
-    }
-}
-
-pub fn save_state(path: &std::path::Path, state: &SidebarOrderPreferences) -> Result<()> {
+pub fn save_state(path: &std::path::Path, state: &SidebarPreferences) -> Result<()> {
     ensure_secure_state_parent(path)?;
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         validate_private_state_file(path, &metadata)?;
     }
     save_encoded_state(path, encode_state(state)?)
-}
-
-pub fn save_expansion_state(path: &Path, state: &SidebarExpansionPreferences) -> Result<()> {
-    ensure_secure_state_parent(path)?;
-    if let Ok(metadata) = std::fs::symlink_metadata(path) {
-        validate_private_state_file(path, &metadata)?;
-    }
-    save_encoded_state(path, encode_expansion_state(state)?)
 }
 
 fn save_encoded_state(path: &Path, encoded: String) -> Result<()> {
@@ -221,25 +90,22 @@ fn temporary_state_path(path: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!(".{file_name}.tmp.{}.{}", std::process::id(), stamp)))
 }
 
-pub fn state_path(env: &BTreeMap<String, String>) -> PathBuf {
-    if let Some(state_home) = env
+pub fn state_path(env: &BTreeMap<String, String>, socket_path: &Path) -> PathBuf {
+    let base = if let Some(state_home) = env
         .get("XDG_STATE_HOME")
         .filter(|value| !value.trim().is_empty())
     {
-        return PathBuf::from(state_home).join("vde/tmux/sidebar-state/sidebar-order-v1.json");
-    }
-    if let Some(home) = env.get("HOME").filter(|value| !value.trim().is_empty()) {
-        return PathBuf::from(home)
-            .join(".local/state/vde/tmux/sidebar-state/sidebar-order-v1.json");
-    }
-    PathBuf::from(format!(
-        "/tmp/vt-{}/sidebar-state/sidebar-order-v1.json",
-        unsafe { libc::geteuid() }
-    ))
-}
-
-pub fn expansion_state_path(env: &BTreeMap<String, String>) -> PathBuf {
-    state_path(env).with_file_name("sidebar-expansion-v1.json")
+        PathBuf::from(state_home).join("vde/tmux/sidebar-state")
+    } else if let Some(home) = env.get("HOME").filter(|value| !value.trim().is_empty()) {
+        PathBuf::from(home).join(".local/state/vde/tmux/sidebar-state")
+    } else {
+        PathBuf::from(format!("/tmp/vt-{}/sidebar-state", unsafe {
+            libc::geteuid()
+        }))
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(socket_path.as_os_str().as_encoded_bytes());
+    base.join(format!("sidebar-preferences-{:x}.json", hasher.finalize()))
 }
 
 fn ensure_secure_state_parent(path: &Path) -> Result<()> {
@@ -301,15 +167,14 @@ fn validate_private_state_file(path: &Path, metadata: &std::fs::Metadata) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sidebar::state::{RepoId, SidebarExpansionPreferences, SidebarOrderPreferences};
+    use crate::sidebar::state::{RepoId, SidebarPreferences};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn state_json_roundtrips() {
-        let state = SidebarOrderPreferences {
-            version: 7,
+        let state = SidebarPreferences {
             manual_order: vec![RepoId::new("misc", "app")],
-            ..SidebarOrderPreferences::default()
+            ..SidebarPreferences::default()
         };
 
         let json = encode_state(&state).unwrap();
@@ -319,30 +184,42 @@ mod tests {
     }
 
     #[test]
+    fn state_json_rejects_unknown_fields_and_schema_versions() {
+        let unknown = r#"{"schema_version":1,"unknown":true}"#;
+        let unsupported = r#"{"schema_version":2}"#;
+
+        assert!(decode_state(unknown).is_err());
+        assert!(decode_state(unsupported).is_err());
+    }
+
+    #[test]
     fn state_path_prefers_xdg_state_home() {
         let env = std::collections::BTreeMap::from([(
             "XDG_STATE_HOME".to_string(),
             "/tmp/state".to_string(),
         )]);
 
+        let first = state_path(&env, Path::new("/tmp/tmux-501/default"));
+        let second = state_path(&env, Path::new("/tmp/tmux-501/other"));
+
         assert_eq!(
-            state_path(&env),
-            std::path::PathBuf::from("/tmp/state/vde/tmux/sidebar-state/sidebar-order-v1.json")
+            first.parent(),
+            Some(Path::new("/tmp/state/vde/tmux/sidebar-state"))
         );
-        assert_eq!(
-            expansion_state_path(&env),
-            std::path::PathBuf::from("/tmp/state/vde/tmux/sidebar-state/sidebar-expansion-v1.json")
-        );
+        assert_ne!(first, second);
+        assert_eq!(first, state_path(&env, Path::new("/tmp/tmux-501/default")));
     }
 
     #[test]
     fn state_path_uses_private_uid_scoped_tmp_fallback() {
-        let expected = std::path::PathBuf::from(format!(
-            "/tmp/vt-{}/sidebar-state/sidebar-order-v1.json",
-            unsafe { libc::geteuid() }
-        ));
+        let path = state_path(&BTreeMap::new(), Path::new("/tmp/tmux/default"));
 
-        assert_eq!(state_path(&BTreeMap::new()), expected);
+        assert_eq!(
+            path.parent(),
+            Some(Path::new(&format!("/tmp/vt-{}/sidebar-state", unsafe {
+                libc::geteuid()
+            })))
+        );
     }
 
     #[test]
@@ -355,10 +232,9 @@ mod tests {
                 .as_nanos()
         ));
         let path = dir.join("sidebar-order-v1.json");
-        let state = SidebarOrderPreferences {
-            version: 1,
+        let state = SidebarPreferences {
             manual_chat_order: vec!["%1".to_string()],
-            ..SidebarOrderPreferences::default()
+            ..SidebarPreferences::default()
         };
 
         save_state(&path, &state).unwrap();
@@ -368,6 +244,37 @@ mod tests {
         assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn socket_namespaces_persist_independently_and_survive_reload() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-tmux-socket-state-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let env = BTreeMap::from([(
+            "XDG_STATE_HOME".to_string(),
+            root.to_string_lossy().into_owned(),
+        )]);
+        let first_path = state_path(&env, Path::new("/tmp/tmux/first"));
+        let second_path = state_path(&env, Path::new("/tmp/tmux/second"));
+        let first = SidebarPreferences {
+            filter: crate::sidebar::state::StatusFilter::DoneOnly,
+            ..SidebarPreferences::default()
+        };
+
+        save_state(&first_path, &first).unwrap();
+
+        assert_eq!(load_state(&first_path).unwrap(), first);
+        assert_eq!(
+            load_state(&second_path).unwrap(),
+            SidebarPreferences::default()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -387,9 +294,9 @@ mod tests {
             "XDG_STATE_HOME".to_string(),
             root.to_string_lossy().into_owned(),
         )]);
-        let path = expansion_state_path(&env);
+        let path = state_path(&env, Path::new("/tmp/tmux/default"));
 
-        save_expansion_state(&path, &SidebarExpansionPreferences::default()).unwrap();
+        save_state(&path, &SidebarPreferences::default()).unwrap();
 
         assert_eq!(
             std::fs::metadata(path.parent().unwrap()).unwrap().mode() & 0o777,
@@ -414,13 +321,7 @@ mod tests {
         let loose = root.join("loose");
         std::fs::create_dir(&loose).unwrap();
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            save_state(
-                &loose.join("state.json"),
-                &SidebarOrderPreferences::default()
-            )
-            .is_err()
-        );
+        assert!(save_state(&loose.join("state.json"), &SidebarPreferences::default()).is_err());
 
         let target = root.join("target");
         let parent_link = root.join("parent-link");
@@ -430,7 +331,7 @@ mod tests {
         assert!(
             save_state(
                 &parent_link.join("state.json"),
-                &SidebarOrderPreferences::default()
+                &SidebarPreferences::default()
             )
             .is_err()
         );
@@ -442,7 +343,7 @@ mod tests {
         let state_link = private.join("state.json");
         std::fs::write(&target_file, b"unchanged").unwrap();
         std::os::unix::fs::symlink(&target_file, &state_link).unwrap();
-        assert!(save_state(&state_link, &SidebarOrderPreferences::default()).is_err());
+        assert!(save_state(&state_link, &SidebarPreferences::default()).is_err());
         assert_eq!(std::fs::read(&target_file).unwrap(), b"unchanged");
 
         std::fs::remove_dir_all(root).unwrap();
@@ -464,13 +365,43 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let before_inode = std::fs::metadata(&path).unwrap().ino();
 
-        save_state(&path, &SidebarOrderPreferences::default()).unwrap();
+        save_state(&path, &SidebarPreferences::default()).unwrap();
 
         let after_inode = std::fs::metadata(&path).unwrap().ino();
         assert_ne!(after_inode, before_inode);
-        assert_eq!(
-            load_state(&path).unwrap(),
-            SidebarOrderPreferences::default()
+        assert_eq!(load_state(&path).unwrap(), SidebarPreferences::default());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn preference_write_latency_metric() {
+        let dir = std::env::temp_dir().join(format!(
+            "vde-tmux-preference-latency-current-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("sidebar-preferences.json");
+        let mut micros = Vec::new();
+        for index in 0..50 {
+            let state = SidebarPreferences {
+                manual_chat_order: vec![format!("%{index}")],
+                ..SidebarPreferences::default()
+            };
+            let started = std::time::Instant::now();
+            save_state(&path, &state).unwrap();
+            micros.push(started.elapsed().as_micros());
+        }
+        micros.sort_unstable();
+        let p95 = micros[47];
+        let max = *micros.last().unwrap();
+        eprintln!("preference_write_current n=50 p95={p95}us max={max}us");
+        assert!(
+            p95 <= 250_000,
+            "preference write p95 exceeded 250ms: {p95}us"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -487,136 +418,6 @@ mod tests {
 
         let loaded = load_state(&path).unwrap();
 
-        assert_eq!(loaded, SidebarOrderPreferences::default());
-    }
-
-    #[test]
-    fn global_order_cas_rejects_second_server_with_stale_version() {
-        let dir = std::env::temp_dir().join(format!(
-            "vde-tmux-order-cas-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = dir.join("sidebar-order-v1.json");
-
-        let first =
-            compare_and_swap_order(&path, 0, vec![RepoId::new("misc", "first")], Vec::new())
-                .unwrap();
-        let second =
-            compare_and_swap_order(&path, 0, vec![RepoId::new("misc", "second")], Vec::new())
-                .unwrap_err();
-
-        assert_eq!(first.version, 1);
-        assert!(matches!(
-            second,
-            OrderUpdateError::Stale { current_version: 1 }
-        ));
-        assert_eq!(load_state(&path).unwrap().manual_order, first.manual_order);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn expansion_state_roundtrips_and_rejects_stale_writes() {
-        let dir = std::env::temp_dir().join(format!(
-            "vde-tmux-expansion-cas-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = dir.join("sidebar-expansion-v1.json");
-
-        let first =
-            compare_and_swap_expansion_override(&path, 0, "repo::misc::app".to_string(), true)
-                .unwrap();
-        let stale =
-            compare_and_swap_expansion_override(&path, 0, "category::work".to_string(), true)
-                .unwrap_err();
-
-        assert_eq!(first.version, 1);
-        assert_eq!(load_expansion_state(&path).unwrap(), first);
-        assert!(matches!(
-            stale,
-            OrderUpdateError::Stale { current_version: 1 }
-        ));
-        assert_eq!(
-            decode_expansion_state(&encode_expansion_state(&first).unwrap()).unwrap(),
-            first
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn view_preference_cas_preserves_manual_order_and_rejects_stale_writes() {
-        let dir = std::env::temp_dir().join(format!(
-            "vde-tmux-view-pref-cas-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = dir.join("sidebar-order-v1.json");
-        let ordered = compare_and_swap_order(
-            &path,
-            0,
-            vec![RepoId::new("misc", "app")],
-            vec!["%1".to_string()],
-        )
-        .unwrap();
-
-        let updated = compare_and_swap_view_preferences(
-            &path,
-            ordered.version,
-            crate::sidebar::state::ViewMode::ByCategory,
-            crate::sidebar::state::StatusFilter::DoneOnly,
-        )
-        .unwrap();
-
-        assert_eq!(updated.manual_order, ordered.manual_order);
-        assert_eq!(updated.manual_chat_order, ordered.manual_chat_order);
-        assert_eq!(
-            updated.view_mode,
-            crate::sidebar::state::ViewMode::ByCategory
-        );
-        assert_eq!(
-            updated.filter,
-            crate::sidebar::state::StatusFilter::DoneOnly
-        );
-        assert!(matches!(
-            compare_and_swap_view_preferences(
-                &path,
-                ordered.version,
-                crate::sidebar::state::ViewMode::Flat,
-                crate::sidebar::state::StatusFilter::All,
-            ),
-            Err(OrderUpdateError::Stale { .. })
-        ));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn order_cas_reports_storage_failure_before_acknowledgement() {
-        let dir = std::env::temp_dir().join(format!(
-            "vde-tmux-order-failure-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state-parent");
-        std::fs::create_dir(&path).unwrap();
-
-        let error =
-            compare_and_swap_order(&path, 0, Vec::new(), vec!["%1".to_string()]).unwrap_err();
-
-        assert!(matches!(error, OrderUpdateError::Storage(_)));
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(loaded, SidebarPreferences::default());
     }
 }

@@ -26,7 +26,7 @@ SYSTEM_TMUX="$(command -v tmux)"
 
 cleanup() {
   set +e
-  local cleanup_pids="${CLIENT_PID_1:-} ${CLIENT_PID_2:-} ${CLIENT_PID_3:-} ${CONTROL_PID:-} ${HOOK_CLI_PID:-} ${DAEMON_PIDS:-}"
+  local cleanup_pids="${CLIENT_PID_1:-} ${CLIENT_PID_2:-} ${CLIENT_PID_3:-} ${CONTROL_PID:-} ${HOOK_CLI_PID:-}"
   [[ -n "${STOPPED_DAEMON_PID:-}" ]] && kill -CONT "$STOPPED_DAEMON_PID" 2>/dev/null
   for cleanup_pid in $cleanup_pids; do
     kill "$cleanup_pid" 2>/dev/null
@@ -393,116 +393,6 @@ CLIENT_2="$(client_for_session aux)"
 [[ -n "$CLIENT_1" && -n "$CLIENT_2" ]]
 tmux -L "$TMUX_SOCKET" select-window -t aux:own
 
-# Category mutations use one session snapshot, commit the target client switch first, and leave
-# remembered-session/topology/status work to the foreground hook path. Exercise three categories
-# on this isolated server so two rapid Next operations have an unambiguous two-category result.
-tmux -L "$TMUX_SOCKET" new-session -d -s category-fast -n work "sleep 600"
-CATEGORY_FAST_SESSION_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t category-fast '#{session_id}')"
-tmux -L "$TMUX_SOCKET" set-option -t main @vde_category_override category-a
-tmux -L "$TMUX_SOCKET" set-option -t aux @vde_category_override category-b
-tmux -L "$TMUX_SOCKET" set-option -t category-fast @vde_category_override category-c
-tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'
-CATEGORY_TIMINGS="$RUNTIME_DIR/category-timings.txt"
-: >"$CATEGORY_TIMINGS"
-
-run_category_action() {
-  local direction="$1"
-  local source_session
-  local switched_session
-  local started_ns
-  local switched_ns
-  local action_pid
-  local action_error="$RUNTIME_DIR/category-action-error.txt"
-  source_session="$(client_session_value "$CLIENT_1" '#{session_id}')"
-  started_ns="$(python3 -c 'import time; print(time.time_ns())')"
-  VT_PANE="$AGENT_PANE" run_vt category "$direction" \
-    --client-name "$CLIENT_1" --session-id "$source_session" \
-    > /dev/null 2>"$action_error" &
-  action_pid=$!
-  switched_session="$source_session"
-  for _ in $(seq 1 100); do
-    switched_session="$(client_session_value "$CLIENT_1" '#{session_id}')"
-    [[ "$switched_session" != "$source_session" ]] && break
-    sleep 0.005
-  done
-  switched_ns="$(python3 -c 'import time; print(time.time_ns())')"
-  if [[ "$switched_session" == "$source_session" ]]; then
-    echo "category client did not switch before the measurement deadline" >&2
-    cat "$action_error" >&2
-    wait "$action_pid" || true
-    return 1
-  fi
-  if ! wait "$action_pid"; then
-    cat "$action_error" >&2
-    return 1
-  fi
-  python3 - "$started_ns" "$switched_ns" >>"$CATEGORY_TIMINGS" <<'PY'
-import sys
-started_ns, switched_ns = map(int, sys.argv[1:])
-print((switched_ns - started_ns) / 1_000_000_000)
-PY
-}
-
-# Warm every relevant binary, daemon query, and tmux hook path before measuring.
-run_category_action next
-tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'
-HOOK_CALLS_BEFORE_CATEGORY="$(wc -l <"$HOOK_LOG")"
-for _ in $(seq 1 30); do
-  run_category_action next
-done
-[[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == main ]]
-[[ "$(client_session_value "$CLIENT_2" '#{client_session}')" == aux ]]
-
-run_category_action next
-[[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == aux ]]
-run_category_action next
-[[ "$(client_session_value "$CLIENT_1" '#{session_id}')" == "$CATEGORY_FAST_SESSION_ID" ]]
-run_category_action prev
-[[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == aux ]]
-[[ "$(client_session_value "$CLIENT_2" '#{client_session}')" == aux ]]
-
-HOOK_CALLS_AFTER_CATEGORY="$(wc -l <"$HOOK_LOG")"
-CATEGORY_HOOK_LOG="$(tail -n "$((HOOK_CALLS_AFTER_CATEGORY - HOOK_CALLS_BEFORE_CATEGORY))" "$HOOK_LOG")"
-[[ "$(grep -c 'pane-state-view client-session-changed' <<<"$CATEGORY_HOOK_LOG")" -ge 33 ]]
-if grep 'pane-state-view client-session-changed' <<<"$CATEGORY_HOOK_LOG" | grep -v 'status=0 '; then
-  echo "category owned hook failed before ViewQueued receipt" >&2
-  exit 1
-fi
-[[ "$(grep -c 'hooks on-client-session-changed' <<<"$CATEGORY_HOOK_LOG")" -ge 33 ]]
-if grep 'hooks on-client-session-changed' <<<"$CATEGORY_HOOK_LOG" | grep -v 'status=0 '; then
-  echo "category remembered-session hook failed" >&2
-  exit 1
-fi
-python3 - "$CATEGORY_TIMINGS" <<'PY'
-import math, sys
-
-durations = [float(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
-# Exclude the initial warmup sample; the following 30 Next plus 3 order checks are measured.
-durations = durations[1:]
-assert len(durations) == 33, durations
-ordered = sorted(durations)
-p95 = ordered[math.ceil(len(ordered) * 0.95) - 1]
-assert p95 <= 0.150, (p95, ordered)
-print(f"category warm switch SLA ok: n={len(durations)} p95={p95 * 1000:.1f}ms max={ordered[-1] * 1000:.1f}ms")
-PY
-
-tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'
-tmux -L "$TMUX_SOCKET" set-option -u -t main @vde_category_override
-tmux -L "$TMUX_SOCKET" set-option -u -t aux @vde_category_override
-tmux -L "$TMUX_SOCKET" kill-session -t '=category-fast:'
-for category in category-a category-b category-c; do
-  key="$(python3 - "$CLIENT_1" "$category" <<'PY'
-import sys
-client, category = sys.argv[1:]
-print("@vde_client_" + client.encode().hex() + "_" + category)
-PY
-)"
-  tmux -L "$TMUX_SOCKET" set-option -gu "$key"
-done
-run_vt sessions refresh-category
-sleep 1
-echo "category consecutive order, multi-client pin, and foreground SLA ok"
-
 wait_badge() {
   wait_pane_badge "$AGENT_PANE" "$1"
 }
@@ -523,6 +413,7 @@ PY
     sleep 0.1
   done
   echo "pane badge did not become $expected" >&2
+  cat "$QUERY_JSON" >&2
   return 1
 }
 
@@ -538,7 +429,7 @@ wait_badge Done
 # Correct ownership/protocol markers do not make malformed or oversized inline frames acceptable.
 # Both failures are logged outside canonical state and must leave the hidden Done pane untouched.
 AGENT_PANE_PID="$(tmux -L "$TMUX_SOCKET" display-message -p -t "$AGENT_PANE" '#{pane_pid}')"
-PANE_STATE_HOOK_LOG="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-hook.log"
+PANE_STATE_HOOK_LOG="$STATE_HOME/vde-tmux/$SERVER_HASH/daemon.log"
 HOOK_FAILURES_BEFORE=0
 if [[ -f "$PANE_STATE_HOOK_LOG" ]]; then
   HOOK_FAILURES_BEFORE="$(wc -l <"$PANE_STATE_HOOK_LOG")"
@@ -568,6 +459,10 @@ HOOK_FAILURES_AFTER="$(wc -l <"$PANE_STATE_HOOK_LOG")"
 [[ "$((HOOK_FAILURES_AFTER - HOOK_FAILURES_BEFORE))" == 2 ]]
 tail -n 2 "$PANE_STATE_HOOK_LOG" | grep -F 'unterminated hook panes row' >/dev/null
 tail -n 2 "$PANE_STATE_HOOK_LOG" | grep -F 'exceeds byte limit' >/dev/null
+tail -n 2 "$PANE_STATE_HOOK_LOG" | grep -F 'hook_delivery:' >/dev/null
+for dedicated_log in notification.log status-push.log pane-state-hook.log; do
+  [[ ! -e "$STATE_HOME/vde-tmux/$SERVER_HASH/$dedicated_log" ]]
+done
 echo "malformed and oversized inline hook snapshots rejected without acknowledgment"
 
 # A pane/window change issued by either normal client acknowledges globally.
@@ -591,7 +486,11 @@ print(json.dumps(reply.get("snapshot", {}).get("diagnostics", []), indent=2))
 PY
   exit 1
 fi
-HOOK_CALLS_AFTER="$(wc -l <"$HOOK_LOG")"
+for _ in $(seq 1 50); do
+  HOOK_CALLS_AFTER="$(wc -l <"$HOOK_LOG")"
+  [[ "$((HOOK_CALLS_AFTER - HOOK_CALLS_BEFORE))" -ge 2 ]] && break
+  sleep 0.01
+done
 [[ "$((HOOK_CALLS_AFTER - HOOK_CALLS_BEFORE))" -ge 2 ]]
 if tail -n "$((HOOK_CALLS_AFTER - HOOK_CALLS_BEFORE))" "$HOOK_LOG" | grep -v 'status=0 '; then
   echo "owned hook command failed" >&2
@@ -890,6 +789,93 @@ sidebar_snapshot() {
 echo "checking sidebar snapshot surface"
 VT_PANE="$OTHER_PANE" run_vt sidebar attach --once >/dev/null
 sleep 6
+
+# Build a separate Blocked pane carrying every full-state detail, then compare its canonical JSON
+# byte-for-byte across daemon restart. The pane process stays alive so PaneInstance is unchanged.
+DETAIL_PANE_ROW="$(tmux -L "$TMUX_SOCKET" split-window -d -P -F '#{pane_id}	#{pane_pid}' \
+  -t "$WINDOW_ID" "sleep 600")"
+DETAIL_PANE="${DETAIL_PANE_ROW%%$'\t'*}"
+DETAIL_PANE_PID="${DETAIL_PANE_ROW#*$'\t'}"
+FULL_STATE_BEFORE="$RUNTIME_DIR/full-state-before.json"
+python3 - "$DAEMON_SOCKET" "$DETAIL_PANE" "$DETAIL_PANE_PID" "$NOW" "$FULL_STATE_BEFORE" <<'PY'
+import json, secrets, socket, sys, time
+
+socket_path, pane_id, pane_pid, now, output = sys.argv[1:]
+pane = {"pane_id": pane_id, "pane_pid": int(pane_pid)}
+
+def request(message):
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(5)
+    client.connect(socket_path)
+    reader = client.makefile("rb")
+    client.sendall(b'{"op":"hello","proto":4}\n')
+    hello = json.loads(reader.readline())
+    assert hello["type"] == "hello_ack", hello
+    if "daemon_instance_id" in message:
+        message["daemon_instance_id"] = hello["daemon_instance_id"]
+    if message["op"] == "submit_pane_event":
+        message["envelope"]["daemon_instance_id"] = hello["daemon_instance_id"]
+    client.sendall(json.dumps(message, separators=(",", ":")).encode() + b"\n")
+    reply = json.loads(reader.readline())
+    client.close()
+    return reply
+
+def submit(event):
+    reply = request({
+        "op": "submit_pane_event",
+        "proto": 4,
+        "envelope": {
+            "daemon_instance_id": "",
+            "event_id": secrets.token_hex(16),
+            "pane_instance": pane,
+            "agent": "generic",
+            "agent_session_id": "full-state-session",
+            "event": event,
+        },
+    })
+    assert reply["type"] == "pane_event_result", reply
+
+refresh = request({
+    "op":"refresh_topology",
+    "proto":4,
+    "daemon_instance_id":"",
+    "event_id":secrets.token_hex(16),
+})
+assert refresh["type"] == "snapshot_ack", refresh
+
+submit({"type":"begin_run","data":{
+    "started_at":int(now) + 20,
+    "prompt":{"text":"full snapshot prompt","source":"smoke"},
+}})
+submit({"type":"progress_updated","data":{
+    "observed_at":int(now) + 21,
+    "operations":[
+        {"replace_tasks":{"progress":{"done":1,"total":2},"items":[
+            {"id":"task-1","step":"persist details","status":"completed"},
+            {"id":"task-2","step":"restore details","status":"in_progress"}
+        ]}},
+        {"upsert_subagent":{"agent_id":"worker-1","agent_type":"review","display_name":"Reviewer"}},
+        {"set_worktree_activity":{"kind":"vw_exec","name":"snapshot","path":"/tmp/snapshot","command":"cargo test","observed_at":int(now) + 21}}
+    ]
+}})
+submit({"type":"wait_requested","data":{
+    "observed_at":int(now) + 22,
+    "reason":"permission_prompt",
+}})
+
+reply = request({"op":"query_resolved_snapshot","proto":4})
+record = next(p["resolved"]["canonical"] for p in reply["snapshot"]["panes"]
+              if p["pane_instance"] == pane)
+assert record["lifecycle"] == {"waiting":{"reason":"permission_prompt"}}, record
+assert record["prompt"]["text"] == "full snapshot prompt", record
+assert record["tasks"]["progress"] == {"done":1,"total":2}, record
+assert len(record["tasks"]["items"]) == 2, record
+assert record["subagents"][0]["agent_id"] == "worker-1", record
+assert record["worktree_activity"]["name"] == "snapshot", record
+json.dump(record, open(output, "w", encoding="utf-8"), sort_keys=True)
+PY
+SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v1.json"
+[[ -f "$SNAPSHOT_FILE" && "$(stat -f '%Lp' "$SNAPSHOT_FILE")" == 600 ]]
 SIDEBAR_BEFORE="$(sidebar_snapshot)"
 [[ -n "$SIDEBAR_BEFORE" ]]
 
@@ -945,42 +931,218 @@ if [[ "$SIDEBAR_AFTER" != "$SIDEBAR_BEFORE" ]]; then
   exit 1
 fi
 wait_badge Done
-echo "daemon restart parity ok"
+python3 - "$DAEMON_SOCKET" "$DETAIL_PANE" "$DETAIL_PANE_PID" "$FULL_STATE_BEFORE" <<'PY'
+import json, socket, sys
+socket_path, pane_id, pane_pid, expected_path = sys.argv[1:]
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(5)
+client.connect(socket_path)
+reader = client.makefile("rb")
+client.sendall(b'{"op":"hello","proto":4}\n')
+assert json.loads(reader.readline())["type"] == "hello_ack"
+client.sendall(b'{"op":"query_resolved_snapshot","proto":4}\n')
+reply = json.loads(reader.readline())
+pane = {"pane_id":pane_id,"pane_pid":int(pane_pid)}
+actual = next(p["resolved"]["canonical"] for p in reply["snapshot"]["panes"]
+              if p["pane_instance"] == pane)
+expected = json.load(open(expected_path, encoding="utf-8"))
+assert actual == expected, (actual, expected)
+print("full pane details restored across daemon restart")
+PY
+echo "daemon restart display, sidebar, and full-state parity ok"
 
-# Deliberately drop foreground view hooks. A still-visible pane must reconcile to Idle on the next
-# poll, while a pane focused out before completion must remain Done. Restart restores owned hooks.
-run_vt pane-state hooks uninstall >/dev/null
+# Deliberately drop foreground view hooks. Current-view polling must not stand in for a missing
+# transient proof: the Done badge remains until hooks are restored and the next focus event arrives.
+sleep 1
+for hook in window-pane-changed session-window-changed client-session-changed client-attached client-detached; do
+  tmux -L "$TMUX_SOCKET" set-hook -gu "${hook}[70]"
+done
 printf '\002A' >&7
-wait_badge Idle
-printf '\002O' >&7
-VT_PANE="$AGENT_PANE" run_vt hook emit --agent generic --session-id smoke-session \
-  --status running --started-at "$((NOW + 12))"
-VT_PANE="$AGENT_PANE" run_vt hook emit --agent generic --session-id smoke-session \
-  --status idle --completed-at "$((NOW + 13))"
 sleep 1
 wait_badge Done
+printf '\002O' >&7
 run_vt daemon restart >/dev/null
 record_daemon_pid
 for hook in window-pane-changed session-window-changed client-session-changed client-attached client-detached; do
   tmux -L "$TMUX_SOCKET" show-hooks -g "${hook}[70]" | grep -F "${hook}[70]" >/dev/null
 done
-echo "dropped-view reconciliation ok"
+printf '\002A' >&7
+wait_badge Idle
+printf '\002O' >&7
+echo "dropped view remains best-effort until the next owned focus event"
+
+# Reload config-derived categories on the stable daemon, then verify the external tmux mirrors.
+# The navigation stress runs after the remaining pane-state fixture so its hook burst cannot alter
+# that fixture's completion history.
+if ! tmux -L "$TMUX_SOCKET" new-session -d -s category-fast -n work "sleep 600"; then
+  echo "category-fast session creation failed" >&2
+  exit 1
+fi
+CATEGORY_FAST_SESSION_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t category-fast '#{session_id}')"
+cat >"$CONFIG_HOME/vde/tmux/config.yml" <<'YAML'
+categories:
+  default_category: smoke
+  session_name_rules:
+    - category: category-a
+      patterns: [main]
+    - category: category-b
+      patterns: [aux]
+    - category: category-c
+      patterns: [category-fast, late]
+daemon:
+  done_clear_on: pane
+YAML
+if ! run_vt daemon reload >"$RUNTIME_DIR/category-reload.log" 2>&1; then
+  echo "category fixture daemon reload failed" >&2
+  cat "$RUNTIME_DIR/category-reload.log" >&2
+  exit 1
+fi
+record_daemon_pid
+for _ in $(seq 1 80); do
+  MAIN_CATEGORY="$(tmux -L "$TMUX_SOCKET" show-options -qv -t main @vde_category || true)"
+  AUX_CATEGORY="$(tmux -L "$TMUX_SOCKET" show-options -qv -t aux @vde_category || true)"
+  FAST_CATEGORY="$(tmux -L "$TMUX_SOCKET" show-options -qv -t category-fast @vde_category || true)"
+  if [[ "$MAIN_CATEGORY" == category-a && "$AUX_CATEGORY" == category-b && "$FAST_CATEGORY" == category-c ]]; then
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$MAIN_CATEGORY" != category-a || "$AUX_CATEGORY" != category-b || "$FAST_CATEGORY" != category-c ]]; then
+  echo "category mirrors did not converge: main=$MAIN_CATEGORY aux=$AUX_CATEGORY fast=$FAST_CATEGORY" >&2
+  exit 1
+fi
+
+# Category navigation uses one session snapshot, commits the target client switch first, and leaves
+# remembered-session/topology/status work to the foreground hook path.
+if ! tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'; then
+  echo "category fixture could not pin client 1 to main" >&2
+  tmux -L "$TMUX_SOCKET" list-clients -F '#{client_name} #{client_session}' >&2 || true
+  exit 1
+fi
+CATEGORY_TIMINGS="$RUNTIME_DIR/category-timings.txt"
+: >"$CATEGORY_TIMINGS"
+run_category_action() {
+  local direction="$1"
+  local source_session
+  local switched_session
+  local started_ns
+  local switched_ns
+  local action_pid
+  local action_error="$RUNTIME_DIR/category-action-error.txt"
+  source_session="$(client_session_value "$CLIENT_1" '#{session_id}')"
+  started_ns="$(python3 -c 'import time; print(time.time_ns())')"
+  VT_PANE="$AGENT_PANE" run_vt category "$direction" \
+    --client-name "$CLIENT_1" --session-id "$source_session" \
+    >/dev/null 2>"$action_error" &
+  action_pid=$!
+  switched_session="$source_session"
+  for _ in $(seq 1 100); do
+    switched_session="$(client_session_value "$CLIENT_1" '#{session_id}')"
+    [[ "$switched_session" != "$source_session" ]] && break
+    sleep 0.005
+  done
+  switched_ns="$(python3 -c 'import time; print(time.time_ns())')"
+  if [[ "$switched_session" == "$source_session" ]]; then
+    echo "category client did not switch before the measurement deadline" >&2
+    cat "$action_error" >&2
+    wait "$action_pid" || true
+    return 1
+  fi
+  if ! wait "$action_pid"; then
+    cat "$action_error" >&2
+    return 1
+  fi
+  python3 - "$started_ns" "$switched_ns" >>"$CATEGORY_TIMINGS" <<'PY'
+import sys
+started_ns, switched_ns = map(int, sys.argv[1:])
+print((switched_ns - started_ns) / 1_000_000_000)
+PY
+}
+if ! run_category_action next; then
+  echo "category warmup action failed" >&2
+  exit 1
+fi
+tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'
+HOOK_CALLS_BEFORE_CATEGORY="$(wc -l <"$HOOK_LOG")"
+for _ in $(seq 1 30); do
+  run_category_action next
+done
+[[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == main ]]
+[[ "$(client_session_value "$CLIENT_2" '#{client_session}')" == aux ]]
+run_category_action next
+[[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == aux ]]
+run_category_action next
+[[ "$(client_session_value "$CLIENT_1" '#{session_id}')" == "$CATEGORY_FAST_SESSION_ID" ]]
+run_category_action prev
+[[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == aux ]]
+[[ "$(client_session_value "$CLIENT_2" '#{client_session}')" == aux ]]
+HOOK_CALLS_AFTER_CATEGORY="$(wc -l <"$HOOK_LOG")"
+CATEGORY_HOOK_LOG="$(tail -n "$((HOOK_CALLS_AFTER_CATEGORY - HOOK_CALLS_BEFORE_CATEGORY))" "$HOOK_LOG")"
+[[ "$(grep -c 'pane-state-view client-session-changed' <<<"$CATEGORY_HOOK_LOG")" -ge 33 ]]
+if grep 'pane-state-view client-session-changed' <<<"$CATEGORY_HOOK_LOG" | grep -v 'status=0 '; then
+  echo "category owned hook failed before ViewQueued receipt" >&2
+  exit 1
+fi
+[[ "$(grep -c 'hooks on-client-session-changed' <<<"$CATEGORY_HOOK_LOG")" -ge 33 ]]
+if grep 'hooks on-client-session-changed' <<<"$CATEGORY_HOOK_LOG" | grep -v 'status=0 '; then
+  echo "category remembered-session hook failed" >&2
+  exit 1
+fi
+python3 - "$CATEGORY_TIMINGS" <<'PY'
+import math, sys
+
+durations = [float(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()][1:]
+assert len(durations) == 33, durations
+ordered = sorted(durations)
+p95 = ordered[math.ceil(len(ordered) * 0.95) - 1]
+assert p95 <= 0.150, (p95, ordered)
+print(f"category warm switch SLA ok: n={len(durations)} p95={p95 * 1000:.1f}ms max={ordered[-1] * 1000:.1f}ms")
+PY
+tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'
+tmux -L "$TMUX_SOCKET" kill-session -t '=category-fast:'
+for category in category-a category-b category-c; do
+  key="$(python3 - "$CLIENT_1" "$category" <<'PY'
+import sys
+client, category = sys.argv[1:]
+print("@vde_client_" + client.encode().hex() + "_" + category)
+PY
+)"
+  tmux -L "$TMUX_SOCKET" set-option -gu "$key"
+done
+echo "category reload mirror, consecutive order, multi-client pin, and foreground SLA ok"
+sleep 1
 
 # Window scope uses only the pane membership frozen into the occurrence. Pane C is already Done in
 # canonical state but is joined after the A/B snapshot; moving the witnessing client away before
-# the daemon resumes also prevents periodic reconciliation from obscuring this event-level proof.
-tmux -L "$TMUX_SOCKET" new-session -d -s late -n source "sleep 600"
+# the daemon resumes demonstrates that current views cannot replace this event-level proof.
+if ! tmux -L "$TMUX_SOCKET" new-session -d -s late -n source "sleep 600"; then
+  echo "late session creation failed" >&2
+  exit 1
+fi
 LATE_PANE="$(tmux -L "$TMUX_SOCKET" display-message -p -t late:source '#{pane_id}')"
 cat >"$CONFIG_HOME/vde/tmux/config.yml" <<'YAML'
 categories:
   default_category: smoke
+  session_name_rules:
+    - category: category-a
+      patterns: [main]
+    - category: category-b
+      patterns: [aux]
+    - category: category-c
+      patterns: [category-fast, late]
 daemon:
   done_clear_on: window
   poll_ms: 60000
 YAML
-run_vt daemon restart >/dev/null
+if ! run_vt daemon restart >"$RUNTIME_DIR/window-restart.log" 2>&1; then
+  echo "window-scope fixture daemon restart failed" >&2
+  cat "$RUNTIME_DIR/window-restart.log" >&2
+  exit 1
+fi
 record_daemon_pid
-run_vt pane-state hooks uninstall >/dev/null
+for hook in window-pane-changed session-window-changed client-session-changed client-attached client-detached; do
+  tmux -L "$TMUX_SOCKET" set-hook -gu "${hook}[70]"
+done
 tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=aux:'
 tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_2" -t '=aux:'
 tmux -L "$TMUX_SOCKET" select-window -t aux:own
@@ -1017,7 +1179,6 @@ WINDOW_SNAPSHOT_PANE="$(tmux -L "$TMUX_SOCKET" display-message -p -c "$CLIENT_1"
 WINDOW_SNAPSHOT_PANE_PID="$(tmux -L "$TMUX_SOCKET" display-message -p -c "$CLIENT_1" '#{pane_pid}')"
 WINDOW_SNAPSHOT_PANES="$(tmux -L "$TMUX_SOCKET" display-message -p -t "$WINDOW_ID" '#{P:#{pane_id}__vde_hook_pane_field_v2__#{pane_pid}__vde_hook_pane_row_v2__,#{pane_id}__vde_hook_pane_field_v2__#{pane_pid}__vde_hook_pane_row_v2__}')"
 WINDOW_SNAPSHOT_CLIENTS="$(tmux -L "$TMUX_SOCKET" display-message -p -c "$CLIENT_1" '#{L:#{S:#{?#{==:#{client_session},#{session_name}},#{client_pid}__vde_hook_client_field_v2__#{session_id}__vde_hook_client_field_v2__#{window_id}__vde_hook_client_field_v2__#{pane_id}__vde_hook_client_field_v2__#{pane_pid}__vde_hook_client_field_v2__#{client_control_mode}__vde_hook_client_field_v2__#{client_flags}__vde_hook_client_row_v2__,}}}')"
-WINDOW_SOURCE_CLIENT_PID="$(tmux -L "$TMUX_SOCKET" display-message -p -c "$CLIENT_1" '#{client_pid}')"
 [[ "$WINDOW_SNAPSHOT_PANES" == *"$AGENT_PANE"* && "$WINDOW_SNAPSHOT_PANES" == *"$OTHER_PANE"* ]]
 [[ "$WINDOW_SNAPSHOT_PANES" != *"$LATE_PANE"* ]]
 
@@ -1026,7 +1187,7 @@ run_vt hooks pane-state-view window-pane-changed \
   --snapshot-session="$WINDOW_SNAPSHOT_SESSION" --snapshot-window="$WINDOW_SNAPSHOT_WINDOW" \
   --snapshot-pane="$WINDOW_SNAPSHOT_PANE" --snapshot-pane-pid="$WINDOW_SNAPSHOT_PANE_PID" \
   --snapshot-panes="$WINDOW_SNAPSHOT_PANES" --snapshot-clients="$WINDOW_SNAPSHOT_CLIENTS" \
-  --hook-client="$WINDOW_SOURCE_CLIENT_PID" >"$RUNTIME_DIR/window-occurrence.log" 2>&1 &
+  >"$RUNTIME_DIR/window-occurrence.log" 2>&1 &
 HOOK_CLI_PID=$!
 sleep 0.05
 tmux -L "$TMUX_SOCKET" join-pane -d -s "$LATE_PANE" -t "$WINDOW_ID"
@@ -1040,62 +1201,38 @@ wait_pane_badge "$OTHER_PANE" Idle
 wait_pane_badge "$LATE_PANE" Done
 echo "window occurrence excludes pane joined after immutable snapshot"
 
-cat >"$CONFIG_HOME/vde/tmux/config.yml" <<'YAML'
-categories:
-  default_category: smoke
-daemon:
-  done_clear_on: pane
-YAML
+# A corrupt full-state snapshot must stop startup, surface the exact manual reset path, and keep
+# typed hook failures at exit 1 (never the agent-blocking exit 2). This is an isolated state root.
+CORRUPT_STOP_PID="$(lsof -t "$DAEMON_SOCKET" 2>/dev/null | head -n 1)"
+run_vt daemon stop --force >/dev/null 2>&1 || true
+for _ in $(seq 1 80); do
+  if ! kill -0 "$CORRUPT_STOP_PID" 2>/dev/null && [[ ! -S "$DAEMON_SOCKET" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+! kill -0 "$CORRUPT_STOP_PID" 2>/dev/null
+[[ ! -S "$DAEMON_SOCKET" ]]
+printf '{corrupt snapshot\n' >"$SNAPSHOT_FILE"
+if run_vt daemon ensure >"$RUNTIME_DIR/corrupt-ensure.log" 2>&1; then
+  echo "corrupt snapshot unexpectedly allowed daemon startup" >&2
+  exit 1
+fi
+CORRUPT_STATUS="$(run_vt daemon status 2>&1 || true)"
+grep -F "$SNAPSHOT_FILE" <<<"$CORRUPT_STATUS" >/dev/null
+grep -F 'remove' <<<"$CORRUPT_STATUS" >/dev/null
+set +e
+VT_PANE="$AGENT_PANE" run_vt hook emit --agent generic --session-id corrupt-snapshot \
+  --status running --started-at "$((NOW + 30))" >/dev/null 2>&1
+CORRUPT_HOOK_STATUS=$?
+set -e
+[[ "$CORRUPT_HOOK_STATUS" == 1 ]]
+rm "$SNAPSHOT_FILE"
+run_vt daemon ensure >/dev/null
+record_daemon_pid
+echo "corrupt snapshot fail-stop, status reset path, and hook exit status ok"
 
-# Cleanup precedes reset. Exactly the fixed legacy keys are removed; canonical, display and
-# unrelated category/sidebar options survive. Reset then replaces canonical Active with a tombstone.
-PANE_LEGACY_KEYS=(
-  @vde_agent @vde_status @vde_prompt @vde_prompt_source @vde_wait_reason @vde_attention
-  @vde_started_at @vde_completed_at @vde_tasks @vde_task_items @vde_task_item_ids
-  @vde_subagents @vde_worktree_activity
-)
-SESSION_LEGACY_KEYS=(@vde_session_status @vde_session_state @vde_session_agent_counts)
-WINDOW_LEGACY_KEYS=(@vde_window_status @vde_window_state @vde_window_agent_counts)
-for key in "${PANE_LEGACY_KEYS[@]}"; do
-  tmux -L "$TMUX_SOCKET" set-option -p -t "$AGENT_PANE" "$key" legacy
-done
-for key in "${SESSION_LEGACY_KEYS[@]}"; do
-  tmux -L "$TMUX_SOCKET" set-option -t main "$key" legacy
-done
-for key in "${WINDOW_LEGACY_KEYS[@]}"; do
-  tmux -L "$TMUX_SOCKET" set-option -w -t "$WINDOW_ID" "$key" legacy
-done
-tmux -L "$TMUX_SOCKET" set-option -p -t "$AGENT_PANE" @vde_sidebar 1
-tmux -L "$TMUX_SOCKET" set-option -t main @vde_category smoke-category
-CANONICAL_BEFORE="$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_pane_state)"
-DISPLAY_PANE_BEFORE="$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_status_pane)"
-run_vt pane-state cleanup-legacy --all >/dev/null
-for key in "${PANE_LEGACY_KEYS[@]}"; do
-  [[ -z "$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" "$key" 2>/dev/null || true)" ]]
-done
-for key in "${SESSION_LEGACY_KEYS[@]}"; do
-  [[ -z "$(tmux -L "$TMUX_SOCKET" show-options -v -t main "$key" 2>/dev/null || true)" ]]
-done
-for key in "${WINDOW_LEGACY_KEYS[@]}"; do
-  [[ -z "$(tmux -L "$TMUX_SOCKET" show-options -wv -t "$WINDOW_ID" "$key" 2>/dev/null || true)" ]]
-done
-[[ "$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_pane_state)" == "$CANONICAL_BEFORE" ]]
-DISPLAY_PANE_AFTER="$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_status_pane)"
-# Cleanup preserves the display option itself, while the live daemon may legitimately refresh its
-# rendered value from the unchanged canonical state during this assertion window.
-[[ -n "$DISPLAY_PANE_BEFORE" && -n "$DISPLAY_PANE_AFTER" && "$DISPLAY_PANE_AFTER" == *"$AGENT_PANE"* ]]
-[[ "$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_sidebar)" == 1 ]]
-[[ "$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_category)" == smoke-category ]]
-
-run_vt pane-state reset --target "$AGENT_PANE" >/dev/null
-CANONICAL_AFTER="$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_pane_state)"
-[[ -n "$CANONICAL_AFTER" && "$CANONICAL_AFTER" != "$CANONICAL_BEFORE" ]]
-grep -F 'reset' <<<"$CANONICAL_AFTER" >/dev/null
-[[ -z "$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_agent 2>/dev/null || true)" ]]
-[[ "$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$AGENT_PANE" @vde_sidebar)" == 1 ]]
-echo "legacy cleanup ordering and reset preservation ok"
-
-# Recreate the scratch tmux server at the same socket path. Ask the old daemon to mutate legacy
+# Recreate the scratch tmux server at the same socket path. Ask the old daemon to mutate canonical
 # state if it is still reachable; its server-side incarnation/PID guards must leave the new pane's
 # sentinel untouched, and the config run-shell must start a distinct Serving daemon generation.
 OLD_DAEMON_SOCKET="$DAEMON_SOCKET"
@@ -1190,7 +1327,7 @@ NEW_PANE="$(tmux -L "$TMUX_SOCKET" display-message -p -t recreated:new '#{pane_i
 NEW_PANE_PID="$(tmux -L "$TMUX_SOCKET" display-message -p -t "$NEW_PANE" '#{pane_pid}')"
 echo "recreated pane identity: old=$OLD_WRITE_PANE/$OLD_WRITE_PANE_PID new=$NEW_PANE/$NEW_PANE_PID"
 [[ "$NEW_PANE" == "$OLD_WRITE_PANE" && "$NEW_PANE_PID" != "$OLD_WRITE_PANE_PID" ]]
-tmux -L "$TMUX_SOCKET" set-option -p -t "$NEW_PANE" @vde_pane_state incarnation-sentinel
+tmux -L "$TMUX_SOCKET" set-option -p -t "$NEW_PANE" @vde_unrelated_pane_sentinel incarnation-sentinel
 tmux -L "$TMUX_SOCKET" set-option -g @vde_status_summary incarnation-summary-sentinel
 tmux -L "$TMUX_SOCKET" set-option -p -t "$NEW_PANE" @vde_status_pane incarnation-pane-display-sentinel
 
@@ -1201,15 +1338,18 @@ wait "$OLD_MUTATION_PID"
 cat "$OLD_MUTATION_RESULT"
 grep -F 'hello_ack' "$OLD_MUTATION_RESULT" >/dev/null
 grep -F 'mutation_response=' "$OLD_MUTATION_RESULT" >/dev/null
-if ! grep -Eq 'tmux server (incarnation changed|identity mismatch)|mutation_response=eof_after_fail_stop' "$OLD_MUTATION_RESULT"; then
-  echo "old daemon did not report a recognized fail-stop outcome" >&2
+if ! grep -Eq 'tmux server (incarnation changed|identity mismatch)|mutation_response=eof_after_fail_stop|"type": "pane_event_result"' "$OLD_MUTATION_RESULT"; then
+  echo "old daemon did not report a recognized isolated-or-fail-stop outcome" >&2
   exit 1
 fi
-sleep 1
-[[ "$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$NEW_PANE" @vde_pane_state)" == incarnation-sentinel ]]
+for _ in $(seq 1 100); do
+  ! kill -0 "$OLD_DAEMON_PID" 2>/dev/null && break
+  sleep 0.05
+done
+[[ "$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$NEW_PANE" @vde_unrelated_pane_sentinel)" == incarnation-sentinel ]]
 [[ "$(tmux -L "$TMUX_SOCKET" show-options -gv @vde_status_summary)" == incarnation-summary-sentinel ]]
 [[ "$(tmux -L "$TMUX_SOCKET" show-options -pv -t "$NEW_PANE" @vde_status_pane)" == incarnation-pane-display-sentinel ]]
-echo "new-server canonical and display sentinels survived old writer attempt"
+echo "new-server unrelated and display sentinels survived old writer attempt"
 if kill -0 "$OLD_DAEMON_PID" 2>/dev/null; then
   echo "old daemon survived same-socket server recreation" >&2
   exit 1
@@ -1238,5 +1378,28 @@ while True:
     time.sleep(0.05)
 PY
 echo "same-socket incarnation guard ok"
+
+# A persist failure returns a normal hook failure and never commits the candidate state. Run this
+# final fault after the lifecycle scenarios so an intentionally unavailable store cannot mask them.
+SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v1.json"
+SNAPSHOT_DIR="$(dirname "$SNAPSHOT_FILE")"
+chmod 500 "$SNAPSHOT_DIR"
+set +e
+VT_PANE="$NEW_PANE" run_vt hook emit --agent generic --session-id persist-failure \
+  --status running --started-at "$((NOW + 29))" >/dev/null 2>&1
+PERSIST_HOOK_STATUS=$?
+set -e
+chmod 700 "$SNAPSHOT_DIR"
+[[ "$PERSIST_HOOK_STATUS" == 1 ]]
+query_v4 '{"op":"query_resolved_snapshot","proto":4}'
+python3 - "$QUERY_JSON" "$NEW_PANE" <<'PY'
+import json, sys
+reply = json.load(open(sys.argv[1], encoding="utf-8"))
+pane = next(p for p in reply["snapshot"]["panes"] if p["pane_instance"]["pane_id"] == sys.argv[2])
+resolved = pane.get("resolved")
+canonical = resolved.get("canonical") if resolved else None
+assert not canonical or canonical.get("agent_session_id") != "persist-failure", canonical
+PY
+echo "persist failure hook exit status ok"
 
 echo "pane-state v2 scratch smoke ok"

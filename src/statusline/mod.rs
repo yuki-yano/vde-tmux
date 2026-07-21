@@ -472,15 +472,7 @@ pub fn render_structured_pane_status(config: &Config, pane: &PanePresentation) -
             (agent, badge, status, time, detail)
         }
         None => {
-            let (badge, status) = if pane.diagnostic.is_some()
-                || matches!(
-                    &pane.stored,
-                    Some(crate::pane_state::StoredStateDescriptor::Quarantined { .. })
-                ) {
-                ("?".to_string(), "Invalid state".to_string())
-            } else {
-                ("—".to_string(), "No state".to_string())
-            };
+            let (badge, status) = ("—".to_string(), "No state".to_string());
             (
                 "(no agent)".to_string(),
                 badge,
@@ -1852,6 +1844,8 @@ fn tmux_style_category_body_with_bg(
 mod tests {
     use super::*;
     use crate::config::{BadgeStyle, Config, SessionBadgeMode};
+    use crate::daemon::protocol::v2::AttentionEntry;
+    use crate::pane_state::PaneInstance;
     use crate::tmux::mock::MockTmuxRunner;
 
     fn status_session(id: &str, name: &str, active: bool) -> SessionStatusPresentation {
@@ -1868,6 +1862,75 @@ mod tests {
                 done: 1,
                 idle: 1,
             },
+        }
+    }
+
+    fn plain_status_session(id: &str, name: &str, active: bool) -> SessionStatusPresentation {
+        SessionStatusPresentation {
+            session_id: id.to_string(),
+            session_name: name.to_string(),
+            category: Some("work".to_string()),
+            attached: None,
+            created_at: None,
+            active,
+            counts: BadgeStateCounts::default(),
+        }
+    }
+
+    fn status_snapshot() -> StatusSnapshot {
+        StatusSnapshot {
+            snapshot_revision: 1,
+            context: crate::daemon::protocol::v2::StatusContext::Global,
+            summary: BadgeStateCounts::default(),
+            session_zone_width: None,
+            sessions: Vec::new(),
+            windows: Vec::new(),
+            categories: Vec::new(),
+            attention: Vec::new(),
+        }
+    }
+
+    fn status_window(id: &str, name: &str, index: i64, active: bool) -> WindowStatusPresentation {
+        WindowStatusPresentation {
+            window_id: id.to_string(),
+            window_name: name.to_string(),
+            pane_count: 1,
+            session_ids: vec!["$1".to_string()],
+            window_index: Some(index),
+            active,
+            last: false,
+            bell: None,
+            activity: None,
+            silence: None,
+            current_command: None,
+            counts: BadgeStateCounts::default(),
+        }
+    }
+
+    fn status_category(name: &str, active: bool) -> CategoryStatusPresentation {
+        CategoryStatusPresentation {
+            category: name.to_string(),
+            session_ids: vec!["$1".to_string()],
+            active,
+            counts: BadgeStateCounts::default(),
+        }
+    }
+
+    fn blocked_attention(
+        pane_id: &str,
+        pane_pid: u32,
+        session_name: &str,
+        elapsed_seconds: i64,
+    ) -> AttentionEntry {
+        AttentionEntry {
+            pane_instance: PaneInstance {
+                pane_id: pane_id.to_string(),
+                pane_pid,
+            },
+            session_name: session_name.to_string(),
+            badge: BadgeState::Blocked,
+            reason: Some("permission_prompt".to_string()),
+            elapsed_seconds,
         }
     }
 
@@ -1921,7 +1984,6 @@ mod tests {
             active,
             stored: None,
             resolved,
-            diagnostic: None,
         }
     }
 
@@ -1963,13 +2025,7 @@ mod tests {
                 },
             }],
             windows: vec![WindowStatusPresentation {
-                window_id: "@2".to_string(),
-                window_name: "editor".to_string(),
                 pane_count: 3,
-                session_ids: vec!["$1".to_string()],
-                window_index: Some(2),
-                active: true,
-                last: false,
                 bell: Some(false),
                 activity: Some(false),
                 silence: Some(false),
@@ -1978,25 +2034,19 @@ mod tests {
                     working: 1,
                     ..BadgeStateCounts::default()
                 },
+                ..status_window("@2", "editor", 2, true)
             }],
             categories: vec![CategoryStatusPresentation {
-                category: "work".to_string(),
-                session_ids: vec!["$1".to_string()],
-                active: true,
                 counts: BadgeStateCounts {
                     done: 1,
                     ..BadgeStateCounts::default()
                 },
+                ..status_category("work", true)
             }],
-            attention: vec![crate::daemon::protocol::v2::AttentionEntry {
-                pane_instance: crate::pane_state::PaneInstance {
-                    pane_id: "%7".to_string(),
-                    pane_pid: 700,
-                },
-                session_name: "main".to_string(),
-                badge: BadgeState::Blocked,
-                reason: Some("PermissionPrompt".to_string()),
-                elapsed_seconds: 125,
+            attention: vec![{
+                let mut entry = blocked_attention("%7", 700, "main", 125);
+                entry.reason = Some("PermissionPrompt".to_string());
+                entry
             }],
         };
 
@@ -2068,8 +2118,6 @@ mod tests {
             context: crate::daemon::protocol::v2::StatusContext::Session {
                 session_id: "$1".to_string(),
             },
-            summary: BadgeStateCounts::default(),
-            session_zone_width: None,
             sessions: vec![SessionStatusPresentation {
                 session_id: "$1".to_string(),
                 session_name: "dev#[fg=red]\n{index}".to_string(),
@@ -2080,21 +2128,10 @@ mod tests {
                 counts: BadgeStateCounts::default(),
             }],
             windows: vec![WindowStatusPresentation {
-                window_id: "@1".to_string(),
-                window_name: "win#{command}".to_string(),
-                pane_count: 1,
-                session_ids: vec!["$1".to_string()],
-                window_index: Some(4),
-                active: true,
-                last: false,
-                bell: None,
-                activity: None,
-                silence: None,
                 current_command: Some("sh#[bg=red]\t{window}".to_string()),
-                counts: BadgeStateCounts::default(),
+                ..status_window("@1", "win#{command}", 4, true)
             }],
-            categories: Vec::new(),
-            attention: Vec::new(),
+            ..status_snapshot()
         };
 
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
@@ -2239,14 +2276,9 @@ mod tests {
         config.statusline.sessions.fixed_width = true;
         let sessions = vec![status_session("$1", "main", false)];
         let snapshot = StatusSnapshot {
-            snapshot_revision: 1,
-            context: StatusContext::Global,
-            summary: BadgeStateCounts::default(),
             session_zone_width: Some(40),
             sessions: sessions.clone(),
-            windows: Vec::new(),
-            categories: Vec::new(),
-            attention: Vec::new(),
+            ..status_snapshot()
         };
 
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
@@ -2262,16 +2294,12 @@ mod tests {
         let config = Config::default();
         let sessions = vec![status_session("$1", "main", true)];
         let snapshot = StatusSnapshot {
-            snapshot_revision: 1,
             context: StatusContext::Session {
                 session_id: "$1".to_string(),
             },
-            summary: BadgeStateCounts::default(),
             session_zone_width: Some(40),
             sessions: sessions.clone(),
-            windows: Vec::new(),
-            categories: Vec::new(),
-            attention: Vec::new(),
+            ..status_snapshot()
         };
 
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
@@ -2301,24 +2329,15 @@ mod tests {
     }
 
     #[test]
-    fn pane_border_does_not_infer_an_invalid_unresolved_state_as_idle() {
+    fn pane_border_does_not_infer_an_unresolved_state_as_idle() {
         let mut config = Config::default();
         config.statusline.panes.current.format =
             "{agent}|{badge}|{state}|{time}|{detail}".to_string();
-        let mut pane = structured_pane("zsh", "/tmp", true, None);
-        pane.stored = Some(crate::pane_state::StoredStateDescriptor::Quarantined {
-            quarantine_id: "q1".to_string(),
-        });
-        pane.diagnostic = Some(crate::pane_state::PaneStateLoadError {
-            pane_instance: pane.pane_instance.clone(),
-            quarantine_id: "q1".to_string(),
-            message: "invalid custom state".to_string(),
-        });
-
+        let pane = structured_pane("zsh", "/tmp", true, None);
         let rendered = render_structured_pane_status(&config, &pane);
 
         assert!(
-            rendered.contains("(no agent)|?|Invalid state|(empty)|zsh"),
+            rendered.contains("(no agent)|—|No state|(empty)|zsh"),
             "{rendered}"
         );
         assert!(!rendered.contains("Idle"), "{rendered}");
@@ -2338,50 +2357,43 @@ mod tests {
         config.statusline.category.inactive_format = " {category} ".to_string();
 
         let sessions = (0..12)
-            .map(|index| SessionStatusPresentation {
-                session_id: format!("${}", index + 1),
-                session_name: if index == 5 {
-                    "現在🚀".to_string()
-                } else {
-                    format!("日本語セッション{index}🚀")
-                },
-                category: Some("work".to_string()),
-                attached: None,
-                created_at: None,
-                active: index == 5,
-                counts: BadgeStateCounts::default(),
+            .map(|index| {
+                plain_status_session(
+                    &format!("${}", index + 1),
+                    &if index == 5 {
+                        "現在🚀".to_string()
+                    } else {
+                        format!("日本語セッション{index}🚀")
+                    },
+                    index == 5,
+                )
             })
             .collect::<Vec<_>>();
         let windows = (0..12)
-            .map(|index| WindowStatusPresentation {
-                window_id: format!("@{}", index + 1),
-                window_name: if index == 7 {
-                    "現在の窓🪟".to_string()
-                } else {
-                    format!("編集ウィンドウ{index}🪟")
-                },
-                pane_count: 1,
-                session_ids: vec!["$1".to_string()],
-                window_index: Some(index),
-                active: index == 7,
-                last: false,
-                bell: None,
-                activity: None,
-                silence: None,
-                current_command: None,
-                counts: BadgeStateCounts::default(),
+            .map(|index| {
+                status_window(
+                    &format!("@{}", index + 1),
+                    &if index == 7 {
+                        "現在の窓🪟".to_string()
+                    } else {
+                        format!("編集ウィンドウ{index}🪟")
+                    },
+                    index,
+                    index == 7,
+                )
             })
             .collect::<Vec<_>>();
         let categories = (0..12)
             .map(|index| CategoryStatusPresentation {
-                category: if index == 4 {
-                    "現在カテゴリ🚀".to_string()
-                } else {
-                    format!("カテゴリ{index}🚀")
-                },
                 session_ids: vec![format!("${}", index + 1)],
-                active: index == 4,
-                counts: BadgeStateCounts::default(),
+                ..status_category(
+                    &if index == 4 {
+                        "現在カテゴリ🚀".to_string()
+                    } else {
+                        format!("カテゴリ{index}🚀")
+                    },
+                    index == 4,
+                )
             })
             .collect::<Vec<_>>();
         let snapshot = StatusSnapshot {
@@ -2394,16 +2406,7 @@ mod tests {
             sessions,
             windows,
             categories,
-            attention: vec![crate::daemon::protocol::v2::AttentionEntry {
-                pane_instance: crate::pane_state::PaneInstance {
-                    pane_id: "%9".to_string(),
-                    pane_pid: 900,
-                },
-                session_name: "要確認".to_string(),
-                badge: BadgeState::Blocked,
-                reason: Some("permission_prompt".to_string()),
-                elapsed_seconds: 5_400,
-            }],
+            attention: vec![blocked_attention("%9", 900, "要確認", 5_400)],
         };
 
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
@@ -2588,44 +2591,13 @@ mod tests {
             },
             session_zone_width: None,
             sessions: vec![SessionStatusPresentation {
-                session_id: "$1".to_string(),
-                session_name: "main".to_string(),
-                category: Some("work".to_string()),
                 attached: Some(true),
                 created_at: Some(1),
-                active: true,
-                counts: BadgeStateCounts::default(),
+                ..plain_status_session("$1", "main", true)
             }],
-            windows: vec![WindowStatusPresentation {
-                window_id: "@1".to_string(),
-                window_name: "editor".to_string(),
-                pane_count: 1,
-                session_ids: vec!["$1".to_string()],
-                window_index: Some(0),
-                active: true,
-                last: false,
-                bell: None,
-                activity: None,
-                silence: None,
-                current_command: None,
-                counts: BadgeStateCounts::default(),
-            }],
-            categories: vec![CategoryStatusPresentation {
-                category: "work".to_string(),
-                session_ids: vec!["$1".to_string()],
-                active: true,
-                counts: BadgeStateCounts::default(),
-            }],
-            attention: vec![crate::daemon::protocol::v2::AttentionEntry {
-                pane_instance: crate::pane_state::PaneInstance {
-                    pane_id: "%9".to_string(),
-                    pane_pid: 900,
-                },
-                session_name: "review".to_string(),
-                badge: BadgeState::Blocked,
-                reason: Some("permission_prompt".to_string()),
-                elapsed_seconds: 90,
-            }],
+            windows: vec![status_window("@1", "editor", 0, true)],
+            categories: vec![status_category("work", true)],
+            attention: vec![blocked_attention("%9", 900, "review", 90)],
         };
 
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
@@ -2659,42 +2631,19 @@ mod tests {
         config.statusline.windows.current.format = "{window}".to_string();
         config.statusline.category.format = "{category}".to_string();
         let snapshot = StatusSnapshot {
-            snapshot_revision: 1,
             context: crate::daemon::protocol::v2::StatusContext::Session {
                 session_id: "$42".to_string(),
             },
-            summary: BadgeStateCounts::default(),
-            session_zone_width: None,
-            sessions: vec![SessionStatusPresentation {
-                session_id: "$42".to_string(),
-                session_name: "界🚀".repeat(100),
-                category: Some("work".to_string()),
-                attached: None,
-                created_at: None,
-                active: true,
-                counts: BadgeStateCounts::default(),
-            }],
+            sessions: vec![plain_status_session("$42", &"界🚀".repeat(100), true)],
             windows: vec![WindowStatusPresentation {
-                window_id: "@77".to_string(),
-                window_name: "窓🪟".repeat(100),
-                pane_count: 1,
                 session_ids: vec!["$42".to_string()],
-                window_index: Some(1),
-                active: true,
-                last: false,
-                bell: None,
-                activity: None,
-                silence: None,
-                current_command: None,
-                counts: BadgeStateCounts::default(),
+                ..status_window("@77", &"窓🪟".repeat(100), 1, true)
             }],
             categories: vec![CategoryStatusPresentation {
-                category: "分類🚀".repeat(25),
                 session_ids: vec!["$42".to_string()],
-                active: true,
-                counts: BadgeStateCounts::default(),
+                ..status_category(&"分類🚀".repeat(25), true)
             }],
-            attention: Vec::new(),
+            ..status_snapshot()
         };
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
 
@@ -2719,7 +2668,6 @@ mod tests {
         config.statusline.windows.current.format = "{window}".to_string();
         config.statusline.category.format = "{category}".to_string();
         let snapshot = StatusSnapshot {
-            snapshot_revision: 1,
             context: crate::daemon::protocol::v2::StatusContext::Session {
                 session_id: "$42".to_string(),
             },
@@ -2727,48 +2675,19 @@ mod tests {
                 blocked: 1,
                 ..BadgeStateCounts::default()
             },
-            session_zone_width: None,
             sessions: vec![
-                SessionStatusPresentation {
-                    session_id: "$42".to_string(),
-                    session_name: "界🚀".repeat(100),
-                    category: Some("work".to_string()),
-                    attached: None,
-                    created_at: None,
-                    active: true,
-                    counts: BadgeStateCounts::default(),
-                },
-                SessionStatusPresentation {
-                    session_id: "$43".to_string(),
-                    session_name: "inactive-peer-abcdefghijklmnop".to_string(),
-                    category: Some("work".to_string()),
-                    attached: None,
-                    created_at: None,
-                    active: false,
-                    counts: BadgeStateCounts::default(),
-                },
+                plain_status_session("$42", &"界🚀".repeat(100), true),
+                plain_status_session("$43", "inactive-peer-abcdefghijklmnop", false),
             ],
             windows: vec![WindowStatusPresentation {
-                window_id: "@77".to_string(),
-                window_name: "窓🪟".repeat(100),
-                pane_count: 1,
                 session_ids: vec!["$42".to_string()],
-                window_index: Some(1),
-                active: true,
-                last: false,
-                bell: None,
-                activity: None,
-                silence: None,
-                current_command: None,
-                counts: BadgeStateCounts::default(),
+                ..status_window("@77", &"窓🪟".repeat(100), 1, true)
             }],
             categories: vec![CategoryStatusPresentation {
-                category: "分類🚀".repeat(25),
                 session_ids: vec!["$42".to_string(), "$43".to_string()],
-                active: true,
-                counts: BadgeStateCounts::default(),
+                ..status_category(&"分類🚀".repeat(25), true)
             }],
-            attention: Vec::new(),
+            ..status_snapshot()
         };
 
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
@@ -2812,46 +2731,17 @@ mod tests {
             },
             session_zone_width: None,
             sessions: (1..=8)
-                .map(|index| SessionStatusPresentation {
-                    session_id: format!("${index}"),
-                    session_name: format!("session-{index}-{}", "x".repeat(24)),
-                    category: Some("work".to_string()),
-                    attached: None,
-                    created_at: None,
-                    active: index == 1,
-                    counts: BadgeStateCounts::default(),
+                .map(|index| {
+                    plain_status_session(
+                        &format!("${index}"),
+                        &format!("session-{index}-{}", "x".repeat(24)),
+                        index == 1,
+                    )
                 })
                 .collect(),
-            windows: vec![WindowStatusPresentation {
-                window_id: "@1".to_string(),
-                window_name: "editor".to_string(),
-                pane_count: 1,
-                session_ids: vec!["$1".to_string()],
-                window_index: Some(1),
-                active: true,
-                last: false,
-                bell: None,
-                activity: None,
-                silence: None,
-                current_command: None,
-                counts: BadgeStateCounts::default(),
-            }],
-            categories: vec![CategoryStatusPresentation {
-                category: "work".to_string(),
-                session_ids: vec!["$1".to_string()],
-                active: true,
-                counts: BadgeStateCounts::default(),
-            }],
-            attention: vec![crate::daemon::protocol::v2::AttentionEntry {
-                pane_instance: crate::pane_state::PaneInstance {
-                    pane_id: "%1".to_string(),
-                    pane_pid: 101,
-                },
-                session_name: "review".to_string(),
-                badge: BadgeState::Blocked,
-                reason: Some("permission_prompt".to_string()),
-                elapsed_seconds: 90,
-            }],
+            windows: vec![status_window("@1", "editor", 1, true)],
+            categories: vec![status_category("work", true)],
+            attention: vec![blocked_attention("%1", 101, "review", 90)],
         };
 
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
@@ -2869,17 +2759,10 @@ mod tests {
     fn compact_category_visual_ids_are_unique_within_one_snapshot() {
         let config = Config::default();
         let categories = vec![
+            status_category(&"同じ見た目🚀".repeat(10), true),
             CategoryStatusPresentation {
-                category: "同じ見た目🚀".repeat(10),
-                session_ids: vec!["$1".to_string()],
-                active: true,
-                counts: BadgeStateCounts::default(),
-            },
-            CategoryStatusPresentation {
-                category: "同じ見た目🚀".repeat(9) + "別",
                 session_ids: vec!["$2".to_string()],
-                active: true,
-                counts: BadgeStateCounts::default(),
+                ..status_category(&("同じ見た目🚀".repeat(9) + "別"), true)
             },
         ];
 
@@ -2901,13 +2784,12 @@ mod tests {
         config.statusline.sessions.separator = " ".to_string();
         let sessions = (0..10)
             .map(|index| SessionStatusPresentation {
-                session_id: format!("${}", index + 1),
-                session_name: format!("session-{index}-{}", "x".repeat(20)),
                 category: None,
-                attached: None,
-                created_at: None,
-                active: index == 8,
-                counts: BadgeStateCounts::default(),
+                ..plain_status_session(
+                    &format!("${}", index + 1),
+                    &format!("session-{index}-{}", "x".repeat(20)),
+                    index == 8,
+                )
             })
             .collect::<Vec<_>>();
 
@@ -2930,16 +2812,12 @@ mod tests {
     fn attention_budget_never_drops_the_blocked_identity() {
         let mut config = Config::default();
         config.statusline.attention.prefix = "x".repeat(100);
-        let entries = vec![crate::daemon::protocol::v2::AttentionEntry {
-            pane_instance: crate::pane_state::PaneInstance {
-                pane_id: "%9".to_string(),
-                pane_pid: 900,
-            },
-            session_name: "長いセッション🚀".repeat(50),
-            badge: BadgeState::Blocked,
-            reason: Some("permission_prompt".to_string()),
-            elapsed_seconds: 5_400,
-        }];
+        let entries = vec![blocked_attention(
+            "%9",
+            900,
+            &"長いセッション🚀".repeat(50),
+            5_400,
+        )];
 
         let rendered = render_structured_attention(&config, &entries);
 
@@ -2955,26 +2833,9 @@ mod tests {
 
     #[test]
     fn attention_target_tracks_the_oldest_pane_and_fails_closed_when_stale() {
-        let newer = crate::daemon::protocol::v2::AttentionEntry {
-            pane_instance: crate::pane_state::PaneInstance {
-                pane_id: "%1".to_string(),
-                pane_pid: 101,
-            },
-            session_name: "newer".to_string(),
-            badge: BadgeState::Blocked,
-            reason: Some("permission_prompt".to_string()),
-            elapsed_seconds: 10,
-        };
-        let older = crate::daemon::protocol::v2::AttentionEntry {
-            pane_instance: crate::pane_state::PaneInstance {
-                pane_id: "%2".to_string(),
-                pane_pid: 202,
-            },
-            session_name: "older".to_string(),
-            badge: BadgeState::Blocked,
-            reason: Some("Other(wait)".to_string()),
-            elapsed_seconds: 20,
-        };
+        let newer = blocked_attention("%1", 101, "newer", 10);
+        let mut older = blocked_attention("%2", 202, "older", 20);
+        older.reason = Some("Other(wait)".to_string());
         let entries = vec![newer, older.clone()];
         let target = attention_target_key(&older.pane_instance);
 
@@ -2990,16 +2851,7 @@ mod tests {
     #[test]
     fn attention_hides_permission_reason_but_keeps_other_wait_and_error_reasons() {
         let config = Config::default();
-        let mut entry = crate::daemon::protocol::v2::AttentionEntry {
-            pane_instance: crate::pane_state::PaneInstance {
-                pane_id: "%1".to_string(),
-                pane_pid: 101,
-            },
-            session_name: "main".to_string(),
-            badge: BadgeState::Blocked,
-            reason: Some("permission_prompt".to_string()),
-            elapsed_seconds: 10,
-        };
+        let mut entry = blocked_attention("%1", 101, "main", 10);
 
         let permission = render_structured_attention(&config, std::slice::from_ref(&entry));
         assert!(permission.contains("▲ main"), "{permission}");
@@ -3332,6 +3184,13 @@ mod tests {
         mock.stub(&["set-option", "-g", &memory_key, "two"], "");
         let mut config = Config::default();
         config.statusline.category.mode = "current".to_string();
+        config.categories.session_name_rules = [("one", "a"), ("two", "b"), ("three", "c")]
+            .into_iter()
+            .map(|(name, category)| crate::config::SessionNameRule {
+                category: category.to_string(),
+                patterns: vec![name.to_string()],
+            })
+            .collect();
 
         cycle_statusline_category(&mock, &config, "client", "$1", Direction::Next).unwrap();
 
@@ -3374,7 +3233,14 @@ mod tests {
         mock.stub(&["switch-client", "-c", "client", "-t", "=two:"], "");
         mock.stub(&["switch-client", "-c", "client", "-t", "=three:"], "");
 
-        let config = Config::default();
+        let mut config = Config::default();
+        config.categories.session_name_rules = [("one", "a"), ("two", "b"), ("three", "c")]
+            .into_iter()
+            .map(|(name, category)| crate::config::SessionNameRule {
+                category: category.to_string(),
+                patterns: vec![name.to_string()],
+            })
+            .collect();
         cycle_statusline_category(&mock, &config, "client", "$1", Direction::Next).unwrap();
         cycle_statusline_category(&mock, &config, "client", "$2", Direction::Next).unwrap();
         cycle_statusline_category(&mock, &config, "client", "$3", Direction::Previous).unwrap();
@@ -3441,19 +3307,11 @@ mod tests {
     #[test]
     fn structured_snapshot_rejects_unaddressable_category_key() {
         let snapshot = StatusSnapshot {
-            snapshot_revision: 1,
-            context: crate::daemon::protocol::v2::StatusContext::Global,
-            summary: BadgeStateCounts::default(),
-            session_zone_width: None,
-            sessions: Vec::new(),
-            windows: Vec::new(),
             categories: vec![CategoryStatusPresentation {
                 category: "x".repeat(257),
-                session_ids: vec!["$1".to_string()],
-                active: true,
-                counts: BadgeStateCounts::default(),
+                ..status_category("placeholder", true)
             }],
-            attention: Vec::new(),
+            ..status_snapshot()
         };
 
         let error = render_structured_status_snapshot(&Config::default(), &snapshot).unwrap_err();

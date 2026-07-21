@@ -1,10 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::config::Config;
+use crate::daemon::protocol::v2::{
+    DaemonDiagnostic, ErrorCode, HookHealth, PanePresentation, ResolvedSnapshot, ServerMessage,
+    SessionLinkPresentation, StatusContext, StatusSnapshot,
+};
+use crate::daemon::topology::TopologySnapshot;
 use crate::daemon::{SidebarModel, TransitionEvent};
 use crate::git::{GitBadge, WorktreeInfo};
 pub use crate::pane_state::CanonicalStateRuntime as CanonicalPaneStateRuntime;
-use crate::sidebar::state::SidebarOrderPreferences;
+use crate::pane_state::{PaneInstance, PaneState, StoreError, StoredStateDescriptor, WaitReason};
+use crate::sidebar::state::{SidebarIntentDedupe, SidebarPreferences};
 use crate::sidebar::tree::now_epoch_secs;
 
 const EVENT_CAP: usize = crate::pane_state::store::MAX_DIAGNOSTICS;
@@ -15,38 +21,38 @@ pub(crate) struct LeasedCanonicalPaneStateRuntime {
 }
 
 impl LeasedCanonicalPaneStateRuntime {
-    pub fn acquire(namespace: &std::path::Path) -> Result<Self, crate::pane_state::StoreError> {
+    pub fn acquire(namespace: &std::path::Path) -> Result<Self, StoreError> {
         let lease = crate::daemon::lifecycle::try_acquire_writer_lease(namespace)
-            .map_err(|error| crate::pane_state::StoreError::PersistFailed(error.to_string()))?
-            .ok_or(crate::pane_state::StoreError::WriterLeaseHeld)?;
+            .map_err(|error| StoreError::PersistFailed(error.to_string()))?
+            .ok_or(StoreError::WriterLeaseHeld)?;
         Ok(Self {
             runtime: CanonicalPaneStateRuntime::default(),
             _writer_lease: lease,
         })
     }
 
-    pub fn hydrate(&mut self, entries: Vec<crate::pane_state::RawPaneRecord>) {
-        self.runtime = CanonicalPaneStateRuntime::hydrate(entries);
+    pub fn hydrate(
+        &mut self,
+        entries: BTreeMap<PaneInstance, PaneState>,
+    ) -> Result<(), StoreError> {
+        self.runtime = CanonicalPaneStateRuntime::hydrate(entries)?;
+        Ok(())
     }
 
     #[cfg(test)]
     pub fn bootstrap(
         namespace: &std::path::Path,
-        load_after_lease: impl FnOnce() -> Result<
-            Vec<crate::pane_state::RawPaneRecord>,
-            crate::pane_state::StoreError,
-        >,
-    ) -> Result<Self, crate::pane_state::StoreError> {
+        load_after_lease: impl FnOnce() -> Result<BTreeMap<PaneInstance, PaneState>, StoreError>,
+    ) -> Result<Self, StoreError> {
         let mut leased = Self::acquire(namespace)?;
         let entries = load_after_lease()?;
-        leased.hydrate(entries);
+        leased.hydrate(entries)?;
         Ok(leased)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct StatusProjectionMetadata {
-    pub categories: BTreeSet<String>,
     pub sessions: BTreeMap<String, SessionProjectionMetadata>,
     pub windows: BTreeMap<String, WindowProjectionMetadata>,
 }
@@ -54,9 +60,7 @@ pub(crate) struct StatusProjectionMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SessionProjectionMetadata {
     pub session_name: String,
-    pub stored_category: Option<String>,
     pub project_path: String,
-    pub category_override: String,
     pub attached: Option<bool>,
     pub created_at: Option<i64>,
 }
@@ -71,21 +75,21 @@ pub(crate) struct WindowProjectionMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CanonicalSidebarEffect {
     JumpPane {
-        pane_instance: crate::pane_state::PaneInstance,
+        pane_instance: PaneInstance,
         client_pid: u32,
-        source_pane: crate::pane_state::PaneInstance,
+        source_pane: PaneInstance,
     },
 }
 
 pub(crate) struct CanonicalCoordinatorState {
     pub leased: LeasedCanonicalPaneStateRuntime,
-    pub topology: crate::daemon::topology::TopologySnapshot,
-    pub views: crate::daemon::view_hooks::ViewRegistry,
-    pub sidebar_order: SidebarOrderPreferences,
-    pub sidebar_expansion: crate::sidebar::state::SidebarExpansionPreferences,
-    pub hook_health: crate::daemon::protocol::v2::HookHealth,
-    pub hook_diagnostic: Option<crate::daemon::protocol::v2::DaemonDiagnostic>,
-    pub global_diagnostics: VecDeque<crate::daemon::protocol::v2::DaemonDiagnostic>,
+    pub topology: TopologySnapshot,
+    pub views: crate::daemon::view_hooks::CurrentClientViews,
+    pub sidebar_preferences: SidebarPreferences,
+    pub sidebar_intent_dedupe: SidebarIntentDedupe,
+    pub hook_health: HookHealth,
+    pub hook_diagnostic: Option<DaemonDiagnostic>,
+    pub global_diagnostics: VecDeque<DaemonDiagnostic>,
     pub status_metadata: StatusProjectionMetadata,
     pub git_badges: BTreeMap<String, GitBadge>,
     pub worktrees: BTreeMap<String, WorktreeInfo>,
@@ -95,17 +99,17 @@ pub(crate) struct CanonicalCoordinatorState {
 impl CanonicalCoordinatorState {
     pub fn new(
         leased: LeasedCanonicalPaneStateRuntime,
-        topology: crate::daemon::topology::TopologySnapshot,
-        views: crate::daemon::view_hooks::ViewRegistry,
-        sidebar_order: SidebarOrderPreferences,
+        topology: TopologySnapshot,
+        views: crate::daemon::view_hooks::CurrentClientViews,
+        sidebar_preferences: SidebarPreferences,
     ) -> Self {
         Self {
             leased,
             topology,
             views,
-            sidebar_order,
-            sidebar_expansion: crate::sidebar::state::SidebarExpansionPreferences::default(),
-            hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
+            sidebar_preferences,
+            sidebar_intent_dedupe: SidebarIntentDedupe::default(),
+            hook_health: HookHealth::Healthy,
             hook_diagnostic: None,
             global_diagnostics: VecDeque::new(),
             status_metadata: StatusProjectionMetadata::default(),
@@ -117,9 +121,9 @@ impl CanonicalCoordinatorState {
 
     pub fn set_hook_health(
         &mut self,
-        health: crate::daemon::protocol::v2::HookHealth,
+        health: HookHealth,
         diagnostic: Option<String>,
-    ) -> Result<bool, crate::pane_state::StoreError> {
+    ) -> Result<bool, StoreError> {
         use crate::daemon::protocol::v2::{DaemonDiagnostic, ErrorCode, HookHealth};
 
         let hook_diagnostic = (health == HookHealth::Degraded).then(|| DaemonDiagnostic {
@@ -149,11 +153,11 @@ impl CanonicalCoordinatorState {
 
     pub fn add_global_diagnostic(
         &mut self,
-        code: crate::daemon::protocol::v2::ErrorCode,
+        code: ErrorCode,
         message: String,
-    ) -> Result<u64, crate::pane_state::StoreError> {
+    ) -> Result<u64, StoreError> {
         let mut diagnostics = self.global_diagnostics.clone();
-        diagnostics.push_back(crate::daemon::protocol::v2::DaemonDiagnostic {
+        diagnostics.push_back(DaemonDiagnostic {
             code,
             message,
             pane_instance: None,
@@ -179,7 +183,7 @@ impl CanonicalCoordinatorState {
     pub fn record_frame_too_large_diagnostic(
         &mut self,
         rejected_revision: u64,
-    ) -> Result<bool, crate::pane_state::StoreError> {
+    ) -> Result<bool, StoreError> {
         use crate::daemon::protocol::v2::{DaemonDiagnostic, ErrorCode};
 
         let message = format!(
@@ -209,9 +213,7 @@ impl CanonicalCoordinatorState {
         Ok(true)
     }
 
-    pub fn records_snapshot(
-        &self,
-    ) -> BTreeMap<crate::pane_state::PaneInstance, crate::pane_state::StoredPaneRecord> {
+    pub fn records_snapshot(&self) -> BTreeMap<PaneInstance, PaneState> {
         self.leased.runtime.records_snapshot()
     }
 
@@ -219,14 +221,13 @@ impl CanonicalCoordinatorState {
     /// git polling without building the full resolved snapshot. Mirrors the
     /// `resolved.is_some()` filter in `resolved_snapshot_with_git_at`.
     pub fn git_polling_paths(&self) -> BTreeSet<String> {
-        use crate::pane_state::StoredPaneRecord;
         self.topology
             .panes
             .iter()
             .filter(|topology| {
                 matches!(
                     self.leased.runtime.record(&topology.pane_instance),
-                    Some(StoredPaneRecord::Active(state))
+                    Some(state)
                         if state.agent_present || state.completed_seq > state.acknowledged_seq
                 )
             })
@@ -237,15 +238,15 @@ impl CanonicalCoordinatorState {
 
     /// Whether the canonical topology currently contains `pane_instance`,
     /// without building the full resolved snapshot.
-    pub fn contains_pane(&self, pane_instance: &crate::pane_state::PaneInstance) -> bool {
+    pub fn contains_pane(&self, pane_instance: &PaneInstance) -> bool {
         self.topology
             .panes
             .iter()
             .any(|pane| &pane.pane_instance == pane_instance)
     }
 
-    pub fn window_panes(&self) -> BTreeMap<String, Vec<crate::pane_state::PaneInstance>> {
-        let mut windows = BTreeMap::<String, Vec<crate::pane_state::PaneInstance>>::new();
+    pub fn window_panes(&self) -> BTreeMap<String, Vec<PaneInstance>> {
+        let mut windows = BTreeMap::<String, Vec<PaneInstance>>::new();
         for pane in &self.topology.panes {
             windows
                 .entry(pane.window_id.clone())
@@ -259,10 +260,7 @@ impl CanonicalCoordinatorState {
         windows
     }
 
-    pub fn replace_topology(
-        &mut self,
-        topology: crate::daemon::topology::TopologySnapshot,
-    ) -> Result<bool, crate::pane_state::StoreError> {
+    pub fn replace_topology(&mut self, topology: TopologySnapshot) -> Result<bool, StoreError> {
         if self.topology == topology {
             return Ok(false);
         }
@@ -284,7 +282,7 @@ impl CanonicalCoordinatorState {
         &mut self,
         git_badges: BTreeMap<String, GitBadge>,
         worktrees: BTreeMap<String, WorktreeInfo>,
-    ) -> Result<bool, crate::pane_state::StoreError> {
+    ) -> Result<bool, StoreError> {
         if self.git_badges == git_badges && self.worktrees == worktrees {
             return Ok(false);
         }
@@ -306,7 +304,7 @@ impl CanonicalCoordinatorState {
         Ok(true)
     }
 
-    pub fn resolved_snapshot(&self) -> crate::daemon::protocol::v2::ResolvedSnapshot {
+    pub fn resolved_snapshot(&self) -> ResolvedSnapshot {
         self.resolved_snapshot_from(
             &self.leased.runtime,
             &self.topology,
@@ -315,9 +313,7 @@ impl CanonicalCoordinatorState {
         )
     }
 
-    pub(crate) fn checked_resolved_snapshot(
-        &self,
-    ) -> Result<crate::daemon::protocol::v2::ResolvedSnapshot, crate::pane_state::StoreError> {
+    pub(crate) fn checked_resolved_snapshot(&self) -> Result<ResolvedSnapshot, StoreError> {
         let snapshot = self.resolved_snapshot();
         preflight_resolved_snapshot_against_runtime(&snapshot, &self.leased.runtime)?;
         Ok(snapshot)
@@ -326,10 +322,10 @@ impl CanonicalCoordinatorState {
     fn resolved_snapshot_from(
         &self,
         runtime: &CanonicalPaneStateRuntime,
-        topology_snapshot: &crate::daemon::topology::TopologySnapshot,
-        hook_diagnostic: Option<&crate::daemon::protocol::v2::DaemonDiagnostic>,
-        global_diagnostics: &VecDeque<crate::daemon::protocol::v2::DaemonDiagnostic>,
-    ) -> crate::daemon::protocol::v2::ResolvedSnapshot {
+        topology_snapshot: &TopologySnapshot,
+        hook_diagnostic: Option<&DaemonDiagnostic>,
+        global_diagnostics: &VecDeque<DaemonDiagnostic>,
+    ) -> ResolvedSnapshot {
         self.resolved_snapshot_with_git_from(
             runtime,
             topology_snapshot,
@@ -344,12 +340,12 @@ impl CanonicalCoordinatorState {
     fn resolved_snapshot_with_git_from(
         &self,
         runtime: &CanonicalPaneStateRuntime,
-        topology_snapshot: &crate::daemon::topology::TopologySnapshot,
-        hook_diagnostic: Option<&crate::daemon::protocol::v2::DaemonDiagnostic>,
-        global_diagnostics: &VecDeque<crate::daemon::protocol::v2::DaemonDiagnostic>,
+        topology_snapshot: &TopologySnapshot,
+        hook_diagnostic: Option<&DaemonDiagnostic>,
+        global_diagnostics: &VecDeque<DaemonDiagnostic>,
         git_badges: &BTreeMap<String, GitBadge>,
         worktrees: &BTreeMap<String, WorktreeInfo>,
-    ) -> crate::daemon::protocol::v2::ResolvedSnapshot {
+    ) -> ResolvedSnapshot {
         self.resolved_snapshot_with_git_at(
             runtime,
             topology_snapshot,
@@ -365,17 +361,17 @@ impl CanonicalCoordinatorState {
     fn resolved_snapshot_with_git_at(
         &self,
         runtime: &CanonicalPaneStateRuntime,
-        topology_snapshot: &crate::daemon::topology::TopologySnapshot,
-        hook_diagnostic: Option<&crate::daemon::protocol::v2::DaemonDiagnostic>,
-        global_diagnostics: &VecDeque<crate::daemon::protocol::v2::DaemonDiagnostic>,
+        topology_snapshot: &TopologySnapshot,
+        hook_diagnostic: Option<&DaemonDiagnostic>,
+        global_diagnostics: &VecDeque<DaemonDiagnostic>,
         git_badges: &BTreeMap<String, GitBadge>,
         worktrees: &BTreeMap<String, WorktreeInfo>,
         now: i64,
-    ) -> crate::daemon::protocol::v2::ResolvedSnapshot {
+    ) -> ResolvedSnapshot {
         use crate::daemon::protocol::v2::{
             AttentionEntry, DaemonDiagnostic, ErrorCode, PanePresentation, ResolvedSnapshot,
         };
-        use crate::pane_state::{LifecycleState, ResolvedPaneState, StoredPaneRecord};
+        use crate::pane_state::{LifecycleState, ResolvedPaneState};
 
         let mut panes = Vec::with_capacity(topology_snapshot.panes.len());
         let mut attention = Vec::new();
@@ -394,7 +390,7 @@ impl CanonicalCoordinatorState {
             let stored = runtime.descriptor(&topology.pane_instance);
             let record = runtime.record(&topology.pane_instance);
             let resolved = match record {
-                Some(StoredPaneRecord::Active(state))
+                Some(state)
                     if state.agent_present || state.completed_seq > state.acknowledged_seq =>
                 {
                     Some(ResolvedPaneState {
@@ -410,16 +406,13 @@ impl CanonicalCoordinatorState {
             if let Some(badge) = triage.get(&topology.pane_instance)
                 && !visible_instances.contains(&topology.pane_instance)
             {
-                let active = match record {
-                    Some(StoredPaneRecord::Active(state)) => Some(state),
-                    _ => None,
-                };
+                let active = record;
                 let reason = match active.map(|state| &state.lifecycle) {
                     Some(LifecycleState::Waiting {
-                        reason: crate::pane_state::WaitReason::PermissionPrompt,
+                        reason: WaitReason::PermissionPrompt,
                     }) => Some("permission_prompt".to_string()),
                     Some(LifecycleState::Waiting {
-                        reason: crate::pane_state::WaitReason::Other(_),
+                        reason: WaitReason::Other(_),
                     }) => Some("Other(wait)".to_string()),
                     Some(LifecycleState::Error { .. }) => Some("error".to_string()),
                     _ => Some("Other(calm)".to_string()),
@@ -449,9 +442,6 @@ impl CanonicalCoordinatorState {
                 active: topology.active,
                 stored,
                 resolved,
-                diagnostic: runtime
-                    .quarantined(&topology.pane_instance)
-                    .map(|record| record.error.clone()),
             });
         }
         panes.sort_by(|left, right| left.pane_instance.cmp(&right.pane_instance));
@@ -501,8 +491,7 @@ impl CanonicalCoordinatorState {
             snapshot_revision,
             panes,
             sidebar_model: SidebarModel {
-                order: self.sidebar_order.clone(),
-                expansion: self.sidebar_expansion.clone(),
+                preferences: self.sidebar_preferences.clone(),
                 active_sessions: self
                     .views
                     .clients()
@@ -521,20 +510,14 @@ impl CanonicalCoordinatorState {
         }
     }
 
-    pub fn pane_presentation(
-        &self,
-        pane_id: &str,
-    ) -> Option<crate::daemon::protocol::v2::PanePresentation> {
+    pub fn pane_presentation(&self, pane_id: &str) -> Option<PanePresentation> {
         self.resolved_snapshot()
             .panes
             .into_iter()
             .find(|pane| pane.pane_instance.pane_id == pane_id)
     }
 
-    pub fn status_snapshot(
-        &self,
-        context: crate::daemon::protocol::v2::StatusContext,
-    ) -> crate::daemon::protocol::v2::StatusSnapshot {
+    pub fn status_snapshot(&self, context: StatusContext) -> StatusSnapshot {
         build_status_snapshot(
             &self.resolved_snapshot(),
             context,
@@ -545,15 +528,11 @@ impl CanonicalCoordinatorState {
 
     pub fn display_projection(
         &self,
-    ) -> (
-        crate::daemon::protocol::v2::StatusSnapshot,
-        Vec<crate::daemon::protocol::v2::StatusSnapshot>,
-        Vec<crate::daemon::protocol::v2::PanePresentation>,
-    ) {
+    ) -> (StatusSnapshot, Vec<StatusSnapshot>, Vec<PanePresentation>) {
         let resolved = self.resolved_snapshot();
         let global = build_status_snapshot(
             &resolved,
-            crate::daemon::protocol::v2::StatusContext::Global,
+            StatusContext::Global,
             &self.status_metadata,
             &self.projection_config,
         );
@@ -564,7 +543,7 @@ impl CanonicalCoordinatorState {
             .map(|session_id| {
                 build_status_snapshot(
                     &resolved,
-                    crate::daemon::protocol::v2::StatusContext::Session {
+                    StatusContext::Session {
                         session_id: session_id.clone(),
                     },
                     &self.status_metadata,
@@ -575,63 +554,34 @@ impl CanonicalCoordinatorState {
         (global, sessions, resolved.panes)
     }
 
-    pub fn replace_sidebar_order_preferences(
+    pub fn replace_sidebar_preferences(
         &mut self,
-        order: SidebarOrderPreferences,
-    ) -> Result<bool, crate::pane_state::StoreError> {
-        order
-            .validate()
-            .map_err(crate::pane_state::StoreError::Random)?;
-        if self.sidebar_order == order {
+        preferences: SidebarPreferences,
+    ) -> Result<bool, StoreError> {
+        preferences.validate().map_err(StoreError::Random)?;
+        if self.sidebar_preferences == preferences {
             return Ok(false);
         }
         let mut runtime = self.leased.runtime.clone();
         runtime.mark_projection_changed()?;
-        let previous = std::mem::replace(&mut self.sidebar_order, order);
+        let previous = std::mem::replace(&mut self.sidebar_preferences, preferences);
         let snapshot = self.resolved_snapshot_from(
             &runtime,
             &self.topology,
             self.hook_diagnostic.as_ref(),
             &self.global_diagnostics,
         );
-        self.sidebar_order = previous;
+        self.sidebar_preferences = previous;
         preflight_resolved_snapshot(&snapshot)?;
         self.leased.runtime = runtime;
-        self.sidebar_order = snapshot.sidebar_model.order;
-        Ok(true)
-    }
-
-    pub fn replace_sidebar_expansion_preferences(
-        &mut self,
-        expansion: crate::sidebar::state::SidebarExpansionPreferences,
-    ) -> Result<bool, crate::pane_state::StoreError> {
-        expansion
-            .validate()
-            .map_err(crate::pane_state::StoreError::Random)?;
-        if self.sidebar_expansion == expansion {
-            return Ok(false);
-        }
-        let mut runtime = self.leased.runtime.clone();
-        runtime.mark_projection_changed()?;
-        let previous = std::mem::replace(&mut self.sidebar_expansion, expansion);
-        let snapshot = self.resolved_snapshot_from(
-            &runtime,
-            &self.topology,
-            self.hook_diagnostic.as_ref(),
-            &self.global_diagnostics,
-        );
-        if let Err(error) = preflight_resolved_snapshot(&snapshot) {
-            self.sidebar_expansion = previous;
-            return Err(error);
-        }
-        self.leased.runtime = runtime;
+        self.sidebar_preferences = snapshot.sidebar_model.preferences;
         Ok(true)
     }
 
     pub fn replace_status_metadata(
         &mut self,
         metadata: StatusProjectionMetadata,
-    ) -> Result<bool, crate::pane_state::StoreError> {
+    ) -> Result<bool, StoreError> {
         if self.status_metadata == metadata {
             return Ok(false);
         }
@@ -646,7 +596,7 @@ impl CanonicalCoordinatorState {
         preflight_resolved_snapshot(&resolved)?;
         let status = build_status_snapshot(
             &resolved,
-            crate::daemon::protocol::v2::StatusContext::Global,
+            StatusContext::Global,
             &metadata,
             &self.projection_config,
         );
@@ -660,16 +610,16 @@ impl CanonicalCoordinatorState {
 #[derive(Debug, Clone)]
 struct WindowStatusAggregate {
     window_name: String,
-    links: BTreeMap<String, crate::daemon::protocol::v2::SessionLinkPresentation>,
+    links: BTreeMap<String, SessionLinkPresentation>,
     current_command: Option<String>,
 }
 
 pub(crate) fn build_status_snapshot(
-    resolved: &crate::daemon::protocol::v2::ResolvedSnapshot,
-    context: crate::daemon::protocol::v2::StatusContext,
+    resolved: &ResolvedSnapshot,
+    context: StatusContext,
     metadata: &StatusProjectionMetadata,
     config: &Config,
-) -> crate::daemon::protocol::v2::StatusSnapshot {
+) -> StatusSnapshot {
     use crate::daemon::protocol::v2::{
         CategoryStatusPresentation, SessionStatusPresentation, StatusContext, StatusSnapshot,
         WindowStatusPresentation,
@@ -677,8 +627,8 @@ pub(crate) fn build_status_snapshot(
 
     let mut pane_badges = BTreeMap::new();
     let mut session_names = BTreeMap::<String, String>::new();
-    let mut session_panes = BTreeMap::<String, BTreeSet<crate::pane_state::PaneInstance>>::new();
-    let mut window_panes = BTreeMap::<String, BTreeSet<crate::pane_state::PaneInstance>>::new();
+    let mut session_panes = BTreeMap::<String, BTreeSet<PaneInstance>>::new();
+    let mut window_panes = BTreeMap::<String, BTreeSet<PaneInstance>>::new();
     let mut windows = BTreeMap::<String, WindowStatusAggregate>::new();
 
     for pane in &resolved.panes {
@@ -734,14 +684,8 @@ pub(crate) fn build_status_snapshot(
                     .filter(|name| !name.is_empty())
                     .unwrap_or(topology_name)
                     .to_string(),
-                category: projection
-                    .and_then(|session| session.stored_category.clone())
-                    .unwrap_or_default(),
                 project_path: projection
                     .map(|session| session.project_path.clone())
-                    .unwrap_or_default(),
-                category_override: projection
-                    .map(|session| session.category_override.clone())
                     .unwrap_or_default(),
                 id: session_id.clone(),
                 ..crate::session::SessionInfo::default()
@@ -755,7 +699,7 @@ pub(crate) fn build_status_snapshot(
 
     let summary =
         crate::daemon::session_badge::BadgeStateCounts::from_states(pane_badges.values().copied());
-    let counts_for = |panes: Option<&BTreeSet<crate::pane_state::PaneInstance>>| {
+    let counts_for = |panes: Option<&BTreeSet<PaneInstance>>| {
         crate::daemon::session_badge::BadgeStateCounts::from_states(
             panes
                 .into_iter()
@@ -945,23 +889,19 @@ pub(crate) fn build_status_snapshot(
     }
 }
 
-fn preflight_resolved_snapshot(
-    snapshot: &crate::daemon::protocol::v2::ResolvedSnapshot,
-) -> Result<(), crate::pane_state::StoreError> {
+fn preflight_resolved_snapshot(snapshot: &ResolvedSnapshot) -> Result<(), StoreError> {
     for pane in &snapshot.panes {
         if pane.pane_width == 0 {
-            return Err(crate::pane_state::StoreError::FailStop(format!(
+            return Err(StoreError::FailStop(format!(
                 "projection invariant violated for {}: pane width must be positive",
                 pane.pane_instance.pane_id
             )));
         }
-        if let (
-            Some(crate::pane_state::StoredStateDescriptor::Canonical { version }),
-            Some(resolved),
-        ) = (&pane.stored, &pane.resolved)
+        if let (Some(StoredStateDescriptor::Canonical { version }), Some(resolved)) =
+            (&pane.stored, &pane.resolved)
             && version != &resolved.canonical.version()
         {
-            return Err(crate::pane_state::StoreError::Reduce(
+            return Err(StoreError::Reduce(
                 crate::pane_state::reducer::ReduceError::StateInvariantViolation(format!(
                     "projection invariant violated for {}: stored and resolved canonical versions differ",
                     pane.pane_instance.pane_id
@@ -969,51 +909,48 @@ fn preflight_resolved_snapshot(
             ));
         }
     }
-    let message = crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+    let message = ServerMessage::ResolvedSnapshotResult {
         snapshot_revision: snapshot.snapshot_revision,
         snapshot: snapshot.clone(),
     };
-    let _bytes = serde_json::to_vec(&message)
-        .map_err(|error| crate::pane_state::StoreError::Random(error.to_string()))?;
+    let _bytes =
+        serde_json::to_vec(&message).map_err(|error| StoreError::Random(error.to_string()))?;
     Ok(())
 }
 
 fn preflight_resolved_snapshot_against_runtime(
-    snapshot: &crate::daemon::protocol::v2::ResolvedSnapshot,
+    snapshot: &ResolvedSnapshot,
     runtime: &CanonicalPaneStateRuntime,
-) -> Result<(), crate::pane_state::StoreError> {
+) -> Result<(), StoreError> {
     preflight_resolved_snapshot(snapshot)?;
     for pane in &snapshot.panes {
         match (&pane.stored, &pane.resolved) {
-            (
-                Some(crate::pane_state::StoredStateDescriptor::Canonical { version }),
-                Some(resolved),
-            ) if version == &resolved.canonical.version() => {}
-            (Some(crate::pane_state::StoredStateDescriptor::Canonical { version }), None) => {
+            (Some(StoredStateDescriptor::Canonical { version }), Some(resolved))
+                if version == &resolved.canonical.version() => {}
+            (Some(StoredStateDescriptor::Canonical { version }), None) => {
                 let confirmed_ended = matches!(
                     runtime.record(&pane.pane_instance),
-                    Some(crate::pane_state::StoredPaneRecord::Active(state))
+                    Some(state)
                         if &state.version() == version
                             && !state.agent_present
                             && state.completed_seq == state.acknowledged_seq
                 );
                 if !confirmed_ended {
-                    return Err(crate::pane_state::StoreError::FailStop(format!(
+                    return Err(StoreError::FailStop(format!(
                         "projection invariant violated for {}: canonical state is unresolved without a confirmed agent end",
                         pane.pane_instance.pane_id
                     )));
                 }
             }
-            (Some(crate::pane_state::StoredStateDescriptor::Canonical { .. }), Some(_)) => {
-                return Err(crate::pane_state::StoreError::FailStop(format!(
+            (Some(StoredStateDescriptor::Canonical { .. }), Some(_)) => {
+                return Err(StoreError::FailStop(format!(
                     "projection invariant violated for {}: stored and resolved canonical versions differ",
                     pane.pane_instance.pane_id
                 )));
             }
-            (None | Some(crate::pane_state::StoredStateDescriptor::Reset { .. }), None)
-            | (Some(crate::pane_state::StoredStateDescriptor::Quarantined { .. }), None) => {}
+            (None, None) => {}
             (_, Some(_)) => {
-                return Err(crate::pane_state::StoreError::FailStop(format!(
+                return Err(StoreError::FailStop(format!(
                     "projection invariant violated for {}: resolved state has no canonical storage",
                     pane.pane_instance.pane_id
                 )));
@@ -1023,15 +960,13 @@ fn preflight_resolved_snapshot_against_runtime(
     Ok(())
 }
 
-fn preflight_status_snapshot(
-    snapshot: &crate::daemon::protocol::v2::StatusSnapshot,
-) -> Result<(), crate::pane_state::StoreError> {
-    let message = crate::daemon::protocol::v2::ServerMessage::StatusSnapshotResult {
+fn preflight_status_snapshot(snapshot: &StatusSnapshot) -> Result<(), StoreError> {
+    let message = ServerMessage::StatusSnapshotResult {
         snapshot_revision: snapshot.snapshot_revision,
         snapshot: snapshot.clone(),
     };
-    let _bytes = serde_json::to_vec(&message)
-        .map_err(|error| crate::pane_state::StoreError::Random(error.to_string()))?;
+    let _bytes =
+        serde_json::to_vec(&message).map_err(|error| StoreError::Random(error.to_string()))?;
     Ok(())
 }
 
@@ -1039,31 +974,30 @@ fn preflight_status_snapshot(
 mod tests {
     use super::*;
     use crate::config::DoneClearOn;
+    use crate::daemon::protocol::v2::AttentionEntry;
     use crate::daemon::session_badge::BadgeState;
+    use crate::daemon::topology::ServerIdentity;
+    use crate::pane_state::EventId;
     use crate::sidebar::state::SidebarState;
-    use std::time::Duration;
 
     #[test]
     fn canonical_bootstrap_acquires_writer_lease_before_loading_state() {
         let root = std::env::temp_dir().join(format!(
             "vde-runtime-bootstrap-{}-{}",
             std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
+            EventId::generate().unwrap().as_str()
         ));
         std::fs::create_dir_all(&root).unwrap();
         let namespace = root.join("server");
         let first =
-            LeasedCanonicalPaneStateRuntime::bootstrap(&namespace, || Ok(Vec::new())).unwrap();
+            LeasedCanonicalPaneStateRuntime::bootstrap(&namespace, || Ok(BTreeMap::new())).unwrap();
         assert_eq!(first.runtime.snapshot_revision(), 0);
         let mut loader_called = false;
         let second = LeasedCanonicalPaneStateRuntime::bootstrap(&namespace, || {
             loader_called = true;
-            Ok(Vec::new())
+            Ok(BTreeMap::new())
         });
-        assert!(matches!(
-            second,
-            Err(crate::pane_state::StoreError::WriterLeaseHeld)
-        ));
+        assert!(matches!(second, Err(StoreError::WriterLeaseHeld)));
         assert!(!loader_called);
         drop(first);
         std::fs::remove_dir_all(root).unwrap();
@@ -1074,47 +1008,37 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "vde-runtime-hook-health-{}-{}",
             std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
+            EventId::generate().unwrap().as_str()
         ));
         std::fs::create_dir_all(&root).unwrap();
         let leased = LeasedCanonicalPaneStateRuntime::acquire(&root.join("server")).unwrap();
         let mut state = CanonicalCoordinatorState::new(
             leased,
-            crate::daemon::topology::TopologySnapshot {
-                server_identity: crate::daemon::topology::ServerIdentity {
+            TopologySnapshot {
+                server_identity: ServerIdentity {
                     pid: 1,
                     start_time: 2,
                 },
                 panes: Vec::new(),
             },
-            crate::daemon::view_hooks::ViewRegistry::default(),
-            SidebarOrderPreferences::default(),
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+            SidebarPreferences::default(),
         );
 
         assert!(
             state
-                .set_hook_health(
-                    crate::daemon::protocol::v2::HookHealth::Degraded,
-                    Some("foreign hook".to_string()),
-                )
+                .set_hook_health(HookHealth::Degraded, Some("foreign hook".to_string()),)
                 .unwrap()
         );
         assert_eq!(state.leased.runtime.snapshot_revision(), 1);
         assert_eq!(state.resolved_snapshot().diagnostics.len(), 1);
         assert!(
             !state
-                .set_hook_health(
-                    crate::daemon::protocol::v2::HookHealth::Degraded,
-                    Some("foreign hook".to_string()),
-                )
+                .set_hook_health(HookHealth::Degraded, Some("foreign hook".to_string()),)
                 .unwrap()
         );
         assert_eq!(state.leased.runtime.snapshot_revision(), 1);
-        assert!(
-            state
-                .set_hook_health(crate::daemon::protocol::v2::HookHealth::Healthy, None)
-                .unwrap()
-        );
+        assert!(state.set_hook_health(HookHealth::Healthy, None).unwrap());
         assert_eq!(state.leased.runtime.snapshot_revision(), 2);
         assert!(state.resolved_snapshot().diagnostics.is_empty());
 
@@ -1123,19 +1047,10 @@ mod tests {
             .runtime
             .set_snapshot_revision_for_test(u64::MAX);
         let error = state
-            .set_hook_health(
-                crate::daemon::protocol::v2::HookHealth::Degraded,
-                Some("must not publish".to_string()),
-            )
+            .set_hook_health(HookHealth::Degraded, Some("must not publish".to_string()))
             .unwrap_err();
-        assert!(matches!(
-            error,
-            crate::pane_state::StoreError::CounterOverflow(_)
-        ));
-        assert_eq!(
-            state.hook_health,
-            crate::daemon::protocol::v2::HookHealth::Healthy
-        );
+        assert!(matches!(error, StoreError::CounterOverflow(_)));
+        assert_eq!(state.hook_health, HookHealth::Healthy);
         assert!(state.hook_diagnostic.is_none());
         assert_eq!(state.leased.runtime.snapshot_revision(), u64::MAX);
 
@@ -1148,8 +1063,8 @@ mod tests {
         session_name: &str,
         window_index: i64,
         window_active: bool,
-    ) -> crate::daemon::protocol::v2::SessionLinkPresentation {
-        crate::daemon::protocol::v2::SessionLinkPresentation {
+    ) -> SessionLinkPresentation {
+        SessionLinkPresentation {
             session_id: session_id.to_string(),
             session_name: session_name.to_string(),
             window_index,
@@ -1163,16 +1078,16 @@ mod tests {
         pane_pid: u32,
         window_id: &str,
         window_name: &str,
-        links: Vec<crate::daemon::protocol::v2::SessionLinkPresentation>,
+        links: Vec<SessionLinkPresentation>,
         badge: Option<BadgeState>,
         active: bool,
-    ) -> crate::daemon::protocol::v2::PanePresentation {
-        let pane_instance = crate::pane_state::PaneInstance {
+    ) -> PanePresentation {
+        let pane_instance = PaneInstance {
             pane_id: pane_id.to_string(),
             pane_pid,
         };
         let resolved = badge.map(|badge| crate::pane_state::ResolvedPaneState {
-            canonical: crate::pane_state::PaneState {
+            canonical: PaneState {
                 schema_version: crate::pane_state::PANE_STATE_SCHEMA_VERSION,
                 state_id: crate::pane_state::StateId::parse(format!("{pane_pid:032x}")).unwrap(),
                 revision: 1,
@@ -1199,7 +1114,7 @@ mod tests {
             current_path: "/tmp".to_string(),
             badge,
         });
-        crate::daemon::protocol::v2::PanePresentation {
+        PanePresentation {
             pane_instance,
             session_links: links,
             window_id: window_id.to_string(),
@@ -1208,26 +1123,25 @@ mod tests {
             current_command: if resolved.is_some() { "codex" } else { "zsh" }.to_string(),
             pane_width: 80,
             active,
-            stored: resolved.as_ref().map(|resolved| {
-                crate::pane_state::StoredStateDescriptor::Canonical {
+            stored: resolved
+                .as_ref()
+                .map(|resolved| StoredStateDescriptor::Canonical {
                     version: resolved.canonical.version(),
-                }
-            }),
+                }),
             resolved,
-            diagnostic: None,
         }
     }
 
     fn canonical_sidebar_fixture() -> (CanonicalCoordinatorState, std::path::PathBuf) {
         use crate::pane_state::{
             AgentKind, LifecycleState, PANE_STATE_SCHEMA_VERSION, PaneInstance, PaneState,
-            PromptState, RawPaneRecord, StateId, StoredPaneRecord, TaskState, WaitReason,
+            PromptState, StateId, TaskState, WaitReason,
         };
 
         let root = std::env::temp_dir().join(format!(
             "vde-runtime-sidebar-{}-{}",
             std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
+            EventId::generate().unwrap().as_str()
         ));
         std::fs::create_dir_all(&root).unwrap();
         let mut leased = LeasedCanonicalPaneStateRuntime::acquire(&root.join("server")).unwrap();
@@ -1265,16 +1179,10 @@ mod tests {
                     subagents: Vec::new(),
                     worktree_activity: None,
                 };
-                RawPaneRecord {
-                    pane_instance,
-                    raw: Some(
-                        crate::pane_state::serialize_record(&StoredPaneRecord::Active(state))
-                            .unwrap(),
-                    ),
-                }
+                (pane_instance, state)
             })
-            .collect::<Vec<_>>();
-        leased.hydrate(active);
+            .collect::<BTreeMap<_, _>>();
+        leased.hydrate(active).unwrap();
         let topology_pane = |pane_id: &str,
                              pane_pid: u32,
                              window_id: &str,
@@ -1299,8 +1207,8 @@ mod tests {
                 active: true,
             }
         };
-        let topology = crate::daemon::topology::TopologySnapshot {
-            server_identity: crate::daemon::topology::ServerIdentity {
+        let topology = TopologySnapshot {
+            server_identity: ServerIdentity {
                 pid: 1,
                 start_time: 2,
             },
@@ -1314,8 +1222,8 @@ mod tests {
             CanonicalCoordinatorState::new(
                 leased,
                 topology,
-                crate::daemon::view_hooks::ViewRegistry::default(),
-                SidebarOrderPreferences::default(),
+                crate::daemon::view_hooks::CurrentClientViews::default(),
+                SidebarPreferences::default(),
             ),
             root,
         )
@@ -1351,11 +1259,11 @@ mod tests {
     #[test]
     fn contains_pane_matches_resolved_snapshot_membership() {
         let (state, root) = canonical_sidebar_fixture();
-        assert!(state.contains_pane(&crate::pane_state::PaneInstance {
+        assert!(state.contains_pane(&PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 101,
         }));
-        assert!(!state.contains_pane(&crate::pane_state::PaneInstance {
+        assert!(!state.contains_pane(&PaneInstance {
             pane_id: "%missing".to_string(),
             pane_pid: 999,
         }));
@@ -1364,28 +1272,9 @@ mod tests {
 
     struct ImmediatePaneStateIo;
 
-    impl crate::pane_state::PaneStateStoreIo for ImmediatePaneStateIo {
-        fn write_candidate(
-            &mut self,
-            _pane: &crate::pane_state::PaneInstance,
-            candidate: &str,
-        ) -> crate::pane_state::WriteAttempt {
-            crate::pane_state::WriteAttempt::ReadBack(Some(candidate.to_string()))
-        }
-
-        fn read_independent(
-            &mut self,
-            _pane: &crate::pane_state::PaneInstance,
-        ) -> crate::pane_state::IndependentRead {
-            crate::pane_state::IndependentRead::Unavailable("unused".to_string())
-        }
-    }
-
-    struct ZeroRecoveryClock;
-
-    impl crate::pane_state::RecoveryClock for ZeroRecoveryClock {
-        fn elapsed(&self) -> Duration {
-            Duration::ZERO
+    impl crate::pane_state::snapshot::PaneSnapshotStoreIo for ImmediatePaneStateIo {
+        fn save(&mut self, _records: &BTreeMap<PaneInstance, PaneState>) -> Result<(), StoreError> {
+            Ok(())
         }
     }
 
@@ -1394,7 +1283,7 @@ mod tests {
         pane_id: &str,
         pane_pid: u32,
         started_at: i64,
-        reason: crate::pane_state::WaitReason,
+        reason: WaitReason,
     ) {
         use crate::pane_state::{
             AgentKind, AgentSessionId, DaemonInstanceId, EventId, PaneEvent, PaneEventEnvelope,
@@ -1406,7 +1295,6 @@ mod tests {
             pane_pid,
         };
         let mut io = ImmediatePaneStateIo;
-        let mut clock = ZeroRecoveryClock;
         for event in [
             PaneEvent::BeginRun {
                 started_at,
@@ -1422,7 +1310,6 @@ mod tests {
                 .runtime
                 .apply_event(
                     &mut io,
-                    &mut clock,
                     &PaneEventEnvelope {
                         daemon_instance_id: DaemonInstanceId::generate().unwrap(),
                         event_id: EventId::generate().unwrap(),
@@ -1454,7 +1341,6 @@ mod tests {
             .runtime
             .apply_event(
                 &mut ImmediatePaneStateIo,
-                &mut ZeroRecoveryClock,
                 &PaneEventEnvelope {
                     daemon_instance_id: DaemonInstanceId::generate().unwrap(),
                     event_id: EventId::generate().unwrap(),
@@ -1474,7 +1360,7 @@ mod tests {
 
     #[test]
     fn resolved_history_keeps_discarded_completion_under_the_old_agent_and_time() {
-        use crate::pane_state::{AgentSessionSource, PaneEvent, StoredPaneRecord};
+        use crate::pane_state::{AgentSessionSource, PaneEvent};
 
         let (mut state, root) = canonical_sidebar_fixture();
         state.leased.runtime = CanonicalPaneStateRuntime::default();
@@ -1504,11 +1390,11 @@ mod tests {
             },
         );
 
-        let pane = crate::pane_state::PaneInstance {
+        let pane = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 101,
         };
-        let Some(StoredPaneRecord::Active(current)) = state.leased.runtime.record(&pane) else {
+        let Some(current) = state.leased.runtime.record(&pane) else {
             panic!("expected active pane state");
         };
         assert_eq!(current.agent.as_str(), "claude");
@@ -1526,7 +1412,7 @@ mod tests {
 
     #[test]
     fn resolved_history_keeps_same_agent_previous_session_completion_time() {
-        use crate::pane_state::{AgentSessionSource, PaneEvent, StoredPaneRecord};
+        use crate::pane_state::{AgentSessionSource, PaneEvent};
 
         let (mut state, root) = canonical_sidebar_fixture();
         state.leased.runtime = CanonicalPaneStateRuntime::default();
@@ -1556,11 +1442,11 @@ mod tests {
             },
         );
 
-        let pane = crate::pane_state::PaneInstance {
+        let pane = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 101,
         };
-        let Some(StoredPaneRecord::Active(current)) = state.leased.runtime.record(&pane) else {
+        let Some(current) = state.leased.runtime.record(&pane) else {
             panic!("expected active pane state");
         };
         assert_eq!(
@@ -1667,7 +1553,7 @@ mod tests {
         );
         assert_eq!(state.git_badges, oversized);
         assert_eq!(state.leased.runtime.snapshot_revision(), 3);
-        let message = crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+        let message = ServerMessage::ResolvedSnapshotResult {
             snapshot_revision: 3,
             snapshot: state.resolved_snapshot(),
         };
@@ -1828,7 +1714,7 @@ mod tests {
         remove_canonical_sidebar_fixture(state, root);
     }
 
-    fn status_resolved_snapshot() -> crate::daemon::protocol::v2::ResolvedSnapshot {
+    fn status_resolved_snapshot() -> ResolvedSnapshot {
         let first = status_pane(
             "%1",
             101,
@@ -1859,11 +1745,11 @@ mod tests {
             None,
             false,
         );
-        crate::daemon::protocol::v2::ResolvedSnapshot {
+        ResolvedSnapshot {
             snapshot_revision: 42,
             panes: vec![first.clone(), second, non_agent],
             sidebar_model: SidebarModel::default(),
-            attention: vec![crate::daemon::protocol::v2::AttentionEntry {
+            attention: vec![AttentionEntry {
                 pane_instance: first.pane_instance,
                 session_name: "main".to_string(),
                 badge: BadgeState::Blocked,
@@ -1887,7 +1773,7 @@ mod tests {
 
         for changed_field in ["state_id", "agent_epoch", "revision"] {
             let mut mismatched = valid.clone();
-            let Some(crate::pane_state::StoredStateDescriptor::Canonical { version }) =
+            let Some(StoredStateDescriptor::Canonical { version }) =
                 mismatched.panes[0].stored.as_mut()
             else {
                 panic!("fixture pane must have canonical stored state");
@@ -1927,13 +1813,11 @@ mod tests {
 
     fn status_metadata() -> StatusProjectionMetadata {
         StatusProjectionMetadata {
-            categories: BTreeSet::from(["empty".to_string(), "work".to_string()]),
             sessions: BTreeMap::from([
                 (
                     "$1".to_string(),
                     SessionProjectionMetadata {
                         session_name: "main".to_string(),
-                        stored_category: Some("work".to_string()),
                         attached: Some(true),
                         created_at: Some(10),
                         ..SessionProjectionMetadata::default()
@@ -1943,7 +1827,6 @@ mod tests {
                     "$2".to_string(),
                     SessionProjectionMetadata {
                         session_name: "mirror".to_string(),
-                        stored_category: Some("work".to_string()),
                         attached: Some(false),
                         created_at: Some(20),
                         ..SessionProjectionMetadata::default()
@@ -1959,6 +1842,18 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    fn status_config() -> Config {
+        let mut config = Config::default();
+        config
+            .categories
+            .session_name_rules
+            .push(crate::config::SessionNameRule {
+                category: "work".to_string(),
+                patterns: vec!["main".to_string(), "mirror".to_string()],
+            });
+        config
     }
 
     #[test]
@@ -1980,10 +1875,10 @@ mod tests {
             sessions
                 .iter()
                 .map(|snapshot| match &snapshot.context {
-                    crate::daemon::protocol::v2::StatusContext::Session { session_id } => {
+                    StatusContext::Session { session_id } => {
                         session_id.as_str()
                     }
-                    crate::daemon::protocol::v2::StatusContext::Global => "global",
+                    StatusContext::Global => "global",
                 })
                 .collect::<Vec<_>>(),
             vec!["$1", "$2"]
@@ -2038,7 +1933,7 @@ mod tests {
 
         let status = build_status_snapshot(
             &resolved,
-            crate::daemon::protocol::v2::StatusContext::Global,
+            StatusContext::Global,
             &state.status_metadata,
             &state.projection_config,
         );
@@ -2077,17 +1972,15 @@ mod tests {
 
     #[test]
     fn done_focus_idle_focus_out_next_completion_is_consistent_across_all_surfaces() {
-        use crate::pane_state::{PaneEvent, StoredPaneRecord};
+        use crate::pane_state::PaneEvent;
 
         let (mut state, root) = canonical_sidebar_fixture();
         state.leased.runtime = CanonicalPaneStateRuntime::default();
         state.status_metadata = StatusProjectionMetadata {
-            categories: BTreeSet::from(["work".to_string()]),
             sessions: BTreeMap::from([(
                 "$1".to_string(),
                 SessionProjectionMetadata {
                     session_name: "main".to_string(),
-                    stored_category: Some("work".to_string()),
                     attached: Some(true),
                     created_at: Some(1),
                     ..SessionProjectionMetadata::default()
@@ -2095,6 +1988,7 @@ mod tests {
             )]),
             windows: BTreeMap::new(),
         };
+        state.projection_config = status_config();
 
         apply_history_event(
             &mut state,
@@ -2114,19 +2008,16 @@ mod tests {
         );
         assert_continuous_display_state(&state, BadgeState::Done);
 
-        let pane = crate::pane_state::PaneInstance {
+        let pane = PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid: 101,
         };
-        let (state_id, agent_epoch, through_seq) = match state.leased.runtime.record(&pane).unwrap()
-        {
-            StoredPaneRecord::Active(current) => (
-                current.state_id.clone(),
-                current.agent_epoch,
-                current.completed_seq,
-            ),
-            other => panic!("expected active scenario state, got {other:?}"),
-        };
+        let current = state.leased.runtime.record(&pane).unwrap();
+        let (state_id, agent_epoch, through_seq) = (
+            current.state_id.clone(),
+            current.agent_epoch,
+            current.completed_seq,
+        );
         apply_history_event(
             &mut state,
             "codex",
@@ -2171,9 +2062,9 @@ mod tests {
     fn status_snapshot_deduplicates_linked_panes_for_every_scope() {
         let snapshot = build_status_snapshot(
             &status_resolved_snapshot(),
-            crate::daemon::protocol::v2::StatusContext::Global,
+            StatusContext::Global,
             &status_metadata(),
-            &Config::default(),
+            &status_config(),
         );
 
         assert_eq!(snapshot.snapshot_revision, 42);
@@ -2250,7 +2141,6 @@ mod tests {
                         format!("${}", index + 1),
                         SessionProjectionMetadata {
                             session_name: name.to_string(),
-                            stored_category: Some("work".to_string()),
                             ..SessionProjectionMetadata::default()
                         },
                     )
@@ -2261,7 +2151,7 @@ mod tests {
 
         let snapshot = build_status_snapshot(
             &resolved,
-            crate::daemon::protocol::v2::StatusContext::Global,
+            StatusContext::Global,
             &metadata,
             &Config::default(),
         );
@@ -2287,16 +2177,17 @@ mod tests {
             .order
             .insert("empty-config-only".to_string(), 0);
         config.categories.default_category = Some("misc".to_string());
+        config.categories.rules.push(crate::config::CategoryRule {
+            category: "private".to_string(),
+            path_patterns: vec!["/repo".to_string()],
+        });
         let metadata = StatusProjectionMetadata {
-            categories: BTreeSet::from(["empty-config-only".to_string()]),
             sessions: BTreeMap::from([
                 (
                     "$1".to_string(),
                     SessionProjectionMetadata {
                         session_name: "private".to_string(),
-                        stored_category: Some("stale".to_string()),
                         project_path: "/repo".to_string(),
-                        category_override: "private".to_string(),
                         ..SessionProjectionMetadata::default()
                     },
                 ),
@@ -2313,7 +2204,7 @@ mod tests {
 
         let snapshot = build_status_snapshot(
             &resolved,
-            crate::daemon::protocol::v2::StatusContext::Session {
+            StatusContext::Session {
                 session_id: "$1".to_string(),
             },
             &metadata,
@@ -2354,7 +2245,6 @@ mod tests {
                     "$1".to_string(),
                     SessionProjectionMetadata {
                         session_name: "a".to_string(),
-                        stored_category: Some("short".to_string()),
                         ..SessionProjectionMetadata::default()
                     },
                 ),
@@ -2362,7 +2252,6 @@ mod tests {
                     "$2".to_string(),
                     SessionProjectionMetadata {
                         session_name: "much-longer-session".to_string(),
-                        stored_category: Some("long".to_string()),
                         ..SessionProjectionMetadata::default()
                     },
                 ),
@@ -2370,7 +2259,6 @@ mod tests {
                     "$3".to_string(),
                     SessionProjectionMetadata {
                         session_name: "peer".to_string(),
-                        stored_category: Some("long".to_string()),
                         ..SessionProjectionMetadata::default()
                     },
                 ),
@@ -2380,10 +2268,20 @@ mod tests {
         let mut config = Config::default();
         config.statusline.sessions.fixed_width = true;
         config.statusline.sessions.separator = " | ".to_string();
+        config.categories.session_name_rules = [
+            ("short", vec!["a"]),
+            ("long", vec!["much-longer-session", "peer"]),
+        ]
+        .into_iter()
+        .map(|(category, patterns)| crate::config::SessionNameRule {
+            category: category.to_string(),
+            patterns: patterns.into_iter().map(str::to_string).collect(),
+        })
+        .collect();
 
         let short = build_status_snapshot(
             &resolved,
-            crate::daemon::protocol::v2::StatusContext::Session {
+            StatusContext::Session {
                 session_id: "$1".to_string(),
             },
             &metadata,
@@ -2391,7 +2289,7 @@ mod tests {
         );
         let long = build_status_snapshot(
             &resolved,
-            crate::daemon::protocol::v2::StatusContext::Session {
+            StatusContext::Session {
                 session_id: "$2".to_string(),
             },
             &metadata,
@@ -2433,11 +2331,11 @@ mod tests {
     fn session_status_context_filters_windows_and_marks_active_membership() {
         let snapshot = build_status_snapshot(
             &status_resolved_snapshot(),
-            crate::daemon::protocol::v2::StatusContext::Session {
+            StatusContext::Session {
                 session_id: "$1".to_string(),
             },
             &status_metadata(),
-            &Config::default(),
+            &status_config(),
         );
 
         assert_eq!(snapshot.snapshot_revision, 42);
@@ -2473,7 +2371,7 @@ mod tests {
     fn missing_status_metadata_is_explicit_and_non_agent_panes_do_not_count() {
         let snapshot = build_status_snapshot(
             &status_resolved_snapshot(),
-            crate::daemon::protocol::v2::StatusContext::Session {
+            StatusContext::Session {
                 session_id: "$1".to_string(),
             },
             &StatusProjectionMetadata::default(),

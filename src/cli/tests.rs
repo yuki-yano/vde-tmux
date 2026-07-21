@@ -168,31 +168,24 @@ fn spawn_v2_query_fixture(
 }
 
 fn spawn_active_config_guard_fixture() -> V2QueryFixture {
-    let config_hash = crate::daemon::lifecycle::config_hash(&crate::config::Config::default());
-    let response = crate::daemon::protocol::v2::ServerMessage::HealthResult {
-        health: crate::daemon::protocol::v2::DaemonHealth {
-            config_hash,
-            projection_revision: 1,
-            projection_updated_at_epoch_seconds: 1,
-            notification_enabled: false,
-            notification_failures: 0,
-            notification_queue_drops: 0,
-            notification_degraded: false,
-            last_notification_error_code: None,
-            current_quarantine_count: 0,
-            quarantine_observed_total: 0,
-            recent_error_code: None,
-            hook_delivery_failures: 0,
-            hook_delivery_degraded: false,
-            last_hook_error_code: None,
-            status_push_failures: 0,
-            status_push_degraded: false,
-            last_status_push_error: None,
-            last_status_push_error_at_epoch_seconds: None,
-        },
+    spawn_active_config_guard_fixture_with_yaml("")
+}
+
+fn spawn_category_config_guard_fixture() -> V2QueryFixture {
+    spawn_active_config_guard_fixture_with_yaml(
+        "categories:\n  session_name_rules:\n    - category: alpha\n      patterns: [a]\n    - category: beta\n      patterns: [b]\n    - category: gamma\n      patterns: [c]\n    - category: work\n      patterns: [main, sub]\n",
+    )
+}
+
+fn spawn_active_config_guard_fixture_with_yaml(yaml: &str) -> V2QueryFixture {
+    let loaded = crate::config::load::parse_config(yaml);
+    assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
+    let config_hash = crate::daemon::lifecycle::config_hash(&loaded.config);
+    let response = crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult {
+        info: crate::daemon::protocol::v2::RuntimeInfo { config_hash },
     };
     let mut fixture = spawn_v2_query_fixture(
-        crate::daemon::protocol::v2::ClientMessage::QueryHealth {
+        crate::daemon::protocol::v2::ClientMessage::QueryRuntimeInfo {
             proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
         },
         response,
@@ -201,6 +194,11 @@ fn spawn_active_config_guard_fixture() -> V2QueryFixture {
         "HOME".to_string(),
         fixture.root.join("home").display().to_string(),
     );
+    if !yaml.is_empty() {
+        let config_dir = fixture.root.join("home/.config/vde/tmux");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.yml"), yaml).unwrap();
+    }
     fixture
 }
 
@@ -276,32 +274,15 @@ fn spawn_v2_handshake_fixture() -> V2QueryFixture {
         assert_eq!(
             serde_json::from_str::<crate::daemon::protocol::v2::ClientMessage>(line.trim())
                 .unwrap(),
-            crate::daemon::protocol::v2::ClientMessage::QueryHealth {
+            crate::daemon::protocol::v2::ClientMessage::QueryRuntimeInfo {
                 proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
             }
         );
         serde_json::to_writer(
             &mut stream,
-            &crate::daemon::protocol::v2::ServerMessage::HealthResult {
-                health: crate::daemon::protocol::v2::DaemonHealth {
+            &crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult {
+                info: crate::daemon::protocol::v2::RuntimeInfo {
                     config_hash: "test-config".to_string(),
-                    projection_revision: 7,
-                    projection_updated_at_epoch_seconds: 1,
-                    notification_enabled: false,
-                    notification_failures: 0,
-                    notification_queue_drops: 0,
-                    notification_degraded: false,
-                    last_notification_error_code: None,
-                    current_quarantine_count: 0,
-                    quarantine_observed_total: 0,
-                    recent_error_code: None,
-                    hook_delivery_failures: 0,
-                    hook_delivery_degraded: false,
-                    last_hook_error_code: None,
-                    status_push_failures: 0,
-                    status_push_degraded: false,
-                    last_status_push_error: None,
-                    last_status_push_error_at_epoch_seconds: None,
                 },
             },
         )
@@ -473,7 +454,6 @@ fn pane_query_fixture(pane_id: &str) -> V2QueryFixture {
             current_path: "/tmp".to_string(),
             badge: crate::daemon::session_badge::BadgeState::Working,
         }),
-        diagnostic: None,
     };
     spawn_v2_query_fixture(
         crate::daemon::protocol::v2::ClientMessage::QueryPane {
@@ -485,186 +465,6 @@ fn pane_query_fixture(pane_id: &str) -> V2QueryFixture {
             pane,
         },
     )
-}
-
-fn spawn_v2_reset_fixture(pane_id: &str) -> V2QueryFixture {
-    use std::io::{BufRead, Write};
-
-    use crate::daemon::protocol::v2::{
-        ClientMessage, DaemonPhase, HookHealth, PanePresentation, ResetOutcome, ServerMessage,
-    };
-    use crate::pane_state::{
-        DaemonInstanceId, PaneInstance, StateId, StateVersion, StoredStateDescriptor,
-    };
-
-    let root = std::env::temp_dir().join(format!(
-        "vde-cli-reset-v2-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let tmux_socket = root.join("tmux.sock");
-    let tmux_listener = std::os::unix::net::UnixListener::bind(&tmux_socket).unwrap();
-    let mock = MockTmuxRunner::new();
-    mock.stub(
-        &[
-            "display-message",
-            "-p",
-            "#{pid}\t#{start_time}\t#{socket_path}",
-        ],
-        &format!("321\t654\t{}\n", tmux_socket.display()),
-    );
-    let env = BTreeMap::from([(
-        "TMUX".to_string(),
-        format!("{},321,0", tmux_socket.display()),
-    )]);
-    let incarnation =
-        crate::daemon::lifecycle::TmuxServerIncarnation::resolve(&mock, &env).unwrap();
-    let daemon_socket =
-        crate::daemon::daemon_socket_path_for_incarnation(&env, None, &incarnation.hash);
-    std::fs::create_dir_all(daemon_socket.parent().unwrap()).unwrap();
-    let listener = std::os::unix::net::UnixListener::bind(&daemon_socket).unwrap();
-    let server_identity = incarnation.hash;
-    let pane_instance = PaneInstance {
-        pane_id: pane_id.to_string(),
-        pane_pid: 101,
-    };
-    let expected = StoredStateDescriptor::Canonical {
-        version: StateVersion {
-            state_id: StateId::parse("00112233445566778899aabbccddeeff").unwrap(),
-            agent_epoch: 1,
-            revision: 7,
-        },
-    };
-    let daemon_instance_id = DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap();
-    let server = std::thread::spawn({
-        let pane_id = pane_id.to_string();
-        let pane_instance = pane_instance.clone();
-        let expected = expected.clone();
-        move || {
-            let handshake = |stream: &mut std::os::unix::net::UnixStream| {
-                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                assert_eq!(
-                    serde_json::from_str::<ClientMessage>(line.trim()).unwrap(),
-                    ClientMessage::Hello {
-                        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-                    }
-                );
-                serde_json::to_writer(
-                    &mut *stream,
-                    &ServerMessage::HelloAck {
-                        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-                        daemon_instance_id: daemon_instance_id.clone(),
-                        server_identity: server_identity.clone(),
-                        phase: DaemonPhase::Serving,
-                        hook_health: HookHealth::Healthy,
-                    },
-                )
-                .unwrap();
-                stream.write_all(b"\n").unwrap();
-                reader
-            };
-
-            let (mut query_stream, mut query_reader, mut line) = loop {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut reader = handshake(&mut stream);
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line.is_empty() {
-                    continue;
-                }
-                break (stream, reader, line);
-            };
-            assert_eq!(
-                serde_json::from_str::<ClientMessage>(line.trim()).unwrap(),
-                ClientMessage::QueryPane {
-                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-                    pane_id: pane_id.clone(),
-                }
-            );
-            serde_json::to_writer(
-                &mut query_stream,
-                &ServerMessage::PaneResult {
-                    snapshot_revision: 7,
-                    pane: PanePresentation {
-                        pane_instance: pane_instance.clone(),
-                        session_links: Vec::new(),
-                        window_id: "@1".to_string(),
-                        window_name: "main".to_string(),
-                        current_path: "/tmp".to_string(),
-                        current_command: "node".to_string(),
-                        pane_width: 80,
-                        active: true,
-                        stored: Some(expected.clone()),
-                        resolved: None,
-                        diagnostic: None,
-                    },
-                },
-            )
-            .unwrap();
-            query_stream.write_all(b"\n").unwrap();
-
-            // The query connection must be closed before the mutation handshake begins.
-            line.clear();
-            query_reader.read_line(&mut line).unwrap();
-            assert!(
-                line.is_empty(),
-                "reset reused the QueryPane connection: {line}"
-            );
-
-            let (mut reset_stream, _reset_reader, line) = loop {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut reader = handshake(&mut stream);
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line.is_empty() {
-                    continue;
-                }
-                break (stream, reader, line);
-            };
-            let request = serde_json::from_str::<ClientMessage>(line.trim()).unwrap();
-            let ClientMessage::ResetPaneState {
-                proto,
-                daemon_instance_id: request_instance_id,
-                event_id,
-                pane_instance: request_pane,
-                expected: request_expected,
-            } = request
-            else {
-                panic!("expected ResetPaneState, got {request:?}");
-            };
-            assert_eq!(proto, crate::daemon::protocol::v2::PROTOCOL_VERSION);
-            assert_eq!(request_instance_id, daemon_instance_id);
-            assert_eq!(request_pane, pane_instance);
-            assert_eq!(request_expected, expected);
-            serde_json::to_writer(
-                &mut reset_stream,
-                &ServerMessage::ResetResult {
-                    event_id,
-                    accepted_seq: 8,
-                    previous: expected.clone(),
-                    current: expected,
-                    outcome: ResetOutcome::AlreadyReset,
-                    snapshot_revision: 8,
-                },
-            )
-            .unwrap();
-            reset_stream.write_all(b"\n").unwrap();
-        }
-    });
-    V2QueryFixture {
-        mock,
-        env,
-        daemon_socket,
-        root,
-        tmux_listener,
-        server,
-    }
 }
 
 fn window_row(
@@ -687,57 +487,14 @@ mod sidebar;
 
 #[test]
 fn pane_state_commands_use_the_documented_command_tree() {
-    let cleanup = Cli::try_parse_from(["vt", "pane-state", "cleanup-legacy", "--all"])
-        .expect("cleanup command should parse");
-    assert!(matches!(
-        cleanup.command,
-        Command::PaneState {
-            command: PaneStateCommand::CleanupLegacy {
-                all: true,
-                dry_run: false,
-            }
-        }
-    ));
-    assert!(Cli::try_parse_from(["vt", "pane-state", "cleanup-legacy"]).is_err());
-    assert!(matches!(
-        Cli::try_parse_from(["vt", "pane-state", "cleanup-legacy", "--all", "--dry-run",])
-            .unwrap()
-            .command,
-        Command::PaneState {
-            command: PaneStateCommand::CleanupLegacy {
-                all: true,
-                dry_run: true,
-            }
-        }
-    ));
-
-    let reset = Cli::try_parse_from(["vt", "pane-state", "reset", "--target", "%31"])
-        .expect("reset command should parse");
-    let Command::PaneState {
-        command: PaneStateCommand::Reset { target },
-    } = reset.command
-    else {
-        panic!("expected pane-state reset command");
-    };
-    assert_eq!(target, "%31");
-
-    let uninstall = Cli::try_parse_from(["vt", "pane-state", "hooks", "uninstall"])
-        .expect("hook uninstall command should parse");
-    assert!(matches!(
-        uninstall.command,
-        Command::PaneState {
-            command: PaneStateCommand::Hooks {
-                command: PaneStateHooksCommand::Uninstall
-            }
-        }
-    ));
+    assert!(Cli::try_parse_from(["vt", "pane-state", "reset", "--target", "%31"]).is_err());
+    assert!(Cli::try_parse_from(["vt", "pane-state", "cleanup-legacy", "--all"]).is_err());
+    assert!(Cli::try_parse_from(["vt", "pane-state", "hooks", "uninstall"]).is_err());
 }
 
 #[test]
 fn daemon_lifecycle_commands_parse_with_force_scoped_to_stop() {
-    for command in [
-        "ensure", "start", "disable", "enable", "status", "doctor", "reload", "logs",
-    ] {
+    for command in ["ensure", "start", "disable", "enable", "status", "reload"] {
         Cli::try_parse_from(["vt", "daemon", command])
             .unwrap_or_else(|error| panic!("daemon {command} must parse: {error}"));
     }
@@ -751,23 +508,8 @@ fn daemon_lifecycle_commands_parse_with_force_scoped_to_stop() {
         }
     ));
     assert!(Cli::try_parse_from(["vt", "daemon", "start", "--force"]).is_err());
-    assert!(Cli::try_parse_from(["vt", "daemon", "logs", "--lines", "501"]).is_err());
-}
-
-#[test]
-fn dispatch_pane_state_reset_uses_separate_query_and_mutation_connections() {
-    let fixture = spawn_v2_reset_fixture("%31");
-
-    let output = run_with(
-        ["vt", "pane-state", "reset", "--target", "%31"],
-        &fixture.mock,
-        &fixture.env,
-    )
-    .unwrap()
-    .unwrap();
-
-    assert_eq!(output, "pane state reset: %31 (already reset)");
-    fixture.finish();
+    assert!(Cli::try_parse_from(["vt", "daemon", "doctor"]).is_err());
+    assert!(Cli::try_parse_from(["vt", "daemon", "logs"]).is_err());
 }
 
 #[test]
@@ -819,7 +561,21 @@ fn daemon_status_reports_handshake_without_sending_a_mutation() {
     assert!(output.contains("daemon: running"));
     assert!(output.contains("phase: Serving"));
     assert!(output.contains("hooks: Degraded"));
-    assert!(output.contains("daemon.log"));
+    assert!(output.contains("daemon_instance: ffeeddccbbaa99887766554433221100"));
+    assert!(output.contains("config_hash: test-config"));
+    assert!(output.contains("last_transition_error: none"));
+    for removed in [
+        "projection_",
+        "notification:",
+        "hook_delivery:",
+        "status_push:",
+        "log:",
+    ] {
+        assert!(
+            !output.contains(removed),
+            "unexpected status field: {removed}"
+        );
+    }
     fixture.finish();
 }
 
@@ -1023,7 +779,7 @@ fn dispatch_category_cycle_uses_explicit_scope_when_a_pane_is_shared() {
     for (command, target_category, target_session) in
         [("next", "gamma", "c"), ("prev", "alpha", "a")]
     {
-        let mut fixture = spawn_active_config_guard_fixture();
+        let mut fixture = spawn_category_config_guard_fixture();
         fixture
             .env
             .insert("TMUX_PANE".to_string(), "%1".to_string());
@@ -1072,7 +828,7 @@ fn dispatch_category_cycle_uses_explicit_scope_when_a_pane_is_shared() {
 
 #[test]
 fn dispatch_category_click_uses_explicit_scope_when_a_pane_is_shared() {
-    let mut fixture = spawn_active_config_guard_fixture();
+    let mut fixture = spawn_category_config_guard_fixture();
     fixture
         .env
         .insert("TMUX_PANE".to_string(), "%1".to_string());
@@ -1343,7 +1099,7 @@ fn dispatch_statusline_click_routes_attention_range_to_exact_pane_for_invoking_c
 #[test]
 fn dispatch_statusline_click_routes_active_and_inactive_category_targets() {
     for prefix in ["c:", "C:"] {
-        let mut fixture = spawn_active_config_guard_fixture();
+        let mut fixture = spawn_category_config_guard_fixture();
         fixture
             .env
             .insert("TMUX_PANE".to_string(), "%1".to_string());
@@ -1389,7 +1145,7 @@ fn dispatch_statusline_click_ignores_empty_zero_and_unknown_ranges() {
 
 #[test]
 fn dispatch_category_use_switches_category() {
-    let mut fixture = spawn_active_config_guard_fixture();
+    let mut fixture = spawn_category_config_guard_fixture();
     fixture
         .env
         .insert("TMUX_PANE".to_string(), "%1".to_string());
@@ -1425,7 +1181,7 @@ fn dispatch_category_use_switches_category() {
 
 #[test]
 fn dispatch_client_session_changed_only_updates_memory() {
-    let fixture = spawn_active_config_guard_fixture();
+    let fixture = spawn_category_config_guard_fixture();
     let mock = &fixture.mock;
     let client_format = crate::session::client_pid_name_format();
     let session_format = crate::session::session_list_format();
@@ -1793,7 +1549,10 @@ fn dispatch_session_manager_renders_preview() {
             "ni.zsh",
         ],
         &mock,
-        &env(),
+        &BTreeMap::from([(
+            "HOME".to_string(),
+            "/nonexistent-home-for-vde-tmux-preview-test".to_string(),
+        )]),
     )
     .unwrap()
     .unwrap();

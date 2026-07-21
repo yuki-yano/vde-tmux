@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use crate::daemon::protocol::v2::SessionLinkPresentation;
 use crate::pane_state::{EventId, PaneInstance};
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
@@ -13,7 +15,8 @@ pub const TARGETED_REFRESH_TIMEOUT: Duration = Duration::from_millis(100);
 const STATUS_SESSION_FIELD_COUNT: usize = 8;
 const STATUS_WINDOW_FIELD_COUNT: usize = 5;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerIdentity {
     pub pid: u32,
     pub start_time: i64,
@@ -107,9 +110,9 @@ impl QueryFraming {
         const FIELDS: [&str; STATUS_SESSION_FIELD_COUNT - 1] = [
             "#{session_id}",
             "#{session_name}",
-            "#{@vde_category}",
+            "",
             "#{@vde_project_path}",
-            "#{@vde_category_override}",
+            "",
             "#{session_attached}",
             "#{session_created}",
         ];
@@ -161,9 +164,7 @@ pub struct TopologySnapshot {
 pub struct StatusSessionMetadata {
     pub session_id: String,
     pub session_name: String,
-    pub category: Option<String>,
     pub project_path: String,
-    pub category_override: String,
     pub attached: bool,
     pub created_at: i64,
 }
@@ -354,22 +355,6 @@ pub fn guarded_poll_query_args(framing: &QueryFraming) -> Vec<String> {
     ]
 }
 
-pub fn hydrate_query_args(framing: &QueryFraming) -> Vec<String> {
-    vec![
-        "display-message".to_string(),
-        "-p".to_string(),
-        framing.identity_format(),
-        ";".to_string(),
-        "list-panes".to_string(),
-        "-a".to_string(),
-        "-F".to_string(),
-        format!(
-            "#{{pane_id}}{}#{{pane_pid}}{}#{{@vde_pane_state}}{}",
-            framing.field, framing.field, framing.row
-        ),
-    ]
-}
-
 pub fn status_metadata_query_args(framing: &QueryFraming) -> Vec<String> {
     // tmux returns an empty successful result for list-sessions with zero sessions. list-windows
     // needs the explicit guard because it otherwise exits with "no current target".
@@ -392,48 +377,6 @@ pub fn status_metadata_query_args(framing: &QueryFraming) -> Vec<String> {
             framing.status_window_format(),
         ]),
     ]
-}
-
-pub fn parse_hydrate_records(
-    output: &str,
-    framing: &QueryFraming,
-    expected_identity: &ServerIdentity,
-) -> Result<Vec<crate::pane_state::RawPaneRecord>, TopologyError> {
-    let (_identity, rows) = parse_envelope(output, framing, expected_identity)?;
-    let mut records = BTreeMap::<PaneInstance, Option<String>>::new();
-    for row in rows {
-        let fields = row.split(&framing.field).collect::<Vec<_>>();
-        if fields.len() != 3 {
-            return Err(TopologyError::InvalidRow(
-                "hydrate row has an invalid field count".to_string(),
-            ));
-        }
-        reject_query_sentinels(&fields, framing, "hydrate")?;
-        validate_pane_id(fields[0])?;
-        let pane_pid = fields[1]
-            .parse::<u32>()
-            .ok()
-            .filter(|pid| *pid > 0)
-            .ok_or_else(|| TopologyError::InvalidRow("invalid hydrate pane PID".to_string()))?;
-        let pane = PaneInstance {
-            pane_id: fields[0].to_string(),
-            pane_pid,
-        };
-        let raw = (!fields[2].is_empty()).then(|| fields[2].to_string());
-        if records
-            .insert(pane.clone(), raw.clone())
-            .is_some_and(|previous| previous != raw)
-        {
-            return Err(TopologyError::InvalidRow(format!(
-                "linked pane {} has inconsistent canonical state",
-                pane.pane_id
-            )));
-        }
-    }
-    Ok(records
-        .into_iter()
-        .map(|(pane_instance, raw)| crate::pane_state::RawPaneRecord { pane_instance, raw })
-        .collect())
 }
 
 pub fn targeted_session_query_args(framing: &QueryFraming) -> Vec<String> {
@@ -520,9 +463,7 @@ pub fn parse_status_metadata(
                 let metadata = StatusSessionMetadata {
                     session_id: fields[1].to_string(),
                     session_name: fields[2].to_string(),
-                    category: (!fields[3].is_empty()).then(|| fields[3].to_string()),
                     project_path: fields[4].to_string(),
-                    category_override: fields[5].to_string(),
                     attached: parse_attached(fields[6])?,
                     created_at: parse_i64(fields[7], "session created at")?,
                 };
@@ -898,7 +839,7 @@ mod tests {
     fn status_session_row(
         session_id: &str,
         session_name: &str,
-        category: &str,
+        _category: &str,
         attached: &str,
         created_at: &str,
     ) -> Vec<String> {
@@ -906,7 +847,7 @@ mod tests {
             framing().status_session,
             session_id.to_string(),
             session_name.to_string(),
-            category.to_string(),
+            String::new(),
             "/repo".to_string(),
             String::new(),
             attached.to_string(),
@@ -977,18 +918,14 @@ mod tests {
                 StatusSessionMetadata {
                     session_id: "$1".to_string(),
                     session_name: "alpha\tteam".to_string(),
-                    category: Some("work".to_string()),
                     project_path: "/repo".to_string(),
-                    category_override: String::new(),
                     attached: true,
                     created_at: 100,
                 },
                 StatusSessionMetadata {
                     session_id: "$2".to_string(),
                     session_name: "beta\nteam".to_string(),
-                    category: None,
                     project_path: "/repo".to_string(),
-                    category_override: String::new(),
                     attached: false,
                     created_at: 200,
                 },
@@ -1310,43 +1247,6 @@ mod tests {
                 if actual == MAX_TMUX_QUERY_OUTPUT_BYTES + 1
                     && limit == MAX_TMUX_QUERY_OUTPUT_BYTES
         ));
-    }
-
-    #[test]
-    fn hydrate_rejects_query_sentinel_collisions() {
-        let framing = framing();
-        for sentinel in [&framing.field, &framing.row, &framing.header] {
-            let mut framed = format!(
-                "{}{}123{}456{}\n",
-                framing.header, framing.field, framing.field, framing.row
-            );
-            framed.push_str(&format!(
-                "%3{}99{}{{\"prompt\":\"collision{sentinel}\"}}{}\n",
-                framing.field, framing.field, framing.row
-            ));
-            assert!(matches!(
-                parse_hydrate_records(&framed, &framing, &identity()),
-                Err(TopologyError::InvalidRow(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn hydrate_accepts_more_than_sixty_four_unique_panes() {
-        let framing = framing();
-        let mut output = format!(
-            "{}{}123{}456{}\n",
-            framing.header, framing.field, framing.field, framing.row
-        );
-        for index in 1..=128 {
-            output.push_str(&format!(
-                "%{index}{}{index}{}{}\n",
-                framing.field, framing.field, framing.row
-            ));
-        }
-
-        let records = parse_hydrate_records(&output, &framing, &identity()).unwrap();
-        assert_eq!(records.len(), 128);
     }
 
     #[test]

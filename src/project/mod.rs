@@ -179,7 +179,9 @@ pub fn switch_project(runner: &dyn TmuxRunner, config: &Config, path: &str) -> R
     let session_name = session_name_for_path(path);
     let sessions = list_sessions(runner)?;
     let (category, created_window) = if let Some(session) = find_session(&sessions, &session_name) {
-        (resolve_category_for_session(config, session), None)
+        let category = resolve_category_for_session(config, session);
+        set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
+        (category, None)
     } else {
         let created_window = runner
             .run(&[
@@ -436,6 +438,49 @@ mod tests {
         );
         switch_project(&mock, &config, "/tmp/repo").unwrap();
         assert_eq!(mock.calls().len(), 8);
+    }
+
+    #[test]
+    fn switch_project_updates_category_mirror_for_existing_session() {
+        let mock = MockTmuxRunner::new();
+        let format = crate::session::session_list_format();
+        let mut config = crate::config::Config::default();
+        config.categories.rules.push(crate::config::CategoryRule {
+            category: "work".to_string(),
+            path_patterns: vec!["/tmp/repo".to_string()],
+        });
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "client\t/dev/ttys001\n",
+        );
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "repo\u{1f}1\u{1f}100\u{1f}\u{1f}/tmp/repo\u{1f}\u{1f}$1\n",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "repo",
+                crate::options::KEY_CATEGORY,
+                "work",
+            ],
+            "",
+        );
+        mock.stub(&["switch-client", "-c", "client", "-t", "=repo:"], "");
+        mock.stub(
+            &["set-option", "-g", "@vde_client_636c69656e74_work", "repo"],
+            "",
+        );
+
+        switch_project(&mock, &config, "/tmp/repo").unwrap();
+
+        assert!(mock.calls().iter().all(|call| {
+            !matches!(
+                call.first().map(String::as_str),
+                Some("new-session" | "set-option")
+            ) || call.get(3).map(String::as_str) != Some(crate::options::KEY_PROJECT_PATH)
+        }));
     }
 
     #[test]

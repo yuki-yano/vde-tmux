@@ -162,9 +162,13 @@ pub fn open_popup(runner: &dyn TmuxRunner, popup: &PopupConfig, exe: &str) -> Re
     Ok(())
 }
 
-pub fn run_interactive(runner: &dyn TmuxRunner) -> Result<SessionManagerOutcome> {
+pub fn run_interactive(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<SessionManagerOutcome> {
     let mut io = SystemSessionManagerIo;
-    run_interactive_with_io(runner, &mut io)
+    let config = crate::config::load::load_config_strict(env).map_err(anyhow::Error::msg)?;
+    run_interactive_with_config_and_io(runner, &config, &mut io)
 }
 
 pub fn run_interactive_outside_tmux(
@@ -173,15 +177,24 @@ pub fn run_interactive_outside_tmux(
 ) -> Result<SessionManagerOutcome> {
     let mut io = SystemSessionManagerIo;
     let mut attach = SystemSessionAttachIo::from_env(env);
-    run_interactive_outside_tmux_with_io(runner, &mut io, &mut attach)
+    let config = crate::config::load::load_config_strict(env).map_err(anyhow::Error::msg)?;
+    run_interactive_outside_tmux_with_config_and_io(runner, &config, &mut io, &mut attach)
 }
 
 pub fn run_interactive_with_io(
     runner: &dyn TmuxRunner,
     io: &mut dyn SessionManagerIo,
 ) -> Result<SessionManagerOutcome> {
+    run_interactive_with_config_and_io(runner, &crate::config::Config::default(), io)
+}
+
+fn run_interactive_with_config_and_io(
+    runner: &dyn TmuxRunner,
+    config: &crate::config::Config,
+    io: &mut dyn SessionManagerIo,
+) -> Result<SessionManagerOutcome> {
     ensure_tmux_server(runner)?;
-    let entries = build_entries(runner)?;
+    let entries = build_entries_with_config(runner, config)?;
     let rows = entries.iter().map(render_entry).collect::<Vec<_>>();
     let Some(selected) = io.choose(&rows)? else {
         return Ok(SessionManagerOutcome::Done);
@@ -189,13 +202,28 @@ pub fn run_interactive_with_io(
     run_selection(runner, &selected)
 }
 
+#[cfg(test)]
 fn run_interactive_outside_tmux_with_io(
     runner: &dyn TmuxRunner,
     io: &mut dyn SessionManagerIo,
     attach: &mut dyn SessionAttachIo,
 ) -> Result<SessionManagerOutcome> {
+    run_interactive_outside_tmux_with_config_and_io(
+        runner,
+        &crate::config::Config::default(),
+        io,
+        attach,
+    )
+}
+
+fn run_interactive_outside_tmux_with_config_and_io(
+    runner: &dyn TmuxRunner,
+    config: &crate::config::Config,
+    io: &mut dyn SessionManagerIo,
+    attach: &mut dyn SessionAttachIo,
+) -> Result<SessionManagerOutcome> {
     ensure_tmux_server(runner)?;
-    let entries = build_entries(runner)?;
+    let entries = build_entries_with_config(runner, config)?;
     let rows = entries.iter().map(render_entry).collect::<Vec<_>>();
     let Some(selected) = io.choose(&rows)? else {
         return Ok(SessionManagerOutcome::Done);
@@ -213,7 +241,15 @@ fn ensure_tmux_server(runner: &dyn TmuxRunner) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn build_entries(runner: &dyn TmuxRunner) -> Result<Vec<ManagerEntry>> {
+    build_entries_with_config(runner, &crate::config::Config::default())
+}
+
+fn build_entries_with_config(
+    runner: &dyn TmuxRunner,
+    config: &crate::config::Config,
+) -> Result<Vec<ManagerEntry>> {
     let sessions = list_sessions(runner)?;
     let windows = list_windows(runner)?;
     let current_session = current_session_name(runner).unwrap_or_default();
@@ -249,10 +285,11 @@ fn build_entries(runner: &dyn TmuxRunner) -> Result<Vec<ManagerEntry>> {
         } else {
             gray("detached")
         };
-        let category = if session.category.is_empty() {
+        let resolved_category = crate::category::resolve_category_for_session(config, &session);
+        let category = if resolved_category.is_empty() {
             "-"
         } else {
-            &session.category
+            &resolved_category
         };
         let category_label = if session.name == current_session {
             green(format!("[{category}]"))
@@ -604,7 +641,11 @@ pub fn render_preview(
     env: &BTreeMap<String, String>,
 ) -> Result<String> {
     match action {
-        "session" => render_session_preview(runner, name, env),
+        "session" => {
+            let config =
+                crate::config::load::load_config_strict(env).map_err(anyhow::Error::msg)?;
+            render_session_preview(runner, &config, name, env)
+        }
         "window" => render_window_preview(runner, name, env),
         "server" => Ok(render_server_preview(env)),
         _ => Ok("Preview not available".to_string()),
@@ -624,6 +665,7 @@ fn render_server_preview(env: &BTreeMap<String, String>) -> String {
 
 fn render_session_preview(
     runner: &dyn TmuxRunner,
+    config: &crate::config::Config,
     session_name: &str,
     env: &BTreeMap<String, String>,
 ) -> Result<String> {
@@ -667,10 +709,12 @@ fn render_session_preview(
                 "Category".to_string(),
                 session
                     .map(|session| {
-                        if session.category.is_empty() {
+                        let category =
+                            crate::category::resolve_category_for_session(config, session);
+                        if category.is_empty() {
                             "-".to_string()
                         } else {
-                            session.category.clone()
+                            category
                         }
                     })
                     .unwrap_or_else(|| "-".to_string()),
@@ -1713,7 +1757,16 @@ mod tests {
             "hello\nworld\n",
         );
 
-        let preview = render_preview(&mock, "session", "ni.zsh", &BTreeMap::new()).unwrap();
+        let preview = render_preview(
+            &mock,
+            "session",
+            "ni.zsh",
+            &BTreeMap::from([(
+                "HOME".to_string(),
+                "/nonexistent-home-for-vde-tmux-preview-test".to_string(),
+            )]),
+        )
+        .unwrap();
 
         assert!(preview.contains("Session ni.zsh"));
         assert!(preview.contains("editor"));

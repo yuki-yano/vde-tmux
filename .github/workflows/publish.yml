@@ -28,6 +28,9 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Validate tag matches Cargo.toml version
         run: |
           set -euo pipefail

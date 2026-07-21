@@ -13,8 +13,8 @@ use crate::daemon::session_badge::{BadgeState, BadgeStateCounts};
 use crate::daemon::{SidebarModel, TransitionEvent};
 use crate::pane_state::{
     DaemonInstanceId, EventId, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
-    PaneEventEnvelope, PaneInstance, PaneStateLoadError, ResolvedPaneState, StateVersion,
-    StoredStateDescriptor, ViewEvent,
+    PaneEventEnvelope, PaneInstance, ResolvedPaneState, StateVersion, StoredStateDescriptor,
+    ViewEvent,
 };
 
 pub const PROTOCOL_VERSION: u16 = 4;
@@ -551,25 +551,8 @@ pub enum HookHealth {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DaemonHealth {
+pub struct RuntimeInfo {
     pub config_hash: String,
-    pub projection_revision: u64,
-    pub projection_updated_at_epoch_seconds: u64,
-    pub notification_enabled: bool,
-    pub notification_failures: u64,
-    pub notification_queue_drops: u64,
-    pub notification_degraded: bool,
-    pub last_notification_error_code: Option<String>,
-    pub current_quarantine_count: u64,
-    pub quarantine_observed_total: u64,
-    pub recent_error_code: Option<ErrorCode>,
-    pub hook_delivery_failures: u64,
-    pub hook_delivery_degraded: bool,
-    pub last_hook_error_code: Option<String>,
-    pub status_push_failures: u64,
-    pub status_push_degraded: bool,
-    pub last_status_push_error: Option<String>,
-    pub last_status_push_error_at_epoch_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -602,7 +585,6 @@ pub struct PanePresentation {
     pub active: bool,
     pub stored: Option<StoredStateDescriptor>,
     pub resolved: Option<ResolvedPaneState>,
-    pub diagnostic: Option<PaneStateLoadError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,20 +695,8 @@ pub enum SidebarCommand {
         pane_instance: PaneInstance,
         expected: StateVersion,
     },
-    UpdateManualOrder {
-        expected_version: u64,
-        manual_order: Vec<crate::sidebar::state::RepoId>,
-        manual_chat_order: Vec<String>,
-    },
-    UpdateViewPreferences {
-        expected_version: u64,
-        view_mode: crate::sidebar::state::ViewMode,
-        filter: crate::sidebar::state::StatusFilter,
-    },
-    SetExpansionOverride {
-        expected_version: u64,
-        row_id: String,
-        overridden: bool,
+    PreferenceIntent {
+        intent: crate::sidebar::state::SidebarPreferenceIntent,
     },
 }
 
@@ -748,7 +718,7 @@ pub enum ClientMessage {
         proto: u16,
         pane_id: String,
     },
-    QueryHealth {
+    QueryRuntimeInfo {
         proto: u16,
     },
     Subscribe {
@@ -774,30 +744,7 @@ pub enum ClientMessage {
         event_id: EventId,
         command: SidebarCommand,
     },
-    RefreshPanes {
-        proto: u16,
-        daemon_instance_id: DaemonInstanceId,
-        event_id: EventId,
-    },
     RefreshTopology {
-        proto: u16,
-        daemon_instance_id: DaemonInstanceId,
-        event_id: EventId,
-    },
-    ResetPaneState {
-        proto: u16,
-        daemon_instance_id: DaemonInstanceId,
-        event_id: EventId,
-        pane_instance: PaneInstance,
-        expected: StoredStateDescriptor,
-    },
-    CleanupLegacyState {
-        proto: u16,
-        daemon_instance_id: DaemonInstanceId,
-        event_id: EventId,
-        dry_run: bool,
-    },
-    UninstallHooks {
         proto: u16,
         daemon_instance_id: DaemonInstanceId,
         event_id: EventId,
@@ -816,17 +763,13 @@ impl ClientMessage {
             | Self::QueryResolvedSnapshot { proto }
             | Self::QueryStatusSnapshot { proto, .. }
             | Self::QueryPane { proto, .. }
-            | Self::QueryHealth { proto }
+            | Self::QueryRuntimeInfo { proto }
             | Self::Subscribe { proto }
             | Self::SubscribeLive { proto, .. }
             | Self::SubmitPaneEvent { proto, .. }
             | Self::SubmitViewEvent { proto, .. }
             | Self::SidebarCommand { proto, .. }
-            | Self::RefreshPanes { proto, .. }
             | Self::RefreshTopology { proto, .. }
-            | Self::ResetPaneState { proto, .. }
-            | Self::CleanupLegacyState { proto, .. }
-            | Self::UninstallHooks { proto, .. }
             | Self::Shutdown { proto, .. } => *proto,
         }
     }
@@ -838,19 +781,7 @@ impl ClientMessage {
             Self::SidebarCommand {
                 daemon_instance_id, ..
             }
-            | Self::RefreshPanes {
-                daemon_instance_id, ..
-            }
             | Self::RefreshTopology {
-                daemon_instance_id, ..
-            }
-            | Self::ResetPaneState {
-                daemon_instance_id, ..
-            }
-            | Self::CleanupLegacyState {
-                daemon_instance_id, ..
-            }
-            | Self::UninstallHooks {
                 daemon_instance_id, ..
             }
             | Self::Shutdown {
@@ -865,11 +796,7 @@ impl ClientMessage {
             Self::SubmitPaneEvent { envelope, .. } => Some(&envelope.event_id),
             Self::SubmitViewEvent { event, .. } => Some(&event.event_id),
             Self::SidebarCommand { event_id, .. }
-            | Self::RefreshPanes { event_id, .. }
             | Self::RefreshTopology { event_id, .. }
-            | Self::ResetPaneState { event_id, .. }
-            | Self::CleanupLegacyState { event_id, .. }
-            | Self::UninstallHooks { event_id, .. }
             | Self::Shutdown { event_id, .. } => Some(event_id),
             _ => None,
         }
@@ -885,7 +812,7 @@ impl ClientMessage {
             Self::QueryResolvedSnapshot { .. }
                 | Self::QueryStatusSnapshot { .. }
                 | Self::QueryPane { .. }
-                | Self::QueryHealth { .. }
+                | Self::QueryRuntimeInfo { .. }
                 | Self::Subscribe { .. }
                 | Self::SubscribeLive { .. }
         )
@@ -897,58 +824,6 @@ impl ClientMessage {
 pub enum PaneApplyOutcome {
     Noop,
     Committed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum ResetOutcome {
-    Replaced,
-    AlreadyReset,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PaneMutationFailure {
-    pub pane_instance: PaneInstance,
-    pub code: ErrorCode,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ViewApplyResult {
-    Noop {
-        snapshot_revision: u64,
-    },
-    TopologyOnly {
-        snapshot_revision: u64,
-    },
-    Committed {
-        snapshot_revision: u64,
-        panes: usize,
-    },
-    Partial {
-        snapshot_revision: u64,
-        committed: usize,
-        failed: Vec<PaneMutationFailure>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyCleanupFailure {
-    pub scope: String,
-    pub target: String,
-    pub option: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyCleanupScopeCounts {
-    pub pane: u64,
-    pub window: u64,
-    pub session: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -966,19 +841,12 @@ pub enum ErrorCode {
     InvalidProgressOperation,
     StateInvariantViolation,
     StateTooLarge,
-    StateLoadError,
     PersistFailed,
     HookCollision,
     WriterLeaseHeld,
     QueueFull,
     FrameTooLarge,
     InternalError,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ErrorDetails {
-    pub fields: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1004,8 +872,8 @@ pub enum ServerMessage {
         snapshot_revision: u64,
         pane: PanePresentation,
     },
-    HealthResult {
-        health: DaemonHealth,
+    RuntimeInfoResult {
+        info: RuntimeInfo,
     },
     PaneEventResult {
         event_id: EventId,
@@ -1015,37 +883,6 @@ pub enum ServerMessage {
         outcome: PaneApplyOutcome,
     },
     ViewQueued {
-        event_id: EventId,
-        accepted_seq: u64,
-    },
-    ViewResult {
-        event_id: EventId,
-        accepted_seq: u64,
-        result: ViewApplyResult,
-    },
-    ResetResult {
-        event_id: EventId,
-        accepted_seq: u64,
-        previous: StoredStateDescriptor,
-        current: StoredStateDescriptor,
-        outcome: ResetOutcome,
-        snapshot_revision: u64,
-    },
-    CleanupLegacyResult {
-        event_id: EventId,
-        accepted_seq: u64,
-        dry_run: bool,
-        attempted: u64,
-        removed: u64,
-        remaining: u64,
-        scope_counts: LegacyCleanupScopeCounts,
-        remaining_scope_counts: LegacyCleanupScopeCounts,
-        failed: Vec<LegacyCleanupFailure>,
-        failed_total: u64,
-        failed_omitted: u64,
-        snapshot_revision: u64,
-    },
-    HooksUninstalled {
         event_id: EventId,
         accepted_seq: u64,
     },
@@ -1076,7 +913,6 @@ pub enum ServerMessage {
         code: ErrorCode,
         message: String,
         event_id: Option<EventId>,
-        details: Option<ErrorDetails>,
     },
 }
 
@@ -1095,7 +931,6 @@ impl ServerMessage {
             code,
             message: message.into(),
             event_id,
-            details: None,
         }
     }
 }
@@ -1251,7 +1086,7 @@ mod tests {
                 proto: PROTOCOL_VERSION,
                 pane_id: "%1".to_string(),
             },
-            ClientMessage::QueryHealth {
+            ClientMessage::QueryRuntimeInfo {
                 proto: PROTOCOL_VERSION,
             },
             ClientMessage::Subscribe {
@@ -1273,9 +1108,12 @@ mod tests {
                     daemon_instance_id: daemon_id(),
                     event_id: event_id(),
                     hook_kind: crate::pane_state::ViewHookKind::ClientDetached,
-                    occurrence: None,
-                    source_client: None,
-                    witnesses: Vec::new(),
+                    active_pane: None,
+                    window_panes: Vec::new(),
+                    visibility: crate::pane_state::ViewVisibilityProof {
+                        pane_visible: false,
+                        window_visible: false,
+                    },
                 },
             },
             ClientMessage::SidebarCommand {
@@ -1295,48 +1133,24 @@ mod tests {
                 proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
-                command: SidebarCommand::UpdateViewPreferences {
-                    expected_version: 3,
-                    view_mode: crate::sidebar::state::ViewMode::ByCategory,
-                    filter: crate::sidebar::state::StatusFilter::DoneOnly,
+                command: SidebarCommand::PreferenceIntent {
+                    intent: crate::sidebar::state::SidebarPreferenceIntent::SetDefaultViewMode {
+                        view_mode: crate::sidebar::state::ViewMode::ByCategory,
+                    },
                 },
             },
             ClientMessage::SidebarCommand {
                 proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
-                command: SidebarCommand::SetExpansionOverride {
-                    expected_version: 4,
-                    row_id: "repo::misc::app".to_string(),
-                    overridden: true,
+                command: SidebarCommand::PreferenceIntent {
+                    intent: crate::sidebar::state::SidebarPreferenceIntent::SetExpanded {
+                        row_id: "repo::misc::app".to_string(),
+                        expanded: false,
+                    },
                 },
-            },
-            ClientMessage::RefreshPanes {
-                proto: PROTOCOL_VERSION,
-                daemon_instance_id: daemon_id(),
-                event_id: event_id(),
             },
             ClientMessage::RefreshTopology {
-                proto: PROTOCOL_VERSION,
-                daemon_instance_id: daemon_id(),
-                event_id: event_id(),
-            },
-            ClientMessage::ResetPaneState {
-                proto: PROTOCOL_VERSION,
-                daemon_instance_id: daemon_id(),
-                event_id: event_id(),
-                pane_instance: pane(),
-                expected: StoredStateDescriptor::Quarantined {
-                    quarantine_id: "hash".to_string(),
-                },
-            },
-            ClientMessage::CleanupLegacyState {
-                proto: PROTOCOL_VERSION,
-                daemon_instance_id: daemon_id(),
-                event_id: event_id(),
-                dry_run: false,
-            },
-            ClientMessage::UninstallHooks {
                 proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
@@ -1491,7 +1305,6 @@ mod tests {
             active: true,
             stored: None,
             resolved: None,
-            diagnostic: None,
         };
         let pane_json = serde_json::to_value(&pane_presentation).unwrap();
         assert_eq!(pane_json["pane_width"], 80);
@@ -1545,9 +1358,6 @@ mod tests {
             }],
             attention: Vec::new(),
         };
-        let descriptor = StoredStateDescriptor::Quarantined {
-            quarantine_id: "hash".to_string(),
-        };
         let messages = vec![
             ServerMessage::HelloAck {
                 proto: PROTOCOL_VERSION,
@@ -1568,26 +1378,9 @@ mod tests {
                 snapshot_revision: 1,
                 pane: pane_presentation,
             },
-            ServerMessage::HealthResult {
-                health: DaemonHealth {
+            ServerMessage::RuntimeInfoResult {
+                info: RuntimeInfo {
                     config_hash: "hash".to_string(),
-                    projection_revision: 1,
-                    projection_updated_at_epoch_seconds: 2,
-                    notification_enabled: true,
-                    notification_failures: 0,
-                    notification_queue_drops: 0,
-                    notification_degraded: false,
-                    last_notification_error_code: None,
-                    current_quarantine_count: 0,
-                    quarantine_observed_total: 0,
-                    recent_error_code: None,
-                    hook_delivery_failures: 0,
-                    hook_delivery_degraded: false,
-                    last_hook_error_code: None,
-                    status_push_failures: 0,
-                    status_push_degraded: false,
-                    last_status_push_error: None,
-                    last_status_push_error_at_epoch_seconds: None,
                 },
             },
             ServerMessage::PaneEventResult {
@@ -1600,39 +1393,6 @@ mod tests {
             ServerMessage::ViewQueued {
                 event_id: event_id(),
                 accepted_seq: 2,
-            },
-            ServerMessage::ViewResult {
-                event_id: event_id(),
-                accepted_seq: 2,
-                result: ViewApplyResult::Noop {
-                    snapshot_revision: 1,
-                },
-            },
-            ServerMessage::ResetResult {
-                event_id: event_id(),
-                accepted_seq: 3,
-                previous: descriptor.clone(),
-                current: descriptor,
-                outcome: ResetOutcome::AlreadyReset,
-                snapshot_revision: 1,
-            },
-            ServerMessage::CleanupLegacyResult {
-                event_id: event_id(),
-                accepted_seq: 4,
-                dry_run: false,
-                attempted: 0,
-                removed: 0,
-                remaining: 0,
-                scope_counts: LegacyCleanupScopeCounts::default(),
-                remaining_scope_counts: LegacyCleanupScopeCounts::default(),
-                failed: Vec::new(),
-                failed_total: 0,
-                failed_omitted: 0,
-                snapshot_revision: 1,
-            },
-            ServerMessage::HooksUninstalled {
-                event_id: event_id(),
-                accepted_seq: 5,
             },
             ServerMessage::ShutdownAccepted {
                 event_id: event_id(),
@@ -1672,6 +1432,38 @@ mod tests {
             ServerMessage::error(ErrorCode::InternalError, "error", Some(event_id())),
         ];
         for message in messages {
+            let encoded = serde_json::to_vec(&message).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ServerMessage>(&encoded).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn every_error_code_roundtrips() {
+        let codes = [
+            ErrorCode::UnsupportedProtocol,
+            ErrorCode::NotReady,
+            ErrorCode::InvalidRequest,
+            ErrorCode::InvalidPaneInstance,
+            ErrorCode::PaneNotFound,
+            ErrorCode::StaleStateIdentity,
+            ErrorCode::StaleSelection,
+            ErrorCode::StaleAgentEvent,
+            ErrorCode::StaleDaemonInstance,
+            ErrorCode::InvalidProgressOperation,
+            ErrorCode::StateInvariantViolation,
+            ErrorCode::StateTooLarge,
+            ErrorCode::PersistFailed,
+            ErrorCode::HookCollision,
+            ErrorCode::WriterLeaseHeld,
+            ErrorCode::QueueFull,
+            ErrorCode::FrameTooLarge,
+            ErrorCode::InternalError,
+        ];
+        for code in codes {
+            let message = ServerMessage::error(code, "error", Some(event_id()));
             let encoded = serde_json::to_vec(&message).unwrap();
             assert_eq!(
                 serde_json::from_slice::<ServerMessage>(&encoded).unwrap(),

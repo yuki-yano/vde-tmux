@@ -1,0 +1,49 @@
+name: Runtime smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: runtime-smoke
+
+      - name: Detect tmux version
+        id: tmux
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmux_version="$(tmux -V | awk '{print $2}')"
+          echo "tmux version: $tmux_version"
+          if printf '%s\n%s\n' "3.7" "$tmux_version" | sort -CV; then
+            echo "supports_redraw_probe=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "supports_redraw_probe=false" >> "$GITHUB_OUTPUT"
+            echo "tmux $tmux_version is older than 3.7; ignored redraw probes will be skipped"
+          fi
+
+      - name: Run ignored tmux redraw probes
+        if: steps.tmux.outputs.supports_redraw_probe == 'true'
+        run: cargo test --locked -- --ignored
+
+      - name: Record ignored probe skip
+        if: steps.tmux.outputs.supports_redraw_probe != 'true'
+        run: echo "SKIP ignored tmux redraw probes because tmux 3.7+ is required"
+
+      - name: Run isolated runtime smoke
+        run: scripts/smoke-m6-runtime.sh

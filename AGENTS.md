@@ -14,7 +14,7 @@ These live in `scripts/` and all run against an isolated `tmux -L <scratch>` ser
 - `scripts/preflight-ui-ux.sh`: multi-client UI/UX preflight against a scratch server. Run it when changing statusline or sidebar rendering.
 - `scripts/test-kill-server-isolated.sh`: exercises the session-manager kill-server / tmux-server shutdown path in isolation. Run it when changing the session manager, the kill-server flow, or daemon/tmux shutdown handling.
 
-These scripts are not run in CI; execute them locally.
+The runtime smoke script also runs in the manually dispatched `Runtime smoke` GitHub Actions workflow. Run all three scripts locally before a release; the UI/UX preflight and kill-server test remain local-only.
 
 ## Release
 

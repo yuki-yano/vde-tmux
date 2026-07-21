@@ -12,7 +12,7 @@ use crate::hook::{RollupLevel, TaskItem, TaskItemStatus, WorktreeActivity};
 use crate::pane_state::PaneInstance;
 use crate::session::SessionInfo;
 use crate::sidebar::state::{
-    SidebarOrderPreferences, SidebarRowRef, SidebarState, StatusFilter, ViewMode,
+    SidebarPreferences, SidebarRowRef, SidebarState, StatusFilter, ViewMode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,7 +140,7 @@ pub fn project_sidebar(
         now,
     };
     let (rows, counts) =
-        build_rows_from_presentations(config, panes, state, &model.order, &context);
+        build_rows_from_presentations(config, panes, state, &model.preferences, &context);
     SidebarProjection { rows, counts }
 }
 
@@ -148,7 +148,7 @@ pub fn build_rows_from_presentations(
     config: &Config,
     panes: &[crate::daemon::protocol::v2::PanePresentation],
     state: &SidebarState,
-    order: &SidebarOrderPreferences,
+    order: &SidebarPreferences,
     ctx: &RowBuildContext,
 ) -> (Vec<SidebarRow>, BadgeCounts) {
     let mut groups: BTreeMap<(String, String), Vec<AgentPane>> = BTreeMap::new();
@@ -257,7 +257,7 @@ pub fn build_rows_from_presentations(
 fn build_rows_from_groups(
     mut groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
-    order: &SidebarOrderPreferences,
+    order: &SidebarPreferences,
     ctx: &RowBuildContext,
 ) -> (Vec<SidebarRow>, BadgeCounts) {
     for panes in groups.values_mut() {
@@ -355,7 +355,7 @@ pub(crate) fn pane_instance_from_row_id(id: &str) -> Option<PaneInstance> {
 fn category_rows(
     groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
-    order: &SidebarOrderPreferences,
+    order: &SidebarPreferences,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
     metas: &BTreeMap<(String, String), RowMeta>,
@@ -406,7 +406,7 @@ fn category_rows(
 fn repo_rows(
     groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
-    order: &SidebarOrderPreferences,
+    order: &SidebarPreferences,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
@@ -422,7 +422,7 @@ fn repo_rows(
 fn repo_rows_from_map(
     repos: BTreeMap<String, Vec<AgentPane>>,
     state: &SidebarState,
-    order: &SidebarOrderPreferences,
+    order: &SidebarPreferences,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
@@ -444,7 +444,7 @@ fn repo_rows_from_map(
 fn repo_rows_from_keyed_map(
     repos: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
-    order: &SidebarOrderPreferences,
+    order: &SidebarPreferences,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
@@ -861,7 +861,7 @@ fn pane_matches_attention_filter(pane: &AgentPane) -> bool {
     pane.badge_state == BadgeState::Blocked
 }
 
-fn order_repo_groups(groups: &mut [Vec<AgentPane>], order: &SidebarOrderPreferences) {
+fn order_repo_groups(groups: &mut [Vec<AgentPane>], order: &SidebarPreferences) {
     let position = |panes: &Vec<AgentPane>| -> usize {
         let Some(first) = panes.first() else {
             return usize::MAX;
@@ -889,14 +889,14 @@ pub(crate) fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn order_agent_panes(panes: &mut [AgentPane], order: &SidebarOrderPreferences) {
+fn order_agent_panes(panes: &mut [AgentPane], order: &SidebarPreferences) {
     panes.sort_by(|left, right| compare_agent_panes(left, right, order));
 }
 
 fn compare_agent_panes(
     left: &AgentPane,
     right: &AgentPane,
-    order: &SidebarOrderPreferences,
+    order: &SidebarPreferences,
 ) -> std::cmp::Ordering {
     let manual_position = |pane: &AgentPane| {
         order
@@ -1183,7 +1183,7 @@ mod tests {
             &Config::default(),
             &[],
             &SidebarState::default(),
-            &SidebarOrderPreferences::default(),
+            &SidebarPreferences::default(),
             &RowBuildContext::default(),
         );
 
@@ -1238,7 +1238,7 @@ mod tests {
         let (rows, counts) = build_rows_from_groups(
             groups,
             &SidebarState::default(),
-            &SidebarOrderPreferences::default(),
+            &SidebarPreferences::default(),
             &context,
         );
 
@@ -1321,7 +1321,6 @@ mod tests {
                 current_path: "/tmp/app".to_string(),
                 badge: BadgeState::Working,
             }),
-            diagnostic: None,
         };
         let snapshot = crate::daemon::protocol::v2::ResolvedSnapshot {
             snapshot_revision: 7,

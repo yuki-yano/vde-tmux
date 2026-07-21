@@ -276,63 +276,18 @@ pub fn send_sidebar_mark_complete_v2(
     Ok(())
 }
 
-pub fn send_sidebar_update_manual_order_v2(
+pub fn send_sidebar_preference_intent_v2(
     socket: &Path,
     server_identity: &str,
-    expected_version: u64,
-    manual_order: Vec<crate::sidebar::state::RepoId>,
-    manual_chat_order: Vec<String>,
+    intent: crate::sidebar::state::SidebarPreferenceIntent,
 ) -> Result<()> {
     request_v2_sidebar(
         socket,
         server_identity,
-        V2SidebarCommand::UpdateManualOrder {
-            expected_version,
-            manual_order,
-            manual_chat_order,
-        },
+        V2SidebarCommand::PreferenceIntent { intent },
         V2SidebarResponse::SnapshotAck,
     )?;
     Ok(())
-}
-
-pub fn send_sidebar_update_view_preferences_v2(
-    socket: &Path,
-    server_identity: &str,
-    expected_version: u64,
-    view_mode: crate::sidebar::state::ViewMode,
-    filter: crate::sidebar::state::StatusFilter,
-) -> Result<()> {
-    request_v2_sidebar(
-        socket,
-        server_identity,
-        V2SidebarCommand::UpdateViewPreferences {
-            expected_version,
-            view_mode,
-            filter,
-        },
-        V2SidebarResponse::SnapshotAck,
-    )?;
-    Ok(())
-}
-
-pub fn send_sidebar_set_expansion_override_v2(
-    socket: &Path,
-    server_identity: &str,
-    expected_version: u64,
-    row_id: String,
-    overridden: bool,
-) -> Result<u64> {
-    request_v2_sidebar(
-        socket,
-        server_identity,
-        V2SidebarCommand::SetExpansionOverride {
-            expected_version,
-            row_id,
-            overridden,
-        },
-        V2SidebarResponse::SnapshotAck,
-    )
 }
 
 pub fn request_topology_refresh_v2(socket: &Path, server_identity: &str) -> Result<()> {
@@ -733,18 +688,18 @@ fn verify_active_config_hash(
 ) -> Result<()> {
     let mut client =
         V2Client::connect_with_timeout(socket, server_identity, V2_SUBSCRIBE_INITIAL_TIMEOUT)?;
-    let response = client.request(&V2ClientMessage::QueryHealth {
+    let response = client.request(&V2ClientMessage::QueryRuntimeInfo {
         proto: PROTOCOL_VERSION,
     })?;
-    let V2ServerMessage::HealthResult { health } = response else {
-        return v2_server_error("HealthResult", response);
+    let V2ServerMessage::RuntimeInfoResult { info } = response else {
+        return v2_server_error("RuntimeInfoResult", response);
     };
-    if health.config_hash.trim().is_empty() {
+    if info.config_hash.trim().is_empty() {
         bail!("daemon active config hash is empty");
     }
-    if health.config_hash != expected_config_hash {
+    if info.config_hash != expected_config_hash {
         return Err(SidebarConfigMismatch {
-            active_config_hash: health.config_hash,
+            active_config_hash: info.config_hash,
         }
         .into());
     }
@@ -891,6 +846,12 @@ mod tests {
         stream.write_all(b"\n").unwrap();
     }
 
+    fn read_client_frame(reader: &mut impl BufRead) -> V2ClientMessage {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
     #[test]
     fn subscription_ignores_heartbeats_without_producing_snapshots() {
         let (mut server, client) = UnixStream::pair().unwrap();
@@ -973,16 +934,12 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
             assert!(matches!(
-                serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+                read_client_frame(&mut reader),
                 V2ClientMessage::Hello { .. }
             ));
             write_hello_ack(&mut stream, "live-server");
-            line.clear();
-            reader.read_line(&mut line).unwrap();
-            let subscribe = serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap();
+            let subscribe = read_client_frame(&mut reader);
             let V2ClientMessage::SubscribeLive {
                 target_pane,
                 interval_ms,
@@ -994,16 +951,14 @@ mod tests {
             assert_eq!(target_pane, expected_target);
             assert_eq!(interval_ms, 2000);
             // A keepalive during a quiet capture period is consumed silently.
-            serde_json::to_writer(
+            write_frame(
                 &mut stream,
                 &V2ServerMessage::Heartbeat {
                     daemon_instance_id: daemon_instance_id(),
                     snapshot_revision: 1,
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
-            serde_json::to_writer(
+            );
+            write_frame(
                 &mut stream,
                 &V2ServerMessage::LivePreviewResult {
                     live_revision: 1,
@@ -1011,18 +966,14 @@ mod tests {
                     captured_at_epoch_millis: 42,
                     body: "\u{1b}[32mok\u{1b}[0m\n".to_string(),
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
-            serde_json::to_writer(
+            );
+            write_frame(
                 &mut stream,
                 &V2ServerMessage::LivePreviewUnavailable {
                     target_pane,
                     reason: crate::daemon::protocol::v2::LiveUnavailableReason::TargetMissing,
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
+            );
             // Keep the connection open so the client blocks in read until it
             // shuts the socket down from the run loop side.
             let mut buffer = [0u8; 1];
@@ -1064,62 +1015,35 @@ mod tests {
     fn accept_config_guard(listener: &UnixListener, server_identity: &str, config_hash: &str) {
         let (mut stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
         assert!(matches!(
-            serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+            read_client_frame(&mut reader),
             V2ClientMessage::Hello { .. }
         ));
         write_hello_ack(&mut stream, server_identity);
-        line.clear();
-        reader.read_line(&mut line).unwrap();
         assert!(matches!(
-            serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
-            V2ClientMessage::QueryHealth { .. }
+            read_client_frame(&mut reader),
+            V2ClientMessage::QueryRuntimeInfo { .. }
         ));
-        serde_json::to_writer(
+        write_frame(
             &mut stream,
-            &V2ServerMessage::HealthResult {
-                health: crate::daemon::protocol::v2::DaemonHealth {
+            &V2ServerMessage::RuntimeInfoResult {
+                info: crate::daemon::protocol::v2::RuntimeInfo {
                     config_hash: config_hash.to_string(),
-                    projection_revision: 1,
-                    projection_updated_at_epoch_seconds: 2,
-                    notification_enabled: true,
-                    notification_failures: 0,
-                    notification_queue_drops: 0,
-                    notification_degraded: false,
-                    last_notification_error_code: None,
-                    current_quarantine_count: 0,
-                    quarantine_observed_total: 0,
-                    recent_error_code: None,
-                    hook_delivery_failures: 0,
-                    hook_delivery_degraded: false,
-                    last_hook_error_code: None,
-                    status_push_failures: 0,
-                    status_push_degraded: false,
-                    last_status_push_error: None,
-                    last_status_push_error_at_epoch_seconds: None,
                 },
             },
-        )
-        .unwrap();
-        stream.write_all(b"\n").unwrap();
+        );
     }
 
     fn accept_subscription(listener: &UnixListener, server_identity: &str) -> UnixStream {
         let (mut stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
         assert!(matches!(
-            serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+            read_client_frame(&mut reader),
             V2ClientMessage::Hello { .. }
         ));
         write_hello_ack(&mut stream, server_identity);
-        line.clear();
-        reader.read_line(&mut line).unwrap();
         assert!(matches!(
-            serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+            read_client_frame(&mut reader),
             V2ClientMessage::Subscribe { .. }
         ));
         stream
@@ -1132,17 +1056,6 @@ mod tests {
     ) -> UnixStream {
         accept_config_guard(listener, server_identity, config_hash);
         accept_subscription(listener, server_identity)
-    }
-
-    fn empty_resolved_snapshot(revision: u64) -> ResolvedSnapshot {
-        ResolvedSnapshot {
-            snapshot_revision: revision,
-            panes: Vec::new(),
-            sidebar_model: crate::daemon::SidebarModel::default(),
-            attention: Vec::new(),
-            events: Vec::new(),
-            diagnostics: Vec::new(),
-        }
     }
 
     fn recv_connected(rx: &std::sync::mpsc::Receiver<SubscriptionUpdate>) -> ResolvedSnapshot {
@@ -1172,30 +1085,15 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
             assert_eq!(
-                serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+                read_client_frame(&mut reader),
                 V2ClientMessage::Hello {
                     proto: PROTOCOL_VERSION
                 }
             );
-            serde_json::to_writer(
-                &mut stream,
-                &V2ServerMessage::HelloAck {
-                    proto: PROTOCOL_VERSION,
-                    daemon_instance_id: daemon_for_server.clone(),
-                    server_identity: "scratch".to_string(),
-                    phase: crate::daemon::protocol::v2::DaemonPhase::Serving,
-                    hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
-                },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
+            write_hello_ack(&mut stream, "scratch");
 
-            line.clear();
-            reader.read_line(&mut line).unwrap();
-            let request = serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap();
+            let request = read_client_frame(&mut reader);
             let V2ClientMessage::SidebarCommand {
                 daemon_instance_id,
                 event_id,
@@ -1216,7 +1114,7 @@ mod tests {
                     expected: expected_for_server.clone(),
                 }
             );
-            serde_json::to_writer(
+            write_frame(
                 &mut stream,
                 &V2ServerMessage::PaneEventResult {
                     event_id,
@@ -1225,9 +1123,7 @@ mod tests {
                     snapshot_revision: 2,
                     outcome: crate::daemon::protocol::v2::PaneApplyOutcome::Committed,
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
+            );
         });
 
         send_sidebar_mark_complete_v2(
@@ -1259,7 +1155,7 @@ mod tests {
                 serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
                 V2ClientMessage::Hello { .. }
             ));
-            serde_json::to_writer(
+            write_frame(
                 &mut stream,
                 &V2ServerMessage::HelloAck {
                     proto: PROTOCOL_VERSION,
@@ -1271,9 +1167,7 @@ mod tests {
                     phase: crate::daemon::protocol::v2::DaemonPhase::Serving,
                     hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
+            );
             stream
                 .set_read_timeout(Some(Duration::from_millis(100)))
                 .unwrap();
@@ -1329,20 +1223,23 @@ mod tests {
                 },
                 expected: expected_version.clone(),
             },
-            V2SidebarCommand::UpdateManualOrder {
-                expected_version: 7,
-                manual_order: vec![crate::sidebar::state::RepoId::new("misc", "app")],
-                manual_chat_order: vec!["%3".to_string()],
+            V2SidebarCommand::PreferenceIntent {
+                intent: crate::sidebar::state::SidebarPreferenceIntent::MoveRepo {
+                    repo: crate::sidebar::state::RepoId::new("misc", "app"),
+                    neighbor: crate::sidebar::state::RepoId::new("misc", "other"),
+                    direction: crate::sidebar::state::MoveDirection::Up,
+                },
             },
-            V2SidebarCommand::UpdateViewPreferences {
-                expected_version: 8,
-                view_mode: crate::sidebar::state::ViewMode::ByCategory,
-                filter: crate::sidebar::state::StatusFilter::DoneOnly,
+            V2SidebarCommand::PreferenceIntent {
+                intent: crate::sidebar::state::SidebarPreferenceIntent::SetDefaultFilter {
+                    filter: crate::sidebar::state::StatusFilter::DoneOnly,
+                },
             },
-            V2SidebarCommand::SetExpansionOverride {
-                expected_version: 2,
-                row_id: "repo::misc::app".to_string(),
-                overridden: true,
+            V2SidebarCommand::PreferenceIntent {
+                intent: crate::sidebar::state::SidebarPreferenceIntent::SetExpanded {
+                    row_id: "repo::misc::app".to_string(),
+                    expanded: false,
+                },
             },
         ];
         let expected_for_server = expected_commands.clone();
@@ -1350,23 +1247,19 @@ mod tests {
             for expected in expected_for_server {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
                 assert_eq!(
-                    serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
+                    read_client_frame(&mut reader),
                     V2ClientMessage::Hello {
                         proto: PROTOCOL_VERSION
                     }
                 );
                 write_hello_ack(&mut stream, "scratch");
-                line.clear();
-                reader.read_line(&mut line).unwrap();
                 let V2ClientMessage::SidebarCommand {
                     daemon_instance_id,
                     event_id,
                     command,
                     ..
-                } = serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap()
+                } = read_client_frame(&mut reader)
                 else {
                     panic!("expected sidebar command");
                 };
@@ -1387,8 +1280,7 @@ mod tests {
                         snapshot_revision: 2,
                     }
                 };
-                serde_json::to_writer(&mut stream, &response).unwrap();
-                stream.write_all(b"\n").unwrap();
+                write_frame(&mut stream, &response);
             }
         });
 
@@ -1415,33 +1307,33 @@ mod tests {
             expected_version,
         )
         .unwrap();
-        send_sidebar_update_manual_order_v2(
+        send_sidebar_preference_intent_v2(
             &socket,
             "scratch",
-            7,
-            vec![crate::sidebar::state::RepoId::new("misc", "app")],
-            vec!["%3".to_string()],
+            crate::sidebar::state::SidebarPreferenceIntent::MoveRepo {
+                repo: crate::sidebar::state::RepoId::new("misc", "app"),
+                neighbor: crate::sidebar::state::RepoId::new("misc", "other"),
+                direction: crate::sidebar::state::MoveDirection::Up,
+            },
         )
         .unwrap();
-        send_sidebar_update_view_preferences_v2(
+        send_sidebar_preference_intent_v2(
             &socket,
             "scratch",
-            8,
-            crate::sidebar::state::ViewMode::ByCategory,
-            crate::sidebar::state::StatusFilter::DoneOnly,
+            crate::sidebar::state::SidebarPreferenceIntent::SetDefaultFilter {
+                filter: crate::sidebar::state::StatusFilter::DoneOnly,
+            },
         )
         .unwrap();
-        assert_eq!(
-            send_sidebar_set_expansion_override_v2(
-                &socket,
-                "scratch",
-                2,
-                "repo::misc::app".to_string(),
-                true,
-            )
-            .unwrap(),
-            2
-        );
+        send_sidebar_preference_intent_v2(
+            &socket,
+            "scratch",
+            crate::sidebar::state::SidebarPreferenceIntent::SetExpanded {
+                row_id: "repo::misc::app".to_string(),
+                expanded: false,
+            },
+        )
+        .unwrap();
 
         handle.join().unwrap();
         std::fs::remove_file(socket).unwrap();
@@ -1454,30 +1346,25 @@ mod tests {
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
+            let _ = read_client_frame(&mut reader);
             write_hello_ack(&mut stream, "scratch");
-            line.clear();
-            reader.read_line(&mut line).unwrap();
             let V2ClientMessage::RefreshTopology {
                 daemon_instance_id,
                 event_id,
                 ..
-            } = serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap()
+            } = read_client_frame(&mut reader)
             else {
                 panic!("expected topology refresh");
             };
             assert_eq!(daemon_instance_id, self::daemon_instance_id());
-            serde_json::to_writer(
+            write_frame(
                 &mut stream,
                 &V2ServerMessage::SnapshotAck {
                     event_id,
                     accepted_seq: 7,
                     snapshot_revision: 11,
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
+            );
         });
 
         request_topology_refresh_v2(&socket, "scratch").unwrap();
@@ -1493,21 +1380,17 @@ mod tests {
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
+            let _ = read_client_frame(&mut reader);
             write_hello_ack(&mut stream, "scratch");
-            line.clear();
-            reader.read_line(&mut line).unwrap();
-            serde_json::to_writer(
+            let _ = read_client_frame(&mut reader);
+            write_frame(
                 &mut stream,
                 &V2ServerMessage::SnapshotAck {
                     event_id: EventId::generate().unwrap(),
                     accepted_seq: 1,
                     snapshot_revision: 1,
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
+            );
         });
 
         let error = send_sidebar_jump_v2(
@@ -1537,15 +1420,13 @@ mod tests {
         let handle = thread::spawn(move || {
             let mut stream = accept_guarded_subscription(&listener, "scratch", "hash");
             for revision in [1, 1, 0, 2] {
-                serde_json::to_writer(
+                write_frame(
                     &mut stream,
                     &V2ServerMessage::ResolvedSnapshotResult {
                         snapshot_revision: revision,
-                        snapshot: empty_resolved_snapshot(revision),
+                        snapshot: empty_snapshot(revision),
                     },
-                )
-                .unwrap();
-                stream.write_all(b"\n").unwrap();
+                );
             }
             // Keep the peer open until the client's finite initial poll/read completes. A real
             // Subscribe peer remains connected while later snapshots are streamed.
@@ -1568,15 +1449,13 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let handle = thread::spawn(move || {
             let mut stream = accept_guarded_subscription(&listener, "scratch", "hash");
-            serde_json::to_writer(
+            write_frame(
                 &mut stream,
                 &V2ServerMessage::ResolvedSnapshotResult {
                     snapshot_revision: 2,
-                    snapshot: empty_resolved_snapshot(1),
+                    snapshot: empty_snapshot(1),
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
+            );
         });
         let (tx, rx) = std::sync::mpsc::channel();
 
@@ -1603,15 +1482,13 @@ mod tests {
         let handle = thread::spawn(move || {
             for revision in [1, 2] {
                 let mut stream = accept_guarded_subscription(&listener, "scratch", "hash");
-                serde_json::to_writer(
+                write_frame(
                     &mut stream,
                     &V2ServerMessage::ResolvedSnapshotResult {
                         snapshot_revision: revision,
-                        snapshot: empty_resolved_snapshot(revision),
+                        snapshot: empty_snapshot(revision),
                     },
-                )
-                .unwrap();
-                stream.write_all(b"\n").unwrap();
+                );
                 if revision == 1 {
                     kill_first_rx.recv().unwrap();
                 } else {
@@ -1660,15 +1537,13 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
             let mut stream = accept_guarded_subscription(&listener, "scratch", "hash");
-            serde_json::to_writer(
+            write_frame(
                 &mut stream,
                 &V2ServerMessage::ResolvedSnapshotResult {
                     snapshot_revision: 1,
-                    snapshot: empty_resolved_snapshot(1),
+                    snapshot: empty_snapshot(1),
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
+            );
             release_rx.recv().unwrap();
         });
         let mut subscription = V2SnapshotSubscription::connect(&socket, "scratch", "hash").unwrap();
@@ -1686,43 +1561,21 @@ mod tests {
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
+            let _ = read_client_frame(&mut reader);
             write_hello_ack(&mut stream, "scratch");
-            line.clear();
-            reader.read_line(&mut line).unwrap();
             assert!(matches!(
-                serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
-                V2ClientMessage::QueryHealth { .. }
+                read_client_frame(&mut reader),
+                V2ClientMessage::QueryRuntimeInfo { .. }
             ));
-            serde_json::to_writer(
+            write_frame(
                 &mut stream,
-                &V2ServerMessage::HealthResult {
-                    health: crate::daemon::protocol::v2::DaemonHealth {
+                &V2ServerMessage::RuntimeInfoResult {
+                    info: crate::daemon::protocol::v2::RuntimeInfo {
                         config_hash: "active".to_string(),
-                        projection_revision: 1,
-                        projection_updated_at_epoch_seconds: 1,
-                        notification_enabled: false,
-                        notification_failures: 0,
-                        notification_queue_drops: 0,
-                        notification_degraded: false,
-                        last_notification_error_code: None,
-                        current_quarantine_count: 0,
-                        quarantine_observed_total: 0,
-                        recent_error_code: None,
-                        hook_delivery_failures: 0,
-                        hook_delivery_degraded: false,
-                        last_hook_error_code: None,
-                        status_push_failures: 0,
-                        status_push_degraded: false,
-                        last_status_push_error: None,
-                        last_status_push_error_at_epoch_seconds: None,
                     },
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
-            line.clear();
+            );
+            let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             assert!(line.is_empty(), "mismatched config must not subscribe");
         });
@@ -1772,27 +1625,21 @@ mod tests {
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
+            let _ = read_client_frame(&mut reader);
             write_hello_ack(&mut stream, "scratch");
-            line.clear();
-            reader.read_line(&mut line).unwrap();
-            let V2ClientMessage::SidebarCommand { event_id, .. } =
-                serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap()
+            let V2ClientMessage::SidebarCommand { event_id, .. } = read_client_frame(&mut reader)
             else {
                 panic!("expected sidebar command");
             };
             thread::sleep(Duration::from_millis(600));
-            serde_json::to_writer(
+            write_frame(
                 &mut stream,
                 &V2ServerMessage::SnapshotAck {
                     event_id,
                     accepted_seq: 1,
                     snapshot_revision: 1,
                 },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
+            );
         });
         let started = Instant::now();
 

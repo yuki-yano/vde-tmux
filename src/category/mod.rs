@@ -4,21 +4,6 @@ use crate::config::Config;
 use crate::session::{Direction, SessionInfo};
 
 pub fn resolve_category_for_session(config: &Config, session: &SessionInfo) -> String {
-    resolve_category_for_session_with_stored(config, session, true)
-}
-
-pub fn resolve_dynamic_category_for_session(config: &Config, session: &SessionInfo) -> String {
-    resolve_category_for_session_with_stored(config, session, false)
-}
-
-fn resolve_category_for_session_with_stored(
-    config: &Config,
-    session: &SessionInfo,
-    use_stored_category: bool,
-) -> String {
-    if !session.category_override.is_empty() {
-        return session.category_override.clone();
-    }
     for rule in &config.categories.rules {
         if rule
             .path_patterns
@@ -36,9 +21,6 @@ fn resolve_category_for_session_with_stored(
         {
             return rule.category.clone();
         }
-    }
-    if use_stored_category && !session.category.is_empty() {
-        return session.category.clone();
     }
     config
         .categories
@@ -191,30 +173,14 @@ mod tests {
     fn session(
         name: &str,
         project_path: &str,
-        category: &str,
-        override_category: &str,
+        _stored_category: &str,
+        _override_category: &str,
     ) -> SessionInfo {
         SessionInfo {
             name: name.to_string(),
             project_path: project_path.to_string(),
-            category: category.to_string(),
-            category_override: override_category.to_string(),
             ..SessionInfo::default()
         }
-    }
-
-    #[test]
-    fn override_wins_over_project_and_stored_category() {
-        let mut config = Config::default();
-        config.categories.rules.push(CategoryRule {
-            category: "project".to_string(),
-            path_patterns: vec!["github.com/acme/*".to_string()],
-        });
-        let actual = resolve_category_for_session(
-            &config,
-            &session("main", "/ghq/github.com/acme/app", "work", "private"),
-        );
-        assert_eq!(actual, "private");
     }
 
     #[test]
@@ -258,21 +224,19 @@ mod tests {
     }
 
     #[test]
-    fn stored_category_wins_over_default() {
+    fn default_category_ignores_stored_category() {
         let mut config = Config::default();
         config.categories.default_category = Some("default".to_string());
         let actual = resolve_category_for_session(&config, &session("repo", "", "work", ""));
-        assert_eq!(actual, "work");
+        assert_eq!(actual, "default");
     }
 
     #[test]
     fn dynamic_category_uses_default_instead_of_stored_category() {
         let mut config = Config::default();
         config.categories.default_category = Some("public".to_string());
-        let actual = resolve_dynamic_category_for_session(
-            &config,
-            &session("repo", "/Users/me", "work", ""),
-        );
+        let actual =
+            resolve_category_for_session(&config, &session("repo", "/Users/me", "work", ""));
         assert_eq!(actual, "public");
     }
 
@@ -284,7 +248,7 @@ mod tests {
             category: "work".to_string(),
             path_patterns: vec!["github.com/acme/*".to_string()],
         });
-        let actual = resolve_dynamic_category_for_session(
+        let actual = resolve_category_for_session(
             &config,
             &session("repo", "/Users/me/src/github.com/acme/app", "public", ""),
         );
@@ -294,6 +258,10 @@ mod tests {
     #[test]
     fn sorted_categories_uses_order_then_name() {
         let mut config = Config::default();
+        config.categories.session_name_rules.push(SessionNameRule {
+            category: "misc".to_string(),
+            patterns: vec!["main".to_string()],
+        });
         config
             .categories
             .display_names
@@ -311,6 +279,16 @@ mod tests {
     #[test]
     fn adjacent_category_wraps_by_direction() {
         let mut config = Config::default();
+        config.categories.session_name_rules.extend([
+            SessionNameRule {
+                category: "a".to_string(),
+                patterns: vec!["one".to_string()],
+            },
+            SessionNameRule {
+                category: "b".to_string(),
+                patterns: vec!["two".to_string()],
+            },
+        ]);
         config.categories.order.insert("a".into(), 10);
         config.categories.order.insert("b".into(), 20);
         let sessions = [session("one", "", "a", ""), session("two", "", "b", "")];
@@ -335,6 +313,16 @@ mod tests {
     #[test]
     fn adjacent_category_skips_empty_configured_categories() {
         let mut config = Config::default();
+        config.categories.session_name_rules.extend([
+            SessionNameRule {
+                category: "a".to_string(),
+                patterns: vec!["one".to_string()],
+            },
+            SessionNameRule {
+                category: "b".to_string(),
+                patterns: vec!["two".to_string()],
+            },
+        ]);
         config.categories.order.insert("a".into(), 10);
         config.categories.order.insert("empty".into(), 20);
         config.categories.order.insert("b".into(), 30);

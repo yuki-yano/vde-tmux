@@ -19,11 +19,4 @@ pub(crate) fn current_degraded_message(
         .rev()
         .find(|diagnostic| diagnostic.code == crate::daemon::protocol::v2::ErrorCode::HookCollision)
         .map(|diagnostic| diagnostic.message.clone())
-        .or_else(|| {
-            snapshot
-                .panes
-                .iter()
-                .find_map(|pane| pane.diagnostic.clone())
-                .map(|diagnostic| format!("pane state quarantined: {diagnostic:?}"))
-        })
 }

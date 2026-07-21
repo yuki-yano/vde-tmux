@@ -278,6 +278,7 @@ raw = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw)
 raw = re.sub(r"\b\d+m\d{2}s\b", "<age>", raw)
 raw = re.sub(r"\b\d+[smhd]\b", "<age>", raw)
 raw = re.sub(r"\b\d+h\d+m\b", "<age>", raw)
+raw = re.sub(r" +<age>", " <age>", raw)
 open(sys.argv[2], "w", encoding="utf-8").write(raw.rstrip() + "\n")
 PY
 }
@@ -293,7 +294,7 @@ metadata_fingerprint() {
     tmux_cmd show-options -gw | grep -v '^@vde_status_' || true
     tmux_cmd list-sessions -F '#{session_id} #{session_name} #{@vde_category}'
     tmux_cmd list-windows -a -F '#{window_id} #{window_name}'
-    tmux_cmd list-panes -a -F '#{pane_id} #{@vde_pane_state} #{@vde_sidebar}'
+    tmux_cmd list-panes -a -F '#{pane_id} #{@vde_sidebar}'
   } | shasum -a 256 | awk '{print $1}'
 }
 
@@ -564,11 +565,17 @@ record notifications PASS-focus-independent-three-transitions
 VT_PANE="$A_PANE" run_vt hook emit --agent generic --session-id attention-preflight \
   --status running --started-at "$((NOW + 3))"
 
-# status and doctor are read-only, while lifecycle transitions remain distinct.
+# Status is read-only, while lifecycle transitions remain distinct.
 PID_BEFORE="$(daemon_pid)"
 META_BEFORE="$(metadata_fingerprint)"
 run_vt daemon status >"$ARTIFACT_DIR/status-readonly.txt"
-run_vt daemon doctor >"$ARTIFACT_DIR/doctor-readonly.txt"
+for field in daemon phase hooks daemon_instance server socket process config_hash last_transition_error; do
+  grep -E "^${field}: " "$ARTIFACT_DIR/status-readonly.txt" >/dev/null
+done
+if grep -E '^(projection_|notification:|hook_delivery:|status_push:|log:|generation:|record:)' \
+  "$ARTIFACT_DIR/status-readonly.txt" >/dev/null; then
+  fail "daemon status exposed removed observability fields"
+fi
 PID_AFTER="$(daemon_pid)"
 META_AFTER="$(metadata_fingerprint)"
 [[ -n "$PID_BEFORE" && "$PID_BEFORE" == "$PID_AFTER" && "$META_BEFORE" == "$META_AFTER" ]]
@@ -586,7 +593,7 @@ wait_daemon_running >"$ARTIFACT_DIR/daemon-status-after-stop.log"
 run_vt daemon disable >"$ARTIFACT_DIR/daemon-disable.log"
 wait_daemon_stopped
 run_vt daemon status >"$ARTIFACT_DIR/daemon-status-disabled.log"
-grep -F 'mode: Disabled' "$ARTIFACT_DIR/daemon-status-disabled.log" >/dev/null
+grep -F 'daemon: unavailable' "$ARTIFACT_DIR/daemon-status-disabled.log" >/dev/null
 if run_vt daemon start >"$ARTIFACT_DIR/daemon-start-disabled.log" 2>&1; then
   fail "daemon start unexpectedly succeeded while disabled"
 fi
@@ -598,7 +605,7 @@ VT_PANE="$A_PANE" run_vt hook emit --agent generic --session-id disabled-event \
 wait_daemon_stopped
 run_vt daemon enable >"$ARTIFACT_DIR/daemon-enable.log"
 wait_daemon_running >"$ARTIFACT_DIR/daemon-status-enabled.log"
-record lifecycle PASS-ensure-stop-disable-enable-status-doctor
+record lifecycle PASS-ensure-stop-disable-enable-status
 
 PID_BEFORE_RELOAD="$(daemon_pid)"
 run_vt daemon status >"$ARTIFACT_DIR/status-before-invalid-reload.txt"
@@ -617,10 +624,15 @@ CONFIG_HASH_AFTER="$(awk '/^config_hash:/ { print $2; exit }' "$ARTIFACT_DIR/sta
 [[ -n "$CONFIG_HASH_BEFORE" && "$CONFIG_HASH_BEFORE" == "$CONFIG_HASH_AFTER" ]]
 record invalid-reload PASS-running-daemon-unchanged
 
-# A valid config can still fail during child bootstrap. An intentionally insecure order file is
+# A valid config can still fail during child bootstrap. An intentionally insecure preference file is
 # rejected only by the new child after the old daemon has stopped, proving no automatic rollback.
 ORDER_STATE_DIR="$STATE_HOME/vde/tmux/sidebar-state"
-ORDER_STATE_FILE="$ORDER_STATE_DIR/sidebar-order-v1.json"
+ORDER_STATE_FILE="$ORDER_STATE_DIR/sidebar-preferences-$(
+  python3 - "$TMUX_PATH" <<'PY'
+import hashlib, sys
+print(hashlib.sha256(sys.argv[1].encode()).hexdigest())
+PY
+).json"
 mkdir -p "$ORDER_STATE_DIR"
 chmod 700 "$ORDER_STATE_DIR"
 printf '{}\n' >"$ORDER_STATE_FILE"
@@ -644,6 +656,7 @@ S1_AGENT="$(tmux_cmd display-message -p -t "$S1_WINDOW" '#{pane_id}')"
 S1_PEER="$(tmux_cmd split-window -d -P -F '#{pane_id}' -t "$S1_WINDOW" -c "$ROOT" "sleep 900")"
 S2_WINDOW="$(tmux_cmd new-window -d -P -F '#{window_id}' -t a10: -n side-two -c "$ROOT" "sleep 900")"
 S2_AGENT="$(tmux_cmd display-message -p -t "$S2_WINDOW" '#{pane_id}')"
+S2_AGENT_PID="$(tmux_cmd display-message -p -t "$S2_AGENT" '#{pane_pid}')"
 S2_PEER="$(tmux_cmd split-window -d -P -F '#{pane_id}' -t "$S2_WINDOW" -c "$ROOT" "sleep 900")"
 SIDEBAR_NOW="$(date +%s)"
 VT_PANE="$S1_AGENT" run_vt hook emit --agent 'ascii-one' --session-id side-one-a \
@@ -653,7 +666,7 @@ VT_PANE="$S1_PEER" run_vt hook emit --agent 'cjk-agent' --session-id side-one-b 
 VT_PANE="$S1_PEER" run_vt hook emit --agent 'cjk-agent' --session-id side-one-b \
   --status idle --completed-at "$((SIDEBAR_NOW - 180))"
 VT_PANE="$S2_AGENT" run_vt hook emit --agent 'ascii-two' --session-id side-two-a \
-  --status running --started-at "$((SIDEBAR_NOW - 245))"
+  --status running --started-at "$((SIDEBAR_NOW - 125))"
 VT_PANE="$S2_PEER" run_vt hook emit --agent 'emoji-agent' --session-id side-two-b \
   --status running --started-at "$((SIDEBAR_NOW - 305))" --prompt 'emoji fleet 🚀🙂' --prompt-source preflight
 wait_badge "$S1_PEER" Done
@@ -679,34 +692,47 @@ capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-selection
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-1-selection.txt")" != "$(fingerprint "$ARTIFACT_DIR/sidebar-1-before.txt")" ]]
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-selection.txt")" == "$SIDE2_STABLE" ]]
 
+VT_PANE="$SIDEBAR_1" run_vt sidebar input "toggle:chat::$S2_AGENT::$S2_AGENT_PID"
+sleep 0.3
+capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-shared-expansion.txt"
+SIDE2_SHARED_EXPANSION="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-shared-expansion.txt")"
+[[ "$SIDE2_SHARED_EXPANSION" != "$SIDE2_STABLE" ]]
+
+VT_PANE="$SIDEBAR_1" run_vt sidebar input K
+sleep 0.3
+capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-shared-order.txt"
+SIDE2_SHARED_ORDER="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-shared-order.txt")"
+[[ "$SIDE2_SHARED_ORDER" != "$SIDE2_SHARED_EXPANSION" ]]
+record sidebar-shared-state PASS-manual-order-and-expansion-live-across-two-sidebars
+
 VT_PANE="$SIDEBAR_1" run_vt sidebar input 1
 sleep 0.15
 capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-view-flat.txt"
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-view.txt"
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-1-view-flat.txt")" != "$(fingerprint "$ARTIFACT_DIR/sidebar-1-selection.txt")" ]]
-[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-view.txt")" == "$SIDE2_STABLE" ]]
+[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-view.txt")" == "$SIDE2_SHARED_ORDER" ]]
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input 'done'
 sleep 0.15
 capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-filter-done.txt"
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-filter.txt"
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-1-filter-done.txt")" != "$(fingerprint "$ARTIFACT_DIR/sidebar-1-view-flat.txt")" ]]
-[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-filter.txt")" == "$SIDE2_STABLE" ]]
+[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-filter.txt")" == "$SIDE2_SHARED_ORDER" ]]
 
 tmux_cmd send-keys -t "$SIDEBAR_1" e
 sleep 0.15
 capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-live-toggle.txt"
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-live.txt"
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-1-live-toggle.txt")" != "$(fingerprint "$ARTIFACT_DIR/sidebar-1-filter-done.txt")" ]]
-[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-live.txt")" == "$SIDE2_STABLE" ]]
+[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-live.txt")" == "$SIDE2_SHARED_ORDER" ]]
 REVISION_AFTER_LOCAL="$(snapshot_revision)"
 (( REVISION_AFTER_LOCAL > REVISION_BEFORE_LOCAL ))
 python3 - "$QUERY_JSON" <<'PY'
 import json, sys
-order = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["order"]
-assert order["view_mode"] == "flat", order
-assert order["filter"] == "done_only", order
-assert order["version"] >= 2, order
+preferences = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["preferences"]
+assert preferences["view_mode"] == "flat", preferences
+assert preferences["filter"] == "done_only", preferences
+assert preferences["schema_version"] == 1, preferences
 PY
 record sidebar-local-state PASS-selection-live-noninterference-and-view-filter-defaults-persisted
 
@@ -755,6 +781,16 @@ mv "$SANDBOX/config.window.yml" "$CONFIG_HOME/vde/tmux/config.yml"
 cp "$CONFIG_HOME/vde/tmux/config.yml" "$ARTIFACT_DIR/config.window.yml"
 run_vt daemon reload >"$ARTIFACT_DIR/daemon-reload-window-mode.log"
 wait_daemon_running >"$ARTIFACT_DIR/daemon-status-window-mode.log"
+query_snapshot
+python3 - "$QUERY_JSON" "$S2_AGENT" "$S2_AGENT_PID" "$S1_AGENT" <<'PY'
+import json, sys
+preferences = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["preferences"]
+assert preferences["view_mode"] == "flat", preferences
+assert preferences["filter"] == "done_only", preferences
+assert preferences["manual_chat_order"][:2] == [sys.argv[2], sys.argv[4]], preferences
+assert f"chat::{sys.argv[2]}::{sys.argv[3]}" in preferences["expansion_overrides"], preferences
+PY
+record sidebar-restart PASS-same-socket-order-view-filter-expansion-restored
 tmux_cmd switch-client -c "$CLIENT_1" -t "$S1_WINDOW"
 tmux_cmd select-pane -t "$S1_PEER"
 WINDOW_ACK_NOW="$((NOW + 100))"

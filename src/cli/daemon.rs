@@ -126,207 +126,6 @@ fn status_snapshot(
     }
 }
 
-struct CleanupReportInput<'a> {
-    dry_run: bool,
-    attempted: u64,
-    removed: u64,
-    remaining: u64,
-    scope_counts: crate::daemon::protocol::v2::LegacyCleanupScopeCounts,
-    remaining_scope_counts: crate::daemon::protocol::v2::LegacyCleanupScopeCounts,
-    failed: &'a [crate::daemon::protocol::v2::LegacyCleanupFailure],
-    failed_total: u64,
-    failed_omitted: u64,
-}
-
-fn cleanup_report(input: CleanupReportInput<'_>) -> (String, bool) {
-    let details = input
-        .failed
-        .iter()
-        .map(|failure| {
-            format!(
-                "{} {} {}: {}",
-                failure.scope, failure.target, failure.option, failure.message
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    let partial = input.failed_total > 0 || (!input.dry_run && input.remaining > 0);
-    let report = format!(
-        "legacy pane-state cleanup {}: before={} pane={} window={} session={} removed={} remaining={} remaining_pane={} remaining_window={} remaining_session={} failed={} omitted={}{}",
-        if input.dry_run {
-            "dry-run"
-        } else if partial {
-            "partial"
-        } else {
-            "complete"
-        },
-        input.attempted,
-        input.scope_counts.pane,
-        input.scope_counts.window,
-        input.scope_counts.session,
-        input.removed,
-        input.remaining,
-        input.remaining_scope_counts.pane,
-        input.remaining_scope_counts.window,
-        input.remaining_scope_counts.session,
-        input.failed_total,
-        input.failed_omitted,
-        if details.is_empty() {
-            String::new()
-        } else {
-            format!(" details={details}")
-        }
-    );
-    (report, partial)
-}
-
-pub(crate) fn cleanup_legacy_state(
-    runner: &dyn TmuxRunner,
-    env: &BTreeMap<String, String>,
-    dry_run: bool,
-) -> Result<Option<String>> {
-    let (_, mut client) = pane_state_client(runner, env)?;
-    let event_id = crate::pane_state::EventId::generate()?;
-    match client.request(
-        &crate::daemon::protocol::v2::ClientMessage::CleanupLegacyState {
-            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-            daemon_instance_id: client.daemon_instance_id().clone(),
-            event_id: event_id.clone(),
-            dry_run,
-        },
-    )? {
-        crate::daemon::protocol::v2::ServerMessage::CleanupLegacyResult {
-            event_id: response_id,
-            dry_run: response_dry_run,
-            attempted,
-            removed,
-            remaining,
-            scope_counts,
-            remaining_scope_counts,
-            failed,
-            failed_total,
-            failed_omitted,
-            ..
-        } if response_id == event_id => {
-            let (report, partial) = cleanup_report(CleanupReportInput {
-                dry_run: response_dry_run,
-                attempted,
-                removed,
-                remaining,
-                scope_counts,
-                remaining_scope_counts,
-                failed: &failed,
-                failed_total,
-                failed_omitted,
-            });
-            if partial {
-                bail!(report);
-            }
-            Ok(Some(report))
-        }
-        crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
-            bail!("daemon returned {code:?}: {message}")
-        }
-        response => bail!("unexpected daemon legacy cleanup response: {response:?}"),
-    }
-}
-
-pub(crate) fn reset_pane_state(
-    runner: &dyn TmuxRunner,
-    env: &BTreeMap<String, String>,
-    pane_id: &str,
-) -> Result<Option<String>> {
-    let (_, mut query_client) = pane_state_client(runner, env)?;
-    let pane =
-        match query_client.request(&crate::daemon::protocol::v2::ClientMessage::QueryPane {
-            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-            pane_id: pane_id.to_string(),
-        })? {
-            crate::daemon::protocol::v2::ServerMessage::PaneResult { pane, .. } => pane,
-            crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
-                bail!("daemon returned {code:?}: {message}")
-            }
-            response => bail!("unexpected daemon pane response: {response:?}"),
-        };
-    let expected = pane.stored.ok_or_else(|| {
-        anyhow::anyhow!(
-            "pane {} has no canonical or quarantined state to reset",
-            pane_id
-        )
-    })?;
-    drop(query_client);
-    // A normal v2 connection carries exactly one request/response after Hello. Reset therefore
-    // performs its guarded query and mutation on separate, freshly handshaken connections.
-    let (_, mut client) = pane_state_client(runner, env)?;
-    let event_id = crate::pane_state::EventId::generate()?;
-    match client.request(
-        &crate::daemon::protocol::v2::ClientMessage::ResetPaneState {
-            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-            daemon_instance_id: client.daemon_instance_id().clone(),
-            event_id: event_id.clone(),
-            pane_instance: pane.pane_instance,
-            expected,
-        },
-    )? {
-        crate::daemon::protocol::v2::ServerMessage::ResetResult {
-            event_id: response_id,
-            outcome,
-            ..
-        } if response_id == event_id => Ok(Some(format!(
-            "pane state reset: {pane_id} ({})",
-            match outcome {
-                crate::daemon::protocol::v2::ResetOutcome::Replaced => "replaced",
-                crate::daemon::protocol::v2::ResetOutcome::AlreadyReset => "already reset",
-            }
-        ))),
-        crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
-            bail!("daemon returned {code:?}: {message}")
-        }
-        response => bail!("unexpected daemon reset response: {response:?}"),
-    }
-}
-
-pub(crate) fn uninstall_pane_state_hooks(
-    runner: &dyn TmuxRunner,
-    env: &BTreeMap<String, String>,
-) -> Result<Option<String>> {
-    let (_, mut client) = pane_state_client(runner, env)?;
-    let event_id = crate::pane_state::EventId::generate()?;
-    match client.request(
-        &crate::daemon::protocol::v2::ClientMessage::UninstallHooks {
-            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-            daemon_instance_id: client.daemon_instance_id().clone(),
-            event_id: event_id.clone(),
-        },
-    )? {
-        crate::daemon::protocol::v2::ServerMessage::HooksUninstalled {
-            event_id: response_id,
-            ..
-        } if response_id == event_id => Ok(Some("pane-state hooks uninstalled".to_string())),
-        crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
-            bail!("daemon returned {code:?}: {message}")
-        }
-        response => bail!("unexpected daemon hook uninstall response: {response:?}"),
-    }
-}
-
-fn pane_state_client(
-    runner: &dyn TmuxRunner,
-    env: &BTreeMap<String, String>,
-) -> Result<(
-    crate::daemon::lifecycle::TmuxServerIncarnation,
-    crate::daemon::protocol::v2::V2Client,
-)> {
-    let (incarnation, socket) =
-        crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, None)?;
-    let client = crate::daemon::protocol::v2::V2Client::connect_with_timeout(
-        &socket,
-        &incarnation.hash,
-        Duration::from_secs(2),
-    )?;
-    Ok((incarnation, client))
-}
-
 pub(crate) fn run_daemon(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
@@ -370,12 +169,7 @@ pub(crate) fn run_daemon(
         Ok(config) => config,
         Err(error) => {
             let message = format!("strict config validation failed before daemon startup: {error}");
-            let _ = crate::daemon::lifecycle::append_incarnation_log(
-                env,
-                &incarnation.hash,
-                "daemon.log",
-                &message,
-            );
+            let _ = crate::daemon::lifecycle::append_daemon_log(env, &incarnation.hash, &message);
             let _ = crate::daemon::lifecycle::update_lifecycle_record(
                 env,
                 &incarnation.hash,
@@ -388,26 +182,6 @@ pub(crate) fn run_daemon(
             bail!(message);
         }
     };
-    let legacy_formats = crate::daemon::lifecycle::inspect_legacy_pull_formats(runner)?;
-    if !legacy_formats.is_empty() {
-        let message = format!(
-            "legacy pull-based status commands remain in {}; migrate tmux formats to the zero-process daemon push setup before startup",
-            legacy_formats.join(", ")
-        );
-        let _ = crate::daemon::lifecycle::append_incarnation_log(
-            env,
-            &incarnation.hash,
-            "daemon.log",
-            &format!("daemon startup preflight failed: {message}"),
-        );
-        let _ =
-            crate::daemon::lifecycle::update_lifecycle_record(env, &incarnation.hash, |record| {
-                record.process = None;
-                record.degrade(format!("daemon startup preflight failed: {message}"));
-                Ok(())
-            });
-        bail!(message);
-    }
     if let Err(error) = crate::daemon::server::run_runtime_daemon_server(
         config,
         &socket_path,
@@ -420,10 +194,9 @@ pub(crate) fn run_daemon(
                 record.degrade(format!("daemon runtime exited with error: {error:#}"));
                 Ok(())
             });
-        let _ = crate::daemon::lifecycle::append_incarnation_log(
+        let _ = crate::daemon::lifecycle::append_daemon_log(
             env,
             &incarnation.hash,
-            "daemon.log",
             &format!("daemon runtime exited with error: {error:#}"),
         );
         return Err(error);
@@ -565,20 +338,9 @@ pub(crate) fn status_daemon(
     let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
     let socket_path =
         crate::daemon::daemon_socket_path_for_incarnation(env, socket, &incarnation.hash);
-    let log_path =
-        crate::daemon::lifecycle::incarnation_log_path(env, &incarnation.hash, "daemon.log");
     let record = crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash)?;
-    let server_mode = crate::daemon::lifecycle::tmux_desired_mode(runner, env)?;
-    let record_path = crate::daemon::lifecycle::lifecycle_record_path(env, &incarnation.hash);
-    let record_lines = format!(
-        "mode: {server_mode:?}\nrecord_mode: {:?}\ngeneration: {}\nlifecycle: {:?}\nrecord: {}\nprocess: {}\nlast_error: {}",
-        record.desired_mode,
-        record.generation,
-        record.health,
-        record_path.display(),
-        format_process_identity(record.process.as_ref()),
-        record.last_transition_error.as_deref().unwrap_or("none")
-    );
+    let process = format_process_identity(record.process.as_ref());
+    let last_transition_error = record.last_transition_error.as_deref().unwrap_or("none");
     match crate::daemon::protocol::v2::V2Client::connect_with_timeout(
         &socket_path,
         &incarnation.hash,
@@ -588,76 +350,26 @@ pub(crate) fn status_daemon(
             let phase = client.phase();
             let hooks = client.hook_health();
             let daemon_instance = client.daemon_instance_id().as_str().to_string();
-            let health = client.request(&crate::daemon::protocol::v2::ClientMessage::QueryHealth {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-            });
-            let health_lines = match health {
-                Ok(crate::daemon::protocol::v2::ServerMessage::HealthResult { health }) => {
-                    let age = crate::sidebar::tree::now_epoch_secs()
-                        .saturating_sub(health.projection_updated_at_epoch_seconds as i64)
-                        .max(0);
-                    format!(
-                        "config_hash: {}\nprojection_revision: {}\nprojection_age_seconds: {}\nnotification: {} current={} failures={} queue_drops={} last_code={}\ncurrent_quarantine_count: {}\nquarantine_observed_total: {}\nrecent_error_code: {}\nhook_delivery: {} failures={} last_code={}\nstatus_push: {} failures={} last_error={} last_error_at={}",
-                        health.config_hash,
-                        health.projection_revision,
-                        age,
-                        if health.notification_enabled {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        },
-                        if health.notification_degraded {
-                            "degraded"
-                        } else {
-                            "healthy"
-                        },
-                        health.notification_failures,
-                        health.notification_queue_drops,
-                        health
-                            .last_notification_error_code
-                            .as_deref()
-                            .unwrap_or("none"),
-                        health.current_quarantine_count,
-                        health.quarantine_observed_total,
-                        health
-                            .recent_error_code
-                            .as_ref()
-                            .map_or_else(|| "none".to_string(), |code| format!("{code:?}")),
-                        if health.hook_delivery_degraded {
-                            "degraded"
-                        } else {
-                            "healthy"
-                        },
-                        health.hook_delivery_failures,
-                        health.last_hook_error_code.as_deref().unwrap_or("none"),
-                        if health.status_push_degraded {
-                            "degraded"
-                        } else {
-                            "healthy"
-                        },
-                        health.status_push_failures,
-                        health.last_status_push_error.as_deref().unwrap_or("none"),
-                        health
-                            .last_status_push_error_at_epoch_seconds
-                            .map_or_else(|| "none".to_string(), |at| at.to_string())
-                    )
+            let config_hash = match client.request(
+                &crate::daemon::protocol::v2::ClientMessage::QueryRuntimeInfo {
+                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                },
+            ) {
+                Ok(crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult { info }) => {
+                    info.config_hash
                 }
-                Ok(other) => format!("health_detail: unexpected response {other:?}"),
-                Err(error) => format!("health_detail: {error}"),
+                Ok(_) | Err(_) => "unavailable".to_string(),
             };
             Ok(Some(format!(
-                "daemon: running\nphase: {phase:?}\nhooks: {hooks:?}\ndaemon_instance: {daemon_instance}\n{health_lines}\nserver: {}\nsocket: {}\nlog: {}\n{record_lines}",
+                "daemon: running\nphase: {phase:?}\nhooks: {hooks:?}\ndaemon_instance: {daemon_instance}\nserver: {}\nsocket: {}\nprocess: {process}\nconfig_hash: {config_hash}\nlast_transition_error: {last_transition_error}",
                 incarnation.hash,
                 socket_path.display(),
-                log_path.display(),
             )))
         }
-        Err(error) => Ok(Some(format!(
-            "daemon: unavailable\nserver: {}\nsocket: {}\nlog: {}\n{record_lines}\ndetail: {}",
+        Err(_) => Ok(Some(format!(
+            "daemon: unavailable\nphase: unavailable\nhooks: unavailable\ndaemon_instance: unavailable\nserver: {}\nsocket: {}\nprocess: {process}\nconfig_hash: unavailable\nlast_transition_error: {last_transition_error}",
             incarnation.hash,
             socket_path.display(),
-            log_path.display(),
-            error
         ))),
     }
 }
@@ -974,12 +686,7 @@ fn rollback_failed_enable(
             outcome.failures.join("; ")
         )
     };
-    let _ = crate::daemon::lifecycle::append_incarnation_log(
-        env,
-        &incarnation.hash,
-        "daemon.log",
-        &final_message,
-    );
+    let _ = crate::daemon::lifecycle::append_daemon_log(env, &incarnation.hash, &final_message);
     anyhow::anyhow!(final_message)
 }
 
@@ -1057,11 +764,7 @@ pub(crate) fn reload_daemon(
     match crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, socket) {
         Ok((_, socket_path)) => Ok(Some(format!("daemon reloaded: {}", socket_path.display()))),
         Err(error) => {
-            let log = crate::daemon::lifecycle::incarnation_log_path(
-                env,
-                &incarnation.hash,
-                "daemon.log",
-            );
+            let log = crate::daemon::lifecycle::daemon_log_path(env, &incarnation.hash);
             let failure = anyhow::anyhow!(
                 "reload startup failed; daemon remains stopped; see {}: {error:#}",
                 log.display()
@@ -1070,135 +773,6 @@ pub(crate) fn reload_daemon(
             Err(failure)
         }
     }
-}
-
-pub(crate) fn doctor_daemon(
-    runner: &dyn TmuxRunner,
-    env: &BTreeMap<String, String>,
-    socket: Option<&str>,
-) -> Result<Option<String>> {
-    let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
-    let socket_path =
-        crate::daemon::daemon_socket_path_for_incarnation(env, socket, &incarnation.hash);
-    let state_directory =
-        crate::daemon::lifecycle::incarnation_log_directory(env, &incarnation.hash);
-    let record_path = crate::daemon::lifecycle::lifecycle_record_path(env, &incarnation.hash);
-    let config = match crate::config::load::load_config_strict(env) {
-        Ok(config) => format!(
-            "ok (hash {})",
-            crate::daemon::lifecycle::config_hash(&config)
-        ),
-        Err(error) => format!("invalid ({error})"),
-    };
-    let format_preflight = match crate::daemon::lifecycle::inspect_legacy_pull_formats(runner) {
-        Ok(options) if options.is_empty() => "ok (zero-process push formats)".to_string(),
-        Ok(options) => format!("migration required ({})", options.join(", ")),
-        Err(error) => format!("inspection failed ({error})"),
-    };
-    let hooks = match crate::daemon::view_hooks::preflight_hooks(runner, &incarnation.identity) {
-        Ok(inspection) => format!(
-            "{:?} (owned or missing, no foreign collision)",
-            inspection.health()
-        ),
-        Err(error) => format!("degraded ({error})"),
-    };
-    let runtime = match crate::daemon::protocol::v2::V2Client::connect_with_timeout(
-        &socket_path,
-        &incarnation.hash,
-        Duration::from_millis(250),
-    ) {
-        Ok(mut client) => {
-            let phase = client.phase();
-            match client.request(&crate::daemon::protocol::v2::ClientMessage::QueryHealth {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-            }) {
-                Ok(crate::daemon::protocol::v2::ServerMessage::HealthResult { health }) => {
-                    let age = crate::sidebar::tree::now_epoch_secs()
-                        .saturating_sub(health.projection_updated_at_epoch_seconds as i64)
-                        .max(0);
-                    format!(
-                        "running ({phase:?}); projection revision {}, age {}s; notification {} current {} (failures {}, queue drops {}); quarantine current {} observed {}; recent error {}; hook delivery {} ({} failures); status push {} ({} failures)",
-                        health.projection_revision,
-                        age,
-                        if health.notification_enabled {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        },
-                        if health.notification_degraded {
-                            "degraded"
-                        } else {
-                            "healthy"
-                        },
-                        health.notification_failures,
-                        health.notification_queue_drops,
-                        health.current_quarantine_count,
-                        health.quarantine_observed_total,
-                        health
-                            .recent_error_code
-                            .as_ref()
-                            .map_or_else(|| "none".to_string(), |code| format!("{code:?}")),
-                        if health.hook_delivery_degraded {
-                            "degraded"
-                        } else {
-                            "healthy"
-                        },
-                        health.hook_delivery_failures,
-                        if health.status_push_degraded {
-                            "degraded"
-                        } else {
-                            "healthy"
-                        },
-                        health.status_push_failures,
-                    )
-                }
-                Ok(other) => format!("running ({phase:?}); unexpected health response {other:?}"),
-                Err(error) => format!("running ({phase:?}); health query failed: {error}"),
-            }
-        }
-        Err(error) => format!("unavailable ({error})"),
-    };
-    let record = match crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash) {
-        Ok(record) => format!(
-            "ok ({:?}, generation {}, {:?})",
-            record.desired_mode, record.generation, record.health
-        ),
-        Err(error) => format!("invalid ({error})"),
-    };
-    let server_mode = crate::daemon::lifecycle::tmux_desired_mode(runner, env)?;
-    Ok(Some(format!(
-        "config: {config}\nformat_preflight: {format_preflight}\nhooks: {hooks}\nruntime: {runtime}\nserver_mode: {server_mode:?}\nstate_path: {}\nrecord_path: {}\nsocket_path: {}\nstate_path_check: {}\nrecord_path_check: {}\nsocket_path_check: {}\nlifecycle_record: {record}\nnotification_log: {}",
-        state_directory.display(),
-        record_path.display(),
-        socket_path.display(),
-        read_only_path_diagnostic(&state_directory),
-        read_only_path_diagnostic(&record_path),
-        read_only_path_diagnostic(&socket_path),
-        crate::daemon::lifecycle::incarnation_log_path(env, &incarnation.hash, "notification.log")
-            .display(),
-    )))
-}
-
-pub(crate) fn tail_daemon_log(
-    runner: &dyn TmuxRunner,
-    env: &BTreeMap<String, String>,
-    log: super::DaemonLogKind,
-    lines: usize,
-) -> Result<Option<String>> {
-    let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
-    let file_name = match log {
-        super::DaemonLogKind::Daemon => "daemon.log",
-        super::DaemonLogKind::Notification => "notification.log",
-        super::DaemonLogKind::StatusPush => "status-push.log",
-        super::DaemonLogKind::PaneStateHook => "pane-state-hook.log",
-    };
-    let tail = crate::daemon::lifecycle::read_incarnation_log_tail(
-        env,
-        &incarnation.hash,
-        file_name,
-        lines,
-    )?;
-    Ok(Some(tail))
 }
 
 fn request_shutdown(
@@ -1393,10 +967,9 @@ fn record_transition_failure(
         record.degrade(&message);
         Ok(())
     });
-    let _ = crate::daemon::lifecycle::append_incarnation_log(
+    let _ = crate::daemon::lifecycle::append_daemon_log(
         env,
         incarnation_hash,
-        "daemon.log",
         &format!("lifecycle transition failed: {message}"),
     );
 }
@@ -1417,31 +990,6 @@ fn format_process_identity(
             )
         },
     )
-}
-
-fn read_only_path_diagnostic(path: &Path) -> String {
-    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
-
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => format!(
-            "type={} uid={} mode={:o}",
-            if metadata.file_type().is_symlink() {
-                "symlink"
-            } else if metadata.file_type().is_socket() {
-                "socket"
-            } else if metadata.is_dir() {
-                "directory"
-            } else if metadata.is_file() {
-                "file"
-            } else {
-                "other"
-            },
-            metadata.uid(),
-            metadata.permissions().mode() & 0o777
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
-        Err(error) => format!("error ({error})"),
-    }
 }
 
 pub(crate) fn config_schema() -> Result<Option<String>> {
@@ -2016,78 +1564,5 @@ mod lifecycle_command_tests {
         );
         drop(listener);
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn cleanup_report_marks_real_partial_failure_and_preserves_bounded_details() {
-        let failed = vec![crate::daemon::protocol::v2::LegacyCleanupFailure {
-            scope: "pane".to_string(),
-            target: "%7".to_string(),
-            option: "@vde_pane_state".to_string(),
-            message: "pane instance changed".to_string(),
-        }];
-        let (report, partial) = super::cleanup_report(super::CleanupReportInput {
-            dry_run: false,
-            attempted: 5,
-            removed: 2,
-            remaining: 3,
-            scope_counts: crate::daemon::protocol::v2::LegacyCleanupScopeCounts {
-                pane: 3,
-                window: 1,
-                session: 1,
-            },
-            remaining_scope_counts: crate::daemon::protocol::v2::LegacyCleanupScopeCounts {
-                pane: 2,
-                window: 0,
-                session: 1,
-            },
-            failed: &failed,
-            failed_total: 2,
-            failed_omitted: 1,
-        });
-
-        assert!(partial);
-        assert!(report.contains("cleanup partial"));
-        assert!(report.contains("before=5"));
-        assert!(report.contains("removed=2"));
-        assert!(report.contains("remaining=3"));
-        assert!(report.contains("failed=2 omitted=1"));
-        assert!(report.contains("pane %7 @vde_pane_state: pane instance changed"));
-
-        let (dry_run_report, dry_run_partial) = super::cleanup_report(super::CleanupReportInput {
-            dry_run: true,
-            attempted: 5,
-            removed: 0,
-            remaining: 5,
-            scope_counts: crate::daemon::protocol::v2::LegacyCleanupScopeCounts {
-                pane: 3,
-                window: 1,
-                session: 1,
-            },
-            remaining_scope_counts: crate::daemon::protocol::v2::LegacyCleanupScopeCounts {
-                pane: 3,
-                window: 1,
-                session: 1,
-            },
-            failed: &[],
-            failed_total: 0,
-            failed_omitted: 0,
-        });
-        assert!(!dry_run_partial);
-        assert!(dry_run_report.contains("cleanup dry-run"));
-
-        let (_, failed_dry_run_partial) = super::cleanup_report(super::CleanupReportInput {
-            dry_run: true,
-            attempted: 5,
-            removed: 0,
-            remaining: 5,
-            scope_counts: crate::daemon::protocol::v2::LegacyCleanupScopeCounts::default(),
-            remaining_scope_counts: crate::daemon::protocol::v2::LegacyCleanupScopeCounts::default(
-            ),
-            failed: &failed,
-            failed_total: 1,
-            failed_omitted: 0,
-        });
-        assert!(failed_dry_run_partial);
     }
 }

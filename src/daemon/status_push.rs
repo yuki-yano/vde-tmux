@@ -1046,7 +1046,6 @@ mod tests {
                 current_path: "/tmp/#work".to_string(),
                 badge: BadgeState::Blocked,
             }),
-            diagnostic: None,
         }
     }
 
@@ -1065,7 +1064,6 @@ mod tests {
             active: false,
             stored: None,
             resolved: None,
-            diagnostic: None,
         }
     }
 

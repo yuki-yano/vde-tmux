@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -67,14 +67,6 @@ pub struct LifecycleRecord {
     pub last_transition_error: Option<String>,
     pub process: Option<DaemonProcessIdentity>,
     pub active_notification: Option<NotificationProcessIdentity>,
-    pub hook_delivery_failures: u64,
-    pub hook_delivery_degraded: bool,
-    pub last_hook_error_code: Option<String>,
-    pub status_push_failures: u64,
-    pub status_push_degraded: bool,
-    pub last_status_push_error: Option<String>,
-    pub last_status_push_error_at_epoch_seconds: Option<u64>,
-    pub quarantine_observed_total: u64,
     pub updated_at_epoch_seconds: u64,
 }
 
@@ -89,14 +81,6 @@ impl LifecycleRecord {
             last_transition_error: None,
             process: None,
             active_notification: None,
-            hook_delivery_failures: 0,
-            hook_delivery_degraded: false,
-            last_hook_error_code: None,
-            status_push_failures: 0,
-            status_push_degraded: false,
-            last_status_push_error: None,
-            last_status_push_error_at_epoch_seconds: None,
-            quarantine_observed_total: 0,
             updated_at_epoch_seconds: epoch_seconds(),
         }
     }
@@ -118,59 +102,6 @@ impl LifecycleRecord {
         self.last_transition_error = Some(bounded_log_message(&error.into()));
         self.updated_at_epoch_seconds = epoch_seconds();
     }
-}
-
-pub fn record_hook_delivery_failure(
-    env: &BTreeMap<String, String>,
-    incarnation_hash: &str,
-    code: &str,
-) -> Result<()> {
-    update_lifecycle_record(env, incarnation_hash, |record| {
-        record.hook_delivery_failures = record.hook_delivery_failures.saturating_add(1);
-        record.hook_delivery_degraded = true;
-        record.last_hook_error_code = Some(code.chars().take(128).collect());
-        Ok(())
-    })
-}
-
-pub fn record_hook_delivery_recovered(
-    env: &BTreeMap<String, String>,
-    incarnation_hash: &str,
-) -> Result<()> {
-    if !read_lifecycle_record(env, incarnation_hash)?.hook_delivery_degraded {
-        return Ok(());
-    }
-    update_lifecycle_record(env, incarnation_hash, |record| {
-        record.hook_delivery_degraded = false;
-        Ok(())
-    })
-}
-
-pub fn record_status_push_failure(
-    env: &BTreeMap<String, String>,
-    incarnation_hash: &str,
-    message: &str,
-) -> Result<()> {
-    update_lifecycle_record(env, incarnation_hash, |record| {
-        record.status_push_failures = record.status_push_failures.saturating_add(1);
-        record.status_push_degraded = true;
-        record.last_status_push_error = Some(bounded_log_message(message));
-        record.last_status_push_error_at_epoch_seconds = Some(epoch_seconds());
-        Ok(())
-    })
-}
-
-pub fn record_status_push_recovered(
-    env: &BTreeMap<String, String>,
-    incarnation_hash: &str,
-) -> Result<()> {
-    if !read_lifecycle_record(env, incarnation_hash)?.status_push_degraded {
-        return Ok(());
-    }
-    update_lifecycle_record(env, incarnation_hash, |record| {
-        record.status_push_degraded = false;
-        Ok(())
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,7 +292,7 @@ pub fn incarnation_log_directory(
     state_root.join("vde-tmux").join(incarnation_hash)
 }
 
-pub fn incarnation_log_path(
+pub fn incarnation_state_path(
     env: &BTreeMap<String, String>,
     incarnation_hash: &str,
     file_name: &str,
@@ -369,18 +300,18 @@ pub fn incarnation_log_path(
     incarnation_log_directory(env, incarnation_hash).join(file_name)
 }
 
-pub fn append_incarnation_log(
+pub fn daemon_log_path(env: &BTreeMap<String, String>, incarnation_hash: &str) -> PathBuf {
+    incarnation_state_path(env, incarnation_hash, "daemon.log")
+}
+
+pub fn append_daemon_log(
     env: &BTreeMap<String, String>,
     incarnation_hash: &str,
-    file_name: &str,
     message: &str,
 ) -> Result<PathBuf> {
-    if file_name.is_empty() || file_name.contains('/') || file_name == "." || file_name == ".." {
-        bail!("invalid incarnation log file name");
-    }
     let directory = incarnation_log_directory(env, incarnation_hash);
     ensure_private_log_directory(&directory)?;
-    let path = directory.join(file_name);
+    let path = daemon_log_path(env, incarnation_hash);
     rotate_runtime_log_if_needed(&path)?;
     let mut file = open_secure_runtime_log(&path)?;
     use std::io::Write as _;
@@ -389,63 +320,8 @@ pub fn append_incarnation_log(
     Ok(path)
 }
 
-pub fn read_incarnation_log_tail(
-    env: &BTreeMap<String, String>,
-    incarnation_hash: &str,
-    file_name: &str,
-    lines: usize,
-) -> Result<String> {
-    if lines == 0 || lines > 500 {
-        bail!("log tail lines must be between 1 and 500");
-    }
-    if file_name.is_empty() || file_name.contains('/') || file_name == "." || file_name == ".." {
-        bail!("invalid incarnation log file name");
-    }
-    let path = incarnation_log_path(env, incarnation_hash, file_name);
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to stat {}", path.display()));
-        }
-    };
-    validate_private_directory_read_only(
-        path.parent()
-            .ok_or_else(|| anyhow::anyhow!("log path has no parent"))?,
-    )?;
-    validate_private_regular_file(&path, &metadata, 0o600)?;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    validate_private_regular_file(&path, &file.metadata()?, 0o600)?;
-    use std::io::{Read as _, Seek as _, SeekFrom};
-    const MAX_TAIL_BYTES: u64 = 256 * 1024;
-    let length = metadata.len();
-    let offset = length.saturating_sub(MAX_TAIL_BYTES);
-    file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = Vec::with_capacity((length - offset) as usize);
-    file.take(MAX_TAIL_BYTES).read_to_end(&mut bytes)?;
-    if offset > 0
-        && let Some(newline) = bytes.iter().position(|byte| *byte == b'\n')
-    {
-        bytes.drain(..=newline);
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    Ok(text
-        .lines()
-        .rev()
-        .take(lines)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n"))
-}
-
 pub fn lifecycle_record_path(env: &BTreeMap<String, String>, incarnation_hash: &str) -> PathBuf {
-    incarnation_log_path(env, incarnation_hash, LIFECYCLE_RECORD_FILE)
+    incarnation_state_path(env, incarnation_hash, LIFECYCLE_RECORD_FILE)
 }
 
 /// Read lifecycle state without creating directories, locks, or marker files.
@@ -828,107 +704,6 @@ pub fn config_hash(config: &crate::config::Config) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub fn inspect_legacy_pull_formats(runner: &dyn TmuxRunner) -> Result<Vec<String>> {
-    const GLOBAL_OPTIONS: [&str; 5] = [
-        "status-left",
-        "status-right",
-        "window-status-format",
-        "window-status-current-format",
-        "pane-border-format",
-    ];
-    let mut legacy = Vec::new();
-    for option in GLOBAL_OPTIONS {
-        let value = run_format_preflight_query(runner, &["show-option", "-gv", option])?;
-        if contains_legacy_statusline_command(&value) {
-            legacy.push(format!("global:{option}"));
-        }
-    }
-    let sessions = bounded_tmux_targets(&run_format_preflight_query(
-        runner,
-        &["list-sessions", "-F", "#{session_id}"],
-    )?)?;
-    let has_sessions = !sessions.is_empty();
-    for session in sessions {
-        for option in [
-            "status-left",
-            "status-right",
-            "window-status-format",
-            "window-status-current-format",
-        ] {
-            let value = run_format_preflight_query(
-                runner,
-                &["show-option", "-qv", "-t", &session, option],
-            )?;
-            if contains_legacy_statusline_command(&value) {
-                legacy.push(format!("session:{session}:{option}"));
-            }
-        }
-    }
-    if !has_sessions {
-        return Ok(legacy);
-    }
-    let windows = bounded_tmux_targets(&run_format_preflight_query(
-        runner,
-        &["list-windows", "-a", "-F", "#{window_id}"],
-    )?)?;
-    for window in windows {
-        let option = "pane-border-format";
-        let value =
-            run_format_preflight_query(runner, &["show-option", "-wqv", "-t", &window, option])?;
-        if contains_legacy_statusline_command(&value) {
-            legacy.push(format!("window:{window}:{option}"));
-        }
-    }
-    Ok(legacy)
-}
-
-fn run_format_preflight_query(runner: &dyn TmuxRunner, args: &[&str]) -> Result<String> {
-    match runner.run(args) {
-        Ok(output) => Ok(output),
-        #[cfg(test)]
-        Err(error) if error.to_string().contains("no stub registered") => Ok(String::new()),
-        Err(error) => Err(error),
-    }
-}
-
-fn bounded_tmux_targets(output: &str) -> Result<Vec<String>> {
-    const MAX_TARGETS: usize = 4096;
-    let targets = output
-        .lines()
-        .map(str::trim)
-        .filter(|target| !target.is_empty())
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    if targets.len() > MAX_TARGETS {
-        bail!("tmux format preflight target count exceeds {MAX_TARGETS}");
-    }
-    Ok(targets.into_iter().collect())
-}
-
-fn contains_legacy_statusline_command(value: &str) -> bool {
-    let mut rest = value;
-    while let Some(start) = rest.find("#(") {
-        let command = &rest[start + 2..];
-        let Some(end) = command.find(')') else {
-            return false;
-        };
-        let words = command[..end].split_whitespace().collect::<Vec<_>>();
-        if let Some(index) = words.iter().position(|word| {
-            Path::new(word.trim_matches(['\'', '"']))
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| matches!(name, "vt" | "vde-tmux"))
-        }) && words
-            .get(index + 1)
-            .is_some_and(|command| command.trim_matches(['\'', '"']).starts_with("statusline-"))
-        {
-            return true;
-        }
-        rest = &command[end + 1..];
-    }
-    false
-}
-
 fn ensure_private_log_directory(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
@@ -1102,13 +877,6 @@ pub fn ensure_daemon_live_v2_until(
         bail!("daemon is disabled for the current tmux server");
     }
     let incarnation = TmuxServerIncarnation::resolve(runner, env)?;
-    let legacy_formats = inspect_legacy_pull_formats(runner)?;
-    if !legacy_formats.is_empty() {
-        bail!(
-            "legacy pull-based status commands remain in {}; migrate to zero-process daemon push formats",
-            legacy_formats.join(", ")
-        );
-    }
     incarnation.verify(runner, env)?;
     ensure_daemon_live_v2_for_incarnation_until(incarnation, env, explicit_socket, deadline)
 }
@@ -1212,10 +980,9 @@ fn ensure_daemon_live_v2_for_incarnation_until_mode(
             exe.display(),
             socket.display()
         );
-        let _ = append_incarnation_log(
+        let _ = append_daemon_log(
             env,
             &incarnation.hash,
-            "daemon.log",
             &format!("daemon startup failed: {message}"),
         );
         anyhow::Error::new(error).context(message)
@@ -1233,7 +1000,7 @@ fn ensure_daemon_live_v2_for_incarnation_until_mode(
             return Ok((incarnation, socket));
         }
         if let Some(status) = child.try_wait()? {
-            let log_path = incarnation_log_path(env, &incarnation.hash, "daemon.log");
+            let log_path = daemon_log_path(env, &incarnation.hash);
             if let Ok(record) = read_lifecycle_record(env, &incarnation.hash)
                 && let Some(error) = startup_failure_for_generation(&record, startup_generation)
             {
@@ -1248,7 +1015,7 @@ fn ensure_daemon_live_v2_for_incarnation_until_mode(
             );
         }
         if Instant::now() >= deadline {
-            let log_path = incarnation_log_path(env, &incarnation.hash, "daemon.log");
+            let log_path = daemon_log_path(env, &incarnation.hash);
             terminate_timed_out_spawn(
                 &mut child,
                 &child_start_token,
@@ -1304,13 +1071,6 @@ pub fn start_daemon_serving_v2_while_disabled(
 ) -> Result<(TmuxServerIncarnation, PathBuf)> {
     let deadline = Instant::now() + DAEMON_START_TIMEOUT;
     let incarnation = TmuxServerIncarnation::resolve(runner, env)?;
-    let legacy_formats = inspect_legacy_pull_formats(runner)?;
-    if !legacy_formats.is_empty() {
-        bail!(
-            "legacy pull-based status commands remain in {}; migrate to zero-process daemon push formats",
-            legacy_formats.join(", ")
-        );
-    }
     incarnation.verify(runner, env)?;
     let (incarnation, socket) = ensure_daemon_live_v2_for_incarnation_until_mode(
         incarnation,
@@ -2045,10 +1805,9 @@ mod tests {
         let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
         let hash = "a".repeat(64);
 
-        let path = super::append_incarnation_log(
+        let path = super::append_daemon_log(
             &env,
             &hash,
-            "daemon.log",
             &format!(
                 "failure\n{}",
                 "x".repeat(super::MAX_RUNTIME_LOG_LINE_BYTES * 2)
@@ -2083,9 +1842,7 @@ mod tests {
         std::fs::write(&target, "sentinel").unwrap();
         std::os::unix::fs::symlink(&target, directory.join("daemon.log")).unwrap();
 
-        let error =
-            super::append_incarnation_log(&env, &hash, "daemon.log", "must not follow symlink")
-                .unwrap_err();
+        let error = super::append_daemon_log(&env, &hash, "must not follow symlink").unwrap_err();
 
         assert!(error.to_string().contains("regular file"));
         assert_eq!(std::fs::read_to_string(target).unwrap(), "sentinel");
@@ -2188,163 +1945,6 @@ mod tests {
         assert!(!root.join("a").exists());
         assert!(!root.join("b").exists());
         drop(listener);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn legacy_pull_format_detection_is_specific_to_vt_statusline_commands() {
-        assert!(super::contains_legacy_statusline_command(
-            "left #(vt statusline-summary) right"
-        ));
-        assert!(super::contains_legacy_statusline_command(
-            "#(/usr/local/bin/vde-tmux statusline-pane --pane-id %1)"
-        ));
-        assert!(!super::contains_legacy_statusline_command(
-            "#[fg=red] statusline-summary"
-        ));
-        assert!(!super::contains_legacy_statusline_command(
-            "#(other-tool statusline-summary)"
-        ));
-        assert!(!super::contains_legacy_statusline_command(
-            "#(vt project selector)"
-        ));
-    }
-
-    #[test]
-    fn legacy_pull_format_inspection_reports_session_and_window_scope() {
-        let mock = crate::tmux::mock::MockTmuxRunner::new();
-        mock.stub(&["list-sessions", "-F", "#{session_id}"], "$1\n");
-        mock.stub(&["list-windows", "-a", "-F", "#{window_id}"], "@1\n");
-        mock.stub(
-            &["show-option", "-qv", "-t", "$1", "status-right"],
-            "#(vt statusline-summary)\n",
-        );
-        mock.stub(
-            &["show-option", "-wqv", "-t", "@1", "pane-border-format"],
-            "#(/opt/vt statusline-pane --pane-id %1)\n",
-        );
-
-        let findings = super::inspect_legacy_pull_formats(&mock).unwrap();
-
-        assert!(findings.contains(&"session:$1:status-right".to_string()));
-        assert!(findings.contains(&"window:@1:pane-border-format".to_string()));
-        assert_eq!(findings.len(), 2);
-        assert!(mock.calls().iter().all(|args| {
-            !args
-                .iter()
-                .any(|argument| argument == "pane-active-border-format")
-        }));
-    }
-
-    #[test]
-    fn legacy_pull_format_inspection_skips_window_query_on_empty_server() {
-        let mock = crate::tmux::mock::MockTmuxRunner::new();
-        mock.stub(&["list-sessions", "-F", "#{session_id}"], "");
-
-        assert!(
-            super::inspect_legacy_pull_formats(&mock)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            mock.calls()
-                .iter()
-                .all(|args| args.first().map(String::as_str) != Some("list-windows"))
-        );
-    }
-
-    #[test]
-    fn ensure_rejects_legacy_pull_format_before_socket_or_spawn_work() {
-        let root = unique_dir("legacy-preflight-ensure");
-        std::fs::create_dir_all(&root).unwrap();
-        let tmux_socket = root.join("tmux.sock");
-        let listener = UnixListener::bind(&tmux_socket).unwrap();
-        let mock = crate::tmux::mock::MockTmuxRunner::new();
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "#{pid}\t#{start_time}\t#{socket_path}",
-            ],
-            &format!("123\t456\t{}\n", tmux_socket.display()),
-        );
-        mock.stub(&["show-option", "-gqv", super::DISABLED_SERVER_OPTION], "");
-        mock.stub(
-            &["show-option", "-gv", "status-left"],
-            "#(vt statusline-summary)\n",
-        );
-        let env = BTreeMap::from([
-            (
-                "TMUX".to_string(),
-                format!("{},123,0", tmux_socket.display()),
-            ),
-            (
-                "XDG_RUNTIME_DIR".to_string(),
-                root.join("runtime").display().to_string(),
-            ),
-        ]);
-
-        let error = super::ensure_daemon_live_v2_until(
-            &mock,
-            &env,
-            None,
-            Instant::now() + Duration::from_secs(1),
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("global:status-left"));
-        assert!(!root.join("runtime").exists());
-        drop(listener);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn log_tail_is_read_only_bounded_and_rejects_invalid_line_count() {
-        let root = unique_dir("log-tail");
-        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
-        let hash = "f".repeat(64);
-        for line in ["one", "two", "three"] {
-            super::append_incarnation_log(&env, &hash, "daemon.log", line).unwrap();
-        }
-
-        let tail = super::read_incarnation_log_tail(&env, &hash, "daemon.log", 2).unwrap();
-
-        assert_eq!(tail.lines().count(), 2);
-        assert!(tail.contains("two"));
-        assert!(tail.contains("three"));
-        assert!(super::read_incarnation_log_tail(&env, &hash, "daemon.log", 501).is_err());
-        let missing =
-            super::read_incarnation_log_tail(&env, &hash, "notification.log", 10).unwrap();
-        assert!(missing.is_empty());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn operational_health_retains_counters_and_clears_current_degraded_state() {
-        let root = unique_dir("operational-health");
-        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
-        let hash = "8".repeat(64);
-
-        super::record_hook_delivery_failure(&env, &hash, "hook_delivery_timeout").unwrap();
-        super::record_hook_delivery_recovered(&env, &hash).unwrap();
-        super::record_status_push_failure(&env, &hash, "batch failed\nprivate detail").unwrap();
-        super::record_status_push_failure(&env, &hash, "retry failed").unwrap();
-        super::record_status_push_recovered(&env, &hash).unwrap();
-
-        let record = super::read_lifecycle_record(&env, &hash).unwrap();
-        assert_eq!(record.hook_delivery_failures, 1);
-        assert!(!record.hook_delivery_degraded);
-        assert_eq!(
-            record.last_hook_error_code.as_deref(),
-            Some("hook_delivery_timeout")
-        );
-        assert_eq!(record.status_push_failures, 2);
-        assert!(!record.status_push_degraded);
-        assert_eq!(
-            record.last_status_push_error.as_deref(),
-            Some("retry failed")
-        );
-        assert!(record.last_status_push_error_at_epoch_seconds.is_some());
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -11,13 +11,13 @@ pub enum ReductionOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reduction {
-    pub record: Option<StoredPaneRecord>,
+    pub record: Option<PaneState>,
     pub tracker_delta: Option<CaptureTrackerDelta>,
     pub outcome: ReductionOutcome,
 }
 
 impl Reduction {
-    fn unchanged(current: Option<&StoredPaneRecord>) -> Self {
+    fn unchanged(current: Option<&PaneState>) -> Self {
         Self {
             record: current.cloned(),
             tracker_delta: None,
@@ -75,7 +75,7 @@ enum ExistingIdentity {
 }
 
 pub fn reduce(
-    current: Option<&StoredPaneRecord>,
+    current: Option<&PaneState>,
     envelope: &PaneEventEnvelope,
     context: ReductionContext<'_>,
 ) -> Result<Reduction, ReduceError> {
@@ -83,7 +83,7 @@ pub fn reduce(
         .pane_instance
         .validate()
         .map_err(|error| ReduceError::InvalidRequest(error.to_string()))?;
-    if current.is_some_and(|record| record.pane_instance() != &envelope.pane_instance) {
+    if current.is_some_and(|state| state.pane_instance != envelope.pane_instance) {
         return Err(ReduceError::InvalidPaneInstance);
     }
     if envelope.event.is_semantically_empty() {
@@ -104,11 +104,11 @@ pub fn reduce(
 }
 
 fn reduce_internal_state_event(
-    current: Option<&StoredPaneRecord>,
+    current: Option<&PaneState>,
     envelope: &PaneEventEnvelope,
     context: ReductionContext<'_>,
 ) -> Result<Reduction, ReduceError> {
-    let Some(StoredPaneRecord::Active(existing)) = current else {
+    let Some(existing) = current else {
         return match envelope.event {
             PaneEvent::MarkDone { .. } => Err(ReduceError::StaleSelection),
             _ => Ok(Reduction::unchanged(current)),
@@ -155,7 +155,7 @@ fn reduce_internal_state_event(
 }
 
 fn reduce_explicit(
-    current: Option<&StoredPaneRecord>,
+    current: Option<&PaneState>,
     envelope: &PaneEventEnvelope,
     context: ReductionContext<'_>,
 ) -> Result<Reduction, ReduceError> {
@@ -166,13 +166,9 @@ fn reduce_explicit(
         ReduceError::InvalidRequest("explicit event requires an agent session ID".to_string())
     })?;
 
-    let was_reset = matches!(current, Some(StoredPaneRecord::Reset(_)));
-    if was_reset && is_completion(&envelope.event) {
-        return Ok(Reduction::unchanged(current));
-    }
     let mut state = match current {
-        Some(StoredPaneRecord::Active(state)) => state.clone(),
-        Some(StoredPaneRecord::Reset(_)) | None => {
+        Some(state) => state.clone(),
+        None => {
             let Some(mut state) = initial_explicit_state(envelope, context.new_state_id.clone())?
             else {
                 return Ok(Reduction::unchanged(current));
@@ -317,8 +313,9 @@ fn reduce_explicit(
         }
     }
 
-    let identity_changed = state.state_id != existing_state(current).unwrap().state_id
-        || state.agent_epoch != existing_state(current).unwrap().agent_epoch;
+    let existing = current.expect("current state was validated above");
+    let identity_changed =
+        state.state_id != existing.state_id || state.agent_epoch != existing.agent_epoch;
     let mut tracker = if identity_changed || !tracker_matches_epoch {
         reset_tracker_for_state(context.tracker, &state)?
     } else {
@@ -335,7 +332,7 @@ fn reduce_explicit(
 }
 
 fn reduce_observation(
-    current: Option<&StoredPaneRecord>,
+    current: Option<&PaneState>,
     envelope: &PaneEventEnvelope,
     context: ReductionContext<'_>,
 ) -> Result<Reduction, ReduceError> {
@@ -349,22 +346,21 @@ fn reduce_observation(
     else {
         unreachable!();
     };
-    if base.as_ref() != current.map(StoredPaneRecord::descriptor).as_ref()
+    if base.as_ref()
+        != current
+            .map(|state| StoredStateDescriptor::Canonical {
+                version: state.version(),
+            })
+            .as_ref()
         || *tracker_generation != context.tracker.generation
     {
         return Ok(Reduction::unchanged(current));
     }
-    if matches!(current, Some(StoredPaneRecord::Reset(_)))
-        && !matches!(presence, AgentPresenceObservation::Present(_))
-    {
-        return Ok(Reduction::unchanged(current));
-    }
-
     let mut tracker = context.tracker.clone();
     let mut created = false;
     let mut state = match current {
-        Some(StoredPaneRecord::Active(state)) => state.clone(),
-        Some(StoredPaneRecord::Reset(_)) | None => match presence {
+        Some(state) => state.clone(),
+        None => match presence {
             AgentPresenceObservation::Present(agent) => {
                 created = true;
                 new_state(
@@ -488,13 +484,6 @@ fn reduce_observation(
     }
     bump_tracker(&mut tracker)?;
     finish_state_reduction(current, state, tracker, Some(context.tracker))
-}
-
-fn existing_state(current: Option<&StoredPaneRecord>) -> Option<&PaneState> {
-    match current {
-        Some(StoredPaneRecord::Active(state)) => Some(state),
-        _ => None,
-    }
 }
 
 fn initial_explicit_state(
@@ -1181,15 +1170,14 @@ fn bump_tracker(tracker: &mut CaptureTrackerSnapshot) -> Result<(), ReduceError>
 }
 
 fn finish_state_reduction(
-    current: Option<&StoredPaneRecord>,
+    current: Option<&PaneState>,
     mut state: PaneState,
     tracker: CaptureTrackerSnapshot,
     previous_tracker: Option<&CaptureTrackerSnapshot>,
 ) -> Result<Reduction, ReduceError> {
-    let canonical_changed = existing_state(current) != Some(&state)
-        || !matches!(current, Some(StoredPaneRecord::Active(_)));
+    let canonical_changed = current != Some(&state);
     if canonical_changed {
-        state.revision = match existing_state(current) {
+        state.revision = match current {
             Some(existing) => existing
                 .revision
                 .checked_add(1)
@@ -1209,7 +1197,7 @@ fn finish_state_reduction(
         ReductionOutcome::Noop
     };
     Ok(Reduction {
-        record: Some(StoredPaneRecord::Active(state)),
+        record: Some(state),
         tracker_delta: tracker_changed.then_some(CaptureTrackerDelta { next: tracker }),
         outcome,
     })
@@ -1224,7 +1212,6 @@ mod tests {
     use crate::pane_state::resolve_badge;
 
     const STATE_ID: &str = "00112233445566778899aabbccddeeff";
-    const OTHER_STATE_ID: &str = "112233445566778899aabbccddeeff00";
     const EVENT_ID: &str = "102132435465768798a9bacbdcedfe0f";
     const DAEMON_ID: &str = "ffeeddccbbaa99887766554433221100";
 
@@ -1273,14 +1260,17 @@ mod tests {
     }
 
     fn active(result: &Reduction) -> &PaneState {
-        match result.record.as_ref().unwrap() {
-            StoredPaneRecord::Active(state) => state,
-            StoredPaneRecord::Reset(_) => panic!("expected active state"),
+        result.record.as_ref().unwrap()
+    }
+
+    fn descriptor(state: &PaneState) -> StoredStateDescriptor {
+        StoredStateDescriptor::Canonical {
+            version: state.version(),
         }
     }
 
     fn reduce_once(
-        current: Option<&StoredPaneRecord>,
+        current: Option<&PaneState>,
         event: PaneEvent,
         tracker: &CaptureTrackerSnapshot,
     ) -> Reduction {
@@ -1293,7 +1283,7 @@ mod tests {
     }
 
     fn reduce_explicit_once(
-        current: Option<&StoredPaneRecord>,
+        current: Option<&PaneState>,
         agent: &str,
         session: &str,
         event: PaneEvent,
@@ -1306,7 +1296,7 @@ mod tests {
         )
     }
 
-    fn begin(current: Option<&StoredPaneRecord>, tracker: &CaptureTrackerSnapshot) -> Reduction {
+    fn begin(current: Option<&PaneState>, tracker: &CaptureTrackerSnapshot) -> Reduction {
         reduce_once(
             current,
             PaneEvent::BeginRun {
@@ -1328,24 +1318,15 @@ mod tests {
         )
     }
 
-    fn reset_record() -> StoredPaneRecord {
-        StoredPaneRecord::Reset(ResetTombstone {
-            schema_version: PANE_STATE_SCHEMA_VERSION,
-            tombstone_id: ResetTombstoneId::parse(OTHER_STATE_ID).unwrap(),
-            pane_instance: pane(),
-            reset_at: 1,
-        })
-    }
-
     fn observe(
-        current: Option<&StoredPaneRecord>,
+        current: Option<&PaneState>,
         tracker: &CaptureTrackerSnapshot,
         presence: AgentPresenceObservation,
         capture: Option<CaptureObservation>,
         observed_at: i64,
     ) -> Reduction {
         let event = PaneEvent::ObservationBatch {
-            base: current.map(StoredPaneRecord::descriptor),
+            base: current.map(descriptor),
             tracker_generation: tracker.generation,
             observed_at,
             presence,
@@ -1502,29 +1483,6 @@ mod tests {
                 expected_lifecycle,
                 "{name}"
             );
-
-            let reset = reset_record();
-            let after_reset =
-                reduce_explicit_once(Some(&reset), "codex", "session-1", event, &tracker).unwrap();
-            if expected_completed == 1 {
-                assert_eq!(after_reset.record, Some(reset), "{name}");
-                assert_eq!(after_reset.outcome, ReductionOutcome::Noop, "{name}");
-            } else {
-                assert!(
-                    matches!(after_reset.record, Some(StoredPaneRecord::Active(_))),
-                    "{name}"
-                );
-                assert_eq!(
-                    after_reset
-                        .tracker_delta
-                        .as_ref()
-                        .unwrap()
-                        .next
-                        .hook_authoritative,
-                    name == "session",
-                    "{name}"
-                );
-            }
         }
 
         let non_creating = vec![
@@ -1541,26 +1499,11 @@ mod tests {
                 reduce_explicit_once(None, "codex", "session-1", event.clone(), &tracker).unwrap();
             assert_eq!(missing.record, None);
             assert_eq!(missing.outcome, ReductionOutcome::Noop);
-            let reset = reset_record();
-            let after_reset =
-                reduce_explicit_once(Some(&reset), "codex", "session-1", event, &tracker).unwrap();
-            assert_eq!(after_reset.record, Some(reset));
-            assert_eq!(after_reset.outcome, ReductionOutcome::Noop);
         }
 
         let discovered = discover("codex");
         assert!(active(&discovered).scan_verified);
         assert!(active(&discovered).synthetic_completion_armed);
-        let reset = reset_record();
-        let reset_discovered = observe(
-            Some(&reset),
-            &CaptureTrackerSnapshot::default(),
-            AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
-            None,
-            1,
-        );
-        assert!(active(&reset_discovered).scan_verified);
-        assert!(!active(&reset_discovered).synthetic_completion_armed);
     }
 
     #[test]
@@ -1795,9 +1738,7 @@ mod tests {
 
         // Row 5: unbound and absent requires epoch evidence.
         let mut unbound_absent_record = unbound.record.clone().unwrap();
-        let StoredPaneRecord::Active(unbound_absent) = &mut unbound_absent_record else {
-            unreachable!();
-        };
+        let unbound_absent = &mut unbound_absent_record;
         unbound_absent.agent_present = false;
         unbound_absent.synthetic_completion_armed = false;
         let row5 = reduce_explicit_once(
@@ -1959,58 +1900,6 @@ mod tests {
     }
 
     #[test]
-    fn row_four_unarmed_completion_does_not_bind_or_apply_report_fields() {
-        let reset = reset_record();
-        let unarmed = observe(
-            Some(&reset),
-            &CaptureTrackerSnapshot::default(),
-            AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
-            None,
-            1,
-        );
-        let tracker = unarmed.tracker_delta.as_ref().unwrap().next.clone();
-        let original = unarmed.record.clone();
-
-        let completion = reduce_explicit_once(
-            original.as_ref(),
-            "codex",
-            "session-1",
-            PaneEvent::CompleteRun { completed_at: 2 },
-            &tracker,
-        )
-        .unwrap();
-        assert_eq!(completion.record, original);
-        assert!(active(&completion).agent_session_id.is_none());
-
-        let report = reduce_explicit_once(
-            completion.record.as_ref(),
-            "codex",
-            "session-1",
-            PaneEvent::ExplicitStateReported {
-                report: ExplicitStateReport {
-                    observed_at: 3,
-                    lifecycle: Some(ReportedLifecycle::Idle),
-                    started_at: None,
-                    completed_at: Some(3),
-                    prompt: Some(FieldUpdate::Set(PromptState {
-                        text: "must not apply".to_string(),
-                        source: "test".to_string(),
-                    })),
-                    tasks: Some(FieldUpdate::Set(TaskProgress { done: 1, total: 1 })),
-                    subagents: None,
-                    attention: true,
-                },
-            },
-            &tracker,
-        )
-        .unwrap();
-        assert_eq!(report.record, original);
-        assert!(active(&report).agent_session_id.is_none());
-        assert!(active(&report).prompt.is_none());
-        assert_eq!(active(&report).tasks, TaskState::default());
-    }
-
-    #[test]
     fn field_only_report_applies_only_to_exact_present_identity() {
         let discovered = discover("codex");
         let begun = reduce_explicit_once(
@@ -2087,17 +1976,6 @@ mod tests {
         .unwrap();
         assert_eq!(missing.outcome, ReductionOutcome::Noop);
         assert!(missing.record.is_none());
-
-        let reset = reset_record();
-        let reset_result = reduce_explicit_once(
-            Some(&reset),
-            "codex",
-            "session",
-            field_report.clone(),
-            &CaptureTrackerSnapshot::default(),
-        )
-        .unwrap();
-        assert_eq!(reset_result.record, Some(reset));
 
         let unbound = discover("codex");
         let unbound_result = reduce_explicit_once(
@@ -2315,7 +2193,7 @@ mod tests {
         );
         let before_explicit = first_absence.tracker_delta.as_ref().unwrap().next.clone();
         assert_eq!(before_explicit.absence_count, 1);
-        let old_base = first_absence.record.as_ref().unwrap().descriptor();
+        let old_base = descriptor(first_absence.record.as_ref().unwrap());
         let progress = reduce_explicit_once(
             first_absence.record.as_ref(),
             "codex",
@@ -2372,7 +2250,7 @@ mod tests {
     fn descriptor_and_tracker_boundaries_reject_stale_observations() {
         let initial = discover("codex");
         let initial_tracker = initial.tracker_delta.as_ref().unwrap().next.clone();
-        let old_descriptor = initial.record.as_ref().unwrap().descriptor();
+        let old_descriptor = descriptor(initial.record.as_ref().unwrap());
         let changed = reduce_explicit_once(
             initial.record.as_ref(),
             "codex",
@@ -2418,7 +2296,7 @@ mod tests {
         assert_eq!(rejected.tracker_delta, None);
 
         let stale_generation = PaneEvent::ObservationBatch {
-            base: changed.record.as_ref().map(StoredPaneRecord::descriptor),
+            base: changed.record.as_ref().map(descriptor),
             tracker_generation: initial_tracker.generation,
             observed_at: 3,
             presence: AgentPresenceObservation::Absent,
@@ -2432,119 +2310,6 @@ mod tests {
         .unwrap();
         assert_eq!(rejected.outcome, ReductionOutcome::Noop);
         assert_eq!(rejected.tracker_delta, None);
-
-        let reset_a = reset_record();
-        let old_reset_descriptor = reset_a.descriptor();
-        let reset_b = StoredPaneRecord::Reset(ResetTombstone {
-            schema_version: PANE_STATE_SCHEMA_VERSION,
-            tombstone_id: ResetTombstoneId::parse(EVENT_ID).unwrap(),
-            pane_instance: pane(),
-            reset_at: 2,
-        });
-        let stale_reset = PaneEvent::ObservationBatch {
-            base: Some(old_reset_descriptor),
-            tracker_generation: 0,
-            observed_at: 3,
-            presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
-            capture: None,
-        };
-        let rejected = reduce(
-            Some(&reset_b),
-            &observation_envelope(stale_reset),
-            context(
-                &CaptureTrackerSnapshot::default(),
-                &VisibilitySnapshot::default(),
-            ),
-        )
-        .unwrap();
-        assert_eq!(rejected.record, Some(reset_b));
-        assert_eq!(rejected.tracker_delta, None);
-
-        let stale_active_to_reset = PaneEvent::ObservationBatch {
-            base: changed.record.as_ref().map(StoredPaneRecord::descriptor),
-            tracker_generation: 0,
-            observed_at: 3,
-            presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
-            capture: None,
-        };
-        let rejected = reduce(
-            Some(&reset_record()),
-            &observation_envelope(stale_active_to_reset),
-            context(
-                &CaptureTrackerSnapshot::default(),
-                &VisibilitySnapshot::default(),
-            ),
-        )
-        .unwrap();
-        assert_eq!(rejected.outcome, ReductionOutcome::Noop);
-        assert_eq!(rejected.tracker_delta, None);
-    }
-
-    #[test]
-    fn reset_recreation_and_new_epoch_clear_old_tracker_state() {
-        let reset = reset_record();
-        let dirty_tracker = CaptureTrackerSnapshot {
-            generation: 7,
-            epoch: Some((StateId::parse(OTHER_STATE_ID).unwrap(), 9)),
-            hook_authoritative: true,
-            absence_count: 1,
-            replacement_kind: Some(AgentKind::parse("claude").unwrap()),
-            replacement_streak: 2,
-            fingerprint: Some([1; 32]),
-            last_change_at: Some(1),
-            rebaseline_pending: true,
-        };
-        let recreated = observe(
-            Some(&reset),
-            &dirty_tracker,
-            AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
-            Some(CaptureObservation {
-                inference: CaptureInference::ActivityObserved,
-                observed_fingerprint: Some([2; 32]),
-            }),
-            10,
-        );
-        let state = active(&recreated);
-        let tracker = &recreated.tracker_delta.as_ref().unwrap().next;
-        assert_eq!(
-            tracker.epoch,
-            Some((state.state_id.clone(), state.agent_epoch))
-        );
-        assert_eq!(tracker.generation, 8);
-        assert_eq!(tracker.absence_count, 0);
-        assert_eq!(tracker.replacement_kind, None);
-        assert_eq!(tracker.replacement_streak, 0);
-        assert!(!tracker.hook_authoritative);
-        assert_eq!(tracker.fingerprint, Some([2; 32]));
-        assert_eq!(tracker.last_change_at, Some(10));
-        assert!(!tracker.rebaseline_pending);
-        assert!(matches!(state.lifecycle, LifecycleState::Idle));
-
-        let mut dirty_again = tracker.clone();
-        dirty_again.absence_count = 1;
-        dirty_again.replacement_kind = Some(AgentKind::parse("claude").unwrap());
-        dirty_again.replacement_streak = 2;
-        dirty_again.fingerprint = Some([3; 32]);
-        let new_epoch = reduce_explicit_once(
-            recreated.record.as_ref(),
-            "claude",
-            "session-2",
-            PaneEvent::AgentSessionStarted {
-                observed_at: 11,
-                source: AgentSessionSource::Startup,
-                resumed_prompt: None,
-            },
-            &dirty_again,
-        )
-        .unwrap();
-        let tracker = &new_epoch.tracker_delta.as_ref().unwrap().next;
-        assert_eq!(tracker.absence_count, 0);
-        assert_eq!(tracker.replacement_kind, None);
-        assert_eq!(tracker.replacement_streak, 0);
-        assert!(tracker.hook_authoritative);
-        assert_eq!(tracker.fingerprint, None);
-        assert_eq!(tracker.last_change_at, None);
-        assert!(!tracker.rebaseline_pending);
     }
 
     #[test]
@@ -2862,10 +2627,8 @@ mod tests {
             },
             &tracker,
         );
-        if let StoredPaneRecord::Active(state) = discovered.record.as_mut().unwrap() {
-            state.scan_verified = true;
-        }
-        let base = discovered.record.as_ref().unwrap().descriptor();
+        discovered.record.as_mut().unwrap().scan_verified = true;
+        let base = descriptor(discovered.record.as_ref().unwrap());
         let first_tracker = discovered.tracker_delta.as_ref().unwrap().next.clone();
         let first = reduce_once(
             discovered.record.as_ref(),
@@ -2883,7 +2646,7 @@ mod tests {
         let second = reduce_once(
             first.record.as_ref(),
             PaneEvent::ObservationBatch {
-                base: Some(first.record.as_ref().unwrap().descriptor()),
+                base: Some(descriptor(first.record.as_ref().unwrap())),
                 tracker_generation: second_tracker.generation,
                 observed_at: 3,
                 presence: AgentPresenceObservation::Absent,
@@ -3251,7 +3014,7 @@ mod tests {
             text: "preserved prompt".to_string(),
             source: "user".to_string(),
         });
-        let idle = StoredPaneRecord::Active(idle);
+        let idle = idle;
         let activity = observe(
             Some(&idle),
             &baseline.tracker_delta.as_ref().unwrap().next,
@@ -3288,7 +3051,7 @@ mod tests {
         overflow.completed_seq = u64::MAX;
         overflow.acknowledged_seq = u64::MAX;
         overflow.completed_at = Some(2);
-        let record = StoredPaneRecord::Active(overflow);
+        let record = overflow;
         let error = reduce(
             Some(&record),
             &envelope(PaneEvent::BeginRun {
@@ -3305,9 +3068,7 @@ mod tests {
     fn unknown_observation_breaks_absence_streak() {
         let tracker = CaptureTrackerSnapshot::default();
         let mut begun = begin(None, &tracker);
-        let StoredPaneRecord::Active(state) = begun.record.as_mut().unwrap() else {
-            unreachable!();
-        };
+        let state = begun.record.as_mut().unwrap();
         state.scan_verified = true;
         let mut current = begun.record;
         let mut current_tracker = begun.tracker_delta.unwrap().next;
@@ -3319,7 +3080,7 @@ mod tests {
             let result = reduce_once(
                 current.as_ref(),
                 PaneEvent::ObservationBatch {
-                    base: Some(current.as_ref().unwrap().descriptor()),
+                    base: Some(descriptor(current.as_ref().unwrap())),
                     tracker_generation: current_tracker.generation,
                     observed_at: 2,
                     presence,
@@ -3330,9 +3091,7 @@ mod tests {
             current = result.record;
             current_tracker = result.tracker_delta.unwrap().next;
         }
-        let StoredPaneRecord::Active(state) = current.unwrap() else {
-            unreachable!();
-        };
+        let state = current.unwrap();
         assert!(state.agent_present);
         assert_eq!(current_tracker.absence_count, 1);
     }
@@ -3362,7 +3121,7 @@ mod tests {
         let result = reduce_once(
             completed.record.as_ref(),
             PaneEvent::ObservationBatch {
-                base: Some(completed.record.as_ref().unwrap().descriptor()),
+                base: Some(descriptor(completed.record.as_ref().unwrap())),
                 tracker_generation: pending.generation,
                 observed_at: 3,
                 presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
@@ -3380,16 +3139,14 @@ mod tests {
     fn stale_capture_completion_uses_current_capture_as_baseline() {
         let tracker = CaptureTrackerSnapshot::default();
         let mut begun = begin(None, &tracker);
-        let StoredPaneRecord::Active(state) = begun.record.as_mut().unwrap() else {
-            unreachable!();
-        };
+        let state = begun.record.as_mut().unwrap();
         state.scan_verified = true;
         let mut capture_tracker = begun.tracker_delta.unwrap().next;
         capture_tracker.fingerprint = Some([1; 32]);
         let result = reduce_once(
             begun.record.as_ref(),
             PaneEvent::ObservationBatch {
-                base: Some(begun.record.as_ref().unwrap().descriptor()),
+                base: Some(descriptor(begun.record.as_ref().unwrap())),
                 tracker_generation: capture_tracker.generation,
                 observed_at: 301,
                 presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
@@ -3441,42 +3198,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_rejects_delayed_completion() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let reset = reset_record();
-        let visibility = VisibilitySnapshot::default();
-        for event in [
-            PaneEvent::CompleteRun { completed_at: 2 },
-            PaneEvent::ExplicitStateReported {
-                report: ExplicitStateReport {
-                    observed_at: 2,
-                    lifecycle: Some(ReportedLifecycle::Idle),
-                    started_at: None,
-                    completed_at: Some(2),
-                    prompt: None,
-                    tasks: None,
-                    subagents: None,
-                    attention: false,
-                },
-            },
-        ] {
-            let result = reduce(
-                Some(&reset),
-                &envelope(event),
-                ReductionContext {
-                    done_clear_on: crate::config::DoneClearOn::Pane,
-                    visibility: &visibility,
-                    tracker: &tracker,
-                    new_state_id: None,
-                },
-            )
-            .expect("delayed completion after reset must not require a state ID");
-            assert_eq!(result.record, Some(reset.clone()));
-            assert_eq!(result.outcome, ReductionOutcome::Noop);
-        }
-    }
-
-    #[test]
     fn mark_done_uses_full_version_guard() {
         let tracker = CaptureTrackerSnapshot::default();
         let begun = begin(None, &tracker);
@@ -3510,7 +3231,7 @@ mod tests {
         fn valid_begin_complete_ack_sequences_preserve_invariants(
             operations in prop::collection::vec(0_u8..11, 0..128),
         ) {
-            let mut current: Option<StoredPaneRecord> = None;
+            let mut current: Option<PaneState> = None;
             let mut tracker = CaptureTrackerSnapshot::default();
             for (index, operation) in operations.into_iter().enumerate() {
                 let timestamp = index as i64 + 1;
@@ -3527,7 +3248,7 @@ mod tests {
                     },
                     4 => PaneEvent::CompleteRun { completed_at: timestamp },
                     5 => {
-                        let Some(StoredPaneRecord::Active(state)) = current.as_ref() else {
+                        let Some(state) = current.as_ref() else {
                             continue;
                         };
                         PaneEvent::AcknowledgeView {
@@ -3558,7 +3279,7 @@ mod tests {
                     },
                     9 => report(Some(ReportedLifecycle::Running)),
                     _ => {
-                        let Some(StoredPaneRecord::Active(state)) = current.as_ref() else {
+                        let Some(state) = current.as_ref() else {
                             continue;
                         };
                         PaneEvent::MarkDone {
@@ -3577,10 +3298,10 @@ mod tests {
                     tracker = delta.next;
                 }
                 current = result.record;
-                if let Some(StoredPaneRecord::Active(state)) = current.as_ref() {
+                if let Some(state) = current.as_ref() {
                     prop_assert!(state.validate().is_ok());
                     prop_assert!(state.run_seq - state.completed_seq <= 1);
-                    if let Some(StoredPaneRecord::Active(previous)) = previous.as_ref() {
+                    if let Some(previous) = previous.as_ref() {
                         if previous.state_id == state.state_id {
                             prop_assert!(state.revision >= previous.revision);
                         }

@@ -2154,6 +2154,40 @@ mod tests {
         }
     }
 
+    fn chat_row(id: &str, label: &str, rollup: RollupLevel, badge: BadgeState) -> SidebarRow {
+        let mut row = row(id, SidebarRowKind::Chat, 0, label, rollup);
+        row.badge_state = Some(badge);
+        row
+    }
+
+    fn repo_row(label: &str, rollup: RollupLevel) -> SidebarRow {
+        row(
+            &format!("repo::misc::{label}"),
+            SidebarRowKind::Repo,
+            0,
+            label,
+            rollup,
+        )
+    }
+
+    fn category_row(label: &str, rollup: RollupLevel) -> SidebarRow {
+        row(
+            &format!("category::{label}"),
+            SidebarRowKind::Category,
+            0,
+            label,
+            rollup,
+        )
+    }
+
+    fn detail_row(id: &str, label: &str, rollup: RollupLevel) -> SidebarRow {
+        row(id, SidebarRowKind::Detail, 1, label, rollup)
+    }
+
+    fn jump_row(id: &str, label: &str, rollup: RollupLevel) -> SidebarRow {
+        row(id, SidebarRowKind::Jump, 2, label, rollup)
+    }
+
     fn assert_span_fg(spans: &[Span<'_>], content: &str, color: Color) {
         assert!(
             spans
@@ -2275,14 +2309,12 @@ mod tests {
 
     #[test]
     fn dense_tier_renders_one_line_per_chat_with_origin_abbrev() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "claude: fix the bug",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("claude".to_string()),
@@ -2299,14 +2331,12 @@ mod tests {
 
     #[test]
     fn dense_tier_renders_badge_glyph_in_status_color() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "claude: fix the bug",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("claude".to_string()),
@@ -2328,14 +2358,12 @@ mod tests {
 
     #[test]
     fn micro_tier_renders_glyph_and_status_only() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex",
             RollupLevel::Permission,
+            BadgeState::Blocked,
         );
-        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Blocked);
         chat.expanded = false;
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 8);
@@ -2345,30 +2373,24 @@ mod tests {
 
     #[test]
     fn rail_renders_counts_then_rows() {
-        let mut blocked1 = row(
+        let blocked1 = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex",
             RollupLevel::Permission,
+            BadgeState::Blocked,
         );
-        blocked1.badge_state = Some(crate::daemon::session_badge::BadgeState::Blocked);
-        let mut blocked2 = row(
+        let blocked2 = chat_row(
             "chat::%2",
-            SidebarRowKind::Chat,
-            0,
             "claude",
             RollupLevel::Permission,
+            BadgeState::Blocked,
         );
-        blocked2.badge_state = Some(crate::daemon::session_badge::BadgeState::Blocked);
-        let mut working = row(
+        let working = chat_row(
             "chat::%3",
-            SidebarRowKind::Chat,
-            0,
             "opencode",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        working.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
 
         let rendered = render_rows(&[blocked1, blocked2, working], &SidebarState::default(), 3);
 
@@ -2379,15 +2401,12 @@ mod tests {
     fn rail_uses_explicit_overflow_marker_for_double_digit_counts() {
         let rows = (0..10)
             .map(|index| {
-                let mut chat = row(
+                chat_row(
                     &format!("chat::%{index}"),
-                    SidebarRowKind::Chat,
-                    0,
                     "codex",
                     RollupLevel::Running,
-                );
-                chat.badge_state = Some(BadgeState::Working);
-                chat
+                    BadgeState::Working,
+                )
             })
             .collect::<Vec<_>>();
 
@@ -2409,13 +2428,7 @@ mod tests {
         chat.badge_state = Some(BadgeState::Working);
         chat.expanded = true;
         chat.pane_id = Some("%1".to_string());
-        let mut jump = row(
-            "jump::%1",
-            SidebarRowKind::Jump,
-            2,
-            "jump",
-            RollupLevel::Running,
-        );
+        let mut jump = jump_row("jump::%1", "jump", RollupLevel::Running);
         jump.badge_state = Some(BadgeState::Working);
         jump.pane_id = Some("%1".to_string());
 
@@ -2439,10 +2452,8 @@ mod tests {
             elapsed_secs: Some(60),
             ..Default::default()
         });
-        let detail = row(
+        let detail = detail_row(
             "detail::%1::task::0::in_progress",
-            SidebarRowKind::Detail,
-            1,
             "\u{2514} ● Task - Build",
             RollupLevel::Running,
         );
@@ -2485,14 +2496,12 @@ mod tests {
 
     #[test]
     fn render_rows_uses_rail_for_narrow_width() {
-        let mut chat = row(
+        let chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex %1",
             RollupLevel::Permission,
+            BadgeState::Blocked,
         );
-        chat.badge_state = Some(BadgeState::Blocked);
         let rows = vec![chat];
         let rendered = render_rows(&rows, &SidebarState::default(), 2);
         assert_eq!(rendered, "▲1\n──\n ▲");
@@ -2500,13 +2509,7 @@ mod tests {
 
     #[test]
     fn render_repo_row_includes_git_badge() {
-        let mut repo = row(
-            "repo::misc::app",
-            SidebarRowKind::Repo,
-            0,
-            "app",
-            RollupLevel::Running,
-        );
+        let mut repo = repo_row("app", RollupLevel::Running);
         repo.git = Some(crate::git::GitBadge {
             branch: "main".to_string(),
             ahead: 2,
@@ -2520,13 +2523,7 @@ mod tests {
 
     #[test]
     fn render_repo_row_omits_zero_git_counts() {
-        let mut repo = row(
-            "repo::misc::app",
-            SidebarRowKind::Repo,
-            0,
-            "app",
-            RollupLevel::Idle,
-        );
+        let mut repo = repo_row("app", RollupLevel::Idle);
         repo.git = Some(crate::git::GitBadge {
             branch: "main".to_string(),
             ahead: 0,
@@ -2542,25 +2539,13 @@ mod tests {
 
     #[test]
     fn render_lines_color_rollup_category_selection_and_git_badges() {
-        let mut repo = row(
-            "repo::misc::app",
-            SidebarRowKind::Repo,
-            0,
-            "app",
-            RollupLevel::Running,
-        );
+        let mut repo = repo_row("app", RollupLevel::Running);
         repo.git = Some(crate::git::GitBadge {
             branch: "main".to_string(),
             ahead: 2,
             behind: 1,
         });
-        let category = row(
-            "category::misc",
-            SidebarRowKind::Category,
-            0,
-            "misc",
-            RollupLevel::Idle,
-        );
+        let category = category_row("misc", RollupLevel::Idle);
         let state = SidebarState {
             selection: Some("repo::misc::app".to_string()),
             ..SidebarState::default()
@@ -2612,13 +2597,7 @@ mod tests {
     #[test]
     fn category_and_repo_rows_use_distinct_colors() {
         let theme = SidebarRenderTheme::default();
-        let category = row(
-            "category::misc",
-            SidebarRowKind::Category,
-            0,
-            "misc",
-            RollupLevel::Idle,
-        );
+        let category = category_row("misc", RollupLevel::Idle);
         let repo = row(
             "repo::misc::app",
             SidebarRowKind::Repo,
@@ -2710,13 +2689,7 @@ sidebar:
 
     #[test]
     fn category_row_label_omits_diamond_in_every_tier() {
-        let category = row(
-            "category::dev",
-            SidebarRowKind::Category,
-            0,
-            "dev",
-            RollupLevel::Idle,
-        );
+        let category = category_row("dev", RollupLevel::Idle);
 
         let standard = render_rows(
             std::slice::from_ref(&category),
@@ -2732,13 +2705,7 @@ sidebar:
 
     #[test]
     fn category_row_fills_remaining_width_with_rule() {
-        let mut category = row(
-            "category::dev",
-            SidebarRowKind::Category,
-            0,
-            "dev",
-            RollupLevel::Idle,
-        );
+        let mut category = category_row("dev", RollupLevel::Idle);
         category.meta = Some(crate::sidebar::tree::RowMeta {
             attention_count: Some(1),
             ..Default::default()
@@ -2774,13 +2741,7 @@ sidebar:
 
     #[test]
     fn active_rows_render_left_bar_without_chat_bg() {
-        let mut category = row(
-            "category::dev",
-            SidebarRowKind::Category,
-            0,
-            "dev",
-            RollupLevel::Idle,
-        );
+        let mut category = category_row("dev", RollupLevel::Idle);
         category.active = true;
         let mut chat = row(
             "chat::%1",
@@ -2885,13 +2846,7 @@ sidebar:
 
     #[test]
     fn jump_row_renders_action_buttons() {
-        let jump = row(
-            "jump::%1",
-            SidebarRowKind::Jump,
-            2,
-            "jump",
-            RollupLevel::Running,
-        );
+        let jump = jump_row("jump::%1", "jump", RollupLevel::Running);
 
         let rendered = render_rows(std::slice::from_ref(&jump), &SidebarState::default(), 80);
 
@@ -2945,13 +2900,7 @@ sidebar:
 
     #[test]
     fn jump_row_hit_test_maps_columns_to_actions() {
-        let jump = row(
-            "jump::%1",
-            SidebarRowKind::Jump,
-            2,
-            "jump",
-            RollupLevel::Running,
-        );
+        let jump = jump_row("jump::%1", "jump", RollupLevel::Running);
 
         // " " + indent(4) + "└ " => actions start at 7.
         // "↗ Jump"(7..13) · "⌕ Preview"(16..25) · "✓ Complete"(28..38)
@@ -2991,13 +2940,7 @@ sidebar:
 
     #[test]
     fn category_row_never_renders_badge_glyph() {
-        let mut category = row(
-            "category::dev",
-            SidebarRowKind::Category,
-            0,
-            "dev",
-            RollupLevel::Permission,
-        );
+        let mut category = category_row("dev", RollupLevel::Permission);
         category.badge_state = Some(BadgeState::Blocked);
 
         let lines = render_lines(
@@ -3494,14 +3437,12 @@ sidebar:
 
     #[test]
     fn chat_rows_render_badge_glyph_and_omit_trailing_status_text() {
-        let mut chat = row(
+        let chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex (%1)",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Working);
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 80);
 
@@ -3511,14 +3452,12 @@ sidebar:
 
     #[test]
     fn colorize_follows_ideal_multi_tone_scheme() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "claude: fix flicker",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(BadgeState::Working);
         chat.active = true;
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
@@ -3526,20 +3465,8 @@ sidebar:
             elapsed_secs: Some(780),
             ..Default::default()
         });
-        let detail = row(
-            "detail::%1::note",
-            SidebarRowKind::Detail,
-            1,
-            "plain detail",
-            RollupLevel::Running,
-        );
-        let prompt_detail = row(
-            "detail::%1::prompt",
-            SidebarRowKind::Detail,
-            1,
-            "fix flicker",
-            RollupLevel::Running,
-        );
+        let detail = detail_row("detail::%1::note", "plain detail", RollupLevel::Running);
+        let prompt_detail = detail_row("detail::%1::prompt", "fix flicker", RollupLevel::Running);
         let lines = render_lines(
             &[chat, detail, prompt_detail],
             &SidebarState::default(),
@@ -3613,24 +3540,18 @@ sidebar:
     fn task_detail_rows_colorize_status_icons() {
         let theme = SidebarRenderTheme::default();
         let rows = vec![
-            row(
+            detail_row(
                 "detail::%1::task::0::completed",
-                SidebarRowKind::Detail,
-                1,
                 "\u{251c} ✓ Task - Explore",
                 RollupLevel::Running,
             ),
-            row(
+            detail_row(
                 "detail::%1::task::1::in_progress",
-                SidebarRowKind::Detail,
-                1,
                 "\u{251c} ● Task - Build",
                 RollupLevel::Running,
             ),
-            row(
+            detail_row(
                 "detail::%1::task::2::pending",
-                SidebarRowKind::Detail,
-                1,
                 "\u{2514} ○ Task - Verify",
                 RollupLevel::Running,
             ),
@@ -3648,10 +3569,8 @@ sidebar:
     #[test]
     fn subagent_detail_rows_colorize_label_and_id() {
         let theme = SidebarRenderTheme::default();
-        let detail = row(
+        let detail = detail_row(
             "detail::%1::subagent::0",
-            SidebarRowKind::Detail,
-            1,
             "\u{2514} Agent - Explore #sub1",
             RollupLevel::Running,
         );
@@ -3666,13 +3585,7 @@ sidebar:
     #[test]
     fn worktree_detail_row_uses_worktree_color() {
         let theme = SidebarRenderTheme::default();
-        let detail = row(
-            "detail::%1::worktree",
-            SidebarRowKind::Detail,
-            1,
-            "+ feature",
-            RollupLevel::Running,
-        );
+        let detail = detail_row("detail::%1::worktree", "+ feature", RollupLevel::Running);
 
         let lines = render_lines(&[detail], &SidebarState::default(), 60, &theme);
 
@@ -3682,10 +3595,8 @@ sidebar:
     #[test]
     fn worktree_activity_detail_row_uses_worktree_activity_color() {
         let theme = SidebarRenderTheme::default();
-        let detail = row(
+        let detail = detail_row(
             "detail::%1::worktree-activity",
-            SidebarRowKind::Detail,
-            1,
             "vw exec feature",
             RollupLevel::Running,
         );
@@ -3698,13 +3609,7 @@ sidebar:
     #[test]
     fn prompt_detail_row_keeps_reset_color() {
         let theme = SidebarRenderTheme::default();
-        let detail = row(
-            "detail::%1::prompt",
-            SidebarRowKind::Detail,
-            1,
-            "fix flicker",
-            RollupLevel::Running,
-        );
+        let detail = detail_row("detail::%1::prompt", "fix flicker", RollupLevel::Running);
 
         let lines = render_lines(&[detail], &SidebarState::default(), 60, &theme);
 
@@ -3713,10 +3618,8 @@ sidebar:
 
     #[test]
     fn narrow_width_truncates_task_detail_without_panicking() {
-        let detail = row(
+        let detail = detail_row(
             "detail::%1::task::0::in_progress",
-            SidebarRowKind::Detail,
-            1,
             "\u{2514} ● Task - Implement an extremely long task label",
             RollupLevel::Running,
         );
@@ -3728,14 +3631,12 @@ sidebar:
 
     #[test]
     fn expanded_chat_row_right_aligns_state_and_time_with_state_color() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(BadgeState::Working);
         chat.expanded = true;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
@@ -3786,22 +3687,19 @@ sidebar:
         ];
 
         for (badge, rollup, expected) in cases {
-            let mut chat = row("chat::%1", SidebarRowKind::Chat, 0, "codex", rollup);
-            chat.badge_state = Some(badge);
+            let chat = chat_row("chat::%1", "codex", rollup, badge);
             assert_eq!(expanded_chat_state_label(&chat).as_deref(), Some(expected));
         }
     }
 
     #[test]
     fn expanded_chat_row_keeps_wait_reason_context_muted() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex",
             RollupLevel::Permission,
+            BadgeState::Blocked,
         );
-        chat.badge_state = Some(BadgeState::Blocked);
         chat.expanded = true;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
@@ -3828,14 +3726,7 @@ sidebar:
 
     #[test]
     fn expanded_idle_chat_row_right_aligns_completed_age() {
-        let mut chat = row(
-            "chat::%1",
-            SidebarRowKind::Chat,
-            0,
-            "codex",
-            RollupLevel::Idle,
-        );
-        chat.badge_state = Some(BadgeState::Idle);
+        let mut chat = chat_row("chat::%1", "codex", RollupLevel::Idle, BadgeState::Idle);
         chat.expanded = true;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
@@ -3856,14 +3747,7 @@ sidebar:
 
     #[test]
     fn expanded_done_chat_row_right_aligns_done_age_with_done_color() {
-        let mut chat = row(
-            "chat::%1",
-            SidebarRowKind::Chat,
-            0,
-            "codex",
-            RollupLevel::Idle,
-        );
-        chat.badge_state = Some(BadgeState::Done);
+        let mut chat = chat_row("chat::%1", "codex", RollupLevel::Idle, BadgeState::Done);
         chat.expanded = true;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
@@ -3888,13 +3772,7 @@ sidebar:
 
     #[test]
     fn repo_branch_is_rendered_in_branch_color() {
-        let mut repo = row(
-            "repo::misc::app",
-            SidebarRowKind::Repo,
-            0,
-            "app",
-            RollupLevel::Running,
-        );
+        let mut repo = repo_row("app", RollupLevel::Running);
         repo.git = Some(crate::git::GitBadge {
             branch: "main".to_string(),
             ahead: 0,
@@ -3923,14 +3801,7 @@ sidebar:
 
     #[test]
     fn rail_uses_badge_glyphs() {
-        let mut chat = row(
-            "chat::%1",
-            SidebarRowKind::Chat,
-            0,
-            "codex",
-            RollupLevel::Idle,
-        );
-        chat.badge_state = Some(crate::daemon::session_badge::BadgeState::Done);
+        let chat = chat_row("chat::%1", "codex", RollupLevel::Idle, BadgeState::Done);
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 2);
 
@@ -4101,14 +3972,12 @@ badge:
 
     #[test]
     fn selected_chat_has_a_selection_bar_marker_in_every_width_tier() {
-        let mut chat = row(
+        let chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(BadgeState::Working);
         let state = SidebarState {
             selection: Some("chat::%1".to_string()),
             ..SidebarState::default()
@@ -4140,15 +4009,8 @@ badge:
             ..SidebarState::default()
         };
         for label in ["Codex: fix sidebar", "Codex: 修正確認", "Codex: fix 🧭✨"] {
-            let mut chat = row(
-                "chat::%1",
-                SidebarRowKind::Chat,
-                0,
-                label,
-                RollupLevel::Running,
-            );
+            let mut chat = chat_row("chat::%1", label, RollupLevel::Running, BadgeState::Working);
             chat.expanded = false;
-            chat.badge_state = Some(BadgeState::Working);
             chat.pane_id = Some("%1".to_string());
             chat.meta = Some(crate::sidebar::tree::RowMeta {
                 agent: Some("codex".to_string()),
@@ -4335,14 +4197,12 @@ badge:
 
     #[test]
     fn closed_chat_task_progress_with_zero_done_uses_working_color() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex: implement sidebar task colors",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(BadgeState::Working);
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
@@ -4361,14 +4221,12 @@ badge:
 
     #[test]
     fn closed_chat_selection_styles_both_digest_lines() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex: review PR",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(BadgeState::Working);
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
@@ -4401,14 +4259,12 @@ badge:
 
     #[test]
     fn closed_chat_completed_state_matches_expanded_state_appearance() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex: review PR",
             RollupLevel::Idle,
+            BadgeState::Done,
         );
-        chat.badge_state = Some(BadgeState::Done);
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
@@ -4429,14 +4285,12 @@ badge:
 
     #[test]
     fn standard_boundary_switches_closed_chat_from_dense_to_digest() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex: review PR",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(BadgeState::Working);
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
@@ -4461,14 +4315,12 @@ badge:
 
     #[test]
     fn closed_chat_digest_truncates_long_right_tokens_to_width() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex: review very long sidebar prompt",
             RollupLevel::Permission,
+            BadgeState::Blocked,
         );
-        chat.badge_state = Some(BadgeState::Blocked);
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
@@ -4496,14 +4348,12 @@ badge:
 
     #[test]
     fn chat_row_shows_elapsed_when_running() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex: fix",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(BadgeState::Working);
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             elapsed_secs: Some(815),
@@ -4515,14 +4365,12 @@ badge:
 
     #[test]
     fn chat_row_shows_completed_age_when_done() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex: fix",
             RollupLevel::Idle,
+            BadgeState::Done,
         );
-        chat.badge_state = Some(BadgeState::Done);
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             completed_age_secs: Some(815),
@@ -4546,14 +4394,12 @@ badge:
 
     #[test]
     fn chat_row_shows_completed_age_when_idle() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex: fix",
             RollupLevel::Idle,
+            BadgeState::Idle,
         );
-        chat.badge_state = Some(BadgeState::Idle);
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             completed_age_secs: Some(815),
@@ -4572,14 +4418,12 @@ badge:
 
     #[test]
     fn expanded_chat_row_uses_full_elapsed_right_label() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex: fix",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(BadgeState::Working);
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             elapsed_secs: Some(780),
@@ -4599,14 +4443,12 @@ badge:
 
     #[test]
     fn long_cjk_label_is_truncated_with_ellipsis_keeping_right_column() {
-        let mut chat = row(
+        let mut chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex: 日本語のとても長いプロンプトを表示する",
             RollupLevel::Permission,
+            BadgeState::Blocked,
         );
-        chat.badge_state = Some(BadgeState::Blocked);
         chat.expanded = false;
         let rendered = render_rows(&[chat], &SidebarState::default(), 24);
         assert!(rendered.contains('…'), "{rendered:?}");
@@ -4616,14 +4458,12 @@ badge:
 
     #[test]
     fn badge_glyph_is_rendered_in_badge_color_span() {
-        let mut chat = row(
+        let chat = chat_row(
             "chat::%1",
-            SidebarRowKind::Chat,
-            0,
             "codex",
             RollupLevel::Running,
+            BadgeState::Working,
         );
-        chat.badge_state = Some(BadgeState::Working);
         let lines = render_lines(
             &[chat],
             &SidebarState::default(),

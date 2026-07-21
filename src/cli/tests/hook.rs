@@ -102,18 +102,17 @@ fn generic_emit_requires_session_id_before_tmux_access() {
 }
 
 #[test]
-fn codex_legacy_notify_is_rejected_before_tmux_access() {
+fn codex_legacy_notify_is_ignored_before_tmux_access() {
     let mock = MockTmuxRunner::new();
-    let error = run_with_input_at(
+    run_with_input_at(
         ["vt", "hook", "codex", r#"{"type":"agent-turn-complete"}"#],
         "",
         &mock,
         &BTreeMap::new(),
         1_700_000_000,
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(error.to_string().contains("UnsupportedLegacyNotify"));
     assert!(mock.calls().is_empty());
 }
 

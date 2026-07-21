@@ -288,7 +288,6 @@ fn running_pane_presentation(epoch: i64) -> PanePresentation {
             current_path: "/tmp".to_string(),
             badge: BadgeState::Working,
         }),
-        diagnostic: None,
     }
 }
 

@@ -160,7 +160,7 @@ pub(crate) fn run_hook_command(
                 bail!("InvalidRequest: Codex hook event is required");
             };
             if arg.trim_start().starts_with('{') {
-                bail!("UnsupportedLegacyNotify: Codex agent-turn-complete notify is not supported");
+                return Ok(());
             }
             let codex_home = codex_home_from_env(env);
             let (mut client, context, server_hash) =
@@ -224,10 +224,7 @@ fn send_typed_hook_event_observed(
     server_hash: &str,
 ) -> Result<()> {
     match send_typed_hook_event(client, event) {
-        Ok(()) => {
-            let _ = crate::daemon::lifecycle::record_hook_delivery_recovered(env, server_hash);
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(error) => {
             record_agent_hook_delivery(env, server_hash, &error);
             Err(error)
@@ -248,12 +245,10 @@ fn record_agent_hook_delivery(
     } else {
         "agent_hook_delivery_failed"
     };
-    let _ = crate::daemon::lifecycle::record_hook_delivery_failure(env, server_hash, code);
-    let _ = crate::daemon::lifecycle::append_incarnation_log(
+    let _ = crate::daemon::lifecycle::append_daemon_log(
         env,
         server_hash,
-        "pane-state-hook.log",
-        &format!("agent hook delivery failed: {code}"),
+        &format!("hook_delivery: agent hook delivery failed: {code}"),
     );
 }
 
@@ -332,10 +327,8 @@ pub(crate) fn run_view_hook_command(
     snapshot_pane_pid: &str,
     snapshot_panes: &str,
     snapshot_clients: &str,
-    hook_client: Option<&str>,
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
-    config: &crate::config::Config,
 ) -> Result<()> {
     use crate::pane_state::ViewHookKind;
 
@@ -368,7 +361,6 @@ pub(crate) fn run_view_hook_command(
                 pane_pid: snapshot_pane_pid,
                 panes: snapshot_panes,
                 clients: snapshot_clients,
-                hook_client: hook_client.unwrap_or_default(),
             },
         )?;
         ensure_view_hook_deadline(deadline, "parsing immutable hook snapshot")?;
@@ -405,17 +397,13 @@ pub(crate) fn run_view_hook_command(
                 Err(error) => return Err(error),
             }
         };
-        // View events carry only the immutable tmux snapshot. The daemon applies
-        // its active `done_clear_on` policy while processing the event, so disk
-        // config drift must not stop pane/window/client registry synchronization.
-        let built = crate::daemon::view_hooks::build_foreground_view_event(
+        let event = crate::daemon::view_hooks::build_foreground_view_event(
             probe.daemon_instance_id().clone(),
             event_id,
             hook_kind,
-            snapshot.occurrence,
-            snapshot.source_client,
-            snapshot.witnesses,
-            config.daemon.done_clear_on,
+            snapshot.active_pane,
+            snapshot.window_panes,
+            snapshot.visibility,
         )?;
         crate::daemon::view_hooks::deliver_view_event_with_active_attempt(
             &mut crate::daemon::view_hooks::SocketViewEventSender {
@@ -423,7 +411,7 @@ pub(crate) fn run_view_hook_command(
                 server_identity: &incarnation.hash,
                 initial_client: Some(probe),
             },
-            &built.event,
+            &event,
             deadline,
             delivery,
         )?;
@@ -432,8 +420,6 @@ pub(crate) fn run_view_hook_command(
     if let Err(error) = &result {
         eprintln!("{error:#}");
         log_view_hook_failure(env, &server_hash, &format!("{error:#}"));
-    } else {
-        let _ = crate::daemon::lifecycle::record_hook_delivery_recovered(env, &server_hash);
     }
     result
 }
@@ -451,12 +437,10 @@ fn log_view_hook_failure(env: &BTreeMap<String, String>, server_hash: &str, mess
     } else {
         "hook_delivery_failed"
     };
-    let _ = crate::daemon::lifecycle::record_hook_delivery_failure(env, server_hash, code);
-    let _ = crate::daemon::lifecycle::append_incarnation_log(
+    let _ = crate::daemon::lifecycle::append_daemon_log(
         env,
         server_hash,
-        "pane-state-hook.log",
-        message,
+        &format!("hook_delivery: {code}: {message}"),
     );
 }
 
@@ -484,7 +468,7 @@ pub(crate) fn codex_typed_event_from_input(
     codex_home: Option<&Path>,
 ) -> Result<Option<PaneEventEnvelope>> {
     if event.trim_start().starts_with('{') {
-        bail!("UnsupportedLegacyNotify: Codex agent-turn-complete notify is not supported");
+        return Ok(None);
     }
     if let Some(aux_event) =
         codex_aux_event_from_input(event, input, context.observed_at, codex_home)?
@@ -1278,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_goal_fixture_maps_to_begin_run_and_legacy_notify_is_rejected() {
+    fn codex_goal_fixture_maps_to_begin_run_and_legacy_notify_is_ignored() {
         let envelope = codex_typed_event_from_input(
             "PostToolUse",
             r#"{"session_id":"codex-session","tool_name":"create_goal","tool_input":{"objective":"ship\nthe change"}}"#,
@@ -1298,14 +1282,14 @@ mod tests {
             }
         );
 
-        let error = codex_typed_event_from_input(
+        let event = codex_typed_event_from_input(
             r#"{"type":"agent-turn-complete"}"#,
             "",
             &typed_context(),
             None,
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("UnsupportedLegacyNotify"));
+        .unwrap();
+        assert!(event.is_none());
     }
 
     #[test]

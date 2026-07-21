@@ -1006,16 +1006,6 @@ pub fn run_observation_poll(
     let observations = dispatch
         .iter()
         .map(|snapshot| {
-            if matches!(
-                snapshot.base,
-                Some(StoredStateDescriptor::Quarantined { .. })
-            ) {
-                diagnostics.push(format!(
-                    "quarantined_observation_skipped: {}",
-                    snapshot.pane_instance.pane_id
-                ));
-                return None;
-            }
             let detection = processes.detect_from_pid_tree(snapshot.pane_instance.pane_pid);
             if detection.complete && detection.agents.len() > 1 {
                 diagnostics.push(format!(

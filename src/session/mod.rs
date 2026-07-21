@@ -2,14 +2,10 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::category::{
-    adjacent_category, resolve_category_for_session, resolve_dynamic_category_for_session,
-    sessions_in_category,
-};
+use crate::category::{adjacent_category, resolve_category_for_session, sessions_in_category};
 use crate::config::Config;
 use crate::options::{
-    KEY_CATEGORY, KEY_CATEGORY_OVERRIDE, KEY_PROJECT_PATH, set_global_option, set_session_option,
-    show_global_option,
+    KEY_CATEGORY, KEY_PROJECT_PATH, set_global_option, set_session_option, show_global_option,
 };
 use crate::tmux::TmuxRunner;
 
@@ -20,9 +16,7 @@ pub struct SessionInfo {
     pub name: String,
     pub attached: bool,
     pub created_at: i64,
-    pub category: String,
     pub project_path: String,
-    pub category_override: String,
     pub id: String,
 }
 
@@ -49,9 +43,9 @@ pub fn session_list_format() -> String {
         "#{session_name}",
         "#{session_attached}",
         "#{session_created}",
-        "#{@vde_category}",
+        "",
         "#{@vde_project_path}",
-        "#{@vde_category_override}",
+        "",
         "#{session_id}",
     ]
     .join(&FIELD_SEP.to_string())
@@ -69,9 +63,7 @@ pub fn parse_sessions(output: &str) -> Vec<SessionInfo> {
                 name: fields[0].to_string(),
                 attached: fields[1] == "1",
                 created_at: fields[2].parse().unwrap_or_default(),
-                category: fields[3].to_string(),
                 project_path: fields[4].to_string(),
-                category_override: fields[5].to_string(),
                 id: fields[6].to_string(),
             })
         })
@@ -397,15 +389,6 @@ pub fn remember_current_client_session(runner: &dyn TmuxRunner, config: &Config)
     remember_client_session_for_session(runner, config, &client, &current)
 }
 
-pub fn set_session_category_override(
-    runner: &dyn TmuxRunner,
-    session_name: &str,
-    category: &str,
-) -> Result<()> {
-    set_session_option(runner, session_name, KEY_CATEGORY_OVERRIDE, category)?;
-    set_session_option(runner, session_name, KEY_CATEGORY, category)
-}
-
 pub fn create_session(
     runner: &dyn TmuxRunner,
     config: &Config,
@@ -436,7 +419,7 @@ pub fn create_session_for_client(
         project_path: cwd,
         ..SessionInfo::default()
     };
-    let category = resolve_dynamic_category_for_session(config, &session);
+    let category = resolve_category_for_session(config, &session);
     set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
     switch_client_for_client(runner, client, &session_name)?;
     if !window_id.is_empty() {
@@ -503,9 +486,9 @@ fn expand_tilde_path(path: &str, home: Option<&str>) -> String {
     }
 }
 
-pub fn refresh_session_categories(runner: &dyn TmuxRunner, config: &Config) -> Result<()> {
+pub fn sync_session_category_mirrors(runner: &dyn TmuxRunner, config: &Config) -> Result<()> {
     for session in list_sessions(runner)? {
-        let category = resolve_dynamic_category_for_session(config, &session);
+        let category = resolve_category_for_session(config, &session);
         set_session_option(runner, &session.name, KEY_CATEGORY, &category)?;
     }
     Ok(())
@@ -610,21 +593,31 @@ mod tests {
     use super::*;
     use crate::tmux::mock::MockTmuxRunner;
 
+    fn config_for_sessions(pairs: &[(&str, &str)]) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.categories.session_name_rules = pairs
+            .iter()
+            .map(|(name, category)| crate::config::SessionNameRule {
+                category: (*category).to_string(),
+                patterns: vec![(*name).to_string()],
+            })
+            .collect();
+        config
+    }
+
     #[test]
-    fn parse_sessions_reads_vde_options() {
+    fn parse_sessions_reads_project_metadata_without_category_options() {
         let sep = '\u{1f}'.to_string();
         let raw = format!(
             "{}\n{}\n",
-            ["main", "1", "100", "work", "/repo", "", "$1"].join(&sep),
-            ["sub", "0", "90", "", "", "private", "$2"].join(&sep)
+            ["main", "1", "100", "", "/repo", "", "$1"].join(&sep),
+            ["sub", "0", "90", "", "", "", "$2"].join(&sep)
         );
         let sessions = parse_sessions(&raw);
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].name, "main");
         assert!(sessions[0].attached);
-        assert_eq!(sessions[0].category, "work");
         assert_eq!(sessions[0].project_path, "/repo");
-        assert_eq!(sessions[1].category_override, "private");
     }
 
     #[test]
@@ -808,35 +801,8 @@ mod tests {
             "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}$1\n",
         );
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
-        remember_current_client_session(&mock, &crate::config::Config::default()).unwrap();
+        remember_current_client_session(&mock, &config_for_sessions(&[("main", "work")])).unwrap();
         assert_eq!(mock.calls().len(), 4);
-    }
-
-    #[test]
-    fn set_session_category_override_sets_override_and_category() {
-        let mock = MockTmuxRunner::new();
-        mock.stub(
-            &[
-                "set-option",
-                "-t",
-                "main",
-                crate::options::KEY_CATEGORY_OVERRIDE,
-                "private",
-            ],
-            "",
-        );
-        mock.stub(
-            &[
-                "set-option",
-                "-t",
-                "main",
-                crate::options::KEY_CATEGORY,
-                "private",
-            ],
-            "",
-        );
-        set_session_category_override(&mock, "main", "private").unwrap();
-        assert_eq!(mock.calls().len(), 2);
     }
 
     #[test]
@@ -1036,7 +1002,12 @@ mod tests {
         );
         mock.stub(&["switch-client", "-c", "abc", "-t", "=sub:"], "");
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "sub"], "");
-        cycle_session(&mock, &crate::config::Config::default(), Direction::Next).unwrap();
+        cycle_session(
+            &mock,
+            &config_for_sessions(&[("main", "work"), ("sub", "work"), ("other", "private")]),
+            Direction::Next,
+        )
+        .unwrap();
         assert_eq!(mock.calls().len(), 5);
     }
 
@@ -1057,7 +1028,12 @@ mod tests {
         mock.stub(&["switch-client", "-c", "abc", "-t", "=one:"], "");
         mock.stub(&["set-option", "-g", "@vde_client_616263_b", "one"], "");
 
-        use_adjacent_category(&mock, &crate::config::Config::default(), Direction::Next).unwrap();
+        use_adjacent_category(
+            &mock,
+            &config_for_sessions(&[("main", "a"), ("one", "b")]),
+            Direction::Next,
+        )
+        .unwrap();
 
         let calls = mock.calls();
         assert_eq!(
@@ -1088,7 +1064,12 @@ mod tests {
         mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "sub\n");
         mock.stub(&["switch-client", "-c", "abc", "-t", "=sub:"], "");
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "sub"], "");
-        use_category(&mock, &crate::config::Config::default(), "work").unwrap();
+        use_category(
+            &mock,
+            &config_for_sessions(&[("main", "work"), ("sub", "work")]),
+            "work",
+        )
+        .unwrap();
         let calls = mock.calls();
         assert_eq!(
             calls.last().unwrap(),
@@ -1116,7 +1097,7 @@ mod tests {
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
         on_client_session_changed(
             &mock,
-            &crate::config::Config::default(),
+            &config_for_sessions(&[("main", "work")]),
             Some(123),
             Some("main"),
         )
@@ -1209,36 +1190,30 @@ mod tests {
     }
 
     #[test]
-    fn refresh_session_categories_sets_effective_categories() {
+    fn sync_session_category_mirrors_sets_effective_categories() {
         let mock = MockTmuxRunner::new();
         let format = session_list_format();
         mock.stub(
             &["list-sessions", "-F", &format],
-            "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}private\u{1f}$1\n",
+            "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
         );
         mock.stub(
-            &[
-                "set-option",
-                "-t",
-                "main",
-                crate::options::KEY_CATEGORY,
-                "private",
-            ],
+            &["set-option", "-t", "main", crate::options::KEY_CATEGORY, ""],
             "",
         );
-        refresh_session_categories(&mock, &crate::config::Config::default()).unwrap();
+        sync_session_category_mirrors(&mock, &crate::config::Config::default()).unwrap();
         assert_eq!(mock.calls().len(), 2);
     }
 
     #[test]
-    fn refresh_session_categories_uses_default_over_stale_stored_category() {
+    fn sync_session_category_mirrors_uses_config_default() {
         let mock = MockTmuxRunner::new();
         let format = session_list_format();
         let mut config = crate::config::Config::default();
         config.categories.default_category = Some("public".to_string());
         mock.stub(
             &["list-sessions", "-F", &format],
-            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}/Users/me\u{1f}\u{1f}$1\n",
+            "main\u{1f}1\u{1f}100\u{1f}\u{1f}/Users/me\u{1f}\u{1f}$1\n",
         );
         mock.stub(
             &[
@@ -1250,7 +1225,7 @@ mod tests {
             ],
             "",
         );
-        refresh_session_categories(&mock, &config).unwrap();
+        sync_session_category_mirrors(&mock, &config).unwrap();
         assert_eq!(mock.calls().len(), 2);
     }
 
