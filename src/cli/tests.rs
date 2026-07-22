@@ -1683,6 +1683,11 @@ fn dispatch_config_schema_prints_json_schema() {
         schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["fixed_width"]["type"],
         "boolean"
     );
+    assert_eq!(
+        schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["fixed_width_alignment"]
+            ["default"],
+        "left"
+    );
 }
 
 #[test]

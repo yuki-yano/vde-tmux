@@ -107,6 +107,7 @@ pub struct StatuslineConfig {
 pub struct StatuslineSessionsConfig {
     pub show_index: bool,
     pub fixed_width: bool,
+    pub fixed_width_alignment: FixedWidthAlignment,
     pub current: SegmentStyle,
     pub other: SegmentStyle,
     pub badge_style: BadgeStyle,
@@ -118,6 +119,7 @@ impl Default for StatuslineSessionsConfig {
         Self {
             show_index: false,
             fixed_width: false,
+            fixed_width_alignment: FixedWidthAlignment::Left,
             current: SegmentStyle {
                 bold: true,
                 ..SegmentStyle::default()
@@ -127,6 +129,14 @@ impl Default for StatuslineSessionsConfig {
             separator: String::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixedWidthAlignment {
+    #[default]
+    Left,
+    Center,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1229,6 +1239,7 @@ statusline:
   sessions:
     badge_style: chip
     fixed_width: true
+    fixed_width_alignment: center
   session_badge:
     chip:
       bg: "#30304a"
@@ -1240,6 +1251,10 @@ statusline:
 
         assert_eq!(config.statusline.sessions.badge_style, BadgeStyle::Chip);
         assert!(config.statusline.sessions.fixed_width);
+        assert_eq!(
+            config.statusline.sessions.fixed_width_alignment,
+            FixedWidthAlignment::Center
+        );
         assert_eq!(config.statusline.session_badge.chip.bg, "#30304a");
         assert_eq!(config.statusline.session_badge.chip.cap_left, "<");
         assert_eq!(config.statusline.session_badge.chip.cap_right, ">");
@@ -1250,6 +1265,10 @@ statusline:
         let config = Config::default();
 
         assert!(!config.statusline.sessions.fixed_width);
+        assert_eq!(
+            config.statusline.sessions.fixed_width_alignment,
+            FixedWidthAlignment::Left
+        );
     }
 
     #[test]

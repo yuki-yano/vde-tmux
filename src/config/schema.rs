@@ -98,6 +98,11 @@ pub fn config_schema() -> Value {
                         "additionalProperties": true,
                         "properties": {
                             "fixed_width": { "type": "boolean", "default": false },
+                            "fixed_width_alignment": {
+                                "type": "string",
+                                "enum": ["left", "center"],
+                                "default": "left"
+                            },
                             "badge_style": {
                                 "type": "string",
                                 "enum": ["inline", "plain", "outer", "chip"]
@@ -649,5 +654,10 @@ mod tests {
 
         assert_eq!(sessions["fixed_width"]["type"], "boolean");
         assert_eq!(sessions["fixed_width"]["default"], false);
+        assert_eq!(
+            sessions["fixed_width_alignment"]["enum"],
+            serde_json::json!(["left", "center"])
+        );
+        assert_eq!(sessions["fixed_width_alignment"]["default"], "left");
     }
 }

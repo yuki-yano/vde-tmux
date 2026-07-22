@@ -3,8 +3,9 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
 use crate::config::{
-    AgentBadgeConfig, BadgeConfig, BadgeGlyphs, BadgeStyle, Config, SegmentColors, SegmentStyle,
-    SessionBadgeChipConfig, SessionBadgeMode, StatuslineCategoryConfig,
+    AgentBadgeConfig, BadgeConfig, BadgeGlyphs, BadgeStyle, Config, FixedWidthAlignment,
+    SegmentColors, SegmentStyle, SessionBadgeChipConfig, SessionBadgeMode,
+    StatuslineCategoryConfig,
 };
 use crate::daemon::protocol::v2::{
     CategoryStatusPresentation, PanePresentation, SessionStatusPresentation, StatusContext,
@@ -1042,7 +1043,11 @@ fn render_bounded_status_snapshot(
         && matches!(snapshot.context, StatusContext::Session { .. })
         && let Some(session_zone_width) = snapshot.session_zone_width
     {
-        sessions = pad_session_zone(sessions, session_zone_width);
+        sessions = pad_session_zone(
+            sessions,
+            session_zone_width,
+            config.statusline.sessions.fixed_width_alignment,
+        );
     }
     let windows = render_selected_status_tokens(
         &window_tokens,
@@ -1173,19 +1178,28 @@ fn render_selected_sessions(
     )
 }
 
-fn pad_session_zone(rendered: String, target_width: usize) -> String {
+fn pad_session_zone(
+    rendered: String,
+    target_width: usize,
+    alignment: FixedWidthAlignment,
+) -> String {
     let padding = target_width.saturating_sub(tmux_display_width(&rendered));
     if padding == 0 {
         return rendered;
     }
-    let left = padding / 2;
-    let right = padding - left;
-    format!(
-        "#[default]{}{}#[default]{}",
-        " ".repeat(left),
-        rendered,
-        " ".repeat(right)
-    )
+    match alignment {
+        FixedWidthAlignment::Left => format!("{rendered}#[default]{}", " ".repeat(padding)),
+        FixedWidthAlignment::Center => {
+            let left = padding / 2;
+            let right = padding - left;
+            format!(
+                "#[default]{}{}#[default]{}",
+                " ".repeat(left),
+                rendered,
+                " ".repeat(right)
+            )
+        }
+    }
 }
 
 fn compact_current_tokens(tokens: &mut [StatusToken]) {
@@ -2259,14 +2273,48 @@ mod tests {
     }
 
     #[test]
-    fn session_zone_padding_is_balanced_and_puts_an_odd_cell_on_the_right() {
+    fn session_zone_padding_defaults_to_left_alignment() {
         assert_eq!(
-            pad_session_zone("abc".to_string(), 7),
+            pad_session_zone("abc".to_string(), 7, FixedWidthAlignment::Left),
+            "abc#[default]    "
+        );
+    }
+
+    #[test]
+    fn centered_session_zone_padding_is_balanced_and_puts_an_odd_cell_on_the_right() {
+        assert_eq!(
+            pad_session_zone("abc".to_string(), 7, FixedWidthAlignment::Center),
             "#[default]  abc#[default]  "
         );
         assert_eq!(
-            pad_session_zone("abc".to_string(), 8),
+            pad_session_zone("abc".to_string(), 8, FixedWidthAlignment::Center),
             "#[default]  abc#[default]   "
+        );
+    }
+
+    #[test]
+    fn fixed_width_alignment_controls_rendered_session_position() {
+        let sessions = vec![status_session("$1", "main", true)];
+        let mut config = Config::default();
+        config.statusline.sessions.fixed_width = true;
+        let unpadded = render_structured_sessions(&config, &sessions);
+        let snapshot = StatusSnapshot {
+            context: StatusContext::Session {
+                session_id: "$1".to_string(),
+            },
+            session_zone_width: Some(tmux_display_width(&unpadded) + 4),
+            sessions,
+            ..status_snapshot()
+        };
+
+        let left = render_structured_status_snapshot(&config, &snapshot).unwrap();
+        assert_eq!(left.sessions, format!("{unpadded}#[default]    "));
+
+        config.statusline.sessions.fixed_width_alignment = FixedWidthAlignment::Center;
+        let centered = render_structured_status_snapshot(&config, &snapshot).unwrap();
+        assert_eq!(
+            centered.sessions,
+            format!("#[default]  {unpadded}#[default]  ")
         );
     }
 

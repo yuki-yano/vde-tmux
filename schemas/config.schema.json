@@ -473,6 +473,14 @@
               "default": false,
               "type": "boolean"
             },
+            "fixed_width_alignment": {
+              "default": "left",
+              "enum": [
+                "left",
+                "center"
+              ],
+              "type": "string"
+            },
             "badge_style": {
               "enum": [
                 "inline",

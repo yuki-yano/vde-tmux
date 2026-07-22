@@ -278,6 +278,7 @@ sidebar:
 statusline:
   sessions:
     fixed_width: true
+    fixed_width_alignment: center # left（デフォルト）| center
   session_badge:
     mode: rollup # rollup | counts
   summary:
@@ -298,6 +299,7 @@ badge:
 Idle を表示したくない場合は `hide_idle: true` を指定します。
 
 `statusline.sessions.fixed_width: true` を指定すると、active category の session 領域を最も広い category に合わせ、category、session、window を合わせた領域も全 session で同じ幅に揃えます。
+固定領域内のsession表示はデフォルトで左寄せです。中央寄せにする場合は `fixed_width_alignment: center` を指定します。
 window 名やプロセス名の長さが異なる session を切り替えても、中央寄せした status block の位置がずれません。
 inactive category の幅には session の `other` style を使うため、`current.format` と `other.format` の表示幅が異なる場合は数セルの差が生じることがあります。
 
