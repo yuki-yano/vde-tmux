@@ -754,7 +754,18 @@ for _ in $(seq 1 60); do
   sleep 0.05
 done
 [[ "$(client_field "$CLIENT_1" pane_id)" == "$SIDEBAR_1" ]]
-VT_PANE="$SIDEBAR_1" run_vt sidebar jump "$S1_PEER"
+# The tmux client selection changes before the daemon's asynchronous client-view
+# reconciliation is guaranteed to observe it. Retry only that stale-view window;
+# every other jump failure remains fatal.
+SIDEBAR_JUMP_ERROR="$ARTIFACT_DIR/sidebar-jump-error.txt"
+for _ in $(seq 1 60); do
+  if VT_PANE="$SIDEBAR_1" run_vt sidebar jump "$S1_PEER" 2>"$SIDEBAR_JUMP_ERROR"; then
+    break
+  fi
+  grep -F 'StaleSelection: source pane must identify exactly one eligible tmux client' \
+    "$SIDEBAR_JUMP_ERROR" >/dev/null
+  sleep 0.05
+done
 for _ in $(seq 1 60); do
   [[ "$(tmux_cmd display-message -p -t "$S1_WINDOW" '#{pane_id}')" == "$S1_PEER" ]] && break
   sleep 0.05
