@@ -506,7 +506,25 @@ pub fn render_structured_pane_status(config: &Config, pane: &PanePresentation) -
             ("{detail}", detail.as_str()),
         ],
     );
-    escape_tmux_secondary_expansion_percent(&tmux_style_segment(style, &body))
+    let mut rendered = tmux_style_segment(style, &body);
+    if let Some(color) = pane_border_highlight_color(config, pane) {
+        rendered.push_str(&format!(
+            "#[fg={color}]{}#[default]",
+            "─".repeat(usize::from(pane.pane_width))
+        ));
+    }
+    escape_tmux_secondary_expansion_percent(&rendered)
+}
+
+fn pane_border_highlight_color(config: &Config, pane: &PanePresentation) -> Option<String> {
+    let badge = pane.resolved.as_ref()?.badge;
+    let color = match badge {
+        BadgeState::Blocked => &config.badge.colors.blocked,
+        BadgeState::Working => &config.badge.colors.working,
+        BadgeState::Done => &config.badge.colors.done,
+        BadgeState::Idle => return None,
+    };
+    Some(normalize_tmux_color(color))
 }
 
 fn render_structured_summary(config: &Config, counts: BadgeStateCounts) -> String {
@@ -2192,6 +2210,41 @@ mod tests {
             rendered.contains(&config.badge.colors.blocked),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn pane_border_highlight_uses_non_idle_badge_colors_only() {
+        let mut config = Config::default();
+        config.badge.colors.blocked = "ff0000".to_string();
+        config.badge.colors.working = "#00ff00".to_string();
+        config.badge.colors.done = "cyan".to_string();
+
+        for (badge, expected) in [
+            (BadgeState::Blocked, Some("#ff0000")),
+            (BadgeState::Working, Some("#00ff00")),
+            (BadgeState::Done, Some("cyan")),
+            (BadgeState::Idle, None),
+        ] {
+            let pane = structured_pane(
+                "codex",
+                "/tmp",
+                false,
+                Some((crate::pane_state::LifecycleState::Idle, badge)),
+            );
+            assert_eq!(
+                pane_border_highlight_color(&config, &pane).as_deref(),
+                expected
+            );
+            let rendered = render_structured_pane_status(&config, &pane);
+            if let Some(color) = expected {
+                assert!(rendered.contains(&format!("#[fg={color}]─")));
+            } else {
+                assert!(!rendered.contains('─'));
+            }
+        }
+
+        let non_agent = structured_pane("zsh", "/tmp", false, None);
+        assert_eq!(pane_border_highlight_color(&config, &non_agent), None);
     }
 
     #[test]

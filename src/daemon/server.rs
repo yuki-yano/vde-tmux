@@ -27,6 +27,7 @@ const V2_MUTATION_QUEUE_CAPACITY: usize = 1024;
 pub const V2_FRAME_START_TIMEOUT: Duration = Duration::from_secs(2);
 pub const V2_FRAME_BODY_TIMEOUT: Duration = Duration::from_millis(100);
 pub const V2_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+const TMUX_SERVER_LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct V2FrameReader {
     reader: BufReader<UnixStream>,
@@ -3002,6 +3003,37 @@ fn start_status_push_worker(coordinator: Arc<ProductionV2Coordinator>) {
     });
 }
 
+fn start_tmux_server_liveness_monitor(coordinator: Arc<ProductionV2Coordinator>) -> Result<()> {
+    let server_pid = coordinator.incarnation.identity.pid;
+    let expected_start_token = crate::daemon::lifecycle::process_start_token(server_pid)
+        .with_context(|| {
+            format!("failed to identify tmux server process before starting liveness monitor: {server_pid}")
+        })?;
+    thread::spawn(move || {
+        while !coordinator.shutdown.load(Ordering::SeqCst) {
+            let started = Instant::now();
+            while started.elapsed() < TMUX_SERVER_LIVENESS_POLL_INTERVAL
+                && !coordinator.shutdown.load(Ordering::SeqCst)
+            {
+                thread::sleep(
+                    Duration::from_millis(50)
+                        .min(TMUX_SERVER_LIVENESS_POLL_INTERVAL.saturating_sub(started.elapsed())),
+                );
+            }
+            if coordinator.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            if !crate::daemon::lifecycle::process_start_token(server_pid)
+                .is_ok_and(|actual| actual == expected_start_token)
+            {
+                coordinator.fail_stop(format!("tmux server process exited: pid={server_pid}"));
+                break;
+            }
+        }
+    });
+    Ok(())
+}
+
 fn apply_production_mutation(
     coordinator: &ProductionV2Coordinator,
     sequenced: V2SequencedMutation,
@@ -4490,6 +4522,7 @@ pub fn run_runtime_daemon_server(
     });
 
     bootstrap_v2_runtime(&coordinator, leased, env, &config)?;
+    start_tmux_server_liveness_monitor(coordinator.clone())?;
     start_v2_mutation_worker(coordinator.clone());
     start_sidebar_completion_forwarder(coordinator.clone());
     let capture = crate::daemon::workers::start_capture_coordinator(
@@ -4826,6 +4859,7 @@ fn bootstrap_v2_runtime(
             break;
         }
     }
+    crate::daemon::lifecycle::publish_current_executable(&runner, &coordinator.incarnation)?;
     Ok(())
 }
 
@@ -5671,6 +5705,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn tmux_server_liveness_monitor_fail_stops_after_server_process_exits() {
+        let root = test_root("tmux-server-liveness");
+        let mut server = Command::new("sleep").arg("30").spawn().unwrap();
+        let server_pid = server.id();
+        let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation {
+            socket_path: root.join("tmux.sock"),
+            identity: crate::daemon::topology::ServerIdentity {
+                pid: server_pid,
+                start_time: 1,
+            },
+            hash: "b".repeat(64),
+        };
+        let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+        let coordinator = Arc::new(
+            ProductionV2Coordinator::new(incarnation, env, crate::config::DoneClearOn::Pane, None)
+                .unwrap(),
+        );
+        start_tmux_server_liveness_monitor(coordinator.clone()).unwrap();
+
+        server.kill().unwrap();
+        server.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !coordinator.shutdown.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "liveness monitor did not stop the daemon"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(coordinator.shutdown_ready.load(Ordering::SeqCst));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

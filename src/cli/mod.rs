@@ -14,6 +14,7 @@ use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
 mod daemon;
 mod hook;
+mod pane_switch;
 mod sidebar;
 
 /// vde-tmux CLI。
@@ -97,6 +98,14 @@ enum Command {
     Sidebar {
         #[command(subcommand)]
         command: sidebar::SidebarCommand,
+    },
+    #[command(name = "pane-switch")]
+    PaneSwitch {
+        direction: pane_switch::PaneSwitchDirection,
+        #[arg(long = "pane-id")]
+        pane_id: String,
+        #[arg(long = "pane-pid")]
+        pane_pid: u32,
     },
     Category {
         #[command(subcommand)]
@@ -843,6 +852,14 @@ where
                     )?;
                 }
             }
+            Ok(None)
+        }
+        Command::PaneSwitch {
+            direction,
+            pane_id,
+            pane_pid,
+        } => {
+            pane_switch::switch(runner, direction, &pane_id, pane_pid)?;
             Ok(None)
         }
         Command::Session { command } => {

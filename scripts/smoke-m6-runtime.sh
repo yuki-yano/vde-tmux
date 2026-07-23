@@ -180,6 +180,12 @@ assert reply["type"] == "resolved_snapshot_result", reply
 assert reply["snapshot"]["panes"] == [], reply
 print("empty-topology protocol v4 Serving ok")
 PY
+
+PUBLISHED_EXECUTABLE="$(tmux -L "$TMUX_SOCKET" show-options -gqv @vde_executable)"
+if [[ "$PUBLISHED_EXECUTABLE" != "$BIN" ]]; then
+  echo "daemon published unexpected executable: $PUBLISHED_EXECUTABLE" >&2
+  exit 1
+fi
 record_daemon_pid
 for hook in window-pane-changed session-window-changed client-session-changed client-attached client-detached; do
   tmux -L "$TMUX_SOCKET" show-hooks -g "${hook}[70]" | grep -F "${hook}[70]" >/dev/null
@@ -402,7 +408,35 @@ CLIENT_2="$(client_for_session aux)"
 tmux -L "$TMUX_SOCKET" select-window -t aux:own
 
 wait_badge() {
-  wait_pane_badge "$AGENT_PANE" "$1"
+  local expected_badge="$1"
+  wait_pane_badge "$AGENT_PANE" "$expected_badge"
+  wait_pane_bottom_rail "$AGENT_PANE" "$expected_badge"
+}
+
+wait_pane_bottom_rail() {
+  local pane_id="$1"
+  local badge="$2"
+  local expected_color
+  case "$badge" in
+    Blocked) expected_color="#ff6b6b" ;;
+    Working) expected_color="#4fd08a" ;;
+    Done) expected_color="#45cbe6" ;;
+    Idle) expected_color="" ;;
+    *) return 1 ;;
+  esac
+  for _ in $(seq 1 80); do
+    local value
+    value="$(tmux -L "$TMUX_SOCKET" show-options -pqv -t "$pane_id" @vde_status_pane 2>/dev/null || true)"
+    if [[ -n "$expected_color" && "$value" == *"#[fg=$expected_color]─"* ]]; then
+      return 0
+    fi
+    if [[ -z "$expected_color" && "$value" != *"#[fg="*"]─"* ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "pane bottom rail did not match $badge" >&2
+  return 1
 }
 
 wait_pane_badge() {
@@ -1351,7 +1385,7 @@ wait "$OLD_MUTATION_PID"
 cat "$OLD_MUTATION_RESULT"
 grep -F 'hello_ack' "$OLD_MUTATION_RESULT" >/dev/null
 grep -F 'mutation_response=' "$OLD_MUTATION_RESULT" >/dev/null
-if ! grep -Eq 'tmux server (incarnation changed|identity mismatch)|mutation_response=eof_after_fail_stop|"type": "pane_event_result"|"code": "invalid_request".*"message": "request frame start deadline exceeded: [^"]*".*"type": "error"' "$OLD_MUTATION_RESULT"; then
+if ! grep -Eq 'tmux server (incarnation changed|identity mismatch|process exited)|mutation_response=eof_after_fail_stop|"type": "pane_event_result"|"code": "invalid_request".*"message": "request frame start deadline exceeded: [^"]*".*"type": "error"' "$OLD_MUTATION_RESULT"; then
   echo "old daemon did not report a recognized isolated-or-fail-stop outcome" >&2
   exit 1
 fi

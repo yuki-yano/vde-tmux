@@ -66,8 +66,10 @@ bind-key -n M-e run-shell "vt sidebar focus-toggle --window #{q:window_id}"
 Notes:
 
 - `vt daemon ensure` starts the daemon on demand.
+- The daemon stores the absolute path of the running `vt` executable in `@vde_executable`. Neovim pane navigation uses that exact binary instead of searching `PATH`.
 - vde-tmux pushes rendered text into the `@vde_status_*` options, so tmux does not start a process on every status redraw.
 - `@vde_status_now_format` is required for the elapsed time shown on pane borders.
+- `Blocked`, `Working`, and `Done` agent panes fill the unused pane-statusline width with a plain single-line rail in the badge color. With `pane-border-status bottom`, only the bottom edge is highlighted and no content cells on the left or right are covered. `Idle` and non-agent panes get no additional rail.
 - The `window-status-*` settings replace tmux's native window list with the vde-tmux session and window segments.
 - `--client-name` and `--session-id` keep session and category bindings scoped to the client that triggered them, which matters when multiple tmux clients are attached.
 
@@ -77,7 +79,25 @@ Reload the configuration:
 tmux source-file ~/.tmux.conf
 ```
 
-### 2. Claude Code hooks
+### 2. Neovim pane navigation (optional)
+
+This repository also provides a Neovim plugin. Load it with lazy.nvim:
+
+```lua
+{
+  'yuki-yano/vde-tmux',
+  lazy = false,
+  config = function()
+    require('vde-tmux').setup()
+  end,
+}
+```
+
+The default `<C-h/j/k/l>` mappings move between Neovim windows and use `vt pane-switch` at an edge to enter another tmux pane. When the destination runs Neovim, the plugin selects the window aligned with the source cursor. Selection metadata is stored on the destination pane together with its PID, preventing another client or a reused pane from consuming it.
+
+Existing mappings can call the API directly, such as `require('vde-tmux').navigate('h')`. `setup()` accepts `keybindings = false`, `modes`, `debug`, `disable_when_floating`, and `navigate_from_floating`.
+
+### 3. Claude Code hooks
 
 Add these hooks to `~/.claude/settings.json`:
 
@@ -97,7 +117,7 @@ Add these hooks to `~/.claude/settings.json`:
 Restart Claude Code after saving the file.
 Its lifecycle and task progress will then appear in vde-tmux.
 
-### 3. Codex hooks
+### 4. Codex hooks
 
 Add these hooks to `~/.codex/hooks.json` or the project-local `.codex/hooks.json`.
 Review and trust the hooks with Codex `/hooks` after saving the file.
@@ -143,7 +163,7 @@ Review and trust the hooks with Codex `/hooks` after saving the file.
 Restart Codex after saving the file.
 Permission requests, plans, subagents, and worktree activity will then appear in the sidebar.
 
-### 4. Verify
+### 5. Verify
 
 Run these commands inside tmux:
 

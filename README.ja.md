@@ -66,8 +66,10 @@ bind-key -n M-e run-shell "vt sidebar focus-toggle --window #{q:window_id}"
 設定の要点は次のとおりです。
 
 - `vt daemon ensure` が daemon を必要に応じて起動します。
+- daemon は実際に起動している `vt` の絶対パスを `@vde_executable` へ保存します。Neovim pane navigation は PATH を検索せず、この実体を使います。
 - vde-tmux は描画済みのテキストを `@vde_status_*` option へ書き込むため、status line の再描画ごとに外部プロセスは起動しません。
 - `@vde_status_now_format` は pane border の経過時間表示に必要です。
+- `Blocked`、`Working`、`Done` の agent pane は、pane statusline の残り幅をバッジと同じ色の一重罫線で埋めます。`pane-border-status bottom` のため下辺だけが強調され、左右の本文セルには重なりません。`Idle` と non-agent pane には追加の罫線を描きません。
 - `window-status-*` の設定は、tmux 標準の window list を vde-tmux の session と window の表示へ置き換えます。
 - `--client-name` と `--session-id` により、複数の tmux client を使っていても操作対象が別の client へずれません。
 
@@ -77,7 +79,25 @@ bind-key -n M-e run-shell "vt sidebar focus-toggle --window #{q:window_id}"
 tmux source-file ~/.tmux.conf
 ```
 
-### 2. Claude Code の hook
+### 2. Neovim の pane navigation（任意）
+
+この repository は Neovim plugin も提供します。lazy.nvim では次のように読み込みます。
+
+```lua
+{
+  'yuki-yano/vde-tmux',
+  lazy = false,
+  config = function()
+    require('vde-tmux').setup()
+  end,
+}
+```
+
+デフォルトの `<C-h/j/k/l>` は Neovim 内では window 間を移動し、端では `vt pane-switch` を使って tmux pane へ移動します。移動先が Neovim の場合は、移動元のカーソル座標に合う window を選択します。選択情報は移動先 pane の option に PID とともに保存されるため、別 client や再利用された pane が誤って消費しません。
+
+`require('vde-tmux').navigate('h')` のように API だけを既存の mapping から呼ぶこともできます。`setup()` には `keybindings = false`、`modes`、`debug`、`disable_when_floating`、`navigate_from_floating` を指定できます。
+
+### 3. Claude Code の hook
 
 `~/.claude/settings.json` に次の hook を追加します。
 
@@ -96,7 +116,7 @@ tmux source-file ~/.tmux.conf
 
 保存後に Claude Code を再起動すると、状態遷移と task の進捗が表示されます。
 
-### 3. Codex の hook
+### 4. Codex の hook
 
 `~/.codex/hooks.json` または project の `.codex/hooks.json` に次の hook を追加します。
 保存後、Codex の `/hooks` で内容を確認して承認します。
@@ -141,7 +161,7 @@ tmux source-file ~/.tmux.conf
 
 Codex を再起動すると、permission request、plan、subagent、worktree activity がサイドバーへ反映されます。
 
-### 4. 動作確認
+### 5. 動作確認
 
 tmux 内で次のコマンドを実行します。
 

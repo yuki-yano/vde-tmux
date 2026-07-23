@@ -24,6 +24,7 @@ const MAX_RUNTIME_LOG_LINE_BYTES: usize = 8 * 1024;
 const LIFECYCLE_RECORD_VERSION: u16 = 1;
 const LIFECYCLE_RECORD_FILE: &str = "lifecycle.json";
 pub const DISABLED_SERVER_OPTION: &str = "@vde_daemon_disabled";
+pub const EXECUTABLE_OPTION: &str = "@vde_executable";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -265,6 +266,38 @@ pub(crate) fn set_tmux_desired_mode_for_incarnation(
     }
     incarnation.verify_from_runner(runner)?;
     Ok(())
+}
+
+pub(crate) fn publish_current_executable(
+    runner: &dyn TmuxRunner,
+    incarnation: &TmuxServerIncarnation,
+) -> Result<PathBuf> {
+    const SERVER_MISMATCH: &str = "__vde_executable_server_mismatch__";
+    let executable = std::fs::canonicalize(
+        std::env::current_exe().context("failed to resolve current executable")?,
+    )
+    .context("failed to canonicalize current executable")?;
+    let executable_value = executable
+        .to_str()
+        .context("current executable path is not valid UTF-8")?;
+    let command = crate::pane_state::store::tmux_command_string(&[
+        "set-option".to_string(),
+        "-g".to_string(),
+        EXECUTABLE_OPTION.to_string(),
+        executable_value.to_string(),
+    ]);
+    let guarded = crate::pane_state::store::server_guarded_command_args(
+        incarnation.identity.pid,
+        incarnation.identity.start_time,
+        command,
+        SERVER_MISMATCH,
+    );
+    let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = runner.run(&refs)?;
+    if output.lines().any(|line| line.trim() == SERVER_MISMATCH) {
+        bail!("tmux server incarnation changed while publishing the vde-tmux executable");
+    }
+    Ok(executable)
 }
 
 /// Ensure the daemon socket directory is private and owned by the current user.
@@ -1421,6 +1454,40 @@ mod tests {
         record.health = super::LifecycleHealth::Degraded;
         record.last_transition_error = None;
         assert_eq!(super::startup_failure_for_generation(&record, 7), None);
+    }
+
+    #[test]
+    fn publishes_the_canonical_current_executable_for_the_expected_server() {
+        let executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let incarnation = super::TmuxServerIncarnation {
+            socket_path: PathBuf::from("/tmp/vde-tmux-publish-executable.sock"),
+            identity: crate::daemon::topology::ServerIdentity {
+                pid: 321,
+                start_time: 654,
+            },
+            hash: "a".repeat(64),
+        };
+        let command = crate::pane_state::store::tmux_command_string(&[
+            "set-option".to_string(),
+            "-g".to_string(),
+            super::EXECUTABLE_OPTION.to_string(),
+            executable.display().to_string(),
+        ]);
+        let guarded = crate::pane_state::store::server_guarded_command_args(
+            incarnation.identity.pid,
+            incarnation.identity.start_time,
+            command,
+            "__vde_executable_server_mismatch__",
+        );
+        let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
+        let mock = crate::tmux::mock::MockTmuxRunner::new();
+        mock.stub(&refs, "");
+
+        assert_eq!(
+            super::publish_current_executable(&mock, &incarnation).unwrap(),
+            executable
+        );
+        assert_eq!(mock.calls(), vec![guarded]);
     }
 
     #[test]
