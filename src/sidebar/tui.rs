@@ -154,7 +154,7 @@ mod local_state_tests {
     use crate::sidebar::state::ViewMode;
 
     #[test]
-    fn render_gate_draws_once_per_second_when_idle() {
+    fn render_gate_draws_once_per_second_when_visible_and_idle() {
         let mut gate = RenderGate::new();
 
         assert!(gate.take_draw_decision(100, true));
@@ -204,8 +204,8 @@ mod local_state_tests {
     }
 
     #[test]
-    fn nine_idle_sidebars_draw_at_most_ten_times_per_second() {
-        let mut gates = (0..9).map(|_| RenderGate::new()).collect::<Vec<_>>();
+    fn only_visible_sidebar_uses_the_elapsed_clock() {
+        let mut gates = (0..20).map(|_| RenderGate::new()).collect::<Vec<_>>();
         for gate in &mut gates {
             assert!(gate.take_draw_decision(1000, true));
         }
@@ -213,14 +213,57 @@ mod local_state_tests {
         let mut draws = 0;
         for tick in 0..20 {
             let now = if tick < 10 { 1000 } else { 1001 };
-            for gate in &mut gates {
-                if gate.take_draw_decision(now, true) {
+            for (index, gate) in gates.iter_mut().enumerate() {
+                if gate.take_draw_decision(now, index == 0) {
                     draws += 1;
                 }
             }
         }
 
-        assert!(draws <= 10, "idle draws {draws} exceeded 10 per second");
+        assert_eq!(draws, 1);
+
+        // Explicit state changes still redraw hidden sidebars immediately.
+        gates[1].mark_dirty();
+        assert!(gates[1].take_draw_decision(1001, false));
+    }
+
+    #[test]
+    fn sidebar_elapsed_clock_is_visible_only_in_an_attached_current_window() {
+        let sidebar = PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 90,
+        };
+        let mut sidebar_pane = pane(90);
+        sidebar_pane.pane_instance = sidebar.clone();
+        sidebar_pane.session_links = vec![
+            SessionLinkPresentation {
+                session_id: "$1".to_string(),
+                session_name: "main".to_string(),
+                window_index: 0,
+                window_active: false,
+                window_last: true,
+            },
+            SessionLinkPresentation {
+                session_id: "$2".to_string(),
+                session_name: "linked".to_string(),
+                window_index: 3,
+                window_active: true,
+                window_last: false,
+            },
+        ];
+        let mut snapshot = ResolvedSnapshot {
+            panes: vec![sidebar_pane],
+            ..snapshot(10)
+        };
+
+        snapshot.sidebar_model.active_sessions = BTreeSet::from(["$1".to_string()]);
+        assert!(!sidebar_elapsed_clock_visible(&snapshot, &sidebar));
+
+        snapshot.sidebar_model.active_sessions = BTreeSet::from(["$2".to_string()]);
+        assert!(sidebar_elapsed_clock_visible(&snapshot, &sidebar));
+
+        snapshot.sidebar_model.active_sessions.clear();
+        assert!(!sidebar_elapsed_clock_visible(&snapshot, &sidebar));
     }
 
     #[test]
@@ -1119,8 +1162,8 @@ impl ConnectionState {
 }
 
 /// Decides whether a run-loop iteration projects the sidebar view and draws a frame.
-/// The gate stays clean until a visible change is reported; elapsed-time labels are
-/// refreshed once per second boundary instead of on every poll tick.
+/// The gate stays clean until a visible change is reported; elapsed-time labels in a
+/// sidebar visible to an attached client are refreshed once per second boundary.
 #[derive(Debug)]
 struct RenderGate {
     dirty: bool,
@@ -1155,13 +1198,32 @@ impl RenderGate {
         }
     }
 
-    fn take_draw_decision(&mut self, now_epoch_secs: i64, snapshot_visible: bool) -> bool {
-        if snapshot_visible && self.last_elapsed_second != Some(now_epoch_secs) {
+    fn take_draw_decision(&mut self, now_epoch_secs: i64, elapsed_clock_visible: bool) -> bool {
+        if elapsed_clock_visible && self.last_elapsed_second != Some(now_epoch_secs) {
             self.last_elapsed_second = Some(now_epoch_secs);
             self.dirty = true;
         }
         std::mem::take(&mut self.dirty)
     }
+}
+
+fn sidebar_elapsed_clock_visible(
+    snapshot: &ResolvedSnapshot,
+    sidebar_instance: &PaneInstance,
+) -> bool {
+    snapshot
+        .panes
+        .iter()
+        .find(|pane| &pane.pane_instance == sidebar_instance)
+        .is_some_and(|pane| {
+            pane.session_links.iter().any(|link| {
+                link.window_active
+                    && snapshot
+                        .sidebar_model
+                        .active_sessions
+                        .contains(&link.session_id)
+            })
+        })
 }
 
 /// Geometry and row mapping of the most recently drawn frame. Click hit-testing
@@ -1698,8 +1760,13 @@ fn run_loop<B: Backend>(
             source_pane: sidebar_instance,
         };
         render_gate.note_toast(mark_ui.notice());
-        let draw_this_loop = render_gate
-            .take_draw_decision(crate::sidebar::tree::now_epoch_secs(), current.is_some());
+        let elapsed_clock_visible = current
+            .as_ref()
+            .is_some_and(|snapshot| sidebar_elapsed_clock_visible(snapshot, sidebar_instance));
+        let draw_this_loop = render_gate.take_draw_decision(
+            crate::sidebar::tree::now_epoch_secs(),
+            elapsed_clock_visible,
+        );
         if draw_this_loop {
             if let Some(snapshot) = &current {
                 let mut sidebar = project_view(snapshot, config.app, &sidebar_state);
