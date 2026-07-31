@@ -310,7 +310,6 @@ pub fn config_schema() -> Value {
                         "properties": {
                             "selection_bg": { "type": "string" },
                             "selection_bar": { "type": "string" },
-                            "action_icon": { "type": "string" },
                             "badge_blocked": { "type": "string" },
                             "badge_working": { "type": "string" },
                             "badge_done": { "type": "string" },
@@ -347,22 +346,6 @@ pub fn config_schema() -> Value {
                                     "outer_bg": { "type": "string" }
                                 }
                             }
-                        }
-                    },
-                    "preview": {
-                        "type": "object",
-                        "additionalProperties": true,
-                        "properties": {
-                            "history_lines": { "type": "integer", "minimum": 0 }
-                        }
-                    },
-                    "live": {
-                        "type": "object",
-                        "additionalProperties": true,
-                        "properties": {
-                            "enabled": { "type": "boolean" },
-                            "lines": { "type": "integer", "minimum": 0 },
-                            "interval_ms": { "type": "integer", "minimum": 1 }
                         }
                     }
                 }
@@ -457,7 +440,6 @@ mod tests {
         assert_eq!(colors["header_filter_bg"]["type"], "string");
         assert_eq!(colors["selection_bg"]["type"], "string");
         assert_eq!(colors["selection_bar"]["type"], "string");
-        assert_eq!(colors["action_icon"]["type"], "string");
         for key in ["badge_blocked", "badge_working", "badge_done", "badge_idle"] {
             assert_eq!(colors[key]["type"], "string", "{key}");
         }
@@ -511,23 +493,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_contains_sidebar_preview_history_lines() {
+    fn schema_contains_notify() {
         let schema = config_schema();
-        let preview = &schema["properties"]["sidebar"]["properties"]["preview"]["properties"];
-
-        assert_eq!(preview["history_lines"]["type"], "integer");
-        assert_eq!(preview["history_lines"]["minimum"], 0);
-    }
-
-    #[test]
-    fn schema_contains_sidebar_live_and_notify() {
-        let schema = config_schema();
-        let live = &schema["properties"]["sidebar"]["properties"]["live"]["properties"];
         let notify = &schema["properties"]["notify"]["properties"];
-
-        assert_eq!(live["enabled"]["type"], "boolean");
-        assert_eq!(live["lines"]["type"], "integer");
-        assert_eq!(live["interval_ms"]["type"], "integer");
         assert_eq!(notify["enabled"]["type"], "boolean");
         assert_eq!(notify["command"]["type"], "string");
     }

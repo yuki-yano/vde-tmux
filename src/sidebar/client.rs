@@ -18,228 +18,6 @@ use crate::pane_state::{
 const V2_SIDEBAR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const V2_SUBSCRIBE_INITIAL_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// One update from the daemon live preview stream. Delivered per fixed target;
-/// the run loop drops updates whose target no longer matches its selection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LiveSubscriptionUpdate {
-    Body {
-        target: PaneInstance,
-        live_revision: u64,
-        body: String,
-    },
-    Unavailable {
-        target: PaneInstance,
-    },
-}
-
-/// Owner handle of one fixed-target live subscription connection. Changing the
-/// target requires shutting this handle down and spawning a new subscription.
-pub struct LiveSubscriptionHandle {
-    target: PaneInstance,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    stream: std::sync::Arc<std::sync::Mutex<Option<UnixStream>>>,
-    worker: Option<thread::JoinHandle<()>>,
-}
-
-impl LiveSubscriptionHandle {
-    pub fn target(&self) -> &PaneInstance {
-        &self.target
-    }
-
-    /// Shuts the subscription socket down to release the blocking read and
-    /// waits for the worker thread to exit, so a replacement subscription can
-    /// never race a stale delivery from this one.
-    pub fn shutdown_and_join(mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(stream) = self
-            .stream
-            .lock()
-            .expect("live subscription stream lock poisoned")
-            .take()
-        {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
-impl Drop for LiveSubscriptionHandle {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(stream) = self
-            .stream
-            .lock()
-            .expect("live subscription stream lock poisoned")
-            .take()
-        {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
-    }
-}
-
-pub fn spawn_live_subscription(
-    socket: std::path::PathBuf,
-    server_identity: String,
-    source_pane: PaneInstance,
-    target_pane: PaneInstance,
-    interval_ms: u64,
-    tx: Sender<LiveSubscriptionUpdate>,
-) -> LiveSubscriptionHandle {
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stream_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<UnixStream>));
-    let worker = {
-        let stop = stop.clone();
-        let stream_slot = stream_slot.clone();
-        let target = target_pane.clone();
-        thread::spawn(move || {
-            let mut backoff = Duration::from_millis(200);
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                let result = run_live_subscription_once(
-                    &socket,
-                    &server_identity,
-                    &source_pane,
-                    &target,
-                    interval_ms,
-                    &tx,
-                    &stop,
-                    &stream_slot,
-                );
-                stream_slot
-                    .lock()
-                    .expect("live subscription stream lock poisoned")
-                    .take();
-                if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-                if tx
-                    .send(LiveSubscriptionUpdate::Unavailable {
-                        target: target.clone(),
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                let _ = result;
-                thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_secs(2));
-            }
-        })
-    };
-    LiveSubscriptionHandle {
-        target: target_pane,
-        stop,
-        stream: stream_slot,
-        worker: Some(worker),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_live_subscription_once(
-    socket: &Path,
-    server_identity: &str,
-    source_pane: &PaneInstance,
-    target_pane: &PaneInstance,
-    interval_ms: u64,
-    tx: &Sender<LiveSubscriptionUpdate>,
-    stop: &std::sync::atomic::AtomicBool,
-    stream_slot: &std::sync::Mutex<Option<UnixStream>>,
-) -> Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
-    stream.set_write_timeout(Some(V2_SUBSCRIBE_INITIAL_TIMEOUT))?;
-    *stream_slot
-        .lock()
-        .expect("live subscription stream lock poisoned") = Some(stream.try_clone()?);
-    if stop.load(std::sync::atomic::Ordering::SeqCst) {
-        return Ok(());
-    }
-    let deadline = Instant::now() + V2_SUBSCRIBE_INITIAL_TIMEOUT;
-    write_v2_client_frame(
-        &mut stream,
-        &V2ClientMessage::Hello {
-            proto: PROTOCOL_VERSION,
-        },
-        deadline,
-    )?;
-    let mut reader = BufReader::new(stream);
-    let hello = read_v2_server_frame(&mut reader, Some(deadline))?
-        .ok_or_else(|| anyhow::anyhow!("daemon closed the connection before HelloAck"))?;
-    let V2ServerMessage::HelloAck {
-        proto,
-        daemon_instance_id,
-        server_identity: actual_server_identity,
-        ..
-    } = hello
-    else {
-        return v2_server_error("HelloAck", hello);
-    };
-    if proto != PROTOCOL_VERSION {
-        bail!("daemon returned unsupported protocol version {proto}");
-    }
-    if actual_server_identity != server_identity {
-        bail!(
-            "daemon server identity mismatch: expected {server_identity}, received {actual_server_identity}"
-        );
-    }
-    write_v2_client_frame(
-        reader.get_mut(),
-        &V2ClientMessage::SubscribeLive {
-            proto: PROTOCOL_VERSION,
-            source_pane: source_pane.clone(),
-            target_pane: target_pane.clone(),
-            interval_ms,
-        },
-        deadline,
-    )?;
-    loop {
-        let Some(message) = read_v2_server_frame(&mut reader, None)? else {
-            return Ok(());
-        };
-        match message {
-            V2ServerMessage::Heartbeat {
-                daemon_instance_id: heartbeat_instance,
-                ..
-            } => {
-                if heartbeat_instance != daemon_instance_id {
-                    bail!("daemon instance changed during live subscription");
-                }
-            }
-            V2ServerMessage::LivePreviewResult {
-                live_revision,
-                target_pane,
-                body,
-                ..
-            } => {
-                if tx
-                    .send(LiveSubscriptionUpdate::Body {
-                        target: target_pane,
-                        live_revision,
-                        body,
-                    })
-                    .is_err()
-                {
-                    return Ok(());
-                }
-            }
-            V2ServerMessage::LivePreviewUnavailable { target_pane, .. } => {
-                if tx
-                    .send(LiveSubscriptionUpdate::Unavailable {
-                        target: target_pane,
-                    })
-                    .is_err()
-                {
-                    return Ok(());
-                }
-            }
-            V2ServerMessage::Error { code, message, .. } => {
-                bail!("{code:?}: {message}")
-            }
-            other => bail!("unexpected daemon live subscription response: {other:?}"),
-        }
-    }
-}
-
 pub fn send_sidebar_jump_v2(
     socket: &Path,
     server_identity: &str,
@@ -285,6 +63,21 @@ pub fn send_sidebar_preference_intent_v2(
         socket,
         server_identity,
         V2SidebarCommand::PreferenceIntent { intent },
+        V2SidebarResponse::SnapshotAck,
+    )?;
+    Ok(())
+}
+
+pub fn send_sidebar_navigation_v2(
+    socket: &Path,
+    server_identity: &str,
+    selection: Option<String>,
+    scroll: usize,
+) -> Result<()> {
+    request_v2_sidebar(
+        socket,
+        server_identity,
+        V2SidebarCommand::SetNavigation { selection, scroll },
         V2SidebarResponse::SnapshotAck,
     )?;
     Ok(())
@@ -916,100 +709,6 @@ mod tests {
         );
         let error = subscription.read_next_snapshot().unwrap_err();
         assert!(error.to_string().contains("regressed"), "{error}");
-    }
-
-    #[test]
-    fn live_subscription_forwards_stream_and_shutdown_releases_blocking_read() {
-        let socket = unique_socket_path("live-subscription");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let source = PaneInstance {
-            pane_id: "%9".to_string(),
-            pane_pid: 900,
-        };
-        let target = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 100,
-        };
-        let expected_target = target.clone();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            assert!(matches!(
-                read_client_frame(&mut reader),
-                V2ClientMessage::Hello { .. }
-            ));
-            write_hello_ack(&mut stream, "live-server");
-            let subscribe = read_client_frame(&mut reader);
-            let V2ClientMessage::SubscribeLive {
-                target_pane,
-                interval_ms,
-                ..
-            } = subscribe
-            else {
-                panic!("expected SubscribeLive, found {subscribe:?}");
-            };
-            assert_eq!(target_pane, expected_target);
-            assert_eq!(interval_ms, 2000);
-            // A keepalive during a quiet capture period is consumed silently.
-            write_frame(
-                &mut stream,
-                &V2ServerMessage::Heartbeat {
-                    daemon_instance_id: daemon_instance_id(),
-                    snapshot_revision: 1,
-                },
-            );
-            write_frame(
-                &mut stream,
-                &V2ServerMessage::LivePreviewResult {
-                    live_revision: 1,
-                    target_pane: target_pane.clone(),
-                    captured_at_epoch_millis: 42,
-                    body: "\u{1b}[32mok\u{1b}[0m\n".to_string(),
-                },
-            );
-            write_frame(
-                &mut stream,
-                &V2ServerMessage::LivePreviewUnavailable {
-                    target_pane,
-                    reason: crate::daemon::protocol::v2::LiveUnavailableReason::TargetMissing,
-                },
-            );
-            // Keep the connection open so the client blocks in read until it
-            // shuts the socket down from the run loop side.
-            let mut buffer = [0u8; 1];
-            use std::io::Read as _;
-            let _ = stream.read(&mut buffer);
-        });
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = spawn_live_subscription(
-            socket.clone(),
-            "live-server".to_string(),
-            source,
-            target.clone(),
-            2000,
-            tx,
-        );
-
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            LiveSubscriptionUpdate::Body {
-                target: target.clone(),
-                live_revision: 1,
-                body: "\u{1b}[32mok\u{1b}[0m\n".to_string(),
-            }
-        );
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            LiveSubscriptionUpdate::Unavailable {
-                target: target.clone(),
-            }
-        );
-
-        handle.shutdown_and_join();
-        server.join().unwrap();
-        let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
     }
 
     fn accept_config_guard(listener: &UnixListener, server_identity: &str, config_hash: &str) {

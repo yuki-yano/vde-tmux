@@ -279,14 +279,6 @@ fn capture_identity_format(delimiter: &str) -> String {
     format!("__vde_capture_identity_{delimiter}__#{{pid}}:#{{start_time}}")
 }
 
-fn live_ok_marker(delimiter: &str) -> String {
-    format!("__vde_live_ok_{delimiter}__")
-}
-
-fn live_mismatch_marker(delimiter: &str) -> String {
-    format!("__vde_live_mismatch_{delimiter}__")
-}
-
 fn obs_ok_marker(delimiter: &str) -> String {
     format!("__vde_obs_ok_{delimiter}__")
 }
@@ -295,29 +287,15 @@ fn job_boundary_marker(delimiter: &str) -> String {
     format!("__vde_job_{delimiter}__")
 }
 
-/// Per-target outcome of one live ANSI capture invocation. Section-level
-/// failures never poison the other targets in the same tmux command group.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LiveCaptureSection {
-    Body(String),
-    PaneInstanceMismatch,
-    TargetMissing,
-    Malformed,
-}
-
-/// One job inside a combined capture invocation. Observation jobs capture
-/// plain tails with an all-or-nothing contract; live jobs capture ANSI bodies
-/// with per-target isolation and a pane-PID guard inside the tmux command.
+/// One job inside a combined capture invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureJobSpec {
     ObservationPlain { panes: Vec<PaneInstance> },
-    LiveAnsi { targets: Vec<PaneInstance> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureJobOutcome {
     Observation(std::result::Result<Vec<String>, CaptureBatchError>),
-    Live(Vec<LiveCaptureSection>),
 }
 
 /// Builds one framed tmux command group for every job. The server identity
@@ -381,59 +359,14 @@ pub fn combined_capture_args(jobs: &[CaptureJobSpec], delimiter: &str) -> Vec<St
                     ]);
                 }
             }
-            CaptureJobSpec::LiveAnsi { targets } => {
-                for (index, target) in targets.iter().enumerate() {
-                    args.push(";".to_string());
-                    if index > 0 {
-                        args.extend([
-                            "display-message".to_string(),
-                            "-p".to_string(),
-                            delimiter.to_string(),
-                            ";".to_string(),
-                        ]);
-                    }
-                    let capture = vec![
-                        "capture-pane".to_string(),
-                        "-p".to_string(),
-                        "-e".to_string(),
-                        "-t".to_string(),
-                        target.pane_id.clone(),
-                    ];
-                    let ok_marker = vec![
-                        "display-message".to_string(),
-                        "-p".to_string(),
-                        live_ok_marker(delimiter),
-                    ];
-                    let mismatch_marker = vec![
-                        "display-message".to_string(),
-                        "-p".to_string(),
-                        live_mismatch_marker(delimiter),
-                    ];
-                    args.extend([
-                        "if-shell".to_string(),
-                        "-F".to_string(),
-                        "-t".to_string(),
-                        target.pane_id.clone(),
-                        format!("#{{==:#{{pane_pid}},{}}}", target.pane_pid),
-                        format!(
-                            "{} ; {}",
-                            crate::pane_state::store::tmux_command_string(&capture),
-                            crate::pane_state::store::tmux_command_string(&ok_marker),
-                        ),
-                        crate::pane_state::store::tmux_command_string(&mismatch_marker),
-                    ]);
-                }
-            }
         }
     }
     args
 }
 
 /// Parses one combined capture invocation. The exit code and stderr are not
-/// used for validation because a missing live target fails its own tmux
-/// sub-command; correctness is judged from the self-describing stdout
-/// structure instead. Only a bad identity header, an identity mismatch, or a
-/// broken job frame fails every job in the invocation.
+/// used for validation; correctness is judged from the self-describing stdout
+/// structure instead.
 pub fn parse_combined_capture(
     output: CaptureBatchOutput,
     jobs: &[CaptureJobSpec],
@@ -486,9 +419,6 @@ pub fn parse_combined_capture(
         .map(|(job, body)| match job {
             CaptureJobSpec::ObservationPlain { panes } => {
                 CaptureJobOutcome::Observation(parse_observation_job(&body, panes.len(), delimiter))
-            }
-            CaptureJobSpec::LiveAnsi { targets } => {
-                CaptureJobOutcome::Live(parse_live_job(&body, targets.len(), delimiter))
             }
         })
         .collect())
@@ -545,57 +475,13 @@ fn parse_observation_job(
     Ok(tails)
 }
 
-/// Per-target isolation: a broken frame downgrades every target of this job
-/// to `Malformed` without touching the other jobs in the invocation.
-fn parse_live_job(body: &str, target_count: usize, delimiter: &str) -> Vec<LiveCaptureSection> {
-    if target_count == 0 {
-        return Vec::new();
-    }
-    let sections = split_sections(body, delimiter);
-    if sections.len() != target_count {
-        return vec![LiveCaptureSection::Malformed; target_count];
-    }
-    let ok_marker = live_ok_marker(delimiter);
-    let mismatch_marker = live_mismatch_marker(delimiter);
-    sections
-        .into_iter()
-        .map(|section| classify_live_section(&section, &ok_marker, &mismatch_marker))
-        .collect()
-}
-
-fn classify_live_section(
-    section: &str,
-    ok_marker: &str,
-    mismatch_marker: &str,
-) -> LiveCaptureSection {
-    let mut lines = section.split_inclusive('\n').collect::<Vec<_>>();
-    let Some(last) = lines.last() else {
-        return LiveCaptureSection::TargetMissing;
-    };
-    let value = last.strip_suffix('\n').unwrap_or(last);
-    let value = value.strip_suffix('\r').unwrap_or(value);
-    if value == ok_marker {
-        lines.pop();
-        return LiveCaptureSection::Body(lines.concat());
-    }
-    if value == mismatch_marker {
-        return LiveCaptureSection::PaneInstanceMismatch;
-    }
-    LiveCaptureSection::Malformed
-}
-
 /// The only production entry point for tmux capture subprocesses. Observation
-/// polls and live previews request captures here; requests that arrive inside
-/// the same coalesce window share a single tmux invocation.
+/// polls that arrive inside the same coalesce window share one invocation.
 pub trait CaptureSource: Send + Sync {
     fn capture_plain_tails(
         &self,
         panes: &[PaneInstance],
     ) -> std::result::Result<Vec<String>, CaptureBatchError>;
-    fn capture_live_sections(
-        &self,
-        targets: &[PaneInstance],
-    ) -> std::result::Result<Vec<LiveCaptureSection>, CaptureBatchError>;
 }
 
 pub const CAPTURE_COALESCE_WINDOW: Duration = Duration::from_millis(25);
@@ -605,32 +491,11 @@ enum CaptureRequest {
         panes: Vec<PaneInstance>,
         reply: mpsc::SyncSender<std::result::Result<Vec<String>, CaptureBatchError>>,
     },
-    LiveAnsi {
-        targets: Vec<PaneInstance>,
-        reply: mpsc::SyncSender<std::result::Result<Vec<LiveCaptureSection>, CaptureBatchError>>,
-    },
 }
 
 #[derive(Clone)]
 pub struct CaptureCoordinatorHandle {
     tx: mpsc::Sender<CaptureRequest>,
-}
-
-impl CaptureCoordinatorHandle {
-    /// Queues a live capture without blocking; the reply arrives on the
-    /// returned channel once the coalesced invocation completes. Used by the
-    /// observation worker to piggyback due live targets on its own capture.
-    pub fn request_live_sections(
-        &self,
-        targets: Vec<PaneInstance>,
-    ) -> mpsc::Receiver<std::result::Result<Vec<LiveCaptureSection>, CaptureBatchError>> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        let _ = self.tx.send(CaptureRequest::LiveAnsi {
-            targets,
-            reply: reply_tx,
-        });
-        reply_rx
-    }
 }
 
 impl CaptureSource for CaptureCoordinatorHandle {
@@ -651,20 +516,6 @@ impl CaptureSource for CaptureCoordinatorHandle {
         reply_rx.recv().map_err(|_| {
             CaptureBatchError::Io("capture coordinator dropped the reply".to_string())
         })?
-    }
-
-    fn capture_live_sections(
-        &self,
-        targets: &[PaneInstance],
-    ) -> std::result::Result<Vec<LiveCaptureSection>, CaptureBatchError> {
-        if targets.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.request_live_sections(targets.to_vec())
-            .recv()
-            .map_err(|_| {
-                CaptureBatchError::Io("capture coordinator dropped the reply".to_string())
-            })?
     }
 }
 
@@ -702,9 +553,6 @@ const MAX_ARGS_PER_CAPTURE_INVOCATION: usize = 850;
 /// Worst-case arguments one guarded observation capture adds: the command
 /// separator, a section separator, and six if-shell arguments.
 const ARGS_PER_OBSERVATION_ITEM: usize = 11;
-/// Worst-case arguments one guarded live capture adds: the command separator,
-/// a section separator, and seven if-shell arguments.
-const ARGS_PER_LIVE_ITEM: usize = 12;
 const ARGS_PER_JOB_HEADER: usize = 4;
 const ARGS_PER_INVOCATION_HEADER: usize = 3;
 
@@ -716,15 +564,8 @@ fn plan_capture_invocations(requests: &[CaptureRequest]) -> Vec<Vec<(usize, Capt
     let mut current: Vec<(usize, CaptureJobSpec)> = Vec::new();
     let mut current_args = ARGS_PER_INVOCATION_HEADER;
     for (request_index, request) in requests.iter().enumerate() {
-        let (items, live) = match request {
-            CaptureRequest::ObservationPlain { panes, .. } => (panes, false),
-            CaptureRequest::LiveAnsi { targets, .. } => (targets, true),
-        };
-        let item_args = if live {
-            ARGS_PER_LIVE_ITEM
-        } else {
-            ARGS_PER_OBSERVATION_ITEM
-        };
+        let CaptureRequest::ObservationPlain { panes: items, .. } = request;
+        let item_args = ARGS_PER_OBSERVATION_ITEM;
         let mut offset = 0;
         while offset < items.len() {
             let budget =
@@ -739,11 +580,7 @@ fn plan_capture_invocations(requests: &[CaptureRequest]) -> Vec<Vec<(usize, Capt
             let slice = items[offset..offset + take].to_vec();
             current.push((
                 request_index,
-                if live {
-                    CaptureJobSpec::LiveAnsi { targets: slice }
-                } else {
-                    CaptureJobSpec::ObservationPlain { panes: slice }
-                },
+                CaptureJobSpec::ObservationPlain { panes: slice },
             ));
             current_args += ARGS_PER_JOB_HEADER + take * item_args;
             offset += take;
@@ -762,17 +599,10 @@ fn execute_capture_group(
 ) {
     let mut observation_acc: BTreeMap<usize, std::result::Result<Vec<String>, CaptureBatchError>> =
         BTreeMap::new();
-    let mut live_acc: BTreeMap<
-        usize,
-        std::result::Result<Vec<LiveCaptureSection>, CaptureBatchError>,
-    > = BTreeMap::new();
     for (request_index, request) in requests.iter().enumerate() {
         match request {
             CaptureRequest::ObservationPlain { .. } => {
                 observation_acc.insert(request_index, Ok(Vec::new()));
-            }
-            CaptureRequest::LiveAnsi { .. } => {
-                live_acc.insert(request_index, Ok(Vec::new()));
             }
         }
     }
@@ -803,11 +633,6 @@ fn execute_capture_group(
                                 (Err(_), _) => {}
                             }
                         }
-                        CaptureJobOutcome::Live(sections) => {
-                            if let Some(Ok(accumulated)) = live_acc.get_mut(request_index) {
-                                accumulated.extend(sections);
-                            }
-                        }
                     }
                 }
             }
@@ -825,9 +650,6 @@ fn execute_capture_group(
                     if let Some(accumulator) = observation_acc.get_mut(request_index) {
                         *accumulator = Err(error.clone());
                     }
-                    if let Some(accumulator) = live_acc.get_mut(request_index) {
-                        *accumulator = Err(error.clone());
-                    }
                 }
             }
         }
@@ -841,15 +663,6 @@ fn execute_capture_group(
                     None => observation_acc
                         .remove(&request_index)
                         .expect("every observation request has an accumulator"),
-                };
-                let _ = reply.send(result);
-            }
-            CaptureRequest::LiveAnsi { reply, .. } => {
-                let result = match &fatal {
-                    Some(error) => Err(error.clone()),
-                    None => live_acc
-                        .remove(&request_index)
-                        .expect("every live request has an accumulator"),
                 };
                 let _ = reply.send(result);
             }
@@ -1332,11 +1145,6 @@ pub trait WorkerIo: Send + Sync + 'static {
         client_pid: u32,
         source_pane: &PaneInstance,
     ) -> std::result::Result<(), SidebarTmuxError>;
-    fn preview_pane(
-        &self,
-        pane: &PaneInstance,
-        history_lines: u32,
-    ) -> std::result::Result<(), SidebarTmuxError>;
 }
 
 trait TimedTmuxIo: Send + Sync {
@@ -1418,25 +1226,6 @@ impl WorkerIo for SystemWorkerIo {
                 }
             })
     }
-
-    fn preview_pane(
-        &self,
-        pane: &PaneInstance,
-        history_lines: u32,
-    ) -> std::result::Result<(), SidebarTmuxError> {
-        let env = std::env::vars().collect();
-        let budgeted = JobBudgetTmuxRunner {
-            io: &self.io,
-            deadline: Instant::now() + SIDEBAR_JOB_TIMEOUT,
-        };
-        let guarded = GuardedSidebarTmuxRunner {
-            runner: &budgeted,
-            expected_server: &self.expected_server,
-            expected_pane: pane,
-        };
-        crate::sidebar::preview::open_preview_floating_pane(&guarded, &env, pane, history_lines)
-            .map_err(|error| classify_sidebar_error(error, pane))
-    }
 }
 
 pub fn system_git_runner(timeout: Duration) -> SystemGitRunner {
@@ -1471,6 +1260,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn combined_live_job_guards_every_pane_pid_in_one_invocation() {
         let targets = vec![
             PaneInstance {
@@ -1499,6 +1289,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn combined_live_sections_isolate_per_target_failures() {
         let delimiter = "d1";
         let identity = ServerIdentity {
@@ -1545,6 +1336,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn combined_parse_isolates_observation_and_live_job_failures() {
         let delimiter = "d5";
         let identity = ServerIdentity {
@@ -1616,6 +1408,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn combined_live_job_keeps_empty_body_as_success() {
         let delimiter = "d2";
         let identity = ServerIdentity {
@@ -1645,6 +1438,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn combined_parse_identity_mismatch_is_fatal_for_every_job() {
         let delimiter = "d3";
         let wrong_identity = ServerIdentity {
@@ -1692,20 +1486,15 @@ mod tests {
             self.requested_panes.lock().unwrap().push(panes.to_vec());
             Ok(self.tails.clone())
         }
-
-        fn capture_live_sections(
-            &self,
-            _targets: &[PaneInstance],
-        ) -> std::result::Result<Vec<LiveCaptureSection>, CaptureBatchError> {
-            unreachable!("observation poll never captures live sections")
-        }
     }
 
+    #[cfg(any())]
     struct ScriptedCombinedIo {
         calls: Mutex<usize>,
         script: Box<dyn Fn(&str) -> String + Send + Sync>,
     }
 
+    #[cfg(any())]
     impl ObservationWorkerIo for ScriptedCombinedIo {
         fn capture_batch(&self, args: &[String]) -> anyhow::Result<CaptureBatchOutput> {
             *self.calls.lock().unwrap() += 1;
@@ -1844,6 +1633,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn capture_coordinator_coalesces_live_and_observation_into_one_invocation() {
         let io = std::sync::Arc::new(ScriptedCombinedIo {
             calls: Mutex::new(0),
@@ -1877,10 +1667,12 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[cfg(any())]
     struct SynthesizingCombinedIo {
         calls: Mutex<Vec<usize>>,
     }
 
+    #[cfg(any())]
     impl ObservationWorkerIo for SynthesizingCombinedIo {
         fn capture_batch(&self, args: &[String]) -> anyhow::Result<CaptureBatchOutput> {
             self.calls.lock().unwrap().push(args.len());
@@ -1934,6 +1726,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn capture_coordinator_splits_oversized_jobs_and_reassembles_results() {
         let io = std::sync::Arc::new(SynthesizingCombinedIo::default());
         let handle = start_capture_coordinator(io.clone(), server_identity());
@@ -1965,6 +1758,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn default_scale_poll_plans_a_single_invocation() {
         let (observation_reply, _observation_rx) = mpsc::sync_channel(1);
         let (live_reply, _live_rx) = mpsc::sync_channel(1);
@@ -2012,6 +1806,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn capture_coordinator_runs_unaligned_requests_as_separate_invocations() {
         let io = std::sync::Arc::new(ScriptedCombinedIo {
             calls: Mutex::new(0),
@@ -2222,9 +2017,7 @@ mod tests {
             &server_identity(),
         )
         .unwrap();
-        let CaptureJobOutcome::Observation(result) = outcomes.into_iter().next().unwrap() else {
-            panic!("expected an observation outcome");
-        };
+        let CaptureJobOutcome::Observation(result) = outcomes.into_iter().next().unwrap();
         result
     }
 

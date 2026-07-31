@@ -313,9 +313,6 @@ daemon:
 sidebar:
   width: 35
   min_width: 10
-  live:
-    enabled: true
-    lines: 3
 notify:
   enabled: true
   command: '$NOTIFY_BIN'
@@ -650,7 +647,7 @@ run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-after-startup-failure.log"
 wait_daemon_running >"$ARTIFACT_DIR/status-after-startup-recovery.txt"
 record startup-failure PASS-valid-config-no-rollback-and-explicit-recovery
 
-# Two independent live sidebar processes receive instance-local input.
+# Two independent sidebar processes share cursor and scroll navigation.
 S1_WINDOW="$(tmux_cmd new-window -d -P -F '#{window_id}' -t A: -n side-one -c "$ROOT" "sleep 900")"
 S1_AGENT="$(tmux_cmd display-message -p -t "$S1_WINDOW" '#{pane_id}')"
 S1_PEER="$(tmux_cmd split-window -d -P -F '#{pane_id}' -t "$S1_WINDOW" -c "$ROOT" "sleep 900")"
@@ -690,20 +687,21 @@ sleep 0.15
 capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-selection.txt"
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-selection.txt"
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-1-selection.txt")" != "$(fingerprint "$ARTIFACT_DIR/sidebar-1-before.txt")" ]]
-[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-selection.txt")" == "$SIDE2_STABLE" ]]
+[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-selection.txt")" != "$SIDE2_STABLE" ]]
+SIDE2_SHARED_SELECTION="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-selection.txt")"
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input "toggle:chat::$S2_AGENT::$S2_AGENT_PID"
 sleep 0.3
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-shared-expansion.txt"
 SIDE2_SHARED_EXPANSION="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-shared-expansion.txt")"
-[[ "$SIDE2_SHARED_EXPANSION" != "$SIDE2_STABLE" ]]
+[[ "$SIDE2_SHARED_EXPANSION" != "$SIDE2_SHARED_SELECTION" ]]
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input K
 sleep 0.3
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-shared-order.txt"
 SIDE2_SHARED_ORDER="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-shared-order.txt")"
 [[ "$SIDE2_SHARED_ORDER" != "$SIDE2_SHARED_EXPANSION" ]]
-record sidebar-shared-state PASS-manual-order-and-expansion-live-across-two-sidebars
+record sidebar-shared-state PASS-selection-manual-order-and-expansion-shared-across-two-sidebars
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input 1
 sleep 0.15
@@ -719,12 +717,6 @@ capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-filter.tx
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-1-filter-done.txt")" != "$(fingerprint "$ARTIFACT_DIR/sidebar-1-view-flat.txt")" ]]
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-filter.txt")" == "$SIDE2_SHARED_ORDER" ]]
 
-tmux_cmd send-keys -t "$SIDEBAR_1" e
-sleep 0.15
-capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-live-toggle.txt"
-capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-live.txt"
-[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-1-live-toggle.txt")" != "$(fingerprint "$ARTIFACT_DIR/sidebar-1-filter-done.txt")" ]]
-[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-live.txt")" == "$SIDE2_SHARED_ORDER" ]]
 REVISION_AFTER_LOCAL="$(snapshot_revision)"
 (( REVISION_AFTER_LOCAL > REVISION_BEFORE_LOCAL ))
 python3 - "$QUERY_JSON" <<'PY'
@@ -734,7 +726,7 @@ assert preferences["view_mode"] == "flat", preferences
 assert preferences["filter"] == "done_only", preferences
 assert preferences["schema_version"] == 1, preferences
 PY
-record sidebar-local-state PASS-selection-live-noninterference-and-view-filter-defaults-persisted
+record sidebar-state PASS-navigation-shared-and-view-filter-defaults-persisted
 
 # Focus records a pane-instance return target, focus-toggle closes back onto content, and a
 # reopened instance still jumps through a stable PaneInstance.

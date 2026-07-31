@@ -17,7 +17,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -698,6 +698,10 @@ pub enum SidebarCommand {
     PreferenceIntent {
         intent: crate::sidebar::state::SidebarPreferenceIntent,
     },
+    SetNavigation {
+        selection: Option<String>,
+        scroll: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,12 +727,6 @@ pub enum ClientMessage {
     },
     Subscribe {
         proto: u16,
-    },
-    SubscribeLive {
-        proto: u16,
-        source_pane: PaneInstance,
-        target_pane: PaneInstance,
-        interval_ms: u64,
     },
     SubmitPaneEvent {
         proto: u16,
@@ -765,7 +763,6 @@ impl ClientMessage {
             | Self::QueryPane { proto, .. }
             | Self::QueryRuntimeInfo { proto }
             | Self::Subscribe { proto }
-            | Self::SubscribeLive { proto, .. }
             | Self::SubmitPaneEvent { proto, .. }
             | Self::SubmitViewEvent { proto, .. }
             | Self::SidebarCommand { proto, .. }
@@ -814,7 +811,6 @@ impl ClientMessage {
                 | Self::QueryPane { .. }
                 | Self::QueryRuntimeInfo { .. }
                 | Self::Subscribe { .. }
-                | Self::SubscribeLive { .. }
         )
     }
 }
@@ -895,16 +891,6 @@ pub enum ServerMessage {
         accepted_seq: u64,
         snapshot_revision: u64,
     },
-    LivePreviewResult {
-        live_revision: u64,
-        target_pane: PaneInstance,
-        captured_at_epoch_millis: u64,
-        body: String,
-    },
-    LivePreviewUnavailable {
-        target_pane: PaneInstance,
-        reason: LiveUnavailableReason,
-    },
     Heartbeat {
         daemon_instance_id: DaemonInstanceId,
         snapshot_revision: u64,
@@ -914,15 +900,6 @@ pub enum ServerMessage {
         message: String,
         event_id: Option<EventId>,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum LiveUnavailableReason {
-    HiddenSource,
-    TargetMissing,
-    PaneInstanceMismatch,
-    CaptureFailed,
 }
 
 impl ServerMessage {
@@ -1092,15 +1069,6 @@ mod tests {
             ClientMessage::Subscribe {
                 proto: PROTOCOL_VERSION,
             },
-            ClientMessage::SubscribeLive {
-                proto: PROTOCOL_VERSION,
-                source_pane: pane(),
-                target_pane: PaneInstance {
-                    pane_id: "%7".to_string(),
-                    pane_pid: 77,
-                },
-                interval_ms: 2000,
-            },
             pane_event(),
             ClientMessage::SubmitViewEvent {
                 proto: PROTOCOL_VERSION,
@@ -1143,6 +1111,15 @@ mod tests {
                 proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
+                command: SidebarCommand::SetNavigation {
+                    selection: Some("chat::%1::10".to_string()),
+                    scroll: 6,
+                },
+            },
+            ClientMessage::SidebarCommand {
+                proto: PROTOCOL_VERSION,
+                daemon_instance_id: daemon_id(),
+                event_id: event_id(),
                 command: SidebarCommand::PreferenceIntent {
                     intent: crate::sidebar::state::SidebarPreferenceIntent::SetExpanded {
                         row_id: "repo::misc::app".to_string(),
@@ -1169,7 +1146,7 @@ mod tests {
 
     #[test]
     fn unknown_fields_and_oversized_frames_are_rejected() {
-        let json = br#"{"op":"hello","proto":4,"unknown":true}"#;
+        let json = br#"{"op":"hello","proto":5,"unknown":true}"#;
         assert!(matches!(
             decode_request_frame(json),
             Err(ServerMessage::Error {
@@ -1403,28 +1380,6 @@ mod tests {
                 accepted_seq: 7,
                 snapshot_revision: 1,
             },
-            ServerMessage::LivePreviewResult {
-                live_revision: 8,
-                target_pane: pane(),
-                captured_at_epoch_millis: 1_700_000_000_123,
-                body: "\u{1b}[31mred\u{1b}[0m\nline".to_string(),
-            },
-            ServerMessage::LivePreviewUnavailable {
-                target_pane: pane(),
-                reason: LiveUnavailableReason::HiddenSource,
-            },
-            ServerMessage::LivePreviewUnavailable {
-                target_pane: pane(),
-                reason: LiveUnavailableReason::TargetMissing,
-            },
-            ServerMessage::LivePreviewUnavailable {
-                target_pane: pane(),
-                reason: LiveUnavailableReason::PaneInstanceMismatch,
-            },
-            ServerMessage::LivePreviewUnavailable {
-                target_pane: pane(),
-                reason: LiveUnavailableReason::CaptureFailed,
-            },
             ServerMessage::Heartbeat {
                 daemon_instance_id: daemon_id(),
                 snapshot_revision: 42,
@@ -1473,32 +1428,14 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_three_is_rejected() {
+    fn previous_protocol_version_is_rejected() {
         let frame = serde_json::to_vec(&serde_json::json!({
             "op": "hello",
-            "proto": 3,
+            "proto": 4,
         }))
         .unwrap();
 
         let error = decode_request_frame(&frame).unwrap_err();
-        assert!(matches!(
-            error,
-            ServerMessage::Error {
-                code: ErrorCode::UnsupportedProtocol,
-                ..
-            }
-        ));
-
-        let subscribe_live = serde_json::to_vec(&serde_json::json!({
-            "op": "subscribe_live",
-            "proto": 3,
-            "source_pane": {"pane_id": "%1", "pane_pid": 10},
-            "target_pane": {"pane_id": "%2", "pane_pid": 20},
-            "interval_ms": 2000,
-        }))
-        .unwrap();
-
-        let error = decode_request_frame(&subscribe_live).unwrap_err();
         assert!(matches!(
             error,
             ServerMessage::Error {

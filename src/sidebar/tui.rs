@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -23,18 +24,17 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
-use crate::config::{Config, SidebarLiveConfig};
+use crate::config::Config;
 use crate::daemon::protocol::v2::ResolvedSnapshot;
 use crate::daemon::session_badge::BadgeState;
 use crate::pane_state::{PaneInstance, StateVersion, StoredStateDescriptor};
 use crate::sidebar::client::{
     SubscriptionUpdate, send_sidebar_jump_v2, send_sidebar_mark_complete_v2, subscribe_v2,
 };
-use crate::sidebar::preview::open_preview_floating_pane;
 use crate::sidebar::render::{
-    HeaderAction, HeaderLayout, JumpRowAction, RenderedLines, SidebarRenderTheme,
-    build_footer_line, build_header_layout_with_counts, display_width, header_hit_test,
-    jump_row_action_at, render_header_lines, render_lines_with_indices,
+    HeaderAction, HeaderLayout, RenderedLines, SidebarRenderTheme, build_footer_line,
+    build_header_layout_with_counts, display_width, header_hit_test, render_header_lines,
+    render_lines_with_indices,
 };
 use crate::sidebar::state::{SidebarAction, SidebarPreferenceIntent, SidebarState, StatusFilter};
 use crate::sidebar::tree::{
@@ -42,8 +42,6 @@ use crate::sidebar::tree::{
     pane_instance_from_row_id, project_sidebar, row_refs,
 };
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
-
-const LIVE_CARD_MIN_WIDTH: u16 = 24;
 
 static PANIC_RESTORE_HOOK: Once = Once::new();
 
@@ -73,14 +71,9 @@ pub fn run_live_tui(
         let config_hash = crate::daemon::lifecycle::config_hash(&active_config);
         subscribe_v2(socket, server_identity, &config_hash, tx)?;
         let theme = SidebarRenderTheme::from_app_config(&active_config);
-        let (live_update_tx, live_update_rx) = mpsc::channel();
         let runtime_config = RunLoopConfig {
             app: &active_config,
             theme: &theme,
-            preview_history_lines: active_config.sidebar.preview.history_lines,
-            live: &active_config.sidebar.live,
-            live_update_tx: &live_update_tx,
-            live_update_rx: &live_update_rx,
         };
         match run_loop(
             &mut terminal,
@@ -88,7 +81,6 @@ pub fn run_live_tui(
                 socket,
                 server_identity,
                 snapshots: &rx,
-                runner: &runner,
                 env,
                 sidebar_instance: &sidebar_instance,
                 control: &control,
@@ -708,20 +700,182 @@ mod local_state_tests {
 
         assert!(row_for_click_with_indices(&sidebar, 1, 2, 0, &row_indices).is_none());
         assert_eq!(
-            row_for_click_with_indices(&sidebar, 2, 2, 1, &row_indices).map(|row| row.id.as_str()),
+            row_for_click_with_indices(&sidebar, 2, 2, 1, &row_indices)
+                .map(|clicked| clicked.row.id.as_str()),
             Some("first")
         );
         assert_eq!(
-            row_for_click_with_indices(&sidebar, 3, 2, 1, &row_indices).map(|row| row.id.as_str()),
+            row_for_click_with_indices(&sidebar, 3, 2, 1, &row_indices)
+                .map(|clicked| clicked.row.id.as_str()),
             Some("second")
         );
     }
 
     #[test]
-    fn ansi_stripping_removes_csi_and_osc_sequences() {
+    fn agent_click_uses_first_line_for_toggle_and_later_lines_for_jump() {
+        let chat = SidebarRow {
+            id: "chat::%1::101".to_string(),
+            kind: SidebarRowKind::Chat,
+            depth: 0,
+            label: "codex".to_string(),
+            chat_count: 0,
+            rollup: RollupLevel::Running,
+            badge_state: Some(BadgeState::Working),
+            expanded: false,
+            pane_id: Some("%1".to_string()),
+            git: None,
+            active: false,
+            meta: None,
+        };
+        let detail = SidebarRow {
+            id: "detail::%1::101::prompt".to_string(),
+            kind: SidebarRowKind::Detail,
+            depth: 1,
+            label: "fix bug".to_string(),
+            chat_count: 0,
+            rollup: RollupLevel::Running,
+            badge_state: Some(BadgeState::Working),
+            expanded: true,
+            pane_id: Some("%1".to_string()),
+            git: None,
+            active: false,
+            meta: None,
+        };
+        let pane = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+
         assert_eq!(
-            strip_ansi("plain\u{1b}[31mred\u{1b}[0m\u{1b}]0;title\u{7}tail"),
-            "plainredtail"
+            row_click_intent(&ClickedRenderedRow {
+                row: &chat,
+                line_offset: 0,
+            }),
+            Some(RowClickIntent::Toggle(chat.id.clone()))
+        );
+        assert_eq!(
+            row_click_intent(&ClickedRenderedRow {
+                row: &chat,
+                line_offset: 1,
+            }),
+            Some(RowClickIntent::Jump(pane.clone()))
+        );
+        assert_eq!(
+            row_click_intent(&ClickedRenderedRow {
+                row: &detail,
+                line_offset: 0,
+            }),
+            Some(RowClickIntent::Jump(pane))
+        );
+    }
+
+    #[test]
+    fn remote_navigation_updates_every_sidebar_state_once_per_revision() {
+        let mut snapshot = snapshot(10);
+        snapshot.sidebar_model.navigation = crate::sidebar::state::SidebarNavigation {
+            revision: 1,
+            selection: Some("chat::%1::10".to_string()),
+            scroll: 7,
+        };
+        let mut first = SidebarState::default();
+        let mut second = SidebarState::default();
+        let mut first_revision = 0;
+        let mut second_revision = 0;
+        let mut first_queued = None;
+        let mut second_queued = None;
+
+        assert!(apply_remote_navigation(
+            &snapshot,
+            &mut first,
+            &mut first_revision,
+            &mut first_queued,
+        ));
+        assert!(apply_remote_navigation(
+            &snapshot,
+            &mut second,
+            &mut second_revision,
+            &mut second_queued,
+        ));
+        assert_eq!(first.selection, second.selection);
+        assert_eq!(first.scroll, 7);
+        assert_eq!(second.scroll, 7);
+        assert!(!apply_remote_navigation(
+            &snapshot,
+            &mut second,
+            &mut second_revision,
+            &mut second_queued,
+        ));
+    }
+
+    #[test]
+    fn vim_viewport_moves_select_ends_and_scroll_by_page_size() {
+        let rows = (0..8)
+            .map(|index| SidebarRow {
+                id: format!("chat::%{}::{}", index + 1, index + 101),
+                kind: SidebarRowKind::Chat,
+                depth: 0,
+                label: format!("agent-{index}"),
+                chat_count: 0,
+                rollup: RollupLevel::Running,
+                badge_state: Some(BadgeState::Working),
+                expanded: false,
+                pane_id: Some(format!("%{}", index + 1)),
+                git: None,
+                active: false,
+                meta: None,
+            })
+            .collect::<Vec<_>>();
+        let mut state = SidebarState {
+            selection: Some(rows[0].id.clone()),
+            ..SidebarState::default()
+        };
+        let sidebar = SidebarView {
+            state: state.clone(),
+            rows,
+            counts: BadgeCounts::default(),
+        };
+        let theme = SidebarRenderTheme::default();
+        let rendered = render_lines_with_indices(&sidebar.rows, &sidebar.state, 60, &theme);
+        let frame = DrawnFrame {
+            header: build_header_layout_with_counts(&sidebar.state, 60, &theme, sidebar.counts),
+            header_rows: 2,
+            rows_height: 4,
+            width: 60,
+            scroll: 0,
+            row_indices: rendered.row_indices.clone(),
+        };
+
+        move_projected_viewport(
+            &sidebar,
+            &rendered,
+            &mut state,
+            &frame,
+            ViewportMove::PageDown,
+        );
+        assert_eq!(state.scroll, 4);
+        assert_ne!(
+            state.selection.as_deref(),
+            Some(sidebar.rows[0].id.as_str())
+        );
+
+        move_projected_viewport(&sidebar, &rendered, &mut state, &frame, ViewportMove::First);
+        assert_eq!(
+            state.selection.as_deref(),
+            Some(sidebar.rows[0].id.as_str())
+        );
+        assert_eq!(state.scroll, 0);
+
+        move_projected_viewport(&sidebar, &rendered, &mut state, &frame, ViewportMove::Last);
+        assert_eq!(
+            state.selection.as_deref(),
+            Some(sidebar.rows[7].id.as_str())
+        );
+        assert_eq!(
+            state.scroll,
+            rendered
+                .lines
+                .len()
+                .saturating_sub(frame.rows_height as usize)
         );
     }
 
@@ -843,195 +997,6 @@ mod local_state_tests {
 
         assert!(mark_done_target(&snapshot, &stale).is_none());
         assert!(mark_done_target(&snapshot, &current).is_some());
-    }
-
-    #[test]
-    fn keyboard_and_mouse_mark_complete_queue_the_same_versioned_pane_without_retargeting() {
-        let pane_instance = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 101,
-        };
-        let version = StateVersion {
-            state_id: StateId::parse("00112233445566778899aabbccddeeff").unwrap(),
-            agent_epoch: 3,
-            revision: 9,
-        };
-        let mut original = snapshot(101);
-        original.panes[0].stored = Some(StoredStateDescriptor::Canonical {
-            version: version.clone(),
-        });
-        let jump = SidebarRow {
-            id: "jump::%1::101".to_string(),
-            kind: SidebarRowKind::Jump,
-            depth: 2,
-            label: "jump".to_string(),
-            chat_count: 0,
-            rollup: RollupLevel::Running,
-            badge_state: None,
-            expanded: true,
-            pane_id: Some("%1".to_string()),
-            git: None,
-            active: true,
-            meta: None,
-        };
-        let state = SidebarState {
-            selection: Some(jump.id.clone()),
-            ..SidebarState::default()
-        };
-        let sidebar = SidebarView {
-            state: state.clone(),
-            rows: vec![jump.clone()],
-            counts: BadgeCounts::default(),
-        };
-
-        let (keyboard_tx, keyboard_rx) = mpsc::channel();
-        queue_mark_complete_for_selection(
-            &original,
-            &sidebar,
-            &keyboard_tx,
-            &mut MarkCompleteUi::default(),
-        );
-        let keyboard = keyboard_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-        let (mouse_tx, mouse_rx) = mpsc::channel();
-        let env = BTreeMap::new();
-        let runner = crate::tmux::mock::MockTmuxRunner::new();
-        let theme = SidebarRenderTheme::default();
-        let source_pane = PaneInstance {
-            pane_id: "%9".to_string(),
-            pane_pid: 909,
-        };
-        let context = ClickContext {
-            socket: Path::new("/unused"),
-            server_identity: "test",
-            runner: &runner,
-            env: &env,
-            preview_history_lines: 2000,
-            mark_complete_tx: &mouse_tx,
-            source_pane: &source_pane,
-        };
-        let width = crossterm::terminal::size().unwrap_or((80, 24)).0;
-        let header = build_header_layout_with_counts(&state, width, &theme, sidebar.counts);
-        let rendered =
-            render_lines_with_indices(&sidebar.rows, &sidebar.state, width as usize, &theme);
-        let frame = DrawnFrame {
-            header_rows: header.row_count(),
-            header,
-            rows_height: 24,
-            width,
-            scroll: 0,
-            row_indices: rendered.row_indices.clone(),
-        };
-        let mut mouse_state = state.clone();
-        handle_left_click(
-            &context,
-            &original,
-            &mut mouse_state,
-            &sidebar,
-            &mut MarkCompleteUi::default(),
-            &frame,
-            ClickPosition {
-                row: frame.header.row_count(),
-                column: crate::sidebar::render::jump_row_action_column(
-                    &jump,
-                    JumpRowAction::MarkDone,
-                ) as u16,
-            },
-        )
-        .unwrap();
-        let mouse = mouse_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-        assert_eq!(keyboard.pane_instance, pane_instance);
-        assert_eq!(keyboard.expected, version);
-        assert_eq!(mouse.pane_instance, keyboard.pane_instance);
-        assert_eq!(mouse.expected, keyboard.expected);
-
-        let mut reused = original;
-        reused.panes[0].pane_instance.pane_pid = 202;
-        let (stale_keyboard_tx, stale_keyboard_rx) = mpsc::channel();
-        queue_mark_complete_for_selection(
-            &reused,
-            &sidebar,
-            &stale_keyboard_tx,
-            &mut MarkCompleteUi::default(),
-        );
-        assert!(stale_keyboard_rx.try_recv().is_err());
-
-        let (stale_mouse_tx, stale_mouse_rx) = mpsc::channel();
-        let stale_context = ClickContext {
-            mark_complete_tx: &stale_mouse_tx,
-            ..context
-        };
-        handle_left_click(
-            &stale_context,
-            &reused,
-            &mut mouse_state,
-            &sidebar,
-            &mut MarkCompleteUi::default(),
-            &frame,
-            ClickPosition {
-                row: frame.header.row_count(),
-                column: crate::sidebar::render::jump_row_action_column(
-                    &jump,
-                    JumpRowAction::MarkDone,
-                ) as u16,
-            },
-        )
-        .unwrap();
-        assert!(stale_mouse_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn live_capture_result_requires_full_pane_instance() {
-        let current = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 11,
-        };
-        let stale = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 10,
-        };
-        let mut live = LiveState {
-            pane_instance: Some(current.clone()),
-            requested_lines: 2,
-            ..LiveState::default()
-        };
-
-        assert!(!apply_live_capture_result(
-            &mut live,
-            &stale,
-            1,
-            "replacement\noutput\n"
-        ));
-        assert!(live.lines.is_empty());
-
-        assert!(apply_live_capture_result(
-            &mut live,
-            &current,
-            2,
-            "one\ntwo\nthree\n"
-        ));
-        assert_eq!(live.lines, vec!["two".to_string(), "three".to_string()]);
-    }
-
-    #[test]
-    fn live_result_drops_stale_revisions_after_target_change() {
-        let target = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 11,
-        };
-        let mut live = LiveState {
-            pane_instance: Some(target.clone()),
-            requested_lines: 3,
-            ..LiveState::default()
-        };
-
-        assert!(apply_live_capture_result(&mut live, &target, 5, "fresh\n"));
-        // A delayed result from before the current revision must not replace
-        // the newer body.
-        assert!(!apply_live_capture_result(&mut live, &target, 5, "stale\n"));
-        assert!(!apply_live_capture_result(&mut live, &target, 4, "older\n"));
-        assert_eq!(live.lines, vec!["fresh".to_string()]);
     }
 
     #[test]
@@ -1238,47 +1203,16 @@ struct DrawnFrame {
     row_indices: Vec<Option<usize>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum LiveMode {
-    #[default]
-    Tail,
-    Events,
-}
-
-#[derive(Debug, Clone, Default)]
-struct LiveState {
-    mode: LiveMode,
-    pane_instance: Option<PaneInstance>,
-    lines: Vec<String>,
-    requested_lines: u16,
-    last_live_revision: u64,
-    cut_markers: Vec<String>,
-}
-
-impl LiveState {
-    fn toggle_mode(&mut self) {
-        self.mode = match self.mode {
-            LiveMode::Tail => LiveMode::Events,
-            LiveMode::Events => LiveMode::Tail,
-        };
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct RunLoopConfig<'a> {
     pub app: &'a Config,
     pub theme: &'a SidebarRenderTheme,
-    pub preview_history_lines: u32,
-    pub live: &'a SidebarLiveConfig,
-    pub live_update_tx: &'a mpsc::Sender<crate::sidebar::client::LiveSubscriptionUpdate>,
-    pub live_update_rx: &'a mpsc::Receiver<crate::sidebar::client::LiveSubscriptionUpdate>,
 }
 
 struct RunLoopIo<'a> {
     socket: &'a Path,
     server_identity: &'a str,
     snapshots: &'a mpsc::Receiver<SubscriptionUpdate>,
-    runner: &'a dyn TmuxRunner,
     env: &'a BTreeMap<String, String>,
     sidebar_instance: &'a PaneInstance,
     control: &'a crate::sidebar::control::ControlListener,
@@ -1307,6 +1241,17 @@ struct PreferenceIntentRequest {
 
 struct PreferenceIntentResult {
     intent: SidebarPreferenceIntent,
+    result: Result<()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NavigationRequest {
+    selection: Option<String>,
+    scroll: usize,
+}
+
+struct NavigationResult {
+    request: NavigationRequest,
     result: Result<()>,
 }
 
@@ -1402,6 +1347,34 @@ fn spawn_preference_intent_worker(
             );
             let failed = result.is_err();
             if tx.send(PreferenceIntentResult { intent, result }).is_err() {
+                return;
+            }
+            if failed {
+                while rx.try_recv().is_ok() {}
+            }
+        }
+    });
+}
+
+fn spawn_navigation_worker(
+    socket: PathBuf,
+    server_identity: String,
+    rx: mpsc::Receiver<NavigationRequest>,
+    tx: mpsc::Sender<NavigationResult>,
+) {
+    std::thread::spawn(move || {
+        while let Ok(mut request) = rx.recv() {
+            while let Ok(newer) = rx.try_recv() {
+                request = newer;
+            }
+            let result = crate::sidebar::client::send_sidebar_navigation_v2(
+                &socket,
+                &server_identity,
+                request.selection.clone(),
+                request.scroll,
+            );
+            let failed = result.is_err();
+            if tx.send(NavigationResult { request, result }).is_err() {
                 return;
             }
             if failed {
@@ -1575,14 +1548,11 @@ fn run_loop<B: Backend>(
         socket,
         server_identity,
         snapshots: rx,
-        runner,
         env,
         sidebar_instance,
         control,
     } = io;
     let theme = config.theme;
-    let preview_history_lines = config.preview_history_lines;
-    let live_config = config.live;
     let mut current: Option<ResolvedSnapshot> = None;
     let mut connection = ConnectionState::Connecting;
     let mut last_known_rows: Option<(Vec<SidebarRow>, BadgeCounts)> = None;
@@ -1591,6 +1561,8 @@ fn run_loop<B: Backend>(
     let mut last_queued_preferences = None;
     let mut last_expansion_view: Option<BTreeSet<String>> = None;
     let mut last_remote_expansion: Option<BTreeSet<String>> = None;
+    let mut last_remote_navigation_revision = 0;
+    let mut last_queued_navigation: Option<(Option<String>, usize)> = None;
     let (mark_request_tx, mark_request_rx) = mpsc::channel();
     let (mark_result_tx, mark_result_rx) = mpsc::channel();
     spawn_mark_complete_worker(
@@ -1607,15 +1579,18 @@ fn run_loop<B: Backend>(
         preference_intent_rx,
         preference_result_tx,
     );
+    let (navigation_tx, navigation_rx) = mpsc::channel();
+    let (navigation_result_tx, navigation_result_rx) = mpsc::channel();
+    spawn_navigation_worker(
+        socket.to_path_buf(),
+        server_identity.to_string(),
+        navigation_rx,
+        navigation_result_tx,
+    );
     let mut mark_ui = MarkCompleteUi::default();
-    let mut live = LiveState {
-        requested_lines: live_rows_requested(live_config),
-        cut_markers: live_config.cut_markers.clone(),
-        ..LiveState::default()
-    };
     let mut render_gate = RenderGate::new();
     let mut last_frame: Option<DrawnFrame> = None;
-    let mut live_subscription: Option<crate::sidebar::client::LiveSubscriptionHandle> = None;
+    let mut pending_g = false;
     loop {
         render_gate.mark_dirty_if(drain_snapshot_updates(rx, &mut current, &mut connection));
         if let ConnectionState::ConfigChanged(active_config_hash) = &connection {
@@ -1649,7 +1624,24 @@ fn run_loop<B: Backend>(
                 pane_pid,
                 session_id,
             );
+            let navigation = &snapshot.sidebar_model.navigation;
+            last_remote_navigation_revision = navigation.revision;
+            if navigation.revision > 0 {
+                sidebar_state.selection = navigation.selection.clone();
+                sidebar_state.scroll = navigation.scroll;
+                last_queued_navigation = Some((navigation.selection.clone(), navigation.scroll));
+            }
             initial_context_seeded = true;
+        }
+        if let Some(snapshot) = current.as_ref()
+            && apply_remote_navigation(
+                snapshot,
+                &mut sidebar_state,
+                &mut last_remote_navigation_revision,
+                &mut last_queued_navigation,
+            )
+        {
+            render_gate.mark_dirty();
         }
         if let Some(snapshot) = current.as_ref() {
             render_gate.mark_dirty_if(clear_stale_pane_selection(snapshot, &mut sidebar_state));
@@ -1666,6 +1658,21 @@ fn run_loop<B: Backend>(
                     NoticeLevel::Failure,
                     Duration::from_secs(5),
                 );
+            }
+        }
+        while let Ok(result) = navigation_result_rx.try_recv() {
+            if let Err(error) = result.result {
+                if last_queued_navigation
+                    == Some((result.request.selection.clone(), result.request.scroll))
+                {
+                    last_queued_navigation = None;
+                }
+                mark_ui.set_toast(
+                    format!("navigation sync failed: {error}"),
+                    NoticeLevel::Failure,
+                    Duration::from_secs(5),
+                );
+                render_gate.mark_dirty();
             }
         }
         if !matches!(connection, ConnectionState::Connected) {
@@ -1740,23 +1747,42 @@ fn run_loop<B: Backend>(
             }
             last_queued_preferences = Some(preferences);
         }
+        let navigation = (sidebar_state.selection.clone(), sidebar_state.scroll);
+        if matches!(connection, ConnectionState::Connected)
+            && last_queued_navigation.as_ref() != Some(&navigation)
+        {
+            if navigation_tx
+                .send(NavigationRequest {
+                    selection: navigation.0.clone(),
+                    scroll: navigation.1,
+                })
+                .is_err()
+            {
+                mark_ui.set_toast(
+                    "navigation worker unavailable".to_string(),
+                    NoticeLevel::Failure,
+                    Duration::from_secs(5),
+                );
+            } else {
+                last_queued_navigation = Some(navigation);
+            }
+        }
         render_gate.mark_dirty_if(drain_control_messages(
             control,
-            current.as_ref(),
-            config.app,
             &mut sidebar_state,
             &preference_intent_tx,
             &mut mark_ui,
-            matches!(connection, ConnectionState::Connected),
+            ControlMessageContext {
+                snapshot: current.as_ref(),
+                config: config.app,
+                preferences_connected: matches!(connection, ConnectionState::Connected),
+                frame: last_frame.as_ref(),
+                theme,
+            },
         )?);
-        render_gate.mark_dirty_if(drain_live_results(&mut live, config.live_update_rx));
         let context = ClickContext {
             socket,
             server_identity,
-            runner,
-            env,
-            preview_history_lines,
-            mark_complete_tx: &mark_request_tx,
             source_pane: sidebar_instance,
         };
         render_gate.note_toast(mark_ui.notice());
@@ -1780,24 +1806,6 @@ fn run_loop<B: Backend>(
                 } else if matches!(connection, ConnectionState::Connected) {
                     last_known_rows = None;
                 }
-                sync_live_target(snapshot, &sidebar, live_config, &mut live);
-                if live_subscription.as_ref().map(|handle| handle.target())
-                    != live.pane_instance.as_ref()
-                {
-                    if let Some(handle) = live_subscription.take() {
-                        handle.shutdown_and_join();
-                    }
-                    if let Some(target) = live.pane_instance.clone() {
-                        live_subscription = Some(crate::sidebar::client::spawn_live_subscription(
-                            socket.to_path_buf(),
-                            server_identity.to_string(),
-                            sidebar_instance.clone(),
-                            target,
-                            live_config.interval_ms,
-                            config.live_update_tx.clone(),
-                        ));
-                    }
-                }
                 let size = terminal.size()?;
                 let area = Rect::new(0, 0, size.width, size.height);
                 let header = build_header_layout_with_counts(
@@ -1806,7 +1814,7 @@ fn run_loop<B: Backend>(
                     theme,
                     sidebar.counts,
                 );
-                let areas = compute_areas(area, &header, live.requested_lines);
+                let areas = compute_areas(area, &header);
                 let rendered = render_lines_with_indices(
                     &sidebar.rows,
                     &sidebar.state,
@@ -1819,7 +1827,7 @@ fn run_loop<B: Backend>(
                     });
                 let selection_range = selected_row_index
                     .and_then(|row_index| rendered_row_range(&rendered.row_indices, row_index));
-                sidebar_state.scroll = resolve_scroll_range(
+                let frame_scroll = resolve_scroll_range(
                     sidebar_state.scroll,
                     selection_range,
                     rendered.lines.len(),
@@ -1830,17 +1838,16 @@ fn run_loop<B: Backend>(
                     header_rows: areas.header_rows,
                     rows_height: areas.rows_height,
                     width: area.width,
-                    scroll: sidebar_state.scroll,
+                    scroll: frame_scroll,
                     row_indices: rendered.row_indices.clone(),
                 });
-                draw_snapshot_with_theme_and_scroll_live(
+                draw_snapshot_with_theme_and_scroll_options(
                     terminal,
                     snapshot,
                     &sidebar,
                     DrawOptions {
                         theme,
-                        scroll: sidebar_state.scroll,
-                        live: Some(&live),
+                        scroll: frame_scroll,
                         connection: &connection,
                         toast: mark_ui.notice(),
                         rendered: Some(&rendered),
@@ -1853,23 +1860,63 @@ fn run_loop<B: Backend>(
         }
         if event::poll(Duration::from_millis(50))? {
             let state_before = sidebar_state.clone();
-            let live_mode_before = live.mode;
             match event::read()? {
                 Event::Key(key) => match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => return Ok(TuiExit::Quit),
-                    KeyCode::Char('p') => {
-                        if let Some(snapshot) = &current
-                            && let Some(pane) = preview_pane_for_selection(&project_view(
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        pending_g = false;
+                        if let Some(snapshot) = &current {
+                            move_viewport_selection(
                                 snapshot,
                                 config.app,
-                                &sidebar_state,
-                            ))
-                        {
-                            spawn_preview(runner, env, &pane, preview_history_lines);
+                                &mut sidebar_state,
+                                last_frame.as_ref(),
+                                ViewportMove::HalfPageDown,
+                                theme,
+                            );
                         }
                     }
-                    KeyCode::Char('e') => live.toggle_mode(),
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        pending_g = false;
+                        if let Some(snapshot) = &current {
+                            move_viewport_selection(
+                                snapshot,
+                                config.app,
+                                &mut sidebar_state,
+                                last_frame.as_ref(),
+                                ViewportMove::HalfPageUp,
+                                theme,
+                            );
+                        }
+                    }
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        pending_g = false;
+                        if let Some(snapshot) = &current {
+                            move_viewport_selection(
+                                snapshot,
+                                config.app,
+                                &mut sidebar_state,
+                                last_frame.as_ref(),
+                                ViewportMove::PageDown,
+                                theme,
+                            );
+                        }
+                    }
+                    KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        pending_g = false;
+                        if let Some(snapshot) = &current {
+                            move_viewport_selection(
+                                snapshot,
+                                config.app,
+                                &mut sidebar_state,
+                                last_frame.as_ref(),
+                                ViewportMove::PageUp,
+                                theme,
+                            );
+                        }
+                    }
                     KeyCode::Char('d') => {
+                        pending_g = false;
                         if let Some(snapshot) = &current {
                             let sidebar = project_view(snapshot, config.app, &sidebar_state);
                             queue_mark_complete_for_selection(
@@ -1881,6 +1928,7 @@ fn run_loop<B: Backend>(
                         }
                     }
                     KeyCode::Char(' ') => {
+                        pending_g = false;
                         if let Some(snapshot) = &current {
                             let sidebar = project_view(snapshot, config.app, &sidebar_state);
                             apply_local_sidebar_key(&mut sidebar_state, &sidebar, "space");
@@ -1889,9 +1937,34 @@ fn run_loop<B: Backend>(
                     KeyCode::Char(ch) => {
                         if let Some(snapshot) = &current {
                             let sidebar = project_view(snapshot, config.app, &sidebar_state);
-                            if matches!(connection, ConnectionState::Connected)
+                            if ch == 'g' {
+                                if pending_g {
+                                    move_viewport_selection(
+                                        snapshot,
+                                        config.app,
+                                        &mut sidebar_state,
+                                        last_frame.as_ref(),
+                                        ViewportMove::First,
+                                        theme,
+                                    );
+                                    pending_g = false;
+                                } else {
+                                    pending_g = true;
+                                }
+                            } else if ch == 'G' {
+                                move_viewport_selection(
+                                    snapshot,
+                                    config.app,
+                                    &mut sidebar_state,
+                                    last_frame.as_ref(),
+                                    ViewportMove::Last,
+                                    theme,
+                                );
+                                pending_g = false;
+                            } else if matches!(connection, ConnectionState::Connected)
                                 && matches!(ch, 'J' | 'K')
                             {
+                                pending_g = false;
                                 queue_reorder(
                                     &sidebar,
                                     ch == 'K',
@@ -1899,6 +1972,7 @@ fn run_loop<B: Backend>(
                                     &mut mark_ui,
                                 );
                             } else {
+                                pending_g = false;
                                 apply_local_sidebar_key(
                                     &mut sidebar_state,
                                     &sidebar,
@@ -1908,6 +1982,7 @@ fn run_loop<B: Backend>(
                         }
                     }
                     KeyCode::Down | KeyCode::Up | KeyCode::Tab | KeyCode::BackTab => {
+                        pending_g = false;
                         if let Some(snapshot) = &current {
                             let sidebar = project_view(snapshot, config.app, &sidebar_state);
                             let key = match key.code {
@@ -1921,13 +1996,8 @@ fn run_loop<B: Backend>(
                         }
                     }
                     KeyCode::Enter => {
-                        if let Some(snapshot) = &current
-                            && let sidebar = project_view(snapshot, config.app, &sidebar_state)
-                            && selection_is_detail_row(&sidebar)
-                            && let Some(pane) = preview_pane_for_selection(&sidebar)
-                        {
-                            spawn_preview(runner, env, &pane, preview_history_lines);
-                        } else if let Some(snapshot) = &current {
+                        pending_g = false;
+                        if let Some(snapshot) = &current {
                             let sidebar = project_view(snapshot, config.app, &sidebar_state);
                             activate_local_selection(
                                 &context,
@@ -1938,9 +2008,10 @@ fn run_loop<B: Backend>(
                             );
                         }
                     }
-                    _ => {}
+                    _ => pending_g = false,
                 },
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    pending_g = false;
                     if let (Some(snapshot), Some(frame)) = (&current, last_frame.as_ref()) {
                         let sidebar = project_view(snapshot, config.app, &sidebar_state);
                         handle_left_click(
@@ -1957,11 +2028,32 @@ fn run_loop<B: Backend>(
                         )?;
                     }
                 }
-                Event::Resize(_, _) => render_gate.mark_dirty(),
+                Event::Mouse(mouse)
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                    ) =>
+                {
+                    pending_g = false;
+                    if let Some(snapshot) = &current {
+                        for _ in 0..3 {
+                            let sidebar = project_view(snapshot, config.app, &sidebar_state);
+                            let key = if mouse.kind == MouseEventKind::ScrollDown {
+                                "down"
+                            } else {
+                                "up"
+                            };
+                            apply_local_sidebar_key(&mut sidebar_state, &sidebar, key);
+                        }
+                    }
+                }
+                Event::Resize(_, _) => {
+                    pending_g = false;
+                    render_gate.mark_dirty();
+                }
                 _ => {}
             }
-            render_gate
-                .mark_dirty_if(sidebar_state != state_before || live.mode != live_mode_before);
+            render_gate.mark_dirty_if(sidebar_state != state_before);
         }
     }
 }
@@ -1984,6 +2076,27 @@ fn clear_stale_pane_selection(snapshot: &ResolvedSnapshot, state: &mut SidebarSt
         return true;
     }
     false
+}
+
+fn apply_remote_navigation(
+    snapshot: &ResolvedSnapshot,
+    state: &mut SidebarState,
+    last_revision: &mut u64,
+    last_queued: &mut Option<(Option<String>, usize)>,
+) -> bool {
+    let navigation = &snapshot.sidebar_model.navigation;
+    if navigation.revision <= *last_revision {
+        return false;
+    }
+    let changed = state.selection != navigation.selection || state.scroll != navigation.scroll;
+    state.selection = navigation.selection.clone();
+    state.scroll = navigation.scroll;
+    if changed {
+        state.version = state.version.saturating_add(1);
+    }
+    *last_revision = navigation.revision;
+    *last_queued = Some((navigation.selection.clone(), navigation.scroll));
+    changed
 }
 
 fn seed_initial_sidebar_context(
@@ -2153,8 +2266,129 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
             }
         }
         SidebarInputAction::Activate
+        | SidebarInputAction::MoveFirst
+        | SidebarInputAction::MoveLast
+        | SidebarInputAction::HalfPageDown
+        | SidebarInputAction::HalfPageUp
+        | SidebarInputAction::PageDown
+        | SidebarInputAction::PageUp
         | SidebarInputAction::ReorderUp
         | SidebarInputAction::ReorderDown => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportMove {
+    First,
+    Last,
+    HalfPageDown,
+    HalfPageUp,
+    PageDown,
+    PageUp,
+}
+
+fn move_viewport_selection(
+    snapshot: &ResolvedSnapshot,
+    config: &Config,
+    state: &mut SidebarState,
+    frame: Option<&DrawnFrame>,
+    movement: ViewportMove,
+    theme: &SidebarRenderTheme,
+) {
+    let Some(frame) = frame else {
+        return;
+    };
+    let sidebar = project_view(snapshot, config, state);
+    let rendered =
+        render_lines_with_indices(&sidebar.rows, &sidebar.state, frame.width as usize, theme);
+    move_projected_viewport(&sidebar, &rendered, state, frame, movement);
+}
+
+fn move_projected_viewport(
+    sidebar: &SidebarView,
+    rendered: &RenderedLines,
+    state: &mut SidebarState,
+    frame: &DrawnFrame,
+    movement: ViewportMove,
+) {
+    if rendered.lines.is_empty() {
+        return;
+    }
+    let viewport = usize::from(frame.rows_height).max(1);
+    let max_scroll = rendered.lines.len().saturating_sub(viewport);
+    let current_line = state
+        .selection
+        .as_deref()
+        .and_then(|selection| sidebar.rows.iter().position(|row| row.id == selection))
+        .and_then(|row_index| rendered_row_range(&rendered.row_indices, row_index))
+        .map(|range| range.0)
+        .unwrap_or(state.scroll.min(rendered.lines.len() - 1));
+    let amount = match movement {
+        ViewportMove::HalfPageDown | ViewportMove::HalfPageUp => (viewport / 2).max(1),
+        ViewportMove::PageDown | ViewportMove::PageUp => viewport,
+        ViewportMove::First | ViewportMove::Last => 0,
+    };
+    let (target_line, target_scroll, forward) = match movement {
+        ViewportMove::First => (0, 0, true),
+        ViewportMove::Last => (rendered.lines.len() - 1, max_scroll, false),
+        ViewportMove::HalfPageDown | ViewportMove::PageDown => (
+            current_line
+                .saturating_add(amount)
+                .min(rendered.lines.len() - 1),
+            state.scroll.saturating_add(amount).min(max_scroll),
+            true,
+        ),
+        ViewportMove::HalfPageUp | ViewportMove::PageUp => (
+            current_line.saturating_sub(amount),
+            state.scroll.saturating_sub(amount),
+            false,
+        ),
+    };
+    let selection = navigable_selection_at(sidebar, &rendered.row_indices, target_line, forward);
+    if state.selection != selection || state.scroll != target_scroll {
+        state.selection = selection;
+        state.scroll = target_scroll;
+        state.version = state.version.saturating_add(1);
+    }
+}
+
+fn navigable_selection_at(
+    sidebar: &SidebarView,
+    row_indices: &[Option<usize>],
+    target_line: usize,
+    forward: bool,
+) -> Option<String> {
+    let candidate = |line: usize| {
+        let row_index = row_indices.get(line).copied().flatten()?;
+        let row = sidebar.rows.get(row_index)?;
+        match row.kind {
+            SidebarRowKind::Category | SidebarRowKind::Repo | SidebarRowKind::Chat => {
+                Some(row.id.clone())
+            }
+            SidebarRowKind::Detail => {
+                let pane = pane_instance_from_row_id(&row.id)?;
+                let chat = chat_row_id(&pane);
+                sidebar
+                    .rows
+                    .iter()
+                    .any(|row| row.id == chat)
+                    .then_some(chat)
+            }
+            SidebarRowKind::Zone => None,
+        }
+    };
+    if let Some(selection) = candidate(target_line) {
+        return Some(selection);
+    }
+    if forward {
+        (target_line + 1..row_indices.len())
+            .find_map(candidate)
+            .or_else(|| (0..target_line).rev().find_map(candidate))
+    } else {
+        (0..target_line)
+            .rev()
+            .find_map(candidate)
+            .or_else(|| (target_line + 1..row_indices.len()).find_map(candidate))
     }
 }
 
@@ -2191,29 +2425,32 @@ fn activate_local_selection(
             state.selection = Some(row_id.clone());
             state.toggle_expanded(&row_id);
         }
-        Some(crate::sidebar::input::SidebarCommand::PreviewPane(_)) => {
-            if let Some(pane) = selected_pane {
-                spawn_preview(
-                    context.runner,
-                    context.env,
-                    &pane,
-                    context.preview_history_lines,
-                );
-            }
-        }
         None => {}
     }
 }
 
+struct ControlMessageContext<'a> {
+    snapshot: Option<&'a ResolvedSnapshot>,
+    config: &'a Config,
+    preferences_connected: bool,
+    frame: Option<&'a DrawnFrame>,
+    theme: &'a SidebarRenderTheme,
+}
+
 fn drain_control_messages(
     control: &crate::sidebar::control::ControlListener,
-    snapshot: Option<&ResolvedSnapshot>,
-    config: &Config,
     state: &mut SidebarState,
     preference_tx: &mpsc::Sender<PreferenceIntentRequest>,
     ui: &mut MarkCompleteUi,
-    preferences_connected: bool,
+    context: ControlMessageContext<'_>,
 ) -> Result<bool> {
+    let ControlMessageContext {
+        snapshot,
+        config,
+        preferences_connected,
+        frame,
+        theme,
+    } = context;
     let mut before: Option<SidebarState> = None;
     while let Some(message) = control.try_recv()? {
         if before.is_none() {
@@ -2224,6 +2461,51 @@ fn drain_control_messages(
                 if let Some(snapshot) = snapshot {
                     let sidebar = project_view(snapshot, config, state);
                     match crate::sidebar::input::parse_key(&key) {
+                        Some(crate::sidebar::input::SidebarInputAction::MoveFirst) => {
+                            move_viewport_selection(
+                                snapshot,
+                                config,
+                                state,
+                                frame,
+                                ViewportMove::First,
+                                theme,
+                            );
+                        }
+                        Some(crate::sidebar::input::SidebarInputAction::MoveLast) => {
+                            move_viewport_selection(
+                                snapshot,
+                                config,
+                                state,
+                                frame,
+                                ViewportMove::Last,
+                                theme,
+                            );
+                        }
+                        Some(
+                            action @ (crate::sidebar::input::SidebarInputAction::HalfPageDown
+                            | crate::sidebar::input::SidebarInputAction::HalfPageUp
+                            | crate::sidebar::input::SidebarInputAction::PageDown
+                            | crate::sidebar::input::SidebarInputAction::PageUp),
+                        ) => {
+                            let movement = match action {
+                                crate::sidebar::input::SidebarInputAction::HalfPageDown => {
+                                    ViewportMove::HalfPageDown
+                                }
+                                crate::sidebar::input::SidebarInputAction::HalfPageUp => {
+                                    ViewportMove::HalfPageUp
+                                }
+                                crate::sidebar::input::SidebarInputAction::PageDown => {
+                                    ViewportMove::PageDown
+                                }
+                                crate::sidebar::input::SidebarInputAction::PageUp => {
+                                    ViewportMove::PageUp
+                                }
+                                _ => unreachable!(),
+                            };
+                            move_viewport_selection(
+                                snapshot, config, state, frame, movement, theme,
+                            );
+                        }
                         Some(crate::sidebar::input::SidebarInputAction::ReorderUp)
                             if preferences_connected =>
                         {
@@ -2347,83 +2629,6 @@ fn snapshot_degraded_message(snapshot: &ResolvedSnapshot) -> Option<String> {
     crate::sidebar::current_degraded_message(snapshot)
 }
 
-fn live_rows_requested(config: &SidebarLiveConfig) -> u16 {
-    if config.enabled { config.lines } else { 0 }
-}
-
-fn drain_live_results(
-    live: &mut LiveState,
-    result_rx: &mpsc::Receiver<crate::sidebar::client::LiveSubscriptionUpdate>,
-) -> bool {
-    let mut changed = false;
-    while let Ok(update) = result_rx.try_recv() {
-        match update {
-            crate::sidebar::client::LiveSubscriptionUpdate::Body {
-                target,
-                live_revision,
-                body,
-            } => {
-                changed |= apply_live_capture_result(live, &target, live_revision, &body);
-            }
-            crate::sidebar::client::LiveSubscriptionUpdate::Unavailable { target } => {
-                if live.pane_instance.as_ref() == Some(&target) && !live.lines.is_empty() {
-                    live.lines.clear();
-                    changed = true;
-                }
-            }
-        }
-    }
-    changed
-}
-
-/// Re-resolves the live preview target from the projected sidebar selection.
-/// Only runs on draw iterations: the selection cannot change without marking
-/// the render gate dirty first.
-fn sync_live_target(
-    snapshot: &ResolvedSnapshot,
-    sidebar: &SidebarView,
-    config: &SidebarLiveConfig,
-    live: &mut LiveState,
-) {
-    live.requested_lines = live_rows_requested(config);
-    if live.requested_lines == 0 {
-        live.pane_instance = None;
-        live.lines.clear();
-        live.last_live_revision = 0;
-        return;
-    }
-    let selected = preview_pane_for_selection(sidebar).filter(|pane| {
-        snapshot
-            .panes
-            .iter()
-            .any(|current| current.pane_instance == *pane)
-    });
-    if live.pane_instance != selected {
-        live.pane_instance = selected;
-        live.lines.clear();
-        live.last_live_revision = 0;
-    }
-}
-
-fn apply_live_capture_result(
-    live: &mut LiveState,
-    pane_instance: &PaneInstance,
-    live_revision: u64,
-    output: &str,
-) -> bool {
-    if live.pane_instance.as_ref() != Some(pane_instance) {
-        return false;
-    }
-    if live_revision <= live.last_live_revision {
-        return false;
-    }
-    live.last_live_revision = live_revision;
-    let lines = extract_tail(output, live.requested_lines as usize, &live.cut_markers);
-    let changed = live.lines != lines;
-    live.lines = lines;
-    changed
-}
-
 fn resolve_current_window_id(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
@@ -2445,40 +2650,33 @@ fn resolve_current_window_id(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ClickedRow {
-    id: String,
-    kind: SidebarRowKind,
-    pane_id: Option<String>,
-}
-
-impl ClickedRow {
-    fn from_row(row: &SidebarRow) -> Self {
-        Self {
-            id: row.id.clone(),
-            kind: row.kind,
-            pane_id: row.pane_id.clone(),
-        }
-    }
+enum ClickAction {
+    JumpPane(PaneInstance),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ClickAction {
-    ToggleRow(String),
-    PreviewPane(PaneInstance),
-    JumpPane(PaneInstance),
-    MarkComplete {
-        pane_instance: PaneInstance,
-        expected: StateVersion,
-    },
+enum RowClickIntent {
+    Toggle(String),
+    Jump(PaneInstance),
 }
 
-fn single_click_action(row: &ClickedRow) -> Option<ClickAction> {
-    match row.kind {
-        SidebarRowKind::Category | SidebarRowKind::Repo | SidebarRowKind::Chat => {
-            Some(ClickAction::ToggleRow(row.id.clone()))
+struct ClickedRenderedRow<'a> {
+    row: &'a SidebarRow,
+    line_offset: usize,
+}
+
+fn row_click_intent(clicked: &ClickedRenderedRow<'_>) -> Option<RowClickIntent> {
+    match clicked.row.kind {
+        SidebarRowKind::Category | SidebarRowKind::Repo => {
+            Some(RowClickIntent::Toggle(clicked.row.id.clone()))
         }
-        SidebarRowKind::Detail => Some(ClickAction::ToggleRow(row.id.clone())),
-        SidebarRowKind::Jump | SidebarRowKind::Zone => None,
+        SidebarRowKind::Chat if clicked.line_offset == 0 => {
+            Some(RowClickIntent::Toggle(clicked.row.id.clone()))
+        }
+        SidebarRowKind::Chat | SidebarRowKind::Detail => {
+            pane_instance_from_row_id(&clicked.row.id).map(RowClickIntent::Jump)
+        }
+        SidebarRowKind::Zone => None,
     }
 }
 
@@ -2488,13 +2686,21 @@ fn row_for_click_with_indices<'a>(
     header_rows: u16,
     scroll: usize,
     row_indices: &[Option<usize>],
-) -> Option<&'a SidebarRow> {
+) -> Option<ClickedRenderedRow<'a>> {
     if row < header_rows {
         return None;
     }
     let display_index = usize::from(row - header_rows) + scroll;
     let row_index = row_indices.get(display_index).and_then(|index| *index)?;
-    sidebar.rows.get(row_index)
+    let line_offset = row_indices[..display_index]
+        .iter()
+        .rev()
+        .take_while(|mapped| **mapped == Some(row_index))
+        .count();
+    Some(ClickedRenderedRow {
+        row: sidebar.rows.get(row_index)?,
+        line_offset,
+    })
 }
 
 pub fn draw_snapshot<B: Backend>(
@@ -2520,14 +2726,13 @@ fn draw_snapshot_with_theme_and_scroll<B: Backend>(
     theme: &SidebarRenderTheme,
     scroll: usize,
 ) -> Result<()> {
-    draw_snapshot_with_theme_and_scroll_live(
+    draw_snapshot_with_theme_and_scroll_options(
         terminal,
         snapshot,
         sidebar,
         DrawOptions {
             theme,
             scroll,
-            live: None,
             connection: &ConnectionState::Connected,
             toast: None,
             rendered: None,
@@ -2539,7 +2744,6 @@ fn draw_snapshot_with_theme_and_scroll<B: Backend>(
 struct DrawOptions<'a> {
     theme: &'a SidebarRenderTheme,
     scroll: usize,
-    live: Option<&'a LiveState>,
     connection: &'a ConnectionState,
     toast: Option<Notice<'a>>,
     /// Rows already rendered by the caller for scroll resolution; when present
@@ -2547,7 +2751,7 @@ struct DrawOptions<'a> {
     rendered: Option<&'a RenderedLines>,
 }
 
-fn draw_snapshot_with_theme_and_scroll_live<B: Backend>(
+fn draw_snapshot_with_theme_and_scroll_options<B: Backend>(
     terminal: &mut Terminal<B>,
     snapshot: &ResolvedSnapshot,
     sidebar: &SidebarView,
@@ -2592,14 +2796,12 @@ fn draw_snapshot_in_area(
     let DrawOptions {
         theme,
         scroll,
-        live,
         connection,
         toast,
         rendered,
     } = options;
     let header = build_header_layout_with_counts(&sidebar.state, area.width, theme, sidebar.counts);
-    let live_lines = live.map(|live| live.requested_lines).unwrap_or(0);
-    let areas = compute_areas(area, &header, live_lines);
+    let areas = compute_areas(area, &header);
     if areas.header_rows > 0 {
         let header_area = Rect {
             height: areas.header_rows,
@@ -2653,29 +2855,9 @@ fn draw_snapshot_in_area(
     };
     let list = List::new(items).block(Block::default().borders(Borders::NONE));
     frame.render_widget(list, rows_area);
-    if areas.live_rows > 0
-        && let Some(live) = live
-    {
-        let live_area = Rect {
-            y: area.y + areas.header_rows + areas.rows_height,
-            height: areas.live_rows,
-            ..area
-        };
-        frame.render_widget(
-            Paragraph::new(render_live_lines(
-                snapshot,
-                live,
-                areas.live_rows,
-                area.width,
-                crate::sidebar::tree::now_epoch_secs(),
-                theme,
-            )),
-            live_area,
-        );
-    }
     if areas.footer_rows > 0 {
         let footer_area = Rect {
-            y: area.y + areas.header_rows + areas.rows_height + areas.live_rows,
+            y: area.y + areas.header_rows + areas.rows_height,
             height: areas.footer_rows,
             ..area
         };
@@ -2763,148 +2945,6 @@ fn empty_rows_placeholder_lines(
     ]
 }
 
-fn render_live_lines(
-    snapshot: &ResolvedSnapshot,
-    live: &LiveState,
-    live_rows: u16,
-    width: u16,
-    now: i64,
-    theme: &SidebarRenderTheme,
-) -> Vec<Line<'static>> {
-    use ansi_to_tui::IntoText;
-
-    let card = width >= LIVE_CARD_MIN_WIDTH;
-    let body_limit = live_rows.saturating_sub(if card { 2 } else { 1 }) as usize;
-    let (label, title_rest) = match live.mode {
-        LiveMode::Tail => (
-            "LIVE",
-            live.pane_instance
-                .as_ref()
-                .map(|pane| format!(" · {}", pane.pane_id))
-                .unwrap_or_default(),
-        ),
-        LiveMode::Events => ("EVENTS", String::new()),
-    };
-    let body = match live.mode {
-        LiveMode::Tail => live.lines.clone(),
-        LiveMode::Events => event_tail(snapshot, body_limit, now, theme),
-    };
-    let ansi = matches!(live.mode, LiveMode::Tail);
-
-    if card {
-        let width = width as usize;
-        let title = format!("{label}{title_rest}");
-        let title_width = display_width(&title).min(width.saturating_sub(3));
-        let top_rule = width.saturating_sub(3).saturating_sub(title_width);
-        let mut lines = vec![Line::from(vec![
-            Span::styled("╭╴".to_string(), Style::default().fg(theme.marker)),
-            Span::styled(
-                label.to_string(),
-                Style::default().fg(theme.live).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(title_rest, Style::default().fg(theme.detail)),
-            Span::styled(
-                format!("{}╮", "─".repeat(top_rule)),
-                Style::default().fg(theme.marker),
-            ),
-        ])];
-        let mut body_lines = body
-            .into_iter()
-            .take(body_limit)
-            .map(|line| live_card_body_line(&line, ansi, width, theme))
-            .collect::<Vec<_>>();
-        while body_lines.len() < body_limit {
-            body_lines.push(live_card_body_line("", false, width, theme));
-        }
-        lines.extend(body_lines);
-        lines.push(Line::from(Span::styled(
-            format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
-            Style::default().fg(theme.marker),
-        )));
-        return lines;
-    }
-
-    let mut lines = vec![Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            label,
-            Style::default().fg(theme.live).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(title_rest, Style::default().fg(theme.detail)),
-    ])];
-    lines.extend(body.into_iter().take(body_limit).map(|line| {
-        let plain = || {
-            Line::from(Span::styled(
-                format!(" {}", strip_ansi(&line)),
-                Style::default().fg(theme.detail),
-            ))
-        };
-        if !ansi {
-            return plain();
-        }
-        match format!(" {line}").into_text() {
-            Ok(text) => text.lines.into_iter().next().unwrap_or_else(plain),
-            Err(_) => plain(),
-        }
-    }));
-    lines
-}
-
-fn live_card_body_line(
-    raw: &str,
-    ansi: bool,
-    width: usize,
-    theme: &SidebarRenderTheme,
-) -> Line<'static> {
-    use ansi_to_tui::IntoText;
-
-    let content_width = width.saturating_sub(2);
-    let plain = || {
-        let mut text = crate::sidebar::render::truncate_display(
-            &format!(" {}", strip_ansi(raw)),
-            content_width,
-        );
-        let used = display_width(&text);
-        if used < content_width {
-            text.push_str(&" ".repeat(content_width - used));
-        }
-        vec![Span::styled(text, Style::default().fg(theme.detail))]
-    };
-    let mut content = if ansi {
-        match format!(" {raw}").into_text() {
-            Ok(text) => text.lines.into_iter().next().map(|line| line.spans),
-            Err(_) => None,
-        }
-        .unwrap_or_else(plain)
-    } else {
-        plain()
-    };
-    let content_used: usize = content
-        .iter()
-        .map(|span| display_width(&span.content))
-        .sum();
-    if content_used > content_width {
-        content = truncate_spans_to_width(content, content_width);
-    }
-    let content_used: usize = content
-        .iter()
-        .map(|span| display_width(&span.content))
-        .sum();
-    if content_used < content_width {
-        content.push(Span::raw(" ".repeat(content_width - content_used)));
-    }
-    let mut spans = vec![Span::styled(
-        "│".to_string(),
-        Style::default().fg(theme.marker),
-    )];
-    spans.extend(content);
-    spans.push(Span::styled(
-        "│".to_string(),
-        Style::default().fg(theme.marker),
-    ));
-    Line::from(spans)
-}
-
 fn truncate_spans_to_width(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     if width == 0 {
         return Vec::new();
@@ -2950,113 +2990,13 @@ fn fit_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
     Line::from(truncate_spans_to_width(line.spans, width))
 }
 
-pub(crate) fn extract_tail(raw: &str, limit: usize, cut_markers: &[String]) -> Vec<String> {
-    let all = raw.lines().map(str::trim_end).collect::<Vec<_>>();
-    let cut = cut_index(&all, cut_markers).unwrap_or(all.len());
-    let mut lines = all[..cut]
-        .iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
-    let start = lines.len().saturating_sub(limit);
-    lines.drain(0..start);
-    lines
-}
-
-const CUT_SCAN_TAIL: usize = 15;
-
-fn cut_index(lines: &[&str], markers: &[String]) -> Option<usize> {
-    let scan_start = lines.len().saturating_sub(CUT_SCAN_TAIL);
-    markers
-        .iter()
-        .filter(|marker| !marker.is_empty())
-        .filter_map(|marker| {
-            lines[scan_start..]
-                .iter()
-                .rposition(|line| strip_ansi(line).contains(marker.as_str()))
-                .map(|pos| scan_start + pos)
-        })
-        .min()
-}
-
-pub(crate) fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\u{1b}' {
-            out.push(ch);
-            continue;
-        }
-        match chars.peek() {
-            Some('[') => {
-                chars.next();
-                for next in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&next) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                chars.next();
-                while let Some(next) = chars.next() {
-                    if next == '\u{7}' {
-                        break;
-                    }
-                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            _ => {
-                chars.next();
-            }
-        }
-    }
-    out
-}
-
-fn event_tail(
-    snapshot: &ResolvedSnapshot,
-    limit: usize,
-    now: i64,
-    theme: &SidebarRenderTheme,
-) -> Vec<String> {
-    let mut events = snapshot
-        .events
-        .iter()
-        .rev()
-        .take(limit)
-        .map(|event| {
-            let elapsed = (now - event.at_epoch).max(0);
-            let ago = if elapsed >= 60 {
-                format!("{}m前", elapsed / 60)
-            } else {
-                format!("{elapsed}s前")
-            };
-            let from = event
-                .from
-                .map(|state| theme.badge_glyph(state).to_string())
-                .unwrap_or_else(|| "·".to_string());
-            format!(
-                "{ago} {} {} → {}",
-                crate::agent::display_agent_name(&event.agent),
-                from,
-                theme.badge_glyph(event.to)
-            )
-        })
-        .collect::<Vec<_>>();
-    events.reverse();
-    events
-}
-
 pub(crate) struct SidebarAreas {
     pub(crate) header_rows: u16,
     pub(crate) rows_height: u16,
-    pub(crate) live_rows: u16,
     pub(crate) footer_rows: u16,
 }
 
-pub(crate) fn compute_areas(area: Rect, header: &HeaderLayout, live_lines: u16) -> SidebarAreas {
+pub(crate) fn compute_areas(area: Rect, header: &HeaderLayout) -> SidebarAreas {
     let header_rows = header.row_count().min(area.height);
     let remaining = area.height.saturating_sub(header_rows);
     let footer_rows = if area.width > 2 && area.height >= 12 && remaining > 1 {
@@ -3064,22 +3004,9 @@ pub(crate) fn compute_areas(area: Rect, header: &HeaderLayout, live_lines: u16) 
     } else {
         0
     };
-    let live_rows = if live_lines > 0 && area.width > 2 && area.height >= 14 {
-        let live_chrome = if area.width >= LIVE_CARD_MIN_WIDTH {
-            2
-        } else {
-            1
-        };
-        (live_lines + live_chrome).min(remaining.saturating_sub(footer_rows))
-    } else {
-        0
-    };
     SidebarAreas {
         header_rows,
-        rows_height: remaining
-            .saturating_sub(live_rows)
-            .saturating_sub(footer_rows),
-        live_rows,
+        rows_height: remaining.saturating_sub(footer_rows),
         footer_rows,
     }
 }
@@ -3118,10 +3045,6 @@ fn rendered_row_range(row_indices: &[Option<usize>], row_index: usize) -> Option
 struct ClickContext<'a> {
     socket: &'a Path,
     server_identity: &'a str,
-    runner: &'a dyn TmuxRunner,
-    env: &'a BTreeMap<String, String>,
-    preview_history_lines: u32,
-    mark_complete_tx: &'a mpsc::Sender<MarkCompleteRequest>,
     source_pane: &'a PaneInstance,
 }
 
@@ -3164,48 +3087,24 @@ fn handle_left_click(
     ) else {
         return Ok(());
     };
-    if clicked.kind == SidebarRowKind::Jump {
-        let clicked_pane = pane_instance_from_row_id(&clicked.id);
-        match jump_row_action_at(clicked, column, frame.width) {
-            Some(JumpRowAction::Jump) => {
-                if let Some(pane_instance) = clicked_pane.clone().filter(|selected| {
-                    snapshot
-                        .panes
-                        .iter()
-                        .any(|pane| pane.pane_instance == *selected)
-                }) {
-                    dispatch_click_action(context, mark_ui, ClickAction::JumpPane(pane_instance));
-                }
-            }
-            Some(JumpRowAction::Preview) => {
-                if let Some(pane) = clicked_pane.clone() {
-                    dispatch_click_action(context, mark_ui, ClickAction::PreviewPane(pane));
-                }
-            }
-            Some(JumpRowAction::MarkDone) => {
-                if let Some(pane) = clicked_pane
-                    && let Some((pane_instance, expected)) = mark_done_target(snapshot, &pane)
-                {
-                    dispatch_click_action(
-                        context,
-                        mark_ui,
-                        ClickAction::MarkComplete {
-                            pane_instance,
-                            expected,
-                        },
-                    );
-                }
-            }
-            None => {}
-        }
-        return Ok(());
-    }
-    if let Some(action) = single_click_action(&ClickedRow::from_row(clicked)) {
-        if let ClickAction::ToggleRow(row_id) = action {
+    match row_click_intent(&clicked) {
+        Some(RowClickIntent::Toggle(row_id)) => {
             apply_local_sidebar_key(state, sidebar, &format!("toggle:{row_id}"));
-        } else {
-            dispatch_click_action(context, mark_ui, action);
         }
+        Some(RowClickIntent::Jump(pane_instance))
+            if snapshot
+                .panes
+                .iter()
+                .any(|pane| pane.pane_instance == pane_instance) =>
+        {
+            let chat_id = chat_row_id(&pane_instance);
+            if state.selection.as_deref() != Some(chat_id.as_str()) {
+                state.selection = Some(chat_id);
+                state.version = state.version.saturating_add(1);
+            }
+            dispatch_click_action(context, mark_ui, ClickAction::JumpPane(pane_instance));
+        }
+        Some(RowClickIntent::Jump(_)) | None => {}
     }
     Ok(())
 }
@@ -3216,17 +3115,6 @@ fn dispatch_click_action(
     action: ClickAction,
 ) {
     match action {
-        ClickAction::ToggleRow(row_id) => {
-            debug_assert!(!row_id.is_empty());
-        }
-        ClickAction::PreviewPane(pane) => {
-            spawn_preview(
-                context.runner,
-                context.env,
-                &pane,
-                context.preview_history_lines,
-            );
-        }
         ClickAction::JumpPane(pane_instance) => {
             let result = send_sidebar_jump_v2(
                 context.socket,
@@ -3248,12 +3136,6 @@ fn dispatch_click_action(
             };
             mark_ui.set_toast(message, level, duration);
         }
-        ClickAction::MarkComplete {
-            pane_instance,
-            expected,
-        } => {
-            queue_mark_complete(context.mark_complete_tx, mark_ui, pane_instance, expected);
-        }
     }
 }
 
@@ -3274,7 +3156,7 @@ fn mark_complete_target_for_selection(
     snapshot: &ResolvedSnapshot,
     sidebar: &SidebarView,
 ) -> Option<(PaneInstance, StateVersion)> {
-    let pane = preview_pane_for_selection(sidebar)?;
+    let pane = pane_for_selection(sidebar)?;
     mark_done_target(snapshot, &pane)
 }
 
@@ -3289,35 +3171,12 @@ fn queue_mark_complete_for_selection(
     }
 }
 
-fn preview_pane_for_selection(sidebar: &SidebarView) -> Option<PaneInstance> {
+fn pane_for_selection(sidebar: &SidebarView) -> Option<PaneInstance> {
     let selection = sidebar.state.selection.as_deref()?;
     let row = sidebar.rows.iter().find(|row| row.id == selection)?;
     match row.kind {
-        SidebarRowKind::Chat | SidebarRowKind::Jump | SidebarRowKind::Detail => {
-            pane_instance_from_row_id(&row.id)
-        }
+        SidebarRowKind::Chat | SidebarRowKind::Detail => pane_instance_from_row_id(&row.id),
         SidebarRowKind::Category | SidebarRowKind::Repo | SidebarRowKind::Zone => None,
-    }
-}
-
-fn selection_is_detail_row(sidebar: &SidebarView) -> bool {
-    let Some(selection) = sidebar.state.selection.as_deref() else {
-        return false;
-    };
-    sidebar
-        .rows
-        .iter()
-        .any(|row| row.id == selection && row.kind == SidebarRowKind::Detail)
-}
-
-fn spawn_preview(
-    runner: &dyn TmuxRunner,
-    env: &BTreeMap<String, String>,
-    pane: &PaneInstance,
-    history_lines: u32,
-) {
-    if let Err(error) = open_preview_floating_pane(runner, env, pane, history_lines) {
-        eprintln!("[vde-tmux] sidebar preview failed: {error:#}");
     }
 }
 

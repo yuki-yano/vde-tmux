@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::daemon::protocol::v2::{
-    ClientMessage, DaemonPhase, ErrorCode, HookHealth, LiveUnavailableReason, ServerMessage,
+    ClientMessage, DaemonPhase, ErrorCode, HookHealth, ServerMessage,
 };
 use crate::pane_state::{DaemonInstanceId, EventId, PaneEvent, PaneEventEnvelope, PaneInstance};
 use crate::tmux::TmuxRunner;
@@ -655,217 +655,6 @@ enum StatusPushTrigger {
     Flush,
 }
 
-/// One message pushed to a live subscriber. The mailbox keeps only the latest
-/// undelivered message per subscription, so a slow subscriber never queues
-/// intermediate frames.
-#[derive(Debug, Clone)]
-enum LivePush {
-    Result {
-        live_revision: u64,
-        captured_at_epoch_millis: u64,
-        body: Arc<String>,
-    },
-    Unavailable {
-        reason: LiveUnavailableReason,
-    },
-}
-
-#[derive(Debug, Default)]
-struct LiveMailbox {
-    slot: Mutex<(Option<LivePush>, bool)>,
-    ready: Condvar,
-}
-
-impl LiveMailbox {
-    fn push(&self, message: LivePush) {
-        let mut slot = self.slot.lock().expect("live mailbox lock poisoned");
-        slot.0 = Some(message);
-        drop(slot);
-        self.ready.notify_all();
-    }
-
-    fn close(&self) {
-        let mut slot = self.slot.lock().expect("live mailbox lock poisoned");
-        slot.1 = true;
-        drop(slot);
-        self.ready.notify_all();
-    }
-
-    #[cfg(test)]
-    fn wait(&self) -> Option<LivePush> {
-        let mut slot = self.slot.lock().expect("live mailbox lock poisoned");
-        loop {
-            if let Some(message) = slot.0.take() {
-                return Some(message);
-            }
-            if slot.1 {
-                return None;
-            }
-            slot = self
-                .ready
-                .wait(slot)
-                .expect("live mailbox lock poisoned while waiting");
-        }
-    }
-
-    fn wait_timeout(&self, timeout: Duration) -> LiveMailboxWait {
-        let mut slot = self.slot.lock().expect("live mailbox lock poisoned");
-        loop {
-            if let Some(message) = slot.0.take() {
-                return LiveMailboxWait::Message(message);
-            }
-            if slot.1 {
-                return LiveMailboxWait::Closed;
-            }
-            let (next, wait_timeout) = self
-                .ready
-                .wait_timeout(slot, timeout)
-                .expect("live mailbox lock poisoned while waiting");
-            slot = next;
-            if wait_timeout.timed_out() {
-                if let Some(message) = slot.0.take() {
-                    return LiveMailboxWait::Message(message);
-                }
-                if slot.1 {
-                    return LiveMailboxWait::Closed;
-                }
-                return LiveMailboxWait::TimedOut;
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-enum LiveMailboxWait {
-    Message(LivePush),
-    Closed,
-    TimedOut,
-}
-
-#[derive(Debug)]
-struct LiveSubscriptionEntry {
-    source_pane: PaneInstance,
-    target_pane: PaneInstance,
-    interval: Duration,
-    next_due_at: Option<Instant>,
-    last_delivered_revision: u64,
-    mailbox: Arc<LiveMailbox>,
-}
-
-#[derive(Debug, Clone)]
-struct LiveBodyEntry {
-    live_revision: u64,
-    captured_at_epoch_millis: u64,
-    body: Arc<String>,
-}
-
-/// Memory-only registry of live preview demand. Entries are owned by their
-/// connection handler through a drop guard and are pruned when the source or
-/// target pane leaves the topology; nothing is persisted across restarts.
-#[derive(Debug, Default)]
-struct LiveRegistry {
-    entries: Mutex<BTreeMap<u64, LiveSubscriptionEntry>>,
-    next_subscription_id: AtomicU64,
-    live_revision: AtomicU64,
-    bodies: Mutex<BTreeMap<PaneInstance, LiveBodyEntry>>,
-}
-
-impl LiveRegistry {
-    fn register(
-        &self,
-        source_pane: PaneInstance,
-        target_pane: PaneInstance,
-        interval: Duration,
-    ) -> (u64, Arc<LiveMailbox>) {
-        let id = self.next_subscription_id.fetch_add(1, Ordering::SeqCst);
-        let mailbox = Arc::new(LiveMailbox::default());
-        // Serve the cached latest body immediately so a fresh subscriber does
-        // not wait a full interval for its first frame.
-        let mut last_delivered_revision = 0;
-        if let Some(cached) = self
-            .bodies
-            .lock()
-            .expect("live body cache lock poisoned")
-            .get(&target_pane)
-        {
-            last_delivered_revision = cached.live_revision;
-            mailbox.push(LivePush::Result {
-                live_revision: cached.live_revision,
-                captured_at_epoch_millis: cached.captured_at_epoch_millis,
-                body: cached.body.clone(),
-            });
-        }
-        self.entries
-            .lock()
-            .expect("live registry lock poisoned")
-            .insert(
-                id,
-                LiveSubscriptionEntry {
-                    source_pane,
-                    target_pane,
-                    interval,
-                    next_due_at: None,
-                    last_delivered_revision,
-                    mailbox: mailbox.clone(),
-                },
-            );
-        (id, mailbox)
-    }
-
-    fn remove(&self, id: u64) {
-        if let Some(entry) = self
-            .entries
-            .lock()
-            .expect("live registry lock poisoned")
-            .remove(&id)
-        {
-            entry.mailbox.close();
-        }
-    }
-
-    fn close_all(&self) {
-        let entries =
-            std::mem::take(&mut *self.entries.lock().expect("live registry lock poisoned"));
-        for entry in entries.into_values() {
-            entry.mailbox.close();
-        }
-    }
-
-    /// Drops demand whose source or target pane no longer exists in the
-    /// observed topology, and forgets cached bodies for removed targets.
-    fn prune_missing_panes(&self, present: &BTreeSet<PaneInstance>) {
-        let mut entries = self.entries.lock().expect("live registry lock poisoned");
-        let removed = entries
-            .iter()
-            .filter(|(_, entry)| {
-                !present.contains(&entry.source_pane) || !present.contains(&entry.target_pane)
-            })
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>();
-        for id in removed {
-            if let Some(entry) = entries.remove(&id) {
-                entry.mailbox.close();
-            }
-        }
-        drop(entries);
-        self.bodies
-            .lock()
-            .expect("live body cache lock poisoned")
-            .retain(|target, _| present.contains(target));
-    }
-}
-
-struct LiveSubscriptionGuard {
-    coordinator: Arc<ProductionV2Coordinator>,
-    id: u64,
-}
-
-impl Drop for LiveSubscriptionGuard {
-    fn drop(&mut self) {
-        self.coordinator.live.remove(self.id);
-    }
-}
-
 struct ProductionV2Coordinator {
     router: Mutex<V2Router>,
     state: Mutex<Option<super::runtime::CanonicalCoordinatorState>>,
@@ -891,7 +680,6 @@ struct ProductionV2Coordinator {
     config_hash: Mutex<String>,
     current_view_refresh_generation: AtomicU64,
     current_view_refresh_running: AtomicBool,
-    live: LiveRegistry,
 }
 
 #[cfg(test)]
@@ -1237,7 +1025,6 @@ impl ProductionV2Coordinator {
             )),
             current_view_refresh_generation: AtomicU64::new(0),
             current_view_refresh_running: AtomicBool::new(false),
-            live: LiveRegistry::default(),
         })
     }
 
@@ -2233,24 +2020,6 @@ fn handle_v2_runtime_stream(
             return Ok(());
         }
     };
-    if let ClientMessage::SubscribeLive {
-        source_pane,
-        target_pane,
-        interval_ms,
-        ..
-    } = &message
-    {
-        let source_pane = source_pane.clone();
-        let target_pane = target_pane.clone();
-        let interval_ms = *interval_ms;
-        return handle_v2_live_subscription(
-            coordinator,
-            connection.into_stream(),
-            source_pane,
-            target_pane,
-            interval_ms,
-        );
-    }
     let subscribe = matches!(&message, ClientMessage::Subscribe { .. });
     if subscribe {
         let published = match coordinator.route_subscription(&mut connection_state, message) {
@@ -2525,19 +2294,6 @@ fn start_canonical_observation_worker(
             projection.view_base = view_base;
             let processes =
                 crate::daemon::workers::read_agent_process_snapshot(Duration::from_secs(1));
-            // Queue due (or imminently due) live targets before the blocking
-            // observation capture so both jobs share one tmux invocation.
-            let live_targets = collect_due_live_targets(
-                &coordinator,
-                Instant::now(),
-                crate::daemon::workers::CAPTURE_COALESCE_WINDOW,
-            );
-            let live_reply = (!live_targets.is_empty()).then(|| {
-                (
-                    live_targets.clone(),
-                    capture.request_live_sections(live_targets),
-                )
-            });
             let poll_result = crate::daemon::workers::run_observation_poll(
                 &capture,
                 &dispatch,
@@ -2545,14 +2301,6 @@ fn start_canonical_observation_worker(
                 &daemon_instance_id,
                 epoch_seconds(),
             );
-            if let Some((targets, reply)) = live_reply {
-                let result = reply.recv().unwrap_or_else(|_| {
-                    Err(crate::daemon::workers::CaptureBatchError::Io(
-                        "capture coordinator dropped the reply".to_string(),
-                    ))
-                });
-                deliver_live_result(&coordinator, &targets, result);
-            }
             match poll_result {
                 Ok(result) => {
                     let current = projection
@@ -2670,319 +2418,6 @@ fn start_canonical_git_worker(
             }
         }
     });
-}
-
-const LIVE_SCHEDULER_MAX_SLEEP: Duration = Duration::from_millis(250);
-const LIVE_SCHEDULER_MIN_SLEEP: Duration = Duration::from_millis(10);
-
-fn epoch_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// A source sidebar is visible when at least one eligible attached client is
-/// looking at a window that contains the source pane.
-fn live_source_visible(
-    views: &crate::daemon::view_hooks::CurrentClientViews,
-    source_pane: &PaneInstance,
-) -> bool {
-    let window_ids = views
-        .windows()
-        .iter()
-        .filter(|(_, view)| {
-            view.active_pane == *source_pane || view.observed_panes.contains(source_pane)
-        })
-        .map(|(window_id, _)| window_id.as_str())
-        .collect::<BTreeSet<_>>();
-    if window_ids.is_empty() {
-        return false;
-    }
-    views
-        .clients()
-        .values()
-        .any(|witness| witness.is_eligible() && window_ids.contains(witness.window_id.as_str()))
-}
-
-fn start_live_preview_worker(
-    coordinator: Arc<ProductionV2Coordinator>,
-    capture: crate::daemon::workers::CaptureCoordinatorHandle,
-) {
-    thread::spawn(move || {
-        while !coordinator.shutdown.load(Ordering::SeqCst) {
-            let sleep_for = run_live_preview_tick(&coordinator, &capture, Instant::now());
-            thread::sleep(sleep_for);
-        }
-        coordinator.live.close_all();
-    });
-}
-
-/// Consumes every live subscription that is due within `horizon`, advances its
-/// deadline, reports hidden sources, and returns the deduplicated visible
-/// targets to capture. Passing the coalesce window as `horizon` lets the
-/// observation worker pull imminently-due targets onto its own invocation, so
-/// interval-aligned demand never needs an extra tmux process.
-fn collect_due_live_targets(
-    coordinator: &ProductionV2Coordinator,
-    now: Instant,
-    horizon: Duration,
-) -> Vec<PaneInstance> {
-    use LiveUnavailableReason;
-
-    let Some(views) = coordinator
-        .state
-        .lock()
-        .expect("canonical state lock poisoned")
-        .as_ref()
-        .map(|state| state.views.clone())
-    else {
-        return Vec::new();
-    };
-    let mut due_targets = BTreeSet::new();
-    let mut entries = coordinator
-        .live
-        .entries
-        .lock()
-        .expect("live registry lock poisoned");
-    for entry in entries.values_mut() {
-        if let Some(due_at) = entry.next_due_at
-            && now + horizon < due_at
-        {
-            continue;
-        }
-        entry.next_due_at = Some(now + entry.interval);
-        if !live_source_visible(&views, &entry.source_pane) {
-            entry.mailbox.push(LivePush::Unavailable {
-                reason: LiveUnavailableReason::HiddenSource,
-            });
-            continue;
-        }
-        due_targets.insert(entry.target_pane.clone());
-    }
-    due_targets.into_iter().collect()
-}
-
-/// One live scheduler pass. In the aligned default configuration the
-/// observation worker consumes live demand first, so this pass only captures
-/// targets whose interval phase does not line up with an observation poll.
-/// Returns how long the scheduler should sleep.
-fn run_live_preview_tick(
-    coordinator: &ProductionV2Coordinator,
-    capture: &dyn crate::daemon::workers::CaptureSource,
-    now: Instant,
-) -> Duration {
-    let targets = collect_due_live_targets(coordinator, now, Duration::ZERO);
-    if !targets.is_empty() {
-        let result = capture.capture_live_sections(&targets);
-        deliver_live_result(coordinator, &targets, result);
-    }
-    let entries = coordinator
-        .live
-        .entries
-        .lock()
-        .expect("live registry lock poisoned");
-    if entries.is_empty() {
-        return LIVE_SCHEDULER_MAX_SLEEP;
-    }
-    let next_wakeup = entries.values().map(|entry| entry.next_due_at).min();
-    match next_wakeup {
-        Some(Some(at)) => at
-            .saturating_duration_since(Instant::now())
-            .clamp(LIVE_SCHEDULER_MIN_SLEEP, LIVE_SCHEDULER_MAX_SLEEP),
-        // A fresh subscription has no deadline yet and is due immediately.
-        Some(None) => LIVE_SCHEDULER_MIN_SLEEP,
-        None => LIVE_SCHEDULER_MAX_SLEEP,
-    }
-}
-
-fn deliver_live_result(
-    coordinator: &ProductionV2Coordinator,
-    targets: &[PaneInstance],
-    result: std::result::Result<
-        Vec<crate::daemon::workers::LiveCaptureSection>,
-        crate::daemon::workers::CaptureBatchError,
-    >,
-) {
-    use crate::daemon::workers::{CaptureBatchError, LiveCaptureSection};
-    use LiveUnavailableReason;
-
-    let sections = match result {
-        Ok(sections) if sections.len() == targets.len() => sections,
-        Ok(_) => vec![LiveCaptureSection::Malformed; targets.len()],
-        Err(
-            CaptureBatchError::IdentityMismatch { .. } | CaptureBatchError::InvalidIdentityHeader,
-        ) => {
-            coordinator.fail_stop("tmux server incarnation changed during live capture");
-            return;
-        }
-        Err(_) => vec![LiveCaptureSection::Malformed; targets.len()],
-    };
-    let captured_at_epoch_millis = epoch_millis();
-    for (target, section) in targets.iter().zip(sections) {
-        let push = match section {
-            LiveCaptureSection::Body(body) => {
-                let live_revision = coordinator
-                    .live
-                    .live_revision
-                    .fetch_add(1, Ordering::SeqCst)
-                    .saturating_add(1);
-                let body = Arc::new(body);
-                coordinator
-                    .live
-                    .bodies
-                    .lock()
-                    .expect("live body cache lock poisoned")
-                    .insert(
-                        target.clone(),
-                        LiveBodyEntry {
-                            live_revision,
-                            captured_at_epoch_millis,
-                            body: body.clone(),
-                        },
-                    );
-                LivePush::Result {
-                    live_revision,
-                    captured_at_epoch_millis,
-                    body,
-                }
-            }
-            LiveCaptureSection::PaneInstanceMismatch => LivePush::Unavailable {
-                reason: LiveUnavailableReason::PaneInstanceMismatch,
-            },
-            LiveCaptureSection::TargetMissing => LivePush::Unavailable {
-                reason: LiveUnavailableReason::TargetMissing,
-            },
-            LiveCaptureSection::Malformed => LivePush::Unavailable {
-                reason: LiveUnavailableReason::CaptureFailed,
-            },
-        };
-        let mut entries = coordinator
-            .live
-            .entries
-            .lock()
-            .expect("live registry lock poisoned");
-        for entry in entries
-            .values_mut()
-            .filter(|entry| entry.target_pane == *target)
-        {
-            if let LivePush::Result { live_revision, .. } = &push {
-                if *live_revision <= entry.last_delivered_revision {
-                    continue;
-                }
-                entry.last_delivered_revision = *live_revision;
-            }
-            entry.mailbox.push(push.clone());
-        }
-    }
-}
-
-fn handle_v2_live_subscription(
-    coordinator: Arc<ProductionV2Coordinator>,
-    mut stream: UnixStream,
-    source_pane: PaneInstance,
-    target_pane: PaneInstance,
-    interval_ms: u64,
-) -> Result<()> {
-    use crate::daemon::protocol::v2::{ErrorCode, LiveUnavailableReason, ServerMessage};
-
-    if interval_ms < crate::config::load::MIN_LIVE_INTERVAL_MS {
-        let _ = write_v2_response(
-            &mut stream,
-            &ServerMessage::error(
-                ErrorCode::InvalidRequest,
-                format!(
-                    "live interval_ms must be at least {}, got {interval_ms}",
-                    crate::config::load::MIN_LIVE_INTERVAL_MS
-                ),
-                None,
-            ),
-        );
-        return Ok(());
-    }
-    if source_pane.validate().is_err() || target_pane.validate().is_err() {
-        let _ = write_v2_response(
-            &mut stream,
-            &ServerMessage::error(
-                ErrorCode::InvalidRequest,
-                "live subscription panes must be valid pane instances",
-                None,
-            ),
-        );
-        return Ok(());
-    }
-    if coordinator.shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-    let (id, mailbox) = coordinator.live.register(
-        source_pane,
-        target_pane.clone(),
-        Duration::from_millis(interval_ms),
-    );
-    let _guard = LiveSubscriptionGuard {
-        coordinator: coordinator.clone(),
-        id,
-    };
-    let daemon_instance_id = coordinator
-        .router
-        .lock()
-        .expect("v2 router lock poisoned")
-        .daemon_instance_id()
-        .clone();
-    loop {
-        let push = match mailbox.wait_timeout(V2_STREAM_HEARTBEAT_INTERVAL) {
-            LiveMailboxWait::Message(push) => Some(push),
-            LiveMailboxWait::Closed => break,
-            // A quiet capture period still exercises the socket so a dead
-            // subscriber is detected and its demand cleaned up.
-            LiveMailboxWait::TimedOut => None,
-        };
-        let message = match push {
-            Some(LivePush::Result {
-                live_revision,
-                captured_at_epoch_millis,
-                body,
-            }) => ServerMessage::LivePreviewResult {
-                live_revision,
-                target_pane: target_pane.clone(),
-                captured_at_epoch_millis,
-                body: body.as_ref().clone(),
-            },
-            Some(LivePush::Unavailable { reason }) => ServerMessage::LivePreviewUnavailable {
-                target_pane: target_pane.clone(),
-                reason,
-            },
-            None => ServerMessage::Heartbeat {
-                daemon_instance_id: daemon_instance_id.clone(),
-                snapshot_revision: coordinator
-                    .snapshot_cache
-                    .lock()
-                    .expect("snapshot cache lock poisoned")
-                    .as_ref()
-                    .map_or(0, |published| published.revision),
-            },
-        };
-        let frame = match crate::daemon::protocol::v2::encode_response_frame(&message) {
-            Ok(frame) => frame,
-            Err(_) => {
-                // An over-sized body must not tear down the stream; deliver an
-                // explicit failure for this frame instead.
-                match crate::daemon::protocol::v2::encode_response_frame(
-                    &ServerMessage::LivePreviewUnavailable {
-                        target_pane: target_pane.clone(),
-                        reason: LiveUnavailableReason::CaptureFailed,
-                    },
-                ) {
-                    Ok(frame) => frame,
-                    Err(_) => break,
-                }
-            }
-        };
-        if write_v2_frame(&mut stream, &frame).is_err() {
-            break;
-        }
-    }
-    Ok(())
 }
 
 fn start_status_push_worker(coordinator: Arc<ProductionV2Coordinator>) {
@@ -3143,6 +2578,9 @@ fn apply_production_mutation(
             crate::daemon::protocol::v2::SidebarCommand::PreferenceIntent { intent } => {
                 apply_sidebar_preference_intent(coordinator, accepted_seq, event_id, intent)
             }
+            crate::daemon::protocol::v2::SidebarCommand::SetNavigation { selection, scroll } => {
+                apply_sidebar_navigation(coordinator, accepted_seq, event_id, selection, scroll)
+            }
         },
         V2AcceptedMutation::External(ClientMessage::Shutdown { event_id, .. }) => {
             coordinator.begin_graceful_shutdown(accepted_seq);
@@ -3157,8 +2595,7 @@ fn apply_production_mutation(
             | ClientMessage::QueryStatusSnapshot { .. }
             | ClientMessage::QueryPane { .. }
             | ClientMessage::QueryRuntimeInfo { .. }
-            | ClientMessage::Subscribe { .. }
-            | ClientMessage::SubscribeLive { .. },
+            | ClientMessage::Subscribe { .. },
         ) => unreachable!("v2 router cannot sequence a read-only request"),
         V2AcceptedMutation::Internal(V2InternalMutation::TargetedPaneRefresh { pane_id }) => {
             targeted_pane_refresh_response(coordinator, &pane_id)
@@ -3445,6 +2882,38 @@ fn apply_sidebar_preference_intent(
     }
 }
 
+fn apply_sidebar_navigation(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    event_id: EventId,
+    selection: Option<String>,
+    scroll: usize,
+) -> ServerMessage {
+    use crate::daemon::protocol::v2::ServerMessage;
+    let mut state_guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let state = state_guard
+        .as_mut()
+        .expect("state initialized before sidebar navigation");
+    if !state.sidebar_intent_dedupe.accept(event_id.clone()) {
+        return ServerMessage::SnapshotAck {
+            event_id,
+            accepted_seq,
+            snapshot_revision: state.leased.runtime.snapshot_revision(),
+        };
+    }
+    if let Err(error) = state.replace_sidebar_navigation(selection, scroll) {
+        return production_store_error_response(coordinator, error, Some(event_id));
+    }
+    ServerMessage::SnapshotAck {
+        event_id,
+        accepted_seq,
+        snapshot_revision: state.leased.runtime.snapshot_revision(),
+    }
+}
+
 fn apply_external_pane_event(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
@@ -3526,29 +2995,11 @@ fn apply_observation_batch(
         }
     }
     match apply_triage_projection(coordinator) {
-        Ok(revision) => {
-            let present = coordinator
-                .state
-                .lock()
-                .expect("canonical state lock poisoned")
-                .as_ref()
-                .map(|state| {
-                    state
-                        .topology
-                        .panes
-                        .iter()
-                        .map(|pane| pane.pane_instance.clone())
-                        .collect::<BTreeSet<_>>()
-                })
-                .unwrap_or_default();
-            coordinator.live.prune_missing_panes(&present);
-            ServerMessage::SnapshotAck {
-                event_id: EventId::generate()
-                    .expect("OS random source failed after daemon startup"),
-                accepted_seq,
-                snapshot_revision: revision,
-            }
-        }
+        Ok(revision) => ServerMessage::SnapshotAck {
+            event_id: EventId::generate().expect("OS random source failed after daemon startup"),
+            accepted_seq,
+            snapshot_revision: revision,
+        },
         Err(error) => production_store_error_response(coordinator, error, None),
     }
 }
@@ -4545,7 +3996,6 @@ pub fn run_runtime_daemon_server(
         Duration::from_millis(config.daemon.git.poll_interval_ms),
         Duration::from_millis(config.daemon.git.timeout_ms),
     );
-    start_live_preview_worker(coordinator.clone(), capture);
     start_status_push_worker(coordinator.clone());
 
     coordinator.wait_for_shutdown();
@@ -5064,6 +4514,16 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    fn initialized_test_coordinator(
+        root: &Path,
+        hash: impl Into<String>,
+        views: crate::daemon::view_hooks::CurrentClientViews,
+    ) -> ProductionV2Coordinator {
+        let coordinator = test_coordinator(root, hash);
+        install_test_state(&coordinator, root, views);
+        coordinator
     }
 
     fn detached_test_coordinator(hash: impl Into<String>) -> ProductionV2Coordinator {
@@ -6066,86 +5526,6 @@ mod tests {
         }
     }
 
-    struct MockLiveCaptureIo {
-        calls: Mutex<Vec<Vec<PaneInstance>>>,
-        mismatch_targets: BTreeSet<String>,
-    }
-
-    impl MockLiveCaptureIo {
-        fn new(_identity: crate::daemon::topology::ServerIdentity) -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
-                mismatch_targets: BTreeSet::new(),
-            }
-        }
-
-        fn call_count(&self) -> usize {
-            self.calls.lock().unwrap().len()
-        }
-    }
-
-    impl crate::daemon::workers::CaptureSource for MockLiveCaptureIo {
-        fn capture_plain_tails(
-            &self,
-            _panes: &[PaneInstance],
-        ) -> std::result::Result<Vec<String>, crate::daemon::workers::CaptureBatchError> {
-            unreachable!("live scheduler tests never request plain tails")
-        }
-
-        fn capture_live_sections(
-            &self,
-            targets: &[PaneInstance],
-        ) -> std::result::Result<
-            Vec<crate::daemon::workers::LiveCaptureSection>,
-            crate::daemon::workers::CaptureBatchError,
-        > {
-            self.calls.lock().unwrap().push(targets.to_vec());
-            Ok(targets
-                .iter()
-                .map(|target| {
-                    if self.mismatch_targets.contains(&target.pane_id) {
-                        crate::daemon::workers::LiveCaptureSection::PaneInstanceMismatch
-                    } else {
-                        crate::daemon::workers::LiveCaptureSection::Body(format!(
-                            "body-{}\n",
-                            target.pane_id
-                        ))
-                    }
-                })
-                .collect())
-        }
-    }
-
-    fn live_views_showing(
-        source_pane: &PaneInstance,
-    ) -> crate::daemon::view_hooks::CurrentClientViews {
-        let mut views = crate::daemon::view_hooks::CurrentClientViews::default();
-        views
-            .reconcile(
-                &[crate::pane_state::ClientWitness {
-                    client_pid: 400,
-                    session_id: "$1".to_string(),
-                    window_id: "@1".to_string(),
-                    active_pane: source_pane.clone(),
-                    control_mode: false,
-                    active_pane_flag: false,
-                }],
-                &BTreeMap::from([("@1".to_string(), vec![source_pane.clone()])]),
-            )
-            .unwrap();
-        views
-    }
-
-    fn live_test_coordinator(
-        root: &std::path::Path,
-        hash: String,
-        views: crate::daemon::view_hooks::CurrentClientViews,
-    ) -> ProductionV2Coordinator {
-        let coordinator = test_coordinator(root, hash);
-        install_test_state(&coordinator, root, views);
-        coordinator
-    }
-
     #[test]
     fn sidebar_preference_intents_commit_serially_and_dedupe_event_ids() {
         let root = test_root("sidebar-intents");
@@ -6243,6 +5623,60 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_navigation_is_shared_in_snapshots_without_persisting_preferences() {
+        let root = test_root("sidebar-navigation");
+        let coordinator = initialized_test_coordinator(
+            &root,
+            "sidebar-navigation",
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+        );
+        let selection = Some("chat::%1::101".to_string());
+
+        let first = apply_sidebar_navigation(
+            &coordinator,
+            1,
+            EventId::generate().unwrap(),
+            selection.clone(),
+            12,
+        );
+        let first_revision = match first {
+            ServerMessage::SnapshotAck {
+                snapshot_revision, ..
+            } => snapshot_revision,
+            other => panic!("unexpected navigation response: {other:?}"),
+        };
+        let snapshot = coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .resolved_snapshot();
+        assert_eq!(snapshot.sidebar_model.navigation.revision, 1);
+        assert_eq!(snapshot.sidebar_model.navigation.selection, selection);
+        assert_eq!(snapshot.sidebar_model.navigation.scroll, 12);
+
+        let duplicate = apply_sidebar_navigation(
+            &coordinator,
+            2,
+            EventId::generate().unwrap(),
+            snapshot.sidebar_model.navigation.selection.clone(),
+            12,
+        );
+        assert!(matches!(
+            duplicate,
+            ServerMessage::SnapshotAck {
+                snapshot_revision,
+                ..
+            } if snapshot_revision == first_revision
+        ));
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(any())]
     fn live_scheduler_dedupes_targets_into_one_capture_and_fans_out() {
         let root = test_root("live-dedupe");
         let source = PaneInstance {
@@ -6257,7 +5691,7 @@ mod tests {
             pane_id: "%2".to_string(),
             pane_pid: 200,
         };
-        let coordinator = live_test_coordinator(
+        let coordinator = initialized_test_coordinator(
             &root,
             "live-dedupe".to_string(),
             live_views_showing(&source),
@@ -6316,6 +5750,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn live_scheduler_does_not_capture_hidden_sources() {
         let root = test_root("live-hidden");
         let source = PaneInstance {
@@ -6354,6 +5789,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn live_pane_instance_mismatch_delivers_no_body() {
         let root = test_root("live-mismatch");
         let source = PaneInstance {
@@ -6391,6 +5827,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn observation_piggyback_consumes_due_live_demand_before_the_scheduler_tick() {
         let root = test_root("live-piggyback");
         let source = PaneInstance {
@@ -6441,9 +5878,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn live_subscription_rejects_interval_below_minimum() {
         let root = test_root("live-interval");
-        let coordinator = Arc::new(live_test_coordinator(
+        let coordinator = Arc::new(initialized_test_coordinator(
             &root,
             "live-interval".to_string(),
             crate::daemon::view_hooks::CurrentClientViews::default(),
@@ -6479,6 +5917,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn live_subscription_guard_removes_registry_entry_after_write_failure() {
         let root = test_root("live-guard");
         let coordinator = Arc::new(live_test_coordinator(
@@ -6533,7 +5972,7 @@ mod tests {
     #[test]
     fn snapshot_wait_timeout_yields_heartbeat_instead_of_full_snapshot() {
         let root = test_root("heartbeat-wait");
-        let coordinator = live_test_coordinator(
+        let coordinator = initialized_test_coordinator(
             &root,
             "heartbeat-wait".to_string(),
             crate::daemon::view_hooks::CurrentClientViews::default(),
@@ -6560,7 +5999,7 @@ mod tests {
     #[test]
     fn idle_subscription_stream_sends_heartbeats_and_new_revisions_still_flow() {
         let root = test_root("heartbeat-stream");
-        let coordinator = Arc::new(live_test_coordinator(
+        let coordinator = Arc::new(initialized_test_coordinator(
             &root,
             "heartbeat-stream".to_string(),
             crate::daemon::view_hooks::CurrentClientViews::default(),
@@ -6638,6 +6077,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn live_mailbox_delivers_latest_only_and_close_ends_the_stream() {
         let mailbox = LiveMailbox::default();
         mailbox.push(LivePush::Unavailable {
@@ -6660,6 +6100,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn live_registry_prunes_demand_for_missing_panes() {
         let registry = LiveRegistry::default();
         let source = PaneInstance {
@@ -7794,7 +7235,7 @@ mod tests {
         let mut reader = V2FrameReader::new(server);
         client
             .write_all(
-                b"{\"op\":\"hello\",\"proto\":4}\n{\"op\":\"query_resolved_snapshot\",\"proto\":4}\n",
+                b"{\"op\":\"hello\",\"proto\":5}\n{\"op\":\"query_resolved_snapshot\",\"proto\":5}\n",
             )
             .unwrap();
         let frame = read_v2_request_frame(&mut reader).unwrap();

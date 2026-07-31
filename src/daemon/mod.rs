@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::session_badge::{BadgeState, glyph_for_state};
-use crate::sidebar::state::SidebarPreferences;
+use crate::sidebar::state::{SidebarNavigation, SidebarPreferences};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransitionEvent {
@@ -28,6 +28,7 @@ pub struct TransitionEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SidebarModel {
     pub preferences: SidebarPreferences,
+    pub navigation: SidebarNavigation,
     pub active_sessions: BTreeSet<String>,
     #[serde(default)]
     pub git: BTreeMap<String, crate::git::GitBadge>,

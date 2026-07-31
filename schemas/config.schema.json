@@ -166,9 +166,6 @@
         "colors": {
           "additionalProperties": true,
           "properties": {
-            "action_icon": {
-              "type": "string"
-            },
             "badge_blocked": {
               "type": "string"
             },
@@ -262,36 +259,9 @@
           },
           "type": "object"
         },
-        "live": {
-          "additionalProperties": true,
-          "properties": {
-            "enabled": {
-              "type": "boolean"
-            },
-            "interval_ms": {
-              "minimum": 1,
-              "type": "integer"
-            },
-            "lines": {
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          "type": "object"
-        },
         "min_width": {
           "minimum": 1,
           "type": "integer"
-        },
-        "preview": {
-          "additionalProperties": true,
-          "properties": {
-            "history_lines": {
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          "type": "object"
         },
         "width": {
           "oneOf": [

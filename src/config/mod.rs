@@ -464,8 +464,6 @@ pub struct SidebarConfig {
     pub min_width: u16,
     pub colors: SidebarColorsConfig,
     pub header: SidebarHeaderConfig,
-    pub preview: SidebarPreviewConfig,
-    pub live: SidebarLiveConfig,
 }
 
 impl Default for SidebarConfig {
@@ -475,54 +473,6 @@ impl Default for SidebarConfig {
             min_width: 40,
             colors: SidebarColorsConfig::default(),
             header: SidebarHeaderConfig::default(),
-            preview: SidebarPreviewConfig::default(),
-            live: SidebarLiveConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SidebarLiveConfig {
-    pub enabled: bool,
-    pub lines: u16,
-    pub interval_ms: u64,
-    pub cut_markers: Vec<String>,
-}
-
-impl Default for SidebarLiveConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            lines: 3,
-            interval_ms: 2000,
-            cut_markers: [
-                "╭",
-                "? for shortcuts",
-                "› ",
-                "❯",
-                "Ask Codex",
-                "⏎ send",
-                "context left",
-                "new task?",
-                "bypass permissions",
-            ]
-            .map(String::from)
-            .to_vec(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SidebarPreviewConfig {
-    pub history_lines: u32,
-}
-
-impl Default for SidebarPreviewConfig {
-    fn default() -> Self {
-        Self {
-            history_lines: 2000,
         }
     }
 }
@@ -532,7 +482,6 @@ impl Default for SidebarPreviewConfig {
 pub struct SidebarColorsConfig {
     pub selection_bg: Option<String>,
     pub selection_bar: Option<String>,
-    pub action_icon: Option<String>,
     pub badge_blocked: Option<String>,
     pub badge_working: Option<String>,
     pub badge_done: Option<String>,
@@ -552,7 +501,6 @@ pub struct SidebarColorsConfig {
     pub active_bar: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
-    pub live: Option<String>,
     pub task_done: Option<String>,
     pub task_working: Option<String>,
     pub task_pending: Option<String>,
@@ -796,42 +744,14 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_preview_history_lines_defaults_to_2000() {
-        let config = Config::default();
-        assert_eq!(config.sidebar.preview.history_lines, 2000);
-
-        let config =
-            serde_yaml_ng::from_str::<Config>("sidebar:\n  preview:\n    history_lines: 5000\n")
-                .unwrap();
-        assert_eq!(config.sidebar.preview.history_lines, 5000);
-    }
-
-    #[test]
-    fn sidebar_live_config_defaults_and_overrides() {
-        let config = Config::default();
-        assert!(config.sidebar.live.enabled);
-        assert_eq!(config.sidebar.live.lines, 3);
-        assert_eq!(config.sidebar.live.interval_ms, 2000);
-
-        let config = serde_yaml_ng::from_str::<Config>(
-            "sidebar:\n  live:\n    enabled: false\n    lines: 5\n    interval_ms: 750\n",
-        )
-        .unwrap();
-        assert!(!config.sidebar.live.enabled);
-        assert_eq!(config.sidebar.live.lines, 5);
-        assert_eq!(config.sidebar.live.interval_ms, 750);
-    }
-
-    #[test]
     fn sidebar_colors_accept_ui_color_keys_and_reject_state_color_keys() {
         let config = serde_yaml_ng::from_str::<Config>(
-            "sidebar:\n  colors:\n    selection_bg: \"237\"\n    selection_bar: \"229\"\n    action_icon: \"73\"\n    header_active_bg: \"24\"\n    header_filter_bg: \"255\"\n",
+            "sidebar:\n  colors:\n    selection_bg: \"237\"\n    selection_bar: \"229\"\n    header_active_bg: \"24\"\n    header_filter_bg: \"255\"\n",
         )
         .unwrap();
 
         assert_eq!(config.sidebar.colors.selection_bg.as_deref(), Some("237"));
         assert_eq!(config.sidebar.colors.selection_bar.as_deref(), Some("229"));
-        assert_eq!(config.sidebar.colors.action_icon.as_deref(), Some("73"));
         assert_eq!(
             config.sidebar.colors.header_active_bg.as_deref(),
             Some("24")
@@ -901,6 +821,21 @@ sidebar:
         )
         .unwrap_err();
         assert!(active_bg.to_string().contains("selection_active_bg"));
+
+        let action_icon =
+            serde_yaml_ng::from_str::<Config>("sidebar:\n  colors:\n    action_icon: cyan\n")
+                .unwrap_err();
+        assert!(action_icon.to_string().contains("action_icon"));
+    }
+
+    #[test]
+    fn sidebar_rejects_removed_live_and_preview_sections() {
+        for key in ["live", "preview"] {
+            let yaml = format!("sidebar:\n  {key}: {{}}\n");
+            let error = serde_yaml_ng::from_str::<Config>(&yaml).unwrap_err();
+
+            assert!(error.to_string().contains(key), "{error}");
+        }
     }
 
     #[test]

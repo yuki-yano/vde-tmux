@@ -22,7 +22,6 @@ pub enum SidebarRowKind {
     Repo,
     Chat,
     Detail,
-    Jump,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,12 +324,7 @@ fn badge_counts_from_agent_panes<'a>(
 
 pub fn row_refs(rows: &[SidebarRow]) -> Vec<SidebarRowRef> {
     rows.iter()
-        .filter(|row| {
-            !matches!(
-                row.kind,
-                SidebarRowKind::Detail | SidebarRowKind::Jump | SidebarRowKind::Zone
-            )
-        })
+        .filter(|row| !matches!(row.kind, SidebarRowKind::Detail | SidebarRowKind::Zone))
         .map(|row| SidebarRowRef::new(row.id.clone()))
         .collect()
 }
@@ -342,7 +336,6 @@ pub(crate) fn chat_row_id(pane: &PaneInstance) -> String {
 pub(crate) fn pane_instance_from_row_id(id: &str) -> Option<PaneInstance> {
     let rest = id
         .strip_prefix("chat::")
-        .or_else(|| id.strip_prefix("jump::"))
         .or_else(|| id.strip_prefix("detail::"))?;
     let mut fields = rest.split("::");
     let pane_id = fields.next()?.to_string();
@@ -650,20 +643,6 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
             ));
         }
     }
-    rows.push(SidebarRow {
-        id: format!("jump::{}::{}", pane.pane_id, pane.pane_instance.pane_pid),
-        kind: SidebarRowKind::Jump,
-        depth,
-        label: "jump".to_string(),
-        chat_count: 0,
-        rollup: pane.rollup,
-        badge_state: Some(pane.badge_state),
-        expanded: true,
-        pane_id: Some(pane.pane_id.clone()),
-        git: None,
-        active: pane.active,
-        meta: None,
-    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1135,20 +1114,6 @@ mod tests {
                 kind: SidebarRowKind::Detail,
                 depth: 1,
                 label: "fix bug".to_string(),
-                chat_count: 0,
-                rollup: RollupLevel::Running,
-                badge_state: None,
-                expanded: true,
-                pane_id: Some("%1".to_string()),
-                git: None,
-                active: false,
-                meta: None,
-            },
-            SidebarRow {
-                id: "jump::%1".to_string(),
-                kind: SidebarRowKind::Jump,
-                depth: 1,
-                label: "jump".to_string(),
                 chat_count: 0,
                 rollup: RollupLevel::Running,
                 badge_state: None,

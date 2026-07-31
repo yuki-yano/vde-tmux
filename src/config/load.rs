@@ -49,15 +49,7 @@ pub fn parse_config_with_env(yaml: &str, env: &BTreeMap<String, String>) -> Load
     }
 }
 
-pub const MIN_LIVE_INTERVAL_MS: u64 = 100;
-
-fn validate_config(config: &Config) -> Result<(), String> {
-    if config.sidebar.live.interval_ms < MIN_LIVE_INTERVAL_MS {
-        return Err(format!(
-            "invalid config (path: sidebar.live.interval_ms): must be at least {MIN_LIVE_INTERVAL_MS}, got {}",
-            config.sidebar.live.interval_ms
-        ));
-    }
+fn validate_config(_config: &Config) -> Result<(), String> {
     Ok(())
 }
 
@@ -220,12 +212,12 @@ mod tests {
 
     #[test]
     fn parse_unknown_nested_field_returns_default_with_warning() {
-        let loaded = parse_config("sidebar:\n  preview:\n    history_line: 2000\n");
+        let loaded = parse_config("sidebar:\n  preview:\n    history_lines: 2000\n");
 
         assert_eq!(loaded.config, Config::default());
         assert_eq!(loaded.warnings.len(), 1);
         assert!(
-            loaded.warnings[0].contains("sidebar.preview.history_line"),
+            loaded.warnings[0].contains("sidebar.preview"),
             "{}",
             loaded.warnings[0]
         );
@@ -236,24 +228,6 @@ mod tests {
         let loaded = parse_config("   \n");
         assert_eq!(loaded.config, Config::default());
         assert!(loaded.warnings.is_empty());
-    }
-
-    #[test]
-    fn live_interval_below_minimum_is_rejected_not_clamped() {
-        for interval in ["0", "99"] {
-            let loaded = parse_config(&format!("sidebar:\n  live:\n    interval_ms: {interval}\n"));
-            assert_eq!(loaded.config, Config::default());
-            assert_eq!(loaded.warnings.len(), 1);
-            assert!(
-                loaded.warnings[0].contains("sidebar.live.interval_ms"),
-                "{}",
-                loaded.warnings[0]
-            );
-        }
-
-        let valid = parse_config("sidebar:\n  live:\n    interval_ms: 100\n");
-        assert!(valid.warnings.is_empty());
-        assert_eq!(valid.config.sidebar.live.interval_ms, 100);
     }
 
     #[test]

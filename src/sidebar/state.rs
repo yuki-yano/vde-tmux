@@ -54,6 +54,14 @@ pub struct SidebarState {
     pub return_target: Option<crate::pane_state::PaneInstance>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SidebarNavigation {
+    pub revision: u64,
+    pub selection: Option<String>,
+    pub scroll: usize,
+}
+
 pub const SIDEBAR_PREFERENCES_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

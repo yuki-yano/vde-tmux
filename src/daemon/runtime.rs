@@ -10,7 +10,7 @@ use crate::daemon::{SidebarModel, TransitionEvent};
 use crate::git::{GitBadge, WorktreeInfo};
 pub use crate::pane_state::CanonicalStateRuntime as CanonicalPaneStateRuntime;
 use crate::pane_state::{PaneInstance, PaneState, StoreError, StoredStateDescriptor, WaitReason};
-use crate::sidebar::state::{SidebarIntentDedupe, SidebarPreferences};
+use crate::sidebar::state::{SidebarIntentDedupe, SidebarNavigation, SidebarPreferences};
 use crate::sidebar::tree::now_epoch_secs;
 
 const EVENT_CAP: usize = crate::pane_state::store::MAX_DIAGNOSTICS;
@@ -86,6 +86,7 @@ pub(crate) struct CanonicalCoordinatorState {
     pub topology: TopologySnapshot,
     pub views: crate::daemon::view_hooks::CurrentClientViews,
     pub sidebar_preferences: SidebarPreferences,
+    pub sidebar_navigation: SidebarNavigation,
     pub sidebar_intent_dedupe: SidebarIntentDedupe,
     pub hook_health: HookHealth,
     pub hook_diagnostic: Option<DaemonDiagnostic>,
@@ -108,6 +109,7 @@ impl CanonicalCoordinatorState {
             topology,
             views,
             sidebar_preferences,
+            sidebar_navigation: SidebarNavigation::default(),
             sidebar_intent_dedupe: SidebarIntentDedupe::default(),
             hook_health: HookHealth::Healthy,
             hook_diagnostic: None,
@@ -492,6 +494,7 @@ impl CanonicalCoordinatorState {
             panes,
             sidebar_model: SidebarModel {
                 preferences: self.sidebar_preferences.clone(),
+                navigation: self.sidebar_navigation.clone(),
                 active_sessions: self
                     .views
                     .clients()
@@ -575,6 +578,36 @@ impl CanonicalCoordinatorState {
         preflight_resolved_snapshot(&snapshot)?;
         self.leased.runtime = runtime;
         self.sidebar_preferences = snapshot.sidebar_model.preferences;
+        Ok(true)
+    }
+
+    pub fn replace_sidebar_navigation(
+        &mut self,
+        selection: Option<String>,
+        scroll: usize,
+    ) -> Result<bool, StoreError> {
+        if self.sidebar_navigation.selection == selection
+            && self.sidebar_navigation.scroll == scroll
+        {
+            return Ok(false);
+        }
+        let mut runtime = self.leased.runtime.clone();
+        runtime.mark_projection_changed()?;
+        let mut navigation = self.sidebar_navigation.clone();
+        navigation.revision = navigation.revision.saturating_add(1);
+        navigation.selection = selection;
+        navigation.scroll = scroll;
+        let previous = std::mem::replace(&mut self.sidebar_navigation, navigation);
+        let snapshot = self.resolved_snapshot_from(
+            &runtime,
+            &self.topology,
+            self.hook_diagnostic.as_ref(),
+            &self.global_diagnostics,
+        );
+        self.sidebar_navigation = previous;
+        preflight_resolved_snapshot(&snapshot)?;
+        self.leased.runtime = runtime;
+        self.sidebar_navigation = snapshot.sidebar_model.navigation;
         Ok(true)
     }
 

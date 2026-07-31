@@ -10,7 +10,6 @@ use ratatui::text::{Line, Span};
 pub struct SidebarRenderTheme {
     pub selection_bg: Color,
     pub selection_bar: Color,
-    pub action_icon: Color,
     pub header_active_bg: Option<Color>,
     pub header_active_fg: Option<Color>,
     pub header_chip_fg: Option<Color>,
@@ -39,7 +38,6 @@ pub struct SidebarRenderTheme {
     pub active_bar: Color,
     pub repo: Color,
     pub branch: Color,
-    pub live: Color,
     pub task_done: Color,
     pub task_working: Color,
     pub task_pending: Color,
@@ -50,19 +48,11 @@ pub struct SidebarRenderTheme {
     pub worktree_activity: Color,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JumpRowAction {
-    Jump,
-    Preview,
-    MarkDone,
-}
-
 impl Default for SidebarRenderTheme {
     fn default() -> Self {
         Self {
             selection_bg: Color::Rgb(0x30, 0x30, 0x34),
             selection_bar: Color::Indexed(229),
-            action_icon: Color::Indexed(73),
             header_active_bg: None,
             header_active_fg: None,
             header_chip_fg: None,
@@ -91,7 +81,6 @@ impl Default for SidebarRenderTheme {
             active_bar: Color::Indexed(147),
             repo: Color::LightCyan,
             branch: Color::Indexed(73),
-            live: Color::Magenta,
             task_done: Color::Indexed(220),
             task_working: Color::Indexed(220),
             task_pending: Color::DarkGray,
@@ -112,7 +101,6 @@ impl SidebarRenderTheme {
                 .unwrap_or(default.selection_bg),
             selection_bar: parse_color(config.selection_bar.as_deref())
                 .unwrap_or(default.selection_bar),
-            action_icon: parse_color(config.action_icon.as_deref()).unwrap_or(default.action_icon),
             header_active_bg: parse_color(config.header_active_bg.as_deref()),
             header_active_fg: parse_color(config.header_active_fg.as_deref()),
             header_chip_fg: parse_color(config.header_chip_fg.as_deref()),
@@ -143,7 +131,6 @@ impl SidebarRenderTheme {
             active_bar: parse_color(config.active_bar.as_deref()).unwrap_or(default.active_bar),
             repo: parse_color(config.repo.as_deref()).unwrap_or(default.repo),
             branch: parse_color(config.branch.as_deref()).unwrap_or(default.branch),
-            live: parse_color(config.live.as_deref()).unwrap_or(default.live),
             task_done: parse_color(config.task_done.as_deref()).unwrap_or(default.task_done),
             task_working: parse_color(config.task_working.as_deref())
                 .unwrap_or(default.task_working),
@@ -641,13 +628,13 @@ pub fn render_header_lines(
 
 pub fn build_footer_line(width: usize) -> Line<'static> {
     let help = if width >= 64 {
-        " j/k move  enter jump  p preview  d complete  tab/S-tab filter"
+        " j/k move  gg/G ends  C-d/u half  C-f/b page  enter jump"
     } else if width >= 36 {
-        " j/k move  enter jump  d complete"
+        " j/k move  gg/G ends  enter jump"
     } else if width >= 24 {
-        " j/k move  d complete"
+        " j/k  gg/G  enter jump"
     } else {
-        " j/k  d complete"
+        " j/k  gg/G"
     };
     let text = truncate_display(help, width);
     Line::from(Span::styled(
@@ -729,9 +716,9 @@ fn render_standard_lines(
     let mut row_indices = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         if row.kind == SidebarRowKind::Chat && !row.expanded {
-            lines.extend(render_closed_chat_digest_lines(row, state, width, theme));
-            row_indices.push(Some(index));
-            row_indices.push(Some(index));
+            let digest = render_closed_chat_digest_lines(row, state, width, theme);
+            row_indices.extend(std::iter::repeat_n(Some(index), digest.len()));
+            lines.extend(digest);
         } else {
             lines.push(render_row_line(row, state, width, theme));
             row_indices.push(Some(index));
@@ -746,10 +733,15 @@ fn render_closed_chat_digest_lines(
     width: usize,
     theme: &SidebarRenderTheme,
 ) -> Vec<Line<'static>> {
-    vec![
-        render_closed_chat_summary_line(row, state, width, theme),
-        render_closed_chat_prompt_line(row, state, width, theme),
-    ]
+    let mut lines = vec![render_closed_chat_summary_line(row, state, width, theme)];
+    if closed_chat_has_detail_line(row) {
+        lines.push(render_closed_chat_prompt_line(row, state, width, theme));
+    }
+    lines
+}
+
+fn closed_chat_has_detail_line(row: &SidebarRow) -> bool {
+    !chat_prompt_label(row).trim().is_empty() || closed_chat_reason_token(row).is_some()
 }
 
 fn render_closed_chat_summary_line(
@@ -873,8 +865,7 @@ fn render_row_line(
     theme: &SidebarRenderTheme,
 ) -> Line<'static> {
     let selected = row_is_selected(row, state);
-    let selected_marker =
-        selected && !matches!(row.kind, SidebarRowKind::Detail | SidebarRowKind::Jump);
+    let selected_marker = selected && row.kind != SidebarRowKind::Detail;
     if row.kind == SidebarRowKind::Zone {
         let text = truncate_display(
             &format!(" ▍{} {}", row.label, row.chat_count),
@@ -900,7 +891,6 @@ fn render_row_line(
         }
         SidebarRowKind::Detail if row.id.starts_with("meta::") => format!("{indent}  "),
         SidebarRowKind::Detail => format!("{indent}│ "),
-        SidebarRowKind::Jump => format!("{indent}└ "),
         SidebarRowKind::Zone => unreachable!("zone rows return before generic rendering"),
     };
     let badge = if row.kind == SidebarRowKind::Chat {
@@ -937,7 +927,6 @@ fn render_row_line(
         .saturating_sub(right_reserved);
     let label_source = match row.kind {
         SidebarRowKind::Category => row.label.clone(),
-        SidebarRowKind::Jump => JUMP_ROW_LABEL.to_string(),
         SidebarRowKind::Chat => chat_display_label(row),
         _ => row.label.clone(),
     };
@@ -974,11 +963,7 @@ fn render_row_line(
     if let Some((glyph, color)) = badge {
         spans.push(Span::styled(glyph, badge_style(color, row)));
     }
-    if row.kind == SidebarRowKind::Jump {
-        spans.extend(jump_action_spans(&label, theme));
-    } else {
-        spans.extend(label_spans(label, row, style, theme));
-    }
+    spans.extend(label_spans(label, row, style, theme));
     if let Some(git) = &git {
         spans.push(Span::styled(
             format!(" {}", git.branch),
@@ -1033,10 +1018,7 @@ fn row_is_selected(row: &SidebarRow, state: &SidebarState) -> bool {
     if selection == row.id {
         return true;
     }
-    if !matches!(
-        row.kind,
-        SidebarRowKind::Chat | SidebarRowKind::Detail | SidebarRowKind::Jump
-    ) {
+    if !matches!(row.kind, SidebarRowKind::Chat | SidebarRowKind::Detail) {
         return false;
     }
     let Some(selected_pane) = crate::sidebar::tree::pane_instance_from_row_id(selection) else {
@@ -1268,7 +1250,7 @@ fn render_dense_lines(
     let mut row_indices = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         let line = match row.kind {
-            SidebarRowKind::Detail | SidebarRowKind::Jump => None,
+            SidebarRowKind::Detail => None,
             SidebarRowKind::Zone => Some(render_zone_dense_line(row, width, theme)),
             SidebarRowKind::Category | SidebarRowKind::Repo => {
                 Some(render_group_dense_line(row, state, width, theme))
@@ -1593,7 +1575,7 @@ fn right_label(row: &SidebarRow) -> Option<String> {
                     .map(|secs| format!("{} ago", elapsed_label(secs))),
             }
         }
-        SidebarRowKind::Detail | SidebarRowKind::Jump | SidebarRowKind::Zone => None,
+        SidebarRowKind::Detail | SidebarRowKind::Zone => None,
     }
 }
 
@@ -1904,128 +1886,6 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
         SidebarRowKind::Chat => Style::default().fg(Color::Reset),
         SidebarRowKind::Detail if row.id.ends_with("::prompt") => Style::default().fg(Color::Reset),
         SidebarRowKind::Detail => Style::default().fg(theme.detail),
-        SidebarRowKind::Jump => Style::default().fg(theme.detail),
-    }
-}
-
-const JUMP_ACTION_LABEL: &str = "↗ Jump";
-const PREVIEW_ACTION_LABEL: &str = "⌕ Preview";
-const MARK_DONE_ACTION_LABEL: &str = "✓ Complete";
-const ACTION_SEPARATOR: &str = " · ";
-const JUMP_ROW_LABEL: &str = "↗ Jump · ⌕ Preview · ✓ Complete";
-
-fn jump_action_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'static>> {
-    if label != JUMP_ROW_LABEL {
-        return action_label_spans(label, theme);
-    }
-    let separator = Style::default().fg(theme.marker);
-    let text = Style::default().fg(theme.detail);
-    vec![
-        Span::styled("↗".to_string(), Style::default().fg(theme.action_icon)),
-        Span::styled(" Jump".to_string(), text),
-        Span::styled(ACTION_SEPARATOR.to_string(), separator),
-        Span::styled("⌕".to_string(), Style::default().fg(theme.action_icon)),
-        Span::styled(" Preview".to_string(), text),
-        Span::styled(ACTION_SEPARATOR.to_string(), separator),
-        Span::styled("✓".to_string(), Style::default().fg(theme.badge_done)),
-        Span::styled(" Complete".to_string(), text),
-    ]
-}
-
-fn action_label_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut text = String::new();
-    let flush_text = |spans: &mut Vec<Span<'static>>, text: &mut String| {
-        if !text.is_empty() {
-            spans.push(Span::styled(
-                std::mem::take(text),
-                Style::default().fg(theme.detail),
-            ));
-        }
-    };
-    for ch in label.chars() {
-        match ch {
-            '↗' => {
-                flush_text(&mut spans, &mut text);
-                spans.push(Span::styled(
-                    ch.to_string(),
-                    Style::default().fg(theme.action_icon),
-                ));
-            }
-            '⌕' => {
-                flush_text(&mut spans, &mut text);
-                spans.push(Span::styled(
-                    ch.to_string(),
-                    Style::default().fg(theme.action_icon),
-                ));
-            }
-            '✓' => {
-                flush_text(&mut spans, &mut text);
-                spans.push(Span::styled(
-                    ch.to_string(),
-                    Style::default().fg(theme.badge_done),
-                ));
-            }
-            '·' => {
-                flush_text(&mut spans, &mut text);
-                spans.push(Span::styled(
-                    ch.to_string(),
-                    Style::default().fg(theme.marker),
-                ));
-            }
-            _ => text.push(ch),
-        }
-    }
-    flush_text(&mut spans, &mut text);
-    spans
-}
-
-pub fn jump_row_action_at(
-    row: &SidebarRow,
-    column: u16,
-    rendered_width: u16,
-) -> Option<JumpRowAction> {
-    if row.kind != SidebarRowKind::Jump {
-        return None;
-    }
-    let column = column as usize;
-    // Every rendered row reserves its final cell as padding. At narrow widths the
-    // action label is truncated, so the full label's hit area must not extend into
-    // cells where no action was drawn.
-    if column >= usize::from(rendered_width).saturating_sub(1) {
-        return None;
-    }
-    if jump_row_action_range(row, JumpRowAction::Jump).contains(&column) {
-        Some(JumpRowAction::Jump)
-    } else if jump_row_action_range(row, JumpRowAction::Preview).contains(&column) {
-        Some(JumpRowAction::Preview)
-    } else if jump_row_action_range(row, JumpRowAction::MarkDone).contains(&column) {
-        Some(JumpRowAction::MarkDone)
-    } else {
-        None
-    }
-}
-
-pub fn jump_row_action_start(row: &SidebarRow) -> usize {
-    3 + 2 * row.depth
-}
-
-pub fn jump_row_action_column(row: &SidebarRow, action: JumpRowAction) -> usize {
-    jump_row_action_range(row, action).start
-}
-
-fn jump_row_action_range(row: &SidebarRow, action: JumpRowAction) -> std::ops::Range<usize> {
-    let jump_start = jump_row_action_start(row);
-    let jump_end = jump_start + display_width(JUMP_ACTION_LABEL);
-    let preview_start = jump_end + display_width(ACTION_SEPARATOR);
-    let preview_end = preview_start + display_width(PREVIEW_ACTION_LABEL);
-    let mark_done_start = preview_end + display_width(ACTION_SEPARATOR);
-    let mark_done_end = mark_done_start + display_width(MARK_DONE_ACTION_LABEL);
-
-    match action {
-        JumpRowAction::Jump => jump_start..jump_end,
-        JumpRowAction::Preview => preview_start..preview_end,
-        JumpRowAction::MarkDone => mark_done_start..mark_done_end,
     }
 }
 
@@ -2184,10 +2044,6 @@ mod tests {
         row(id, SidebarRowKind::Detail, 1, label, rollup)
     }
 
-    fn jump_row(id: &str, label: &str, rollup: RollupLevel) -> SidebarRow {
-        row(id, SidebarRowKind::Jump, 2, label, rollup)
-    }
-
     fn assert_span_fg(spans: &[Span<'_>], content: &str, color: Color) {
         assert!(
             spans
@@ -2234,7 +2090,6 @@ mod tests {
     #[test]
     fn selection_and_active_colors_are_configurable() {
         let config = crate::config::SidebarColorsConfig {
-            action_icon: Some("#74c7ec".to_string()),
             selection_bar: Some("#f2d98f".to_string()),
             active_bg: Some("235".to_string()),
             active_bar: Some("magenta".to_string()),
@@ -2242,15 +2097,10 @@ mod tests {
         };
         let theme = SidebarRenderTheme::from_config(&config);
 
-        assert_eq!(theme.action_icon, Color::Rgb(0x74, 0xc7, 0xec));
         assert_eq!(theme.selection_bar, Color::Rgb(0xf2, 0xd9, 0x8f));
         assert_eq!(theme.active_bg, Color::Indexed(235));
         assert_eq!(theme.active_bar, Color::Magenta);
         assert_eq!(SidebarRenderTheme::default().active_bg, Color::Indexed(235));
-        assert_eq!(
-            SidebarRenderTheme::default().action_icon,
-            Color::Indexed(73)
-        );
         assert_eq!(
             SidebarRenderTheme::default().active_bar,
             Color::Indexed(147)
@@ -2417,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn rail_does_not_double_count_expanded_chat() {
+    fn rail_counts_expanded_chat_once() {
         let mut chat = row(
             "chat::%1",
             SidebarRowKind::Chat,
@@ -2428,11 +2278,7 @@ mod tests {
         chat.badge_state = Some(BadgeState::Working);
         chat.expanded = true;
         chat.pane_id = Some("%1".to_string());
-        let mut jump = jump_row("jump::%1", "jump", RollupLevel::Running);
-        jump.badge_state = Some(BadgeState::Working);
-        jump.pane_id = Some("%1".to_string());
-
-        let text = render_rows(&[chat, jump], &SidebarState::default(), 2);
+        let text = render_rows(&[chat], &SidebarState::default(), 2);
 
         assert_eq!(text, "●1\n──\n ●");
     }
@@ -2747,7 +2593,7 @@ sidebar:
             "chat::%1",
             SidebarRowKind::Chat,
             1,
-            "codex",
+            "codex: active prompt",
             RollupLevel::Running,
         );
         chat.active = true;
@@ -2794,7 +2640,7 @@ sidebar:
     }
 
     #[test]
-    fn expanded_chat_selection_styles_chat_detail_and_jump_rows() {
+    fn expanded_chat_selection_styles_chat_and_detail_rows() {
         let mut chat = row(
             "chat::%1::101",
             SidebarRowKind::Chat,
@@ -2812,14 +2658,6 @@ sidebar:
             RollupLevel::Running,
         );
         detail.pane_id = Some("%1".to_string());
-        let mut jump = row(
-            "jump::%1::101",
-            SidebarRowKind::Jump,
-            1,
-            "jump",
-            RollupLevel::Running,
-        );
-        jump.pane_id = Some("%1".to_string());
         let other = row(
             "chat::%2::202",
             SidebarRowKind::Chat,
@@ -2833,109 +2671,13 @@ sidebar:
         };
         let theme = SidebarRenderTheme::default();
 
-        let lines = render_lines(&[chat, detail, jump, other], &state, 60, &theme);
+        let lines = render_lines(&[chat, detail, other], &state, 60, &theme);
 
         assert_eq!(lines[0].style.bg, Some(theme.selection_bg));
         assert_eq!(lines[1].style.bg, Some(theme.selection_bg));
-        assert_eq!(lines[2].style.bg, Some(theme.selection_bg));
-        assert_eq!(lines[3].style.bg, None);
+        assert_eq!(lines[2].style.bg, None);
         assert_eq!(line_to_string(lines[0].clone()).chars().next(), Some('▎'));
         assert_eq!(line_to_string(lines[1].clone()).chars().next(), Some(' '));
-        assert_eq!(line_to_string(lines[2].clone()).chars().next(), Some(' '));
-    }
-
-    #[test]
-    fn jump_row_renders_action_buttons() {
-        let jump = jump_row("jump::%1", "jump", RollupLevel::Running);
-
-        let rendered = render_rows(std::slice::from_ref(&jump), &SidebarState::default(), 80);
-
-        assert!(
-            rendered.starts_with("     └ ↗ Jump · ⌕ Preview · ✓ Complete"),
-            "{rendered:?}"
-        );
-
-        let theme = SidebarRenderTheme {
-            action_icon: Color::Rgb(0x74, 0xc7, 0xec),
-            ..SidebarRenderTheme::default()
-        };
-        let lines = render_lines(&[jump], &SidebarState::default(), 80, &theme);
-        let style_of = |needle: &str| {
-            lines[0]
-                .spans
-                .iter()
-                .find(|span| span.content == needle)
-                .unwrap_or_else(|| panic!("span {needle:?} not found: {:?}", lines[0]))
-                .style
-        };
-        assert_eq!(style_of("↗").fg, Some(theme.action_icon));
-        assert_eq!(style_of("⌕").fg, Some(theme.action_icon));
-        assert_eq!(style_of("✓").fg, Some(theme.badge_done));
-        assert_eq!(style_of(" Jump").fg, Some(theme.detail));
-        assert_eq!(style_of(" Preview").fg, Some(theme.detail));
-        assert_eq!(style_of(" Complete").fg, Some(theme.detail));
-        assert_eq!(style_of(ACTION_SEPARATOR).fg, Some(theme.marker));
-    }
-
-    #[test]
-    fn truncated_jump_row_keeps_preview_icon_color() {
-        let theme = SidebarRenderTheme {
-            action_icon: Color::Rgb(0x74, 0xc7, 0xec),
-            ..SidebarRenderTheme::default()
-        };
-        let spans = jump_action_spans("↗ Jump · ⌕ Preview · ✓ Com…", &theme);
-        let style_of = |needle: &str| {
-            spans
-                .iter()
-                .find(|span| span.content == needle)
-                .unwrap_or_else(|| panic!("span {needle:?} not found: {spans:?}"))
-                .style
-        };
-
-        assert_eq!(style_of("↗").fg, Some(theme.action_icon));
-        assert_eq!(style_of("⌕").fg, Some(theme.action_icon));
-        assert_eq!(style_of("✓").fg, Some(theme.badge_done));
-        assert_eq!(style_of("·").fg, Some(theme.marker));
-    }
-
-    #[test]
-    fn jump_row_hit_test_maps_columns_to_actions() {
-        let jump = jump_row("jump::%1", "jump", RollupLevel::Running);
-
-        // " " + indent(4) + "└ " => actions start at 7.
-        // "↗ Jump"(7..13) · "⌕ Preview"(16..25) · "✓ Complete"(28..38)
-        assert_eq!(jump_row_action_at(&jump, 6, 80), None);
-        assert_eq!(jump_row_action_at(&jump, 7, 80), Some(JumpRowAction::Jump));
-        assert_eq!(jump_row_action_at(&jump, 12, 80), Some(JumpRowAction::Jump));
-        assert_eq!(jump_row_action_at(&jump, 13, 80), None);
-        assert_eq!(jump_row_action_at(&jump, 15, 80), None);
-        assert_eq!(
-            jump_row_action_at(&jump, 16, 80),
-            Some(JumpRowAction::Preview)
-        );
-        assert_eq!(
-            jump_row_action_at(&jump, 24, 80),
-            Some(JumpRowAction::Preview)
-        );
-        assert_eq!(jump_row_action_at(&jump, 25, 80), None);
-        assert_eq!(jump_row_action_at(&jump, 27, 80), None);
-        assert_eq!(
-            jump_row_action_at(&jump, 28, 80),
-            Some(JumpRowAction::MarkDone)
-        );
-        assert_eq!(
-            jump_row_action_at(&jump, 37, 80),
-            Some(JumpRowAction::MarkDone)
-        );
-        assert_eq!(jump_row_action_at(&jump, 38, 80), None);
-
-        // Standard tier starts at width 36. Column 35 is the row's padding,
-        // although the untruncated Complete label would extend through 37.
-        assert_eq!(
-            jump_row_action_at(&jump, 34, 36),
-            Some(JumpRowAction::MarkDone)
-        );
-        assert_eq!(jump_row_action_at(&jump, 35, 36), None);
     }
 
     #[test]
@@ -3391,10 +3133,12 @@ sidebar:
     }
 
     #[test]
-    fn footer_documents_forward_and_reverse_filter_keys() {
+    fn footer_documents_vim_navigation_keys() {
         let footer = line_to_string(build_footer_line(64));
 
-        assert!(footer.contains("tab/S-tab filter"), "{footer:?}");
+        assert!(footer.contains("gg/G ends"), "{footer:?}");
+        assert!(footer.contains("C-d/u half"), "{footer:?}");
+        assert!(footer.contains("C-f/b page"), "{footer:?}");
     }
 
     #[test]
@@ -4084,6 +3828,34 @@ badge:
         let rendered = render_rows(&[repo], &SidebarState::default(), 40);
         assert!(rendered.ends_with("▲2 "), "{rendered:?}");
         assert!(!rendered.contains("[permission:"), "{rendered:?}");
+    }
+
+    #[test]
+    fn closed_unoperated_agent_omits_empty_second_line() {
+        let mut chat = row(
+            "chat::%1::101",
+            SidebarRowKind::Chat,
+            0,
+            "codex",
+            RollupLevel::Idle,
+        );
+        chat.badge_state = Some(BadgeState::Idle);
+        chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            prompt: None,
+            wait_reason: None,
+            ..Default::default()
+        });
+        let rendered = render_lines_with_indices(
+            &[chat],
+            &SidebarState::default(),
+            64,
+            &SidebarRenderTheme::default(),
+        );
+
+        assert_eq!(rendered.lines.len(), 1);
+        assert_eq!(rendered.row_indices, vec![Some(0)]);
     }
 
     #[test]

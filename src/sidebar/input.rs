@@ -5,6 +5,12 @@ use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 pub enum SidebarInputAction {
     MoveNext,
     MovePrevious,
+    MoveFirst,
+    MoveLast,
+    HalfPageDown,
+    HalfPageUp,
+    PageDown,
+    PageUp,
     Activate,
     ToggleExpand,
     SetViewMode(ViewMode),
@@ -23,7 +29,6 @@ pub enum SidebarInputAction {
 pub enum SidebarCommand {
     JumpPane(String),
     ToggleExpand(String),
-    PreviewPane(String),
 }
 
 pub fn parse_key(key: &str) -> Option<SidebarInputAction> {
@@ -33,6 +38,12 @@ pub fn parse_key(key: &str) -> Option<SidebarInputAction> {
     match key {
         "j" | "down" => Some(SidebarInputAction::MoveNext),
         "k" | "up" => Some(SidebarInputAction::MovePrevious),
+        "gg" => Some(SidebarInputAction::MoveFirst),
+        "G" => Some(SidebarInputAction::MoveLast),
+        "C-d" => Some(SidebarInputAction::HalfPageDown),
+        "C-u" => Some(SidebarInputAction::HalfPageUp),
+        "C-f" => Some(SidebarInputAction::PageDown),
+        "C-b" => Some(SidebarInputAction::PageUp),
         "enter" | "\n" => Some(SidebarInputAction::Activate),
         "space" => Some(SidebarInputAction::ToggleExpand),
         "v" => Some(SidebarInputAction::CycleViewMode),
@@ -58,13 +69,12 @@ pub fn activate_selected(selection: Option<&str>, rows: &[SidebarRow]) -> Option
     let selection = selection?;
     let row = rows.iter().find(|row| row.id == selection)?;
     match row.kind {
-        SidebarRowKind::Chat | SidebarRowKind::Jump => {
+        SidebarRowKind::Chat | SidebarRowKind::Detail => {
             row.pane_id.clone().map(SidebarCommand::JumpPane)
         }
         SidebarRowKind::Category | SidebarRowKind::Repo => {
             Some(SidebarCommand::ToggleExpand(row.id.clone()))
         }
-        SidebarRowKind::Detail => row.pane_id.clone().map(SidebarCommand::PreviewPane),
         SidebarRowKind::Zone => None,
     }
 }
@@ -108,6 +118,12 @@ mod tests {
         );
         assert_eq!(parse_key("J"), Some(SidebarInputAction::ReorderDown));
         assert_eq!(parse_key("K"), Some(SidebarInputAction::ReorderUp));
+        assert_eq!(parse_key("gg"), Some(SidebarInputAction::MoveFirst));
+        assert_eq!(parse_key("G"), Some(SidebarInputAction::MoveLast));
+        assert_eq!(parse_key("C-d"), Some(SidebarInputAction::HalfPageDown));
+        assert_eq!(parse_key("C-u"), Some(SidebarInputAction::HalfPageUp));
+        assert_eq!(parse_key("C-f"), Some(SidebarInputAction::PageDown));
+        assert_eq!(parse_key("C-b"), Some(SidebarInputAction::PageUp));
         assert_eq!(parse_key("h"), None);
         assert_eq!(parse_key("l"), None);
         assert_eq!(parse_key("right"), None);
