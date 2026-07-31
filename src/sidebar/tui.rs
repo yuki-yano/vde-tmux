@@ -811,7 +811,7 @@ mod local_state_tests {
     }
 
     #[test]
-    fn agent_click_uses_first_line_for_toggle_and_later_lines_for_jump() {
+    fn agent_click_jumps_from_any_rendered_line_without_prior_selection() {
         let chat = SidebarRow {
             id: "chat::%1::101".to_string(),
             kind: SidebarRowKind::Chat,
@@ -846,24 +846,11 @@ mod local_state_tests {
         };
 
         assert_eq!(
-            row_click_intent(&ClickedRenderedRow {
-                row: &chat,
-                line_offset: 0,
-            }),
-            Some(RowClickIntent::Toggle(chat.id.clone()))
-        );
-        assert_eq!(
-            row_click_intent(&ClickedRenderedRow {
-                row: &chat,
-                line_offset: 1,
-            }),
+            row_click_intent(&ClickedRenderedRow { row: &chat }),
             Some(RowClickIntent::Jump(pane.clone()))
         );
         assert_eq!(
-            row_click_intent(&ClickedRenderedRow {
-                row: &detail,
-                line_offset: 0,
-            }),
+            row_click_intent(&ClickedRenderedRow { row: &detail }),
             Some(RowClickIntent::Jump(pane))
         );
     }
@@ -943,6 +930,32 @@ mod local_state_tests {
             scroll: 0,
             row_indices: rendered.row_indices.clone(),
         };
+
+        move_projected_viewport(
+            &sidebar,
+            &rendered,
+            &mut state,
+            &frame,
+            ViewportMove::WheelDown,
+        );
+        assert_eq!(state.scroll, 3);
+        assert_ne!(
+            state.selection.as_deref(),
+            Some(sidebar.rows[0].id.as_str())
+        );
+
+        move_projected_viewport(
+            &sidebar,
+            &rendered,
+            &mut state,
+            &frame,
+            ViewportMove::WheelUp,
+        );
+        assert_eq!(state.scroll, 0);
+        assert_eq!(
+            state.selection.as_deref(),
+            Some(sidebar.rows[0].id.as_str())
+        );
 
         move_projected_viewport(
             &sidebar,
@@ -2640,16 +2653,20 @@ fn run_loop<B: Backend>(
                     ) =>
                 {
                     pending_g = false;
-                    if let Some(snapshot) = &current {
-                        for _ in 0..3 {
-                            let sidebar = project_view(snapshot, config.app, &sidebar_state);
-                            let key = if mouse.kind == MouseEventKind::ScrollDown {
-                                "down"
-                            } else {
-                                "up"
-                            };
-                            apply_local_sidebar_key(&mut sidebar_state, &sidebar, key);
-                        }
+                    if let (Some(snapshot), Some(frame)) = (&current, last_frame.as_ref()) {
+                        let movement = if mouse.kind == MouseEventKind::ScrollDown {
+                            ViewportMove::WheelDown
+                        } else {
+                            ViewportMove::WheelUp
+                        };
+                        move_viewport_selection(
+                            snapshot,
+                            config.app,
+                            &mut sidebar_state,
+                            Some(frame),
+                            movement,
+                            theme,
+                        );
                     }
                 }
                 Event::Resize(_, _) => {
@@ -2886,6 +2903,8 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
 enum ViewportMove {
     First,
     Last,
+    WheelDown,
+    WheelUp,
     HalfPageDown,
     HalfPageUp,
     PageDown,
@@ -2929,6 +2948,7 @@ fn move_projected_viewport(
         .map(|range| range.0)
         .unwrap_or(state.scroll.min(rendered.lines.len() - 1));
     let amount = match movement {
+        ViewportMove::WheelDown | ViewportMove::WheelUp => 3,
         ViewportMove::HalfPageDown | ViewportMove::HalfPageUp => (viewport / 2).max(1),
         ViewportMove::PageDown | ViewportMove::PageUp => viewport,
         ViewportMove::First | ViewportMove::Last => 0,
@@ -2936,14 +2956,14 @@ fn move_projected_viewport(
     let (target_line, target_scroll, forward) = match movement {
         ViewportMove::First => (0, 0, true),
         ViewportMove::Last => (rendered.lines.len() - 1, max_scroll, false),
-        ViewportMove::HalfPageDown | ViewportMove::PageDown => (
+        ViewportMove::WheelDown | ViewportMove::HalfPageDown | ViewportMove::PageDown => (
             current_line
                 .saturating_add(amount)
                 .min(rendered.lines.len() - 1),
             state.scroll.saturating_add(amount).min(max_scroll),
             true,
         ),
-        ViewportMove::HalfPageUp | ViewportMove::PageUp => (
+        ViewportMove::WheelUp | ViewportMove::HalfPageUp | ViewportMove::PageUp => (
             current_line.saturating_sub(amount),
             state.scroll.saturating_sub(amount),
             false,
@@ -3268,15 +3288,11 @@ enum RowClickIntent {
 
 struct ClickedRenderedRow<'a> {
     row: &'a SidebarRow,
-    line_offset: usize,
 }
 
 fn row_click_intent(clicked: &ClickedRenderedRow<'_>) -> Option<RowClickIntent> {
     match clicked.row.kind {
         SidebarRowKind::Category | SidebarRowKind::Repo => {
-            Some(RowClickIntent::Toggle(clicked.row.id.clone()))
-        }
-        SidebarRowKind::Chat if clicked.line_offset == 0 => {
             Some(RowClickIntent::Toggle(clicked.row.id.clone()))
         }
         SidebarRowKind::Chat | SidebarRowKind::Detail => {
@@ -3298,14 +3314,8 @@ fn row_for_click_with_indices<'a>(
     }
     let display_index = usize::from(row - header_rows) + scroll;
     let row_index = row_indices.get(display_index).and_then(|index| *index)?;
-    let line_offset = row_indices[..display_index]
-        .iter()
-        .rev()
-        .take_while(|mapped| **mapped == Some(row_index))
-        .count();
     Some(ClickedRenderedRow {
         row: sidebar.rows.get(row_index)?,
-        line_offset,
     })
 }
 

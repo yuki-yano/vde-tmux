@@ -231,8 +231,9 @@ vt sidebar close
 | `q` / `Esc` | Close the sidebar |
 
 Agents belonging to the active session have a `▎` marker on the left.
-Click the first rendered line of an agent to expand or collapse it. Click any later
-rendered line to jump to that agent, whether the agent is expanded or collapsed.
+Click any rendered line of an agent once to jump to its pane; the agent does not
+need to be selected first. Use `Space` to expand or collapse the selected agent.
+The mouse wheel scrolls the viewport by three rendered lines per event.
 An agent with no activity yet uses a single line while collapsed.
 View mode, filter, manual order, and expansion state are persisted and shared across sidebars.
 Selection and scrolling are synchronized across all open sidebars on the same tmux server.
