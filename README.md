@@ -12,7 +12,7 @@ It tracks Claude Code, Codex, and opencode panes and renders their state in the 
 - Classifies agents across all tmux sessions as `Blocked`, `Working`, `Done`, or `Idle`
 - Shows agents that need attention directly in the tmux status line
 - Displays prompts, elapsed time, tasks, subagents, and worktree activity in a sidebar
-- Jumps to agent panes and previews their scrollback from the sidebar
+- Jumps to agent panes directly from the sidebar
 - Groups sessions into categories and switches them from the keyboard or status line
 - Runs a notification command when an agent starts waiting for input
 
@@ -20,7 +20,7 @@ It tracks Claude Code, Codex, and opencode panes and renders their state in the 
 
 - tmux 3.2 or later
 - The latest stable Rust and Cargo for installation
-- git, lsof, and less on `PATH`
+- git and lsof on `PATH`
 - Optional: fzf for the session manager, ghq for the project selector
 
 ## Installation
@@ -217,6 +217,9 @@ vt sidebar close
 | Key | Action |
 | --- | --- |
 | `j` / `k`, `↓` / `↑` | Move between rows |
+| `gg` / `G` | Move to the first or last row |
+| `Ctrl-D` / `Ctrl-U` | Move down or up by half a page |
+| `Ctrl-F` / `Ctrl-B` | Move down or up by a full page |
 | `Enter` | Jump to the selected agent pane |
 | `Space` | Expand or collapse the selected row |
 | `v` | Cycle the view mode |
@@ -225,13 +228,14 @@ vt sidebar close
 | `n` / `N` | Move to the next or previous agent that needs attention |
 | `d` | Mark the selected run as complete |
 | `J` / `K` | Change manual ordering |
-| `p` | Preview pane scrollback |
-| `e` | Switch the live panel between output and events |
 | `q` / `Esc` | Close the sidebar |
 
 Agents belonging to the active session have a `▎` marker on the left.
+Click the first rendered line of an agent to expand or collapse it. Click any later
+rendered line to jump to that agent, whether the agent is expanded or collapsed.
+An agent with no activity yet uses a single line while collapsed.
 View mode, filter, manual order, and expansion state are persisted and shared across sidebars.
-Selection and scrolling remain local to each sidebar instance.
+Selection and scrolling are synchronized across all open sidebars on the same tmux server.
 
 ## Sessions and categories
 
@@ -293,9 +297,6 @@ daemon:
 sidebar:
   width: "20%"
   min_width: 40
-  live:
-    enabled: true
-    lines: 3
 
 statusline:
   sessions:
@@ -446,14 +447,14 @@ delivery errors use distinct prefixes in that file.
 Sidebar order, default view/filter, and row expansion are stored atomically below
 `$XDG_STATE_HOME/vde/tmux/sidebar-state/`, isolated by tmux socket. Order and expansion
 updates are shared live by sidebars on the same tmux server. View/filter changes stay local
-to an open sidebar and become the default for sidebars opened later. Selection, scrolling,
-live mode, and the return target remain instance-local and are not persisted.
+to an open sidebar and become the default for sidebars opened later. Selection and scrolling
+are shared while the daemon is running but are not persisted. The return target remains
+instance-local and is not persisted.
 
 ## Known limitations
 
 - Without hooks, waiting detection is limited to states that can be inferred from visible pane output
 - When the daemon stops, the last rendered status options remain until the next hook event or `vt daemon ensure`
-- Older versions of less may not close a preview with `Esc`; use `q` instead
 
 ## License
 

@@ -12,7 +12,7 @@ Claude Code、Codex、opencode の pane を追跡し、tmux の status line と�
 - すべての tmux session にいるエージェントを `Blocked`、`Working`、`Done`、`Idle` に分類する
 - 対応が必要なエージェントを status line に表示する
 - prompt、経過時間、task、subagent、worktree activity をサイドバーに表示する
-- サイドバーからエージェントの pane へ移動し、スクロールバックを preview する
+- サイドバーからエージェントの pane へ直接移動する
 - session をカテゴリで整理し、キーボードや status line のクリックで切り替える
 - エージェントが入力待ちになったとき、任意の通知コマンドを実行する
 
@@ -20,7 +20,7 @@ Claude Code、Codex、opencode の pane を追跡し、tmux の status line と�
 
 - tmux 3.2 以降
 - 最新の stable Rust と Cargo（インストールに使用）
-- `PATH` にある git、lsof、less
+- `PATH` にある git、lsof
 - 任意：session manager を使う場合は fzf、project selector を使う場合は ghq
 
 ## インストール
@@ -215,6 +215,9 @@ vt sidebar close
 | キー | 動作 |
 | --- | --- |
 | `j` / `k`、`↓` / `↑` | 行を移動する |
+| `gg` / `G` | 先頭行または末尾行へ移動する |
+| `Ctrl-D` / `Ctrl-U` | 半ページ下または上へ移動する |
+| `Ctrl-F` / `Ctrl-B` | 1ページ下または上へ移動する |
 | `Enter` | 選択したエージェントの pane へ移動する |
 | `Space` | 選択行を開閉する |
 | `v` | 表示モードを切り替える |
@@ -223,13 +226,14 @@ vt sidebar close
 | `n` / `N` | 次または前の要対応エージェントへ移動する |
 | `d` | 選択中の run を完了としてマークする |
 | `J` / `K` | 手動順序を変更する |
-| `p` | スクロールバックを preview する |
-| `e` | live 表示を出力とイベントで切り替える |
 | `q` / `Esc` | サイドバーを閉じる |
 
 現在の session に属するエージェントには左端へ `▎` を表示します。
+エージェントの表示上の1行目をクリックすると開閉し、2行目以降をクリックすると
+開閉状態にかかわらず、そのエージェントの pane へ移動します。
+起動後にまだ操作されていないエージェントは、閉じている間は1行だけ表示します。
 表示モード、フィルタ、手動順序、開閉状態は保存され、すべてのサイドバーで共有されます。
-選択位置と scroll はサイドバーごとの一時状態です。
+選択位置とスクロールも、同じ tmux server で開いているすべてのサイドバー間で同期します。
 
 ## session とカテゴリ
 
@@ -291,9 +295,6 @@ daemon:
 sidebar:
   width: "20%"
   min_width: 40
-  live:
-    enabled: true
-    lines: 3
 
 statusline:
   sessions:
@@ -445,15 +446,15 @@ tmux server incarnation ごとの運用 log は
 notification、status push、hook delivery の error は、この file 内でそれぞれ異なる prefix を使います。
 サイドバーの並び順、既定の表示モードとフィルター、行の展開状態は、tmux socket ごとに分離された
 `$XDG_STATE_HOME/vde/tmux/sidebar-state/` 配下の一つのファイルへatomicに保存されます。
-同じtmux serverのサイドバー間では並び順と展開状態だけが即時共有されます。
+同じtmux serverのサイドバー間では並び順、展開状態、選択、スクロールが即時共有されます。
 表示モードとフィルターの変更は開いているサイドバーごとに独立し、後から開くサイドバーの既定値になります。
-選択、スクロール、live mode、return targetはinstance localのまま保存されません。
+選択とスクロールは daemon の稼働中だけ共有され、保存はされません。
+return target は instance local のまま保存されません。
 
 ## 既知の制約
 
 - hook がない場合、入力待ちの判定は pane に表示された内容から推測できる範囲に限られる
 - daemon が停止すると最後に描画した status option が残り、次の hook event または `vt daemon ensure` まで更新されない
-- 古い less では preview を `Esc` で閉じられない場合があるため、その場合は `q` を使う
 
 ## License
 
