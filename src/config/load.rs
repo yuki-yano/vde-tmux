@@ -49,8 +49,10 @@ pub fn parse_config_with_env(yaml: &str, env: &BTreeMap<String, String>) -> Load
     }
 }
 
-fn validate_config(_config: &Config) -> Result<(), String> {
-    Ok(())
+fn validate_config(config: &Config) -> Result<(), String> {
+    crate::category::configured_category_names(config)
+        .map(|_| ())
+        .map_err(|error| format!("categories: {error}"))
 }
 
 fn expand_config_patterns(
@@ -63,15 +65,6 @@ fn expand_config_patterns(
                 pattern,
                 env,
                 &format!("categories.rules.{rule_index}.path_patterns.{pattern_index}"),
-            )?;
-        }
-    }
-    for (rule_index, rule) in config.categories.session_name_rules.iter_mut().enumerate() {
-        for (pattern_index, pattern) in rule.patterns.iter_mut().enumerate() {
-            *pattern = expand_pattern(
-                pattern,
-                env,
-                &format!("categories.session_name_rules.{rule_index}.patterns.{pattern_index}"),
             )?;
         }
     }
@@ -256,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn config_pattern_env_expands_path_and_session_patterns() {
+    fn config_pattern_env_expands_configured_path_patterns() {
         let loaded = parse_config_with_env(
             r#"
 categories:
@@ -264,21 +257,13 @@ categories:
     - category: work
       path_patterns:
         - github.com/${WORK_GHQ_OWNER}/*
-  session_name_rules:
-    - category: work
-      patterns:
-        - ${WORK_PREFIX}-*
 "#,
-            &env(&[("WORK_GHQ_OWNER", "acme"), ("WORK_PREFIX", "corp")]),
+            &env(&[("WORK_GHQ_OWNER", "acme")]),
         );
         assert!(loaded.warnings.is_empty());
         assert_eq!(
             loaded.config.categories.rules[0].path_patterns[0],
             "github.com/acme/*"
-        );
-        assert_eq!(
-            loaded.config.categories.session_name_rules[0].patterns[0],
-            "corp-*"
         );
     }
 

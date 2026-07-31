@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::category::{adjacent_category, resolve_category_for_session, sessions_in_category};
+use crate::category::ResolvedSessionCategories;
 use crate::config::Config;
 use crate::options::{
     KEY_CATEGORY, KEY_PROJECT_PATH, set_global_option, set_session_option, show_global_option,
@@ -373,20 +373,46 @@ pub fn find_session<'a>(sessions: &'a [SessionInfo], name: &str) -> Option<&'a S
 pub fn remember_client_session_for_session(
     runner: &dyn TmuxRunner,
     config: &Config,
+    env: &BTreeMap<String, String>,
     client_name: &str,
     session_name: &str,
 ) -> Result<()> {
     let sessions = list_sessions(runner)?;
-    let session = find_session(&sessions, session_name)
-        .ok_or_else(|| anyhow!("session not found: {session_name}"))?;
-    let category = resolve_category_for_session(config, session);
-    remember_session_for_client(runner, client_name, &category, session_name)
+    let categories =
+        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
+    remember_client_session_for_session_resolved(
+        runner,
+        &categories,
+        &sessions,
+        client_name,
+        session_name,
+    )
 }
 
-pub fn remember_current_client_session(runner: &dyn TmuxRunner, config: &Config) -> Result<()> {
+fn remember_client_session_for_session_resolved(
+    runner: &dyn TmuxRunner,
+    categories: &ResolvedSessionCategories,
+    sessions: &[SessionInfo],
+    client_name: &str,
+    session_name: &str,
+) -> Result<()> {
+    let session = find_session(&sessions, session_name)
+        .ok_or_else(|| anyhow!("session not found: {session_name}"))?;
+    let category = categories.category_for(session)?;
+    remember_session_for_client(runner, client_name, category.as_str(), session_name)
+}
+
+pub fn remember_current_client_session(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    env: &BTreeMap<String, String>,
+) -> Result<()> {
     let client = current_client_name(runner)?;
     let current = current_session_name(runner)?;
-    remember_client_session_for_session(runner, config, &client, &current)
+    let sessions = list_sessions(runner)?;
+    let categories =
+        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
+    remember_client_session_for_session_resolved(runner, &categories, &sessions, &client, &current)
 }
 
 pub fn create_session(
@@ -410,17 +436,23 @@ pub fn create_session_for_client(
         bail!("no tmux client available for session creation");
     }
     let cwd = resolve_session_cwd(runner, env, cwd)?;
+    let (_, category) =
+        crate::category::resolve_project_category_from_server(runner, config, env, &cwd)?;
+    create_session_for_client_resolved(runner, config, &cwd, client, category.as_str())
+}
+
+fn create_session_for_client_resolved(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    cwd: &str,
+    client: &str,
+    category: &str,
+) -> Result<String> {
     let created_format = format!("#{{session_name}}{FIELD_SEP}#{{window_id}}");
     let created = runner.run(&["new-session", "-d", "-P", "-F", &created_format, "-c", &cwd])?;
     let (session_name, window_id) = parse_created_session(&created)?;
     set_session_option(runner, &session_name, KEY_PROJECT_PATH, &cwd)?;
-    let session = SessionInfo {
-        name: session_name.clone(),
-        project_path: cwd,
-        ..SessionInfo::default()
-    };
-    let category = resolve_category_for_session(config, &session);
-    set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
+    set_session_option(runner, &session_name, KEY_CATEGORY, category)?;
     switch_client_for_client(runner, client, &session_name)?;
     if !window_id.is_empty() {
         crate::sidebar::layout::open_if_auto_all_enabled(
@@ -432,7 +464,7 @@ pub fn create_session_for_client(
         )?;
     }
     if !category.is_empty() {
-        remember_session_for_client(runner, client, &category, &session_name)?;
+        remember_session_for_client(runner, client, category, &session_name)?;
     }
     Ok(session_name)
 }
@@ -486,44 +518,68 @@ fn expand_tilde_path(path: &str, home: Option<&str>) -> String {
     }
 }
 
-pub fn sync_session_category_mirrors(runner: &dyn TmuxRunner, config: &Config) -> Result<()> {
-    for session in list_sessions(runner)? {
-        let category = resolve_category_for_session(config, &session);
-        set_session_option(runner, &session.name, KEY_CATEGORY, &category)?;
+pub fn sync_session_category_mirrors(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    env: &BTreeMap<String, String>,
+) -> Result<()> {
+    let sessions = list_sessions(runner)?;
+    let categories =
+        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
+    sync_session_category_mirrors_resolved(runner, &categories, &sessions)
+}
+
+fn sync_session_category_mirrors_resolved(
+    runner: &dyn TmuxRunner,
+    categories: &ResolvedSessionCategories,
+    sessions: &[SessionInfo],
+) -> Result<()> {
+    for session in sessions {
+        let category = categories.category_for(session)?;
+        set_session_option(runner, &session.name, KEY_CATEGORY, category.as_str())?;
     }
     Ok(())
 }
 
-pub fn use_category(runner: &dyn TmuxRunner, config: &Config, category: &str) -> Result<()> {
+pub fn use_category(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    env: &BTreeMap<String, String>,
+    category: &str,
+) -> Result<()> {
     let client = current_client_name(runner)?;
-    use_category_for_client(runner, config, category, &client)
+    use_category_for_client(runner, config, env, category, &client)
 }
 
 pub fn use_category_for_client(
     runner: &dyn TmuxRunner,
     config: &Config,
+    env: &BTreeMap<String, String>,
     category: &str,
     client: &str,
 ) -> Result<()> {
     let sessions = list_sessions(runner)?;
-    use_category_for_client_from_sessions(runner, config, &sessions, category, client)
+    let categories =
+        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
+    use_category_for_client_from_sessions(runner, &categories, &sessions, category, client)
 }
 
 pub(crate) fn use_category_for_client_from_sessions(
     runner: &dyn TmuxRunner,
-    config: &Config,
+    categories: &ResolvedSessionCategories,
     sessions: &[SessionInfo],
     category: &str,
     client: &str,
 ) -> Result<()> {
     if let Some(remembered) = remembered_session_for_client(runner, client, category)?
         && let Some(remembered_session) = find_session(sessions, &remembered)
-        && resolve_category_for_session(config, remembered_session) == category
+        && categories.category_for(remembered_session)?.as_str() == category
     {
         return switch_client_for_client(runner, client, &remembered);
     }
 
-    let Some(session) = sessions_in_category(config, sessions, category)
+    let Some(session) = categories
+        .sessions_in_category(sessions, category)
         .first()
         .copied()
     else {
@@ -535,27 +591,66 @@ pub(crate) fn use_category_for_client_from_sessions(
 pub fn use_adjacent_category(
     runner: &dyn TmuxRunner,
     config: &Config,
+    env: &BTreeMap<String, String>,
     direction: Direction,
 ) -> Result<()> {
     let client = current_client_name(runner)?;
     let current = current_session_name(runner)?;
     let sessions = list_sessions(runner)?;
-    let session = find_session(&sessions, &current)
-        .ok_or_else(|| anyhow!("current session not found: {current}"))?;
-    let current_category = resolve_category_for_session(config, session);
-    let next_category = adjacent_category(config, &sessions, &current_category, direction)
-        .ok_or_else(|| anyhow!("no categories available"))?;
-    use_category_for_client_from_sessions(runner, config, &sessions, &next_category, &client)
+    let categories =
+        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
+    use_adjacent_category_resolved(runner, &categories, &sessions, &current, &client, direction)
 }
 
-pub fn cycle_session(runner: &dyn TmuxRunner, config: &Config, direction: Direction) -> Result<()> {
+fn use_adjacent_category_resolved(
+    runner: &dyn TmuxRunner,
+    categories: &ResolvedSessionCategories,
+    sessions: &[SessionInfo],
+    current: &str,
+    client: &str,
+    direction: Direction,
+) -> Result<()> {
+    let session = find_session(&sessions, &current)
+        .ok_or_else(|| anyhow!("current session not found: {current}"))?;
+    let current_category = categories.category_for(session)?;
+    let occupied = categories.categories_with_sessions(&sessions);
+    let next_category = adjacent_resolved_category(&occupied, current_category, direction)
+        .ok_or_else(|| anyhow!("no categories available"))?;
+    use_category_for_client_from_sessions(
+        runner,
+        &categories,
+        &sessions,
+        next_category.as_str(),
+        &client,
+    )
+}
+
+pub fn cycle_session(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    env: &BTreeMap<String, String>,
+    direction: Direction,
+) -> Result<()> {
     let client = current_client_name(runner)?;
     let current = current_session_name(runner)?;
     let sessions = list_sessions(runner)?;
+    let categories =
+        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
+    cycle_session_resolved(runner, &categories, &sessions, &current, &client, direction)
+}
+
+fn cycle_session_resolved(
+    runner: &dyn TmuxRunner,
+    categories: &ResolvedSessionCategories,
+    sessions: &[SessionInfo],
+    current: &str,
+    client: &str,
+    direction: Direction,
+) -> Result<()> {
     let session = find_session(&sessions, &current)
         .ok_or_else(|| anyhow!("current session not found: {current}"))?;
-    let category = resolve_category_for_session(config, session);
-    let category_sessions = sessions_in_category(config, &sessions, &category);
+    let category = categories.category_for(session)?;
+    let category_sessions = categories.sessions_in_category(&sessions, category.as_str());
     if category_sessions.is_empty() {
         bail!("no session in current category: {category}");
     }
@@ -568,13 +663,14 @@ pub fn cycle_session(runner: &dyn TmuxRunner, config: &Config, direction: Direct
         Direction::Previous => (index + category_sessions.len() - 1) % category_sessions.len(),
     };
     let next_name = category_sessions[next].name.clone();
-    switch_client_for_client(runner, &client, &next_name)?;
-    remember_session_for_client(runner, &client, &category, &next_name)
+    switch_client_for_client(runner, client, &next_name)?;
+    remember_session_for_client(runner, client, category.as_str(), &next_name)
 }
 
 pub fn on_client_session_changed(
     runner: &dyn TmuxRunner,
     config: &Config,
+    env: &BTreeMap<String, String>,
     client_pid: Option<u32>,
     session_name: Option<&str>,
 ) -> Result<()> {
@@ -585,7 +681,35 @@ pub fn on_client_session_changed(
         ),
         _ => (current_client_name(runner)?, current_session_name(runner)?),
     };
-    remember_client_session_for_session(runner, config, &client_name, &session_name)
+    let sessions = list_sessions(runner)?;
+    let categories =
+        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
+    remember_client_session_for_session_resolved(
+        runner,
+        &categories,
+        &sessions,
+        &client_name,
+        &session_name,
+    )
+}
+
+fn adjacent_resolved_category<'a>(
+    categories: &'a [crate::category::CategoryName],
+    current: &crate::category::CategoryName,
+    direction: Direction,
+) -> Option<&'a crate::category::CategoryName> {
+    if categories.is_empty() {
+        return None;
+    }
+    let index = categories
+        .iter()
+        .position(|category| category == current)
+        .unwrap_or(0);
+    let next = match direction {
+        Direction::Next => (index + 1) % categories.len(),
+        Direction::Previous => (index + categories.len() - 1) % categories.len(),
+    };
+    categories.get(next)
 }
 
 #[cfg(test)]
@@ -593,16 +717,23 @@ mod tests {
     use super::*;
     use crate::tmux::mock::MockTmuxRunner;
 
-    fn config_for_sessions(pairs: &[(&str, &str)]) -> crate::config::Config {
-        let mut config = crate::config::Config::default();
-        config.categories.session_name_rules = pairs
+    fn categories_for_sessions(
+        sessions: &[SessionInfo],
+        pairs: &[(&str, &str)],
+    ) -> ResolvedSessionCategories {
+        let assignments = pairs
             .iter()
-            .map(|(name, category)| crate::config::SessionNameRule {
-                category: (*category).to_string(),
-                patterns: vec![(*name).to_string()],
+            .map(|(name, category)| {
+                (
+                    sessions
+                        .iter()
+                        .find(|session| session.name == *name)
+                        .unwrap(),
+                    *category,
+                )
             })
-            .collect();
-        config
+            .collect::<Vec<_>>();
+        ResolvedSessionCategories::from_assignments(&assignments)
     }
 
     #[test]
@@ -801,7 +932,18 @@ mod tests {
             "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}$1\n",
         );
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
-        remember_current_client_session(&mock, &config_for_sessions(&[("main", "work")])).unwrap();
+        let client = current_client_name(&mock).unwrap();
+        let current = current_session_name(&mock).unwrap();
+        let sessions = list_sessions(&mock).unwrap();
+        let categories = categories_for_sessions(&sessions, &[("main", "work")]);
+        remember_client_session_for_session_resolved(
+            &mock,
+            &categories,
+            &sessions,
+            &client,
+            &current,
+        )
+        .unwrap();
         assert_eq!(mock.calls().len(), 4);
     }
 
@@ -856,13 +998,10 @@ mod tests {
             "",
         );
 
-        let session = create_session(
-            &mock,
-            &config,
-            &BTreeMap::from([("HOME".to_string(), "/Users/me".to_string())]),
-            Some("~/"),
-        )
-        .unwrap();
+        let client = current_client_name(&mock).unwrap();
+        let session =
+            create_session_for_client_resolved(&mock, &config, "/Users/me", &client, "public")
+                .unwrap();
 
         assert_eq!(session, "zsh");
         assert_eq!(mock.calls().len(), 7);
@@ -959,13 +1098,8 @@ mod tests {
             "",
         );
 
-        create_session(
-            &mock,
-            &config,
-            &BTreeMap::from([("HOME".to_string(), "/Users/me".to_string())]),
-            Some("~/"),
-        )
-        .unwrap();
+        let client = current_client_name(&mock).unwrap();
+        create_session_for_client_resolved(&mock, &config, "/Users/me", &client, "public").unwrap();
 
         assert!(mock.calls().iter().any(|call| {
             call.first().map(String::as_str) == Some("split-window")
@@ -1002,9 +1136,19 @@ mod tests {
         );
         mock.stub(&["switch-client", "-c", "abc", "-t", "=sub:"], "");
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "sub"], "");
-        cycle_session(
+        let client = current_client_name(&mock).unwrap();
+        let current = current_session_name(&mock).unwrap();
+        let sessions = list_sessions(&mock).unwrap();
+        let categories = categories_for_sessions(
+            &sessions,
+            &[("main", "work"), ("sub", "work"), ("other", "private")],
+        );
+        cycle_session_resolved(
             &mock,
-            &config_for_sessions(&[("main", "work"), ("sub", "work"), ("other", "private")]),
+            &categories,
+            &sessions,
+            &current,
+            &client,
             Direction::Next,
         )
         .unwrap();
@@ -1028,9 +1172,16 @@ mod tests {
         mock.stub(&["switch-client", "-c", "abc", "-t", "=one:"], "");
         mock.stub(&["set-option", "-g", "@vde_client_616263_b", "one"], "");
 
-        use_adjacent_category(
+        let current = current_session_name(&mock).unwrap();
+        let sessions = list_sessions(&mock).unwrap();
+        let client = current_client_name(&mock).unwrap();
+        let categories = categories_for_sessions(&sessions, &[("main", "a"), ("one", "b")]);
+        use_adjacent_category_resolved(
             &mock,
-            &config_for_sessions(&[("main", "a"), ("one", "b")]),
+            &categories,
+            &sessions,
+            &current,
+            &client,
             Direction::Next,
         )
         .unwrap();
@@ -1064,12 +1215,11 @@ mod tests {
         mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "sub\n");
         mock.stub(&["switch-client", "-c", "abc", "-t", "=sub:"], "");
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "sub"], "");
-        use_category(
-            &mock,
-            &config_for_sessions(&[("main", "work"), ("sub", "work")]),
-            "work",
-        )
-        .unwrap();
+        let client = current_client_name(&mock).unwrap();
+        let sessions = list_sessions(&mock).unwrap();
+        let categories = categories_for_sessions(&sessions, &[("main", "work"), ("sub", "work")]);
+        use_category_for_client_from_sessions(&mock, &categories, &sessions, "work", &client)
+            .unwrap();
         let calls = mock.calls();
         assert_eq!(
             calls.last().unwrap(),
@@ -1095,18 +1245,22 @@ mod tests {
             "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}$1\n",
         );
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
-        on_client_session_changed(
+        let client = regular_client_name_for_pid(&mock, 123).unwrap();
+        let sessions = list_sessions(&mock).unwrap();
+        let categories = categories_for_sessions(&sessions, &[("main", "work")]);
+        remember_client_session_for_session_resolved(
             &mock,
-            &config_for_sessions(&[("main", "work")]),
-            Some(123),
-            Some("main"),
+            &categories,
+            &sessions,
+            &client,
+            "main",
         )
         .unwrap();
         assert_eq!(mock.calls().len(), 3);
     }
 
     #[test]
-    fn hook_resolves_session_name_rule_when_stored_category_is_empty() {
+    fn hook_uses_uncategorized_when_session_has_no_repository_path() {
         let mock = MockTmuxRunner::new();
         let client_format = client_pid_name_format();
         let session_format = session_list_format();
@@ -1119,27 +1273,36 @@ mod tests {
             "dotfiles\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
         );
         mock.stub(
-            &["set-option", "-g", "@vde_client_616263_private", "dotfiles"],
+            &[
+                "set-option",
+                "-g",
+                "@vde_client_616263_Uncategorized",
+                "dotfiles",
+            ],
             "",
         );
-        let mut config = crate::config::Config::default();
-        config
-            .categories
-            .session_name_rules
-            .push(crate::config::SessionNameRule {
-                category: "private".to_string(),
-                patterns: vec!["dotfiles".to_string()],
-            });
-
-        on_client_session_changed(&mock, &config, Some(123), Some("dotfiles")).unwrap();
+        let client = regular_client_name_for_pid(&mock, 123).unwrap();
+        let sessions = list_sessions(&mock).unwrap();
+        let categories =
+            categories_for_sessions(&sessions, &[("dotfiles", crate::category::UNCATEGORIZED)]);
+        remember_client_session_for_session_resolved(
+            &mock,
+            &categories,
+            &sessions,
+            &client,
+            "dotfiles",
+        )
+        .unwrap();
 
         assert_eq!(
             mock.calls().last().unwrap(),
-            &["set-option", "-g", "@vde_client_616263_private", "dotfiles",]
+            &[
+                "set-option",
+                "-g",
+                "@vde_client_616263_Uncategorized",
+                "dotfiles",
+            ]
         );
-        assert!(mock.calls().iter().all(|call| {
-            call.as_slice() != ["set-option", "-g", "@vde_client_616263_", "dotfiles"]
-        }));
     }
 
     #[test]
@@ -1198,10 +1361,19 @@ mod tests {
             "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
         );
         mock.stub(
-            &["set-option", "-t", "main", crate::options::KEY_CATEGORY, ""],
+            &[
+                "set-option",
+                "-t",
+                "main",
+                crate::options::KEY_CATEGORY,
+                crate::category::UNCATEGORIZED,
+            ],
             "",
         );
-        sync_session_category_mirrors(&mock, &crate::config::Config::default()).unwrap();
+        let sessions = list_sessions(&mock).unwrap();
+        let categories =
+            categories_for_sessions(&sessions, &[("main", crate::category::UNCATEGORIZED)]);
+        sync_session_category_mirrors_resolved(&mock, &categories, &sessions).unwrap();
         assert_eq!(mock.calls().len(), 2);
     }
 
@@ -1209,8 +1381,6 @@ mod tests {
     fn sync_session_category_mirrors_uses_config_default() {
         let mock = MockTmuxRunner::new();
         let format = session_list_format();
-        let mut config = crate::config::Config::default();
-        config.categories.default_category = Some("public".to_string());
         mock.stub(
             &["list-sessions", "-F", &format],
             "main\u{1f}1\u{1f}100\u{1f}\u{1f}/Users/me\u{1f}\u{1f}$1\n",
@@ -1225,7 +1395,9 @@ mod tests {
             ],
             "",
         );
-        sync_session_category_mirrors(&mock, &config).unwrap();
+        let sessions = list_sessions(&mock).unwrap();
+        let categories = categories_for_sessions(&sessions, &[("main", "public")]);
+        sync_session_category_mirrors_resolved(&mock, &categories, &sessions).unwrap();
         assert_eq!(mock.calls().len(), 2);
     }
 

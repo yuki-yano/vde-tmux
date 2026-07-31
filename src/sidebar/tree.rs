@@ -4,13 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::display_agent_name;
-use crate::category::resolve_category_for_session;
 use crate::config::Config;
 use crate::daemon::session_badge::BadgeState;
 use crate::git::WorktreeInfo;
 use crate::hook::{RollupLevel, TaskItem, TaskItemStatus, WorktreeActivity};
 use crate::pane_state::PaneInstance;
-use crate::session::SessionInfo;
 use crate::sidebar::state::{
     SidebarPreferences, SidebarRowRef, SidebarState, StatusFilter, ViewMode,
 };
@@ -89,6 +87,7 @@ struct AgentPane {
     pane_instance: PaneInstance,
     pane_id: String,
     repo: String,
+    repo_key: crate::category::RepoKey,
     category: String,
     agent: String,
     prompt: String,
@@ -114,6 +113,9 @@ pub struct RowBuildContext {
     pub triage: BTreeSet<PaneInstance>,
     pub flash: BTreeSet<PaneInstance>,
     pub active_sessions: BTreeSet<String>,
+    pub category_state: crate::category::CategoryState,
+    pub categories: crate::category::EffectiveCategoryModel,
+    pub repo_identities: BTreeMap<String, crate::category::RepoIdentity>,
     pub now: i64,
 }
 
@@ -136,6 +138,9 @@ pub fn project_sidebar(
         triage: model.needs_action.clone(),
         flash: model.flashing.clone(),
         active_sessions: model.active_sessions.clone(),
+        category_state: model.category_state.clone(),
+        categories: model.categories.clone(),
+        repo_identities: model.repo_identities.clone(),
         now,
     };
     let (rows, counts) =
@@ -144,7 +149,7 @@ pub fn project_sidebar(
 }
 
 pub fn build_rows_from_presentations(
-    config: &Config,
+    _config: &Config,
     panes: &[crate::daemon::protocol::v2::PanePresentation],
     state: &SidebarState,
     order: &SidebarPreferences,
@@ -161,8 +166,20 @@ pub fn build_rows_from_presentations(
             .first()
             .map(|link| link.session_name.as_str())
             .unwrap_or("repo");
-        let repo = repo_label_from_values(&pane.current_path, session_name);
-        let category = category_for_values(config, session_name, &pane.current_path, &repo);
+        let fallback_repo = repo_label_from_values(&pane.current_path, session_name);
+        let identity = ctx.repo_identities.get(&pane.current_path);
+        let repo = identity
+            .map(|identity| identity.display_name.clone())
+            .unwrap_or(fallback_repo);
+        let repo_key = identity
+            .map(|identity| identity.key.clone())
+            .unwrap_or_else(|| crate::category::RepoKey::path(&pane.current_path));
+        let category = ctx
+            .categories
+            .placements
+            .get(&repo_key)
+            .map(|placement| placement.category.to_string())
+            .unwrap_or_else(|| crate::category::UNCATEGORIZED.to_string());
         let (rollup, wait_reason) = match &canonical.lifecycle {
             crate::pane_state::LifecycleState::Idle => (RollupLevel::Idle, String::new()),
             crate::pane_state::LifecycleState::Running => (RollupLevel::Running, String::new()),
@@ -212,12 +229,13 @@ pub fn build_rows_from_presentations(
                     observed_at: activity.observed_at,
                 });
         groups
-            .entry((category.clone(), repo.clone()))
+            .entry((category.clone(), repo_key.to_string()))
             .or_default()
             .push(AgentPane {
                 pane_instance: pane.pane_instance.clone(),
                 pane_id: pane.pane_instance.pane_id.clone(),
                 repo,
+                repo_key,
                 category,
                 agent: canonical.agent.as_str().to_string(),
                 prompt: canonical
@@ -293,10 +311,16 @@ fn build_rows_from_groups(
     let mut rows = triage_zone_rows(&triage_panes, state, ctx.now);
     let mut fleet_rows = match state.view_mode {
         ViewMode::Flat => flat_rows(groups, state, ctx.now),
-        ViewMode::ByRepo => repo_rows(groups, state, order, 0, &ctx.git, ctx.now, &group_metas),
-        ViewMode::ByCategory => {
-            category_rows(groups, state, order, &ctx.git, ctx.now, &group_metas)
-        }
+        ViewMode::ByRepo => repo_rows(
+            groups,
+            state,
+            &ctx.category_state,
+            0,
+            &ctx.git,
+            ctx.now,
+            &group_metas,
+        ),
+        ViewMode::ByCategory => category_rows(groups, state, ctx, &group_metas),
     };
     rows.append(&mut fleet_rows);
     (rows, counts)
@@ -348,18 +372,29 @@ pub(crate) fn pane_instance_from_row_id(id: &str) -> Option<PaneInstance> {
 fn category_rows(
     groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
-    order: &SidebarPreferences,
-    git: &BTreeMap<String, crate::git::GitBadge>,
-    now: i64,
+    ctx: &RowBuildContext,
     metas: &BTreeMap<(String, String), RowMeta>,
 ) -> Vec<SidebarRow> {
     let mut by_category: BTreeMap<String, BTreeMap<String, Vec<AgentPane>>> = BTreeMap::new();
     for ((category, repo), panes) in groups {
         by_category.entry(category).or_default().insert(repo, panes);
     }
+    if state.filter == StatusFilter::All {
+        for category in &ctx.categories.categories {
+            by_category.entry(category.name.to_string()).or_default();
+        }
+    }
 
     let mut rows = Vec::new();
-    for (category, repos) in by_category {
+    let mut categories = by_category.into_iter().collect::<Vec<_>>();
+    categories.sort_by_key(|(name, _)| {
+        ctx.categories
+            .categories
+            .iter()
+            .position(|category| category.name.as_str() == name)
+            .unwrap_or(usize::MAX)
+    });
+    for (category, repos) in categories {
         let category_id = format!("category::{category}");
         let all_panes = repos.values().flatten().cloned().collect::<Vec<_>>();
         let active = all_panes.iter().any(|pane| pane.active);
@@ -390,7 +425,15 @@ fn category_rows(
             }),
         });
         if expanded {
-            rows.extend(repo_rows_from_map(repos, state, order, 1, git, now, metas));
+            rows.extend(repo_rows_from_map(
+                repos,
+                state,
+                &ctx.category_state,
+                1,
+                &ctx.git,
+                ctx.now,
+                metas,
+            ));
         }
     }
     rows
@@ -399,7 +442,7 @@ fn category_rows(
 fn repo_rows(
     groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
-    order: &SidebarPreferences,
+    category_state: &crate::category::CategoryState,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
@@ -409,13 +452,13 @@ fn repo_rows(
     for ((category, repo), panes) in groups {
         repos.insert((category, repo), panes);
     }
-    repo_rows_from_keyed_map(repos, state, order, depth, git, now, metas)
+    repo_rows_from_keyed_map(repos, state, category_state, depth, git, now, metas)
 }
 
 fn repo_rows_from_map(
     repos: BTreeMap<String, Vec<AgentPane>>,
     state: &SidebarState,
-    order: &SidebarPreferences,
+    category_state: &crate::category::CategoryState,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
@@ -427,17 +470,17 @@ fn repo_rows_from_map(
             let category = panes
                 .first()
                 .map(|pane| pane.category.clone())
-                .unwrap_or_else(|| "misc".to_string());
+                .unwrap_or_else(|| crate::category::UNCATEGORIZED.to_string());
             ((category, repo), panes)
         })
         .collect();
-    repo_rows_from_keyed_map(keyed, state, order, depth, git, now, metas)
+    repo_rows_from_keyed_map(keyed, state, category_state, depth, git, now, metas)
 }
 
 fn repo_rows_from_keyed_map(
     repos: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
-    order: &SidebarPreferences,
+    category_state: &crate::category::CategoryState,
     depth: usize,
     git: &BTreeMap<String, crate::git::GitBadge>,
     now: i64,
@@ -445,12 +488,12 @@ fn repo_rows_from_keyed_map(
 ) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
     let mut groups = repos.into_values().collect::<Vec<_>>();
-    order_repo_groups(&mut groups, order);
+    order_repo_groups(&mut groups, category_state);
     for panes in groups {
         let Some(first) = panes.first() else {
             continue;
         };
-        let repo_id = repo_id(&first.category, &first.repo);
+        let repo_id = repo_id(&first.category, &first.repo_key);
         let expanded = state.is_expanded(&repo_id);
         rows.push(SidebarRow {
             id: repo_id,
@@ -840,15 +883,26 @@ fn pane_matches_attention_filter(pane: &AgentPane) -> bool {
     pane.badge_state == BadgeState::Blocked
 }
 
-fn order_repo_groups(groups: &mut [Vec<AgentPane>], order: &SidebarPreferences) {
+fn order_repo_groups(
+    groups: &mut [Vec<AgentPane>],
+    category_state: &crate::category::CategoryState,
+) {
     let position = |panes: &Vec<AgentPane>| -> usize {
         let Some(first) = panes.first() else {
             return usize::MAX;
         };
-        order
-            .manual_order
-            .iter()
-            .position(|repo| repo.category == first.category && repo.repo == first.repo)
+        let category = if first.category == crate::category::UNCATEGORIZED {
+            crate::category::CategoryName::uncategorized()
+        } else {
+            match crate::category::CategoryName::parse(&first.category) {
+                Ok(category) => category,
+                Err(_) => return usize::MAX,
+            }
+        };
+        category_state
+            .repo_order
+            .get(&category)
+            .and_then(|repos| repos.iter().position(|repo| repo == &first.repo_key))
             .unwrap_or(usize::MAX)
     };
     groups.sort_by(|left, right| {
@@ -920,7 +974,7 @@ fn parse_epoch(raw: &str) -> Option<i64> {
     raw.trim().parse().ok()
 }
 
-fn repo_id(category: &str, repo: &str) -> String {
+fn repo_id(category: &str, repo: &crate::category::RepoKey) -> String {
     format!("repo::{category}::{repo}")
 }
 
@@ -934,23 +988,6 @@ fn rollup(panes: &[AgentPane]) -> RollupLevel {
 
 fn badge_rollup(panes: &[AgentPane]) -> Option<BadgeState> {
     panes.iter().map(|pane| pane.badge_state).min()
-}
-
-fn category_for_values(config: &Config, session_name: &str, path: &str, repo: &str) -> String {
-    let session = SessionInfo {
-        name: session_name.to_string(),
-        project_path: path.to_string(),
-        ..SessionInfo::default()
-    };
-    let category = resolve_category_for_session(config, &session);
-    let category = if category.is_empty() {
-        "misc".to_string()
-    } else {
-        category
-    };
-    sanitize_detail_label(&category)
-        .if_empty("misc")
-        .unwrap_or_else(|| repo.to_string())
 }
 
 fn repo_label_from_values(path: &str, session_name: &str) -> String {
@@ -971,20 +1008,6 @@ fn non_empty(raw: &str) -> Option<&str> {
     (!raw.trim().is_empty()).then(|| raw.trim())
 }
 
-trait EmptyStringExt {
-    fn if_empty(self, value: &str) -> Option<String>;
-}
-
-impl EmptyStringExt for String {
-    fn if_empty(self, value: &str) -> Option<String> {
-        if self.is_empty() {
-            Some(value.to_string())
-        } else {
-            Some(self)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1020,7 @@ mod tests {
             },
             pane_id: "%1".to_string(),
             repo: "repo".to_string(),
+            repo_key: crate::category::RepoKey::path("/repo"),
             category: "misc".to_string(),
             agent: "codex".to_string(),
             prompt: String::new(),
@@ -1040,33 +1064,6 @@ mod tests {
     #[test]
     fn repo_label_normalizes_unit_separator() {
         assert_eq!(repo_label_from_values("/work/a\u{1f}b", "session"), "a b");
-    }
-
-    #[test]
-    fn category_label_strips_control_chars() {
-        use crate::config::SessionNameRule;
-        let mut config = Config::default();
-        config.categories.session_name_rules.push(SessionNameRule {
-            category: "wo\u{1b}rk".to_string(),
-            patterns: vec!["proj-*".to_string()],
-        });
-        let label = category_for_values(&config, "proj-a", "/tmp/x", "repo");
-        assert!(!label.chars().any(|ch| ch.is_control()));
-        assert_eq!(label, "wo rk");
-    }
-
-    #[test]
-    fn category_label_falls_back_to_misc_when_all_control_chars() {
-        use crate::config::SessionNameRule;
-        let mut config = Config::default();
-        config.categories.session_name_rules.push(SessionNameRule {
-            category: "\u{1b}\u{7}".to_string(),
-            patterns: vec!["proj-*".to_string()],
-        });
-        assert_eq!(
-            category_for_values(&config, "proj-a", "/tmp/x", "repo"),
-            "misc"
-        );
     }
 
     #[test]

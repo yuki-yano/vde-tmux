@@ -93,6 +93,7 @@ pub fn switch_statusline_window(runner: &dyn TmuxRunner, target: &str) -> Result
 pub fn switch_statusline_category(
     runner: &dyn TmuxRunner,
     config: &Config,
+    env: &std::collections::BTreeMap<String, String>,
     client_name: &str,
     session_id: &str,
     index: usize,
@@ -105,12 +106,14 @@ pub fn switch_statusline_category(
                 "displayed category index {} is no longer available; wait for the status line to redraw",
                 index + 1
             )
-        })?;
+    })?;
     let sessions = crate::session::list_sessions(runner)?;
-    let category = resolve_category_target(config, &sessions, target)?;
+    let categories =
+        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
+    let category = resolve_category_target(&categories, &sessions, target)?;
     crate::session::use_category_for_client_from_sessions(
         runner,
-        config,
+        &categories,
         &sessions,
         &category,
         client_name,
@@ -120,17 +123,38 @@ pub fn switch_statusline_category(
 pub fn cycle_statusline_category(
     runner: &dyn TmuxRunner,
     config: &Config,
+    env: &std::collections::BTreeMap<String, String>,
     client_name: &str,
     session_id: &str,
     direction: Direction,
 ) -> Result<()> {
     let sessions = crate::session::list_sessions(runner)?;
+    let categories =
+        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
+    cycle_statusline_category_with_categories(
+        runner,
+        &categories,
+        &sessions,
+        client_name,
+        session_id,
+        direction,
+    )
+}
+
+fn cycle_statusline_category_with_categories(
+    runner: &dyn TmuxRunner,
+    categories: &crate::category::ResolvedSessionCategories,
+    sessions: &[crate::session::SessionInfo],
+    client_name: &str,
+    session_id: &str,
+    direction: Direction,
+) -> Result<()> {
     let current_session = sessions
         .iter()
         .find(|session| session.id == session_id)
         .ok_or_else(|| anyhow!("current session {session_id} is not present in tmux"))?;
-    let current_category = crate::category::resolve_category_for_session(config, current_session);
-    let targets = crate::category::sorted_effective_categories(config, &sessions);
+    let current_category = categories.category_for(current_session)?;
+    let targets = categories.categories_with_sessions(sessions);
     if targets.len() <= 1 {
         return Err(anyhow!(
             "category cycle requires at least two categories with sessions"
@@ -138,7 +162,7 @@ pub fn cycle_statusline_category(
     }
     let current_index = targets
         .iter()
-        .position(|category| category == &current_category)
+        .position(|category| category == current_category)
         .ok_or_else(|| {
             anyhow!("current category {current_category} is not present in the category cycle")
         })?;
@@ -148,9 +172,9 @@ pub fn cycle_statusline_category(
     };
     crate::session::use_category_for_client_from_sessions(
         runner,
-        config,
-        &sessions,
-        &targets[next],
+        categories,
+        sessions,
+        targets[next].as_str(),
         client_name,
     )
 }
@@ -158,6 +182,7 @@ pub fn cycle_statusline_category(
 pub fn handle_statusline_click(
     runner: &dyn TmuxRunner,
     config: &Config,
+    env: &std::collections::BTreeMap<String, String>,
     client_name: Option<&str>,
     range: Option<&str>,
 ) -> Result<()> {
@@ -180,12 +205,12 @@ pub fn handle_statusline_click(
     if let Some(target) = range.strip_prefix(CATEGORY_RANGE_PREFIX) {
         let client_name = client_name
             .ok_or_else(|| anyhow!("category click is missing an invoking tmux client"))?;
-        return switch_category_target(runner, config, client_name, target);
+        return switch_category_target(runner, config, env, client_name, target);
     }
     if let Some(target) = range.strip_prefix(CURRENT_CATEGORY_RANGE_PREFIX) {
         let client_name = client_name
             .ok_or_else(|| anyhow!("category click is missing an invoking tmux client"))?;
-        return switch_category_target(runner, config, client_name, target);
+        return switch_category_target(runner, config, env, client_name, target);
     }
     if range.starts_with('$') {
         validate_tmux_target(range, '$', "session")?;
@@ -246,17 +271,20 @@ fn validate_category_target(target: &str) -> Result<()> {
 }
 
 fn resolve_category_target(
-    config: &Config,
+    categories: &crate::category::ResolvedSessionCategories,
     sessions: &[crate::session::SessionInfo],
     target: &str,
 ) -> Result<String> {
     validate_category_target(target)?;
-    let matches = crate::category::sorted_effective_categories(config, sessions)
+    let matches = categories
+        .categories_with_sessions(sessions)
         .into_iter()
-        .filter(|category| category_target_key(category).is_ok_and(|candidate| candidate == target))
+        .filter(|category| {
+            category_target_key(category.as_str()).is_ok_and(|candidate| candidate == target)
+        })
         .collect::<Vec<_>>();
     match matches.as_slice() {
-        [category] => Ok(category.clone()),
+        [category] => Ok(category.to_string()),
         [] => Err(anyhow!(
             "displayed category target is no longer available; wait for the status line to redraw"
         )),
@@ -269,14 +297,17 @@ fn resolve_category_target(
 fn switch_category_target(
     runner: &dyn TmuxRunner,
     config: &Config,
+    env: &std::collections::BTreeMap<String, String>,
     client_name: &str,
     target: &str,
 ) -> Result<()> {
     let sessions = crate::session::list_sessions(runner)?;
-    let category = resolve_category_target(config, &sessions, target)?;
+    let categories =
+        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
+    let category = resolve_category_target(&categories, &sessions, target)?;
     crate::session::use_category_for_client_from_sessions(
         runner,
-        config,
+        &categories,
         &sessions,
         &category,
         client_name,
@@ -3283,17 +3314,22 @@ mod tests {
         mock.stub(&["show-option", "-gqv", &memory_key], "");
         mock.stub(&["switch-client", "-c", "client", "-t", "=two:"], "");
         mock.stub(&["set-option", "-g", &memory_key, "two"], "");
-        let mut config = Config::default();
-        config.statusline.category.mode = "current".to_string();
-        config.categories.session_name_rules = [("one", "a"), ("two", "b"), ("three", "c")]
-            .into_iter()
-            .map(|(name, category)| crate::config::SessionNameRule {
-                category: category.to_string(),
-                patterns: vec![name.to_string()],
-            })
-            .collect();
+        let sessions = crate::session::parse_sessions(sessions);
+        let categories = crate::category::ResolvedSessionCategories::from_assignments(&[
+            (&sessions[0], "a"),
+            (&sessions[1], "b"),
+            (&sessions[2], "c"),
+        ]);
 
-        cycle_statusline_category(&mock, &config, "client", "$1", Direction::Next).unwrap();
+        cycle_statusline_category_with_categories(
+            &mock,
+            &categories,
+            &sessions,
+            "client",
+            "$1",
+            Direction::Next,
+        )
+        .unwrap();
 
         assert!(mock.calls().iter().all(|call| {
             call.first().map(String::as_str) != Some("show-option")
@@ -3304,13 +3340,11 @@ mod tests {
                 .iter()
                 .any(|call| { call == &["switch-client", "-c", "client", "-t", "=two:"] })
         );
-        assert_eq!(
+        assert!(
             mock.calls()
                 .iter()
-                .filter(|call| call.first().map(String::as_str) == Some("list-sessions"))
-                .count(),
-            1,
-            "one category cycle must use one authoritative session snapshot"
+                .all(|call| call.first().map(String::as_str) != Some("list-sessions")),
+            "resolved category cycle must not query a second session snapshot"
         );
         assert_eq!(
             mock.calls().last().unwrap(),
@@ -3334,17 +3368,41 @@ mod tests {
         mock.stub(&["switch-client", "-c", "client", "-t", "=two:"], "");
         mock.stub(&["switch-client", "-c", "client", "-t", "=three:"], "");
 
-        let mut config = Config::default();
-        config.categories.session_name_rules = [("one", "a"), ("two", "b"), ("three", "c")]
-            .into_iter()
-            .map(|(name, category)| crate::config::SessionNameRule {
-                category: category.to_string(),
-                patterns: vec![name.to_string()],
-            })
-            .collect();
-        cycle_statusline_category(&mock, &config, "client", "$1", Direction::Next).unwrap();
-        cycle_statusline_category(&mock, &config, "client", "$2", Direction::Next).unwrap();
-        cycle_statusline_category(&mock, &config, "client", "$3", Direction::Previous).unwrap();
+        let sessions = crate::session::parse_sessions(
+            "one\u{1f}1\u{1f}100\u{1f}a\u{1f}\u{1f}\u{1f}$1\ntwo\u{1f}0\u{1f}101\u{1f}b\u{1f}\u{1f}\u{1f}$2\nthree\u{1f}0\u{1f}102\u{1f}c\u{1f}\u{1f}\u{1f}$3\n",
+        );
+        let categories = crate::category::ResolvedSessionCategories::from_assignments(&[
+            (&sessions[0], "a"),
+            (&sessions[1], "b"),
+            (&sessions[2], "c"),
+        ]);
+        cycle_statusline_category_with_categories(
+            &mock,
+            &categories,
+            &sessions,
+            "client",
+            "$1",
+            Direction::Next,
+        )
+        .unwrap();
+        cycle_statusline_category_with_categories(
+            &mock,
+            &categories,
+            &sessions,
+            "client",
+            "$2",
+            Direction::Next,
+        )
+        .unwrap();
+        cycle_statusline_category_with_categories(
+            &mock,
+            &categories,
+            &sessions,
+            "client",
+            "$3",
+            Direction::Previous,
+        )
+        .unwrap();
 
         let switches = mock
             .calls()
@@ -3370,9 +3428,19 @@ mod tests {
             "one\u{1f}1\u{1f}100\u{1f}a\u{1f}\u{1f}\u{1f}$1\n",
         );
 
-        let error =
-            cycle_statusline_category(&mock, &Config::default(), "client", "$1", Direction::Next)
-                .unwrap_err();
+        let sessions =
+            crate::session::parse_sessions("one\u{1f}1\u{1f}100\u{1f}a\u{1f}\u{1f}\u{1f}$1\n");
+        let categories =
+            crate::category::ResolvedSessionCategories::from_assignments(&[(&sessions[0], "a")]);
+        let error = cycle_statusline_category_with_categories(
+            &mock,
+            &categories,
+            &sessions,
+            "client",
+            "$1",
+            Direction::Next,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("at least two categories"));
         assert!(

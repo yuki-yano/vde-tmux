@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -69,6 +69,21 @@ impl VwLockedState {
 pub trait GitRunner: Send + Sync {
     fn run(&self, cwd: &str, args: &[&str]) -> Result<String>;
     fn run_vw(&self, cwd: &str, args: &[&str]) -> Result<String>;
+
+    fn probe_worktree(&self, cwd: &str, args: &[&str]) -> Result<Option<String>> {
+        match self.run(cwd, args) {
+            Ok(output) => Ok(Some(output)),
+            Err(error)
+                if error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("not a git repository") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +116,10 @@ impl GitRunner for SystemGitRunner {
 
     fn run_vw(&self, cwd: &str, args: &[&str]) -> Result<String> {
         run_process_command("vw", cwd, args, self.timeout)
+    }
+
+    fn probe_worktree(&self, cwd: &str, args: &[&str]) -> Result<Option<String>> {
+        run_git_probe_command(cwd, args, self.timeout)
     }
 }
 
@@ -173,20 +192,28 @@ impl WorktreeIdentity {
     }
 }
 
-fn probe_worktree_identity(runner: &dyn GitRunner, path: &str) -> Option<WorktreeIdentity> {
-    let output = runner
-        .run(
-            path,
-            &[
-                "rev-parse",
-                "--path-format=absolute",
-                "--show-toplevel",
-                "--git-dir",
-                "--git-common-dir",
-                "--show-superproject-working-tree",
-            ],
-        )
-        .ok()?;
+pub fn probe_worktree_identity(runner: &dyn GitRunner, path: &str) -> Option<WorktreeIdentity> {
+    probe_worktree_identity_result(runner, path).ok().flatten()
+}
+
+pub fn probe_worktree_identity_result(
+    runner: &dyn GitRunner,
+    path: &str,
+) -> Result<Option<WorktreeIdentity>> {
+    let Some(output) = runner.probe_worktree(
+        path,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-dir",
+            "--git-common-dir",
+            "--show-superproject-working-tree",
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
     let lines = output.lines().map(str::trim).collect::<Vec<_>>();
     // `--show-superproject-working-tree` prints nothing outside a submodule,
     // so a plain worktree yields exactly three lines.
@@ -194,24 +221,24 @@ fn probe_worktree_identity(runner: &dyn GitRunner, path: &str) -> Option<Worktre
         [top_level, git_dir, git_common_dir] | [top_level, git_dir, git_common_dir, ""]
             if !top_level.is_empty() =>
         {
-            Some(WorktreeIdentity {
+            Ok(Some(WorktreeIdentity {
                 top_level: (*top_level).to_string(),
                 git_dir: (*git_dir).to_string(),
                 git_common_dir: (*git_common_dir).to_string(),
                 superproject: None,
-            })
+            }))
         }
         [top_level, git_dir, git_common_dir, superproject]
             if !top_level.is_empty() && !superproject.is_empty() =>
         {
-            Some(WorktreeIdentity {
+            Ok(Some(WorktreeIdentity {
                 top_level: (*top_level).to_string(),
                 git_dir: (*git_dir).to_string(),
                 git_common_dir: (*git_common_dir).to_string(),
                 superproject: Some((*superproject).to_string()),
-            })
+            }))
         }
-        _ => None,
+        _ => bail!("git rev-parse returned an invalid worktree identity for {path}"),
     }
 }
 
@@ -221,6 +248,7 @@ pub const GIT_PROBE_CACHE_TTL: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone)]
 struct ProbeCacheEntry {
     identity: Option<WorktreeIdentity>,
+    failed: bool,
     cached_at: Instant,
     last_used: u64,
 }
@@ -246,17 +274,38 @@ impl GitPoller {
         paths: impl IntoIterator<Item = &'a str>,
         now: Instant,
     ) -> (BTreeMap<String, GitBadge>, BTreeMap<String, WorktreeInfo>) {
-        let mut identities: BTreeMap<String, WorktreeIdentity> = BTreeMap::new();
-        for path in paths
+        let (badges, worktrees, _) = self.poll_with_identities(runner, paths, now);
+        (badges, worktrees)
+    }
+
+    pub fn poll_with_identities<'a>(
+        &mut self,
+        runner: &dyn GitRunner,
+        paths: impl IntoIterator<Item = &'a str>,
+        now: Instant,
+    ) -> (
+        BTreeMap<String, GitBadge>,
+        BTreeMap<String, WorktreeInfo>,
+        BTreeMap<String, crate::category::RepoIdentity>,
+    ) {
+        let input_paths = paths
             .into_iter()
             .map(str::trim)
             .filter(|path| !path.is_empty())
-        {
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let mut identities: BTreeMap<String, WorktreeIdentity> = BTreeMap::new();
+        let mut failed_probes = BTreeSet::new();
+        for path in &input_paths {
             if identities.contains_key(path) {
                 continue;
             }
-            if let Some(identity) = self.resolve_identity(runner, path, now) {
-                identities.insert(path.to_string(), identity);
+            let (identity, failed) = self.resolve_identity(runner, path, now);
+            if failed {
+                failed_probes.insert(path.clone());
+            }
+            if let Some(identity) = identity {
+                identities.insert(path.clone(), identity);
             }
         }
 
@@ -320,7 +369,21 @@ impl GitPoller {
                 worktrees.insert(path.clone(), info.clone());
             }
         }
-        (badges, worktrees)
+        let repo_identities = input_paths
+            .into_iter()
+            .filter_map(|path| {
+                if failed_probes.contains(&path) {
+                    return None;
+                }
+                let identity = identities
+                    .get(&path)
+                    .map(crate::category::RepoIdentity::from_worktree)
+                    .unwrap_or_else(|| crate::category::RepoIdentity::from_project_path(&path))
+                    .ok()?;
+                Some((path, identity))
+            })
+            .collect();
+        (badges, worktrees, repo_identities)
     }
 
     fn resolve_identity(
@@ -328,19 +391,23 @@ impl GitPoller {
         runner: &dyn GitRunner,
         path: &str,
         now: Instant,
-    ) -> Option<WorktreeIdentity> {
+    ) -> (Option<WorktreeIdentity>, bool) {
         self.use_counter += 1;
         if let Some(entry) = self.cache.get_mut(path)
             && now.duration_since(entry.cached_at) < GIT_PROBE_CACHE_TTL
         {
             entry.last_used = self.use_counter;
-            return entry.identity.clone();
+            return (entry.identity.clone(), entry.failed);
         }
-        let identity = probe_worktree_identity(runner, path);
+        let (identity, failed) = match probe_worktree_identity_result(runner, path) {
+            Ok(identity) => (identity, false),
+            Err(_) => (None, true),
+        };
         self.cache.insert(
             path.to_string(),
             ProbeCacheEntry {
                 identity: identity.clone(),
+                failed,
                 cached_at: now,
                 last_used: self.use_counter,
             },
@@ -356,7 +423,7 @@ impl GitPoller {
             };
             self.cache.remove(&least_recent);
         }
-        identity
+        (identity, failed)
     }
 }
 
@@ -418,6 +485,35 @@ fn relative_suffix(root: &str, path: &str) -> Option<String> {
 
 fn run_git_command(cwd: &str, args: &[&str], timeout: Duration) -> Result<String> {
     run_process_command("git", cwd, args, timeout)
+}
+
+fn run_git_probe_command(cwd: &str, args: &[&str], timeout: Duration) -> Result<Option<String>> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn git in {cwd}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("failed to collect git probe output in {cwd}"))?;
+            if output.status.success() {
+                return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+            }
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("git {args:?} timed out after {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn run_process_command(

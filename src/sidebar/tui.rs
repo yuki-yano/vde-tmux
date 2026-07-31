@@ -145,6 +145,105 @@ mod local_state_tests {
     use crate::pane_state::StateId;
     use crate::sidebar::state::ViewMode;
 
+    fn structural_row(id: &str, kind: SidebarRowKind) -> SidebarRow {
+        SidebarRow {
+            id: id.to_string(),
+            kind,
+            depth: 0,
+            label: id.to_string(),
+            chat_count: 0,
+            rollup: RollupLevel::Idle,
+            badge_state: None,
+            expanded: true,
+            pane_id: None,
+            git: None,
+            active: false,
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn category_and_repo_reorder_emit_category_state_intents() {
+        let (preference_tx, _preference_rx) = mpsc::channel();
+        let (category_tx, category_rx) = mpsc::channel();
+        let mut ui = MarkCompleteUi::default();
+        let category_view = SidebarView {
+            state: SidebarState {
+                selection: Some("category::work".to_string()),
+                ..SidebarState::default()
+            },
+            rows: vec![
+                structural_row("category::work", SidebarRowKind::Category),
+                structural_row("category::public", SidebarRowKind::Category),
+            ],
+            ..SidebarView::default()
+        };
+
+        queue_reorder(&category_view, false, &preference_tx, &category_tx, &mut ui);
+        assert_eq!(
+            category_rx.recv().unwrap().intent,
+            crate::category::CategoryIntent::MoveCategory {
+                category: crate::category::CategoryName::parse("work").unwrap(),
+                neighbor: crate::category::CategoryName::parse("public").unwrap(),
+                direction: crate::sidebar::state::MoveDirection::Down,
+            }
+        );
+
+        let repo_view = SidebarView {
+            state: SidebarState {
+                selection: Some("repo::work::path:/repo/a".to_string()),
+                ..SidebarState::default()
+            },
+            rows: vec![
+                structural_row("repo::work::path:/repo/a", SidebarRowKind::Repo),
+                structural_row("repo::work::path:/repo/b", SidebarRowKind::Repo),
+                structural_row("repo::public::path:/repo/c", SidebarRowKind::Repo),
+            ],
+            ..SidebarView::default()
+        };
+        queue_reorder(&repo_view, false, &preference_tx, &category_tx, &mut ui);
+        assert_eq!(
+            category_rx.recv().unwrap().intent,
+            crate::category::CategoryIntent::MoveRepo {
+                repo: crate::category::RepoKey::path("/repo/a"),
+                neighbor: crate::category::RepoKey::path("/repo/b"),
+                category: crate::category::CategoryName::parse("work").unwrap(),
+                direction: crate::sidebar::state::MoveDirection::Down,
+            }
+        );
+    }
+
+    #[test]
+    fn category_text_editor_emits_create_intent() {
+        let (tx, rx) = mpsc::channel();
+        let mut mode = Some(CategoryEditMode::Add {
+            input: String::new(),
+        });
+        let mut ui = MarkCompleteUi::default();
+        for key in ['n', 'e', 'w'] {
+            handle_category_edit_key(
+                crossterm::event::KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                &mut mode,
+                &tx,
+                &mut ui,
+            );
+        }
+        handle_category_edit_key(
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut mode,
+            &tx,
+            &mut ui,
+        );
+
+        assert!(mode.is_none());
+        assert_eq!(
+            rx.recv().unwrap().intent,
+            crate::category::CategoryIntent::CreateCategory {
+                name: crate::category::CategoryName::parse("new").unwrap(),
+            }
+        );
+    }
+
     #[test]
     fn render_gate_draws_once_per_second_when_visible_and_idle() {
         let mut gate = RenderGate::new();
@@ -1244,6 +1343,14 @@ struct PreferenceIntentResult {
     result: Result<()>,
 }
 
+struct CategoryIntentRequest {
+    intent: crate::category::CategoryIntent,
+}
+
+struct CategoryIntentResult {
+    result: Result<()>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NavigationRequest {
     selection: Option<String>,
@@ -1253,6 +1360,53 @@ struct NavigationRequest {
 struct NavigationResult {
     request: NavigationRequest,
     result: Result<()>,
+}
+
+#[derive(Debug, Clone)]
+enum CategoryEditMode {
+    Add {
+        input: String,
+    },
+    Rename {
+        current: crate::category::CategoryName,
+        input: String,
+    },
+    MoveRepo {
+        repo: crate::category::RepoKey,
+        choices: Vec<MembershipChoice>,
+        selected: usize,
+        pending_g: bool,
+    },
+    Delete {
+        category: crate::category::CategoryName,
+        choices: Vec<MembershipChoice>,
+        selected: usize,
+        pending_g: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum MembershipChoice {
+    Automatic,
+    Category(crate::category::CategoryName),
+}
+
+impl MembershipChoice {
+    fn label(&self) -> &str {
+        match self {
+            Self::Automatic => crate::category::AUTOMATIC_LABEL,
+            Self::Category(category) => category.as_str(),
+        }
+    }
+
+    fn target(&self) -> crate::category::MembershipTarget {
+        match self {
+            Self::Automatic => crate::category::MembershipTarget::Automatic,
+            Self::Category(category) => {
+                crate::category::MembershipTarget::Category(category.clone())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1301,6 +1455,297 @@ impl MarkCompleteUi {
     fn set_toast(&mut self, message: String, level: NoticeLevel, duration: Duration) {
         self.toast = Some((ToastNotice { message, level }, Instant::now() + duration));
     }
+}
+
+fn begin_category_edit(
+    key: char,
+    snapshot: &ResolvedSnapshot,
+    sidebar: &SidebarView,
+    mode: &mut Option<CategoryEditMode>,
+    ui: &mut MarkCompleteUi,
+) -> bool {
+    let selected = sidebar
+        .state
+        .selection
+        .as_deref()
+        .and_then(|selection| sidebar.rows.iter().find(|row| row.id == selection));
+    *mode = match key {
+        'a' => Some(CategoryEditMode::Add {
+            input: String::new(),
+        }),
+        'r' => {
+            let Some(category) = selected.and_then(|row| category_name_from_row_id(&row.id)) else {
+                return false;
+            };
+            let editable = snapshot
+                .sidebar_model
+                .categories
+                .category(&category)
+                .is_some_and(|category| {
+                    category.source == crate::category::CategorySource::Dynamic
+                });
+            if !editable {
+                ui.set_toast(
+                    "only dynamic categories can be renamed".to_string(),
+                    NoticeLevel::Warning,
+                    Duration::from_secs(4),
+                );
+                return true;
+            }
+            Some(CategoryEditMode::Rename {
+                current: category,
+                input: String::new(),
+            })
+        }
+        'm' => {
+            let Some((_, repo)) = selected.and_then(|row| category_repo_from_row_id(&row.id))
+            else {
+                return false;
+            };
+            Some(CategoryEditMode::MoveRepo {
+                repo,
+                choices: membership_choices(snapshot, None),
+                selected: 0,
+                pending_g: false,
+            })
+        }
+        'D' => {
+            let Some(category) = selected.and_then(|row| category_name_from_row_id(&row.id)) else {
+                return false;
+            };
+            let editable = snapshot
+                .sidebar_model
+                .categories
+                .category(&category)
+                .is_some_and(|candidate| {
+                    candidate.source == crate::category::CategorySource::Dynamic
+                });
+            if !editable {
+                ui.set_toast(
+                    "only dynamic categories can be deleted".to_string(),
+                    NoticeLevel::Warning,
+                    Duration::from_secs(4),
+                );
+                return true;
+            }
+            Some(CategoryEditMode::Delete {
+                choices: membership_choices(snapshot, Some(&category)),
+                category,
+                selected: 0,
+                pending_g: false,
+            })
+        }
+        _ => return false,
+    };
+    refresh_category_edit_notice(mode.as_ref(), ui);
+    true
+}
+
+fn membership_choices(
+    snapshot: &ResolvedSnapshot,
+    exclude: Option<&crate::category::CategoryName>,
+) -> Vec<MembershipChoice> {
+    std::iter::once(MembershipChoice::Automatic)
+        .chain(
+            snapshot
+                .sidebar_model
+                .categories
+                .categories
+                .iter()
+                .filter(|category| exclude != Some(&category.name))
+                .map(|category| MembershipChoice::Category(category.name.clone())),
+        )
+        .collect()
+}
+
+fn handle_category_edit_key(
+    key: crossterm::event::KeyEvent,
+    mode: &mut Option<CategoryEditMode>,
+    tx: &mpsc::Sender<CategoryIntentRequest>,
+    ui: &mut MarkCompleteUi,
+) -> bool {
+    let Some(current) = mode.as_mut() else {
+        return false;
+    };
+    if key.code == KeyCode::Esc {
+        *mode = None;
+        ui.set_toast(
+            "category edit cancelled".to_string(),
+            NoticeLevel::Warning,
+            Duration::from_secs(2),
+        );
+        return true;
+    }
+    let mut intent = None;
+    match current {
+        CategoryEditMode::Add { input } => match key.code {
+            KeyCode::Enter => match crate::category::CategoryName::parse(input.as_str()) {
+                Ok(name) => intent = Some(crate::category::CategoryIntent::CreateCategory { name }),
+                Err(error) => {
+                    ui.set_toast(error, NoticeLevel::Failure, Duration::from_secs(5));
+                    return true;
+                }
+            },
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => input.push(ch),
+            _ => {}
+        },
+        CategoryEditMode::Rename { current, input } => match key.code {
+            KeyCode::Enter => match crate::category::CategoryName::parse(input.as_str()) {
+                Ok(replacement) => {
+                    intent = Some(crate::category::CategoryIntent::RenameCategory {
+                        current: current.clone(),
+                        replacement,
+                    })
+                }
+                Err(error) => {
+                    ui.set_toast(error, NoticeLevel::Failure, Duration::from_secs(5));
+                    return true;
+                }
+            },
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => input.push(ch),
+            _ => {}
+        },
+        CategoryEditMode::MoveRepo {
+            repo,
+            choices,
+            selected,
+            pending_g,
+        } => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+                *pending_g = false;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = (*selected + 1).min(choices.len().saturating_sub(1));
+                *pending_g = false;
+            }
+            KeyCode::Char('g') => {
+                if *pending_g {
+                    *selected = 0;
+                    *pending_g = false;
+                } else {
+                    *pending_g = true;
+                }
+            }
+            KeyCode::Char('G') => {
+                *selected = choices.len().saturating_sub(1);
+                *pending_g = false;
+            }
+            KeyCode::Enter => {
+                intent = choices.get(*selected).map(|choice| match choice {
+                    MembershipChoice::Automatic => {
+                        crate::category::CategoryIntent::SetRepoAutomatic { repo: repo.clone() }
+                    }
+                    MembershipChoice::Category(category) => {
+                        crate::category::CategoryIntent::AssignRepo {
+                            repo: repo.clone(),
+                            category: category.clone(),
+                        }
+                    }
+                });
+            }
+            _ => *pending_g = false,
+        },
+        CategoryEditMode::Delete {
+            category,
+            choices,
+            selected,
+            pending_g,
+        } => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+                *pending_g = false;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = (*selected + 1).min(choices.len().saturating_sub(1));
+                *pending_g = false;
+            }
+            KeyCode::Char('g') => {
+                if *pending_g {
+                    *selected = 0;
+                    *pending_g = false;
+                } else {
+                    *pending_g = true;
+                }
+            }
+            KeyCode::Char('G') => {
+                *selected = choices.len().saturating_sub(1);
+                *pending_g = false;
+            }
+            KeyCode::Enter => {
+                intent = choices.get(*selected).map(|choice| {
+                    crate::category::CategoryIntent::DeleteCategory {
+                        category: category.clone(),
+                        replacement: choice.target(),
+                    }
+                });
+            }
+            _ => *pending_g = false,
+        },
+    }
+    if let Some(intent) = intent {
+        if tx.send(CategoryIntentRequest { intent }).is_err() {
+            ui.set_toast(
+                "category worker unavailable".to_string(),
+                NoticeLevel::Failure,
+                Duration::from_secs(5),
+            );
+        } else {
+            ui.set_toast(
+                "saving category...".to_string(),
+                NoticeLevel::Progress,
+                Duration::from_secs(3),
+            );
+        }
+        *mode = None;
+    } else {
+        refresh_category_edit_notice(mode.as_ref(), ui);
+    }
+    true
+}
+
+fn refresh_category_edit_notice(mode: Option<&CategoryEditMode>, ui: &mut MarkCompleteUi) {
+    let Some(mode) = mode else {
+        return;
+    };
+    let message = match mode {
+        CategoryEditMode::Add { input } => format!("add category: {input}_"),
+        CategoryEditMode::Rename { current, input } => {
+            format!("rename {current} to: {input}_")
+        }
+        CategoryEditMode::MoveRepo {
+            choices, selected, ..
+        } => format!(
+            "move repo to: {}  [j/k, Enter]",
+            choices
+                .get(*selected)
+                .map(MembershipChoice::label)
+                .unwrap_or("-")
+        ),
+        CategoryEditMode::Delete {
+            category,
+            choices,
+            selected,
+            ..
+        } => format!(
+            "delete {category}; move repos to: {}  [j/k, Enter]",
+            choices
+                .get(*selected)
+                .map(MembershipChoice::label)
+                .unwrap_or("-")
+        ),
+    };
+    ui.set_toast(
+        message,
+        NoticeLevel::Progress,
+        Duration::from_secs(24 * 60 * 60),
+    );
 }
 
 fn spawn_mark_complete_worker(
@@ -1356,6 +1801,30 @@ fn spawn_preference_intent_worker(
     });
 }
 
+fn spawn_category_intent_worker(
+    socket: PathBuf,
+    server_identity: String,
+    rx: mpsc::Receiver<CategoryIntentRequest>,
+    tx: mpsc::Sender<CategoryIntentResult>,
+) {
+    std::thread::spawn(move || {
+        while let Ok(request) = rx.recv() {
+            let result = crate::sidebar::client::send_category_intent_v2(
+                &socket,
+                &server_identity,
+                request.intent,
+            );
+            let failed = result.is_err();
+            if tx.send(CategoryIntentResult { result }).is_err() {
+                return;
+            }
+            if failed {
+                while rx.try_recv().is_ok() {}
+            }
+        }
+    });
+}
+
 fn spawn_navigation_worker(
     socket: PathBuf,
     server_identity: String,
@@ -1387,9 +1856,18 @@ fn spawn_navigation_worker(
 fn queue_reorder(
     sidebar: &SidebarView,
     up: bool,
-    tx: &mpsc::Sender<PreferenceIntentRequest>,
+    preference_tx: &mpsc::Sender<PreferenceIntentRequest>,
+    category_tx: &mpsc::Sender<CategoryIntentRequest>,
     ui: &mut MarkCompleteUi,
 ) {
+    if sidebar.state.filter != StatusFilter::All {
+        ui.set_toast(
+            "reorder requires the All filter".to_string(),
+            NoticeLevel::Warning,
+            Duration::from_secs(4),
+        );
+        return;
+    }
     let Some(selection) = sidebar.state.selection.as_deref() else {
         return;
     };
@@ -1401,7 +1879,7 @@ fn queue_reorder(
     } else {
         crate::sidebar::state::MoveDirection::Down
     };
-    let intent = match selected.kind {
+    let preference_intent = match selected.kind {
         SidebarRowKind::Chat => {
             let chats = sidebar
                 .rows
@@ -1421,9 +1899,60 @@ fn queue_reorder(
                 chats.get(index + 1)
             };
             let Some(neighbor) = neighbor else { return };
-            SidebarPreferenceIntent::MoveChat {
+            Some(SidebarPreferenceIntent::MoveChat {
                 pane_id: pane_id.clone(),
                 neighbor_pane_id: (*neighbor).clone(),
+                direction,
+            })
+        }
+        _ => None,
+    };
+    if let Some(intent) = preference_intent {
+        if preference_tx
+            .send(PreferenceIntentRequest { intent })
+            .is_err()
+        {
+            ui.set_toast(
+                "preference worker unavailable".to_string(),
+                NoticeLevel::Failure,
+                Duration::from_secs(5),
+            );
+        } else {
+            ui.set_toast(
+                "saving order...".to_string(),
+                NoticeLevel::Progress,
+                Duration::from_secs(3),
+            );
+        }
+        return;
+    }
+
+    let category_intent = match selected.kind {
+        SidebarRowKind::Category => {
+            let Some(category) = category_name_from_row_id(&selected.id) else {
+                return;
+            };
+            let categories = sidebar
+                .rows
+                .iter()
+                .filter(|row| row.kind == SidebarRowKind::Category)
+                .filter_map(|row| category_name_from_row_id(&row.id))
+                .collect::<Vec<_>>();
+            let Some(index) = categories
+                .iter()
+                .position(|candidate| candidate == &category)
+            else {
+                return;
+            };
+            let neighbor = if up {
+                index.checked_sub(1).and_then(|index| categories.get(index))
+            } else {
+                categories.get(index + 1)
+            };
+            let Some(neighbor) = neighbor else { return };
+            crate::category::CategoryIntent::MoveCategory {
+                category,
+                neighbor: neighbor.clone(),
                 direction,
             }
         }
@@ -1432,12 +1961,16 @@ fn queue_reorder(
                 .rows
                 .iter()
                 .filter(|row| row.kind == SidebarRowKind::Repo)
-                .filter_map(|row| crate::sidebar::state::RepoId::from_row_id(&row.id))
+                .filter_map(|row| category_repo_from_row_id(&row.id))
+                .filter(|(category, _)| {
+                    category_repo_from_row_id(&selected.id)
+                        .is_some_and(|(selected_category, _)| selected_category == *category)
+                })
                 .collect::<Vec<_>>();
-            let Some(repo) = crate::sidebar::state::RepoId::from_row_id(&selected.id) else {
+            let Some((category, repo)) = category_repo_from_row_id(&selected.id) else {
                 return;
             };
-            let Some(index) = repos.iter().position(|candidate| *candidate == repo) else {
+            let Some(index) = repos.iter().position(|(_, candidate)| *candidate == repo) else {
                 return;
             };
             let neighbor = if up {
@@ -1446,17 +1979,23 @@ fn queue_reorder(
                 repos.get(index + 1)
             };
             let Some(neighbor) = neighbor else { return };
-            SidebarPreferenceIntent::MoveRepo {
+            crate::category::CategoryIntent::MoveRepo {
                 repo,
-                neighbor: neighbor.clone(),
+                neighbor: neighbor.1.clone(),
+                category,
                 direction,
             }
         }
         _ => return,
     };
-    if tx.send(PreferenceIntentRequest { intent }).is_err() {
+    if category_tx
+        .send(CategoryIntentRequest {
+            intent: category_intent,
+        })
+        .is_err()
+    {
         ui.set_toast(
-            "preference worker unavailable".to_string(),
+            "category worker unavailable".to_string(),
             NoticeLevel::Failure,
             Duration::from_secs(5),
         );
@@ -1467,6 +2006,30 @@ fn queue_reorder(
             Duration::from_secs(3),
         );
     }
+}
+
+fn category_name_from_row_id(id: &str) -> Option<crate::category::CategoryName> {
+    let name = id.strip_prefix("category::")?;
+    if name == crate::category::UNCATEGORIZED {
+        Some(crate::category::CategoryName::uncategorized())
+    } else {
+        crate::category::CategoryName::parse(name).ok()
+    }
+}
+
+fn category_repo_from_row_id(
+    id: &str,
+) -> Option<(crate::category::CategoryName, crate::category::RepoKey)> {
+    let rest = id.strip_prefix("repo::")?;
+    let split = rest.find("::git:").or_else(|| rest.find("::path:"))?;
+    let category = &rest[..split];
+    let repo = &rest[split + 2..];
+    let category = if category == crate::category::UNCATEGORIZED {
+        crate::category::CategoryName::uncategorized()
+    } else {
+        crate::category::CategoryName::parse(category).ok()?
+    };
+    Some((category, crate::category::RepoKey::parse(repo).ok()?))
 }
 
 fn queue_mark_complete(
@@ -1579,6 +2142,14 @@ fn run_loop<B: Backend>(
         preference_intent_rx,
         preference_result_tx,
     );
+    let (category_intent_tx, category_intent_rx) = mpsc::channel();
+    let (category_result_tx, category_result_rx) = mpsc::channel();
+    spawn_category_intent_worker(
+        socket.to_path_buf(),
+        server_identity.to_string(),
+        category_intent_rx,
+        category_result_tx,
+    );
     let (navigation_tx, navigation_rx) = mpsc::channel();
     let (navigation_result_tx, navigation_result_rx) = mpsc::channel();
     spawn_navigation_worker(
@@ -1591,6 +2162,7 @@ fn run_loop<B: Backend>(
     let mut render_gate = RenderGate::new();
     let mut last_frame: Option<DrawnFrame> = None;
     let mut pending_g = false;
+    let mut category_edit_mode: Option<CategoryEditMode> = None;
     loop {
         render_gate.mark_dirty_if(drain_snapshot_updates(rx, &mut current, &mut connection));
         if let ConnectionState::ConfigChanged(active_config_hash) = &connection {
@@ -1655,6 +2227,16 @@ fn run_loop<B: Backend>(
                 }
                 mark_ui.set_toast(
                     format!("preference save failed: {error}"),
+                    NoticeLevel::Failure,
+                    Duration::from_secs(5),
+                );
+            }
+        }
+        while let Ok(result) = category_result_rx.try_recv() {
+            render_gate.mark_dirty();
+            if let Err(error) = result.result {
+                mark_ui.set_toast(
+                    format!("category save failed: {error}"),
                     NoticeLevel::Failure,
                     Duration::from_secs(5),
                 );
@@ -1771,6 +2353,7 @@ fn run_loop<B: Backend>(
             control,
             &mut sidebar_state,
             &preference_intent_tx,
+            &category_intent_tx,
             &mut mark_ui,
             ControlMessageContext {
                 snapshot: current.as_ref(),
@@ -1861,6 +2444,16 @@ fn run_loop<B: Backend>(
         if event::poll(Duration::from_millis(50))? {
             let state_before = sidebar_state.clone();
             match event::read()? {
+                Event::Key(key) if category_edit_mode.is_some() => {
+                    pending_g = false;
+                    handle_category_edit_key(
+                        key,
+                        &mut category_edit_mode,
+                        &category_intent_tx,
+                        &mut mark_ui,
+                    );
+                    render_gate.mark_dirty();
+                }
                 Event::Key(key) => match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => return Ok(TuiExit::Quit),
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1937,7 +2530,18 @@ fn run_loop<B: Backend>(
                     KeyCode::Char(ch) => {
                         if let Some(snapshot) = &current {
                             let sidebar = project_view(snapshot, config.app, &sidebar_state);
-                            if ch == 'g' {
+                            if matches!(ch, 'a' | 'm' | 'r' | 'D')
+                                && begin_category_edit(
+                                    ch,
+                                    snapshot,
+                                    &sidebar,
+                                    &mut category_edit_mode,
+                                    &mut mark_ui,
+                                )
+                            {
+                                pending_g = false;
+                                render_gate.mark_dirty();
+                            } else if ch == 'g' {
                                 if pending_g {
                                     move_viewport_selection(
                                         snapshot,
@@ -1969,6 +2573,7 @@ fn run_loop<B: Backend>(
                                     &sidebar,
                                     ch == 'K',
                                     &preference_intent_tx,
+                                    &category_intent_tx,
                                     &mut mark_ui,
                                 );
                             } else {
@@ -2441,6 +3046,7 @@ fn drain_control_messages(
     control: &crate::sidebar::control::ControlListener,
     state: &mut SidebarState,
     preference_tx: &mpsc::Sender<PreferenceIntentRequest>,
+    category_tx: &mpsc::Sender<CategoryIntentRequest>,
     ui: &mut MarkCompleteUi,
     context: ControlMessageContext<'_>,
 ) -> Result<bool> {
@@ -2509,12 +3115,12 @@ fn drain_control_messages(
                         Some(crate::sidebar::input::SidebarInputAction::ReorderUp)
                             if preferences_connected =>
                         {
-                            queue_reorder(&sidebar, true, preference_tx, ui);
+                            queue_reorder(&sidebar, true, preference_tx, category_tx, ui);
                         }
                         Some(crate::sidebar::input::SidebarInputAction::ReorderDown)
                             if preferences_connected =>
                         {
-                            queue_reorder(&sidebar, false, preference_tx, ui);
+                            queue_reorder(&sidebar, false, preference_tx, category_tx, ui);
                         }
                         _ => apply_local_sidebar_key(state, &sidebar, &key),
                     }

@@ -221,6 +221,7 @@ pub(crate) enum V2InternalMutation {
     GitProjection {
         badges: std::collections::BTreeMap<String, crate::git::GitBadge>,
         worktrees: std::collections::BTreeMap<String, crate::git::WorktreeInfo>,
+        repo_identities: std::collections::BTreeMap<String, crate::category::RepoIdentity>,
     },
     DiagnosticProjection {
         pane_instance: Option<PaneInstance>,
@@ -2408,10 +2409,13 @@ fn start_canonical_git_worker(
                 .as_ref()
                 .map(|state| state.git_polling_paths())
                 .unwrap_or_default();
-            let (badges, worktrees) =
-                poller.poll(&git, paths.iter().map(String::as_str), Instant::now());
-            let _ = coordinator
-                .enqueue_internal(V2InternalMutation::GitProjection { badges, worktrees });
+            let (badges, worktrees, repo_identities) =
+                poller.poll_with_identities(&git, paths.iter().map(String::as_str), Instant::now());
+            let _ = coordinator.enqueue_internal(V2InternalMutation::GitProjection {
+                badges,
+                worktrees,
+                repo_identities,
+            });
             let started = Instant::now();
             while started.elapsed() < poll && !coordinator.shutdown.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(100).min(poll));
@@ -2577,6 +2581,9 @@ fn apply_production_mutation(
             }
             crate::daemon::protocol::v2::SidebarCommand::PreferenceIntent { intent } => {
                 apply_sidebar_preference_intent(coordinator, accepted_seq, event_id, intent)
+            }
+            crate::daemon::protocol::v2::SidebarCommand::CategoryIntent { intent } => {
+                apply_category_intent(coordinator, accepted_seq, event_id, intent)
             }
             crate::daemon::protocol::v2::SidebarCommand::SetNavigation { selection, scroll } => {
                 apply_sidebar_navigation(coordinator, accepted_seq, event_id, selection, scroll)
@@ -2769,7 +2776,11 @@ fn apply_production_mutation(
                 snapshot_revision,
             }
         }
-        V2AcceptedMutation::Internal(V2InternalMutation::GitProjection { badges, worktrees }) => {
+        V2AcceptedMutation::Internal(V2InternalMutation::GitProjection {
+            badges,
+            worktrees,
+            repo_identities,
+        }) => {
             let mut state_guard = coordinator
                 .state
                 .lock()
@@ -2777,7 +2788,9 @@ fn apply_production_mutation(
             let state = state_guard
                 .as_mut()
                 .expect("state initialized before git projection");
-            if let Err(error) = state.replace_git_projection(badges, worktrees) {
+            if let Err(error) =
+                state.replace_git_projection_with_identities(badges, worktrees, repo_identities)
+            {
                 return production_store_error_response(coordinator, error, None);
             }
             ServerMessage::SnapshotAck {
@@ -2879,6 +2892,90 @@ fn apply_sidebar_preference_intent(
         event_id,
         accepted_seq,
         snapshot_revision: state.leased.runtime.snapshot_revision(),
+    }
+}
+
+fn apply_category_intent(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    event_id: EventId,
+    intent: crate::category::CategoryIntent,
+) -> ServerMessage {
+    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+    let mut state_guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let state = state_guard
+        .as_mut()
+        .expect("state initialized before category intent");
+    if !state.sidebar_intent_dedupe.accept(event_id.clone()) {
+        return ServerMessage::SnapshotAck {
+            event_id,
+            accepted_seq,
+            snapshot_revision: state.leased.runtime.snapshot_revision(),
+        };
+    }
+    let model = state.effective_category_model();
+    let mut candidate = state.category_state.clone();
+    let changed = match candidate.apply_intent(&state.projection_config, &intent, &model) {
+        Ok(changed) => changed,
+        Err(message) => {
+            return ServerMessage::error(ErrorCode::InvalidRequest, message, Some(event_id));
+        }
+    };
+    if !changed {
+        return ServerMessage::SnapshotAck {
+            event_id,
+            accepted_seq,
+            snapshot_revision: state.leased.runtime.snapshot_revision(),
+        };
+    }
+    let path =
+        crate::category::store::state_path(&coordinator.env, &coordinator.incarnation.socket_path);
+    if let Err(error) = crate::category::store::save_state(&path, &candidate) {
+        let message = format!("category state persistence failed: {error:#}");
+        coordinator.log_daemon_error(&message);
+        let _ = state.add_global_diagnostic(ErrorCode::PersistFailed, message.clone());
+        return ServerMessage::error(ErrorCode::PersistFailed, message, Some(event_id));
+    }
+    if let Err(error) = state.replace_category_state(candidate) {
+        return production_store_error_response(coordinator, error, Some(event_id));
+    }
+    let model = state.effective_category_model();
+    let mirrors = state
+        .status_metadata
+        .sessions
+        .values()
+        .map(|session| {
+            let category = state
+                .repo_identities
+                .get(&session.project_path)
+                .and_then(|identity| model.placements.get(&identity.key))
+                .map(|placement| placement.category.to_string())
+                .unwrap_or_else(|| crate::category::UNCATEGORIZED.to_string());
+            (session.session_name.clone(), category)
+        })
+        .collect::<Vec<_>>();
+    let snapshot_revision = state.leased.runtime.snapshot_revision();
+    drop(state_guard);
+    let runner = coordinator.status_push_runner(Duration::from_secs(1));
+    for (session_name, category) in mirrors {
+        if let Err(error) = crate::options::set_session_option(
+            &runner,
+            &session_name,
+            crate::options::KEY_CATEGORY,
+            &category,
+        ) {
+            coordinator.log_daemon_error(&format!(
+                "failed to update category mirror for {session_name}: {error:#}"
+            ));
+        }
+    }
+    ServerMessage::SnapshotAck {
+        event_id,
+        accepted_seq,
+        snapshot_revision,
     }
 }
 
@@ -4261,6 +4358,9 @@ fn bootstrap_v2_runtime(
     let status_metadata = query_status_projection_metadata(coordinator, Duration::from_secs(1))?;
     let state_path = crate::sidebar::store::state_path(env, &coordinator.incarnation.socket_path);
     let sidebar_preferences = crate::sidebar::store::load_state(&state_path)?;
+    let category_state_path =
+        crate::category::store::state_path(env, &coordinator.incarnation.socket_path);
+    let category_state = crate::category::store::load_state(&category_state_path)?;
     let mut canonical = super::runtime::CanonicalCoordinatorState::new(
         leased,
         topology,
@@ -4268,6 +4368,7 @@ fn bootstrap_v2_runtime(
         sidebar_preferences,
     );
     canonical.status_metadata = status_metadata;
+    canonical.category_state = category_state;
     canonical.projection_config = config.clone();
     *coordinator
         .state

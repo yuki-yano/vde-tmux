@@ -31,6 +31,12 @@ pub struct SidebarModel {
     pub navigation: SidebarNavigation,
     pub active_sessions: BTreeSet<String>,
     #[serde(default)]
+    pub category_state: crate::category::CategoryState,
+    #[serde(default)]
+    pub categories: crate::category::EffectiveCategoryModel,
+    #[serde(default)]
+    pub repo_identities: BTreeMap<String, crate::category::RepoIdentity>,
+    #[serde(default)]
     pub git: BTreeMap<String, crate::git::GitBadge>,
     #[serde(default)]
     pub worktrees: BTreeMap<String, crate::git::WorktreeInfo>,

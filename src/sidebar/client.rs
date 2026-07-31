@@ -68,6 +68,20 @@ pub fn send_sidebar_preference_intent_v2(
     Ok(())
 }
 
+pub fn send_category_intent_v2(
+    socket: &Path,
+    server_identity: &str,
+    intent: crate::category::CategoryIntent,
+) -> Result<()> {
+    request_v2_sidebar(
+        socket,
+        server_identity,
+        V2SidebarCommand::CategoryIntent { intent },
+        V2SidebarResponse::SnapshotAck,
+    )?;
+    Ok(())
+}
+
 pub fn send_sidebar_navigation_v2(
     socket: &Path,
     server_identity: &str,

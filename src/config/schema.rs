@@ -9,7 +9,7 @@ pub fn config_schema() -> Value {
         "properties": {
             "categories": {
                 "type": "object",
-                "additionalProperties": true,
+                "additionalProperties": false,
                 "properties": {
                     "display_names": { "type": "object", "additionalProperties": { "type": "string" } },
                     "order": { "type": "object", "additionalProperties": { "type": "integer" } },
@@ -27,8 +27,7 @@ pub fn config_schema() -> Value {
                                 }
                             }
                         }
-                    },
-                    "session_name_rules": { "type": "array" }
+                    }
                 }
             },
             "badge": {

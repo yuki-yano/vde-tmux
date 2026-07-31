@@ -34,13 +34,27 @@ fn stub_shared_action_clients(mock: &MockTmuxRunner) {
     );
 }
 
-fn stub_category_switch(mock: &MockTmuxRunner, client: &str, category: &str, target_session: &str) {
+fn stub_category_switch(
+    mock: &MockTmuxRunner,
+    root: &std::path::Path,
+    client: &str,
+    category: &str,
+    target_session: &str,
+) {
     let format = crate::session::session_list_format();
+    let a = root.join("repos/a");
+    let b = root.join("repos/b");
+    let c = root.join("repos/c");
     mock.stub(
         &["list-sessions", "-F", &format],
-        "a\u{1f}1\u{1f}100\u{1f}alpha\u{1f}\u{1f}\u{1f}$1\n\
-         b\u{1f}1\u{1f}90\u{1f}beta\u{1f}\u{1f}\u{1f}$2\n\
-         c\u{1f}1\u{1f}80\u{1f}gamma\u{1f}\u{1f}\u{1f}$3\n",
+        &format!(
+            "a\u{1f}1\u{1f}100\u{1f}\u{1f}{}\u{1f}\u{1f}$1\n\
+             b\u{1f}1\u{1f}90\u{1f}\u{1f}{}\u{1f}\u{1f}$2\n\
+             c\u{1f}1\u{1f}80\u{1f}\u{1f}{}\u{1f}\u{1f}$3\n",
+            a.display(),
+            b.display(),
+            c.display(),
+        ),
     );
     let memory_key = crate::session::client_memory_key(client, category);
     mock.stub(&["show-option", "-gqv", &memory_key], "");
@@ -172,9 +186,13 @@ fn spawn_active_config_guard_fixture() -> V2QueryFixture {
 }
 
 fn spawn_category_config_guard_fixture() -> V2QueryFixture {
-    spawn_active_config_guard_fixture_with_yaml(
-        "categories:\n  session_name_rules:\n    - category: alpha\n      patterns: [a]\n    - category: beta\n      patterns: [b]\n    - category: gamma\n      patterns: [c]\n    - category: work\n      patterns: [main, sub]\n",
-    )
+    let fixture = spawn_active_config_guard_fixture_with_yaml(
+        "categories:\n  rules:\n    - category: alpha\n      path_patterns: ['*/repos/a']\n    - category: beta\n      path_patterns: ['*/repos/b']\n    - category: gamma\n      path_patterns: ['*/repos/c']\n    - category: work\n      path_patterns: ['*/repos/main', '*/repos/sub']\n",
+    );
+    for repo in ["a", "b", "c", "main", "sub"] {
+        std::fs::create_dir_all(fixture.root.join("repos").join(repo)).unwrap();
+    }
+    fixture
 }
 
 fn spawn_active_config_guard_fixture_with_yaml(yaml: &str) -> V2QueryFixture {
@@ -795,7 +813,13 @@ fn dispatch_category_cycle_uses_explicit_scope_when_a_pane_is_shared() {
             ],
             &rendered,
         );
-        stub_category_switch(mock, "client-2", target_category, target_session);
+        stub_category_switch(
+            mock,
+            &fixture.root,
+            "client-2",
+            target_category,
+            target_session,
+        );
 
         run_with(
             [
@@ -834,7 +858,7 @@ fn dispatch_category_click_uses_explicit_scope_when_a_pane_is_shared() {
         .insert("TMUX_PANE".to_string(), "%1".to_string());
     let mock = &fixture.mock;
     stub_shared_action_clients(mock);
-    stub_category_switch(mock, "client-2", "alpha", "a");
+    stub_category_switch(mock, &fixture.root, "client-2", "alpha", "a");
     let alpha = crate::statusline::category_target_key("alpha").unwrap();
 
     run_with(
@@ -1106,9 +1130,15 @@ fn dispatch_statusline_click_routes_active_and_inactive_category_targets() {
         let mock = &fixture.mock;
         stub_action_client(mock, "abc", "$1");
         let format = crate::session::session_list_format();
+        let a = fixture.root.join("repos/a");
+        let b = fixture.root.join("repos/b");
         mock.stub(
             &["list-sessions", "-F", &format],
-            "a\u{1f}1\u{1f}100\u{1f}alpha\u{1f}\u{1f}\u{1f}$1\nb\u{1f}1\u{1f}100\u{1f}beta\u{1f}\u{1f}\u{1f}$2\n",
+            &format!(
+                "a\u{1f}1\u{1f}100\u{1f}\u{1f}{}\u{1f}\u{1f}$1\nb\u{1f}1\u{1f}100\u{1f}\u{1f}{}\u{1f}\u{1f}$2\n",
+                a.display(),
+                b.display(),
+            ),
         );
         mock.stub(&["show-option", "-gqv", "@vde_client_616263_beta"], "");
         mock.stub(&["switch-client", "-c", "abc", "-t", "=b:"], "");
@@ -1152,9 +1182,13 @@ fn dispatch_category_use_switches_category() {
     let mock = &fixture.mock;
     stub_action_client(mock, "abc", "$1");
     let format = crate::session::session_list_format();
+    let main = fixture.root.join("repos/main");
     mock.stub(
         &["list-sessions", "-F", &format],
-        "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}$1\n",
+        &format!(
+            "main\u{1f}1\u{1f}100\u{1f}\u{1f}{}\u{1f}\u{1f}$1\n",
+            main.display()
+        ),
     );
     mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "");
     mock.stub(&["switch-client", "-c", "abc", "-t", "=main:"], "");
@@ -1185,13 +1219,17 @@ fn dispatch_client_session_changed_only_updates_memory() {
     let mock = &fixture.mock;
     let client_format = crate::session::client_pid_name_format();
     let session_format = crate::session::session_list_format();
+    let main = fixture.root.join("repos/main");
     mock.stub(
         &["list-clients", "-F", &client_format],
         "123\u{1f}abc\u{1f}/dev/ttys001\u{1f}0\n",
     );
     mock.stub(
         &["list-sessions", "-F", &session_format],
-        "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}$1\n",
+        &format!(
+            "main\u{1f}1\u{1f}100\u{1f}\u{1f}{}\u{1f}\u{1f}$1\n",
+            main.display()
+        ),
     );
     mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
 
@@ -1230,6 +1268,9 @@ fn dispatch_session_new_creates_managed_session() {
         .insert("TMUX_PANE".to_string(), "%1".to_string());
     let mock = &fixture.mock;
     stub_action_client(mock, "abc", "$1");
+    let repo = fixture.root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let repo = repo.to_str().unwrap();
     mock.stub(
         &[
             "new-session",
@@ -1238,7 +1279,7 @@ fn dispatch_session_new_creates_managed_session() {
             "-F",
             "#{session_name}\u{1f}#{window_id}",
             "-c",
-            "/tmp/repo",
+            repo,
         ],
         "repo\u{1f}@9\n",
     );
@@ -1248,12 +1289,18 @@ fn dispatch_session_new_creates_managed_session() {
             "-t",
             "repo",
             crate::options::KEY_PROJECT_PATH,
-            "/tmp/repo",
+            repo,
         ],
         "",
     );
     mock.stub(
-        &["set-option", "-t", "repo", crate::options::KEY_CATEGORY, ""],
+        &[
+            "set-option",
+            "-t",
+            "repo",
+            crate::options::KEY_CATEGORY,
+            crate::category::UNCATEGORIZED,
+        ],
         "",
     );
     mock.stub(&["switch-client", "-c", "abc", "-t", "=repo:"], "");
@@ -1261,13 +1308,17 @@ fn dispatch_session_new_creates_managed_session() {
         &["show-hooks", "-g", "after-new-window[90]"],
         "after-new-window[90] \n",
     );
+    mock.stub(
+        &[
+            "set-option",
+            "-g",
+            "@vde_client_616263_Uncategorized",
+            "repo",
+        ],
+        "",
+    );
 
-    run_with(
-        ["vt", "session", "new", "-c", "/tmp/repo"],
-        mock,
-        &fixture.env,
-    )
-    .unwrap();
+    run_with(["vt", "session", "new", "-c", repo], mock, &fixture.env).unwrap();
 
     assert!(
         mock.calls()
@@ -1304,6 +1355,9 @@ fn dispatch_session_new_uses_explicit_scope_when_a_pane_is_shared() {
         .insert("TMUX_PANE".to_string(), "%1".to_string());
     let mock = &fixture.mock;
     stub_shared_action_clients(mock);
+    let repo = fixture.root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let repo = repo.to_str().unwrap();
     mock.stub(
         &[
             "new-session",
@@ -1312,7 +1366,7 @@ fn dispatch_session_new_uses_explicit_scope_when_a_pane_is_shared() {
             "-F",
             "#{session_name}\u{1f}#{window_id}",
             "-c",
-            "/tmp/repo",
+            repo,
         ],
         "repo\u{1f}@9\n",
     );
@@ -1322,18 +1376,33 @@ fn dispatch_session_new_uses_explicit_scope_when_a_pane_is_shared() {
             "-t",
             "repo",
             crate::options::KEY_PROJECT_PATH,
-            "/tmp/repo",
+            repo,
         ],
         "",
     );
     mock.stub(
-        &["set-option", "-t", "repo", crate::options::KEY_CATEGORY, ""],
+        &[
+            "set-option",
+            "-t",
+            "repo",
+            crate::options::KEY_CATEGORY,
+            crate::category::UNCATEGORIZED,
+        ],
         "",
     );
     mock.stub(&["switch-client", "-c", "client-2", "-t", "=repo:"], "");
     mock.stub(
         &["show-hooks", "-g", "after-new-window[90]"],
         "after-new-window[90] \n",
+    );
+    mock.stub(
+        &[
+            "set-option",
+            "-g",
+            "@vde_client_636c69656e742d32_Uncategorized",
+            "repo",
+        ],
+        "",
     );
 
     run_with(
@@ -1342,7 +1411,7 @@ fn dispatch_session_new_uses_explicit_scope_when_a_pane_is_shared() {
             "session",
             "new",
             "-c",
-            "/tmp/repo",
+            repo,
             "--client-name",
             "client-2",
             "--session-id",
@@ -1510,6 +1579,22 @@ fn dispatch_popups_use_configured_size() {
 #[test]
 fn dispatch_session_manager_renders_preview() {
     let mock = MockTmuxRunner::new();
+    let root = std::env::temp_dir().join(format!(
+        "vde-cli-session-preview-{}-{}",
+        std::process::id(),
+        V2_QUERY_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let socket = root.join("tmux.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "#{pid}\t#{start_time}\t#{socket_path}",
+        ],
+        &format!("123\t456\t{}\n", socket.display()),
+    );
     let session_format = crate::session::session_list_format();
     let window_format = crate::window::window_list_format();
     mock.stub(
@@ -1549,16 +1634,15 @@ fn dispatch_session_manager_renders_preview() {
             "ni.zsh",
         ],
         &mock,
-        &BTreeMap::from([(
-            "HOME".to_string(),
-            "/nonexistent-home-for-vde-tmux-preview-test".to_string(),
-        )]),
+        &BTreeMap::from([("HOME".to_string(), root.to_string_lossy().into_owned())]),
     )
     .unwrap()
     .unwrap();
 
     assert!(output.contains("Session ni.zsh"));
     assert!(output.contains("tail"));
+    drop(listener);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

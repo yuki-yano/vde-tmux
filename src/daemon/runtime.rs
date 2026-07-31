@@ -94,6 +94,8 @@ pub(crate) struct CanonicalCoordinatorState {
     pub status_metadata: StatusProjectionMetadata,
     pub git_badges: BTreeMap<String, GitBadge>,
     pub worktrees: BTreeMap<String, WorktreeInfo>,
+    pub repo_identities: BTreeMap<String, crate::category::RepoIdentity>,
+    pub category_state: crate::category::CategoryState,
     pub projection_config: Config,
 }
 
@@ -117,6 +119,8 @@ impl CanonicalCoordinatorState {
             status_metadata: StatusProjectionMetadata::default(),
             git_badges: BTreeMap::new(),
             worktrees: BTreeMap::new(),
+            repo_identities: BTreeMap::new(),
+            category_state: crate::category::CategoryState::default(),
             projection_config: Config::default(),
         }
     }
@@ -223,7 +227,8 @@ impl CanonicalCoordinatorState {
     /// git polling without building the full resolved snapshot. Mirrors the
     /// `resolved.is_some()` filter in `resolved_snapshot_with_git_at`.
     pub fn git_polling_paths(&self) -> BTreeSet<String> {
-        self.topology
+        let mut paths = self
+            .topology
             .panes
             .iter()
             .filter(|topology| {
@@ -235,7 +240,16 @@ impl CanonicalCoordinatorState {
             })
             .map(|topology| topology.current_path.clone())
             .filter(|path| !path.trim().is_empty())
-            .collect()
+            .collect::<BTreeSet<_>>();
+        paths.extend(
+            self.status_metadata
+                .sessions
+                .values()
+                .map(|session| session.project_path.trim())
+                .filter(|path| !path.is_empty())
+                .map(str::to_string),
+        );
+        paths
     }
 
     /// Whether the canonical topology currently contains `pane_instance`,
@@ -280,12 +294,29 @@ impl CanonicalCoordinatorState {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub fn replace_git_projection(
         &mut self,
         git_badges: BTreeMap<String, GitBadge>,
         worktrees: BTreeMap<String, WorktreeInfo>,
     ) -> Result<bool, StoreError> {
-        if self.git_badges == git_badges && self.worktrees == worktrees {
+        self.replace_git_projection_with_identities(
+            git_badges,
+            worktrees,
+            self.repo_identities.clone(),
+        )
+    }
+
+    pub fn replace_git_projection_with_identities(
+        &mut self,
+        git_badges: BTreeMap<String, GitBadge>,
+        worktrees: BTreeMap<String, WorktreeInfo>,
+        repo_identities: BTreeMap<String, crate::category::RepoIdentity>,
+    ) -> Result<bool, StoreError> {
+        if self.git_badges == git_badges
+            && self.worktrees == worktrees
+            && self.repo_identities == repo_identities
+        {
             return Ok(false);
         }
         let mut runtime = self.leased.runtime.clone();
@@ -303,7 +334,38 @@ impl CanonicalCoordinatorState {
         self.leased.runtime = runtime;
         self.git_badges = git_badges;
         self.worktrees = worktrees;
+        self.repo_identities = repo_identities;
         Ok(true)
+    }
+
+    pub fn replace_category_state(
+        &mut self,
+        category_state: crate::category::CategoryState,
+    ) -> Result<bool, StoreError> {
+        category_state.validate().map_err(StoreError::Random)?;
+        if self.category_state == category_state {
+            return Ok(false);
+        }
+        let mut runtime = self.leased.runtime.clone();
+        runtime.mark_projection_changed()?;
+        self.leased.runtime = runtime;
+        self.category_state = category_state;
+        Ok(true)
+    }
+
+    pub fn effective_category_model(&self) -> crate::category::EffectiveCategoryModel {
+        let repos = self
+            .repo_identities
+            .values()
+            .map(|repo| (repo.key.clone(), repo.clone()))
+            .collect::<BTreeMap<_, _>>()
+            .into_values();
+        crate::category::EffectiveCategoryModel::build(
+            &self.projection_config,
+            &self.category_state,
+            repos,
+        )
+        .expect("validated config and category state must build an effective model")
     }
 
     pub fn resolved_snapshot(&self) -> ResolvedSnapshot {
@@ -495,6 +557,9 @@ impl CanonicalCoordinatorState {
             sidebar_model: SidebarModel {
                 preferences: self.sidebar_preferences.clone(),
                 navigation: self.sidebar_navigation.clone(),
+                category_state: self.category_state.clone(),
+                categories: self.effective_category_model(),
+                repo_identities: self.repo_identities.clone(),
                 active_sessions: self
                     .views
                     .clients()
@@ -711,22 +776,24 @@ pub(crate) fn build_status_snapshot(
         .iter()
         .map(|(session_id, topology_name)| {
             let projection = metadata.sessions.get(session_id);
-            let session = crate::session::SessionInfo {
-                name: projection
-                    .map(|session| session.session_name.as_str())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or(topology_name)
-                    .to_string(),
-                project_path: projection
-                    .map(|session| session.project_path.clone())
-                    .unwrap_or_default(),
-                id: session_id.clone(),
-                ..crate::session::SessionInfo::default()
-            };
-            (
-                session_id.clone(),
-                crate::category::resolve_category_for_session(config, &session),
-            )
+            let project_path = projection
+                .map(|session| session.project_path.as_str())
+                .unwrap_or_default();
+            let category = resolved
+                .sidebar_model
+                .repo_identities
+                .get(project_path)
+                .and_then(|identity| {
+                    resolved
+                        .sidebar_model
+                        .categories
+                        .placements
+                        .get(&identity.key)
+                })
+                .map(|placement| placement.category.to_string())
+                .unwrap_or_else(|| crate::category::UNCATEGORIZED.to_string());
+            let _ = topology_name;
+            (session_id.clone(), category)
         })
         .collect::<BTreeMap<_, _>>();
 
@@ -1778,7 +1845,7 @@ mod tests {
             None,
             false,
         );
-        ResolvedSnapshot {
+        let mut snapshot = ResolvedSnapshot {
             snapshot_revision: 42,
             panes: vec![first.clone(), second, non_agent],
             sidebar_model: SidebarModel::default(),
@@ -1791,7 +1858,9 @@ mod tests {
             }],
             events: Vec::new(),
             diagnostics: Vec::new(),
-        }
+        };
+        set_resolved_categories(&mut snapshot, &[("/repo-main", "work")]);
+        snapshot
     }
 
     #[test]
@@ -1851,6 +1920,7 @@ mod tests {
                     "$1".to_string(),
                     SessionProjectionMetadata {
                         session_name: "main".to_string(),
+                        project_path: "/repo-main".to_string(),
                         attached: Some(true),
                         created_at: Some(10),
                         ..SessionProjectionMetadata::default()
@@ -1860,6 +1930,7 @@ mod tests {
                     "$2".to_string(),
                     SessionProjectionMetadata {
                         session_name: "mirror".to_string(),
+                        project_path: "/repo-main".to_string(),
                         attached: Some(false),
                         created_at: Some(20),
                         ..SessionProjectionMetadata::default()
@@ -1878,15 +1949,50 @@ mod tests {
     }
 
     fn status_config() -> Config {
-        let mut config = Config::default();
-        config
-            .categories
-            .session_name_rules
-            .push(crate::config::SessionNameRule {
-                category: "work".to_string(),
-                patterns: vec!["main".to_string(), "mirror".to_string()],
-            });
-        config
+        Config::default()
+    }
+
+    fn set_resolved_categories(resolved: &mut ResolvedSnapshot, assignments: &[(&str, &str)]) {
+        let mut state = crate::category::CategoryState::default();
+        let mut identities = BTreeMap::new();
+        let mut repos = Vec::new();
+        for (path, category) in assignments {
+            let repo = crate::category::RepoIdentity {
+                key: crate::category::RepoKey::path(path),
+                rule_path: (*path).to_string(),
+                display_name: path.trim_matches('/').replace('/', "-"),
+            };
+            let category = if *category == crate::category::UNCATEGORIZED {
+                crate::category::CategoryName::uncategorized()
+            } else {
+                crate::category::CategoryName::parse(*category).unwrap()
+            };
+            if category.as_str() != crate::category::UNCATEGORIZED {
+                state.dynamic_categories.insert(category.clone());
+            }
+            state.repo_overrides.insert(repo.key.clone(), category);
+            identities.insert((*path).to_string(), repo.clone());
+            repos.push(repo);
+        }
+        resolved.sidebar_model.category_state = state.clone();
+        resolved.sidebar_model.repo_identities = identities;
+        resolved.sidebar_model.categories =
+            crate::category::EffectiveCategoryModel::build(&Config::default(), &state, repos)
+                .unwrap();
+    }
+
+    fn set_state_categories(state: &mut CanonicalCoordinatorState, assignments: &[(&str, &str)]) {
+        let mut resolved = ResolvedSnapshot {
+            snapshot_revision: 0,
+            panes: Vec::new(),
+            sidebar_model: SidebarModel::default(),
+            attention: Vec::new(),
+            events: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        set_resolved_categories(&mut resolved, assignments);
+        state.category_state = resolved.sidebar_model.category_state;
+        state.repo_identities = resolved.sidebar_model.repo_identities;
     }
 
     #[test]
@@ -2014,6 +2120,7 @@ mod tests {
                 "$1".to_string(),
                 SessionProjectionMetadata {
                     session_name: "main".to_string(),
+                    project_path: "/repo-main".to_string(),
                     attached: Some(true),
                     created_at: Some(1),
                     ..SessionProjectionMetadata::default()
@@ -2022,6 +2129,7 @@ mod tests {
             windows: BTreeMap::new(),
         };
         state.projection_config = status_config();
+        set_state_categories(&mut state, &[("/repo-main", "work")]);
 
         apply_history_event(
             &mut state,
@@ -2228,12 +2336,17 @@ mod tests {
                     "$2".to_string(),
                     SessionProjectionMetadata {
                         session_name: "uncategorized".to_string(),
+                        project_path: "/repo-misc".to_string(),
                         ..SessionProjectionMetadata::default()
                     },
                 ),
             ]),
             ..StatusProjectionMetadata::default()
         };
+        set_resolved_categories(
+            &mut resolved,
+            &[("/repo", "private"), ("/repo-misc", "misc")],
+        );
 
         let snapshot = build_status_snapshot(
             &resolved,
@@ -2278,6 +2391,7 @@ mod tests {
                     "$1".to_string(),
                     SessionProjectionMetadata {
                         session_name: "a".to_string(),
+                        project_path: "/repo-short".to_string(),
                         ..SessionProjectionMetadata::default()
                     },
                 ),
@@ -2285,6 +2399,7 @@ mod tests {
                     "$2".to_string(),
                     SessionProjectionMetadata {
                         session_name: "much-longer-session".to_string(),
+                        project_path: "/repo-long".to_string(),
                         ..SessionProjectionMetadata::default()
                     },
                 ),
@@ -2292,25 +2407,24 @@ mod tests {
                     "$3".to_string(),
                     SessionProjectionMetadata {
                         session_name: "peer".to_string(),
+                        project_path: "/repo-peer".to_string(),
                         ..SessionProjectionMetadata::default()
                     },
                 ),
             ]),
             ..StatusProjectionMetadata::default()
         };
+        set_resolved_categories(
+            &mut resolved,
+            &[
+                ("/repo-short", "short"),
+                ("/repo-long", "long"),
+                ("/repo-peer", "long"),
+            ],
+        );
         let mut config = Config::default();
         config.statusline.sessions.fixed_width = true;
         config.statusline.sessions.separator = " | ".to_string();
-        config.categories.session_name_rules = [
-            ("short", vec!["a"]),
-            ("long", vec!["much-longer-session", "peer"]),
-        ]
-        .into_iter()
-        .map(|(category, patterns)| crate::config::SessionNameRule {
-            category: category.to_string(),
-            patterns: patterns.into_iter().map(str::to_string).collect(),
-        })
-        .collect();
 
         let short = build_status_snapshot(
             &resolved,
@@ -2413,7 +2527,7 @@ mod tests {
 
         assert_eq!(snapshot.summary.total(), 2);
         assert!(snapshot.sessions.iter().all(|session| {
-            session.category.as_deref() == Some("")
+            session.category.as_deref() == Some(crate::category::UNCATEGORIZED)
                 && session.attached.is_none()
                 && session.created_at.is_none()
         }));
@@ -2421,6 +2535,9 @@ mod tests {
             window.bell.is_none() && window.activity.is_none() && window.silence.is_none()
         }));
         assert_eq!(snapshot.categories.len(), 1);
-        assert_eq!(snapshot.categories[0].category, "");
+        assert_eq!(
+            snapshot.categories[0].category,
+            crate::category::UNCATEGORIZED
+        );
     }
 }

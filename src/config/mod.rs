@@ -73,7 +73,6 @@ pub struct CategoriesConfig {
     pub order: BTreeMap<String, i64>,
     pub default_category: Option<String>,
     pub rules: Vec<CategoryRule>,
-    pub session_name_rules: Vec<SessionNameRule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -81,13 +80,6 @@ pub struct CategoriesConfig {
 pub struct CategoryRule {
     pub category: String,
     pub path_patterns: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SessionNameRule {
-    pub category: String,
-    pub patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -1048,10 +1040,6 @@ categories:
       path_patterns:
         - github.com/example/project-a
         - github.com/${WORK_GHQ_OWNER}/*
-  session_name_rules:
-    - category: private
-      patterns:
-        - dotfiles
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.categories.display_names["private"], "P");
@@ -1065,10 +1053,16 @@ categories:
             config.categories.rules[0].path_patterns[1],
             "github.com/${WORK_GHQ_OWNER}/*"
         );
-        assert_eq!(
-            config.categories.session_name_rules[0].patterns,
-            vec!["dotfiles"]
-        );
+    }
+
+    #[test]
+    fn categories_reject_removed_session_name_rules() {
+        let error = serde_yaml_ng::from_str::<Config>(
+            "categories:\n  session_name_rules:\n    - category: private\n      patterns: [dotfiles]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("session_name_rules"), "{error}");
     }
 
     #[test]

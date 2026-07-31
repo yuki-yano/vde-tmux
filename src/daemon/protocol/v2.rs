@@ -698,6 +698,9 @@ pub enum SidebarCommand {
     PreferenceIntent {
         intent: crate::sidebar::state::SidebarPreferenceIntent,
     },
+    CategoryIntent {
+        intent: crate::category::CategoryIntent,
+    },
     SetNavigation {
         selection: Option<String>,
         scroll: usize,

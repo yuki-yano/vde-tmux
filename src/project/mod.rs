@@ -5,11 +5,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::category::resolve_category_for_session;
 use crate::config::{Config, PopupConfig};
 use crate::options::{KEY_CATEGORY, KEY_PROJECT_PATH, set_session_option};
 use crate::session::{
-    SessionInfo, current_client_name, find_session, list_sessions, remember_session_for_client,
+    current_client_name, find_session, list_sessions, remember_session_for_client,
     switch_client_for_client,
 };
 use crate::tmux::TmuxRunner;
@@ -147,28 +146,40 @@ pub fn run_project_selector(
     env: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     let mut io = SystemProjectSelectorIo;
-    run_project_selector_with_io(runner, config, env.get("HOME").map(String::as_str), &mut io)
+    run_project_selector_with_io(runner, config, env, &mut io)
 }
 
 pub fn run_project_selector_with_io(
     runner: &dyn TmuxRunner,
     config: &Config,
-    home: Option<&str>,
+    env: &std::collections::BTreeMap<String, String>,
     io: &mut dyn ProjectSelectorIo,
 ) -> Result<()> {
+    let home = env.get("HOME").map(String::as_str);
+    let Some(path) = select_project(home, io)? else {
+        return Ok(());
+    };
+    switch_project(runner, config, env, &path)
+}
+
+fn select_project(home: Option<&str>, io: &mut dyn ProjectSelectorIo) -> Result<Option<String>> {
     let projects = io.list_projects()?;
     let choices = projects
         .iter()
         .map(|project| display_project_path(project, home))
         .collect::<Vec<_>>();
     let Some(selection) = io.choose_project(&choices)? else {
-        return Ok(());
+        return Ok(None);
     };
-    let path = restore_project_selection(&selection, home);
-    switch_project(runner, config, &path)
+    Ok(Some(restore_project_selection(&selection, home)))
 }
 
-pub fn switch_project(runner: &dyn TmuxRunner, config: &Config, path: &str) -> Result<()> {
+pub fn switch_project(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    env: &std::collections::BTreeMap<String, String>,
+    path: &str,
+) -> Result<()> {
     if path.trim().is_empty() {
         bail!("project path is empty");
     }
@@ -178,10 +189,58 @@ pub fn switch_project(runner: &dyn TmuxRunner, config: &Config, path: &str) -> R
     }
     let session_name = session_name_for_path(path);
     let sessions = list_sessions(runner)?;
-    let (category, created_window) = if let Some(session) = find_session(&sessions, &session_name) {
-        let category = resolve_category_for_session(config, session);
+    let (_, category) =
+        crate::category::resolve_project_category_from_server(runner, config, env, path)?;
+    switch_project_with_category(
+        runner,
+        config,
+        path,
+        &client,
+        &session_name,
+        &sessions,
+        category.as_str(),
+    )
+}
+
+#[cfg(test)]
+fn switch_project_resolved(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    path: &str,
+    category: &str,
+) -> Result<()> {
+    if path.trim().is_empty() {
+        bail!("project path is empty");
+    }
+    let client = current_client_name(runner)?;
+    if client.trim().is_empty() {
+        bail!("no tmux client available for project switch");
+    }
+    let session_name = session_name_for_path(path);
+    let sessions = list_sessions(runner)?;
+    switch_project_with_category(
+        runner,
+        config,
+        path,
+        &client,
+        &session_name,
+        &sessions,
+        category,
+    )
+}
+
+fn switch_project_with_category(
+    runner: &dyn TmuxRunner,
+    config: &Config,
+    path: &str,
+    client: &str,
+    session_name: &str,
+    sessions: &[crate::session::SessionInfo],
+    category: &str,
+) -> Result<()> {
+    let (category, created_window) = if find_session(sessions, session_name).is_some() {
         set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
-        (category, None)
+        (category.to_string(), None)
     } else {
         let created_window = runner
             .run(&[
@@ -198,14 +257,8 @@ pub fn switch_project(runner: &dyn TmuxRunner, config: &Config, path: &str) -> R
             .trim()
             .to_string();
         set_session_option(runner, &session_name, KEY_PROJECT_PATH, path)?;
-        let session = SessionInfo {
-            name: session_name.clone(),
-            project_path: path.to_string(),
-            ..SessionInfo::default()
-        };
-        let category = resolve_category_for_session(config, &session);
         set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
-        (category, Some(created_window))
+        (category.to_string(), Some(created_window))
     };
     switch_client_for_client(runner, &client, &session_name)?;
     if let Some(window) = created_window
@@ -372,9 +425,10 @@ mod tests {
             "",
         );
 
-        run_project_selector_with_io(&mock, &config, Some("/Users/me"), &mut selector).unwrap();
+        let selected = select_project(Some("/Users/me"), &mut selector).unwrap();
 
         assert_eq!(selector.seen_choices, vec!["~/repos/ni.zsh"]);
+        assert_eq!(selected.as_deref(), Some("/Users/me/repos/ni.zsh"));
     }
 
     #[test]
@@ -436,7 +490,7 @@ mod tests {
             ],
             "",
         );
-        switch_project(&mock, &config, "/tmp/repo").unwrap();
+        switch_project_resolved(&mock, &config, "/tmp/repo", "public").unwrap();
         assert_eq!(mock.calls().len(), 8);
     }
 
@@ -473,7 +527,7 @@ mod tests {
             "",
         );
 
-        switch_project(&mock, &config, "/tmp/repo").unwrap();
+        switch_project_resolved(&mock, &config, "/tmp/repo", "work").unwrap();
 
         assert!(mock.calls().iter().all(|call| {
             !matches!(
@@ -580,7 +634,7 @@ mod tests {
             "",
         );
 
-        switch_project(&mock, &config, "/tmp/repo").unwrap();
+        switch_project_resolved(&mock, &config, "/tmp/repo", "public").unwrap();
 
         assert!(mock.calls().iter().any(|call| {
             call.first().map(String::as_str) == Some("split-window")
@@ -611,9 +665,14 @@ mod tests {
         );
         mock.stub(&["list-clients", "-F", "#{client_name}\t#{client_tty}"], "");
 
-        let err = switch_project(&mock, &crate::config::Config::default(), "/tmp/repo")
-            .unwrap_err()
-            .to_string();
+        let err = switch_project_resolved(
+            &mock,
+            &crate::config::Config::default(),
+            "/tmp/repo",
+            crate::category::UNCATEGORIZED,
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("no tmux client"), "{err}");
         assert_eq!(mock.calls().len(), 2);
@@ -682,6 +741,6 @@ mod tests {
             "",
         );
 
-        switch_project(&mock, &config, "/tmp/ni.zsh").unwrap();
+        switch_project_resolved(&mock, &config, "/tmp/ni.zsh", "public").unwrap();
     }
 }

@@ -12,6 +12,7 @@ use crate::config::load::load_config;
 use crate::session::Direction;
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
+mod category;
 mod daemon;
 mod hook;
 mod pane_switch;
@@ -207,6 +208,30 @@ enum CategoryCommand {
         name: String,
         #[command(flatten)]
         scope: ClientActionScope,
+    },
+    List,
+    Create {
+        name: String,
+    },
+    Rename {
+        name: String,
+        replacement: String,
+    },
+    Delete {
+        name: String,
+        #[arg(long = "move-to")]
+        move_to: Option<String>,
+        #[arg(long)]
+        automatic: bool,
+    },
+    Assign {
+        category: String,
+        #[arg(long)]
+        repo: String,
+    },
+    Automatic {
+        #[arg(long)]
+        repo: String,
     },
 }
 
@@ -557,6 +582,7 @@ where
                 crate::statusline::switch_statusline_category(
                     runner,
                     &config,
+                    env,
                     &context.client_name,
                     &context.session_id,
                     cli_index(index)?,
@@ -683,6 +709,7 @@ where
             crate::statusline::handle_statusline_click(
                 runner,
                 guarded_config.as_ref().unwrap_or(&config),
+                env,
                 context.as_ref().map(|context| context.client_name.as_str()),
                 range.as_deref(),
             )?;
@@ -732,14 +759,14 @@ where
                     let result = daemon::restart_daemon(runner, env, None)?;
                     let config =
                         crate::config::load::load_config_strict(env).map_err(anyhow::Error::msg)?;
-                    crate::session::sync_session_category_mirrors(runner, &config)?;
+                    crate::session::sync_session_category_mirrors(runner, &config, env)?;
                     Ok(result)
                 }
                 Some(DaemonCommand::Reload) => {
                     let result = daemon::reload_daemon(runner, env, None)?;
                     let config =
                         crate::config::load::load_config_strict(env).map_err(anyhow::Error::msg)?;
-                    crate::session::sync_session_category_mirrors(runner, &config)?;
+                    crate::session::sync_session_category_mirrors(runner, &config, env)?;
                     Ok(result)
                 }
                 Some(DaemonCommand::Status) => daemon::status_daemon(runner, env, None),
@@ -782,6 +809,7 @@ where
                     crate::statusline::cycle_statusline_category(
                         runner,
                         &config,
+                        env,
                         &context.client_name,
                         &context.session_id,
                         Direction::Next,
@@ -798,6 +826,7 @@ where
                     crate::statusline::cycle_statusline_category(
                         runner,
                         &config,
+                        env,
                         &context.client_name,
                         &context.session_id,
                         Direction::Previous,
@@ -814,8 +843,68 @@ where
                     crate::session::use_category_for_client(
                         runner,
                         &config,
+                        env,
                         &name,
                         &context.client_name,
+                    )?;
+                }
+                CategoryCommand::List => {
+                    let config = require_active_config(runner, env)?;
+                    return category::list(runner, env, &config).map(Some);
+                }
+                CategoryCommand::Create { name } => {
+                    category::send_intent(
+                        runner,
+                        env,
+                        crate::category::CategoryIntent::CreateCategory {
+                            name: category::parse_dynamic_category(&name)?,
+                        },
+                    )?;
+                }
+                CategoryCommand::Rename { name, replacement } => {
+                    category::send_intent(
+                        runner,
+                        env,
+                        crate::category::CategoryIntent::RenameCategory {
+                            current: category::parse_dynamic_category(&name)?,
+                            replacement: category::parse_dynamic_category(&replacement)?,
+                        },
+                    )?;
+                }
+                CategoryCommand::Delete {
+                    name,
+                    move_to,
+                    automatic,
+                } => {
+                    category::send_intent(
+                        runner,
+                        env,
+                        crate::category::CategoryIntent::DeleteCategory {
+                            category: category::parse_dynamic_category(&name)?,
+                            replacement: category::delete_target(move_to.as_deref(), automatic)?,
+                        },
+                    )?;
+                }
+                CategoryCommand::Assign {
+                    category: target,
+                    repo,
+                } => {
+                    let repo = category::repo_identity(&repo)?;
+                    category::send_intent(
+                        runner,
+                        env,
+                        crate::category::CategoryIntent::AssignRepo {
+                            repo: repo.key,
+                            category: category::parse_category(&target)?,
+                        },
+                    )?;
+                }
+                CategoryCommand::Automatic { repo } => {
+                    let repo = category::repo_identity(&repo)?;
+                    category::send_intent(
+                        runner,
+                        env,
+                        crate::category::CategoryIntent::SetRepoAutomatic { repo: repo.key },
                     )?;
                 }
             }
@@ -897,6 +986,7 @@ where
                     crate::session::on_client_session_changed(
                         runner,
                         &config,
+                        env,
                         client_pid,
                         session_name.as_deref(),
                     )?;
@@ -935,7 +1025,7 @@ where
             match command {
                 ProjectCommand::Switch { path } => {
                     let config = require_active_config(runner, env)?;
-                    crate::project::switch_project(runner, &config, &path)?;
+                    crate::project::switch_project(runner, &config, env, &path)?;
                 }
                 ProjectCommand::Selector { popup } => {
                     if popup {

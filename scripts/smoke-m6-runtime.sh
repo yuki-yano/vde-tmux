@@ -270,6 +270,12 @@ tmux -L "$TMUX_SOCKET" link-window -s main:work -t aux:
 tmux -L "$TMUX_SOCKET" rename-window -t aux:work linked
 tmux -L "$TMUX_SOCKET" set-option -t main @vde_category smoke
 tmux -L "$TMUX_SOCKET" set-option -t aux @vde_category smoke
+CATEGORY_REPO_ROOT="$RUNTIME_DIR/category-repos"
+mkdir -p "$CATEGORY_REPO_ROOT/main" "$CATEGORY_REPO_ROOT/aux" \
+  "$CATEGORY_REPO_ROOT/category-fast" "$CATEGORY_REPO_ROOT/late"
+CATEGORY_REPO_ROOT="$(cd "$CATEGORY_REPO_ROOT" && pwd -P)"
+tmux -L "$TMUX_SOCKET" set-option -t main @vde_project_path "$CATEGORY_REPO_ROOT/main"
+tmux -L "$TMUX_SOCKET" set-option -t aux @vde_project_path "$CATEGORY_REPO_ROOT/aux"
 tmux -L "$TMUX_SOCKET" bind-key -T prefix A select-pane -t "$AGENT_PANE"
 tmux -L "$TMUX_SOCKET" bind-key -T prefix O select-pane -t "$OTHER_PANE"
 MAIN_SESSION_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t main '#{session_id}')"
@@ -1025,17 +1031,18 @@ if ! tmux -L "$TMUX_SOCKET" new-session -d -s category-fast -n work "sleep 600";
   echo "category-fast session creation failed" >&2
   exit 1
 fi
+tmux -L "$TMUX_SOCKET" set-option -t category-fast @vde_project_path "$CATEGORY_REPO_ROOT/category-fast"
 CATEGORY_FAST_SESSION_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t category-fast '#{session_id}')"
-cat >"$CONFIG_HOME/vde/tmux/config.yml" <<'YAML'
+cat >"$CONFIG_HOME/vde/tmux/config.yml" <<YAML
 categories:
   default_category: smoke
-  session_name_rules:
+  rules:
     - category: category-a
-      patterns: [main]
+      path_patterns: ["$CATEGORY_REPO_ROOT/main"]
     - category: category-b
-      patterns: [aux]
+      path_patterns: ["$CATEGORY_REPO_ROOT/aux"]
     - category: category-c
-      patterns: [category-fast, late]
+      path_patterns: ["$CATEGORY_REPO_ROOT/category-fast", "$CATEGORY_REPO_ROOT/late"]
 daemon:
   done_clear_on: pane
 YAML
@@ -1166,17 +1173,18 @@ if ! tmux -L "$TMUX_SOCKET" new-session -d -s late -n source "sleep 600"; then
   echo "late session creation failed" >&2
   exit 1
 fi
+tmux -L "$TMUX_SOCKET" set-option -t late @vde_project_path "$CATEGORY_REPO_ROOT/late"
 LATE_PANE="$(tmux -L "$TMUX_SOCKET" display-message -p -t late:source '#{pane_id}')"
-cat >"$CONFIG_HOME/vde/tmux/config.yml" <<'YAML'
+cat >"$CONFIG_HOME/vde/tmux/config.yml" <<YAML
 categories:
   default_category: smoke
-  session_name_rules:
+  rules:
     - category: category-a
-      patterns: [main]
+      path_patterns: ["$CATEGORY_REPO_ROOT/main"]
     - category: category-b
-      patterns: [aux]
+      path_patterns: ["$CATEGORY_REPO_ROOT/aux"]
     - category: category-c
-      patterns: [category-fast, late]
+      path_patterns: ["$CATEGORY_REPO_ROOT/category-fast", "$CATEGORY_REPO_ROOT/late"]
 daemon:
   done_clear_on: window
   poll_ms: 60000
