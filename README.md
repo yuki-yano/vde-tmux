@@ -202,6 +202,7 @@ a later completion-time visibility check acknowledges it.
 ## Sidebar
 
 The sidebar opens in the current tmux window and groups agents by category by default.
+Flat and ByRepo show only the currently active category.
 
 ```bash
 vt sidebar open --width 40
@@ -233,7 +234,7 @@ vt sidebar close
 Agents belonging to the active session have a `▎` marker on the left.
 Click any rendered line of an agent once to jump to its pane; the agent does not
 need to be selected first. Use `Space` to expand or collapse the selected agent.
-The mouse wheel scrolls the viewport by three rendered lines per event.
+The mouse wheel scrolls overflow without moving the selected cursor.
 An agent with no activity yet uses a single line while collapsed.
 View mode, filter, manual order, and expansion state are persisted and shared across sidebars.
 Selection and scrolling are synchronized across all open sidebars on the same tmux server.

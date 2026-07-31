@@ -30,6 +30,7 @@ pub struct SidebarModel {
     pub preferences: SidebarPreferences,
     pub navigation: SidebarNavigation,
     pub active_sessions: BTreeSet<String>,
+    pub active_categories: BTreeSet<String>,
     #[serde(default)]
     pub category_state: crate::category::CategoryState,
     #[serde(default)]

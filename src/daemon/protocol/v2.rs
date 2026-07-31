@@ -704,6 +704,7 @@ pub enum SidebarCommand {
     SetNavigation {
         selection: Option<String>,
         scroll: usize,
+        manual_scroll: bool,
     },
 }
 
@@ -1117,6 +1118,7 @@ mod tests {
                 command: SidebarCommand::SetNavigation {
                     selection: Some("chat::%1::10".to_string()),
                     scroll: 6,
+                    manual_scroll: true,
                 },
             },
             ClientMessage::SidebarCommand {

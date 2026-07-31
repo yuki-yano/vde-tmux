@@ -730,6 +730,8 @@ mod local_state_tests {
         };
         snapshot.sidebar_model.active_sessions =
             std::collections::BTreeSet::from(["$2".to_string()]);
+        snapshot.sidebar_model.active_categories =
+            std::collections::BTreeSet::from([crate::category::UNCATEGORIZED.to_string()]);
         let state = SidebarState {
             view_mode: ViewMode::Flat,
             ..SidebarState::default()
@@ -862,6 +864,7 @@ mod local_state_tests {
             revision: 1,
             selection: Some("chat::%1::10".to_string()),
             scroll: 7,
+            manual_scroll: true,
         };
         let mut first = SidebarState::default();
         let mut second = SidebarState::default();
@@ -885,6 +888,8 @@ mod local_state_tests {
         assert_eq!(first.selection, second.selection);
         assert_eq!(first.scroll, 7);
         assert_eq!(second.scroll, 7);
+        assert!(first.manual_scroll);
+        assert!(second.manual_scroll);
         assert!(!apply_remote_navigation(
             &snapshot,
             &mut second,
@@ -894,7 +899,7 @@ mod local_state_tests {
     }
 
     #[test]
-    fn vim_viewport_moves_select_ends_and_scroll_by_page_size() {
+    fn mouse_scroll_keeps_cursor_while_vim_moves_follow_selection() {
         let rows = (0..8)
             .map(|index| SidebarRow {
                 id: format!("chat::%{}::{}", index + 1, index + 101),
@@ -922,7 +927,7 @@ mod local_state_tests {
         };
         let theme = SidebarRenderTheme::default();
         let rendered = render_lines_with_indices(&sidebar.rows, &sidebar.state, 60, &theme);
-        let frame = DrawnFrame {
+        let mut frame = DrawnFrame {
             header: build_header_layout_with_counts(&sidebar.state, 60, &theme, sidebar.counts),
             header_rows: 2,
             rows_height: 4,
@@ -931,31 +936,19 @@ mod local_state_tests {
             row_indices: rendered.row_indices.clone(),
         };
 
-        move_projected_viewport(
-            &sidebar,
-            &rendered,
-            &mut state,
-            &frame,
-            ViewportMove::WheelDown,
-        );
+        let original_selection = state.selection.clone();
+        scroll_mouse_viewport(&mut state, &frame, true);
         assert_eq!(state.scroll, 3);
-        assert_ne!(
-            state.selection.as_deref(),
-            Some(sidebar.rows[0].id.as_str())
-        );
+        assert_eq!(state.selection, original_selection);
+        assert!(state.manual_scroll);
 
-        move_projected_viewport(
-            &sidebar,
-            &rendered,
-            &mut state,
-            &frame,
-            ViewportMove::WheelUp,
-        );
+        frame.scroll = state.scroll;
+        scroll_mouse_viewport(&mut state, &frame, false);
         assert_eq!(state.scroll, 0);
-        assert_eq!(
-            state.selection.as_deref(),
-            Some(sidebar.rows[0].id.as_str())
-        );
+        assert_eq!(state.selection, original_selection);
+        assert!(state.manual_scroll);
+
+        frame.scroll = 0;
 
         move_projected_viewport(
             &sidebar,
@@ -969,6 +962,7 @@ mod local_state_tests {
             state.selection.as_deref(),
             Some(sidebar.rows[0].id.as_str())
         );
+        assert!(!state.manual_scroll);
 
         move_projected_viewport(&sidebar, &rendered, &mut state, &frame, ViewportMove::First);
         assert_eq!(
@@ -989,6 +983,14 @@ mod local_state_tests {
                 .len()
                 .saturating_sub(frame.rows_height as usize)
         );
+
+        state.scroll = 0;
+        state.manual_scroll = false;
+        let before = state.clone();
+        frame.scroll = 0;
+        frame.rows_height = rendered.lines.len() as u16;
+        scroll_mouse_viewport(&mut state, &frame, true);
+        assert_eq!(state, before, "wheel is a no-op without overflow");
     }
 
     #[test]
@@ -1368,6 +1370,7 @@ struct CategoryIntentResult {
 struct NavigationRequest {
     selection: Option<String>,
     scroll: usize,
+    manual_scroll: bool,
 }
 
 struct NavigationResult {
@@ -1854,6 +1857,7 @@ fn spawn_navigation_worker(
                 &server_identity,
                 request.selection.clone(),
                 request.scroll,
+                request.manual_scroll,
             );
             let failed = result.is_err();
             if tx.send(NavigationResult { request, result }).is_err() {
@@ -2138,7 +2142,7 @@ fn run_loop<B: Backend>(
     let mut last_expansion_view: Option<BTreeSet<String>> = None;
     let mut last_remote_expansion: Option<BTreeSet<String>> = None;
     let mut last_remote_navigation_revision = 0;
-    let mut last_queued_navigation: Option<(Option<String>, usize)> = None;
+    let mut last_queued_navigation: Option<NavigationRequest> = None;
     let (mark_request_tx, mark_request_rx) = mpsc::channel();
     let (mark_result_tx, mark_result_rx) = mpsc::channel();
     spawn_mark_complete_worker(
@@ -2214,7 +2218,12 @@ fn run_loop<B: Backend>(
             if navigation.revision > 0 {
                 sidebar_state.selection = navigation.selection.clone();
                 sidebar_state.scroll = navigation.scroll;
-                last_queued_navigation = Some((navigation.selection.clone(), navigation.scroll));
+                sidebar_state.manual_scroll = navigation.manual_scroll;
+                last_queued_navigation = Some(NavigationRequest {
+                    selection: navigation.selection.clone(),
+                    scroll: navigation.scroll,
+                    manual_scroll: navigation.manual_scroll,
+                });
             }
             initial_context_seeded = true;
         }
@@ -2257,9 +2266,7 @@ fn run_loop<B: Backend>(
         }
         while let Ok(result) = navigation_result_rx.try_recv() {
             if let Err(error) = result.result {
-                if last_queued_navigation
-                    == Some((result.request.selection.clone(), result.request.scroll))
-                {
+                if last_queued_navigation.as_ref() == Some(&result.request) {
                     last_queued_navigation = None;
                 }
                 mark_ui.set_toast(
@@ -2342,17 +2349,15 @@ fn run_loop<B: Backend>(
             }
             last_queued_preferences = Some(preferences);
         }
-        let navigation = (sidebar_state.selection.clone(), sidebar_state.scroll);
+        let navigation = NavigationRequest {
+            selection: sidebar_state.selection.clone(),
+            scroll: sidebar_state.scroll,
+            manual_scroll: sidebar_state.manual_scroll,
+        };
         if matches!(connection, ConnectionState::Connected)
             && last_queued_navigation.as_ref() != Some(&navigation)
         {
-            if navigation_tx
-                .send(NavigationRequest {
-                    selection: navigation.0.clone(),
-                    scroll: navigation.1,
-                })
-                .is_err()
-            {
+            if navigation_tx.send(navigation.clone()).is_err() {
                 mark_ui.set_toast(
                     "navigation worker unavailable".to_string(),
                     NoticeLevel::Failure,
@@ -2423,12 +2428,20 @@ fn run_loop<B: Backend>(
                     });
                 let selection_range = selected_row_index
                     .and_then(|row_index| rendered_row_range(&rendered.row_indices, row_index));
-                let frame_scroll = resolve_scroll_range(
-                    sidebar_state.scroll,
-                    selection_range,
-                    rendered.lines.len(),
-                    areas.rows_height as usize,
-                );
+                let frame_scroll = if sidebar_state.manual_scroll {
+                    clamp_scroll_range(
+                        sidebar_state.scroll,
+                        rendered.lines.len(),
+                        areas.rows_height as usize,
+                    )
+                } else {
+                    resolve_scroll_range(
+                        sidebar_state.scroll,
+                        selection_range,
+                        rendered.lines.len(),
+                        areas.rows_height as usize,
+                    )
+                };
                 last_frame = Some(DrawnFrame {
                     header,
                     header_rows: areas.header_rows,
@@ -2653,19 +2666,11 @@ fn run_loop<B: Backend>(
                     ) =>
                 {
                     pending_g = false;
-                    if let (Some(snapshot), Some(frame)) = (&current, last_frame.as_ref()) {
-                        let movement = if mouse.kind == MouseEventKind::ScrollDown {
-                            ViewportMove::WheelDown
-                        } else {
-                            ViewportMove::WheelUp
-                        };
-                        move_viewport_selection(
-                            snapshot,
-                            config.app,
+                    if let Some(frame) = last_frame.as_ref() {
+                        scroll_mouse_viewport(
                             &mut sidebar_state,
-                            Some(frame),
-                            movement,
-                            theme,
+                            frame,
+                            mouse.kind == MouseEventKind::ScrollDown,
                         );
                     }
                 }
@@ -2694,6 +2699,7 @@ fn clear_stale_pane_selection(snapshot: &ResolvedSnapshot, state: &mut SidebarSt
         .any(|pane| pane.pane_instance == selected)
     {
         state.selection = None;
+        state.manual_scroll = false;
         state.version = state.version.saturating_add(1);
         return true;
     }
@@ -2704,20 +2710,27 @@ fn apply_remote_navigation(
     snapshot: &ResolvedSnapshot,
     state: &mut SidebarState,
     last_revision: &mut u64,
-    last_queued: &mut Option<(Option<String>, usize)>,
+    last_queued: &mut Option<NavigationRequest>,
 ) -> bool {
     let navigation = &snapshot.sidebar_model.navigation;
     if navigation.revision <= *last_revision {
         return false;
     }
-    let changed = state.selection != navigation.selection || state.scroll != navigation.scroll;
+    let changed = state.selection != navigation.selection
+        || state.scroll != navigation.scroll
+        || state.manual_scroll != navigation.manual_scroll;
     state.selection = navigation.selection.clone();
     state.scroll = navigation.scroll;
+    state.manual_scroll = navigation.manual_scroll;
     if changed {
         state.version = state.version.saturating_add(1);
     }
     *last_revision = navigation.revision;
-    *last_queued = Some((navigation.selection.clone(), navigation.scroll));
+    *last_queued = Some(NavigationRequest {
+        selection: navigation.selection.clone(),
+        scroll: navigation.scroll,
+        manual_scroll: navigation.manual_scroll,
+    });
     changed
 }
 
@@ -2804,6 +2817,7 @@ fn select_context_agent(
         return false;
     }
     state.selection = selection;
+    state.manual_scroll = false;
     state.version = state.version.saturating_add(1);
     true
 }
@@ -2817,10 +2831,14 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
     let refs = row_refs(&sidebar.rows);
     match action {
         SidebarInputAction::MoveNext => {
-            state.apply(SidebarAction::MoveNext, &refs);
+            if state.apply(SidebarAction::MoveNext, &refs) {
+                state.manual_scroll = false;
+            }
         }
         SidebarInputAction::MovePrevious => {
-            state.apply(SidebarAction::MovePrevious, &refs);
+            if state.apply(SidebarAction::MovePrevious, &refs) {
+                state.manual_scroll = false;
+            }
         }
         SidebarInputAction::ToggleExpand => {
             state.apply(SidebarAction::ToggleExpand, &refs);
@@ -2857,6 +2875,7 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
                 .map(|pane| chat_row_id(&pane))
                 .unwrap_or(row_id);
             state.selection = Some(row_id.clone());
+            state.manual_scroll = false;
             state.toggle_expanded(&row_id);
         }
         SidebarInputAction::FocusNextAttention | SidebarInputAction::FocusPreviousAttention => {
@@ -2884,6 +2903,7 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
             };
             if state.selection.as_deref() != Some(ids[index]) {
                 state.selection = Some(ids[index].to_string());
+                state.manual_scroll = false;
                 state.version = state.version.saturating_add(1);
             }
         }
@@ -2903,8 +2923,6 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
 enum ViewportMove {
     First,
     Last,
-    WheelDown,
-    WheelUp,
     HalfPageDown,
     HalfPageUp,
     PageDown,
@@ -2948,7 +2966,6 @@ fn move_projected_viewport(
         .map(|range| range.0)
         .unwrap_or(state.scroll.min(rendered.lines.len() - 1));
     let amount = match movement {
-        ViewportMove::WheelDown | ViewportMove::WheelUp => 3,
         ViewportMove::HalfPageDown | ViewportMove::HalfPageUp => (viewport / 2).max(1),
         ViewportMove::PageDown | ViewportMove::PageUp => viewport,
         ViewportMove::First | ViewportMove::Last => 0,
@@ -2956,14 +2973,14 @@ fn move_projected_viewport(
     let (target_line, target_scroll, forward) = match movement {
         ViewportMove::First => (0, 0, true),
         ViewportMove::Last => (rendered.lines.len() - 1, max_scroll, false),
-        ViewportMove::WheelDown | ViewportMove::HalfPageDown | ViewportMove::PageDown => (
+        ViewportMove::HalfPageDown | ViewportMove::PageDown => (
             current_line
                 .saturating_add(amount)
                 .min(rendered.lines.len() - 1),
             state.scroll.saturating_add(amount).min(max_scroll),
             true,
         ),
-        ViewportMove::WheelUp | ViewportMove::HalfPageUp | ViewportMove::PageUp => (
+        ViewportMove::HalfPageUp | ViewportMove::PageUp => (
             current_line.saturating_sub(amount),
             state.scroll.saturating_sub(amount),
             false,
@@ -2973,6 +2990,7 @@ fn move_projected_viewport(
     if state.selection != selection || state.scroll != target_scroll {
         state.selection = selection;
         state.scroll = target_scroll;
+        state.manual_scroll = false;
         state.version = state.version.saturating_add(1);
     }
 }
@@ -3039,6 +3057,7 @@ fn activate_local_selection(
                 dispatch_click_action(context, mark_ui, ClickAction::JumpPane(pane_instance));
             } else {
                 state.selection = None;
+                state.manual_scroll = false;
                 mark_ui.set_toast(
                     "selected pane is stale".to_string(),
                     NoticeLevel::Warning,
@@ -3048,6 +3067,7 @@ fn activate_local_selection(
         }
         Some(crate::sidebar::input::SidebarCommand::ToggleExpand(row_id)) => {
             state.selection = Some(row_id.clone());
+            state.manual_scroll = false;
             state.toggle_expanded(&row_id);
         }
         None => {}
@@ -3636,8 +3656,8 @@ pub(crate) fn resolve_scroll_range(
     if viewport == 0 || rows_len <= viewport {
         return 0;
     }
-    let max_scroll = rows_len - viewport;
-    let mut scroll = prev.min(max_scroll);
+    let mut scroll = clamp_scroll_range(prev, rows_len, viewport);
+    let max_scroll = rows_len.saturating_sub(viewport);
     if let Some((start, end)) = selection_range {
         if start < scroll {
             scroll = start;
@@ -3646,6 +3666,31 @@ pub(crate) fn resolve_scroll_range(
         }
     }
     scroll.min(max_scroll)
+}
+
+fn clamp_scroll_range(prev: usize, rows_len: usize, viewport: usize) -> usize {
+    if viewport == 0 || rows_len <= viewport {
+        0
+    } else {
+        prev.min(rows_len - viewport)
+    }
+}
+
+fn scroll_mouse_viewport(state: &mut SidebarState, frame: &DrawnFrame, down: bool) {
+    let viewport = usize::from(frame.rows_height);
+    let max_scroll = frame.row_indices.len().saturating_sub(viewport);
+    let current = frame.scroll.min(max_scroll);
+    let target = if down {
+        current.saturating_add(3).min(max_scroll)
+    } else {
+        current.saturating_sub(3)
+    };
+    if target == current {
+        return;
+    }
+    state.scroll = target;
+    state.manual_scroll = true;
+    state.version = state.version.saturating_add(1);
 }
 
 fn rendered_row_range(row_indices: &[Option<usize>], row_index: usize) -> Option<(usize, usize)> {
@@ -3716,6 +3761,7 @@ fn handle_left_click(
             let chat_id = chat_row_id(&pane_instance);
             if state.selection.as_deref() != Some(chat_id.as_str()) {
                 state.selection = Some(chat_id);
+                state.manual_scroll = false;
                 state.version = state.version.saturating_add(1);
             }
             dispatch_click_action(context, mark_ui, ClickAction::JumpPane(pane_instance));

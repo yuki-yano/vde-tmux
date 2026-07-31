@@ -386,6 +386,7 @@ printf '%s\n' "$TMUX_PATH" >"$ARTIFACT_DIR/tmux-socket-path.txt"
 # `daemon ensure` runs from an existing session.
 for session in A a a10 a2 漢; do
   tmux_cmd new-session -d -s "$session" -n own -c "$ROOT" "sleep 900"
+  tmux_cmd set-option -t "$session" @vde_project_path "$ROOT"
   tmux_cmd set-option -t "$session" @vde_category preflight
 done
 A_PANE="$(tmux_cmd display-message -p -t A:own '#{pane_id}')"

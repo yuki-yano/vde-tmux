@@ -87,11 +87,16 @@ pub fn send_sidebar_navigation_v2(
     server_identity: &str,
     selection: Option<String>,
     scroll: usize,
+    manual_scroll: bool,
 ) -> Result<()> {
     request_v2_sidebar(
         socket,
         server_identity,
-        V2SidebarCommand::SetNavigation { selection, scroll },
+        V2SidebarCommand::SetNavigation {
+            selection,
+            scroll,
+            manual_scroll,
+        },
         V2SidebarResponse::SnapshotAck,
     )?;
     Ok(())

@@ -51,6 +51,7 @@ pub struct SidebarState {
     pub selection: Option<String>,
     pub collapsed: BTreeSet<String>,
     pub scroll: usize,
+    pub manual_scroll: bool,
     pub return_target: Option<crate::pane_state::PaneInstance>,
 }
 
@@ -60,6 +61,7 @@ pub struct SidebarNavigation {
     pub revision: u64,
     pub selection: Option<String>,
     pub scroll: usize,
+    pub manual_scroll: bool,
 }
 
 pub const SIDEBAR_PREFERENCES_SCHEMA_VERSION: u32 = 1;

@@ -2585,9 +2585,18 @@ fn apply_production_mutation(
             crate::daemon::protocol::v2::SidebarCommand::CategoryIntent { intent } => {
                 apply_category_intent(coordinator, accepted_seq, event_id, intent)
             }
-            crate::daemon::protocol::v2::SidebarCommand::SetNavigation { selection, scroll } => {
-                apply_sidebar_navigation(coordinator, accepted_seq, event_id, selection, scroll)
-            }
+            crate::daemon::protocol::v2::SidebarCommand::SetNavigation {
+                selection,
+                scroll,
+                manual_scroll,
+            } => apply_sidebar_navigation(
+                coordinator,
+                accepted_seq,
+                event_id,
+                selection,
+                scroll,
+                manual_scroll,
+            ),
         },
         V2AcceptedMutation::External(ClientMessage::Shutdown { event_id, .. }) => {
             coordinator.begin_graceful_shutdown(accepted_seq);
@@ -2985,6 +2994,7 @@ fn apply_sidebar_navigation(
     event_id: EventId,
     selection: Option<String>,
     scroll: usize,
+    manual_scroll: bool,
 ) -> ServerMessage {
     use crate::daemon::protocol::v2::ServerMessage;
     let mut state_guard = coordinator
@@ -3001,7 +3011,7 @@ fn apply_sidebar_navigation(
             snapshot_revision: state.leased.runtime.snapshot_revision(),
         };
     }
-    if let Err(error) = state.replace_sidebar_navigation(selection, scroll) {
+    if let Err(error) = state.replace_sidebar_navigation(selection, scroll, manual_scroll) {
         return production_store_error_response(coordinator, error, Some(event_id));
     }
     ServerMessage::SnapshotAck {
@@ -5739,6 +5749,7 @@ mod tests {
             EventId::generate().unwrap(),
             selection.clone(),
             12,
+            true,
         );
         let first_revision = match first {
             ServerMessage::SnapshotAck {
@@ -5756,6 +5767,7 @@ mod tests {
         assert_eq!(snapshot.sidebar_model.navigation.revision, 1);
         assert_eq!(snapshot.sidebar_model.navigation.selection, selection);
         assert_eq!(snapshot.sidebar_model.navigation.scroll, 12);
+        assert!(snapshot.sidebar_model.navigation.manual_scroll);
 
         let duplicate = apply_sidebar_navigation(
             &coordinator,
@@ -5763,6 +5775,7 @@ mod tests {
             EventId::generate().unwrap(),
             snapshot.sidebar_model.navigation.selection.clone(),
             12,
+            true,
         );
         assert!(matches!(
             duplicate,

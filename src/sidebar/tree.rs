@@ -113,6 +113,7 @@ pub struct RowBuildContext {
     pub triage: BTreeSet<PaneInstance>,
     pub flash: BTreeSet<PaneInstance>,
     pub active_sessions: BTreeSet<String>,
+    pub active_categories: BTreeSet<String>,
     pub category_state: crate::category::CategoryState,
     pub categories: crate::category::EffectiveCategoryModel,
     pub repo_identities: BTreeMap<String, crate::category::RepoIdentity>,
@@ -138,6 +139,7 @@ pub fn project_sidebar(
         triage: model.needs_action.clone(),
         flash: model.flashing.clone(),
         active_sessions: model.active_sessions.clone(),
+        active_categories: model.active_categories.clone(),
         category_state: model.category_state.clone(),
         categories: model.categories.clone(),
         repo_identities: model.repo_identities.clone(),
@@ -277,6 +279,9 @@ fn build_rows_from_groups(
     order: &SidebarPreferences,
     ctx: &RowBuildContext,
 ) -> (Vec<SidebarRow>, BadgeCounts) {
+    if matches!(state.view_mode, ViewMode::Flat | ViewMode::ByRepo) {
+        groups.retain(|(category, _), _| ctx.active_categories.contains(category));
+    }
     for panes in groups.values_mut() {
         order_agent_panes(panes, order);
     }
@@ -1220,6 +1225,74 @@ mod tests {
         assert_eq!(alpha_chats, vec!["%2", "%1"]);
         assert_eq!(counts.total, 3);
         assert_eq!(counts.attention, 1);
+    }
+
+    #[test]
+    fn flat_and_repo_modes_show_only_active_categories() {
+        let mut work = agent_pane(BadgeState::Working, "");
+        work.pane_instance = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 1,
+        };
+        work.pane_id = "%1".to_string();
+        work.repo = "work-repo".to_string();
+        work.repo_key = crate::category::RepoKey::path("/work-repo");
+        work.category = "work".to_string();
+
+        let mut private = agent_pane(BadgeState::Idle, "");
+        private.pane_instance = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 2,
+        };
+        private.pane_id = "%2".to_string();
+        private.repo = "private-repo".to_string();
+        private.repo_key = crate::category::RepoKey::path("/private-repo");
+        private.category = "private".to_string();
+
+        let groups = BTreeMap::from([
+            (
+                ("work".to_string(), work.repo_key.to_string()),
+                vec![work.clone()],
+            ),
+            (
+                ("private".to_string(), private.repo_key.to_string()),
+                vec![private.clone()],
+            ),
+        ]);
+        let context = RowBuildContext {
+            active_categories: BTreeSet::from(["work".to_string()]),
+            ..RowBuildContext::default()
+        };
+
+        for view_mode in [ViewMode::Flat, ViewMode::ByRepo] {
+            let state = SidebarState {
+                view_mode,
+                ..SidebarState::default()
+            };
+            let (rows, counts) = build_rows_from_groups(
+                groups.clone(),
+                &state,
+                &SidebarPreferences::default(),
+                &context,
+            );
+            assert!(rows.iter().any(|row| row.pane_id.as_deref() == Some("%1")));
+            assert!(rows.iter().all(|row| row.pane_id.as_deref() != Some("%2")));
+            assert_eq!(counts.total, 1);
+        }
+
+        let (category_rows, counts) = build_rows_from_groups(
+            groups,
+            &SidebarState::default(),
+            &SidebarPreferences::default(),
+            &context,
+        );
+        assert!(category_rows.iter().any(|row| row.id == "category::work"));
+        assert!(
+            category_rows
+                .iter()
+                .any(|row| row.id == "category::private")
+        );
+        assert_eq!(counts.total, 2);
     }
 
     #[test]

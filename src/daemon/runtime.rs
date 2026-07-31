@@ -551,6 +551,25 @@ impl CanonicalCoordinatorState {
             .into_iter()
             .rev()
             .collect();
+        let active_sessions = self
+            .views
+            .clients()
+            .values()
+            .filter(|witness| witness.is_eligible())
+            .map(|witness| witness.session_id.clone())
+            .collect::<BTreeSet<_>>();
+        let categories = self.effective_category_model();
+        let active_categories = active_sessions
+            .iter()
+            .filter_map(|session_id| self.status_metadata.sessions.get(session_id))
+            .map(|session| {
+                self.repo_identities
+                    .get(&session.project_path)
+                    .and_then(|identity| categories.placements.get(&identity.key))
+                    .map(|placement| placement.category.to_string())
+                    .unwrap_or_else(|| crate::category::UNCATEGORIZED.to_string())
+            })
+            .collect();
         ResolvedSnapshot {
             snapshot_revision,
             panes,
@@ -558,15 +577,10 @@ impl CanonicalCoordinatorState {
                 preferences: self.sidebar_preferences.clone(),
                 navigation: self.sidebar_navigation.clone(),
                 category_state: self.category_state.clone(),
-                categories: self.effective_category_model(),
+                categories,
                 repo_identities: self.repo_identities.clone(),
-                active_sessions: self
-                    .views
-                    .clients()
-                    .values()
-                    .filter(|witness| witness.is_eligible())
-                    .map(|witness| witness.session_id.clone())
-                    .collect(),
+                active_sessions,
+                active_categories,
                 git: git_badges.clone(),
                 worktrees: worktrees.clone(),
                 needs_action: runtime.triage_panes().cloned().collect(),
@@ -650,9 +664,11 @@ impl CanonicalCoordinatorState {
         &mut self,
         selection: Option<String>,
         scroll: usize,
+        manual_scroll: bool,
     ) -> Result<bool, StoreError> {
         if self.sidebar_navigation.selection == selection
             && self.sidebar_navigation.scroll == scroll
+            && self.sidebar_navigation.manual_scroll == manual_scroll
         {
             return Ok(false);
         }
@@ -662,6 +678,7 @@ impl CanonicalCoordinatorState {
         navigation.revision = navigation.revision.saturating_add(1);
         navigation.selection = selection;
         navigation.scroll = scroll;
+        navigation.manual_scroll = manual_scroll;
         let previous = std::mem::replace(&mut self.sidebar_navigation, navigation);
         let snapshot = self.resolved_snapshot_from(
             &runtime,
@@ -1782,6 +1799,28 @@ mod tests {
         use crate::pane_state::ClientWitness;
 
         let (mut state, root) = canonical_sidebar_fixture();
+        set_state_categories(
+            &mut state,
+            &[("/repo-one", "work"), ("/repo-two", "private")],
+        );
+        state.status_metadata.sessions = BTreeMap::from([
+            (
+                "$1".to_string(),
+                SessionProjectionMetadata {
+                    session_name: "one".to_string(),
+                    project_path: "/repo-one".to_string(),
+                    ..SessionProjectionMetadata::default()
+                },
+            ),
+            (
+                "$2".to_string(),
+                SessionProjectionMetadata {
+                    session_name: "two".to_string(),
+                    project_path: "/repo-two".to_string(),
+                    ..SessionProjectionMetadata::default()
+                },
+            ),
+        ]);
         let pane = state.topology.panes[0].pane_instance.clone();
         let window_id = state.topology.panes[0].window_id.clone();
         let window_panes = BTreeMap::from([(window_id.clone(), vec![pane.clone()])]);
@@ -1802,6 +1841,10 @@ mod tests {
             state.resolved_snapshot().sidebar_model.active_sessions,
             BTreeSet::from(["$1".to_string()])
         );
+        assert_eq!(
+            state.resolved_snapshot().sidebar_model.active_categories,
+            BTreeSet::from(["work".to_string()])
+        );
 
         state
             .views
@@ -1810,6 +1853,10 @@ mod tests {
         assert_eq!(
             state.resolved_snapshot().sidebar_model.active_sessions,
             BTreeSet::from(["$2".to_string()])
+        );
+        assert_eq!(
+            state.resolved_snapshot().sidebar_model.active_categories,
+            BTreeSet::from(["private".to_string()])
         );
         remove_canonical_sidebar_fixture(state, root);
     }
