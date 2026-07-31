@@ -239,7 +239,8 @@ Selection and scrolling are synchronized across all open sidebars on the same tm
 
 ## Sessions and categories
 
-Categories group tmux sessions by project path or session name:
+Categories group repositories by canonical project identity. Git worktrees that
+share a common directory are treated as one repository:
 
 ```yaml
 categories:
@@ -248,10 +249,6 @@ categories:
     - category: work
       path_patterns:
         - github.com/acme/*
-  session_name_rules:
-    - category: scratch
-      patterns:
-        - tmp-*
 ```
 
 Common commands:
@@ -260,12 +257,23 @@ Common commands:
 vt category next
 vt category prev
 vt category use work
+vt category list
+vt category create scratch
+vt category assign scratch --repo ~/src/temporary-project
+vt category automatic --repo ~/src/temporary-project
 vt session-cycle next
 vt session-cycle prev
 vt session new -c ~/src/my-project
 ```
 
-Categories are derived only from these config rules and the session/project metadata. `@vde_category` is a derived, write-only mirror for external tmux formats; changing it manually does not affect vde-tmux. Renaming a session matched by `session_name_rules` updates the runtime category immediately, while the mirror may keep its previous value until the next `vt daemon reload`.
+Configured categories remain the read-only baseline. Dynamic categories, explicit
+repository assignments, and category/repository order are stored per tmux socket.
+An explicit assignment wins over config rules until `vt category automatic` is
+used. Recreating a session for the same repository restores its assignment.
+In the sidebar, use `a` to add a category, `m` to move a repository, `r` to
+rename a dynamic category, `D` to delete one, and `J`/`K` to reorder categories
+or repositories. `@vde_category` remains a derived, write-only mirror for
+external tmux formats.
 
 With fzf installed, open a popup for switching or removing sessions, windows, and panes:
 

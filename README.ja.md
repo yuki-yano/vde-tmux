@@ -237,7 +237,8 @@ vt sidebar close
 
 ## session とカテゴリ
 
-カテゴリを使うと、project path または session name で tmux session をまとめられます。
+カテゴリを使うと、canonicalなRepository identity単位でtmux sessionをまとめられます。
+同じgit common directoryを共有するworktreeは一つのRepositoryとして扱われます。
 
 ```yaml
 categories:
@@ -246,10 +247,6 @@ categories:
     - category: work
       path_patterns:
         - github.com/acme/*
-  session_name_rules:
-    - category: scratch
-      patterns:
-        - tmp-*
 ```
 
 主なコマンドは次のとおりです。
@@ -258,12 +255,20 @@ categories:
 vt category next
 vt category prev
 vt category use work
+vt category list
+vt category create scratch
+vt category assign scratch --repo ~/src/temporary-project
+vt category automatic --repo ~/src/temporary-project
 vt session-cycle next
 vt session-cycle prev
 vt session new -c ~/src/my-project
 ```
 
-カテゴリはこの設定ルールと session/project metadata だけから導出されます。`@vde_category` は外部 tmux format 向けの導出済み write-only mirror であり、手動変更しても vde-tmux の分類には影響しません。`session_name_rules` 対象の session を rename すると runtime category は即時更新されますが、mirror は次の `vt daemon reload` まで以前の値を保持する場合があります。
+configのカテゴリはread-onlyな最低限の定義として残ります。
+動的カテゴリ、Repositoryの明示的な所属、カテゴリとRepositoryの順序はtmux socketごとに保存されます。
+明示的な所属は`vt category automatic`を実行するまでconfig ruleより優先され、同じRepositoryのsessionを作り直した場合も復元されます。
+サイドバーでは`a`でカテゴリ追加、`m`でRepository移動、`r`で動的カテゴリ名変更、`D`で削除、`J`/`K`でカテゴリまたはRepositoryを並べ替えられます。
+`@vde_category`は外部tmux format向けの導出済みwrite-only mirrorです。
 
 fzf をインストールすると、session、window、pane を切り替えたり削除したりする popup を利用できます。
 
