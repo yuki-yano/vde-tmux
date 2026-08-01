@@ -285,16 +285,16 @@ pub(crate) fn ensure_daemon(
         ReachServingCommand::Ensure,
     ) {
         ReachServingAction::ReportServing => {
-            return Ok(Some(format!("daemon serving: {}", socket_path.display())));
+            return Ok(None);
         }
         ReachServingAction::DisabledNoop => {
-            return Ok(Some("daemon disabled; ensure made no changes".to_string()));
+            return Ok(None);
         }
         ReachServingAction::Start => {}
         ReachServingAction::DisabledError => unreachable!("ensure never rejects disabled state"),
     }
-    let (_, socket_path) = crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, socket)?;
-    Ok(Some(format!("daemon serving: {}", socket_path.display())))
+    crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, socket)?;
+    Ok(None)
 }
 
 pub(crate) fn start_daemon(
@@ -1153,15 +1153,12 @@ mod lifecycle_command_tests {
     }
 
     #[test]
-    fn ensure_disabled_is_a_function_level_noop() {
+    fn ensure_disabled_is_a_silent_function_level_noop() {
         let (root, listener, env, runner) = disabled_command_fixture("ensure-disabled");
 
         let output = super::ensure_daemon(&runner, &env, None).unwrap();
 
-        assert_eq!(
-            output.as_deref(),
-            Some("daemon disabled; ensure made no changes")
-        );
+        assert_eq!(output, None);
         assert!(
             runner
                 .calls()
