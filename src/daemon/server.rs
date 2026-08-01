@@ -4384,6 +4384,7 @@ fn bootstrap_v2_runtime(
         .state
         .lock()
         .expect("canonical state lock poisoned") = Some(canonical);
+    crate::daemon::lifecycle::publish_current_executable(&runner, &coordinator.incarnation)?;
 
     let mut initial_reconciliation_queued = false;
     loop {
@@ -4420,7 +4421,6 @@ fn bootstrap_v2_runtime(
             break;
         }
     }
-    crate::daemon::lifecycle::publish_current_executable(&runner, &coordinator.incarnation)?;
     Ok(())
 }
 
