@@ -238,7 +238,10 @@ fn switch_project_with_category(
     sessions: &[crate::session::SessionInfo],
     category: &str,
 ) -> Result<()> {
-    let (category, created_window) = if find_session(sessions, session_name).is_some() {
+    let (category, created_window) = if let Some(session) = find_session(sessions, session_name) {
+        if session.project_path.trim().is_empty() {
+            set_session_option(runner, session_name, KEY_PROJECT_PATH, path)?;
+        }
         set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
         (category.to_string(), None)
     } else {
@@ -534,6 +537,63 @@ mod tests {
                 call.first().map(String::as_str),
                 Some("new-session" | "set-option")
             ) || call.get(3).map(String::as_str) != Some(crate::options::KEY_PROJECT_PATH)
+        }));
+    }
+
+    #[test]
+    fn switch_project_adopts_missing_metadata_for_existing_session() {
+        let mock = MockTmuxRunner::new();
+        let format = crate::session::session_list_format();
+        let config = crate::config::Config::default();
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "client\t/dev/ttys001\n",
+        );
+        mock.stub(
+            &["list-sessions", "-F", &format],
+            "repo\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "repo",
+                crate::options::KEY_PROJECT_PATH,
+                "/tmp/repo",
+            ],
+            "",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-t",
+                "repo",
+                crate::options::KEY_CATEGORY,
+                "private",
+            ],
+            "",
+        );
+        mock.stub(&["switch-client", "-c", "client", "-t", "=repo:"], "");
+        mock.stub(
+            &[
+                "set-option",
+                "-g",
+                "@vde_client_636c69656e74_private",
+                "repo",
+            ],
+            "",
+        );
+
+        switch_project_resolved(&mock, &config, "/tmp/repo", "private").unwrap();
+
+        assert!(mock.calls().iter().any(|call| {
+            call == &[
+                "set-option",
+                "-t",
+                "repo",
+                crate::options::KEY_PROJECT_PATH,
+                "/tmp/repo",
+            ]
         }));
     }
 
