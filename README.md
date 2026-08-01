@@ -274,8 +274,9 @@ An explicit assignment wins over config rules until `vt category automatic` is
 used. Recreating a session for the same repository restores its assignment.
 In the sidebar, use `a` to add a category, `m` to move a repository, `r` to
 rename a dynamic category, `D` to delete one, and `J`/`K` to reorder categories
-or repositories. `@vde_category` remains a derived, write-only mirror for
-external tmux formats.
+or repositories. ByCategory keeps repositories from managed sessions visible
+even when they currently have no agent panes. `@vde_category` remains a derived,
+write-only mirror for external tmux formats.
 
 With fzf installed, open a popup for switching or removing sessions, windows, and panes:
 

@@ -402,7 +402,8 @@ fn category_rows(
     for (category, repos) in categories {
         let category_id = format!("category::{category}");
         let all_panes = repos.values().flatten().cloned().collect::<Vec<_>>();
-        let active = all_panes.iter().any(|pane| pane.active);
+        let active =
+            ctx.active_categories.contains(&category) || all_panes.iter().any(|pane| pane.active);
         let attention_count = repos
             .keys()
             .filter_map(|repo| {
@@ -416,7 +417,7 @@ fn category_rows(
             id: category_id,
             kind: SidebarRowKind::Category,
             depth: 0,
-            label: category,
+            label: category.clone(),
             chat_count: all_panes.len(),
             rollup: rollup(&all_panes),
             badge_state: badge_rollup(&all_panes),
@@ -430,7 +431,7 @@ fn category_rows(
             }),
         });
         if expanded {
-            rows.extend(repo_rows_from_map(
+            let repo_rows = repo_rows_from_map(
                 repos,
                 state,
                 &ctx.category_state,
@@ -438,10 +439,82 @@ fn category_rows(
                 &ctx.git,
                 ctx.now,
                 metas,
+            );
+            rows.extend(merge_category_repository_rows(
+                &category, repo_rows, state, ctx,
             ));
         }
     }
     rows
+}
+
+fn merge_category_repository_rows(
+    category: &str,
+    rows: Vec<SidebarRow>,
+    state: &SidebarState,
+    ctx: &RowBuildContext,
+) -> Vec<SidebarRow> {
+    if state.filter != StatusFilter::All {
+        return rows;
+    }
+    let Some(category_model) = ctx
+        .categories
+        .categories
+        .iter()
+        .find(|candidate| candidate.name.as_str() == category)
+    else {
+        return rows;
+    };
+
+    let mut chunks = Vec::<(String, Vec<SidebarRow>)>::new();
+    for row in rows {
+        if row.kind == SidebarRowKind::Repo {
+            chunks.push((row.id.clone(), vec![row]));
+        } else if let Some((_, chunk)) = chunks.last_mut() {
+            chunk.push(row);
+        }
+    }
+
+    let mut merged = Vec::new();
+    for repo in ctx
+        .categories
+        .ordered_repos(&ctx.category_state, &category_model.name)
+    {
+        let id = repo_id(category, &repo);
+        if let Some(index) = chunks.iter().position(|(candidate, _)| candidate == &id) {
+            merged.extend(chunks.remove(index).1);
+            continue;
+        }
+        let Some(placement) = ctx.categories.placements.get(&repo) else {
+            continue;
+        };
+        let label = sanitize_detail_label(&placement.repo.display_name);
+        merged.push(SidebarRow {
+            id: id.clone(),
+            kind: SidebarRowKind::Repo,
+            depth: 1,
+            label: if label.is_empty() {
+                "repo".to_string()
+            } else {
+                label
+            },
+            chat_count: 0,
+            rollup: RollupLevel::Idle,
+            badge_state: None,
+            expanded: state.is_expanded(&id),
+            pane_id: None,
+            git: None,
+            active: false,
+            meta: Some(RowMeta {
+                attention_count: Some(0),
+                ..RowMeta::default()
+            }),
+        });
+    }
+    for (_, chunk) in chunks {
+        merged.extend(chunk);
+    }
+    merged
 }
 
 fn repo_rows(
@@ -1155,6 +1228,48 @@ mod tests {
         );
 
         assert!(rows.is_empty());
+        assert_eq!(counts, BadgeCounts::default());
+    }
+
+    #[test]
+    fn category_view_shows_repository_placements_without_agents() {
+        let mut config = Config::default();
+        config.categories.rules.push(crate::config::CategoryRule {
+            category: "private".to_string(),
+            path_patterns: vec!["dotfiles".to_string()],
+        });
+        let category_state = crate::category::CategoryState::default();
+        let repo = crate::category::RepoIdentity {
+            key: crate::category::RepoKey::git("/Users/me/dotfiles/.git"),
+            rule_path: "/Users/me/dotfiles".to_string(),
+            display_name: "dotfiles".to_string(),
+        };
+        let context = RowBuildContext {
+            categories: crate::category::EffectiveCategoryModel::build(
+                &config,
+                &category_state,
+                [repo.clone()],
+            )
+            .unwrap(),
+            category_state,
+            ..RowBuildContext::default()
+        };
+
+        let (rows, counts) = build_rows_from_presentations(
+            &config,
+            &[],
+            &SidebarState::default(),
+            &SidebarPreferences::default(),
+            &context,
+        );
+
+        let row = rows
+            .iter()
+            .find(|row| row.id == repo_id("private", &repo.key))
+            .expect("repository placement should remain visible without an agent pane");
+        assert_eq!(row.label, "dotfiles");
+        assert_eq!(row.chat_count, 0);
+        assert_eq!(row.badge_state, None);
         assert_eq!(counts, BadgeCounts::default());
     }
 

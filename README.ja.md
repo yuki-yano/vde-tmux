@@ -270,6 +270,7 @@ configのカテゴリはread-onlyな最低限の定義として残ります。
 動的カテゴリ、Repositoryの明示的な所属、カテゴリとRepositoryの順序はtmux socketごとに保存されます。
 明示的な所属は`vt category automatic`を実行するまでconfig ruleより優先され、同じRepositoryのsessionを作り直した場合も復元されます。
 サイドバーでは`a`でカテゴリ追加、`m`でRepository移動、`r`で動的カテゴリ名変更、`D`で削除、`J`/`K`でカテゴリまたはRepositoryを並べ替えられます。
+ByCategoryでは、管理対象sessionのRepositoryはagent paneがない場合も表示されます。
 `@vde_category`は外部tmux format向けの導出済みwrite-only mirrorです。
 
 fzf をインストールすると、session、window、pane を切り替えたり削除したりする popup を利用できます。
