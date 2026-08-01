@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -z "${VDE_TEST_KILL_SERVER_OUTCOME:-}" ]]; then
+  for outcome in enter ctrl-q; do
+    VDE_TEST_KILL_SERVER_OUTCOME="$outcome" bash "${BASH_SOURCE[0]}"
+  done
+  echo "isolated Kill Server cleanup ok (enter and ctrl-q)"
+  exit 0
+fi
+case "$VDE_TEST_KILL_SERVER_OUTCOME" in
+  enter | ctrl-q) ;;
+  *)
+    echo "unsupported kill-server test outcome: $VDE_TEST_KILL_SERVER_OUTCOME" >&2
+    exit 2
+    ;;
+esac
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SYSTEM_TMUX="$(command -v tmux)"
 SOCKET_NAME="vde-kill-server-test-$$-$RANDOM"
@@ -46,7 +61,7 @@ cat >"$FAKE_BIN/fzf" <<'EOF'
 #!/usr/bin/env sh
 row="$(awk -F '\t' '$1 == "server" { selected = $0 } END { print selected }')"
 test -n "$row"
-printf 'enter\n%s\n' "$row"
+printf '%s\n%s\n' "$VDE_TEST_KILL_SERVER_OUTCOME" "$row"
 EOF
 chmod +x "$FAKE_BIN/fzf"
 
@@ -118,4 +133,4 @@ for _ in $(seq 1 100); do
 done
 [[ ! -e "$SOCKET_PATH" ]]
 
-echo "isolated Kill Server cleanup ok"
+echo "isolated Kill Server cleanup ok ($VDE_TEST_KILL_SERVER_OUTCOME)"

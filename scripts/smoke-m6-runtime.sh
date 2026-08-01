@@ -404,8 +404,15 @@ client_for_session() {
 client_session_value() {
   local client_name="$1"
   local field="$2"
-  tmux -L "$TMUX_SOCKET" list-clients -F "#{client_name}${CLIENT_FIELD_SEP}${field}" |
-    awk -F "$CLIENT_FIELD_SEP" -v client_name="$client_name" '$1 == client_name { print $2; found = 1; exit } END { exit !found }'
+  if ! tmux -L "$TMUX_SOCKET" list-clients -F "#{client_name}${CLIENT_FIELD_SEP}${field}" |
+    awk -F "$CLIENT_FIELD_SEP" -v client_name="$client_name" \
+      '$1 == client_name { print $2; found = 1; exit } END { exit !found }'; then
+    echo "client disappeared while resolving $client_name; current clients:" >&2
+    tmux -L "$TMUX_SOCKET" list-clients \
+      -F "#{client_name}${CLIENT_FIELD_SEP}#{session_id}" >&2 ||
+      echo "failed to list remaining clients" >&2
+    return 1
+  fi
 }
 
 CLIENT_1="$(client_for_session main)"
@@ -1083,7 +1090,10 @@ run_category_action() {
   local switched_ns
   local action_pid
   local action_error="$RUNTIME_DIR/category-action-error.txt"
-  source_session="$(client_session_value "$CLIENT_1" '#{session_id}')"
+  source_session="$(client_session_value "$CLIENT_1" '#{session_id}')" || {
+    echo "category $direction could not resolve the source session for $CLIENT_1" >&2
+    return 1
+  }
   started_ns="$(python3 -c 'import time; print(time.time_ns())')"
   VT_PANE="$AGENT_PANE" run_vt category "$direction" \
     --client-name "$CLIENT_1" --session-id "$source_session" \
@@ -1091,7 +1101,11 @@ run_category_action() {
   action_pid=$!
   switched_session="$source_session"
   for _ in $(seq 1 100); do
-    switched_session="$(client_session_value "$CLIENT_1" '#{session_id}')"
+    if ! switched_session="$(client_session_value "$CLIENT_1" '#{session_id}')"; then
+      echo "category $direction lost client $CLIENT_1 while waiting for the switch" >&2
+      wait "$action_pid" || true
+      return 1
+    fi
     [[ "$switched_session" != "$source_session" ]] && break
     sleep 0.005
   done
@@ -1103,7 +1117,12 @@ run_category_action() {
     return 1
   fi
   if ! wait "$action_pid"; then
-    cat "$action_error" >&2
+    echo "category $direction command failed" >&2
+    if [[ -s "$action_error" ]]; then
+      cat "$action_error" >&2
+    else
+      echo "category command produced no stderr" >&2
+    fi
     return 1
   fi
   python3 - "$started_ns" "$switched_ns" >>"$CATEGORY_TIMINGS" <<'PY'

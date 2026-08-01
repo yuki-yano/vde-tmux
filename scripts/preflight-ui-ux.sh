@@ -399,7 +399,8 @@ A_ID="$(tmux_cmd display-message -p -t A '#{session_id}')"
 A10_ID="$(tmux_cmd display-message -p -t a10 '#{session_id}')"
 A2_ID="$(tmux_cmd display-message -p -t a2 '#{session_id}')"
 
-run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-initial.log"
+run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-initial.log" 2>&1
+[[ ! -s "$ARTIFACT_DIR/daemon-ensure-initial.log" ]] || fail "initial daemon ensure produced output"
 wait_daemon_running >"$ARTIFACT_DIR/daemon-status-initial.log"
 
 STATUS_SESSIONS=""
@@ -578,14 +579,16 @@ PID_AFTER="$(daemon_pid)"
 META_AFTER="$(metadata_fingerprint)"
 [[ -n "$PID_BEFORE" && "$PID_BEFORE" == "$PID_AFTER" && "$META_BEFORE" == "$META_AFTER" ]]
 
-run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-idempotent.log"
+run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-idempotent.log" 2>&1
+[[ ! -s "$ARTIFACT_DIR/daemon-ensure-idempotent.log" ]] || fail "idempotent daemon ensure produced output"
 [[ "$(daemon_pid)" == "$PID_BEFORE" ]]
 run_vt daemon stop >"$ARTIFACT_DIR/daemon-stop.log"
 wait_daemon_stopped
 for hook in window-pane-changed session-window-changed client-session-changed client-attached client-detached; do
   tmux_cmd show-hooks -g "${hook}[70]" | grep -F "${hook}[70]" >/dev/null
 done
-run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-after-stop.log"
+run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-after-stop.log" 2>&1
+[[ ! -s "$ARTIFACT_DIR/daemon-ensure-after-stop.log" ]] || fail "post-stop daemon ensure produced output"
 wait_daemon_running >"$ARTIFACT_DIR/daemon-status-after-stop.log"
 
 run_vt daemon disable >"$ARTIFACT_DIR/daemon-disable.log"
@@ -595,8 +598,8 @@ grep -F 'daemon: unavailable' "$ARTIFACT_DIR/daemon-status-disabled.log" >/dev/n
 if run_vt daemon start >"$ARTIFACT_DIR/daemon-start-disabled.log" 2>&1; then
   fail "daemon start unexpectedly succeeded while disabled"
 fi
-run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-disabled.log"
-[[ ! -s "$ARTIFACT_DIR/daemon-ensure-disabled.log" ]]
+run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-disabled.log" 2>&1
+[[ ! -s "$ARTIFACT_DIR/daemon-ensure-disabled.log" ]] || fail "disabled daemon ensure produced output"
 tmux_cmd select-pane -t "$A_PANE"
 VT_PANE="$A_PANE" run_vt hook emit --agent generic --session-id disabled-event \
   --status running --started-at "$((NOW + 4))" >"$ARTIFACT_DIR/disabled-agent-event.log" 2>&1 || true
