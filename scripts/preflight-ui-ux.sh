@@ -596,7 +596,7 @@ if run_vt daemon start >"$ARTIFACT_DIR/daemon-start-disabled.log" 2>&1; then
   fail "daemon start unexpectedly succeeded while disabled"
 fi
 run_vt daemon ensure >"$ARTIFACT_DIR/daemon-ensure-disabled.log"
-grep -F 'ensure made no changes' "$ARTIFACT_DIR/daemon-ensure-disabled.log" >/dev/null
+[[ ! -s "$ARTIFACT_DIR/daemon-ensure-disabled.log" ]]
 tmux_cmd select-pane -t "$A_PANE"
 VT_PANE="$A_PANE" run_vt hook emit --agent generic --session-id disabled-event \
   --status running --started-at "$((NOW + 4))" >"$ARTIFACT_DIR/disabled-agent-event.log" 2>&1 || true
