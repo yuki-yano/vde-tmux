@@ -98,7 +98,7 @@ pub fn switch_statusline_category(
     session_id: &str,
     index: usize,
 ) -> Result<()> {
-    let (targets, _) = displayed_category_targets(runner, session_id)?;
+    let targets = displayed_category_targets(runner, session_id)?;
     let target = targets
         .get(index)
         .ok_or_else(|| {
@@ -346,16 +346,13 @@ fn displayed_targets(
     Ok(targets)
 }
 
-fn displayed_category_targets(
-    runner: &dyn TmuxRunner,
-    session_id: &str,
-) -> Result<(Vec<String>, String)> {
+fn displayed_category_targets(runner: &dyn TmuxRunner, session_id: &str) -> Result<Vec<String>> {
     validate_tmux_target(session_id, '$', "session")?;
     let option = crate::options::KEY_STATUS_CATEGORY;
     let rendered = crate::options::show_session_option(runner, session_id, option)?
         .ok_or_else(|| anyhow!("{option} is empty for {session_id}; wait for redraw"))?;
     let mut targets = Vec::new();
-    let mut current = None;
+    let mut has_current = false;
     for range in top_level_user_ranges(&rendered)? {
         if let Some(target) = range.strip_prefix(CURRENT_CATEGORY_RANGE_PREFIX) {
             if targets.iter().any(|existing| existing == target) {
@@ -363,11 +360,12 @@ fn displayed_category_targets(
                     "{option} contains duplicate category targets; wait for redraw"
                 ));
             }
-            if current.replace(target.to_string()).is_some() {
+            if has_current {
                 return Err(anyhow!(
                     "{option} contains multiple active categories; wait for redraw"
                 ));
             }
+            has_current = true;
             targets.push(target.to_string());
         } else if let Some(target) = range.strip_prefix(CATEGORY_RANGE_PREFIX) {
             if targets.iter().any(|existing| existing == target) {
@@ -378,13 +376,10 @@ fn displayed_category_targets(
             targets.push(target.to_string());
         }
     }
-    let current = current.ok_or_else(|| {
-        anyhow!("{option} has no active category for {session_id}; wait for redraw")
-    })?;
     if targets.is_empty() {
         return Err(anyhow!("{option} has no category targets; wait for redraw"));
     }
-    Ok((targets, current))
+    Ok(targets)
 }
 
 fn top_level_user_ranges(rendered: &str) -> Result<Vec<String>> {
@@ -767,8 +762,7 @@ fn structured_category_tokens(
     let mut seen_targets = std::collections::BTreeSet::new();
     categories
         .into_iter()
-        .enumerate()
-        .map(|(index, category)| -> Result<StatusToken> {
+        .map(|category| -> Result<StatusToken> {
             let active = category.active;
             let label = structured_external_text(if category.category.is_empty() {
                 "uncategorized"
@@ -831,10 +825,10 @@ fn structured_category_tokens(
                 format!("{CATEGORY_RANGE_PREFIX}{target}")
             };
             debug_assert!(range.len() <= TMUX_USER_RANGE_NAME_MAX_BYTES);
-            let compact_label = format!("cat:{}", index + 1);
+            let rendered = format!("#[range=user|{range}]{segment}#[norange]");
             Ok(StatusToken {
-                compact: format!("#[range=user|{range}]{compact_label}#[norange]"),
-                rendered: format!("#[range=user|{range}]{segment}#[norange]"),
+                compact: rendered.clone(),
+                rendered,
                 current: active,
             })
         })
@@ -939,7 +933,13 @@ fn render_bounded_status_snapshot(
     config: &Config,
     snapshot: &StatusSnapshot,
 ) -> Result<StructuredStatusSegments> {
-    let mut category_tokens = structured_category_tokens(config, &snapshot.categories)?;
+    let visible_categories = snapshot
+        .categories
+        .iter()
+        .filter(|category| category.counts.total() > 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    let category_tokens = structured_category_tokens(config, &visible_categories)?;
     let session_tokens = snapshot
         .sessions
         .iter()
@@ -947,10 +947,7 @@ fn render_bounded_status_snapshot(
         .map(|(index, session)| render_session_token(config, session, index))
         .collect::<Vec<_>>();
     let mut window_tokens = structured_window_tokens(config, &snapshot.windows);
-    let mut category_included = category_tokens
-        .iter()
-        .map(|token| token.current)
-        .collect::<Vec<_>>();
+    let category_included = vec![true; category_tokens.len()];
     // Session navigation uses the stable targets embedded in this exact rendered model. Keep
     // every ordered session visible so the status line and next/previous actions never collapse
     // to the current session plus a non-actionable `+N` summary.
@@ -1009,20 +1006,6 @@ fn render_bounded_status_snapshot(
         config,
     ) > STATUS_OPTION_CELL_BUDGET
     {
-        compact_current_tokens(&mut category_tokens);
-    }
-    if status_projection_width(
-        &summary,
-        &category_tokens,
-        &category_included,
-        &session_tokens,
-        &session_included,
-        &window_tokens,
-        &window_included,
-        &attention,
-        config,
-    ) > STATUS_OPTION_CELL_BUDGET
-    {
         attention = attention_compact;
     }
 
@@ -1046,20 +1029,6 @@ fn render_bounded_status_snapshot(
         }
     }
 
-    for index in 0..category_tokens.len() {
-        try_include_status_peer(
-            index,
-            &mut category_included,
-            &category_tokens,
-            &session_tokens,
-            &session_included,
-            &window_tokens,
-            &window_included,
-            &summary,
-            &attention,
-            config,
-        );
-    }
     for index in 0..window_tokens.len() {
         if window_included[index] {
             continue;
@@ -1111,39 +1080,6 @@ fn render_bounded_status_snapshot(
         windows,
         attention,
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn try_include_status_peer(
-    index: usize,
-    included: &mut [bool],
-    category_tokens: &[StatusToken],
-    session_tokens: &[StatusToken],
-    session_included: &[bool],
-    window_tokens: &[StatusToken],
-    window_included: &[bool],
-    summary: &str,
-    attention: &str,
-    config: &Config,
-) {
-    if included[index] {
-        return;
-    }
-    included[index] = true;
-    if status_projection_width(
-        summary,
-        category_tokens,
-        included,
-        session_tokens,
-        session_included,
-        window_tokens,
-        window_included,
-        attention,
-        config,
-    ) > STATUS_OPTION_CELL_BUDGET
-    {
-        included[index] = false;
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1975,7 +1911,10 @@ mod tests {
             category: name.to_string(),
             session_ids: vec!["$1".to_string()],
             active,
-            counts: BadgeStateCounts::default(),
+            counts: BadgeStateCounts {
+                idle: 1,
+                ..BadgeStateCounts::default()
+            },
         }
     }
 
@@ -2169,6 +2108,31 @@ mod tests {
                 pane_pid: 700,
             })]
         );
+    }
+
+    #[test]
+    fn category_status_omits_categories_without_agents() {
+        let mut config = Config::default();
+        config.statusline.category.format = "{category}".to_string();
+        config.statusline.category.inactive_format = "{category}".to_string();
+        let snapshot = StatusSnapshot {
+            categories: vec![
+                CategoryStatusPresentation {
+                    category: crate::category::UNCATEGORIZED.to_string(),
+                    session_ids: vec!["$1".to_string()],
+                    active: false,
+                    counts: BadgeStateCounts::default(),
+                },
+                status_category("work", true),
+            ],
+            ..status_snapshot()
+        };
+
+        let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
+
+        assert!(!rendered.category.contains(crate::category::UNCATEGORIZED));
+        assert!(rendered.category.contains("work"), "{}", rendered.category);
+        assert_eq!(top_level_user_ranges(&rendered.category).unwrap().len(), 1);
     }
 
     #[test]
@@ -2476,7 +2440,7 @@ mod tests {
     }
 
     #[test]
-    fn session_option_keeps_every_unicode_token_while_other_options_remain_bounded() {
+    fn session_and_category_options_keep_every_unicode_token() {
         let mut config = Config::default();
         config.statusline.sessions.show_index = false;
         config.statusline.sessions.current.format = " {session} ".to_string();
@@ -2545,14 +2509,11 @@ mod tests {
         assert!(tmux_display_width(&rendered.sessions) > 80);
         assert_eq!(top_level_user_ranges(&rendered.sessions).unwrap().len(), 12);
         assert!(!rendered.sessions.contains("+"), "{}", rendered.sessions);
-        for option in [&rendered.windows, &rendered.category] {
-            assert!(
-                tmux_display_width(option) <= 80,
-                "{}: {option}",
-                tmux_display_width(option)
-            );
-            assert!(option.contains("+"), "{option}");
-        }
+        assert!(tmux_display_width(&rendered.category) > 80);
+        assert_eq!(top_level_user_ranges(&rendered.category).unwrap().len(), 12);
+        assert!(!rendered.category.contains("+"), "{}", rendered.category);
+        assert!(tmux_display_width(&rendered.windows) <= 80);
+        assert!(rendered.windows.contains("+"), "{}", rendered.windows);
         let total = [
             &rendered.attention,
             &rendered.category,
@@ -2580,21 +2541,14 @@ mod tests {
             rendered.windows
         );
         assert!(
-            rendered.category.contains("現在カテゴリ🚀") || rendered.category.contains("cat:5"),
+            rendered.category.contains("現在カテゴリ🚀"),
             "{}",
             rendered.category
         );
         assert!(rendered.category.contains("range=user|C:"));
         assert!(rendered.attention.contains('▲'), "{}", rendered.attention);
-        for label in ["日本語セッション0🚀", "編集ウィンドウ0🪟", "カテゴリ0🚀"]
-        {
-            assert!(
-                !rendered.sessions.contains(label)
-                    || rendered.sessions.contains(&format!("{label} ")),
-                "semantic tokens must be included whole: {}",
-                rendered.sessions
-            );
-        }
+        assert!(rendered.sessions.contains("日本語セッション0🚀"));
+        assert!(rendered.category.contains("カテゴリ0🚀"));
     }
 
     #[test]
@@ -2757,7 +2711,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_current_tokens_keep_stable_action_targets_within_budget() {
+    fn oversized_current_session_and_category_tokens_keep_full_action_targets() {
         let mut config = Config::default();
         config.statusline.sessions.current.format = "{session}".to_string();
         config.statusline.windows.current.format = "{window}".to_string();
@@ -2784,11 +2738,10 @@ mod tests {
         assert!(rendered.windows.contains("range=user|window:@77"));
         assert!(rendered.windows.contains("@77"));
         assert!(rendered.category.contains("range=user|C:"));
-        assert!(rendered.category.contains("cat:"));
+        assert!(rendered.category.contains(&"分類🚀".repeat(25)));
         assert!(tmux_display_width(&rendered.sessions) > 80);
-        for option in [&rendered.windows, &rendered.category] {
-            assert!(tmux_display_width(option) <= 80, "{option}");
-        }
+        assert!(tmux_display_width(&rendered.category) > 80);
+        assert!(tmux_display_width(&rendered.windows) <= 80);
     }
 
     #[test]
@@ -2824,7 +2777,8 @@ mod tests {
 
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
 
-        assert!(!rendered.summary.is_empty(), "{rendered:?}");
+        assert!(rendered.summary.is_empty(), "{rendered:?}");
+        assert!(rendered.category.contains(&"分類🚀".repeat(25)));
         assert!(rendered.sessions.contains(&"界🚀".repeat(100)));
         assert!(rendered.sessions.contains("inactive-peer"));
         assert!(!rendered.sessions.contains("+1"), "{}", rendered.sessions);
@@ -2888,7 +2842,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_category_visual_ids_are_unique_within_one_snapshot() {
+    fn category_tokens_never_replace_names_with_compact_visual_ids() {
         let config = Config::default();
         let categories = vec![
             status_category(&"同じ見た目🚀".repeat(10), true),
@@ -2900,9 +2854,15 @@ mod tests {
 
         let tokens = structured_category_tokens(&config, &categories).unwrap();
 
-        assert!(tokens[0].compact.contains("cat:1"));
-        assert!(tokens[1].compact.contains("cat:2"));
+        assert_eq!(tokens[0].compact, tokens[0].rendered);
+        assert_eq!(tokens[1].compact, tokens[1].rendered);
         assert_ne!(tokens[0].compact, tokens[1].compact);
+        assert!(tokens[0].compact.contains(&"同じ見た目🚀".repeat(10)));
+        assert!(
+            tokens[1]
+                .compact
+                .contains(&("同じ見た目🚀".repeat(9) + "別"))
+        );
         assert!(tokens[0].compact.contains("range=user|C:"));
         assert!(tokens[1].compact.contains("range=user|C:"));
     }
@@ -3239,7 +3199,7 @@ mod tests {
     }
 
     #[test]
-    fn category_cycle_origin_comes_only_from_the_published_display_model() {
+    fn category_targets_come_only_from_the_published_display_model() {
         let mock = MockTmuxRunner::new();
         let work = category_target_key("work").unwrap();
         let personal = category_target_key("personal").unwrap();
@@ -3256,10 +3216,9 @@ mod tests {
             ),
         );
 
-        let (targets, current) = displayed_category_targets(&mock, "$1").unwrap();
+        let targets = displayed_category_targets(&mock, "$1").unwrap();
 
-        assert_eq!(targets, vec![personal, work.clone()]);
-        assert_eq!(current, work);
+        assert_eq!(targets, vec![personal, work]);
         assert!(
             mock.calls()
                 .iter()
@@ -3268,7 +3227,7 @@ mod tests {
     }
 
     #[test]
-    fn category_cycle_rejects_a_display_without_one_active_target() {
+    fn category_targets_allow_a_hidden_current_and_reject_multiple_active_targets() {
         let mock = MockTmuxRunner::new();
         let work = category_target_key("work").unwrap();
         mock.stub(
@@ -3282,9 +3241,10 @@ mod tests {
             &format!("#[range=user|c:{work}] work #[norange]\n"),
         );
 
-        let error = displayed_category_targets(&mock, "$1").unwrap_err();
-
-        assert!(error.to_string().contains("no active category"));
+        assert_eq!(
+            displayed_category_targets(&mock, "$1").unwrap(),
+            vec![work.clone()]
+        );
 
         let mock = MockTmuxRunner::new();
         let personal = category_target_key("personal").unwrap();

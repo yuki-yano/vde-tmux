@@ -331,6 +331,8 @@ badge:
 `statusline.summary.format` supports the `{badge}` and `{count}` placeholders, such as `{badge}{count}` or `{badge}: {count}`.
 Zero-count states remain visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
 
+The category segment omits categories with no agent panes. Every remaining category is published with its full label and action target; category entries are never collapsed into `+N` or `cat:N`, even when the segment exceeds the shared status width budget.
+
 `statusline.sessions.fixed_width: true` pads the active category's session segment to the widest category and keeps the combined category/session/window area at the same width across sessions. Session content is left-aligned within that fixed area by default; set `fixed_width_alignment: center` to center it. This keeps a centered status block stable when switching between sessions whose window names or process names have different lengths. Widths for inactive categories use the `other` session style; if `current.format` and `other.format` have different visual widths, the fixed width may differ by a few cells.
 
 The full schema is available with `vt config schema`.

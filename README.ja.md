@@ -327,6 +327,9 @@ badge:
 件数が 0 の状態も表示するため、summary の表示幅は安定します。
 Idle を表示したくない場合は `hide_idle: true` を指定します。
 
+category segmentではagent paneが0件のカテゴリを表示しません。
+残りのカテゴリは、共有status幅のbudgetを超える場合も完全なラベルと操作targetをすべてpublishし、`+N`や`cat:N`へ省略しません。
+
 `statusline.sessions.fixed_width: true` を指定すると、active category の session 領域を最も広い category に合わせ、category、session、window を合わせた領域も全 session で同じ幅に揃えます。
 固定領域内のsession表示はデフォルトで左寄せです。中央寄せにする場合は `fixed_width_alignment: center` を指定します。
 window 名やプロセス名の長さが異なる session を切り替えても、中央寄せした status block の位置がずれません。
