@@ -280,7 +280,7 @@ vt session-manager --popup
 ```
 
 selector の最下段には `✕ tmux server | tmux kill-server` が表示されます。
-この行は `Ctrl-Q` にのみ反応し、vde daemon の停止と残った pane プロセスの後始末を済ませてから tmux server 全体を終了します。
+この行を `Enter` または `Ctrl-Q` で選択すると、vde daemon の停止と残った pane プロセスの後始末を済ませてから tmux server 全体を終了します。
 
 ghq を使っている場合は、project selector から session を作成または選択できます。
 

@@ -285,7 +285,7 @@ vt session-manager --popup
 ```
 
 The final selector row is `✕ tmux server | tmux kill-server`.
-It responds only to `Ctrl-Q` and shuts down the whole tmux server after stopping the vde daemon and cleaning up the remaining pane processes.
+Selecting it with `Enter` or `Ctrl-Q` shuts down the whole tmux server after stopping the vde daemon and cleaning up the remaining pane processes.
 
 With ghq installed, create or select a session from the project selector:
 

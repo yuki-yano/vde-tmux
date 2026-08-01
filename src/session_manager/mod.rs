@@ -82,7 +82,7 @@ impl SessionManagerIo for SystemSessionManagerIo {
             .args([
                 "--ansi",
                 "--prompt=tmux> ",
-                "--header=Current tmux | Enter switch | C-q kill | C-t new | C-r rename | C-d/C-u scroll",
+                "--header=Current tmux | Enter switch / kill server | C-q kill | C-t new | C-r rename | C-d/C-u scroll",
                 "--border=none",
                 "--delimiter=\t",
                 "--with-nth=5",
@@ -487,7 +487,7 @@ fn run_selection(runner: &dyn TmuxRunner, selected: &str) -> Result<SessionManag
         return Ok(SessionManagerOutcome::Done);
     };
     if entry.action == "server" {
-        return Ok(SessionManagerOutcome::Done);
+        return Ok(SessionManagerOutcome::KillServer);
     }
     let session = if entry.session.is_empty() {
         &entry.name
@@ -524,7 +524,7 @@ fn run_selection_outside_tmux(
         return Ok(SessionManagerOutcome::Done);
     };
     if entry.action == "server" {
-        return Ok(SessionManagerOutcome::Done);
+        return Ok(SessionManagerOutcome::KillServer);
     }
     let session = if entry.session.is_empty() {
         &entry.name
@@ -678,7 +678,7 @@ pub fn render_preview(
 fn render_server_preview(env: &BTreeMap<String, String>) -> String {
     let mut lines = render_header_box("tmux server", env);
     lines.push(String::new());
-    lines.push("Ctrl-Q runs Kill Server.".to_string());
+    lines.push("Enter or Ctrl-Q runs Kill Server.".to_string());
     lines.push("All tmux sessions will be terminated.".to_string());
     lines.push("Each pane process is asked to shut down gracefully.".to_string());
     lines.push("The vde daemon is stopped before the tmux server.".to_string());
@@ -1259,18 +1259,24 @@ mod tests {
     }
 
     #[test]
-    fn server_enter_and_ctrl_r_are_noops() {
-        for selected in [
-            render_entry(&server_entry()),
-            format!("ctrl-r\n{}", render_entry(&server_entry())),
-        ] {
-            let mock = MockTmuxRunner::new();
-            assert_eq!(
-                run_selection(&mock, &selected).unwrap(),
-                SessionManagerOutcome::Done
-            );
-            assert!(mock.calls().is_empty());
-        }
+    fn server_enter_returns_kill_server_outcome() {
+        let mock = MockTmuxRunner::new();
+        assert_eq!(
+            run_selection(&mock, &render_entry(&server_entry())).unwrap(),
+            SessionManagerOutcome::KillServer
+        );
+        assert!(mock.calls().is_empty());
+    }
+
+    #[test]
+    fn server_ctrl_r_is_a_noop() {
+        let mock = MockTmuxRunner::new();
+        let selected = format!("ctrl-r\n{}", render_entry(&server_entry()));
+        assert_eq!(
+            run_selection(&mock, &selected).unwrap(),
+            SessionManagerOutcome::Done
+        );
+        assert!(mock.calls().is_empty());
     }
 
     #[test]
@@ -1292,7 +1298,7 @@ mod tests {
         mock.stub(&["has-session"], "");
         mock.stub(&["list-sessions", "-F", &session_format], "");
         mock.stub(&["list-windows", "-a", "-F", &window_format], "");
-        let selection = format!("ctrl-q\n{}", render_entry(&server_entry()));
+        let selection = render_entry(&server_entry());
 
         let mut popup_io = MockSessionManagerIo {
             selection: Some(selection.clone()),
@@ -1343,6 +1349,7 @@ mod tests {
             render_preview(&MockTmuxRunner::new(), "server", "", &BTreeMap::new()).unwrap();
         for expected in [
             "tmux server",
+            "Enter",
             "Ctrl-Q",
             "All tmux sessions",
             "gracefully",

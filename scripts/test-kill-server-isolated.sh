@@ -46,7 +46,7 @@ cat >"$FAKE_BIN/fzf" <<'EOF'
 #!/usr/bin/env sh
 row="$(awk -F '\t' '$1 == "server" { selected = $0 } END { print selected }')"
 test -n "$row"
-printf 'ctrl-q\n%s\n' "$row"
+printf 'enter\n%s\n' "$row"
 EOF
 chmod +x "$FAKE_BIN/fzf"
 
