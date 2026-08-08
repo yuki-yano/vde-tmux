@@ -242,7 +242,7 @@ fn switch_project_with_category(
         if session.project_path.trim().is_empty() {
             set_session_option(runner, session_name, KEY_PROJECT_PATH, path)?;
         }
-        set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
+        set_session_option(runner, session_name, KEY_CATEGORY, category)?;
         (category.to_string(), None)
     } else {
         let created_window = runner
@@ -253,17 +253,17 @@ fn switch_project_with_category(
                 "-F",
                 "#{window_id}",
                 "-s",
-                &session_name,
+                session_name,
                 "-c",
                 path,
             ])?
             .trim()
             .to_string();
-        set_session_option(runner, &session_name, KEY_PROJECT_PATH, path)?;
-        set_session_option(runner, &session_name, KEY_CATEGORY, &category)?;
+        set_session_option(runner, session_name, KEY_PROJECT_PATH, path)?;
+        set_session_option(runner, session_name, KEY_CATEGORY, category)?;
         (category.to_string(), Some(created_window))
     };
-    switch_client_for_client(runner, &client, &session_name)?;
+    switch_client_for_client(runner, client, session_name)?;
     if let Some(window) = created_window
         .as_deref()
         .filter(|window| !window.is_empty())
@@ -276,7 +276,7 @@ fn switch_project_with_category(
             config.sidebar.min_width,
         )?;
     }
-    remember_session_for_client(runner, &client, &category, &session_name)
+    remember_session_for_client(runner, client, &category, session_name)
 }
 
 fn shell_quote(value: &str) -> String {

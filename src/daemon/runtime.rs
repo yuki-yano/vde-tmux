@@ -1970,7 +1970,6 @@ mod tests {
                         project_path: "/repo-main".to_string(),
                         attached: Some(true),
                         created_at: Some(10),
-                        ..SessionProjectionMetadata::default()
                     },
                 ),
                 (
@@ -1980,7 +1979,6 @@ mod tests {
                         project_path: "/repo-main".to_string(),
                         attached: Some(false),
                         created_at: Some(20),
-                        ..SessionProjectionMetadata::default()
                     },
                 ),
             ]),
@@ -2170,7 +2168,6 @@ mod tests {
                     project_path: "/repo-main".to_string(),
                     attached: Some(true),
                     created_at: Some(1),
-                    ..SessionProjectionMetadata::default()
                 },
             )]),
             windows: BTreeMap::new(),

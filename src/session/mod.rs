@@ -396,7 +396,7 @@ fn remember_client_session_for_session_resolved(
     client_name: &str,
     session_name: &str,
 ) -> Result<()> {
-    let session = find_session(&sessions, session_name)
+    let session = find_session(sessions, session_name)
         .ok_or_else(|| anyhow!("session not found: {session_name}"))?;
     let category = categories.category_for(session)?;
     remember_session_for_client(runner, client_name, category.as_str(), session_name)
@@ -449,9 +449,9 @@ fn create_session_for_client_resolved(
     category: &str,
 ) -> Result<String> {
     let created_format = format!("#{{session_name}}{FIELD_SEP}#{{window_id}}");
-    let created = runner.run(&["new-session", "-d", "-P", "-F", &created_format, "-c", &cwd])?;
+    let created = runner.run(&["new-session", "-d", "-P", "-F", &created_format, "-c", cwd])?;
     let (session_name, window_id) = parse_created_session(&created)?;
-    set_session_option(runner, &session_name, KEY_PROJECT_PATH, &cwd)?;
+    set_session_option(runner, &session_name, KEY_PROJECT_PATH, cwd)?;
     set_session_option(runner, &session_name, KEY_CATEGORY, category)?;
     switch_client_for_client(runner, client, &session_name)?;
     if !window_id.is_empty() {
@@ -610,18 +610,18 @@ fn use_adjacent_category_resolved(
     client: &str,
     direction: Direction,
 ) -> Result<()> {
-    let session = find_session(&sessions, &current)
+    let session = find_session(sessions, current)
         .ok_or_else(|| anyhow!("current session not found: {current}"))?;
     let current_category = categories.category_for(session)?;
-    let occupied = categories.categories_with_sessions(&sessions);
+    let occupied = categories.categories_with_sessions(sessions);
     let next_category = adjacent_resolved_category(&occupied, current_category, direction)
         .ok_or_else(|| anyhow!("no categories available"))?;
     use_category_for_client_from_sessions(
         runner,
-        &categories,
-        &sessions,
+        categories,
+        sessions,
         next_category.as_str(),
-        &client,
+        client,
     )
 }
 
@@ -647,10 +647,10 @@ fn cycle_session_resolved(
     client: &str,
     direction: Direction,
 ) -> Result<()> {
-    let session = find_session(&sessions, &current)
+    let session = find_session(sessions, current)
         .ok_or_else(|| anyhow!("current session not found: {current}"))?;
     let category = categories.category_for(session)?;
-    let category_sessions = categories.sessions_in_category(&sessions, category.as_str());
+    let category_sessions = categories.sessions_in_category(sessions, category.as_str());
     if category_sessions.is_empty() {
         bail!("no session in current category: {category}");
     }
