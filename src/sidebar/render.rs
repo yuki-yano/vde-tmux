@@ -434,7 +434,7 @@ fn build_header_chip_line(
         },
         HeaderChipSpec {
             filter: StatusFilter::AttentionOnly,
-            count: counts.attention,
+            count: counts.blocked,
             badge_state: Some(BadgeState::Blocked),
         },
         HeaderChipSpec {
@@ -872,7 +872,7 @@ fn render_row_line(
             width.saturating_sub(1),
         );
         let style = Style::default()
-            .fg(theme.badge_color(BadgeState::Blocked))
+            .fg(theme.badge_color(row.badge_state.unwrap_or(BadgeState::Blocked)))
             .add_modifier(Modifier::BOLD);
         return Line::from(Span::styled(text, style));
     }
@@ -1274,7 +1274,7 @@ fn render_zone_dense_line(
     Line::from(Span::styled(
         text,
         Style::default()
-            .fg(theme.badge_color(BadgeState::Blocked))
+            .fg(theme.badge_color(row.badge_state.unwrap_or(BadgeState::Blocked)))
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -1739,14 +1739,24 @@ fn short_wait_reason(reason: &str) -> String {
 }
 
 fn chat_agent_label(row: &SidebarRow) -> String {
-    row.meta
+    let agent = row
+        .meta
         .as_ref()
         .and_then(|meta| meta.agent.as_deref())
         .filter(|agent| !agent.trim().is_empty())
         .map(display_agent_name)
         .unwrap_or_else(|| {
             display_agent_name(row.label.split(':').next().unwrap_or(row.label.as_str()))
-        })
+        });
+    match row
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.origin.as_deref())
+        .filter(|origin| !origin.trim().is_empty())
+    {
+        Some(origin) => format!("{agent} · {origin}"),
+        None => agent,
+    }
 }
 
 fn chat_display_label(row: &SidebarRow) -> String {
@@ -1934,15 +1944,21 @@ fn view_mode_label(view_mode: ViewMode) -> &'static str {
         ViewMode::Flat => "Flat",
         ViewMode::ByRepo => "Repository",
         ViewMode::ByCategory => "Category",
+        ViewMode::Priority => "Priority",
     }
 }
 
 fn view_mode_label_padded(view_mode: ViewMode) -> String {
-    let width = [ViewMode::Flat, ViewMode::ByRepo, ViewMode::ByCategory]
-        .into_iter()
-        .map(|mode| view_mode_label(mode).len())
-        .max()
-        .unwrap_or(0);
+    let width = [
+        ViewMode::Flat,
+        ViewMode::ByRepo,
+        ViewMode::ByCategory,
+        ViewMode::Priority,
+    ]
+    .into_iter()
+    .map(|mode| view_mode_label(mode).len())
+    .max()
+    .unwrap_or(0);
     format!("{:<width$}", view_mode_label(view_mode))
 }
 
@@ -2522,6 +2538,7 @@ sidebar:
         let flat = text_for(ViewMode::Flat);
         let repo = text_for(ViewMode::ByRepo);
         let category = text_for(ViewMode::ByCategory);
+        let priority = text_for(ViewMode::Priority);
 
         assert_eq!(flat.find('≡'), repo.find('≡'), "{flat:?} vs {repo:?}");
         assert_eq!(
@@ -2531,6 +2548,8 @@ sidebar:
         );
         assert_eq!(display_width(&flat), display_width(&repo));
         assert_eq!(display_width(&repo), display_width(&category));
+        assert_eq!(display_width(&category), display_width(&priority));
+        assert_eq!(category.find('≡'), priority.find('≡'));
     }
 
     #[test]
@@ -2702,7 +2721,6 @@ sidebar:
     fn rich_header_counts() -> BadgeCounts {
         BadgeCounts {
             total: 7,
-            attention: 2,
             blocked: 1,
             working: 1,
             done: 0,
@@ -2757,7 +2775,7 @@ sidebar:
             header.lines[1].text,
             format!(" ≣ Category   ▾ \u{e0b0} 7 tasks \u{e0b0}")
         );
-        assert_eq!(header.lines[2].text, " ≡ 7  ▲ 2  ● 1  ✓ 0  ○ 5 ");
+        assert_eq!(header.lines[2].text, " ≡ 7  ▲ 1  ● 1  ✓ 0  ○ 5 ");
         let section = style_for_segment(&header, 0, "SIDEBAR");
         assert_eq!(section.fg, Some(SidebarRenderTheme::default().category));
         assert!(section.add_modifier.contains(Modifier::BOLD));
@@ -2830,17 +2848,16 @@ sidebar:
     }
 
     #[test]
-    fn attention_chip_uses_attention_count_and_is_clickable_without_blocked_count() {
+    fn unread_done_does_not_render_the_red_attention_chip() {
         let state = SidebarState {
             view_mode: ViewMode::ByCategory,
             filter: StatusFilter::All,
             ..SidebarState::default()
         };
         let counts = BadgeCounts {
-            total: 2,
-            attention: 2,
+            total: 1,
             blocked: 0,
-            working: 2,
+            done: 1,
             ..BadgeCounts::default()
         };
 
@@ -2848,13 +2865,14 @@ sidebar:
             build_header_layout_with_counts(&state, 80, &SidebarRenderTheme::default(), counts);
 
         assert!(
-            header.lines[2].text.contains("▲ 2"),
+            header.lines[2].text.contains("▲ 0"),
             "{:?}",
             header.lines[2].text
         );
-        assert_eq!(
-            header_hit_test(&header, 2, 6),
-            Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
+        assert!(
+            header.lines[2].text.contains("✓ 1"),
+            "{:?}",
+            header.lines[2].text
         );
     }
 
@@ -2866,7 +2884,6 @@ sidebar:
         };
         let counts = BadgeCounts {
             total: 3,
-            attention: 1,
             blocked: 1,
             working: 1,
             done: 0,
@@ -2897,7 +2914,6 @@ sidebar:
         };
         let counts = BadgeCounts {
             total: 3,
-            attention: 1,
             blocked: 1,
             working: 1,
             done: 0,
@@ -3000,7 +3016,6 @@ sidebar:
         };
         let counts = BadgeCounts {
             total: 3,
-            attention: 1,
             blocked: 1,
             working: 0,
             done: 0,
@@ -3036,7 +3051,6 @@ sidebar:
         let theme = SidebarRenderTheme::default();
         let counts = BadgeCounts {
             total: 7,
-            attention: 0,
             blocked: 0,
             working: 2,
             done: 0,

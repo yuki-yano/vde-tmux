@@ -9,6 +9,7 @@ use crate::tmux::TmuxRunner;
 
 const SELECTION_CONTEXT_FORMAT: &str = "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{session_id}";
 const SIDEBAR_CONTROL_FORMAT: &str = "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{@vde_sidebar}";
+const SOURCE_WINDOW_FORMAT: &str = "#{pane_pid}\u{1f}#{window_id}";
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SidebarCommand {
@@ -18,6 +19,8 @@ pub(crate) enum SidebarCommand {
     },
     Input {
         key: String,
+        #[arg(long)]
+        window: Option<String>,
     },
     Open {
         #[arg(long)]
@@ -118,14 +121,19 @@ where
             }
             crate::sidebar::tui::run_live_tui(env, config, &socket, &server_identity)
         }
-        SidebarCommand::Input { key } => {
+        SidebarCommand::Input { key, window } => {
             let (server_identity, _socket) = ensure_daemon(runner, env)?;
-            let sidebar = crate::sidebar::control::resolve_current_pane_instance(runner, env)
-                .context("sidebar input requires the invoking sidebar pane instance")?;
+            let source_pane = crate::sidebar::control::resolve_current_pane_instance(runner, env)
+                .context("failed to resolve the sidebar input source pane")?;
+            let target = match window.filter(|value| !value.trim().is_empty()) {
+                Some(window) => window,
+                None => resolve_source_window_target(runner, &source_pane)?,
+            };
+            let sidebar = resolve_sidebar_instance(runner, Some(&target))?;
             crate::sidebar::control::send(
                 &server_identity,
                 &sidebar,
-                &crate::sidebar::control::ControlMessage::Input { key },
+                &crate::sidebar::control::ControlMessage::Input { key, source_pane },
             )?;
             Ok(None)
         }
@@ -401,6 +409,35 @@ fn resolve_sidebar_instance(
         [] => bail!("sidebar pane is not running"),
         _ => bail!("multiple sidebar panes matched the requested window"),
     }
+}
+
+fn resolve_source_window_target(
+    runner: &dyn TmuxRunner,
+    source_pane: &crate::pane_state::PaneInstance,
+) -> Result<String> {
+    source_pane.validate().map_err(anyhow::Error::msg)?;
+    let raw = runner.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        &source_pane.pane_id,
+        "-F",
+        SOURCE_WINDOW_FORMAT,
+    ])?;
+    let (pane_pid, window_id) = raw
+        .trim()
+        .split_once('\u{1f}')
+        .context("sidebar input source window is missing fields")?;
+    let pane_pid = pane_pid
+        .parse::<u32>()
+        .context("invalid sidebar input source pane PID")?;
+    if pane_pid != source_pane.pane_pid {
+        bail!("sidebar input source pane was replaced");
+    }
+    if window_id.trim().is_empty() {
+        bail!("failed to resolve sidebar input source window");
+    }
+    Ok(window_id.to_string())
 }
 
 fn normalize_context_field(value: Option<&str>) -> Option<String> {

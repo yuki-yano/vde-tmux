@@ -59,7 +59,6 @@ pub struct RowMeta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BadgeCounts {
     pub total: usize,
-    pub attention: usize,
     pub blocked: usize,
     pub working: usize,
     pub done: usize,
@@ -70,7 +69,7 @@ impl BadgeCounts {
     pub fn count_for_filter(self, filter: StatusFilter) -> usize {
         match filter {
             StatusFilter::All => self.total,
-            StatusFilter::AttentionOnly => self.attention,
+            StatusFilter::AttentionOnly => self.blocked,
             StatusFilter::WorkingOnly => self.working,
             StatusFilter::DoneOnly => self.done,
             StatusFilter::IdleOnly => self.idle,
@@ -285,9 +284,17 @@ fn build_rows_from_groups(
     for panes in groups.values_mut() {
         order_agent_panes(panes, order);
     }
+    let counts = badge_counts_from_agent_panes(groups.values().flat_map(|panes| panes.iter()));
+    if state.view_mode == ViewMode::Priority {
+        for panes in groups.values_mut() {
+            panes.retain(|pane| pane_matches_filter(pane, state.filter));
+        }
+        groups.retain(|_, panes| !panes.is_empty());
+        return (priority_rows(groups, state, order, ctx.now), counts);
+    }
     let group_metas = groups
         .iter()
-        .map(|(key, panes)| (key.clone(), group_meta(panes, &ctx.triage)))
+        .map(|(key, panes)| (key.clone(), group_meta(panes)))
         .collect::<BTreeMap<_, _>>();
     let mut triage_panes = Vec::new();
     for panes in groups.values_mut() {
@@ -301,13 +308,6 @@ fn build_rows_from_groups(
         }
     }
     order_agent_panes(&mut triage_panes, order);
-    let counts = badge_counts_from_agent_panes(
-        groups
-            .values()
-            .flat_map(|panes| panes.iter())
-            .chain(triage_panes.iter()),
-        &ctx.triage,
-    );
     for panes in groups.values_mut() {
         panes.retain(|pane| pane_matches_filter(pane, state.filter));
     }
@@ -326,6 +326,7 @@ fn build_rows_from_groups(
             &group_metas,
         ),
         ViewMode::ByCategory => category_rows(groups, state, ctx, &group_metas),
+        ViewMode::Priority => unreachable!("priority returns before structural projection"),
     };
     rows.append(&mut fleet_rows);
     (rows, counts)
@@ -333,14 +334,10 @@ fn build_rows_from_groups(
 
 fn badge_counts_from_agent_panes<'a>(
     panes: impl IntoIterator<Item = &'a AgentPane>,
-    triage: &BTreeSet<PaneInstance>,
 ) -> BadgeCounts {
     let mut counts = BadgeCounts::default();
     for pane in panes {
         counts.total += 1;
-        if pane_matches_attention_filter(pane) || triage.contains(&pane.pane_instance) {
-            counts.attention += 1;
-        }
         match pane.badge_state {
             BadgeState::Blocked => counts.blocked += 1,
             BadgeState::Working => counts.working += 1,
@@ -589,7 +586,7 @@ fn repo_rows_from_keyed_map(
                 metas
                     .get(&(first.category.clone(), first.repo.clone()))
                     .cloned()
-                    .unwrap_or_else(|| group_meta(&panes, &BTreeSet::new())),
+                    .unwrap_or_else(|| group_meta(&panes)),
             ),
         });
         if expanded {
@@ -649,6 +646,83 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
         }
     }
     rows
+}
+
+fn priority_rows(
+    groups: BTreeMap<(String, String), Vec<AgentPane>>,
+    state: &SidebarState,
+    order: &SidebarPreferences,
+    now: i64,
+) -> Vec<SidebarRow> {
+    let mut panes = groups.into_values().flatten().collect::<Vec<_>>();
+    order_agent_panes(&mut panes, order);
+    let mut rows = Vec::new();
+    for (badge, key, label) in [
+        (BadgeState::Blocked, "needs-input", "NEEDS INPUT"),
+        (BadgeState::Done, "unread-done", "UNREAD DONE"),
+        (BadgeState::Working, "running", "RUNNING"),
+        (BadgeState::Idle, "idle", "IDLE"),
+    ] {
+        let section = panes
+            .iter()
+            .filter(|pane| pane.badge_state == badge)
+            .collect::<Vec<_>>();
+        if section.is_empty() {
+            continue;
+        }
+        rows.push(SidebarRow {
+            id: format!("zone::priority::{key}"),
+            kind: SidebarRowKind::Zone,
+            depth: 0,
+            label: label.to_string(),
+            chat_count: section.len(),
+            rollup: section
+                .iter()
+                .map(|pane| pane.rollup)
+                .min()
+                .unwrap_or(RollupLevel::Idle),
+            badge_state: Some(badge),
+            expanded: true,
+            pane_id: None,
+            git: None,
+            active: false,
+            meta: None,
+        });
+        for pane in section {
+            push_priority_chat_row(pane, state, now, &mut rows);
+        }
+    }
+    rows
+}
+
+fn push_priority_chat_row(
+    pane: &AgentPane,
+    state: &SidebarState,
+    now: i64,
+    rows: &mut Vec<SidebarRow>,
+) {
+    let id = chat_row_id(&pane.pane_instance);
+    let expanded = state.is_expanded_with_default(&id, false);
+    let origin = format!("{}/{}", pane.category, pane.repo);
+    let mut meta = chat_meta(pane, now);
+    meta.origin = Some(origin.clone());
+    rows.push(SidebarRow {
+        id,
+        kind: SidebarRowKind::Chat,
+        depth: 1,
+        label: format!("{} · {origin}", expanded_chat_label(pane)),
+        chat_count: 1,
+        rollup: pane.rollup,
+        badge_state: Some(pane.badge_state),
+        expanded,
+        pane_id: Some(pane.pane_id.clone()),
+        git: None,
+        active: pane.active,
+        meta: Some(meta),
+    });
+    if expanded {
+        push_chat_detail_rows(pane, 2, rows);
+    }
 }
 
 fn flat_rows(
@@ -865,14 +939,12 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
     }
 }
 
-fn group_meta(panes: &[AgentPane], triage: &BTreeSet<PaneInstance>) -> RowMeta {
+fn group_meta(panes: &[AgentPane]) -> RowMeta {
     RowMeta {
         attention_count: Some(
             panes
                 .iter()
-                .filter(|pane| {
-                    pane_matches_attention_filter(pane) || triage.contains(&pane.pane_instance)
-                })
+                .filter(|pane| pane_matches_attention_filter(pane))
                 .count(),
         ),
         ..RowMeta::default()
@@ -958,7 +1030,11 @@ fn pane_matches_filter(pane: &AgentPane, filter: StatusFilter) -> bool {
 }
 
 fn pane_matches_attention_filter(pane: &AgentPane) -> bool {
-    pane.badge_state == BadgeState::Blocked
+    badge_needs_user_input(pane.badge_state)
+}
+
+pub(crate) fn badge_needs_user_input(badge: BadgeState) -> bool {
+    badge == BadgeState::Blocked
 }
 
 fn order_repo_groups(
@@ -1339,7 +1415,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(alpha_chats, vec!["%2", "%1"]);
         assert_eq!(counts.total, 3);
-        assert_eq!(counts.attention, 1);
+        assert_eq!(counts.blocked, 1);
     }
 
     #[test]
@@ -1518,6 +1594,145 @@ mod tests {
             chat_sort_bucket(&blocked_with_history),
             ChatSortBucket::NeedsAttention
         );
+
+        let done = agent_pane(BadgeState::Done, "200");
+        assert!(!pane_matches_attention_filter(&done));
+        assert!(badge_needs_user_input(BadgeState::Blocked));
+        assert!(!badge_needs_user_input(BadgeState::Done));
+        assert!(!badge_needs_user_input(BadgeState::Working));
+        assert!(!badge_needs_user_input(BadgeState::Idle));
+    }
+
+    #[test]
+    fn priority_groups_all_categories_by_attention_then_done_running_and_idle() {
+        let mut blocked = agent_pane(BadgeState::Blocked, "");
+        blocked.pane_instance = PaneInstance {
+            pane_id: "%4".to_string(),
+            pane_pid: 4,
+        };
+        blocked.pane_id = "%4".to_string();
+        blocked.category = "work".to_string();
+        blocked.repo = "frontend".to_string();
+        blocked.repo_key = crate::category::RepoKey::path("/frontend");
+        blocked.rollup = RollupLevel::Permission;
+
+        let mut done = agent_pane(BadgeState::Done, "300");
+        done.pane_instance = PaneInstance {
+            pane_id: "%3".to_string(),
+            pane_pid: 3,
+        };
+        done.pane_id = "%3".to_string();
+        done.category = "private".to_string();
+        done.repo = "dotfiles".to_string();
+        done.repo_key = crate::category::RepoKey::path("/dotfiles");
+
+        let mut working = agent_pane(BadgeState::Working, "");
+        working.pane_instance = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 2,
+        };
+        working.pane_id = "%2".to_string();
+        working.category = "work".to_string();
+        working.repo = "backend".to_string();
+        working.repo_key = crate::category::RepoKey::path("/backend");
+        working.rollup = RollupLevel::Running;
+
+        let mut idle = agent_pane(BadgeState::Idle, "");
+        idle.pane_instance = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 1,
+        };
+        idle.pane_id = "%1".to_string();
+        idle.category = "private".to_string();
+        idle.repo = "notes".to_string();
+        idle.repo_key = crate::category::RepoKey::path("/notes");
+
+        let groups = BTreeMap::from([
+            (
+                (blocked.category.clone(), blocked.repo_key.to_string()),
+                vec![blocked.clone()],
+            ),
+            (
+                (done.category.clone(), done.repo_key.to_string()),
+                vec![done.clone()],
+            ),
+            (
+                (working.category.clone(), working.repo_key.to_string()),
+                vec![working.clone()],
+            ),
+            (
+                (idle.category.clone(), idle.repo_key.to_string()),
+                vec![idle.clone()],
+            ),
+        ]);
+        let context = RowBuildContext {
+            triage: BTreeSet::from([blocked.pane_instance.clone()]),
+            active_categories: BTreeSet::from(["work".to_string()]),
+            now: 400,
+            ..RowBuildContext::default()
+        };
+        let state = SidebarState {
+            view_mode: ViewMode::Priority,
+            ..SidebarState::default()
+        };
+
+        let (rows, counts) = build_rows_from_groups(
+            groups.clone(),
+            &state,
+            &SidebarPreferences::default(),
+            &context,
+        );
+
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Zone)
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["NEEDS INPUT", "UNREAD DONE", "RUNNING", "IDLE"]
+        );
+        assert!(!rows.iter().any(|row| row.id == "zone::triage"));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Chat)
+                .map(|row| row.pane_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["%4", "%3", "%2", "%1"]
+        );
+        assert!(rows.iter().any(|row| {
+            row.pane_id.as_deref() == Some("%3")
+                && row.meta.as_ref().and_then(|meta| meta.origin.as_deref())
+                    == Some("private/dotfiles")
+        }));
+        assert_eq!(counts.total, 4);
+        assert_eq!(counts.blocked, 1);
+        assert_eq!(counts.done, 1);
+
+        for (filter, expected) in [
+            (StatusFilter::AttentionOnly, vec!["%4"]),
+            (StatusFilter::WorkingOnly, vec!["%2"]),
+            (StatusFilter::DoneOnly, vec!["%3"]),
+            (StatusFilter::IdleOnly, vec!["%1"]),
+        ] {
+            let filtered = SidebarState {
+                view_mode: ViewMode::Priority,
+                filter,
+                ..SidebarState::default()
+            };
+            let (rows, _) = build_rows_from_groups(
+                groups.clone(),
+                &filtered,
+                &SidebarPreferences::default(),
+                &context,
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.kind == SidebarRowKind::Chat)
+                    .map(|row| row.pane_id.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                expected,
+                "filter {filter:?}"
+            );
+        }
     }
 
     #[test]

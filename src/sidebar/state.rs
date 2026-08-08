@@ -30,6 +30,7 @@ pub enum ViewMode {
     ByRepo,
     #[default]
     ByCategory,
+    Priority,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -416,7 +417,8 @@ impl ViewMode {
         match self {
             ViewMode::Flat => ViewMode::ByRepo,
             ViewMode::ByRepo => ViewMode::ByCategory,
-            ViewMode::ByCategory => ViewMode::Flat,
+            ViewMode::ByCategory => ViewMode::Priority,
+            ViewMode::Priority => ViewMode::Flat,
         }
     }
 }
@@ -535,6 +537,8 @@ mod tests {
         assert_eq!(state.view_mode, ViewMode::ByRepo);
         assert!(state.apply(SidebarAction::CycleViewMode, &[]));
         assert_eq!(state.view_mode, ViewMode::ByCategory);
+        assert!(state.apply(SidebarAction::CycleViewMode, &[]));
+        assert_eq!(state.view_mode, ViewMode::Priority);
         assert!(state.apply(SidebarAction::CycleViewMode, &[]));
         assert_eq!(state.view_mode, ViewMode::Flat);
 

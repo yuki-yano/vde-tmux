@@ -510,7 +510,6 @@ mod local_state_tests {
         let view = SidebarView {
             counts: BadgeCounts {
                 total: 6,
-                attention: 0,
                 blocked: 0,
                 working: 2,
                 done: 0,
@@ -532,6 +531,45 @@ mod local_state_tests {
         assert_eq!(state.filter, StatusFilter::WorkingOnly);
         apply_local_sidebar_key(&mut state, &view, "backtab");
         assert_eq!(state.filter, StatusFilter::All);
+    }
+
+    #[test]
+    fn attention_navigation_targets_only_blocked_agents() {
+        let row = |pane_id: &str, pane_pid: u32, badge_state: BadgeState| SidebarRow {
+            id: chat_row_id(&PaneInstance {
+                pane_id: pane_id.to_string(),
+                pane_pid,
+            }),
+            kind: SidebarRowKind::Chat,
+            depth: 0,
+            label: pane_id.to_string(),
+            chat_count: 1,
+            rollup: RollupLevel::Idle,
+            badge_state: Some(badge_state),
+            expanded: false,
+            pane_id: Some(pane_id.to_string()),
+            git: None,
+            active: false,
+            meta: None,
+        };
+        let blocked = row("%1", 101, BadgeState::Blocked);
+        let done = row("%2", 202, BadgeState::Done);
+        let working = row("%3", 303, BadgeState::Working);
+        let sidebar = SidebarView {
+            rows: vec![blocked.clone(), working, done.clone()],
+            ..SidebarView::default()
+        };
+        let mut state = SidebarState {
+            selection: Some(done.id),
+            ..SidebarState::default()
+        };
+
+        apply_local_sidebar_key(&mut state, &sidebar, "n");
+        assert_eq!(state.selection, Some(blocked.id.clone()));
+        apply_local_sidebar_key(&mut state, &sidebar, "n");
+        assert_eq!(state.selection, Some(blocked.id.clone()));
+        apply_local_sidebar_key(&mut state, &sidebar, "N");
+        assert_eq!(state.selection, Some(blocked.id));
     }
 
     #[test]
@@ -644,6 +682,107 @@ mod local_state_tests {
         );
 
         assert_eq!(state.selection, Some(chat_row_id(&direct.pane_instance)));
+    }
+
+    #[test]
+    fn agent_navigation_targets_only_chat_rows_and_stops_at_edges() {
+        let chat = |pane_id: &str, pane_pid: u32| SidebarRow {
+            id: chat_row_id(&PaneInstance {
+                pane_id: pane_id.to_string(),
+                pane_pid,
+            }),
+            kind: SidebarRowKind::Chat,
+            depth: 0,
+            label: pane_id.to_string(),
+            chat_count: 1,
+            rollup: RollupLevel::Running,
+            badge_state: Some(BadgeState::Working),
+            expanded: false,
+            pane_id: Some(pane_id.to_string()),
+            git: None,
+            active: false,
+            meta: None,
+        };
+        let first = chat("%1", 101);
+        let second = chat("%2", 202);
+        let rows = vec![
+            SidebarRow {
+                id: "zone::running".to_string(),
+                kind: SidebarRowKind::Zone,
+                depth: 0,
+                label: "RUNNING".to_string(),
+                chat_count: 2,
+                rollup: RollupLevel::Running,
+                badge_state: Some(BadgeState::Working),
+                expanded: true,
+                pane_id: None,
+                git: None,
+                active: false,
+                meta: None,
+            },
+            first.clone(),
+            SidebarRow {
+                id: "detail::%1::101::prompt".to_string(),
+                kind: SidebarRowKind::Detail,
+                depth: 1,
+                label: "details".to_string(),
+                chat_count: 0,
+                rollup: RollupLevel::Running,
+                badge_state: Some(BadgeState::Working),
+                expanded: true,
+                pane_id: Some("%1".to_string()),
+                git: None,
+                active: false,
+                meta: None,
+            },
+            second.clone(),
+        ];
+
+        assert_eq!(
+            adjacent_agent_target(None, &rows, true).map(|target| target.0),
+            Some(first.id.clone())
+        );
+        assert_eq!(
+            adjacent_agent_target(None, &rows, false).map(|target| target.0),
+            Some(second.id.clone())
+        );
+        assert_eq!(
+            adjacent_agent_target(Some(&first.id), &rows, true).map(|target| target.0),
+            Some(second.id.clone())
+        );
+        assert!(adjacent_agent_target(Some(&first.id), &rows, false).is_none());
+        assert!(adjacent_agent_target(Some(&second.id), &rows, true).is_none());
+    }
+
+    #[test]
+    fn latest_unread_done_uses_completion_time_then_pane_identity() {
+        let done = |pane_id: &str, pane_pid: u32, completed_at: Option<i64>| {
+            let mut pane = resolved_pane(pane_id, pane_pid, "$1");
+            let resolved = pane.resolved.as_mut().unwrap();
+            resolved.badge = BadgeState::Done;
+            resolved.canonical.completed_at = completed_at;
+            pane
+        };
+        let newest_later_id = done("%3", 303, Some(200));
+        let newest_first_id = done("%2", 202, Some(200));
+        let older = done("%1", 101, Some(100));
+        let missing_time = done("%0", 1, None);
+        let working = resolved_pane("%9", 909, "$1");
+        let snapshot = ResolvedSnapshot {
+            panes: vec![
+                newest_later_id,
+                working,
+                older,
+                missing_time,
+                newest_first_id.clone(),
+            ],
+            ..snapshot(10)
+        };
+
+        assert_eq!(
+            latest_unread_done_target(&snapshot),
+            Some(newest_first_id.pane_instance)
+        );
     }
 
     #[test]
@@ -2376,7 +2515,9 @@ fn run_loop<B: Backend>(
             ControlMessageContext {
                 snapshot: current.as_ref(),
                 config: config.app,
-                preferences_connected: matches!(connection, ConnectionState::Connected),
+                daemon_connected: matches!(connection, ConnectionState::Connected),
+                socket,
+                server_identity,
                 frame: last_frame.as_ref(),
                 theme,
             },
@@ -2883,7 +3024,10 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
                 .rows
                 .iter()
                 .filter(|row| {
-                    row.kind == SidebarRowKind::Chat && row.badge_state == Some(BadgeState::Blocked)
+                    row.kind == SidebarRowKind::Chat
+                        && row
+                            .badge_state
+                            .is_some_and(crate::sidebar::tree::badge_needs_user_input)
                 })
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>();
@@ -2914,9 +3058,98 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
         | SidebarInputAction::HalfPageUp
         | SidebarInputAction::PageDown
         | SidebarInputAction::PageUp
+        | SidebarInputAction::AgentNext
+        | SidebarInputAction::AgentPrevious
+        | SidebarInputAction::UnreadLatest
         | SidebarInputAction::ReorderUp
         | SidebarInputAction::ReorderDown => {}
     }
+}
+
+fn adjacent_agent_target(
+    selection: Option<&str>,
+    rows: &[SidebarRow],
+    forward: bool,
+) -> Option<(String, PaneInstance)> {
+    let agents = rows
+        .iter()
+        .filter(|row| row.kind == SidebarRowKind::Chat)
+        .filter_map(|row| pane_instance_from_row_id(&row.id).map(|pane| (row.id.clone(), pane)))
+        .collect::<Vec<_>>();
+    if agents.is_empty() {
+        return None;
+    }
+    let current =
+        selection.and_then(|selection| agents.iter().position(|(row_id, _)| row_id == selection));
+    let index = match (current, forward) {
+        (None, true) => 0,
+        (None, false) => agents.len() - 1,
+        (Some(index), true) => index.checked_add(1).filter(|next| *next < agents.len())?,
+        (Some(index), false) => index.checked_sub(1)?,
+    };
+    Some(agents[index].clone())
+}
+
+fn latest_unread_done_target(snapshot: &ResolvedSnapshot) -> Option<PaneInstance> {
+    let mut candidates = snapshot
+        .panes
+        .iter()
+        .filter_map(|pane| {
+            let resolved = pane.resolved.as_ref()?;
+            (resolved.badge == BadgeState::Done)
+                .then_some((resolved.canonical.completed_at, pane.pane_instance.clone()))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    candidates.into_iter().next().map(|(_, pane)| pane)
+}
+
+fn jump_from_control(
+    socket: &Path,
+    server_identity: &str,
+    snapshot: &ResolvedSnapshot,
+    source_pane: &PaneInstance,
+    target: Option<(String, PaneInstance)>,
+    state: &mut SidebarState,
+    ui: &mut MarkCompleteUi,
+) {
+    if let Err(error) = source_pane.validate() {
+        ui.set_toast(
+            format!("invalid jump source: {error}"),
+            NoticeLevel::Failure,
+            Duration::from_secs(5),
+        );
+        return;
+    }
+    let Some((row_id, pane_instance)) = target else {
+        return;
+    };
+    if !snapshot
+        .panes
+        .iter()
+        .any(|pane| pane.pane_instance == pane_instance)
+    {
+        ui.set_toast(
+            "jump target is stale".to_string(),
+            NoticeLevel::Warning,
+            Duration::from_secs(5),
+        );
+        return;
+    }
+    if state.selection.as_deref() != Some(row_id.as_str()) || state.manual_scroll {
+        state.selection = Some(row_id);
+        state.manual_scroll = false;
+        state.version = state.version.saturating_add(1);
+    }
+    dispatch_click_action(
+        &ClickContext {
+            socket,
+            server_identity,
+            source_pane,
+        },
+        ui,
+        ClickAction::JumpPane(pane_instance),
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3077,7 +3310,9 @@ fn activate_local_selection(
 struct ControlMessageContext<'a> {
     snapshot: Option<&'a ResolvedSnapshot>,
     config: &'a Config,
-    preferences_connected: bool,
+    daemon_connected: bool,
+    socket: &'a Path,
+    server_identity: &'a str,
     frame: Option<&'a DrawnFrame>,
     theme: &'a SidebarRenderTheme,
 }
@@ -3093,7 +3328,9 @@ fn drain_control_messages(
     let ControlMessageContext {
         snapshot,
         config,
-        preferences_connected,
+        daemon_connected,
+        socket,
+        server_identity,
         frame,
         theme,
     } = context;
@@ -3103,10 +3340,75 @@ fn drain_control_messages(
             before = Some(state.clone());
         }
         match message {
-            crate::sidebar::control::ControlMessage::Input { key } => {
+            crate::sidebar::control::ControlMessage::Input { key, source_pane } => {
                 if let Some(snapshot) = snapshot {
                     let sidebar = project_view(snapshot, config, state);
                     match crate::sidebar::input::parse_key(&key) {
+                        Some(crate::sidebar::input::SidebarInputAction::AgentNext)
+                        | Some(crate::sidebar::input::SidebarInputAction::AgentPrevious)
+                        | Some(crate::sidebar::input::SidebarInputAction::UnreadLatest)
+                            if !daemon_connected =>
+                        {
+                            ui.set_toast(
+                                "jump unavailable while sidebar is degraded".to_string(),
+                                NoticeLevel::Warning,
+                                Duration::from_secs(5),
+                            );
+                        }
+                        Some(crate::sidebar::input::SidebarInputAction::AgentNext) => {
+                            let target = adjacent_agent_target(
+                                state.selection.as_deref(),
+                                &sidebar.rows,
+                                true,
+                            );
+                            jump_from_control(
+                                socket,
+                                server_identity,
+                                snapshot,
+                                &source_pane,
+                                target,
+                                state,
+                                ui,
+                            );
+                        }
+                        Some(crate::sidebar::input::SidebarInputAction::AgentPrevious) => {
+                            let target = adjacent_agent_target(
+                                state.selection.as_deref(),
+                                &sidebar.rows,
+                                false,
+                            );
+                            jump_from_control(
+                                socket,
+                                server_identity,
+                                snapshot,
+                                &source_pane,
+                                target,
+                                state,
+                                ui,
+                            );
+                        }
+                        Some(crate::sidebar::input::SidebarInputAction::UnreadLatest) => {
+                            let target = latest_unread_done_target(snapshot).map(|pane| {
+                                let row_id = chat_row_id(&pane);
+                                (row_id, pane)
+                            });
+                            if target.is_none() {
+                                ui.set_toast(
+                                    "no unread Done agents".to_string(),
+                                    NoticeLevel::Warning,
+                                    Duration::from_secs(3),
+                                );
+                            }
+                            jump_from_control(
+                                socket,
+                                server_identity,
+                                snapshot,
+                                &source_pane,
+                                target,
+                                state,
+                                ui,
+                            );
+                        }
                         Some(crate::sidebar::input::SidebarInputAction::MoveFirst) => {
                             move_viewport_selection(
                                 snapshot,
@@ -3153,17 +3455,28 @@ fn drain_control_messages(
                             );
                         }
                         Some(crate::sidebar::input::SidebarInputAction::ReorderUp)
-                            if preferences_connected =>
+                            if daemon_connected =>
                         {
                             queue_reorder(&sidebar, true, preference_tx, category_tx, ui);
                         }
                         Some(crate::sidebar::input::SidebarInputAction::ReorderDown)
-                            if preferences_connected =>
+                            if daemon_connected =>
                         {
                             queue_reorder(&sidebar, false, preference_tx, category_tx, ui);
                         }
                         _ => apply_local_sidebar_key(state, &sidebar, &key),
                     }
+                } else if matches!(
+                    crate::sidebar::input::parse_key(&key),
+                    Some(crate::sidebar::input::SidebarInputAction::AgentNext)
+                        | Some(crate::sidebar::input::SidebarInputAction::AgentPrevious)
+                        | Some(crate::sidebar::input::SidebarInputAction::UnreadLatest)
+                ) {
+                    ui.set_toast(
+                        "jump unavailable before the first snapshot".to_string(),
+                        NoticeLevel::Warning,
+                        Duration::from_secs(5),
+                    );
                 }
             }
             crate::sidebar::control::ControlMessage::Focus {

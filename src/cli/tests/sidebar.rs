@@ -552,7 +552,6 @@ fn dispatch_sidebar_jump_forwards_to_daemon_when_socket_exists() {
         &["display-message", "-p", "-F", "#{pane_id}\u{1f}#{pane_pid}"],
         "%9\u{1f}909\n",
     );
-
     crate::cli::sidebar::run_sidebar_command_with_ensure(
         crate::cli::sidebar::SidebarCommand::Jump {
             pane: "%1".to_string(),
@@ -596,6 +595,27 @@ fn dispatch_sidebar_input_targets_the_invoking_sidebar_instance() {
         ],
         "%9\u{1f}909\n",
     );
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "%9",
+            "-F",
+            "#{pane_pid}\u{1f}#{window_id}",
+        ],
+        "909\u{1f}@1\n",
+    );
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@1",
+            "-F",
+            "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{@vde_sidebar}",
+        ],
+        "%9\u{1f}909\u{1f}1\n",
+    );
     let server_identity = format!("cli_input_{}", std::process::id());
     let sidebar = crate::pane_state::PaneInstance {
         pane_id: "%9".to_string(),
@@ -608,6 +628,7 @@ fn dispatch_sidebar_input_targets_the_invoking_sidebar_instance() {
     crate::cli::sidebar::run_sidebar_command_with_ensure(
         crate::cli::sidebar::SidebarCommand::Input {
             key: "j".to_string(),
+            window: None,
         },
         &mock,
         &env,
@@ -619,7 +640,263 @@ fn dispatch_sidebar_input_targets_the_invoking_sidebar_instance() {
     assert_eq!(
         listener.try_recv().unwrap(),
         Some(crate::sidebar::control::ControlMessage::Input {
-            key: "j".to_string()
+            key: "j".to_string(),
+            source_pane: sidebar,
+        })
+    );
+}
+
+#[test]
+fn dispatch_sidebar_input_separates_nonfocused_source_from_target_sidebar() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "%1",
+            "-F",
+            "#{pane_id}\u{1f}#{pane_pid}",
+        ],
+        "%1\u{1f}101\n",
+    );
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "%1",
+            "-F",
+            "#{pane_pid}\u{1f}#{window_id}",
+        ],
+        "101\u{1f}@1\n",
+    );
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@1",
+            "-F",
+            "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{@vde_sidebar}",
+        ],
+        "%1\u{1f}101\u{1f}0\n%9\u{1f}909\u{1f}1\n",
+    );
+    let server_identity = format!("cli_nonfocus_input_{}", std::process::id());
+    let sidebar = crate::pane_state::PaneInstance {
+        pane_id: "%9".to_string(),
+        pane_pid: 909,
+    };
+    let source = crate::pane_state::PaneInstance {
+        pane_id: "%1".to_string(),
+        pane_pid: 101,
+    };
+    let listener =
+        crate::sidebar::control::ControlListener::bind(&server_identity, &sidebar).unwrap();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+
+    crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Input {
+            key: "agent-next".to_string(),
+            window: None,
+        },
+        &mock,
+        &env,
+        &crate::config::Config::default(),
+        |_, _| Ok((server_identity.clone(), std::path::PathBuf::new())),
+    )
+    .unwrap();
+
+    assert_eq!(
+        listener.try_recv().unwrap(),
+        Some(crate::sidebar::control::ControlMessage::Input {
+            key: "agent-next".to_string(),
+            source_pane: source,
+        })
+    );
+}
+
+#[test]
+fn dispatch_sidebar_input_rejects_reused_source_pane() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "%1",
+            "-F",
+            "#{pane_id}\u{1f}#{pane_pid}",
+        ],
+        "%1\u{1f}101\n",
+    );
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "%1",
+            "-F",
+            "#{pane_pid}\u{1f}#{window_id}",
+        ],
+        "202\u{1f}@1\n",
+    );
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+
+    let error = crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Input {
+            key: "v".to_string(),
+            window: None,
+        },
+        &mock,
+        &env,
+        &crate::config::Config::default(),
+        |_, _| Ok(("scratch".to_string(), std::path::PathBuf::new())),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("source pane was replaced"));
+}
+
+#[test]
+fn dispatch_sidebar_input_rejects_a_window_without_a_sidebar() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "%1",
+            "-F",
+            "#{pane_id}\u{1f}#{pane_pid}",
+        ],
+        "%1\u{1f}101\n",
+    );
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@2",
+            "-F",
+            "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{@vde_sidebar}",
+        ],
+        "%2\u{1f}202\u{1f}0\n",
+    );
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+
+    let error = crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Input {
+            key: "v".to_string(),
+            window: Some("@2".to_string()),
+        },
+        &mock,
+        &env,
+        &crate::config::Config::default(),
+        |_, _| Ok(("scratch".to_string(), std::path::PathBuf::new())),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("sidebar pane is not running"));
+}
+
+#[test]
+fn dispatch_sidebar_input_rejects_multiple_sidebars_in_the_requested_window() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "%1",
+            "-F",
+            "#{pane_id}\u{1f}#{pane_pid}",
+        ],
+        "%1\u{1f}101\n",
+    );
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@2",
+            "-F",
+            "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{@vde_sidebar}",
+        ],
+        "%8\u{1f}808\u{1f}1\n%9\u{1f}909\u{1f}1\n",
+    );
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+
+    let error = crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Input {
+            key: "v".to_string(),
+            window: Some("@2".to_string()),
+        },
+        &mock,
+        &env,
+        &crate::config::Config::default(),
+        |_, _| Ok(("scratch".to_string(), std::path::PathBuf::new())),
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("multiple sidebar panes matched the requested window")
+    );
+}
+
+#[test]
+fn dispatch_sidebar_input_targets_an_explicit_different_window() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "%1",
+            "-F",
+            "#{pane_id}\u{1f}#{pane_pid}",
+        ],
+        "%1\u{1f}101\n",
+    );
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@2",
+            "-F",
+            "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{@vde_sidebar}",
+        ],
+        "%9\u{1f}909\u{1f}1\n",
+    );
+    let server_identity = format!("cli_explicit_window_input_{}", std::process::id());
+    let sidebar = crate::pane_state::PaneInstance {
+        pane_id: "%9".to_string(),
+        pane_pid: 909,
+    };
+    let source = crate::pane_state::PaneInstance {
+        pane_id: "%1".to_string(),
+        pane_pid: 101,
+    };
+    let listener =
+        crate::sidebar::control::ControlListener::bind(&server_identity, &sidebar).unwrap();
+    let env = BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())]);
+
+    crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Input {
+            key: "agent-next".to_string(),
+            window: Some("@2".to_string()),
+        },
+        &mock,
+        &env,
+        &crate::config::Config::default(),
+        |_, _| Ok((server_identity.clone(), std::path::PathBuf::new())),
+    )
+    .unwrap();
+
+    assert_eq!(
+        listener.try_recv().unwrap(),
+        Some(crate::sidebar::control::ControlMessage::Input {
+            key: "agent-next".to_string(),
+            source_pane: source,
         })
     );
 }

@@ -21,6 +21,9 @@ pub enum SidebarInputAction {
     ToggleRow(String),
     FocusNextAttention,
     FocusPreviousAttention,
+    AgentNext,
+    AgentPrevious,
+    UnreadLatest,
     ReorderUp,
     ReorderDown,
 }
@@ -51,11 +54,15 @@ pub fn parse_key(key: &str) -> Option<SidebarInputAction> {
         "backtab" => Some(SidebarInputAction::CycleFilterBackward),
         "n" => Some(SidebarInputAction::FocusNextAttention),
         "N" => Some(SidebarInputAction::FocusPreviousAttention),
+        "agent-next" => Some(SidebarInputAction::AgentNext),
+        "agent-prev" => Some(SidebarInputAction::AgentPrevious),
+        "unread-latest" => Some(SidebarInputAction::UnreadLatest),
         "J" => Some(SidebarInputAction::ReorderDown),
         "K" => Some(SidebarInputAction::ReorderUp),
         "1" => Some(SidebarInputAction::SetViewMode(ViewMode::Flat)),
         "2" => Some(SidebarInputAction::SetViewMode(ViewMode::ByRepo)),
         "3" => Some(SidebarInputAction::SetViewMode(ViewMode::ByCategory)),
+        "4" => Some(SidebarInputAction::SetViewMode(ViewMode::Priority)),
         "all" => Some(SidebarInputAction::SetFilter(StatusFilter::All)),
         "attn" => Some(SidebarInputAction::SetFilter(StatusFilter::AttentionOnly)),
         "working" => Some(SidebarInputAction::SetFilter(StatusFilter::WorkingOnly)),
@@ -124,6 +131,15 @@ mod tests {
         assert_eq!(parse_key("C-u"), Some(SidebarInputAction::HalfPageUp));
         assert_eq!(parse_key("C-f"), Some(SidebarInputAction::PageDown));
         assert_eq!(parse_key("C-b"), Some(SidebarInputAction::PageUp));
+        assert_eq!(parse_key("agent-next"), Some(SidebarInputAction::AgentNext));
+        assert_eq!(
+            parse_key("agent-prev"),
+            Some(SidebarInputAction::AgentPrevious)
+        );
+        assert_eq!(
+            parse_key("unread-latest"),
+            Some(SidebarInputAction::UnreadLatest)
+        );
         assert_eq!(parse_key("h"), None);
         assert_eq!(parse_key("l"), None);
         assert_eq!(parse_key("right"), None);
@@ -135,6 +151,10 @@ mod tests {
         assert_eq!(
             parse_key("3"),
             Some(SidebarInputAction::SetViewMode(ViewMode::ByCategory))
+        );
+        assert_eq!(
+            parse_key("4"),
+            Some(SidebarInputAction::SetViewMode(ViewMode::Priority))
         );
         assert_eq!(parse_key("unknown"), None);
     }

@@ -16,6 +16,7 @@ const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024;
 pub enum ControlMessage {
     Input {
         key: String,
+        source_pane: PaneInstance,
     },
     Focus {
         pane_instance: PaneInstance,
@@ -240,6 +241,30 @@ mod tests {
         };
         send("test_server", &sidebar, &message).unwrap();
         assert_eq!(listener.try_recv().unwrap(), Some(message));
+    }
+
+    #[test]
+    fn control_socket_roundtrips_input_source_identity() {
+        let sidebar = PaneInstance {
+            pane_id: "%987651".to_string(),
+            pane_pid: std::process::id(),
+        };
+        let listener = ControlListener::bind("test_input_server", &sidebar).unwrap();
+        let message = ControlMessage::Input {
+            key: "agent-next".to_string(),
+            source_pane: PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 7,
+            },
+        };
+        send("test_input_server", &sidebar, &message).unwrap();
+        assert_eq!(listener.try_recv().unwrap(), Some(message));
+    }
+
+    #[test]
+    fn input_frame_requires_source_identity() {
+        let legacy = br#"{"type":"input","key":"v"}"#;
+        assert!(serde_json::from_slice::<ControlMessage>(legacy).is_err());
     }
 
     #[test]
