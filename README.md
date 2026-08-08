@@ -203,6 +203,9 @@ a later completion-time visibility check acknowledges it.
 
 The sidebar opens in the current tmux window and groups agents by category by default.
 Flat and ByRepo show only the currently active category.
+Priority spans all categories and groups agents as Needs Input, Unread Done, Running, then Idle.
+The Needs action filter and red triangle match only Blocked agents waiting for user input.
+Unread Done agents remain separate under the Done filter and `unread-latest` navigation.
 
 ```bash
 vt sidebar open --width 40
@@ -224,9 +227,9 @@ vt sidebar close
 | `Enter` | Jump to the selected agent pane |
 | `Space` | Expand or collapse the selected row |
 | `v` | Cycle the view mode |
-| `1` / `2` / `3` | Select Flat / ByRepo / ByCategory |
+| `1` / `2` / `3` / `4` | Select Flat / ByRepo / ByCategory / Priority |
 | `Tab` / `Shift+Tab` | Cycle the state filter |
-| `n` / `N` | Move to the next or previous agent that needs attention |
+| `n` / `N` | Move to the next or previous Blocked agent waiting for user input |
 | `d` | Mark the selected run as complete |
 | `J` / `K` | Change manual ordering |
 | `q` / `Esc` | Close the sidebar |
@@ -236,8 +239,19 @@ Click any rendered line of an agent once to jump to its pane; the agent does not
 need to be selected first. Use `Space` to expand or collapse the selected agent.
 The mouse wheel scrolls overflow without moving the selected cursor.
 An agent with no activity yet uses a single line while collapsed.
-View mode, filter, manual order, and expansion state are persisted and shared across sidebars.
-Selection and scrolling are synchronized across all open sidebars on the same tmux server.
+View mode and filter are local to each open sidebar; their persisted values seed newly opened sidebars.
+Manual order, expansion state, selection, and scrolling are synchronized across all open sidebars on the same tmux server.
+
+An open sidebar can also be controlled without focusing it. View and filter changes affect only
+the sidebar in the target window; Agent selection and scrolling use the shared navigation state.
+
+```tmux
+bind-key -n M-v run-shell "vt sidebar input v --window #{q:window_id}"
+bind-key -n M-f run-shell "vt sidebar input tab --window #{q:window_id}"
+bind-key -n M-j run-shell "vt sidebar input agent-next --window #{q:window_id}"
+bind-key -n M-k run-shell "vt sidebar input agent-prev --window #{q:window_id}"
+bind-key -n M-u run-shell "vt sidebar input unread-latest --window #{q:window_id}"
+```
 
 ## Sessions and categories
 

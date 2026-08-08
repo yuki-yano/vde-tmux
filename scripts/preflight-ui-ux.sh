@@ -732,6 +732,54 @@ assert preferences["schema_version"] == 1, preferences
 PY
 record sidebar-state PASS-navigation-shared-and-view-filter-defaults-persisted
 
+# A regular pane can operate only the sidebar in its own window without first focusing it.
+# Semantic navigation selects a visible agent and jumps the invoking client in one action;
+# unread-latest scans the full snapshot and may cross session/window boundaries.
+tmux_cmd switch-client -c "$CLIENT_1" -t "$S1_WINDOW"
+tmux_cmd select-pane -t "$S1_AGENT"
+wait_client_pane "$CLIENT_1" "$S1_AGENT"
+capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-before-nonfocus-input.txt"
+SIDE2_BEFORE_NONFOCUS="$(fingerprint "$ARTIFACT_DIR/sidebar-2-before-nonfocus-input.txt")"
+
+VT_PANE="$S1_AGENT" run_vt sidebar input all --window "$S1_WINDOW"
+VT_PANE="$S1_AGENT" run_vt sidebar input 4 --window "$S1_WINDOW"
+sleep 0.2
+capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-priority-nonfocus.txt"
+capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-nonfocus-view.txt"
+grep -F 'Priority' "$ARTIFACT_DIR/sidebar-1-priority-nonfocus.txt" >/dev/null
+grep -F 'UNREAD DONE' "$ARTIFACT_DIR/sidebar-1-priority-nonfocus.txt" >/dev/null
+grep -F 'RUNNING' "$ARTIFACT_DIR/sidebar-1-priority-nonfocus.txt" >/dev/null
+SIDEBAR_PRIORITY_HEADER="$(sed -n '1,3p' "$ARTIFACT_DIR/sidebar-1-priority-nonfocus.txt")"
+grep -F '▲ 0' <<<"$SIDEBAR_PRIORITY_HEADER" >/dev/null
+grep -F '✓ 1' <<<"$SIDEBAR_PRIORITY_HEADER" >/dev/null
+[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-nonfocus-view.txt")" == "$SIDE2_BEFORE_NONFOCUS" ]]
+wait_client_pane "$CLIENT_1" "$S1_AGENT"
+
+VT_PANE="$S1_AGENT" run_vt sidebar input done --window "$S1_WINDOW"
+sleep 0.15
+VT_PANE="$S1_AGENT" run_vt sidebar input agent-next --window "$S1_WINDOW"
+wait_client_pane "$CLIENT_1" "$S1_PEER"
+wait_badge "$S1_PEER" Idle
+
+tmux_cmd switch-client -c "$CLIENT_1" -t "$S1_WINDOW"
+tmux_cmd select-pane -t "$S1_AGENT"
+wait_client_pane "$CLIENT_1" "$S1_AGENT"
+VT_PANE="$S1_AGENT" run_vt sidebar input all --window "$S1_WINDOW"
+UNREAD_NOW="$(date +%s)"
+VT_PANE="$S2_AGENT" run_vt hook emit --agent 'ascii-two' --session-id side-two-a \
+  --status running --started-at "$UNREAD_NOW"
+VT_PANE="$S2_AGENT" run_vt hook emit --agent 'ascii-two' --session-id side-two-a \
+  --status idle --completed-at "$((UNREAD_NOW + 1))"
+wait_badge "$S2_AGENT" Done
+VT_PANE="$S1_AGENT" run_vt sidebar input unread-latest --window "$S1_WINDOW"
+wait_client_pane "$CLIENT_1" "$S2_AGENT"
+wait_badge "$S2_AGENT" Idle
+record sidebar-nonfocus PASS-window-local-view-agent-next-and-cross-window-unread-latest
+
+tmux_cmd switch-client -c "$CLIENT_1" -t "$S1_WINDOW"
+tmux_cmd select-pane -t "$S1_AGENT"
+wait_client_pane "$CLIENT_1" "$S1_AGENT"
+
 # Focus records a pane-instance return target, focus-toggle closes back onto content, and a
 # reopened instance still jumps through a stable PaneInstance.
 tmux_cmd switch-client -c "$CLIENT_1" -t "$S1_WINDOW"
@@ -792,8 +840,8 @@ query_snapshot
 python3 - "$QUERY_JSON" "$S2_AGENT" "$S2_AGENT_PID" "$S1_AGENT" <<'PY'
 import json, sys
 preferences = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["preferences"]
-assert preferences["view_mode"] == "flat", preferences
-assert preferences["filter"] == "done_only", preferences
+assert preferences["view_mode"] == "priority", preferences
+assert preferences["filter"] == "all", preferences
 assert preferences["manual_chat_order"][:2] == [sys.argv[2], sys.argv[4]], preferences
 assert f"chat::{sys.argv[2]}::{sys.argv[3]}" in preferences["expansion_overrides"], preferences
 PY
