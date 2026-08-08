@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -574,36 +574,58 @@ fn kill_selection(
         .iter()
         .filter_map(|entry| {
             if entry.action == "session" {
-                Some(entry.name.as_str())
-            } else if entry.action == "window" {
-                Some(entry.session.as_str())
+                Some(entry.name.clone())
             } else {
                 None
             }
         })
         .filter(|session| !session.is_empty())
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
+    let affected_sessions = entries
+        .iter()
+        .filter_map(|entry| match entry.action.as_str() {
+            "session" => Some(entry.name.as_str()),
+            "window" => Some(entry.session.as_str()),
+            _ => None,
+        })
+        .filter(|session| !session.is_empty())
+        .collect::<BTreeSet<_>>();
     if let Ok(current) = current_session_name(runner)
-        && session_targets.iter().any(|session| *session == current)
-        && let Some(fallback) = list_sessions(runner)?
-            .iter()
-            .find(|session| !session_targets.contains(&session.name.as_str()))
+        && affected_sessions.contains(current.as_str())
     {
-        let client = current_client_name(runner)?;
-        switch_client_for_client(runner, &client, &fallback.name)?;
+        let sessions = list_sessions(runner)?;
+        let fallback = sessions
+            .iter()
+            .find(|session| !affected_sessions.contains(session.name.as_str()))
+            .or_else(|| {
+                sessions.iter().find(|session| {
+                    session.name != current && !session_targets.contains(&session.name)
+                })
+            });
+        if let Some(fallback) = fallback {
+            let client = current_client_name(runner)?;
+            switch_client_for_client(runner, &client, &fallback.name)?;
+        }
     }
+    let mut killed_sessions = BTreeSet::new();
+    let mut killed_windows = BTreeSet::new();
     for entry in entries {
         match entry.action.as_str() {
-            "session" => {
+            "session" if killed_sessions.insert(entry.name.clone()) => {
                 runner.run(&["kill-session", "-t", &exact_session_target(&entry.name)])?;
             }
             "window" => {
+                if session_targets.contains(&entry.session) {
+                    continue;
+                }
                 let target = if entry.target.is_empty() {
                     &entry.name
                 } else {
                     &entry.target
                 };
-                runner.run(&["kill-window", "-t", target])?;
+                if killed_windows.insert(target.clone()) {
+                    runner.run(&["kill-window", "-t", target])?;
+                }
             }
             _ => {}
         }
@@ -1662,6 +1684,165 @@ mod tests {
                 ]
             ]
         );
+    }
+
+    #[test]
+    fn ctrl_q_switches_away_before_killing_a_window_in_the_current_session() {
+        let mock = MockTmuxRunner::new();
+        let session_format = crate::session::session_list_format();
+        let selected = render_entry(&ManagerEntry {
+            action: "window".to_string(),
+            name: "@9".to_string(),
+            session: "main".to_string(),
+            target: "@9".to_string(),
+            display: "main:1".to_string(),
+        });
+        mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+        mock.stub(
+            &["list-sessions", "-F", &session_format],
+            "main\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}$1\nother\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}$2\n",
+        );
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "abc\t/dev/ttys001\n",
+        );
+        mock.stub(&["switch-client", "-c", "abc", "-t", "=other:"], "");
+        mock.stub(&["kill-window", "-t", "@9"], "");
+
+        run_selection(&mock, &format!("ctrl-q\n{selected}")).unwrap();
+
+        assert_eq!(
+            mock.calls().last().unwrap(),
+            &vec![
+                "kill-window".to_string(),
+                "-t".to_string(),
+                "@9".to_string(),
+            ]
+        );
+        assert!(mock.calls().contains(&vec![
+            "switch-client".to_string(),
+            "-c".to_string(),
+            "abc".to_string(),
+            "-t".to_string(),
+            "=other:".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn ctrl_q_kills_parent_session_once_when_its_window_is_also_selected() {
+        let mock = MockTmuxRunner::new();
+        let session = render_entry(&ManagerEntry {
+            action: "session".to_string(),
+            name: "alpha".to_string(),
+            session: "alpha".to_string(),
+            target: String::new(),
+            display: "alpha".to_string(),
+        });
+        let window = render_entry(&ManagerEntry {
+            action: "window".to_string(),
+            name: "@9".to_string(),
+            session: "alpha".to_string(),
+            target: "@9".to_string(),
+            display: "alpha:1".to_string(),
+        });
+        mock.stub(&["display-message", "-p", "#{session_name}"], "beta\n");
+        mock.stub(&["kill-session", "-t", "=alpha:"], "");
+
+        run_selection(&mock, &format!("ctrl-q\n{session}\n{window}")).unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            vec![
+                vec![
+                    "display-message".to_string(),
+                    "-p".to_string(),
+                    "#{session_name}".to_string(),
+                ],
+                vec![
+                    "kill-session".to_string(),
+                    "-t".to_string(),
+                    "=alpha:".to_string(),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn ctrl_q_kills_multiple_selected_sessions() {
+        let mock = MockTmuxRunner::new();
+        let alpha = render_entry(&ManagerEntry {
+            action: "session".to_string(),
+            name: "alpha".to_string(),
+            session: "alpha".to_string(),
+            target: String::new(),
+            display: "alpha".to_string(),
+        });
+        let beta = render_entry(&ManagerEntry {
+            action: "session".to_string(),
+            name: "beta".to_string(),
+            session: "beta".to_string(),
+            target: String::new(),
+            display: "beta".to_string(),
+        });
+        mock.stub(&["display-message", "-p", "#{session_name}"], "gamma\n");
+        mock.stub(&["kill-session", "-t", "=alpha:"], "");
+        mock.stub(&["kill-session", "-t", "=beta:"], "");
+
+        run_selection(&mock, &format!("ctrl-q\n{alpha}\n{beta}")).unwrap();
+
+        let calls = mock.calls();
+        assert!(calls.contains(&vec![
+            "kill-session".to_string(),
+            "-t".to_string(),
+            "=alpha:".to_string(),
+        ]));
+        assert!(calls.contains(&vec![
+            "kill-session".to_string(),
+            "-t".to_string(),
+            "=beta:".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn ctrl_q_can_use_a_partially_affected_session_as_fallback() {
+        let mock = MockTmuxRunner::new();
+        let session_format = crate::session::session_list_format();
+        let main = render_entry(&ManagerEntry {
+            action: "session".to_string(),
+            name: "main".to_string(),
+            session: "main".to_string(),
+            target: String::new(),
+            display: "main".to_string(),
+        });
+        let other_window = render_entry(&ManagerEntry {
+            action: "window".to_string(),
+            name: "@9".to_string(),
+            session: "other".to_string(),
+            target: "@9".to_string(),
+            display: "other:1".to_string(),
+        });
+        mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
+        mock.stub(
+            &["list-sessions", "-F", &session_format],
+            "main\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}$1\nother\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}$2\n",
+        );
+        mock.stub(
+            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
+            "abc\t/dev/ttys001\n",
+        );
+        mock.stub(&["switch-client", "-c", "abc", "-t", "=other:"], "");
+        mock.stub(&["kill-session", "-t", "=main:"], "");
+        mock.stub(&["kill-window", "-t", "@9"], "");
+
+        run_selection(&mock, &format!("ctrl-q\n{main}\n{other_window}")).unwrap();
+
+        assert!(mock.calls().contains(&vec![
+            "switch-client".to_string(),
+            "-c".to_string(),
+            "abc".to_string(),
+            "-t".to_string(),
+            "=other:".to_string(),
+        ]));
     }
 
     #[test]
