@@ -36,7 +36,9 @@ use crate::sidebar::render::{
     build_header_layout_with_counts, display_width, header_hit_test, render_header_lines,
     render_lines_with_indices,
 };
-use crate::sidebar::state::{SidebarAction, SidebarPreferenceIntent, SidebarState, StatusFilter};
+use crate::sidebar::state::{
+    SidebarAction, SidebarPreferenceIntent, SidebarState, StatusFilter, ViewMode,
+};
 use crate::sidebar::tree::{
     BadgeCounts, SidebarProjection, SidebarRow, SidebarRowKind, chat_row_id,
     pane_instance_from_row_id, project_sidebar, row_refs,
@@ -143,7 +145,6 @@ mod local_state_tests {
     };
     use crate::hook::RollupLevel;
     use crate::pane_state::StateId;
-    use crate::sidebar::state::ViewMode;
 
     fn structural_row(id: &str, kind: SidebarRowKind) -> SidebarRow {
         SidebarRow {
@@ -820,6 +821,80 @@ mod local_state_tests {
             (state.selection, state.scroll, state.return_target),
             instance_local
         );
+    }
+
+    #[test]
+    fn remote_view_and_filter_updates_converge_without_moving_the_shared_cursor() {
+        let mut snapshot = snapshot(11);
+        snapshot.sidebar_model.preferences.view_mode = ViewMode::Flat;
+        snapshot.sidebar_model.preferences.filter = StatusFilter::DoneOnly;
+        let selection = Some("chat::%7::70".to_string());
+        let mut first = SidebarState {
+            selection: selection.clone(),
+            scroll: 4,
+            manual_scroll: true,
+            ..SidebarState::default()
+        };
+        let mut second = first.clone();
+        let original_preferences = Some((ViewMode::ByCategory, StatusFilter::All));
+        let mut first_remote = original_preferences;
+        let mut second_remote = original_preferences;
+        let mut first_queued = original_preferences;
+        let mut second_queued = original_preferences;
+
+        assert!(apply_remote_sidebar_preferences(
+            &snapshot,
+            &mut first,
+            &mut first_remote,
+            &mut first_queued,
+        ));
+        assert!(apply_remote_sidebar_preferences(
+            &snapshot,
+            &mut second,
+            &mut second_remote,
+            &mut second_queued,
+        ));
+
+        assert_eq!(first.view_mode, ViewMode::Flat);
+        assert_eq!(first.filter, StatusFilter::DoneOnly);
+        assert_eq!(first, second);
+        assert_eq!(first.selection, selection);
+        assert_eq!(first.scroll, 4);
+        assert!(first.manual_scroll);
+        assert_eq!(first_queued, Some((ViewMode::Flat, StatusFilter::DoneOnly)));
+        assert_eq!(second_queued, first_queued);
+        assert!(!apply_remote_sidebar_preferences(
+            &snapshot,
+            &mut second,
+            &mut second_remote,
+            &mut second_queued,
+        ));
+    }
+
+    #[test]
+    fn remote_filter_ack_does_not_undo_a_newer_unqueued_view_change() {
+        let mut snapshot = snapshot(12);
+        snapshot.sidebar_model.preferences.view_mode = ViewMode::Flat;
+        snapshot.sidebar_model.preferences.filter = StatusFilter::All;
+        let mut state = SidebarState {
+            view_mode: ViewMode::Priority,
+            filter: StatusFilter::All,
+            ..SidebarState::default()
+        };
+        let mut last_remote = Some((ViewMode::Flat, StatusFilter::DoneOnly));
+        let mut last_queued = Some((ViewMode::Flat, StatusFilter::All));
+
+        assert!(!apply_remote_sidebar_preferences(
+            &snapshot,
+            &mut state,
+            &mut last_remote,
+            &mut last_queued,
+        ));
+
+        assert_eq!(state.view_mode, ViewMode::Priority);
+        assert_eq!(state.filter, StatusFilter::All);
+        assert_eq!(last_remote, Some((ViewMode::Flat, StatusFilter::All)));
+        assert_eq!(last_queued, Some((ViewMode::Flat, StatusFilter::All)));
     }
 
     #[test]
@@ -2278,6 +2353,7 @@ fn run_loop<B: Backend>(
     let mut sidebar_state = SidebarState::default();
     let mut initial_context_seeded = false;
     let mut last_queued_preferences = None;
+    let mut last_remote_preferences = None;
     let mut last_expansion_view: Option<BTreeSet<String>> = None;
     let mut last_remote_expansion: Option<BTreeSet<String>> = None;
     let mut last_remote_navigation_revision = 0;
@@ -2328,7 +2404,9 @@ fn run_loop<B: Backend>(
         }
         if !initial_context_seeded && let Some(snapshot) = current.as_ref() {
             seed_persisted_sidebar_preferences(snapshot, &mut sidebar_state);
-            last_queued_preferences = Some((sidebar_state.view_mode, sidebar_state.filter));
+            let preferences = (sidebar_state.view_mode, sidebar_state.filter);
+            last_queued_preferences = Some(preferences);
+            last_remote_preferences = Some(preferences);
             last_expansion_view = Some(sidebar_state.collapsed.clone());
             last_remote_expansion = Some(
                 snapshot
@@ -2365,6 +2443,16 @@ fn run_loop<B: Backend>(
                 });
             }
             initial_context_seeded = true;
+        }
+        if let Some(snapshot) = current.as_ref()
+            && apply_remote_sidebar_preferences(
+                snapshot,
+                &mut sidebar_state,
+                &mut last_remote_preferences,
+                &mut last_queued_preferences,
+            )
+        {
+            render_gate.mark_dirty();
         }
         if let Some(snapshot) = current.as_ref()
             && apply_remote_navigation(
@@ -2909,6 +2997,49 @@ fn seed_persisted_sidebar_preferences(snapshot: &ResolvedSnapshot, state: &mut S
         .preferences
         .expansion_overrides
         .clone();
+}
+
+fn apply_remote_sidebar_preferences(
+    snapshot: &ResolvedSnapshot,
+    state: &mut SidebarState,
+    last_remote: &mut Option<(ViewMode, StatusFilter)>,
+    last_queued: &mut Option<(ViewMode, StatusFilter)>,
+) -> bool {
+    let remote = (
+        snapshot.sidebar_model.preferences.view_mode,
+        snapshot.sidebar_model.preferences.filter,
+    );
+    if last_remote.as_ref() == Some(&remote) {
+        return false;
+    }
+    let local = (state.view_mode, state.filter);
+    let mut queued = last_queued.unwrap_or(local);
+    // A field that differs from the last locally queued value was changed by a newer local input
+    // that has not reached the preference worker yet. Preserve it while adopting independent
+    // remote fields so rapid mode/filter inputs cannot undo each other.
+    let next = (
+        if local.0 == queued.0 {
+            queued.0 = remote.0;
+            remote.0
+        } else {
+            local.0
+        },
+        if local.1 == queued.1 {
+            queued.1 = remote.1;
+            remote.1
+        } else {
+            local.1
+        },
+    );
+    let changed = local != next;
+    state.view_mode = next.0;
+    state.filter = next.1;
+    if changed {
+        state.version = state.version.saturating_add(1);
+    }
+    *last_remote = Some(remote);
+    *last_queued = Some(queued);
+    changed
 }
 
 fn select_context_agent(

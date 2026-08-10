@@ -708,18 +708,27 @@ SIDE2_SHARED_ORDER="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-shared-order.tx
 record sidebar-shared-state PASS-selection-manual-order-and-expansion-shared-across-two-sidebars
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input 1
-sleep 0.15
+for _ in $(seq 1 60); do
+  capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-view.txt"
+  grep -F 'Flat' "$ARTIFACT_DIR/sidebar-2-after-view.txt" >/dev/null && break
+  sleep 0.05
+done
 capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-view-flat.txt"
-capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-view.txt"
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-1-view-flat.txt")" != "$(fingerprint "$ARTIFACT_DIR/sidebar-1-selection.txt")" ]]
-[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-view.txt")" == "$SIDE2_SHARED_ORDER" ]]
+grep -F 'Flat' "$ARTIFACT_DIR/sidebar-1-view-flat.txt" >/dev/null
+grep -F 'Flat' "$ARTIFACT_DIR/sidebar-2-after-view.txt" >/dev/null
+SIDE2_SHARED_VIEW="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-view.txt")"
+[[ "$SIDE2_SHARED_VIEW" != "$SIDE2_SHARED_ORDER" ]]
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input 'done'
-sleep 0.15
+for _ in $(seq 1 60); do
+  capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-filter.txt"
+  [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-filter.txt")" != "$SIDE2_SHARED_VIEW" ]] && break
+  sleep 0.05
+done
 capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-filter-done.txt"
-capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-filter.txt"
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-1-filter-done.txt")" != "$(fingerprint "$ARTIFACT_DIR/sidebar-1-view-flat.txt")" ]]
-[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-filter.txt")" == "$SIDE2_SHARED_ORDER" ]]
+[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-filter.txt")" != "$SIDE2_SHARED_VIEW" ]]
 
 REVISION_AFTER_LOCAL="$(snapshot_revision)"
 (( REVISION_AFTER_LOCAL > REVISION_BEFORE_LOCAL ))
@@ -730,11 +739,11 @@ assert preferences["view_mode"] == "flat", preferences
 assert preferences["filter"] == "done_only", preferences
 assert preferences["schema_version"] == 1, preferences
 PY
-record sidebar-state PASS-navigation-shared-and-view-filter-defaults-persisted
+record sidebar-state PASS-navigation-view-filter-shared-and-defaults-persisted
 
-# A regular pane can operate only the sidebar in its own window without first focusing it.
-# Semantic navigation selects a visible agent and jumps the invoking client in one action;
-# unread-latest scans the full snapshot and may cross session/window boundaries.
+# A regular pane can address the sidebar in its own window without first focusing it. Presentation
+# changes are then shared with every sidebar. Semantic navigation selects a visible agent and jumps
+# the invoking client in one action; unread-latest scans the full snapshot and may cross windows.
 tmux_cmd switch-client -c "$CLIENT_1" -t "$S1_WINDOW"
 tmux_cmd select-pane -t "$S1_AGENT"
 wait_client_pane "$CLIENT_1" "$S1_AGENT"
@@ -743,16 +752,20 @@ SIDE2_BEFORE_NONFOCUS="$(fingerprint "$ARTIFACT_DIR/sidebar-2-before-nonfocus-in
 
 VT_PANE="$S1_AGENT" run_vt sidebar input all --window "$S1_WINDOW"
 VT_PANE="$S1_AGENT" run_vt sidebar input 4 --window "$S1_WINDOW"
-sleep 0.2
+for _ in $(seq 1 60); do
+  capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-nonfocus-view.txt"
+  grep -F 'Priority' "$ARTIFACT_DIR/sidebar-2-after-nonfocus-view.txt" >/dev/null && break
+  sleep 0.05
+done
 capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-priority-nonfocus.txt"
-capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-nonfocus-view.txt"
 grep -F 'Priority' "$ARTIFACT_DIR/sidebar-1-priority-nonfocus.txt" >/dev/null
+grep -F 'Priority' "$ARTIFACT_DIR/sidebar-2-after-nonfocus-view.txt" >/dev/null
 grep -F 'UNREAD DONE' "$ARTIFACT_DIR/sidebar-1-priority-nonfocus.txt" >/dev/null
 grep -F 'RUNNING' "$ARTIFACT_DIR/sidebar-1-priority-nonfocus.txt" >/dev/null
 SIDEBAR_PRIORITY_HEADER="$(sed -n '1,3p' "$ARTIFACT_DIR/sidebar-1-priority-nonfocus.txt")"
 grep -F '▲ 0' <<<"$SIDEBAR_PRIORITY_HEADER" >/dev/null
 grep -F '✓ 1' <<<"$SIDEBAR_PRIORITY_HEADER" >/dev/null
-[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-nonfocus-view.txt")" == "$SIDE2_BEFORE_NONFOCUS" ]]
+[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-nonfocus-view.txt")" != "$SIDE2_BEFORE_NONFOCUS" ]]
 wait_client_pane "$CLIENT_1" "$S1_AGENT"
 
 VT_PANE="$S1_AGENT" run_vt sidebar input done --window "$S1_WINDOW"
@@ -774,7 +787,7 @@ wait_badge "$S2_AGENT" Done
 VT_PANE="$S1_AGENT" run_vt sidebar input unread-latest --window "$S1_WINDOW"
 wait_client_pane "$CLIENT_1" "$S2_AGENT"
 wait_badge "$S2_AGENT" Idle
-record sidebar-nonfocus PASS-window-local-view-agent-next-and-cross-window-unread-latest
+record sidebar-nonfocus PASS-shared-view-agent-next-and-cross-window-unread-latest
 
 tmux_cmd switch-client -c "$CLIENT_1" -t "$S1_WINDOW"
 tmux_cmd select-pane -t "$S1_AGENT"
