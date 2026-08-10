@@ -933,13 +933,7 @@ fn render_bounded_status_snapshot(
     config: &Config,
     snapshot: &StatusSnapshot,
 ) -> Result<StructuredStatusSegments> {
-    let visible_categories = snapshot
-        .categories
-        .iter()
-        .filter(|category| category.counts.total() > 0)
-        .cloned()
-        .collect::<Vec<_>>();
-    let category_tokens = structured_category_tokens(config, &visible_categories)?;
+    let category_tokens = structured_category_tokens(config, &snapshot.categories)?;
     let session_tokens = snapshot
         .sessions
         .iter()
@@ -2111,7 +2105,7 @@ mod tests {
     }
 
     #[test]
-    fn category_status_omits_categories_without_agents() {
+    fn category_status_keeps_categories_without_agents() {
         let mut config = Config::default();
         config.statusline.category.format = "{category}".to_string();
         config.statusline.category.inactive_format = "{category}".to_string();
@@ -2130,9 +2124,13 @@ mod tests {
 
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
 
-        assert!(!rendered.category.contains(crate::category::UNCATEGORIZED));
+        assert!(
+            rendered.category.contains(crate::category::UNCATEGORIZED),
+            "{}",
+            rendered.category
+        );
         assert!(rendered.category.contains("work"), "{}", rendered.category);
-        assert_eq!(top_level_user_ranges(&rendered.category).unwrap().len(), 1);
+        assert_eq!(top_level_user_ranges(&rendered.category).unwrap().len(), 2);
     }
 
     #[test]
