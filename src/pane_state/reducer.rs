@@ -90,17 +90,30 @@ pub fn reduce(
         return Ok(Reduction::unchanged(current));
     }
 
-    match &envelope.event {
-        PaneEvent::ObservationBatch { .. } => reduce_observation(current, envelope, context),
-        PaneEvent::PaneRemoved { .. } => Ok(Reduction::unchanged(current)),
-        PaneEvent::AcknowledgeView { .. } | PaneEvent::MarkDone { .. } => {
-            reduce_internal_state_event(current, envelope, context)
+    let mut reduction = match &envelope.event {
+        PaneEvent::ObservationBatch { .. } => {
+            reduce_observation(current, envelope, context.clone())
         }
-        event if event.is_external() => reduce_explicit(current, envelope, context),
+        PaneEvent::PaneRemoved { .. } => Ok(Reduction::unchanged(current)),
+        PaneEvent::MarkPaneRead { .. } | PaneEvent::MarkDone { .. } => {
+            reduce_internal_state_event(current, envelope, context.clone())
+        }
+        event if event.is_external() => reduce_explicit(current, envelope, context.clone()),
         _ => Err(ReduceError::InvalidRequest(
             "unsupported reducer event".to_string(),
         )),
+    }?;
+    if reduction.outcome == ReductionOutcome::CanonicalChanged {
+        let state = reduction
+            .record
+            .as_mut()
+            .expect("canonical mutation has a state");
+        apply_unread_transition(current, &envelope.event, state, context)?;
+        state
+            .validate()
+            .map_err(|error| ReduceError::StateInvariantViolation(error.to_string()))?;
     }
+    Ok(reduction)
 }
 
 fn reduce_internal_state_event(
@@ -117,17 +130,15 @@ fn reduce_internal_state_event(
     let mut state = existing.clone();
     let completed_before = state.completed_seq;
     match &envelope.event {
-        PaneEvent::AcknowledgeView {
-            expected_state_id,
-            expected_agent_epoch,
-            through_seq,
-        } => {
-            if &state.state_id != expected_state_id || state.agent_epoch != *expected_agent_epoch {
-                return Ok(Reduction::unchanged(current));
+        PaneEvent::MarkPaneRead { through_order } => {
+            if state
+                .unread
+                .latest
+                .as_ref()
+                .is_some_and(|latest| latest.order <= *through_order)
+            {
+                state.unread.read_seq = state.unread.occurrence_seq;
             }
-            state.acknowledged_seq = state
-                .acknowledged_seq
-                .max((*through_seq).min(state.completed_seq));
         }
         PaneEvent::MarkDone {
             expected,
@@ -173,12 +184,7 @@ fn reduce_explicit(
             else {
                 return Ok(Reduction::unchanged(current));
             };
-            apply_initial_explicit_event(
-                &mut state,
-                &envelope.event,
-                context.visibility,
-                context.done_clear_on,
-            )?;
+            apply_initial_explicit_event(&mut state, &envelope.event, context.visibility)?;
             let completed_outside_capture = state.completed_seq > 0;
             let mut tracker = reset_tracker_for_state(context.tracker, &state)?;
             tracker.hook_authoritative =
@@ -210,12 +216,7 @@ fn reduce_explicit(
     let completed_before = state.completed_seq;
     match identity {
         ExistingIdentity::ExactPresent => {
-            apply_regular_explicit_event(
-                &mut state,
-                &envelope.event,
-                context.visibility,
-                context.done_clear_on,
-            )?;
+            apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
         }
         ExistingIdentity::ExactAbsent => {
             if epoch_evidence {
@@ -225,19 +226,9 @@ fn reduce_explicit(
                     Some(session.clone()),
                     EpochSource::Explicit,
                 )?;
-                apply_regular_explicit_event(
-                    &mut state,
-                    &envelope.event,
-                    context.visibility,
-                    context.done_clear_on,
-                )?;
+                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
             } else if completion {
-                apply_regular_explicit_event(
-                    &mut state,
-                    &envelope.event,
-                    context.visibility,
-                    context.done_clear_on,
-                )?;
+                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
                 state.agent_present = false;
                 state.scan_verified = true;
             } else {
@@ -247,12 +238,7 @@ fn reduce_explicit(
         ExistingIdentity::UnboundPresent => {
             if epoch_evidence || (completion && state.synthetic_completion_armed) {
                 state.agent_session_id = Some(session.clone());
-                apply_regular_explicit_event(
-                    &mut state,
-                    &envelope.event,
-                    context.visibility,
-                    context.done_clear_on,
-                )?;
+                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
             }
         }
         ExistingIdentity::UnboundAbsent => {
@@ -263,12 +249,7 @@ fn reduce_explicit(
                     Some(session.clone()),
                     EpochSource::Explicit,
                 )?;
-                apply_regular_explicit_event(
-                    &mut state,
-                    &envelope.event,
-                    context.visibility,
-                    context.done_clear_on,
-                )?;
+                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
             } else {
                 return Err(ReduceError::StaleAgentEvent);
             }
@@ -287,12 +268,7 @@ fn reduce_explicit(
                 Some(session.clone()),
                 EpochSource::ProcessVerifiedExplicitHandover,
             )?;
-            apply_regular_explicit_event(
-                &mut state,
-                &envelope.event,
-                context.visibility,
-                context.done_clear_on,
-            )?;
+            apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
         }
         ExistingIdentity::MismatchAbsent => {
             if !epoch_evidence {
@@ -304,12 +280,7 @@ fn reduce_explicit(
                 Some(session.clone()),
                 EpochSource::Explicit,
             )?;
-            apply_regular_explicit_event(
-                &mut state,
-                &envelope.event,
-                context.visibility,
-                context.done_clear_on,
-            )?;
+            apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
         }
     }
 
@@ -403,12 +374,7 @@ fn reduce_observation(
                     .checked_add(1)
                     .ok_or(ReduceError::CounterOverflow("absence"))?;
                 if tracker.absence_count >= 2 {
-                    confirm_absent(
-                        &mut state,
-                        *observed_at,
-                        context.visibility,
-                        context.done_clear_on,
-                    )?;
+                    confirm_absent(&mut state, *observed_at, context.visibility)?;
                     tracker.absence_count = 0;
                 }
             }
@@ -425,7 +391,6 @@ fn reduce_observation(
                     &mut tracker,
                     *observed_at,
                     context.visibility,
-                    context.done_clear_on,
                 )?;
             } else {
                 begin_agent_epoch(
@@ -449,12 +414,7 @@ fn reduce_observation(
                         .checked_add(1)
                         .ok_or(ReduceError::CounterOverflow("absence"))?;
                     if tracker.absence_count >= 2 {
-                        confirm_absent(
-                            &mut state,
-                            *observed_at,
-                            context.visibility,
-                            context.done_clear_on,
-                        )?;
+                        confirm_absent(&mut state, *observed_at, context.visibility)?;
                         tracker.absence_count = 0;
                     }
                 }
@@ -524,7 +484,7 @@ fn new_state(
         lifecycle: LifecycleState::Idle,
         run_seq: 0,
         completed_seq: 0,
-        acknowledged_seq: 0,
+        unread: UnreadState::default(),
         started_at: None,
         completed_at: None,
         prompt: None,
@@ -542,12 +502,11 @@ fn apply_initial_explicit_event(
     state: &mut PaneState,
     event: &PaneEvent,
     visibility: &VisibilitySnapshot,
-    done_clear_on: crate::config::DoneClearOn,
 ) -> Result<(), ReduceError> {
     match event {
         PaneEvent::AgentSessionStarted { .. } => apply_agent_session_started(state, event),
         PaneEvent::CompleteRun { completed_at } => {
-            complete_run(state, *completed_at, visibility, done_clear_on, true)
+            complete_run(state, *completed_at, visibility, true)
         }
         PaneEvent::ExplicitStateReported { report }
             if matches!(report.lifecycle, Some(ReportedLifecycle::Idle)) =>
@@ -556,12 +515,11 @@ fn apply_initial_explicit_event(
                 state,
                 report.completed_at.unwrap_or(report.observed_at),
                 visibility,
-                done_clear_on,
                 true,
             )?;
             apply_report_fields(state, report)
         }
-        _ => apply_regular_explicit_event(state, event, visibility, done_clear_on),
+        _ => apply_regular_explicit_event(state, event, visibility),
     }
 }
 
@@ -569,7 +527,6 @@ fn apply_regular_explicit_event(
     state: &mut PaneState,
     event: &PaneEvent,
     visibility: &VisibilitySnapshot,
-    done_clear_on: crate::config::DoneClearOn,
 ) -> Result<(), ReduceError> {
     match event {
         PaneEvent::AgentSessionStarted { .. } => apply_agent_session_started(state, event),
@@ -587,7 +544,7 @@ fn apply_regular_explicit_event(
             reason,
         } => wait_requested(state, *observed_at, reason.clone()),
         PaneEvent::CompleteRun { completed_at } => {
-            complete_run(state, *completed_at, visibility, done_clear_on, false)
+            complete_run(state, *completed_at, visibility, false)
         }
         PaneEvent::FailRun {
             observed_at,
@@ -595,7 +552,7 @@ fn apply_regular_explicit_event(
         } => fail_run(state, *observed_at, reason.clone()),
         PaneEvent::ProgressUpdated { operations, .. } => apply_progress(state, operations),
         PaneEvent::ExplicitStateReported { report } => {
-            apply_explicit_report(state, report, visibility, done_clear_on)
+            apply_explicit_report(state, report, visibility)
         }
         _ => Err(ReduceError::InvalidRequest(
             "event is not an explicit agent event".to_string(),
@@ -627,7 +584,6 @@ fn apply_explicit_report(
     state: &mut PaneState,
     report: &ExplicitStateReport,
     visibility: &VisibilitySnapshot,
-    done_clear_on: crate::config::DoneClearOn,
 ) -> Result<(), ReduceError> {
     match &report.lifecycle {
         Some(ReportedLifecycle::Running) => {
@@ -647,7 +603,6 @@ fn apply_explicit_report(
                 state,
                 report.completed_at.unwrap_or(report.observed_at),
                 visibility,
-                done_clear_on,
                 false,
             )?;
         }
@@ -777,6 +732,13 @@ fn begin_agent_epoch(
     session: Option<AgentSessionId>,
     source: EpochSource,
 ) -> Result<(), ReduceError> {
+    if state.unread.is_unread()
+        && state.unread.latest.as_ref().is_some_and(|latest| {
+            matches!(latest.reason, UnreadReason::Waiting | UnreadReason::Error)
+        })
+    {
+        state.unread.read_seq = state.unread.occurrence_seq;
+    }
     state.agent_epoch = state
         .agent_epoch
         .checked_add(1)
@@ -792,7 +754,6 @@ fn begin_agent_epoch(
     state.lifecycle = LifecycleState::Idle;
     state.run_seq = 0;
     state.completed_seq = 0;
-    state.acknowledged_seq = 0;
     state.started_at = None;
     state.completed_at = None;
     state.prompt = None;
@@ -858,8 +819,7 @@ fn fail_run(
 fn complete_run(
     state: &mut PaneState,
     completed_at: i64,
-    visibility: &VisibilitySnapshot,
-    done_clear_on: crate::config::DoneClearOn,
+    _visibility: &VisibilitySnapshot,
     allow_unarmed_synthetic: bool,
 ) -> Result<(), ReduceError> {
     // Parent agents can stop their turn while background subagents are still active.
@@ -882,13 +842,6 @@ fn complete_run(
     state.synthetic_completion_armed = false;
     state.subagents.clear();
     state.worktree_activity = None;
-    let visible = match done_clear_on {
-        crate::config::DoneClearOn::Pane => visibility.pane_visible_to_eligible_client,
-        crate::config::DoneClearOn::Window => visibility.window_visible_to_eligible_client,
-    };
-    if visible {
-        state.acknowledged_seq = state.completed_seq;
-    }
     Ok(())
 }
 
@@ -910,14 +863,105 @@ fn mark_done(state: &mut PaneState, completed_at: i64) -> Result<(), ReduceError
     Ok(())
 }
 
+fn apply_unread_transition(
+    current: Option<&PaneState>,
+    event: &PaneEvent,
+    state: &mut PaneState,
+    context: ReductionContext<'_>,
+) -> Result<(), ReduceError> {
+    if matches!(event, PaneEvent::MarkPaneRead { .. }) {
+        return Ok(());
+    }
+    let same_epoch = current.is_some_and(|previous| previous.agent_epoch == state.agent_epoch);
+    let previous_lifecycle = same_epoch
+        .then(|| current.map(|previous| &previous.lifecycle))
+        .flatten();
+    let reason = match &state.lifecycle {
+        LifecycleState::Waiting { .. }
+            if !matches!(previous_lifecycle, Some(LifecycleState::Waiting { .. })) =>
+        {
+            Some(UnreadReason::Waiting)
+        }
+        LifecycleState::Error { .. }
+            if !matches!(previous_lifecycle, Some(LifecycleState::Error { .. })) =>
+        {
+            Some(UnreadReason::Error)
+        }
+        _ => {
+            let completed = match current {
+                Some(previous) if same_epoch => state.completed_seq > previous.completed_seq,
+                Some(_) | None => state.completed_seq > 0,
+            };
+            completed.then_some(UnreadReason::Completed)
+        }
+    };
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    let seq = state
+        .unread
+        .occurrence_seq
+        .checked_add(1)
+        .ok_or(ReduceError::CounterOverflow("unread occurrence sequence"))?;
+    let previous_order = state
+        .unread
+        .latest
+        .as_ref()
+        .map(|latest| latest.order)
+        .unwrap_or_default();
+    let order = context
+        .latest_unread_order
+        .max(previous_order)
+        .checked_add(1)
+        .ok_or(ReduceError::CounterOverflow("unread occurrence order"))?;
+    let occurred_at = match reason {
+        UnreadReason::Completed => state
+            .completed_at
+            .unwrap_or_else(|| event_epoch(event, state)),
+        UnreadReason::Waiting | UnreadReason::Error => event_epoch(event, state),
+    };
+    state.unread.occurrence_seq = seq;
+    state.unread.latest = Some(UnreadOccurrence {
+        seq,
+        order,
+        reason,
+        occurred_at,
+    });
+    if context.visibility.pane_visible_to_eligible_client
+        || matches!(event, PaneEvent::MarkDone { .. })
+    {
+        state.unread.read_seq = seq;
+    }
+    Ok(())
+}
+
+fn event_epoch(event: &PaneEvent, state: &PaneState) -> i64 {
+    match event {
+        PaneEvent::AgentSessionStarted { observed_at, .. }
+        | PaneEvent::ActivityObserved { observed_at }
+        | PaneEvent::ActivityAndProgressObserved { observed_at, .. }
+        | PaneEvent::WaitRequested { observed_at, .. }
+        | PaneEvent::FailRun { observed_at, .. }
+        | PaneEvent::ProgressUpdated { observed_at, .. }
+        | PaneEvent::ObservationBatch { observed_at, .. } => *observed_at,
+        PaneEvent::BeginRun { started_at, .. } => *started_at,
+        PaneEvent::CompleteRun { completed_at } | PaneEvent::MarkDone { completed_at, .. } => {
+            *completed_at
+        }
+        PaneEvent::ExplicitStateReported { report } => report.observed_at,
+        PaneEvent::MarkPaneRead { .. } | PaneEvent::PaneRemoved { .. } => {
+            state.completed_at.or(state.started_at).unwrap_or_default()
+        }
+    }
+}
+
 fn confirm_absent(
     state: &mut PaneState,
     observed_at: i64,
     visibility: &VisibilitySnapshot,
-    done_clear_on: crate::config::DoneClearOn,
 ) -> Result<(), ReduceError> {
     if state.run_seq > state.completed_seq {
-        complete_run(state, observed_at, visibility, done_clear_on, false)?;
+        complete_run(state, observed_at, visibility, false)?;
     }
     state.agent_present = false;
     state.scan_verified = true;
@@ -1096,7 +1140,6 @@ fn apply_capture(
     tracker: &mut CaptureTrackerSnapshot,
     observed_at: i64,
     visibility: &VisibilitySnapshot,
-    done_clear_on: crate::config::DoneClearOn,
 ) -> Result<(), ReduceError> {
     let Some(capture) = capture else {
         return Ok(());
@@ -1122,7 +1165,7 @@ fn apply_capture(
         }
         CaptureInference::StaleRunCompleted => {
             if matches!(state.lifecycle, LifecycleState::Running) {
-                complete_run(state, observed_at, visibility, done_clear_on, false)?;
+                complete_run(state, observed_at, visibility, false)?;
             }
         }
         CaptureInference::NoChange => {}
@@ -1252,10 +1295,10 @@ mod tests {
         visibility: &'a VisibilitySnapshot,
     ) -> ReductionContext<'a> {
         ReductionContext {
-            done_clear_on: crate::config::DoneClearOn::Pane,
             visibility,
             tracker,
             new_state_id: Some(StateId::parse(STATE_ID).unwrap()),
+            latest_unread_order: 0,
         }
     }
 
@@ -2328,10 +2371,8 @@ mod tests {
         let state = active(&completed);
         let acknowledged = reduce_once(
             completed.record.as_ref(),
-            PaneEvent::AcknowledgeView {
-                expected_state_id: state.state_id.clone(),
-                expected_agent_epoch: state.agent_epoch,
-                through_seq: state.completed_seq,
+            PaneEvent::MarkPaneRead {
+                through_order: state.unread.latest_unread().unwrap().order,
             },
             &completed.tracker_delta.as_ref().unwrap().next,
         );
@@ -2500,7 +2541,6 @@ mod tests {
         let begun = begin(None, &tracker);
         let visible = VisibilitySnapshot {
             pane_visible_to_eligible_client: true,
-            ..VisibilitySnapshot::default()
         };
         let result = reduce(
             begun.record.as_ref(),
@@ -2508,47 +2548,110 @@ mod tests {
             context(&begun.tracker_delta.as_ref().unwrap().next, &visible),
         )
         .unwrap();
-        assert_eq!(active(&result).acknowledged_seq, 1);
+        assert!(!active(&result).unread.is_unread());
         assert_eq!(resolve_badge(active(&result)), BadgeState::Idle);
     }
 
     #[test]
-    fn completion_uses_configured_visibility_scope_before_publication() {
+    fn waiting_and_error_transitions_create_ordered_unread_occurrences_once_per_class() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let waiting = reduce_once(
+            None,
+            PaneEvent::WaitRequested {
+                observed_at: 10,
+                reason: WaitReason::PermissionPrompt,
+            },
+            &tracker,
+        );
+        let first = active(&waiting).unread.latest_unread().unwrap();
+        assert_eq!(
+            (first.seq, first.order, first.reason, first.occurred_at),
+            (1, 1, UnreadReason::Waiting, 10)
+        );
+
+        let repeated = reduce_once(
+            waiting.record.as_ref(),
+            PaneEvent::WaitRequested {
+                observed_at: 11,
+                reason: WaitReason::PermissionPrompt,
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+        assert_eq!(active(&repeated).unread.occurrence_seq, 1);
+
+        let failed = reduce_once(
+            repeated.record.as_ref(),
+            PaneEvent::FailRun {
+                observed_at: 12,
+                reason: Some("failed".to_string()),
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+        let latest = active(&failed).unread.latest_unread().unwrap();
+        assert_eq!(
+            (latest.seq, latest.order, latest.reason, latest.occurred_at),
+            (2, 2, UnreadReason::Error, 12)
+        );
+    }
+
+    #[test]
+    fn new_agent_epoch_retires_blocked_unread_but_keeps_sequence_history() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let waiting = reduce_once(
+            None,
+            PaneEvent::WaitRequested {
+                observed_at: 10,
+                reason: WaitReason::PermissionPrompt,
+            },
+            &tracker,
+        );
+        let restarted = reduce_once(
+            waiting.record.as_ref(),
+            PaneEvent::AgentSessionStarted {
+                observed_at: 20,
+                source: AgentSessionSource::Resume,
+                resumed_prompt: None,
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+        assert!(!active(&restarted).unread.is_unread());
+        assert_eq!(active(&restarted).unread.occurrence_seq, 1);
+        assert_eq!(active(&restarted).unread.read_seq, 1);
+
+        let next_wait = reduce_once(
+            restarted.record.as_ref(),
+            PaneEvent::WaitRequested {
+                observed_at: 30,
+                reason: WaitReason::PermissionPrompt,
+            },
+            &restarted.tracker_delta.as_ref().unwrap().next,
+        );
+        let latest = active(&next_wait).unread.latest_unread().unwrap();
+        assert_eq!((latest.seq, latest.order), (2, 2));
+    }
+
+    #[test]
+    fn completion_uses_exact_pane_visibility_before_publication() {
         let tracker = CaptureTrackerSnapshot::default();
         let begun = begin(None, &tracker);
         let begun_tracker = begun.tracker_delta.as_ref().unwrap().next.clone();
         let other_split_visible = VisibilitySnapshot {
             pane_visible_to_eligible_client: false,
-            window_visible_to_eligible_client: true,
         };
         let event = envelope(PaneEvent::CompleteRun { completed_at: 20 });
-
-        let window = reduce(
-            begun.record.as_ref(),
-            &event,
-            ReductionContext {
-                done_clear_on: crate::config::DoneClearOn::Window,
-                visibility: &other_split_visible,
-                tracker: &begun_tracker,
-                new_state_id: Some(StateId::parse(STATE_ID).unwrap()),
-            },
-        )
-        .unwrap();
-        assert_eq!(active(&window).acknowledged_seq, 1);
-        assert_eq!(resolve_badge(active(&window)), BadgeState::Idle);
 
         let pane = reduce(
             begun.record.as_ref(),
             &event,
             ReductionContext {
-                done_clear_on: crate::config::DoneClearOn::Pane,
                 visibility: &other_split_visible,
                 tracker: &begun_tracker,
                 new_state_id: Some(StateId::parse(STATE_ID).unwrap()),
+                latest_unread_order: 0,
             },
         )
         .unwrap();
-        assert_eq!(active(&pane).acknowledged_seq, 0);
+        assert!(active(&pane).unread.is_unread());
         assert_eq!(resolve_badge(active(&pane)), BadgeState::Done);
     }
 
@@ -2556,7 +2659,6 @@ mod tests {
     fn stale_ack_cannot_change_new_epoch() {
         let tracker = CaptureTrackerSnapshot::default();
         let begun = begin(None, &tracker);
-        let old = active(&begun).version();
         let restarted = reduce_once(
             begun.record.as_ref(),
             PaneEvent::AgentSessionStarted {
@@ -2568,15 +2670,11 @@ mod tests {
         );
         let stale = reduce_once(
             restarted.record.as_ref(),
-            PaneEvent::AcknowledgeView {
-                expected_state_id: old.state_id,
-                expected_agent_epoch: old.agent_epoch,
-                through_seq: u64::MAX,
-            },
+            PaneEvent::MarkPaneRead { through_order: 0 },
             &restarted.tracker_delta.as_ref().unwrap().next,
         );
         assert_eq!(active(&stale).agent_epoch, 2);
-        assert_eq!(active(&stale).acknowledged_seq, 0);
+        assert_eq!(active(&stale).unread.read_seq, 0);
     }
 
     #[test]
@@ -2588,7 +2686,11 @@ mod tests {
             PaneEvent::CompleteRun { completed_at: 2 },
             &first_begin.tracker_delta.as_ref().unwrap().next,
         );
-        let first_version = active(&first_complete).version();
+        let first_order = active(&first_complete)
+            .unread
+            .latest_unread()
+            .unwrap()
+            .order;
         let second_begin = reduce_once(
             first_complete.record.as_ref(),
             PaneEvent::BeginRun {
@@ -2604,15 +2706,14 @@ mod tests {
         );
         let acknowledged = reduce_once(
             second_complete.record.as_ref(),
-            PaneEvent::AcknowledgeView {
-                expected_state_id: first_version.state_id,
-                expected_agent_epoch: first_version.agent_epoch,
-                through_seq: 1,
+            PaneEvent::MarkPaneRead {
+                through_order: first_order,
             },
             &second_complete.tracker_delta.as_ref().unwrap().next,
         );
         assert_eq!(active(&acknowledged).completed_seq, 2);
-        assert_eq!(active(&acknowledged).acknowledged_seq, 1);
+        assert_eq!(active(&acknowledged).unread.read_seq, 0);
+        assert!(active(&acknowledged).unread.is_unread());
         assert_eq!(resolve_badge(active(&acknowledged)), BadgeState::Done);
     }
 
@@ -2701,7 +2802,7 @@ mod tests {
             },
             &completed.tracker_delta.as_ref().unwrap().next,
         );
-        assert_eq!(active(&running).acknowledged_seq, 0);
+        assert!(active(&running).unread.is_unread());
         assert_eq!(resolve_badge(active(&running)), BadgeState::Working);
         let failed = reduce_once(
             running.record.as_ref(),
@@ -3049,7 +3150,6 @@ mod tests {
         overflow.lifecycle = LifecycleState::Idle;
         overflow.run_seq = u64::MAX;
         overflow.completed_seq = u64::MAX;
-        overflow.acknowledged_seq = u64::MAX;
         overflow.completed_at = Some(2);
         let record = overflow;
         let error = reduce(
@@ -3210,7 +3310,8 @@ mod tests {
             },
             &begun.tracker_delta.as_ref().unwrap().next,
         );
-        assert_eq!(resolve_badge(active(&done)), BadgeState::Done);
+        assert_eq!(resolve_badge(active(&done)), BadgeState::Idle);
+        assert!(!active(&done).unread.is_unread());
         let error = reduce(
             done.record.as_ref(),
             &envelope(PaneEvent::MarkDone {
@@ -3251,10 +3352,11 @@ mod tests {
                         let Some(state) = current.as_ref() else {
                             continue;
                         };
-                        PaneEvent::AcknowledgeView {
-                            expected_state_id: state.state_id.clone(),
-                            expected_agent_epoch: state.agent_epoch,
-                            through_seq: state.completed_seq,
+                        PaneEvent::MarkPaneRead {
+                            through_order: state
+                                .unread
+                                .latest_unread()
+                                .map_or(0, |latest| latest.order),
                         }
                     },
                     6 => PaneEvent::ProgressUpdated {
@@ -3310,7 +3412,8 @@ mod tests {
                         {
                             prop_assert!(state.run_seq >= previous.run_seq);
                             prop_assert!(state.completed_seq >= previous.completed_seq);
-                            prop_assert!(state.acknowledged_seq >= previous.acknowledged_seq);
+                            prop_assert!(state.unread.occurrence_seq >= previous.unread.occurrence_seq);
+                            prop_assert!(state.unread.read_seq >= previous.unread.read_seq);
                         }
                     }
                 }

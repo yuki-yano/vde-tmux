@@ -79,6 +79,11 @@ pub(crate) enum CanonicalSidebarEffect {
         client_pid: u32,
         source_pane: PaneInstance,
     },
+    JumpLatestUnread {
+        candidates: Vec<PaneInstance>,
+        client_pid: u32,
+        source_pane: PaneInstance,
+    },
 }
 
 pub(crate) struct CanonicalCoordinatorState {
@@ -235,7 +240,7 @@ impl CanonicalCoordinatorState {
                 matches!(
                     self.leased.runtime.record(&topology.pane_instance),
                     Some(state)
-                        if state.agent_present || state.completed_seq > state.acknowledged_seq
+                        if state.agent_present || state.unread.is_unread()
                 )
             })
             .map(|topology| topology.current_path.clone())
@@ -259,6 +264,24 @@ impl CanonicalCoordinatorState {
             .panes
             .iter()
             .any(|pane| &pane.pane_instance == pane_instance)
+    }
+
+    pub fn latest_unread_candidates(&self) -> Vec<PaneInstance> {
+        let mut candidates = self
+            .topology
+            .panes
+            .iter()
+            .filter_map(|topology| {
+                let state = self.leased.runtime.record(&topology.pane_instance)?;
+                let occurrence = state.unread.latest_unread()?;
+                state
+                    .unread
+                    .is_jump_eligible(&state.lifecycle)
+                    .then_some((occurrence.order, topology.pane_instance.clone()))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        candidates.into_iter().map(|(_, pane)| pane).collect()
     }
 
     pub fn window_panes(&self) -> BTreeMap<String, Vec<PaneInstance>> {
@@ -454,9 +477,7 @@ impl CanonicalCoordinatorState {
             let stored = runtime.descriptor(&topology.pane_instance);
             let record = runtime.record(&topology.pane_instance);
             let resolved = match record {
-                Some(state)
-                    if state.agent_present || state.completed_seq > state.acknowledged_seq =>
-                {
+                Some(state) if state.agent_present || state.unread.is_unread() => {
                     Some(ResolvedPaneState {
                         canonical: state.clone(),
                         window_id: topology.window_id.clone(),
@@ -1050,7 +1071,7 @@ fn preflight_resolved_snapshot_against_runtime(
                     Some(state)
                         if &state.version() == version
                             && !state.agent_present
-                            && state.completed_seq == state.acknowledged_seq
+                            && !state.unread.is_unread()
                 );
                 if !confirmed_ended {
                     return Err(StoreError::FailStop(format!(
@@ -1090,11 +1111,10 @@ fn preflight_status_snapshot(snapshot: &StatusSnapshot) -> Result<(), StoreError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DoneClearOn;
     use crate::daemon::protocol::v2::AttentionEntry;
     use crate::daemon::session_badge::BadgeState;
     use crate::daemon::topology::ServerIdentity;
-    use crate::pane_state::EventId;
+    use crate::pane_state::{EventId, PaneEvent};
     use crate::sidebar::state::SidebarState;
 
     #[test]
@@ -1175,6 +1195,40 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn latest_unread_candidates_are_global_newest_first_and_drop_read_panes() {
+        let (mut state, root) = canonical_sidebar_fixture();
+        assert_eq!(
+            state.latest_unread_candidates(),
+            vec![
+                PaneInstance {
+                    pane_id: "%2".to_string(),
+                    pane_pid: 102,
+                },
+                PaneInstance {
+                    pane_id: "%1".to_string(),
+                    pane_pid: 101,
+                },
+            ]
+        );
+
+        apply_history_event(
+            &mut state,
+            "codex",
+            "test-session",
+            PaneEvent::MarkPaneRead { through_order: 102 },
+        );
+        assert_eq!(
+            state.latest_unread_candidates(),
+            vec![PaneInstance {
+                pane_id: "%2".to_string(),
+                pane_pid: 102,
+            }]
+        );
+
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
     fn status_link(
         session_id: &str,
         session_name: &str,
@@ -1218,7 +1272,7 @@ mod tests {
                 lifecycle: crate::pane_state::LifecycleState::Idle,
                 run_seq: 1,
                 completed_seq: 1,
-                acknowledged_seq: 1,
+                unread: crate::pane_state::UnreadState::default(),
                 started_at: Some(1),
                 completed_at: Some(2),
                 prompt: None,
@@ -1285,7 +1339,16 @@ mod tests {
                     },
                     run_seq: 1,
                     completed_seq: 0,
-                    acknowledged_seq: 0,
+                    unread: crate::pane_state::UnreadState {
+                        occurrence_seq: 1,
+                        read_seq: 0,
+                        latest: Some(crate::pane_state::UnreadOccurrence {
+                            seq: 1,
+                            order: u64::from(pane_pid),
+                            reason: crate::pane_state::UnreadReason::Waiting,
+                            occurred_at: 1,
+                        }),
+                    },
                     started_at: Some(1),
                     completed_at: None,
                     prompt: Some(PromptState {
@@ -1436,7 +1499,6 @@ mod tests {
                         event,
                     },
                     &VisibilitySnapshot::default(),
-                    DoneClearOn::Pane,
                 )
                 .unwrap();
         }
@@ -1470,7 +1532,6 @@ mod tests {
                     event,
                 },
                 &VisibilitySnapshot::default(),
-                DoneClearOn::Pane,
             )
             .unwrap();
     }
@@ -1516,13 +1577,21 @@ mod tests {
         };
         assert_eq!(current.agent.as_str(), "claude");
         let snapshot = state.resolved_snapshot();
-        let discarded = snapshot
-            .events
-            .iter()
-            .find(|event| event.from == Some(BadgeState::Done) && event.to == BadgeState::Idle)
-            .unwrap();
-        assert_eq!(discarded.agent, "codex");
-        assert_eq!(discarded.at_epoch, 20);
+        assert_eq!(
+            snapshot
+                .panes
+                .iter()
+                .find(|presentation| presentation.pane_instance == pane)
+                .and_then(|presentation| presentation.resolved.as_ref())
+                .map(|resolved| resolved.badge),
+            Some(BadgeState::Done)
+        );
+        assert!(
+            !snapshot
+                .events
+                .iter()
+                .any(|event| event.from == Some(BadgeState::Done) && event.to == BadgeState::Idle)
+        );
 
         remove_canonical_sidebar_fixture(state, root);
     }
@@ -1574,13 +1643,21 @@ mod tests {
             Some("session-b")
         );
         let snapshot = state.resolved_snapshot();
-        let discarded = snapshot
-            .events
-            .iter()
-            .find(|event| event.from == Some(BadgeState::Done) && event.to == BadgeState::Idle)
-            .unwrap();
-        assert_eq!(discarded.agent, "codex");
-        assert_eq!(discarded.at_epoch, 20);
+        assert_eq!(
+            snapshot
+                .panes
+                .iter()
+                .find(|presentation| presentation.pane_instance == pane)
+                .and_then(|presentation| presentation.resolved.as_ref())
+                .map(|resolved| resolved.badge),
+            Some(BadgeState::Done)
+        );
+        assert!(
+            !snapshot
+                .events
+                .iter()
+                .any(|event| event.from == Some(BadgeState::Done) && event.to == BadgeState::Idle)
+        );
 
         remove_canonical_sidebar_fixture(state, root);
     }
@@ -2198,20 +2275,12 @@ mod tests {
             pane_pid: 101,
         };
         let current = state.leased.runtime.record(&pane).unwrap();
-        let (state_id, agent_epoch, through_seq) = (
-            current.state_id.clone(),
-            current.agent_epoch,
-            current.completed_seq,
-        );
+        let through_order = current.unread.latest_unread().unwrap().order;
         apply_history_event(
             &mut state,
             "codex",
             "scenario-session",
-            PaneEvent::AcknowledgeView {
-                expected_state_id: state_id,
-                expected_agent_epoch: agent_epoch,
-                through_seq,
-            },
+            PaneEvent::MarkPaneRead { through_order },
         );
         assert_continuous_display_state(&state, BadgeState::Idle);
 

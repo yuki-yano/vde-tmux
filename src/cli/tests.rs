@@ -459,7 +459,7 @@ fn pane_query_fixture(pane_id: &str) -> V2QueryFixture {
                 lifecycle: LifecycleState::Running,
                 run_seq: 1,
                 completed_seq: 0,
-                acknowledged_seq: 0,
+                unread: crate::pane_state::UnreadState::default(),
                 started_at: Some(crate::sidebar::tree::now_epoch_secs()),
                 completed_at: None,
                 prompt: None,

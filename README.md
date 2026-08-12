@@ -184,20 +184,15 @@ Hooks are still required for accurate prompts, completion times, and waiting sta
 | `✓` | Done | The run completed and has not been acknowledged |
 | `○` | Idle | No work is active, or the completed run was acknowledged |
 
-A `Done` agent becomes `Idle` after its pane or window is viewed.
-Choose the acknowledgment scope with `daemon.done_clear_on`:
+A `Done` agent becomes `Idle` when its exact pane is active for an eligible tmux client.
+Viewing another split in the same window does not acknowledge it. Read state survives daemon
+restarts and is shared by every tmux client and sidebar. The daemon periodically reconciles current
+client views, so a missed view hook is repaired by the next observation poll.
 
-```yaml
-daemon:
-  done_clear_on: window # window | pane
-```
-
-Acknowledgment survives daemon restarts and is shared by every tmux client and sidebar.
-The tmux view hook freezes the visible pane/window at hook time, so a brief focus followed by an
-immediate move still acknowledges the `Done` state that was seen. The hook returns after the daemon
-queues this event. If the daemon stops after queue acceptance but before applying it, that one
-acknowledgment is best-effort and is not replayed; the badge remains `Done` until the next focus or
-a later completion-time visibility check acknowledges it.
+`unread-latest` jumps to the newest unread Waiting, Error, or Completed occurrence across all panes.
+The daemon owns the global ordering and retries the next unread pane if the newest target disappears
+during the jump. The jump itself does not mark anything read; the destination becomes read after it
+is observed as the active pane.
 
 ## Sidebar
 
@@ -205,7 +200,8 @@ The sidebar opens in the current tmux window and groups agents by category by de
 Flat and ByRepo show only the currently active category.
 Priority spans all categories and groups agents as Needs Input, Unread Done, Running, then Idle.
 The Needs action filter and red triangle match only Blocked agents waiting for user input.
-Unread Done agents remain separate under the Done filter and `unread-latest` navigation.
+Unread Done agents remain separate under the Done filter. `unread-latest` navigation also includes
+unread Blocked occurrences.
 
 ```bash
 vt sidebar open --width 40
@@ -316,9 +312,6 @@ Every setting has a default, so the file is optional; start with only the settin
 Together with the `categories` section shown above, the commonly used settings are:
 
 ```yaml
-daemon:
-  done_clear_on: window
-
 sidebar:
   width: "20%"
   min_width: 40
@@ -413,7 +406,7 @@ Use `disable` when the daemon must remain stopped.
 ### Pane-state persistence
 
 The daemon stores one private full-state snapshot per tmux server incarnation under
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v1.json`. A daemon restart restores the
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v2.json`. A daemon restart restores the
 prompt, task progress and items, subagents, worktree activity, lifecycle, timestamps, agent
 identity, and Done/acknowledgement state for panes whose pane ID and PID still match.
 

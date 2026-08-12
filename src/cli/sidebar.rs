@@ -122,9 +122,17 @@ where
             crate::sidebar::tui::run_live_tui(env, config, &socket, &server_identity)
         }
         SidebarCommand::Input { key, window } => {
-            let (server_identity, _socket) = ensure_daemon(runner, env)?;
+            let (server_identity, socket) = ensure_daemon(runner, env)?;
             let source_pane = crate::sidebar::control::resolve_current_pane_instance(runner, env)
                 .context("failed to resolve the sidebar input source pane")?;
+            if key == "unread-latest" {
+                crate::sidebar::client::send_latest_unread_jump_v2(
+                    &socket,
+                    &server_identity,
+                    source_pane,
+                )?;
+                return Ok(None);
+            }
             let target = match window.filter(|value| !value.trim().is_empty()) {
                 Some(window) => window,
                 None => resolve_source_window_target(runner, &source_pane)?,

@@ -3,7 +3,6 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::config::DoneClearOn;
 use crate::daemon::protocol::v2::HookHealth;
 use crate::daemon::protocol::v2::{
     ClientMessage as V2ClientMessage, PROTOCOL_VERSION, ServerMessage as V2ServerMessage, V2Client,
@@ -12,14 +11,14 @@ use crate::daemon::protocol::v2::{
 use crate::daemon::topology::ServerIdentity;
 use crate::pane_state::store::{server_guarded_command_args, tmux_command_string};
 use crate::pane_state::{
-    ClientWitness, DaemonInstanceId, EventId, PaneInstance, PaneState, StateId, ViewEvent,
-    ViewHookKind, ViewVisibilityProof, VisibilitySnapshot,
+    ClientWitness, DaemonInstanceId, EventId, PaneInstance, PaneState, ViewEvent, ViewHookKind,
+    ViewVisibilityProof, VisibilitySnapshot,
 };
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
 pub const HOOK_INDEX: u8 = 70;
 pub const HOOK_OWNER: &str = "vde-tmux-pane-state";
-pub const HOOK_PROTOCOL: u16 = 2;
+pub const HOOK_PROTOCOL: u16 = 3;
 pub const HOOK_MONITOR_INTERVAL_SECONDS: u64 = 10;
 pub const VIEW_HOOK_DEADLINE_MILLIS: u64 = 500;
 pub const VIEW_HOOK_MAX_ATTEMPTS: u8 = 3;
@@ -683,22 +682,14 @@ impl CurrentClientViews {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcknowledgementIntent {
+pub struct PaneReadIntent {
     pub pane_instance: PaneInstance,
-    pub expected_state_id: StateId,
-    pub expected_agent_epoch: u64,
-    pub through_seq: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ViewProcessingResult {
-    pub acknowledgements: Vec<crate::pane_state::PaneEventEnvelope>,
+    pub through_order: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewError {
     InvalidEvent(String),
-    UnverifiedOccurrence,
 }
 
 pub fn build_foreground_view_event(
@@ -727,66 +718,64 @@ impl fmt::Display for ViewError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidEvent(message) => formatter.write_str(message),
-            Self::UnverifiedOccurrence => formatter.write_str("unverified view occurrence"),
         }
     }
 }
 
 impl std::error::Error for ViewError {}
 
-pub fn acknowledgement_intents(
-    event: &ViewEvent,
-    done_clear_on: DoneClearOn,
+pub fn pane_read_intents(
+    witnesses: &[ClientWitness],
+    through_order: u64,
     records: &BTreeMap<PaneInstance, PaneState>,
-) -> Result<Vec<AcknowledgementIntent>, ViewError> {
-    event
-        .validate()
-        .map_err(|error| ViewError::InvalidEvent(error.to_string()))?;
-    let Some(active_pane) = event.active_pane.as_ref() else {
-        return Ok(Vec::new());
-    };
-    let verified = match done_clear_on {
-        DoneClearOn::Pane => event.visibility.pane_visible,
-        DoneClearOn::Window => event.visibility.window_visible,
-    };
-    if !verified {
-        return Err(ViewError::UnverifiedOccurrence);
-    }
-    let targets = match done_clear_on {
-        DoneClearOn::Pane => std::slice::from_ref(active_pane),
-        DoneClearOn::Window => event.window_panes.as_slice(),
-    };
+) -> Result<Vec<PaneReadIntent>, ViewError> {
+    validate_witnesses(witnesses)?;
+    let targets = witnesses
+        .iter()
+        .filter(|witness| witness.is_eligible())
+        .map(|witness| witness.active_pane.clone())
+        .collect::<BTreeSet<_>>();
     let mut intents = Vec::new();
     for pane in targets {
-        let Some(state) = records.get(pane) else {
+        let Some(state) = records.get(&pane) else {
             continue;
         };
-        intents.push(intent_for_state(pane, state));
+        if state
+            .unread
+            .latest
+            .as_ref()
+            .is_some_and(|latest| state.unread.is_unread() && latest.order <= through_order)
+        {
+            intents.push(PaneReadIntent {
+                pane_instance: pane,
+                through_order,
+            });
+        }
     }
     intents.sort_by(|left, right| left.pane_instance.cmp(&right.pane_instance));
     Ok(intents)
 }
 
-pub fn process_view_event(
-    event: &ViewEvent,
-    done_clear_on: DoneClearOn,
+pub fn pane_read_envelopes(
+    daemon_instance_id: &DaemonInstanceId,
+    event_id: &EventId,
+    witnesses: &[ClientWitness],
+    through_order: u64,
     records: &BTreeMap<PaneInstance, PaneState>,
-) -> Result<ViewProcessingResult, ViewError> {
-    event
-        .validate()
-        .map_err(|error| ViewError::InvalidEvent(error.to_string()))?;
-    let intents = match acknowledgement_intents(event, done_clear_on, records) {
-        Ok(intents) => intents,
-        Err(ViewError::UnverifiedOccurrence) => Vec::new(),
-        Err(error) => return Err(error),
-    };
-    Ok(ViewProcessingResult {
-        acknowledgements: acknowledgement_envelopes(
-            &event.daemon_instance_id,
-            &event.event_id,
-            intents,
-        ),
-    })
+) -> Result<Vec<crate::pane_state::PaneEventEnvelope>, ViewError> {
+    Ok(pane_read_intents(witnesses, through_order, records)?
+        .into_iter()
+        .map(|intent| crate::pane_state::PaneEventEnvelope {
+            daemon_instance_id: daemon_instance_id.clone(),
+            event_id: event_id.clone(),
+            pane_instance: intent.pane_instance,
+            agent: None,
+            agent_session_id: None,
+            event: crate::pane_state::PaneEvent::MarkPaneRead {
+                through_order: intent.through_order,
+            },
+        })
+        .collect())
 }
 
 pub fn reconcile_current_views(
@@ -797,51 +786,11 @@ pub fn reconcile_current_views(
     registry.reconcile(witnesses, window_panes)
 }
 
-fn acknowledgement_envelopes(
-    daemon_instance_id: &DaemonInstanceId,
-    event_id: &EventId,
-    intents: Vec<AcknowledgementIntent>,
-) -> Vec<crate::pane_state::PaneEventEnvelope> {
-    intents
-        .into_iter()
-        .map(|intent| crate::pane_state::PaneEventEnvelope {
-            daemon_instance_id: daemon_instance_id.clone(),
-            event_id: event_id.clone(),
-            pane_instance: intent.pane_instance,
-            agent: None,
-            agent_session_id: None,
-            event: crate::pane_state::PaneEvent::AcknowledgeView {
-                expected_state_id: intent.expected_state_id,
-                expected_agent_epoch: intent.expected_agent_epoch,
-                through_seq: intent.through_seq,
-            },
-        })
-        .collect()
-}
-
-pub fn visibility_snapshot(
-    pane: &PaneInstance,
-    window_id: Option<&str>,
-    witnesses: &[ClientWitness],
-) -> VisibilitySnapshot {
+pub fn visibility_snapshot(pane: &PaneInstance, witnesses: &[ClientWitness]) -> VisibilitySnapshot {
     VisibilitySnapshot {
         pane_visible_to_eligible_client: witnesses
             .iter()
             .any(|witness| witness.is_eligible() && witness.active_pane == *pane),
-        window_visible_to_eligible_client: window_id.is_some_and(|window_id| {
-            witnesses
-                .iter()
-                .any(|witness| witness.is_eligible() && witness.window_id == window_id)
-        }),
-    }
-}
-
-fn intent_for_state(pane: &PaneInstance, state: &PaneState) -> AcknowledgementIntent {
-    AcknowledgementIntent {
-        pane_instance: pane.clone(),
-        expected_state_id: state.state_id.clone(),
-        expected_agent_epoch: state.agent_epoch,
-        through_seq: state.completed_seq,
     }
 }
 
@@ -1202,12 +1151,11 @@ impl FreshVisibilityIo for SystemFreshVisibilityIo {
 pub fn query_fresh_visibility(
     io: &dyn FreshVisibilityIo,
     pane: &PaneInstance,
-    window_id: Option<&str>,
 ) -> Result<VisibilitySnapshot, FreshVisibilityError> {
     let witnesses = io.query_witnesses(FRESH_VISIBILITY_TIMEOUT)?;
     validate_witnesses(&witnesses)
         .map_err(|error| FreshVisibilityError::Parse(error.to_string()))?;
-    Ok(visibility_snapshot(pane, window_id, &witnesses))
+    Ok(visibility_snapshot(pane, &witnesses))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1219,9 +1167,8 @@ pub struct CompletionVisibility {
 pub fn completion_visibility(
     io: &dyn FreshVisibilityIo,
     pane: &PaneInstance,
-    window_id: Option<&str>,
 ) -> Result<CompletionVisibility, FreshVisibilityError> {
-    match query_fresh_visibility(io, pane, window_id) {
+    match query_fresh_visibility(io, pane) {
         Ok(snapshot) => Ok(CompletionVisibility {
             snapshot,
             diagnostic: None,
@@ -1371,7 +1318,10 @@ fn parse_client_rows<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pane_state::{AgentKind, LifecycleState, PANE_STATE_SCHEMA_VERSION, TaskState};
+    use crate::pane_state::{
+        AgentKind, LifecycleState, PANE_STATE_SCHEMA_VERSION, StateId, TaskState, UnreadOccurrence,
+        UnreadReason, UnreadState,
+    };
 
     fn pane(id: &str, pid: u32) -> PaneInstance {
         PaneInstance {
@@ -1421,7 +1371,7 @@ mod tests {
         }
     }
 
-    fn state(pane_instance: PaneInstance, completed: u64, acknowledged: u64) -> PaneState {
+    fn state(pane_instance: PaneInstance, order: u64, read: bool) -> PaneState {
         PaneState {
             schema_version: PANE_STATE_SCHEMA_VERSION,
             state_id: StateId::parse("00112233445566778899aabbccddeeff").unwrap(),
@@ -1434,9 +1384,18 @@ mod tests {
             scan_verified: true,
             synthetic_completion_armed: false,
             lifecycle: LifecycleState::Idle,
-            run_seq: completed,
-            completed_seq: completed,
-            acknowledged_seq: acknowledged,
+            run_seq: 1,
+            completed_seq: 1,
+            unread: UnreadState {
+                occurrence_seq: 1,
+                read_seq: u64::from(read),
+                latest: Some(UnreadOccurrence {
+                    seq: 1,
+                    order,
+                    reason: UnreadReason::Completed,
+                    occurred_at: 2,
+                }),
+            },
             started_at: Some(1),
             completed_at: Some(2),
             prompt: None,
@@ -1446,23 +1405,14 @@ mod tests {
         }
     }
 
-    fn event(
-        active_pane: PaneInstance,
-        window_panes: Vec<PaneInstance>,
-        pane_visible: bool,
-        window_visible: bool,
-    ) -> ViewEvent {
-        ViewEvent {
-            daemon_instance_id: DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100")
-                .unwrap(),
-            event_id: EventId::parse("102132435465768798a9bacbdcedfe0f").unwrap(),
-            hook_kind: ViewHookKind::WindowPaneChanged,
-            active_pane: Some(active_pane),
-            window_panes,
-            visibility: ViewVisibilityProof {
-                pane_visible,
-                window_visible,
-            },
+    fn witness(client_pid: u32, active_pane: PaneInstance, control_mode: bool) -> ClientWitness {
+        ClientWitness {
+            client_pid,
+            session_id: format!("${client_pid}"),
+            window_id: "@2".to_string(),
+            active_pane,
+            control_mode,
+            active_pane_flag: false,
         }
     }
 
@@ -1543,51 +1493,50 @@ mod tests {
     }
 
     #[test]
-    fn daemon_policy_selects_pane_or_window_from_same_proof() {
+    fn pane_read_intents_only_include_exact_panes_visible_to_eligible_clients() {
         let first = pane("%1", 101);
         let second = pane("%2", 202);
-        let event = event(
-            first.clone(),
-            vec![first.clone(), second.clone()],
-            false,
-            true,
-        );
         let records = [
-            (first.clone(), state(first.clone(), 1, 0)),
-            (second.clone(), state(second.clone(), 1, 0)),
+            (first.clone(), state(first.clone(), 1, false)),
+            (second.clone(), state(second.clone(), 2, false)),
         ]
         .into_iter()
         .collect();
+        let witnesses = [
+            witness(10, first.clone(), false),
+            witness(11, second.clone(), true),
+        ];
 
+        let intents = pane_read_intents(&witnesses, 2, &records).unwrap();
         assert_eq!(
-            acknowledgement_intents(&event, DoneClearOn::Pane, &records).unwrap_err(),
-            ViewError::UnverifiedOccurrence
-        );
-        let window = acknowledgement_intents(&event, DoneClearOn::Window, &records).unwrap();
-        assert_eq!(
-            window
+            intents
                 .iter()
                 .map(|intent| intent.pane_instance.clone())
                 .collect::<Vec<_>>(),
-            vec![first, second]
+            vec![first]
         );
     }
 
     #[test]
-    fn sequencer_position_freezes_completion_upper_bound() {
+    fn sequencer_position_freezes_unread_order_upper_bound() {
         let target = pane("%1", 101);
-        let event = event(target.clone(), vec![target.clone()], true, true);
-        let records = [(target.clone(), state(target, 4, 2))]
+        let records = [(target.clone(), state(target.clone(), 4, false))]
             .into_iter()
             .collect();
-        let intent = acknowledgement_intents(&event, DoneClearOn::Pane, &records).unwrap();
+        let witnesses = [witness(10, target, false)];
 
-        assert_eq!(intent.len(), 1);
-        assert_eq!(intent[0].through_seq, 4);
-        assert_eq!(intent[0].expected_agent_epoch, 1);
+        assert!(
+            pane_read_intents(&witnesses, 3, &records)
+                .unwrap()
+                .is_empty()
+        );
+        let intents = pane_read_intents(&witnesses, 4, &records).unwrap();
         assert_eq!(
-            intent[0].expected_state_id.as_str(),
-            "00112233445566778899aabbccddeeff"
+            intents,
+            vec![PaneReadIntent {
+                pane_instance: pane("%1", 101),
+                through_order: 4,
+            }]
         );
     }
 
@@ -1675,11 +1624,9 @@ mod tests {
                 }],
             },
             &target,
-            Some("@1"),
         )
         .unwrap();
         assert!(visibility.snapshot.pane_visible_to_eligible_client);
-        assert!(visibility.snapshot.window_visible_to_eligible_client);
         assert_eq!(visibility.diagnostic, None);
     }
 

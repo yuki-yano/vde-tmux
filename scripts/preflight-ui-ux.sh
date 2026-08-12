@@ -308,7 +308,6 @@ cat >"$CONFIG_HOME/vde/tmux/config.yml" <<EOF
 categories:
   default_category: preflight
 daemon:
-  done_clear_on: pane
   poll_ms: 250
 sidebar:
   width: 35
@@ -839,16 +838,7 @@ capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-after-global-ac
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-global-ack.txt"
 record sidebar-ack PASS-pane-global
 
-# Window mode must acknowledge inside the completion mutation when another split in the same
-# window is focused; a transient Done publication is a contract violation.
-awk '{
-  if ($0 == "  done_clear_on: pane") print "  done_clear_on: window";
-  else print $0;
-}' "$CONFIG_HOME/vde/tmux/config.yml" >"$SANDBOX/config.window.yml"
-mv "$SANDBOX/config.window.yml" "$CONFIG_HOME/vde/tmux/config.yml"
-cp "$CONFIG_HOME/vde/tmux/config.yml" "$ARTIFACT_DIR/config.window.yml"
-run_vt daemon reload >"$ARTIFACT_DIR/daemon-reload-window-mode.log"
-wait_daemon_running >"$ARTIFACT_DIR/daemon-status-window-mode.log"
+# Another split in the same window must not read the completed pane.
 query_snapshot
 python3 - "$QUERY_JSON" "$S2_AGENT" "$S2_AGENT_PID" "$S1_AGENT" <<'PY'
 import json, sys
@@ -867,14 +857,16 @@ VT_PANE="$S1_AGENT" run_vt hook emit --agent 'ascii-one' --session-id side-one-a
 VT_PANE="$S1_AGENT" run_vt hook emit --agent 'ascii-one' --session-id side-one-a \
   --status idle --completed-at "$((WINDOW_ACK_NOW + 1))"
 query_snapshot
-cp "$QUERY_JSON" "$ARTIFACT_DIR/window-ack-snapshot.json"
-python3 - "$ARTIFACT_DIR/window-ack-snapshot.json" "$S1_AGENT" <<'PY'
+cp "$QUERY_JSON" "$ARTIFACT_DIR/pane-read-before-focus.json"
+python3 - "$ARTIFACT_DIR/pane-read-before-focus.json" "$S1_AGENT" <<'PY'
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
 pane = next(p for p in reply["snapshot"]["panes"] if p["pane_instance"]["pane_id"] == sys.argv[2])
-assert pane["resolved"]["badge"] == "Idle", pane
+assert pane["resolved"]["badge"] == "Done", pane
 PY
-record window-ack PASS-immediate-same-window-nonfocus-split
+tmux_cmd select-pane -t "$S1_AGENT"
+wait_badge "$S1_AGENT" Idle
+record pane-read PASS-other-split-stays-unread-until-exact-focus
 
 # Save ANSI evidence at all required sidebar widths and enforce terminal cell bounds.
 VT_PANE="$SIDEBAR_1" run_vt sidebar input all

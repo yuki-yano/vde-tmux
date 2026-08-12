@@ -26,6 +26,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::config::Config;
 use crate::daemon::protocol::v2::ResolvedSnapshot;
+#[cfg(test)]
 use crate::daemon::session_badge::BadgeState;
 use crate::pane_state::{PaneInstance, StateVersion, StoredStateDescriptor};
 use crate::sidebar::client::{
@@ -456,7 +457,7 @@ mod local_state_tests {
             lifecycle: LifecycleState::Running,
             run_seq: 1,
             completed_seq: 0,
-            acknowledged_seq: 0,
+            unread: crate::pane_state::UnreadState::default(),
             started_at: Some(1),
             completed_at: None,
             prompt: None,
@@ -753,37 +754,6 @@ mod local_state_tests {
         );
         assert!(adjacent_agent_target(Some(&first.id), &rows, false).is_none());
         assert!(adjacent_agent_target(Some(&second.id), &rows, true).is_none());
-    }
-
-    #[test]
-    fn latest_unread_done_uses_completion_time_then_pane_identity() {
-        let done = |pane_id: &str, pane_pid: u32, completed_at: Option<i64>| {
-            let mut pane = resolved_pane(pane_id, pane_pid, "$1");
-            let resolved = pane.resolved.as_mut().unwrap();
-            resolved.badge = BadgeState::Done;
-            resolved.canonical.completed_at = completed_at;
-            pane
-        };
-        let newest_later_id = done("%3", 303, Some(200));
-        let newest_first_id = done("%2", 202, Some(200));
-        let older = done("%1", 101, Some(100));
-        let missing_time = done("%0", 1, None);
-        let working = resolved_pane("%9", 909, "$1");
-        let snapshot = ResolvedSnapshot {
-            panes: vec![
-                newest_later_id,
-                working,
-                older,
-                missing_time,
-                newest_first_id.clone(),
-            ],
-            ..snapshot(10)
-        };
-
-        assert_eq!(
-            latest_unread_done_target(&snapshot),
-            Some(newest_first_id.pane_instance)
-        );
     }
 
     #[test]
@@ -3221,20 +3191,6 @@ fn adjacent_agent_target(
     Some(agents[index].clone())
 }
 
-fn latest_unread_done_target(snapshot: &ResolvedSnapshot) -> Option<PaneInstance> {
-    let mut candidates = snapshot
-        .panes
-        .iter()
-        .filter_map(|pane| {
-            let resolved = pane.resolved.as_ref()?;
-            (resolved.badge == BadgeState::Done)
-                .then_some((resolved.canonical.completed_at, pane.pane_instance.clone()))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    candidates.into_iter().next().map(|(_, pane)| pane)
-}
-
 fn jump_from_control(
     socket: &Path,
     server_identity: &str,
@@ -3281,6 +3237,32 @@ fn jump_from_control(
         ui,
         ClickAction::JumpPane(pane_instance),
     );
+}
+
+fn jump_latest_unread_from_control(
+    socket: &Path,
+    server_identity: &str,
+    source_pane: &PaneInstance,
+    ui: &mut MarkCompleteUi,
+) {
+    let result = crate::sidebar::client::send_latest_unread_jump_v2(
+        socket,
+        server_identity,
+        source_pane.clone(),
+    );
+    let (message, level, duration) = match result {
+        Ok(()) => (
+            "jumped to latest unread pane".to_string(),
+            NoticeLevel::Success,
+            Duration::from_secs(3),
+        ),
+        Err(error) => (
+            format!("unread jump failed: {error}"),
+            NoticeLevel::Failure,
+            Duration::from_secs(5),
+        ),
+    };
+    ui.set_toast(message, level, duration);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3519,24 +3501,10 @@ fn drain_control_messages(
                             );
                         }
                         Some(crate::sidebar::input::SidebarInputAction::UnreadLatest) => {
-                            let target = latest_unread_done_target(snapshot).map(|pane| {
-                                let row_id = chat_row_id(&pane);
-                                (row_id, pane)
-                            });
-                            if target.is_none() {
-                                ui.set_toast(
-                                    "no unread Done agents".to_string(),
-                                    NoticeLevel::Warning,
-                                    Duration::from_secs(3),
-                                );
-                            }
-                            jump_from_control(
+                            jump_latest_unread_from_control(
                                 socket,
                                 server_identity,
-                                snapshot,
                                 &source_pane,
-                                target,
-                                state,
                                 ui,
                             );
                         }

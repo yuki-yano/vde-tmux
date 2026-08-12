@@ -182,20 +182,15 @@ hook を設定していなくても、Claude Code、Codex、opencode は pane �
 | `✓` | Done | 作業が完了し、まだ確認されていない |
 | `○` | Idle | 作業がない、または完了を確認済み |
 
-`Done` は、対象の pane または window を確認すると `Idle` になります。
-確認範囲は `daemon.done_clear_on` で変更できます。
+`Done` は、対象の exact pane が eligible な tmux client で active になると `Idle` になります。
+同じ window の別 split を見ても既読にはなりません。
+既読状態は daemon の再起動後も保持され、すべての tmux client とサイドバーで共有されます。
+daemon は現在の client view を定期的に再照合するため、view hook を一度取りこぼしても次の
+observation pollで修復されます。
 
-```yaml
-daemon:
-  done_clear_on: window # window | pane
-```
-
-確認状態は daemon の再起動後も保持され、すべての tmux client とサイドバーで共有されます。
-tmux の view hook は hook 発火時に見えていた pane と window を固定するため、短時間だけ
-focus して直ちに移動しても、その時点で確認した `Done` は `Idle` になります。
-hook は daemon が event を queue に受理した時点で終了します。
-受理後から適用前までに daemon が停止した一回の確認 event は再送されない best-effort 境界であり、
-次の focus または後続の完了時 visibility 確認まで badge は `Done` のまま残ります。
+`unread-latest` は全paneを横断し、未読のWaiting、Error、Completedのうち最新の発生へ移動します。
+globalな発生順はdaemonが管理し、移動中に最新paneが消えた場合は次の未読paneを試します。
+移動操作そのものは既読化せず、移動先がactive paneとして観測された後に既読になります。
 
 ## サイドバー
 
@@ -297,9 +292,6 @@ vt project selector --popup
 前節の `categories` と合わせて、よく使う設定は次のとおりです。
 
 ```yaml
-daemon:
-  done_clear_on: window
-
 sidebar:
   width: "20%"
   min_width: 40
@@ -399,7 +391,7 @@ vt hook emit \
 ### pane state の永続化
 
 daemon は tmux server incarnation ごとに一つの private な full-state snapshot を
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v1.json` へ保存します。
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v2.json` へ保存します。
 daemon 再起動後も、pane ID と PID が一致する pane の prompt、task の進捗と項目、subagent、worktree activity、lifecycle、時刻、agent identity、Done と確認済み状態を復元します。
 
 snapshot が破損している、または権限が安全でない場合、daemon は修復や fallback を行わず起動を停止します。

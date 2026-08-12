@@ -966,6 +966,7 @@ const SIDEBAR_JOB_TIMEOUT: Duration = Duration::from_secs(2);
 pub enum SidebarTmuxError {
     ServerIncarnationMismatch,
     PaneInstanceMismatch(String),
+    NoAvailablePane,
     SourceClientMismatch,
     Command(anyhow::Error),
 }
@@ -977,6 +978,7 @@ impl std::fmt::Display for SidebarTmuxError {
             Self::PaneInstanceMismatch(pane_id) => {
                 write!(formatter, "pane instance changed: {pane_id}")
             }
+            Self::NoAvailablePane => write!(formatter, "no unread pane is still available"),
             Self::SourceClientMismatch => {
                 write!(
                     formatter,
@@ -994,6 +996,7 @@ impl std::error::Error for SidebarTmuxError {
             Self::Command(error) => Some(error.as_ref()),
             Self::ServerIncarnationMismatch
             | Self::PaneInstanceMismatch(_)
+            | Self::NoAvailablePane
             | Self::SourceClientMismatch => None,
         }
     }
@@ -1139,12 +1142,12 @@ fn is_missing_pane_error(error: &anyhow::Error) -> bool {
 }
 
 pub trait WorkerIo: Send + Sync + 'static {
-    fn jump_to_pane(
+    fn jump_to_first_available_pane(
         &self,
-        pane: &PaneInstance,
+        panes: &[PaneInstance],
         client_pid: u32,
         source_pane: &PaneInstance,
-    ) -> std::result::Result<(), SidebarTmuxError>;
+    ) -> std::result::Result<PaneInstance, SidebarTmuxError>;
 }
 
 trait TimedTmuxIo: Send + Sync {
@@ -1198,33 +1201,62 @@ impl SystemWorkerIo {
     }
 }
 
+fn jump_to_first_available_pane_with_runner(
+    runner: &dyn TmuxRunner,
+    expected_server: &ServerIdentity,
+    panes: &[PaneInstance],
+    client_pid: u32,
+    source_pane: &PaneInstance,
+) -> std::result::Result<PaneInstance, SidebarTmuxError> {
+    for pane in panes {
+        let guarded = GuardedSidebarTmuxRunner {
+            runner,
+            expected_server,
+            expected_pane: pane,
+        };
+        let result = crate::sidebar::layout::jump_to_pane_for_client(
+            &guarded,
+            pane,
+            client_pid,
+            source_pane,
+        )
+        .map_err(|error| {
+            if error
+                .to_string()
+                .contains(crate::sidebar::layout::SOURCE_CLIENT_MISMATCH_SENTINEL)
+            {
+                SidebarTmuxError::SourceClientMismatch
+            } else {
+                classify_sidebar_error(error, pane)
+            }
+        });
+        match result {
+            Ok(()) => return Ok(pane.clone()),
+            Err(SidebarTmuxError::PaneInstanceMismatch(_)) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(SidebarTmuxError::NoAvailablePane)
+}
+
 impl WorkerIo for SystemWorkerIo {
-    fn jump_to_pane(
+    fn jump_to_first_available_pane(
         &self,
-        pane: &PaneInstance,
+        panes: &[PaneInstance],
         client_pid: u32,
         source_pane: &PaneInstance,
-    ) -> std::result::Result<(), SidebarTmuxError> {
+    ) -> std::result::Result<PaneInstance, SidebarTmuxError> {
         let budgeted = JobBudgetTmuxRunner {
             io: &self.io,
             deadline: Instant::now() + SIDEBAR_JOB_TIMEOUT,
         };
-        let guarded = GuardedSidebarTmuxRunner {
-            runner: &budgeted,
-            expected_server: &self.expected_server,
-            expected_pane: pane,
-        };
-        crate::sidebar::layout::jump_to_pane_for_client(&guarded, pane, client_pid, source_pane)
-            .map_err(|error| {
-                if error
-                    .to_string()
-                    .contains(crate::sidebar::layout::SOURCE_CLIENT_MISMATCH_SENTINEL)
-                {
-                    SidebarTmuxError::SourceClientMismatch
-                } else {
-                    classify_sidebar_error(error, pane)
-                }
-            })
+        jump_to_first_available_pane_with_runner(
+            &budgeted,
+            &self.expected_server,
+            panes,
+            client_pid,
+            source_pane,
+        )
     }
 }
 
@@ -1535,6 +1567,7 @@ mod tests {
         client_read_body: Option<String>,
         mutation_output: String,
         mutation_error: Option<String>,
+        stale_pane_pid: Option<u32>,
         calls: Mutex<Vec<Vec<String>>>,
     }
 
@@ -1546,6 +1579,7 @@ mod tests {
                 client_read_body: None,
                 mutation_output: String::new(),
                 mutation_error: None,
+                stale_pane_pid: None,
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -1562,6 +1596,11 @@ mod tests {
 
         fn with_mutation_error(mut self, error: impl Into<String>) -> Self {
             self.mutation_error = Some(error.into());
+            self
+        }
+
+        fn with_stale_pane_pid(mut self, pane_pid: u32) -> Self {
+            self.stale_pane_pid = Some(pane_pid);
             self
         }
 
@@ -1589,6 +1628,12 @@ mod tests {
             }
             if let Some(error) = &self.mutation_error {
                 anyhow::bail!(error.clone());
+            }
+            if self.stale_pane_pid.is_some_and(|pane_pid| {
+                args.iter()
+                    .any(|arg| arg.contains(&format!("#{{pane_pid}},{pane_pid}")))
+            }) {
+                return Ok(format!("{SIDEBAR_PANE_MISMATCH_SENTINEL}\n"));
             }
             Ok(self.mutation_output.clone())
         }
@@ -1622,7 +1667,7 @@ mod tests {
             lifecycle: LifecycleState::Running,
             run_seq: 1,
             completed_seq: 0,
-            acknowledged_seq: 0,
+            unread: crate::pane_state::UnreadState::default(),
             started_at: Some(100),
             completed_at: None,
             prompt: None,
@@ -1971,6 +2016,33 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0][0], "if-shell");
         assert_ne!(calls[0][0], "select-pane");
+    }
+
+    #[test]
+    fn unread_jump_skips_a_stale_target_and_uses_the_next_candidate() {
+        let runner = SidebarGuardRunner::new(
+            server_identity(),
+            "$1\u{1f}@1\u{1f}%1\u{1f}11\n$1\u{1f}@2\u{1f}%2\u{1f}22\n",
+        )
+        .with_client_read_body("20\u{1f}/dev/ttys002\n")
+        .with_stale_pane_pid(11);
+        let source = pane_instance("%9", 909);
+        let candidates = [pane_instance("%1", 11), pane_instance("%2", 22)];
+
+        let selected = jump_to_first_available_pane_with_runner(
+            &runner,
+            &server_identity(),
+            &candidates,
+            20,
+            &source,
+        )
+        .unwrap();
+
+        assert_eq!(selected, pane_instance("%2", 22));
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 6);
+        assert!(calls[2][3].contains("#{pane_pid},11"));
+        assert!(calls[5][3].contains("#{pane_pid},22"));
     }
 
     #[test]

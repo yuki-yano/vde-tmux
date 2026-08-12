@@ -47,3 +47,19 @@ _Avoid_: Resolved session category
 **Dormant Repository**:
 Explicit Membershipや表示順は保持されているが、現在はSessionを一つも持たないRepository。sidebarには表示されない。
 _Avoid_: Deleted repository, inactive session
+
+**Unread Occurrence**:
+Paneで新しく発生したWaiting、Error、Completedの通知単位。Pane内sequenceとtmux server全体のglobal orderを持つ。
+_Avoid_: Unread Done, notification flag
+
+**Pane Read**:
+eligibleなtmux clientでexact Paneがactiveになった事実に基づき、そのPaneの観測時点までのUnread Occurrenceを既読にする操作。Window内の他Paneには波及しない。
+_Avoid_: Window acknowledgment, focus clear
+
+**Latest Unread Jump**:
+global orderが最新のeligibleなUnread Occurrenceへ移動するdaemon action。移動自体はPane Readを行わず、移動後のview観測が既読化する。
+_Avoid_: Latest Done jump, sidebar-local selection
+
+**Unread Span**:
+Paneが既読状態から最初のUnread Occurrenceを生成してから、Pane Readによって再び既読になるまでの連続した期間。一つのUnread Span内で複数のUnread Occurrenceが発生し得る。
+_Avoid_: Notification history, unread session

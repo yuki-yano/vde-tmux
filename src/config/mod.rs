@@ -602,7 +602,6 @@ impl<'de> Deserialize<'de> for SidebarWidth {
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
     pub poll_ms: u64,
-    pub done_clear_on: DoneClearOn,
     pub git: GitConfig,
 }
 
@@ -610,18 +609,9 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             poll_ms: 1000,
-            done_clear_on: DoneClearOn::Window,
             git: GitConfig::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DoneClearOn {
-    #[default]
-    Window,
-    Pane,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -652,7 +642,6 @@ mod tests {
         assert!(!config.statusline.summary.hide_idle);
         assert_eq!(config.statusline.summary.format, "{badge} {count}");
         assert_eq!(config.daemon.poll_ms, 1000);
-        assert_eq!(config.daemon.done_clear_on, DoneClearOn::Window);
         assert_eq!(config.daemon.git.timeout_ms, 500);
         assert_eq!(config.sidebar.width, SidebarWidth::Columns(40));
         assert_eq!(config.sidebar.min_width, 40);
@@ -894,7 +883,6 @@ daemon:
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(config.statusline.sessions.show_index);
         assert_eq!(config.daemon.poll_ms, 250);
-        assert_eq!(config.daemon.done_clear_on, DoneClearOn::Window);
         assert_eq!(config.daemon.git.poll_interval_ms, 10_000);
         assert_eq!(config.statusline.sessions.current.format, " {session} ");
         assert_eq!(
@@ -906,13 +894,6 @@ daemon:
             config.statusline.panes.current.format,
             " {pane} \u{e0b1} {detail} "
         );
-    }
-
-    #[test]
-    fn daemon_done_clear_on_parses_pane() {
-        let config: Config = serde_yaml_ng::from_str("daemon:\n  done_clear_on: pane\n").unwrap();
-
-        assert_eq!(config.daemon.done_clear_on, DoneClearOn::Pane);
     }
 
     #[test]

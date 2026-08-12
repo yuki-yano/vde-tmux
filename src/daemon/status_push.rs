@@ -1055,7 +1055,7 @@ mod tests {
                     },
                     run_seq: 1,
                     completed_seq: 0,
-                    acknowledged_seq: 0,
+                    unread: crate::pane_state::UnreadState::default(),
                     started_at: Some(0),
                     completed_at: None,
                     prompt: None,

@@ -17,7 +17,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -691,6 +691,9 @@ pub enum SidebarCommand {
         pane_instance: PaneInstance,
         source_pane: PaneInstance,
     },
+    JumpLatestUnread {
+        source_pane: PaneInstance,
+    },
     MarkComplete {
         pane_instance: PaneInstance,
         expected: StateVersion,
@@ -1151,9 +1154,9 @@ mod tests {
 
     #[test]
     fn unknown_fields_and_oversized_frames_are_rejected() {
-        let json = br#"{"op":"hello","proto":5,"unknown":true}"#;
+        let json = format!(r#"{{"op":"hello","proto":{PROTOCOL_VERSION},"unknown":true}}"#);
         assert!(matches!(
-            decode_request_frame(json),
+            decode_request_frame(json.as_bytes()),
             Err(ServerMessage::Error {
                 code: ErrorCode::InvalidRequest,
                 ..

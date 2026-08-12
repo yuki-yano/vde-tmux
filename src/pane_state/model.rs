@@ -3,10 +3,9 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::config::DoneClearOn;
 use crate::daemon::session_badge::BadgeState;
 
-pub const PANE_STATE_SCHEMA_VERSION: u16 = 1;
+pub const PANE_STATE_SCHEMA_VERSION: u16 = 2;
 pub const IDENTIFIER_MAX_BYTES: usize = 256;
 pub const BODY_MAX_BYTES: usize = 4096;
 pub const PATH_MAX_BYTES: usize = 8192;
@@ -291,6 +290,71 @@ pub enum LifecycleState {
     Error { reason: Option<String> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum UnreadReason {
+    Waiting,
+    Error,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnreadOccurrence {
+    pub seq: u64,
+    pub order: u64,
+    pub reason: UnreadReason,
+    pub occurred_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnreadState {
+    pub occurrence_seq: u64,
+    pub read_seq: u64,
+    pub latest: Option<UnreadOccurrence>,
+}
+
+impl UnreadState {
+    pub fn is_unread(&self) -> bool {
+        self.occurrence_seq > self.read_seq
+    }
+
+    pub fn latest_unread(&self) -> Option<&UnreadOccurrence> {
+        self.is_unread().then_some(self.latest.as_ref()).flatten()
+    }
+
+    pub fn is_jump_eligible(&self, lifecycle: &LifecycleState) -> bool {
+        self.latest_unread().is_some_and(|occurrence| {
+            matches!(occurrence.reason, UnreadReason::Completed)
+                || matches!(
+                    (&occurrence.reason, lifecycle),
+                    (UnreadReason::Waiting, LifecycleState::Waiting { .. })
+                        | (UnreadReason::Error, LifecycleState::Error { .. })
+                )
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.read_seq > self.occurrence_seq {
+            return Err(ModelError(
+                "unread read sequence exceeds occurrence sequence".to_string(),
+            ));
+        }
+        match (&self.latest, self.occurrence_seq) {
+            (None, 0) => Ok(()),
+            (Some(latest), sequence)
+                if sequence > 0 && latest.seq == sequence && latest.order > 0 =>
+            {
+                Ok(())
+            }
+            _ => Err(ModelError(
+                "unread latest occurrence disagrees with occurrence sequence".to_string(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromptState {
@@ -375,7 +439,7 @@ pub struct PaneState {
     pub lifecycle: LifecycleState,
     pub run_seq: u64,
     pub completed_seq: u64,
-    pub acknowledged_seq: u64,
+    pub unread: UnreadState,
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub prompt: Option<PromptState>,
@@ -406,7 +470,7 @@ impl PaneState {
                 "revision and agent epoch must be positive".to_string(),
             ));
         }
-        if self.acknowledged_seq > self.completed_seq || self.completed_seq > self.run_seq {
+        if self.completed_seq > self.run_seq {
             return Err(ModelError(
                 "pane state sequence order is invalid".to_string(),
             ));
@@ -439,9 +503,7 @@ impl PaneState {
         {
             return Err(ModelError("invalid synthetic completion state".to_string()));
         }
-        if self.run_seq == 0
-            && (self.completed_seq != 0 || self.acknowledged_seq != 0 || self.started_at.is_some())
-        {
+        if self.run_seq == 0 && (self.completed_seq != 0 || self.started_at.is_some()) {
             return Err(ModelError("zero run sequence has run metadata".to_string()));
         }
         if (self.completed_seq == 0) != self.completed_at.is_none() {
@@ -473,6 +535,7 @@ impl PaneState {
             validate_required_text(&activity.path, "worktree path", PATH_MAX_BYTES)?;
             validate_required_text(&activity.command, "worktree command", BODY_MAX_BYTES)?;
         }
+        self.unread.validate()?;
         Ok(())
     }
 }
@@ -681,10 +744,8 @@ pub enum PaneEvent {
         observed_at: i64,
         reason: Option<String>,
     },
-    AcknowledgeView {
-        expected_state_id: StateId,
-        expected_agent_epoch: u64,
-        through_seq: u64,
+    MarkPaneRead {
+        through_order: u64,
     },
     MarkDone {
         expected: StateVersion,
@@ -833,7 +894,6 @@ impl ViewEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VisibilitySnapshot {
     pub pane_visible_to_eligible_client: bool,
-    pub window_visible_to_eligible_client: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -856,10 +916,10 @@ pub struct CaptureTrackerDelta {
 
 #[derive(Debug, Clone)]
 pub struct ReductionContext<'a> {
-    pub done_clear_on: DoneClearOn,
     pub visibility: &'a VisibilitySnapshot,
     pub tracker: &'a CaptureTrackerSnapshot,
     pub new_state_id: Option<StateId>,
+    pub latest_unread_order: u64,
 }
 
 #[cfg(test)]
@@ -884,7 +944,7 @@ mod tests {
             lifecycle: LifecycleState::Idle,
             run_seq: 0,
             completed_seq: 0,
-            acknowledged_seq: 0,
+            unread: UnreadState::default(),
             started_at: None,
             completed_at: None,
             prompt: None,
@@ -941,6 +1001,36 @@ mod tests {
         state.started_at = Some(1);
         state.lifecycle = LifecycleState::Running;
         assert!(state.validate().is_err());
+    }
+
+    #[test]
+    fn unread_state_validates_sequences_and_lifecycle_eligibility() {
+        let mut unread = UnreadState {
+            occurrence_seq: 1,
+            read_seq: 0,
+            latest: Some(UnreadOccurrence {
+                seq: 1,
+                order: 7,
+                reason: UnreadReason::Waiting,
+                occurred_at: 10,
+            }),
+        };
+        assert!(unread.validate().is_ok());
+        assert!(unread.is_jump_eligible(&LifecycleState::Waiting {
+            reason: WaitReason::PermissionPrompt,
+        }));
+        assert!(!unread.is_jump_eligible(&LifecycleState::Running));
+
+        unread.latest.as_mut().unwrap().reason = UnreadReason::Completed;
+        assert!(unread.is_jump_eligible(&LifecycleState::Running));
+        unread.read_seq = 1;
+        assert!(!unread.is_jump_eligible(&LifecycleState::Idle));
+
+        unread.read_seq = 2;
+        assert!(unread.validate().is_err());
+        unread.read_seq = 0;
+        unread.latest.as_mut().unwrap().order = 0;
+        assert!(unread.validate().is_err());
     }
 
     #[test]

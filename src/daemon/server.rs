@@ -28,6 +28,7 @@ pub const V2_FRAME_START_TIMEOUT: Duration = Duration::from_secs(2);
 pub const V2_FRAME_BODY_TIMEOUT: Duration = Duration::from_millis(100);
 pub const V2_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 const TMUX_SERVER_LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CURRENT_VIEW_REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
 
 pub struct V2FrameReader {
     reader: BufReader<UnixStream>,
@@ -217,6 +218,7 @@ pub(crate) enum V2InternalMutation {
     ReconcileViews,
     CurrentViewsReplacement {
         witnesses: Vec<crate::pane_state::ClientWitness>,
+        through_unread_order: u64,
     },
     GitProjection {
         badges: std::collections::BTreeMap<String, crate::git::GitBadge>,
@@ -244,6 +246,7 @@ pub(crate) struct ObservationPollProjection {
     witnesses: Vec<crate::pane_state::ClientWitness>,
     observation_bases: BTreeMap<PaneInstance, Option<crate::pane_state::StoredStateDescriptor>>,
     view_base: crate::daemon::view_hooks::CurrentClientViews,
+    through_unread_order: u64,
 }
 
 /// One successful observation poll as a single sequenced mutation. Application
@@ -584,7 +587,6 @@ struct NotificationWorkerJob {
 
 struct SidebarTmuxJob {
     effect: super::runtime::CanonicalSidebarEffect,
-    expected_pane: PaneInstance,
     original_accepted_seq: u64,
     event_id: EventId,
     snapshot_revision: u64,
@@ -620,6 +622,7 @@ enum SidebarEffectResult {
     Succeeded,
     ServerIncarnationMismatch,
     PaneInstanceMismatch,
+    NoAvailablePane,
     SourceClientMismatch,
     Failed(String),
 }
@@ -669,7 +672,6 @@ struct ProductionV2Coordinator {
     shutdown_ready: AtomicBool,
     incarnation: crate::daemon::lifecycle::TmuxServerIncarnation,
     env: std::collections::BTreeMap<String, String>,
-    done_clear_on: crate::config::DoneClearOn,
     notification_tx: Option<SyncSender<NotificationWorkerJob>>,
     notification_shutdown: Arc<AtomicBool>,
     notification_process_lock: Arc<Mutex<()>>,
@@ -709,23 +711,29 @@ fn start_sidebar_tmux_worker(
                 socket_name.clone(),
                 expected_server.clone(),
             );
-            let result = match job.effect {
+            let (candidates, client_pid, source_pane) = match job.effect {
                 super::runtime::CanonicalSidebarEffect::JumpPane {
                     pane_instance,
                     client_pid,
                     source_pane,
-                } => {
-                    debug_assert_eq!(pane_instance, job.expected_pane);
-                    io.jump_to_pane(&job.expected_pane, client_pid, &source_pane)
-                }
+                } => (vec![pane_instance], client_pid, source_pane),
+                super::runtime::CanonicalSidebarEffect::JumpLatestUnread {
+                    candidates,
+                    client_pid,
+                    source_pane,
+                } => (candidates, client_pid, source_pane),
             };
+            let result = io.jump_to_first_available_pane(&candidates, client_pid, &source_pane);
             let result = match result {
-                Ok(()) => SidebarEffectResult::Succeeded,
+                Ok(_) => SidebarEffectResult::Succeeded,
                 Err(crate::daemon::workers::SidebarTmuxError::ServerIncarnationMismatch) => {
                     SidebarEffectResult::ServerIncarnationMismatch
                 }
                 Err(crate::daemon::workers::SidebarTmuxError::PaneInstanceMismatch(_)) => {
                     SidebarEffectResult::PaneInstanceMismatch
+                }
+                Err(crate::daemon::workers::SidebarTmuxError::NoAvailablePane) => {
+                    SidebarEffectResult::NoAvailablePane
                 }
                 Err(crate::daemon::workers::SidebarTmuxError::SourceClientMismatch) => {
                     SidebarEffectResult::SourceClientMismatch
@@ -975,7 +983,6 @@ impl ProductionV2Coordinator {
     fn new(
         incarnation: crate::daemon::lifecycle::TmuxServerIncarnation,
         env: std::collections::BTreeMap<String, String>,
-        done_clear_on: crate::config::DoneClearOn,
         notification_command: Option<String>,
     ) -> Result<Self> {
         let notification_shutdown = Arc::new(AtomicBool::new(false));
@@ -1012,7 +1019,6 @@ impl ProductionV2Coordinator {
             shutdown_ready: AtomicBool::new(false),
             incarnation,
             env,
-            done_clear_on,
             notification_tx,
             notification_shutdown,
             notification_process_lock,
@@ -1050,10 +1056,27 @@ impl ProductionV2Coordinator {
                 let generation = coordinator
                     .current_view_refresh_generation
                     .load(Ordering::SeqCst);
+                thread::sleep(CURRENT_VIEW_REFRESH_DEBOUNCE);
+                if coordinator
+                    .current_view_refresh_generation
+                    .load(Ordering::SeqCst)
+                    != generation
+                {
+                    continue;
+                }
+                let through_unread_order = coordinator
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned")
+                    .as_ref()
+                    .map_or(0, |state| state.leased.runtime.latest_unread_order());
                 match query_client_witnesses(&coordinator, Duration::from_millis(100)) {
                     Ok(witnesses) => {
                         let _ = coordinator.enqueue_internal(
-                            V2InternalMutation::CurrentViewsReplacement { witnesses },
+                            V2InternalMutation::CurrentViewsReplacement {
+                                witnesses,
+                                through_unread_order,
+                            },
                         );
                     }
                     Err(error) if error.requires_daemon_exit() => {
@@ -1063,7 +1086,8 @@ impl ProductionV2Coordinator {
                             .store(false, Ordering::SeqCst);
                         return;
                     }
-                    Err(_) => {}
+                    Err(error) => coordinator
+                        .log_daemon_error(&format!("current view refresh failed: {error}")),
                 }
                 if coordinator
                     .current_view_refresh_generation
@@ -1814,15 +1838,22 @@ impl ProductionV2Coordinator {
     ) -> std::result::Result<(), ErrorCode> {
         let expected_pane = match &effect {
             super::runtime::CanonicalSidebarEffect::JumpPane { pane_instance, .. } => {
-                pane_instance.clone()
+                Some(pane_instance.clone())
+            }
+            super::runtime::CanonicalSidebarEffect::JumpLatestUnread { candidates, .. } => {
+                if candidates.is_empty() {
+                    return Err(ErrorCode::StaleSelection);
+                }
+                None
             }
         };
-        let exists = self
-            .state
-            .lock()
-            .expect("canonical state lock poisoned")
-            .as_ref()
-            .is_some_and(|state| state.contains_pane(&expected_pane));
+        let exists = expected_pane.as_ref().is_none_or(|expected_pane| {
+            self.state
+                .lock()
+                .expect("canonical state lock poisoned")
+                .as_ref()
+                .is_some_and(|state| state.contains_pane(expected_pane))
+        });
         if !exists {
             return Err(ErrorCode::StaleSelection);
         }
@@ -1831,7 +1862,6 @@ impl ProductionV2Coordinator {
             &self.deferred_responses,
             SidebarTmuxJob {
                 effect,
-                expected_pane,
                 original_accepted_seq,
                 event_id,
                 snapshot_revision,
@@ -2217,7 +2247,7 @@ fn start_canonical_observation_worker(
     thread::spawn(move || {
         let mut last_hook_check = Instant::now();
         while !coordinator.shutdown.load(Ordering::SeqCst) {
-            let (dispatch, view_base) = {
+            let (dispatch, view_base, through_unread_order) = {
                 let state_guard = coordinator
                     .state
                     .lock()
@@ -2238,6 +2268,7 @@ fn start_canonical_observation_worker(
                 (
                     state.leased.runtime.freeze_observation_dispatch(panes),
                     state.views.clone(),
+                    state.leased.runtime.latest_unread_order(),
                 )
             };
             let daemon_instance_id = coordinator
@@ -2293,6 +2324,7 @@ fn start_canonical_observation_worker(
                 .map(|snapshot| (snapshot.pane_instance.clone(), snapshot.base.clone()))
                 .collect();
             projection.view_base = view_base;
+            projection.through_unread_order = through_unread_order;
             let processes =
                 crate::daemon::workers::read_agent_process_snapshot(Duration::from_secs(1));
             let poll_result = crate::daemon::workers::run_observation_poll(
@@ -2579,6 +2611,61 @@ fn apply_production_mutation(
                     }
                 }
             }
+            crate::daemon::protocol::v2::SidebarCommand::JumpLatestUnread { source_pane } => {
+                let (revision, clients, candidates) = {
+                    let guard = coordinator
+                        .state
+                        .lock()
+                        .expect("canonical state lock poisoned");
+                    let state = guard
+                        .as_ref()
+                        .expect("state initialized before sidebar command");
+                    (
+                        state.leased.runtime.snapshot_revision(),
+                        unique_eligible_client_pid(&state.views, &source_pane),
+                        state.latest_unread_candidates(),
+                    )
+                };
+                let client_pid = match clients {
+                    Ok(client_pid) => client_pid,
+                    Err(count) => {
+                        return ServerMessage::error(
+                            ErrorCode::StaleSelection,
+                            format!(
+                                "source pane must identify exactly one eligible tmux client: {}:{} matched {}",
+                                source_pane.pane_id, source_pane.pane_pid, count
+                            ),
+                            Some(event_id),
+                        );
+                    }
+                };
+                if candidates.is_empty() {
+                    return ServerMessage::error(
+                        ErrorCode::StaleSelection,
+                        "no eligible unread pane",
+                        Some(event_id),
+                    );
+                }
+                let effect = super::runtime::CanonicalSidebarEffect::JumpLatestUnread {
+                    candidates,
+                    client_pid,
+                    source_pane,
+                };
+                if let Err(code) = coordinator.schedule_sidebar_effect(
+                    effect,
+                    accepted_seq,
+                    event_id.clone(),
+                    revision,
+                ) {
+                    ServerMessage::error(code, "unread pane selection is stale", Some(event_id))
+                } else {
+                    ServerMessage::SnapshotAck {
+                        event_id,
+                        accepted_seq,
+                        snapshot_revision: revision,
+                    }
+                }
+            }
             crate::daemon::protocol::v2::SidebarCommand::PreferenceIntent { intent } => {
                 apply_sidebar_preference_intent(coordinator, accepted_seq, event_id, intent)
             }
@@ -2643,13 +2730,20 @@ fn apply_production_mutation(
                         snapshot_revision: revision,
                     }
                 }
-                Err(error) => {
-                    ServerMessage::error(ErrorCode::InternalError, error.to_string(), None)
-                }
+                Err(error) => observation_poll_error_response(coordinator, error),
             }
         }
-        V2AcceptedMutation::Internal(V2InternalMutation::CurrentViewsReplacement { witnesses }) => {
-            match reconcile_views_with_witnesses(coordinator, &witnesses, None, None) {
+        V2AcceptedMutation::Internal(V2InternalMutation::CurrentViewsReplacement {
+            witnesses,
+            through_unread_order,
+        }) => {
+            match reconcile_views_with_witnesses(
+                coordinator,
+                &witnesses,
+                through_unread_order,
+                None,
+                None,
+            ) {
                 Ok(()) => {
                     let revision = coordinator
                         .state
@@ -2664,9 +2758,7 @@ fn apply_production_mutation(
                         snapshot_revision: revision,
                     }
                 }
-                Err(error) => {
-                    ServerMessage::error(ErrorCode::InternalError, error.to_string(), None)
-                }
+                Err(error) => observation_poll_error_response(coordinator, error),
             }
         }
         V2AcceptedMutation::Internal(V2InternalMutation::PaneEvent(envelope)) => {
@@ -2747,6 +2839,11 @@ fn apply_production_mutation(
                 SidebarEffectResult::PaneInstanceMismatch => ServerMessage::error(
                     ErrorCode::StaleSelection,
                     "sidebar pane selection became stale before tmux mutation",
+                    Some(completion.event_id.clone()),
+                ),
+                SidebarEffectResult::NoAvailablePane => ServerMessage::error(
+                    ErrorCode::StaleSelection,
+                    "no unread pane remained available before tmux mutation",
                     Some(completion.event_id.clone()),
                 ),
                 SidebarEffectResult::SourceClientMismatch => ServerMessage::error(
@@ -3130,7 +3227,7 @@ fn apply_pane_event_mutation(
         );
     }
     let (visibility, visibility_diagnostic) =
-        match completion_visibility_for_event(coordinator, &envelope) {
+        match unread_visibility_for_event(coordinator, &envelope) {
             Ok(value) => value,
             Err(error) => {
                 coordinator.fail_stop(error.to_string());
@@ -3154,7 +3251,7 @@ fn apply_pane_event_mutation(
         state
             .leased
             .runtime
-            .apply_event(&mut io, &envelope, &visibility, coordinator.done_clear_on)
+            .apply_event(&mut io, &envelope, &visibility)
             .and_then(|result| {
                 finish_pane_event_projection(
                     coordinator,
@@ -3348,16 +3445,14 @@ fn apply_pane_removal(
     }
 }
 
-fn completion_visibility_for_event(
+fn unread_visibility_for_event(
     coordinator: &ProductionV2Coordinator,
     envelope: &PaneEventEnvelope,
 ) -> Result<
     (crate::pane_state::VisibilitySnapshot, Option<String>),
     crate::pane_state::store::StoreError,
 > {
-    use crate::pane_state::{
-        AgentPresenceObservation, CaptureInference, LifecycleState, PaneEvent, ReportedLifecycle,
-    };
+    use crate::pane_state::{PaneEvent, ReportedLifecycle};
 
     let (current, tracker) = {
         let state_guard = coordinator
@@ -3373,10 +3468,19 @@ fn completion_visibility_for_event(
             .unwrap_or_default();
         (current, tracker)
     };
-    let may_complete = match &envelope.event {
+    let may_create_unread = match &envelope.event {
+        PaneEvent::WaitRequested { .. } | PaneEvent::FailRun { .. } => true,
         PaneEvent::CompleteRun { .. } => current.as_ref().is_none_or(|state| {
             state.run_seq > state.completed_seq || state.synthetic_completion_armed
         }),
+        PaneEvent::ExplicitStateReported { report }
+            if matches!(
+                report.lifecycle,
+                Some(ReportedLifecycle::Waiting { .. } | ReportedLifecycle::Error { .. })
+            ) =>
+        {
+            true
+        }
         PaneEvent::ExplicitStateReported { report }
             if matches!(report.lifecycle, Some(ReportedLifecycle::Idle)) =>
         {
@@ -3391,56 +3495,13 @@ fn completion_visibility_for_event(
         PaneEvent::ObservationBatch {
             presence, capture, ..
         } => current.as_ref().is_some_and(|state| {
-            let absence_evidence = match presence {
-                AgentPresenceObservation::Absent => true,
-                AgentPresenceObservation::Present(kind) => kind != &state.agent,
-                AgentPresenceObservation::Unknown => false,
-            };
-            let confirmed_absence_can_complete = absence_evidence
-                && tracker.absence_count >= 1
-                && state.scan_verified
-                && !matches!(state.lifecycle, LifecycleState::Idle);
-            let stale_capture_can_complete =
-                matches!(
-                    capture,
-                    Some(crate::pane_state::CaptureObservation {
-                        inference: CaptureInference::StaleRunCompleted,
-                        ..
-                    })
-                ) && matches!(state.lifecycle, LifecycleState::Running);
-            confirmed_absence_can_complete || stale_capture_can_complete
+            observation_may_create_unread(state, &tracker, presence, capture.as_ref())
         }),
         _ => false,
     };
-    if !may_complete {
+    if !may_create_unread {
         return Ok((crate::pane_state::VisibilitySnapshot::default(), None));
     }
-    let mut diagnostic = None;
-    let window_id = if coordinator.done_clear_on == crate::config::DoneClearOn::Window {
-        match query_full_topology(
-            coordinator,
-            crate::daemon::view_hooks::FRESH_VISIBILITY_TIMEOUT,
-        ) {
-            Ok(topology) => match completion_window_id(&topology, &envelope.pane_instance) {
-                Some(window_id) => Some(window_id.to_string()),
-                None => {
-                    diagnostic = Some("fresh_visibility_target_missing".to_string());
-                    None
-                }
-            },
-            Err(error) if error.requires_daemon_exit() => {
-                return Err(crate::pane_state::store::StoreError::FailStop(
-                    error.to_string(),
-                ));
-            }
-            Err(error) => {
-                diagnostic = Some(format!("fresh_visibility_topology_unavailable: {error}"));
-                None
-            }
-        }
-    } else {
-        None
-    };
     let io = crate::daemon::view_hooks::SystemFreshVisibilityIo::new(
         coordinator
             .env
@@ -3449,27 +3510,52 @@ fn completion_visibility_for_event(
             .filter(|value| !value.trim().is_empty()),
         coordinator.incarnation.identity.clone(),
     );
-    match crate::daemon::view_hooks::completion_visibility(
-        &io,
-        &envelope.pane_instance,
-        window_id.as_deref(),
-    ) {
-        Ok(result) => Ok((result.snapshot, result.diagnostic.or(diagnostic))),
+    match crate::daemon::view_hooks::completion_visibility(&io, &envelope.pane_instance) {
+        Ok(result) => Ok((result.snapshot, result.diagnostic)),
         Err(error) => Err(crate::pane_state::store::StoreError::FailStop(
             error.to_string(),
         )),
     }
 }
 
-fn completion_window_id<'a>(
-    topology: &'a crate::daemon::topology::TopologySnapshot,
-    pane: &PaneInstance,
-) -> Option<&'a str> {
-    topology
-        .panes
-        .iter()
-        .find(|candidate| candidate.pane_instance == *pane)
-        .map(|candidate| candidate.window_id.as_str())
+fn observation_may_create_unread(
+    state: &crate::pane_state::PaneState,
+    tracker: &crate::pane_state::CaptureTrackerSnapshot,
+    presence: &crate::pane_state::AgentPresenceObservation,
+    capture: Option<&crate::pane_state::CaptureObservation>,
+) -> bool {
+    use crate::pane_state::{AgentPresenceObservation, CaptureInference, LifecycleState};
+
+    let absence_evidence = match presence {
+        AgentPresenceObservation::Absent => true,
+        AgentPresenceObservation::Present(kind) => kind != &state.agent,
+        AgentPresenceObservation::Unknown => false,
+    };
+    let confirmed_absence_can_complete = absence_evidence
+        && tracker.absence_count >= 1
+        && state.scan_verified
+        && !matches!(state.lifecycle, LifecycleState::Idle);
+    let capture_is_applied = state.agent_present
+        && matches!(presence, AgentPresenceObservation::Present(kind) if kind == &state.agent);
+    let stale_capture_can_complete = capture_is_applied
+        && matches!(
+            capture,
+            Some(crate::pane_state::CaptureObservation {
+                inference: CaptureInference::StaleRunCompleted,
+                ..
+            })
+        )
+        && matches!(state.lifecycle, LifecycleState::Running);
+    let permission_wait_can_create = capture_is_applied
+        && matches!(
+            capture,
+            Some(crate::pane_state::CaptureObservation {
+                inference: CaptureInference::PermissionWait { .. },
+                ..
+            })
+        )
+        && !matches!(state.lifecycle, LifecycleState::Waiting { .. });
+    confirmed_absence_can_complete || stale_capture_can_complete || permission_wait_can_create
 }
 
 fn apply_external_view_event(
@@ -3487,22 +3573,10 @@ fn apply_external_view_event(
     let Some(state) = state_guard.as_mut() else {
         return ServerMessage::error(ErrorCode::NotReady, "daemon is hydrating", Some(event_id));
     };
-    let records = state.records_snapshot();
     let revision_before = state.leased.runtime.snapshot_revision();
-    let processing = match crate::daemon::view_hooks::process_view_event(
-        &event,
-        coordinator.done_clear_on,
-        &records,
-    ) {
-        Ok(result) => result,
-        Err(error) => {
-            return ServerMessage::error(
-                ErrorCode::InvalidRequest,
-                error.to_string(),
-                Some(event_id),
-            );
-        }
-    };
+    if let Err(error) = event.validate() {
+        return ServerMessage::error(ErrorCode::InvalidRequest, error.to_string(), Some(event_id));
+    }
 
     let diagnostic_pane = event.active_pane.as_ref().cloned().or_else(|| {
         state
@@ -3512,30 +3586,6 @@ fn apply_external_view_event(
             .map(|pane| pane.pane_instance.clone())
     });
 
-    if processing.acknowledgements.is_empty() {
-        if let Err(error) = state.leased.runtime.finish_sequenced_projection(
-            diagnostic_pane.as_ref(),
-            std::iter::empty(),
-            false,
-            revision_before,
-        ) {
-            return production_store_error_response(coordinator, error, Some(event_id));
-        }
-        return ServerMessage::ViewQueued {
-            event_id,
-            accepted_seq,
-        };
-    }
-
-    let mut io = pane_snapshot_store(coordinator);
-    if let Err(error) = state.leased.runtime.apply_view_acknowledgements(
-        &mut io,
-        &processing.acknowledgements,
-        coordinator.done_clear_on,
-    ) {
-        coordinator.fail_stop(error.to_string());
-        return production_store_error_response(coordinator, error, Some(event_id));
-    }
     if let Err(error) = state.leased.runtime.finish_sequenced_projection(
         diagnostic_pane.as_ref(),
         std::iter::empty(),
@@ -3729,6 +3779,7 @@ fn parse_observation_poll_projection(
         witnesses,
         observation_bases: BTreeMap::new(),
         view_base: crate::daemon::view_hooks::CurrentClientViews::default(),
+        through_unread_order: 0,
     })
 }
 
@@ -3860,6 +3911,7 @@ fn apply_observation_poll_projection(
     reconcile_views_with_witnesses(
         coordinator,
         &projection.witnesses,
+        projection.through_unread_order,
         Some(&projection.observation_bases),
         Some(&projection.view_base),
     )?;
@@ -4122,7 +4174,6 @@ fn initialize_runtime_daemon_post_bind(
     let coordinator = Arc::new(ProductionV2Coordinator::new(
         incarnation,
         env.clone(),
-        config.daemon.done_clear_on,
         notification_command,
     )?);
     coordinator.configure_health(config);
@@ -4425,6 +4476,12 @@ fn bootstrap_v2_runtime(
 }
 
 fn initial_view_reconciliation(coordinator: &ProductionV2Coordinator) -> Result<()> {
+    let through_unread_order = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned")
+        .as_ref()
+        .map_or(0, |state| state.leased.runtime.latest_unread_order());
     let witnesses = match query_client_witnesses(coordinator, Duration::from_millis(250)) {
         Ok(witnesses) => witnesses,
         Err(error) if error.requires_daemon_exit() => return Err(error.into()),
@@ -4444,17 +4501,24 @@ fn initial_view_reconciliation(coordinator: &ProductionV2Coordinator) -> Result<
             return Ok(());
         }
     };
-    reconcile_views_with_witnesses(coordinator, &witnesses, None, None)
+    reconcile_views_with_witnesses(coordinator, &witnesses, through_unread_order, None, None)
 }
 
 fn reconcile_views_with_witnesses(
     coordinator: &ProductionV2Coordinator,
     witnesses: &[crate::pane_state::ClientWitness],
+    through_unread_order: u64,
     _observation_bases: Option<
         &BTreeMap<PaneInstance, Option<crate::pane_state::StoredStateDescriptor>>,
     >,
     view_base: Option<&crate::daemon::view_hooks::CurrentClientViews>,
 ) -> Result<()> {
+    let daemon_instance_id = coordinator
+        .router
+        .lock()
+        .expect("v2 router lock poisoned")
+        .daemon_instance_id()
+        .clone();
     let mut state_guard = coordinator
         .state
         .lock()
@@ -4465,8 +4529,23 @@ fn reconcile_views_with_witnesses(
     if !observation_view_base_matches(&state.views, view_base) {
         return Ok(());
     }
+    let read_event_id = EventId::generate()?;
+    let pane_reads = crate::daemon::view_hooks::pane_read_envelopes(
+        &daemon_instance_id,
+        &read_event_id,
+        witnesses,
+        through_unread_order,
+        &state.records_snapshot(),
+    )?;
     let window_panes = state.window_panes();
     let revision_before = state.leased.runtime.snapshot_revision();
+    if !pane_reads.is_empty() {
+        let mut io = pane_snapshot_store(coordinator);
+        state
+            .leased
+            .runtime
+            .apply_pane_reads(&mut io, &pane_reads)?;
+    }
     let mut next_views = state.views.clone();
     let registry_changed = crate::daemon::view_hooks::reconcile_current_views(
         &mut next_views,
@@ -4618,13 +4697,7 @@ mod tests {
     }
 
     fn test_coordinator(root: &Path, hash: impl Into<String>) -> ProductionV2Coordinator {
-        ProductionV2Coordinator::new(
-            test_incarnation(root, hash),
-            BTreeMap::new(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap()
+        ProductionV2Coordinator::new(test_incarnation(root, hash), BTreeMap::new(), None).unwrap()
     }
 
     fn initialized_test_coordinator(
@@ -4958,40 +5031,6 @@ mod tests {
     }
 
     #[test]
-    fn completion_window_lookup_requires_full_pane_instance() {
-        let framing = observation_poll_framing();
-        let projection = parse_observation_poll_projection(
-            &observation_poll_output(&framing),
-            &framing,
-            &crate::daemon::topology::ServerIdentity {
-                pid: 123,
-                start_time: 456,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            completion_window_id(
-                &projection.topology,
-                &PaneInstance {
-                    pane_id: "%1".to_string(),
-                    pane_pid: 100,
-                },
-            ),
-            Some("@1")
-        );
-        assert_eq!(
-            completion_window_id(
-                &projection.topology,
-                &PaneInstance {
-                    pane_id: "%1".to_string(),
-                    pane_pid: 101,
-                },
-            ),
-            None
-        );
-    }
-
-    #[test]
     fn stale_poll_view_base_blocks_full_replacement() {
         let pane = PaneInstance {
             pane_id: "%1".to_string(),
@@ -5237,13 +5276,9 @@ mod tests {
         let root = test_root("status-push-log");
         let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
         let hash = "d".repeat(64);
-        let coordinator = ProductionV2Coordinator::new(
-            test_incarnation(&root, hash.clone()),
-            env.clone(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
+        let coordinator =
+            ProductionV2Coordinator::new(test_incarnation(&root, hash.clone()), env.clone(), None)
+                .unwrap();
 
         coordinator.log_status_push_error("test failure");
 
@@ -5292,10 +5327,7 @@ mod tests {
             hash: "b".repeat(64),
         };
         let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
-        let coordinator = Arc::new(
-            ProductionV2Coordinator::new(incarnation, env, crate::config::DoneClearOn::Pane, None)
-                .unwrap(),
-        );
+        let coordinator = Arc::new(ProductionV2Coordinator::new(incarnation, env, None).unwrap());
         start_tmux_server_liveness_monitor(coordinator.clone()).unwrap();
 
         server.kill().unwrap();
@@ -5331,6 +5363,81 @@ mod tests {
                 code: ErrorCode::InternalError,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn repeated_permission_wait_observation_skips_fresh_visibility_query() {
+        use crate::pane_state::{
+            AgentKind, AgentPresenceObservation, CaptureInference, CaptureObservation,
+            CaptureTrackerSnapshot, LifecycleState, PANE_STATE_SCHEMA_VERSION, PaneInstance,
+            PaneState, StateId, TaskState, UnreadState, WaitReason,
+        };
+
+        let agent = AgentKind::parse("codex").unwrap();
+        let mut state = PaneState {
+            schema_version: PANE_STATE_SCHEMA_VERSION,
+            state_id: StateId::parse("00112233445566778899aabbccddeeff").unwrap(),
+            revision: 1,
+            pane_instance: PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 101,
+            },
+            agent: agent.clone(),
+            agent_session_id: None,
+            agent_epoch: 1,
+            agent_present: true,
+            scan_verified: true,
+            synthetic_completion_armed: false,
+            lifecycle: LifecycleState::Waiting {
+                reason: WaitReason::PermissionPrompt,
+            },
+            run_seq: 1,
+            completed_seq: 0,
+            unread: UnreadState::default(),
+            started_at: Some(1),
+            completed_at: None,
+            prompt: None,
+            tasks: TaskState::default(),
+            subagents: Vec::new(),
+            worktree_activity: None,
+        };
+        let permission_wait = CaptureObservation {
+            inference: CaptureInference::PermissionWait {
+                reason: WaitReason::PermissionPrompt,
+            },
+            observed_fingerprint: Some([1; 32]),
+        };
+        let tracker = CaptureTrackerSnapshot::default();
+        let present = AgentPresenceObservation::Present(agent);
+
+        assert!(!observation_may_create_unread(
+            &state,
+            &tracker,
+            &present,
+            Some(&permission_wait),
+        ));
+
+        state.lifecycle = LifecycleState::Error { reason: None };
+        assert!(observation_may_create_unread(
+            &state,
+            &tracker,
+            &present,
+            Some(&permission_wait),
+        ));
+
+        state.lifecycle = LifecycleState::Waiting {
+            reason: WaitReason::PermissionPrompt,
+        };
+        let absence_tracker = CaptureTrackerSnapshot {
+            absence_count: 1,
+            ..CaptureTrackerSnapshot::default()
+        };
+        assert!(observation_may_create_unread(
+            &state,
+            &absence_tracker,
+            &AgentPresenceObservation::Absent,
+            Some(&permission_wait),
         ));
     }
 
@@ -5431,13 +5538,8 @@ mod tests {
             root.to_string_lossy().into_owned(),
         )]);
         let hash = "mutation-queue-capacity";
-        let coordinator = ProductionV2Coordinator::new(
-            test_incarnation(&root, hash),
-            env.clone(),
-            crate::config::DoneClearOn::Pane,
-            None,
-        )
-        .unwrap();
+        let coordinator =
+            ProductionV2Coordinator::new(test_incarnation(&root, hash), env.clone(), None).unwrap();
         coordinator
             .router
             .lock()
@@ -5514,6 +5616,7 @@ mod tests {
                             witnesses: Vec::new(),
                             observation_bases: BTreeMap::new(),
                             view_base: crate::daemon::view_hooks::CurrentClientViews::default(),
+                            through_unread_order: 0,
                         }),
                         observations,
                         removals: Vec::new(),
@@ -5613,6 +5716,7 @@ mod tests {
                                 witnesses: Vec::new(),
                                 observation_bases: BTreeMap::new(),
                                 view_base: crate::daemon::view_hooks::CurrentClientViews::default(),
+                                through_unread_order: 0,
                             }),
                             observations,
                             removals: Vec::new(),
@@ -5652,7 +5756,6 @@ mod tests {
         let coordinator = ProductionV2Coordinator::new(
             test_incarnation(&root, "sidebar-intents"),
             env.clone(),
-            crate::config::DoneClearOn::Pane,
             None,
         )
         .unwrap();
@@ -6274,6 +6377,7 @@ mod tests {
                         witnesses: Vec::new(),
                         observation_bases: BTreeMap::new(),
                         view_base: crate::daemon::view_hooks::CurrentClientViews::default(),
+                        through_unread_order: 0,
                     }),
                     observations: Vec::new(),
                     removals: Vec::new(),
@@ -6934,10 +7038,6 @@ mod tests {
                         pane_pid: 909,
                     },
                 },
-                expected_pane: PaneInstance {
-                    pane_id: "%1".to_string(),
-                    pane_pid: 100,
-                },
                 original_accepted_seq: 1,
                 event_id: v2_event_id(),
                 snapshot_revision: 7,
@@ -7213,14 +7313,7 @@ mod tests {
             })
         ));
         let internal_events = [
-            PaneEvent::AcknowledgeView {
-                expected_state_id: crate::pane_state::StateId::parse(
-                    "00112233445566778899aabbccddeeff",
-                )
-                .unwrap(),
-                expected_agent_epoch: 1,
-                through_seq: 1,
-            },
+            PaneEvent::MarkPaneRead { through_order: 1 },
             PaneEvent::ObservationBatch {
                 base: None,
                 tracker_generation: 0,
@@ -7347,11 +7440,12 @@ mod tests {
     fn v2_frame_reader_and_writer_use_newline_framing() {
         let (server, mut client) = UnixStream::pair().unwrap();
         let mut reader = V2FrameReader::new(server);
-        client
-            .write_all(
-                b"{\"op\":\"hello\",\"proto\":5}\n{\"op\":\"query_resolved_snapshot\",\"proto\":5}\n",
-            )
-            .unwrap();
+        write!(
+            client,
+            "{{\"op\":\"hello\",\"proto\":{PROTOCOL_VERSION}}}\n\
+             {{\"op\":\"query_resolved_snapshot\",\"proto\":{PROTOCOL_VERSION}}}\n"
+        )
+        .unwrap();
         let frame = read_v2_request_frame(&mut reader).unwrap();
         assert_eq!(
             crate::daemon::protocol::v2::decode_request_frame(&frame).unwrap(),

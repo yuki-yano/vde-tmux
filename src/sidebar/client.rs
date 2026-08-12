@@ -36,6 +36,20 @@ pub fn send_sidebar_jump_v2(
     Ok(())
 }
 
+pub fn send_latest_unread_jump_v2(
+    socket: &Path,
+    server_identity: &str,
+    source_pane: PaneInstance,
+) -> Result<()> {
+    request_v2_sidebar(
+        socket,
+        server_identity,
+        V2SidebarCommand::JumpLatestUnread { source_pane },
+        V2SidebarResponse::SnapshotAck,
+    )?;
+    Ok(())
+}
+
 pub fn send_sidebar_mark_complete_v2(
     socket: &Path,
     server_identity: &str,

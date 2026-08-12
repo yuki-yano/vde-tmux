@@ -1,9 +1,7 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use serde::Serialize;
-
-use crate::config::DoneClearOn;
 
 use super::model::*;
 use super::reducer::{ReduceError, ReductionOutcome, reduce};
@@ -134,7 +132,7 @@ pub struct ObservationDispatchSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ViewAcknowledgementApplyResult {
+pub struct PaneReadApplyResult {
     pub committed: usize,
     pub snapshot_revision: u64,
 }
@@ -150,14 +148,21 @@ pub struct CanonicalStateRuntime {
     triage_calm_polls: BTreeMap<PaneInstance, u8>,
     flash: BTreeMap<PaneInstance, u8>,
     snapshot_revision: u64,
+    latest_unread_order: u64,
     snapshot_frame_too_large: bool,
     fail_stopped: bool,
 }
 
 impl CanonicalStateRuntime {
     pub fn hydrate(records: BTreeMap<PaneInstance, PaneState>) -> Result<Self, StoreError> {
+        let latest_unread_order = records
+            .values()
+            .filter_map(|state| state.unread.latest.as_ref().map(|latest| latest.order))
+            .max()
+            .unwrap_or_default();
         let mut runtime = Self {
             records,
+            latest_unread_order,
             ..Self::default()
         };
         runtime.validate_projection()?;
@@ -375,6 +380,10 @@ impl CanonicalStateRuntime {
         self.snapshot_revision
     }
 
+    pub fn latest_unread_order(&self) -> u64 {
+        self.latest_unread_order
+    }
+
     #[cfg(test)]
     pub(crate) fn set_snapshot_revision_for_test(&mut self, revision: u64) {
         self.snapshot_revision = revision;
@@ -389,13 +398,12 @@ impl CanonicalStateRuntime {
         io: &mut dyn PaneSnapshotStoreIo,
         envelope: &PaneEventEnvelope,
         visibility: &VisibilitySnapshot,
-        done_clear_on: DoneClearOn,
     ) -> Result<ApplyResult, StoreError> {
         if self.fail_stopped {
             return Err(StoreError::FailStop("daemon is fail-stopped".to_string()));
         }
         let mut draft = self.clone();
-        let result = draft.apply_event_in_memory(envelope, visibility, done_clear_on)?;
+        let result = draft.apply_event_in_memory(envelope, visibility)?;
         if result.outcome == ReductionOutcome::CanonicalChanged {
             io.save(&draft.records)?;
         }
@@ -403,12 +411,11 @@ impl CanonicalStateRuntime {
         Ok(result)
     }
 
-    pub fn apply_view_acknowledgements(
+    pub fn apply_pane_reads(
         &mut self,
         io: &mut dyn PaneSnapshotStoreIo,
         envelopes: &[PaneEventEnvelope],
-        done_clear_on: DoneClearOn,
-    ) -> Result<ViewAcknowledgementApplyResult, StoreError> {
+    ) -> Result<PaneReadApplyResult, StoreError> {
         if self.fail_stopped {
             return Err(StoreError::FailStop("daemon is fail-stopped".to_string()));
         }
@@ -418,16 +425,12 @@ impl CanonicalStateRuntime {
         let mut projection_changed = false;
         for envelope in envelopes {
             working.snapshot_revision = revision_before;
-            if !matches!(envelope.event, PaneEvent::AcknowledgeView { .. }) {
+            if !matches!(envelope.event, PaneEvent::MarkPaneRead { .. }) {
                 return Err(StoreError::Reduce(ReduceError::InvalidRequest(
-                    "view acknowledgment commit accepts only AcknowledgeView events".to_string(),
+                    "pane read commit accepts only MarkPaneRead events".to_string(),
                 )));
             }
-            match working.apply_event_in_memory(
-                envelope,
-                &VisibilitySnapshot::default(),
-                done_clear_on,
-            ) {
+            match working.apply_event_in_memory(envelope, &VisibilitySnapshot::default()) {
                 Ok(result) => {
                     projection_changed |= result.outcome != ReductionOutcome::Noop;
                     if result.outcome == ReductionOutcome::CanonicalChanged {
@@ -459,7 +462,7 @@ impl CanonicalStateRuntime {
         {
             return Err(error);
         }
-        let result = ViewAcknowledgementApplyResult {
+        let result = PaneReadApplyResult {
             committed,
             snapshot_revision: working.snapshot_revision,
         };
@@ -479,7 +482,6 @@ impl CanonicalStateRuntime {
         &mut self,
         envelope: &PaneEventEnvelope,
         visibility: &VisibilitySnapshot,
-        done_clear_on: DoneClearOn,
     ) -> Result<ApplyResult, StoreError> {
         let current = self.records.get(&envelope.pane_instance);
         let tracker = self.tracker(&envelope.pane_instance);
@@ -492,10 +494,10 @@ impl CanonicalStateRuntime {
             current,
             envelope,
             ReductionContext {
-                done_clear_on,
                 visibility,
                 tracker: &tracker,
                 new_state_id,
+                latest_unread_order: self.latest_unread_order,
             },
         )?;
         if reduction.outcome != ReductionOutcome::CanonicalChanged {
@@ -513,6 +515,24 @@ impl CanonicalStateRuntime {
             });
         }
         let candidate = reduction.record.expect("canonical mutation has a state");
+        let candidate_unread_order = candidate
+            .unread
+            .latest
+            .as_ref()
+            .map(|latest| latest.order)
+            .unwrap_or_default();
+        if candidate_unread_order > self.latest_unread_order {
+            let expected = self
+                .latest_unread_order
+                .checked_add(1)
+                .ok_or(StoreError::CounterOverflow("unread occurrence order"))?;
+            if candidate_unread_order != expected {
+                return Err(StoreError::PersistFailed(
+                    "unread occurrence order is not globally monotonic".to_string(),
+                ));
+            }
+            self.latest_unread_order = candidate_unread_order;
+        }
         let previous = self.records.get(&envelope.pane_instance).cloned();
         self.records
             .insert(envelope.pane_instance.clone(), candidate.clone());
@@ -673,6 +693,7 @@ impl CanonicalStateRuntime {
     }
 
     fn validate_projection(&self) -> Result<(), StoreError> {
+        let mut unread_orders = BTreeSet::new();
         for (pane, state) in &self.records {
             if &state.pane_instance != pane {
                 return Err(StoreError::PersistFailed(
@@ -682,6 +703,13 @@ impl CanonicalStateRuntime {
             state
                 .validate()
                 .map_err(|error| StoreError::PersistFailed(error.to_string()))?;
+            if let Some(latest) = &state.unread.latest
+                && !unread_orders.insert(latest.order)
+            {
+                return Err(StoreError::PersistFailed(
+                    "duplicate unread occurrence order".to_string(),
+                ));
+            }
         }
         if self.transitions.len() > MAX_DIAGNOSTICS
             || self.diagnostics.len() > MAX_DIAGNOSTICS
@@ -716,7 +744,7 @@ fn transition_at_epoch(event: &PaneEvent, current: Option<&PaneState>) -> i64 {
             *completed_at
         }
         PaneEvent::ExplicitStateReported { report } => report.observed_at,
-        PaneEvent::AcknowledgeView { .. } | PaneEvent::PaneRemoved { .. } => current
+        PaneEvent::MarkPaneRead { .. } | PaneEvent::PaneRemoved { .. } => current
             .and_then(|state| state.completed_at.or(state.started_at))
             .unwrap_or_default(),
     }
@@ -808,7 +836,6 @@ mod tests {
             io,
             &envelope(pane_instance, event),
             &VisibilitySnapshot::default(),
-            DoneClearOn::Pane,
         )
     }
 
@@ -869,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_pane_acknowledgement_persists_candidate_map_once() {
+    fn multi_pane_read_persists_candidate_map_once() {
         let mut runtime = CanonicalStateRuntime::default();
         let mut io = RecordingStore::default();
         for target in [pane(1), pane(2)] {
@@ -892,29 +919,65 @@ mod tests {
             .unwrap();
         }
         io.saves = 0;
-        let acknowledgements = [pane(1), pane(2)]
+        let reads = [pane(1), pane(2)]
             .into_iter()
             .map(|target| {
                 let state = runtime.record(&target).unwrap();
                 envelope(
                     target,
-                    PaneEvent::AcknowledgeView {
-                        expected_state_id: state.state_id.clone(),
-                        expected_agent_epoch: state.agent_epoch,
-                        through_seq: state.completed_seq,
+                    PaneEvent::MarkPaneRead {
+                        through_order: state.unread.latest_unread().unwrap().order,
                     },
                 )
             })
             .collect::<Vec<_>>();
-        let result = runtime
-            .apply_view_acknowledgements(&mut io, &acknowledgements, DoneClearOn::Window)
-            .unwrap();
+        let result = runtime.apply_pane_reads(&mut io, &reads).unwrap();
         assert_eq!(result.committed, 2);
         assert_eq!(io.saves, 1);
         for target in [pane(1), pane(2)] {
             let state = runtime.record(&target).unwrap();
-            assert_eq!(state.acknowledged_seq, state.completed_seq);
+            assert!(!state.unread.is_unread());
         }
+    }
+
+    #[test]
+    fn hydrate_restores_global_unread_order_for_the_next_occurrence() {
+        let mut io = RecordingStore::default();
+        let mut first = CanonicalStateRuntime::default();
+        apply(
+            &mut first,
+            &mut io,
+            pane(1),
+            PaneEvent::WaitRequested {
+                observed_at: 10,
+                reason: WaitReason::PermissionPrompt,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.latest_unread_order(), 1);
+
+        let mut restarted = CanonicalStateRuntime::hydrate(first.records_snapshot()).unwrap();
+        apply(
+            &mut restarted,
+            &mut io,
+            pane(2),
+            PaneEvent::WaitRequested {
+                observed_at: 20,
+                reason: WaitReason::PermissionPrompt,
+            },
+        )
+        .unwrap();
+        assert_eq!(restarted.latest_unread_order(), 2);
+        assert_eq!(
+            restarted
+                .record(&pane(2))
+                .unwrap()
+                .unread
+                .latest_unread()
+                .unwrap()
+                .order,
+            2
+        );
     }
 
     #[test]
@@ -953,23 +1016,20 @@ mod tests {
             )
             .unwrap();
         }
-        let acknowledgements = (1..=50)
+        let reads = (1..=50)
             .map(|index| {
                 let target = pane(index);
                 let state = runtime.record(&target).unwrap();
                 envelope(
                     target,
-                    PaneEvent::AcknowledgeView {
-                        expected_state_id: state.state_id.clone(),
-                        expected_agent_epoch: state.agent_epoch,
-                        through_seq: state.completed_seq,
+                    PaneEvent::MarkPaneRead {
+                        through_order: state.unread.latest_unread().unwrap().order,
                     },
                 )
             })
             .collect::<Vec<_>>();
         let view_started = Instant::now();
-        let result =
-            runtime.apply_view_acknowledgements(&mut io, &acknowledgements, DoneClearOn::Window);
+        let result = runtime.apply_pane_reads(&mut io, &reads);
         let view_elapsed = view_started.elapsed();
         assert!(result.is_ok());
         assert!(view_elapsed < Duration::from_millis(500));
