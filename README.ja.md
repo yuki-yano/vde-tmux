@@ -196,6 +196,10 @@ globalな発生順はdaemonが管理し、移動中に最新paneが消えた場�
 
 サイドバーは現在の tmux window に開き、デフォルトではエージェントをカテゴリ別に表示します。
 FlatとByRepoは現在のカテゴリだけを表示します。
+Priorityは全カテゴリを横断し、Pinned、Needs Input、Unread Done、Running、Idleの順に表示します。
+Priorityで未読agentを選択して`p`を押すと、共有されたUnread Spanのpinを切り替えます。
+pinされたagentは先頭の`PINNED` zoneへ移動しますが、未読順、badge、notificationは変わりません。
+exact paneを表示した場合は通常どおり既読になり、pinも解除されます。
 
 ```bash
 vt sidebar open --width 40
@@ -217,9 +221,10 @@ vt sidebar close
 | `Enter` | 選択したエージェントの pane へ移動する |
 | `Space` | 選択行を開閉する |
 | `v` | 表示モードを切り替える |
-| `1` / `2` / `3` | Flat / ByRepo / ByCategory へ切り替える |
+| `1` / `2` / `3` / `4` | Flat / ByRepo / ByCategory / Priority へ切り替える |
 | `Tab` / `Shift+Tab` | 状態フィルタを切り替える |
 | `n` / `N` | 次または前の要対応エージェントへ移動する |
+| `p` | Priorityで選択中の未読agentをpinまたはunpinする |
 | `d` | 選択中の run を完了としてマークする |
 | `J` / `K` | 手動順序を変更する |
 | `q` / `Esc` | サイドバーを閉じる |
@@ -229,8 +234,13 @@ vt sidebar close
 そのエージェントのpaneへ移動します。選択中のエージェントは`Space`で開閉します。
 マウスホイールは選択カーソルを動かさず、はみ出した表示範囲をスクロールします。
 起動後にまだ操作されていないエージェントは、閉じている間は1行だけ表示します。
-表示モード、フィルタ、手動順序、開閉状態は保存され、すべてのサイドバーで共有されます。
-選択位置とスクロールも、同じ tmux server で開いているすべてのサイドバー間で同期します。
+表示モードとフィルタは各サイドバーにlocalで、保存値は新しく開くサイドバーの初期値になります。
+手動順序、開閉状態、選択位置、スクロールは同じtmux serverの全サイドバーで同期します。
+開いているサイドバーへ非focus状態でpin操作を送る場合は`pin-toggle`を使えます。
+
+```tmux
+bind-key -n M-p run-shell "vt sidebar input pin-toggle --window #{q:window_id}"
+```
 
 ## session とカテゴリ
 
@@ -391,16 +401,16 @@ vt hook emit \
 ### pane state の永続化
 
 daemon は tmux server incarnation ごとに一つの private な full-state snapshot を
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v2.json` へ保存します。
-daemon 再起動後も、pane ID と PID が一致する pane の prompt、task の進捗と項目、subagent、worktree activity、lifecycle、時刻、agent identity、Done と確認済み状態を復元します。
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v3.json` へ保存します。
+daemon 再起動後も、pane ID と PID が一致する pane の prompt、task の進捗と項目、subagent、worktree activity、lifecycle、時刻、agent identity、Unread Spanのpin、Done と確認済み状態を復元します。
 
 snapshot が破損している、または権限が安全でない場合、daemon は修復や fallback を行わず起動を停止します。
 `vt daemon status` の `last_transition_error` に snapshot path が表示されます。
 その tmux server の保存済み pane state をすべてリセットする場合に限り、表示された file を削除してから `vt daemon ensure` を実行してください。
 
-tmux option に pane state を保存していた version から初めて更新するときは旧 state を移行しないため、pane 詳細が一度リセットされます。
-すべての agent が Idle で、保持すべき Done または Blocked がないタイミングで更新してください。
-別の tmux server incarnation の snapshot は自動削除しません。
+productionの起動処理は、古いpane-state schemaのsnapshotを移行しません。
+別途ワンショット移行を行わない場合、schema更新後にpane詳細はリセットされます。
+別のtmux server incarnationのsnapshotは自動削除しません。
 
 ## アップグレード
 

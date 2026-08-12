@@ -13,6 +13,8 @@ use crate::sidebar::state::{
     SidebarPreferences, SidebarRowRef, SidebarState, StatusFilter, ViewMode,
 };
 
+pub(crate) const PRIORITY_PINNED_ZONE_ID: &str = "zone::priority::pinned";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SidebarRowKind {
     Zone,
@@ -54,6 +56,10 @@ pub struct RowMeta {
     pub attention_count: Option<usize>,
     pub origin: Option<String>,
     pub flash: Option<bool>,
+    pub is_unread: bool,
+    pub unread_pinned: bool,
+    pub latest_unread_order: Option<u64>,
+    pub latest_unread_reason: Option<crate::pane_state::UnreadReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -103,6 +109,10 @@ struct AgentPane {
     repo_path: String,
     flash: bool,
     active: bool,
+    is_unread: bool,
+    unread_pinned: bool,
+    latest_unread_order: Option<u64>,
+    latest_unread_reason: Option<crate::pane_state::UnreadReason>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -267,6 +277,16 @@ pub fn build_rows_from_presentations(
                     .session_links
                     .iter()
                     .any(|link| ctx.active_sessions.contains(&link.session_id)),
+                is_unread: canonical.unread.is_unread(),
+                unread_pinned: canonical.unread.pinned,
+                latest_unread_order: canonical
+                    .unread
+                    .latest_unread()
+                    .map(|occurrence| occurrence.order),
+                latest_unread_reason: canonical
+                    .unread
+                    .latest_unread()
+                    .map(|occurrence| occurrence.reason),
             });
     }
     build_rows_from_groups(groups, state, order, ctx)
@@ -657,6 +677,44 @@ fn priority_rows(
     let mut panes = groups.into_values().flatten().collect::<Vec<_>>();
     order_agent_panes(&mut panes, order);
     let mut rows = Vec::new();
+    let mut pinned = Vec::new();
+    panes.retain(|pane| {
+        if pane.unread_pinned {
+            pinned.push(pane.clone());
+            false
+        } else {
+            true
+        }
+    });
+    pinned.sort_by(|left, right| {
+        right
+            .latest_unread_order
+            .cmp(&left.latest_unread_order)
+            .then_with(|| left.pane_instance.cmp(&right.pane_instance))
+    });
+    if !pinned.is_empty() {
+        rows.push(SidebarRow {
+            id: PRIORITY_PINNED_ZONE_ID.to_string(),
+            kind: SidebarRowKind::Zone,
+            depth: 0,
+            label: "PINNED".to_string(),
+            chat_count: pinned.len(),
+            rollup: pinned
+                .iter()
+                .map(|pane| pane.rollup)
+                .min()
+                .unwrap_or(RollupLevel::Idle),
+            badge_state: None,
+            expanded: true,
+            pane_id: None,
+            git: None,
+            active: false,
+            meta: None,
+        });
+        for pane in &pinned {
+            push_priority_chat_row(pane, state, now, &mut rows);
+        }
+    }
     for (badge, key, label) in [
         (BadgeState::Blocked, "needs-input", "NEEDS INPUT"),
         (BadgeState::Done, "unread-done", "UNREAD DONE"),
@@ -936,6 +994,10 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
         attention_count: None,
         origin: None,
         flash: pane.flash.then_some(true),
+        is_unread: pane.is_unread,
+        unread_pinned: pane.unread_pinned,
+        latest_unread_order: pane.latest_unread_order,
+        latest_unread_reason: pane.latest_unread_reason,
     }
 }
 
@@ -1191,6 +1253,10 @@ mod tests {
             repo_path: "/tmp/repo".to_string(),
             flash: false,
             active: false,
+            is_unread: false,
+            unread_pinned: false,
+            latest_unread_order: None,
+            latest_unread_reason: None,
         }
     }
 
@@ -1733,6 +1799,93 @@ mod tests {
                 "filter {filter:?}"
             );
         }
+    }
+
+    #[test]
+    fn priority_extracts_filtered_pins_and_orders_them_by_latest_unread() {
+        let mut newest = agent_pane(BadgeState::Working, "");
+        newest.pane_instance = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 2,
+        };
+        newest.pane_id = "%2".to_string();
+        newest.is_unread = true;
+        newest.unread_pinned = true;
+        newest.latest_unread_order = Some(20);
+        newest.latest_unread_reason = Some(crate::pane_state::UnreadReason::Waiting);
+
+        let mut tied = newest.clone();
+        tied.pane_instance = PaneInstance {
+            pane_id: "%0".to_string(),
+            pane_pid: 3,
+        };
+        tied.pane_id = "%0".to_string();
+
+        let mut older = agent_pane(BadgeState::Done, "10");
+        older.pane_instance = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 1,
+        };
+        older.pane_id = "%1".to_string();
+        older.is_unread = true;
+        older.unread_pinned = true;
+        older.latest_unread_order = Some(10);
+        older.latest_unread_reason = Some(crate::pane_state::UnreadReason::Completed);
+
+        let groups = BTreeMap::from([(
+            (
+                "misc".to_string(),
+                crate::category::RepoKey::path("/repo").to_string(),
+            ),
+            vec![older, newest, tied],
+        )]);
+        let state = SidebarState {
+            view_mode: ViewMode::Priority,
+            ..SidebarState::default()
+        };
+        let (rows, counts) = build_rows_from_groups(
+            groups.clone(),
+            &state,
+            &SidebarPreferences::default(),
+            &RowBuildContext::default(),
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Zone)
+                .map(|row| (row.label.as_str(), row.chat_count))
+                .collect::<Vec<_>>(),
+            vec![("PINNED", 3)]
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Chat)
+                .map(|row| row.pane_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["%0", "%2", "%1"]
+        );
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.working, 2);
+        assert_eq!(counts.done, 1);
+
+        let filtered = SidebarState {
+            view_mode: ViewMode::Priority,
+            filter: StatusFilter::DoneOnly,
+            ..SidebarState::default()
+        };
+        let (rows, counts) = build_rows_from_groups(
+            groups,
+            &filtered,
+            &SidebarPreferences::default(),
+            &RowBuildContext::default(),
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Chat)
+                .map(|row| row.pane_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["%1"]
+        );
+        assert_eq!(counts.total, 3, "header count is filter-independent");
     }
 
     #[test]

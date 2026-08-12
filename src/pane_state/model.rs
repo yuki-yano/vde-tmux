@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::daemon::session_badge::BadgeState;
 
-pub const PANE_STATE_SCHEMA_VERSION: u16 = 2;
+pub const PANE_STATE_SCHEMA_VERSION: u16 = 3;
 pub const IDENTIFIER_MAX_BYTES: usize = 256;
 pub const BODY_MAX_BYTES: usize = 4096;
 pub const PATH_MAX_BYTES: usize = 8192;
@@ -313,6 +313,7 @@ pub struct UnreadState {
     pub occurrence_seq: u64,
     pub read_seq: u64,
     pub latest: Option<UnreadOccurrence>,
+    pub pinned: bool,
 }
 
 impl UnreadState {
@@ -339,6 +340,11 @@ impl UnreadState {
         if self.read_seq > self.occurrence_seq {
             return Err(ModelError(
                 "unread read sequence exceeds occurrence sequence".to_string(),
+            ));
+        }
+        if self.pinned && !self.is_unread() {
+            return Err(ModelError(
+                "read unread span cannot remain pinned".to_string(),
             ));
         }
         match (&self.latest, self.occurrence_seq) {
@@ -747,6 +753,11 @@ pub enum PaneEvent {
     MarkPaneRead {
         through_order: u64,
     },
+    SetUnreadPin {
+        expected_state_id: StateId,
+        expected_read_seq: u64,
+        pinned: bool,
+    },
     MarkDone {
         expected: StateVersion,
         completed_at: i64,
@@ -1014,6 +1025,7 @@ mod tests {
                 reason: UnreadReason::Waiting,
                 occurred_at: 10,
             }),
+            pinned: false,
         };
         assert!(unread.validate().is_ok());
         assert!(unread.is_jump_eligible(&LifecycleState::Waiting {
@@ -1023,8 +1035,12 @@ mod tests {
 
         unread.latest.as_mut().unwrap().reason = UnreadReason::Completed;
         assert!(unread.is_jump_eligible(&LifecycleState::Running));
+        unread.pinned = true;
+        assert!(unread.validate().is_ok());
         unread.read_seq = 1;
         assert!(!unread.is_jump_eligible(&LifecycleState::Idle));
+        assert!(unread.validate().is_err());
+        unread.pinned = false;
 
         unread.read_seq = 2;
         assert!(unread.validate().is_err());

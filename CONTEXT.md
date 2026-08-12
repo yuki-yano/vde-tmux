@@ -63,3 +63,7 @@ _Avoid_: Latest Done jump, sidebar-local selection
 **Unread Span**:
 Paneが既読状態から最初のUnread Occurrenceを生成してから、Pane Readによって再び既読になるまでの連続した期間。一つのUnread Span内で複数のUnread Occurrenceが発生し得る。
 _Avoid_: Notification history, unread session
+
+**Priority Unread Pin**:
+Priority viewで現在のUnread Spanを`PINNED` zoneへ優先表示する一時的な共有マーカー。Pane Readを妨げず、Unread Spanの終了時に自動解除される。
+_Avoid_: Unread View, read lock, pane favorite, saved notification

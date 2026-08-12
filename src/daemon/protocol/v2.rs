@@ -17,7 +17,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -694,6 +694,12 @@ pub enum SidebarCommand {
     JumpLatestUnread {
         source_pane: PaneInstance,
     },
+    SetUnreadPin {
+        pane_instance: PaneInstance,
+        expected_state_id: crate::pane_state::StateId,
+        expected_read_seq: u64,
+        pinned: bool,
+    },
     MarkComplete {
         pane_instance: PaneInstance,
         expected: StateVersion,
@@ -1102,6 +1108,17 @@ mod tests {
                         agent_epoch: 1,
                         revision: 1,
                     },
+                },
+            },
+            ClientMessage::SidebarCommand {
+                proto: PROTOCOL_VERSION,
+                daemon_instance_id: daemon_id(),
+                event_id: event_id(),
+                command: SidebarCommand::SetUnreadPin {
+                    pane_instance: pane(),
+                    expected_state_id: StateId::parse("00112233445566778899aabbccddeeff").unwrap(),
+                    expected_read_seq: 3,
+                    pinned: true,
                 },
             },
             ClientMessage::SidebarCommand {

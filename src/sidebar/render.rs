@@ -2,7 +2,7 @@ use crate::agent::{display_agent_label_prefix, display_agent_name};
 use crate::daemon::session_badge::{BadgeState, glyph_for_state};
 use crate::hook::RollupLevel;
 use crate::sidebar::state::{SidebarState, StatusFilter, ViewMode};
-use crate::sidebar::tree::{BadgeCounts, SidebarRow, SidebarRowKind};
+use crate::sidebar::tree::{BadgeCounts, PRIORITY_PINNED_ZONE_ID, SidebarRow, SidebarRowKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -758,10 +758,7 @@ fn render_closed_chat_summary_line(
 
     let mut prefix = Vec::new();
     push_leading_marker_span(&mut prefix, row, selected, theme, &indent);
-    prefix.push(Span::styled(
-        " ".to_string(),
-        Style::default().fg(theme.marker),
-    ));
+    prefix.push(unread_pin_marker_span(row, state, theme));
     prefix.push(Span::styled("▸ ".to_string(), toggle_marker_style(theme)));
     prefix.push(Span::styled(
         format!("{glyph} "),
@@ -871,9 +868,12 @@ fn render_row_line(
             &format!(" ▍{} {}", row.label, row.chat_count),
             width.saturating_sub(1),
         );
-        let style = Style::default()
-            .fg(theme.badge_color(row.badge_state.unwrap_or(BadgeState::Blocked)))
-            .add_modifier(Modifier::BOLD);
+        let zone_color = if row.id == PRIORITY_PINNED_ZONE_ID {
+            theme.toggle
+        } else {
+            theme.badge_color(row.badge_state.unwrap_or(BadgeState::Blocked))
+        };
+        let style = Style::default().fg(zone_color).add_modifier(Modifier::BOLD);
         return Line::from(Span::styled(text, style));
     }
     let style = row_style(row, theme);
@@ -936,10 +936,7 @@ fn render_row_line(
     if row.kind == SidebarRowKind::Chat {
         let marker = if row.expanded { "▾" } else { "▸" };
         push_leading_marker_span(&mut spans, row, selected_marker, theme, &indent);
-        spans.push(Span::styled(
-            " ".to_string(),
-            Style::default().fg(theme.marker),
-        ));
+        spans.push(unread_pin_marker_span(row, state, theme));
         spans.push(Span::styled(
             format!("{marker} "),
             toggle_marker_style(theme),
@@ -1271,11 +1268,14 @@ fn render_zone_dense_line(
     theme: &SidebarRenderTheme,
 ) -> Line<'static> {
     let text = truncate_display(&format!(" ▍{} {}", row.label, row.chat_count), width);
+    let color = if row.id == PRIORITY_PINNED_ZONE_ID {
+        theme.toggle
+    } else {
+        theme.badge_color(row.badge_state.unwrap_or(BadgeState::Blocked))
+    };
     Line::from(Span::styled(
         text,
-        Style::default()
-            .fg(theme.badge_color(row.badge_state.unwrap_or(BadgeState::Blocked)))
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -1324,17 +1324,23 @@ fn render_chat_dense_line(
         .map(|(_, body)| body.trim())
         .unwrap_or(row.label.as_str());
     let prefix_after_glyph = format!(" {agent:<7} {origin:<3} ");
+    let show_pin_cell = state.view_mode == ViewMode::Priority;
+    let pin_width = usize::from(show_pin_cell);
     let right_width = display_width(&right);
     let right_reserved = if right_width > 0 { right_width + 1 } else { 0 };
     let label_budget = width
         .saturating_sub(1)
+        .saturating_sub(pin_width)
         .saturating_sub(display_width(glyph))
         .saturating_sub(display_width(&prefix_after_glyph))
         .saturating_sub(right_reserved)
         .saturating_sub(1);
     let label = truncate_display(body, label_budget);
-    let used =
-        1 + display_width(glyph) + display_width(&prefix_after_glyph) + display_width(&label);
+    let used = 1
+        + pin_width
+        + display_width(glyph)
+        + display_width(&prefix_after_glyph)
+        + display_width(&label);
     let filler = width
         .saturating_sub(1)
         .saturating_sub(used)
@@ -1347,8 +1353,11 @@ fn render_chat_dense_line(
     if row_flash(row) {
         right_status_style = right_status_style.add_modifier(Modifier::REVERSED);
     }
-    let mut line = Line::from(vec![
-        row_leading_marker_span(row, selected, theme),
+    let mut spans = vec![row_leading_marker_span(row, selected, theme)];
+    if show_pin_cell {
+        spans.push(unread_pin_marker_span(row, state, theme));
+    }
+    spans.extend([
         Span::styled(
             glyph.to_string(),
             badge_style(theme.badge_color(badge_state), row),
@@ -1359,6 +1368,7 @@ fn render_chat_dense_line(
         Span::styled(right, right_status_style),
         Span::raw(" ".to_string()),
     ]);
+    let mut line = Line::from(spans);
     if selected {
         line = line.style(
             Style::default()
@@ -1403,19 +1413,29 @@ fn render_micro_lines(
         let right = right_label(row).unwrap_or_default();
         let selected = state.selection.as_deref() == Some(row.id.as_str());
         let marker = row_leading_marker_span(row, selected, theme);
+        let pinned = row_unread_pinned(row, state);
+        let pin_width = usize::from(pinned);
         let text = if right.is_empty() {
             glyph.to_string()
         } else {
             format!("{glyph} {right}")
         };
         let body = pad_to_width(
-            truncate_display(&text, width.saturating_sub(1)),
-            width.saturating_sub(1),
+            truncate_display(&text, width.saturating_sub(1 + pin_width)),
+            width.saturating_sub(1 + pin_width),
         );
-        let mut line = Line::from(vec![
-            marker,
-            Span::styled(body, badge_style(theme.badge_color(badge_state), row)),
-        ]);
+        let mut spans = vec![marker];
+        if pinned {
+            spans.push(Span::styled(
+                "✦".to_string(),
+                Style::default().fg(theme.toggle),
+            ));
+        }
+        spans.push(Span::styled(
+            body,
+            badge_style(theme.badge_color(badge_state), row),
+        ));
+        let mut line = Line::from(spans);
         if selected {
             line = line.style(
                 Style::default()
@@ -1478,9 +1498,20 @@ fn render_rail_lines(
             style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
         }
         let glyph = row.badge_state.expect("rail rows must carry badge_state");
+        let pinned = row_unread_pinned(row, state);
+        let visible_glyph = if pinned {
+            "✦"
+        } else {
+            theme.badge_glyph(glyph)
+        };
+        let glyph_style = if pinned {
+            style.fg(theme.toggle)
+        } else {
+            style
+        };
         lines.push(Line::from(vec![
             row_leading_marker_span(row, selected, theme),
-            Span::styled(theme.badge_glyph(glyph).to_string(), style),
+            Span::styled(visible_glyph.to_string(), glyph_style),
         ]));
         row_indices.push(Some(index));
     }
@@ -1508,6 +1539,33 @@ fn row_flash(row: &SidebarRow) -> bool {
         .as_ref()
         .and_then(|meta| meta.flash)
         .unwrap_or(false)
+}
+
+fn row_unread_pinned(row: &SidebarRow, state: &SidebarState) -> bool {
+    state.view_mode == ViewMode::Priority
+        && row
+            .meta
+            .as_ref()
+            .is_some_and(|meta| meta.is_unread && meta.unread_pinned)
+}
+
+fn unread_pin_marker_span(
+    row: &SidebarRow,
+    state: &SidebarState,
+    theme: &SidebarRenderTheme,
+) -> Span<'static> {
+    if state.view_mode != ViewMode::Priority {
+        return Span::styled(" ".to_string(), Style::default().fg(theme.marker));
+    }
+    match row.meta.as_ref() {
+        Some(meta) if meta.is_unread && meta.unread_pinned => {
+            Span::styled("✦".to_string(), Style::default().fg(theme.toggle))
+        }
+        Some(meta) if meta.is_unread => {
+            Span::styled("·".to_string(), Style::default().fg(theme.marker))
+        }
+        _ => Span::styled(" ".to_string(), Style::default().fg(theme.marker)),
+    }
 }
 
 pub(crate) fn display_width(text: &str) -> usize {
@@ -2261,6 +2319,56 @@ mod tests {
         let rendered = render_rows(&[blocked1, blocked2, working], &SidebarState::default(), 3);
 
         assert_eq!(rendered, "▲2\n●1\n──\n ▲\n ▲\n ●");
+    }
+
+    #[test]
+    fn priority_unread_pin_markers_fit_every_width_tier() {
+        let mut pinned = chat_row(
+            "chat::%1::100",
+            "codex: pinned unread",
+            RollupLevel::Permission,
+            BadgeState::Blocked,
+        );
+        pinned.expanded = false;
+        pinned.meta = Some(crate::sidebar::tree::RowMeta {
+            is_unread: true,
+            unread_pinned: true,
+            agent: Some("codex".to_string()),
+            ..Default::default()
+        });
+        let mut priority = SidebarState {
+            view_mode: ViewMode::Priority,
+            ..SidebarState::default()
+        };
+        let theme = SidebarRenderTheme::default();
+
+        for width in [3, 8, 30, 40] {
+            let rendered = render_rows(std::slice::from_ref(&pinned), &priority, width);
+            assert!(rendered.contains('✦'), "width={width}: {rendered:?}");
+            assert!(
+                rendered.lines().all(|line| display_width(line) <= width),
+                "width={width}: {rendered:?}"
+            );
+            let styled = render_lines(std::slice::from_ref(&pinned), &priority, width, &theme);
+            assert!(
+                styled.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.content.as_ref() == "✦" && span.style.fg == Some(theme.toggle)
+                }),
+                "width={width}: {styled:?}"
+            );
+        }
+        let styled = render_lines(std::slice::from_ref(&pinned), &priority, 40, &theme);
+        assert_span_fg(&styled[0].spans, "✦", theme.toggle);
+
+        pinned.meta.as_mut().unwrap().unread_pinned = false;
+        let unpinned = render_rows(std::slice::from_ref(&pinned), &priority, 40);
+        assert!(unpinned.contains('·'), "{unpinned:?}");
+        assert!(!unpinned.contains('✦'), "{unpinned:?}");
+
+        priority.view_mode = ViewMode::Flat;
+        let outside_priority = render_rows(&[pinned], &priority, 40);
+        assert!(!outside_priority.contains('✦'), "{outside_priority:?}");
+        assert!(!outside_priority.contains('·'), "{outside_priority:?}");
     }
 
     #[test]

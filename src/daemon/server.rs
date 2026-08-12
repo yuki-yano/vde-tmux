@@ -2532,6 +2532,31 @@ fn apply_production_mutation(
         V2AcceptedMutation::External(ClientMessage::SidebarCommand {
             event_id, command, ..
         }) => match command {
+            crate::daemon::protocol::v2::SidebarCommand::SetUnreadPin {
+                pane_instance,
+                expected_state_id,
+                expected_read_seq,
+                pinned,
+            } => {
+                let envelope = PaneEventEnvelope {
+                    daemon_instance_id: coordinator
+                        .router
+                        .lock()
+                        .expect("v2 router lock poisoned")
+                        .daemon_instance_id()
+                        .clone(),
+                    event_id,
+                    pane_instance,
+                    agent: None,
+                    agent_session_id: None,
+                    event: PaneEvent::SetUnreadPin {
+                        expected_state_id,
+                        expected_read_seq,
+                        pinned,
+                    },
+                };
+                apply_external_pane_event(coordinator, accepted_seq, envelope)
+            }
             crate::daemon::protocol::v2::SidebarCommand::MarkComplete {
                 pane_instance,
                 expected,
@@ -5102,6 +5127,113 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn sidebar_set_unread_pin_mutates_canonical_state_without_changing_badge() {
+        let root = test_root("sidebar-unread-pin");
+        let coordinator = initialized_test_coordinator(
+            &root,
+            "7".repeat(64),
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+        );
+        coordinator
+            .router
+            .lock()
+            .unwrap()
+            .set_phase(DaemonPhase::Serving);
+        let target = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        let daemon_instance_id = coordinator
+            .router
+            .lock()
+            .unwrap()
+            .daemon_instance_id()
+            .clone();
+        let agent = crate::pane_state::AgentKind::parse("codex").unwrap();
+        let session = crate::pane_state::AgentSessionId::parse("session").unwrap();
+        let mut io = pane_snapshot_store(&coordinator);
+        {
+            let mut guard = coordinator.state.lock().unwrap();
+            let runtime = &mut guard.as_mut().unwrap().leased.runtime;
+            for event in [
+                PaneEvent::BeginRun {
+                    started_at: 1,
+                    prompt: None,
+                },
+                PaneEvent::CompleteRun { completed_at: 2 },
+            ] {
+                runtime
+                    .apply_event(
+                        &mut io,
+                        &PaneEventEnvelope {
+                            daemon_instance_id: daemon_instance_id.clone(),
+                            event_id: EventId::generate().unwrap(),
+                            pane_instance: target.clone(),
+                            agent: Some(agent.clone()),
+                            agent_session_id: Some(session.clone()),
+                            event,
+                        },
+                        &crate::pane_state::VisibilitySnapshot::default(),
+                    )
+                    .unwrap();
+            }
+        }
+        let (expected_state_id, expected_read_seq, badge_before) = {
+            let guard = coordinator.state.lock().unwrap();
+            let state = guard
+                .as_ref()
+                .unwrap()
+                .leased
+                .runtime
+                .record(&target)
+                .unwrap();
+            (
+                state.state_id.clone(),
+                state.unread.read_seq,
+                crate::pane_state::resolve_badge(state),
+            )
+        };
+
+        let response = apply_production_mutation(
+            &coordinator,
+            V2SequencedMutation {
+                accepted_seq: 1,
+                mutation: V2AcceptedMutation::External(ClientMessage::SidebarCommand {
+                    proto: PROTOCOL_VERSION,
+                    daemon_instance_id,
+                    event_id: EventId::generate().unwrap(),
+                    command: crate::daemon::protocol::v2::SidebarCommand::SetUnreadPin {
+                        pane_instance: target.clone(),
+                        expected_state_id,
+                        expected_read_seq,
+                        pinned: true,
+                    },
+                }),
+            },
+        );
+        assert!(matches!(
+            response,
+            ServerMessage::PaneEventResult {
+                outcome: crate::daemon::protocol::v2::PaneApplyOutcome::Committed,
+                ..
+            }
+        ));
+        let guard = coordinator.state.lock().unwrap();
+        let state = guard
+            .as_ref()
+            .unwrap()
+            .leased
+            .runtime
+            .record(&target)
+            .unwrap();
+        assert!(state.unread.pinned);
+        assert_eq!(crate::pane_state::resolve_badge(state), badge_before);
+        drop(guard);
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

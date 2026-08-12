@@ -654,6 +654,7 @@ record startup-failure PASS-valid-config-no-rollback-and-explicit-recovery
 S1_WINDOW="$(tmux_cmd new-window -d -P -F '#{window_id}' -t A: -n side-one -c "$ROOT" "sleep 900")"
 S1_AGENT="$(tmux_cmd display-message -p -t "$S1_WINDOW" '#{pane_id}')"
 S1_PEER="$(tmux_cmd split-window -d -P -F '#{pane_id}' -t "$S1_WINDOW" -c "$ROOT" "sleep 900")"
+S1_PEER_PID="$(tmux_cmd display-message -p -t "$S1_PEER" '#{pane_pid}')"
 S2_WINDOW="$(tmux_cmd new-window -d -P -F '#{window_id}' -t a10: -n side-two -c "$ROOT" "sleep 900")"
 S2_AGENT="$(tmux_cmd display-message -p -t "$S2_WINDOW" '#{pane_id}')"
 S2_AGENT_PID="$(tmux_cmd display-message -p -t "$S2_AGENT" '#{pane_pid}')"
@@ -767,11 +768,49 @@ grep -F '✓ 1' <<<"$SIDEBAR_PRIORITY_HEADER" >/dev/null
 [[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-nonfocus-view.txt")" != "$SIDE2_BEFORE_NONFOCUS" ]]
 wait_client_pane "$CLIENT_1" "$S1_AGENT"
 
+PIN_ATTENTION_BEFORE="$(tmux_cmd show-options -qv -t A @vde_status_attention 2>/dev/null || true)"
+PIN_NOTIFICATIONS_BEFORE="$(wc -l <"$NOTIFY_LOG" | tr -d ' ')"
+VT_PANE="$S1_AGENT" run_vt sidebar input "toggle:chat::$S1_PEER::$S1_PEER_PID" --window "$S1_WINDOW"
+VT_PANE="$S1_AGENT" run_vt sidebar input pin-toggle --window "$S1_WINDOW"
+for _ in $(seq 1 60); do
+  query_snapshot
+  if python3 - "$QUERY_JSON" "$S1_PEER" 2>/dev/null <<'PY'
+import json, sys
+reply = json.load(open(sys.argv[1], encoding="utf-8"))
+pane = next(p for p in reply["snapshot"]["panes"] if p["pane_instance"]["pane_id"] == sys.argv[2])
+canonical = pane["resolved"]["canonical"]
+assert canonical["unread"]["pinned"] is True, canonical["unread"]
+assert pane["resolved"]["badge"] == "Done", pane["resolved"]
+PY
+  then break; fi
+  sleep 0.05
+done
+capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-pinned.txt"
+capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-pinned.txt"
+for artifact in "$ARTIFACT_DIR/sidebar-1-pinned.txt" "$ARTIFACT_DIR/sidebar-2-pinned.txt"; do
+  grep -F 'PINNED' "$artifact" >/dev/null
+  grep -F '✦' "$artifact" >/dev/null
+done
+[[ "$(tmux_cmd show-options -qv -t A @vde_status_attention 2>/dev/null || true)" == "$PIN_ATTENTION_BEFORE" ]]
+[[ "$(wc -l <"$NOTIFY_LOG" | tr -d ' ')" == "$PIN_NOTIFICATIONS_BEFORE" ]]
+record sidebar-pin PASS-nonfocus-control-shared-projection-badge-attention-notification-stable
+
+# Move the shared cursor off the sole Done row so the existing agent-next scenario still
+# exercises selection of the first row admitted by the Done filter.
+VT_PANE="$S1_AGENT" run_vt sidebar input j --window "$S1_WINDOW"
+sleep 0.1
 VT_PANE="$S1_AGENT" run_vt sidebar input done --window "$S1_WINDOW"
 sleep 0.15
 VT_PANE="$S1_AGENT" run_vt sidebar input agent-next --window "$S1_WINDOW"
 wait_client_pane "$CLIENT_1" "$S1_PEER"
 wait_badge "$S1_PEER" Idle
+query_snapshot
+python3 - "$QUERY_JSON" "$S1_PEER" <<'PY'
+import json, sys
+reply = json.load(open(sys.argv[1], encoding="utf-8"))
+pane = next(p for p in reply["snapshot"]["panes"] if p["pane_instance"]["pane_id"] == sys.argv[2])
+assert pane["resolved"]["canonical"]["unread"]["pinned"] is False, pane
+PY
 
 tmux_cmd switch-client -c "$CLIENT_1" -t "$S1_WINDOW"
 tmux_cmd select-pane -t "$S1_AGENT"

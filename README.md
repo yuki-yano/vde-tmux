@@ -198,7 +198,10 @@ is observed as the active pane.
 
 The sidebar opens in the current tmux window and groups agents by category by default.
 Flat and ByRepo show only the currently active category.
-Priority spans all categories and groups agents as Needs Input, Unread Done, Running, then Idle.
+Priority spans all categories and groups agents as Pinned, Needs Input, Unread Done, Running, then Idle.
+Press `p` on an unread agent in Priority to toggle its shared unread-span pin. Pinned agents move to
+the first `PINNED` zone without changing their unread order, badge, or notification state. Viewing
+the exact pane still marks it read and clears the pin.
 The Needs action filter and red triangle match only Blocked agents waiting for user input.
 Unread Done agents remain separate under the Done filter. `unread-latest` navigation also includes
 unread Blocked occurrences.
@@ -226,6 +229,7 @@ vt sidebar close
 | `1` / `2` / `3` / `4` | Select Flat / ByRepo / ByCategory / Priority |
 | `Tab` / `Shift+Tab` | Cycle the state filter |
 | `n` / `N` | Move to the next or previous Blocked agent waiting for user input |
+| `p` | Pin or unpin the selected unread agent in Priority |
 | `d` | Mark the selected run as complete |
 | `J` / `K` | Change manual ordering |
 | `q` / `Esc` | Close the sidebar |
@@ -247,6 +251,7 @@ bind-key -n M-f run-shell "vt sidebar input tab --window #{q:window_id}"
 bind-key -n M-j run-shell "vt sidebar input agent-next --window #{q:window_id}"
 bind-key -n M-k run-shell "vt sidebar input agent-prev --window #{q:window_id}"
 bind-key -n M-u run-shell "vt sidebar input unread-latest --window #{q:window_id}"
+bind-key -n M-p run-shell "vt sidebar input pin-toggle --window #{q:window_id}"
 ```
 
 ## Sessions and categories
@@ -406,18 +411,17 @@ Use `disable` when the daemon must remain stopped.
 ### Pane-state persistence
 
 The daemon stores one private full-state snapshot per tmux server incarnation under
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v2.json`. A daemon restart restores the
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v3.json`. A daemon restart restores the
 prompt, task progress and items, subagents, worktree activity, lifecycle, timestamps, agent
-identity, and Done/acknowledgement state for panes whose pane ID and PID still match.
+identity, unread-span pins, and Done/acknowledgement state for panes whose pane ID and PID still match.
 
 If this snapshot is corrupt or insecure, daemon startup stops instead of repairing it or falling
 back. `vt daemon status` reports the snapshot path in `last_transition_error`; remove that file only when you
 intend to reset all saved pane state for that tmux server, then run `vt daemon ensure`.
 
-The first upgrade from a version that stored pane state in tmux options does not migrate that old
-state, so pane details reset once. Perform that upgrade only while all agents are idle and there is
-no Done or Blocked state that must be retained. Snapshots for other tmux server incarnations are not
-removed automatically.
+Production startup does not migrate snapshots from older pane-state schemas. Without a separate
+one-shot migration, pane details reset after a schema upgrade. Snapshots for other tmux server
+incarnations are not removed automatically.
 
 ## Upgrading
 

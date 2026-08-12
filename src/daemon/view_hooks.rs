@@ -1395,6 +1395,7 @@ mod tests {
                     reason: UnreadReason::Completed,
                     occurred_at: 2,
                 }),
+                pinned: false,
             },
             started_at: Some(1),
             completed_at: Some(2),

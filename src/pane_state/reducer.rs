@@ -95,7 +95,9 @@ pub fn reduce(
             reduce_observation(current, envelope, context.clone())
         }
         PaneEvent::PaneRemoved { .. } => Ok(Reduction::unchanged(current)),
-        PaneEvent::MarkPaneRead { .. } | PaneEvent::MarkDone { .. } => {
+        PaneEvent::MarkPaneRead { .. }
+        | PaneEvent::SetUnreadPin { .. }
+        | PaneEvent::MarkDone { .. } => {
             reduce_internal_state_event(current, envelope, context.clone())
         }
         event if event.is_external() => reduce_explicit(current, envelope, context.clone()),
@@ -123,7 +125,9 @@ fn reduce_internal_state_event(
 ) -> Result<Reduction, ReduceError> {
     let Some(existing) = current else {
         return match envelope.event {
-            PaneEvent::MarkDone { .. } => Err(ReduceError::StaleSelection),
+            PaneEvent::SetUnreadPin { .. } | PaneEvent::MarkDone { .. } => {
+                Err(ReduceError::StaleSelection)
+            }
             _ => Ok(Reduction::unchanged(current)),
         };
     };
@@ -138,6 +142,24 @@ fn reduce_internal_state_event(
                 .is_some_and(|latest| latest.order <= *through_order)
             {
                 state.unread.read_seq = state.unread.occurrence_seq;
+                state.unread.pinned = false;
+            }
+        }
+        PaneEvent::SetUnreadPin {
+            expected_state_id,
+            expected_read_seq,
+            pinned,
+        } => {
+            if state.state_id != *expected_state_id {
+                return Err(ReduceError::StaleSelection);
+            }
+            if *pinned {
+                if !state.unread.is_unread() || state.unread.read_seq != *expected_read_seq {
+                    return Err(ReduceError::StaleSelection);
+                }
+                state.unread.pinned = true;
+            } else if state.unread.is_unread() && state.unread.read_seq == *expected_read_seq {
+                state.unread.pinned = false;
             }
         }
         PaneEvent::MarkDone {
@@ -738,6 +760,7 @@ fn begin_agent_epoch(
         })
     {
         state.unread.read_seq = state.unread.occurrence_seq;
+        state.unread.pinned = false;
     }
     state.agent_epoch = state
         .agent_epoch
@@ -869,7 +892,10 @@ fn apply_unread_transition(
     state: &mut PaneState,
     context: ReductionContext<'_>,
 ) -> Result<(), ReduceError> {
-    if matches!(event, PaneEvent::MarkPaneRead { .. }) {
+    if matches!(
+        event,
+        PaneEvent::MarkPaneRead { .. } | PaneEvent::SetUnreadPin { .. }
+    ) {
         return Ok(());
     }
     let same_epoch = current.is_some_and(|previous| previous.agent_epoch == state.agent_epoch);
@@ -920,7 +946,11 @@ fn apply_unread_transition(
             .unwrap_or_else(|| event_epoch(event, state)),
         UnreadReason::Waiting | UnreadReason::Error => event_epoch(event, state),
     };
+    let starts_new_span = !state.unread.is_unread();
     state.unread.occurrence_seq = seq;
+    if starts_new_span {
+        state.unread.pinned = false;
+    }
     state.unread.latest = Some(UnreadOccurrence {
         seq,
         order,
@@ -931,6 +961,7 @@ fn apply_unread_transition(
         || matches!(event, PaneEvent::MarkDone { .. })
     {
         state.unread.read_seq = seq;
+        state.unread.pinned = false;
     }
     Ok(())
 }
@@ -949,7 +980,9 @@ fn event_epoch(event: &PaneEvent, state: &PaneState) -> i64 {
             *completed_at
         }
         PaneEvent::ExplicitStateReported { report } => report.observed_at,
-        PaneEvent::MarkPaneRead { .. } | PaneEvent::PaneRemoved { .. } => {
+        PaneEvent::MarkPaneRead { .. }
+        | PaneEvent::SetUnreadPin { .. }
+        | PaneEvent::PaneRemoved { .. } => {
             state.completed_at.or(state.started_at).unwrap_or_default()
         }
     }
@@ -2595,6 +2628,248 @@ mod tests {
     }
 
     #[test]
+    fn unread_pin_uses_read_sequence_as_span_token_and_survives_new_occurrences() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let waiting = reduce_once(
+            None,
+            PaneEvent::WaitRequested {
+                observed_at: 10,
+                reason: WaitReason::PermissionPrompt,
+            },
+            &tracker,
+        );
+        let current = active(&waiting);
+        let pinned = reduce_once(
+            waiting.record.as_ref(),
+            PaneEvent::SetUnreadPin {
+                expected_state_id: current.state_id.clone(),
+                expected_read_seq: current.unread.read_seq,
+                pinned: true,
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+        assert!(active(&pinned).unread.pinned);
+
+        let failed = reduce_once(
+            pinned.record.as_ref(),
+            PaneEvent::FailRun {
+                observed_at: 11,
+                reason: Some("failed".to_string()),
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+        assert!(active(&failed).unread.pinned);
+        assert_eq!(active(&failed).unread.read_seq, 0);
+        assert_eq!(active(&failed).unread.occurrence_seq, 2);
+
+        let latest_order = active(&failed).unread.latest_unread().unwrap().order;
+        let read = reduce_once(
+            failed.record.as_ref(),
+            PaneEvent::MarkPaneRead {
+                through_order: latest_order,
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+        assert!(!active(&read).unread.is_unread());
+        assert!(!active(&read).unread.pinned);
+    }
+
+    #[test]
+    fn unread_pin_rejects_inactive_or_replaced_spans_and_stale_unpin_is_noop() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let waiting = reduce_once(
+            None,
+            PaneEvent::WaitRequested {
+                observed_at: 10,
+                reason: WaitReason::PermissionPrompt,
+            },
+            &tracker,
+        );
+        let state = active(&waiting);
+        let stale = reduce(
+            waiting.record.as_ref(),
+            &envelope(PaneEvent::SetUnreadPin {
+                expected_state_id: StateId::parse("abcdefabcdefabcdefabcdefabcdefab").unwrap(),
+                expected_read_seq: state.unread.read_seq,
+                pinned: true,
+            }),
+            context(
+                &waiting.tracker_delta.as_ref().unwrap().next,
+                &VisibilitySnapshot::default(),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(stale, ReduceError::StaleSelection);
+
+        let latest_order = state.unread.latest_unread().unwrap().order;
+        let read = reduce_once(
+            waiting.record.as_ref(),
+            PaneEvent::MarkPaneRead {
+                through_order: latest_order,
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+        let state = active(&read);
+        let pin_error = reduce(
+            read.record.as_ref(),
+            &envelope(PaneEvent::SetUnreadPin {
+                expected_state_id: state.state_id.clone(),
+                expected_read_seq: state.unread.read_seq,
+                pinned: true,
+            }),
+            context(
+                &waiting.tracker_delta.as_ref().unwrap().next,
+                &VisibilitySnapshot::default(),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(pin_error, ReduceError::StaleSelection);
+
+        let stale_unpin = reduce(
+            read.record.as_ref(),
+            &envelope(PaneEvent::SetUnreadPin {
+                expected_state_id: state.state_id.clone(),
+                expected_read_seq: 0,
+                pinned: false,
+            }),
+            context(
+                &waiting.tracker_delta.as_ref().unwrap().next,
+                &VisibilitySnapshot::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(stale_unpin.outcome, ReductionOutcome::Noop);
+    }
+
+    #[test]
+    fn pane_reuse_cannot_apply_an_unread_pin_to_a_replaced_instance() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let waiting = reduce_once(
+            None,
+            PaneEvent::WaitRequested {
+                observed_at: 10,
+                reason: WaitReason::PermissionPrompt,
+            },
+            &tracker,
+        );
+        let state = active(&waiting);
+        let mut reused = envelope(PaneEvent::SetUnreadPin {
+            expected_state_id: state.state_id.clone(),
+            expected_read_seq: state.unread.read_seq,
+            pinned: true,
+        });
+        reused.pane_instance.pane_pid += 1;
+
+        let error = reduce(
+            waiting.record.as_ref(),
+            &reused,
+            context(
+                &waiting.tracker_delta.as_ref().unwrap().next,
+                &VisibilitySnapshot::default(),
+            ),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, ReduceError::InvalidPaneInstance);
+        assert!(!state.unread.pinned);
+    }
+
+    #[test]
+    fn a_new_unread_span_starts_unpinned_after_the_previous_span_was_read() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let waiting = reduce_once(
+            None,
+            PaneEvent::WaitRequested {
+                observed_at: 10,
+                reason: WaitReason::PermissionPrompt,
+            },
+            &tracker,
+        );
+        let state = active(&waiting);
+        let pinned = reduce_once(
+            waiting.record.as_ref(),
+            PaneEvent::SetUnreadPin {
+                expected_state_id: state.state_id.clone(),
+                expected_read_seq: state.unread.read_seq,
+                pinned: true,
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+        let read = reduce_once(
+            pinned.record.as_ref(),
+            PaneEvent::MarkPaneRead {
+                through_order: active(&pinned).unread.latest_unread().unwrap().order,
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+        let running = reduce_once(
+            read.record.as_ref(),
+            PaneEvent::BeginRun {
+                started_at: 20,
+                prompt: None,
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+        let next_span = reduce_once(
+            running.record.as_ref(),
+            PaneEvent::WaitRequested {
+                observed_at: 30,
+                reason: WaitReason::PermissionPrompt,
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+
+        assert!(active(&next_span).unread.is_unread());
+        assert!(!active(&next_span).unread.pinned);
+        assert_eq!(active(&next_span).unread.occurrence_seq, 2);
+        assert_eq!(active(&next_span).unread.read_seq, 1);
+    }
+
+    #[test]
+    fn born_read_completion_clears_pin_and_completed_epoch_preserves_it() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let begun = begin(None, &tracker);
+        let completed = reduce_once(
+            begun.record.as_ref(),
+            PaneEvent::CompleteRun { completed_at: 2 },
+            &begun.tracker_delta.as_ref().unwrap().next,
+        );
+        let state = active(&completed);
+        let pinned = reduce_once(
+            completed.record.as_ref(),
+            PaneEvent::SetUnreadPin {
+                expected_state_id: state.state_id.clone(),
+                expected_read_seq: state.unread.read_seq,
+                pinned: true,
+            },
+            &begun.tracker_delta.as_ref().unwrap().next,
+        );
+        let restarted = reduce_once(
+            pinned.record.as_ref(),
+            PaneEvent::AgentSessionStarted {
+                observed_at: 3,
+                source: AgentSessionSource::Resume,
+                resumed_prompt: None,
+            },
+            &begun.tracker_delta.as_ref().unwrap().next,
+        );
+        assert!(active(&restarted).unread.is_unread());
+        assert!(active(&restarted).unread.pinned);
+
+        let expected = active(&restarted).version();
+        let marked = reduce_once(
+            restarted.record.as_ref(),
+            PaneEvent::MarkDone {
+                expected,
+                completed_at: 4,
+            },
+            &begun.tracker_delta.as_ref().unwrap().next,
+        );
+        assert!(!active(&marked).unread.is_unread());
+        assert!(!active(&marked).unread.pinned);
+    }
+
+    #[test]
     fn new_agent_epoch_retires_blocked_unread_but_keeps_sequence_history() {
         let tracker = CaptureTrackerSnapshot::default();
         let waiting = reduce_once(
@@ -2605,8 +2880,19 @@ mod tests {
             },
             &tracker,
         );
-        let restarted = reduce_once(
+        let waiting_state = active(&waiting);
+        let pinned = reduce_once(
             waiting.record.as_ref(),
+            PaneEvent::SetUnreadPin {
+                expected_state_id: waiting_state.state_id.clone(),
+                expected_read_seq: waiting_state.unread.read_seq,
+                pinned: true,
+            },
+            &waiting.tracker_delta.as_ref().unwrap().next,
+        );
+        assert!(active(&pinned).unread.pinned);
+        let restarted = reduce_once(
+            pinned.record.as_ref(),
             PaneEvent::AgentSessionStarted {
                 observed_at: 20,
                 source: AgentSessionSource::Resume,
@@ -2615,6 +2901,7 @@ mod tests {
             &waiting.tracker_delta.as_ref().unwrap().next,
         );
         assert!(!active(&restarted).unread.is_unread());
+        assert!(!active(&restarted).unread.pinned);
         assert_eq!(active(&restarted).unread.occurrence_seq, 1);
         assert_eq!(active(&restarted).unread.read_seq, 1);
 
