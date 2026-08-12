@@ -107,6 +107,8 @@ enum Command {
         pane_id: String,
         #[arg(long = "pane-pid")]
         pane_pid: u32,
+        #[arg(long = "pane-snapshot", hide = true)]
+        pane_snapshot: String,
     },
     Category {
         #[command(subcommand)]
@@ -947,8 +949,9 @@ where
             direction,
             pane_id,
             pane_pid,
+            pane_snapshot,
         } => {
-            pane_switch::switch(runner, direction, &pane_id, pane_pid)?;
+            pane_switch::switch(runner, direction, &pane_id, pane_pid, &pane_snapshot)?;
             Ok(None)
         }
         Command::Session { command } => {

@@ -37,7 +37,10 @@ local selection_options = {
 }
 
 local executable_option = "@vde_executable"
+local active_pane_pid_option = "@vde_nvim_active_pane_pid"
 local context_separator = "\31"
+local pane_snapshot_field_separator = "__vde_pane_switch_field__"
+local pane_snapshot_row_separator = "__vde_pane_switch_row__"
 
 local state = {
 	config = vim.deepcopy(defaults),
@@ -80,35 +83,92 @@ local function notify_error(message)
 	vim.notify("vde-tmux: " .. message, vim.log.levels.ERROR)
 end
 
+local function mark_navigation_active()
+	local pane_id = vim.env.TMUX_PANE
+	if type(pane_id) ~= "string" or not pane_id:match("^%%%d+$") then
+		notify_error("TMUX_PANE does not contain a valid pane ID")
+		return
+	end
+	local output = vim.fn.system({
+		"tmux",
+		"set-option",
+		"-p",
+		"-F",
+		"-t",
+		pane_id,
+		active_pane_pid_option,
+		"#{pane_pid}",
+	})
+	if vim.v.shell_error ~= 0 then
+		notify_error("failed to mark the current tmux pane for Neovim navigation: " .. vim.trim(output))
+	end
+end
+
+local function clear_navigation_active()
+	local pane_id = vim.env.TMUX_PANE
+	if type(pane_id) ~= "string" or not pane_id:match("^%%%d+$") then
+		return
+	end
+	vim.fn.system({ "tmux", "set-option", "-pu", "-t", pane_id, active_pane_pid_option })
+end
+
 local function current_pane_context()
 	local pane_id = vim.env.TMUX_PANE
 	if type(pane_id) ~= "string" or not pane_id:match("^%%%d+$") then
-		return nil, nil, nil, "TMUX_PANE does not contain a valid pane ID"
+		return nil, nil, nil, nil, "TMUX_PANE does not contain a valid pane ID"
 	end
+	local pane_row = table.concat({
+		"#{pane_id}",
+		"#{pane_pid}",
+		"#{pane_active}",
+		"#{cursor_x}",
+		"#{cursor_y}",
+		"#{pane_left}",
+		"#{pane_top}",
+		"#{pane_width}",
+		"#{pane_height}",
+		"#{pane_current_command}",
+		"#{@vde_sidebar}",
+		"#{pane_floating_flag}",
+	}, pane_snapshot_field_separator) .. pane_snapshot_row_separator
 	local context = vim.trim(vim.fn.system({
 		"tmux",
 		"display-message",
 		"-p",
 		"-t",
 		pane_id,
-		"#{pane_pid}" .. context_separator .. "#{" .. executable_option .. "}",
+		"#{pane_pid}"
+			.. context_separator
+			.. "#{"
+			.. executable_option
+			.. "}"
+			.. context_separator
+			.. "#{P:"
+			.. pane_row
+			.. ","
+			.. pane_row
+			.. "}",
 	}))
 	if vim.v.shell_error ~= 0 then
-		return nil, nil, nil, "failed to resolve the current tmux pane context"
+		return nil, nil, nil, nil, "failed to resolve the current tmux pane context"
 	end
 	local fields = vim.split(context, context_separator, { plain = true })
 	local pane_pid = fields[1] or ""
 	local executable = fields[2] or ""
+	local pane_snapshot = fields[3] or ""
 	if not pane_pid:match("^[1-9]%d*$") then
-		return nil, nil, nil, "failed to resolve the current tmux pane PID"
+		return nil, nil, nil, nil, "failed to resolve the current tmux pane PID"
 	end
 	if not executable:match("^/") then
-		return nil, nil, nil, "tmux does not contain an absolute @vde_executable"
+		return nil, nil, nil, nil, "tmux does not contain an absolute @vde_executable"
 	end
 	if vim.fn.executable(executable) ~= 1 then
-		return nil, nil, nil, "@vde_executable is not executable: " .. executable
+		return nil, nil, nil, nil, "@vde_executable is not executable: " .. executable
 	end
-	return pane_id, pane_pid, executable, nil
+	if pane_snapshot == "" or not vim.endswith(pane_snapshot, pane_snapshot_row_separator) then
+		return nil, nil, nil, nil, "tmux returned an invalid pane snapshot"
+	end
+	return pane_id, pane_pid, executable, pane_snapshot, nil
 end
 
 local function navigate_to_tmux(direction)
@@ -117,7 +177,7 @@ local function navigate_to_tmux(direction)
 		notify_error("invalid navigation direction: " .. tostring(direction))
 		return
 	end
-	local pane_id, pane_pid, executable, context_error = current_pane_context()
+	local pane_id, pane_pid, executable, pane_snapshot, context_error = current_pane_context()
 	if context_error ~= nil then
 		notify_error(context_error)
 		return
@@ -131,6 +191,8 @@ local function navigate_to_tmux(direction)
 		pane_id,
 		"--pane-pid",
 		pane_pid,
+		"--pane-snapshot",
+		pane_snapshot,
 	})
 	if vim.v.shell_error ~= 0 then
 		notify_error("pane navigation failed: " .. vim.trim(result))
@@ -345,6 +407,12 @@ function M.setup(config)
 
 	local group = vim.api.nvim_create_augroup("VdeTmuxNavigation", { clear = true })
 	if state.in_tmux then
+		mark_navigation_active()
+		vim.api.nvim_create_autocmd("VimLeavePre", {
+			group = group,
+			callback = clear_navigation_active,
+			desc = "Clear the active vde-tmux Neovim pane marker",
+		})
 		vim.api.nvim_create_autocmd("FocusLost", {
 			group = group,
 			callback = function()

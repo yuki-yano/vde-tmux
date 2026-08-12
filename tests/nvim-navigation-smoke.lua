@@ -28,6 +28,16 @@ assert(
 local pane_id = assert(vim.env.TMUX_PANE, "TMUX_PANE is required")
 local pane_pid = vim.trim(vim.fn.system({ "tmux", "display-message", "-p", "-t", pane_id, "#{pane_pid}" }))
 assert(vim.v.shell_error == 0 and pane_pid:match("^[1-9]%d*$"), "failed to resolve pane PID")
+local active_pane_pid = vim.trim(vim.fn.system({
+	"tmux",
+	"display-message",
+	"-p",
+	"-t",
+	pane_id,
+	"#{@vde_nvim_active_pane_pid}",
+}))
+assert(vim.v.shell_error == 0, active_pane_pid)
+assert(active_pane_pid == pane_pid, "Neovim navigation did not publish its pane PID marker")
 
 for option, value in pairs({
 	["@vde_nvim_cursor_y"] = "50",

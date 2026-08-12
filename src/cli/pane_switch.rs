@@ -4,7 +4,10 @@ use clap::ValueEnum;
 use crate::pane_state::store::tmux_command_string;
 use crate::tmux::TmuxRunner;
 
-const FIELD_SEPARATOR: char = '\u{1f}';
+const FIELD_SEPARATOR: &str = "__vde_pane_switch_field__";
+const ROW_SEPARATOR: &str = "__vde_pane_switch_row__";
+const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
+const MAX_PANES: usize = 4096;
 const SELECTION_CHANGED_SENTINEL: &str = "__vde_pane_switch_selection_changed__";
 const NVIM_CURSOR_Y_OPTION: &str = "@vde_nvim_cursor_y";
 const NVIM_CURSOR_X_OPTION: &str = "@vde_nvim_cursor_x";
@@ -52,13 +55,14 @@ pub(crate) fn switch(
     direction: PaneSwitchDirection,
     source_pane_id: &str,
     source_pane_pid: u32,
+    pane_snapshot: &str,
 ) -> Result<()> {
     validate_pane_id(source_pane_id)?;
     if source_pane_pid == 0 {
         bail!("source pane PID must be positive");
     }
 
-    let panes = query_panes(runner, source_pane_id)?;
+    let panes = parse_pane_snapshot(pane_snapshot)?;
     let source = panes
         .iter()
         .find(|pane| pane.pane_id == source_pane_id && pane.pane_pid == source_pane_pid)
@@ -106,28 +110,21 @@ pub(crate) fn switch(
     Ok(())
 }
 
-fn query_panes(runner: &dyn TmuxRunner, source_pane_id: &str) -> Result<Vec<Pane>> {
-    let format = [
-        "#{pane_id}",
-        "#{pane_pid}",
-        "#{pane_active}",
-        "#{cursor_x}",
-        "#{cursor_y}",
-        "#{pane_left}",
-        "#{pane_top}",
-        "#{pane_width}",
-        "#{pane_height}",
-        "#{pane_current_command}",
-        "#{@vde_sidebar}",
-        "#{pane_floating_flag}",
-    ]
-    .join(&FIELD_SEPARATOR.to_string());
-    runner
-        .run(&["list-panes", "-t", source_pane_id, "-F", &format])?
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(parse_pane)
-        .collect()
+fn parse_pane_snapshot(snapshot: &str) -> Result<Vec<Pane>> {
+    if snapshot.len() > MAX_SNAPSHOT_BYTES {
+        bail!("pane switch snapshot exceeds 1 MiB");
+    }
+    if snapshot.is_empty() || !snapshot.ends_with(ROW_SEPARATOR) {
+        bail!("pane switch snapshot is empty or truncated");
+    }
+    let rows = snapshot
+        .split(ROW_SEPARATOR)
+        .filter(|row| !row.is_empty())
+        .collect::<Vec<_>>();
+    if rows.is_empty() || rows.len() > MAX_PANES {
+        bail!("pane switch snapshot has an invalid pane count");
+    }
+    rows.into_iter().map(parse_pane).collect()
 }
 
 fn parse_pane(row: &str) -> Result<Pane> {
@@ -367,5 +364,28 @@ mod tests {
         assert!(action.contains("'-p' '-t' '%2' '@vde_nvim_is_cycle' 'false'"));
         assert!(action.contains("'-p' '-t' '%2' '@vde_nvim_target_pane_pid' '2'"));
         assert!(action.ends_with("'select-pane' '-t' '%2'"));
+    }
+
+    #[test]
+    fn parses_a_complete_pane_snapshot_and_rejects_truncation() {
+        let row = [
+            "%1", "10", "1", "2", "3", "0", "0", "80", "24", "nvim", "", "0",
+        ]
+        .join(FIELD_SEPARATOR);
+        let snapshot = format!("{row}{ROW_SEPARATOR}");
+
+        let panes = parse_pane_snapshot(&snapshot).unwrap();
+
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, "%1");
+        assert_eq!(panes[0].pane_pid, 10);
+        assert!(panes[0].active);
+        assert_eq!(panes[0].current_command, "nvim");
+        assert!(
+            parse_pane_snapshot(&row)
+                .unwrap_err()
+                .to_string()
+                .contains("truncated")
+        );
     }
 }

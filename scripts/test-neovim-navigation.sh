@@ -34,4 +34,12 @@ if [[ "$DEAD_STATUS" != "0" ]]; then
   exit 1
 fi
 
+ACTIVE_PANE_PID="$(
+  tmux -L "$TMUX_SOCKET" display-message -p -t "$PANE_ID" '#{@vde_nvim_active_pane_pid}'
+)"
+if [[ -n "$ACTIVE_PANE_PID" ]]; then
+  echo "Neovim navigation left a stale pane marker: $ACTIVE_PANE_PID" >&2
+  exit 1
+fi
+
 echo "Neovim navigation smoke passed"
