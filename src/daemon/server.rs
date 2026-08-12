@@ -29,6 +29,7 @@ pub const V2_FRAME_BODY_TIMEOUT: Duration = Duration::from_millis(100);
 pub const V2_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 const TMUX_SERVER_LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CURRENT_VIEW_REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
+const PANE_SWITCH_REQUEST_SEPARATOR: &str = "__vde_pane_switch_request__";
 
 pub struct V2FrameReader {
     reader: BufReader<UnixStream>,
@@ -677,6 +678,8 @@ struct ProductionV2Coordinator {
     notification_process_lock: Arc<Mutex<()>>,
     sidebar_tmux_tx: SyncSender<SidebarTmuxJob>,
     sidebar_completion_rx: Mutex<Option<mpsc::Receiver<SidebarEffectCompletion>>>,
+    tmux_control: Mutex<Option<crate::daemon::tmux_control::TmuxControlHandle>>,
+    pane_switch_trigger_shutdown: Arc<AtomicBool>,
     status_push: Mutex<crate::daemon::status_push::StatusPushState>,
     status_push_driver: Mutex<()>,
     status_push_started: Instant,
@@ -1024,6 +1027,8 @@ impl ProductionV2Coordinator {
             notification_process_lock,
             sidebar_tmux_tx,
             sidebar_completion_rx: Mutex::new(Some(sidebar_completion_rx)),
+            tmux_control: Mutex::new(None),
+            pane_switch_trigger_shutdown: Arc::new(AtomicBool::new(false)),
             status_push: Mutex::new(status_push),
             status_push_driver: Mutex::new(()),
             status_push_started: Instant::now(),
@@ -1033,6 +1038,127 @@ impl ProductionV2Coordinator {
             current_view_refresh_generation: AtomicU64::new(0),
             current_view_refresh_running: AtomicBool::new(false),
         })
+    }
+
+    fn start_tmux_control(&self) {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let mut control = self
+            .tmux_control
+            .lock()
+            .expect("tmux control lock poisoned");
+        if control.is_some() {
+            return;
+        }
+        *control = Some(
+            if std::fs::metadata(&self.incarnation.socket_path)
+                .is_ok_and(|metadata| metadata.file_type().is_socket())
+            {
+                crate::daemon::tmux_control::TmuxControlHandle::start(
+                    self.incarnation.socket_path.clone(),
+                )
+            } else {
+                crate::daemon::tmux_control::TmuxControlHandle::unavailable()
+            },
+        );
+    }
+
+    fn control_health(&self) -> crate::daemon::protocol::v2::ControlHealth {
+        self.tmux_control
+            .lock()
+            .expect("tmux control lock poisoned")
+            .as_ref()
+            .map_or(
+                crate::daemon::protocol::v2::ControlHealth::Starting,
+                |control| control.health(),
+            )
+    }
+
+    fn shutdown_tmux_control(&self) {
+        if let Some(control) = self
+            .tmux_control
+            .lock()
+            .expect("tmux control lock poisoned")
+            .as_ref()
+        {
+            control.shutdown();
+        }
+    }
+
+    fn pane_switch_channel(&self) -> String {
+        "vde-pane-switch".to_string()
+    }
+
+    fn stop_pane_switch_trigger(&self) {
+        if self
+            .pane_switch_trigger_shutdown
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let command = crate::pane_state::store::tmux_command_string(&[
+            "wait-for".to_string(),
+            "-S".to_string(),
+            self.pane_switch_channel(),
+        ]);
+        if let Some(control) = self
+            .tmux_control
+            .lock()
+            .expect("tmux control lock poisoned")
+            .as_ref()
+        {
+            let _ = control.execute_until(command, Instant::now() + Duration::from_millis(250));
+        }
+    }
+
+    fn handle_pane_switch_trigger(&self) {
+        if self.shutdown.load(Ordering::SeqCst)
+            || self.pane_switch_trigger_shutdown.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let command = crate::pane_state::store::tmux_command_string(&[
+            "show-options".to_string(),
+            "-gqv".to_string(),
+            crate::daemon::lifecycle::PANE_SWITCH_REQUEST_OPTION.to_string(),
+        ]);
+        let request = {
+            let control = self
+                .tmux_control
+                .lock()
+                .expect("tmux control lock poisoned");
+            let Some(control) = control.as_ref() else {
+                return;
+            };
+            let Ok(output) = control.execute_until(command, deadline) else {
+                return;
+            };
+            output.trim_end_matches(['\r', '\n']).to_string()
+        };
+        let fields = request
+            .split(PANE_SWITCH_REQUEST_SEPARATOR)
+            .collect::<Vec<_>>();
+        if fields.len() != 4 || fields[0] != self.incarnation.hash {
+            return;
+        }
+        let direction = match fields[1] {
+            "left" => crate::cli::pane_switch::PaneSwitchDirection::Left,
+            "right" => crate::cli::pane_switch::PaneSwitchDirection::Right,
+            "up" => crate::cli::pane_switch::PaneSwitchDirection::Up,
+            "down" => crate::cli::pane_switch::PaneSwitchDirection::Down,
+            _ => return,
+        };
+        let Ok(pane_pid) = fields[3].parse::<u32>() else {
+            return;
+        };
+        let _ = self.pane_switch(
+            direction,
+            PaneInstance {
+                pane_id: fields[2].to_string(),
+                pane_pid,
+            },
+        );
     }
 
     fn configure_health(&self, config: &crate::config::Config) {
@@ -1359,9 +1485,169 @@ impl ProductionV2Coordinator {
                         .lock()
                         .expect("config hash lock poisoned")
                         .clone(),
+                    control_health: self.control_health(),
                 },
             },
+            ClientMessage::PaneSwitch {
+                direction,
+                source_pane,
+                ..
+            } => self.pane_switch(direction, source_pane),
             _ => ServerMessage::error(ErrorCode::InvalidRequest, "unsupported query", None),
+        }
+    }
+
+    fn pane_switch(
+        &self,
+        direction: crate::cli::pane_switch::PaneSwitchDirection,
+        source_pane: PaneInstance,
+    ) -> ServerMessage {
+        use crate::cli::pane_switch::{
+            PaneSwitchAction, PaneSwitchOutcome, SELECTION_CHANGED_SENTINEL,
+        };
+        use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+
+        if let Err(error) = source_pane.validate() {
+            return ServerMessage::error(ErrorCode::InvalidPaneInstance, error.to_string(), None);
+        }
+        const SNAPSHOT_IDENTITY_SEPARATOR: &str = "__vde_pane_switch_identity__";
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let control_guard = self
+            .tmux_control
+            .lock()
+            .expect("tmux control lock poisoned");
+        let Some(control) = control_guard.as_ref() else {
+            return ServerMessage::error(
+                ErrorCode::ControlUnavailable,
+                "tmux control client is starting",
+                None,
+            );
+        };
+        let snapshot_format = format!(
+            "#{{pid}}{SNAPSHOT_IDENTITY_SEPARATOR}#{{start_time}}{SNAPSHOT_IDENTITY_SEPARATOR}{}",
+            crate::cli::pane_switch::pane_snapshot_format()
+        );
+        let snapshot_command = crate::pane_state::store::tmux_command_string(&[
+            "display-message".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            source_pane.pane_id.clone(),
+            snapshot_format,
+        ]);
+        let snapshot_output = match control.execute_until(snapshot_command, deadline) {
+            Ok(output) => output,
+            Err(crate::daemon::tmux_control::ControlError::QueueFull) => {
+                return ServerMessage::error(
+                    ErrorCode::QueueFull,
+                    "tmux control command queue is full",
+                    None,
+                );
+            }
+            Err(crate::daemon::tmux_control::ControlError::CommandFailed(message)) => {
+                return ServerMessage::error(
+                    ErrorCode::StaleSelection,
+                    format!("source pane could not be captured: {message}"),
+                    None,
+                );
+            }
+            Err(error) => {
+                return ServerMessage::error(
+                    ErrorCode::ControlUnavailable,
+                    error.to_string(),
+                    None,
+                );
+            }
+        };
+        let mut snapshot_fields = snapshot_output
+            .trim_end_matches(['\r', '\n'])
+            .splitn(3, SNAPSHOT_IDENTITY_SEPARATOR);
+        let snapshot_identity = snapshot_fields
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .zip(
+                snapshot_fields
+                    .next()
+                    .and_then(|start_time| start_time.parse::<i64>().ok()),
+            );
+        let pane_snapshot = snapshot_fields.next();
+        if snapshot_identity
+            != Some((
+                self.incarnation.identity.pid,
+                self.incarnation.identity.start_time,
+            ))
+            || pane_snapshot.is_none()
+        {
+            drop(control_guard);
+            self.fail_stop("tmux server incarnation changed during pane snapshot capture");
+            return ServerMessage::error(
+                ErrorCode::InternalError,
+                "tmux server incarnation changed during pane navigation",
+                None,
+            );
+        }
+        let action = match crate::cli::pane_switch::prepare(
+            direction,
+            &source_pane.pane_id,
+            source_pane.pane_pid,
+            pane_snapshot.expect("pane snapshot checked above"),
+        ) {
+            Ok(PaneSwitchAction::NoTarget) => {
+                return ServerMessage::PaneSwitchResult {
+                    outcome: PaneSwitchOutcome::NoTarget,
+                };
+            }
+            Ok(PaneSwitchAction::Apply(command)) => command,
+            Err(error) => {
+                let message = error.to_string();
+                let code = if message.contains("source pane") {
+                    ErrorCode::StaleSelection
+                } else {
+                    ErrorCode::InvalidRequest
+                };
+                return ServerMessage::error(code, message, None);
+            }
+        };
+        const SERVER_CHANGED: &str = "__vde_pane_switch_server_changed__";
+        let guarded = crate::pane_state::store::server_guarded_command_args(
+            self.incarnation.identity.pid,
+            self.incarnation.identity.start_time,
+            action,
+            SERVER_CHANGED,
+        );
+        let command = crate::pane_state::store::tmux_command_string(&guarded);
+        let result = control.execute_until(command, deadline);
+        drop(control_guard);
+        match result {
+            Ok(output) if output.lines().any(|line| line.trim() == SERVER_CHANGED) => {
+                self.fail_stop("tmux server incarnation changed during pane navigation");
+                ServerMessage::error(
+                    ErrorCode::InternalError,
+                    "tmux server incarnation changed during pane navigation",
+                    None,
+                )
+            }
+            Ok(output)
+                if output
+                    .lines()
+                    .any(|line| line.trim() == SELECTION_CHANGED_SENTINEL) =>
+            {
+                ServerMessage::error(
+                    ErrorCode::StaleSelection,
+                    "pane selection changed before the switch could be applied",
+                    None,
+                )
+            }
+            Ok(_) => ServerMessage::PaneSwitchResult {
+                outcome: PaneSwitchOutcome::Applied,
+            },
+            Err(crate::daemon::tmux_control::ControlError::QueueFull) => ServerMessage::error(
+                ErrorCode::QueueFull,
+                "tmux control command queue is full",
+                None,
+            ),
+            Err(error) => {
+                ServerMessage::error(ErrorCode::ControlUnavailable, error.to_string(), None)
+            }
         }
     }
 
@@ -1894,6 +2180,8 @@ impl ProductionV2Coordinator {
         self.snapshot_changed.notify_all();
         drop(snapshot_cache);
         if first_shutdown {
+            self.stop_pane_switch_trigger();
+            self.shutdown_tmux_control();
             self.stop_notification_worker();
             self.log_daemon_error(&format!("canonical daemon fail-stop: {message}"));
         }
@@ -1927,6 +2215,8 @@ impl ProductionV2Coordinator {
     }
 
     fn begin_shutdown(&self, current_accepted_seq: Option<u64>) {
+        self.stop_pane_switch_trigger();
+        self.shutdown_tmux_control();
         self.stop_notification_worker();
         self.write_status_shutdown_projection();
         let snapshot_cache = self
@@ -2723,6 +3013,7 @@ fn apply_production_mutation(
             | ClientMessage::QueryStatusSnapshot { .. }
             | ClientMessage::QueryPane { .. }
             | ClientMessage::QueryRuntimeInfo { .. }
+            | ClientMessage::PaneSwitch { .. }
             | ClientMessage::Subscribe { .. },
         ) => unreachable!("v2 router cannot sequence a read-only request"),
         V2AcceptedMutation::Internal(V2InternalMutation::TargetedPaneRefresh { pane_id }) => {
@@ -3800,7 +4091,7 @@ fn parse_observation_poll_projection(
 
     Ok(ObservationPollProjection {
         topology,
-        status_metadata: status_projection_metadata(status),
+        status_metadata: status_projection_metadata(status, &witnesses),
         witnesses,
         observation_bases: BTreeMap::new(),
         view_base: crate::daemon::view_hooks::CurrentClientViews::default(),
@@ -3830,6 +4121,7 @@ fn split_observation_poll_frame<'a>(
 fn query_status_projection_metadata(
     coordinator: &ProductionV2Coordinator,
     timeout: Duration,
+    witnesses: &[crate::pane_state::ClientWitness],
 ) -> Result<super::runtime::StatusProjectionMetadata, crate::daemon::topology::TopologyError> {
     let framing = crate::daemon::topology::QueryFraming::generate()?;
     let args = crate::daemon::topology::status_metadata_query_args(&framing);
@@ -3844,20 +4136,23 @@ fn query_status_projection_metadata(
         &framing,
         &coordinator.incarnation.identity,
     )?;
-    Ok(status_projection_metadata(snapshot))
+    Ok(status_projection_metadata(snapshot, witnesses))
 }
 
 fn status_projection_metadata(
     snapshot: crate::daemon::topology::StatusMetadataSnapshot,
+    witnesses: &[crate::pane_state::ClientWitness],
 ) -> super::runtime::StatusProjectionMetadata {
+    let attached_sessions = crate::session::regular_client_session_ids(witnesses);
     let mut metadata = super::runtime::StatusProjectionMetadata::default();
     for session in snapshot.sessions {
+        let attached = attached_sessions.contains(&session.session_id);
         metadata.sessions.insert(
             session.session_id,
             super::runtime::SessionProjectionMetadata {
                 session_name: session.session_name,
                 project_path: session.project_path,
-                attached: Some(session.attached),
+                attached: Some(attached),
                 created_at: Some(session.created_at),
             },
         );
@@ -4157,6 +4452,7 @@ pub fn run_runtime_daemon_server(
     });
 
     bootstrap_v2_runtime(&coordinator, leased, env, &config)?;
+    start_pane_switch_trigger_worker(coordinator.clone());
     start_tmux_server_liveness_monitor(coordinator.clone())?;
     start_v2_mutation_worker(coordinator.clone());
     start_sidebar_completion_forwarder(coordinator.clone());
@@ -4185,6 +4481,46 @@ pub fn run_runtime_daemon_server(
     coordinator.wait_for_shutdown();
     runtime_cleanup.cleanup()?;
     Ok(())
+}
+
+fn start_pane_switch_trigger_worker(coordinator: Arc<ProductionV2Coordinator>) {
+    const TRIGGER_QUEUE_CAPACITY: usize = 32;
+    let (triggers, receiver) = mpsc::sync_channel(TRIGGER_QUEUE_CAPACITY);
+    let waiter = coordinator.clone();
+    thread::spawn(move || {
+        while !waiter.pane_switch_trigger_shutdown.load(Ordering::SeqCst) {
+            let status = Command::new("tmux")
+                .arg("-S")
+                .arg(&waiter.incarnation.socket_path)
+                .arg("wait-for")
+                .arg(waiter.pane_switch_channel())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if waiter.pane_switch_trigger_shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            match status {
+                Ok(status) if status.success() => {
+                    let _ = triggers.try_send(());
+                }
+                _ => thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    });
+    thread::spawn(move || {
+        while receiver.recv().is_ok() {
+            if coordinator
+                .pane_switch_trigger_shutdown
+                .load(Ordering::SeqCst)
+                || coordinator.shutdown.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            coordinator.handle_pane_switch_trigger();
+        }
+    });
 }
 
 fn initialize_runtime_daemon_post_bind(
@@ -4441,7 +4777,8 @@ fn bootstrap_v2_runtime(
     views
         .reconcile(&witnesses, &window_panes)
         .map_err(|error| anyhow::anyhow!("failed to build initial view registry: {error}"))?;
-    let status_metadata = query_status_projection_metadata(coordinator, Duration::from_secs(1))?;
+    let status_metadata =
+        query_status_projection_metadata(coordinator, Duration::from_secs(1), &witnesses)?;
     let state_path = crate::sidebar::store::state_path(env, &coordinator.incarnation.socket_path);
     let sidebar_preferences = crate::sidebar::store::load_state(&state_path)?;
     let category_state_path =
@@ -4460,7 +4797,13 @@ fn bootstrap_v2_runtime(
         .state
         .lock()
         .expect("canonical state lock poisoned") = Some(canonical);
-    crate::daemon::lifecycle::publish_current_executable(&runner, &coordinator.incarnation)?;
+    let daemon_socket =
+        crate::daemon::daemon_socket_path_for_incarnation(env, None, &coordinator.incarnation.hash);
+    crate::daemon::lifecycle::publish_runtime_context(
+        &runner,
+        &coordinator.incarnation,
+        &daemon_socket,
+    )?;
 
     let mut initial_reconciliation_queued = false;
     loop {
@@ -4494,6 +4837,11 @@ fn bootstrap_v2_runtime(
         coordinator.drive_status_push(StatusPushTrigger::Snapshot)?;
         let mut router = coordinator.router.lock().expect("v2 router lock poisoned");
         if router.enter_serving_if_bootstrap_empty() {
+            drop(router);
+            // Attaching earlier would let a bootstrap failure emit a client-detached hook that
+            // starts another enabled daemon. Serving is the first point at which the control
+            // client's lifecycle is allowed to affect tmux hooks.
+            coordinator.start_tmux_control();
             break;
         }
     }
@@ -5474,7 +5822,20 @@ mod tests {
         }
 
         assert!(coordinator.shutdown_ready.load(Ordering::SeqCst));
-        std::fs::remove_dir_all(root).unwrap();
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    assert!(
+                        Instant::now() < cleanup_deadline,
+                        "liveness monitor did not finish writing its fail-stop log"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to remove test state: {error}"),
+            }
+        }
     }
 
     #[test]

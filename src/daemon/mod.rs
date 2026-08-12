@@ -4,6 +4,7 @@ pub mod runtime;
 pub mod server;
 pub mod session_badge;
 pub mod status_push;
+pub(crate) mod tmux_control;
 pub mod topology;
 pub mod view_hooks;
 pub mod workers;

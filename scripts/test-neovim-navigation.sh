@@ -16,7 +16,8 @@ PANE_ID="$(
     'sleep 30'
 )"
 tmux -L "$TMUX_SOCKET" set-option -g remain-on-exit on
-tmux -L "$TMUX_SOCKET" set-option -g @vde_executable /usr/bin/false
+tmux -L "$TMUX_SOCKET" set-option -g @vde_daemon_server_identity "$(printf 'a%.0s' {1..64})"
+tmux -L "$TMUX_SOCKET" set-option -g @vde_pane_switch_channel vde-pane-switch
 tmux -L "$TMUX_SOCKET" respawn-pane -k -t "$PANE_ID" \
   "env VDE_TMUX_NVIM_PLUGIN_ROOT='$ROOT' nvim --clean --headless -l '$ROOT/tests/nvim-navigation-smoke.lua'"
 

@@ -25,6 +25,10 @@ const LIFECYCLE_RECORD_VERSION: u16 = 1;
 const LIFECYCLE_RECORD_FILE: &str = "lifecycle.json";
 pub const DISABLED_SERVER_OPTION: &str = "@vde_daemon_disabled";
 pub const EXECUTABLE_OPTION: &str = "@vde_executable";
+pub const DAEMON_SOCKET_OPTION: &str = "@vde_daemon_socket";
+pub const DAEMON_SERVER_OPTION: &str = "@vde_daemon_server_identity";
+pub const PANE_SWITCH_CHANNEL_OPTION: &str = "@vde_pane_switch_channel";
+pub const PANE_SWITCH_REQUEST_OPTION: &str = "@vde_pane_switch_request";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -268,9 +272,10 @@ pub(crate) fn set_tmux_desired_mode_for_incarnation(
     Ok(())
 }
 
-pub(crate) fn publish_current_executable(
+pub(crate) fn publish_runtime_context(
     runner: &dyn TmuxRunner,
     incarnation: &TmuxServerIncarnation,
+    daemon_socket: &Path,
 ) -> Result<PathBuf> {
     const SERVER_MISMATCH: &str = "__vde_executable_server_mismatch__";
     let executable = std::fs::canonicalize(
@@ -280,11 +285,30 @@ pub(crate) fn publish_current_executable(
     let executable_value = executable
         .to_str()
         .context("current executable path is not valid UTF-8")?;
+    let daemon_socket = daemon_socket
+        .to_str()
+        .context("daemon socket path is not valid UTF-8")?;
+    let pane_switch_channel = "vde-pane-switch".to_string();
     let command = crate::pane_state::store::tmux_command_string(&[
         "set-option".to_string(),
         "-g".to_string(),
         EXECUTABLE_OPTION.to_string(),
         executable_value.to_string(),
+        ";".to_string(),
+        "set-option".to_string(),
+        "-g".to_string(),
+        DAEMON_SOCKET_OPTION.to_string(),
+        daemon_socket.to_string(),
+        ";".to_string(),
+        "set-option".to_string(),
+        "-g".to_string(),
+        DAEMON_SERVER_OPTION.to_string(),
+        incarnation.hash.clone(),
+        ";".to_string(),
+        "set-option".to_string(),
+        "-g".to_string(),
+        PANE_SWITCH_CHANNEL_OPTION.to_string(),
+        pane_switch_channel,
     ]);
     let guarded = crate::pane_state::store::server_guarded_command_args(
         incarnation.identity.pid,
@@ -295,7 +319,7 @@ pub(crate) fn publish_current_executable(
     let refs = guarded.iter().map(String::as_str).collect::<Vec<_>>();
     let output = runner.run(&refs)?;
     if output.lines().any(|line| line.trim() == SERVER_MISMATCH) {
-        bail!("tmux server incarnation changed while publishing the vde-tmux executable");
+        bail!("tmux server incarnation changed while publishing the vde-tmux runtime context");
     }
     Ok(executable)
 }
@@ -1459,6 +1483,7 @@ mod tests {
     #[test]
     fn publishes_the_canonical_current_executable_for_the_expected_server() {
         let executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let daemon_socket = PathBuf::from("/tmp/vde-tmux-publish-runtime.sock");
         let incarnation = super::TmuxServerIncarnation {
             socket_path: PathBuf::from("/tmp/vde-tmux-publish-executable.sock"),
             identity: crate::daemon::topology::ServerIdentity {
@@ -1472,6 +1497,21 @@ mod tests {
             "-g".to_string(),
             super::EXECUTABLE_OPTION.to_string(),
             executable.display().to_string(),
+            ";".to_string(),
+            "set-option".to_string(),
+            "-g".to_string(),
+            super::DAEMON_SOCKET_OPTION.to_string(),
+            daemon_socket.display().to_string(),
+            ";".to_string(),
+            "set-option".to_string(),
+            "-g".to_string(),
+            super::DAEMON_SERVER_OPTION.to_string(),
+            incarnation.hash.clone(),
+            ";".to_string(),
+            "set-option".to_string(),
+            "-g".to_string(),
+            super::PANE_SWITCH_CHANNEL_OPTION.to_string(),
+            "vde-pane-switch".to_string(),
         ]);
         let guarded = crate::pane_state::store::server_guarded_command_args(
             incarnation.identity.pid,
@@ -1484,7 +1524,7 @@ mod tests {
         mock.stub(&refs, "");
 
         assert_eq!(
-            super::publish_current_executable(&mock, &incarnation).unwrap(),
+            super::publish_runtime_context(&mock, &incarnation, &daemon_socket).unwrap(),
             executable
         );
         assert_eq!(mock.calls(), vec![guarded]);

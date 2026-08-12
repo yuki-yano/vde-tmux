@@ -350,24 +350,24 @@ pub(crate) fn status_daemon(
             let phase = client.phase();
             let hooks = client.hook_health();
             let daemon_instance = client.daemon_instance_id().as_str().to_string();
-            let config_hash = match client.request(
+            let (config_hash, control_health) = match client.request(
                 &crate::daemon::protocol::v2::ClientMessage::QueryRuntimeInfo {
                     proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
                 },
             ) {
                 Ok(crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult { info }) => {
-                    info.config_hash
+                    (info.config_hash, format!("{:?}", info.control_health))
                 }
-                Ok(_) | Err(_) => "unavailable".to_string(),
+                Ok(_) | Err(_) => ("unavailable".to_string(), "unavailable".to_string()),
             };
             Ok(Some(format!(
-                "daemon: running\nphase: {phase:?}\nhooks: {hooks:?}\ndaemon_instance: {daemon_instance}\nserver: {}\nsocket: {}\nprocess: {process}\nconfig_hash: {config_hash}\nlast_transition_error: {last_transition_error}",
+                "daemon: running\nphase: {phase:?}\nhooks: {hooks:?}\ncontrol: {control_health}\ndaemon_instance: {daemon_instance}\nserver: {}\nsocket: {}\nprocess: {process}\nconfig_hash: {config_hash}\nlast_transition_error: {last_transition_error}",
                 incarnation.hash,
                 socket_path.display(),
             )))
         }
         Err(_) => Ok(Some(format!(
-            "daemon: unavailable\nphase: unavailable\nhooks: unavailable\ndaemon_instance: unavailable\nserver: {}\nsocket: {}\nprocess: {process}\nconfig_hash: unavailable\nlast_transition_error: {last_transition_error}",
+            "daemon: unavailable\nphase: unavailable\nhooks: unavailable\ncontrol: unavailable\ndaemon_instance: unavailable\nserver: {}\nsocket: {}\nprocess: {process}\nconfig_hash: unavailable\nlast_transition_error: {last_transition_error}",
             incarnation.hash,
             socket_path.display(),
         ))),

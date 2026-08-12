@@ -432,7 +432,7 @@ for _ in $(seq 1 60); do
   [[ "$(tmux_cmd list-clients -F '#{client_control_mode}' 2>/dev/null | grep -c '^0$' || true)" -ge 1 ]] && break
   sleep 0.1
 done
-CLIENT_1="$(tmux_cmd list-clients -F '#{client_name} #{session_name}' | awk '$2 == "A" { print $1; exit }')"
+CLIENT_1="$(tmux_cmd list-clients -F '#{client_name} #{session_name} #{client_control_mode}' | awk '$2 == "A" && $3 == "0" { print $1; exit }')"
 [[ -n "$CLIENT_1" ]]
 
 VT_BIND_ENV="XDG_STATE_HOME=$STATE_HOME XDG_CONFIG_HOME=$CONFIG_HOME HOME=$HOME_DIR VDE_TMUX_SOCKET_NAME=$TMUX_SOCKET"
@@ -461,7 +461,7 @@ for _ in $(seq 1 60); do
   [[ "$(tmux_cmd list-clients -F '#{client_control_mode}' 2>/dev/null | grep -c '^0$' || true)" -ge 2 ]] && break
   sleep 0.1
 done
-CLIENT_2="$(tmux_cmd list-clients -F '#{client_name} #{session_name}' | awk '$2 == "a" { print $1; exit }')"
+CLIENT_2="$(tmux_cmd list-clients -F '#{client_name} #{session_name} #{client_control_mode}' | awk '$2 == "a" && $3 == "0" { print $1; exit }')"
 [[ -n "$CLIENT_2" ]]
 printf '%s %s %s\n' \
   "$(client_field "$CLIENT_2" session_name)" \
@@ -536,8 +536,8 @@ tmux_cmd -C attach-session -f active-pane -t A <"$CONTROL_FIFO" >"$ARTIFACT_DIR/
 CONTROL_PID=$!
 CONTROL_CLIENT=""
 for _ in $(seq 1 60); do
-  CONTROL_CLIENT="$(tmux_cmd list-clients -F '#{client_name} #{client_control_mode}' \
-    | awk '$2 != "0" { print $1; exit }')"
+  CONTROL_CLIENT="$(tmux_cmd list-clients -F '#{client_name} #{client_control_mode} #{client_flags}' \
+    | awk '$2 != "0" && $0 ~ /active-pane/ { print $1; exit }')"
   [[ -n "$CONTROL_CLIENT" ]] && break
   sleep 0.05
 done

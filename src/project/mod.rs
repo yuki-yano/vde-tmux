@@ -723,7 +723,16 @@ mod tests {
             &["display-message", "-p", "#{client_name}\t#{client_tty}"],
             "\t\n",
         );
-        mock.stub(&["list-clients", "-F", "#{client_name}\t#{client_tty}"], "");
+        mock.stub(
+            &[
+                "list-clients",
+                "-f",
+                "#{==:#{client_control_mode},0}",
+                "-F",
+                "#{client_name}\t#{client_tty}",
+            ],
+            "",
+        );
 
         let err = switch_project_resolved(
             &mock,

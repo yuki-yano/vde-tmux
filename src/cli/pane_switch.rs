@@ -1,26 +1,92 @@
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
+use std::path::Path;
+use std::time::Duration;
 
 use crate::pane_state::store::tmux_command_string;
-use crate::tmux::TmuxRunner;
+use serde::{Deserialize, Serialize};
 
 const FIELD_SEPARATOR: &str = "__vde_pane_switch_field__";
 const ROW_SEPARATOR: &str = "__vde_pane_switch_row__";
-const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
-const MAX_PANES: usize = 4096;
-const SELECTION_CHANGED_SENTINEL: &str = "__vde_pane_switch_selection_changed__";
+pub(crate) const MAX_SNAPSHOT_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_PANES: usize = 512;
+pub(crate) const SELECTION_CHANGED_SENTINEL: &str = "__vde_pane_switch_selection_changed__";
 const NVIM_CURSOR_Y_OPTION: &str = "@vde_nvim_cursor_y";
 const NVIM_CURSOR_X_OPTION: &str = "@vde_nvim_cursor_x";
 const NVIM_DIRECTION_OPTION: &str = "@vde_nvim_select_direction";
 const NVIM_CYCLE_OPTION: &str = "@vde_nvim_is_cycle";
 const NVIM_TARGET_PID_OPTION: &str = "@vde_nvim_target_pane_pid";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum PaneSwitchDirection {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PaneSwitchDirection {
     Left,
     Right,
     Up,
     Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PaneSwitchOutcome {
+    Applied,
+    NoTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PaneSwitchAction {
+    Apply(String),
+    NoTarget,
+}
+
+pub(crate) fn request(
+    socket: &Path,
+    server_identity: &str,
+    direction: PaneSwitchDirection,
+    source_pane_id: String,
+    source_pane_pid: u32,
+) -> Result<()> {
+    let source_pane = crate::pane_state::PaneInstance {
+        pane_id: source_pane_id,
+        pane_pid: source_pane_pid,
+    };
+    source_pane.validate().map_err(anyhow::Error::msg)?;
+    let mut client = crate::daemon::protocol::v2::V2Client::connect_with_timeout(
+        socket,
+        server_identity,
+        Duration::from_millis(750),
+    )?;
+    match client.request(&crate::daemon::protocol::v2::ClientMessage::PaneSwitch {
+        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+        direction,
+        source_pane,
+    })? {
+        crate::daemon::protocol::v2::ServerMessage::PaneSwitchResult { .. } => Ok(()),
+        crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
+            bail!("daemon pane switch failed ({code:?}): {message}")
+        }
+        response => bail!("unexpected daemon pane switch response: {response:?}"),
+    }
+}
+
+pub(crate) fn pane_snapshot_format() -> String {
+    let row = [
+        "#{pane_id}",
+        "#{pane_pid}",
+        "#{pane_active}",
+        "#{cursor_x}",
+        "#{cursor_y}",
+        "#{pane_left}",
+        "#{pane_top}",
+        "#{pane_width}",
+        "#{pane_height}",
+        "#{pane_current_command}",
+        "#{@vde_sidebar}",
+        "#{pane_floating_flag}",
+    ]
+    .join(FIELD_SEPARATOR)
+        + ROW_SEPARATOR;
+    format!("#{{P:{row},{row}}}")
 }
 
 impl PaneSwitchDirection {
@@ -50,13 +116,12 @@ struct Pane {
     floating: bool,
 }
 
-pub(crate) fn switch(
-    runner: &dyn TmuxRunner,
+pub(crate) fn prepare(
     direction: PaneSwitchDirection,
     source_pane_id: &str,
     source_pane_pid: u32,
     pane_snapshot: &str,
-) -> Result<()> {
+) -> Result<PaneSwitchAction> {
     validate_pane_id(source_pane_id)?;
     if source_pane_pid == 0 {
         bail!("source pane PID must be positive");
@@ -71,7 +136,7 @@ pub(crate) fn switch(
         bail!("source pane is no longer active");
     }
     let Some((target, is_cycle)) = choose_target(&panes, source, direction) else {
-        return Ok(());
+        return Ok(PaneSwitchAction::NoTarget);
     };
 
     let action = switch_action(target, source, direction, is_cycle);
@@ -91,28 +156,20 @@ pub(crate) fn switch(
     let source_guard =
         format!("#{{&&:#{{==:#{{pane_pid}},{source_pane_pid}}},#{{==:#{{pane_active}},1}}}}");
     let source_mismatch_command = format!("display-message -p '{SELECTION_CHANGED_SENTINEL}'");
-    let args = [
-        "if-shell",
-        "-F",
-        "-t",
-        source_pane_id,
-        &source_guard,
-        &guarded_target,
-        &source_mismatch_command,
-    ];
-    let output = runner.run(&args)?;
-    if output
-        .lines()
-        .any(|line| line.trim() == SELECTION_CHANGED_SENTINEL)
-    {
-        bail!("pane selection changed before the switch could be applied");
-    }
-    Ok(())
+    Ok(PaneSwitchAction::Apply(tmux_command_string(&[
+        "if-shell".to_string(),
+        "-F".to_string(),
+        "-t".to_string(),
+        source_pane_id.to_string(),
+        source_guard,
+        guarded_target,
+        source_mismatch_command,
+    ])))
 }
 
 fn parse_pane_snapshot(snapshot: &str) -> Result<Vec<Pane>> {
     if snapshot.len() > MAX_SNAPSHOT_BYTES {
-        bail!("pane switch snapshot exceeds 1 MiB");
+        bail!("pane switch snapshot exceeds 128 KiB");
     }
     if snapshot.is_empty() || !snapshot.ends_with(ROW_SEPARATOR) {
         bail!("pane switch snapshot is empty or truncated");
@@ -387,5 +444,80 @@ mod tests {
                 .to_string()
                 .contains("truncated")
         );
+    }
+
+    #[test]
+    fn prepare_preserves_source_and_target_instance_guards() {
+        let source = pane("%1", 0, 0, 20, 20);
+        let target = pane("%2", 21, 0, 20, 20);
+        let row = |pane: &Pane| {
+            [
+                pane.pane_id.clone(),
+                pane.pane_pid.to_string(),
+                u8::from(pane.active).to_string(),
+                pane.cursor_x.to_string(),
+                pane.cursor_y.to_string(),
+                pane.left.to_string(),
+                pane.top.to_string(),
+                pane.width.to_string(),
+                pane.height.to_string(),
+                pane.current_command.clone(),
+                u8::from(pane.sidebar).to_string(),
+                u8::from(pane.floating).to_string(),
+            ]
+            .join(FIELD_SEPARATOR)
+        };
+        let snapshot = format!(
+            "{}{}{}{}",
+            row(&source),
+            ROW_SEPARATOR,
+            row(&target),
+            ROW_SEPARATOR
+        );
+
+        let PaneSwitchAction::Apply(command) =
+            prepare(PaneSwitchDirection::Right, "%1", 1, &snapshot).unwrap()
+        else {
+            panic!("expected a pane switch command");
+        };
+
+        assert!(command.contains("#{==:#{pane_pid},1}"));
+        assert!(command.contains("#{==:#{pane_active},1}"));
+        assert!(command.contains("#{==:#{pane_pid},2}"));
+        assert!(command.contains("#{!=:#{@vde_sidebar},1}"));
+        assert!(command.contains("#{!=:#{pane_floating_flag},1}"));
+        assert!(command.contains(SELECTION_CHANGED_SENTINEL));
+        assert!(command.contains("select-pane"), "{command}");
+        assert!(command.contains("%2"), "{command}");
+    }
+
+    #[test]
+    fn rejects_snapshot_and_pane_counts_above_protocol_limits() {
+        let oversized = format!("{}{}", "x".repeat(MAX_SNAPSHOT_BYTES), ROW_SEPARATOR);
+        assert!(
+            parse_pane_snapshot(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("128 KiB")
+        );
+        let row = [
+            "%1", "10", "1", "2", "3", "0", "0", "80", "24", "zsh", "", "0",
+        ]
+        .join(FIELD_SEPARATOR);
+        let too_many = format!(
+            "{}{}",
+            format!("{row}{ROW_SEPARATOR}").repeat(MAX_PANES + 1),
+            ""
+        );
+        // The escaped wire row is large enough that 513 valid rows hit the byte limit first.
+        // This still proves that an over-count snapshot is rejected without weakening the
+        // independent MAX_PANES guard used for more compact future encodings.
+        assert!(
+            parse_pane_snapshot(&too_many)
+                .unwrap_err()
+                .to_string()
+                .contains("128 KiB")
+        );
+        assert_eq!(MAX_PANES, 512);
     }
 }

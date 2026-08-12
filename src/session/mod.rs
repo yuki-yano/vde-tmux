@@ -10,6 +10,8 @@ use crate::options::{
 use crate::tmux::TmuxRunner;
 
 const FIELD_SEP: char = '\u{1f}';
+const CLIENT_FIELD: &str = "__vde_session_client_field__";
+const CLIENT_ROW: &str = "__vde_session_client_row__";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SessionInfo {
@@ -41,9 +43,9 @@ struct ClientSessionRow {
 pub fn session_list_format() -> String {
     [
         "#{session_name}",
-        "#{session_attached}",
-        "#{session_created}",
         "",
+        "#{session_created}",
+        &format!("#{{L:#{{client_session}}{CLIENT_FIELD}#{{client_control_mode}}{CLIENT_ROW}}}"),
         "#{@vde_project_path}",
         "",
         "#{session_id}",
@@ -61,12 +63,43 @@ pub fn parse_sessions(output: &str) -> Vec<SessionInfo> {
             }
             Some(SessionInfo {
                 name: fields[0].to_string(),
-                attached: fields[1] == "1",
+                attached: regular_client_session_names(fields[3]).contains(fields[0]),
                 created_at: fields[2].parse().unwrap_or_default(),
                 project_path: fields[4].to_string(),
                 id: fields[6].to_string(),
             })
         })
+        .collect()
+}
+
+pub(crate) fn regular_client_session_ids<'a>(
+    witnesses: impl IntoIterator<Item = &'a crate::pane_state::ClientWitness>,
+) -> std::collections::BTreeSet<String> {
+    regular_client_sessions(
+        witnesses
+            .into_iter()
+            .map(|witness| (witness.session_id.clone(), witness.control_mode)),
+    )
+}
+
+fn regular_client_session_names(snapshot: &str) -> std::collections::BTreeSet<String> {
+    regular_client_sessions(snapshot.split(CLIENT_ROW).filter_map(|row| {
+        let (session_name, control_mode) = row.split_once(CLIENT_FIELD)?;
+        let control_mode = match control_mode {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        (!session_name.is_empty()).then_some((session_name.to_string(), control_mode))
+    }))
+}
+
+fn regular_client_sessions(
+    clients: impl IntoIterator<Item = (String, bool)>,
+) -> std::collections::BTreeSet<String> {
+    clients
+        .into_iter()
+        .filter_map(|(session, control_mode)| (!control_mode).then_some(session))
         .collect()
 }
 
@@ -77,14 +110,21 @@ pub fn list_sessions(runner: &dyn TmuxRunner) -> Result<Vec<SessionInfo>> {
 }
 
 pub fn current_client_name(runner: &dyn TmuxRunner) -> Result<String> {
-    if let Ok(client) = runner.run(&["display-message", "-p", "#{client_name}\t#{client_tty}"]) {
+    const FORMAT: &str = "#{client_name}\t#{client_tty}";
+    if let Ok(client) = runner.run(&["display-message", "-p", FORMAT]) {
         let client = parse_client_target_line(client.trim());
         if !client.is_empty() {
             return Ok(client.to_string());
         }
     }
     Ok(runner
-        .run(&["list-clients", "-F", "#{client_name}\t#{client_tty}"])?
+        .run(&[
+            "list-clients",
+            "-f",
+            "#{==:#{client_control_mode},0}",
+            "-F",
+            FORMAT,
+        ])?
         .lines()
         .map(parse_client_target_line)
         .find(|client| !client.is_empty())
@@ -140,7 +180,12 @@ pub fn client_pid_name_format() -> String {
     .join(&FIELD_SEP.to_string())
 }
 
-pub fn regular_client_name_for_pid(runner: &dyn TmuxRunner, requested_pid: u32) -> Result<String> {
+enum ClientForPid {
+    Regular(String),
+    Control,
+}
+
+fn client_for_pid(runner: &dyn TmuxRunner, requested_pid: u32) -> Result<ClientForPid> {
     if requested_pid == 0 {
         bail!("explicit tmux client PID must be positive");
     }
@@ -150,24 +195,38 @@ pub fn regular_client_name_for_pid(runner: &dyn TmuxRunner, requested_pid: u32) 
         .lines()
         .filter_map(|line| {
             let fields = line.split(FIELD_SEP).collect::<Vec<_>>();
-            if fields.len() != 4
-                || fields[0].parse::<u32>().ok() != Some(requested_pid)
-                || fields[3] != "0"
-            {
-                return None;
-            }
-            let client_name = if fields[1].trim().is_empty() {
-                fields[2].trim()
-            } else {
-                fields[1].trim()
-            };
-            (!client_name.is_empty()).then(|| client_name.to_string())
+            (fields.len() == 4 && fields[0].parse::<u32>().ok() == Some(requested_pid))
+                .then_some(fields)
         })
         .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [client_name] => Ok(client_name.clone()),
-        [] => bail!("regular tmux client PID {requested_pid} is not attached"),
-        _ => bail!("tmux returned multiple regular clients for PID {requested_pid}"),
+    let [fields] = matches.as_slice() else {
+        return match matches.len() {
+            0 => Err(anyhow!("tmux client PID {requested_pid} is not attached")),
+            _ => Err(anyhow!(
+                "tmux returned multiple clients for PID {requested_pid}"
+            )),
+        };
+    };
+    if fields[3] != "0" {
+        return Ok(ClientForPid::Control);
+    }
+    let client_name = if fields[1].trim().is_empty() {
+        fields[2].trim()
+    } else {
+        fields[1].trim()
+    };
+    if client_name.is_empty() {
+        bail!("regular tmux client PID {requested_pid} has no name");
+    }
+    Ok(ClientForPid::Regular(client_name.to_string()))
+}
+
+pub fn regular_client_name_for_pid(runner: &dyn TmuxRunner, requested_pid: u32) -> Result<String> {
+    match client_for_pid(runner, requested_pid)? {
+        ClientForPid::Regular(client_name) => Ok(client_name),
+        ClientForPid::Control => {
+            bail!("tmux client PID {requested_pid} is a control-mode client")
+        }
     }
 }
 
@@ -675,10 +734,12 @@ pub fn on_client_session_changed(
     session_name: Option<&str>,
 ) -> Result<()> {
     let (client_name, session_name) = match (client_pid, session_name) {
-        (Some(client_pid), Some(session_name)) => (
-            regular_client_name_for_pid(runner, client_pid)?,
-            session_name.to_string(),
-        ),
+        (Some(client_pid), Some(session_name)) => match client_for_pid(runner, client_pid)? {
+            ClientForPid::Regular(client_name) => (client_name, session_name.to_string()),
+            // The daemon's persistent control client also triggers tmux's global hook. It does
+            // not participate in remembered-session state, so the hook is an intentional no-op.
+            ClientForPid::Control => return Ok(()),
+        },
         _ => (current_client_name(runner)?, current_session_name(runner)?),
     };
     let sessions = list_sessions(runner)?;
@@ -741,7 +802,16 @@ mod tests {
         let sep = '\u{1f}'.to_string();
         let raw = format!(
             "{}\n{}\n",
-            ["main", "1", "100", "", "/repo", "", "$1"].join(&sep),
+            [
+                "main",
+                "1",
+                "100",
+                "main__vde_session_client_field__0__vde_session_client_row__",
+                "/repo",
+                "",
+                "$1",
+            ]
+            .join(&sep),
             ["sub", "0", "90", "", "", "", "$2"].join(&sep)
         );
         let sessions = parse_sessions(&raw);
@@ -749,6 +819,37 @@ mod tests {
         assert_eq!(sessions[0].name, "main");
         assert!(sessions[0].attached);
         assert_eq!(sessions[0].project_path, "/repo");
+    }
+
+    #[test]
+    fn attached_sessions_include_active_pane_clients_but_exclude_control_clients() {
+        let regular = crate::pane_state::ClientWitness {
+            client_pid: 10,
+            session_id: "$1".to_string(),
+            window_id: "@1".to_string(),
+            active_pane: crate::pane_state::PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 11,
+            },
+            control_mode: false,
+            active_pane_flag: true,
+        };
+        let control = crate::pane_state::ClientWitness {
+            client_pid: 20,
+            session_id: "$2".to_string(),
+            window_id: "@2".to_string(),
+            active_pane: crate::pane_state::PaneInstance {
+                pane_id: "%2".to_string(),
+                pane_pid: 21,
+            },
+            control_mode: true,
+            active_pane_flag: false,
+        };
+
+        assert_eq!(
+            regular_client_session_ids([&regular, &control]),
+            std::collections::BTreeSet::from(["$1".to_string()])
+        );
     }
 
     #[test]
@@ -891,7 +992,13 @@ mod tests {
             "\t\n",
         );
         mock.stub(
-            &["list-clients", "-F", "#{client_name}\t#{client_tty}"],
+            &[
+                "list-clients",
+                "-f",
+                "#{==:#{client_control_mode},0}",
+                "-F",
+                "#{client_name}\t#{client_tty}",
+            ],
             "\t/dev/ttys001\n",
         );
 
@@ -902,7 +1009,13 @@ mod tests {
     fn current_client_name_falls_back_to_list_clients_when_display_message_fails() {
         let mock = MockTmuxRunner::new();
         mock.stub(
-            &["list-clients", "-F", "#{client_name}\t#{client_tty}"],
+            &[
+                "list-clients",
+                "-f",
+                "#{==:#{client_control_mode},0}",
+                "-F",
+                "#{client_name}\t#{client_tty}",
+            ],
             "abc\t/dev/ttys001\n",
         );
 
@@ -1334,6 +1447,21 @@ mod tests {
             "123\u{1f}control\u{1f}\u{1f}1\n",
         );
         assert!(regular_client_name_for_pid(&control, 123).is_err());
+
+        let control_hook = MockTmuxRunner::new();
+        control_hook.stub(
+            &["list-clients", "-F", &format],
+            "123\u{1f}control\u{1f}\u{1f}1\n",
+        );
+        on_client_session_changed(
+            &control_hook,
+            &crate::config::Config::default(),
+            &BTreeMap::new(),
+            Some(123),
+            Some("main"),
+        )
+        .unwrap();
+        assert_eq!(control_hook.calls().len(), 1);
 
         let duplicate = MockTmuxRunner::new();
         duplicate.stub(

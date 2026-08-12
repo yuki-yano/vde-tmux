@@ -15,7 +15,7 @@ use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 mod category;
 mod daemon;
 mod hook;
-mod pane_switch;
+pub mod pane_switch;
 mod sidebar;
 
 /// vde-tmux CLI。
@@ -107,8 +107,10 @@ enum Command {
         pane_id: String,
         #[arg(long = "pane-pid")]
         pane_pid: u32,
-        #[arg(long = "pane-snapshot", hide = true)]
-        pane_snapshot: String,
+        #[arg(long = "daemon-socket", hide = true)]
+        daemon_socket: String,
+        #[arg(long = "server-identity", hide = true)]
+        server_identity: String,
     },
     Category {
         #[command(subcommand)]
@@ -949,9 +951,16 @@ where
             direction,
             pane_id,
             pane_pid,
-            pane_snapshot,
+            daemon_socket,
+            server_identity,
         } => {
-            pane_switch::switch(runner, direction, &pane_id, pane_pid, &pane_snapshot)?;
+            pane_switch::request(
+                std::path::Path::new(&daemon_socket),
+                &server_identity,
+                direction,
+                pane_id,
+                pane_pid,
+            )?;
             Ok(None)
         }
         Command::Session { command } => {

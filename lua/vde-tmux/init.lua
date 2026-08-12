@@ -36,11 +36,12 @@ local selection_options = {
 	target_pid = "@vde_nvim_target_pane_pid",
 }
 
-local executable_option = "@vde_executable"
+local daemon_server_option = "@vde_daemon_server_identity"
+local pane_switch_channel_option = "@vde_pane_switch_channel"
+local pane_switch_request_option = "@vde_pane_switch_request"
+local pane_switch_request_separator = "__vde_pane_switch_request__"
 local active_pane_pid_option = "@vde_nvim_active_pane_pid"
 local context_separator = "\31"
-local pane_snapshot_field_separator = "__vde_pane_switch_field__"
-local pane_snapshot_row_separator = "__vde_pane_switch_row__"
 
 local state = {
 	config = vim.deepcopy(defaults),
@@ -117,20 +118,6 @@ local function current_pane_context()
 	if type(pane_id) ~= "string" or not pane_id:match("^%%%d+$") then
 		return nil, nil, nil, nil, "TMUX_PANE does not contain a valid pane ID"
 	end
-	local pane_row = table.concat({
-		"#{pane_id}",
-		"#{pane_pid}",
-		"#{pane_active}",
-		"#{cursor_x}",
-		"#{cursor_y}",
-		"#{pane_left}",
-		"#{pane_top}",
-		"#{pane_width}",
-		"#{pane_height}",
-		"#{pane_current_command}",
-		"#{@vde_sidebar}",
-		"#{pane_floating_flag}",
-	}, pane_snapshot_field_separator) .. pane_snapshot_row_separator
 	local context = vim.trim(vim.fn.system({
 		"tmux",
 		"display-message",
@@ -140,13 +127,11 @@ local function current_pane_context()
 		"#{pane_pid}"
 			.. context_separator
 			.. "#{"
-			.. executable_option
+			.. daemon_server_option
 			.. "}"
 			.. context_separator
-			.. "#{P:"
-			.. pane_row
-			.. ","
-			.. pane_row
+			.. "#{"
+			.. pane_switch_channel_option
 			.. "}",
 	}))
 	if vim.v.shell_error ~= 0 then
@@ -154,21 +139,18 @@ local function current_pane_context()
 	end
 	local fields = vim.split(context, context_separator, { plain = true })
 	local pane_pid = fields[1] or ""
-	local executable = fields[2] or ""
-	local pane_snapshot = fields[3] or ""
+	local server_identity = fields[2] or ""
+	local pane_switch_channel = fields[3] or ""
 	if not pane_pid:match("^[1-9]%d*$") then
 		return nil, nil, nil, nil, "failed to resolve the current tmux pane PID"
 	end
-	if not executable:match("^/") then
-		return nil, nil, nil, nil, "tmux does not contain an absolute @vde_executable"
+	if not server_identity:match("^[0-9a-f]+$") or #server_identity ~= 64 then
+		return nil, nil, nil, nil, "tmux does not contain a valid @vde_daemon_server_identity"
 	end
-	if vim.fn.executable(executable) ~= 1 then
-		return nil, nil, nil, nil, "@vde_executable is not executable: " .. executable
+	if pane_switch_channel ~= "vde-pane-switch" then
+		return nil, nil, nil, nil, "tmux does not contain a valid @vde_pane_switch_channel"
 	end
-	if pane_snapshot == "" or not vim.endswith(pane_snapshot, pane_snapshot_row_separator) then
-		return nil, nil, nil, nil, "tmux returned an invalid pane snapshot"
-	end
-	return pane_id, pane_pid, executable, pane_snapshot, nil
+	return pane_id, pane_pid, server_identity, pane_switch_channel, nil
 end
 
 local function navigate_to_tmux(direction)
@@ -177,22 +159,23 @@ local function navigate_to_tmux(direction)
 		notify_error("invalid navigation direction: " .. tostring(direction))
 		return
 	end
-	local pane_id, pane_pid, executable, pane_snapshot, context_error = current_pane_context()
+	local pane_id, pane_pid, server_identity, pane_switch_channel, context_error = current_pane_context()
 	if context_error ~= nil then
 		notify_error(context_error)
 		return
 	end
 	debug_log("pane-switch %s from %s/%s", direction_name, pane_id, pane_pid)
+	local request = table.concat({ server_identity, direction_name, pane_id, pane_pid }, pane_switch_request_separator)
 	local result = vim.fn.system({
-		executable,
-		"pane-switch",
-		direction_name,
-		"--pane-id",
-		pane_id,
-		"--pane-pid",
-		pane_pid,
-		"--pane-snapshot",
-		pane_snapshot,
+		"tmux",
+		"set-option",
+		"-g",
+		pane_switch_request_option,
+		request,
+		";",
+		"wait-for",
+		"-S",
+		pane_switch_channel,
 	})
 	if vim.v.shell_error ~= 0 then
 		notify_error("pane navigation failed: " .. vim.trim(result))

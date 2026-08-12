@@ -12,22 +12,28 @@ end)
 assert(#windows == 2, "expected two Neovim windows")
 local left_window, right_window = windows[1], windows[2]
 
-local notifications = {}
-vim.notify = function(message)
-	notifications[#notifications + 1] = message
-end
 vim.api.nvim_set_current_win(right_window)
 vde_tmux.navigate("l")
-assert(
-	vim.iter(notifications):any(function(message)
-		return message:find("pane navigation failed", 1, true) ~= nil
-	end),
-	"navigation did not invoke the canonical @vde_executable: " .. table.concat(notifications, " | ")
-)
 
 local pane_id = assert(vim.env.TMUX_PANE, "TMUX_PANE is required")
 local pane_pid = vim.trim(vim.fn.system({ "tmux", "display-message", "-p", "-t", pane_id, "#{pane_pid}" }))
 assert(vim.v.shell_error == 0 and pane_pid:match("^[1-9]%d*$"), "failed to resolve pane PID")
+local request = vim.trim(vim.fn.system({
+	"tmux",
+	"show-option",
+	"-gqv",
+	"@vde_pane_switch_request",
+}))
+assert(vim.v.shell_error == 0, request)
+assert(
+	request
+		== string.rep("a", 64)
+			.. "__vde_pane_switch_request__right__vde_pane_switch_request__"
+			.. pane_id
+			.. "__vde_pane_switch_request__"
+			.. pane_pid,
+	"navigation did not publish the daemon pane-switch request: " .. request
+)
 local active_pane_pid = vim.trim(vim.fn.system({
 	"tmux",
 	"display-message",

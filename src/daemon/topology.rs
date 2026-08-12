@@ -113,7 +113,7 @@ impl QueryFraming {
             "",
             "#{@vde_project_path}",
             "",
-            "#{session_attached}",
+            "0",
             "#{session_created}",
         ];
         format!(

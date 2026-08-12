@@ -93,7 +93,9 @@ tmux source-file ~/.tmux.conf
 }
 ```
 
-デフォルトの `<C-h/j/k/l>` は Neovim 内では window 間を移動し、端では `vt pane-switch` を使って tmux pane へ移動します。移動先が Neovim の場合は、移動元のカーソル座標に合う window を選択します。選択情報は移動先 pane の option に PID とともに保存されるため、別 client や再利用された pane が誤って消費しません。
+デフォルトの `<C-h/j/k/l>` は Neovim 内では window 間を移動し、端ではtmux内の軽量なsignalをdaemonへ送り、tmux paneへ移動します。tmux root bindingはキーごとの`vt`/`tmux` processを起動せず、Neovimの端からは1つのtmux clientだけでsignalを送ります。移動先が Neovim の場合は、移動元のカーソル座標に合う window を選択します。選択情報は移動先 pane の option に PID とともに保存されるため、別 client や再利用された pane が誤って消費しません。
+
+pane移動はdaemonが所有する1つの常駐tmux control-mode clientを通して実行します。このclientは`ignore-size`、`no-output`、`no-detach-on-destroy`付きで既存sessionへattachし、vde-tmuxがregular clientのattach有無を判定するときは除外されます。nativeな`tmux list-clients`には表示されます。またregular clientが1つもいない間、control clientのattach先となる1 sessionでは、tmux nativeのalertと`destroy-unattached`判定がtmuxのattached-client意味論に従います。
 
 `require('vde-tmux').navigate('h')` のように API だけを既存の mapping から呼ぶこともできます。`setup()` には `keybindings = false`、`modes`、`debug`、`disable_when_floating`、`navigate_from_floating` を指定できます。
 

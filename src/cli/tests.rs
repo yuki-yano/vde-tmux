@@ -200,7 +200,10 @@ fn spawn_active_config_guard_fixture_with_yaml(yaml: &str) -> V2QueryFixture {
     assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
     let config_hash = crate::daemon::lifecycle::config_hash(&loaded.config);
     let response = crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult {
-        info: crate::daemon::protocol::v2::RuntimeInfo { config_hash },
+        info: crate::daemon::protocol::v2::RuntimeInfo {
+            config_hash,
+            control_health: crate::daemon::protocol::v2::ControlHealth::Ready,
+        },
     };
     let mut fixture = spawn_v2_query_fixture(
         crate::daemon::protocol::v2::ClientMessage::QueryRuntimeInfo {
@@ -301,6 +304,7 @@ fn spawn_v2_handshake_fixture() -> V2QueryFixture {
             &crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult {
                 info: crate::daemon::protocol::v2::RuntimeInfo {
                     config_hash: "test-config".to_string(),
+                    control_health: crate::daemon::protocol::v2::ControlHealth::Ready,
                 },
             },
         )

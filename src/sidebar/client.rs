@@ -783,6 +783,7 @@ mod tests {
             &V2ServerMessage::RuntimeInfoResult {
                 info: crate::daemon::protocol::v2::RuntimeInfo {
                     config_hash: config_hash.to_string(),
+                    control_health: crate::daemon::protocol::v2::ControlHealth::Ready,
                 },
             },
         );
@@ -1350,6 +1351,7 @@ mod tests {
                 &V2ServerMessage::RuntimeInfoResult {
                     info: crate::daemon::protocol::v2::RuntimeInfo {
                         config_hash: "active".to_string(),
+                        control_health: crate::daemon::protocol::v2::ControlHealth::Ready,
                     },
                 },
             );

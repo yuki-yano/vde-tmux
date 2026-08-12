@@ -17,7 +17,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,10 +549,19 @@ pub enum HookHealth {
     Degraded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ControlHealth {
+    Starting,
+    Ready,
+    Degraded,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeInfo {
     pub config_hash: String,
+    pub control_health: ControlHealth,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -738,6 +747,11 @@ pub enum ClientMessage {
     QueryRuntimeInfo {
         proto: u16,
     },
+    PaneSwitch {
+        proto: u16,
+        direction: crate::cli::pane_switch::PaneSwitchDirection,
+        source_pane: PaneInstance,
+    },
     Subscribe {
         proto: u16,
     },
@@ -775,6 +789,7 @@ impl ClientMessage {
             | Self::QueryStatusSnapshot { proto, .. }
             | Self::QueryPane { proto, .. }
             | Self::QueryRuntimeInfo { proto }
+            | Self::PaneSwitch { proto, .. }
             | Self::Subscribe { proto }
             | Self::SubmitPaneEvent { proto, .. }
             | Self::SubmitViewEvent { proto, .. }
@@ -823,6 +838,7 @@ impl ClientMessage {
                 | Self::QueryStatusSnapshot { .. }
                 | Self::QueryPane { .. }
                 | Self::QueryRuntimeInfo { .. }
+                | Self::PaneSwitch { .. }
                 | Self::Subscribe { .. }
         )
     }
@@ -854,6 +870,7 @@ pub enum ErrorCode {
     HookCollision,
     WriterLeaseHeld,
     QueueFull,
+    ControlUnavailable,
     FrameTooLarge,
     InternalError,
 }
@@ -883,6 +900,9 @@ pub enum ServerMessage {
     },
     RuntimeInfoResult {
         info: RuntimeInfo,
+    },
+    PaneSwitchResult {
+        outcome: crate::cli::pane_switch::PaneSwitchOutcome,
     },
     PaneEventResult {
         event_id: EventId,
@@ -1078,6 +1098,11 @@ mod tests {
             },
             ClientMessage::QueryRuntimeInfo {
                 proto: PROTOCOL_VERSION,
+            },
+            ClientMessage::PaneSwitch {
+                proto: PROTOCOL_VERSION,
+                direction: crate::cli::pane_switch::PaneSwitchDirection::Left,
+                source_pane: pane(),
             },
             ClientMessage::Subscribe {
                 proto: PROTOCOL_VERSION,
@@ -1383,7 +1408,11 @@ mod tests {
             ServerMessage::RuntimeInfoResult {
                 info: RuntimeInfo {
                     config_hash: "hash".to_string(),
+                    control_health: ControlHealth::Ready,
                 },
+            },
+            ServerMessage::PaneSwitchResult {
+                outcome: crate::cli::pane_switch::PaneSwitchOutcome::Applied,
             },
             ServerMessage::PaneEventResult {
                 event_id: event_id(),
@@ -1439,6 +1468,7 @@ mod tests {
             ErrorCode::HookCollision,
             ErrorCode::WriterLeaseHeld,
             ErrorCode::QueueFull,
+            ErrorCode::ControlUnavailable,
             ErrorCode::FrameTooLarge,
             ErrorCode::InternalError,
         ];

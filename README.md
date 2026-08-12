@@ -93,7 +93,9 @@ This repository also provides a Neovim plugin. Load it with lazy.nvim:
 }
 ```
 
-The default `<C-h/j/k/l>` mappings move between Neovim windows and use `vt pane-switch` at an edge to enter another tmux pane. When the destination runs Neovim, the plugin selects the window aligned with the source cursor. Selection metadata is stored on the destination pane together with its PID, preventing another client or a reused pane from consuming it.
+The default `<C-h/j/k/l>` mappings move between Neovim windows and signal the daemon through a lightweight tmux channel at an edge to enter another tmux pane. The tmux root binding spawns no per-key `vt` or `tmux` process; a Neovim edge uses one tmux client only to send the signal. When the destination runs Neovim, the plugin selects the window aligned with the source cursor. Selection metadata is stored on the destination pane together with its PID, preventing another client or a reused pane from consuming it.
+
+Pane switching is executed through one persistent tmux control-mode client owned by the daemon. The client is attached to an existing session with `ignore-size`, `no-output`, and `no-detach-on-destroy`; vde-tmux excludes it when deciding whether a session has a regular attached client. It is still visible to native `tmux list-clients`, and while no regular client is attached, tmux's native alert and `destroy-unattached` bookkeeping for the one session hosting the control client follows tmux's attached-client semantics.
 
 Existing mappings can call the API directly, such as `require('vde-tmux').navigate('h')`. `setup()` accepts `keybindings = false`, `modes`, `debug`, `disable_when_floating`, and `navigate_from_floating`.
 
