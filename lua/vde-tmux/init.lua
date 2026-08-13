@@ -40,7 +40,8 @@ local daemon_server_option = "@vde_daemon_server_identity"
 local pane_switch_channel_option = "@vde_pane_switch_channel"
 local pane_switch_request_option = "@vde_pane_switch_request"
 local pane_switch_request_separator = "__vde_pane_switch_request__"
-local active_pane_pid_option = "@vde_nvim_active_pane_pid"
+local nvim_process_pid_option = "@vde_nvim_process_pid"
+local nvim_process_pid = tostring(vim.fn.getpid())
 local context_separator = "\31"
 
 local state = {
@@ -94,11 +95,10 @@ local function mark_navigation_active()
 		"tmux",
 		"set-option",
 		"-p",
-		"-F",
 		"-t",
 		pane_id,
-		active_pane_pid_option,
-		"#{pane_pid}",
+		nvim_process_pid_option,
+		nvim_process_pid,
 	})
 	if vim.v.shell_error ~= 0 then
 		notify_error("failed to mark the current tmux pane for Neovim navigation: " .. vim.trim(output))
@@ -110,7 +110,15 @@ local function clear_navigation_active()
 	if type(pane_id) ~= "string" or not pane_id:match("^%%%d+$") then
 		return
 	end
-	vim.fn.system({ "tmux", "set-option", "-pu", "-t", pane_id, active_pane_pid_option })
+	vim.fn.system({
+		"tmux",
+		"if-shell",
+		"-F",
+		"-t",
+		pane_id,
+		"#{==:#{" .. nvim_process_pid_option .. "}," .. nvim_process_pid .. "}",
+		"set-option -pu -t " .. pane_id .. " " .. nvim_process_pid_option,
+	})
 end
 
 local function current_pane_context()

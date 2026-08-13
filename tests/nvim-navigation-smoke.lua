@@ -34,16 +34,19 @@ assert(
 			.. pane_pid,
 	"navigation did not publish the daemon pane-switch request: " .. request
 )
-local active_pane_pid = vim.trim(vim.fn.system({
+local active_process_pid = vim.trim(vim.fn.system({
 	"tmux",
 	"display-message",
 	"-p",
 	"-t",
 	pane_id,
-	"#{@vde_nvim_active_pane_pid}",
+	"#{@vde_nvim_process_pid}",
 }))
-assert(vim.v.shell_error == 0, active_pane_pid)
-assert(active_pane_pid == pane_pid, "Neovim navigation did not publish its pane PID marker")
+assert(vim.v.shell_error == 0, active_process_pid)
+assert(
+	active_process_pid == tostring(vim.fn.getpid()),
+	"Neovim navigation did not publish its process PID marker"
+)
 
 for option, value in pairs({
 	["@vde_nvim_cursor_y"] = "50",

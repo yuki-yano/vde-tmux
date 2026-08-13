@@ -36,6 +36,7 @@ pub struct ProcessDetection {
 pub struct AgentProcessSnapshot {
     commands: BTreeMap<u32, String>,
     children: BTreeMap<u32, Vec<u32>>,
+    process_groups: BTreeMap<u32, (i32, i32)>,
     complete: bool,
 }
 
@@ -65,12 +66,30 @@ impl AgentProcessSnapshot {
                 snapshot.complete = false;
                 continue;
             };
+            let Some(process_group) = fields.next().and_then(|value| value.parse::<i32>().ok())
+            else {
+                snapshot.complete = false;
+                continue;
+            };
+            let Some(terminal_process_group) =
+                fields.next().and_then(|value| value.parse::<i32>().ok())
+            else {
+                snapshot.complete = false;
+                continue;
+            };
             let command = fields.collect::<Vec<_>>().join(" ");
             if command.is_empty() {
                 snapshot.complete = false;
                 continue;
             }
             if snapshot.commands.insert(pid, command).is_some() {
+                snapshot.complete = false;
+            }
+            if snapshot
+                .process_groups
+                .insert(pid, (process_group, terminal_process_group))
+                .is_some()
+            {
                 snapshot.complete = false;
             }
             snapshot.children.entry(ppid).or_default().push(pid);
@@ -106,6 +125,60 @@ impl AgentProcessSnapshot {
             complete: true,
         }
     }
+
+    pub fn contains_nvim_process(&self, root_pid: u32, process_pid: u32) -> Option<bool> {
+        let (_, root_terminal_process_group) = self.process_groups.get(&root_pid).copied()?;
+        if !self.complete || root_terminal_process_group <= 0 {
+            return None;
+        }
+        let mut stack = vec![root_pid];
+        let mut visited = BTreeSet::new();
+        while let Some(pid) = stack.pop() {
+            if !visited.insert(pid) {
+                continue;
+            }
+            if pid == process_pid {
+                let is_foreground = self.process_groups.get(&pid).is_some_and(
+                    |(process_group, terminal_process_group)| {
+                        *process_group == root_terminal_process_group
+                            && *terminal_process_group == root_terminal_process_group
+                    },
+                );
+                return Some(
+                    is_foreground
+                        && self
+                            .commands
+                            .get(&pid)
+                            .is_some_and(|command| is_nvim_process(command)),
+                );
+            }
+            if let Some(children) = self.children.get(&pid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        Some(false)
+    }
+}
+
+fn is_nvim_process(command: &str) -> bool {
+    let Some(executable) = command.split_whitespace().next() else {
+        return false;
+    };
+    matches!(
+        executable.rsplit('/').next().unwrap_or(executable),
+        "gview"
+            | "gvim"
+            | "view"
+            | "vim"
+            | "vimdiff"
+            | "vi"
+            | "nvi"
+            | "nvim"
+            | "nvimdiff"
+            | "vimx"
+            | "nvimx"
+            | "nvimxdiff"
+    )
 }
 
 fn detect_process_agent(command: &str) -> Option<AgentKind> {
@@ -136,7 +209,11 @@ fn detect_process_agent(command: &str) -> Option<AgentKind> {
 }
 
 pub fn read_agent_process_snapshot(timeout: Duration) -> AgentProcessSnapshot {
-    match run_command("ps", &["-ax", "-o", "pid=,ppid=,command="], Some(timeout)) {
+    match run_command(
+        "ps",
+        &["-ax", "-o", "pid=,ppid=,pgid=,tpgid=,command="],
+        Some(timeout),
+    ) {
         Ok(output) => AgentProcessSnapshot::parse(&output, true),
         Err(_) => AgentProcessSnapshot::parse("", false),
     }
@@ -1270,6 +1347,23 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn nvim_marker_requires_the_exact_process_inside_the_pane_tree() {
+        let snapshot = AgentProcessSnapshot::parse(
+            "100 1 100 200 -zsh\n200 100 200 200 node editprompt\n300 200 200 200 /opt/bin/nvim prompt.md\n400 100 400 400 node codex\n500 400 500 0 nvim +Man!\n",
+            true,
+        );
+        assert_eq!(snapshot.contains_nvim_process(100, 300), Some(true));
+        assert_eq!(snapshot.contains_nvim_process(100, 400), Some(false));
+        assert_eq!(snapshot.contains_nvim_process(100, 500), Some(false));
+        assert_eq!(snapshot.contains_nvim_process(100, 999), Some(false));
+        assert_eq!(snapshot.contains_nvim_process(999, 300), None);
+        assert_eq!(
+            AgentProcessSnapshot::parse("", false).contains_nvim_process(100, 300),
+            None
+        );
+    }
+
+    #[test]
     fn git_worker_runner_receives_configured_timeout() {
         let runner = system_git_runner(Duration::from_millis(1234));
         assert_eq!(runner.timeout(), Duration::from_millis(1234));
@@ -2163,7 +2257,7 @@ mod tests {
     #[test]
     fn process_snapshot_collects_all_agent_kinds_and_marks_malformed_input_incomplete() {
         let snapshot = AgentProcessSnapshot::parse(
-            "   10     1 zsh\n   11    10 codex\n   12    10 /usr/bin/claude --resume\n   13    12 opencode\n   14    10 rg codex\n",
+            "   10     1 10 10 zsh\n   11    10 11 11 codex\n   12    10 12 12 /usr/bin/claude --resume\n   13    12 13 13 opencode\n   14    10 14 14 rg codex\n",
             true,
         );
         let detection = snapshot.detect_from_pid_tree(10);
@@ -2177,7 +2271,7 @@ mod tests {
             vec!["claude", "codex", "opencode"]
         );
 
-        let malformed = AgentProcessSnapshot::parse("10 1 zsh\nbroken\n", true);
+        let malformed = AgentProcessSnapshot::parse("10 1 10 10 zsh\nbroken\n", true);
         assert!(!malformed.detect_from_pid_tree(10).complete);
         assert!(
             !AgentProcessSnapshot::parse("", false)
@@ -2273,7 +2367,7 @@ mod tests {
             requested_panes: Mutex::new(Vec::new()),
             tails: vec!["after\n".to_string()],
         };
-        let processes = AgentProcessSnapshot::parse("11 1 opencode\n", true);
+        let processes = AgentProcessSnapshot::parse("11 1 11 11 opencode\n", true);
         let result = run_observation_poll(
             &source,
             &dispatch,
@@ -2346,7 +2440,10 @@ mod tests {
             requested_panes: Mutex::new(Vec::new()),
             tails: vec!["fallback tail\n".to_string()],
         };
-        let processes = AgentProcessSnapshot::parse("11 1 zsh\n22 1 codex\n33 1 opencode\n", true);
+        let processes = AgentProcessSnapshot::parse(
+            "11 1 11 11 zsh\n22 1 22 22 codex\n33 1 33 33 opencode\n",
+            true,
+        );
 
         let result = run_observation_poll(
             &source,
@@ -2405,7 +2502,7 @@ mod tests {
             requested_panes: Mutex::new(Vec::new()),
             tails: Vec::new(),
         };
-        let processes = AgentProcessSnapshot::parse("11 1 zsh\n22 1 codex\n", true);
+        let processes = AgentProcessSnapshot::parse("11 1 11 11 zsh\n22 1 22 22 codex\n", true);
 
         let result = run_observation_poll(
             &source,
@@ -2449,7 +2546,8 @@ mod tests {
             requested_panes: Mutex::new(Vec::new()),
             tails: vec!["only one tail\n".to_string()],
         };
-        let processes = AgentProcessSnapshot::parse("11 1 codex\n22 1 opencode\n", true);
+        let processes =
+            AgentProcessSnapshot::parse("11 1 11 11 codex\n22 1 22 22 opencode\n", true);
 
         let result = run_observation_poll(
             &source,

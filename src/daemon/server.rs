@@ -593,6 +593,75 @@ struct SidebarTmuxJob {
     snapshot_revision: u64,
 }
 
+const NVIM_PROCESS_PID_OPTION: &str = "@vde_nvim_process_pid";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NvimPaneMarker {
+    pane_id: String,
+    pane_pid: u32,
+    process_pid: u32,
+}
+
+fn parse_nvim_pane_markers(output: &str) -> Vec<NvimPaneMarker> {
+    let mut markers = BTreeMap::new();
+    for line in output.lines() {
+        let mut fields = line.split('\u{1f}');
+        let (Some(pane_id), Some(pane_pid), Some(process_pid), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(pane_pid) = pane_pid.parse::<u32>().ok().filter(|pid| *pid > 0) else {
+            continue;
+        };
+        let Some(process_pid) = process_pid.parse::<u32>().ok().filter(|pid| *pid > 0) else {
+            continue;
+        };
+        if crate::daemon::topology::validate_pane_id(pane_id).is_err() {
+            continue;
+        }
+        let marker = NvimPaneMarker {
+            pane_id: pane_id.to_string(),
+            pane_pid,
+            process_pid,
+        };
+        markers.entry(marker.pane_id.clone()).or_insert(marker);
+    }
+    markers.into_values().collect()
+}
+
+fn stale_nvim_marker_cleanup_command(
+    expected_server_pid: u32,
+    markers: &[NvimPaneMarker],
+) -> Option<String> {
+    let mut arguments = Vec::new();
+    for marker in markers {
+        if !arguments.is_empty() {
+            arguments.push(";".to_string());
+        }
+        let guard = format!(
+            "#{{&&:#{{==:#{{pid}},{expected_server_pid}}},#{{&&:#{{==:#{{pane_pid}},{}}},#{{==:#{{{NVIM_PROCESS_PID_OPTION}}},{}}}}}}}",
+            marker.pane_pid, marker.process_pid
+        );
+        let unset = crate::pane_state::store::tmux_command_string(&[
+            "set-option".to_string(),
+            "-pu".to_string(),
+            "-t".to_string(),
+            marker.pane_id.clone(),
+            NVIM_PROCESS_PID_OPTION.to_string(),
+        ]);
+        arguments.extend([
+            "if-shell".to_string(),
+            "-F".to_string(),
+            "-t".to_string(),
+            marker.pane_id.clone(),
+            guard,
+            unset,
+        ]);
+    }
+    (!arguments.is_empty()).then(|| crate::pane_state::store::tmux_command_string(&arguments))
+}
+
 fn enqueue_sidebar_tmux_job(
     tx: &SyncSender<SidebarTmuxJob>,
     deferred_responses: &Mutex<BTreeSet<u64>>,
@@ -1072,6 +1141,54 @@ impl ProductionV2Coordinator {
                 crate::daemon::protocol::v2::ControlHealth::Starting,
                 |control| control.health(),
             )
+    }
+
+    fn query_nvim_pane_markers(&self) -> Option<Vec<NvimPaneMarker>> {
+        let control = self
+            .tmux_control
+            .lock()
+            .expect("tmux control lock poisoned")
+            .as_ref()
+            .cloned()?;
+        let format = format!("#{{pane_id}}\u{1f}#{{pane_pid}}\u{1f}#{{{NVIM_PROCESS_PID_OPTION}}}");
+        let command = crate::pane_state::store::tmux_command_string(&[
+            "list-panes".to_string(),
+            "-a".to_string(),
+            "-F".to_string(),
+            format,
+        ]);
+        control
+            .execute_until(command, Instant::now() + Duration::from_millis(250))
+            .ok()
+            .map(|output| parse_nvim_pane_markers(&output))
+    }
+
+    fn cleanup_stale_nvim_pane_markers(
+        &self,
+        markers: &[NvimPaneMarker],
+        processes: &crate::daemon::workers::AgentProcessSnapshot,
+    ) {
+        let stale = markers
+            .iter()
+            .filter(|marker| {
+                processes.contains_nvim_process(marker.pane_pid, marker.process_pid) == Some(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let Some(command) =
+            stale_nvim_marker_cleanup_command(self.incarnation.identity.pid, &stale)
+        else {
+            return;
+        };
+        let control = self
+            .tmux_control
+            .lock()
+            .expect("tmux control lock poisoned")
+            .as_ref()
+            .cloned();
+        if let Some(control) = control {
+            let _ = control.execute_until(command, Instant::now() + Duration::from_millis(250));
+        }
     }
 
     fn shutdown_tmux_control(&self) {
@@ -2615,8 +2732,12 @@ fn start_canonical_observation_worker(
                 .collect();
             projection.view_base = view_base;
             projection.through_unread_order = through_unread_order;
+            let nvim_markers = coordinator.query_nvim_pane_markers();
             let processes =
                 crate::daemon::workers::read_agent_process_snapshot(Duration::from_secs(1));
+            if let Some(markers) = nvim_markers {
+                coordinator.cleanup_stale_nvim_pane_markers(&markers, &processes);
+            }
             let poll_result = crate::daemon::workers::run_observation_poll(
                 &capture,
                 &dispatch,
@@ -5047,6 +5168,37 @@ mod tests {
     const V2_EVENT_ID: &str = "102132435465768798a9bacbdcedfe0f";
     const V2_DAEMON_ID: &str = "ffeeddccbbaa99887766554433221100";
     const POLL_TOKEN: &str = "00112233445566778899aabbccddeeff";
+
+    #[test]
+    fn nvim_marker_parser_ignores_empty_and_malformed_values() {
+        let output = "%6\u{1f}94451\u{1f}68736\n%8\u{1f}95025\u{1f}\ninvalid\n";
+        assert_eq!(
+            parse_nvim_pane_markers(output),
+            vec![NvimPaneMarker {
+                pane_id: "%6".to_string(),
+                pane_pid: 94451,
+                process_pid: 68736,
+            }]
+        );
+    }
+
+    #[test]
+    fn nvim_marker_cleanup_is_guarded_by_server_pane_and_marker_identity() {
+        let marker = NvimPaneMarker {
+            pane_id: "%6".to_string(),
+            pane_pid: 94451,
+            process_pid: 68736,
+        };
+        let command = stale_nvim_marker_cleanup_command(74133, &[marker]).unwrap();
+        assert!(command.contains("#{==:#{pid},74133}"));
+        assert!(command.contains("#{==:#{pane_pid},94451}"));
+        assert!(command.contains("#{==:#{@vde_nvim_process_pid},68736}"));
+        assert!(command.contains("set-option"));
+        assert!(command.contains("-pu"));
+        assert!(command.contains("%6"));
+        assert!(command.contains(NVIM_PROCESS_PID_OPTION));
+        assert!(stale_nvim_marker_cleanup_command(74133, &[]).is_none());
+    }
 
     fn test_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

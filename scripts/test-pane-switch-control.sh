@@ -40,6 +40,16 @@ SOURCE_PID="$(tmux -L "$TMUX_SOCKET" display-message -p -t "$SOURCE" '#{pane_pid
 DAEMON_SOCKET="$(tmux -L "$TMUX_SOCKET" show-option -gqv @vde_daemon_socket)"
 SERVER_IDENTITY="$(tmux -L "$TMUX_SOCKET" show-option -gqv @vde_daemon_server_identity)"
 
+# A Neovim process marker is validated against the pane's process tree. A stale marker left by an
+# abnormal editor exit must not make a later Codex/Claude process consume C-h/j/k/l itself.
+tmux -L "$TMUX_SOCKET" set-option -p -t "$SOURCE" @vde_nvim_process_pid "$SOURCE_PID"
+for _ in $(seq 1 100); do
+  STALE_NVIM_MARKER="$(tmux -L "$TMUX_SOCKET" show-option -pqv -t "$SOURCE" @vde_nvim_process_pid)"
+  [[ -z "$STALE_NVIM_MARKER" ]] && break
+  sleep 0.05
+done
+[[ -z "$STALE_NVIM_MARKER" ]]
+
 python3 - "$DAEMON_SOCKET" <<'PY'
 import json
 import socket

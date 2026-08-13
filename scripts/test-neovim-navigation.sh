@@ -36,7 +36,7 @@ if [[ "$DEAD_STATUS" != "0" ]]; then
 fi
 
 ACTIVE_PANE_PID="$(
-  tmux -L "$TMUX_SOCKET" display-message -p -t "$PANE_ID" '#{@vde_nvim_active_pane_pid}'
+  tmux -L "$TMUX_SOCKET" display-message -p -t "$PANE_ID" '#{@vde_nvim_process_pid}'
 )"
 if [[ -n "$ACTIVE_PANE_PID" ]]; then
   echo "Neovim navigation left a stale pane marker: $ACTIVE_PANE_PID" >&2
