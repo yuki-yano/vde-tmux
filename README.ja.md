@@ -196,9 +196,11 @@ globalな発生順はdaemonが管理し、移動中に最新paneが消えた場�
 
 ## サイドバー
 
-サイドバーは現在の tmux window に開き、デフォルトではエージェントをカテゴリ別に表示します。
-FlatとByRepoは現在のカテゴリだけを表示します。
-Priorityは全カテゴリを横断し、Pinned、Needs Input、Unread Done、Running、Idleの順に表示します。
+サイドバーは現在のtmux windowに開き、対象範囲と表示方法を独立した2軸で切り替えます。
+`Current`はそのサイドバーの起点sessionが属するcategoryだけ、`All`は全categoryを対象にします。
+`Tree`はCurrentではRepository→Agent、AllではCategory→Repository→Agentの階層表示です。
+`Priority`は選択中のscopeをPinned、Needs Input、Unread Done、Running、Idleの順にまとめ、
+`Flat`はgroupingを外します。
 Priorityで未読agentを選択して`p`を押すと、共有されたUnread Spanのpinを切り替えます。
 pinされたagentは先頭の`PINNED` zoneへ移動しますが、未読順、badge、notificationは変わりません。
 exact paneを表示した場合は通常どおり既読になり、pinも解除されます。
@@ -222,8 +224,9 @@ vt sidebar close
 | `Ctrl-F` / `Ctrl-B` | 1ページ下または上へ移動する |
 | `Enter` | 選択したエージェントの pane へ移動する |
 | `Space` | 選択行を開閉する |
-| `v` | 表示モードを切り替える |
-| `1` / `2` / `3` / `4` | Flat / ByRepo / ByCategory / Priority へ切り替える |
+| `c` | category scopeをCurrent / Allで切り替える |
+| `v` | presentationをTree / Priority / Flatの順に切り替える |
+| `1` / `2` / `3` | Tree / Priority / Flatへ直接切り替える |
 | `Tab` / `Shift+Tab` | 状態フィルタを切り替える |
 | `n` / `N` | 次または前の要対応エージェントへ移動する |
 | `p` | Priorityで選択中の未読agentをpinまたはunpinする |
@@ -236,8 +239,9 @@ vt sidebar close
 そのエージェントのpaneへ移動します。選択中のエージェントは`Space`で開閉します。
 マウスホイールは選択カーソルを動かさず、はみ出した表示範囲をスクロールします。
 起動後にまだ操作されていないエージェントは、閉じている間は1行だけ表示します。
-表示モードとフィルタは各サイドバーにlocalで、保存値は新しく開くサイドバーの初期値になります。
-手動順序、開閉状態、選択位置、スクロールは同じtmux serverの全サイドバーで同期します。
+category scope、presentation、filter、手動順序、開閉状態、選択位置、スクロールは、
+同じtmux serverの全サイドバーで同期します。具体的なCurrent categoryとreturn targetだけは
+sidebar instanceごとに保持し、そのサイドバーへ入力した起点sessionへ追従します。
 開いているサイドバーへ非focus状態でpin操作を送る場合は`pin-toggle`を使えます。
 
 ```tmux
@@ -277,7 +281,7 @@ configのカテゴリはread-onlyな最低限の定義として残ります。
 動的カテゴリ、Repositoryの明示的な所属、カテゴリとRepositoryの順序はtmux socketごとに保存されます。
 明示的な所属は`vt category automatic`を実行するまでconfig ruleより優先され、同じRepositoryのsessionを作り直した場合も復元されます。
 サイドバーでは`a`でカテゴリ追加、`m`でRepository移動、`r`で動的カテゴリ名変更、`D`で削除、`J`/`K`でカテゴリまたはRepositoryを並べ替えられます。
-ByCategoryでは、管理対象sessionのRepositoryはagent paneがない場合も表示されます。
+All × Treeでは、管理対象sessionのRepositoryはagent paneがない場合も表示されます。
 `@vde_category`は外部tmux format向けの導出済みwrite-only mirrorです。
 
 fzf をインストールすると、session、window、pane を切り替えたり削除したりする popup を利用できます。
@@ -459,12 +463,11 @@ vt daemon status
 tmux server incarnation ごとの運用 log は
 `$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/daemon.log` 一つです。
 notification、status push、hook delivery の error は、この file 内でそれぞれ異なる prefix を使います。
-サイドバーの並び順、既定の表示モードとフィルター、行の展開状態は、tmux socket ごとに分離された
+サイドバーの並び順、category scope、presentation、filter、行の展開状態は、tmux socketごとに分離された
 `$XDG_STATE_HOME/vde/tmux/sidebar-state/` 配下の一つのファイルへatomicに保存されます。
-同じtmux serverのサイドバー間では並び順、展開状態、選択、スクロールが即時共有されます。
-表示モードとフィルターの変更は開いているサイドバーごとに独立し、後から開くサイドバーの既定値になります。
+同じtmux serverのサイドバー間では保存対象の値と選択、スクロールが即時共有されます。
 選択とスクロールは daemon の稼働中だけ共有され、保存はされません。
-return target は instance local のまま保存されません。
+具体的なCurrent categoryとreturn targetはinstance localのまま保存されません。
 
 ## 既知の制約
 

@@ -17,6 +17,7 @@ pub enum ControlMessage {
     Input {
         key: String,
         source_pane: PaneInstance,
+        session_id: String,
     },
     Focus {
         pane_instance: PaneInstance,
@@ -256,15 +257,19 @@ mod tests {
                 pane_id: "%1".to_string(),
                 pane_pid: 7,
             },
+            session_id: "$1".to_string(),
         };
         send("test_input_server", &sidebar, &message).unwrap();
         assert_eq!(listener.try_recv().unwrap(), Some(message));
     }
 
     #[test]
-    fn input_frame_requires_source_identity() {
-        let legacy = br#"{"type":"input","key":"v"}"#;
-        assert!(serde_json::from_slice::<ControlMessage>(legacy).is_err());
+    fn input_frame_requires_source_and_session_identity() {
+        let without_source = br#"{"type":"input","key":"v"}"#;
+        let without_session =
+            br#"{"type":"input","key":"v","source_pane":{"pane_id":"%1","pane_pid":7}}"#;
+        assert!(serde_json::from_slice::<ControlMessage>(without_source).is_err());
+        assert!(serde_json::from_slice::<ControlMessage>(without_session).is_err());
     }
 
     #[test]

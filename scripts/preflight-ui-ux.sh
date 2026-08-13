@@ -707,7 +707,7 @@ SIDE2_SHARED_ORDER="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-shared-order.tx
 [[ "$SIDE2_SHARED_ORDER" != "$SIDE2_SHARED_EXPANSION" ]]
 record sidebar-shared-state PASS-selection-manual-order-and-expansion-shared-across-two-sidebars
 
-VT_PANE="$SIDEBAR_1" run_vt sidebar input 1
+VT_PANE="$SIDEBAR_1" run_vt sidebar input 3
 for _ in $(seq 1 60); do
   capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-view.txt"
   grep -F 'Flat' "$ARTIFACT_DIR/sidebar-2-after-view.txt" >/dev/null && break
@@ -719,6 +719,24 @@ grep -F 'Flat' "$ARTIFACT_DIR/sidebar-1-view-flat.txt" >/dev/null
 grep -F 'Flat' "$ARTIFACT_DIR/sidebar-2-after-view.txt" >/dev/null
 SIDE2_SHARED_VIEW="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-view.txt")"
 [[ "$SIDE2_SHARED_VIEW" != "$SIDE2_SHARED_ORDER" ]]
+
+VT_PANE="$SIDEBAR_1" run_vt sidebar input c
+for _ in $(seq 1 60); do
+  capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-scope-all.txt"
+  grep -F 'All' "$ARTIFACT_DIR/sidebar-2-scope-all.txt" >/dev/null && break
+  sleep 0.05
+done
+capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-scope-all.txt"
+grep -F 'All' "$ARTIFACT_DIR/sidebar-1-scope-all.txt" >/dev/null
+grep -F 'All' "$ARTIFACT_DIR/sidebar-2-scope-all.txt" >/dev/null
+VT_PANE="$SIDEBAR_1" run_vt sidebar input c
+for _ in $(seq 1 60); do
+  capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-scope-current.txt"
+  grep -F 'Current' "$ARTIFACT_DIR/sidebar-2-scope-current.txt" >/dev/null && break
+  sleep 0.05
+done
+grep -F 'Current' "$ARTIFACT_DIR/sidebar-2-scope-current.txt" >/dev/null
+record sidebar-view-axes PASS-scope-and-presentation-shared-across-two-sidebars
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input 'done'
 for _ in $(seq 1 60); do
@@ -735,9 +753,10 @@ REVISION_AFTER_LOCAL="$(snapshot_revision)"
 python3 - "$QUERY_JSON" <<'PY'
 import json, sys
 preferences = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["preferences"]
-assert preferences["view_mode"] == "flat", preferences
+assert preferences["category_scope"] == "current", preferences
+assert preferences["presentation_mode"] == "flat", preferences
 assert preferences["filter"] == "done_only", preferences
-assert preferences["schema_version"] == 1, preferences
+assert preferences["schema_version"] == 2, preferences
 PY
 record sidebar-state PASS-navigation-view-filter-shared-and-defaults-persisted
 
@@ -751,7 +770,7 @@ capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-before-nonfocus
 SIDE2_BEFORE_NONFOCUS="$(fingerprint "$ARTIFACT_DIR/sidebar-2-before-nonfocus-input.txt")"
 
 VT_PANE="$S1_AGENT" run_vt sidebar input all --window "$S1_WINDOW"
-VT_PANE="$S1_AGENT" run_vt sidebar input 4 --window "$S1_WINDOW"
+VT_PANE="$S1_AGENT" run_vt sidebar input 2 --window "$S1_WINDOW"
 for _ in $(seq 1 60); do
   capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-nonfocus-view.txt"
   grep -F 'Priority' "$ARTIFACT_DIR/sidebar-2-after-nonfocus-view.txt" >/dev/null && break
@@ -882,7 +901,8 @@ query_snapshot
 python3 - "$QUERY_JSON" "$S2_AGENT" "$S2_AGENT_PID" "$S1_AGENT" <<'PY'
 import json, sys
 preferences = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["preferences"]
-assert preferences["view_mode"] == "priority", preferences
+assert preferences["category_scope"] == "current", preferences
+assert preferences["presentation_mode"] == "priority", preferences
 assert preferences["filter"] == "all", preferences
 assert preferences["manual_chat_order"][:2] == [sys.argv[2], sys.argv[4]], preferences
 assert f"chat::{sys.argv[2]}::{sys.argv[3]}" in preferences["expansion_overrides"], preferences

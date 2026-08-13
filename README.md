@@ -198,9 +198,10 @@ is observed as the active pane.
 
 ## Sidebar
 
-The sidebar opens in the current tmux window and groups agents by category by default.
-Flat and ByRepo show only the currently active category.
-Priority spans all categories and groups agents as Pinned, Needs Input, Unread Done, Running, then Idle.
+The sidebar opens in the current tmux window with two independent view axes. `Current` limits the
+rows to the category of that sidebar's source session, while `All` spans every category. `Tree`
+groups Current as Repository→Agent and All as Category→Repository→Agent. `Priority` groups the
+selected scope as Pinned, Needs Input, Unread Done, Running, then Idle. `Flat` removes grouping.
 Press `p` on an unread agent in Priority to toggle its shared unread-span pin. Pinned agents move to
 the first `PINNED` zone without changing their unread order, badge, or notification state. Viewing
 the exact pane still marks it read and clears the pin.
@@ -227,8 +228,9 @@ vt sidebar close
 | `Ctrl-F` / `Ctrl-B` | Move down or up by a full page |
 | `Enter` | Jump to the selected agent pane |
 | `Space` | Expand or collapse the selected row |
-| `v` | Cycle the view mode |
-| `1` / `2` / `3` / `4` | Select Flat / ByRepo / ByCategory / Priority |
+| `c` | Toggle Current / All category scope |
+| `v` | Cycle Tree / Priority / Flat presentation |
+| `1` / `2` / `3` | Select Tree / Priority / Flat presentation |
 | `Tab` / `Shift+Tab` | Cycle the state filter |
 | `n` / `N` | Move to the next or previous Blocked agent waiting for user input |
 | `p` | Pin or unpin the selected unread agent in Priority |
@@ -241,11 +243,12 @@ Click any rendered line of an agent once to jump to its pane; the agent does not
 need to be selected first. Use `Space` to expand or collapse the selected agent.
 The mouse wheel scrolls overflow without moving the selected cursor.
 An agent with no activity yet uses a single line while collapsed.
-View mode and filter are local to each open sidebar; their persisted values seed newly opened sidebars.
-Manual order, expansion state, selection, and scrolling are synchronized across all open sidebars on the same tmux server.
+Category scope, presentation, filter, manual order, expansion state, selection, and scrolling are
+synchronized across all open sidebars on the same tmux server. The concrete Current category and
+return target remain local to each sidebar and follow its source session.
 
-An open sidebar can also be controlled without focusing it. View and filter changes affect only
-the sidebar in the target window; Agent selection and scrolling use the shared navigation state.
+An open sidebar can also be controlled without focusing it. The input source updates that sidebar's
+Current category context; axis, filter, selection, and scrolling changes use shared state.
 
 ```tmux
 bind-key -n M-v run-shell "vt sidebar input v --window #{q:window_id}"
@@ -291,7 +294,7 @@ An explicit assignment wins over config rules until `vt category automatic` is
 used. Recreating a session for the same repository restores its assignment.
 In the sidebar, use `a` to add a category, `m` to move a repository, `r` to
 rename a dynamic category, `D` to delete one, and `J`/`K` to reorder categories
-or repositories. ByCategory keeps repositories from managed sessions visible
+or repositories. All × Tree keeps repositories from managed sessions visible
 even when they currently have no agent panes. `@vde_category` remains a derived,
 write-only mirror for external tmux formats.
 
@@ -470,12 +473,11 @@ vt daemon status
 Each tmux server incarnation has one operational log at
 `$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/daemon.log`. Notification, status-push, and hook
 delivery errors use distinct prefixes in that file.
-Sidebar order, default view/filter, and row expansion are stored atomically below
-`$XDG_STATE_HOME/vde/tmux/sidebar-state/`, isolated by tmux socket. Order and expansion
-updates are shared live by sidebars on the same tmux server. View/filter changes stay local
-to an open sidebar and become the default for sidebars opened later. Selection and scrolling
-are shared while the daemon is running but are not persisted. The return target remains
-instance-local and is not persisted.
+Sidebar order, category scope, presentation, filter, and row expansion are stored atomically below
+`$XDG_STATE_HOME/vde/tmux/sidebar-state/`, isolated by tmux socket. These values are shared live by
+sidebars on the same tmux server. Selection and scrolling are shared while the daemon is running but
+are not persisted. The concrete Current category and return target remain instance-local and are not
+persisted.
 
 ## Known limitations
 

@@ -10,7 +10,7 @@ use crate::git::WorktreeInfo;
 use crate::hook::{RollupLevel, TaskItem, TaskItemStatus, WorktreeActivity};
 use crate::pane_state::PaneInstance;
 use crate::sidebar::state::{
-    SidebarPreferences, SidebarRowRef, SidebarState, StatusFilter, ViewMode,
+    CategoryScope, PresentationMode, SidebarPreferences, SidebarRowRef, SidebarState, StatusFilter,
 };
 
 pub(crate) const PRIORITY_PINNED_ZONE_ID: &str = "zone::priority::pinned";
@@ -298,14 +298,14 @@ fn build_rows_from_groups(
     order: &SidebarPreferences,
     ctx: &RowBuildContext,
 ) -> (Vec<SidebarRow>, BadgeCounts) {
-    if matches!(state.view_mode, ViewMode::Flat | ViewMode::ByRepo) {
-        groups.retain(|(category, _), _| ctx.active_categories.contains(category));
+    if state.category_scope == CategoryScope::Current {
+        groups.retain(|(category, _), _| state.current_category.as_ref() == Some(category));
     }
     for panes in groups.values_mut() {
         order_agent_panes(panes, order);
     }
     let counts = badge_counts_from_agent_panes(groups.values().flat_map(|panes| panes.iter()));
-    if state.view_mode == ViewMode::Priority {
+    if state.presentation_mode == PresentationMode::Priority {
         for panes in groups.values_mut() {
             panes.retain(|pane| pane_matches_filter(pane, state.filter));
         }
@@ -334,9 +334,14 @@ fn build_rows_from_groups(
     groups.retain(|_, panes| !panes.is_empty());
 
     let mut rows = triage_zone_rows(&triage_panes, state, ctx.now);
-    let mut fleet_rows = match state.view_mode {
-        ViewMode::Flat => flat_rows(groups, state, ctx.now),
-        ViewMode::ByRepo => repo_rows(
+    let mut fleet_rows = match state.presentation_mode {
+        PresentationMode::Flat => flat_rows(
+            groups,
+            state,
+            ctx.now,
+            state.category_scope == CategoryScope::All,
+        ),
+        PresentationMode::Tree if state.category_scope == CategoryScope::Current => repo_rows(
             groups,
             state,
             &ctx.category_state,
@@ -345,8 +350,10 @@ fn build_rows_from_groups(
             ctx.now,
             &group_metas,
         ),
-        ViewMode::ByCategory => category_rows(groups, state, ctx, &group_metas),
-        ViewMode::Priority => unreachable!("priority returns before structural projection"),
+        PresentationMode::Tree => category_rows(groups, state, ctx, &group_metas),
+        PresentationMode::Priority => {
+            unreachable!("priority returns before structural projection")
+        }
     };
     rows.append(&mut fleet_rows);
     (rows, counts)
@@ -611,7 +618,7 @@ fn repo_rows_from_keyed_map(
         });
         if expanded {
             for pane in &panes {
-                push_chat_row(pane, depth + 1, state, now, &mut rows);
+                push_chat_row(pane, depth + 1, state, now, false, &mut rows);
             }
         }
     }
@@ -787,10 +794,11 @@ fn flat_rows(
     groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
     now: i64,
+    show_origin: bool,
 ) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
     for pane in groups.values().flat_map(|panes| panes.iter()) {
-        push_chat_row(pane, 0, state, now, &mut rows);
+        push_chat_row(pane, 0, state, now, show_origin, &mut rows);
     }
     rows
 }
@@ -800,16 +808,23 @@ fn push_chat_row(
     depth: usize,
     state: &SidebarState,
     now: i64,
+    show_origin: bool,
     rows: &mut Vec<SidebarRow>,
 ) {
     let id = chat_row_id(&pane.pane_instance);
     let expanded = state.is_expanded_with_default(&id, false);
-    let meta = chat_meta(pane, now);
-    let label = if expanded {
+    let mut meta = chat_meta(pane, now);
+    let mut label = if expanded {
         expanded_chat_label(pane)
     } else {
         chat_label(pane)
     };
+    if show_origin {
+        let origin = format!("{}/{}", pane.category, pane.repo);
+        meta.origin = Some(origin.clone());
+        label.push_str(" · ");
+        label.push_str(&origin);
+    }
     rows.push(SidebarRow {
         id,
         kind: SidebarRowKind::Chat,
@@ -1400,7 +1415,10 @@ mod tests {
         let (rows, counts) = build_rows_from_presentations(
             &config,
             &[],
-            &SidebarState::default(),
+            &SidebarState {
+                category_scope: CategoryScope::All,
+                ..SidebarState::default()
+            },
             &SidebarPreferences::default(),
             &context,
         );
@@ -1461,7 +1479,10 @@ mod tests {
 
         let (rows, counts) = build_rows_from_groups(
             groups,
-            &SidebarState::default(),
+            &SidebarState {
+                current_category: Some("misc".to_string()),
+                ..SidebarState::default()
+            },
             &SidebarPreferences::default(),
             &context,
         );
@@ -1485,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_and_repo_modes_show_only_active_categories() {
+    fn current_and_all_scopes_compose_with_every_presentation() {
         let mut work = agent_pane(BadgeState::Working, "");
         work.pane_instance = PaneInstance {
             pane_id: "%1".to_string(),
@@ -1521,9 +1542,14 @@ mod tests {
             ..RowBuildContext::default()
         };
 
-        for view_mode in [ViewMode::Flat, ViewMode::ByRepo] {
+        for presentation_mode in [
+            PresentationMode::Tree,
+            PresentationMode::Priority,
+            PresentationMode::Flat,
+        ] {
             let state = SidebarState {
-                view_mode,
+                current_category: Some("work".to_string()),
+                presentation_mode,
                 ..SidebarState::default()
             };
             let (rows, counts) = build_rows_from_groups(
@@ -1537,19 +1563,53 @@ mod tests {
             assert_eq!(counts.total, 1);
         }
 
-        let (category_rows, counts) = build_rows_from_groups(
+        for presentation_mode in [
+            PresentationMode::Tree,
+            PresentationMode::Priority,
+            PresentationMode::Flat,
+        ] {
+            let (rows, counts) = build_rows_from_groups(
+                groups.clone(),
+                &SidebarState {
+                    category_scope: CategoryScope::All,
+                    presentation_mode,
+                    ..SidebarState::default()
+                },
+                &SidebarPreferences::default(),
+                &context,
+            );
+            assert!(rows.iter().any(|row| row.pane_id.as_deref() == Some("%1")));
+            assert!(rows.iter().any(|row| row.pane_id.as_deref() == Some("%2")));
+            assert_eq!(counts.total, 2);
+            if presentation_mode == PresentationMode::Tree {
+                assert!(rows.iter().any(|row| row.id == "category::work"));
+                assert!(rows.iter().any(|row| row.id == "category::private"));
+            }
+            if presentation_mode == PresentationMode::Flat {
+                assert!(
+                    rows.iter()
+                        .filter(|row| row.kind == SidebarRowKind::Chat)
+                        .all(|row| row
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.origin.as_deref())
+                            .is_some())
+                );
+                assert!(rows.iter().any(|row| {
+                    row.pane_id.as_deref() == Some("%2")
+                        && row.label.contains("private/private-repo")
+                }));
+            }
+        }
+
+        let (rows, counts) = build_rows_from_groups(
             groups,
             &SidebarState::default(),
             &SidebarPreferences::default(),
             &context,
         );
-        assert!(category_rows.iter().any(|row| row.id == "category::work"));
-        assert!(
-            category_rows
-                .iter()
-                .any(|row| row.id == "category::private")
-        );
-        assert_eq!(counts.total, 2);
+        assert!(rows.is_empty());
+        assert_eq!(counts, BadgeCounts::default());
     }
 
     #[test]
@@ -1623,7 +1683,10 @@ mod tests {
             diagnostics: Vec::new(),
         };
         let encoded = serde_json::to_vec(&snapshot).unwrap();
-        let state = SidebarState::default();
+        let state = SidebarState {
+            category_scope: CategoryScope::All,
+            ..SidebarState::default()
+        };
 
         let before = project_sidebar(
             &Config::default(),
@@ -1738,7 +1801,8 @@ mod tests {
             ..RowBuildContext::default()
         };
         let state = SidebarState {
-            view_mode: ViewMode::Priority,
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Priority,
             ..SidebarState::default()
         };
 
@@ -1780,7 +1844,8 @@ mod tests {
             (StatusFilter::IdleOnly, vec!["%1"]),
         ] {
             let filtered = SidebarState {
-                view_mode: ViewMode::Priority,
+                category_scope: CategoryScope::All,
+                presentation_mode: PresentationMode::Priority,
                 filter,
                 ..SidebarState::default()
             };
@@ -1840,7 +1905,8 @@ mod tests {
             vec![older, newest, tied],
         )]);
         let state = SidebarState {
-            view_mode: ViewMode::Priority,
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Priority,
             ..SidebarState::default()
         };
         let (rows, counts) = build_rows_from_groups(
@@ -1868,7 +1934,8 @@ mod tests {
         assert_eq!(counts.done, 1);
 
         let filtered = SidebarState {
-            view_mode: ViewMode::Priority,
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Priority,
             filter: StatusFilter::DoneOnly,
             ..SidebarState::default()
         };

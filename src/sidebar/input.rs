@@ -1,4 +1,4 @@
-use crate::sidebar::state::{StatusFilter, ViewMode};
+use crate::sidebar::state::{PresentationMode, StatusFilter};
 use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,8 +13,9 @@ pub enum SidebarInputAction {
     PageUp,
     Activate,
     ToggleExpand,
-    SetViewMode(ViewMode),
-    CycleViewMode,
+    ToggleCategoryScope,
+    SetPresentationMode(PresentationMode),
+    CyclePresentationMode,
     SetFilter(StatusFilter),
     CycleFilterForward,
     CycleFilterBackward,
@@ -50,7 +51,8 @@ pub fn parse_key(key: &str) -> Option<SidebarInputAction> {
         "C-b" => Some(SidebarInputAction::PageUp),
         "enter" | "\n" => Some(SidebarInputAction::Activate),
         "space" => Some(SidebarInputAction::ToggleExpand),
-        "v" => Some(SidebarInputAction::CycleViewMode),
+        "c" => Some(SidebarInputAction::ToggleCategoryScope),
+        "v" => Some(SidebarInputAction::CyclePresentationMode),
         "tab" => Some(SidebarInputAction::CycleFilterForward),
         "backtab" => Some(SidebarInputAction::CycleFilterBackward),
         "n" => Some(SidebarInputAction::FocusNextAttention),
@@ -61,10 +63,15 @@ pub fn parse_key(key: &str) -> Option<SidebarInputAction> {
         "p" | "pin-toggle" => Some(SidebarInputAction::ToggleUnreadPin),
         "J" => Some(SidebarInputAction::ReorderDown),
         "K" => Some(SidebarInputAction::ReorderUp),
-        "1" => Some(SidebarInputAction::SetViewMode(ViewMode::Flat)),
-        "2" => Some(SidebarInputAction::SetViewMode(ViewMode::ByRepo)),
-        "3" => Some(SidebarInputAction::SetViewMode(ViewMode::ByCategory)),
-        "4" => Some(SidebarInputAction::SetViewMode(ViewMode::Priority)),
+        "1" => Some(SidebarInputAction::SetPresentationMode(
+            PresentationMode::Tree,
+        )),
+        "2" => Some(SidebarInputAction::SetPresentationMode(
+            PresentationMode::Priority,
+        )),
+        "3" => Some(SidebarInputAction::SetPresentationMode(
+            PresentationMode::Flat,
+        )),
         "all" => Some(SidebarInputAction::SetFilter(StatusFilter::All)),
         "attn" => Some(SidebarInputAction::SetFilter(StatusFilter::AttentionOnly)),
         "working" => Some(SidebarInputAction::SetFilter(StatusFilter::WorkingOnly)),
@@ -91,7 +98,7 @@ pub fn activate_selected(selection: Option<&str>, rows: &[SidebarRow]) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sidebar::state::ViewMode;
+    use crate::sidebar::state::PresentationMode;
     use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 
     fn row(id: &str, kind: SidebarRowKind, pane_id: Option<&str>) -> SidebarRow {
@@ -116,7 +123,14 @@ mod tests {
         assert_eq!(parse_key("j"), Some(SidebarInputAction::MoveNext));
         assert_eq!(parse_key("k"), Some(SidebarInputAction::MovePrevious));
         assert_eq!(parse_key("enter"), Some(SidebarInputAction::Activate));
-        assert_eq!(parse_key("v"), Some(SidebarInputAction::CycleViewMode));
+        assert_eq!(
+            parse_key("c"),
+            Some(SidebarInputAction::ToggleCategoryScope)
+        );
+        assert_eq!(
+            parse_key("v"),
+            Some(SidebarInputAction::CyclePresentationMode)
+        );
         assert_eq!(
             parse_key("tab"),
             Some(SidebarInputAction::CycleFilterForward)
@@ -157,12 +171,11 @@ mod tests {
         );
         assert_eq!(
             parse_key("3"),
-            Some(SidebarInputAction::SetViewMode(ViewMode::ByCategory))
+            Some(SidebarInputAction::SetPresentationMode(
+                PresentationMode::Flat
+            ))
         );
-        assert_eq!(
-            parse_key("4"),
-            Some(SidebarInputAction::SetViewMode(ViewMode::Priority))
-        );
+        assert_eq!(parse_key("4"), None);
         assert_eq!(parse_key("unknown"), None);
     }
 

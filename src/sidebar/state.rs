@@ -25,12 +25,19 @@ impl RepoId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ViewMode {
-    Flat,
-    ByRepo,
+pub enum CategoryScope {
     #[default]
-    ByCategory,
+    Current,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentationMode {
+    #[default]
+    Tree,
     Priority,
+    Flat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -47,13 +54,16 @@ pub enum StatusFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SidebarState {
     pub version: u64,
-    pub view_mode: ViewMode,
+    pub category_scope: CategoryScope,
+    pub presentation_mode: PresentationMode,
     pub filter: StatusFilter,
     pub selection: Option<String>,
     pub collapsed: BTreeSet<String>,
     pub scroll: usize,
     pub manual_scroll: bool,
     pub return_target: Option<crate::pane_state::PaneInstance>,
+    pub current_session_id: Option<String>,
+    pub current_category: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -65,7 +75,7 @@ pub struct SidebarNavigation {
     pub manual_scroll: bool,
 }
 
-pub const SIDEBAR_PREFERENCES_SCHEMA_VERSION: u32 = 1;
+pub const SIDEBAR_PREFERENCES_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,8 +85,8 @@ pub struct SidebarPreferences {
     pub manual_order: Vec<RepoId>,
     #[serde(default)]
     pub manual_chat_order: Vec<String>,
-    #[serde(default)]
-    pub view_mode: ViewMode,
+    pub category_scope: CategoryScope,
+    pub presentation_mode: PresentationMode,
     #[serde(default)]
     pub filter: StatusFilter,
     #[serde(default)]
@@ -89,7 +99,8 @@ impl Default for SidebarPreferences {
             schema_version: SIDEBAR_PREFERENCES_SCHEMA_VERSION,
             manual_order: Vec::new(),
             manual_chat_order: Vec::new(),
-            view_mode: ViewMode::default(),
+            category_scope: CategoryScope::default(),
+            presentation_mode: PresentationMode::default(),
             filter: StatusFilter::default(),
             expansion_overrides: BTreeSet::new(),
         }
@@ -121,8 +132,11 @@ pub enum SidebarPreferenceIntent {
         neighbor_pane_id: String,
         direction: MoveDirection,
     },
-    SetDefaultViewMode {
-        view_mode: ViewMode,
+    SetDefaultCategoryScope {
+        category_scope: CategoryScope,
+    },
+    SetDefaultPresentationMode {
+        presentation_mode: PresentationMode,
     },
     SetDefaultFilter {
         filter: StatusFilter,
@@ -155,8 +169,9 @@ pub enum SidebarAction {
     MoveNext,
     MovePrevious,
     ToggleExpand,
-    SetViewMode(ViewMode),
-    CycleViewMode,
+    ToggleCategoryScope,
+    SetPresentationMode(PresentationMode),
+    CyclePresentationMode,
     CycleFilterForward,
     CycleFilterBackward,
 }
@@ -172,16 +187,21 @@ impl SidebarState {
                 };
                 self.toggle_expanded(&id)
             }
-            SidebarAction::SetViewMode(view_mode) => {
-                if self.view_mode == view_mode {
-                    return false;
-                }
-                self.view_mode = view_mode;
+            SidebarAction::ToggleCategoryScope => {
+                self.category_scope = self.category_scope.toggle();
                 self.bump();
                 true
             }
-            SidebarAction::CycleViewMode => {
-                self.view_mode = self.view_mode.next();
+            SidebarAction::SetPresentationMode(presentation_mode) => {
+                if self.presentation_mode == presentation_mode {
+                    return false;
+                }
+                self.presentation_mode = presentation_mode;
+                self.bump();
+                true
+            }
+            SidebarAction::CyclePresentationMode => {
+                self.presentation_mode = self.presentation_mode.next();
                 self.bump();
                 true
             }
@@ -222,8 +242,17 @@ impl SidebarState {
         self.toggle_expanded(id)
     }
 
-    pub fn set_view_mode(&mut self, view_mode: ViewMode) -> bool {
-        self.apply(SidebarAction::SetViewMode(view_mode), &[])
+    pub fn set_category_scope(&mut self, category_scope: CategoryScope) -> bool {
+        if self.category_scope == category_scope {
+            return false;
+        }
+        self.category_scope = category_scope;
+        self.bump();
+        true
+    }
+
+    pub fn set_presentation_mode(&mut self, presentation_mode: PresentationMode) -> bool {
+        self.apply(SidebarAction::SetPresentationMode(presentation_mode), &[])
     }
 
     pub fn set_filter(&mut self, filter: StatusFilter) -> bool {
@@ -297,11 +326,18 @@ impl SidebarPreferences {
                     *direction,
                 )
             }
-            SidebarPreferenceIntent::SetDefaultViewMode { view_mode } => {
-                if self.view_mode == *view_mode {
+            SidebarPreferenceIntent::SetDefaultCategoryScope { category_scope } => {
+                if self.category_scope == *category_scope {
                     return false;
                 }
-                self.view_mode = *view_mode;
+                self.category_scope = *category_scope;
+                true
+            }
+            SidebarPreferenceIntent::SetDefaultPresentationMode { presentation_mode } => {
+                if self.presentation_mode == *presentation_mode {
+                    return false;
+                }
+                self.presentation_mode = *presentation_mode;
                 true
             }
             SidebarPreferenceIntent::SetDefaultFilter { filter } => {
@@ -412,13 +448,21 @@ impl SidebarState {
     }
 }
 
-impl ViewMode {
+impl CategoryScope {
+    pub fn toggle(self) -> Self {
+        match self {
+            CategoryScope::Current => CategoryScope::All,
+            CategoryScope::All => CategoryScope::Current,
+        }
+    }
+}
+
+impl PresentationMode {
     pub fn next(self) -> Self {
         match self {
-            ViewMode::Flat => ViewMode::ByRepo,
-            ViewMode::ByRepo => ViewMode::ByCategory,
-            ViewMode::ByCategory => ViewMode::Priority,
-            ViewMode::Priority => ViewMode::Flat,
+            PresentationMode::Tree => PresentationMode::Priority,
+            PresentationMode::Priority => PresentationMode::Flat,
+            PresentationMode::Flat => PresentationMode::Tree,
         }
     }
 }
@@ -497,19 +541,26 @@ mod tests {
     }
 
     #[test]
-    fn state_switches_view_mode() {
+    fn state_switches_view_axes() {
         let mut state = SidebarState::default();
-        assert_eq!(state.view_mode, ViewMode::ByCategory);
-        state.apply(SidebarAction::SetViewMode(ViewMode::Flat), &[]);
-        assert_eq!(state.view_mode, ViewMode::Flat);
-        assert_eq!(state.version, 1);
+        assert_eq!(state.category_scope, CategoryScope::Current);
+        assert_eq!(state.presentation_mode, PresentationMode::Tree);
+        state.apply(SidebarAction::ToggleCategoryScope, &[]);
+        state.apply(
+            SidebarAction::SetPresentationMode(PresentationMode::Flat),
+            &[],
+        );
+        assert_eq!(state.category_scope, CategoryScope::All);
+        assert_eq!(state.presentation_mode, PresentationMode::Flat);
+        assert_eq!(state.version, 2);
     }
 
     #[test]
     fn preferences_serialize_view_and_filter_without_instance_local_state() {
         let state = SidebarPreferences {
             manual_order: vec![RepoId::new("misc", "app")],
-            view_mode: ViewMode::ByCategory,
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Tree,
             filter: StatusFilter::DoneOnly,
             expansion_overrides: BTreeSet::from(["repo::misc::app".to_string()]),
             ..SidebarPreferences::default()
@@ -518,7 +569,8 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
 
         assert!(json.contains(r#""manual_order""#));
-        assert!(json.contains(r#""view_mode":"by_category""#));
+        assert!(json.contains(r#""category_scope":"all""#));
+        assert!(json.contains(r#""presentation_mode":"tree""#));
         assert!(json.contains(r#""filter":"done_only""#));
         assert!(!json.contains("selection"));
         assert!(json.contains("expansion_overrides"));
@@ -527,20 +579,18 @@ mod tests {
     }
 
     #[test]
-    fn state_cycles_view_mode_and_filter() {
+    fn state_cycles_presentation_and_filter() {
         let mut state = SidebarState {
-            view_mode: ViewMode::Flat,
+            presentation_mode: PresentationMode::Tree,
             ..SidebarState::default()
         };
 
-        assert!(state.apply(SidebarAction::CycleViewMode, &[]));
-        assert_eq!(state.view_mode, ViewMode::ByRepo);
-        assert!(state.apply(SidebarAction::CycleViewMode, &[]));
-        assert_eq!(state.view_mode, ViewMode::ByCategory);
-        assert!(state.apply(SidebarAction::CycleViewMode, &[]));
-        assert_eq!(state.view_mode, ViewMode::Priority);
-        assert!(state.apply(SidebarAction::CycleViewMode, &[]));
-        assert_eq!(state.view_mode, ViewMode::Flat);
+        assert!(state.apply(SidebarAction::CyclePresentationMode, &[]));
+        assert_eq!(state.presentation_mode, PresentationMode::Priority);
+        assert!(state.apply(SidebarAction::CyclePresentationMode, &[]));
+        assert_eq!(state.presentation_mode, PresentationMode::Flat);
+        assert!(state.apply(SidebarAction::CyclePresentationMode, &[]));
+        assert_eq!(state.presentation_mode, PresentationMode::Tree);
 
         assert!(state.apply(SidebarAction::CycleFilterForward, &[]));
         assert_eq!(state.filter, StatusFilter::AttentionOnly);

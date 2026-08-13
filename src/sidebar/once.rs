@@ -15,7 +15,9 @@ fn render_snapshot(snapshot: &ResolvedSnapshot, config: &Config) -> String {
         SidebarWidth::Columns(width) => width,
         SidebarWidth::Percent(_) => config.sidebar.min_width,
     };
-    let state = crate::sidebar::state::SidebarState::default();
+    // The one-shot surface has no live sidebar instance whose source session can
+    // define `Current`, so its projection is deliberately server-wide.
+    let state = one_shot_state();
     let projection = crate::sidebar::tree::project_sidebar(
         config,
         &snapshot.panes,
@@ -37,9 +39,27 @@ fn render_snapshot(snapshot: &ResolvedSnapshot, config: &Config) -> String {
     }
 }
 
+fn one_shot_state() -> crate::sidebar::state::SidebarState {
+    crate::sidebar::state::SidebarState {
+        category_scope: crate::sidebar::state::CategoryScope::All,
+        ..crate::sidebar::state::SidebarState::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_shot_projection_uses_all_categories_without_instance_context() {
+        let state = one_shot_state();
+
+        assert_eq!(
+            state.category_scope,
+            crate::sidebar::state::CategoryScope::All
+        );
+    }
+
     #[test]
     fn render_snapshot_projects_sidebar_model_without_tmux_reparse() {
         let snapshot = ResolvedSnapshot {

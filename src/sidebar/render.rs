@@ -1,7 +1,7 @@
 use crate::agent::{display_agent_label_prefix, display_agent_name};
 use crate::daemon::session_badge::{BadgeState, glyph_for_state};
 use crate::hook::RollupLevel;
-use crate::sidebar::state::{SidebarState, StatusFilter, ViewMode};
+use crate::sidebar::state::{CategoryScope, PresentationMode, SidebarState, StatusFilter};
 use crate::sidebar::tree::{BadgeCounts, PRIORITY_PINNED_ZONE_ID, SidebarRow, SidebarRowKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -209,7 +209,8 @@ impl SidebarRenderTheme {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderAction {
-    CycleViewMode,
+    ToggleCategoryScope,
+    CyclePresentationMode,
     SetFilter(StatusFilter),
 }
 
@@ -317,7 +318,11 @@ fn build_header_title_line(
     theme: &SidebarRenderTheme,
     counts: BadgeCounts,
 ) -> HeaderLine {
-    let mode_body = format_header_mode_body(state.view_mode, theme);
+    let mode_pieces = format_header_mode_pieces(state, theme);
+    let mode_body = mode_pieces
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<String>();
     let mode_prefix = theme.header_prefix.as_str();
     let mode_text = format!("{mode_prefix}{mode_body}");
     let mode_suffix = theme.header_suffix.as_str();
@@ -344,14 +349,14 @@ fn build_header_title_line(
         pieces.push((
             mode_prefix.to_string(),
             Style::default().fg(mode_bg(theme)),
-            Some(HeaderAction::CycleViewMode),
+            None,
         ));
     }
-    pieces.push((
-        mode_body,
-        mode_segment_style(theme),
-        Some(HeaderAction::CycleViewMode),
-    ));
+    pieces.extend(
+        mode_pieces
+            .into_iter()
+            .map(|(text, action)| (text, mode_segment_style(theme), action)),
+    );
     if include_total {
         if !mode_suffix.is_empty() {
             let mut suffix_style = Style::default().fg(mode_bg(theme));
@@ -398,15 +403,52 @@ fn build_header_title_line(
     HeaderLine { text, segments }
 }
 
-fn format_header_mode_body(view_mode: ViewMode, theme: &SidebarRenderTheme) -> String {
-    let mode = view_mode_label(view_mode);
-    let mode_padded = view_mode_label_padded(view_mode);
-    let label = format!("≣ {mode_padded}");
-    theme
+fn format_header_mode_pieces(
+    state: &SidebarState,
+    theme: &SidebarRenderTheme,
+) -> Vec<(String, Option<HeaderAction>)> {
+    let scope = category_scope_label_padded(state.category_scope);
+    let presentation = presentation_mode_label_padded(state.presentation_mode);
+    let scope_segment = format!("◉ {scope}");
+    let presentation_segment = format!("≣ {presentation}");
+    let label = format!("{scope_segment} · {presentation_segment}");
+    let formatted = theme
         .header_format
         .replace("{label}", &label)
-        .replace("{mode_padded}", &mode_padded)
-        .replace("{mode}", mode)
+        .replace("{scope}", category_scope_label(state.category_scope))
+        .replace(
+            "{presentation}",
+            presentation_mode_label(state.presentation_mode),
+        );
+    let Some(scope_start) = formatted.find(&scope_segment) else {
+        return vec![(formatted, None)];
+    };
+    let scope_end = scope_start + scope_segment.len();
+    let Some(relative_presentation_start) = formatted[scope_end..].find(&presentation_segment)
+    else {
+        return vec![(formatted, None)];
+    };
+    let presentation_start = scope_end + relative_presentation_start;
+    let presentation_end = presentation_start + presentation_segment.len();
+    let mut pieces = Vec::new();
+    if scope_start > 0 {
+        pieces.push((formatted[..scope_start].to_string(), None));
+    }
+    pieces.push((
+        formatted[scope_start..scope_end].to_string(),
+        Some(HeaderAction::ToggleCategoryScope),
+    ));
+    if scope_end < presentation_start {
+        pieces.push((formatted[scope_end..presentation_start].to_string(), None));
+    }
+    pieces.push((
+        formatted[presentation_start..presentation_end].to_string(),
+        Some(HeaderAction::CyclePresentationMode),
+    ));
+    if presentation_end < formatted.len() {
+        pieces.push((formatted[presentation_end..].to_string(), None));
+    }
+    pieces
 }
 
 fn header_total_suffix(theme: &SidebarRenderTheme) -> &str {
@@ -1324,7 +1366,7 @@ fn render_chat_dense_line(
         .map(|(_, body)| body.trim())
         .unwrap_or(row.label.as_str());
     let prefix_after_glyph = format!(" {agent:<7} {origin:<3} ");
-    let show_pin_cell = state.view_mode == ViewMode::Priority;
+    let show_pin_cell = state.presentation_mode == PresentationMode::Priority;
     let pin_width = usize::from(show_pin_cell);
     let right_width = display_width(&right);
     let right_reserved = if right_width > 0 { right_width + 1 } else { 0 };
@@ -1542,7 +1584,7 @@ fn row_flash(row: &SidebarRow) -> bool {
 }
 
 fn row_unread_pinned(row: &SidebarRow, state: &SidebarState) -> bool {
-    state.view_mode == ViewMode::Priority
+    state.presentation_mode == PresentationMode::Priority
         && row
             .meta
             .as_ref()
@@ -1554,7 +1596,7 @@ fn unread_pin_marker_span(
     state: &SidebarState,
     theme: &SidebarRenderTheme,
 ) -> Span<'static> {
-    if state.view_mode != ViewMode::Priority {
+    if state.presentation_mode != PresentationMode::Priority {
         return Span::styled(" ".to_string(), Style::default().fg(theme.marker));
     }
     match row.meta.as_ref() {
@@ -1997,27 +2039,41 @@ fn parse_color(raw: Option<&str>) -> Option<Color> {
     }
 }
 
-fn view_mode_label(view_mode: ViewMode) -> &'static str {
-    match view_mode {
-        ViewMode::Flat => "Flat",
-        ViewMode::ByRepo => "Repository",
-        ViewMode::ByCategory => "Category",
-        ViewMode::Priority => "Priority",
+fn category_scope_label(scope: CategoryScope) -> &'static str {
+    match scope {
+        CategoryScope::Current => "Current",
+        CategoryScope::All => "All",
     }
 }
 
-fn view_mode_label_padded(view_mode: ViewMode) -> String {
+fn category_scope_label_padded(scope: CategoryScope) -> String {
+    let width = [CategoryScope::Current, CategoryScope::All]
+        .into_iter()
+        .map(|scope| category_scope_label(scope).len())
+        .max()
+        .unwrap_or(0);
+    format!("{:<width$}", category_scope_label(scope))
+}
+
+fn presentation_mode_label(mode: PresentationMode) -> &'static str {
+    match mode {
+        PresentationMode::Tree => "Tree",
+        PresentationMode::Priority => "Priority",
+        PresentationMode::Flat => "Flat",
+    }
+}
+
+fn presentation_mode_label_padded(mode: PresentationMode) -> String {
     let width = [
-        ViewMode::Flat,
-        ViewMode::ByRepo,
-        ViewMode::ByCategory,
-        ViewMode::Priority,
+        PresentationMode::Tree,
+        PresentationMode::Priority,
+        PresentationMode::Flat,
     ]
     .into_iter()
-    .map(|mode| view_mode_label(mode).len())
+    .map(|mode| presentation_mode_label(mode).len())
     .max()
     .unwrap_or(0);
-    format!("{:<width$}", view_mode_label(view_mode))
+    format!("{:<width$}", presentation_mode_label(mode))
 }
 
 fn visible_segment_range(text: &str, start: usize, len: usize) -> Option<std::ops::Range<u16>> {
@@ -2337,7 +2393,7 @@ mod tests {
             ..Default::default()
         });
         let mut priority = SidebarState {
-            view_mode: ViewMode::Priority,
+            presentation_mode: PresentationMode::Priority,
             ..SidebarState::default()
         };
         let theme = SidebarRenderTheme::default();
@@ -2365,7 +2421,7 @@ mod tests {
         assert!(unpinned.contains('·'), "{unpinned:?}");
         assert!(!unpinned.contains('✦'), "{unpinned:?}");
 
-        priority.view_mode = ViewMode::Flat;
+        priority.presentation_mode = PresentationMode::Flat;
         let outside_priority = render_rows(&[pinned], &priority, 40);
         assert!(!outside_priority.contains('✦'), "{outside_priority:?}");
         assert!(!outside_priority.contains('·'), "{outside_priority:?}");
@@ -2581,10 +2637,11 @@ mod tests {
     }
 
     #[test]
-    fn mode_segment_uses_header_mode_color_and_glyph() {
+    fn axis_segments_use_header_mode_color_and_glyphs() {
         let theme = SidebarRenderTheme::default();
         let state = SidebarState {
-            view_mode: ViewMode::ByRepo,
+            category_scope: CategoryScope::Current,
+            presentation_mode: PresentationMode::Tree,
             ..SidebarState::default()
         };
 
@@ -2594,7 +2651,7 @@ mod tests {
         assert!(mode_style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(
             build_header_layout(&state, 80).lines[1].text,
-            format!(" ≣ Repository ▾ \u{e0b0} 0 tasks \u{e0b0}")
+            format!(" ◉ Current · ≣ Tree     ▾ \u{e0b0} 0 tasks \u{e0b0}")
         );
     }
 
@@ -2628,36 +2685,29 @@ sidebar:
         assert_eq!(section.bg, None);
         assert!(section.add_modifier.contains(Modifier::BOLD));
 
-        let mode = style_for_segment(&header, 1, "≣ Category");
+        let mode = style_for_segment(&header, 1, "≣ Tree");
         assert_eq!(mode.fg, Some(Color::Rgb(0xb4, 0xbe, 0xfe)));
         assert_eq!(mode.bg, None);
         assert!(mode.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
-    fn header_filter_positions_are_stable_across_view_modes() {
-        let text_for = |view_mode: ViewMode| {
+    fn header_filter_positions_are_stable_across_view_axes() {
+        let text_for = |presentation_mode: PresentationMode| {
             let state = SidebarState {
-                view_mode,
+                presentation_mode,
                 ..SidebarState::default()
             };
             build_header_layout(&state, 80).lines[2].text.clone()
         };
-        let flat = text_for(ViewMode::Flat);
-        let repo = text_for(ViewMode::ByRepo);
-        let category = text_for(ViewMode::ByCategory);
-        let priority = text_for(ViewMode::Priority);
+        let tree = text_for(PresentationMode::Tree);
+        let flat = text_for(PresentationMode::Flat);
+        let priority = text_for(PresentationMode::Priority);
 
-        assert_eq!(flat.find('≡'), repo.find('≡'), "{flat:?} vs {repo:?}");
-        assert_eq!(
-            repo.find('≡'),
-            category.find('≡'),
-            "{repo:?} vs {category:?}"
-        );
-        assert_eq!(display_width(&flat), display_width(&repo));
-        assert_eq!(display_width(&repo), display_width(&category));
-        assert_eq!(display_width(&category), display_width(&priority));
-        assert_eq!(category.find('≡'), priority.find('≡'));
+        assert_eq!(flat.find('≡'), tree.find('≡'), "{flat:?} vs {tree:?}");
+        assert_eq!(display_width(&flat), display_width(&tree));
+        assert_eq!(display_width(&tree), display_width(&priority));
+        assert_eq!(tree.find('≡'), priority.find('≡'));
     }
 
     #[test]
@@ -2865,7 +2915,8 @@ sidebar:
     #[test]
     fn header_layout_uses_powerline_title_and_filter_chip_rows() {
         let state = SidebarState {
-            view_mode: ViewMode::ByCategory,
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Tree,
             filter: StatusFilter::All,
             ..SidebarState::default()
         };
@@ -2881,7 +2932,7 @@ sidebar:
         assert_eq!(header.lines[0].text, " SIDEBAR");
         assert_eq!(
             header.lines[1].text,
-            format!(" ≣ Category   ▾ \u{e0b0} 7 tasks \u{e0b0}")
+            format!(" ◉ All     · ≣ Tree     ▾ \u{e0b0} 7 tasks \u{e0b0}")
         );
         assert_eq!(header.lines[2].text, " ≡ 7  ▲ 1  ● 1  ✓ 0  ○ 5 ");
         let section = style_for_segment(&header, 0, "SIDEBAR");
@@ -2911,14 +2962,15 @@ sidebar:
 
         assert_eq!(
             header.lines[1].text,
-            format!(" ≣ Category   ▾ \u{e0b0} 1 task \u{e0b0}")
+            format!(" ◉ Current · ≣ Tree     ▾ \u{e0b0} 1 task \u{e0b0}")
         );
     }
 
     #[test]
     fn header_hit_test_ignores_total_segment_and_zero_count_chips() {
         let state = SidebarState {
-            view_mode: ViewMode::ByCategory,
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Tree,
             filter: StatusFilter::All,
             ..SidebarState::default()
         };
@@ -2933,9 +2985,12 @@ sidebar:
         assert_eq!(header_hit_test(&header, 0, 2), None);
         assert_eq!(
             header_hit_test(&header, 1, 2),
-            Some(HeaderAction::CycleViewMode)
+            Some(HeaderAction::ToggleCategoryScope)
         );
-        assert_eq!(header_hit_test(&header, 1, 18), None);
+        assert_eq!(
+            header_hit_test(&header, 1, 18),
+            Some(HeaderAction::CyclePresentationMode)
+        );
         assert_eq!(
             header_hit_test(&header, 2, 1),
             Some(HeaderAction::SetFilter(StatusFilter::All))
@@ -2958,7 +3013,8 @@ sidebar:
     #[test]
     fn unread_done_does_not_render_the_red_attention_chip() {
         let state = SidebarState {
-            view_mode: ViewMode::ByCategory,
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Tree,
             filter: StatusFilter::All,
             ..SidebarState::default()
         };
@@ -3165,14 +3221,15 @@ sidebar:
             idle: 5,
         };
         let state = SidebarState {
-            view_mode: ViewMode::ByCategory,
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Tree,
             filter: StatusFilter::AttentionOnly,
             ..SidebarState::default()
         };
 
         let header = build_header_layout_with_counts(&state, 80, &theme, counts);
 
-        let mode = style_for_segment(&header, 1, "≣ Category");
+        let mode = style_for_segment(&header, 1, "≣ Tree");
         assert_eq!(mode.fg, Some(Color::Indexed(16)));
         assert_eq!(mode.bg, Some(theme.header_mode));
         assert!(mode.add_modifier.contains(Modifier::BOLD));
@@ -3221,13 +3278,14 @@ sidebar:
 
         assert_eq!(theme.header_suffix, "");
         assert!(!header.lines[1].text.contains('\u{e0b0}'));
-        assert_eq!(header.lines[1].text, " ≣ Category   ▾  7 tasks ");
+        assert_eq!(header.lines[1].text, " ◉ Current · ≣ Tree     ▾  7 tasks ");
     }
 
     #[test]
     fn header_width_fallback_drops_total_before_truncating_mode() {
         let state = SidebarState {
-            view_mode: ViewMode::ByCategory,
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Tree,
             ..SidebarState::default()
         };
 
@@ -3237,7 +3295,7 @@ sidebar:
             &SidebarRenderTheme::default(),
             rich_header_counts(),
         );
-        assert_eq!(compact.lines[1].text, " ≣ Category…");
+        assert_eq!(compact.lines[1].text, " ◉ All     …");
         assert!(!compact.lines[1].text.contains("tasks"));
 
         let narrow = build_header_layout_with_counts(
@@ -3285,10 +3343,10 @@ sidebar:
 
         let header = build_header_layout_with_counts(&state, 80, &theme, rich_header_counts());
         let lines = render_header_lines(&header, &theme);
-        let mode = style_for_segment(&header, 1, "≣ Category");
+        let mode = style_for_segment(&header, 1, "≣ Tree");
         let suffix = style_for_segment(&header, 1, "]");
 
-        assert_eq!(header.lines[1].text, "[ ≣ Category   ] 7 tasks ]");
+        assert_eq!(header.lines[1].text, "[ ◉ Current · ≣ Tree     ] 7 tasks ]");
         assert_eq!(mode.fg, Some(Color::White));
         assert_eq!(mode.bg, Some(Color::Indexed(24)));
         assert!(mode.add_modifier.contains(Modifier::BOLD));

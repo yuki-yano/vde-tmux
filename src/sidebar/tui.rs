@@ -38,7 +38,8 @@ use crate::sidebar::render::{
     render_lines_with_indices,
 };
 use crate::sidebar::state::{
-    SidebarAction, SidebarPreferenceIntent, SidebarState, StatusFilter, ViewMode,
+    CategoryScope, PresentationMode, SidebarAction, SidebarPreferenceIntent, SidebarState,
+    StatusFilter,
 };
 use crate::sidebar::tree::{
     BadgeCounts, SidebarProjection, SidebarRow, SidebarRowKind, chat_row_id,
@@ -644,7 +645,10 @@ mod local_state_tests {
             ],
             ..snapshot(10)
         };
-        let mut state = SidebarState::default();
+        let mut state = SidebarState {
+            current_category: Some(crate::category::UNCATEGORIZED.to_string()),
+            ..SidebarState::default()
+        };
         let expected = project_view(&snapshot, &Config::default(), &state)
             .rows
             .into_iter()
@@ -662,6 +666,60 @@ mod local_state_tests {
         );
 
         assert_eq!(state.selection, Some(expected));
+    }
+
+    #[test]
+    fn current_category_prefers_linked_session_and_re_resolves_pane_placement() {
+        let mut snapshot = snapshot(90);
+        let identity = crate::category::RepoIdentity {
+            key: crate::category::RepoKey::path("/tmp"),
+            rule_path: "/tmp".to_string(),
+            display_name: "tmp".to_string(),
+        };
+        let model_for = |category: &str| {
+            let mut config = Config::default();
+            config.categories.rules.push(crate::config::CategoryRule {
+                category: category.to_string(),
+                path_patterns: vec!["/tmp".to_string()],
+            });
+            crate::category::EffectiveCategoryModel::build(
+                &config,
+                &crate::category::CategoryState::default(),
+                [identity.clone()],
+            )
+            .unwrap()
+        };
+        snapshot
+            .sidebar_model
+            .repo_identities
+            .insert("/tmp".to_string(), identity.clone());
+        snapshot.sidebar_model.categories = model_for("pane-category");
+        snapshot
+            .sidebar_model
+            .session_categories
+            .insert("$1".to_string(), "session-category".to_string());
+        let target = snapshot.panes[0].pane_instance.clone();
+        let mut state = SidebarState::default();
+
+        assert!(set_sidebar_context(&snapshot, &mut state, &target, "$1"));
+        assert_eq!(state.current_category.as_deref(), Some("session-category"));
+
+        snapshot.sidebar_model.session_categories.clear();
+        assert!(refresh_current_category(&snapshot, &mut state));
+        assert_eq!(state.current_category.as_deref(), Some("pane-category"));
+
+        snapshot.sidebar_model.categories = model_for("moved-category");
+        assert!(refresh_current_category(&snapshot, &mut state));
+        assert_eq!(state.current_category.as_deref(), Some("moved-category"));
+
+        let before = state.clone();
+        assert!(!set_sidebar_context(
+            &snapshot,
+            &mut state,
+            &target,
+            "$not-linked"
+        ));
+        assert_eq!(state, before);
     }
 
     #[test]
@@ -757,9 +815,10 @@ mod local_state_tests {
     }
 
     #[test]
-    fn persisted_preferences_seed_view_filter_and_global_expansion() {
+    fn persisted_preferences_seed_axes_filter_and_global_expansion() {
         let mut snapshot = snapshot(10);
-        snapshot.sidebar_model.preferences.view_mode = ViewMode::ByCategory;
+        snapshot.sidebar_model.preferences.category_scope = CategoryScope::All;
+        snapshot.sidebar_model.preferences.presentation_mode = PresentationMode::Tree;
         snapshot.sidebar_model.preferences.filter = StatusFilter::DoneOnly;
         snapshot.sidebar_model.preferences.expansion_overrides =
             std::collections::BTreeSet::from(["category::work".to_string()]);
@@ -781,7 +840,8 @@ mod local_state_tests {
 
         seed_persisted_sidebar_preferences(&snapshot, &mut state);
 
-        assert_eq!(state.view_mode, ViewMode::ByCategory);
+        assert_eq!(state.category_scope, CategoryScope::All);
+        assert_eq!(state.presentation_mode, PresentationMode::Tree);
         assert_eq!(state.filter, StatusFilter::DoneOnly);
         assert_eq!(
             state.collapsed,
@@ -794,19 +854,25 @@ mod local_state_tests {
     }
 
     #[test]
-    fn remote_view_and_filter_updates_converge_without_moving_the_shared_cursor() {
+    fn remote_axes_and_filter_updates_converge_without_moving_the_shared_cursor() {
         let mut snapshot = snapshot(11);
-        snapshot.sidebar_model.preferences.view_mode = ViewMode::Flat;
+        snapshot.sidebar_model.preferences.category_scope = CategoryScope::Current;
+        snapshot.sidebar_model.preferences.presentation_mode = PresentationMode::Flat;
         snapshot.sidebar_model.preferences.filter = StatusFilter::DoneOnly;
         let selection = Some("chat::%7::70".to_string());
         let mut first = SidebarState {
+            category_scope: CategoryScope::All,
             selection: selection.clone(),
             scroll: 4,
             manual_scroll: true,
             ..SidebarState::default()
         };
         let mut second = first.clone();
-        let original_preferences = Some((ViewMode::ByCategory, StatusFilter::All));
+        let original_preferences = Some((
+            CategoryScope::All,
+            PresentationMode::Tree,
+            StatusFilter::All,
+        ));
         let mut first_remote = original_preferences;
         let mut second_remote = original_preferences;
         let mut first_queued = original_preferences;
@@ -825,13 +891,21 @@ mod local_state_tests {
             &mut second_queued,
         ));
 
-        assert_eq!(first.view_mode, ViewMode::Flat);
+        assert_eq!(first.category_scope, CategoryScope::Current);
+        assert_eq!(first.presentation_mode, PresentationMode::Flat);
         assert_eq!(first.filter, StatusFilter::DoneOnly);
         assert_eq!(first, second);
         assert_eq!(first.selection, selection);
         assert_eq!(first.scroll, 4);
         assert!(first.manual_scroll);
-        assert_eq!(first_queued, Some((ViewMode::Flat, StatusFilter::DoneOnly)));
+        assert_eq!(
+            first_queued,
+            Some((
+                CategoryScope::Current,
+                PresentationMode::Flat,
+                StatusFilter::DoneOnly
+            ))
+        );
         assert_eq!(second_queued, first_queued);
         assert!(!apply_remote_sidebar_preferences(
             &snapshot,
@@ -842,17 +916,25 @@ mod local_state_tests {
     }
 
     #[test]
-    fn remote_filter_ack_does_not_undo_a_newer_unqueued_view_change() {
+    fn remote_filter_ack_does_not_undo_a_newer_unqueued_presentation_change() {
         let mut snapshot = snapshot(12);
-        snapshot.sidebar_model.preferences.view_mode = ViewMode::Flat;
+        snapshot.sidebar_model.preferences.presentation_mode = PresentationMode::Flat;
         snapshot.sidebar_model.preferences.filter = StatusFilter::All;
         let mut state = SidebarState {
-            view_mode: ViewMode::Priority,
+            presentation_mode: PresentationMode::Priority,
             filter: StatusFilter::All,
             ..SidebarState::default()
         };
-        let mut last_remote = Some((ViewMode::Flat, StatusFilter::DoneOnly));
-        let mut last_queued = Some((ViewMode::Flat, StatusFilter::All));
+        let mut last_remote = Some((
+            CategoryScope::Current,
+            PresentationMode::Flat,
+            StatusFilter::DoneOnly,
+        ));
+        let mut last_queued = Some((
+            CategoryScope::Current,
+            PresentationMode::Flat,
+            StatusFilter::All,
+        ));
 
         assert!(!apply_remote_sidebar_preferences(
             &snapshot,
@@ -861,10 +943,17 @@ mod local_state_tests {
             &mut last_queued,
         ));
 
-        assert_eq!(state.view_mode, ViewMode::Priority);
+        assert_eq!(state.presentation_mode, PresentationMode::Priority);
         assert_eq!(state.filter, StatusFilter::All);
-        assert_eq!(last_remote, Some((ViewMode::Flat, StatusFilter::All)));
-        assert_eq!(last_queued, Some((ViewMode::Flat, StatusFilter::All)));
+        assert_eq!(
+            last_remote,
+            Some((
+                CategoryScope::Current,
+                PresentationMode::Flat,
+                StatusFilter::All
+            ))
+        );
+        assert_eq!(last_queued, last_remote);
     }
 
     #[test]
@@ -885,8 +974,8 @@ mod local_state_tests {
             .unwrap();
         request_tx
             .send(PreferenceIntentRequest {
-                intent: SidebarPreferenceIntent::SetDefaultViewMode {
-                    view_mode: ViewMode::Flat,
+                intent: SidebarPreferenceIntent::SetDefaultPresentationMode {
+                    presentation_mode: PresentationMode::Flat,
                 },
             })
             .unwrap();
@@ -917,7 +1006,8 @@ mod local_state_tests {
         snapshot.sidebar_model.active_categories =
             std::collections::BTreeSet::from([crate::category::UNCATEGORIZED.to_string()]);
         let state = SidebarState {
-            view_mode: ViewMode::Flat,
+            current_category: Some(crate::category::UNCATEGORIZED.to_string()),
+            presentation_mode: PresentationMode::Flat,
             ..SidebarState::default()
         };
 
@@ -945,7 +1035,10 @@ mod local_state_tests {
             ..snapshot(10)
         };
         snapshot.sidebar_model.preferences.filter = StatusFilter::DoneOnly;
-        let mut state = SidebarState::default();
+        let mut state = SidebarState {
+            current_category: Some(crate::category::UNCATEGORIZED.to_string()),
+            ..SidebarState::default()
+        };
 
         seed_persisted_sidebar_preferences(&snapshot, &mut state);
         seed_initial_sidebar_context(
@@ -1324,7 +1417,8 @@ mod local_state_tests {
         let mut snapshot = snapshot(70);
         snapshot.panes = vec![presentation];
         let state = SidebarState {
-            view_mode: ViewMode::Priority,
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Priority,
             selection: Some(chat_row_id(&target)),
             ..SidebarState::default()
         };
@@ -1352,7 +1446,7 @@ mod local_state_tests {
         assert!(ui.pin_pending.contains(&target));
 
         let mut flat = sidebar.clone();
-        flat.state.view_mode = ViewMode::Flat;
+        flat.state.presentation_mode = PresentationMode::Flat;
         let mut flat_ui = MarkCompleteUi::default();
         queue_unread_pin_for_selection(&snapshot, &flat, &tx, &mut flat_ui);
         assert_eq!(
@@ -2576,7 +2670,11 @@ fn run_loop<B: Backend>(
         }
         if !initial_context_seeded && let Some(snapshot) = current.as_ref() {
             seed_persisted_sidebar_preferences(snapshot, &mut sidebar_state);
-            let preferences = (sidebar_state.view_mode, sidebar_state.filter);
+            let preferences = (
+                sidebar_state.category_scope,
+                sidebar_state.presentation_mode,
+                sidebar_state.filter,
+            );
             last_queued_preferences = Some(preferences);
             last_remote_preferences = Some(preferences);
             last_expansion_view = Some(sidebar_state.collapsed.clone());
@@ -2637,6 +2735,7 @@ fn run_loop<B: Backend>(
             render_gate.mark_dirty();
         }
         if let Some(snapshot) = current.as_ref() {
+            render_gate.mark_dirty_if(refresh_current_category(snapshot, &mut sidebar_state));
             render_gate.mark_dirty_if(clear_stale_pane_selection(snapshot, &mut sidebar_state));
         }
         render_gate.mark_dirty_if(drain_mark_complete_results(&mark_result_rx, &mut mark_ui));
@@ -2684,7 +2783,11 @@ fn run_loop<B: Backend>(
                 last_remote_expansion = Some(remote.clone());
                 last_expansion_view = Some(remote.clone());
             }
-            last_queued_preferences = Some((sidebar_state.view_mode, sidebar_state.filter));
+            last_queued_preferences = Some((
+                sidebar_state.category_scope,
+                sidebar_state.presentation_mode,
+                sidebar_state.filter,
+            ));
         } else if let Some(previous) = last_expansion_view.as_ref() {
             for row_id in previous
                 .symmetric_difference(&sidebar_state.collapsed)
@@ -2717,18 +2820,27 @@ fn run_loop<B: Backend>(
                 render_gate.mark_dirty();
             }
         }
-        let preferences = (sidebar_state.view_mode, sidebar_state.filter);
+        let preferences = (
+            sidebar_state.category_scope,
+            sidebar_state.presentation_mode,
+            sidebar_state.filter,
+        );
         if matches!(connection, ConnectionState::Connected)
             && last_queued_preferences.is_some_and(|previous| previous != preferences)
         {
             let previous = last_queued_preferences.expect("preference seed checked");
             let intents = [
-                (previous.0 != sidebar_state.view_mode).then_some(
-                    SidebarPreferenceIntent::SetDefaultViewMode {
-                        view_mode: sidebar_state.view_mode,
+                (previous.0 != sidebar_state.category_scope).then_some(
+                    SidebarPreferenceIntent::SetDefaultCategoryScope {
+                        category_scope: sidebar_state.category_scope,
                     },
                 ),
-                (previous.1 != sidebar_state.filter).then_some(
+                (previous.1 != sidebar_state.presentation_mode).then_some(
+                    SidebarPreferenceIntent::SetDefaultPresentationMode {
+                        presentation_mode: sidebar_state.presentation_mode,
+                    },
+                ),
+                (previous.2 != sidebar_state.filter).then_some(
                     SidebarPreferenceIntent::SetDefaultFilter {
                         filter: sidebar_state.filter,
                     },
@@ -3164,19 +3276,88 @@ fn seed_initial_sidebar_context(
         };
         pane.validate().is_ok().then_some(pane)
     });
-    if let Some(pane) = pane_instance.as_ref()
-        && snapshot
-            .panes
-            .iter()
-            .any(|candidate| candidate.pane_instance == *pane)
-    {
-        state.return_target = Some(pane.clone());
+    if let Some(pane) = pane_instance.as_ref() {
+        set_sidebar_context(snapshot, state, pane, session_id.unwrap_or_default());
+    } else {
+        state.current_session_id = session_id
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        refresh_current_category(snapshot, state);
     }
     select_context_agent(snapshot, config, state, pane_instance.as_ref(), session_id);
 }
 
+fn set_sidebar_context(
+    snapshot: &ResolvedSnapshot,
+    state: &mut SidebarState,
+    pane_instance: &PaneInstance,
+    session_id: &str,
+) -> bool {
+    let Some(pane) = snapshot
+        .panes
+        .iter()
+        .find(|pane| pane.pane_instance == *pane_instance)
+    else {
+        return false;
+    };
+    if !session_id.is_empty()
+        && !pane
+            .session_links
+            .iter()
+            .any(|link| link.session_id == session_id)
+    {
+        return false;
+    }
+    let next_session = (!session_id.trim().is_empty()).then(|| session_id.to_string());
+    let context_changed = state.return_target.as_ref() != Some(pane_instance)
+        || state.current_session_id != next_session;
+    state.return_target = Some(pane_instance.clone());
+    state.current_session_id = next_session;
+    let category_changed = refresh_current_category(snapshot, state);
+    if context_changed && !category_changed {
+        state.version = state.version.saturating_add(1);
+    }
+    context_changed || category_changed
+}
+
+fn refresh_current_category(snapshot: &ResolvedSnapshot, state: &mut SidebarState) -> bool {
+    let session_category = state
+        .current_session_id
+        .as_ref()
+        .and_then(|session_id| snapshot.sidebar_model.session_categories.get(session_id))
+        .cloned();
+    let pane_category = state.return_target.as_ref().and_then(|target| {
+        let pane = snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.pane_instance == *target)?;
+        let category = snapshot
+            .sidebar_model
+            .repo_identities
+            .get(&pane.current_path)
+            .and_then(|identity| {
+                snapshot
+                    .sidebar_model
+                    .categories
+                    .placements
+                    .get(&identity.key)
+            })
+            .map(|placement| placement.category.to_string())
+            .unwrap_or_else(|| crate::category::UNCATEGORIZED.to_string());
+        Some(category)
+    });
+    let next = session_category.or(pane_category);
+    if state.current_category == next {
+        return false;
+    }
+    state.current_category = next;
+    state.version = state.version.saturating_add(1);
+    true
+}
+
 fn seed_persisted_sidebar_preferences(snapshot: &ResolvedSnapshot, state: &mut SidebarState) {
-    state.view_mode = snapshot.sidebar_model.preferences.view_mode;
+    state.category_scope = snapshot.sidebar_model.preferences.category_scope;
+    state.presentation_mode = snapshot.sidebar_model.preferences.presentation_mode;
     state.filter = snapshot.sidebar_model.preferences.filter;
     state.collapsed = snapshot
         .sidebar_model
@@ -3188,17 +3369,18 @@ fn seed_persisted_sidebar_preferences(snapshot: &ResolvedSnapshot, state: &mut S
 fn apply_remote_sidebar_preferences(
     snapshot: &ResolvedSnapshot,
     state: &mut SidebarState,
-    last_remote: &mut Option<(ViewMode, StatusFilter)>,
-    last_queued: &mut Option<(ViewMode, StatusFilter)>,
+    last_remote: &mut Option<(CategoryScope, PresentationMode, StatusFilter)>,
+    last_queued: &mut Option<(CategoryScope, PresentationMode, StatusFilter)>,
 ) -> bool {
     let remote = (
-        snapshot.sidebar_model.preferences.view_mode,
+        snapshot.sidebar_model.preferences.category_scope,
+        snapshot.sidebar_model.preferences.presentation_mode,
         snapshot.sidebar_model.preferences.filter,
     );
     if last_remote.as_ref() == Some(&remote) {
         return false;
     }
-    let local = (state.view_mode, state.filter);
+    let local = (state.category_scope, state.presentation_mode, state.filter);
     let mut queued = last_queued.unwrap_or(local);
     // A field that differs from the last locally queued value was changed by a newer local input
     // that has not reached the preference worker yet. Preserve it while adopting independent
@@ -3216,10 +3398,17 @@ fn apply_remote_sidebar_preferences(
         } else {
             local.1
         },
+        if local.2 == queued.2 {
+            queued.2 = remote.2;
+            remote.2
+        } else {
+            local.2
+        },
     );
     let changed = local != next;
-    state.view_mode = next.0;
-    state.filter = next.1;
+    state.category_scope = next.0;
+    state.presentation_mode = next.1;
+    state.filter = next.2;
     if changed {
         state.version = state.version.saturating_add(1);
     }
@@ -3301,11 +3490,14 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
         SidebarInputAction::ToggleExpand => {
             state.apply(SidebarAction::ToggleExpand, &refs);
         }
-        SidebarInputAction::SetViewMode(mode) => {
-            state.apply(SidebarAction::SetViewMode(mode), &refs);
+        SidebarInputAction::ToggleCategoryScope => {
+            state.apply(SidebarAction::ToggleCategoryScope, &refs);
         }
-        SidebarInputAction::CycleViewMode => {
-            state.apply(SidebarAction::CycleViewMode, &refs);
+        SidebarInputAction::SetPresentationMode(mode) => {
+            state.apply(SidebarAction::SetPresentationMode(mode), &refs);
+        }
+        SidebarInputAction::CyclePresentationMode => {
+            state.apply(SidebarAction::CyclePresentationMode, &refs);
         }
         SidebarInputAction::SetFilter(filter) => {
             if sidebar.counts.filter_is_available(filter) {
@@ -3671,8 +3863,13 @@ fn drain_control_messages(
             before = Some(state.clone());
         }
         match message {
-            crate::sidebar::control::ControlMessage::Input { key, source_pane } => {
+            crate::sidebar::control::ControlMessage::Input {
+                key,
+                source_pane,
+                session_id,
+            } => {
                 if let Some(snapshot) = snapshot {
+                    set_sidebar_context(snapshot, state, &source_pane, &session_id);
                     let sidebar = project_view(snapshot, config, state);
                     match crate::sidebar::input::parse_key(&key) {
                         Some(crate::sidebar::input::SidebarInputAction::AgentNext)
@@ -3837,7 +4034,7 @@ fn apply_focus_message(
     {
         return false;
     }
-    state.return_target = Some(pane_instance.clone());
+    set_sidebar_context(snapshot, state, &pane_instance, session_id);
     let changed = select_context_agent(
         snapshot,
         config,
@@ -4363,7 +4560,12 @@ fn handle_left_click(
     let header = &frame.header;
     if row < header.row_count() {
         match header_hit_test(header, row, column) {
-            Some(HeaderAction::CycleViewMode) => apply_local_sidebar_key(state, sidebar, "v"),
+            Some(HeaderAction::ToggleCategoryScope) => {
+                apply_local_sidebar_key(state, sidebar, "c");
+            }
+            Some(HeaderAction::CyclePresentationMode) => {
+                apply_local_sidebar_key(state, sidebar, "v");
+            }
             Some(HeaderAction::SetFilter(filter)) => {
                 apply_local_sidebar_key(state, sidebar, filter.key());
             }
@@ -4483,7 +4685,7 @@ fn queue_unread_pin_for_selection(
     tx: &mpsc::Sender<UnreadPinRequest>,
     ui: &mut MarkCompleteUi,
 ) {
-    if sidebar.state.view_mode != ViewMode::Priority {
+    if sidebar.state.presentation_mode != PresentationMode::Priority {
         ui.set_toast(
             "pin is available in Priority view".to_string(),
             NoticeLevel::Warning,

@@ -580,16 +580,23 @@ impl CanonicalCoordinatorState {
             .map(|witness| witness.session_id.clone())
             .collect::<BTreeSet<_>>();
         let categories = self.effective_category_model();
-        let active_categories = active_sessions
+        let session_categories = self
+            .status_metadata
+            .sessions
             .iter()
-            .filter_map(|session_id| self.status_metadata.sessions.get(session_id))
-            .map(|session| {
-                self.repo_identities
+            .map(|(session_id, session)| {
+                let category = self
+                    .repo_identities
                     .get(&session.project_path)
                     .and_then(|identity| categories.placements.get(&identity.key))
                     .map(|placement| placement.category.to_string())
-                    .unwrap_or_else(|| crate::category::UNCATEGORIZED.to_string())
+                    .unwrap_or_else(|| crate::category::UNCATEGORIZED.to_string());
+                (session_id.clone(), category)
             })
+            .collect::<BTreeMap<_, _>>();
+        let active_categories = active_sessions
+            .iter()
+            .filter_map(|session_id| session_categories.get(session_id).cloned())
             .collect();
         ResolvedSnapshot {
             snapshot_revision,
@@ -602,6 +609,7 @@ impl CanonicalCoordinatorState {
                 repo_identities: self.repo_identities.clone(),
                 active_sessions,
                 active_categories,
+                session_categories,
                 git: git_badges.clone(),
                 worktrees: worktrees.clone(),
                 needs_action: runtime.triage_panes().cloned().collect(),
@@ -2168,7 +2176,10 @@ mod tests {
             &state.projection_config,
             &resolved.panes,
             &resolved.sidebar_model,
-            &SidebarState::default(),
+            &SidebarState {
+                category_scope: crate::sidebar::state::CategoryScope::All,
+                ..SidebarState::default()
+            },
             now_epoch_secs(),
         );
         assert_eq!(projection.counts.total, 1);

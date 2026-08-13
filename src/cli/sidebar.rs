@@ -123,8 +123,15 @@ where
         }
         SidebarCommand::Input { key, window } => {
             let (server_identity, socket) = ensure_daemon(runner, env)?;
-            let source_pane = crate::sidebar::control::resolve_current_pane_instance(runner, env)
-                .context("failed to resolve the sidebar input source pane")?;
+            let source_context = resolve_selection_context(runner, env)
+                .context("failed to resolve the sidebar input source context")?;
+            let source_pane = source_context
+                .pane
+                .zip(source_context.pane_pid)
+                .map(|(pane_id, pane_pid)| crate::pane_state::PaneInstance { pane_id, pane_pid })
+                .ok_or_else(|| anyhow::anyhow!("sidebar input source pane is unavailable"))?;
+            source_pane.validate().map_err(anyhow::Error::msg)?;
+            let session_id = source_context.session.unwrap_or_default();
             if key == "unread-latest" {
                 crate::sidebar::client::send_latest_unread_jump_v2(
                     &socket,
@@ -141,7 +148,11 @@ where
             crate::sidebar::control::send(
                 &server_identity,
                 &sidebar,
-                &crate::sidebar::control::ControlMessage::Input { key, source_pane },
+                &crate::sidebar::control::ControlMessage::Input {
+                    key,
+                    source_pane,
+                    session_id,
+                },
             )?;
             Ok(None)
         }

@@ -17,7 +17,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1151,9 +1151,10 @@ mod tests {
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
                 command: SidebarCommand::PreferenceIntent {
-                    intent: crate::sidebar::state::SidebarPreferenceIntent::SetDefaultViewMode {
-                        view_mode: crate::sidebar::state::ViewMode::ByCategory,
-                    },
+                    intent:
+                        crate::sidebar::state::SidebarPreferenceIntent::SetDefaultPresentationMode {
+                            presentation_mode: crate::sidebar::state::PresentationMode::Tree,
+                        },
                 },
             },
             ClientMessage::SidebarCommand {

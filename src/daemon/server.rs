@@ -3283,7 +3283,10 @@ fn apply_sidebar_preference_intent(
         &state.projection_config,
         &snapshot.panes,
         &snapshot.sidebar_model,
-        &crate::sidebar::state::SidebarState::default(),
+        &crate::sidebar::state::SidebarState {
+            category_scope: crate::sidebar::state::CategoryScope::All,
+            ..crate::sidebar::state::SidebarState::default()
+        },
         crate::sidebar::tree::now_epoch_secs(),
     );
     let known_rows = projection
@@ -6280,8 +6283,8 @@ mod tests {
             &coordinator,
             2,
             second_event,
-            crate::sidebar::state::SidebarPreferenceIntent::SetDefaultViewMode {
-                view_mode: crate::sidebar::state::ViewMode::Flat,
+            crate::sidebar::state::SidebarPreferenceIntent::SetDefaultPresentationMode {
+                presentation_mode: crate::sidebar::state::PresentationMode::Flat,
             },
         );
         let duplicate = apply_sidebar_preference_intent(
@@ -6323,7 +6326,10 @@ mod tests {
             persisted.filter,
             crate::sidebar::state::StatusFilter::DoneOnly
         );
-        assert_eq!(persisted.view_mode, crate::sidebar::state::ViewMode::Flat);
+        assert_eq!(
+            persisted.presentation_mode,
+            crate::sidebar::state::PresentationMode::Flat
+        );
 
         drop(coordinator);
         std::fs::remove_dir_all(root).unwrap();

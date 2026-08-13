@@ -591,9 +591,9 @@ fn dispatch_sidebar_input_targets_the_invoking_sidebar_instance() {
             "-t",
             "%9",
             "-F",
-            "#{pane_id}\u{1f}#{pane_pid}",
+            "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{session_id}",
         ],
-        "%9\u{1f}909\n",
+        "%9\u{1f}909\u{1f}$1\n",
     );
     mock.stub(
         &[
@@ -642,6 +642,7 @@ fn dispatch_sidebar_input_targets_the_invoking_sidebar_instance() {
         Some(crate::sidebar::control::ControlMessage::Input {
             key: "j".to_string(),
             source_pane: sidebar,
+            session_id: "$1".to_string(),
         })
     );
 }
@@ -656,9 +657,9 @@ fn dispatch_sidebar_input_separates_nonfocused_source_from_target_sidebar() {
             "-t",
             "%1",
             "-F",
-            "#{pane_id}\u{1f}#{pane_pid}",
+            "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{session_id}",
         ],
-        "%1\u{1f}101\n",
+        "%1\u{1f}101\u{1f}$1\n",
     );
     mock.stub(
         &[
@@ -711,6 +712,7 @@ fn dispatch_sidebar_input_separates_nonfocused_source_from_target_sidebar() {
         Some(crate::sidebar::control::ControlMessage::Input {
             key: "agent-next".to_string(),
             source_pane: source,
+            session_id: "$1".to_string(),
         })
     );
 }
@@ -725,9 +727,9 @@ fn dispatch_sidebar_input_rejects_reused_source_pane() {
             "-t",
             "%1",
             "-F",
-            "#{pane_id}\u{1f}#{pane_pid}",
+            "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{session_id}",
         ],
-        "%1\u{1f}101\n",
+        "%1\u{1f}101\u{1f}$1\n",
     );
     mock.stub(
         &[
@@ -767,9 +769,9 @@ fn dispatch_sidebar_input_rejects_a_window_without_a_sidebar() {
             "-t",
             "%1",
             "-F",
-            "#{pane_id}\u{1f}#{pane_pid}",
+            "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{session_id}",
         ],
-        "%1\u{1f}101\n",
+        "%1\u{1f}101\u{1f}$1\n",
     );
     mock.stub(
         &[
@@ -808,9 +810,9 @@ fn dispatch_sidebar_input_rejects_multiple_sidebars_in_the_requested_window() {
             "-t",
             "%1",
             "-F",
-            "#{pane_id}\u{1f}#{pane_pid}",
+            "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{session_id}",
         ],
-        "%1\u{1f}101\n",
+        "%1\u{1f}101\u{1f}$1\n",
     );
     mock.stub(
         &[
@@ -853,9 +855,9 @@ fn dispatch_sidebar_input_targets_an_explicit_different_window() {
             "-t",
             "%1",
             "-F",
-            "#{pane_id}\u{1f}#{pane_pid}",
+            "#{pane_id}\u{1f}#{pane_pid}\u{1f}#{session_id}",
         ],
-        "%1\u{1f}101\n",
+        "%1\u{1f}101\u{1f}$1\n",
     );
     mock.stub(
         &[
@@ -897,6 +899,7 @@ fn dispatch_sidebar_input_targets_an_explicit_different_window() {
         Some(crate::sidebar::control::ControlMessage::Input {
             key: "agent-next".to_string(),
             source_pane: source,
+            session_id: "$1".to_string(),
         })
     );
 }
