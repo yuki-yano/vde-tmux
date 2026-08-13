@@ -239,8 +239,9 @@ vt sidebar close
 | `q` / `Esc` | Close the sidebar |
 
 Agents belonging to the active session have a `▎` marker on the left.
-Click any rendered line of an agent once to jump to its pane; the agent does not
-need to be selected first. Use `Space` to expand or collapse the selected agent.
+Click the first rendered line of an agent to expand or collapse it. Click its
+second or later line to jump to the agent pane without selecting it first.
+Use `Space` to expand or collapse the selected agent from the keyboard.
 The mouse wheel scrolls overflow without moving the selected cursor.
 An agent with no activity yet uses a single line while collapsed.
 Category scope, presentation, filter, manual order, expansion state, selection, and scrolling are

@@ -1079,18 +1079,18 @@ mod local_state_tests {
         assert!(row_for_click_with_indices(&sidebar, 1, 2, 0, &row_indices).is_none());
         assert_eq!(
             row_for_click_with_indices(&sidebar, 2, 2, 1, &row_indices)
-                .map(|clicked| clicked.row.id.as_str()),
-            Some("first")
+                .map(|clicked| (clicked.row.id.as_str(), clicked.is_first_rendered_line)),
+            Some(("first", true))
         );
         assert_eq!(
             row_for_click_with_indices(&sidebar, 3, 2, 1, &row_indices)
-                .map(|clicked| clicked.row.id.as_str()),
-            Some("second")
+                .map(|clicked| (clicked.row.id.as_str(), clicked.is_first_rendered_line)),
+            Some(("second", true))
         );
     }
 
     #[test]
-    fn agent_click_jumps_from_any_rendered_line_without_prior_selection() {
+    fn agent_click_toggles_the_first_rendered_line_and_jumps_from_later_lines() {
         let chat = SidebarRow {
             id: "chat::%1::101".to_string(),
             kind: SidebarRowKind::Chat,
@@ -1125,13 +1125,55 @@ mod local_state_tests {
         };
 
         assert_eq!(
-            row_click_intent(&ClickedRenderedRow { row: &chat }),
+            row_click_intent(&ClickedRenderedRow {
+                row: &chat,
+                is_first_rendered_line: true,
+            }),
+            Some(RowClickIntent::Toggle(chat.id.clone()))
+        );
+        assert_eq!(
+            row_click_intent(&ClickedRenderedRow {
+                row: &chat,
+                is_first_rendered_line: false,
+            }),
             Some(RowClickIntent::Jump(pane.clone()))
         );
         assert_eq!(
-            row_click_intent(&ClickedRenderedRow { row: &detail }),
+            row_click_intent(&ClickedRenderedRow {
+                row: &detail,
+                is_first_rendered_line: true,
+            }),
             Some(RowClickIntent::Jump(pane))
         );
+    }
+
+    #[test]
+    fn repeated_rendered_chat_rows_preserve_their_line_offset_when_scrolled() {
+        let chat = SidebarRow {
+            id: "chat::%1::101".to_string(),
+            kind: SidebarRowKind::Chat,
+            depth: 0,
+            label: "codex".to_string(),
+            chat_count: 0,
+            rollup: RollupLevel::Running,
+            badge_state: Some(BadgeState::Working),
+            expanded: false,
+            pane_id: Some("%1".to_string()),
+            git: None,
+            active: false,
+            meta: None,
+        };
+        let sidebar = SidebarView {
+            rows: vec![chat],
+            ..SidebarView::default()
+        };
+        let row_indices = vec![Some(0), Some(0)];
+
+        let first = row_for_click_with_indices(&sidebar, 2, 2, 0, &row_indices).unwrap();
+        let second = row_for_click_with_indices(&sidebar, 2, 2, 1, &row_indices).unwrap();
+
+        assert!(first.is_first_rendered_line);
+        assert!(!second.is_first_rendered_line);
     }
 
     #[test]
@@ -4140,11 +4182,15 @@ enum RowClickIntent {
 
 struct ClickedRenderedRow<'a> {
     row: &'a SidebarRow,
+    is_first_rendered_line: bool,
 }
 
 fn row_click_intent(clicked: &ClickedRenderedRow<'_>) -> Option<RowClickIntent> {
     match clicked.row.kind {
         SidebarRowKind::Category | SidebarRowKind::Repo => {
+            Some(RowClickIntent::Toggle(clicked.row.id.clone()))
+        }
+        SidebarRowKind::Chat if clicked.is_first_rendered_line => {
             Some(RowClickIntent::Toggle(clicked.row.id.clone()))
         }
         SidebarRowKind::Chat | SidebarRowKind::Detail => {
@@ -4166,8 +4212,12 @@ fn row_for_click_with_indices<'a>(
     }
     let display_index = usize::from(row - header_rows) + scroll;
     let row_index = row_indices.get(display_index).and_then(|index| *index)?;
+    let first_rendered_index = row_indices
+        .iter()
+        .position(|index| *index == Some(row_index))?;
     Some(ClickedRenderedRow {
         row: sidebar.rows.get(row_index)?,
+        is_first_rendered_line: display_index == first_rendered_index,
     })
 }
 
