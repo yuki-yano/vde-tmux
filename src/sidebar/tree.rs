@@ -47,6 +47,7 @@ pub struct SidebarRow {
 pub struct RowMeta {
     pub agent: Option<String>,
     pub prompt: Option<String>,
+    pub task_summary: Option<String>,
     pub wait_reason: Option<String>,
     pub elapsed_secs: Option<i64>,
     pub completed_age_secs: Option<i64>,
@@ -96,6 +97,7 @@ struct AgentPane {
     category: String,
     agent: String,
     prompt: String,
+    task_summary: String,
     wait_reason: String,
     started_at: String,
     completed_at: String,
@@ -253,6 +255,12 @@ pub fn build_rows_from_presentations(
                     .prompt
                     .as_ref()
                     .map(|prompt| prompt.text.clone())
+                    .unwrap_or_default(),
+                task_summary: canonical
+                    .task_context
+                    .summary
+                    .as_ref()
+                    .and_then(|summary| summary.text.clone())
                     .unwrap_or_default(),
                 wait_reason,
                 started_at: canonical
@@ -865,6 +873,12 @@ fn detail_row(pane: &AgentPane, depth: usize, suffix: &str, label: String) -> Si
 }
 
 fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarRow>) {
+    if let Some(summary) = non_empty(&pane.task_summary) {
+        rows.push(detail_row(pane, depth, "summary", summary.to_string()));
+    }
+    if let Some(prompt) = non_empty(&pane.prompt) {
+        rows.push(detail_row(pane, depth, "prompt", prompt.to_string()));
+    }
     if let Some(worktree) = &pane.worktree {
         rows.push(detail_row(
             pane,
@@ -872,9 +886,6 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
             "worktree",
             format!("+ {}", sanitize_detail_label(&worktree.name)),
         ));
-    }
-    if let Some(prompt) = non_empty(&pane.prompt) {
-        rows.push(detail_row(pane, depth, "prompt", prompt.to_string()));
     }
 
     if let Some(activity) = pane
@@ -992,6 +1003,7 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
     RowMeta {
         agent: Some(display_agent_name(&pane.agent)),
         prompt: non_empty(&pane.prompt).map(str::to_string),
+        task_summary: non_empty(&pane.task_summary).map(str::to_string),
         wait_reason: non_empty(&pane.wait_reason).map(str::to_string),
         elapsed_secs: pane
             .started_at
@@ -1255,6 +1267,7 @@ mod tests {
             category: "misc".to_string(),
             agent: "codex".to_string(),
             prompt: String::new(),
+            task_summary: String::new(),
             wait_reason: String::new(),
             started_at: "100".to_string(),
             completed_at: completed_at.to_string(),
@@ -1644,6 +1657,7 @@ mod tests {
                 text: "working".to_string(),
                 source: "test".to_string(),
             }),
+            task_context: crate::pane_state::TaskContextState::default(),
             tasks: TaskState::default(),
             subagents: Vec::new(),
             worktree_activity: None,
@@ -1730,6 +1744,21 @@ mod tests {
         assert!(!badge_needs_user_input(BadgeState::Done));
         assert!(!badge_needs_user_input(BadgeState::Working));
         assert!(!badge_needs_user_input(BadgeState::Idle));
+    }
+
+    #[test]
+    fn expanded_chat_places_summary_before_latest_prompt() {
+        let mut pane = agent_pane(BadgeState::Working, "");
+        pane.task_summary = "サイドバー要約表示".to_string();
+        pane.prompt = "実装してlocal installして".to_string();
+        let mut rows = Vec::new();
+
+        push_chat_detail_rows(&pane, 1, &mut rows);
+
+        assert_eq!(rows[0].id, "detail::%1::1::summary");
+        assert_eq!(rows[0].label, "サイドバー要約表示");
+        assert_eq!(rows[1].id, "detail::%1::1::prompt");
+        assert_eq!(rows[1].label, "実装してlocal installして");
     }
 
     #[test]

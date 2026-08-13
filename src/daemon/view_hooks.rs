@@ -1400,6 +1400,7 @@ mod tests {
             started_at: Some(1),
             completed_at: Some(2),
             prompt: None,
+            task_context: crate::pane_state::TaskContextState::default(),
             tasks: TaskState::default(),
             subagents: Vec::new(),
             worktree_activity: None,

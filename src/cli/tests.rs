@@ -467,6 +467,7 @@ fn pane_query_fixture(pane_id: &str) -> V2QueryFixture {
                 started_at: Some(crate::sidebar::tree::now_epoch_secs()),
                 completed_at: None,
                 prompt: None,
+                task_context: crate::pane_state::TaskContextState::default(),
                 tasks: TaskState::default(),
                 subagents: Vec::new(),
                 worktree_activity: None,

@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::daemon::session_badge::BadgeState;
 
-pub const PANE_STATE_SCHEMA_VERSION: u16 = 3;
+pub const PANE_STATE_SCHEMA_VERSION: u16 = 4;
 pub const IDENTIFIER_MAX_BYTES: usize = 256;
 pub const BODY_MAX_BYTES: usize = 4096;
 pub const PATH_MAX_BYTES: usize = 8192;
@@ -13,6 +13,9 @@ pub const MAX_TASK_ITEMS: usize = 256;
 pub const MAX_SUBAGENTS: usize = 256;
 pub const MAX_VIEW_PANES: usize = 512;
 pub const MAX_VIEW_WITNESSES: usize = 64;
+pub const MAX_TASK_CONTEXT_PROMPTS: usize = 4;
+pub const TASK_CONTEXT_PROMPT_MAX_BYTES: usize = 1_200;
+pub const TASK_SUMMARY_MAX_BYTES: usize = 256;
 pub const MAX_STORED_RECORD_BYTES: usize = 256 * 1024;
 pub const MAX_REQUEST_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -375,6 +378,113 @@ impl PromptState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSummaryState {
+    pub text: Option<String>,
+    pub context_fingerprint: String,
+    pub generated_at: i64,
+}
+
+impl TaskSummaryState {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if let Some(text) = &self.text {
+            validate_required_text(text, "task summary", TASK_SUMMARY_MAX_BYTES)?;
+            if text.contains(['\r', '\n']) {
+                return Err(ModelError("task summary must be one line".to_string()));
+            }
+        }
+        if self.context_fingerprint.len() != 64
+            || !self
+                .context_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ModelError(
+                "task summary context fingerprint is invalid".to_string(),
+            ));
+        }
+        if self.generated_at < 0 {
+            return Err(ModelError(
+                "task summary timestamp must be non-negative".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskContextState {
+    pub origin_prompt: Option<String>,
+    pub recent_prompts: Vec<String>,
+    pub summary: Option<TaskSummaryState>,
+}
+
+impl TaskContextState {
+    pub fn observe_prompt(&mut self, prompt: &str) {
+        let prompt = truncate_utf8(prompt.trim(), TASK_CONTEXT_PROMPT_MAX_BYTES);
+        if prompt.is_empty() {
+            return;
+        }
+        if self.origin_prompt.is_none() {
+            self.origin_prompt = Some(prompt.clone());
+        }
+        if self.recent_prompts.last() == Some(&prompt) {
+            return;
+        }
+        self.recent_prompts.push(prompt);
+        if self.recent_prompts.len() > MAX_TASK_CONTEXT_PROMPTS {
+            self.recent_prompts.remove(0);
+        }
+    }
+
+    pub fn context_fingerprint(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+
+        if self.origin_prompt.is_none() && self.recent_prompts.is_empty() {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        if let Some(origin) = &self.origin_prompt {
+            digest.update(b"origin\0");
+            digest.update(origin.as_bytes());
+        }
+        for prompt in &self.recent_prompts {
+            digest.update(b"\0recent\0");
+            digest.update(prompt.as_bytes());
+        }
+        Some(format!("{:x}", digest.finalize()))
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.recent_prompts.len() > MAX_TASK_CONTEXT_PROMPTS {
+            return Err(ModelError("too many task context prompts".to_string()));
+        }
+        if let Some(origin) = &self.origin_prompt {
+            validate_required_text(origin, "task context origin", TASK_CONTEXT_PROMPT_MAX_BYTES)?;
+        }
+        for prompt in &self.recent_prompts {
+            validate_required_text(prompt, "task context prompt", TASK_CONTEXT_PROMPT_MAX_BYTES)?;
+        }
+        if let Some(summary) = &self.summary {
+            summary.validate()?;
+        }
+        Ok(())
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].trim_end().to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskProgress {
@@ -449,6 +559,7 @@ pub struct PaneState {
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub prompt: Option<PromptState>,
+    pub task_context: TaskContextState,
     pub tasks: TaskState,
     pub subagents: Vec<SubagentState>,
     pub worktree_activity: Option<WorktreeActivity>,
@@ -534,6 +645,7 @@ impl PaneState {
         if let Some(prompt) = &self.prompt {
             prompt.validate()?;
         }
+        self.task_context.validate()?;
         validate_tasks(&self.tasks)?;
         validate_subagents(&self.subagents)?;
         if let Some(activity) = &self.worktree_activity {
@@ -762,6 +874,11 @@ pub enum PaneEvent {
         expected: StateVersion,
         completed_at: i64,
     },
+    TaskSummaryGenerated {
+        expected_state_id: StateId,
+        expected_agent_epoch: u64,
+        summary: TaskSummaryState,
+    },
     ProgressUpdated {
         observed_at: i64,
         operations: Vec<ProgressOperation>,
@@ -959,10 +1076,24 @@ mod tests {
             started_at: None,
             completed_at: None,
             prompt: None,
+            task_context: TaskContextState::default(),
             tasks: TaskState::default(),
             subagents: Vec::new(),
             worktree_activity: None,
         }
+    }
+
+    #[test]
+    fn task_context_keeps_origin_and_bounded_recent_prompts() {
+        let mut context = TaskContextState::default();
+        for prompt in ["origin", "one", "two", "three", "four", "five", "five"] {
+            context.observe_prompt(prompt);
+        }
+
+        assert_eq!(context.origin_prompt.as_deref(), Some("origin"));
+        assert_eq!(context.recent_prompts, ["two", "three", "four", "five"]);
+        assert_eq!(context.context_fingerprint().unwrap().len(), 64);
+        context.validate().unwrap();
     }
 
     #[test]

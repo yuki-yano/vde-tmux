@@ -267,6 +267,7 @@ fn running_pane_presentation(epoch: i64) -> PanePresentation {
         started_at: Some(epoch),
         completed_at: None,
         prompt: None,
+        task_context: vde_tmux::pane_state::TaskContextState::default(),
         tasks: TaskState::default(),
         subagents: Vec::new(),
         worktree_activity: None,

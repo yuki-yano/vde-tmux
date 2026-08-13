@@ -746,6 +746,7 @@ fn transition_at_epoch(event: &PaneEvent, current: Option<&PaneState>) -> i64 {
         PaneEvent::ExplicitStateReported { report } => report.observed_at,
         PaneEvent::MarkPaneRead { .. }
         | PaneEvent::SetUnreadPin { .. }
+        | PaneEvent::TaskSummaryGenerated { .. }
         | PaneEvent::PaneRemoved { .. } => current
             .and_then(|state| state.completed_at.or(state.started_at))
             .unwrap_or_default(),

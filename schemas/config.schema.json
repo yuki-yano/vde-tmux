@@ -253,6 +253,38 @@
           "minimum": 1,
           "type": "integer"
         },
+        "task_summary": {
+          "additionalProperties": false,
+          "properties": {
+            "claude_model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "codex_model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "debounce_ms": {
+              "default": 750,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "enabled": {
+              "default": false,
+              "type": "boolean"
+            },
+            "timeout_ms": {
+              "default": 90000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
         "width": {
           "oneOf": [
             {

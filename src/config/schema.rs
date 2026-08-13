@@ -303,6 +303,17 @@ pub fn config_schema() -> Value {
                         ]
                     },
                     "min_width": { "type": "integer", "minimum": 1 },
+                    "task_summary": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "enabled": { "type": "boolean", "default": false },
+                            "debounce_ms": { "type": "integer", "minimum": 1, "default": 750 },
+                            "timeout_ms": { "type": "integer", "minimum": 1, "default": 90000 },
+                            "codex_model": { "type": ["string", "null"] },
+                            "claude_model": { "type": ["string", "null"] }
+                        }
+                    },
                     "colors": {
                         "type": "object",
                         "additionalProperties": true,

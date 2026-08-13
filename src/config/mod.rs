@@ -454,6 +454,7 @@ impl BadgeColors {
 pub struct SidebarConfig {
     pub width: SidebarWidth,
     pub min_width: u16,
+    pub task_summary: SidebarTaskSummaryConfig,
     pub colors: SidebarColorsConfig,
     pub header: SidebarHeaderConfig,
 }
@@ -463,8 +464,31 @@ impl Default for SidebarConfig {
         Self {
             width: SidebarWidth::default(),
             min_width: 40,
+            task_summary: SidebarTaskSummaryConfig::default(),
             colors: SidebarColorsConfig::default(),
             header: SidebarHeaderConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SidebarTaskSummaryConfig {
+    pub enabled: bool,
+    pub debounce_ms: u64,
+    pub timeout_ms: u64,
+    pub codex_model: Option<String>,
+    pub claude_model: Option<String>,
+}
+
+impl Default for SidebarTaskSummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            debounce_ms: 750,
+            timeout_ms: 90_000,
+            codex_model: None,
+            claude_model: None,
         }
     }
 }
@@ -645,12 +669,35 @@ mod tests {
         assert_eq!(config.daemon.git.timeout_ms, 500);
         assert_eq!(config.sidebar.width, SidebarWidth::Columns(40));
         assert_eq!(config.sidebar.min_width, 40);
+        assert!(!config.sidebar.task_summary.enabled);
+        assert_eq!(config.sidebar.task_summary.debounce_ms, 750);
+        assert_eq!(config.sidebar.task_summary.timeout_ms, 90_000);
         assert_eq!(config.popup.width, "50%");
         assert_eq!(config.popup.height, "50%");
         assert!(config.session_manager.kill.send_ctrl_c);
         assert_eq!(config.session_manager.kill.term_wait_ms, 300);
         assert_eq!(config.session_manager.kill.kill_wait_ms, 300);
         assert_eq!(config.statusline.category.mode, "list");
+    }
+
+    #[test]
+    fn sidebar_task_summary_config_parses_agent_models() {
+        let config: Config = serde_yaml_ng::from_str(
+            "sidebar:\n  task_summary:\n    enabled: true\n    debounce_ms: 250\n    timeout_ms: 30000\n    codex_model: codex-small\n    claude_model: claude-fast\n",
+        )
+        .unwrap();
+
+        assert!(config.sidebar.task_summary.enabled);
+        assert_eq!(config.sidebar.task_summary.debounce_ms, 250);
+        assert_eq!(config.sidebar.task_summary.timeout_ms, 30_000);
+        assert_eq!(
+            config.sidebar.task_summary.codex_model.as_deref(),
+            Some("codex-small")
+        );
+        assert_eq!(
+            config.sidebar.task_summary.claude_model.as_deref(),
+            Some("claude-fast")
+        );
     }
 
     #[test]

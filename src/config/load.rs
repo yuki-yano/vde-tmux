@@ -52,7 +52,25 @@ pub fn parse_config_with_env(yaml: &str, env: &BTreeMap<String, String>) -> Load
 fn validate_config(config: &Config) -> Result<(), String> {
     crate::category::configured_category_names(config)
         .map(|_| ())
-        .map_err(|error| format!("categories: {error}"))
+        .map_err(|error| format!("categories: {error}"))?;
+    let summary = &config.sidebar.task_summary;
+    if summary.debounce_ms == 0 {
+        return Err("sidebar.task_summary.debounce_ms must be positive".to_string());
+    }
+    if summary.timeout_ms == 0 {
+        return Err("sidebar.task_summary.timeout_ms must be positive".to_string());
+    }
+    for (name, model) in [
+        ("codex_model", summary.codex_model.as_deref()),
+        ("claude_model", summary.claude_model.as_deref()),
+    ] {
+        if model.is_some_and(|value| value.trim().is_empty() || value.contains(['\r', '\n'])) {
+            return Err(format!(
+                "sidebar.task_summary.{name} must be a non-empty single-line model name"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn expand_config_patterns(
@@ -214,6 +232,17 @@ mod tests {
             "{}",
             loaded.warnings[0]
         );
+    }
+
+    #[test]
+    fn task_summary_rejects_zero_timeout_and_blank_model() {
+        let zero = parse_config("sidebar:\n  task_summary:\n    timeout_ms: 0\n");
+        assert_eq!(zero.config, Config::default());
+        assert!(zero.warnings[0].contains("timeout_ms"));
+
+        let blank = parse_config("sidebar:\n  task_summary:\n    codex_model: '   '\n");
+        assert_eq!(blank.config, Config::default());
+        assert!(blank.warnings[0].contains("codex_model"));
     }
 
     #[test]

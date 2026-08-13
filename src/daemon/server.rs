@@ -237,6 +237,7 @@ pub(crate) enum V2InternalMutation {
         health: HookHealth,
         diagnostic: Option<String>,
     },
+    TaskSummaryCompleted(crate::daemon::task_summary::TaskSummaryCompletion),
     SidebarEffectCompleted(SidebarEffectCompletion),
 }
 
@@ -745,6 +746,9 @@ struct ProductionV2Coordinator {
     notification_tx: Option<SyncSender<NotificationWorkerJob>>,
     notification_shutdown: Arc<AtomicBool>,
     notification_process_lock: Arc<Mutex<()>>,
+    task_summary_tx: Option<SyncSender<crate::daemon::task_summary::TaskSummaryJob>>,
+    task_summary_completion_rx:
+        Mutex<Option<mpsc::Receiver<crate::daemon::task_summary::TaskSummaryCompletion>>>,
     sidebar_tmux_tx: SyncSender<SidebarTmuxJob>,
     sidebar_completion_rx: Mutex<Option<mpsc::Receiver<SidebarEffectCompletion>>>,
     tmux_control: Mutex<Option<crate::daemon::tmux_control::TmuxControlHandle>>,
@@ -1052,10 +1056,25 @@ fn try_wait_notification_process_group(
 }
 
 impl ProductionV2Coordinator {
+    #[cfg(test)]
     fn new(
         incarnation: crate::daemon::lifecycle::TmuxServerIncarnation,
         env: std::collections::BTreeMap<String, String>,
         notification_command: Option<String>,
+    ) -> Result<Self> {
+        Self::new_with_task_summary(
+            incarnation,
+            env,
+            notification_command,
+            crate::config::SidebarTaskSummaryConfig::default(),
+        )
+    }
+
+    fn new_with_task_summary(
+        incarnation: crate::daemon::lifecycle::TmuxServerIncarnation,
+        env: std::collections::BTreeMap<String, String>,
+        notification_command: Option<String>,
+        task_summary_config: crate::config::SidebarTaskSummaryConfig,
     ) -> Result<Self> {
         let notification_shutdown = Arc::new(AtomicBool::new(false));
         let notification_process_lock = Arc::new(Mutex::new(()));
@@ -1068,6 +1087,13 @@ impl ProductionV2Coordinator {
                 notification_process_lock.clone(),
             )
         });
+        let task_summary_worker = task_summary_config
+            .enabled
+            .then(|| crate::daemon::task_summary::start_worker(task_summary_config));
+        let (task_summary_tx, task_summary_completion_rx) = task_summary_worker
+            .map_or((None, None), |worker| {
+                (Some(worker.sender), Some(worker.completions))
+            });
         let (sidebar_tmux_tx, sidebar_completion_rx) =
             start_sidebar_tmux_worker(&env, incarnation.identity.clone());
         let status_push = crate::daemon::status_push::StatusPushState::new(
@@ -1094,6 +1120,8 @@ impl ProductionV2Coordinator {
             notification_tx,
             notification_shutdown,
             notification_process_lock,
+            task_summary_tx,
+            task_summary_completion_rx: Mutex::new(task_summary_completion_rx),
             sidebar_tmux_tx,
             sidebar_completion_rx: Mutex::new(Some(sidebar_completion_rx)),
             tmux_control: Mutex::new(None),
@@ -1107,6 +1135,39 @@ impl ProductionV2Coordinator {
             current_view_refresh_generation: AtomicU64::new(0),
             current_view_refresh_running: AtomicBool::new(false),
         })
+    }
+
+    fn schedule_task_summary(&self, state: &crate::pane_state::PaneState) {
+        let Some(sender) = &self.task_summary_tx else {
+            return;
+        };
+        if !matches!(state.agent.as_str(), "codex" | "claude") {
+            return;
+        }
+        let Some(fingerprint) = state.task_context.context_fingerprint() else {
+            return;
+        };
+        if state
+            .task_context
+            .summary
+            .as_ref()
+            .is_some_and(|summary| summary.context_fingerprint == fingerprint)
+        {
+            return;
+        }
+        let job = crate::daemon::task_summary::TaskSummaryJob {
+            pane_instance: state.pane_instance.clone(),
+            state_id: state.state_id.clone(),
+            agent_epoch: state.agent_epoch,
+            agent: state.agent.clone(),
+            task_context: state.task_context.clone(),
+        };
+        if let Err(error) = sender.try_send(job) {
+            self.log_daemon_error(&format!(
+                "task summary dispatch failed for pane {}: {error}",
+                state.pane_instance.pane_id
+            ));
+        }
     }
 
     fn start_tmux_control(&self) {
@@ -2628,6 +2689,29 @@ fn start_sidebar_completion_forwarder(coordinator: Arc<ProductionV2Coordinator>)
     });
 }
 
+fn start_task_summary_completion_forwarder(coordinator: Arc<ProductionV2Coordinator>) {
+    let Some(receiver) = coordinator
+        .task_summary_completion_rx
+        .lock()
+        .expect("task summary completion receiver lock poisoned")
+        .take()
+    else {
+        return;
+    };
+    thread::spawn(move || {
+        while let Ok(completion) = receiver.recv() {
+            if coordinator.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            if !coordinator.enqueue_internal(V2InternalMutation::TaskSummaryCompleted(completion)) {
+                coordinator.log_daemon_error(
+                    "task summary completion could not enter sequenced mutation queue",
+                );
+            }
+        }
+    });
+}
+
 fn mutation_changes_topology_targets(mutation: &V2SequencedMutation) -> bool {
     match &mutation.mutation {
         V2AcceptedMutation::External(ClientMessage::RefreshTopology { .. })
@@ -3262,6 +3346,48 @@ fn apply_production_mutation(
                 snapshot_revision: state.leased.runtime.snapshot_revision(),
             }
         }
+        V2AcceptedMutation::Internal(V2InternalMutation::TaskSummaryCompleted(completion)) => {
+            let summary = match completion.result {
+                Ok(summary) => summary,
+                Err(error) => {
+                    coordinator.log_daemon_error(&format!(
+                        "task summary generation failed for pane {}: {error}",
+                        completion.pane_instance.pane_id
+                    ));
+                    let revision = coordinator
+                        .state
+                        .lock()
+                        .expect("canonical state lock poisoned")
+                        .as_ref()
+                        .map_or(0, |state| state.leased.runtime.snapshot_revision());
+                    return ServerMessage::SnapshotAck {
+                        event_id: EventId::generate()
+                            .expect("OS random source failed after daemon startup"),
+                        accepted_seq,
+                        snapshot_revision: revision,
+                    };
+                }
+            };
+            let envelope = PaneEventEnvelope {
+                daemon_instance_id: coordinator
+                    .router
+                    .lock()
+                    .expect("v2 router lock poisoned")
+                    .daemon_instance_id()
+                    .clone(),
+                event_id: EventId::generate()
+                    .expect("OS random source failed after daemon startup"),
+                pane_instance: completion.pane_instance,
+                agent: None,
+                agent_session_id: None,
+                event: PaneEvent::TaskSummaryGenerated {
+                    expected_state_id: completion.state_id,
+                    expected_agent_epoch: completion.agent_epoch,
+                    summary,
+                },
+            };
+            apply_external_pane_event(coordinator, accepted_seq, envelope)
+        }
         V2AcceptedMutation::Internal(V2InternalMutation::SidebarEffectCompleted(completion)) => {
             let fail_stop = matches!(
                 completion.result,
@@ -3693,7 +3819,7 @@ fn apply_pane_event_mutation(
             .runtime
             .apply_event(&mut io, &envelope, &visibility)
             .and_then(|result| {
-                finish_pane_event_projection(
+                let result = finish_pane_event_projection(
                     coordinator,
                     state,
                     &envelope.pane_instance,
@@ -3701,7 +3827,13 @@ fn apply_pane_event_mutation(
                     revision_before,
                     result,
                     defer_full_preflight,
-                )
+                )?;
+                if matches!(envelope.event, PaneEvent::BeginRun { .. })
+                    && let Some(record) = state.leased.runtime.record(&envelope.pane_instance)
+                {
+                    coordinator.schedule_task_summary(record);
+                }
+                Ok(result)
             })
     };
     match result {
@@ -4580,6 +4712,7 @@ pub fn run_runtime_daemon_server(
     start_tmux_server_liveness_monitor(coordinator.clone())?;
     start_v2_mutation_worker(coordinator.clone());
     start_sidebar_completion_forwarder(coordinator.clone());
+    start_task_summary_completion_forwarder(coordinator.clone());
     let capture = crate::daemon::workers::start_capture_coordinator(
         Arc::new(crate::daemon::workers::SystemObservationWorkerIo::new(
             coordinator
@@ -4656,10 +4789,11 @@ fn initialize_runtime_daemon_post_bind(
 ) -> Result<(Arc<ProductionV2Coordinator>, RuntimeDaemonCleanup)> {
     let notification_command = (config.notify.enabled && !config.notify.command.trim().is_empty())
         .then(|| config.notify.command.clone());
-    let coordinator = Arc::new(ProductionV2Coordinator::new(
+    let coordinator = Arc::new(ProductionV2Coordinator::new_with_task_summary(
         incarnation,
         env.clone(),
         notification_command,
+        config.sidebar.task_summary.clone(),
     )?);
     coordinator.configure_health(config);
     let daemon_instance_id = coordinator
@@ -6046,6 +6180,7 @@ mod tests {
             started_at: Some(1),
             completed_at: None,
             prompt: None,
+            task_context: crate::pane_state::TaskContextState::default(),
             tasks: TaskState::default(),
             subagents: Vec::new(),
             worktree_activity: None,

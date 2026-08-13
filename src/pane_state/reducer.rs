@@ -97,6 +97,7 @@ pub fn reduce(
         PaneEvent::PaneRemoved { .. } => Ok(Reduction::unchanged(current)),
         PaneEvent::MarkPaneRead { .. }
         | PaneEvent::SetUnreadPin { .. }
+        | PaneEvent::TaskSummaryGenerated { .. }
         | PaneEvent::MarkDone { .. } => {
             reduce_internal_state_event(current, envelope, context.clone())
         }
@@ -170,6 +171,23 @@ fn reduce_internal_state_event(
                 return Err(ReduceError::StaleSelection);
             }
             mark_done(&mut state, *completed_at)?;
+        }
+        PaneEvent::TaskSummaryGenerated {
+            expected_state_id,
+            expected_agent_epoch,
+            summary,
+        } => {
+            let current_fingerprint = state.task_context.context_fingerprint();
+            if state.state_id != *expected_state_id
+                || state.agent_epoch != *expected_agent_epoch
+                || current_fingerprint.as_deref() != Some(&summary.context_fingerprint)
+            {
+                return Ok(Reduction::unchanged(current));
+            }
+            summary.validate().map_err(|error| {
+                ReduceError::InvalidRequest(format!("invalid task summary: {error}"))
+            })?;
+            state.task_context.summary = Some(summary.clone());
         }
         _ => unreachable!(),
     }
@@ -510,6 +528,7 @@ fn new_state(
         started_at: None,
         completed_at: None,
         prompt: None,
+        task_context: TaskContextState::default(),
         tasks: TaskState::default(),
         subagents: Vec::new(),
         worktree_activity: None,
@@ -599,6 +618,9 @@ fn apply_agent_session_started(
     } else {
         None
     };
+    if let Some(prompt) = &state.prompt {
+        state.task_context.observe_prompt(&prompt.text);
+    }
     Ok(())
 }
 
@@ -780,6 +802,7 @@ fn begin_agent_epoch(
     state.started_at = None;
     state.completed_at = None;
     state.prompt = None;
+    state.task_context = TaskContextState::default();
     state.tasks = TaskState::default();
     state.subagents.clear();
     state.worktree_activity = None;
@@ -810,6 +833,9 @@ fn begin_run(
     start_new_run(state, started_at)?;
     state.lifecycle = LifecycleState::Running;
     state.prompt = prompt;
+    if let Some(prompt) = &state.prompt {
+        state.task_context.observe_prompt(&prompt.text);
+    }
     Ok(())
 }
 
@@ -982,6 +1008,7 @@ fn event_epoch(event: &PaneEvent, state: &PaneState) -> i64 {
         PaneEvent::ExplicitStateReported { report } => report.observed_at,
         PaneEvent::MarkPaneRead { .. }
         | PaneEvent::SetUnreadPin { .. }
+        | PaneEvent::TaskSummaryGenerated { .. }
         | PaneEvent::PaneRemoved { .. } => {
             state.completed_at.or(state.started_at).unwrap_or_default()
         }
@@ -3140,6 +3167,79 @@ mod tests {
         );
         assert_eq!(active(&cleared).agent_epoch, 3);
         assert!(active(&cleared).prompt.is_none());
+    }
+
+    #[test]
+    fn task_summary_applies_only_to_the_matching_context() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let running = reduce_once(
+            None,
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: Some(PromptState {
+                    text: "サイドバー要約を実装して".to_string(),
+                    source: "user".to_string(),
+                }),
+            },
+            &tracker,
+        );
+        let running_state = active(&running);
+        let fingerprint = running_state.task_context.context_fingerprint().unwrap();
+        let current_tracker = running.tracker_delta.as_ref().unwrap().next.clone();
+        let generated = reduce_once(
+            Some(running_state),
+            PaneEvent::TaskSummaryGenerated {
+                expected_state_id: running_state.state_id.clone(),
+                expected_agent_epoch: running_state.agent_epoch,
+                summary: TaskSummaryState {
+                    text: Some("サイドバー要約表示".to_string()),
+                    context_fingerprint: fingerprint.clone(),
+                    generated_at: 2,
+                },
+            },
+            &current_tracker,
+        );
+        assert_eq!(generated.outcome, ReductionOutcome::CanonicalChanged);
+        assert_eq!(
+            active(&generated)
+                .task_context
+                .summary
+                .as_ref()
+                .and_then(|summary| summary.text.as_deref()),
+            Some("サイドバー要約表示")
+        );
+
+        let changed = reduce_once(
+            generated.record.as_ref(),
+            PaneEvent::BeginRun {
+                started_at: 3,
+                prompt: Some(PromptState {
+                    text: "別のタスクへ切り替える".to_string(),
+                    source: "user".to_string(),
+                }),
+            },
+            &current_tracker,
+        );
+        let changed_state = active(&changed);
+        let changed_tracker = changed
+            .tracker_delta
+            .as_ref()
+            .map(|delta| &delta.next)
+            .unwrap_or(&current_tracker);
+        let stale = reduce_once(
+            Some(changed_state),
+            PaneEvent::TaskSummaryGenerated {
+                expected_state_id: changed_state.state_id.clone(),
+                expected_agent_epoch: changed_state.agent_epoch,
+                summary: TaskSummaryState {
+                    text: Some("古い要約".to_string()),
+                    context_fingerprint: fingerprint,
+                    generated_at: 4,
+                },
+            },
+            changed_tracker,
+        );
+        assert_eq!(stale.outcome, ReductionOutcome::Noop);
     }
 
     #[test]

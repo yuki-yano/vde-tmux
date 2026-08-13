@@ -968,17 +968,17 @@ record = next(p["resolved"]["canonical"] for p in reply["snapshot"]["panes"]
 assert record["unread"]["pinned"] is True, record["unread"]
 json.dump(record, open(output, "w", encoding="utf-8"), sort_keys=True)
 PY
-SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v3.json"
+SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v4.json"
 python3 - "$SNAPSHOT_FILE" "$DETAIL_PANE" "$DETAIL_PANE_PID" <<'PY'
 import json, os, stat, sys
 
 path = sys.argv[1]
 assert stat.S_IMODE(os.stat(path).st_mode) == 0o600, oct(stat.S_IMODE(os.stat(path).st_mode))
 snapshot = json.load(open(path, encoding="utf-8"))
-assert snapshot["schema_version"] == 3, snapshot["schema_version"]
+assert snapshot["schema_version"] == 4, snapshot["schema_version"]
 pane = {"pane_id":sys.argv[2], "pane_pid":int(sys.argv[3])}
 record = next(record for record in snapshot["records"] if record["pane_instance"] == pane)
-assert record["schema_version"] == 3, record["schema_version"]
+assert record["schema_version"] == 4, record["schema_version"]
 assert record["unread"]["pinned"] is True, record["unread"]
 PY
 SIDEBAR_BEFORE="$(sidebar_snapshot)"
@@ -1435,7 +1435,7 @@ echo "same-socket incarnation guard ok"
 
 # A persist failure returns a normal hook failure and never commits the candidate state. Run this
 # final fault after the lifecycle scenarios so an intentionally unavailable store cannot mask them.
-SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v3.json"
+SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v4.json"
 SNAPSHOT_DIR="$(dirname "$SNAPSHOT_FILE")"
 chmod 500 "$SNAPSHOT_DIR"
 set +e
@@ -1456,4 +1456,4 @@ assert not canonical or canonical.get("agent_session_id") != "persist-failure", 
 PY
 echo "persist failure hook exit status ok"
 
-echo "pane-state v3 scratch smoke ok"
+echo "pane-state v4 scratch smoke ok"

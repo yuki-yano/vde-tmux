@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{PaneInstance, PaneState, StoreError};
 
-pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
-pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v3.json";
+pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
+pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v4.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,6 +299,7 @@ mod tests {
                 text: format!("prompt-{index}"),
                 source: "hook".to_string(),
             }),
+            task_context: crate::pane_state::TaskContextState::default(),
             tasks: super::super::TaskState {
                 progress: super::super::TaskProgress { done: 1, total: 2 },
                 items: vec![
