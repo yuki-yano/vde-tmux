@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::daemon::session_badge::BadgeState;
 
-pub const PANE_STATE_SCHEMA_VERSION: u16 = 4;
+pub const PANE_STATE_SCHEMA_VERSION: u16 = 5;
 pub const IDENTIFIER_MAX_BYTES: usize = 256;
 pub const BODY_MAX_BYTES: usize = 4096;
 pub const PATH_MAX_BYTES: usize = 8192;
@@ -16,6 +16,8 @@ pub const MAX_VIEW_WITNESSES: usize = 64;
 pub const MAX_TASK_CONTEXT_PROMPTS: usize = 4;
 pub const TASK_CONTEXT_PROMPT_MAX_BYTES: usize = 1_200;
 pub const TASK_SUMMARY_MAX_BYTES: usize = 256;
+pub const RESPONSE_PREVIEW_MAX_BYTES: usize = 1_200;
+pub const MAX_LISTENING_PORTS: usize = 64;
 pub const MAX_STORED_RECORD_BYTES: usize = 256 * 1024;
 pub const MAX_REQUEST_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -380,6 +382,75 @@ impl PromptState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ResponseState {
+    pub text: String,
+    pub observed_at: i64,
+}
+
+impl ResponseState {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        validate_required_text(&self.text, "response preview", RESPONSE_PREVIEW_MAX_BYTES)?;
+        if self.text.contains(['\r', '\n']) {
+            return Err(ModelError("response preview must be one line".to_string()));
+        }
+        if self.observed_at < 0 {
+            return Err(ModelError(
+                "response preview timestamp must be non-negative".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundProcessState {
+    pub command: String,
+    pub observed_at: i64,
+}
+
+impl BackgroundProcessState {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        validate_required_text(&self.command, "background process command", BODY_MAX_BYTES)?;
+        if self.command.contains(['\r', '\n']) {
+            return Err(ModelError(
+                "background process command must be one line".to_string(),
+            ));
+        }
+        if self.observed_at < 0 {
+            return Err(ModelError(
+                "background process timestamp must be non-negative".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessObservation {
+    pub background_process_alive: Option<bool>,
+    pub listening_ports: Option<Vec<u16>>,
+}
+
+impl ProcessObservation {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if let Some(ports) = &self.listening_ports {
+            if ports.len() > MAX_LISTENING_PORTS {
+                return Err(ModelError("too many listening ports".to_string()));
+            }
+            if ports.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(ModelError(
+                    "listening ports must be sorted and unique".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskSummaryState {
     pub text: Option<String>,
     pub context_fingerprint: String,
@@ -559,10 +630,13 @@ pub struct PaneState {
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub prompt: Option<PromptState>,
+    pub latest_response: Option<ResponseState>,
     pub task_context: TaskContextState,
     pub tasks: TaskState,
     pub subagents: Vec<SubagentState>,
     pub worktree_activity: Option<WorktreeActivity>,
+    pub background_process: Option<BackgroundProcessState>,
+    pub listening_ports: Vec<u16>,
 }
 
 impl PaneState {
@@ -645,6 +719,9 @@ impl PaneState {
         if let Some(prompt) = &self.prompt {
             prompt.validate()?;
         }
+        if let Some(response) = &self.latest_response {
+            response.validate()?;
+        }
         self.task_context.validate()?;
         validate_tasks(&self.tasks)?;
         validate_subagents(&self.subagents)?;
@@ -653,6 +730,14 @@ impl PaneState {
             validate_required_text(&activity.path, "worktree path", PATH_MAX_BYTES)?;
             validate_required_text(&activity.command, "worktree command", BODY_MAX_BYTES)?;
         }
+        if let Some(process) = &self.background_process {
+            process.validate()?;
+        }
+        ProcessObservation {
+            background_process_alive: None,
+            listening_ports: Some(self.listening_ports.clone()),
+        }
+        .validate()?;
         self.unread.validate()?;
         Ok(())
     }
@@ -784,6 +869,8 @@ pub enum ProgressOperation {
     ClearSubagents,
     SetWorktreeActivity(WorktreeActivity),
     ClearWorktreeActivity,
+    SetBackgroundProcess(BackgroundProcessState),
+    ClearBackgroundProcess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -858,6 +945,10 @@ pub enum PaneEvent {
     CompleteRun {
         completed_at: i64,
     },
+    ResponseAndCompleteRun {
+        completed_at: i64,
+        response: ResponseState,
+    },
     FailRun {
         observed_at: i64,
         reason: Option<String>,
@@ -892,6 +983,7 @@ pub enum PaneEvent {
         observed_at: i64,
         presence: AgentPresenceObservation,
         capture: Option<CaptureObservation>,
+        process: Option<ProcessObservation>,
     },
     PaneRemoved {
         expected: Option<StoredStateDescriptor>,
@@ -908,6 +1000,7 @@ impl PaneEvent {
                 | Self::ActivityAndProgressObserved { .. }
                 | Self::WaitRequested { .. }
                 | Self::CompleteRun { .. }
+                | Self::ResponseAndCompleteRun { .. }
                 | Self::FailRun { .. }
                 | Self::ProgressUpdated { .. }
                 | Self::ExplicitStateReported { .. }
@@ -1076,10 +1169,13 @@ mod tests {
             started_at: None,
             completed_at: None,
             prompt: None,
+            latest_response: None,
             task_context: TaskContextState::default(),
             tasks: TaskState::default(),
             subagents: Vec::new(),
             worktree_activity: None,
+            background_process: None,
+            listening_ports: Vec::new(),
         }
     }
 

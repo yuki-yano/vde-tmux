@@ -1284,10 +1284,13 @@ mod tests {
                 started_at: Some(1),
                 completed_at: Some(2),
                 prompt: None,
+                latest_response: None,
                 task_context: crate::pane_state::TaskContextState::default(),
                 tasks: crate::pane_state::TaskState::default(),
                 subagents: Vec::new(),
                 worktree_activity: None,
+                background_process: None,
+                listening_ports: Vec::new(),
             },
             window_id: window_id.to_string(),
             pane_id: pane_id.to_string(),
@@ -1365,10 +1368,13 @@ mod tests {
                         text: format!("prompt for {pane_id}"),
                         source: "test".to_string(),
                     }),
+                    latest_response: None,
                     task_context: crate::pane_state::TaskContextState::default(),
                     tasks: TaskState::default(),
                     subagents: Vec::new(),
                     worktree_activity: None,
+                    background_process: None,
+                    listening_ports: Vec::new(),
                 };
                 (pane_instance, state)
             })

@@ -2,9 +2,16 @@ use crate::agent::{display_agent_label_prefix, display_agent_name};
 use crate::daemon::session_badge::{BadgeState, glyph_for_state};
 use crate::hook::RollupLevel;
 use crate::sidebar::state::{CategoryScope, PresentationMode, SidebarState, StatusFilter};
-use crate::sidebar::tree::{BadgeCounts, PRIORITY_PINNED_ZONE_ID, SidebarRow, SidebarRowKind};
+use crate::sidebar::tree::{
+    BadgeCounts, PRIORITY_PINNED_ZONE_ID, SidebarRow, SidebarRowKind, task_progress_label,
+};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+
+const CODEX_AGENT_COLOR: Color = Color::Rgb(169, 142, 210);
+const CLAUDE_AGENT_COLOR: Color = Color::Rgb(127, 166, 195);
+const AGENT_ORIGIN_COLOR: Color = Color::Rgb(146, 191, 193);
+const RESPONSE_PREVIEW_COLOR: Color = Color::Rgb(166, 173, 200);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRenderTheme {
@@ -826,10 +833,7 @@ fn render_closed_chat_summary_line(
     let agent = truncate_display(&agent_source, agent_budget);
 
     let mut spans = prefix;
-    spans.push(Span::styled(
-        agent,
-        row_style(row, theme).add_modifier(Modifier::BOLD),
-    ));
+    spans.extend(label_spans(agent, row, row_style(row, theme), theme));
     let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
     let filler = width
         .saturating_sub(1)
@@ -1121,19 +1125,22 @@ fn label_spans(
         && label.starts_with(&agent)
     {
         let (agent_part, rest) = label.split_at(agent.len());
+        let agent_style = base
+            .fg(agent_identity_color(&agent, theme))
+            .add_modifier(Modifier::BOLD);
         if row.expanded
             && let Some(state_context) = rest.strip_prefix(": ")
         {
             let mut spans = vec![
-                Span::styled(agent_part.to_string(), base.add_modifier(Modifier::BOLD)),
-                Span::styled(": ".to_string(), base),
+                Span::styled(agent_part.to_string(), agent_style),
+                Span::styled(": ".to_string(), base.fg(AGENT_ORIGIN_COLOR)),
             ];
             spans.extend(state_context_spans(state_context, row, theme));
             return spans;
         }
         return vec![
-            Span::styled(agent_part.to_string(), base.add_modifier(Modifier::BOLD)),
-            Span::styled(rest.to_string(), base),
+            Span::styled(agent_part.to_string(), agent_style),
+            Span::styled(rest.to_string(), base.fg(AGENT_ORIGIN_COLOR)),
         ];
     }
     vec![Span::styled(label, base)]
@@ -1144,6 +1151,36 @@ fn detail_label_spans(
     row: &SidebarRow,
     theme: &SidebarRenderTheme,
 ) -> Option<Vec<Span<'static>>> {
+    if row.id.ends_with("::signal") {
+        return Some(signal_label_spans(label, row, theme));
+    }
+    if row.id.ends_with("::origin") {
+        return Some(vec![Span::styled(
+            label.to_string(),
+            Style::default().fg(AGENT_ORIGIN_COLOR),
+        )]);
+    }
+    if row.id.ends_with("::background") {
+        return Some(vec![Span::styled(
+            label.to_string(),
+            Style::default().fg(theme.badge_working),
+        )]);
+    }
+    if row.id.ends_with("::response") {
+        let body = label.strip_prefix("▷ ").unwrap_or(label);
+        return Some(vec![
+            Span::styled(
+                "▷ ".to_string(),
+                Style::default()
+                    .fg(theme.branch)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                body.to_string(),
+                Style::default().fg(RESPONSE_PREVIEW_COLOR),
+            ),
+        ]);
+    }
     if row.id.contains("::task::") {
         return task_detail_label_spans(label, row, theme);
     }
@@ -1163,6 +1200,33 @@ fn detail_label_spans(
         )]);
     }
     None
+}
+
+fn signal_label_spans(
+    label: &str,
+    row: &SidebarRow,
+    theme: &SidebarRenderTheme,
+) -> Vec<Span<'static>> {
+    let branch_style = Style::default().fg(theme.branch);
+    let Some(task) = task_progress_token(row) else {
+        return vec![Span::styled(label.to_string(), branch_style)];
+    };
+    let Some(start) = label.find(&task.text) else {
+        return vec![Span::styled(label.to_string(), branch_style)];
+    };
+    let end = start + task.text.len();
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled(label[..start].to_string(), branch_style));
+    }
+    spans.push(Span::styled(
+        task.text,
+        closed_chat_right_tone_style(task.tone, row, theme),
+    ));
+    if end < label.len() {
+        spans.push(Span::styled(label[end..].to_string(), branch_style));
+    }
+    spans
 }
 
 fn task_detail_label_spans(
@@ -1346,12 +1410,13 @@ fn render_chat_dense_line(
     let selected = state.selection.as_deref() == Some(row.id.as_str());
     let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
     let glyph = theme.badge_glyph(badge_state);
-    let agent = row
+    let agent_source = row
         .meta
         .as_ref()
         .and_then(|meta| meta.agent.as_deref())
         .unwrap_or_else(|| row.label.split(':').next().unwrap_or(row.label.as_str()));
-    let agent = truncate_display(&display_agent_name(agent), 7);
+    let agent_color = agent_identity_color(agent_source, theme);
+    let agent = truncate_display(&display_agent_name(agent_source), 7);
     let origin = row
         .meta
         .as_ref()
@@ -1365,7 +1430,9 @@ fn render_chat_dense_line(
         .split_once(':')
         .map(|(_, body)| body.trim())
         .unwrap_or(row.label.as_str());
-    let prefix_after_glyph = format!(" {agent:<7} {origin:<3} ");
+    let agent_cell = format!(" {agent:<7}");
+    let origin_cell = format!(" {origin:<3} ");
+    let prefix_after_glyph = format!("{agent_cell}{origin_cell}");
     let show_pin_cell = state.presentation_mode == PresentationMode::Priority;
     let pin_width = usize::from(show_pin_cell);
     let right_width = display_width(&right);
@@ -1404,7 +1471,11 @@ fn render_chat_dense_line(
             glyph.to_string(),
             badge_style(theme.badge_color(badge_state), row),
         ),
-        Span::styled(prefix_after_glyph, style),
+        Span::styled(
+            agent_cell,
+            style.fg(agent_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(origin_cell, style.fg(AGENT_ORIGIN_COLOR)),
         Span::styled(label, style),
         Span::raw(" ".repeat(filler)),
         Span::styled(right, right_status_style),
@@ -1658,22 +1729,7 @@ fn right_label(row: &SidebarRow) -> Option<String> {
             if row.expanded {
                 return expanded_chat_right_label(row);
             }
-            match row.rollup {
-                RollupLevel::Error => Some("Err".to_string()),
-                RollupLevel::Permission => Some("Perm".to_string()),
-                RollupLevel::Waiting => Some("Wait".to_string()),
-                RollupLevel::Background => Some("Bg".to_string()),
-                RollupLevel::Running => row
-                    .meta
-                    .as_ref()
-                    .and_then(|meta| meta.elapsed_secs)
-                    .map(elapsed_label),
-                RollupLevel::Idle => row
-                    .meta
-                    .as_ref()
-                    .and_then(|meta| meta.completed_age_secs)
-                    .map(|secs| format!("{} ago", elapsed_label(secs))),
-            }
+            closed_chat_state_or_time_label(row)
         }
         SidebarRowKind::Detail | SidebarRowKind::Zone => None,
     }
@@ -1768,31 +1824,42 @@ fn closed_chat_right_tone_style(
 
 fn closed_chat_right_parts(row: &SidebarRow) -> Vec<ClosedChatRightPart> {
     let mut parts = Vec::new();
-    if let Some(state_or_time) = closed_chat_state_or_time_label(row) {
-        parts.push(ClosedChatRightPart {
-            text: state_or_time,
-            tone: ClosedChatRightTone::State,
-        });
-    }
     if let Some(task) = task_progress_token(row) {
         parts.push(task);
     }
     if let Some(subagents) = subagent_count_token(row) {
         parts.push(subagents);
     }
+    if let Some(time) = closed_chat_state_or_time_label(row) {
+        parts.push(ClosedChatRightPart {
+            text: time,
+            tone: ClosedChatRightTone::State,
+        });
+    }
     parts
 }
 
 fn closed_chat_state_or_time_label(row: &SidebarRow) -> Option<String> {
-    expanded_chat_right_label(row)
+    match row.badge_state? {
+        BadgeState::Blocked | BadgeState::Working => row
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.elapsed_secs)
+            .map(elapsed_label),
+        BadgeState::Done | BadgeState::Idle => row
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.completed_age_secs)
+            .map(|secs| format!("{} ago", elapsed_label(secs))),
+    }
 }
 
 fn task_progress_token(row: &SidebarRow) -> Option<ClosedChatRightPart> {
     let meta = row.meta.as_ref()?;
     let done = meta.tasks_done?;
     let total = meta.tasks_total?;
-    (total > 0).then(|| ClosedChatRightPart {
-        text: format!("☑ {done}/{total}"),
+    task_progress_label(done, total).map(|text| ClosedChatRightPart {
+        text,
         tone: task_progress_tone(done, total),
     })
 }
@@ -1896,45 +1963,18 @@ fn elapsed_full_label(secs: i64) -> String {
 }
 
 fn expanded_chat_right_label(row: &SidebarRow) -> Option<String> {
-    let state = expanded_chat_state_label(row)?;
     match row.badge_state? {
         BadgeState::Blocked | BadgeState::Working => row
             .meta
             .as_ref()
             .and_then(|meta| meta.elapsed_secs)
-            .map(|secs| format!("{state} {}", elapsed_full_label(secs))),
+            .map(elapsed_full_label),
         BadgeState::Done | BadgeState::Idle => row
             .meta
             .as_ref()
             .and_then(|meta| meta.completed_age_secs)
-            .map(|secs| format!("{state} {} ago", elapsed_label(secs))),
+            .map(|secs| format!("{} ago", elapsed_label(secs))),
     }
-}
-
-fn expanded_chat_state_label(row: &SidebarRow) -> Option<String> {
-    let badge_state = row.badge_state?;
-    let mut state = match badge_state {
-        BadgeState::Blocked => match row.rollup {
-            RollupLevel::Error => "Error",
-            RollupLevel::Permission | RollupLevel::Waiting => "Waiting",
-            _ => "Blocked",
-        },
-        BadgeState::Working => "Running",
-        BadgeState::Done => "Done",
-        BadgeState::Idle => "Idle",
-    }
-    .to_string();
-
-    if matches!(badge_state, BadgeState::Blocked)
-        && let Some(wait_reason) = row
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.wait_reason.as_deref())
-            .filter(|value| !value.trim().is_empty())
-    {
-        state.push_str(&format!(" ({wait_reason})"));
-    }
-    Some(state)
 }
 
 fn right_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
@@ -1992,6 +2032,14 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
             Style::default().fg(Color::Reset)
         }
         SidebarRowKind::Detail => Style::default().fg(theme.detail),
+    }
+}
+
+fn agent_identity_color(agent: &str, theme: &SidebarRenderTheme) -> Color {
+    match agent.trim().to_ascii_lowercase().as_str() {
+        "codex" => CODEX_AGENT_COLOR,
+        "claude" => CLAUDE_AGENT_COLOR,
+        _ => theme.branch,
     }
 }
 
@@ -2284,6 +2332,27 @@ mod tests {
     }
 
     #[test]
+    fn agent_identity_palette_is_fixed_and_distinct_from_status_palette() {
+        let theme = SidebarRenderTheme::default();
+
+        assert_eq!(agent_identity_color("codex", &theme), CODEX_AGENT_COLOR);
+        assert_eq!(agent_identity_color("Codex", &theme), CODEX_AGENT_COLOR);
+        assert_eq!(agent_identity_color("claude", &theme), CLAUDE_AGENT_COLOR);
+        assert_eq!(agent_identity_color("Claude", &theme), CLAUDE_AGENT_COLOR);
+        assert_eq!(agent_identity_color("opencode", &theme), theme.branch);
+        assert_ne!(CODEX_AGENT_COLOR, CLAUDE_AGENT_COLOR);
+        for status in [
+            BadgeState::Blocked,
+            BadgeState::Working,
+            BadgeState::Done,
+            BadgeState::Idle,
+        ] {
+            assert_ne!(CODEX_AGENT_COLOR, theme.badge_color(status));
+            assert_ne!(CLAUDE_AGENT_COLOR, theme.badge_color(status));
+        }
+    }
+
+    #[test]
     fn dense_tier_renders_one_line_per_chat_with_origin_abbrev() {
         let mut chat = chat_row(
             "chat::%1",
@@ -2330,6 +2399,19 @@ mod tests {
             .find(|span| span.content == "●")
             .unwrap_or_else(|| panic!("badge glyph span not found: {:?}", lines[0]));
         assert_eq!(glyph.style.fg, Some(theme.badge_color(BadgeState::Working)));
+        let agent = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Claude"))
+            .unwrap_or_else(|| panic!("agent span not found: {:?}", lines[0]));
+        assert_eq!(agent.style.fg, Some(CLAUDE_AGENT_COLOR));
+        assert!(agent.style.add_modifier.contains(Modifier::BOLD));
+        let origin = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("vde"))
+            .unwrap_or_else(|| panic!("origin span not found: {:?}", lines[0]));
+        assert_eq!(origin.style.fg, Some(AGENT_ORIGIN_COLOR));
     }
 
     #[test]
@@ -2344,7 +2426,7 @@ mod tests {
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 8);
 
-        assert_eq!(rendered, " ▲ Perm ");
+        assert_eq!(rendered, " ▲      ");
     }
 
     #[test]
@@ -3405,7 +3487,7 @@ sidebar:
             chat_spans
                 .iter()
                 .any(|span| span.content.as_ref() == "Claude"
-                    && span.style.fg == Some(Color::Reset)
+                    && span.style.fg == Some(CLAUDE_AGENT_COLOR)
                     && span.style.add_modifier.contains(Modifier::BOLD)),
             "{chat_spans:?}"
         );
@@ -3413,7 +3495,7 @@ sidebar:
             chat_spans
                 .iter()
                 .any(|span| span.content.as_ref() == "Claude"
-                    && span.style.fg == Some(Color::Reset)
+                    && span.style.fg == Some(CLAUDE_AGENT_COLOR)
                     && span.style.add_modifier.contains(Modifier::BOLD)),
             "{chat_spans:?}"
         );
@@ -3435,11 +3517,9 @@ sidebar:
             "{chat_spans:?}"
         );
         assert!(
-            chat_spans
-                .iter()
-                .any(|span| span.content.as_ref() == "Running 13m 00s"
-                    && span.style.fg == Some(Color::Green)
-                    && !span.style.add_modifier.contains(Modifier::DIM)),
+            chat_spans.iter().any(|span| span.content.as_ref() == "13m"
+                && span.style.fg == Some(Color::Green)
+                && !span.style.add_modifier.contains(Modifier::DIM)),
             "{chat_spans:?}"
         );
         let detail_spans = &lines[2].spans;
@@ -3553,6 +3633,135 @@ sidebar:
     }
 
     #[test]
+    fn expanded_agent_header_separates_identity_origin_and_summary_colors() {
+        let theme = SidebarRenderTheme::default();
+        let mut chat = row(
+            "chat::%1::101",
+            SidebarRowKind::Chat,
+            0,
+            "Codex · public/vde-tmux",
+            RollupLevel::Running,
+        );
+        chat.expanded = true;
+        chat.badge_state = Some(BadgeState::Working);
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            ..Default::default()
+        });
+        let summary = detail_row(
+            "detail::%1::summary",
+            "サイドバー表示を改善",
+            RollupLevel::Running,
+        );
+
+        let lines = render_lines(&[chat, summary], &SidebarState::default(), 60, &theme);
+
+        assert_span_fg(&lines[0].spans, "Codex", CODEX_AGENT_COLOR);
+        assert!(
+            lines[0].spans.iter().any(|span| {
+                span.content.as_ref() == "Codex" && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "{:?}",
+            lines[0].spans
+        );
+        assert_span_fg(&lines[0].spans, " · public/vde-tmux", AGENT_ORIGIN_COLOR);
+        assert_span_fg(&lines[1].spans, "サイドバー表示を改善", Color::Reset);
+    }
+
+    #[test]
+    fn closed_agent_header_uses_the_same_identity_origin_and_summary_colors() {
+        let theme = SidebarRenderTheme::default();
+        let mut chat = row(
+            "chat::%1::101",
+            SidebarRowKind::Chat,
+            0,
+            "Codex · public/vde-tmux",
+            RollupLevel::Running,
+        );
+        chat.expanded = false;
+        chat.badge_state = Some(BadgeState::Working);
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            origin: Some("public/vde-tmux".to_string()),
+            task_summary: Some("サイドバー表示を改善".to_string()),
+            elapsed_secs: Some(60),
+            ..Default::default()
+        });
+
+        let lines = render_lines(&[chat], &SidebarState::default(), 64, &theme);
+
+        assert_span_fg(&lines[0].spans, "Codex", CODEX_AGENT_COLOR);
+        assert!(
+            lines[0].spans.iter().any(|span| {
+                span.content.as_ref() == "Codex" && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "{:?}",
+            lines[0].spans
+        );
+        assert_span_fg(&lines[0].spans, " · public/vde-tmux", AGENT_ORIGIN_COLOR);
+        assert_span_fg(&lines[1].spans, "サイドバー表示を改善", Color::Reset);
+    }
+
+    #[test]
+    fn signal_background_and_response_use_distinct_semantic_colors() {
+        let theme = SidebarRenderTheme::default();
+        let mut signal = detail_row(
+            "detail::%1::signal",
+            "feature  ☑ 1/3  :3000",
+            RollupLevel::Running,
+        );
+        signal.meta = Some(crate::sidebar::tree::RowMeta {
+            tasks_done: Some(1),
+            tasks_total: Some(3),
+            ..Default::default()
+        });
+        let rows = vec![
+            signal,
+            detail_row(
+                "detail::%1::background",
+                "◎ $ pnpm dev",
+                RollupLevel::Running,
+            ),
+            detail_row(
+                "detail::%1::response",
+                "▷ server is ready",
+                RollupLevel::Idle,
+            ),
+        ];
+
+        let lines = render_lines(&rows, &SidebarState::default(), 60, &theme);
+
+        assert_span_fg(&lines[0].spans, "feature  ", theme.branch);
+        assert_span_fg(&lines[0].spans, "☑ 1/3", theme.task_working);
+        assert_span_fg(&lines[0].spans, "  :3000", theme.branch);
+        assert_span_fg(&lines[1].spans, "◎ $ pnpm dev", theme.badge_working);
+        assert_span_fg(&lines[2].spans, "▷ ", theme.branch);
+        assert_span_fg(&lines[2].spans, "server is ready", RESPONSE_PREVIEW_COLOR);
+    }
+
+    #[test]
+    fn triage_origin_uses_the_muted_teal_identity_context_color() {
+        let origin = detail_row(
+            "detail::%1::origin",
+            "origin: public/vde-tmux",
+            RollupLevel::Idle,
+        );
+
+        let lines = render_lines(
+            &[origin],
+            &SidebarState::default(),
+            60,
+            &SidebarRenderTheme::default(),
+        );
+
+        assert_span_fg(
+            &lines[0].spans,
+            "origin: public/vde-tmux",
+            AGENT_ORIGIN_COLOR,
+        );
+    }
+
+    #[test]
     fn narrow_width_truncates_task_detail_without_panicking() {
         let detail = detail_row(
             "detail::%1::task::0::in_progress",
@@ -3566,7 +3775,7 @@ sidebar:
     }
 
     #[test]
-    fn expanded_chat_row_right_aligns_state_and_time_with_state_color() {
+    fn expanded_chat_row_right_aligns_time_without_state_text() {
         let mut chat = chat_row(
             "chat::%1",
             "codex",
@@ -3581,7 +3790,7 @@ sidebar:
         });
         let theme = SidebarRenderTheme::default();
 
-        assert_eq!(right_label(&chat).as_deref(), Some("Running 12m 00s"));
+        assert_eq!(right_label(&chat).as_deref(), Some("12m 00s"));
         assert_eq!(
             right_style(&chat, &theme).fg,
             Some(theme.badge_color(BadgeState::Working))
@@ -3594,7 +3803,7 @@ sidebar:
                 .iter()
                 .any(|span| span.content.as_ref() == "Codex"
                     && span.style.add_modifier.contains(Modifier::BOLD)
-                    && span.style.fg == Some(Color::Reset)),
+                    && span.style.fg == Some(CODEX_AGENT_COLOR)),
             "{chat_spans:?}"
         );
         assert!(
@@ -3605,31 +3814,35 @@ sidebar:
         );
         assert_span_fg(
             chat_spans,
-            "Running 12m 00s",
+            "12m 00s",
             theme.badge_color(BadgeState::Working),
         );
-        assert!(line_to_string(lines[0].clone()).ends_with("Running 12m 00s "));
+        assert!(line_to_string(lines[0].clone()).ends_with("12m 00s "));
     }
 
     #[test]
-    fn sidebar_state_labels_start_with_uppercase_letters() {
+    fn expanded_chat_rows_omit_state_text_for_every_badge() {
         let cases = [
-            (BadgeState::Blocked, RollupLevel::Error, "Error"),
-            (BadgeState::Blocked, RollupLevel::Permission, "Waiting"),
-            (BadgeState::Blocked, RollupLevel::Background, "Blocked"),
-            (BadgeState::Working, RollupLevel::Running, "Running"),
-            (BadgeState::Done, RollupLevel::Idle, "Done"),
-            (BadgeState::Idle, RollupLevel::Idle, "Idle"),
+            (BadgeState::Blocked, RollupLevel::Error, "2m 00s"),
+            (BadgeState::Working, RollupLevel::Running, "2m 00s"),
+            (BadgeState::Done, RollupLevel::Idle, "2m00s ago"),
+            (BadgeState::Idle, RollupLevel::Idle, "2m00s ago"),
         ];
 
         for (badge, rollup, expected) in cases {
-            let chat = chat_row("chat::%1", "codex", rollup, badge);
-            assert_eq!(expanded_chat_state_label(&chat).as_deref(), Some(expected));
+            let mut chat = chat_row("chat::%1", "codex", rollup, badge);
+            chat.expanded = true;
+            chat.meta = Some(crate::sidebar::tree::RowMeta {
+                elapsed_secs: Some(120),
+                completed_age_secs: Some(120),
+                ..Default::default()
+            });
+            assert_eq!(right_label(&chat).as_deref(), Some(expected));
         }
     }
 
     #[test]
-    fn expanded_chat_row_keeps_wait_reason_context_muted() {
+    fn expanded_blocked_chat_row_shows_only_elapsed_time() {
         let mut chat = chat_row(
             "chat::%1",
             "codex",
@@ -3645,19 +3858,13 @@ sidebar:
         });
         let theme = SidebarRenderTheme::default();
 
-        assert_eq!(
-            right_label(&chat).as_deref(),
-            Some("Waiting (permission_prompt) 2m 00s")
-        );
+        assert_eq!(right_label(&chat).as_deref(), Some("2m 00s"));
         let lines = render_lines(&[chat], &SidebarState::default(), 60, &theme);
         let chat_spans = &lines[0].spans;
 
-        assert_span_fg(
-            chat_spans,
-            "Waiting (permission_prompt) 2m 00s",
-            theme.badge_color(BadgeState::Blocked),
-        );
-        assert!(line_to_string(lines[0].clone()).ends_with("Waiting (permission_prompt) 2m 00s "));
+        assert_span_fg(chat_spans, "2m 00s", theme.badge_color(BadgeState::Blocked));
+        assert!(line_to_string(lines[0].clone()).ends_with("2m 00s "));
+        assert!(!line_to_string(lines[0].clone()).contains("permission_prompt"));
     }
 
     #[test]
@@ -3671,14 +3878,14 @@ sidebar:
         });
         let theme = SidebarRenderTheme::default();
 
-        assert_eq!(right_label(&chat).as_deref(), Some("Idle 13m ago"));
+        assert_eq!(right_label(&chat).as_deref(), Some("13m ago"));
         assert_eq!(
             right_style(&chat, &theme).fg,
             Some(theme.badge_color(BadgeState::Idle))
         );
 
         let rendered = render_rows(&[chat], &SidebarState::default(), 32);
-        assert!(rendered.ends_with("Idle 13m ago "), "{rendered:?}");
+        assert!(rendered.ends_with("13m ago "), "{rendered:?}");
     }
 
     #[test]
@@ -3692,7 +3899,7 @@ sidebar:
         });
         let theme = SidebarRenderTheme::default();
 
-        assert_eq!(right_label(&chat).as_deref(), Some("Done 13m ago"));
+        assert_eq!(right_label(&chat).as_deref(), Some("13m ago"));
         assert_eq!(
             right_style(&chat, &theme).fg,
             Some(theme.badge_color(BadgeState::Done))
@@ -3701,7 +3908,7 @@ sidebar:
         let lines = render_lines(&[chat], &SidebarState::default(), 32, &theme);
         assert_span_fg(
             &lines[0].spans,
-            "Done 13m ago",
+            "13m ago",
             theme.badge_color(BadgeState::Done),
         );
     }
@@ -3979,7 +4186,7 @@ badge:
                         vec!["▎● Codex       fix sidebar   1m30s "]
                     }
                     ("Codex: fix sidebar", 36) => vec![
-                        "▎ ▸ ● Codex          Running 1m 30s ",
+                        "▎ ▸ ● Codex                   1m30s ",
                         "     fix sidebar                    ",
                     ],
                     ("Codex: 修正確認", 16) => vec!["▎● 1m30s        "],
@@ -3988,7 +4195,7 @@ badge:
                         vec!["▎● Codex       修正確認      1m30s "]
                     }
                     ("Codex: 修正確認", 36) => vec![
-                        "▎ ▸ ● Codex          Running 1m 30s ",
+                        "▎ ▸ ● Codex                   1m30s ",
                         "     修正確認                       ",
                     ],
                     ("Codex: fix 🧭✨", 16) => vec!["▎● 1m30s        "],
@@ -3997,7 +4204,7 @@ badge:
                         vec!["▎● Codex       fix 🧭✨      1m30s "]
                     }
                     ("Codex: fix 🧭✨", 36) => vec![
-                        "▎ ▸ ● Codex          Running 1m 30s ",
+                        "▎ ▸ ● Codex                   1m30s ",
                         "     fix 🧭✨                       ",
                     ],
                     _ => unreachable!(),
@@ -4087,10 +4294,7 @@ badge:
         assert_eq!(rendered.row_indices, vec![Some(0), Some(0)]);
         assert_eq!(text.len(), 2);
         assert!(text[0].contains("▸ ▲ Codex"), "{text:?}");
-        assert!(
-            text[0].ends_with("Waiting (permission_prompt) 2m 07s · ☑ 2/5 · ↳ 2 "),
-            "{text:?}"
-        );
+        assert!(text[0].ends_with("☑ 2/5 · ↳ 2 · 2m07s "), "{text:?}");
         assert!(
             text[1].starts_with("     review sidebar state shape"),
             "{text:?}"
@@ -4100,13 +4304,46 @@ badge:
         assert_span_fg(&rendered.lines[0].spans, "↳ 2", theme.subagent_label);
         assert_span_fg(
             &rendered.lines[0].spans,
-            "Waiting (permission_prompt) 2m 07s",
+            "2m07s",
             theme.badge_color(BadgeState::Blocked),
         );
         assert!(
             text.iter().all(|line| display_width(line) == 64),
             "{text:?}"
         );
+    }
+
+    #[test]
+    fn closed_chat_places_task_before_colored_time_without_state_words() {
+        let mut chat = chat_row(
+            "chat::%1",
+            "codex: implement sidebar",
+            RollupLevel::Running,
+            BadgeState::Working,
+        );
+        chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            elapsed_secs: Some(127),
+            tasks_done: Some(1),
+            tasks_total: Some(3),
+            subagent_count: Some(2),
+            ..Default::default()
+        });
+
+        let parts = closed_chat_right_parts(&chat);
+
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["☑ 1/3", "↳ 2", "2m07s"]
+        );
+        assert!(parts.iter().all(|part| {
+            !["Running", "Idle", "Done", "Waiting"]
+                .iter()
+                .any(|state| part.text.contains(state))
+        }));
     }
 
     #[test]
@@ -4219,10 +4456,10 @@ badge:
         );
         assert_eq!(line_to_string(lines[0].clone()).chars().next(), Some('▎'));
         assert_eq!(line_to_string(lines[1].clone()).chars().next(), Some(' '));
-        assert!(line_to_string(lines[0].clone()).ends_with("Running 8m 42s "));
+        assert!(line_to_string(lines[0].clone()).ends_with("8m42s "));
         assert_span_fg(
             &lines[0].spans,
-            "Running 8m 42s",
+            "8m42s",
             SidebarRenderTheme::default().badge_color(BadgeState::Working),
         );
     }
@@ -4248,7 +4485,7 @@ badge:
 
         assert_span_fg(
             &lines[0].spans,
-            "Done 13m ago",
+            "13m ago",
             theme.badge_color(BadgeState::Done),
         );
     }
@@ -4313,7 +4550,7 @@ badge:
             "{rendered:?}"
         );
         assert!(
-            rendered.lines().next().unwrap().contains('…'),
+            rendered.lines().nth(1).unwrap().contains('…'),
             "{rendered:?}"
         );
     }
@@ -4406,7 +4643,7 @@ badge:
 
         chat.expanded = true;
 
-        assert_eq!(right_label(&chat).as_deref(), Some("Running 13m 00s"));
+        assert_eq!(right_label(&chat).as_deref(), Some("13m 00s"));
         assert_eq!(
             right_style(&chat, &SidebarRenderTheme::default()).fg,
             Some(SidebarRenderTheme::default().badge_color(BadgeState::Working))
@@ -4424,7 +4661,7 @@ badge:
         chat.expanded = false;
         let rendered = render_rows(&[chat], &SidebarState::default(), 24);
         assert!(rendered.contains('…'), "{rendered:?}");
-        assert!(rendered.ends_with("Perm "), "{rendered:?}");
+        assert!(rendered.ends_with("  "), "{rendered:?}");
         assert_eq!(display_width(&rendered), 24, "{rendered:?}");
     }
 

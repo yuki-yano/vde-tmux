@@ -244,6 +244,12 @@ second or later line to jump to the agent pane without selecting it first.
 Use `Space` to expand or collapse the selected agent from the keyboard.
 The mouse wheel scrolls overflow without moving the selected cursor.
 An agent with no activity yet uses a single line while collapsed.
+Expanded agents show a compact signal row with the pane branch or worktree, task status glyphs,
+ahead/behind counts, and listening TCP ports. Claude Bash calls are shown as background processes
+only when the hook explicitly reports `run_in_background`; command text is never guessed, and the
+process row clears after the command leaves the pane process tree. Codex does not currently report a
+background flag, but its listening ports are still discovered from the pane process tree. A Stop
+payload's `last_assistant_message` appears as a muted `▷` response preview below the latest prompt.
 Category scope, presentation, filter, manual order, expansion state, selection, and scrolling are
 synchronized across all open sidebars on the same tmux server. The concrete Current category and
 return target remain local to each sidebar and follow its source session.
@@ -431,10 +437,11 @@ Use `disable` when the daemon must remain stopped.
 ### Pane-state persistence
 
 The daemon stores one private full-state snapshot per tmux server incarnation under
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v4.json`. A daemon restart restores the
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v5.json`. A daemon restart restores the
 prompt, task progress and items, subagents, worktree activity, lifecycle, timestamps, agent
-identity, task context and generated summaries, unread-span pins, and Done/acknowledgement state
-for panes whose pane ID and PID still match.
+identity, task context and generated summaries, the latest response preview, explicitly reported
+background processes, listening ports, unread-span pins, and Done/acknowledgement state for panes
+whose pane ID and PID still match.
 
 If this snapshot is corrupt or insecure, daemon startup stops instead of repairing it or falling
 back. `vt daemon status` reports the snapshot path in `last_transition_error`; remove that file only when you

@@ -449,7 +449,9 @@ pub(crate) fn claude_typed_event_from_input(
     input: &str,
     context: &TypedAdapterContext,
 ) -> Result<Option<PaneEventEnvelope>> {
-    if let Some(progress_event) = claude_progress_event_from_input(event, input)? {
+    if let Some(progress_event) =
+        claude_progress_event_from_input(event, input, context.observed_at)?
+    {
         let session_id = required_payload_session(input)?;
         return Ok(Some(typed_progress_event(
             "claude",
@@ -553,7 +555,11 @@ fn parse_subagents_arg(raw: &str) -> Result<Vec<SubagentEntry>> {
         .collect()
 }
 
-fn claude_progress_event_from_input(event: &str, input: &str) -> Result<Option<ProgressEvent>> {
+fn claude_progress_event_from_input(
+    event: &str,
+    input: &str,
+    observed_at: i64,
+) -> Result<Option<ProgressEvent>> {
     #[derive(serde::Deserialize, Default)]
     struct Payload {
         agent_transcript_path: Option<String>,
@@ -595,22 +601,42 @@ fn claude_progress_event_from_input(event: &str, input: &str) -> Result<Option<P
         }
         "TaskCreated" => ProgressEvent::TaskCreated,
         "TaskCompleted" => ProgressEvent::TaskCompleted,
-        "PostToolUse" => return claude_post_tool_use_event(&payload_value),
+        "PostToolUse" => return claude_post_tool_use_event(&payload_value, observed_at),
         _ => return Ok(None),
     };
     Ok(Some(progress))
 }
 
-fn claude_post_tool_use_event(payload: &Value) -> Result<Option<ProgressEvent>> {
+fn claude_post_tool_use_event(payload: &Value, observed_at: i64) -> Result<Option<ProgressEvent>> {
     let Some(tool_name) = payload.get("tool_name").and_then(Value::as_str) else {
         return Ok(None);
     };
     match tool_name {
+        "Bash" => Ok(claude_background_process_event(payload, observed_at)),
         "TodoWrite" => claude_todo_write_event(payload),
         "TaskCreate" => claude_task_create_event(payload),
         "TaskUpdate" => claude_task_update_event(payload),
         _ => Ok(None),
     }
+}
+
+fn claude_background_process_event(payload: &Value, observed_at: i64) -> Option<ProgressEvent> {
+    let input = payload.get("tool_input")?;
+    let runs_in_background = ["run_in_background", "runInBackground"]
+        .iter()
+        .any(|key| input.get(key).and_then(Value::as_bool) == Some(true));
+    if !runs_in_background {
+        return None;
+    }
+    let command = input
+        .get("command")
+        .and_then(Value::as_str)
+        .map(normalize_text)
+        .filter(|command| !command.is_empty())?;
+    Some(ProgressEvent::BackgroundProcessStarted {
+        command,
+        observed_at,
+    })
 }
 
 fn claude_todo_write_event(payload: &Value) -> Result<Option<ProgressEvent>> {
@@ -1036,7 +1062,7 @@ mod tests {
                 ]
             }
         });
-        let event = claude_post_tool_use_event(&payload).unwrap().unwrap();
+        let event = claude_post_tool_use_event(&payload, 123).unwrap().unwrap();
         let ProgressEvent::TaskSnapshot { progress, items } = event else {
             panic!("expected task snapshot");
         };
@@ -1050,7 +1076,7 @@ mod tests {
     #[test]
     fn claude_todo_write_without_todos_is_none() {
         let payload = serde_json::json!({"tool_name": "TodoWrite", "tool_input": {}});
-        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+        assert!(claude_post_tool_use_event(&payload, 123).unwrap().is_none());
     }
 
     #[test]
@@ -1061,7 +1087,7 @@ mod tests {
             "tool_response": {"task": {"id": "task-1", "subject": "real subject"}}
         });
         let ProgressEvent::TaskItemCreated { id, step } =
-            claude_post_tool_use_event(&payload).unwrap().unwrap()
+            claude_post_tool_use_event(&payload, 123).unwrap().unwrap()
         else {
             panic!("expected task item created");
         };
@@ -1077,7 +1103,7 @@ mod tests {
             "tool_response": {"task": {"id": "task-2"}}
         });
         let ProgressEvent::TaskItemCreated { id, step } =
-            claude_post_tool_use_event(&payload).unwrap().unwrap()
+            claude_post_tool_use_event(&payload, 123).unwrap().unwrap()
         else {
             panic!("expected task item created");
         };
@@ -1092,7 +1118,7 @@ mod tests {
             "tool_input": {"taskId": "task-3", "status": "completed"}
         });
         let ProgressEvent::TaskItemUpdated { id, status } =
-            claude_post_tool_use_event(&payload).unwrap().unwrap()
+            claude_post_tool_use_event(&payload, 123).unwrap().unwrap()
         else {
             panic!("expected task item updated");
         };
@@ -1103,7 +1129,31 @@ mod tests {
     #[test]
     fn claude_post_tool_use_ignores_unknown_tool() {
         let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {}});
-        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+        assert!(claude_post_tool_use_event(&payload, 123).unwrap().is_none());
+    }
+
+    #[test]
+    fn claude_background_bash_requires_explicit_flag_and_command() {
+        let payload = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "pnpm dev\n--port 3000",
+                "run_in_background": true
+            }
+        });
+        assert_eq!(
+            claude_post_tool_use_event(&payload, 123).unwrap(),
+            Some(ProgressEvent::BackgroundProcessStarted {
+                command: "pnpm dev --port 3000".to_string(),
+                observed_at: 123,
+            })
+        );
+
+        let no_flag = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "pnpm dev"}
+        });
+        assert!(claude_post_tool_use_event(&no_flag, 123).unwrap().is_none());
     }
 
     #[test]
@@ -1112,7 +1162,7 @@ mod tests {
             "tool_name": "TaskCreate",
             "tool_input": {"subject": "s"}
         });
-        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+        assert!(claude_post_tool_use_event(&payload, 123).unwrap().is_none());
     }
 
     #[test]
@@ -1122,7 +1172,7 @@ mod tests {
             "tool_input": {"subject": "s"},
             "tool_response": {"task": {"subject": "x"}}
         });
-        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+        assert!(claude_post_tool_use_event(&payload, 123).unwrap().is_none());
     }
 
     #[test]
@@ -1132,7 +1182,7 @@ mod tests {
             "tool_input": {},
             "tool_response": {"task": {"id": "t1"}}
         });
-        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+        assert!(claude_post_tool_use_event(&payload, 123).unwrap().is_none());
     }
 
     #[test]
@@ -1141,7 +1191,7 @@ mod tests {
             "tool_name": "TaskUpdate",
             "tool_input": {"status": "completed"}
         });
-        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+        assert!(claude_post_tool_use_event(&payload, 123).unwrap().is_none());
     }
 
     #[test]
@@ -1150,7 +1200,7 @@ mod tests {
             "tool_name": "TaskUpdate",
             "tool_input": {"taskId": "t1", "status": "bogus"}
         });
-        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+        assert!(claude_post_tool_use_event(&payload, 123).unwrap().is_none());
     }
 
     #[test]
@@ -1159,7 +1209,7 @@ mod tests {
             "tool_name": "TaskUpdate",
             "tool_input": {"taskId": "t1"}
         });
-        assert!(claude_post_tool_use_event(&payload).unwrap().is_none());
+        assert!(claude_post_tool_use_event(&payload, 123).unwrap().is_none());
     }
 
     #[test]

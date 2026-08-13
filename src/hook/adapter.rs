@@ -9,8 +9,9 @@ use crate::hook::origin::{HookOrigin, claude_hook_origin, codex_hook_origin_from
 use crate::pane_state::{
     AgentKind, AgentSessionId, AgentSessionSource, BODY_MAX_BYTES, DaemonInstanceId, EventId,
     ExplicitStateReport, FieldUpdate, PaneEvent, PaneEventEnvelope, PaneInstance,
-    ProgressOperation, PromptState, ReportedLifecycle, SubagentState,
-    TaskProgress as CanonicalTaskProgress, WaitReason, normalize_text, validate_subagents,
+    ProgressOperation, PromptState, RESPONSE_PREVIEW_MAX_BYTES, ReportedLifecycle, ResponseState,
+    SubagentState, TaskProgress as CanonicalTaskProgress, WaitReason, normalize_text,
+    validate_subagents,
 };
 
 #[derive(Debug, Clone)]
@@ -105,9 +106,10 @@ pub fn claude_typed_event_from_json(
             }
         }
         "Notification" => return Ok(None),
-        "Stop" => PaneEvent::CompleteRun {
-            completed_at: context.observed_at,
-        },
+        "Stop" => stop_event(
+            payload.last_assistant_message.as_deref(),
+            context.observed_at,
+        ),
         _ => return Ok(None),
     };
     Ok(Some(context.envelope(
@@ -172,9 +174,10 @@ pub fn codex_typed_event_from_json_with_home(
             observed_at: context.observed_at,
             reason: WaitReason::PermissionPrompt,
         },
-        "Stop" => PaneEvent::CompleteRun {
-            completed_at: context.observed_at,
-        },
+        "Stop" => stop_event(
+            payload.last_assistant_message.as_deref(),
+            context.observed_at,
+        ),
         _ => return Ok(None),
     };
     Ok(Some(context.envelope(
@@ -342,6 +345,7 @@ fn normalize_subagents(subagents: &mut [SubagentState]) {
 struct ClaudeHookPayload {
     agent_transcript_path: Option<String>,
     hook_event_name: Option<String>,
+    last_assistant_message: Option<String>,
     notification_type: Option<String>,
     prompt: Option<String>,
     #[allow(dead_code)]
@@ -353,6 +357,7 @@ struct ClaudeHookPayload {
 #[derive(Debug, Deserialize, Default)]
 struct CodexHookPayload {
     agent_id: Option<String>,
+    last_assistant_message: Option<String>,
     prompt: Option<String>,
     session_id: Option<String>,
     source: Option<String>,
@@ -412,6 +417,36 @@ pub fn build_prompt_preview(raw: &str) -> Option<String> {
     } else {
         Some(preview)
     }
+}
+
+fn stop_event(last_assistant_message: Option<&str>, completed_at: i64) -> PaneEvent {
+    match last_assistant_message.and_then(build_response_preview) {
+        Some(text) => PaneEvent::ResponseAndCompleteRun {
+            completed_at,
+            response: ResponseState {
+                text,
+                observed_at: completed_at,
+            },
+        },
+        None => PaneEvent::CompleteRun { completed_at },
+    }
+}
+
+fn build_response_preview(raw: &str) -> Option<String> {
+    let normalized = raw
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let mut preview = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if preview.len() > RESPONSE_PREVIEW_MAX_BYTES {
+        let mut end = RESPONSE_PREVIEW_MAX_BYTES;
+        while !preview.is_char_boundary(end) {
+            end -= 1;
+        }
+        preview.truncate(end);
+        preview.truncate(preview.trim_end().len());
+    }
+    (!preview.is_empty()).then_some(preview)
 }
 
 fn latest_user_prompt_from_transcript(path: &str) -> Option<String> {
@@ -594,6 +629,33 @@ mod tests {
             assert_eq!(envelope.agent.unwrap().as_str(), "codex");
             assert_eq!(envelope.agent_session_id.unwrap().as_str(), "session-2");
             assert_eq!(envelope.event, expected);
+        }
+    }
+
+    #[test]
+    fn stop_payloads_store_one_line_response_previews() {
+        for (agent, parse) in [
+            (
+                "claude",
+                claude_typed_event_from_json
+                    as fn(&str, &str, &TypedAdapterContext) -> Result<Option<PaneEventEnvelope>>,
+            ),
+            ("codex", codex_typed_event_from_json),
+        ] {
+            let payload = format!(
+                r#"{{"session_id":"session-1","last_assistant_message":"done\nfor {agent}"}}"#
+            );
+            let envelope = parse("Stop", &payload, &typed_context()).unwrap().unwrap();
+            let PaneEvent::ResponseAndCompleteRun {
+                completed_at,
+                response,
+            } = envelope.event
+            else {
+                panic!("expected response completion for {agent}");
+            };
+            assert_eq!(completed_at, 123);
+            assert_eq!(response.text, format!("done for {agent}"));
+            assert_eq!(response.observed_at, 123);
         }
     }
 

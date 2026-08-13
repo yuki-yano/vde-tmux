@@ -462,10 +462,13 @@ mod local_state_tests {
             started_at: Some(1),
             completed_at: None,
             prompt: None,
+            latest_response: None,
             task_context: crate::pane_state::TaskContextState::default(),
             tasks: TaskState::default(),
             subagents: Vec::new(),
             worktree_activity: None,
+            background_process: None,
+            listening_ports: Vec::new(),
         };
         PanePresentation {
             pane_instance: pane_instance.clone(),
@@ -1146,6 +1149,88 @@ mod local_state_tests {
             }),
             Some(RowClickIntent::Jump(pane))
         );
+    }
+
+    #[test]
+    fn expanded_agent_selection_keeps_all_detail_rows_in_view() {
+        let chat = |id: String| SidebarRow {
+            id: id.clone(),
+            kind: SidebarRowKind::Chat,
+            depth: 0,
+            label: id,
+            chat_count: 0,
+            rollup: RollupLevel::Running,
+            badge_state: Some(BadgeState::Working),
+            expanded: false,
+            pane_id: None,
+            git: None,
+            active: false,
+            meta: None,
+        };
+        let detail = |suffix: &str| SidebarRow {
+            id: format!("detail::%6::106::{suffix}"),
+            kind: SidebarRowKind::Detail,
+            depth: 1,
+            label: suffix.to_string(),
+            chat_count: 0,
+            rollup: RollupLevel::Running,
+            badge_state: Some(BadgeState::Working),
+            expanded: true,
+            pane_id: Some("%6".to_string()),
+            git: None,
+            active: false,
+            meta: None,
+        };
+        let mut rows = (1..=5)
+            .map(|index| chat(format!("chat::%{index}::{}", index + 100)))
+            .collect::<Vec<_>>();
+        let mut selected = chat("chat::%6::106".to_string());
+        selected.expanded = true;
+        rows.push(selected);
+        rows.extend([detail("summary"), detail("origin"), detail("prompt")]);
+        rows.push(chat("chat::%7::107".to_string()));
+        let row_indices = (0..rows.len()).map(Some).collect::<Vec<_>>();
+
+        let range = rendered_selection_range(&rows, &row_indices, 5);
+
+        assert_eq!(range, Some((5, 8)));
+        assert_eq!(resolve_scroll_range(0, range, rows.len(), 6), 3);
+    }
+
+    #[test]
+    fn oversized_expanded_agent_is_anchored_at_its_first_line() {
+        let rows = (0..10)
+            .map(|index| SidebarRow {
+                id: if index == 1 {
+                    "chat::%1::101".to_string()
+                } else if index > 1 && index < 9 {
+                    format!("detail::%1::101::{index}")
+                } else {
+                    format!("chat::%{}::{}", index + 1, index + 101)
+                },
+                kind: if index > 1 && index < 9 {
+                    SidebarRowKind::Detail
+                } else {
+                    SidebarRowKind::Chat
+                },
+                depth: usize::from(index > 1 && index < 9),
+                label: format!("row-{index}"),
+                chat_count: 0,
+                rollup: RollupLevel::Running,
+                badge_state: Some(BadgeState::Working),
+                expanded: index == 1,
+                pane_id: None,
+                git: None,
+                active: false,
+                meta: None,
+            })
+            .collect::<Vec<_>>();
+        let row_indices = (0..rows.len()).map(Some).collect::<Vec<_>>();
+
+        let range = rendered_selection_range(&rows, &row_indices, 1);
+
+        assert_eq!(range, Some((1, 8)));
+        assert_eq!(resolve_scroll_range(5, range, rows.len(), 4), 1);
     }
 
     #[test]
@@ -2984,8 +3069,9 @@ fn run_loop<B: Backend>(
                     sidebar.state.selection.as_deref().and_then(|selection| {
                         sidebar.rows.iter().position(|row| row.id == selection)
                     });
-                let selection_range = selected_row_index
-                    .and_then(|row_index| rendered_row_range(&rendered.row_indices, row_index));
+                let selection_range = selected_row_index.and_then(|row_index| {
+                    rendered_selection_range(&sidebar.rows, &rendered.row_indices, row_index)
+                });
                 let frame_scroll = if sidebar_state.manual_scroll {
                     clamp_scroll_range(
                         sidebar_state.scroll,
@@ -4542,7 +4628,8 @@ pub(crate) fn resolve_scroll_range(
     let mut scroll = clamp_scroll_range(prev, rows_len, viewport);
     let max_scroll = rows_len.saturating_sub(viewport);
     if let Some((start, end)) = selection_range {
-        if start < scroll {
+        let selection_height = end.saturating_sub(start).saturating_add(1);
+        if selection_height > viewport || start < scroll {
             scroll = start;
         } else if end >= scroll + viewport {
             scroll = end + 1 - viewport;
@@ -4583,6 +4670,32 @@ fn rendered_row_range(row_indices: &[Option<usize>], row_index: usize) -> Option
     let end = row_indices
         .iter()
         .rposition(|mapped| *mapped == Some(row_index))?;
+    Some((start, end))
+}
+
+fn rendered_selection_range(
+    rows: &[SidebarRow],
+    row_indices: &[Option<usize>],
+    selected_row_index: usize,
+) -> Option<(usize, usize)> {
+    let selected = rows.get(selected_row_index)?;
+    let (start, mut end) = rendered_row_range(row_indices, selected_row_index)?;
+    if selected.kind != SidebarRowKind::Chat {
+        return Some((start, end));
+    }
+    let Some(selected_pane) = pane_instance_from_row_id(&selected.id) else {
+        return Some((start, end));
+    };
+    for (row_index, row) in rows.iter().enumerate().skip(selected_row_index + 1) {
+        if row.kind != SidebarRowKind::Detail
+            || pane_instance_from_row_id(&row.id).as_ref() != Some(&selected_pane)
+        {
+            break;
+        }
+        if let Some((_, row_end)) = rendered_row_range(row_indices, row_index) {
+            end = row_end;
+        }
+    }
     Some((start, end))
 }
 

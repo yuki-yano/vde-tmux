@@ -740,9 +740,9 @@ fn transition_at_epoch(event: &PaneEvent, current: Option<&PaneState>) -> i64 {
         | PaneEvent::ProgressUpdated { observed_at, .. }
         | PaneEvent::ObservationBatch { observed_at, .. } => *observed_at,
         PaneEvent::BeginRun { started_at, .. } => *started_at,
-        PaneEvent::CompleteRun { completed_at } | PaneEvent::MarkDone { completed_at, .. } => {
-            *completed_at
-        }
+        PaneEvent::CompleteRun { completed_at }
+        | PaneEvent::ResponseAndCompleteRun { completed_at, .. }
+        | PaneEvent::MarkDone { completed_at, .. } => *completed_at,
         PaneEvent::ExplicitStateReported { report } => report.observed_at,
         PaneEvent::MarkPaneRead { .. }
         | PaneEvent::SetUnreadPin { .. }
@@ -764,7 +764,8 @@ fn event_can_create_record(current: Option<&PaneState>, event: &PaneEvent) -> bo
         | PaneEvent::ActivityAndProgressObserved { .. }
         | PaneEvent::WaitRequested { .. }
         | PaneEvent::FailRun { .. }
-        | PaneEvent::CompleteRun { .. } => true,
+        | PaneEvent::CompleteRun { .. }
+        | PaneEvent::ResponseAndCompleteRun { .. } => true,
         PaneEvent::ExplicitStateReported { report } => match &report.lifecycle {
             Some(ReportedLifecycle::Running)
             | Some(ReportedLifecycle::Waiting { .. })

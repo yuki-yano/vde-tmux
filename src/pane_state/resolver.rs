@@ -62,10 +62,13 @@ mod tests {
             started_at: (run > 0).then_some(1),
             completed_at: (completed > 0).then_some(2),
             prompt: None,
+            latest_response: None,
             task_context: crate::pane_state::TaskContextState::default(),
             tasks: TaskState::default(),
             subagents: Vec::new(),
             worktree_activity: None,
+            background_process: None,
+            listening_ports: Vec::new(),
         }
     }
 

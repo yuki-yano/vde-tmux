@@ -58,9 +58,9 @@ import sys
 connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 connection.connect(sys.argv[1])
 stream = connection.makefile("rwb", buffering=0)
-stream.write(b'{"op":"hello","proto":10}\n')
+stream.write(b'{"op":"hello","proto":11}\n')
 assert json.loads(stream.readline())["type"] == "hello_ack"
-stream.write(b'{"op":"query_status_snapshot","proto":10,"context":"global"}\n')
+stream.write(b'{"op":"query_status_snapshot","proto":11,"context":"global"}\n')
 response = json.loads(stream.readline())
 assert response["type"] == "status_snapshot_result", response
 assert response["snapshot"]["sessions"][0]["attached"] is False, response

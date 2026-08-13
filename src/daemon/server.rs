@@ -2737,6 +2737,7 @@ fn start_canonical_observation_worker(
 ) {
     thread::spawn(move || {
         let mut last_hook_check = Instant::now();
+        let mut last_port_scan = None;
         while !coordinator.shutdown.load(Ordering::SeqCst) {
             let (dispatch, view_base, through_unread_order) = {
                 let state_guard = coordinator
@@ -2782,9 +2783,12 @@ fn start_canonical_observation_worker(
                                 snapshot.pane_instance.clone(),
                                 snapshot.base.clone(),
                                 &snapshot.tracker,
-                                epoch_seconds(),
-                                crate::pane_state::AgentPresenceObservation::Unknown,
-                                None,
+                                crate::daemon::workers::ObservationSample {
+                                    observed_at: epoch_seconds(),
+                                    presence: crate::pane_state::AgentPresenceObservation::Unknown,
+                                    capture: None,
+                                    process: None,
+                                },
                             ) {
                                 Ok(envelope) => {
                                     let _ = coordinator.enqueue_internal(
@@ -2817,8 +2821,15 @@ fn start_canonical_observation_worker(
             projection.view_base = view_base;
             projection.through_unread_order = through_unread_order;
             let nvim_markers = coordinator.query_nvim_pane_markers();
-            let processes =
-                crate::daemon::workers::read_agent_process_snapshot(Duration::from_secs(1));
+            let scan_ports = last_port_scan
+                .is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(10));
+            let processes = crate::daemon::workers::read_agent_process_snapshot(
+                Duration::from_secs(1),
+                scan_ports,
+            );
+            if scan_ports {
+                last_port_scan = Some(Instant::now());
+            }
             if let Some(markers) = nvim_markers {
                 coordinator.cleanup_stale_nvim_pane_markers(&markers, &processes);
             }
@@ -4042,9 +4053,11 @@ fn unread_visibility_for_event(
     };
     let may_create_unread = match &envelope.event {
         PaneEvent::WaitRequested { .. } | PaneEvent::FailRun { .. } => true,
-        PaneEvent::CompleteRun { .. } => current.as_ref().is_none_or(|state| {
-            state.run_seq > state.completed_seq || state.synthetic_completion_armed
-        }),
+        PaneEvent::CompleteRun { .. } | PaneEvent::ResponseAndCompleteRun { .. } => {
+            current.as_ref().is_none_or(|state| {
+                state.run_seq > state.completed_seq || state.synthetic_completion_armed
+            })
+        }
         PaneEvent::ExplicitStateReported { report }
             if matches!(
                 report.lifecycle,
@@ -6006,11 +6019,19 @@ mod tests {
             .unwrap();
         let path = crate::daemon::lifecycle::daemon_log_path(&env, &hash);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !path.exists() && Instant::now() < deadline {
+        let contents = loop {
+            if let Ok(contents) = std::fs::read_to_string(&path)
+                && contents.contains("notification:")
+            {
+                break contents;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "notification failure was not written"
+            );
             thread::sleep(Duration::from_millis(10));
-        }
+        };
 
-        let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("notification:"));
         assert!(contents.contains("exited with status"));
         assert!(contents.contains("pane %7"));
@@ -6180,10 +6201,13 @@ mod tests {
             started_at: Some(1),
             completed_at: None,
             prompt: None,
+            latest_response: None,
             task_context: crate::pane_state::TaskContextState::default(),
             tasks: TaskState::default(),
             subagents: Vec::new(),
             worktree_activity: None,
+            background_process: None,
+            listening_ports: Vec::new(),
         };
         let permission_wait = CaptureObservation {
             inference: CaptureInference::PermissionWait {
@@ -6383,6 +6407,7 @@ mod tests {
                         observed_at: 1,
                         presence: crate::pane_state::AgentPresenceObservation::Unknown,
                         capture: None,
+                        process: None,
                     },
                 })
                 .collect::<Vec<_>>();
@@ -6480,6 +6505,7 @@ mod tests {
                         observed_at: 1,
                         presence: crate::pane_state::AgentPresenceObservation::Unknown,
                         capture: None,
+                        process: None,
                     },
                 })
                 .collect::<Vec<_>>();
@@ -8106,6 +8132,7 @@ mod tests {
                 observed_at: 1,
                 presence: crate::pane_state::AgentPresenceObservation::Unknown,
                 capture: None,
+                process: None,
             },
             PaneEvent::PaneRemoved { expected: None },
         ];

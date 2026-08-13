@@ -353,6 +353,7 @@ fn reduce_observation(
         observed_at,
         presence,
         capture,
+        process,
     } = &envelope.event
     else {
         unreachable!();
@@ -390,6 +391,7 @@ fn reduce_observation(
     };
 
     if created {
+        apply_process_observation(&mut state, process.as_ref())?;
         tracker = reset_tracker_for_state(&tracker, &state)?;
         tracker.fingerprint = capture
             .as_ref()
@@ -482,6 +484,7 @@ fn reduce_observation(
             }
         }
     }
+    apply_process_observation(&mut state, process.as_ref())?;
     bump_tracker(&mut tracker)?;
     finish_state_reduction(current, state, tracker, Some(context.tracker))
 }
@@ -528,10 +531,13 @@ fn new_state(
         started_at: None,
         completed_at: None,
         prompt: None,
+        latest_response: None,
         task_context: TaskContextState::default(),
         tasks: TaskState::default(),
         subagents: Vec::new(),
         worktree_activity: None,
+        background_process: None,
+        listening_ports: Vec::new(),
     })
 }
 
@@ -549,6 +555,10 @@ fn apply_initial_explicit_event(
         PaneEvent::CompleteRun { completed_at } => {
             complete_run(state, *completed_at, visibility, true)
         }
+        PaneEvent::ResponseAndCompleteRun {
+            completed_at,
+            response,
+        } => complete_run_with_response(state, *completed_at, response, visibility, true),
         PaneEvent::ExplicitStateReported { report }
             if matches!(report.lifecycle, Some(ReportedLifecycle::Idle)) =>
         {
@@ -587,6 +597,10 @@ fn apply_regular_explicit_event(
         PaneEvent::CompleteRun { completed_at } => {
             complete_run(state, *completed_at, visibility, false)
         }
+        PaneEvent::ResponseAndCompleteRun {
+            completed_at,
+            response,
+        } => complete_run_with_response(state, *completed_at, response, visibility, false),
         PaneEvent::FailRun {
             observed_at,
             reason,
@@ -733,41 +747,44 @@ fn is_epoch_start_evidence(event: &PaneEvent) -> bool {
 }
 
 fn is_completion(event: &PaneEvent) -> bool {
-    matches!(event, PaneEvent::CompleteRun { .. })
-        || matches!(
-            event,
-            PaneEvent::ExplicitStateReported {
-                report: ExplicitStateReport {
-                    lifecycle: Some(ReportedLifecycle::Idle),
-                    completed_at: Some(_),
-                    ..
-                }
+    matches!(
+        event,
+        PaneEvent::CompleteRun { .. } | PaneEvent::ResponseAndCompleteRun { .. }
+    ) || matches!(
+        event,
+        PaneEvent::ExplicitStateReported {
+            report: ExplicitStateReport {
+                lifecycle: Some(ReportedLifecycle::Idle),
+                completed_at: Some(_),
+                ..
             }
-        )
-        || matches!(
-            event,
-            PaneEvent::ExplicitStateReported {
-                report: ExplicitStateReport {
-                    lifecycle: Some(ReportedLifecycle::Idle),
-                    attention: true,
-                    ..
-                }
+        }
+    ) || matches!(
+        event,
+        PaneEvent::ExplicitStateReported {
+            report: ExplicitStateReport {
+                lifecycle: Some(ReportedLifecycle::Idle),
+                attention: true,
+                ..
             }
-        )
+        }
+    )
 }
 
 fn is_completion_for_state(state: &PaneState, event: &PaneEvent) -> bool {
-    matches!(event, PaneEvent::CompleteRun { .. })
-        || matches!(
-            event,
-            PaneEvent::ExplicitStateReported {
-                report: ExplicitStateReport {
-                    lifecycle: Some(ReportedLifecycle::Idle),
-                    ..
-                }
-            } if state.run_seq > state.completed_seq
-                || (state.synthetic_completion_armed && is_completion(event))
-        )
+    matches!(
+        event,
+        PaneEvent::CompleteRun { .. } | PaneEvent::ResponseAndCompleteRun { .. }
+    ) || matches!(
+        event,
+        PaneEvent::ExplicitStateReported {
+            report: ExplicitStateReport {
+                lifecycle: Some(ReportedLifecycle::Idle),
+                ..
+            }
+        } if state.run_seq > state.completed_seq
+            || (state.synthetic_completion_armed && is_completion(event))
+    )
 }
 
 fn begin_agent_epoch(
@@ -802,10 +819,13 @@ fn begin_agent_epoch(
     state.started_at = None;
     state.completed_at = None;
     state.prompt = None;
+    state.latest_response = None;
     state.task_context = TaskContextState::default();
     state.tasks = TaskState::default();
     state.subagents.clear();
     state.worktree_activity = None;
+    state.background_process = None;
+    state.listening_ports.clear();
     Ok(())
 }
 
@@ -817,6 +837,7 @@ fn start_new_run(state: &mut PaneState, started_at: i64) -> Result<(), ReduceErr
             .ok_or(ReduceError::CounterOverflow("run sequence"))?;
         state.started_at = Some(started_at);
         state.prompt = None;
+        state.latest_response = None;
         state.tasks = TaskState::default();
         state.subagents.clear();
         state.worktree_activity = None;
@@ -891,6 +912,24 @@ fn complete_run(
     state.synthetic_completion_armed = false;
     state.subagents.clear();
     state.worktree_activity = None;
+    Ok(())
+}
+
+fn complete_run_with_response(
+    state: &mut PaneState,
+    completed_at: i64,
+    response: &ResponseState,
+    visibility: &VisibilitySnapshot,
+    allow_unarmed_synthetic: bool,
+) -> Result<(), ReduceError> {
+    response
+        .validate()
+        .map_err(|error| ReduceError::InvalidRequest(error.to_string()))?;
+    let completed_before = state.completed_seq;
+    complete_run(state, completed_at, visibility, allow_unarmed_synthetic)?;
+    if state.completed_seq > completed_before {
+        state.latest_response = Some(response.clone());
+    }
     Ok(())
 }
 
@@ -1002,9 +1041,9 @@ fn event_epoch(event: &PaneEvent, state: &PaneState) -> i64 {
         | PaneEvent::ProgressUpdated { observed_at, .. }
         | PaneEvent::ObservationBatch { observed_at, .. } => *observed_at,
         PaneEvent::BeginRun { started_at, .. } => *started_at,
-        PaneEvent::CompleteRun { completed_at } | PaneEvent::MarkDone { completed_at, .. } => {
-            *completed_at
-        }
+        PaneEvent::CompleteRun { completed_at }
+        | PaneEvent::ResponseAndCompleteRun { completed_at, .. }
+        | PaneEvent::MarkDone { completed_at, .. } => *completed_at,
         PaneEvent::ExplicitStateReported { report } => report.observed_at,
         PaneEvent::MarkPaneRead { .. }
         | PaneEvent::SetUnreadPin { .. }
@@ -1025,6 +1064,8 @@ fn confirm_absent(
     }
     state.agent_present = false;
     state.scan_verified = true;
+    state.background_process = None;
+    state.listening_ports.clear();
     Ok(())
 }
 
@@ -1124,10 +1165,20 @@ fn apply_progress(
                 state.worktree_activity = Some(activity.clone());
             }
             ProgressOperation::ClearWorktreeActivity => state.worktree_activity = None,
+            ProgressOperation::SetBackgroundProcess(process) => {
+                state.background_process = Some(process.clone());
+            }
+            ProgressOperation::ClearBackgroundProcess => state.background_process = None,
         }
     }
     validate_tasks(&state.tasks)
         .and_then(|_| validate_subagents(&state.subagents))
+        .and_then(|_| {
+            state
+                .background_process
+                .as_ref()
+                .map_or(Ok(()), BackgroundProcessState::validate)
+        })
         .map_err(|error| ReduceError::InvalidProgressOperation(error.to_string()))?;
     Ok(())
 }
@@ -1141,7 +1192,8 @@ fn validate_progress_operation(operation: &ProgressOperation) -> Result<(), Redu
         | ProgressOperation::TaskCompleted
         | ProgressOperation::ClearTasks
         | ProgressOperation::ClearSubagents
-        | ProgressOperation::ClearWorktreeActivity => Ok(()),
+        | ProgressOperation::ClearWorktreeActivity
+        | ProgressOperation::ClearBackgroundProcess => Ok(()),
         ProgressOperation::ReplaceTasks { progress, items } => {
             let mut tasks = TaskState {
                 progress: progress.clone(),
@@ -1177,7 +1229,27 @@ fn validate_progress_operation(operation: &ProgressOperation) -> Result<(), Redu
                 })
                 .map_err(invalid)
         }
+        ProgressOperation::SetBackgroundProcess(process) => process.validate().map_err(invalid),
     }
+}
+
+fn apply_process_observation(
+    state: &mut PaneState,
+    observation: Option<&ProcessObservation>,
+) -> Result<(), ReduceError> {
+    let Some(observation) = observation else {
+        return Ok(());
+    };
+    observation
+        .validate()
+        .map_err(|error| ReduceError::InvalidRequest(error.to_string()))?;
+    if observation.background_process_alive == Some(false) {
+        state.background_process = None;
+    }
+    if let Some(ports) = &observation.listening_ports {
+        state.listening_ports.clone_from(ports);
+    }
+    Ok(())
 }
 
 fn derive_task_progress(tasks: &mut TaskState) {
@@ -1434,6 +1506,7 @@ mod tests {
             observed_at,
             presence,
             capture,
+            process: None,
         };
         reduce(
             current,
@@ -2319,6 +2392,7 @@ mod tests {
             observed_at: 4,
             presence: AgentPresenceObservation::Absent,
             capture: None,
+            process: None,
         };
         let rejected = reduce(
             progress.record.as_ref(),
@@ -2372,6 +2446,7 @@ mod tests {
             observed_at: 3,
             presence: AgentPresenceObservation::Absent,
             capture: None,
+            process: None,
         };
         let rejected = reduce(
             changed.record.as_ref(),
@@ -2388,6 +2463,7 @@ mod tests {
             observed_at: 3,
             presence: AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
             capture: None,
+            process: None,
         };
         let rejected = reduce(
             changed.record.as_ref(),
@@ -2404,6 +2480,7 @@ mod tests {
             observed_at: 3,
             presence: AgentPresenceObservation::Absent,
             capture: None,
+            process: None,
         };
         let rejected = reduce(
             changed.record.as_ref(),
@@ -2553,6 +2630,7 @@ mod tests {
             observed_at: 1,
             presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
             capture: None,
+            process: None,
         };
         let mut observation = envelope(event);
         observation.agent = None;
@@ -3053,6 +3131,7 @@ mod tests {
                 observed_at: 2,
                 presence: AgentPresenceObservation::Absent,
                 capture: None,
+                process: None,
             },
             &first_tracker,
         );
@@ -3066,6 +3145,7 @@ mod tests {
                 observed_at: 3,
                 presence: AgentPresenceObservation::Absent,
                 capture: None,
+                process: None,
             },
             &second_tracker,
         );
@@ -3240,6 +3320,89 @@ mod tests {
             changed_tracker,
         );
         assert_eq!(stale.outcome, ReductionOutcome::Noop);
+    }
+
+    #[test]
+    fn response_background_and_process_observation_follow_run_and_liveness_boundaries() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let running = reduce_once(
+            None,
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: Some(PromptState {
+                    text: "start dev server".to_string(),
+                    source: "user".to_string(),
+                }),
+            },
+            &tracker,
+        );
+        let running_tracker = running.tracker_delta.as_ref().unwrap().next.clone();
+        let background = reduce_once(
+            running.record.as_ref(),
+            PaneEvent::ProgressUpdated {
+                observed_at: 2,
+                operations: vec![ProgressOperation::SetBackgroundProcess(
+                    BackgroundProcessState {
+                        command: "pnpm dev".to_string(),
+                        observed_at: 2,
+                    },
+                )],
+            },
+            &running_tracker,
+        );
+        let background_tracker = background.tracker_delta.as_ref().unwrap().next.clone();
+        let completed = reduce_once(
+            background.record.as_ref(),
+            PaneEvent::ResponseAndCompleteRun {
+                completed_at: 3,
+                response: ResponseState {
+                    text: "server is ready".to_string(),
+                    observed_at: 3,
+                },
+            },
+            &background_tracker,
+        );
+        assert_eq!(
+            active(&completed)
+                .latest_response
+                .as_ref()
+                .map(|response| response.text.as_str()),
+            Some("server is ready")
+        );
+        assert!(active(&completed).background_process.is_some());
+
+        let completed_tracker = completed.tracker_delta.as_ref().unwrap().next.clone();
+        let next_run = reduce_once(
+            completed.record.as_ref(),
+            PaneEvent::BeginRun {
+                started_at: 4,
+                prompt: None,
+            },
+            &completed_tracker,
+        );
+        assert!(active(&next_run).latest_response.is_none());
+        assert!(active(&next_run).background_process.is_some());
+
+        let next_tracker = next_run.tracker_delta.as_ref().unwrap().next.clone();
+        let observation = PaneEvent::ObservationBatch {
+            base: Some(descriptor(active(&next_run))),
+            tracker_generation: next_tracker.generation,
+            observed_at: 5,
+            presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+            capture: None,
+            process: Some(ProcessObservation {
+                background_process_alive: Some(false),
+                listening_ports: Some(vec![3000, 5173]),
+            }),
+        };
+        let observed = reduce(
+            next_run.record.as_ref(),
+            &observation_envelope(observation),
+            context(&next_tracker, &VisibilitySnapshot::default()),
+        )
+        .unwrap();
+        assert!(active(&observed).background_process.is_none());
+        assert_eq!(active(&observed).listening_ports, [3000, 5173]);
     }
 
     #[test]
@@ -3572,6 +3735,7 @@ mod tests {
                     observed_at: 2,
                     presence,
                     capture: None,
+                    process: None,
                 },
                 &current_tracker,
             );
@@ -3616,6 +3780,7 @@ mod tests {
                     inference: CaptureInference::NoChange,
                     observed_fingerprint: None,
                 }),
+                process: None,
             },
             &pending,
         );
@@ -3641,6 +3806,7 @@ mod tests {
                     inference: CaptureInference::StaleRunCompleted,
                     observed_fingerprint: Some([2; 32]),
                 }),
+                process: None,
             },
             &capture_tracker,
         );

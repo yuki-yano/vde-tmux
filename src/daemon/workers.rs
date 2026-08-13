@@ -37,7 +37,9 @@ pub struct AgentProcessSnapshot {
     commands: BTreeMap<u32, String>,
     children: BTreeMap<u32, Vec<u32>>,
     process_groups: BTreeMap<u32, (i32, i32)>,
+    listening_ports: BTreeMap<u32, BTreeSet<u16>>,
     complete: bool,
+    ports_complete: bool,
 }
 
 impl AgentProcessSnapshot {
@@ -158,6 +160,105 @@ impl AgentProcessSnapshot {
         }
         Some(false)
     }
+
+    pub fn process_observation(
+        &self,
+        root_pid: u32,
+        background_command: Option<&str>,
+    ) -> Option<crate::pane_state::ProcessObservation> {
+        let descendants = self.descendants(root_pid)?;
+        let background_process_alive = background_command.map(|command| {
+            descendants.iter().any(|pid| {
+                self.commands
+                    .get(pid)
+                    .is_some_and(|line| process_line_matches_command(line, command))
+            })
+        });
+        let listening_ports = self.ports_complete.then(|| {
+            descendants
+                .iter()
+                .filter_map(|pid| self.listening_ports.get(pid))
+                .flatten()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .take(crate::pane_state::MAX_LISTENING_PORTS)
+                .collect::<Vec<_>>()
+        });
+        (background_process_alive.is_some() || listening_ports.is_some()).then_some(
+            crate::pane_state::ProcessObservation {
+                background_process_alive,
+                listening_ports,
+            },
+        )
+    }
+
+    fn descendants(&self, root_pid: u32) -> Option<BTreeSet<u32>> {
+        if !self.complete || !self.commands.contains_key(&root_pid) {
+            return None;
+        }
+        let mut descendants = BTreeSet::new();
+        let mut stack = vec![root_pid];
+        while let Some(pid) = stack.pop() {
+            if !descendants.insert(pid) {
+                continue;
+            }
+            if let Some(children) = self.children.get(&pid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        Some(descendants)
+    }
+
+    fn observe_listening_ports(&mut self, output: &str) {
+        self.listening_ports.clear();
+        let mut current_pid = None;
+        for line in output.lines() {
+            if let Some(pid) = line.strip_prefix('p') {
+                current_pid = pid.parse::<u32>().ok();
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('n')
+                && let Some(pid) = current_pid
+                && let Some(port) = listening_port_from_name(name)
+            {
+                self.listening_ports.entry(pid).or_default().insert(port);
+            }
+        }
+        self.ports_complete = true;
+    }
+}
+
+fn listening_port_from_name(name: &str) -> Option<u16> {
+    let (_, tail) = name.trim().rsplit_once(':')?;
+    let digits = tail
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn process_line_matches_command(line: &str, command: &str) -> bool {
+    let line = normalize_process_text(line);
+    let command = normalize_process_text(command);
+    if command.is_empty() {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    line.match_indices(&command).any(|(index, _)| {
+        let end = index + command.len();
+        let before = index == 0 || !is_process_token_byte(bytes[index - 1]);
+        let after = end == bytes.len() || !is_process_token_byte(bytes[end]);
+        before && after
+    })
+}
+
+fn normalize_process_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_process_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
 }
 
 fn is_nvim_process(command: &str) -> bool {
@@ -208,15 +309,28 @@ fn detect_process_agent(command: &str) -> Option<AgentKind> {
         .and_then(|agent| AgentKind::parse(agent).ok())
 }
 
-pub fn read_agent_process_snapshot(timeout: Duration) -> AgentProcessSnapshot {
-    match run_command(
+pub fn read_agent_process_snapshot(timeout: Duration, scan_ports: bool) -> AgentProcessSnapshot {
+    let mut snapshot = match run_command(
         "ps",
         &["-ax", "-o", "pid=,ppid=,pgid=,tpgid=,command="],
         Some(timeout),
     ) {
         Ok(output) => AgentProcessSnapshot::parse(&output, true),
         Err(_) => AgentProcessSnapshot::parse("", false),
+    };
+    if scan_ports
+        && let Ok(output) = run_command(
+            "sh",
+            &[
+                "-c",
+                "lsof -iTCP -sTCP:LISTEN -nP -F pn; code=$?; [ \"$code\" -eq 0 ] || [ \"$code\" -eq 1 ]",
+            ],
+            Some(timeout),
+        )
+    {
+        snapshot.observe_listening_ports(&output);
     }
+    snapshot
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -828,17 +942,23 @@ pub fn capture_sha256(tail: &str) -> Option<[u8; 32]> {
     Some(Sha256::digest(tail.as_bytes()).into())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationSample {
+    pub observed_at: i64,
+    pub presence: AgentPresenceObservation,
+    pub capture: Option<CaptureObservation>,
+    pub process: Option<crate::pane_state::ProcessObservation>,
+}
+
 pub fn observation_envelope(
     daemon_instance_id: DaemonInstanceId,
     pane_instance: PaneInstance,
     base: Option<StoredStateDescriptor>,
     tracker: &CaptureTrackerSnapshot,
-    observed_at: i64,
-    presence: AgentPresenceObservation,
-    capture: Option<CaptureObservation>,
+    sample: ObservationSample,
 ) -> Result<PaneEventEnvelope> {
-    let capture = (!matches!(presence, AgentPresenceObservation::Unknown))
-        .then_some(capture)
+    let capture = (!matches!(sample.presence, AgentPresenceObservation::Unknown))
+        .then_some(sample.capture)
         .flatten();
     Ok(PaneEventEnvelope {
         daemon_instance_id,
@@ -849,9 +969,10 @@ pub fn observation_envelope(
         event: PaneEvent::ObservationBatch {
             base,
             tracker_generation: tracker.generation,
-            observed_at,
-            presence,
+            observed_at: sample.observed_at,
+            presence: sample.presence,
             capture,
+            process: sample.process,
         },
     })
 }
@@ -962,15 +1083,26 @@ pub fn run_observation_poll(
                 observed_at,
             )
         });
+        let process = processes.process_observation(
+            snapshot.pane_instance.pane_pid,
+            snapshot
+                .state
+                .as_ref()
+                .and_then(|state| state.background_process.as_ref())
+                .map(|process| process.command.as_str()),
+        );
         envelopes.push(
             observation_envelope(
                 daemon_instance_id.clone(),
                 snapshot.pane_instance.clone(),
                 snapshot.base.clone(),
                 &snapshot.tracker,
-                observed_at,
-                presence,
-                capture,
+                ObservationSample {
+                    observed_at,
+                    presence,
+                    capture,
+                    process,
+                },
             )
             .map_err(|error| ObservationPollError::Event(error.to_string()))?,
         );
@@ -1765,10 +1897,13 @@ mod tests {
             started_at: Some(100),
             completed_at: None,
             prompt: None,
+            latest_response: None,
             task_context: crate::pane_state::TaskContextState::default(),
             tasks: crate::pane_state::TaskState::default(),
             subagents: Vec::new(),
             worktree_activity: None,
+            background_process: None,
+            listening_ports: Vec::new(),
         }
     }
 
@@ -2282,6 +2417,26 @@ mod tests {
     }
 
     #[test]
+    fn process_snapshot_maps_ports_and_background_liveness_to_pane_tree() {
+        let mut snapshot = AgentProcessSnapshot::parse(
+            "100 1 100 100 zsh\n200 100 200 100 bash -c pnpm dev\n300 200 300 100 node server.js\n",
+            true,
+        );
+        snapshot.observe_listening_ports("p300\nn127.0.0.1:3000\nn*:5173\n");
+
+        let observation = snapshot.process_observation(100, Some("pnpm dev")).unwrap();
+        assert_eq!(observation.background_process_alive, Some(true));
+        assert_eq!(observation.listening_ports, Some(vec![3000, 5173]));
+        assert_eq!(
+            snapshot
+                .process_observation(100, Some("cargo watch"))
+                .unwrap()
+                .background_process_alive,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn capture_inference_handles_baseline_change_rebaseline_and_stale() {
         let state = canonical_state("opencode");
         let baseline = infer_capture(
@@ -2332,12 +2487,15 @@ mod tests {
             pane_instance("%1", 11),
             None,
             &tracker,
-            100,
-            AgentPresenceObservation::Unknown,
-            Some(CaptureObservation {
-                inference: CaptureInference::ActivityObserved,
-                observed_fingerprint: Some([1; 32]),
-            }),
+            ObservationSample {
+                observed_at: 100,
+                presence: AgentPresenceObservation::Unknown,
+                capture: Some(CaptureObservation {
+                    inference: CaptureInference::ActivityObserved,
+                    observed_fingerprint: Some([1; 32]),
+                }),
+                process: None,
+            },
         )
         .unwrap();
         let PaneEvent::ObservationBatch { capture, .. } = envelope.event else {

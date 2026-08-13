@@ -4,8 +4,8 @@ use anyhow::{Result, bail};
 
 use crate::hook::{SubagentEntry, TaskItem, TaskProgress, WorktreeActivity};
 use crate::pane_state::{
-    BODY_MAX_BYTES, IDENTIFIER_MAX_BYTES, PATH_MAX_BYTES, PaneInstance, ProgressOperation,
-    SubagentState, TaskItemState, TaskItemStatus as CanonicalTaskItemStatus,
+    BODY_MAX_BYTES, BackgroundProcessState, IDENTIFIER_MAX_BYTES, PATH_MAX_BYTES, PaneInstance,
+    ProgressOperation, SubagentState, TaskItemState, TaskItemStatus as CanonicalTaskItemStatus,
     TaskProgress as CanonicalTaskProgress, WorktreeActivity as CanonicalWorktreeActivity,
     WorktreeActivityKind as CanonicalWorktreeActivityKind, normalize_text, validate_required_text,
 };
@@ -31,6 +31,10 @@ pub enum ProgressEvent {
     SubagentStart(SubagentEntry),
     SubagentStop {
         agent_id: String,
+    },
+    BackgroundProcessStarted {
+        command: String,
+        observed_at: i64,
     },
 }
 
@@ -114,6 +118,17 @@ pub fn typed_progress_operations(event: ProgressEvent) -> Result<Vec<ProgressOpe
             let agent_id = normalize_text(&agent_id);
             validate_required_text(&agent_id, "subagent ID", IDENTIFIER_MAX_BYTES)?;
             ProgressOperation::RemoveSubagent { agent_id }
+        }
+        ProgressEvent::BackgroundProcessStarted {
+            command,
+            observed_at,
+        } => {
+            let process = BackgroundProcessState {
+                command: normalize_text(&command),
+                observed_at,
+            };
+            process.validate()?;
+            ProgressOperation::SetBackgroundProcess(process)
         }
     };
     Ok(vec![operation])
@@ -307,6 +322,19 @@ mod tests {
             vec![ProgressOperation::RemoveSubagent {
                 agent_id: "worker 1".to_string(),
             }]
+        );
+        assert_eq!(
+            typed_progress_operations(ProgressEvent::BackgroundProcessStarted {
+                command: " pnpm\ndev ".to_string(),
+                observed_at: 42,
+            })
+            .unwrap(),
+            vec![ProgressOperation::SetBackgroundProcess(
+                BackgroundProcessState {
+                    command: "pnpm dev".to_string(),
+                    observed_at: 42,
+                }
+            )]
         );
     }
 

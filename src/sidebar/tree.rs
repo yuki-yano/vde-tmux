@@ -97,6 +97,7 @@ struct AgentPane {
     category: String,
     agent: String,
     prompt: String,
+    latest_response: String,
     task_summary: String,
     wait_reason: String,
     started_at: String,
@@ -105,7 +106,10 @@ struct AgentPane {
     task_items: Vec<TaskItem>,
     subagents: Vec<SubagentDetail>,
     worktree_activity: Option<WorktreeActivity>,
+    background_process: Option<crate::pane_state::BackgroundProcessState>,
+    listening_ports: Vec<u16>,
     worktree: Option<WorktreeInfo>,
+    git: Option<crate::git::GitBadge>,
     rollup: RollupLevel,
     badge_state: BadgeState,
     repo_path: String,
@@ -256,6 +260,11 @@ pub fn build_rows_from_presentations(
                     .as_ref()
                     .map(|prompt| prompt.text.clone())
                     .unwrap_or_default(),
+                latest_response: canonical
+                    .latest_response
+                    .as_ref()
+                    .map(|response| response.text.clone())
+                    .unwrap_or_default(),
                 task_summary: canonical
                     .task_context
                     .summary
@@ -276,7 +285,10 @@ pub fn build_rows_from_presentations(
                 task_items,
                 subagents,
                 worktree_activity,
+                background_process: canonical.background_process.clone(),
+                listening_ports: canonical.listening_ports.clone(),
                 worktree: ctx.worktrees.get(&pane.current_path).cloned(),
+                git: ctx.git.get(&pane.current_path).cloned(),
                 rollup,
                 badge_state: resolved.badge,
                 repo_path: pane.current_path.clone(),
@@ -876,15 +888,34 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
     if let Some(summary) = non_empty(&pane.task_summary) {
         rows.push(detail_row(pane, depth, "summary", summary.to_string()));
     }
+    if let Some(signal) = agent_signal_label(pane) {
+        let mut row = detail_row(pane, depth, "signal", signal);
+        if let Some((done, total)) = parse_tasks(&pane.tasks) {
+            row.meta = Some(RowMeta {
+                tasks_done: Some(done),
+                tasks_total: Some(total),
+                ..RowMeta::default()
+            });
+        }
+        rows.push(row);
+    }
     if let Some(prompt) = non_empty(&pane.prompt) {
         rows.push(detail_row(pane, depth, "prompt", prompt.to_string()));
     }
-    if let Some(worktree) = &pane.worktree {
+    if let Some(process) = &pane.background_process {
         rows.push(detail_row(
             pane,
             depth,
-            "worktree",
-            format!("+ {}", sanitize_detail_label(&worktree.name)),
+            "background",
+            format!("◎ $ {}", sanitize_detail_label(&process.command)),
+        ));
+    }
+    if let Some(response) = non_empty(&pane.latest_response) {
+        rows.push(detail_row(
+            pane,
+            depth,
+            "response",
+            format!("▷ {}", sanitize_detail_label(response)),
         ));
     }
 
@@ -922,6 +953,62 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
             ));
         }
     }
+}
+
+fn agent_signal_label(pane: &AgentPane) -> Option<String> {
+    const MAX_SIGNAL_PORTS: usize = 3;
+
+    let mut parts = Vec::new();
+    let worktree_branch = pane
+        .worktree
+        .as_ref()
+        .and_then(|worktree| worktree.branch.as_deref());
+    let branch = worktree_branch
+        .or_else(|| pane.git.as_ref().map(|git| git.branch.as_str()))
+        .or_else(|| {
+            pane.worktree
+                .as_ref()
+                .map(|worktree| worktree.name.as_str())
+        });
+    if let Some(branch) = branch.filter(|branch| !branch.trim().is_empty()) {
+        let marker = if pane.worktree.is_some() { "+ " } else { "" };
+        parts.push(format!("{marker}{}", sanitize_detail_label(branch)));
+    }
+    if let Some(git) = &pane.git {
+        if git.ahead > 0 {
+            parts.push(format!("↑ {}", git.ahead));
+        }
+        if git.behind > 0 {
+            parts.push(format!("↓ {}", git.behind));
+        }
+    }
+
+    let progress = parse_tasks(&pane.tasks).unwrap_or((0, 0));
+    if let Some(label) = task_progress_label(progress.0, progress.1) {
+        parts.push(label);
+    }
+
+    if !pane.listening_ports.is_empty() {
+        let mut ports = pane
+            .listening_ports
+            .iter()
+            .take(MAX_SIGNAL_PORTS)
+            .map(|port| format!(":{port}"))
+            .collect::<Vec<_>>();
+        if pane.listening_ports.len() > MAX_SIGNAL_PORTS {
+            ports.push(format!(
+                "+{}",
+                pane.listening_ports.len() - MAX_SIGNAL_PORTS
+            ));
+        }
+        parts.push(ports.join(" "));
+    }
+
+    (!parts.is_empty()).then(|| parts.join("  "))
+}
+
+pub(crate) fn task_progress_label(done: i64, total: i64) -> Option<String> {
+    (total > 0).then(|| format!("☑ {done}/{total}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1267,6 +1354,7 @@ mod tests {
             category: "misc".to_string(),
             agent: "codex".to_string(),
             prompt: String::new(),
+            latest_response: String::new(),
             task_summary: String::new(),
             wait_reason: String::new(),
             started_at: "100".to_string(),
@@ -1275,7 +1363,10 @@ mod tests {
             task_items: Vec::new(),
             subagents: Vec::new(),
             worktree_activity: None,
+            background_process: None,
+            listening_ports: Vec::new(),
             worktree: None,
+            git: None,
             rollup: RollupLevel::Idle,
             badge_state,
             repo_path: "/tmp/repo".to_string(),
@@ -1657,10 +1748,13 @@ mod tests {
                 text: "working".to_string(),
                 source: "test".to_string(),
             }),
+            latest_response: None,
             task_context: crate::pane_state::TaskContextState::default(),
             tasks: TaskState::default(),
             subagents: Vec::new(),
             worktree_activity: None,
+            background_process: None,
+            listening_ports: Vec::new(),
         };
         let pane = crate::daemon::protocol::v2::PanePresentation {
             pane_instance: pane_instance.clone(),
@@ -1720,7 +1814,7 @@ mod tests {
         let after_text = crate::sidebar::render::render_rows(&after.rows, &state, 36);
 
         assert!(before_text.contains("59s"), "{before_text}");
-        assert!(after_text.contains("Running 1m 00s"), "{after_text}");
+        assert!(after_text.contains("1m00s"), "{after_text}");
         assert_eq!(snapshot.snapshot_revision, 7);
         assert_eq!(serde_json::to_vec(&snapshot).unwrap(), encoded);
     }
@@ -1759,6 +1853,48 @@ mod tests {
         assert_eq!(rows[0].label, "サイドバー要約表示");
         assert_eq!(rows[1].id, "detail::%1::1::prompt");
         assert_eq!(rows[1].label, "実装してlocal installして");
+    }
+
+    #[test]
+    fn expanded_chat_combines_branch_tasks_ports_and_shows_background_response() {
+        let mut pane = agent_pane(BadgeState::Working, "");
+        pane.git = Some(crate::git::GitBadge {
+            branch: "feature/sidebar".to_string(),
+            ahead: 2,
+            behind: 1,
+        });
+        pane.tasks = "1/3".to_string();
+        pane.task_items = vec![
+            TaskItem {
+                step: "done".to_string(),
+                status: TaskItemStatus::Completed,
+            },
+            TaskItem {
+                step: "working".to_string(),
+                status: TaskItemStatus::InProgress,
+            },
+            TaskItem {
+                step: "pending".to_string(),
+                status: TaskItemStatus::Pending,
+            },
+        ];
+        pane.listening_ports = vec![3000, 5173];
+        pane.background_process = Some(crate::pane_state::BackgroundProcessState {
+            command: "pnpm dev".to_string(),
+            observed_at: 1,
+        });
+        pane.latest_response = "server is ready".to_string();
+        let mut rows = Vec::new();
+
+        push_chat_detail_rows(&pane, 1, &mut rows);
+
+        assert_eq!(rows[0].id, "detail::%1::1::signal");
+        assert_eq!(
+            rows[0].label,
+            "feature/sidebar  ↑ 2  ↓ 1  ☑ 1/3  :3000 :5173"
+        );
+        assert!(rows.iter().any(|row| row.label == "◎ $ pnpm dev"));
+        assert!(rows.iter().any(|row| row.label == "▷ server is ready"));
     }
 
     #[test]
