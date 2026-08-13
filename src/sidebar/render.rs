@@ -783,7 +783,7 @@ fn render_closed_chat_digest_lines(
 }
 
 fn closed_chat_has_detail_line(row: &SidebarRow) -> bool {
-    !chat_prompt_label(row).trim().is_empty() || closed_chat_reason_token(row).is_some()
+    !chat_task_summary_label(row).trim().is_empty() || closed_chat_reason_token(row).is_some()
 }
 
 fn render_closed_chat_summary_line(
@@ -863,8 +863,8 @@ fn render_closed_chat_prompt_line(
         }
         _ => (available, None),
     };
-    let prompt = truncate_display(&chat_prompt_label(row), prompt_budget);
-    spans.push(Span::styled(prompt, row_style(row, theme)));
+    let summary = truncate_display(&chat_task_summary_label(row), prompt_budget);
+    spans.push(Span::styled(summary, row_style(row, theme)));
     let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
     let reason_width = reason.as_deref().map(display_width).unwrap_or(0);
     let filler = width
@@ -1878,19 +1878,13 @@ fn chat_display_label(row: &SidebarRow) -> String {
     display_agent_label_prefix(&row.label)
 }
 
-fn chat_prompt_label(row: &SidebarRow) -> String {
-    if let Some(prompt) = row
-        .meta
+fn chat_task_summary_label(row: &SidebarRow) -> String {
+    row.meta
         .as_ref()
-        .and_then(|meta| meta.prompt.as_deref())
-        .filter(|prompt| !prompt.trim().is_empty())
-    {
-        return prompt.to_string();
-    }
-    row.label
-        .split_once(':')
-        .map(|(_, prompt)| prompt.trim().to_string())
+        .and_then(|meta| meta.task_summary.as_deref())
+        .filter(|summary| !summary.trim().is_empty())
         .unwrap_or_default()
+        .to_string()
 }
 
 fn elapsed_label(secs: i64) -> String {
@@ -1994,7 +1988,9 @@ fn row_style(row: &SidebarRow, theme: &SidebarRenderTheme) -> Style {
             .add_modifier(Modifier::BOLD),
         SidebarRowKind::Repo => Style::default().fg(theme.repo).add_modifier(Modifier::BOLD),
         SidebarRowKind::Chat => Style::default().fg(Color::Reset),
-        SidebarRowKind::Detail if row.id.ends_with("::prompt") => Style::default().fg(Color::Reset),
+        SidebarRowKind::Detail if row.id.ends_with("::summary") => {
+            Style::default().fg(Color::Reset)
+        }
         SidebarRowKind::Detail => Style::default().fg(theme.detail),
     }
 }
@@ -2775,6 +2771,11 @@ sidebar:
         );
         chat.active = true;
         chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            task_summary: Some("active task".to_string()),
+            ..Default::default()
+        });
         let theme = SidebarRenderTheme::default();
 
         let lines = render_lines(
@@ -3386,6 +3387,7 @@ sidebar:
         chat.expanded = false;
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("claude".to_string()),
+            task_summary: Some("fix flicker".to_string()),
             elapsed_secs: Some(780),
             ..Default::default()
         });
@@ -3454,7 +3456,7 @@ sidebar:
             prompt_detail_spans
                 .iter()
                 .any(|span| span.content.as_ref().contains("fix flicker")
-                    && span.style.fg == Some(Color::Reset)
+                    && span.style.fg == Some(Color::Indexed(246))
                     && !span.style.add_modifier.contains(Modifier::DIM)),
             "{prompt_detail_spans:?}"
         );
@@ -3531,13 +3533,23 @@ sidebar:
     }
 
     #[test]
-    fn prompt_detail_row_keeps_reset_color() {
+    fn summary_is_white_and_latest_prompt_is_detail_gray() {
         let theme = SidebarRenderTheme::default();
-        let detail = detail_row("detail::%1::prompt", "fix flicker", RollupLevel::Running);
+        let summary = detail_row(
+            "detail::%1::summary",
+            "sidebar task summary",
+            RollupLevel::Running,
+        );
+        let prompt = detail_row(
+            "detail::%1::prompt",
+            "latest user prompt",
+            RollupLevel::Running,
+        );
 
-        let lines = render_lines(&[detail], &SidebarState::default(), 60, &theme);
+        let lines = render_lines(&[summary, prompt], &SidebarState::default(), 60, &theme);
 
-        assert_span_fg(&lines[0].spans, "fix flicker", Color::Reset);
+        assert_span_fg(&lines[0].spans, "sidebar task summary", Color::Reset);
+        assert_span_fg(&lines[1].spans, "latest user prompt", theme.detail);
     }
 
     #[test]
@@ -3941,6 +3953,9 @@ badge:
                 prompt: label
                     .split_once(':')
                     .map(|(_, prompt)| prompt.trim().to_string()),
+                task_summary: label
+                    .split_once(':')
+                    .map(|(_, prompt)| prompt.trim().to_string()),
                 elapsed_secs: Some(90),
                 ..Default::default()
             });
@@ -4052,6 +4067,7 @@ badge:
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
             prompt: Some("review sidebar state shape".to_string()),
+            task_summary: Some("review sidebar state shape".to_string()),
             wait_reason: Some("permission_prompt".to_string()),
             elapsed_secs: Some(127),
             tasks_done: Some(2),
@@ -4094,15 +4110,15 @@ badge:
     }
 
     #[test]
-    fn closed_and_expanded_prompt_content_start_at_the_same_column() {
-        let prompt = "align this prompt";
+    fn closed_and_expanded_summary_content_start_at_the_same_column() {
+        let summary = "align this task";
         for depth in [0, 2] {
             for (active, selected) in [(false, false), (true, false), (false, true)] {
                 let mut closed = row(
                     "chat::%1::10",
                     SidebarRowKind::Chat,
                     depth,
-                    "codex: align this prompt",
+                    "codex: align this task",
                     RollupLevel::Running,
                 );
                 closed.badge_state = Some(BadgeState::Working);
@@ -4110,14 +4126,15 @@ badge:
                 closed.active = active;
                 closed.meta = Some(crate::sidebar::tree::RowMeta {
                     agent: Some("codex".to_string()),
-                    prompt: Some(prompt.to_string()),
+                    prompt: Some("raw latest prompt".to_string()),
+                    task_summary: Some(summary.to_string()),
                     ..Default::default()
                 });
                 let mut expanded = row(
-                    "detail::%1::10::prompt",
+                    "detail::%1::10::summary",
                     SidebarRowKind::Detail,
                     depth + 1,
-                    prompt,
+                    summary,
                     RollupLevel::Running,
                 );
                 expanded.active = active;
@@ -4134,13 +4151,13 @@ badge:
                         .clone(),
                 );
 
-                let prompt_column = |line: &str| {
-                    let byte_index = line.find(prompt).expect("prompt must be rendered");
+                let summary_column = |line: &str| {
+                    let byte_index = line.find(summary).expect("summary must be rendered");
                     display_width(&line[..byte_index])
                 };
                 assert_eq!(
-                    prompt_column(&closed_line),
-                    prompt_column(&expanded_line),
+                    summary_column(&closed_line),
+                    summary_column(&expanded_line),
                     "depth={depth} active={active} selected={selected}"
                 );
             }
@@ -4183,6 +4200,7 @@ badge:
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
             prompt: Some("review PR".to_string()),
+            task_summary: Some("review PR".to_string()),
             elapsed_secs: Some(522),
             ..Default::default()
         });
@@ -4247,6 +4265,7 @@ badge:
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
             prompt: Some("review PR".to_string()),
+            task_summary: Some("review PR".to_string()),
             elapsed_secs: Some(720),
             ..Default::default()
         });
@@ -4277,6 +4296,7 @@ badge:
         chat.meta = Some(crate::sidebar::tree::RowMeta {
             agent: Some("codex".to_string()),
             prompt: Some("review very long sidebar prompt".to_string()),
+            task_summary: Some("review very long sidebar prompt".to_string()),
             wait_reason: Some("very_long_custom_wait_reason".to_string()),
             elapsed_secs: Some(8 * 60 + 42),
             tasks_done: Some(123),

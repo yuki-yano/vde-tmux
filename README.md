@@ -326,6 +326,12 @@ Together with the `categories` section shown above, the commonly used settings a
 sidebar:
   width: "20%"
   min_width: 40
+  task_summary:
+    enabled: false
+    debounce_ms: 750
+    timeout_ms: 90000
+    # codex_model: optional-model-name
+    # claude_model: optional-model-name
 
 statusline:
   sessions:
@@ -348,6 +354,14 @@ badge:
 
 `statusline.summary.format` supports the `{badge}` and `{count}` placeholders, such as `{badge}{count}` or `{badge}: {count}`.
 Zero-count states remain visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
+
+`sidebar.task_summary.enabled` replaces the collapsed agent row's latest-prompt line with a short
+persistent-task summary. The daemon generates it asynchronously with an isolated CLI matching the
+pane agent (`codex exec` for Codex and `claude -p` for Claude). Expanded rows keep the summary on
+the second line and show the latest prompt below it. No cross-provider fallback is used. Prompt
+evidence is bounded and best-effort redacted before the additional model request; keep the feature
+disabled if that extra request is not acceptable. Model names are optional and otherwise follow the
+installed CLI's default.
 
 The category segment publishes every category that contains a session, including categories with no agent panes. Each category keeps its full label and action target; category entries are never collapsed into `+N` or `cat:N`, even when the segment exceeds the shared status width budget.
 
@@ -417,9 +431,10 @@ Use `disable` when the daemon must remain stopped.
 ### Pane-state persistence
 
 The daemon stores one private full-state snapshot per tmux server incarnation under
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v3.json`. A daemon restart restores the
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v4.json`. A daemon restart restores the
 prompt, task progress and items, subagents, worktree activity, lifecycle, timestamps, agent
-identity, unread-span pins, and Done/acknowledgement state for panes whose pane ID and PID still match.
+identity, task context and generated summaries, unread-span pins, and Done/acknowledgement state
+for panes whose pane ID and PID still match.
 
 If this snapshot is corrupt or insecure, daemon startup stops instead of repairing it or falling
 back. `vt daemon status` reports the snapshot path in `last_transition_error`; remove that file only when you
