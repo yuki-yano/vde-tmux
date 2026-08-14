@@ -372,6 +372,11 @@ fn reduce_observation(
     if created {
         apply_process_observation(&mut state, process.as_ref())?;
         tracker = reset_tracker_for_state(&tracker, &state)?;
+        tracker.agent_process = process
+            .as_ref()
+            .filter(|observation| observation.agent_process_checked)
+            .and_then(|observation| observation.agent_process.clone());
+        tracker.last_agent_process = state.agent_process.clone();
         tracker.fingerprint = capture
             .as_ref()
             .and_then(|capture| capture.observed_fingerprint);
@@ -382,11 +387,13 @@ fn reduce_observation(
 
     match presence {
         AgentPresenceObservation::Unknown => {
+            tracker.agent_process = None;
             tracker.absence_count = 0;
             tracker.replacement_kind = None;
             tracker.replacement_streak = 0;
         }
         AgentPresenceObservation::Absent => {
+            tracker.agent_process = None;
             tracker.replacement_kind = None;
             tracker.replacement_streak = 0;
             if state.scan_verified && supports_process_detection(&state.agent) {
@@ -405,14 +412,48 @@ fn reduce_observation(
             tracker.replacement_kind = None;
             tracker.replacement_streak = 0;
             if state.agent_present {
-                state.scan_verified = true;
-                apply_capture(
-                    &mut state,
-                    capture.as_ref(),
-                    &mut tracker,
-                    *observed_at,
-                    context.visibility,
-                )?;
+                let observed_process = process
+                    .as_ref()
+                    .filter(|observation| observation.agent_process_checked)
+                    .and_then(|observation| observation.agent_process.as_ref());
+                let process_replaced = tracker
+                    .last_agent_process
+                    .as_ref()
+                    .zip(observed_process)
+                    .is_some_and(|(expected, actual)| expected != actual);
+                if process_replaced {
+                    begin_agent_epoch(
+                        &mut state,
+                        observed_agent.clone(),
+                        None,
+                        EpochSource::Process,
+                    )?;
+                    tracker = reset_tracker_for_state(&tracker, &state)?;
+                    tracker.agent_process = observed_process.cloned();
+                    tracker.last_agent_process = observed_process.cloned();
+                    tracker.fingerprint = capture
+                        .as_ref()
+                        .and_then(|capture| capture.observed_fingerprint);
+                    tracker.last_change_at = tracker.fingerprint.map(|_| *observed_at);
+                } else {
+                    state.scan_verified = true;
+                    if process
+                        .as_ref()
+                        .is_some_and(|observation| observation.agent_process_checked)
+                    {
+                        tracker.agent_process = observed_process.cloned();
+                    }
+                    if let Some(observed_process) = observed_process {
+                        tracker.last_agent_process = Some(observed_process.clone());
+                    }
+                    apply_capture(
+                        &mut state,
+                        capture.as_ref(),
+                        &mut tracker,
+                        *observed_at,
+                        context.visibility,
+                    )?;
+                }
             } else {
                 begin_agent_epoch(
                     &mut state,
@@ -421,6 +462,11 @@ fn reduce_observation(
                     EpochSource::Process,
                 )?;
                 tracker = reset_tracker_for_state(&tracker, &state)?;
+                tracker.agent_process = process
+                    .as_ref()
+                    .filter(|observation| observation.agent_process_checked)
+                    .and_then(|observation| observation.agent_process.clone());
+                tracker.last_agent_process = tracker.agent_process.clone();
                 tracker.fingerprint = capture
                     .as_ref()
                     .and_then(|capture| capture.observed_fingerprint);
@@ -456,6 +502,11 @@ fn reduce_observation(
                     EpochSource::Process,
                 )?;
                 tracker = reset_tracker_for_state(&tracker, &state)?;
+                tracker.agent_process = process
+                    .as_ref()
+                    .filter(|observation| observation.agent_process_checked)
+                    .and_then(|observation| observation.agent_process.clone());
+                tracker.last_agent_process = tracker.agent_process.clone();
                 tracker.fingerprint = capture
                     .as_ref()
                     .and_then(|capture| capture.observed_fingerprint);
@@ -499,6 +550,7 @@ fn new_state(
         pane_instance: envelope.pane_instance.clone(),
         agent,
         agent_session_id: session,
+        agent_process: None,
         agent_epoch: 1,
         agent_present: true,
         scan_verified,
@@ -785,6 +837,7 @@ fn begin_agent_epoch(
         .ok_or(ReduceError::CounterOverflow("agent epoch"))?;
     state.agent = agent;
     state.agent_session_id = session;
+    state.agent_process = None;
     state.agent_present = true;
     state.scan_verified = matches!(
         source,
@@ -1212,6 +1265,11 @@ fn apply_process_observation(
     observation
         .validate()
         .map_err(|error| ReduceError::InvalidRequest(error.to_string()))?;
+    if observation.agent_process_checked
+        && let Some(identity) = &observation.agent_process
+    {
+        state.agent_process = Some(identity.clone());
+    }
     if observation.background_process_alive == Some(false) {
         state.background_process = None;
     }
@@ -1296,6 +1354,8 @@ fn reset_tracker_for_state(
         generation: tracker.generation,
         epoch: Some((state.state_id.clone(), state.agent_epoch)),
         hook_authoritative: false,
+        agent_process: None,
+        last_agent_process: state.agent_process.clone(),
         absence_count: 0,
         replacement_kind: None,
         replacement_streak: 0,
@@ -1476,6 +1536,44 @@ mod tests {
             presence,
             capture,
             process: None,
+        };
+        reduce(
+            current,
+            &observation_envelope(event),
+            context(tracker, &VisibilitySnapshot::default()),
+        )
+        .unwrap()
+    }
+
+    fn observe_process(
+        current: Option<&PaneState>,
+        tracker: &CaptureTrackerSnapshot,
+        agent: &str,
+        process: AgentProcessIdentity,
+        observed_at: i64,
+    ) -> Reduction {
+        observe_process_check(current, tracker, agent, Some(process), observed_at)
+    }
+
+    fn observe_process_check(
+        current: Option<&PaneState>,
+        tracker: &CaptureTrackerSnapshot,
+        agent: &str,
+        process: Option<AgentProcessIdentity>,
+        observed_at: i64,
+    ) -> Reduction {
+        let event = PaneEvent::ObservationBatch {
+            base: current.map(descriptor),
+            tracker_generation: tracker.generation,
+            observed_at,
+            presence: AgentPresenceObservation::Present(AgentKind::parse(agent).unwrap()),
+            capture: None,
+            process: Some(ProcessObservation {
+                agent_process_checked: true,
+                agent_process: process,
+                background_process_alive: None,
+                listening_ports: None,
+            }),
         };
         reduce(
             current,
@@ -2241,6 +2339,98 @@ mod tests {
         assert_eq!(active(&rediscovered).agent.as_str(), "codex");
         assert_eq!(active(&rediscovered).agent_epoch, 2);
         assert!(active(&rediscovered).agent_session_id.is_none());
+    }
+
+    #[test]
+    fn same_kind_process_replacement_starts_a_new_agent_epoch_immediately() {
+        let first_process = AgentProcessIdentity {
+            pid: 1001,
+            start_token: "process-a".to_string(),
+        };
+        let first = observe_process(
+            None,
+            &CaptureTrackerSnapshot::default(),
+            "codex",
+            first_process.clone(),
+            1,
+        );
+        assert_eq!(active(&first).agent_epoch, 1);
+        assert_eq!(
+            first.tracker_delta.as_ref().unwrap().next.agent_process,
+            Some(first_process)
+        );
+
+        let second_process = AgentProcessIdentity {
+            pid: 1002,
+            start_token: "process-b".to_string(),
+        };
+        let replaced = observe_process(
+            first.record.as_ref(),
+            &first.tracker_delta.as_ref().unwrap().next,
+            "codex",
+            second_process.clone(),
+            2,
+        );
+
+        assert_eq!(active(&replaced).agent.as_str(), "codex");
+        assert_eq!(active(&replaced).agent_epoch, 2);
+        assert!(active(&replaced).agent_present);
+        assert!(active(&replaced).agent_session_id.is_none());
+        assert_eq!(
+            replaced.tracker_delta.as_ref().unwrap().next.agent_process,
+            Some(second_process)
+        );
+    }
+
+    #[test]
+    fn ambiguous_process_scan_revokes_public_identity_without_forgetting_replacement_baseline() {
+        let first_process = AgentProcessIdentity {
+            pid: 1001,
+            start_token: "process-a".to_string(),
+        };
+        let first = observe_process(
+            None,
+            &CaptureTrackerSnapshot::default(),
+            "codex",
+            first_process.clone(),
+            1,
+        );
+        let ambiguous = observe_process_check(
+            first.record.as_ref(),
+            &first.tracker_delta.as_ref().unwrap().next,
+            "codex",
+            None,
+            2,
+        );
+        let ambiguous_tracker = &ambiguous.tracker_delta.as_ref().unwrap().next;
+        assert_eq!(ambiguous_tracker.agent_process, None);
+        assert_eq!(
+            ambiguous_tracker.last_agent_process,
+            Some(first_process.clone())
+        );
+        assert_eq!(active(&ambiguous).agent_process, Some(first_process));
+        assert_eq!(active(&ambiguous).agent_epoch, 1);
+
+        let second_process = AgentProcessIdentity {
+            pid: 1002,
+            start_token: "process-b".to_string(),
+        };
+        let replaced = observe_process(
+            ambiguous.record.as_ref(),
+            ambiguous_tracker,
+            "codex",
+            second_process.clone(),
+            3,
+        );
+        assert_eq!(active(&replaced).agent_epoch, 2);
+        assert_eq!(
+            active(&replaced).agent_process,
+            Some(second_process.clone())
+        );
+        assert_eq!(
+            replaced.tracker_delta.as_ref().unwrap().next.agent_process,
+            Some(second_process)
+        );
     }
 
     #[test]
@@ -3106,6 +3296,8 @@ mod tests {
             presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
             capture: None,
             process: Some(ProcessObservation {
+                agent_process_checked: false,
+                agent_process: None,
                 background_process_alive: Some(false),
                 listening_ports: Some(vec![3000, 5173]),
             }),

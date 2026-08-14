@@ -1037,6 +1037,7 @@ mod tests {
             current_command: "codex#[fg=red]".to_string(),
             pane_width: 80,
             active: true,
+            agent_process: None,
             stored: None,
             resolved: Some(ResolvedPaneState {
                 canonical: PaneState {
@@ -1046,6 +1047,7 @@ mod tests {
                     pane_instance: pane_instance.clone(),
                     agent: AgentKind::parse("codex").unwrap(),
                     agent_session_id: None,
+                    agent_process: None,
                     agent_epoch: 1,
                     agent_present: true,
                     scan_verified: true,
@@ -1072,6 +1074,7 @@ mod tests {
                 current_path: "/tmp/#work".to_string(),
                 badge: BadgeState::Blocked,
             }),
+            retained_state: None,
         }
     }
 
@@ -1088,8 +1091,10 @@ mod tests {
             current_command: "zsh#[fg=red]\n".to_string(),
             pane_width: 80,
             active: false,
+            agent_process: None,
             stored: None,
             resolved: None,
+            retained_state: None,
         }
     }
 

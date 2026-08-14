@@ -175,6 +175,24 @@ vt sidebar open
 hook を設定していなくても、Claude Code、Codex、opencode は pane の実行コマンドから検出できます。
 ただし、prompt、完了時刻、入力待ちを正確に表示するには hook が必要です。
 
+## エージェント向け JSON API
+
+エージェントは tmux topology をポーリングせず、daemon の canonical topology cache を参照し、
+実プロセスで識別された同一の agent occupant を固定して完了を待てます。
+
+```bash
+vt api schema --json
+vt agent list --status working --json
+vt agent wait %456 --until done,blocked --json
+vt pane read %456 --source latest --lines 120 --json
+```
+
+response envelope、occupant を固定する参照、filter、capture 上限については
+[Agent JSON API](./AGENT_API.md) を参照してください。PID と OS の process start token で一意な
+実プロセスを固定できる場合だけ exact `agent_ref` が発行されます。正確な lifecycle 表示には
+引き続き hook が必要ですが、実プロセスを一意に識別できれば hookless agent でも
+`agent wait` / `agent read` を利用できます。
+
 ## 状態の読み方
 
 | 表示 | 状態 | 意味 |
@@ -408,7 +426,7 @@ vt hook emit \
 ### pane state の永続化
 
 daemon は tmux server incarnation ごとに一つの private な full-state snapshot を
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v3.json` へ保存します。
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v7.json` へ保存します。
 daemon 再起動後も、pane ID と PID が一致する pane の prompt、task の進捗と項目、subagent、worktree activity、lifecycle、時刻、agent identity、Unread Spanのpin、Done と確認済み状態を復元します。
 
 snapshot が破損している、または権限が安全でない場合、daemon は修復や fallback を行わず起動を停止します。

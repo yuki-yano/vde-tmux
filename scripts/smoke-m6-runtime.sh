@@ -31,17 +31,31 @@ tmux() {
 }
 
 cleanup() {
+  local original_status=$?
   set +e
-  local cleanup_pids="${CLIENT_PID_1:-} ${CLIENT_PID_2:-} ${CLIENT_PID_3:-} ${CONTROL_PID:-} ${HOOK_CLI_PID:-}"
+  local cleanup_pids="${CLIENT_PID_1:-} ${CLIENT_PID_2:-} ${CLIENT_PID_3:-} ${CONTROL_PID:-} ${HOOK_CLI_PID:-} ${API_WAIT_PID:-}"
+  local daemon_pids="${DAEMON_PIDS:-}"
+  local current_daemon_pid=""
+  if [[ -n "${DAEMON_SOCKET:-}" ]]; then
+    current_daemon_pid="$(lsof -t "$DAEMON_SOCKET" 2>/dev/null | head -n 1 || true)"
+    [[ -n "$current_daemon_pid" ]] && daemon_pids="$daemon_pids $current_daemon_pid"
+  fi
+  scratch_daemon_alive() {
+    local command
+    command="$(ps -ww -o command= -p "$1" 2>/dev/null || true)"
+    [[ -n "${DAEMON_SOCKET:-}" && "$command" == *"daemon --socket $DAEMON_SOCKET"* ]]
+  }
   [[ -n "${STOPPED_DAEMON_PID:-}" ]] && kill -CONT "$STOPPED_DAEMON_PID" 2>/dev/null
-  for cleanup_pid in $cleanup_pids; do
-    kill "$cleanup_pid" 2>/dev/null
-  done
+  # Remove owned hooks and suppress automatic startup before detaching clients. Otherwise their
+  # client-detached hooks can outlive cleanup and recreate the runtime directory after deletion.
   if [[ -n "${TMUX_ENV:-}" ]]; then
     env TMUX="$TMUX_ENV" VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET" \
       XDG_STATE_HOME="$STATE_HOME" XDG_CONFIG_HOME="$CONFIG_HOME" HOME="$HOME_DIR" \
-      "$BIN" daemon stop >/dev/null 2>&1
+      "$BIN" daemon disable >/dev/null 2>&1
   fi
+  for cleanup_pid in $cleanup_pids; do
+    kill "$cleanup_pid" 2>/dev/null
+  done
   "$SYSTEM_TMUX" -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1
   "$SYSTEM_TMUX" -L "$SECONDARY_TMUX_SOCKET" kill-server >/dev/null 2>&1
   for _ in $(seq 1 40); do
@@ -60,7 +74,71 @@ cleanup() {
     fi
     wait "$cleanup_pid" 2>/dev/null
   done
-  rm -rf "$RUNTIME_DIR"
+
+  # A failed graceful stop can race the tmux fail-stop path. Wait for every recorded isolated
+  # daemon generation before removing its runtime directory so no worker can recreate files while
+  # cleanup is in progress.
+  for _ in $(seq 1 100); do
+    local any_daemon_alive=0
+    local daemon_pid
+    for daemon_pid in $daemon_pids; do
+      if scratch_daemon_alive "$daemon_pid"; then
+        any_daemon_alive=1
+      fi
+    done
+    [[ "$any_daemon_alive" == 0 ]] && break
+    sleep 0.05
+  done
+  local daemon_pid
+  for daemon_pid in $daemon_pids; do
+    scratch_daemon_alive "$daemon_pid" && kill "$daemon_pid" 2>/dev/null
+  done
+  for _ in $(seq 1 40); do
+    local any_daemon_alive=0
+    for daemon_pid in $daemon_pids; do
+      if scratch_daemon_alive "$daemon_pid"; then
+        any_daemon_alive=1
+      fi
+    done
+    [[ "$any_daemon_alive" == 0 ]] && break
+    sleep 0.05
+  done
+  for daemon_pid in $daemon_pids; do
+    scratch_daemon_alive "$daemon_pid" && kill -KILL "$daemon_pid" 2>/dev/null
+  done
+  for _ in $(seq 1 40); do
+    local any_daemon_alive=0
+    for daemon_pid in $daemon_pids; do
+      if scratch_daemon_alive "$daemon_pid"; then
+        any_daemon_alive=1
+      fi
+    done
+    [[ "$any_daemon_alive" == 0 ]] && break
+    sleep 0.05
+  done
+  local daemon_survived=0
+  for daemon_pid in $daemon_pids; do
+    if scratch_daemon_alive "$daemon_pid"; then
+      echo "scratch daemon survived cleanup: pid=$daemon_pid runtime=$RUNTIME_DIR" >&2
+      daemon_survived=1
+      [[ "$original_status" == 0 ]] && original_status=1
+    fi
+  done
+  if [[ "$daemon_survived" == 0 ]]; then
+    # An owned hook accepted just before disable can run until its delivery deadline. Give those
+    # already-started processes time to finish, then prove deletion remains stable.
+    sleep 2.5
+    rm -rf "$RUNTIME_DIR"
+    for _ in $(seq 1 20); do
+      if [[ -e "$RUNTIME_DIR" ]]; then
+        echo "scratch runtime directory was recreated after cleanup: $RUNTIME_DIR" >&2
+        [[ "$original_status" == 0 ]] && original_status=1
+        break
+      fi
+      sleep 0.05
+    done
+  fi
+  exit "$original_status"
 }
 trap cleanup EXIT
 
@@ -163,20 +241,20 @@ while True:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     s.connect(path)
-    s.sendall(b'{"op":"hello","proto":12}\n')
+    s.sendall(b'{"op":"hello","proto":13}\n')
     reader = s.makefile("rb")
     hello = json.loads(reader.readline())
-    assert hello["type"] == "hello_ack" and hello["proto"] == 12, hello
+    assert hello["type"] == "hello_ack" and hello["proto"] == 13, hello
     if hello["phase"] == "serving":
         break
     s.close()
     assert time.time() < deadline, hello
     time.sleep(0.1)
-s.sendall(b'{"op":"query_resolved_snapshot","proto":12}\n')
+s.sendall(b'{"op":"query_resolved_snapshot","proto":13}\n')
 reply = json.loads(reader.readline())
 assert reply["type"] == "resolved_snapshot_result", reply
 assert reply["snapshot"]["panes"] == [], reply
-print("empty-topology protocol v12 Serving ok")
+print("empty-topology protocol v13 Serving ok")
 PY
 
 PUBLISHED_EXECUTABLE="$(tmux -L "$TMUX_SOCKET" show-options -gqv @vde_executable)"
@@ -223,7 +301,7 @@ for path in sys.argv[1:]:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.settimeout(5)
         client.connect(path)
-        client.sendall(b'{"op":"hello","proto":12}\n')
+        client.sendall(b'{"op":"hello","proto":13}\n')
         reply = json.loads(client.makefile("rb").readline())
         assert reply["type"] == "hello_ack", reply
         if reply["phase"] == "serving":
@@ -280,7 +358,7 @@ MAIN_SESSION_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t main '#{session_
 AUX_SESSION_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t aux '#{session_id}')"
 WINDOW_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t main:work '#{window_id}')"
 
-query_v12() {
+query_v13() {
   local request="$1"
   python3 - "$DAEMON_SOCKET" "$request" "$QUERY_JSON" <<'PY'
 import json, socket, sys
@@ -289,7 +367,7 @@ s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.settimeout(5)
 s.connect(path)
 reader = s.makefile("rb")
-s.sendall(b'{"op":"hello","proto":12}\n')
+s.sendall(b'{"op":"hello","proto":13}\n')
 hello = json.loads(reader.readline())
 assert hello["type"] == "hello_ack" and hello["phase"] == "serving", hello
 s.sendall(json.dumps(json.loads(raw), separators=(",", ":")).encode() + b"\n")
@@ -301,7 +379,7 @@ PY
 
 wait_for_topology() {
   for _ in $(seq 1 80); do
-    query_v12 '{"op":"query_resolved_snapshot","proto":12}'
+    query_v13 '{"op":"query_resolved_snapshot","proto":13}'
     if python3 - "$QUERY_JSON" "$AGENT_PANE" "$MAIN_SESSION_ID" "$AUX_SESSION_ID" 2>/dev/null <<'PY'
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -319,12 +397,12 @@ PY
   return 1
 }
 wait_for_topology
-echo "protocol v12 linked-window topology converged"
+echo "protocol v13 linked-window topology converged"
 
 # Representative old and unknown protocols are rejected at Hello, before any side effect.
 python3 - "$DAEMON_SOCKET" <<'PY'
 import json, socket, sys
-for proto in (1, 2, 3, 4, 5, 6, 7, 8, 9, 999):
+for proto in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 999):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     s.connect(sys.argv[1])
@@ -456,7 +534,7 @@ wait_pane_badge() {
   local pane_id="$1"
   local expected="$2"
   for _ in $(seq 1 80); do
-    query_v12 '{"op":"query_resolved_snapshot","proto":12}'
+    query_v13 '{"op":"query_resolved_snapshot","proto":13}'
     if python3 - "$QUERY_JSON" "$pane_id" "$expected" 2>/dev/null <<'PY'
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -480,6 +558,175 @@ wait_badge Working
 VT_PANE="$AGENT_PANE" run_vt hook emit --agent generic --session-id smoke-session \
   --status idle --completed-at "$((NOW + 1))"
 wait_badge Done
+
+run_vt api schema --json | python3 -c '
+import json, sys
+reply = json.load(sys.stdin)
+assert reply["meta"]["api_version"] == 1, reply
+assert reply["result"]["type"] == "schema", reply
+assert set(reply["result"]["schemas"]) == {"request", "success", "error"}, reply
+'
+run_vt api snapshot --json | python3 -c '
+import json, sys
+reply = json.load(sys.stdin)
+assert reply["result"]["type"] == "snapshot", reply
+assert isinstance(reply["result"]["panes"], list), reply
+assert isinstance(reply["result"]["agents"], list), reply
+'
+VT_PANE="$AGENT_PANE" run_vt pane read --source visible --lines 1 --json | python3 -c '
+import json, sys
+reply = json.load(sys.stdin)
+assert reply["result"]["type"] == "pane_read", reply
+assert reply["result"]["pane"]["pane_id"].startswith("%"), reply
+assert reply["result"]["read"]["lines_requested"] == 1, reply
+'
+
+# A dedicated short-lived pane with a uniquely detectable agent process exercises the exact
+# process-pinned get/read/wait path against the real isolated daemon and tmux server.
+ln -s "$(command -v sleep)" "$HOOK_BIN_DIR/claude"
+tmux -L "$TMUX_SOCKET" new-session -d -s api-exact -n work -c "$ROOT" \
+  "$HOOK_BIN_DIR/claude 600"
+API_AGENT_PANE="$(tmux -L "$TMUX_SOCKET" display-message -p -t api-exact:work '#{pane_id}')"
+API_AGENT_PANE_PID="$(tmux -L "$TMUX_SOCKET" display-message -p -t "$API_AGENT_PANE" '#{pane_pid}')"
+API_AGENT_JSON=""
+for _ in $(seq 1 80); do
+  API_AGENT_JSON="$(VT_PANE="$API_AGENT_PANE" run_vt agent get "$API_AGENT_PANE" --json 2>/dev/null || true)"
+  if printf '%s' "$API_AGENT_JSON" | python3 -c '
+import json, sys
+reply = json.load(sys.stdin)
+summary = reply["result"]["agent"]["summary"]
+assert summary["agent"] == "claude", summary
+assert summary["identity"] == "exact", summary
+assert summary["agent_ref"].startswith("vta1:"), summary
+' 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+if ! printf '%s' "$API_AGENT_JSON" | python3 -c '
+import json, sys
+summary = json.load(sys.stdin)["result"]["agent"]["summary"]
+assert summary["identity"] == "exact" and summary["agent_ref"].startswith("vta1:")
+' 2>/dev/null; then
+  echo "exact API agent identity did not converge for $API_AGENT_PANE/$API_AGENT_PANE_PID" >&2
+  printf '%s\n' "$API_AGENT_JSON" >&2
+  exit 1
+fi
+
+API_NOW="$(date +%s)"
+VT_PANE="$API_AGENT_PANE" run_vt hook emit --agent claude --session-id api-exact-session \
+  --status running --started-at "$API_NOW"
+wait_pane_badge "$API_AGENT_PANE" Working
+API_AGENT_JSON="$(VT_PANE="$API_AGENT_PANE" run_vt agent get "$API_AGENT_PANE" --json)"
+API_AGENT_REF="$(printf '%s' "$API_AGENT_JSON" | python3 -c '
+import json, sys
+print(json.load(sys.stdin)["result"]["agent"]["summary"]["agent_ref"])
+')"
+API_AGENT_COMPLETED_SEQ="$(printf '%s' "$API_AGENT_JSON" | python3 -c '
+import json, sys
+print(json.load(sys.stdin)["result"]["agent"]["completed_seq"])
+')"
+
+VT_PANE="$API_AGENT_PANE" run_vt agent list --agent claude --json | \
+  python3 -c '
+import json, sys
+pane_id, agent_ref = sys.argv[1:]
+reply = json.load(sys.stdin)
+agent = next(item for item in reply["result"]["agents"] if item["pane_id"] == pane_id)
+assert agent["agent_ref"] == agent_ref and agent["identity"] == "exact", agent
+' "$API_AGENT_PANE" "$API_AGENT_REF"
+VT_PANE="$API_AGENT_PANE" run_vt agent get "$API_AGENT_REF" --json | python3 -c '
+import json, sys
+reply = json.load(sys.stdin)
+assert reply["result"]["type"] == "agent_get", reply
+assert reply["result"]["agent"]["summary"]["identity"] == "exact", reply
+'
+
+API_WAIT_JSON="$RUNTIME_DIR/api-agent-wait.json"
+API_WAIT_ERROR="$RUNTIME_DIR/api-agent-wait.error"
+API_DAEMON_PID="$(lsof -t "$DAEMON_SOCKET" 2>/dev/null | head -n 1 || true)"
+[[ -n "$API_DAEMON_PID" ]]
+API_DAEMON_UNIX_FDS_BEFORE="$(lsof -a -p "$API_DAEMON_PID" -U -Fn 2>/dev/null | grep -c '^f' || true)"
+VT_PANE="$API_AGENT_PANE" run_vt agent wait "$API_AGENT_REF" \
+  --until done --after-completed-seq "$API_AGENT_COMPLETED_SEQ" --timeout-ms 5000 \
+  --json >"$API_WAIT_JSON" 2>"$API_WAIT_ERROR" &
+API_WAIT_PID=$!
+API_WAIT_CONNECTED=0
+for _ in $(seq 1 100); do
+  API_DAEMON_UNIX_FDS_AFTER="$(lsof -a -p "$API_DAEMON_PID" -U -Fn 2>/dev/null | grep -c '^f' || true)"
+  if (( API_DAEMON_UNIX_FDS_AFTER > API_DAEMON_UNIX_FDS_BEFORE )); then
+    API_WAIT_CONNECTED=1
+    break
+  fi
+  if ! kill -0 "$API_WAIT_PID" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$API_WAIT_CONNECTED" != 1 ]]; then
+  echo "exact API wait did not establish its subscription" >&2
+  cat "$API_WAIT_ERROR" >&2 || true
+  exit 1
+fi
+VT_PANE="$API_AGENT_PANE" run_vt hook emit --agent claude --session-id api-exact-session \
+  --status idle --completed-at "$((API_NOW + 1))"
+wait_pane_badge "$API_AGENT_PANE" Done
+if ! wait "$API_WAIT_PID"; then
+  echo "exact API subscription wait failed" >&2
+  cat "$API_WAIT_ERROR" >&2 || true
+  exit 1
+fi
+API_WAIT_PID=""
+python3 - "$API_WAIT_JSON" "$API_AGENT_COMPLETED_SEQ" <<'PY'
+import json, sys
+reply = json.load(open(sys.argv[1], encoding="utf-8"))
+result = reply["result"]
+assert result["type"] == "agent_wait", result
+assert result["matched_status"] == "done", result
+assert result["target"]["agent_ref"].startswith("vta1:"), result
+assert result["match_source"] == "transition_event", result
+assert result["baseline_completed_seq"] == int(sys.argv[2]), result
+assert result["matched_completed_seq"] > int(sys.argv[2]), result
+PY
+VT_PANE="$API_AGENT_PANE" run_vt agent read "$API_AGENT_REF" \
+  --source latest --lines 5 --json | python3 -c '
+import json, sys
+reply = json.load(sys.stdin)
+assert reply["result"]["type"] == "agent_read", reply
+assert reply["result"]["read"]["source"] == "latest", reply
+assert reply["result"]["read"]["lines_requested"] == 5, reply
+'
+tmux -L "$TMUX_SOCKET" kill-session -t '=api-exact:'
+unlink "$HOOK_BIN_DIR/claude"
+for _ in $(seq 1 80); do
+  query_v13 '{"op":"query_resolved_snapshot","proto":13}'
+  if python3 - "$QUERY_JSON" "$API_AGENT_PANE" 2>/dev/null <<'PY'
+import json, sys
+reply = json.load(open(sys.argv[1], encoding="utf-8"))
+assert all(
+    pane["pane_instance"]["pane_id"] != sys.argv[2]
+    for pane in reply["snapshot"]["panes"]
+), reply
+PY
+  then
+    break
+  fi
+  sleep 0.1
+done
+if ! python3 - "$QUERY_JSON" "$API_AGENT_PANE" 2>/dev/null <<'PY'
+import json, sys
+reply = json.load(open(sys.argv[1], encoding="utf-8"))
+assert all(
+    pane["pane_instance"]["pane_id"] != sys.argv[2]
+    for pane in reply["snapshot"]["panes"]
+), reply
+PY
+then
+  echo "exact API fixture pane remained in canonical topology" >&2
+  python3 -m json.tool "$QUERY_JSON" >&2 || true
+  exit 1
+fi
+echo "agent JSON API schema, snapshot, bounded reads, and exact get/wait/read ok"
 
 # Correct ownership/protocol markers do not make malformed or oversized inline frames acceptable.
 # Both failures are logged outside canonical state and must leave the hidden Done pane untouched.
@@ -532,7 +779,7 @@ done
 if ! wait_badge Idle; then
   echo "owned hook delivery log:" >&2
   cat "$HOOK_LOG" >&2 || true
-  query_v12 '{"op":"query_resolved_snapshot","proto":12}'
+  query_v13 '{"op":"query_resolved_snapshot","proto":13}'
   python3 - "$QUERY_JSON" <<'PY' >&2
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -689,9 +936,9 @@ def query(context):
     client.settimeout(5)
     client.connect(socket_path)
     reader = client.makefile("rb")
-    client.sendall(b'{"op":"hello","proto":12}\n')
+    client.sendall(b'{"op":"hello","proto":13}\n')
     assert json.loads(reader.readline())["type"] == "hello_ack"
-    request = {"op":"query_status_snapshot", "proto":12, "context":context}
+    request = {"op":"query_status_snapshot", "proto":13, "context":context}
     client.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
     response = json.loads(reader.readline())
     assert response["type"] == "status_snapshot_result", response
@@ -876,7 +1123,7 @@ def request(message):
     client.settimeout(5)
     client.connect(socket_path)
     reader = client.makefile("rb")
-    client.sendall(b'{"op":"hello","proto":12}\n')
+    client.sendall(b'{"op":"hello","proto":13}\n')
     hello = json.loads(reader.readline())
     assert hello["type"] == "hello_ack", hello
     if "daemon_instance_id" in message:
@@ -891,7 +1138,7 @@ def request(message):
 def submit(event):
     reply = request({
         "op": "submit_pane_event",
-        "proto":12,
+        "proto":13,
         "envelope": {
             "daemon_instance_id": "",
             "event_id": secrets.token_hex(16),
@@ -905,14 +1152,14 @@ def submit(event):
 
 refresh = request({
     "op":"refresh_topology",
-    "proto":12,
+    "proto":13,
     "daemon_instance_id":"",
     "event_id":secrets.token_hex(16),
 })
 assert refresh["type"] == "snapshot_ack", refresh
 deadline = time.time() + 5
 while True:
-    topology = request({"op":"query_resolved_snapshot","proto":12})
+    topology = request({"op":"query_resolved_snapshot","proto":13})
     if any(item["pane_instance"] == pane for item in topology["snapshot"]["panes"]):
         break
     assert time.time() < deadline, topology
@@ -940,7 +1187,7 @@ submit({"type":"wait_requested","data":{
 
 deadline = time.time() + 5
 while True:
-    reply = request({"op":"query_resolved_snapshot","proto":12})
+    reply = request({"op":"query_resolved_snapshot","proto":13})
     record = next((p["resolved"]["canonical"] for p in reply["snapshot"]["panes"]
                    if p["pane_instance"] == pane and p.get("resolved")), None)
     if record is not None:
@@ -956,7 +1203,7 @@ assert record["worktree_activity"]["name"] == "snapshot", record
 
 pin_request = {
     "op":"sidebar_command",
-    "proto":12,
+    "proto":13,
     "daemon_instance_id":"",
     "event_id":secrets.token_hex(16),
     "command":{
@@ -971,27 +1218,32 @@ pin_request = {
 }
 pin_reply = request(pin_request)
 assert pin_reply["type"] == "snapshot_ack", pin_reply
+after_first = request({"op":"query_resolved_snapshot","proto":13})
+first_preferences = after_first["snapshot"]["sidebar_model"]["preferences"]
+assert pane in first_preferences["pinned_panes"], first_preferences
 pin_request["event_id"] = secrets.token_hex(16)
 duplicate = request(pin_request)
 assert duplicate["type"] == "snapshot_ack", duplicate
-assert duplicate["snapshot_revision"] == pin_reply["snapshot_revision"], (pin_reply, duplicate)
-reply = request({"op":"query_resolved_snapshot","proto":12})
+assert duplicate["accepted_seq"] > pin_reply["accepted_seq"], (pin_reply, duplicate)
+reply = request({"op":"query_resolved_snapshot","proto":13})
+duplicate_preferences = reply["snapshot"]["sidebar_model"]["preferences"]
+assert duplicate_preferences == first_preferences, (first_preferences, duplicate_preferences)
 record = next(p["resolved"]["canonical"] for p in reply["snapshot"]["panes"]
               if p["pane_instance"] == pane)
-assert pane in reply["snapshot"]["sidebar_model"]["preferences"]["pinned_panes"], reply
+assert pane in duplicate_preferences["pinned_panes"], duplicate_preferences
 json.dump(record, open(output, "w", encoding="utf-8"), sort_keys=True)
 PY
-SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v6.json"
+SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v7.json"
 python3 - "$SNAPSHOT_FILE" "$DETAIL_PANE" "$DETAIL_PANE_PID" <<'PY'
 import json, os, stat, sys
 
 path = sys.argv[1]
 assert stat.S_IMODE(os.stat(path).st_mode) == 0o600, oct(stat.S_IMODE(os.stat(path).st_mode))
 snapshot = json.load(open(path, encoding="utf-8"))
-assert snapshot["schema_version"] == 6, snapshot["schema_version"]
+assert snapshot["schema_version"] == 7, snapshot["schema_version"]
 pane = {"pane_id":sys.argv[2], "pane_pid":int(sys.argv[3])}
 record = next(record for record in snapshot["records"] if record["pane_instance"] == pane)
-assert record["schema_version"] == 6, record["schema_version"]
+assert record["schema_version"] == 7, record["schema_version"]
 assert "pinned" not in record["unread"], record["unread"]
 PY
 SIDEBAR_BEFORE="$(sidebar_snapshot)"
@@ -1021,11 +1273,40 @@ sys.stdout.write(re.sub(duration, "<elapsed>", value))
 '
 }
 
+wait_for_restart_category_projection() {
+  local deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    query_v13 '{"op":"query_status_snapshot","proto":13,"context":"global"}'
+    if python3 - "$QUERY_JSON" "$MAIN_SESSION_ID" "$AUX_SESSION_ID" 2>/dev/null <<'PY'
+import json, sys
+
+reply = json.load(open(sys.argv[1], encoding="utf-8"))
+snapshot = reply["snapshot"]
+category = next(
+    (entry for entry in snapshot["categories"] if entry["category"] == "smoke"),
+    None,
+)
+assert category is not None, snapshot
+assert {sys.argv[2], sys.argv[3]} <= set(category["session_ids"]), category
+PY
+    then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "restart canonical category projection did not converge" >&2
+  python3 -m json.tool "$QUERY_JSON" >&2 || true
+  return 1
+}
+
 sleep 2
 DISPLAY_BEFORE="$(capture_stable_display_surface)"
 run_vt daemon restart >/dev/null
 record_daemon_pid
-for _ in $(seq 1 80); do
+wait_for_restart_category_projection
+DISPLAY_AFTER=""
+DISPLAY_DEADLINE=$((SECONDS + 15))
+while (( SECONDS < DISPLAY_DEADLINE )); do
   DISPLAY_AFTER="$(capture_stable_display_surface)"
   [[ "$DISPLAY_AFTER" == "$DISPLAY_BEFORE" ]] && break
   sleep 0.1
@@ -1056,9 +1337,9 @@ client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 client.settimeout(5)
 client.connect(socket_path)
 reader = client.makefile("rb")
-client.sendall(b'{"op":"hello","proto":12}\n')
+client.sendall(b'{"op":"hello","proto":13}\n')
 assert json.loads(reader.readline())["type"] == "hello_ack"
-client.sendall(b'{"op":"query_resolved_snapshot","proto":12}\n')
+client.sendall(b'{"op":"query_resolved_snapshot","proto":13}\n')
 reply = json.loads(reader.readline())
 pane = {"pane_id":pane_id,"pane_pid":int(pane_pid)}
 actual = next(p["resolved"]["canonical"] for p in reply["snapshot"]["panes"]
@@ -1242,7 +1523,8 @@ echo "category reload mirror, consecutive order, multi-client pin, and foregroun
 sleep 1
 
 # A corrupt full-state snapshot must stop startup, surface the exact manual reset path, and keep
-# typed hook failures at exit 1 (never the agent-blocking exit 2). This is an isolated state root.
+# typed hook failures at exit 1 (never the agent-blocking exit 2). Disable first so an in-flight
+# owned hook cannot automatically start a replacement daemon between shutdown and corruption.
 CORRUPT_STOP_PID=""
 for _ in $(seq 1 40); do
   CORRUPT_STOP_PID="$(lsof -t "$DAEMON_SOCKET" 2>/dev/null | head -n 1 || true)"
@@ -1255,17 +1537,25 @@ if [[ -z "$CORRUPT_STOP_PID" ]]; then
   ls -l "$DAEMON_SOCKET" >&2 || true
   exit 1
 fi
-run_vt daemon stop --force >/dev/null 2>&1 || true
-for _ in $(seq 1 80); do
+if ! run_vt daemon disable >"$RUNTIME_DIR/corrupt-disable.log" 2>&1; then
+  echo "daemon disable failed before corrupting the snapshot" >&2
+  cat "$RUNTIME_DIR/corrupt-disable.log" >&2
+  exit 1
+fi
+for _ in $(seq 1 200); do
   if ! kill -0 "$CORRUPT_STOP_PID" 2>/dev/null && [[ ! -S "$DAEMON_SOCKET" ]]; then
     break
   fi
   sleep 0.05
 done
-! kill -0 "$CORRUPT_STOP_PID" 2>/dev/null
-[[ ! -S "$DAEMON_SOCKET" ]]
+if kill -0 "$CORRUPT_STOP_PID" 2>/dev/null || [[ -S "$DAEMON_SOCKET" ]]; then
+  echo "daemon did not fully stop before corrupting the snapshot: pid=$CORRUPT_STOP_PID" >&2
+  run_vt daemon status >&2 || true
+  ls -l "$DAEMON_SOCKET" >&2 || true
+  exit 1
+fi
 printf '{corrupt snapshot\n' >"$SNAPSHOT_FILE"
-if run_vt daemon ensure >"$RUNTIME_DIR/corrupt-ensure.log" 2>&1; then
+if run_vt daemon enable >"$RUNTIME_DIR/corrupt-enable.log" 2>&1; then
   echo "corrupt snapshot unexpectedly allowed daemon startup" >&2
   exit 1
 fi
@@ -1279,7 +1569,7 @@ CORRUPT_HOOK_STATUS=$?
 set -e
 [[ "$CORRUPT_HOOK_STATUS" == 1 ]]
 rm "$SNAPSHOT_FILE"
-run_vt daemon ensure >/dev/null
+run_vt daemon enable >/dev/null
 record_daemon_pid
 echo "corrupt snapshot fail-stop, status reset path, and hook exit status ok"
 
@@ -1298,7 +1588,7 @@ import json, os, socket, sys, time
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.settimeout(5)
 s.connect(sys.argv[1])
-s.sendall(b'{"op":"hello","proto":12}\n')
+s.sendall(b'{"op":"hello","proto":13}\n')
 reader = s.makefile("rb")
 hello_line = reader.readline()
 assert hello_line, "old daemon closed before persistent Hello response"
@@ -1308,7 +1598,7 @@ print("hello_ack", flush=True)
 while not os.path.exists(sys.argv[5]):
     time.sleep(0.005)
 request = {
-    "op":"submit_pane_event", "proto":12,
+    "op":"submit_pane_event", "proto":13,
     "envelope": {
     "daemon_instance_id":hello["daemon_instance_id"],
     "event_id":"00112233445566778899aabbccddeeff",
@@ -1389,7 +1679,7 @@ wait "$OLD_MUTATION_PID"
 cat "$OLD_MUTATION_RESULT"
 grep -F 'hello_ack' "$OLD_MUTATION_RESULT" >/dev/null
 grep -F 'mutation_response=' "$OLD_MUTATION_RESULT" >/dev/null
-if ! grep -Eq 'tmux server (incarnation changed|identity mismatch|process exited)|mutation_response=eof_after_fail_stop|"type": "pane_event_result"|"code": "invalid_request".*"message": "request frame start deadline exceeded: [^"]*".*"type": "error"' "$OLD_MUTATION_RESULT"; then
+if ! grep -Eq 'tmux server (incarnation changed|identity mismatch|process exited)|mutation_response=eof_after_fail_stop|"type": "pane_event_result"|"code": "not_ready".*"message": "daemon is shutting down"|"code": "invalid_request".*"message": "request frame start deadline exceeded: [^"]*".*"type": "error"' "$OLD_MUTATION_RESULT"; then
   echo "old daemon did not report a recognized isolated-or-fail-stop outcome" >&2
   exit 1
 fi
@@ -1404,7 +1694,7 @@ try:
 except OSError:
     raise SystemExit(0)
 reader = client.makefile("rb")
-client.sendall(b'{"op":"hello","proto":12}\n')
+client.sendall(b'{"op":"hello","proto":13}\n')
 hello_line = reader.readline()
 if not hello_line:
     raise SystemExit(0)
@@ -1412,7 +1702,7 @@ hello = json.loads(hello_line)
 assert hello["type"] == "hello_ack", hello
 request = {
     "op": "refresh_topology",
-    "proto":12,
+    "proto":13,
     "daemon_instance_id": hello["daemon_instance_id"],
     "event_id": "ffeeddccbbaa99887766554433221100",
 }
@@ -1446,7 +1736,7 @@ while True:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     s.connect(sys.argv[1])
-    s.sendall(b'{"op":"hello","proto":12}\n')
+    s.sendall(b'{"op":"hello","proto":13}\n')
     reply = json.loads(s.makefile("rb").readline())
     assert reply["type"] == "hello_ack", reply
     if reply["phase"] == "serving":
@@ -1459,7 +1749,7 @@ echo "same-socket incarnation guard ok"
 
 # A persist failure returns a normal hook failure and never commits the candidate state. Run this
 # final fault after the lifecycle scenarios so an intentionally unavailable store cannot mask them.
-SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v6.json"
+SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v7.json"
 SNAPSHOT_DIR="$(dirname "$SNAPSHOT_FILE")"
 chmod 500 "$SNAPSHOT_DIR"
 set +e
@@ -1469,7 +1759,7 @@ PERSIST_HOOK_STATUS=$?
 set -e
 chmod 700 "$SNAPSHOT_DIR"
 [[ "$PERSIST_HOOK_STATUS" == 1 ]]
-query_v12 '{"op":"query_resolved_snapshot","proto":12}'
+query_v13 '{"op":"query_resolved_snapshot","proto":13}'
 python3 - "$QUERY_JSON" "$NEW_PANE" <<'PY'
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -1480,4 +1770,4 @@ assert not canonical or canonical.get("agent_session_id") != "persist-failure", 
 PY
 echo "persist failure hook exit status ok"
 
-echo "pane-state v6 scratch smoke ok"
+echo "pane-state v7 scratch smoke ok"

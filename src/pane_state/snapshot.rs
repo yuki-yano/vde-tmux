@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{PaneInstance, PaneState, StoreError};
 
-pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 6;
-pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v6.json";
+pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 7;
+pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v7.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -273,6 +273,7 @@ mod tests {
             agent_session_id: Some(
                 super::super::AgentSessionId::parse(format!("session-{index}")).unwrap(),
             ),
+            agent_process: None,
             agent_epoch: 3,
             agent_present: true,
             scan_verified: true,

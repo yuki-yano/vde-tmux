@@ -6093,6 +6093,7 @@ mod tests {
             },
             agent: agent.clone(),
             agent_session_id: None,
+            agent_process: None,
             agent_epoch: 1,
             agent_present: true,
             scan_verified: true,

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -10,6 +11,37 @@ pub mod mock;
 
 pub trait TmuxRunner {
     fn run(&self, args: &[&str]) -> Result<String>;
+
+    fn resolve_agent_process(
+        &self,
+        root_pid: u32,
+        agent: &crate::pane_state::AgentKind,
+    ) -> Result<Option<crate::pane_state::AgentProcessIdentity>> {
+        let processes =
+            crate::daemon::workers::read_agent_process_snapshot(Duration::from_secs(1), false);
+        let detection = processes.detect_from_pid_tree(root_pid);
+        if !detection.complete || !detection.process_identities_complete {
+            bail!("agent process scan was incomplete");
+        }
+        Ok(detection.exact_agent_process(agent))
+    }
+
+    fn run_bounded(&self, args: &[&str], max_stdout_bytes: usize) -> Result<BoundedOutput> {
+        let output = self.run(args)?;
+        Ok(bound_string(output, max_stdout_bytes))
+    }
+
+    fn run_tail_bounded(&self, args: &[&str], max_stdout_bytes: usize) -> Result<BoundedOutput> {
+        let output = self.run(args)?;
+        Ok(bound_string_tail(output, max_stdout_bytes))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedOutput {
+    pub text: String,
+    pub total_bytes: usize,
+    pub truncated: bool,
 }
 
 pub fn run_command(program: &str, args: &[&str], timeout: Option<Duration>) -> Result<String> {
@@ -33,11 +65,11 @@ pub fn run_command_with_output_limit(
     let mut stdout = child
         .stdout
         .take()
-        .map(|stdout| read_pipe_in_background(stdout, max_stdout_bytes));
+        .map(|stdout| read_pipe_in_background(stdout, max_stdout_bytes, Retention::Prefix));
     let mut stderr = child
         .stderr
         .take()
-        .map(|stderr| read_pipe_in_background(stderr, None));
+        .map(|stderr| read_pipe_in_background(stderr, None, Retention::Prefix));
 
     let status = match timeout {
         None => child
@@ -79,6 +111,163 @@ pub fn run_command_with_output_limit(
     )
 }
 
+pub fn run_command_bounded(
+    program: &str,
+    args: &[&str],
+    timeout: Option<Duration>,
+    max_stdout_bytes: usize,
+) -> Result<BoundedOutput> {
+    run_command_bounded_with_retention(program, args, timeout, max_stdout_bytes, Retention::Prefix)
+}
+
+pub fn run_command_tail_bounded(
+    program: &str,
+    args: &[&str],
+    timeout: Option<Duration>,
+    max_stdout_bytes: usize,
+) -> Result<BoundedOutput> {
+    run_command_bounded_with_retention(program, args, timeout, max_stdout_bytes, Retention::Tail)
+}
+
+fn run_command_bounded_with_retention(
+    program: &str,
+    args: &[&str],
+    timeout: Option<Duration>,
+    max_stdout_bytes: usize,
+    retention: Retention,
+) -> Result<BoundedOutput> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn {program}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .map(|stdout| read_pipe_in_background(stdout, Some(max_stdout_bytes), retention));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stderr| read_pipe_in_background(stderr, None, Retention::Prefix));
+
+    let status = wait_for_child(program, &mut child, timeout)?;
+    let stdout = collect_pipe_output(stdout);
+    if !status.success() {
+        let stderr = collect_pipe_output(stderr);
+        let stderr = String::from_utf8_lossy(&stderr.bytes);
+        bail!(
+            "{program} {args:?} failed (exit: {code:?}): {stderr}",
+            code = status.code()
+        );
+    }
+    let text = retained_utf8(stdout.bytes, retention, max_stdout_bytes);
+    Ok(BoundedOutput {
+        text,
+        total_bytes: stdout.total_bytes,
+        truncated: stdout.exceeded,
+    })
+}
+
+fn wait_for_child(
+    program: &str,
+    child: &mut std::process::Child,
+    timeout: Option<Duration>,
+) -> Result<std::process::ExitStatus> {
+    match timeout {
+        None => child
+            .wait()
+            .with_context(|| format!("failed to wait {program}")),
+        Some(limit) => {
+            let deadline = Instant::now() + limit;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("{program} timed out after {limit:?}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn bound_string(mut text: String, max_bytes: usize) -> BoundedOutput {
+    let total_bytes = text.len();
+    if total_bytes <= max_bytes {
+        return BoundedOutput {
+            text,
+            total_bytes,
+            truncated: false,
+        };
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    BoundedOutput {
+        text,
+        total_bytes,
+        truncated: true,
+    }
+}
+
+fn bound_string_tail(text: String, max_bytes: usize) -> BoundedOutput {
+    let total_bytes = text.len();
+    if total_bytes <= max_bytes {
+        return BoundedOutput {
+            text,
+            total_bytes,
+            truncated: false,
+        };
+    }
+    let mut start = total_bytes.saturating_sub(max_bytes);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    BoundedOutput {
+        text: text[start..].to_string(),
+        total_bytes,
+        truncated: true,
+    }
+}
+
+fn retained_utf8(mut bytes: Vec<u8>, retention: Retention, max_bytes: usize) -> String {
+    match retention {
+        Retention::Prefix => {
+            if let Err(error) = std::str::from_utf8(&bytes)
+                && error.error_len().is_none()
+            {
+                bytes.truncate(error.valid_up_to());
+            }
+        }
+        Retention::Tail => {
+            let leading_continuations = bytes
+                .iter()
+                .take_while(|byte| **byte & 0b1100_0000 == 0b1000_0000)
+                .count();
+            bytes.drain(..leading_continuations);
+        }
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    match retention {
+        Retention::Prefix => bound_string(text, max_bytes).text,
+        Retention::Tail => bound_string_tail(text, max_bytes).text,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Retention {
+    Prefix,
+    Tail,
+}
+
 #[derive(Debug, Default)]
 struct CapturedPipe {
     bytes: Vec<u8>,
@@ -86,12 +275,17 @@ struct CapturedPipe {
     exceeded: bool,
 }
 
-fn read_pipe_in_background<R>(mut pipe: R, limit: Option<usize>) -> thread::JoinHandle<CapturedPipe>
+fn read_pipe_in_background<R>(
+    mut pipe: R,
+    limit: Option<usize>,
+    retention: Retention,
+) -> thread::JoinHandle<CapturedPipe>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
         let mut output = CapturedPipe::default();
+        let mut tail = VecDeque::new();
         let mut chunk = [0_u8; 8192];
         loop {
             let read = match pipe.read(&mut chunk) {
@@ -99,11 +293,29 @@ where
                 Ok(read) => read,
             };
             output.total_bytes = output.total_bytes.saturating_add(read);
-            let keep = limit
-                .map(|limit| limit.saturating_sub(output.bytes.len()).min(read))
-                .unwrap_or(read);
-            output.bytes.extend_from_slice(&chunk[..keep]);
+            match (limit, retention) {
+                (Some(limit), Retention::Prefix) => {
+                    let keep = limit.saturating_sub(output.bytes.len()).min(read);
+                    output.bytes.extend_from_slice(&chunk[..keep]);
+                }
+                (Some(0), Retention::Tail) => tail.clear(),
+                (Some(limit), Retention::Tail) if read >= limit => {
+                    tail.clear();
+                    tail.extend(chunk[read - limit..read].iter().copied());
+                }
+                (Some(limit), Retention::Tail) => {
+                    let overflow = tail.len().saturating_add(read).saturating_sub(limit);
+                    for _ in 0..overflow {
+                        tail.pop_front();
+                    }
+                    tail.extend(chunk[..read].iter().copied());
+                }
+                (None, _) => output.bytes.extend_from_slice(&chunk[..read]),
+            }
             output.exceeded |= limit.is_some_and(|limit| output.total_bytes > limit);
+        }
+        if limit.is_some() && matches!(retention, Retention::Tail) {
+            output.bytes = tail.into_iter().collect();
         }
         output
     })
@@ -164,6 +376,18 @@ impl TmuxRunner for SystemTmuxRunner {
         let refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         run_command_with_output_limit("tmux", &refs, self.timeout, self.max_output_bytes)
     }
+
+    fn run_bounded(&self, args: &[&str], max_stdout_bytes: usize) -> Result<BoundedOutput> {
+        let owned_args = tmux_args(self.socket_name.as_deref(), args);
+        let refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+        run_command_bounded("tmux", &refs, self.timeout, max_stdout_bytes)
+    }
+
+    fn run_tail_bounded(&self, args: &[&str], max_stdout_bytes: usize) -> Result<BoundedOutput> {
+        let owned_args = tmux_args(self.socket_name.as_deref(), args);
+        let refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+        run_command_tail_bounded("tmux", &refs, self.timeout, max_stdout_bytes)
+    }
 }
 
 pub fn tmux_args(socket_name: Option<&str>, args: &[&str]) -> Vec<String> {
@@ -219,6 +443,86 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(error.to_string().contains("stdout exceeded byte limit"));
         assert!(error.to_string().contains("262144 bytes > 1024 bytes"));
+    }
+
+    #[test]
+    fn bounded_command_returns_a_truncated_prefix_and_total_size() {
+        let output = run_command_bounded(
+            "/bin/sh",
+            &[
+                "-c",
+                "i=0; while [ $i -lt 4096 ]; do printf x; i=$((i + 1)); done",
+            ],
+            Some(Duration::from_secs(2)),
+            1024,
+        )
+        .unwrap();
+
+        assert_eq!(output.text.len(), 1024);
+        assert_eq!(output.total_bytes, 4096);
+        assert!(output.truncated);
+    }
+
+    #[test]
+    fn tail_bounded_command_returns_latest_bytes_and_total_size() {
+        let output = run_command_tail_bounded(
+            "/bin/sh",
+            &["-c", "printf 'old-newest'"],
+            Some(Duration::from_secs(2)),
+            6,
+        )
+        .unwrap();
+
+        assert_eq!(output.text, "newest");
+        assert_eq!(output.total_bytes, 10);
+        assert!(output.truncated);
+    }
+
+    #[test]
+    fn production_bounded_commands_do_not_return_partial_utf8_codepoints() {
+        let prefix = run_command_bounded(
+            "/bin/sh",
+            &["-c", "printf 'あいう'"],
+            Some(Duration::from_secs(2)),
+            4,
+        )
+        .unwrap();
+        let tail = run_command_tail_bounded(
+            "/bin/sh",
+            &["-c", "printf 'あいう'"],
+            Some(Duration::from_secs(2)),
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(prefix.text, "あ");
+        assert_eq!(tail.text, "う");
+        assert!(prefix.text.len() <= 4);
+        assert!(tail.text.len() <= 4);
+    }
+
+    #[test]
+    fn default_bounded_runner_truncates_at_a_utf8_boundary() {
+        let runner = crate::tmux::mock::MockTmuxRunner::new();
+        runner.stub(&["display-message"], "あいう");
+
+        let output = runner.run_bounded(&["display-message"], 4).unwrap();
+
+        assert_eq!(output.text, "あ");
+        assert_eq!(output.total_bytes, 9);
+        assert!(output.truncated);
+    }
+
+    #[test]
+    fn default_tail_bounded_runner_keeps_the_latest_utf8_suffix() {
+        let runner = crate::tmux::mock::MockTmuxRunner::new();
+        runner.stub(&["display-message"], "あいう");
+
+        let output = runner.run_tail_bounded(&["display-message"], 4).unwrap();
+
+        assert_eq!(output.text, "う");
+        assert_eq!(output.total_bytes, 9);
+        assert!(output.truncated);
     }
 
     #[test]

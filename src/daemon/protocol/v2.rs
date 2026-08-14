@@ -17,7 +17,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +186,10 @@ impl V2Client {
         self.hook_health
     }
 
+    pub fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+    }
+
     pub fn request(&mut self, message: &ClientMessage) -> Result<ServerMessage> {
         self.request_with_stage(message).map_err(anyhow::Error::new)
     }
@@ -209,6 +213,12 @@ impl V2Client {
             stage: V2RequestFailureStage::AfterFullWrite,
             message: format!("failed to read v2 response frame: {error:#}"),
         })
+    }
+
+    /// Read the next server-pushed frame after a streaming request such as `Subscribe`.
+    pub fn receive(&mut self) -> Result<ServerMessage> {
+        read_server_message(&mut self.reader, self.deadline)
+            .context("failed to read v2 streaming response frame")
     }
 
     fn validate_request(&self, message: &ClientMessage) -> Result<()> {
@@ -494,8 +504,10 @@ fn read_server_message(
         if remaining.is_zero() {
             bail!("daemon response read deadline exceeded");
         }
-        wait_for_unix_readable(reader.get_ref(), deadline)
-            .context("failed to wait for daemon response readability")?;
+        if reader.buffer().is_empty() {
+            wait_for_unix_readable(reader.get_ref(), deadline)
+                .context("failed to wait for daemon response readability")?;
+        }
         let chunk = match reader.fill_buf() {
             Ok(chunk) => chunk,
             Err(error)
@@ -585,6 +597,7 @@ pub struct SessionLinkPresentation {
 #[serde(deny_unknown_fields)]
 pub struct PanePresentation {
     pub pane_instance: PaneInstance,
+    pub agent_process: Option<crate::pane_state::AgentProcessIdentity>,
     pub session_links: Vec<SessionLinkPresentation>,
     pub window_id: String,
     pub window_name: String,
@@ -594,6 +607,39 @@ pub struct PanePresentation {
     pub active: bool,
     pub stored: Option<StoredStateDescriptor>,
     pub resolved: Option<ResolvedPaneState>,
+    pub retained_state: Option<RetainedAgentState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedAgentState {
+    pub state_id: crate::pane_state::StateId,
+    pub revision: u64,
+    pub agent: crate::pane_state::AgentKind,
+    pub agent_process: Option<crate::pane_state::AgentProcessIdentity>,
+    pub agent_epoch: u64,
+    pub agent_present: bool,
+    pub lifecycle: crate::pane_state::LifecycleState,
+    pub run_seq: u64,
+    pub completed_seq: u64,
+    pub completed_at: Option<i64>,
+}
+
+impl From<&crate::pane_state::PaneState> for RetainedAgentState {
+    fn from(state: &crate::pane_state::PaneState) -> Self {
+        Self {
+            state_id: state.state_id.clone(),
+            revision: state.revision,
+            agent: state.agent.clone(),
+            agent_process: state.agent_process.clone(),
+            agent_epoch: state.agent_epoch,
+            agent_present: state.agent_present,
+            lifecycle: state.lifecycle.clone(),
+            run_seq: state.run_seq,
+            completed_seq: state.completed_seq,
+            completed_at: state.completed_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1003,6 +1049,33 @@ mod tests {
     }
 
     #[test]
+    fn streaming_receive_consumes_frames_already_buffered_by_buf_reader() {
+        let (mut writer, reader_stream) = UnixStream::pair().unwrap();
+        let first = ServerMessage::Heartbeat {
+            daemon_instance_id: daemon_id(),
+            snapshot_revision: 1,
+        };
+        let second = ServerMessage::Heartbeat {
+            daemon_instance_id: daemon_id(),
+            snapshot_revision: 2,
+        };
+        serde_json::to_writer(&mut writer, &first).unwrap();
+        writer.write_all(b"\n").unwrap();
+        serde_json::to_writer(&mut writer, &second).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+
+        let mut reader = BufReader::with_capacity(4096, reader_stream);
+        {
+            let buffered = reader.fill_buf().unwrap();
+            assert_eq!(buffered.iter().filter(|byte| **byte == b'\n').count(), 2);
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert_eq!(read_server_message(&mut reader, deadline).unwrap(), first);
+        assert_eq!(read_server_message(&mut reader, deadline).unwrap(), second);
+    }
+
+    #[test]
     fn client_classifies_an_old_daemon_handshake_as_a_protocol_mismatch() {
         use std::io::{BufRead as _, Write as _};
         use std::os::unix::net::UnixListener;
@@ -1314,8 +1387,10 @@ mod tests {
             current_command: "zsh".to_string(),
             pane_width: 80,
             active: true,
+            agent_process: None,
             stored: None,
             resolved: None,
+            retained_state: None,
         };
         let pane_json = serde_json::to_value(&pane_presentation).unwrap();
         assert_eq!(pane_json["pane_width"], 80);

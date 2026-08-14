@@ -89,6 +89,13 @@ fn spawn_v2_query_fixture(
     expected: crate::daemon::protocol::v2::ClientMessage,
     response: crate::daemon::protocol::v2::ServerMessage,
 ) -> V2QueryFixture {
+    spawn_v2_query_fixture_with_responses(expected, vec![response])
+}
+
+fn spawn_v2_query_fixture_with_responses(
+    expected: crate::daemon::protocol::v2::ClientMessage,
+    responses: Vec<crate::daemon::protocol::v2::ServerMessage>,
+) -> V2QueryFixture {
     use std::io::{BufRead, Write};
 
     let root = std::env::temp_dir().join(format!(
@@ -111,6 +118,24 @@ fn spawn_v2_query_fixture(
             "#{pid}\t#{start_time}\t#{socket_path}",
         ],
         &format!("321\t654\t{}\n", tmux_socket.display()),
+    );
+    mock.stub_agent_process(
+        101,
+        "codex",
+        Some(crate::pane_state::AgentProcessIdentity {
+            pid: 9001,
+            start_token: "fixture-process-start".to_string(),
+        }),
+    );
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "%1",
+            "#{pane_id}\t#{pane_pid}",
+        ],
+        "%1\t101\n",
     );
     let env = BTreeMap::from([(
         "TMUX".to_string(),
@@ -161,8 +186,10 @@ fn spawn_v2_query_fixture(
                     .unwrap(),
                 expected
             );
-            serde_json::to_writer(&mut stream, &response).unwrap();
-            stream.write_all(b"\n").unwrap();
+            for response in &responses {
+                serde_json::to_writer(&mut stream, response).unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
             // Keep the peer alive until the one-request client has consumed the response and
             // closed. Closing immediately after write races socket timeout setup on Darwin.
             line.clear();
@@ -423,16 +450,30 @@ fn status_query_fixture(context: crate::daemon::protocol::v2::StatusContext) -> 
 }
 
 fn pane_query_fixture(pane_id: &str) -> V2QueryFixture {
+    let pane = agent_pane_presentation(pane_id);
+    spawn_v2_query_fixture(
+        crate::daemon::protocol::v2::ClientMessage::QueryPane {
+            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            pane_id: pane_id.to_string(),
+        },
+        crate::daemon::protocol::v2::ServerMessage::PaneResult {
+            snapshot_revision: 7,
+            pane,
+        },
+    )
+}
+
+fn agent_pane_presentation(pane_id: &str) -> crate::daemon::protocol::v2::PanePresentation {
     use crate::pane_state::{
-        AgentKind, LifecycleState, PANE_STATE_SCHEMA_VERSION, PaneInstance, PaneState,
-        ResolvedPaneState, StateId, TaskState,
+        AgentKind, AgentProcessIdentity, LifecycleState, PANE_STATE_SCHEMA_VERSION, PaneInstance,
+        PaneState, ResolvedPaneState, StateId, TaskState,
     };
 
     let pane_instance = PaneInstance {
         pane_id: pane_id.to_string(),
         pane_pid: 101,
     };
-    let pane = crate::daemon::protocol::v2::PanePresentation {
+    crate::daemon::protocol::v2::PanePresentation {
         pane_instance: pane_instance.clone(),
         session_links: vec![crate::daemon::protocol::v2::SessionLinkPresentation {
             session_id: "$1".to_string(),
@@ -447,6 +488,10 @@ fn pane_query_fixture(pane_id: &str) -> V2QueryFixture {
         current_command: "node".to_string(),
         pane_width: 80,
         active: true,
+        agent_process: Some(AgentProcessIdentity {
+            pid: 9001,
+            start_token: "fixture-process-start".to_string(),
+        }),
         stored: None,
         resolved: Some(ResolvedPaneState {
             canonical: PaneState {
@@ -455,7 +500,13 @@ fn pane_query_fixture(pane_id: &str) -> V2QueryFixture {
                 revision: 1,
                 pane_instance,
                 agent: AgentKind::parse("codex").unwrap(),
-                agent_session_id: None,
+                agent_session_id: Some(
+                    crate::pane_state::AgentSessionId::parse("fixture-session").unwrap(),
+                ),
+                agent_process: Some(crate::pane_state::AgentProcessIdentity {
+                    pid: 9001,
+                    start_token: "fixture-process-start".to_string(),
+                }),
                 agent_epoch: 1,
                 agent_present: true,
                 scan_verified: true,
@@ -480,16 +531,123 @@ fn pane_query_fixture(pane_id: &str) -> V2QueryFixture {
             current_path: "/tmp".to_string(),
             badge: crate::daemon::session_badge::BadgeState::Working,
         }),
+        retained_state: None,
+    }
+}
+
+fn resolved_snapshot_query_fixture(subscribe: bool) -> V2QueryFixture {
+    let snapshot = crate::daemon::protocol::v2::ResolvedSnapshot {
+        snapshot_revision: 7,
+        panes: vec![agent_pane_presentation("%1")],
+        sidebar_model: crate::daemon::SidebarModel::default(),
+        attention: Vec::new(),
+        events: Vec::new(),
+        diagnostics: Vec::new(),
     };
     spawn_v2_query_fixture(
-        crate::daemon::protocol::v2::ClientMessage::QueryPane {
+        if subscribe {
+            crate::daemon::protocol::v2::ClientMessage::Subscribe {
+                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            }
+        } else {
+            crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot {
+                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            }
+        },
+        crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+            snapshot_revision: snapshot.snapshot_revision,
+            snapshot,
+        },
+    )
+}
+
+fn agent_wait_transition_fixture(replaced: bool) -> V2QueryFixture {
+    let first = crate::daemon::protocol::v2::ResolvedSnapshot {
+        snapshot_revision: 7,
+        panes: vec![agent_pane_presentation("%1")],
+        sidebar_model: crate::daemon::SidebarModel::default(),
+        attention: Vec::new(),
+        events: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let mut completed_pane = agent_pane_presentation("%1");
+    let resolved = completed_pane.resolved.as_mut().unwrap();
+    resolved.canonical.revision += 1;
+    resolved.canonical.lifecycle = crate::pane_state::LifecycleState::Idle;
+    resolved.canonical.completed_seq = resolved.canonical.run_seq;
+    resolved.canonical.completed_at = Some(crate::sidebar::tree::now_epoch_secs());
+    resolved.badge = crate::daemon::session_badge::BadgeState::Done;
+    if replaced {
+        resolved.canonical.agent_epoch += 1;
+    }
+    let second = crate::daemon::protocol::v2::ResolvedSnapshot {
+        snapshot_revision: 8,
+        panes: vec![completed_pane],
+        sidebar_model: crate::daemon::SidebarModel::default(),
+        attention: Vec::new(),
+        events: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    spawn_v2_query_fixture_with_responses(
+        crate::daemon::protocol::v2::ClientMessage::Subscribe {
             proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-            pane_id: pane_id.to_string(),
         },
-        crate::daemon::protocol::v2::ServerMessage::PaneResult {
-            snapshot_revision: 7,
-            pane,
+        vec![
+            crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+                snapshot_revision: first.snapshot_revision,
+                snapshot: first,
+            },
+            crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+                snapshot_revision: second.snapshot_revision,
+                snapshot: second,
+            },
+        ],
+    )
+}
+
+fn agent_wait_identity_gap_fixture() -> V2QueryFixture {
+    let first_pane = agent_pane_presentation("%1");
+    let mut gap_pane = first_pane.clone();
+    gap_pane.agent_process = None;
+    gap_pane.resolved.as_mut().unwrap().canonical.revision = 2;
+
+    let mut finished_pane = gap_pane.clone();
+    let mut finished_state = finished_pane.resolved.take().unwrap().canonical;
+    finished_state.revision = 3;
+    finished_state.agent_present = false;
+    finished_state.lifecycle = crate::pane_state::LifecycleState::Idle;
+    finished_state.completed_seq = finished_state.run_seq;
+    finished_state.completed_at = Some(crate::sidebar::tree::now_epoch_secs());
+    finished_pane.retained_state = Some(crate::daemon::protocol::v2::RetainedAgentState::from(
+        &finished_state,
+    ));
+
+    let snapshot = |snapshot_revision, pane| crate::daemon::protocol::v2::ResolvedSnapshot {
+        snapshot_revision,
+        panes: vec![pane],
+        sidebar_model: crate::daemon::SidebarModel::default(),
+        attention: Vec::new(),
+        events: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let snapshots = [
+        snapshot(7, first_pane),
+        snapshot(8, gap_pane),
+        snapshot(9, finished_pane),
+    ];
+    spawn_v2_query_fixture_with_responses(
+        crate::daemon::protocol::v2::ClientMessage::Subscribe {
+            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
         },
+        snapshots
+            .into_iter()
+            .map(
+                |snapshot| crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+                    snapshot_revision: snapshot.snapshot_revision,
+                    snapshot,
+                },
+            )
+            .collect(),
     )
 }
 
@@ -536,6 +694,183 @@ fn daemon_lifecycle_commands_parse_with_force_scoped_to_stop() {
     assert!(Cli::try_parse_from(["vt", "daemon", "start", "--force"]).is_err());
     assert!(Cli::try_parse_from(["vt", "daemon", "doctor"]).is_err());
     assert!(Cli::try_parse_from(["vt", "daemon", "logs"]).is_err());
+}
+
+#[test]
+fn agent_json_list_projects_the_cached_resolved_snapshot() {
+    let fixture = resolved_snapshot_query_fixture(false);
+    let calls_before = fixture.mock.calls().len();
+    let output = run_with(
+        ["vt", "agent", "list", "--status", "working", "--json"],
+        &fixture.mock,
+        &fixture.env,
+    )
+    .unwrap()
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+    assert_eq!(value["meta"]["api_version"], crate::api::API_VERSION);
+    assert_eq!(value["meta"]["snapshot_revision"], 7);
+    assert_eq!(value["result"]["type"], "agent_list");
+    assert_eq!(value["result"]["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(value["result"]["agents"][0]["pane_id"], "%1");
+    assert_eq!(value["result"]["agents"][0]["status"], "working");
+    assert!(
+        value["result"]["agents"][0]["agent_ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("vta1:")
+    );
+    let calls = fixture.mock.calls();
+    assert_eq!(calls.len(), calls_before + 1);
+    assert_eq!(
+        calls.last().unwrap(),
+        &vec![
+            "display-message".to_string(),
+            "-p".to_string(),
+            "#{pid}\t#{start_time}\t#{socket_path}".to_string(),
+        ]
+    );
+    fixture.finish();
+}
+
+#[test]
+fn agent_json_wait_uses_the_daemon_subscription() {
+    let fixture = resolved_snapshot_query_fixture(true);
+    let output = run_with(
+        [
+            "vt",
+            "agent",
+            "wait",
+            "%1",
+            "--until",
+            "working",
+            "--timeout-ms",
+            "1000",
+            "--json",
+        ],
+        &fixture.mock,
+        &fixture.env,
+    )
+    .unwrap()
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+    assert_eq!(value["result"]["type"], "agent_wait");
+    assert_eq!(value["result"]["matched_status"], "working");
+    assert_eq!(value["result"]["match_source"], "current_state");
+    assert_eq!(value["result"]["baseline_completed_seq"], 0);
+    assert_eq!(value["result"]["matched_completed_seq"], 0);
+    assert_eq!(value["result"]["target"]["pane_id"], "%1");
+    assert_eq!(value["result"]["current_agent"]["pane_id"], "%1");
+    fixture.finish();
+}
+
+#[test]
+fn agent_json_wait_consumes_a_later_snapshot_revision() {
+    let fixture = agent_wait_transition_fixture(false);
+    let output = run_with(
+        [
+            "vt",
+            "agent",
+            "wait",
+            "%1",
+            "--until",
+            "done",
+            "--timeout-ms",
+            "1000",
+            "--json",
+        ],
+        &fixture.mock,
+        &fixture.env,
+    )
+    .unwrap()
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+    assert_eq!(value["meta"]["snapshot_revision"], 8);
+    assert_eq!(value["result"]["matched_status"], "done");
+    assert_eq!(value["result"]["matched_completed_seq"], 1);
+    fixture.finish();
+}
+
+#[test]
+fn agent_json_wait_rejects_a_replaced_occupant() {
+    let fixture = agent_wait_transition_fixture(true);
+    let error = run_with(
+        [
+            "vt",
+            "agent",
+            "wait",
+            "%1",
+            "--until",
+            "done",
+            "--timeout-ms",
+            "1000",
+            "--json",
+        ],
+        &fixture.mock,
+        &fixture.env,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<crate::api::ApiError>().unwrap().code(),
+        "stale_reference"
+    );
+    fixture.finish();
+}
+
+#[test]
+fn agent_json_wait_survives_an_identity_gap_before_process_exit() {
+    let fixture = agent_wait_identity_gap_fixture();
+    let output = run_with(
+        [
+            "vt",
+            "agent",
+            "wait",
+            "%1",
+            "--until",
+            "done",
+            "--timeout-ms",
+            "1000",
+            "--json",
+        ],
+        &fixture.mock,
+        &fixture.env,
+    )
+    .unwrap()
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+    assert_eq!(value["meta"]["snapshot_revision"], 9);
+    assert_eq!(value["result"]["matched_status"], "done");
+    assert_eq!(value["result"]["matched_completed_seq"], 1);
+    assert!(value["result"]["current_agent"].is_null());
+    fixture.finish();
+}
+
+#[test]
+fn api_schema_does_not_require_tmux_or_emit_config_warnings() {
+    let mock = MockTmuxRunner::new();
+    let mut warnings = Vec::new();
+    let output = run_with_input_at_writing_warnings(
+        ["vt", "api", "schema", "--json"],
+        "",
+        &mock,
+        &env(),
+        123,
+        &mut warnings,
+    )
+    .unwrap()
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+    assert_eq!(value["meta"]["api_version"], crate::api::API_VERSION);
+    assert_eq!(value["result"]["type"], "schema");
+    assert!(value["result"]["schemas"]["request"].is_object());
+    assert!(warnings.is_empty());
+    assert!(mock.calls().is_empty());
 }
 
 #[test]

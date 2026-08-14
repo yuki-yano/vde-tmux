@@ -8,6 +8,8 @@ use super::TmuxRunner;
 #[derive(Debug, Default)]
 pub struct MockTmuxRunner {
     responses: RefCell<HashMap<Vec<String>, String>>,
+    agent_processes:
+        RefCell<HashMap<(u32, String), Option<crate::pane_state::AgentProcessIdentity>>>,
     calls: RefCell<Vec<Vec<String>>>,
 }
 
@@ -26,6 +28,17 @@ impl MockTmuxRunner {
     pub fn calls(&self) -> Vec<Vec<String>> {
         self.calls.borrow().clone()
     }
+
+    pub fn stub_agent_process(
+        &self,
+        root_pid: u32,
+        agent: &str,
+        identity: Option<crate::pane_state::AgentProcessIdentity>,
+    ) {
+        self.agent_processes
+            .borrow_mut()
+            .insert((root_pid, agent.to_string()), identity);
+    }
 }
 
 impl TmuxRunner for MockTmuxRunner {
@@ -36,6 +49,23 @@ impl TmuxRunner for MockTmuxRunner {
             Some(output) => Ok(output.clone()),
             None => bail!("no stub registered for tmux {key:?}"),
         }
+    }
+
+    fn resolve_agent_process(
+        &self,
+        root_pid: u32,
+        agent: &crate::pane_state::AgentKind,
+    ) -> Result<Option<crate::pane_state::AgentProcessIdentity>> {
+        self.agent_processes
+            .borrow()
+            .get(&(root_pid, agent.as_str().to_string()))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no agent process stub registered for {root_pid}/{}",
+                    agent.as_str()
+                )
+            })
     }
 }
 

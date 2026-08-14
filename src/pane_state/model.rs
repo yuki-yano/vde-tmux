@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::daemon::session_badge::BadgeState;
 
-pub const PANE_STATE_SCHEMA_VERSION: u16 = 6;
+pub const PANE_STATE_SCHEMA_VERSION: u16 = 7;
 pub const IDENTIFIER_MAX_BYTES: usize = 256;
 pub const BODY_MAX_BYTES: usize = 4096;
 pub const PATH_MAX_BYTES: usize = 8192;
@@ -420,15 +420,45 @@ impl BackgroundProcessState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProcessIdentity {
+    pub pid: u32,
+    pub start_token: String,
+}
+
+impl AgentProcessIdentity {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.pid == 0
+            || self.start_token.trim().is_empty()
+            || self.start_token.len() > IDENTIFIER_MAX_BYTES
+            || self.start_token.contains(['\r', '\n'])
+        {
+            return Err(ModelError("invalid agent process identity".to_string()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessObservation {
+    pub agent_process_checked: bool,
+    pub agent_process: Option<AgentProcessIdentity>,
     pub background_process_alive: Option<bool>,
     pub listening_ports: Option<Vec<u16>>,
 }
 
 impl ProcessObservation {
     pub fn validate(&self) -> Result<(), ModelError> {
+        if self.agent_process.is_some() && !self.agent_process_checked {
+            return Err(ModelError(
+                "agent process identity requires a completed check".to_string(),
+            ));
+        }
+        if let Some(identity) = &self.agent_process {
+            identity.validate()?;
+        }
         if let Some(ports) = &self.listening_ports {
             if ports.len() > MAX_LISTENING_PORTS {
                 return Err(ModelError("too many listening ports".to_string()));
@@ -613,6 +643,7 @@ pub struct PaneState {
     pub pane_instance: PaneInstance,
     pub agent: AgentKind,
     pub agent_session_id: Option<AgentSessionId>,
+    pub agent_process: Option<AgentProcessIdentity>,
     pub agent_epoch: u64,
     pub agent_present: bool,
     pub scan_verified: bool,
@@ -650,6 +681,9 @@ impl PaneState {
             )));
         }
         self.pane_instance.validate()?;
+        if let Some(identity) = &self.agent_process {
+            identity.validate()?;
+        }
         if self.revision == 0 || self.agent_epoch == 0 {
             return Err(ModelError(
                 "revision and agent epoch must be positive".to_string(),
@@ -728,6 +762,8 @@ impl PaneState {
             process.validate()?;
         }
         ProcessObservation {
+            agent_process_checked: false,
+            agent_process: None,
             background_process_alive: None,
             listening_ports: Some(self.listening_ports.clone()),
         }
@@ -1111,6 +1147,10 @@ pub struct CaptureTrackerSnapshot {
     pub generation: u64,
     pub epoch: Option<(StateId, u64)>,
     pub hook_authoritative: bool,
+    /// Currently verified exact identity exposed through the daemon projection.
+    pub agent_process: Option<AgentProcessIdentity>,
+    /// Last exact identity, retained across temporary ambiguity for replacement detection.
+    pub last_agent_process: Option<AgentProcessIdentity>,
     pub absence_count: u8,
     pub replacement_kind: Option<AgentKind>,
     pub replacement_streak: u8,
@@ -1147,6 +1187,7 @@ mod tests {
             },
             agent: AgentKind::parse("codex").unwrap(),
             agent_session_id: Some(AgentSessionId::parse("session-1").unwrap()),
+            agent_process: None,
             agent_epoch: 1,
             agent_present: true,
             scan_verified: false,

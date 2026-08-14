@@ -1949,6 +1949,7 @@ mod tests {
                 pane_instance: pane_instance.clone(),
                 agent: crate::pane_state::AgentKind::parse("codex").unwrap(),
                 agent_session_id: None,
+                agent_process: None,
                 agent_epoch: 1,
                 agent_present: true,
                 scan_verified: true,
@@ -1982,8 +1983,10 @@ mod tests {
             current_command: command.to_string(),
             pane_width: 80,
             active,
+            agent_process: None,
             stored: None,
             resolved,
+            retained_state: None,
         }
     }
 

@@ -20,8 +20,11 @@ use crate::sidebar::state::{SidebarNavigation, SidebarPreferences};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransitionEvent {
-    pub pane_id: String,
+    pub pane_instance: crate::pane_state::PaneInstance,
     pub agent: String,
+    pub state_version: Option<crate::pane_state::StateVersion>,
+    pub run_seq: u64,
+    pub completed_seq: u64,
     pub from: Option<BadgeState>,
     pub to: BadgeState,
     pub at_epoch: i64,

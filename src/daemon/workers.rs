@@ -29,7 +29,24 @@ pub const STALE_CAPTURE_SECONDS: i64 = 300;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessDetection {
     pub agents: BTreeSet<AgentKind>,
+    pub agent_processes: BTreeMap<AgentKind, BTreeSet<crate::pane_state::AgentProcessIdentity>>,
     pub complete: bool,
+    pub process_identities_complete: bool,
+}
+
+impl ProcessDetection {
+    pub fn exact_agent_process(
+        &self,
+        agent: &AgentKind,
+    ) -> Option<crate::pane_state::AgentProcessIdentity> {
+        if !self.complete || !self.process_identities_complete {
+            return None;
+        }
+        let processes = self.agent_processes.get(agent)?;
+        (processes.len() == 1)
+            .then(|| processes.iter().next().cloned())
+            .flatten()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -103,10 +120,15 @@ impl AgentProcessSnapshot {
         if !self.complete || !self.commands.contains_key(&root_pid) {
             return ProcessDetection {
                 agents: BTreeSet::new(),
+                agent_processes: BTreeMap::new(),
                 complete: false,
+                process_identities_complete: false,
             };
         }
         let mut agents = BTreeSet::new();
+        let mut agent_processes =
+            BTreeMap::<AgentKind, BTreeSet<crate::pane_state::AgentProcessIdentity>>::new();
+        let mut process_identities_complete = true;
         let mut stack = vec![root_pid];
         let mut visited = BTreeSet::new();
         while let Some(pid) = stack.pop() {
@@ -116,7 +138,16 @@ impl AgentProcessSnapshot {
             if let Some(command) = self.commands.get(&pid)
                 && let Some(agent) = detect_process_agent(command)
             {
-                agents.insert(agent);
+                agents.insert(agent.clone());
+                match crate::daemon::lifecycle::agent_process_start_token(pid) {
+                    Ok(start_token) => {
+                        agent_processes
+                            .entry(agent)
+                            .or_default()
+                            .insert(crate::pane_state::AgentProcessIdentity { pid, start_token });
+                    }
+                    Err(_) => process_identities_complete = false,
+                }
             }
             if let Some(children) = self.children.get(&pid) {
                 stack.extend(children.iter().copied());
@@ -124,7 +155,9 @@ impl AgentProcessSnapshot {
         }
         ProcessDetection {
             agents,
+            agent_processes,
             complete: true,
+            process_identities_complete,
         }
     }
 
@@ -165,6 +198,8 @@ impl AgentProcessSnapshot {
         &self,
         root_pid: u32,
         background_command: Option<&str>,
+        agent_process_checked: bool,
+        agent_process: Option<crate::pane_state::AgentProcessIdentity>,
     ) -> Option<crate::pane_state::ProcessObservation> {
         let descendants = self.descendants(root_pid)?;
         let background_process_alive = background_command.map(|command| {
@@ -185,12 +220,16 @@ impl AgentProcessSnapshot {
                 .take(crate::pane_state::MAX_LISTENING_PORTS)
                 .collect::<Vec<_>>()
         });
-        (background_process_alive.is_some() || listening_ports.is_some()).then_some(
-            crate::pane_state::ProcessObservation {
-                background_process_alive,
-                listening_ports,
-            },
-        )
+        (agent_process_checked
+            || agent_process.is_some()
+            || background_process_alive.is_some()
+            || listening_ports.is_some())
+        .then_some(crate::pane_state::ProcessObservation {
+            agent_process_checked,
+            agent_process,
+            background_process_alive,
+            listening_ports,
+        })
     }
 
     fn descendants(&self, root_pid: u32) -> Option<BTreeSet<u32>> {
@@ -1014,7 +1053,7 @@ pub fn run_observation_poll(
     observed_at: i64,
 ) -> std::result::Result<ObservationPollResult, ObservationPollError> {
     let mut diagnostics = Vec::new();
-    let observations = dispatch
+    let detections = dispatch
         .iter()
         .map(|snapshot| {
             let detection = processes.detect_from_pid_tree(snapshot.pane_instance.pane_pid);
@@ -1024,6 +1063,13 @@ pub fn run_observation_poll(
                     snapshot.pane_instance.pane_id
                 ));
             }
+            detection
+        })
+        .collect::<Vec<_>>();
+    let observations = dispatch
+        .iter()
+        .zip(&detections)
+        .map(|(snapshot, detection)| {
             Some(classify_presence(
                 snapshot.state.as_ref(),
                 &detection.agents,
@@ -1090,6 +1136,13 @@ pub fn run_observation_poll(
                 .as_ref()
                 .and_then(|state| state.background_process.as_ref())
                 .map(|process| process.command.as_str()),
+            matches!(presence, AgentPresenceObservation::Present(_)),
+            match &presence {
+                AgentPresenceObservation::Present(agent) => {
+                    detections[index].exact_agent_process(agent)
+                }
+                AgentPresenceObservation::Absent | AgentPresenceObservation::Unknown => None,
+            },
         );
         envelopes.push(
             observation_envelope(
@@ -1886,6 +1939,7 @@ mod tests {
             pane_instance: pane_instance("%1", 11),
             agent: AgentKind::parse(agent).unwrap(),
             agent_session_id: None,
+            agent_process: None,
             agent_epoch: 1,
             agent_present: true,
             scan_verified: true,
@@ -2417,6 +2471,33 @@ mod tests {
     }
 
     #[test]
+    fn exact_agent_process_requires_one_unique_identity() {
+        let codex = AgentKind::parse("codex").unwrap();
+        let first = crate::pane_state::AgentProcessIdentity {
+            pid: 10,
+            start_token: "first".to_string(),
+        };
+        let second = crate::pane_state::AgentProcessIdentity {
+            pid: 11,
+            start_token: "second".to_string(),
+        };
+        let mut detection = ProcessDetection {
+            agents: BTreeSet::from([codex.clone()]),
+            agent_processes: BTreeMap::from([(codex.clone(), BTreeSet::from([first.clone()]))]),
+            complete: true,
+            process_identities_complete: true,
+        };
+
+        assert_eq!(detection.exact_agent_process(&codex), Some(first));
+        detection
+            .agent_processes
+            .get_mut(&codex)
+            .unwrap()
+            .insert(second);
+        assert_eq!(detection.exact_agent_process(&codex), None);
+    }
+
+    #[test]
     fn process_snapshot_maps_ports_and_background_liveness_to_pane_tree() {
         let mut snapshot = AgentProcessSnapshot::parse(
             "100 1 100 100 zsh\n200 100 200 100 bash -c pnpm dev\n300 200 300 100 node server.js\n",
@@ -2424,12 +2505,14 @@ mod tests {
         );
         snapshot.observe_listening_ports("p300\nn127.0.0.1:3000\nn*:5173\n");
 
-        let observation = snapshot.process_observation(100, Some("pnpm dev")).unwrap();
+        let observation = snapshot
+            .process_observation(100, Some("pnpm dev"), false, None)
+            .unwrap();
         assert_eq!(observation.background_process_alive, Some(true));
         assert_eq!(observation.listening_ports, Some(vec![3000, 5173]));
         assert_eq!(
             snapshot
-                .process_observation(100, Some("cargo watch"))
+                .process_observation(100, Some("cargo watch"), false, None)
                 .unwrap()
                 .background_process_alive,
             Some(false)

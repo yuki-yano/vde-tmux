@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::config::load::load_config;
 use crate::session::Direction;
@@ -28,6 +28,30 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Inspect the versioned agent JSON API.
+    Api {
+        /// Accepted for explicit agent invocation; API output is always JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: ApiCommand,
+    },
+    /// Read pane topology and bounded terminal output as JSON.
+    Pane {
+        /// Accepted for explicit agent invocation; API output is always JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: PaneCommand,
+    },
+    /// Inspect and wait for agent occupants as JSON.
+    Agent {
+        /// Accepted for explicit agent invocation; API output is always JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     #[command(name = "statusline-category")]
     StatuslineCategory {
         #[arg(long = "session-id")]
@@ -152,6 +176,117 @@ enum Command {
         #[command(subcommand)]
         command: hook::HookCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ApiCommand {
+    /// Emit the public JSON schemas without connecting to tmux or the daemon.
+    Schema,
+    /// Emit one compact, canonical pane/agent snapshot.
+    Snapshot,
+}
+
+#[derive(Debug, Subcommand)]
+enum PaneCommand {
+    /// List panes from the daemon's cached canonical snapshot.
+    List,
+    /// Get one pane by %pane_id or pane_ref.
+    Get { target: String },
+    /// Get the pane identified by TMUX_PANE, never by client focus.
+    Current,
+    /// Capture bounded terminal output after pinning the pane process identity.
+    Read {
+        /// %pane_id or pane_ref; defaults to TMUX_PANE.
+        target: Option<String>,
+        #[command(flatten)]
+        read: ApiReadArgs,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// List resolved agents from the daemon's cached canonical snapshot.
+    List {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        status: Option<ApiAgentStatusArg>,
+        #[arg(long = "cwd-prefix")]
+        cwd_prefix: Option<String>,
+        #[arg(long)]
+        unread: bool,
+        #[arg(long = "needs-action")]
+        needs_action: bool,
+    },
+    /// Get one current agent by %pane_id or exact agent_ref.
+    Get { target: String },
+    /// Wait on daemon snapshot events while pinning the exact agent occupant.
+    Wait {
+        target: String,
+        /// Completion states. May be repeated or comma-separated.
+        #[arg(long, value_delimiter = ',')]
+        until: Vec<ApiAgentStatusArg>,
+        #[arg(
+            long = "timeout-ms",
+            default_value_t = crate::api::DEFAULT_WAIT_TIMEOUT.as_millis() as u64
+        )]
+        timeout_ms: u64,
+        /// Require a completion newer than this completed sequence.
+        #[arg(long = "after-completed-seq")]
+        after_completed_seq: Option<u64>,
+    },
+    /// Capture bounded terminal output after pinning the exact agent occupant.
+    Read {
+        target: String,
+        #[command(flatten)]
+        read: ApiReadArgs,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ApiAgentStatusArg {
+    Blocked,
+    Working,
+    Done,
+    Idle,
+}
+
+impl From<ApiAgentStatusArg> for crate::api::AgentStatus {
+    fn from(value: ApiAgentStatusArg) -> Self {
+        match value {
+            ApiAgentStatusArg::Blocked => Self::Blocked,
+            ApiAgentStatusArg::Working => Self::Working,
+            ApiAgentStatusArg::Done => Self::Done,
+            ApiAgentStatusArg::Idle => Self::Idle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ApiReadSourceArg {
+    Visible,
+    Latest,
+}
+
+impl From<ApiReadSourceArg> for crate::api::ReadSource {
+    fn from(value: ApiReadSourceArg) -> Self {
+        match value {
+            ApiReadSourceArg::Visible => Self::Visible,
+            ApiReadSourceArg::Latest => Self::Latest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Args)]
+struct ApiReadArgs {
+    #[arg(long, default_value_t = crate::api::DEFAULT_READ_LINES)]
+    lines: usize,
+    #[arg(long, value_enum, default_value_t = ApiReadSourceArg::Latest)]
+    source: ApiReadSourceArg,
+    #[arg(long)]
+    ansi: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -330,6 +465,7 @@ fn current_env() -> BTreeMap<String, String> {
 
 pub fn run() -> ExitCode {
     let args = std::env::args_os().collect::<Vec<_>>();
+    let is_json_api = is_json_api_args(&args);
     let is_agent_hook = args.get(1).and_then(|arg| arg.to_str()) == Some("hook");
     let is_view_hook = args.get(1).and_then(|arg| arg.to_str()) == Some("hooks")
         && args.get(2).and_then(|arg| arg.to_str()) == Some("pane-state-view");
@@ -354,12 +490,13 @@ pub fn run() -> ExitCode {
         None => String::new(),
     };
     let runner = SystemTmuxRunner::from_env(timeout);
+    let observed_at = now_epoch();
     match run_with_input_at_with_hook_deadline(
         args,
         &input,
         &runner,
         &current_env(),
-        now_epoch(),
+        observed_at,
         agent_hook_deadline,
     ) {
         Ok(Some(output)) => {
@@ -368,10 +505,25 @@ pub fn run() -> ExitCode {
         }
         Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error:#}");
+            if is_json_api {
+                eprintln!("{}", crate::api::render_error(&error, observed_at));
+            } else {
+                eprintln!("{error:#}");
+            }
             ExitCode::FAILURE
         }
     }
+}
+
+fn is_json_api_args(args: &[OsString]) -> bool {
+    !args
+        .iter()
+        .skip(2)
+        .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
+        && matches!(
+            args.get(1).and_then(|arg| arg.to_str()),
+            Some("api" | "pane" | "agent")
+        )
 }
 
 fn agent_hook_requires_stdin(args: &[OsString]) -> bool {
@@ -567,9 +719,108 @@ where
 {
     let cli = Cli::try_parse_from(args)?;
     let loaded = load_config(env);
-    emit_config_warnings(&loaded.warnings, warning_writer)?;
+    let is_json_api = matches!(
+        &cli.command,
+        Command::Api { .. } | Command::Pane { .. } | Command::Agent { .. }
+    );
+    if !is_json_api {
+        emit_config_warnings(&loaded.warnings, warning_writer)?;
+    }
     let config = loaded.config;
     match cli.command {
+        Command::Api { command, json: _ } => match command {
+            ApiCommand::Schema => Ok(Some(crate::api::schema_json(now_epoch)?)),
+            ApiCommand::Snapshot => Ok(Some(crate::api::snapshot(runner, env, now_epoch)?)),
+        },
+        Command::Pane { command, json: _ } => match command {
+            PaneCommand::List => Ok(Some(crate::api::pane_list(runner, env, now_epoch)?)),
+            PaneCommand::Get { target } => {
+                Ok(Some(crate::api::pane_get(runner, env, now_epoch, &target)?))
+            }
+            PaneCommand::Current => Ok(Some(crate::api::pane_current(runner, env, now_epoch)?)),
+            PaneCommand::Read { target, read } => {
+                let target = target
+                    .or_else(|| env.get("TMUX_PANE").cloned())
+                    .ok_or_else(|| {
+                        crate::api::ApiError::new(
+                            crate::api::ApiErrorCode::NoCurrentPane,
+                            "target is required when TMUX_PANE is not set",
+                        )
+                    })?;
+                Ok(Some(crate::api::pane_read(
+                    runner,
+                    env,
+                    now_epoch,
+                    &target,
+                    crate::api::ReadOptions {
+                        source: read.source.into(),
+                        lines: read.lines,
+                        ansi: read.ansi,
+                    },
+                )?))
+            }
+        },
+        Command::Agent { command, json: _ } => match command {
+            AgentCommand::List {
+                session,
+                agent,
+                status,
+                cwd_prefix,
+                unread,
+                needs_action,
+            } => Ok(Some(crate::api::agent_list(
+                runner,
+                env,
+                now_epoch,
+                &crate::api::AgentListFilter {
+                    session,
+                    agent,
+                    status: status.map(Into::into),
+                    cwd_prefix,
+                    unread_only: unread,
+                    needs_action_only: needs_action,
+                },
+            )?)),
+            AgentCommand::Get { target } => Ok(Some(crate::api::agent_get(
+                runner, env, now_epoch, &target,
+            )?)),
+            AgentCommand::Wait {
+                target,
+                until,
+                timeout_ms,
+                after_completed_seq,
+            } => {
+                let until = if until.is_empty() {
+                    [
+                        crate::api::AgentStatus::Done,
+                        crate::api::AgentStatus::Blocked,
+                    ]
+                    .into_iter()
+                    .collect()
+                } else {
+                    until.into_iter().map(Into::into).collect()
+                };
+                Ok(Some(crate::api::agent_wait(
+                    runner,
+                    env,
+                    &target,
+                    &until,
+                    Duration::from_millis(timeout_ms),
+                    after_completed_seq,
+                )?))
+            }
+            AgentCommand::Read { target, read } => Ok(Some(crate::api::agent_read(
+                runner,
+                env,
+                now_epoch,
+                &target,
+                crate::api::ReadOptions {
+                    source: read.source.into(),
+                    lines: read.lines,
+                    ansi: read.ansi,
+                },
+            )?)),
+        },
         Command::StatuslineCategory {
             session_id,
             client_name,

@@ -256,6 +256,7 @@ fn running_pane_presentation(epoch: i64) -> PanePresentation {
         pane_instance: pane_instance.clone(),
         agent: AgentKind::parse("codex").unwrap(),
         agent_session_id: None,
+        agent_process: None,
         agent_epoch: 1,
         agent_present: true,
         scan_verified: true,
@@ -284,6 +285,7 @@ fn running_pane_presentation(epoch: i64) -> PanePresentation {
         current_command: "codex".to_string(),
         pane_width: 80,
         active: true,
+        agent_process: None,
         stored: None,
         resolved: Some(ResolvedPaneState {
             canonical,
@@ -292,6 +294,7 @@ fn running_pane_presentation(epoch: i64) -> PanePresentation {
             current_path: "/tmp".to_string(),
             badge: BadgeState::Working,
         }),
+        retained_state: None,
     }
 }
 

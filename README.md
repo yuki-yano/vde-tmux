@@ -177,6 +177,24 @@ vt sidebar open
 vde-tmux can detect Claude Code, Codex, and opencode from the command running in a pane even without hooks.
 Hooks are still required for accurate prompts, completion times, and waiting states.
 
+## Agent JSON API
+
+Agents can inspect the daemon's cached canonical topology and wait for live process-identified exact
+agent occupants without polling tmux topology:
+
+```bash
+vt api schema --json
+vt agent list --status working --json
+vt agent wait %456 --until done,blocked --json
+vt pane read %456 --source latest --lines 120 --json
+```
+
+See [Agent JSON API](./AGENT_API.md) for the response envelope, stable occupant references,
+durable run completion, filters, and capture bounds. An exact `agent_ref` is emitted only when one
+unique live agent process can be pinned by PID and OS start token. Hooks remain necessary for
+accurate lifecycle details, but hookless agents can use `agent wait` and `agent read` when that live
+process identity is available.
+
 ## Agent states
 
 | Badge | State | Meaning |
@@ -439,7 +457,7 @@ Use `disable` when the daemon must remain stopped.
 ### Pane-state persistence
 
 The daemon stores one private full-state snapshot per tmux server incarnation under
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v6.json`. A daemon restart restores the
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v7.json`. A daemon restart restores the
 prompt, task progress and items, subagents, worktree activity, lifecycle, timestamps, agent
 identity, task context and generated summaries, the latest response preview, explicitly reported
 background processes, listening ports, and Done/acknowledgement state for panes

@@ -37,6 +37,7 @@ mod tests {
             },
             agent: AgentKind::parse("codex").unwrap(),
             agent_session_id: None,
+            agent_process: None,
             agent_epoch: 1,
             agent_present: true,
             scan_verified: false,

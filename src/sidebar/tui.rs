@@ -420,8 +420,10 @@ mod local_state_tests {
             current_command: "zsh".to_string(),
             pane_width: 80,
             active: true,
+            agent_process: None,
             stored: None,
             resolved: None,
+            retained_state: None,
         }
     }
 
@@ -451,6 +453,7 @@ mod local_state_tests {
             pane_instance: pane_instance.clone(),
             agent: AgentKind::parse("codex").unwrap(),
             agent_session_id: None,
+            agent_process: None,
             agent_epoch: 1,
             agent_present: true,
             scan_verified: true,
@@ -485,6 +488,7 @@ mod local_state_tests {
             current_command: "codex".to_string(),
             pane_width: 80,
             active: true,
+            agent_process: None,
             stored: Some(StoredStateDescriptor::Canonical {
                 version: canonical.version(),
             }),
@@ -495,6 +499,7 @@ mod local_state_tests {
                 current_path: "/tmp/app".to_string(),
                 badge: BadgeState::Working,
             }),
+            retained_state: None,
         }
     }
 

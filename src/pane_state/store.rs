@@ -108,6 +108,8 @@ pub struct CanonicalTransition {
     pub to: Option<crate::daemon::session_badge::BadgeState>,
     pub at_epoch: i64,
     pub state_version: Option<StateVersion>,
+    pub run_seq: u64,
+    pub completed_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -171,6 +173,7 @@ impl CanonicalStateRuntime {
                 pane.clone(),
                 CaptureTrackerSnapshot {
                     epoch: Some((state.state_id.clone(), state.agent_epoch)),
+                    last_agent_process: state.agent_process.clone(),
                     ..CaptureTrackerSnapshot::default()
                 },
             );
@@ -502,8 +505,14 @@ impl CanonicalStateRuntime {
         )?;
         if reduction.outcome != ReductionOutcome::CanonicalChanged {
             if let Some(delta) = reduction.tracker_delta {
+                let public_identity_changed = tracker.agent_process != delta.next.agent_process;
                 self.trackers
                     .insert(envelope.pane_instance.clone(), delta.next);
+                if public_identity_changed {
+                    self.bump_snapshot_revision()?;
+                    self.validate_projection()?;
+                    let _ = self.preflight_projection(super::MAX_RESPONSE_FRAME_BYTES)?;
+                }
             }
             return Ok(ApplyResult {
                 outcome: reduction.outcome,
@@ -587,6 +596,7 @@ impl CanonicalStateRuntime {
                 at_epoch,
             )
         };
+        let transition_state = current.or(previous);
         let state_version = current.map(PaneState::version);
         self.transitions.push_back(CanonicalTransition {
             pane_instance: pane.clone(),
@@ -595,6 +605,8 @@ impl CanonicalStateRuntime {
             to: current_badge,
             at_epoch,
             state_version: state_version.clone(),
+            run_seq: transition_state.map_or(0, |state| state.run_seq),
+            completed_seq: transition_state.map_or(0, |state| state.completed_seq),
         });
         while self.transitions.len() > MAX_DIAGNOSTICS {
             self.transitions.pop_front();
@@ -981,6 +993,82 @@ mod tests {
                 .order,
             2
         );
+    }
+
+    #[test]
+    fn process_identity_projection_revokes_ambiguous_refs_and_survives_restart() {
+        let mut io = RecordingStore::default();
+        let mut runtime = CanonicalStateRuntime::default();
+        let target = pane(1);
+        apply(
+            &mut runtime,
+            &mut io,
+            target.clone(),
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: None,
+            },
+        )
+        .unwrap();
+        let process_a = AgentProcessIdentity {
+            pid: 1001,
+            start_token: "process-a".to_string(),
+        };
+        let exact_event = |runtime: &CanonicalStateRuntime,
+                           process: Option<AgentProcessIdentity>,
+                           observed_at: i64| {
+            PaneEvent::ObservationBatch {
+                base: runtime
+                    .record(&target)
+                    .map(|state| StoredStateDescriptor::Canonical {
+                        version: state.version(),
+                    }),
+                tracker_generation: runtime.tracker(&target).generation,
+                observed_at,
+                presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+                capture: None,
+                process: Some(ProcessObservation {
+                    agent_process_checked: true,
+                    agent_process: process,
+                    background_process_alive: None,
+                    listening_ports: None,
+                }),
+            }
+        };
+        let event = exact_event(&runtime, Some(process_a.clone()), 2);
+        apply(&mut runtime, &mut io, target.clone(), event).unwrap();
+        assert_eq!(
+            runtime.tracker(&target).agent_process,
+            Some(process_a.clone())
+        );
+
+        let revision = runtime.snapshot_revision();
+        let event = exact_event(&runtime, None, 3);
+        apply(&mut runtime, &mut io, target.clone(), event).unwrap();
+        assert_eq!(runtime.snapshot_revision(), revision + 1);
+        assert_eq!(runtime.tracker(&target).agent_process, None);
+        assert_eq!(
+            runtime.tracker(&target).last_agent_process,
+            Some(process_a.clone())
+        );
+        assert_eq!(
+            runtime.record(&target).unwrap().agent_process,
+            Some(process_a)
+        );
+
+        let mut restarted = CanonicalStateRuntime::hydrate(runtime.records_snapshot()).unwrap();
+        let process_b = AgentProcessIdentity {
+            pid: 1002,
+            start_token: "process-b".to_string(),
+        };
+        let event = exact_event(&restarted, Some(process_b.clone()), 4);
+        apply(&mut restarted, &mut io, target.clone(), event).unwrap();
+        assert_eq!(restarted.record(&target).unwrap().agent_epoch, 2);
+        assert_eq!(
+            restarted.record(&target).unwrap().agent_process,
+            Some(process_b.clone())
+        );
+        assert_eq!(restarted.tracker(&target).agent_process, Some(process_b));
     }
 
     #[test]

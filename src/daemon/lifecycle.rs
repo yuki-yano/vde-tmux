@@ -582,6 +582,39 @@ pub fn process_start_token(pid: u32) -> Result<String> {
     }
 }
 
+pub fn agent_process_start_token(pid: u32) -> Result<String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        process_start_token(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let pid = i32::try_from(pid).context("process PID does not fit macOS pid_t")?;
+        // SAFETY: proc_bsdinfo is a plain C record which proc_pidinfo fully initializes on
+        // success. The returned byte count is checked before any field is read.
+        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+        let expected = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .context("proc_bsdinfo size does not fit c_int")?;
+        // SAFETY: `info` is writable for exactly `expected` bytes for the duration of the call.
+        let received = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&raw mut info).cast(),
+                expected,
+            )
+        };
+        if received != expected || info.pbi_pid != pid as u32 {
+            bail!("process PID {pid} is not available");
+        }
+        Ok(format!(
+            "{}:{}",
+            info.pbi_start_tvsec, info.pbi_start_tvusec
+        ))
+    }
+}
+
 pub fn process_identity_is_alive(identity: &DaemonProcessIdentity) -> bool {
     process_start_token(identity.pid).is_ok_and(|token| token == identity.start_token)
         && !process_is_zombie(identity.pid)
@@ -1444,6 +1477,17 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_agent_process_start_token_is_stable_and_has_microsecond_precision() {
+        let first = super::agent_process_start_token(std::process::id()).unwrap();
+        let second = super::agent_process_start_token(std::process::id()).unwrap();
+        assert_eq!(first, second);
+        let fields = first.split(':').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 2);
+        assert!(fields.iter().all(|field| field.parse::<u64>().is_ok()));
+    }
 
     fn unique_dir(label: &str) -> PathBuf {
         let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);

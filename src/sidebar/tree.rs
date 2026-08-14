@@ -1772,6 +1772,7 @@ mod tests {
             pane_instance: pane_instance.clone(),
             agent: AgentKind::parse("codex").unwrap(),
             agent_session_id: None,
+            agent_process: None,
             agent_epoch: 1,
             agent_present: true,
             scan_verified: true,
@@ -1809,6 +1810,7 @@ mod tests {
             current_command: "codex".to_string(),
             pane_width: 80,
             active: true,
+            agent_process: None,
             stored: Some(crate::pane_state::StoredStateDescriptor::Canonical {
                 version: canonical.version(),
             }),
@@ -1819,6 +1821,7 @@ mod tests {
                 current_path: "/tmp/app".to_string(),
                 badge: BadgeState::Working,
             }),
+            retained_state: None,
         };
         let snapshot = crate::daemon::protocol::v2::ResolvedSnapshot {
             snapshot_revision: 7,

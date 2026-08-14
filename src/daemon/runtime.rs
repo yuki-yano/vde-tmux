@@ -488,6 +488,11 @@ impl CanonicalCoordinatorState {
                 }
                 _ => None,
             };
+            let retained_state = if resolved.is_none() {
+                record.map(crate::daemon::protocol::v2::RetainedAgentState::from)
+            } else {
+                None
+            };
             if let Some(badge) = triage.get(&topology.pane_instance)
                 && !visible_instances.contains(&topology.pane_instance)
             {
@@ -518,6 +523,7 @@ impl CanonicalCoordinatorState {
             }
             panes.push(PanePresentation {
                 pane_instance: topology.pane_instance.clone(),
+                agent_process: runtime.tracker(&topology.pane_instance).agent_process,
                 session_links: topology.session_links.clone(),
                 window_id: topology.window_id.clone(),
                 window_name: topology.window_name.clone(),
@@ -527,6 +533,7 @@ impl CanonicalCoordinatorState {
                 active: topology.active,
                 stored,
                 resolved,
+                retained_state,
             });
         }
         panes.sort_by(|left, right| left.pane_instance.cmp(&right.pane_instance));
@@ -556,12 +563,15 @@ impl CanonicalCoordinatorState {
             .filter_map(|transition| {
                 let to = transition.to?;
                 Some(TransitionEvent {
-                    pane_id: transition.pane_instance.pane_id.clone(),
+                    pane_instance: transition.pane_instance.clone(),
                     agent: transition
                         .agent
                         .as_ref()
                         .map(|agent| agent.as_str().to_string())
                         .unwrap_or_default(),
+                    state_version: transition.state_version.clone(),
+                    run_seq: transition.run_seq,
+                    completed_seq: transition.completed_seq,
                     from: transition.from,
                     to,
                     at_epoch: transition.at_epoch,
@@ -1273,6 +1283,7 @@ mod tests {
                 pane_instance: pane_instance.clone(),
                 agent: crate::pane_state::AgentKind::parse("codex").unwrap(),
                 agent_session_id: None,
+                agent_process: None,
                 agent_epoch: 1,
                 agent_present: true,
                 scan_verified: true,
@@ -1306,12 +1317,14 @@ mod tests {
             current_command: if resolved.is_some() { "codex" } else { "zsh" }.to_string(),
             pane_width: 80,
             active,
+            agent_process: None,
             stored: resolved
                 .as_ref()
                 .map(|resolved| StoredStateDescriptor::Canonical {
                     version: resolved.canonical.version(),
                 }),
             resolved,
+            retained_state: None,
         }
     }
 
@@ -1342,6 +1355,7 @@ mod tests {
                     pane_instance: pane_instance.clone(),
                     agent: AgentKind::parse("codex").unwrap(),
                     agent_session_id: None,
+                    agent_process: None,
                     agent_epoch: 1,
                     agent_present: true,
                     scan_verified: true,
