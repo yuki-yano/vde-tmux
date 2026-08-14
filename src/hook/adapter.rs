@@ -69,7 +69,7 @@ pub fn claude_typed_event_from_json(
         payload.agent_transcript_path.as_deref(),
     );
     let event = payload.hook_event_name.as_deref().unwrap_or(event);
-    if origin == HookOrigin::Subagent && is_guarded_claude_lifecycle_event(event) {
+    if origin == HookOrigin::NonParent && is_guarded_claude_lifecycle_event(event) {
         return Ok(None);
     }
     let event = match event {
@@ -140,7 +140,7 @@ pub fn codex_typed_event_from_json_with_home(
         payload.transcript_path.as_deref(),
         codex_home,
     );
-    if origin == HookOrigin::Subagent && is_guarded_codex_lifecycle_event(event) {
+    if !origin.is_parent() && is_guarded_codex_lifecycle_event(event) {
         return Ok(None);
     }
     let event = match event {
@@ -495,6 +495,8 @@ fn text_from_content(content: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn typed_context() -> TypedAdapterContext {
         TypedAdapterContext {
@@ -585,6 +587,13 @@ mod tests {
 
     #[test]
     fn codex_typed_fixture_maps_supported_lifecycle_events() {
+        let root = codex_root_session("typed-fixtures", "session-2");
+        let transcript = root
+            .join("sessions")
+            .join("2026")
+            .join("08")
+            .join("14")
+            .join("rollout-session-2.jsonl");
         let fixtures = [
             (
                 "PreToolUse",
@@ -622,41 +631,75 @@ mod tests {
             ),
         ];
         for (hook, payload, expected) in fixtures {
-            let envelope =
-                codex_typed_event_from_json_with_home(hook, payload, &typed_context(), None)
-                    .unwrap()
-                    .unwrap();
+            let mut payload = serde_json::from_str::<Value>(payload).unwrap();
+            payload["transcript_path"] = Value::String(transcript.display().to_string());
+            let envelope = codex_typed_event_from_json_with_home(
+                hook,
+                &payload.to_string(),
+                &typed_context(),
+                Some(&root),
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(envelope.agent.unwrap().as_str(), "codex");
             assert_eq!(envelope.agent_session_id.unwrap().as_str(), "session-2");
             assert_eq!(envelope.event, expected);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_unverified_lifecycle_hooks_are_ignored() {
+        let root = unique_temp_dir("codex-unverified-lifecycle");
+        let payload = r#"{"session_id":"internal-session","source":"startup","prompt":"hidden","tool_name":"exec"}"#;
+
+        for hook in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+            "Stop",
+        ] {
+            assert!(
+                codex_typed_event_from_json_with_home(
+                    hook,
+                    payload,
+                    &typed_context(),
+                    Some(&root),
+                )
+                .unwrap()
+                .is_none(),
+                "{hook} should not mutate lifecycle for an unverified session"
+            );
         }
     }
 
     #[test]
     fn stop_payloads_store_one_line_response_previews() {
-        for (agent, parse) in [
-            (
-                "claude",
-                claude_typed_event_from_json
-                    as fn(&str, &str, &TypedAdapterContext) -> Result<Option<PaneEventEnvelope>>,
-            ),
-            ("codex", codex_typed_event_from_json),
-        ] {
-            let payload = format!(
-                r#"{{"session_id":"session-1","last_assistant_message":"done\nfor {agent}"}}"#
-            );
-            let envelope = parse("Stop", &payload, &typed_context()).unwrap().unwrap();
-            let PaneEvent::ResponseAndCompleteRun {
-                completed_at,
-                response,
-            } = envelope.event
-            else {
-                panic!("expected response completion for {agent}");
-            };
-            assert_eq!(completed_at, 123);
-            assert_eq!(response.text, format!("done for {agent}"));
-            assert_eq!(response.observed_at, 123);
-        }
+        let claude_payload =
+            r#"{"session_id":"session-1","last_assistant_message":"done\nfor claude"}"#;
+        let claude = claude_typed_event_from_json("Stop", claude_payload, &typed_context())
+            .unwrap()
+            .unwrap();
+        assert_response_completion(claude, "claude");
+
+        let root = codex_root_session("stop-preview", "session-1");
+        let codex_payload = format!(
+            r#"{{"session_id":"session-1","transcript_path":"{}","last_assistant_message":"done\nfor codex"}}"#,
+            root.join("sessions/2026/08/14/rollout-session-1.jsonl")
+                .display()
+        );
+        let codex = codex_typed_event_from_json_with_home(
+            "Stop",
+            &codex_payload,
+            &typed_context(),
+            Some(&root),
+        )
+        .unwrap()
+        .unwrap();
+        assert_response_completion(codex, "codex");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -669,14 +712,17 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("requires startup"));
 
-        let error = codex_typed_event_from_json_with_home(
-            "Stop",
-            r#"{"agent_id":"not-a-session"}"#,
-            &typed_context(),
-            None,
-        )
-        .unwrap_err();
+        let root = codex_root_session("missing-session-id", "session-1");
+        let payload = format!(
+            r#"{{"transcript_path":"{}","last_assistant_message":"done"}}"#,
+            root.join("sessions/2026/08/14/rollout-session-1.jsonl")
+                .display()
+        );
+        let error =
+            codex_typed_event_from_json_with_home("Stop", &payload, &typed_context(), Some(&root))
+                .unwrap_err();
         assert!(error.to_string().contains("requires session_id"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -877,5 +923,40 @@ mod tests {
     fn semantic_empty_generic_report_skips_identity_validation() {
         let event = generic_typed_event(GenericEmitInput::default(), &typed_context()).unwrap();
         assert!(event.is_none());
+    }
+
+    fn assert_response_completion(envelope: PaneEventEnvelope, agent: &str) {
+        let PaneEvent::ResponseAndCompleteRun {
+            completed_at,
+            response,
+        } = envelope.event
+        else {
+            panic!("expected response completion for {agent}");
+        };
+        assert_eq!(completed_at, 123);
+        assert_eq!(response.text, format!("done for {agent}"));
+        assert_eq!(response.observed_at, 123);
+    }
+
+    fn codex_root_session(name: &str, session_id: &str) -> PathBuf {
+        let root = unique_temp_dir(name);
+        let sessions = root.join("sessions").join("2026").join("08").join("14");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join(format!("rollout-{session_id}.jsonl")),
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{session_id}","thread_source":"user"}}}}"#
+            ),
+        )
+        .unwrap();
+        root
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("vde-tmux-{name}-{}-{nanos}", std::process::id()))
     }
 }

@@ -595,7 +595,7 @@ fn claude_progress_event_from_input(
             if claude_hook_origin(
                 payload.transcript_path.as_deref(),
                 payload.agent_transcript_path.as_deref(),
-            ) == HookOrigin::Subagent =>
+            ) == HookOrigin::NonParent =>
         {
             return Ok(None);
         }
@@ -765,7 +765,7 @@ fn codex_aux_event_from_input(
                     payload.get("agent_id").and_then(Value::as_str),
                     payload.get("transcript_path").and_then(Value::as_str),
                     codex_home,
-                ) == HookOrigin::Subagent
+                ) != HookOrigin::Parent
             {
                 return Ok(None);
             }
@@ -1313,14 +1313,18 @@ mod tests {
 
     #[test]
     fn codex_goal_fixture_maps_to_begin_run_and_legacy_notify_is_ignored() {
-        let envelope = codex_typed_event_from_input(
-            "PostToolUse",
-            r#"{"session_id":"codex-session","tool_name":"create_goal","tool_input":{"objective":"ship\nthe change"}}"#,
-            &typed_context(),
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        let (root, transcript) = codex_root_session("codex-goal", "codex-session");
+        let payload = serde_json::json!({
+            "session_id": "codex-session",
+            "transcript_path": transcript,
+            "tool_name": "create_goal",
+            "tool_input": {"objective": "ship\nthe change"},
+        })
+        .to_string();
+        let envelope =
+            codex_typed_event_from_input("PostToolUse", &payload, &typed_context(), Some(&root))
+                .unwrap()
+                .unwrap();
         assert_eq!(
             envelope.event,
             PaneEvent::BeginRun {
@@ -1340,18 +1344,23 @@ mod tests {
         )
         .unwrap();
         assert!(event.is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn codex_post_tool_progress_also_reports_lifecycle_activity() {
-        let envelope = codex_typed_event_from_input(
-            "PostToolUse",
-            r#"{"session_id":"codex-session","tool_name":"update_plan","tool_input":{"plan":[{"step":"ship it","status":"in_progress"}]}}"#,
-            &typed_context(),
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        let (root, transcript) = codex_root_session("codex-progress", "codex-session");
+        let payload = serde_json::json!({
+            "session_id": "codex-session",
+            "transcript_path": transcript,
+            "tool_name": "update_plan",
+            "tool_input": {"plan": [{"step": "ship it", "status": "in_progress"}]},
+        })
+        .to_string();
+        let envelope =
+            codex_typed_event_from_input("PostToolUse", &payload, &typed_context(), Some(&root))
+                .unwrap()
+                .unwrap();
 
         assert_eq!(
             envelope.event,
@@ -1367,6 +1376,7 @@ mod tests {
                 }],
             }
         );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1376,7 +1386,7 @@ mod tests {
         fs::create_dir_all(&sessions).unwrap();
         fs::write(
             sessions.join("rollout-parent-session.jsonl"),
-            r#"{"type":"session_meta","payload":{"id":"parent-session","thread_source":"root"}}"#,
+            r#"{"type":"session_meta","payload":{"id":"parent-session","thread_source":"user"}}"#,
         )
         .unwrap();
         fs::write(
@@ -1404,5 +1414,20 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("vde-tmux-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn codex_root_session(name: &str, session_id: &str) -> (PathBuf, PathBuf) {
+        let root = unique_temp_dir(name);
+        let sessions = root.join("sessions").join("2026").join("08").join("14");
+        fs::create_dir_all(&sessions).unwrap();
+        let transcript = sessions.join(format!("rollout-{session_id}.jsonl"));
+        fs::write(
+            &transcript,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{session_id}","thread_source":"user"}}}}"#
+            ),
+        )
+        .unwrap();
+        (root, transcript)
     }
 }
