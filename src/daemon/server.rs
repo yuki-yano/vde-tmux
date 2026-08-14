@@ -3038,31 +3038,6 @@ fn apply_production_mutation(
         V2AcceptedMutation::External(ClientMessage::SidebarCommand {
             event_id, command, ..
         }) => match command {
-            crate::daemon::protocol::v2::SidebarCommand::SetUnreadPin {
-                pane_instance,
-                expected_state_id,
-                expected_read_seq,
-                pinned,
-            } => {
-                let envelope = PaneEventEnvelope {
-                    daemon_instance_id: coordinator
-                        .router
-                        .lock()
-                        .expect("v2 router lock poisoned")
-                        .daemon_instance_id()
-                        .clone(),
-                    event_id,
-                    pane_instance,
-                    agent: None,
-                    agent_session_id: None,
-                    event: PaneEvent::SetUnreadPin {
-                        expected_state_id,
-                        expected_read_seq,
-                        pinned,
-                    },
-                };
-                apply_external_pane_event(coordinator, accepted_seq, envelope)
-            }
             crate::daemon::protocol::v2::SidebarCommand::MarkComplete {
                 pane_instance,
                 expected,
@@ -3578,6 +3553,30 @@ fn apply_sidebar_preference_intent(
     }
 }
 
+fn persist_pruned_sidebar_pins(
+    coordinator: &ProductionV2Coordinator,
+    state: &mut super::runtime::CanonicalCoordinatorState,
+) -> Result<bool, crate::pane_state::store::StoreError> {
+    let present = state
+        .topology
+        .panes
+        .iter()
+        .map(|pane| pane.pane_instance.clone())
+        .collect::<BTreeSet<_>>();
+    let mut candidate = state.sidebar_preferences.clone();
+    if !candidate.retain_panes(&present) {
+        return Ok(false);
+    }
+    let path =
+        crate::sidebar::store::state_path(&coordinator.env, &coordinator.incarnation.socket_path);
+    crate::sidebar::store::save_state(&path, &candidate).map_err(|error| {
+        crate::pane_state::store::StoreError::PersistFailed(format!(
+            "sidebar pin cleanup persistence failed: {error:#}"
+        ))
+    })?;
+    state.replace_sidebar_preferences(candidate)
+}
+
 fn apply_category_intent(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
@@ -3982,6 +3981,9 @@ fn apply_pane_removal(
         .expect("state initialized before pane removal");
     let topology_changed = state.topology != topology;
     state.topology = topology;
+    if let Err(error) = persist_pruned_sidebar_pins(coordinator, state) {
+        return production_store_error_response(coordinator, error, Some(event_id));
+    }
     if still_present {
         if topology_changed && let Err(error) = state.leased.runtime.mark_projection_changed() {
             return production_store_error_response(coordinator, error, Some(event_id));
@@ -4479,6 +4481,7 @@ fn refresh_full_topology(
         crate::pane_state::store::StoreError::PersistFailed("daemon is hydrating".to_string())
     })?;
     state.replace_topology(topology)?;
+    persist_pruned_sidebar_pins(coordinator, state)?;
     Ok(state.leased.runtime.snapshot_revision())
 }
 
@@ -4495,6 +4498,7 @@ fn apply_observation_poll_projection(
             .as_mut()
             .context("state initialized before observation projection")?;
         state.replace_topology(projection.topology)?;
+        persist_pruned_sidebar_pins(coordinator, state)?;
         state.replace_status_metadata(projection.status_metadata)?;
     }
     reconcile_views_with_witnesses(
@@ -5051,7 +5055,15 @@ fn bootstrap_v2_runtime(
     let status_metadata =
         query_status_projection_metadata(coordinator, Duration::from_secs(1), &witnesses)?;
     let state_path = crate::sidebar::store::state_path(env, &coordinator.incarnation.socket_path);
-    let sidebar_preferences = crate::sidebar::store::load_state(&state_path)?;
+    let mut sidebar_preferences = crate::sidebar::store::load_state(&state_path)?;
+    let present_panes = topology
+        .panes
+        .iter()
+        .map(|pane| pane.pane_instance.clone())
+        .collect::<BTreeSet<_>>();
+    if sidebar_preferences.retain_panes(&present_panes) {
+        crate::sidebar::store::save_state(&state_path, &sidebar_preferences)?;
+    }
     let category_state_path =
         crate::category::store::state_path(env, &coordinator.incarnation.socket_path);
     let category_state = crate::category::store::load_state(&category_state_path)?;
@@ -5777,113 +5789,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn sidebar_set_unread_pin_mutates_canonical_state_without_changing_badge() {
-        let root = test_root("sidebar-unread-pin");
-        let coordinator = initialized_test_coordinator(
-            &root,
-            "7".repeat(64),
-            crate::daemon::view_hooks::CurrentClientViews::default(),
-        );
-        coordinator
-            .router
-            .lock()
-            .unwrap()
-            .set_phase(DaemonPhase::Serving);
-        let target = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 100,
-        };
-        let daemon_instance_id = coordinator
-            .router
-            .lock()
-            .unwrap()
-            .daemon_instance_id()
-            .clone();
-        let agent = crate::pane_state::AgentKind::parse("codex").unwrap();
-        let session = crate::pane_state::AgentSessionId::parse("session").unwrap();
-        let mut io = pane_snapshot_store(&coordinator);
-        {
-            let mut guard = coordinator.state.lock().unwrap();
-            let runtime = &mut guard.as_mut().unwrap().leased.runtime;
-            for event in [
-                PaneEvent::BeginRun {
-                    started_at: 1,
-                    prompt: None,
-                },
-                PaneEvent::CompleteRun { completed_at: 2 },
-            ] {
-                runtime
-                    .apply_event(
-                        &mut io,
-                        &PaneEventEnvelope {
-                            daemon_instance_id: daemon_instance_id.clone(),
-                            event_id: EventId::generate().unwrap(),
-                            pane_instance: target.clone(),
-                            agent: Some(agent.clone()),
-                            agent_session_id: Some(session.clone()),
-                            event,
-                        },
-                        &crate::pane_state::VisibilitySnapshot::default(),
-                    )
-                    .unwrap();
-            }
-        }
-        let (expected_state_id, expected_read_seq, badge_before) = {
-            let guard = coordinator.state.lock().unwrap();
-            let state = guard
-                .as_ref()
-                .unwrap()
-                .leased
-                .runtime
-                .record(&target)
-                .unwrap();
-            (
-                state.state_id.clone(),
-                state.unread.read_seq,
-                crate::pane_state::resolve_badge(state),
-            )
-        };
-
-        let response = apply_production_mutation(
-            &coordinator,
-            V2SequencedMutation {
-                accepted_seq: 1,
-                mutation: V2AcceptedMutation::External(ClientMessage::SidebarCommand {
-                    proto: PROTOCOL_VERSION,
-                    daemon_instance_id,
-                    event_id: EventId::generate().unwrap(),
-                    command: crate::daemon::protocol::v2::SidebarCommand::SetUnreadPin {
-                        pane_instance: target.clone(),
-                        expected_state_id,
-                        expected_read_seq,
-                        pinned: true,
-                    },
-                }),
-            },
-        );
-        assert!(matches!(
-            response,
-            ServerMessage::PaneEventResult {
-                outcome: crate::daemon::protocol::v2::PaneApplyOutcome::Committed,
-                ..
-            }
-        ));
-        let guard = coordinator.state.lock().unwrap();
-        let state = guard
-            .as_ref()
-            .unwrap()
-            .leased
-            .runtime
-            .record(&target)
-            .unwrap();
-        assert!(state.unread.pinned);
-        assert_eq!(crate::pane_state::resolve_badge(state), badge_before);
-        drop(guard);
-        drop(coordinator);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6642,6 +6547,110 @@ mod tests {
         assert_eq!(
             persisted.presentation_mode,
             crate::sidebar::state::PresentationMode::Flat
+        );
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pane_pin_persists_outside_canonical_state_and_prunes_with_topology() {
+        let root = test_root("sidebar-pane-pin");
+        let coordinator = initialized_test_coordinator(
+            &root,
+            "pane-pin",
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+        );
+        let target = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        {
+            let mut guard = coordinator.state.lock().unwrap();
+            let state = guard.as_mut().unwrap();
+            state
+                .replace_topology(crate::daemon::topology::TopologySnapshot {
+                    server_identity: coordinator.incarnation.identity.clone(),
+                    panes: vec![crate::daemon::topology::TopologyPane {
+                        pane_instance: target.clone(),
+                        session_links: Vec::new(),
+                        window_id: "@1".to_string(),
+                        window_name: "main".to_string(),
+                        current_path: "/tmp/app".to_string(),
+                        current_command: "codex".to_string(),
+                        pane_width: 80,
+                        active: false,
+                    }],
+                })
+                .unwrap();
+            let daemon_instance_id = coordinator
+                .router
+                .lock()
+                .unwrap()
+                .daemon_instance_id()
+                .clone();
+            state
+                .leased
+                .runtime
+                .apply_event(
+                    &mut pane_snapshot_store(&coordinator),
+                    &PaneEventEnvelope {
+                        daemon_instance_id,
+                        event_id: EventId::generate().unwrap(),
+                        pane_instance: target.clone(),
+                        agent: Some(crate::pane_state::AgentKind::parse("codex").unwrap()),
+                        agent_session_id: Some(
+                            crate::pane_state::AgentSessionId::parse("pin-session").unwrap(),
+                        ),
+                        event: PaneEvent::BeginRun {
+                            started_at: 1,
+                            prompt: None,
+                        },
+                    },
+                    &crate::pane_state::VisibilitySnapshot::default(),
+                )
+                .unwrap();
+        }
+
+        let response = apply_sidebar_preference_intent(
+            &coordinator,
+            1,
+            EventId::generate().unwrap(),
+            crate::sidebar::state::SidebarPreferenceIntent::SetPanePinned {
+                pane_instance: target.clone(),
+                pinned: true,
+            },
+        );
+        assert!(matches!(response, ServerMessage::SnapshotAck { .. }));
+        let state_path = crate::sidebar::store::state_path(
+            &coordinator.env,
+            &coordinator.incarnation.socket_path,
+        );
+        assert!(
+            crate::sidebar::store::load_state(&state_path)
+                .unwrap()
+                .pinned_panes
+                .contains(&target)
+        );
+        {
+            let mut guard = coordinator.state.lock().unwrap();
+            let state = guard.as_mut().unwrap();
+            assert!(state.sidebar_preferences.pinned_panes.contains(&target));
+            assert!(
+                serde_json::to_value(state.leased.runtime.record(&target).unwrap())
+                    .unwrap()["unread"]
+                    .get("pinned")
+                    .is_none()
+            );
+            state.topology.panes.clear();
+            assert!(persist_pruned_sidebar_pins(&coordinator, state).unwrap());
+            assert!(state.sidebar_preferences.pinned_panes.is_empty());
+        }
+        assert!(
+            crate::sidebar::store::load_state(&state_path)
+                .unwrap()
+                .pinned_panes
+                .is_empty()
         );
 
         drop(coordinator);

@@ -75,7 +75,7 @@ pub struct SidebarNavigation {
     pub manual_scroll: bool,
 }
 
-pub const SIDEBAR_PREFERENCES_SCHEMA_VERSION: u32 = 2;
+pub const SIDEBAR_PREFERENCES_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,6 +85,8 @@ pub struct SidebarPreferences {
     pub manual_order: Vec<RepoId>,
     #[serde(default)]
     pub manual_chat_order: Vec<String>,
+    #[serde(default)]
+    pub pinned_panes: BTreeSet<crate::pane_state::PaneInstance>,
     pub category_scope: CategoryScope,
     pub presentation_mode: PresentationMode,
     #[serde(default)]
@@ -99,6 +101,7 @@ impl Default for SidebarPreferences {
             schema_version: SIDEBAR_PREFERENCES_SCHEMA_VERSION,
             manual_order: Vec::new(),
             manual_chat_order: Vec::new(),
+            pinned_panes: BTreeSet::new(),
             category_scope: CategoryScope::default(),
             presentation_mode: PresentationMode::default(),
             filter: StatusFilter::default(),
@@ -131,6 +134,10 @@ pub enum SidebarPreferenceIntent {
         pane_id: String,
         neighbor_pane_id: String,
         direction: MoveDirection,
+    },
+    SetPanePinned {
+        pane_instance: crate::pane_state::PaneInstance,
+        pinned: bool,
     },
     SetDefaultCategoryScope {
         category_scope: CategoryScope,
@@ -284,6 +291,9 @@ impl SidebarPreferences {
         {
             return Err("sidebar expansion row ID must not be empty".to_string());
         }
+        for pane in &self.pinned_panes {
+            pane.validate().map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
@@ -326,6 +336,20 @@ impl SidebarPreferences {
                     *direction,
                 )
             }
+            SidebarPreferenceIntent::SetPanePinned {
+                pane_instance,
+                pinned,
+            } => {
+                let row_id = crate::sidebar::tree::chat_row_id(pane_instance);
+                if !known_rows.contains(&row_id) {
+                    return false;
+                }
+                if *pinned {
+                    self.pinned_panes.insert(pane_instance.clone())
+                } else {
+                    self.pinned_panes.remove(pane_instance)
+                }
+            }
             SidebarPreferenceIntent::SetDefaultCategoryScope { category_scope } => {
                 if self.category_scope == *category_scope {
                     return false;
@@ -364,6 +388,12 @@ impl SidebarPreferences {
                 true
             }
         }
+    }
+
+    pub fn retain_panes(&mut self, panes: &BTreeSet<crate::pane_state::PaneInstance>) -> bool {
+        let before = self.pinned_panes.len();
+        self.pinned_panes.retain(|pane| panes.contains(pane));
+        self.pinned_panes.len() != before
     }
 }
 
@@ -569,6 +599,7 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
 
         assert!(json.contains(r#""manual_order""#));
+        assert!(json.contains(r#""pinned_panes""#));
         assert!(json.contains(r#""category_scope":"all""#));
         assert!(json.contains(r#""presentation_mode":"tree""#));
         assert!(json.contains(r#""filter":"done_only""#));
@@ -755,6 +786,37 @@ mod tests {
             &known,
         ));
         assert_eq!(state.manual_chat_order, vec!["%2", "%1"]);
+    }
+
+    #[test]
+    fn pane_pin_intent_is_independent_and_prunes_absent_instances() {
+        let first = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 10,
+        };
+        let reused = crate::pane_state::PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 11,
+        };
+        let known = BTreeSet::from([crate::sidebar::tree::chat_row_id(&first)]);
+        let mut state = SidebarPreferences::default();
+        let pin = SidebarPreferenceIntent::SetPanePinned {
+            pane_instance: first.clone(),
+            pinned: true,
+        };
+
+        assert!(state.apply_intent(&pin, &known));
+        assert!(!state.apply_intent(&pin, &known));
+        assert!(state.pinned_panes.contains(&first));
+        assert!(!state.apply_intent(
+            &SidebarPreferenceIntent::SetPanePinned {
+                pane_instance: reused.clone(),
+                pinned: true,
+            },
+            &known,
+        ));
+        assert!(state.retain_panes(&BTreeSet::from([reused])));
+        assert!(state.pinned_panes.is_empty());
     }
 
     #[test]

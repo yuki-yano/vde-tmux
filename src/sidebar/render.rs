@@ -807,7 +807,7 @@ fn render_closed_chat_summary_line(
 
     let mut prefix = Vec::new();
     push_leading_marker_span(&mut prefix, row, selected, theme, &indent);
-    prefix.push(unread_pin_marker_span(row, state, theme));
+    prefix.push(pin_marker_span(row, state, theme));
     prefix.push(Span::styled("▸ ".to_string(), toggle_marker_style(theme)));
     prefix.push(Span::styled(
         format!("{glyph} "),
@@ -982,7 +982,7 @@ fn render_row_line(
     if row.kind == SidebarRowKind::Chat {
         let marker = if row.expanded { "▾" } else { "▸" };
         push_leading_marker_span(&mut spans, row, selected_marker, theme, &indent);
-        spans.push(unread_pin_marker_span(row, state, theme));
+        spans.push(pin_marker_span(row, state, theme));
         spans.push(Span::styled(
             format!("{marker} "),
             toggle_marker_style(theme),
@@ -1433,7 +1433,7 @@ fn render_chat_dense_line(
     let agent_cell = format!(" {agent:<7}");
     let origin_cell = format!(" {origin:<3} ");
     let prefix_after_glyph = format!("{agent_cell}{origin_cell}");
-    let show_pin_cell = state.presentation_mode == PresentationMode::Priority;
+    let show_pin_cell = state.presentation_mode == PresentationMode::Priority || row_pinned(row);
     let pin_width = usize::from(show_pin_cell);
     let right_width = display_width(&right);
     let right_reserved = if right_width > 0 { right_width + 1 } else { 0 };
@@ -1464,7 +1464,7 @@ fn render_chat_dense_line(
     }
     let mut spans = vec![row_leading_marker_span(row, selected, theme)];
     if show_pin_cell {
-        spans.push(unread_pin_marker_span(row, state, theme));
+        spans.push(pin_marker_span(row, state, theme));
     }
     spans.extend([
         Span::styled(
@@ -1526,7 +1526,7 @@ fn render_micro_lines(
         let right = right_label(row).unwrap_or_default();
         let selected = state.selection.as_deref() == Some(row.id.as_str());
         let marker = row_leading_marker_span(row, selected, theme);
-        let pinned = row_unread_pinned(row, state);
+        let pinned = row_pinned(row);
         let pin_width = usize::from(pinned);
         let text = if right.is_empty() {
             glyph.to_string()
@@ -1611,7 +1611,7 @@ fn render_rail_lines(
             style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
         }
         let glyph = row.badge_state.expect("rail rows must carry badge_state");
-        let pinned = row_unread_pinned(row, state);
+        let pinned = row_pinned(row);
         let visible_glyph = if pinned {
             "✦"
         } else {
@@ -1654,27 +1654,20 @@ fn row_flash(row: &SidebarRow) -> bool {
         .unwrap_or(false)
 }
 
-fn row_unread_pinned(row: &SidebarRow, state: &SidebarState) -> bool {
-    state.presentation_mode == PresentationMode::Priority
-        && row
-            .meta
-            .as_ref()
-            .is_some_and(|meta| meta.is_unread && meta.unread_pinned)
+fn row_pinned(row: &SidebarRow) -> bool {
+    row.meta.as_ref().is_some_and(|meta| meta.pinned)
 }
 
-fn unread_pin_marker_span(
+fn pin_marker_span(
     row: &SidebarRow,
     state: &SidebarState,
     theme: &SidebarRenderTheme,
 ) -> Span<'static> {
-    if state.presentation_mode != PresentationMode::Priority {
-        return Span::styled(" ".to_string(), Style::default().fg(theme.marker));
-    }
     match row.meta.as_ref() {
-        Some(meta) if meta.is_unread && meta.unread_pinned => {
+        Some(meta) if meta.pinned => {
             Span::styled("✦".to_string(), Style::default().fg(theme.toggle))
         }
-        Some(meta) if meta.is_unread => {
+        Some(meta) if state.presentation_mode == PresentationMode::Priority && meta.is_unread => {
             Span::styled("·".to_string(), Style::default().fg(theme.marker))
         }
         _ => Span::styled(" ".to_string(), Style::default().fg(theme.marker)),
@@ -2456,7 +2449,7 @@ mod tests {
     }
 
     #[test]
-    fn priority_unread_pin_markers_fit_every_width_tier() {
+    fn pane_pin_markers_fit_every_width_tier_and_view() {
         let mut pinned = chat_row(
             "chat::%1::100",
             "codex: pinned unread",
@@ -2466,7 +2459,7 @@ mod tests {
         pinned.expanded = false;
         pinned.meta = Some(crate::sidebar::tree::RowMeta {
             is_unread: true,
-            unread_pinned: true,
+            pinned: true,
             agent: Some("codex".to_string()),
             ..Default::default()
         });
@@ -2494,7 +2487,12 @@ mod tests {
         let styled = render_lines(std::slice::from_ref(&pinned), &priority, 40, &theme);
         assert_span_fg(&styled[0].spans, "✦", theme.toggle);
 
-        pinned.meta.as_mut().unwrap().unread_pinned = false;
+        priority.presentation_mode = PresentationMode::Flat;
+        let flat = render_rows(std::slice::from_ref(&pinned), &priority, 40);
+        assert!(flat.contains('✦'), "{flat:?}");
+
+        pinned.meta.as_mut().unwrap().pinned = false;
+        priority.presentation_mode = PresentationMode::Priority;
         let unpinned = render_rows(std::slice::from_ref(&pinned), &priority, 40);
         assert!(unpinned.contains('·'), "{unpinned:?}");
         assert!(!unpinned.contains('✦'), "{unpinned:?}");

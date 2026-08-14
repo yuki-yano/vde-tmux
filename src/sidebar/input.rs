@@ -25,7 +25,7 @@ pub enum SidebarInputAction {
     AgentNext,
     AgentPrevious,
     UnreadLatest,
-    ToggleUnreadPin,
+    TogglePanePin,
     ReorderUp,
     ReorderDown,
 }
@@ -60,7 +60,7 @@ pub fn parse_key(key: &str) -> Option<SidebarInputAction> {
         "agent-next" => Some(SidebarInputAction::AgentNext),
         "agent-prev" => Some(SidebarInputAction::AgentPrevious),
         "unread-latest" => Some(SidebarInputAction::UnreadLatest),
-        "p" | "pin-toggle" => Some(SidebarInputAction::ToggleUnreadPin),
+        "p" | "pin-toggle" => Some(SidebarInputAction::TogglePanePin),
         "J" => Some(SidebarInputAction::ReorderDown),
         "K" => Some(SidebarInputAction::ReorderUp),
         "1" => Some(SidebarInputAction::SetPresentationMode(
@@ -156,10 +156,10 @@ mod tests {
             parse_key("unread-latest"),
             Some(SidebarInputAction::UnreadLatest)
         );
-        assert_eq!(parse_key("p"), Some(SidebarInputAction::ToggleUnreadPin));
+        assert_eq!(parse_key("p"), Some(SidebarInputAction::TogglePanePin));
         assert_eq!(
             parse_key("pin-toggle"),
-            Some(SidebarInputAction::ToggleUnreadPin)
+            Some(SidebarInputAction::TogglePanePin)
         );
         assert_eq!(parse_key("h"), None);
         assert_eq!(parse_key("l"), None);

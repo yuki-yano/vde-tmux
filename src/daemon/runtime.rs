@@ -1360,7 +1360,6 @@ mod tests {
                             reason: crate::pane_state::UnreadReason::Waiting,
                             occurred_at: 1,
                         }),
-                        pinned: false,
                     },
                     started_at: Some(1),
                     completed_at: None,
@@ -2398,47 +2397,6 @@ mod tests {
                 .all(|category| category.category != "empty")
         );
         assert_eq!(snapshot.attention, status_resolved_snapshot().attention);
-    }
-
-    #[test]
-    fn priority_unread_pin_does_not_change_status_snapshot_or_attention() {
-        let mut resolved = status_resolved_snapshot();
-        let canonical = &mut resolved.panes[0].resolved.as_mut().unwrap().canonical;
-        canonical.unread = crate::pane_state::UnreadState {
-            occurrence_seq: 1,
-            read_seq: 0,
-            latest: Some(crate::pane_state::UnreadOccurrence {
-                seq: 1,
-                order: 1,
-                reason: crate::pane_state::UnreadReason::Waiting,
-                occurred_at: 2,
-            }),
-            pinned: false,
-        };
-        let before = build_status_snapshot(
-            &resolved,
-            StatusContext::Global,
-            &status_metadata(),
-            &status_config(),
-        );
-        let attention_before = resolved.attention.clone();
-
-        resolved.panes[0]
-            .resolved
-            .as_mut()
-            .unwrap()
-            .canonical
-            .unread
-            .pinned = true;
-        let after = build_status_snapshot(
-            &resolved,
-            StatusContext::Global,
-            &status_metadata(),
-            &status_config(),
-        );
-
-        assert_eq!(after, before);
-        assert_eq!(resolved.attention, attention_before);
     }
 
     #[test]

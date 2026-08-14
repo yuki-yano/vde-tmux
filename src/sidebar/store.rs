@@ -185,9 +185,9 @@ mod tests {
 
     #[test]
     fn state_json_rejects_unknown_fields_and_schema_versions() {
-        let unknown = r#"{"schema_version":2,"category_scope":"current","presentation_mode":"tree","filter":"all","unknown":true}"#;
+        let unknown = r#"{"schema_version":3,"category_scope":"current","presentation_mode":"tree","filter":"all","unknown":true}"#;
         let legacy = r#"{"schema_version":1,"manual_order":[],"manual_chat_order":[],"view_mode":"by_category","filter":"all","expansion_overrides":[]}"#;
-        let unsupported = r#"{"schema_version":3,"category_scope":"current","presentation_mode":"tree","filter":"all"}"#;
+        let unsupported = r#"{"schema_version":4,"category_scope":"current","presentation_mode":"tree","filter":"all"}"#;
 
         assert!(decode_state(unknown).is_err());
         assert!(decode_state(legacy).is_err());

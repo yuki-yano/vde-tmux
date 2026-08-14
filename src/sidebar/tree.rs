@@ -58,7 +58,7 @@ pub struct RowMeta {
     pub origin: Option<String>,
     pub flash: Option<bool>,
     pub is_unread: bool,
-    pub unread_pinned: bool,
+    pub pinned: bool,
     pub latest_unread_order: Option<u64>,
     pub latest_unread_reason: Option<crate::pane_state::UnreadReason>,
 }
@@ -116,7 +116,7 @@ struct AgentPane {
     flash: bool,
     active: bool,
     is_unread: bool,
-    unread_pinned: bool,
+    pinned: bool,
     latest_unread_order: Option<u64>,
     latest_unread_reason: Option<crate::pane_state::UnreadReason>,
 }
@@ -298,7 +298,7 @@ pub fn build_rows_from_presentations(
                     .iter()
                     .any(|link| ctx.active_sessions.contains(&link.session_id)),
                 is_unread: canonical.unread.is_unread(),
-                unread_pinned: canonical.unread.pinned,
+                pinned: order.pinned_panes.contains(&pane.pane_instance),
                 latest_unread_order: canonical
                     .unread
                     .latest_unread()
@@ -340,7 +340,7 @@ fn build_rows_from_groups(
     for panes in groups.values_mut() {
         let mut index = 0;
         while index < panes.len() {
-            if ctx.triage.contains(&panes[index].pane_instance) {
+            if ctx.triage.contains(&panes[index].pane_instance) && !panes[index].pinned {
                 triage_panes.push(panes.remove(index));
             } else {
                 index += 1;
@@ -358,6 +358,7 @@ fn build_rows_from_groups(
         PresentationMode::Flat => flat_rows(
             groups,
             state,
+            order,
             ctx.now,
             state.category_scope == CategoryScope::All,
         ),
@@ -436,12 +437,22 @@ fn category_rows(
 
     let mut rows = Vec::new();
     let mut categories = by_category.into_iter().collect::<Vec<_>>();
-    categories.sort_by_key(|(name, _)| {
-        ctx.categories
-            .categories
-            .iter()
-            .position(|category| category.name.as_str() == name)
-            .unwrap_or(usize::MAX)
+    categories.sort_by(|(left_name, left_repos), (right_name, right_repos)| {
+        let has_pin = |repos: &BTreeMap<String, Vec<AgentPane>>| {
+            repos.values().flatten().any(|pane| pane.pinned)
+        };
+        has_pin(right_repos)
+            .cmp(&has_pin(left_repos))
+            .then_with(|| {
+                let position = |name: &String| {
+                    ctx.categories
+                        .categories
+                        .iter()
+                        .position(|category| category.name.as_str() == name)
+                        .unwrap_or(usize::MAX)
+                };
+                position(left_name).cmp(&position(right_name))
+            })
     });
     for (category, repos) in categories {
         let category_id = format!("category::{category}");
@@ -471,6 +482,7 @@ fn category_rows(
             active,
             meta: Some(RowMeta {
                 attention_count: Some(attention_count),
+                pinned: all_panes.iter().any(|pane| pane.pinned),
                 ..RowMeta::default()
             }),
         });
@@ -520,6 +532,19 @@ fn merge_category_repository_rows(
     }
 
     let mut merged = Vec::new();
+    let mut index = 0;
+    while index < chunks.len() {
+        let pinned = chunks[index]
+            .1
+            .first()
+            .and_then(|row| row.meta.as_ref())
+            .is_some_and(|meta| meta.pinned);
+        if pinned {
+            merged.extend(chunks.remove(index).1);
+        } else {
+            index += 1;
+        }
+    }
     for repo in ctx
         .categories
         .ordered_repos(&ctx.category_state, &category_model.name)
@@ -629,12 +654,14 @@ fn repo_rows_from_keyed_map(
             pane_id: None,
             git: git.get(&first.repo_path).cloned(),
             active: panes.iter().any(|pane| pane.active),
-            meta: Some(
-                metas
+            meta: Some({
+                let mut meta = metas
                     .get(&(first.category.clone(), first.repo.clone()))
                     .cloned()
-                    .unwrap_or_else(|| group_meta(&panes)),
-            ),
+                    .unwrap_or_else(|| group_meta(&panes));
+                meta.pinned = panes.iter().any(|pane| pane.pinned);
+                meta
+            }),
         });
         if expanded {
             for pane in &panes {
@@ -706,18 +733,12 @@ fn priority_rows(
     let mut rows = Vec::new();
     let mut pinned = Vec::new();
     panes.retain(|pane| {
-        if pane.unread_pinned {
+        if pane.pinned {
             pinned.push(pane.clone());
             false
         } else {
             true
         }
-    });
-    pinned.sort_by(|left, right| {
-        right
-            .latest_unread_order
-            .cmp(&left.latest_unread_order)
-            .then_with(|| left.pane_instance.cmp(&right.pane_instance))
     });
     if !pinned.is_empty() {
         rows.push(SidebarRow {
@@ -813,11 +834,14 @@ fn push_priority_chat_row(
 fn flat_rows(
     groups: BTreeMap<(String, String), Vec<AgentPane>>,
     state: &SidebarState,
+    order: &SidebarPreferences,
     now: i64,
     show_origin: bool,
 ) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
-    for pane in groups.values().flat_map(|panes| panes.iter()) {
+    let mut panes = groups.into_values().flatten().collect::<Vec<_>>();
+    order_agent_panes(&mut panes, order);
+    for pane in &panes {
         push_chat_row(pane, 0, state, now, show_origin, &mut rows);
     }
     rows
@@ -1109,7 +1133,7 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
         origin: None,
         flash: pane.flash.then_some(true),
         is_unread: pane.is_unread,
-        unread_pinned: pane.unread_pinned,
+        pinned: pane.pinned,
         latest_unread_order: pane.latest_unread_order,
         latest_unread_reason: pane.latest_unread_reason,
     }
@@ -1123,6 +1147,7 @@ fn group_meta(panes: &[AgentPane]) -> RowMeta {
                 .filter(|pane| pane_matches_attention_filter(pane))
                 .count(),
         ),
+        pinned: panes.iter().any(|pane| pane.pinned),
         ..RowMeta::default()
     }
 }
@@ -1236,12 +1261,16 @@ fn order_repo_groups(
             .unwrap_or(usize::MAX)
     };
     groups.sort_by(|left, right| {
-        position(left).cmp(&position(right)).then_with(|| {
-            let left = left.first();
-            let right = right.first();
-            left.map(|pane| (&pane.category, &pane.repo))
-                .cmp(&right.map(|pane| (&pane.category, &pane.repo)))
-        })
+        let has_pin = |panes: &Vec<AgentPane>| panes.iter().any(|pane| pane.pinned);
+        has_pin(right)
+            .cmp(&has_pin(left))
+            .then_with(|| position(left).cmp(&position(right)))
+            .then_with(|| {
+                let left = left.first();
+                let right = right.first();
+                left.map(|pane| (&pane.category, &pane.repo))
+                    .cmp(&right.map(|pane| (&pane.category, &pane.repo)))
+            })
     });
 }
 
@@ -1268,8 +1297,17 @@ fn compare_agent_panes(
             .position(|pane_id| pane_id == &pane.pane_id)
             .unwrap_or(usize::MAX)
     };
-    chat_sort_bucket(left)
-        .cmp(&chat_sort_bucket(right))
+    right
+        .pinned
+        .cmp(&left.pinned)
+        .then_with(|| {
+            if left.pinned && right.pinned {
+                manual_position(left).cmp(&manual_position(right))
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .then_with(|| chat_sort_bucket(left).cmp(&chat_sort_bucket(right)))
         .then_with(|| Reverse(chat_sort_time(left)).cmp(&Reverse(chat_sort_time(right))))
         .then_with(|| manual_position(left).cmp(&manual_position(right)))
         .then_with(|| left.pane_id.cmp(&right.pane_id))
@@ -1373,7 +1411,7 @@ mod tests {
             flash: false,
             active: false,
             is_unread: false,
-            unread_pinned: false,
+            pinned: false,
             latest_unread_order: None,
             latest_unread_reason: None,
         }
@@ -2032,7 +2070,7 @@ mod tests {
     }
 
     #[test]
-    fn priority_extracts_filtered_pins_and_orders_them_by_latest_unread() {
+    fn priority_extracts_filtered_pins_independent_of_unread_state() {
         let mut newest = agent_pane(BadgeState::Working, "");
         newest.pane_instance = PaneInstance {
             pane_id: "%2".to_string(),
@@ -2040,7 +2078,7 @@ mod tests {
         };
         newest.pane_id = "%2".to_string();
         newest.is_unread = true;
-        newest.unread_pinned = true;
+        newest.pinned = true;
         newest.latest_unread_order = Some(20);
         newest.latest_unread_reason = Some(crate::pane_state::UnreadReason::Waiting);
 
@@ -2057,8 +2095,8 @@ mod tests {
             pane_pid: 1,
         };
         older.pane_id = "%1".to_string();
-        older.is_unread = true;
-        older.unread_pinned = true;
+        older.is_unread = false;
+        older.pinned = true;
         older.latest_unread_order = Some(10);
         older.latest_unread_reason = Some(crate::pane_state::UnreadReason::Completed);
 
@@ -2118,6 +2156,179 @@ mod tests {
             vec!["%1"]
         );
         assert_eq!(counts.total, 3, "header count is filter-independent");
+    }
+
+    #[test]
+    fn flat_places_pinned_agents_first_across_repositories() {
+        let mut regular = agent_pane(BadgeState::Blocked, "");
+        regular.pane_id = "%1".to_string();
+        regular.pane_instance = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 1,
+        };
+        regular.repo = "alpha".to_string();
+        regular.repo_key = crate::category::RepoKey::path("/alpha");
+
+        let mut pinned = agent_pane(BadgeState::Idle, "");
+        pinned.pane_id = "%2".to_string();
+        pinned.pane_instance = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 2,
+        };
+        pinned.repo = "zeta".to_string();
+        pinned.repo_key = crate::category::RepoKey::path("/zeta");
+        pinned.pinned = true;
+
+        let groups = BTreeMap::from([
+            (("misc".to_string(), "alpha".to_string()), vec![regular]),
+            (("misc".to_string(), "zeta".to_string()), vec![pinned]),
+        ]);
+        let state = SidebarState {
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Flat,
+            ..SidebarState::default()
+        };
+        let (rows, _) = build_rows_from_groups(
+            groups,
+            &state,
+            &SidebarPreferences::default(),
+            &RowBuildContext::default(),
+        );
+
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Chat)
+                .map(|row| row.pane_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["%2", "%1"]
+        );
+    }
+
+    #[test]
+    fn current_tree_promotes_pinned_repository_and_agent_without_triage_extraction() {
+        let mut regular_repo = agent_pane(BadgeState::Working, "");
+        regular_repo.pane_id = "%1".to_string();
+        regular_repo.pane_instance = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 1,
+        };
+        regular_repo.repo = "alpha".to_string();
+        regular_repo.repo_key = crate::category::RepoKey::path("/alpha");
+
+        let mut pinned = agent_pane(BadgeState::Blocked, "");
+        pinned.pane_id = "%2".to_string();
+        pinned.pane_instance = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 2,
+        };
+        pinned.repo = "zeta".to_string();
+        pinned.repo_key = crate::category::RepoKey::path("/zeta");
+        pinned.pinned = true;
+
+        let mut sibling = agent_pane(BadgeState::Working, "");
+        sibling.pane_id = "%3".to_string();
+        sibling.pane_instance = PaneInstance {
+            pane_id: "%3".to_string(),
+            pane_pid: 3,
+        };
+        sibling.repo = "zeta".to_string();
+        sibling.repo_key = crate::category::RepoKey::path("/zeta");
+
+        let groups = BTreeMap::from([
+            (
+                ("misc".to_string(), "alpha".to_string()),
+                vec![regular_repo],
+            ),
+            (
+                ("misc".to_string(), "zeta".to_string()),
+                vec![sibling, pinned.clone()],
+            ),
+        ]);
+        let state = SidebarState {
+            category_scope: CategoryScope::Current,
+            presentation_mode: PresentationMode::Tree,
+            current_category: Some("misc".to_string()),
+            ..SidebarState::default()
+        };
+        let context = RowBuildContext {
+            triage: BTreeSet::from([pinned.pane_instance]),
+            ..RowBuildContext::default()
+        };
+        let (rows, _) =
+            build_rows_from_groups(groups, &state, &SidebarPreferences::default(), &context);
+
+        assert!(!rows.iter().any(|row| row.id == "zone::triage"));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Repo)
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zeta", "alpha"]
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Chat)
+                .map(|row| row.pane_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["%2", "%3", "%1"]
+        );
+    }
+
+    #[test]
+    fn all_tree_promotes_pinned_category_then_repository() {
+        let make = |pane_id: &str, pid, category: &str, repo: &str, pinned| {
+            let mut pane = agent_pane(BadgeState::Idle, "");
+            pane.pane_id = pane_id.to_string();
+            pane.pane_instance = PaneInstance {
+                pane_id: pane_id.to_string(),
+                pane_pid: pid,
+            };
+            pane.category = category.to_string();
+            pane.repo = repo.to_string();
+            pane.repo_key = crate::category::RepoKey::path(format!("/{category}/{repo}"));
+            pane.pinned = pinned;
+            pane
+        };
+        let groups = BTreeMap::from([
+            (
+                ("alpha".to_string(), "first".to_string()),
+                vec![make("%1", 1, "alpha", "first", false)],
+            ),
+            (
+                ("zeta".to_string(), "alpha".to_string()),
+                vec![make("%2", 2, "zeta", "alpha", false)],
+            ),
+            (
+                ("zeta".to_string(), "zeta".to_string()),
+                vec![make("%3", 3, "zeta", "zeta", true)],
+            ),
+        ]);
+        let state = SidebarState {
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Tree,
+            ..SidebarState::default()
+        };
+        let (rows, _) = build_rows_from_groups(
+            groups,
+            &state,
+            &SidebarPreferences::default(),
+            &RowBuildContext::default(),
+        );
+
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Category)
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zeta", "alpha"]
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Repo)
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zeta", "alpha", "first"]
+        );
     }
 
     #[test]

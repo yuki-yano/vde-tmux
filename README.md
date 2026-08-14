@@ -202,9 +202,11 @@ The sidebar opens in the current tmux window with two independent view axes. `Cu
 rows to the category of that sidebar's source session, while `All` spans every category. `Tree`
 groups Current as Repository→Agent and All as Category→Repository→Agent. `Priority` groups the
 selected scope as Pinned, Needs Input, Unread Done, Running, then Idle. `Flat` removes grouping.
-Press `p` on an unread agent in Priority to toggle its shared unread-span pin. Pinned agents move to
-the first `PINNED` zone without changing their unread order, badge, or notification state. Viewing
-the exact pane still marks it read and clears the pin.
+Press `p` on any agent to toggle its persistent pane pin without changing unread, badge, or
+notification state. `Priority` places pinned agents in the first `PINNED` zone, `Flat` places them
+first, and `Tree` promotes their enclosing Category and Repository while keeping the hierarchy.
+Pinned agents remain pinned when they become read or their lifecycle changes, and stale pins are
+removed when the pane disappears.
 The Needs action filter and red triangle match only Blocked agents waiting for user input.
 Unread Done agents remain separate under the Done filter. `unread-latest` navigation also includes
 unread Blocked occurrences.
@@ -233,7 +235,7 @@ vt sidebar close
 | `1` / `2` / `3` | Select Tree / Priority / Flat presentation |
 | `Tab` / `Shift+Tab` | Cycle the state filter |
 | `n` / `N` | Move to the next or previous Blocked agent waiting for user input |
-| `p` | Pin or unpin the selected unread agent in Priority |
+| `p` | Pin or unpin the selected agent |
 | `d` | Mark the selected run as complete |
 | `J` / `K` | Change manual ordering |
 | `q` / `Esc` | Close the sidebar |
@@ -437,10 +439,10 @@ Use `disable` when the daemon must remain stopped.
 ### Pane-state persistence
 
 The daemon stores one private full-state snapshot per tmux server incarnation under
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v5.json`. A daemon restart restores the
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v6.json`. A daemon restart restores the
 prompt, task progress and items, subagents, worktree activity, lifecycle, timestamps, agent
 identity, task context and generated summaries, the latest response preview, explicitly reported
-background processes, listening ports, unread-span pins, and Done/acknowledgement state for panes
+background processes, listening ports, and Done/acknowledgement state for panes
 whose pane ID and PID still match.
 
 If this snapshot is corrupt or insecure, daemon startup stops instead of repairing it or falling

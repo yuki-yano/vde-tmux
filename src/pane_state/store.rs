@@ -745,7 +745,6 @@ fn transition_at_epoch(event: &PaneEvent, current: Option<&PaneState>) -> i64 {
         | PaneEvent::MarkDone { completed_at, .. } => *completed_at,
         PaneEvent::ExplicitStateReported { report } => report.observed_at,
         PaneEvent::MarkPaneRead { .. }
-        | PaneEvent::SetUnreadPin { .. }
         | PaneEvent::TaskSummaryGenerated { .. }
         | PaneEvent::PaneRemoved { .. } => current
             .and_then(|state| state.completed_at.or(state.started_at))
@@ -982,61 +981,6 @@ mod tests {
                 .order,
             2
         );
-    }
-
-    #[test]
-    fn unread_pin_persists_once_is_idempotent_and_hydrates() {
-        let target = pane(1);
-        let mut runtime = CanonicalStateRuntime::default();
-        let mut io = RecordingStore::default();
-        apply(
-            &mut runtime,
-            &mut io,
-            target.clone(),
-            PaneEvent::WaitRequested {
-                observed_at: 10,
-                reason: WaitReason::PermissionPrompt,
-            },
-        )
-        .unwrap();
-        let state = runtime.record(&target).unwrap();
-        let expected_state_id = state.state_id.clone();
-        let expected_read_seq = state.unread.read_seq;
-
-        io.saves = 0;
-        let pinned = apply(
-            &mut runtime,
-            &mut io,
-            target.clone(),
-            PaneEvent::SetUnreadPin {
-                expected_state_id: expected_state_id.clone(),
-                expected_read_seq,
-                pinned: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(pinned.outcome, ReductionOutcome::CanonicalChanged);
-        assert_eq!(io.saves, 1);
-        assert!(runtime.record(&target).unwrap().unread.pinned);
-        let pinned_revision = runtime.snapshot_revision();
-
-        let duplicate = apply(
-            &mut runtime,
-            &mut io,
-            target.clone(),
-            PaneEvent::SetUnreadPin {
-                expected_state_id,
-                expected_read_seq,
-                pinned: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(duplicate.outcome, ReductionOutcome::Noop);
-        assert_eq!(io.saves, 1);
-        assert_eq!(runtime.snapshot_revision(), pinned_revision);
-
-        let restarted = CanonicalStateRuntime::hydrate(runtime.records_snapshot()).unwrap();
-        assert!(restarted.record(&target).unwrap().unread.pinned);
     }
 
     #[test]

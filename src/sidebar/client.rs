@@ -68,28 +68,6 @@ pub fn send_sidebar_mark_complete_v2(
     Ok(())
 }
 
-pub fn send_sidebar_set_unread_pin_v2(
-    socket: &Path,
-    server_identity: &str,
-    pane_instance: PaneInstance,
-    expected_state_id: crate::pane_state::StateId,
-    expected_read_seq: u64,
-    pinned: bool,
-) -> Result<()> {
-    request_v2_sidebar(
-        socket,
-        server_identity,
-        V2SidebarCommand::SetUnreadPin {
-            pane_instance,
-            expected_state_id,
-            expected_read_seq,
-            pinned,
-        },
-        V2SidebarResponse::PaneEventResult,
-    )?;
-    Ok(())
-}
-
 pub fn send_sidebar_preference_intent_v2(
     socket: &Path,
     server_identity: &str,
@@ -978,14 +956,14 @@ mod tests {
                 },
                 expected: expected_version.clone(),
             },
-            V2SidebarCommand::SetUnreadPin {
-                pane_instance: PaneInstance {
-                    pane_id: "%3".to_string(),
-                    pane_pid: 303,
+            V2SidebarCommand::PreferenceIntent {
+                intent: crate::sidebar::state::SidebarPreferenceIntent::SetPanePinned {
+                    pane_instance: PaneInstance {
+                        pane_id: "%3".to_string(),
+                        pane_pid: 303,
+                    },
+                    pinned: true,
                 },
-                expected_state_id: expected_version.state_id.clone(),
-                expected_read_seq: 6,
-                pinned: true,
             },
             V2SidebarCommand::PreferenceIntent {
                 intent: crate::sidebar::state::SidebarPreferenceIntent::MoveRepo {
@@ -1029,10 +1007,7 @@ mod tests {
                 };
                 assert_eq!(daemon_instance_id, self::daemon_instance_id());
                 assert_eq!(command, expected);
-                let response = if matches!(
-                    command,
-                    V2SidebarCommand::MarkComplete { .. } | V2SidebarCommand::SetUnreadPin { .. }
-                ) {
+                let response = if matches!(command, V2SidebarCommand::MarkComplete { .. }) {
                     V2ServerMessage::PaneEventResult {
                         event_id,
                         accepted_seq: 1,
@@ -1074,16 +1049,16 @@ mod tests {
             expected_version.clone(),
         )
         .unwrap();
-        send_sidebar_set_unread_pin_v2(
+        send_sidebar_preference_intent_v2(
             &socket,
             "scratch",
-            PaneInstance {
-                pane_id: "%3".to_string(),
-                pane_pid: 303,
+            crate::sidebar::state::SidebarPreferenceIntent::SetPanePinned {
+                pane_instance: PaneInstance {
+                    pane_id: "%3".to_string(),
+                    pane_pid: 303,
+                },
+                pinned: true,
             },
-            expected_version.state_id,
-            6,
-            true,
         )
         .unwrap();
         send_sidebar_preference_intent_v2(

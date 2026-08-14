@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{PaneInstance, PaneState, StoreError};
 
-pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 5;
-pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v5.json";
+pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 6;
+pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v6.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -291,7 +291,6 @@ mod tests {
                     reason: super::super::UnreadReason::Waiting,
                     occurred_at: 10,
                 }),
-                pinned: false,
             },
             started_at: Some(10),
             completed_at: Some(9),
@@ -331,21 +330,6 @@ mod tests {
             background_process: None,
             listening_ports: Vec::new(),
         }
-    }
-
-    #[test]
-    fn snapshot_rejects_a_pin_without_an_active_unread_span() {
-        let mut invalid = state(1);
-        invalid.unread.read_seq = invalid.unread.occurrence_seq;
-        invalid.unread.pinned = true;
-        let records = BTreeMap::from([(invalid.pane_instance.clone(), invalid)]);
-
-        let error = encode_snapshot(&identity(), &records).unwrap_err();
-
-        assert!(
-            error.to_string().contains("cannot remain pinned"),
-            "{error}"
-        );
     }
 
     fn private_root(name: &str) -> PathBuf {

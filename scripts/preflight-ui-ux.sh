@@ -756,7 +756,7 @@ preferences = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sideba
 assert preferences["category_scope"] == "current", preferences
 assert preferences["presentation_mode"] == "flat", preferences
 assert preferences["filter"] == "done_only", preferences
-assert preferences["schema_version"] == 2, preferences
+assert preferences["schema_version"] == 3, preferences
 PY
 record sidebar-state PASS-navigation-view-filter-shared-and-defaults-persisted
 
@@ -796,9 +796,11 @@ for _ in $(seq 1 60); do
   if python3 - "$QUERY_JSON" "$S1_PEER" 2>/dev/null <<'PY'
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
-pane = next(p for p in reply["snapshot"]["panes"] if p["pane_instance"]["pane_id"] == sys.argv[2])
-canonical = pane["resolved"]["canonical"]
-assert canonical["unread"]["pinned"] is True, canonical["unread"]
+target = next(p["pane_instance"] for p in reply["snapshot"]["panes"]
+              if p["pane_instance"]["pane_id"] == sys.argv[2])
+preferences = reply["snapshot"]["sidebar_model"]["preferences"]
+assert target in preferences["pinned_panes"], preferences
+pane = next(p for p in reply["snapshot"]["panes"] if p["pane_instance"] == target)
 assert pane["resolved"]["badge"] == "Done", pane["resolved"]
 PY
   then break; fi
@@ -827,8 +829,10 @@ query_snapshot
 python3 - "$QUERY_JSON" "$S1_PEER" <<'PY'
 import json, sys
 reply = json.load(open(sys.argv[1], encoding="utf-8"))
-pane = next(p for p in reply["snapshot"]["panes"] if p["pane_instance"]["pane_id"] == sys.argv[2])
-assert pane["resolved"]["canonical"]["unread"]["pinned"] is False, pane
+target = next(p["pane_instance"] for p in reply["snapshot"]["panes"]
+              if p["pane_instance"]["pane_id"] == sys.argv[2])
+preferences = reply["snapshot"]["sidebar_model"]["preferences"]
+assert target in preferences["pinned_panes"], preferences
 PY
 
 tmux_cmd switch-client -c "$CLIENT_1" -t "$S1_WINDOW"

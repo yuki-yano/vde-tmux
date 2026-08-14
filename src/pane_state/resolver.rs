@@ -56,7 +56,6 @@ mod tests {
                         reason: UnreadReason::Completed,
                         occurred_at: 2,
                     }),
-                    pinned: false,
                 }
             },
             started_at: (run > 0).then_some(1),

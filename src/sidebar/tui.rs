@@ -1519,34 +1519,17 @@ mod local_state_tests {
     }
 
     #[test]
-    fn unread_pin_requires_priority_unread_chat_and_queues_span_guard() {
+    fn pane_pin_accepts_read_chat_in_any_view_and_toggles_persisted_state() {
         let target = PaneInstance {
             pane_id: "%7".to_string(),
             pane_pid: 70,
         };
-        let mut presentation = resolved_pane("%7", 70, "$1");
-        let resolved = presentation.resolved.as_mut().unwrap();
-        resolved.canonical.lifecycle = crate::pane_state::LifecycleState::Waiting {
-            reason: crate::pane_state::WaitReason::PermissionPrompt,
-        };
-        resolved.canonical.unread = crate::pane_state::UnreadState {
-            occurrence_seq: 1,
-            read_seq: 0,
-            latest: Some(crate::pane_state::UnreadOccurrence {
-                seq: 1,
-                order: 4,
-                reason: crate::pane_state::UnreadReason::Waiting,
-                occurred_at: 2,
-            }),
-            pinned: false,
-        };
-        resolved.badge = BadgeState::Blocked;
-        let expected_state_id = resolved.canonical.state_id.clone();
+        let presentation = resolved_pane("%7", 70, "$1");
         let mut snapshot = snapshot(70);
         snapshot.panes = vec![presentation];
         let state = SidebarState {
             category_scope: CategoryScope::All,
-            presentation_mode: PresentationMode::Priority,
+            presentation_mode: PresentationMode::Flat,
             selection: Some(chat_row_id(&target)),
             ..SidebarState::default()
         };
@@ -1560,42 +1543,36 @@ mod local_state_tests {
         let (tx, rx) = mpsc::channel();
         let mut ui = MarkCompleteUi::default();
 
-        queue_unread_pin_for_selection(&snapshot, &sidebar, &tx, &mut ui);
+        queue_pane_pin_for_selection(&snapshot, &sidebar, &tx, &mut ui);
 
         assert_eq!(
             rx.try_recv().unwrap(),
-            UnreadPinRequest {
+            PanePinRequest {
                 pane_instance: target.clone(),
-                expected_state_id,
-                expected_read_seq: 0,
                 pinned: true,
             }
         );
         assert!(ui.pin_pending.contains(&target));
 
-        let mut flat = sidebar.clone();
-        flat.state.presentation_mode = PresentationMode::Flat;
-        let mut flat_ui = MarkCompleteUi::default();
-        queue_unread_pin_for_selection(&snapshot, &flat, &tx, &mut flat_ui);
+        snapshot
+            .sidebar_model
+            .preferences
+            .pinned_panes
+            .insert(target.clone());
+        let sidebar = project_view(&snapshot, &Config::default(), &state);
+        let mut unpin_ui = MarkCompleteUi::default();
+        queue_pane_pin_for_selection(&snapshot, &sidebar, &tx, &mut unpin_ui);
         assert_eq!(
-            flat_ui.notice().unwrap().message,
-            "pin is available in Priority view"
+            rx.try_recv().unwrap(),
+            PanePinRequest {
+                pane_instance: target,
+                pinned: false,
+            }
         );
-
-        let canonical = &mut snapshot.panes[0].resolved.as_mut().unwrap().canonical;
-        canonical.unread.read_seq = canonical.unread.occurrence_seq;
-        canonical.unread.pinned = false;
-        let mut read_ui = MarkCompleteUi::default();
-        queue_unread_pin_for_selection(&snapshot, &sidebar, &tx, &mut read_ui);
-        assert_eq!(
-            read_ui.notice().unwrap().message,
-            "selected pane is already read"
-        );
-        assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn unread_pin_results_report_success_and_stale_span() {
+    fn pane_pin_results_report_success_and_failure() {
         let target = PaneInstance {
             pane_id: "%7".to_string(),
             pane_pid: 70,
@@ -1603,27 +1580,27 @@ mod local_state_tests {
         let (tx, rx) = mpsc::channel();
         let mut ui = MarkCompleteUi::default();
         ui.pin_pending.insert(target.clone());
-        tx.send(UnreadPinResult {
+        tx.send(PanePinResult {
             pane_instance: target.clone(),
             pinned: true,
             result: Ok(()),
         })
         .unwrap();
-        assert!(drain_unread_pin_results(&rx, &mut ui));
-        assert_eq!(ui.notice().unwrap().message, "pinned unread pane");
+        assert!(drain_pane_pin_results(&rx, &mut ui));
+        assert_eq!(ui.notice().unwrap().message, "pinned pane");
         assert!(!ui.pin_pending.contains(&target));
 
         ui.pin_pending.insert(target.clone());
-        tx.send(UnreadPinResult {
+        tx.send(PanePinResult {
             pane_instance: target.clone(),
             pinned: false,
-            result: Err(anyhow::anyhow!("StaleSelection: unread span changed")),
+            result: Err(anyhow::anyhow!("persistence unavailable")),
         })
         .unwrap();
-        assert!(drain_unread_pin_results(&rx, &mut ui));
+        assert!(drain_pane_pin_results(&rx, &mut ui));
         assert_eq!(
             ui.notice().unwrap().message,
-            "unread span changed; retry pin"
+            "pin failed: persistence unavailable"
         );
         assert!(!ui.pin_pending.contains(&target));
     }
@@ -1865,14 +1842,12 @@ struct MarkCompleteResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UnreadPinRequest {
+struct PanePinRequest {
     pane_instance: PaneInstance,
-    expected_state_id: crate::pane_state::StateId,
-    expected_read_seq: u64,
     pinned: bool,
 }
 
-struct UnreadPinResult {
+struct PanePinResult {
     pane_instance: PaneInstance,
     pinned: bool,
     result: Result<()>,
@@ -1998,7 +1973,7 @@ impl MarkCompleteUi {
             })
             .or_else(|| {
                 (!self.pin_pending.is_empty()).then_some(Notice {
-                    message: "updating unread pin...",
+                    message: "updating pin...",
                     level: NoticeLevel::Progress,
                 })
             })
@@ -2328,26 +2303,26 @@ fn spawn_mark_complete_worker(
     });
 }
 
-fn spawn_unread_pin_worker(
+fn spawn_pane_pin_worker(
     socket: PathBuf,
     server_identity: String,
-    rx: mpsc::Receiver<UnreadPinRequest>,
-    tx: mpsc::Sender<UnreadPinResult>,
+    rx: mpsc::Receiver<PanePinRequest>,
+    tx: mpsc::Sender<PanePinResult>,
 ) {
     std::thread::spawn(move || {
         while let Ok(request) = rx.recv() {
             let pane_instance = request.pane_instance.clone();
             let pinned = request.pinned;
-            let result = crate::sidebar::client::send_sidebar_set_unread_pin_v2(
+            let result = crate::sidebar::client::send_sidebar_preference_intent_v2(
                 &socket,
                 &server_identity,
-                request.pane_instance,
-                request.expected_state_id,
-                request.expected_read_seq,
-                pinned,
+                SidebarPreferenceIntent::SetPanePinned {
+                    pane_instance: request.pane_instance,
+                    pinned,
+                },
             );
             if tx
-                .send(UnreadPinResult {
+                .send(PanePinResult {
                     pane_instance,
                     pinned,
                     result,
@@ -2672,29 +2647,24 @@ fn drain_mark_complete_results(
     changed
 }
 
-fn drain_unread_pin_results(rx: &mpsc::Receiver<UnreadPinResult>, ui: &mut MarkCompleteUi) -> bool {
+fn drain_pane_pin_results(rx: &mpsc::Receiver<PanePinResult>, ui: &mut MarkCompleteUi) -> bool {
     let mut changed = false;
     while let Ok(result) = rx.try_recv() {
         changed = true;
         ui.pin_pending.remove(&result.pane_instance);
         let (message, level, duration) = match result.result {
             Ok(()) if result.pinned => (
-                "pinned unread pane".to_string(),
+                "pinned pane".to_string(),
                 NoticeLevel::Success,
                 Duration::from_secs(3),
             ),
             Ok(()) => (
-                "unpinned unread pane".to_string(),
+                "unpinned pane".to_string(),
                 NoticeLevel::Success,
                 Duration::from_secs(3),
             ),
-            Err(error) if error.to_string().to_ascii_lowercase().contains("stale") => (
-                "unread span changed; retry pin".to_string(),
-                NoticeLevel::Warning,
-                Duration::from_secs(5),
-            ),
             Err(error) => (
-                format!("unread pin failed: {error}"),
+                format!("pin failed: {error}"),
                 NoticeLevel::Failure,
                 Duration::from_secs(5),
             ),
@@ -2754,7 +2724,7 @@ fn run_loop<B: Backend>(
     );
     let (pin_request_tx, pin_request_rx) = mpsc::channel();
     let (pin_result_tx, pin_result_rx) = mpsc::channel();
-    spawn_unread_pin_worker(
+    spawn_pane_pin_worker(
         socket.to_path_buf(),
         server_identity.to_string(),
         pin_request_rx,
@@ -2867,7 +2837,7 @@ fn run_loop<B: Backend>(
             render_gate.mark_dirty_if(clear_stale_pane_selection(snapshot, &mut sidebar_state));
         }
         render_gate.mark_dirty_if(drain_mark_complete_results(&mark_result_rx, &mut mark_ui));
-        render_gate.mark_dirty_if(drain_unread_pin_results(&pin_result_rx, &mut mark_ui));
+        render_gate.mark_dirty_if(drain_pane_pin_results(&pin_result_rx, &mut mark_ui));
         while let Ok(result) = preference_result_rx.try_recv() {
             render_gate.mark_dirty();
             if let Err(error) = result.result {
@@ -3201,7 +3171,7 @@ fn run_loop<B: Backend>(
                         pending_g = false;
                         if let Some(snapshot) = &current {
                             let sidebar = project_view(snapshot, config.app, &sidebar_state);
-                            queue_unread_pin_for_selection(
+                            queue_pane_pin_for_selection(
                                 snapshot,
                                 &sidebar,
                                 &pin_request_tx,
@@ -3699,7 +3669,7 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
         | SidebarInputAction::AgentNext
         | SidebarInputAction::AgentPrevious
         | SidebarInputAction::UnreadLatest
-        | SidebarInputAction::ToggleUnreadPin
+        | SidebarInputAction::TogglePanePin
         | SidebarInputAction::ReorderUp
         | SidebarInputAction::ReorderDown => {}
     }
@@ -3973,7 +3943,7 @@ fn drain_control_messages(
     state: &mut SidebarState,
     preference_tx: &mpsc::Sender<PreferenceIntentRequest>,
     category_tx: &mpsc::Sender<CategoryIntentRequest>,
-    pin_tx: &mpsc::Sender<UnreadPinRequest>,
+    pin_tx: &mpsc::Sender<PanePinRequest>,
     ui: &mut MarkCompleteUi,
     context: ControlMessageContext<'_>,
 ) -> Result<bool> {
@@ -4004,7 +3974,7 @@ fn drain_control_messages(
                         Some(crate::sidebar::input::SidebarInputAction::AgentNext)
                         | Some(crate::sidebar::input::SidebarInputAction::AgentPrevious)
                         | Some(crate::sidebar::input::SidebarInputAction::UnreadLatest)
-                        | Some(crate::sidebar::input::SidebarInputAction::ToggleUnreadPin)
+                        | Some(crate::sidebar::input::SidebarInputAction::TogglePanePin)
                             if !daemon_connected =>
                         {
                             ui.set_toast(
@@ -4053,8 +4023,8 @@ fn drain_control_messages(
                                 ui,
                             );
                         }
-                        Some(crate::sidebar::input::SidebarInputAction::ToggleUnreadPin) => {
-                            queue_unread_pin_for_selection(snapshot, &sidebar, pin_tx, ui);
+                        Some(crate::sidebar::input::SidebarInputAction::TogglePanePin) => {
+                            queue_pane_pin_for_selection(snapshot, &sidebar, pin_tx, ui);
                         }
                         Some(crate::sidebar::input::SidebarInputAction::MoveFirst) => {
                             move_viewport_selection(
@@ -4118,7 +4088,7 @@ fn drain_control_messages(
                     Some(crate::sidebar::input::SidebarInputAction::AgentNext)
                         | Some(crate::sidebar::input::SidebarInputAction::AgentPrevious)
                         | Some(crate::sidebar::input::SidebarInputAction::UnreadLatest)
-                        | Some(crate::sidebar::input::SidebarInputAction::ToggleUnreadPin)
+                        | Some(crate::sidebar::input::SidebarInputAction::TogglePanePin)
                 ) {
                     ui.set_toast(
                         "jump unavailable before the first snapshot".to_string(),
@@ -4843,23 +4813,15 @@ fn pane_for_selection(sidebar: &SidebarView) -> Option<PaneInstance> {
     }
 }
 
-fn queue_unread_pin_for_selection(
+fn queue_pane_pin_for_selection(
     snapshot: &ResolvedSnapshot,
     sidebar: &SidebarView,
-    tx: &mpsc::Sender<UnreadPinRequest>,
+    tx: &mpsc::Sender<PanePinRequest>,
     ui: &mut MarkCompleteUi,
 ) {
-    if sidebar.state.presentation_mode != PresentationMode::Priority {
-        ui.set_toast(
-            "pin is available in Priority view".to_string(),
-            NoticeLevel::Warning,
-            Duration::from_secs(4),
-        );
-        return;
-    }
     let Some(selection) = sidebar.state.selection.as_deref() else {
         ui.set_toast(
-            "select an unread pane to pin".to_string(),
+            "select a pane to pin".to_string(),
             NoticeLevel::Warning,
             Duration::from_secs(4),
         );
@@ -4871,7 +4833,7 @@ fn queue_unread_pin_for_selection(
         .find(|row| row.id == selection && row.kind == SidebarRowKind::Chat)
     else {
         ui.set_toast(
-            "select an unread pane to pin".to_string(),
+            "select a pane to pin".to_string(),
             NoticeLevel::Warning,
             Duration::from_secs(4),
         );
@@ -4885,23 +4847,13 @@ fn queue_unread_pin_for_selection(
         );
         return;
     };
-    let Some(canonical) = snapshot
+    if !snapshot
         .panes
         .iter()
-        .find(|pane| pane.pane_instance == pane_instance)
-        .and_then(|pane| pane.resolved.as_ref())
-        .map(|resolved| &resolved.canonical)
-    else {
+        .any(|pane| pane.pane_instance == pane_instance && pane.resolved.is_some())
+    {
         ui.set_toast(
             "selected pane is stale".to_string(),
-            NoticeLevel::Warning,
-            Duration::from_secs(4),
-        );
-        return;
-    };
-    if !canonical.unread.is_unread() {
-        ui.set_toast(
-            "selected pane is already read".to_string(),
             NoticeLevel::Warning,
             Duration::from_secs(4),
         );
@@ -4910,16 +4862,18 @@ fn queue_unread_pin_for_selection(
     if !ui.pin_pending.insert(pane_instance.clone()) {
         return;
     }
-    let request = UnreadPinRequest {
+    let request = PanePinRequest {
         pane_instance: pane_instance.clone(),
-        expected_state_id: canonical.state_id.clone(),
-        expected_read_seq: canonical.unread.read_seq,
-        pinned: !canonical.unread.pinned,
+        pinned: !snapshot
+            .sidebar_model
+            .preferences
+            .pinned_panes
+            .contains(&pane_instance),
     };
     if tx.send(request).is_err() {
         ui.pin_pending.remove(&pane_instance);
         ui.set_toast(
-            "unread pin worker unavailable".to_string(),
+            "pin worker unavailable".to_string(),
             NoticeLevel::Failure,
             Duration::from_secs(5),
         );
