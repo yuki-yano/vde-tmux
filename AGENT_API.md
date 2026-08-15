@@ -1,7 +1,8 @@
 # Agent JSON API
 
-`vt` exposes a versioned, read-only JSON interface for terminal agents. The command tree is the
-public API. The daemon Unix-socket protocol is internal and changes independently.
+`vt` exposes a versioned JSON interface for terminal agents. The command tree is the public API.
+Most commands are read-only; `agent prompt` is the single guarded mutation. The daemon Unix-socket
+protocol is internal and changes independently.
 
 Compatibility exists only within the same `api_version`. Breaking public changes increment that
 version; old versions and fallback behavior are not kept in parallel. Callers must reject an
@@ -24,6 +25,8 @@ vt agent wait %456 --until done,blocked --timeout-ms 120000 --json
 AGENT_JSON="$(vt agent get %456 --json)"
 AGENT_REF="$(printf '%s' "$AGENT_JSON" | jq -r '.result.agent.summary.agent_ref')"
 COMPLETED_SEQ="$(printf '%s' "$AGENT_JSON" | jq -r '.result.agent.completed_seq')"
+printf '%s' 'Review the current diff and report must-fix findings.' \
+  | vt agent prompt "$AGENT_REF" --stdin --json
 vt agent wait "$AGENT_REF" --until done --after-completed-seq "$COMPLETED_SEQ" --json
 vt agent read %456 --source latest --lines 120 --json
 ```
@@ -36,7 +39,7 @@ the conceptual request command, success envelope, and error envelope.
 ```json
 {
   "meta": {
-    "api_version": 1,
+    "api_version": 2,
     "server_identity": "...",
     "daemon_instance_id": "...",
     "snapshot_revision": 42,
@@ -61,7 +64,11 @@ snapshot_revision)` and reject an identity change.
 The request schema describes the normalized command contract rather than raw argv syntax. Defaults
 and limits match the CLI: pane-read target is optional, read defaults are `latest`, 120 lines, and no
 ANSI, wait defaults are `done,blocked` and 120,000 ms, read lines are 1..2,000, and wait timeout is
-1..86,400,000 ms. Repeated and comma-separated `--until` argv forms normalize to the same set.
+1..86,400,000 ms. Prompt confirmation defaults to 7,000 ms and is limited to 1..60,000 ms. Prompt
+bytes are supplied out-of-band through stdin or a file and therefore do not appear in the conceptual
+request schema. Repeated and comma-separated `--until` argv forms normalize to the same set.
+The prompt deadline covers the whole operation from daemon connection and preflight through digest
+confirmation; it does not start only after submission.
 
 ## Agent state
 
@@ -148,6 +155,92 @@ reports elapsed monotonic wait time rounded down to milliseconds. A durable comp
 therefore succeed after its process exits; callers can use `target.pane_ref` to inspect the terminal
 pane without accidentally targeting a replacement agent.
 
+## Guarded prompt dispatch
+
+`agent prompt` submits one prompt to an exact idle/done Claude Code or Codex occupant. It accepts
+only an `agent_ref`; pane IDs and inferred identities are rejected. Supply the body through exactly
+one private input source:
+
+```bash
+printf '%s' 'Review the current diff.' \
+  | vt agent prompt "$AGENT_REF" --stdin --confirm-timeout-ms 7000 --json
+
+vt agent prompt "$AGENT_REF" --prompt-file /tmp/review-request.txt --json
+```
+
+The prompt must be valid UTF-8 and 1..65,536 bytes. LF is the only allowed control character; CR,
+TAB, other C0 controls, DEL, and C1 controls are rejected. The body is never placed in the
+`agent prompt` argv, response envelope, or error. That response contains only a domain-separated
+SHA-256 digest. A later provider hook may store a bounded prompt preview in canonical agent state;
+that preview is intentionally visible through read-only `agent get` and snapshot responses.
+
+Before writing any bytes, the command requires all of the following:
+
+- the daemon-owned tmux observation hook health is `healthy`, and the agent kind has a
+  prompt-bearing hook adapter;
+- the exact state ID, epoch, live PID, and OS process start token still match the `agent_ref`;
+- lifecycle is idle/done, not working or blocked;
+- the exact agent process belongs to the pane's foreground terminal process group;
+- a nonblocking, secure lock for the exact tmux server/pane/PID tuple is held.
+
+The command establishes its daemon subscription and run baseline before dispatch. It loads a unique
+named tmux buffer from stdin, then runs server-PID/start-time and pane-PID guards around
+`paste-buffer -p -d`, Enter, and a submission marker in one tmux command queue. The buffer is deleted
+on every observed path. Fresh live process fences run before and after that queue.
+
+Success requires a `UserPromptSubmit` hook transition for the same exact agent, expected
+`run_seq`, and raw decoded prompt digest. A successful result resembles:
+
+```json
+{
+  "result": {
+    "type": "agent_prompt",
+    "receipt": {
+      "target": { "agent_ref": "vta1:...", "pane_id": "%456" },
+      "prompt_digest": "...",
+      "baseline_run_seq": 4,
+      "baseline_completed_seq": 4,
+      "expected_run_seq": 5
+    },
+    "dispatch": "submitted",
+    "confirmation": "digest_matched",
+    "observed_run_seq": 5,
+    "observed_state_revision": 18,
+    "wait_cursor": {
+      "agent_ref": "vta1:...",
+      "after_completed_seq": 4
+    }
+  }
+}
+```
+
+Use `wait_cursor` to wait for that newly submitted run without resending it:
+
+```bash
+RECEIPT_JSON="$(printf '%s' 'Review the diff.' | vt agent prompt "$AGENT_REF" --stdin --json)"
+WAIT_REF="$(printf '%s' "$RECEIPT_JSON" | jq -r '.result.wait_cursor.agent_ref')"
+AFTER="$(printf '%s' "$RECEIPT_JSON" | jq -r '.result.wait_cursor.after_completed_seq')"
+vt agent wait "$WAIT_REF" --until done,blocked --after-completed-seq "$AFTER" --json
+```
+
+There is no internal prompt retry after the tmux client is spawned. A missing/mismatched digest,
+post-dispatch fence failure, or any post-spawn transport failure—including failure before the first
+stdin byte—returns `delivery_unknown`, `side_effect: possible`, `retry_action: inspect_manually`, and
+a receipt. Only a failure before child creation can return `retry_same_request`. Do not rerun
+`agent prompt` after `delivery_unknown`; inspect the pane and continue waiting from the receipt if
+appropriate.
+
+The daemon cannot prove the external Claude Code/Codex `UserPromptSubmit` hook configuration before
+the first dispatch: its `hook_health` field covers the daemon-owned tmux observation hook. A missing
+or misconfigured provider hook therefore fails closed at digest confirmation as `delivery_unknown`;
+the caller must inspect the pane and must not resend automatically.
+
+The lock coordinates vde-tmux callers only. Direct human/tmux input can still race. The pre/post
+process fences and tmux PID guards shrink and detect that race but cannot make OS process identity
+and tmux input one atomic operation. Without a durable operation ledger, a CLI kill or daemon
+restart between tmux submission and envelope delivery is not recoverable, and caller retries are
+not deduplicated. These are explicit initial-version limits, not fallback behavior.
+
 ## Terminal read
 
 `pane read` and `agent read` are the only API commands that execute `capture-pane`.
@@ -171,8 +264,8 @@ fails closed with `stale_reference`; a daemon restart or connection loss is repo
 
 ## Errors
 
-Every error contains a closed-enum `code`, human-readable `message`, and `retryable` boolean. Public
-codes are:
+Every error contains a closed-enum `code`, human-readable `message`, `stage`, `side_effect`, and
+`retry_action`. Mutation errors may also contain a receipt. Public codes are:
 
 - Input/identity: `invalid_arguments`, `invalid_target`, `invalid_reference`, `no_current_pane`,
   `pane_not_found`, `agent_not_found`, `exact_identity_unavailable`, `stale_reference`.
@@ -181,12 +274,24 @@ codes are:
   `event_history_lost`, `identity_verification_failed`, `control_unavailable`.
 - Contract/resource: `protocol_mismatch`, `invalid_daemon_response`, `resource_limit`,
   `capture_failed`, `daemon_error`, `internal_error`.
+- Prompt mutation: `agent_busy`, `agent_blocked`, `prompt_confirmation_unavailable`,
+  `agent_not_input_owner`, `prompt_dispatch_busy`, `dispatch_rejected`, `delivery_unknown`.
 
-`retryable` is true only for `exact_identity_unavailable`, `tmux_server_unavailable`,
-`daemon_unavailable`, `daemon_not_ready`, `daemon_query_failed`, `daemon_stream_error`,
-`stale_daemon`, `timeout`, `identity_verification_failed`, and `control_unavailable`.
-`event_history_lost` is terminal for that wait baseline; start a new observation instead of retrying
-the same reference and cursor.
+`stage` is one of `request_validation`, `target_resolution`, `observation`, `before_dispatch`,
+`dispatch`, or `after_dispatch`. `side_effect` is `none`, `possible`, or `confirmed`.
+`retry_action` is a closed enum:
+
+| Action | Caller behavior |
+| --- | --- |
+| `retry_same_request` | The operation failed before any side effect; the same request may be retried |
+| `refresh_target` | Resolve a new reference before retrying |
+| `wait_then_retry` | Preserve the request and retry only after capacity/state changes |
+| `restart_observation` | Establish a new daemon observation/baseline |
+| `inspect_manually` | A side effect may have happened; do not resend automatically |
+| `never` | Fix the request/configuration instead of retrying |
+
+`event_history_lost` requires a new observation. `delivery_unknown` always requires manual
+inspection; it is never permission to resend the prompt.
 
 ## Query cost
 
@@ -201,3 +306,38 @@ the process table to verify the pinned process at their live verification fences
 also receives each subscribed full snapshot. Do not use exact reads or waits as a high-frequency
 polling loop: use one subscription wait and bounded reads at the points where terminal text is
 actually needed.
+
+The daemon accepts at most 64 simultaneous socket handlers. At most 48 may be streaming
+subscriptions, reserving 16 slots for short queries and hook/mutation traffic. Overload is returned
+as `resource_limit` with `wait_then_retry` without spawning another handler thread. The daemon
+observation capture coordinator has a separate bounded queue of eight requests; this does not bound
+the direct `capture-pane` subprocess used by `pane read` and `agent read`. Each daemon observation
+tmux process drains all output but retains at most 8 MiB stdout and 64 KiB stderr, and one coalesced
+observation group retains at most 16 MiB of parsed pane tails. Exceeding any of those bounds produces
+a typed capture output-limit failure.
+
+## Definition of Done for guarded dispatch
+
+### Functional completion
+
+- [x] Exact ref, supported agent kind, healthy daemon-owned hook state, idle/done lifecycle,
+  foreground ownership, secure lock, server/pane guards, and provider raw-digest confirmation are
+  mandatory.
+- [x] Prompt input is private, bounded, control-character checked, and absent from mutation
+  argv/responses/errors; later hook-derived previews remain observable state.
+- [x] Digest mismatch or post-side-effect ambiguity cannot be reported as success or auto-retried.
+- [x] The receipt connects directly to the existing completion cursor wait.
+
+### Test completion
+
+- [x] Input boundaries, digest normalization order/history, foreground process-group checks, secure
+  lock behavior, typed stdin stages, guarded queue ordering, connection caps, and capture queue
+  saturation have unit coverage.
+- [x] Full Rust tests and all three isolated tmux release scripts pass on the final diff.
+- [x] Isolated prompt dispatch and real Claude Code/Codex prompt-to-wait flows are verified.
+
+### Operational completion
+
+- [x] Public API, pane snapshot schema, and daemon protocol versions are bumped together.
+- [x] The locally installed binary and running daemon are replaced and their versions verified.
+- [x] Independent subagent and Fable reviews converge to zero must-fix findings.

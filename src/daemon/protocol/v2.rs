@@ -17,7 +17,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +77,24 @@ pub struct V2RequestError {
     pub stage: V2RequestFailureStage,
     pub message: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonHandshakeError {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for DaemonHandshakeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "daemon rejected handshake ({:?}): {}",
+            self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for DaemonHandshakeError {}
 
 impl std::fmt::Display for V2RequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -144,6 +162,9 @@ impl V2Client {
                     received: None,
                     detail: message,
                 }));
+            }
+            ServerMessage::Error { code, message, .. } => {
+                return Err(anyhow::Error::new(DaemonHandshakeError { code, message }));
             }
             response => return server_response_error("HelloAck", response),
         };

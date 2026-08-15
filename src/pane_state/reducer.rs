@@ -1856,6 +1856,7 @@ mod tests {
                 operations: vec![ProgressOperation::SetPrompt(PromptState {
                     text: "exact".to_string(),
                     source: "test".to_string(),
+                    digest: None,
                 })],
             },
             &bound_tracker,
@@ -2166,6 +2167,7 @@ mod tests {
                 prompt: Some(FieldUpdate::Set(PromptState {
                     text: "field-only".to_string(),
                     source: "test".to_string(),
+                    digest: None,
                 })),
                 tasks: None,
                 subagents: None,
@@ -3129,6 +3131,7 @@ mod tests {
         let prompt = PromptState {
             text: "continue".to_string(),
             source: "transcript".to_string(),
+            digest: None,
         };
         let resumed = reduce_once(
             started.record.as_ref(),
@@ -3164,6 +3167,7 @@ mod tests {
                 prompt: Some(PromptState {
                     text: "サイドバー要約を実装して".to_string(),
                     source: "user".to_string(),
+                    digest: None,
                 }),
             },
             &tracker,
@@ -3201,6 +3205,7 @@ mod tests {
                 prompt: Some(PromptState {
                     text: "別のタスクへ切り替える".to_string(),
                     source: "user".to_string(),
+                    digest: None,
                 }),
             },
             &current_tracker,
@@ -3237,6 +3242,7 @@ mod tests {
                 prompt: Some(PromptState {
                     text: "start dev server".to_string(),
                     source: "user".to_string(),
+                    digest: None,
                 }),
             },
             &tracker,
@@ -3354,6 +3360,7 @@ mod tests {
             vec![ProgressOperation::SetPrompt(PromptState {
                 text: "prompt".to_string(),
                 source: "test".to_string(),
+                digest: None,
             })],
         );
         assert_eq!(active(&prompted).prompt.as_ref().unwrap().text, "prompt");
@@ -3571,6 +3578,7 @@ mod tests {
         idle.prompt = Some(PromptState {
             text: "preserved prompt".to_string(),
             source: "user".to_string(),
+            digest: None,
         });
         let idle = idle;
         let activity = observe(
@@ -3824,6 +3832,7 @@ mod tests {
                         operations: vec![ProgressOperation::SetPrompt(PromptState {
                             text: format!("prompt-{timestamp}"),
                             source: "property".to_string(),
+                            digest: None,
                         })],
                     },
                     7 => PaneEvent::ProgressUpdated {

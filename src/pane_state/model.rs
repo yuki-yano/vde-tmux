@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::daemon::session_badge::BadgeState;
 
-pub const PANE_STATE_SCHEMA_VERSION: u16 = 7;
+pub const PANE_STATE_SCHEMA_VERSION: u16 = 8;
 pub const IDENTIFIER_MAX_BYTES: usize = 256;
 pub const BODY_MAX_BYTES: usize = 4096;
 pub const PATH_MAX_BYTES: usize = 8192;
@@ -365,12 +365,31 @@ impl UnreadState {
 pub struct PromptState {
     pub text: String,
     pub source: String,
+    pub digest: Option<String>,
 }
 
 impl PromptState {
+    pub fn digest_decoded_prompt(prompt: &str) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut digest = Sha256::new();
+        digest.update(b"vde-tmux:prompt:v1\0");
+        digest.update(prompt.as_bytes());
+        format!("{:x}", digest.finalize())
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         validate_required_text(&self.text, "prompt", BODY_MAX_BYTES)?;
-        validate_required_text(&self.source, "prompt source", IDENTIFIER_MAX_BYTES)
+        validate_required_text(&self.source, "prompt source", IDENTIFIER_MAX_BYTES)?;
+        if self.digest.as_ref().is_some_and(|digest| {
+            digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        }) {
+            return Err(ModelError("prompt digest is invalid".to_string()));
+        }
+        Ok(())
     }
 }
 
@@ -1220,6 +1239,23 @@ mod tests {
         assert_eq!(context.recent_prompts, ["two", "three", "four", "five"]);
         assert_eq!(context.context_fingerprint().unwrap().len(), 64);
         context.validate().unwrap();
+    }
+
+    #[test]
+    fn prompt_digest_is_domain_separated_and_strictly_validated() {
+        assert_eq!(
+            PromptState::digest_decoded_prompt("hello\nworld"),
+            "3cf479a04899c793e4faf30c5b150c0c6e0aca73f52780ec274168e795a9634b"
+        );
+
+        let mut prompt = PromptState {
+            text: "hello world".to_string(),
+            source: "user".to_string(),
+            digest: Some(PromptState::digest_decoded_prompt("hello\nworld")),
+        };
+        prompt.validate().unwrap();
+        prompt.digest = Some("A".repeat(64));
+        assert_eq!(prompt.validate().unwrap_err().0, "prompt digest is invalid");
     }
 
     #[test]

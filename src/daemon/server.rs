@@ -24,12 +24,100 @@ static SHUTDOWN_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
 const V2_BOOTSTRAP_FIFO_CAPACITY: usize = 64;
 const V2_MUTATION_QUEUE_CAPACITY: usize = 1024;
+// Bound all socket-owned threads, including clients stalled during the
+// handshake. Long-lived subscriptions have a lower ceiling so routine hook,
+// mutation, and query traffic retains capacity under a subscriber burst.
+const V2_CONNECTION_THREAD_CAPACITY: usize = 64;
+const V2_RESERVED_NON_STREAMING_CONNECTION_CAPACITY: usize = 16;
 pub const V2_FRAME_START_TIMEOUT: Duration = Duration::from_secs(2);
 pub const V2_FRAME_BODY_TIMEOUT: Duration = Duration::from_millis(100);
 pub const V2_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+const V2_OVERLOAD_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(25);
 const TMUX_SERVER_LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CURRENT_VIEW_REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
 const PANE_SWITCH_REQUEST_SEPARATOR: &str = "__vde_pane_switch_request__";
+
+#[derive(Default)]
+struct V2ConnectionThreadCounts {
+    active: usize,
+    streaming: usize,
+}
+
+struct V2ConnectionThreadLimiter {
+    capacity: usize,
+    streaming_capacity: usize,
+    counts: Mutex<V2ConnectionThreadCounts>,
+}
+
+impl V2ConnectionThreadLimiter {
+    fn new(capacity: usize, reserved_non_streaming: usize) -> Self {
+        assert!(reserved_non_streaming <= capacity);
+        Self {
+            capacity,
+            streaming_capacity: capacity - reserved_non_streaming,
+            counts: Mutex::new(V2ConnectionThreadCounts::default()),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<V2ConnectionThreadPermit> {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("v2 connection thread limiter lock poisoned");
+        if counts.active >= self.capacity {
+            return None;
+        }
+        counts.active += 1;
+        Some(V2ConnectionThreadPermit {
+            limiter: self.clone(),
+            streaming: false,
+        })
+    }
+}
+
+struct V2ConnectionThreadPermit {
+    limiter: Arc<V2ConnectionThreadLimiter>,
+    streaming: bool,
+}
+
+impl V2ConnectionThreadPermit {
+    fn try_mark_streaming(&mut self) -> bool {
+        if self.streaming {
+            return true;
+        }
+        let mut counts = self
+            .limiter
+            .counts
+            .lock()
+            .expect("v2 connection thread limiter lock poisoned");
+        if counts.streaming >= self.limiter.streaming_capacity {
+            return false;
+        }
+        counts.streaming += 1;
+        self.streaming = true;
+        true
+    }
+}
+
+impl Drop for V2ConnectionThreadPermit {
+    fn drop(&mut self) {
+        let mut counts = self
+            .limiter
+            .counts
+            .lock()
+            .expect("v2 connection thread limiter lock poisoned");
+        counts.active = counts
+            .active
+            .checked_sub(1)
+            .expect("v2 connection thread permit released once");
+        if self.streaming {
+            counts.streaming = counts
+                .streaming
+                .checked_sub(1)
+                .expect("v2 streaming connection permit released once");
+        }
+    }
+}
 
 pub struct V2FrameReader {
     reader: BufReader<UnixStream>,
@@ -151,9 +239,18 @@ pub fn write_v2_response(
 
 #[allow(clippy::result_large_err)]
 fn write_v2_frame(stream: &mut UnixStream, frame: &[u8]) -> std::result::Result<(), ServerMessage> {
+    write_v2_frame_with_timeout(stream, frame, V2_RESPONSE_WRITE_TIMEOUT)
+}
+
+#[allow(clippy::result_large_err)]
+fn write_v2_frame_with_timeout(
+    stream: &mut UnixStream,
+    frame: &[u8],
+    timeout: Duration,
+) -> std::result::Result<(), ServerMessage> {
     use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
 
-    let deadline = std::time::Instant::now() + V2_RESPONSE_WRITE_TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
     let mut written = 0;
     while written < frame.len() {
         let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
@@ -184,6 +281,17 @@ fn write_v2_frame(stream: &mut UnixStream, frame: &[u8]) -> std::result::Result<
         written += count;
     }
     Ok(())
+}
+
+fn write_v2_overload_response(stream: &mut UnixStream) {
+    let response = ServerMessage::error(
+        ErrorCode::QueueFull,
+        "daemon connection capacity is full",
+        None,
+    );
+    if let Ok(frame) = crate::daemon::protocol::v2::encode_response_frame(&response) {
+        let _ = write_v2_frame_with_timeout(stream, &frame, V2_OVERLOAD_RESPONSE_WRITE_TIMEOUT);
+    }
 }
 
 fn bounded_write_timeout(remaining: Duration) -> Duration {
@@ -2477,6 +2585,7 @@ impl ProductionV2Coordinator {
 fn handle_v2_runtime_stream(
     coordinator: Arc<ProductionV2Coordinator>,
     stream: UnixStream,
+    connection_permit: &mut V2ConnectionThreadPermit,
 ) -> Result<()> {
     let mut connection = V2FrameReader::new(stream);
     let frame = match read_v2_request_frame(&mut connection) {
@@ -2521,6 +2630,15 @@ fn handle_v2_runtime_stream(
     };
     let subscribe = matches!(&message, ClientMessage::Subscribe { .. });
     if subscribe {
+        if !connection_permit.try_mark_streaming() {
+            let response = ServerMessage::error(
+                ErrorCode::QueueFull,
+                "daemon streaming connection capacity is full",
+                None,
+            );
+            let _ = write_v2_response(connection.stream_mut(), &response);
+            return Ok(());
+        }
         let published = match coordinator.route_subscription(&mut connection_state, message) {
             Ok(published) => published,
             Err(response) => {
@@ -4703,17 +4821,36 @@ pub fn run_runtime_daemon_server(
     )?;
     install_shutdown_signal_handler(coordinator.clone())?;
     let listener_coordinator = coordinator.clone();
+    let connection_limiter = Arc::new(V2ConnectionThreadLimiter::new(
+        V2_CONNECTION_THREAD_CAPACITY,
+        V2_RESERVED_NON_STREAMING_CONNECTION_CAPACITY,
+    ));
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
-                Ok(stream) => {
+                Ok(mut stream) => {
+                    let Some(mut connection_permit) = connection_limiter.try_acquire() else {
+                        // Report overload without creating another connection thread. The
+                        // short write deadline keeps overload handling itself bounded.
+                        write_v2_overload_response(&mut stream);
+                        drop(stream);
+                        continue;
+                    };
                     let coordinator = listener_coordinator.clone();
-                    thread::spawn(move || {
-                        if let Err(error) = handle_v2_runtime_stream(coordinator.clone(), stream) {
+                    if let Err(error) = thread::Builder::new().spawn(move || {
+                        if let Err(error) = handle_v2_runtime_stream(
+                            coordinator.clone(),
+                            stream,
+                            &mut connection_permit,
+                        ) {
                             coordinator
                                 .log_daemon_error(&format!("daemon connection error: {error:#}"));
                         }
-                    });
+                    }) {
+                        listener_coordinator.log_daemon_error(&format!(
+                            "daemon connection thread spawn failed: {error}"
+                        ));
+                    }
                 }
                 Err(error) => {
                     listener_coordinator
@@ -5324,6 +5461,72 @@ where
 mod tests {
     use super::*;
     use crate::daemon::protocol::v2::PROTOCOL_VERSION;
+
+    #[test]
+    fn connection_thread_limiter_enforces_cap_and_releases_slots() {
+        let limiter = Arc::new(V2ConnectionThreadLimiter::new(2, 1));
+        let first = limiter.try_acquire().expect("first connection fits");
+        let second = limiter.try_acquire().expect("second connection fits");
+        assert!(limiter.try_acquire().is_none());
+
+        drop(first);
+        let replacement = limiter.try_acquire();
+        assert!(replacement.is_some());
+
+        drop(second);
+        drop(replacement);
+        assert_eq!(limiter.counts.lock().expect("limiter lock").active, 0);
+    }
+
+    #[test]
+    fn connection_overload_returns_queue_full_without_a_handler_thread() {
+        let (mut server, client) = UnixStream::pair().unwrap();
+        write_v2_overload_response(&mut server);
+
+        let mut response = String::new();
+        BufReader::new(client).read_line(&mut response).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&response).unwrap(),
+            ServerMessage::Error {
+                code: ErrorCode::QueueFull,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn connection_thread_permit_releases_during_unwind() {
+        let limiter = Arc::new(V2ConnectionThreadLimiter::new(1, 0));
+        let permit = limiter.try_acquire().expect("connection fits");
+
+        let result = std::panic::catch_unwind(move || {
+            let _permit = permit;
+            panic!("simulated connection handler panic");
+        });
+
+        assert!(result.is_err());
+        assert!(limiter.try_acquire().is_some());
+    }
+
+    #[test]
+    fn streaming_connections_leave_reserved_non_streaming_capacity() {
+        let limiter = Arc::new(V2ConnectionThreadLimiter::new(4, 1));
+        let mut streaming = (0..3)
+            .map(|_| limiter.try_acquire().expect("streaming connection fits"))
+            .collect::<Vec<_>>();
+        assert!(
+            streaming
+                .iter_mut()
+                .all(|permit| permit.try_mark_streaming())
+        );
+
+        let mut reserved = limiter.try_acquire().expect("reserved connection fits");
+        assert!(!reserved.try_mark_streaming());
+        assert!(limiter.try_acquire().is_none());
+
+        drop(streaming.pop());
+        assert!(reserved.try_mark_streaming());
+    }
     const V2_EVENT_ID: &str = "102132435465768798a9bacbdcedfe0f";
     const V2_DAEMON_ID: &str = "ffeeddccbbaa99887766554433221100";
     const POLL_TOKEN: &str = "00112233445566778899aabbccddeeff";

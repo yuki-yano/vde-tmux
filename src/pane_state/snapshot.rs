@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{PaneInstance, PaneState, StoreError};
 
-pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 7;
-pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v7.json";
+pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 8;
+pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v8.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -298,6 +298,7 @@ mod tests {
             prompt: Some(super::super::PromptState {
                 text: format!("prompt-{index}"),
                 source: "hook".to_string(),
+                digest: None,
             }),
             latest_response: None,
             task_context: crate::pane_state::TaskContextState::default(),
@@ -411,6 +412,15 @@ mod tests {
         .unwrap();
         unknown["unknown"] = serde_json::json!(true);
         assert!(decode_snapshot(&serde_json::to_vec(&unknown).unwrap(), &identity()).is_err());
+
+        let mut old_schema = serde_json::to_value(PaneStateSnapshot {
+            schema_version: PANE_SNAPSHOT_SCHEMA_VERSION,
+            server_identity: identity(),
+            records: vec![state(1)],
+        })
+        .unwrap();
+        old_schema["schema_version"] = serde_json::json!(7);
+        assert!(decode_snapshot(&serde_json::to_vec(&old_schema).unwrap(), &identity()).is_err());
 
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink("target", &path).unwrap();

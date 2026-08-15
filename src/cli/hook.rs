@@ -491,7 +491,7 @@ pub(crate) fn codex_typed_event_from_input(
                 typed_progress_operations(progress_event)?,
                 context,
             )?)),
-            CodexAuxEvent::Agent(event) => {
+            CodexAuxEvent::Agent(event, prompt_digest) => {
                 let Some(OptionUpdate::Set(text)) = event.prompt else {
                     return Ok(None);
                 };
@@ -501,6 +501,7 @@ pub(crate) fn codex_typed_event_from_input(
                 let prompt = PromptState {
                     text: normalize_text(&text),
                     source: normalize_text(&source),
+                    digest: Some(prompt_digest),
                 };
                 prompt.validate()?;
                 Ok(Some(context.envelope(
@@ -744,7 +745,7 @@ fn claude_task_status_from_str(raw: &str) -> Option<TaskItemStatus> {
 enum CodexAuxEvent {
     ActivityAndProgress(ProgressEvent),
     Progress(ProgressEvent),
-    Agent(AgentEvent),
+    Agent(AgentEvent, String),
 }
 
 fn codex_aux_event_from_input(
@@ -797,31 +798,40 @@ fn codex_post_tool_use_event(payload: &Value, now_epoch: i64) -> Result<Option<C
     match tool_name {
         "update_plan" => Ok(codex_update_plan_event(payload)?.map(CodexAuxEvent::Progress)),
         "Bash" => Ok(codex_bash_event(payload, now_epoch)?.map(CodexAuxEvent::Progress)),
-        "create_goal" => Ok(codex_create_goal_event(payload, now_epoch)?.map(CodexAuxEvent::Agent)),
+        "create_goal" => Ok(codex_create_goal_event(payload, now_epoch)?
+            .map(|(event, digest)| CodexAuxEvent::Agent(event, digest))),
         _ => Ok(None),
     }
 }
 
-fn codex_create_goal_event(payload: &Value, now_epoch: i64) -> Result<Option<AgentEvent>> {
-    let Some(objective) = payload
+fn codex_create_goal_event(
+    payload: &Value,
+    now_epoch: i64,
+) -> Result<Option<(AgentEvent, String)>> {
+    let Some(raw_objective) = payload
         .get("tool_input")
         .and_then(|tool_input| tool_input.get("objective"))
         .and_then(Value::as_str)
-        .and_then(build_prompt_preview)
     else {
         return Ok(None);
     };
-    Ok(Some(AgentEvent {
-        agent: "codex".to_string(),
-        status: Some(AgentStatus::Running),
-        prompt: Some(OptionUpdate::Set(objective)),
-        prompt_source: Some(OptionUpdate::Set("goal".to_string())),
-        started_at: Some(now_epoch),
-        tasks: Some(OptionUpdate::Unset),
-        task_items: Some(OptionUpdate::Unset),
-        worktree_activity: Some(OptionUpdate::Unset),
-        ..AgentEvent::default()
-    }))
+    let Some(objective) = build_prompt_preview(raw_objective) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        AgentEvent {
+            agent: "codex".to_string(),
+            status: Some(AgentStatus::Running),
+            prompt: Some(OptionUpdate::Set(objective)),
+            prompt_source: Some(OptionUpdate::Set("goal".to_string())),
+            started_at: Some(now_epoch),
+            tasks: Some(OptionUpdate::Unset),
+            task_items: Some(OptionUpdate::Unset),
+            worktree_activity: Some(OptionUpdate::Unset),
+            ..AgentEvent::default()
+        },
+        PromptState::digest_decoded_prompt(raw_objective),
+    )))
 }
 
 fn codex_update_plan_event(payload: &Value) -> Result<Option<ProgressEvent>> {
@@ -1332,6 +1342,7 @@ mod tests {
                 prompt: Some(PromptState {
                     text: "ship the change".to_string(),
                     source: "goal".to_string(),
+                    digest: Some(PromptState::digest_decoded_prompt("ship\nthe change")),
                 }),
             }
         );

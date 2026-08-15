@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +18,8 @@ mod daemon;
 mod hook;
 pub mod pane_switch;
 mod sidebar;
+
+const MAX_AGENT_HOOK_STDIN_BYTES: usize = 16 * 1024 * 1024;
 
 /// vde-tmux CLI。
 #[derive(Debug, Parser)]
@@ -222,6 +225,30 @@ enum AgentCommand {
     },
     /// Get one current agent by %pane_id or exact agent_ref.
     Get { target: String },
+    /// Submit one guarded prompt to an exact idle/done Claude or Codex occupant.
+    Prompt {
+        target: String,
+        /// Read the prompt from stdin until EOF.
+        #[arg(
+            long,
+            required_unless_present = "prompt_file",
+            conflicts_with = "prompt_file"
+        )]
+        stdin: bool,
+        /// Read the prompt from a file without placing it in argv.
+        #[arg(
+            long = "prompt-file",
+            required_unless_present = "stdin",
+            conflicts_with = "stdin"
+        )]
+        prompt_file: Option<PathBuf>,
+        /// Operation-wide deadline through preflight, dispatch, and raw hook digest confirmation.
+        #[arg(
+            long = "confirm-timeout-ms",
+            default_value_t = crate::api::DEFAULT_PROMPT_CONFIRM_TIMEOUT.as_millis() as u64
+        )]
+        confirm_timeout_ms: u64,
+    },
     /// Wait on daemon snapshot events while pinning the exact agent occupant.
     Wait {
         target: String,
@@ -466,6 +493,7 @@ fn current_env() -> BTreeMap<String, String> {
 pub fn run() -> ExitCode {
     let args = std::env::args_os().collect::<Vec<_>>();
     let is_json_api = is_json_api_args(&args);
+    let observed_at = now_epoch();
     let is_agent_hook = args.get(1).and_then(|arg| arg.to_str()) == Some("hook");
     let is_view_hook = args.get(1).and_then(|arg| arg.to_str()) == Some("hooks")
         && args.get(2).and_then(|arg| arg.to_str()) == Some("pane-state-view");
@@ -487,10 +515,16 @@ pub fn run() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
+        None if agent_prompt_requires_stdin(&args) => match read_prompt_input(std::io::stdin()) {
+            Ok(input) => input,
+            Err(error) => {
+                eprintln!("{}", crate::api::render_error(&error, observed_at));
+                return ExitCode::FAILURE;
+            }
+        },
         None => String::new(),
     };
     let runner = SystemTmuxRunner::from_env(timeout);
-    let observed_at = now_epoch();
     match run_with_input_at_with_hook_deadline(
         args,
         &input,
@@ -513,6 +547,62 @@ pub fn run() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn agent_prompt_requires_stdin(args: &[OsString]) -> bool {
+    args.get(1).and_then(|arg| arg.to_str()) == Some("agent")
+        && args.get(2).and_then(|arg| arg.to_str()) == Some("prompt")
+        && args
+            .iter()
+            .skip(3)
+            .any(|arg| arg.to_str() == Some("--stdin"))
+        && !args
+            .iter()
+            .skip(3)
+            .any(|arg| arg.to_str() == Some("--prompt-file"))
+        && !args
+            .iter()
+            .skip(2)
+            .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
+}
+
+fn read_prompt_input(mut input: impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    input
+        .by_ref()
+        .take((crate::api::MAX_PROMPT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    finish_prompt_input(bytes)
+}
+
+fn read_prompt_file(path: &Path) -> Result<String> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        crate::api::ApiError::new(
+            crate::api::ApiErrorCode::InvalidArguments,
+            format!("could not open prompt file {}: {error}", path.display()),
+        )
+    })?;
+    read_prompt_input(file)
+}
+
+fn finish_prompt_input(bytes: Vec<u8>) -> Result<String> {
+    if bytes.len() > crate::api::MAX_PROMPT_BYTES {
+        return Err(crate::api::ApiError::new(
+            crate::api::ApiErrorCode::InvalidArguments,
+            format!(
+                "prompt exceeds the {} byte limit",
+                crate::api::MAX_PROMPT_BYTES
+            ),
+        )
+        .into());
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        crate::api::ApiError::new(
+            crate::api::ApiErrorCode::InvalidArguments,
+            "prompt input must be valid UTF-8",
+        )
+        .into()
+    })
 }
 
 fn is_json_api_args(args: &[OsString]) -> bool {
@@ -576,6 +666,12 @@ where
         let read = input.read(&mut chunk)?;
         if read == 0 {
             return finish_agent_hook_input(bytes);
+        }
+        if bytes.len().saturating_add(read) > MAX_AGENT_HOOK_STDIN_BYTES {
+            bail!(
+                "agent hook stdin exceeds the {} byte limit",
+                MAX_AGENT_HOOK_STDIN_BYTES
+            );
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
@@ -784,6 +880,24 @@ where
             AgentCommand::Get { target } => Ok(Some(crate::api::agent_get(
                 runner, env, now_epoch, &target,
             )?)),
+            AgentCommand::Prompt {
+                target,
+                stdin: _,
+                prompt_file,
+                confirm_timeout_ms,
+            } => {
+                let prompt = match prompt_file {
+                    Some(path) => read_prompt_file(&path)?,
+                    None => input.to_string(),
+                };
+                Ok(Some(crate::api::agent_prompt(
+                    runner,
+                    env,
+                    &target,
+                    &prompt,
+                    Duration::from_millis(confirm_timeout_ms),
+                )?))
+            }
             AgentCommand::Wait {
                 target,
                 until,

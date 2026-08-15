@@ -2217,3 +2217,35 @@ fn agent_hook_stdin_errors_when_no_bytes_arrive_before_deadline() {
     assert!(error.to_string().contains("deadline exceeded"));
     unsafe { libc::close(write_fd) };
 }
+
+#[test]
+fn prompt_input_reader_enforces_utf8_and_the_byte_limit() {
+    let accepted =
+        super::read_prompt_input(std::io::Cursor::new(b"review\nthis".to_vec())).unwrap();
+    assert_eq!(accepted, "review\nthis");
+
+    let too_large = vec![b'x'; crate::api::MAX_PROMPT_BYTES + 1];
+    let error = super::read_prompt_input(std::io::Cursor::new(too_large)).unwrap_err();
+    assert!(error.to_string().contains("byte limit"));
+
+    let error = super::read_prompt_input(std::io::Cursor::new(vec![0xff])).unwrap_err();
+    assert!(error.to_string().contains("valid UTF-8"));
+}
+
+#[test]
+fn prompt_cli_requires_exactly_one_private_input_source() {
+    assert!(Cli::try_parse_from(["vt", "agent", "prompt", "vta1:test"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "vt",
+            "agent",
+            "prompt",
+            "vta1:test",
+            "--stdin",
+            "--prompt-file",
+            "/tmp/prompt",
+        ])
+        .is_err()
+    );
+    assert!(Cli::try_parse_from(["vt", "agent", "prompt", "vta1:test", "--stdin"]).is_ok());
+}

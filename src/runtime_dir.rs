@@ -8,11 +8,19 @@
 //! directory we own that an older version left group/other-accessible is
 //! tightened back to 0700.
 
+use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
+
+use crate::daemon::topology::ServerIdentity;
+
+const PANE_DISPATCH_LOCK_DOMAIN: &[u8] = b"vde-tmux:guarded-pane-dispatch-lock:v1\0";
+const PANE_DISPATCH_LOCK_DIR: &str = "guarded-pane-dispatch-locks-v1";
 
 /// The per-user runtime root under `/tmp`.
 pub fn per_user_runtime_root() -> PathBuf {
@@ -50,6 +58,134 @@ pub fn ensure_secure_runtime_dir(path: &Path) -> Result<()> {
         ensure_secure_dir_chain(&root, path)
     } else {
         ensure_secure_dir_chain(path, path)
+    }
+}
+
+/// Try to acquire the process-wide dispatch lease for one exact pane instance.
+///
+/// The lease is nonblocking. `Ok(None)` means another dispatch currently owns
+/// the same server/pane/PID tuple. Dropping the returned guard releases it.
+pub fn try_acquire_pane_dispatch_lock(
+    server_identity: &ServerIdentity,
+    pane_id: &str,
+    pane_pid: u32,
+) -> Result<Option<PaneDispatchLock>> {
+    let directory = per_user_runtime_root().join(PANE_DISPATCH_LOCK_DIR);
+    try_acquire_pane_dispatch_lock_in(&directory, server_identity, pane_id, pane_pid)
+}
+
+#[derive(Debug)]
+pub struct PaneDispatchLock {
+    file: File,
+}
+
+impl Drop for PaneDispatchLock {
+    fn drop(&mut self) {
+        // SAFETY: `file` owns a valid descriptor until after this Drop returns.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn try_acquire_pane_dispatch_lock_in(
+    directory: &Path,
+    server_identity: &ServerIdentity,
+    pane_id: &str,
+    pane_pid: u32,
+) -> Result<Option<PaneDispatchLock>> {
+    ensure_secure_runtime_dir(directory)?;
+    let path = pane_dispatch_lock_path(directory, server_identity, pane_id, pane_pid);
+    let file = open_private_lock_file(&path)?;
+    try_lock_nonblocking(file, &path)
+}
+
+fn pane_dispatch_lock_path(
+    directory: &Path,
+    server_identity: &ServerIdentity,
+    pane_id: &str,
+    pane_pid: u32,
+) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(PANE_DISPATCH_LOCK_DOMAIN);
+    hash_field(
+        &mut hasher,
+        b"server-pid",
+        &server_identity.pid.to_be_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"server-start-time",
+        &server_identity.start_time.to_be_bytes(),
+    );
+    hash_field(&mut hasher, b"pane-id", pane_id.as_bytes());
+    hash_field(&mut hasher, b"pane-pid", &pane_pid.to_be_bytes());
+    directory.join(format!("{:x}.lock", hasher.finalize()))
+}
+
+fn hash_field(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
+    hasher.update((label.len() as u64).to_be_bytes());
+    hasher.update(label);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn open_private_lock_file(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open pane dispatch lock {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat pane dispatch lock {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "pane dispatch lock is not a regular file: {}",
+            path.display()
+        );
+    }
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid {
+        bail!(
+            "pane dispatch lock owner mismatch for {}: expected uid {}, got {}",
+            path.display(),
+            euid,
+            metadata.uid()
+        );
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        bail!(
+            "pane dispatch lock mode mismatch for {}: expected 600, got {:o}",
+            path.display(),
+            mode
+        );
+    }
+    Ok(file)
+}
+
+fn try_lock_nonblocking(file: File, path: &Path) -> Result<Option<PaneDispatchLock>> {
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the duration of this call.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != -1 {
+            return Ok(Some(PaneDispatchLock { file }));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            ErrorKind::Interrupted => continue,
+            ErrorKind::WouldBlock => return Ok(None),
+            _ => {
+                return Err(error).with_context(|| {
+                    format!("failed to lock pane dispatch lock {}", path.display())
+                });
+            }
+        }
     }
 }
 
@@ -226,5 +362,98 @@ mod tests {
             0o700
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn server_identity() -> ServerIdentity {
+        ServerIdentity {
+            pid: 1234,
+            start_time: 5678,
+        }
+    }
+
+    #[test]
+    fn pane_dispatch_lock_is_nonblocking_and_released_on_drop() {
+        let directory = unique_root();
+        let first = try_acquire_pane_dispatch_lock_in(&directory, &server_identity(), "%7", 9001)
+            .unwrap()
+            .expect("first acquisition");
+        assert!(
+            try_acquire_pane_dispatch_lock_in(&directory, &server_identity(), "%7", 9001)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(first);
+        assert!(
+            try_acquire_pane_dispatch_lock_in(&directory, &server_identity(), "%7", 9001)
+                .unwrap()
+                .is_some()
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn pane_dispatch_lock_key_is_hashed_and_separates_every_identity_field() {
+        let directory = unique_root();
+        let identity = server_identity();
+        let base = pane_dispatch_lock_path(&directory, &identity, "%7/../../raw", 9001);
+        let other_server = pane_dispatch_lock_path(
+            &directory,
+            &ServerIdentity {
+                pid: identity.pid,
+                start_time: identity.start_time + 1,
+            },
+            "%7/../../raw",
+            9001,
+        );
+        let other_pane = pane_dispatch_lock_path(&directory, &identity, "%8", 9001);
+        let other_pid = pane_dispatch_lock_path(&directory, &identity, "%7/../../raw", 9002);
+
+        let file_name = base.file_name().unwrap().to_string_lossy();
+        assert_eq!(file_name.len(), 64 + ".lock".len());
+        assert!(file_name.ends_with(".lock"));
+        assert!(!file_name.contains("raw"));
+        assert_ne!(base, other_server);
+        assert_ne!(base, other_pane);
+        assert_ne!(base, other_pid);
+    }
+
+    #[test]
+    fn pane_dispatch_lock_file_is_private_regular_and_rejects_symlinks() {
+        let directory = unique_root();
+        let identity = server_identity();
+        let guard = try_acquire_pane_dispatch_lock_in(&directory, &identity, "%1", 42)
+            .unwrap()
+            .unwrap();
+        let path = pane_dispatch_lock_path(&directory, &identity, "%1", 42);
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        drop(guard);
+
+        let symlink_path = pane_dispatch_lock_path(&directory, &identity, "%2", 43);
+        symlink(&path, &symlink_path).unwrap();
+        assert!(
+            try_acquire_pane_dispatch_lock_in(&directory, &identity, "%2", 43).is_err(),
+            "O_NOFOLLOW must reject a lock-file symlink"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn pane_dispatch_lock_rejects_an_existing_nonprivate_file() {
+        let directory = unique_root();
+        ensure_secure_runtime_dir(&directory).unwrap();
+        let identity = server_identity();
+        let path = pane_dispatch_lock_path(&directory, &identity, "%3", 44);
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            try_acquire_pane_dispatch_lock_in(&directory, &identity, "%3", 44).is_err(),
+            "an existing lock file must already be mode 0600"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

@@ -81,8 +81,9 @@ pub fn claude_typed_event_from_json(
                     .transcript_path
                     .as_deref()
                     .and_then(latest_user_prompt_from_transcript)
-                    .map(|text| prompt_state(text, "resume"))
+                    .map(|text| prompt_preview_state(&text, "resume"))
                     .transpose()?
+                    .flatten()
             } else {
                 None
             },
@@ -92,9 +93,9 @@ pub fn claude_typed_event_from_json(
             prompt: payload
                 .prompt
                 .as_deref()
-                .and_then(build_prompt_preview)
-                .map(|text| prompt_state(text, "user"))
-                .transpose()?,
+                .map(|text| prompt_preview_state(text, "user"))
+                .transpose()?
+                .flatten(),
         },
         "PreToolUse" | "PostToolUse" => PaneEvent::ActivityObserved {
             observed_at: context.observed_at,
@@ -152,8 +153,9 @@ pub fn codex_typed_event_from_json_with_home(
                     .transcript_path
                     .as_deref()
                     .and_then(latest_user_prompt_from_transcript)
-                    .map(|text| prompt_state(text, "resume"))
+                    .map(|text| prompt_preview_state(&text, "resume"))
                     .transpose()?
+                    .flatten()
             } else {
                 None
             },
@@ -163,9 +165,9 @@ pub fn codex_typed_event_from_json_with_home(
             prompt: payload
                 .prompt
                 .as_deref()
-                .and_then(build_prompt_preview)
-                .map(|text| prompt_state(text, "user"))
-                .transpose()?,
+                .map(|text| prompt_preview_state(text, "user"))
+                .transpose()?
+                .flatten(),
         },
         "PreToolUse" | "PostToolUse" => PaneEvent::ActivityObserved {
             observed_at: context.observed_at,
@@ -321,12 +323,27 @@ fn parse_wait_reason(reason: Option<&str>) -> Result<WaitReason> {
 }
 
 fn prompt_state(text: impl AsRef<str>, source: impl AsRef<str>) -> Result<PromptState> {
+    let raw = text.as_ref();
     let prompt = PromptState {
-        text: normalize_text(text.as_ref()),
+        text: normalize_text(raw),
         source: normalize_text(source.as_ref()),
+        digest: Some(PromptState::digest_decoded_prompt(raw)),
     };
     prompt.validate()?;
     Ok(prompt)
+}
+
+fn prompt_preview_state(raw: &str, source: &str) -> Result<Option<PromptState>> {
+    let Some(text) = build_prompt_preview(raw) else {
+        return Ok(None);
+    };
+    let prompt = PromptState {
+        text,
+        source: normalize_text(source),
+        digest: Some(PromptState::digest_decoded_prompt(raw)),
+    };
+    prompt.validate()?;
+    Ok(Some(prompt))
 }
 
 fn normalize_subagents(subagents: &mut [SubagentState]) {
@@ -457,7 +474,7 @@ fn latest_user_prompt_from_transcript(path: &str) -> Option<String> {
         .map_while(Result::ok)
         .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
         .filter_map(|value| user_prompt_from_transcript_value(&value))
-        .filter_map(|prompt| build_prompt_preview(&prompt))
+        .filter(|prompt| build_prompt_preview(prompt).is_some())
         .last()
 }
 
@@ -522,6 +539,10 @@ mod tests {
                     prompt: Some(PromptState {
                         text: "hello world".to_string(),
                         source: "user".to_string(),
+                        digest: Some(
+                            "3cf479a04899c793e4faf30c5b150c0c6e0aca73f52780ec274168e795a9634b"
+                                .to_string(),
+                        ),
                     }),
                 },
             ),
@@ -586,6 +607,23 @@ mod tests {
     }
 
     #[test]
+    fn prompt_digest_uses_decoded_bytes_before_preview_normalization() {
+        let normalized = prompt_preview_state("hello world", "user")
+            .unwrap()
+            .unwrap();
+        let multiline = prompt_preview_state("hello\nworld", "user")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(normalized.text, multiline.text);
+        assert_ne!(normalized.digest, multiline.digest);
+        assert_eq!(
+            multiline.digest.as_deref(),
+            Some("3cf479a04899c793e4faf30c5b150c0c6e0aca73f52780ec274168e795a9634b")
+        );
+    }
+
+    #[test]
     fn codex_typed_fixture_maps_supported_lifecycle_events() {
         let root = codex_root_session("typed-fixtures", "session-2");
         let transcript = root
@@ -613,6 +651,10 @@ mod tests {
                     prompt: Some(PromptState {
                         text: "do it".to_string(),
                         source: "user".to_string(),
+                        digest: Some(
+                            "e9de5641495b8879a8d6b829979d53ae024f7f236b82b3ae9b26e6587d2b7087"
+                                .to_string(),
+                        ),
                     }),
                 },
             ),
@@ -726,6 +768,42 @@ mod tests {
     }
 
     #[test]
+    fn resumed_prompt_digest_uses_raw_transcript_text() {
+        let root = unique_temp_dir("resume-prompt-digest");
+        fs::create_dir_all(&root).unwrap();
+        let transcript = root.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            serde_json::json!({"role": "user", "content": "continue\nraw"}).to_string(),
+        )
+        .unwrap();
+        let payload = serde_json::json!({
+            "session_id": "session-1",
+            "source": "resume",
+            "transcript_path": transcript,
+        })
+        .to_string();
+
+        let envelope = claude_typed_event_from_json("SessionStart", &payload, &typed_context())
+            .unwrap()
+            .unwrap();
+        let PaneEvent::AgentSessionStarted {
+            resumed_prompt: Some(prompt),
+            ..
+        } = envelope.event
+        else {
+            panic!("expected resumed prompt");
+        };
+        assert_eq!(prompt.text, "continue raw");
+        assert_eq!(
+            prompt.digest,
+            Some(PromptState::digest_decoded_prompt("continue\nraw"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn generic_typed_event_normalizes_fields_and_validates_combinations() {
         let envelope = generic_typed_event(
             GenericEmitInput {
@@ -757,6 +835,7 @@ mod tests {
             Some(FieldUpdate::Set(PromptState {
                 text: "explain this".to_string(),
                 source: "user input".to_string(),
+                digest: Some(PromptState::digest_decoded_prompt(" explain\nthis ")),
             }))
         );
 

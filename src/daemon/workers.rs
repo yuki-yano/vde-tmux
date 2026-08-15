@@ -25,6 +25,9 @@ use crate::{
 
 pub const CAPTURE_HISTORY_LINES: &str = "-80";
 pub const STALE_CAPTURE_SECONDS: i64 = 300;
+pub const OBSERVATION_CAPTURE_STDOUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub const OBSERVATION_CAPTURE_STDERR_MAX_BYTES: usize = 64 * 1024;
+pub const OBSERVATION_CAPTURE_GROUP_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessDetection {
@@ -126,8 +129,11 @@ impl AgentProcessSnapshot {
             };
         }
         let mut agents = BTreeSet::new();
-        let mut agent_processes =
+        let mut direct_agent_processes =
             BTreeMap::<AgentKind, BTreeSet<crate::pane_state::AgentProcessIdentity>>::new();
+        let mut interpreted_agent_processes =
+            BTreeMap::<AgentKind, BTreeSet<crate::pane_state::AgentProcessIdentity>>::new();
+        let mut direct_agents = BTreeSet::new();
         let mut process_identities_complete = true;
         let mut stack = vec![root_pid];
         let mut visited = BTreeSet::new();
@@ -136,12 +142,20 @@ impl AgentProcessSnapshot {
                 continue;
             }
             if let Some(command) = self.commands.get(&pid)
-                && let Some(agent) = detect_process_agent(command)
+                && let Some(detected) = detect_process_agent(command)
             {
+                let agent = detected.agent;
                 agents.insert(agent.clone());
+                if detected.source == AgentProcessSource::Direct {
+                    direct_agents.insert(agent.clone());
+                }
                 match crate::daemon::lifecycle::agent_process_start_token(pid) {
                     Ok(start_token) => {
-                        agent_processes
+                        let processes = match detected.source {
+                            AgentProcessSource::Direct => &mut direct_agent_processes,
+                            AgentProcessSource::Interpreted => &mut interpreted_agent_processes,
+                        };
+                        processes
                             .entry(agent)
                             .or_default()
                             .insert(crate::pane_state::AgentProcessIdentity { pid, start_token });
@@ -153,6 +167,12 @@ impl AgentProcessSnapshot {
                 stack.extend(children.iter().copied());
             }
         }
+        let agent_processes = prefer_direct_agent_processes(
+            &agents,
+            &direct_agents,
+            direct_agent_processes,
+            interpreted_agent_processes,
+        );
         ProcessDetection {
             agents,
             agent_processes,
@@ -192,6 +212,23 @@ impl AgentProcessSnapshot {
             }
         }
         Some(false)
+    }
+
+    pub fn is_foreground_process_owner(&self, root_pid: u32, process_pid: u32) -> Option<bool> {
+        let (_, root_terminal_process_group) = self.process_groups.get(&root_pid).copied()?;
+        if !self.complete || root_terminal_process_group <= 1 {
+            return None;
+        }
+        let descendants = self.descendants(root_pid)?;
+        if !descendants.contains(&process_pid) {
+            return Some(false);
+        }
+        Some(self.process_groups.get(&process_pid).is_some_and(
+            |(process_group, terminal_process_group)| {
+                *process_group == root_terminal_process_group
+                    && *terminal_process_group == root_terminal_process_group
+            },
+        ))
     }
 
     pub fn process_observation(
@@ -268,6 +305,25 @@ impl AgentProcessSnapshot {
     }
 }
 
+fn prefer_direct_agent_processes(
+    agents: &BTreeSet<AgentKind>,
+    direct_agents: &BTreeSet<AgentKind>,
+    mut direct: BTreeMap<AgentKind, BTreeSet<crate::pane_state::AgentProcessIdentity>>,
+    mut interpreted: BTreeMap<AgentKind, BTreeSet<crate::pane_state::AgentProcessIdentity>>,
+) -> BTreeMap<AgentKind, BTreeSet<crate::pane_state::AgentProcessIdentity>> {
+    agents
+        .iter()
+        .filter_map(|agent| {
+            let candidates = if direct_agents.contains(agent) {
+                direct.remove(agent)
+            } else {
+                interpreted.remove(agent)
+            };
+            candidates.map(|candidates| (agent.clone(), candidates))
+        })
+        .collect()
+}
+
 fn listening_port_from_name(name: &str) -> Option<u16> {
     let (_, tail) = name.trim().rsplit_once(':')?;
     let digits = tail
@@ -321,11 +377,27 @@ fn is_nvim_process(command: &str) -> bool {
     )
 }
 
-fn detect_process_agent(command: &str) -> Option<AgentKind> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentProcessSource {
+    Direct,
+    Interpreted,
+}
+
+struct DetectedProcessAgent {
+    agent: AgentKind,
+    source: AgentProcessSource,
+}
+
+fn detect_process_agent(command: &str) -> Option<DetectedProcessAgent> {
     let mut fields = command.split_whitespace();
-    let executable = fields.next()?.rsplit('/').next()?.to_ascii_lowercase();
-    let direct = matches!(executable.as_str(), "claude" | "codex" | "opencode")
-        .then_some(executable.as_str());
+    let executable = fields.next()?.rsplit('/').next()?;
+    if matches!(executable, "claude" | "codex" | "opencode") {
+        return Some(DetectedProcessAgent {
+            agent: AgentKind::parse(executable).ok()?,
+            source: AgentProcessSource::Direct,
+        });
+    }
+    let executable = executable.to_ascii_lowercase();
     let interpreted = matches!(
         executable.as_str(),
         "node" | "bun" | "deno" | "python" | "python3"
@@ -343,9 +415,10 @@ fn detect_process_agent(command: &str) -> Option<AgentKind> {
                 _ => None,
             })
     });
-    direct
-        .or(interpreted)
-        .and_then(|agent| AgentKind::parse(agent).ok())
+    Some(DetectedProcessAgent {
+        agent: AgentKind::parse(interpreted?).ok()?,
+        source: AgentProcessSource::Interpreted,
+    })
 }
 
 pub fn read_agent_process_snapshot(timeout: Duration, scan_ports: bool) -> AgentProcessSnapshot {
@@ -380,7 +453,10 @@ pub struct CaptureBatchOutput {
 }
 
 pub trait ObservationWorkerIo: Send + Sync + 'static {
-    fn capture_batch(&self, args: &[String]) -> Result<CaptureBatchOutput>;
+    fn capture_batch(
+        &self,
+        args: &[String],
+    ) -> std::result::Result<CaptureBatchOutput, CaptureBatchError>;
 }
 
 #[derive(Debug, Clone)]
@@ -406,7 +482,10 @@ impl SystemObservationWorkerIo {
 }
 
 impl ObservationWorkerIo for SystemObservationWorkerIo {
-    fn capture_batch(&self, args: &[String]) -> Result<CaptureBatchOutput> {
+    fn capture_batch(
+        &self,
+        args: &[String],
+    ) -> std::result::Result<CaptureBatchOutput, CaptureBatchError> {
         let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
         let tmux_args = tmux_args(self.socket_name.as_deref(), &refs);
         let mut child = std::process::Command::new("tmux")
@@ -417,17 +496,16 @@ impl ObservationWorkerIo for SystemObservationWorkerIo {
             // Own process group so a descendant that inherited the capture pipes
             // is killed with the child, letting the reader threads reach EOF.
             .process_group(0)
-            .spawn()?;
-        let stdout = child.stdout.take().map(|mut stdout| {
+            .spawn()
+            .map_err(|error| CaptureBatchError::Io(error.to_string()))?;
+        let stdout = child.stdout.take().map(|stdout| {
             thread::spawn(move || {
-                let mut bytes = Vec::new();
-                stdout.read_to_end(&mut bytes).map(|_| bytes)
+                read_capture_pipe_bounded(stdout, OBSERVATION_CAPTURE_STDOUT_MAX_BYTES)
             })
         });
-        let stderr = child.stderr.take().map(|mut stderr| {
+        let stderr = child.stderr.take().map(|stderr| {
             thread::spawn(move || {
-                let mut bytes = Vec::new();
-                stderr.read_to_end(&mut bytes).map(|_| bytes)
+                read_capture_pipe_bounded(stderr, OBSERVATION_CAPTURE_STDERR_MAX_BYTES)
             })
         });
         // On every path, kill the whole process group before reaping the child
@@ -438,32 +516,89 @@ impl ObservationWorkerIo for SystemObservationWorkerIo {
         // detached on the error path.
         let stdout = collect_capture_reader("stdout", stdout);
         let stderr = collect_capture_reader("stderr", stderr);
-        let status = status?.ok_or_else(|| {
-            anyhow::anyhow!("tmux capture batch timed out after {:?}", self.timeout)
-        })?;
+        let status = status
+            .map_err(|error| CaptureBatchError::Io(error.to_string()))?
+            .ok_or_else(|| {
+                CaptureBatchError::Io(format!(
+                    "tmux capture batch timed out after {:?}",
+                    self.timeout
+                ))
+            })?;
+        let stdout = stdout?;
+        let stderr = stderr?;
         Ok(CaptureBatchOutput {
             exit_code: status.code(),
-            stdout: String::from_utf8(stdout?)?,
-            stderr: String::from_utf8(stderr?)?,
+            stdout: String::from_utf8(stdout.bytes)
+                .map_err(|error| CaptureBatchError::Io(error.to_string()))?,
+            stderr: String::from_utf8(stderr.bytes)
+                .map_err(|error| CaptureBatchError::Io(error.to_string()))?,
         })
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CaptureReaderOutput {
+    bytes: Vec<u8>,
+    total_bytes: usize,
+    exceeded: bool,
+}
+
+fn read_capture_pipe_bounded(
+    mut reader: impl Read,
+    limit: usize,
+) -> std::io::Result<CaptureReaderOutput> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    let mut total_bytes = 0usize;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(count);
+        let retained = limit.saturating_sub(bytes.len()).min(count);
+        bytes.extend_from_slice(&buffer[..retained]);
+    }
+    Ok(CaptureReaderOutput {
+        bytes,
+        total_bytes,
+        exceeded: total_bytes > limit,
+    })
+}
+
 fn collect_capture_reader(
     label: &str,
-    reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
-) -> Result<Vec<u8>> {
-    reader
-        .ok_or_else(|| anyhow::anyhow!("capture {label} was not piped"))?
+    reader: Option<thread::JoinHandle<std::io::Result<CaptureReaderOutput>>>,
+) -> std::result::Result<CaptureReaderOutput, CaptureBatchError> {
+    let output = reader
+        .ok_or_else(|| CaptureBatchError::Io(format!("capture {label} was not piped")))?
         .join()
-        .map_err(|_| anyhow::anyhow!("capture {label} reader panicked"))?
-        .map_err(Into::into)
+        .map_err(|_| CaptureBatchError::Io(format!("capture {label} reader panicked")))?
+        .map_err(|error| CaptureBatchError::Io(error.to_string()))?;
+    if output.exceeded {
+        return Err(CaptureBatchError::OutputLimit {
+            scope: format!("capture {label}"),
+            actual: output.total_bytes,
+            limit: if label == "stdout" {
+                OBSERVATION_CAPTURE_STDOUT_MAX_BYTES
+            } else {
+                OBSERVATION_CAPTURE_STDERR_MAX_BYTES
+            },
+        });
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureBatchError {
     Random(String),
     Io(String),
+    ObservationQueueFull,
+    OutputLimit {
+        scope: String,
+        actual: usize,
+        limit: usize,
+    },
     ProcessFailed(Option<i32>),
     Stderr(String),
     DelimiterMismatch {
@@ -481,6 +616,17 @@ impl std::fmt::Display for CaptureBatchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Random(message) | Self::Io(message) => formatter.write_str(message),
+            Self::ObservationQueueFull => {
+                formatter.write_str("daemon observation capture queue is full")
+            }
+            Self::OutputLimit {
+                scope,
+                actual,
+                limit,
+            } => write!(
+                formatter,
+                "{scope} exceeded byte limit: {actual} bytes > {limit} bytes"
+            ),
             Self::ProcessFailed(code) => write!(formatter, "capture batch failed with {code:?}"),
             Self::Stderr(stderr) => write!(formatter, "capture batch wrote stderr: {stderr}"),
             Self::DelimiterMismatch { expected, actual } => write!(
@@ -715,6 +861,9 @@ pub trait CaptureSource: Send + Sync {
 }
 
 pub const CAPTURE_COALESCE_WINDOW: Duration = Duration::from_millis(25);
+/// Bounds daemon observation capture requests only. Other tmux command paths
+/// use their own queues and resource limits.
+const DAEMON_OBSERVATION_CAPTURE_QUEUE_CAPACITY: usize = 8;
 
 enum CaptureRequest {
     ObservationPlain {
@@ -725,7 +874,18 @@ enum CaptureRequest {
 
 #[derive(Clone)]
 pub struct CaptureCoordinatorHandle {
-    tx: mpsc::Sender<CaptureRequest>,
+    tx: mpsc::SyncSender<CaptureRequest>,
+}
+
+impl CaptureCoordinatorHandle {
+    fn try_enqueue(&self, request: CaptureRequest) -> Result<(), CaptureBatchError> {
+        self.tx.try_send(request).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => CaptureBatchError::ObservationQueueFull,
+            mpsc::TrySendError::Disconnected(_) => {
+                CaptureBatchError::Io("capture coordinator is stopped".to_string())
+            }
+        })
+    }
 }
 
 impl CaptureSource for CaptureCoordinatorHandle {
@@ -737,12 +897,10 @@ impl CaptureSource for CaptureCoordinatorHandle {
             return Ok(Vec::new());
         }
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.tx
-            .send(CaptureRequest::ObservationPlain {
-                panes: panes.to_vec(),
-                reply: reply_tx,
-            })
-            .map_err(|_| CaptureBatchError::Io("capture coordinator is stopped".to_string()))?;
+        self.try_enqueue(CaptureRequest::ObservationPlain {
+            panes: panes.to_vec(),
+            reply: reply_tx,
+        })?;
         reply_rx.recv().map_err(|_| {
             CaptureBatchError::Io("capture coordinator dropped the reply".to_string())
         })?
@@ -753,7 +911,7 @@ pub fn start_capture_coordinator(
     io: std::sync::Arc<dyn ObservationWorkerIo>,
     expected_identity: ServerIdentity,
 ) -> CaptureCoordinatorHandle {
-    let (tx, rx) = mpsc::channel::<CaptureRequest>();
+    let (tx, rx) = mpsc::sync_channel::<CaptureRequest>(DAEMON_OBSERVATION_CAPTURE_QUEUE_CAPACITY);
     thread::spawn(move || {
         while let Ok(first) = rx.recv() {
             let mut requests = vec![first];
@@ -838,15 +996,14 @@ fn execute_capture_group(
     }
 
     let mut fatal: Option<CaptureBatchError> = None;
-    for invocation in plan_capture_invocations(&requests) {
+    let mut retained_group_bytes = 0usize;
+    'invocations: for invocation in plan_capture_invocations(&requests) {
         let jobs = invocation
             .iter()
             .map(|(_, job)| job.clone())
             .collect::<Vec<_>>();
         let outcome = generate_capture_delimiter().and_then(|delimiter| {
-            let output = io
-                .capture_batch(&combined_capture_args(&jobs, &delimiter))
-                .map_err(|error| CaptureBatchError::Io(error.to_string()))?;
+            let output = io.capture_batch(&combined_capture_args(&jobs, &delimiter))?;
             parse_combined_capture(output, &jobs, &delimiter, expected_identity)
         });
         match outcome {
@@ -858,7 +1015,16 @@ fn execute_capture_group(
                                 .get_mut(request_index)
                                 .expect("observation slice maps to an observation request");
                             match (accumulator, result) {
-                                (Ok(tails), Ok(more)) => tails.extend(more),
+                                (Ok(tails), Ok(more)) => {
+                                    let added = more.iter().map(String::len).sum::<usize>();
+                                    if let Err(error) =
+                                        add_retained_capture_bytes(&mut retained_group_bytes, added)
+                                    {
+                                        fatal = Some(error);
+                                        break 'invocations;
+                                    }
+                                    tails.extend(more);
+                                }
                                 (accumulator @ Ok(_), Err(error)) => *accumulator = Err(error),
                                 (Err(_), _) => {}
                             }
@@ -898,6 +1064,21 @@ fn execute_capture_group(
             }
         }
     }
+}
+
+fn add_retained_capture_bytes(
+    retained: &mut usize,
+    added: usize,
+) -> std::result::Result<(), CaptureBatchError> {
+    *retained = retained.saturating_add(added);
+    if *retained > OBSERVATION_CAPTURE_GROUP_MAX_BYTES {
+        return Err(CaptureBatchError::OutputLimit {
+            scope: "coalesced observation group".to_string(),
+            actual: *retained,
+            limit: OBSERVATION_CAPTURE_GROUP_MAX_BYTES,
+        });
+    }
+    Ok(())
 }
 
 pub fn classify_presence(
@@ -1532,6 +1713,72 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn observation_capture_reader_drains_but_retains_only_the_limit() {
+        let input = vec![b'x'; 4096];
+        let output = read_capture_pipe_bounded(input.as_slice(), 1024).unwrap();
+
+        assert_eq!(output.bytes.len(), 1024);
+        assert_eq!(output.total_bytes, 4096);
+        assert!(output.exceeded);
+    }
+
+    #[test]
+    fn observation_capture_reader_reports_a_typed_stream_limit() {
+        let reader = thread::spawn(|| {
+            Ok(CaptureReaderOutput {
+                bytes: vec![b'x'; OBSERVATION_CAPTURE_STDOUT_MAX_BYTES],
+                total_bytes: OBSERVATION_CAPTURE_STDOUT_MAX_BYTES + 1,
+                exceeded: true,
+            })
+        });
+
+        let error = collect_capture_reader("stdout", Some(reader)).unwrap_err();
+        assert_eq!(
+            error,
+            CaptureBatchError::OutputLimit {
+                scope: "capture stdout".to_string(),
+                actual: OBSERVATION_CAPTURE_STDOUT_MAX_BYTES + 1,
+                limit: OBSERVATION_CAPTURE_STDOUT_MAX_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn observation_capture_group_has_a_typed_total_byte_limit() {
+        let mut retained = OBSERVATION_CAPTURE_GROUP_MAX_BYTES - 1;
+        add_retained_capture_bytes(&mut retained, 1).unwrap();
+        let error = add_retained_capture_bytes(&mut retained, 1).unwrap_err();
+
+        assert_eq!(
+            error,
+            CaptureBatchError::OutputLimit {
+                scope: "coalesced observation group".to_string(),
+                actual: OBSERVATION_CAPTURE_GROUP_MAX_BYTES + 1,
+                limit: OBSERVATION_CAPTURE_GROUP_MAX_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn observation_capture_queue_rejects_full_without_blocking() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let handle = CaptureCoordinatorHandle { tx };
+        let (first_reply, _first_rx) = mpsc::sync_channel(1);
+        handle
+            .try_enqueue(CaptureRequest::ObservationPlain {
+                panes: vec![pane_instance("%1", 10)],
+                reply: first_reply,
+            })
+            .unwrap();
+
+        let error = handle
+            .capture_plain_tails(&[pane_instance("%2", 20)])
+            .unwrap_err();
+
+        assert_eq!(error, CaptureBatchError::ObservationQueueFull);
+    }
+
+    #[test]
     fn nvim_marker_requires_the_exact_process_inside_the_pane_tree() {
         let snapshot = AgentProcessSnapshot::parse(
             "100 1 100 200 -zsh\n200 100 200 200 node editprompt\n300 200 200 200 /opt/bin/nvim prompt.md\n400 100 400 400 node codex\n500 400 500 0 nvim +Man!\n",
@@ -1544,6 +1791,34 @@ mod tests {
         assert_eq!(snapshot.contains_nvim_process(999, 300), None);
         assert_eq!(
             AgentProcessSnapshot::parse("", false).contains_nvim_process(100, 300),
+            None
+        );
+    }
+
+    #[test]
+    fn foreground_process_owner_requires_the_pane_tpgid_on_both_agent_fields() {
+        let snapshot = AgentProcessSnapshot::parse(
+            "100 1 100 200 -zsh\n\
+             200 100 200 200 codex\n\
+             201 100 201 200 claude\n\
+             202 100 200 202 opencode\n\
+             203 1 200 200 codex\n",
+            true,
+        );
+
+        assert_eq!(snapshot.is_foreground_process_owner(100, 200), Some(true));
+        assert_eq!(snapshot.is_foreground_process_owner(100, 201), Some(false));
+        assert_eq!(snapshot.is_foreground_process_owner(100, 202), Some(false));
+        assert_eq!(snapshot.is_foreground_process_owner(100, 203), Some(false));
+        assert_eq!(snapshot.is_foreground_process_owner(100, 999), Some(false));
+
+        let no_foreground = AgentProcessSnapshot::parse("100 1 100 1 -zsh\n", true);
+        assert_eq!(no_foreground.is_foreground_process_owner(100, 100), None);
+        let no_terminal = AgentProcessSnapshot::parse("100 1 100 0 -zsh\n", true);
+        assert_eq!(no_terminal.is_foreground_process_owner(100, 100), None);
+        assert_eq!(snapshot.is_foreground_process_owner(999, 200), None);
+        assert_eq!(
+            AgentProcessSnapshot::parse("", false).is_foreground_process_owner(100, 200),
             None
         );
     }
@@ -1807,7 +2082,10 @@ mod tests {
 
     #[cfg(any())]
     impl ObservationWorkerIo for ScriptedCombinedIo {
-        fn capture_batch(&self, args: &[String]) -> anyhow::Result<CaptureBatchOutput> {
+        fn capture_batch(
+            &self,
+            args: &[String],
+        ) -> std::result::Result<CaptureBatchOutput, CaptureBatchError> {
             *self.calls.lock().unwrap() += 1;
             let delimiter = args
                 .iter()
@@ -2003,7 +2281,10 @@ mod tests {
 
     #[cfg(any())]
     impl ObservationWorkerIo for SynthesizingCombinedIo {
-        fn capture_batch(&self, args: &[String]) -> anyhow::Result<CaptureBatchOutput> {
+        fn capture_batch(
+            &self,
+            args: &[String],
+        ) -> std::result::Result<CaptureBatchOutput, CaptureBatchError> {
             self.calls.lock().unwrap().push(args.len());
             let delimiter = args
                 .iter()
@@ -2495,6 +2776,47 @@ mod tests {
             .unwrap()
             .insert(second);
         assert_eq!(detection.exact_agent_process(&codex), None);
+    }
+
+    #[test]
+    fn direct_agent_binary_wins_over_its_interpreted_launcher() {
+        let codex = AgentKind::parse("codex").unwrap();
+        let launcher = crate::pane_state::AgentProcessIdentity {
+            pid: 10,
+            start_token: "launcher".to_string(),
+        };
+        let native = crate::pane_state::AgentProcessIdentity {
+            pid: 11,
+            start_token: "native".to_string(),
+        };
+        let processes = prefer_direct_agent_processes(
+            &BTreeSet::from([codex.clone()]),
+            &BTreeSet::from([codex.clone()]),
+            BTreeMap::from([(codex.clone(), BTreeSet::from([native.clone()]))]),
+            BTreeMap::from([(codex.clone(), BTreeSet::from([launcher]))]),
+        );
+
+        assert_eq!(processes[&codex], BTreeSet::from([native]));
+    }
+
+    #[test]
+    fn process_agent_detection_distinguishes_native_binary_from_launcher() {
+        let launcher =
+            detect_process_agent("node /opt/node_modules/@openai/codex/bin/codex.js --yolo")
+                .unwrap();
+        let native =
+            detect_process_agent("/opt/vendor/aarch64-apple-darwin/bin/codex --yolo").unwrap();
+
+        assert_eq!(launcher.agent.as_str(), "codex");
+        assert_eq!(launcher.source, AgentProcessSource::Interpreted);
+        assert_eq!(native.agent.as_str(), "codex");
+        assert_eq!(native.source, AgentProcessSource::Direct);
+        assert!(
+            detect_process_agent(
+                "/Users/example/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/client"
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -187,13 +187,20 @@ vt api schema --json
 vt agent list --status working --json
 vt agent wait %456 --until done,blocked --json
 vt pane read %456 --source latest --lines 120 --json
+
+AGENT_REF="$(vt agent get %456 --json | jq -r '.result.agent.summary.agent_ref')"
+printf '%s' 'Review the current diff.' | vt agent prompt "$AGENT_REF" --stdin --json
 ```
 
 See [Agent JSON API](./AGENT_API.md) for the response envelope, stable occupant references,
 durable run completion, filters, and capture bounds. An exact `agent_ref` is emitted only when one
 unique live agent process can be pinned by PID and OS start token. Hooks remain necessary for
 accurate lifecycle details, but hookless agents can use `agent wait` and `agent read` when that live
-process identity is available.
+process identity is available. Guarded prompt dispatch additionally requires healthy daemon-owned
+tmux hook state, an available Claude Code/Codex prompt adapter, an idle/done occupant, and foreground
+input ownership. The external provider hook is proven by the post-submit digest event, not by the
+preflight health field. The command returns a digest-confirmed receipt for `agent wait`; ambiguous
+delivery is never auto-retried.
 
 ## Agent states
 
@@ -457,7 +464,7 @@ Use `disable` when the daemon must remain stopped.
 ### Pane-state persistence
 
 The daemon stores one private full-state snapshot per tmux server incarnation under
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v7.json`. A daemon restart restores the
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v8.json`. A daemon restart restores the
 prompt, task progress and items, subagents, worktree activity, lifecycle, timestamps, agent
 identity, task context and generated summaries, the latest response preview, explicitly reported
 background processes, listening ports, and Done/acknowledgement state for panes

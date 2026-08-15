@@ -1,16 +1,80 @@
 use std::collections::VecDeque;
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+
+pub const INPUT_COMMAND_MAX_STDOUT_BYTES: usize = 16 * 1024;
+pub const INPUT_COMMAND_MAX_STDERR_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputWriteStage {
+    BeforeSpawn,
+    AfterSpawnBeforeWrite,
+    AfterPartialWrite,
+    AfterFullWrite,
+}
+
+#[derive(Debug)]
+pub struct InputCommandError {
+    pub stage: InputWriteStage,
+    source: anyhow::Error,
+}
+
+impl InputCommandError {
+    pub fn new(stage: InputWriteStage, source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            stage,
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for InputCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for InputCommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 #[cfg(test)]
 pub mod mock;
 
 pub trait TmuxRunner {
     fn run(&self, args: &[&str]) -> Result<String>;
+
+    fn run_with_input(
+        &self,
+        _args: &[&str],
+        _input: &[u8],
+    ) -> std::result::Result<String, InputCommandError> {
+        Err(InputCommandError::new(
+            InputWriteStage::BeforeSpawn,
+            anyhow::anyhow!("tmux runner does not support piped input"),
+        ))
+    }
+
+    fn verify_agent_input_owner(&self, root_pid: u32, agent_pid: u32) -> Result<()> {
+        let processes =
+            crate::daemon::workers::read_agent_process_snapshot(Duration::from_secs(1), false);
+        match processes.is_foreground_process_owner(root_pid, agent_pid) {
+            Some(true) => Ok(()),
+            Some(false) => bail!(
+                "agent process {agent_pid} is not the foreground input owner for pane root {root_pid}"
+            ),
+            None => bail!("agent input owner process scan was incomplete"),
+        }
+    }
 
     fn resolve_agent_process(
         &self,
@@ -54,44 +118,73 @@ pub fn run_command_with_output_limit(
     timeout: Option<Duration>,
     max_stdout_bytes: Option<usize>,
 ) -> Result<String> {
+    run_command_with_optional_input(program, args, None, timeout, max_stdout_bytes)
+}
+
+pub fn run_command_with_input_and_output_limits(
+    program: &str,
+    args: &[&str],
+    input: &[u8],
+    timeout: Option<Duration>,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> std::result::Result<String, InputCommandError> {
+    run_command_with_input_limits(
+        program,
+        args,
+        input,
+        timeout,
+        max_stdout_bytes,
+        max_stderr_bytes,
+    )
+}
+
+fn run_command_with_optional_input(
+    program: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Option<Duration>,
+    max_stdout_bytes: Option<usize>,
+) -> Result<String> {
     let mut child = Command::new(program)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn {program}"))?;
 
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .map(|stdout| read_pipe_in_background(stdout, max_stdout_bytes, Retention::Prefix));
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .map(|stderr| read_pipe_in_background(stderr, None, Retention::Prefix));
+    let input_cancelled = Arc::new(AtomicBool::new(false));
+    let stdin = input.and_then(|input| {
+        child
+            .stdin
+            .take()
+            .map(|stdin| write_pipe_in_background(stdin, input.to_vec(), input_cancelled.clone()))
+    });
 
-    let status = match timeout {
-        None => child
-            .wait()
-            .with_context(|| format!("failed to wait {program}"))?,
-        Some(limit) => {
-            let deadline = Instant::now() + limit;
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    break status;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!("{program} timed out after {limit:?}");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    };
+    let status = wait_for_child(program, &mut child, timeout);
+    input_cancelled.store(true, Ordering::Release);
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
-    let stdout = collect_pipe_output(stdout.take());
+    let stdin = collect_pipe_input(stdin);
+    let stdout = collect_pipe_output(stdout);
+    let stderr = collect_pipe_output(stderr);
+    let status = status?;
     if stdout.exceeded {
         bail!(
             "{program} stdout exceeded byte limit: {actual} bytes > {limit} bytes",
@@ -101,14 +194,220 @@ pub fn run_command_with_output_limit(
     }
     let stdout = String::from_utf8_lossy(&stdout.bytes).into_owned();
     if status.success() {
+        stdin.with_context(|| format!("failed to pipe input to {program}"))?;
         return Ok(stdout);
     }
-    let stderr = collect_pipe_output(stderr.take());
     let stderr = String::from_utf8_lossy(&stderr.bytes);
     bail!(
         "{program} {args:?} failed (exit: {code:?}): {stderr}",
         code = status.code()
     )
+}
+
+fn run_command_with_input_limits(
+    program: &str,
+    args: &[&str],
+    input: &[u8],
+    timeout: Option<Duration>,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> std::result::Result<String, InputCommandError> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            InputCommandError::new(
+                InputWriteStage::BeforeSpawn,
+                anyhow::Error::new(error).context(format!("failed to spawn {program}")),
+            )
+        })?;
+
+    let io_cancelled = Arc::new(AtomicBool::new(false));
+    let stdout = child.stdout.take().map(|stdout| {
+        read_pipe_in_background_cancellable(
+            stdout,
+            Some(max_stdout_bytes),
+            Retention::Prefix,
+            io_cancelled.clone(),
+        )
+    });
+    let stderr = child.stderr.take().map(|stderr| {
+        read_pipe_in_background_cancellable(
+            stderr,
+            Some(max_stderr_bytes),
+            Retention::Prefix,
+            io_cancelled.clone(),
+        )
+    });
+    let stdin = child
+        .stdin
+        .take()
+        .map(|stdin| write_pipe_in_background(stdin, input.to_vec(), io_cancelled.clone()));
+
+    let status = wait_for_child(program, &mut child, timeout);
+    io_cancelled.store(true, Ordering::Release);
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let stdin = collect_pipe_input(stdin);
+    let mut stdout = collect_pipe_output(stdout);
+    let mut stderr = collect_pipe_output(stderr);
+    let stage = classify_input_write_stage(&stdin);
+
+    let status = status.map_err(|error| InputCommandError::new(stage, error))?;
+    stdin.map_err(|error| {
+        InputCommandError::new(
+            stage,
+            anyhow::Error::new(error).context(format!("failed to pipe input to {program}")),
+        )
+    })?;
+    if let Some(error) = stdout.error.take() {
+        return Err(InputCommandError::new(
+            stage,
+            anyhow::Error::new(error).context(format!("failed to read {program} stdout")),
+        ));
+    }
+    if let Some(error) = stderr.error.take() {
+        return Err(InputCommandError::new(
+            stage,
+            anyhow::Error::new(error).context(format!("failed to read {program} stderr")),
+        ));
+    }
+    if stdout.exceeded {
+        return Err(InputCommandError::new(
+            stage,
+            anyhow::anyhow!(
+                "{program} stdout exceeded byte limit: {actual} bytes > {limit} bytes",
+                actual = stdout.total_bytes,
+                limit = max_stdout_bytes,
+            ),
+        ));
+    }
+    if stderr.exceeded {
+        return Err(InputCommandError::new(
+            stage,
+            anyhow::anyhow!(
+                "{program} stderr exceeded byte limit: {actual} bytes > {limit} bytes",
+                actual = stderr.total_bytes,
+                limit = max_stderr_bytes,
+            ),
+        ));
+    }
+    if !status.success() {
+        return Err(InputCommandError::new(
+            stage,
+            anyhow::anyhow!(
+                "{program} {args:?} failed (exit: {code:?}; stderr: {stderr_bytes} bytes)",
+                code = status.code(),
+                stderr_bytes = stderr.total_bytes,
+            ),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&stdout.bytes).into_owned())
+}
+
+fn classify_input_write_stage(stdin: &std::result::Result<(), PipeInputError>) -> InputWriteStage {
+    match stdin {
+        Ok(()) => InputWriteStage::AfterFullWrite,
+        Err(error) if error.written == 0 => InputWriteStage::AfterSpawnBeforeWrite,
+        Err(_) => InputWriteStage::AfterPartialWrite,
+    }
+}
+
+fn write_pipe_in_background(
+    mut pipe: ChildStdin,
+    input: Vec<u8>,
+    cancelled: Arc<AtomicBool>,
+) -> thread::JoinHandle<std::result::Result<(), PipeInputError>> {
+    thread::spawn(move || {
+        let descriptor = pipe.as_raw_fd();
+        let mut written = 0;
+        // SAFETY: `descriptor` belongs to `pipe` for the duration of this
+        // thread. Nonblocking writes let timeout cancellation interrupt a full
+        // stdin pipe even if a descendant inherited the read end.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(PipeInputError::new(
+                written,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        while written < input.len() {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(PipeInputError::new(
+                    written,
+                    std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "input write cancelled after child exit",
+                    ),
+                ));
+            }
+            match pipe.write(&input[written..]) {
+                Ok(0) => {
+                    return Err(PipeInputError::new(
+                        written,
+                        std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "failed to write complete input",
+                        ),
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(PipeInputError::new(written, error)),
+            }
+        }
+        Ok(())
+    })
+}
+
+#[derive(Debug)]
+struct PipeInputError {
+    written: usize,
+    source: std::io::Error,
+}
+
+impl PipeInputError {
+    fn new(written: usize, source: std::io::Error) -> Self {
+        Self { written, source }
+    }
+}
+
+impl std::fmt::Display for PipeInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PipeInputError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn collect_pipe_input(
+    handle: Option<thread::JoinHandle<std::result::Result<(), PipeInputError>>>,
+) -> std::result::Result<(), PipeInputError> {
+    handle
+        .map(|handle| {
+            handle.join().unwrap_or_else(|_| {
+                Err(PipeInputError::new(
+                    0,
+                    std::io::Error::other("input writer thread panicked"),
+                ))
+            })
+        })
+        .unwrap_or(Ok(()))
 }
 
 pub fn run_command_bounded(
@@ -273,6 +572,7 @@ struct CapturedPipe {
     bytes: Vec<u8>,
     total_bytes: usize,
     exceeded: bool,
+    error: Option<std::io::Error>,
 }
 
 fn read_pipe_in_background<R>(
@@ -292,32 +592,101 @@ where
                 Ok(0) | Err(_) => break,
                 Ok(read) => read,
             };
-            output.total_bytes = output.total_bytes.saturating_add(read);
-            match (limit, retention) {
-                (Some(limit), Retention::Prefix) => {
-                    let keep = limit.saturating_sub(output.bytes.len()).min(read);
-                    output.bytes.extend_from_slice(&chunk[..keep]);
-                }
-                (Some(0), Retention::Tail) => tail.clear(),
-                (Some(limit), Retention::Tail) if read >= limit => {
-                    tail.clear();
-                    tail.extend(chunk[read - limit..read].iter().copied());
-                }
-                (Some(limit), Retention::Tail) => {
-                    let overflow = tail.len().saturating_add(read).saturating_sub(limit);
-                    for _ in 0..overflow {
-                        tail.pop_front();
-                    }
-                    tail.extend(chunk[..read].iter().copied());
-                }
-                (None, _) => output.bytes.extend_from_slice(&chunk[..read]),
+            retain_pipe_chunk(&mut output, &mut tail, &chunk[..read], limit, retention);
+        }
+        finish_pipe_capture(output, tail, limit, retention)
+    })
+}
+
+fn retain_pipe_chunk(
+    output: &mut CapturedPipe,
+    tail: &mut VecDeque<u8>,
+    chunk: &[u8],
+    limit: Option<usize>,
+    retention: Retention,
+) {
+    output.total_bytes = output.total_bytes.saturating_add(chunk.len());
+    match (limit, retention) {
+        (Some(limit), Retention::Prefix) => {
+            let keep = limit.saturating_sub(output.bytes.len()).min(chunk.len());
+            output.bytes.extend_from_slice(&chunk[..keep]);
+        }
+        (Some(0), Retention::Tail) => tail.clear(),
+        (Some(limit), Retention::Tail) if chunk.len() >= limit => {
+            tail.clear();
+            tail.extend(chunk[chunk.len() - limit..].iter().copied());
+        }
+        (Some(limit), Retention::Tail) => {
+            let overflow = tail.len().saturating_add(chunk.len()).saturating_sub(limit);
+            for _ in 0..overflow {
+                tail.pop_front();
             }
-            output.exceeded |= limit.is_some_and(|limit| output.total_bytes > limit);
+            tail.extend(chunk.iter().copied());
         }
-        if limit.is_some() && matches!(retention, Retention::Tail) {
-            output.bytes = tail.into_iter().collect();
+        (None, _) => output.bytes.extend_from_slice(chunk),
+    }
+    output.exceeded |= limit.is_some_and(|limit| output.total_bytes > limit);
+}
+
+fn finish_pipe_capture(
+    mut output: CapturedPipe,
+    tail: VecDeque<u8>,
+    limit: Option<usize>,
+    retention: Retention,
+) -> CapturedPipe {
+    if limit.is_some() && matches!(retention, Retention::Tail) {
+        output.bytes = tail.into_iter().collect();
+    }
+    output
+}
+
+fn read_pipe_in_background_cancellable<R>(
+    mut pipe: R,
+    limit: Option<usize>,
+    retention: Retention,
+    cancelled: Arc<AtomicBool>,
+) -> thread::JoinHandle<CapturedPipe>
+where
+    R: Read + AsRawFd + Send + 'static,
+{
+    thread::spawn(move || {
+        let descriptor = pipe.as_raw_fd();
+        // SAFETY: `descriptor` belongs to `pipe` for this thread. Nonblocking
+        // reads allow cancellation once the direct child exits even if a
+        // descendant inherited a pipe writer.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return CapturedPipe {
+                error: Some(std::io::Error::last_os_error()),
+                ..CapturedPipe::default()
+            };
         }
-        output
+
+        let mut output = CapturedPipe::default();
+        let mut tail = VecDeque::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => {
+                    output.error = Some(error);
+                    break;
+                }
+            };
+            retain_pipe_chunk(&mut output, &mut tail, &chunk[..read], limit, retention);
+        }
+        finish_pipe_capture(output, tail, limit, retention)
     })
 }
 
@@ -375,6 +744,26 @@ impl TmuxRunner for SystemTmuxRunner {
         let owned_args = tmux_args(self.socket_name.as_deref(), args);
         let refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         run_command_with_output_limit("tmux", &refs, self.timeout, self.max_output_bytes)
+    }
+
+    fn run_with_input(
+        &self,
+        args: &[&str],
+        input: &[u8],
+    ) -> std::result::Result<String, InputCommandError> {
+        let owned_args = tmux_args(self.socket_name.as_deref(), args);
+        let refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+        run_command_with_input_and_output_limits(
+            "tmux",
+            &refs,
+            input,
+            self.timeout,
+            self.max_output_bytes
+                .map_or(INPUT_COMMAND_MAX_STDOUT_BYTES, |limit| {
+                    limit.min(INPUT_COMMAND_MAX_STDOUT_BYTES)
+                }),
+            INPUT_COMMAND_MAX_STDERR_BYTES,
+        )
     }
 
     fn run_bounded(&self, args: &[&str], max_stdout_bytes: usize) -> Result<BoundedOutput> {
@@ -443,6 +832,130 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(error.to_string().contains("stdout exceeded byte limit"));
         assert!(error.to_string().contains("262144 bytes > 1024 bytes"));
+    }
+
+    #[test]
+    fn piped_input_and_output_are_drained_concurrently_with_existing_bound() {
+        let input = vec![b'x'; 256 * 1024];
+        let started = Instant::now();
+        let error = run_command_with_input_and_output_limits(
+            "/bin/sh",
+            &["-c", "cat"],
+            &input,
+            Some(Duration::from_secs(2)),
+            1024,
+            1024,
+        )
+        .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("stdout exceeded byte limit"));
+        assert!(error.to_string().contains("262144 bytes > 1024 bytes"));
+    }
+
+    #[test]
+    fn piped_input_timeout_does_not_wait_for_a_full_stdin_pipe_or_expose_input() {
+        let secret = b"private-prompt-value".repeat(16 * 1024);
+        let started = Instant::now();
+        let error = run_command_with_input_and_output_limits(
+            "/bin/sh",
+            &["-c", "sleep 5"],
+            &secret,
+            Some(Duration::from_millis(100)),
+            1024,
+            1024,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(message.contains("timed out"));
+        assert!(!message.contains("private-prompt-value"));
+    }
+
+    #[test]
+    fn piped_input_is_not_in_nonzero_exit_error() {
+        let error = run_command_with_input_and_output_limits(
+            "/bin/sh",
+            &["-c", "cat >&2; exit 3"],
+            b"private-prompt-value",
+            Some(Duration::from_secs(2)),
+            1024,
+            1024,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("stderr: 20 bytes"));
+        assert!(!error.contains("private-prompt-value"));
+    }
+
+    #[test]
+    fn piped_input_stderr_is_drained_with_a_fixed_bound() {
+        let error = run_command_with_input_and_output_limits(
+            "/bin/sh",
+            &[
+                "-c",
+                "cat >/dev/null; i=0; while [ $i -lt 4096 ]; do printf x >&2; i=$((i + 1)); done; exit 3",
+            ],
+            b"short input",
+            Some(Duration::from_secs(2)),
+            1024,
+            1024,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.stage, InputWriteStage::AfterFullWrite);
+        assert!(error.to_string().contains("stderr exceeded byte limit"));
+        assert!(error.to_string().contains("4096 bytes > 1024 bytes"));
+    }
+
+    #[test]
+    fn input_error_distinguishes_partial_from_full_write() {
+        let partial = run_command_with_input_and_output_limits(
+            "/bin/sh",
+            &["-c", "dd bs=1 count=1 of=/dev/null 2>/dev/null; exit 4"],
+            &vec![b'x'; 1024 * 1024],
+            Some(Duration::from_secs(2)),
+            1024,
+            1024,
+        )
+        .unwrap_err();
+        let after = run_command_with_input_and_output_limits(
+            "/bin/sh",
+            &["-c", "cat >/dev/null; exit 4"],
+            b"short input",
+            Some(Duration::from_secs(2)),
+            1024,
+            1024,
+        )
+        .unwrap_err();
+
+        assert_eq!(partial.stage, InputWriteStage::AfterPartialWrite);
+        assert_eq!(after.stage, InputWriteStage::AfterFullWrite);
+    }
+
+    #[test]
+    fn input_error_distinguishes_pre_spawn_from_zero_byte_post_spawn_failure() {
+        let before_spawn = run_command_with_input_and_output_limits(
+            "/definitely/not/a/vde-tmux-test-program",
+            &[],
+            b"input",
+            Some(Duration::from_secs(2)),
+            1024,
+            1024,
+        )
+        .unwrap_err();
+        let zero_write = Err(PipeInputError::new(
+            0,
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed before first byte"),
+        ));
+
+        assert_eq!(before_spawn.stage, InputWriteStage::BeforeSpawn);
+        assert_eq!(
+            classify_input_write_stage(&zero_write),
+            InputWriteStage::AfterSpawnBeforeWrite
+        );
     }
 
     #[test]

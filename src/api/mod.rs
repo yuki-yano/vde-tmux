@@ -8,17 +8,20 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::daemon::protocol::v2::{
-    CLIENT_REQUEST_TIMEOUT, ClientMessage, DaemonDiagnostic, PROTOCOL_VERSION, PanePresentation,
-    ResolvedSnapshot, ServerMessage, V2Client,
+    CLIENT_REQUEST_TIMEOUT, ClientMessage, DaemonDiagnostic, HookHealth, PROTOCOL_VERSION,
+    PanePresentation, ResolvedSnapshot, ServerMessage, V2Client,
 };
 use crate::daemon::session_badge::BadgeState;
 use crate::pane_state::{LifecycleState, PaneInstance, WaitReason};
 use crate::tmux::TmuxRunner;
 
-pub const API_VERSION: u16 = 1;
+pub const API_VERSION: u16 = 2;
 pub const DEFAULT_READ_LINES: usize = 120;
 pub const MAX_READ_LINES: usize = 2_000;
 pub const MAX_READ_BYTES: usize = 1024 * 1024;
+pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
+pub const DEFAULT_PROMPT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(7);
+pub const MAX_PROMPT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -26,6 +29,10 @@ pub const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct ApiError {
     code: ApiErrorCode,
     message: String,
+    stage: ApiErrorStage,
+    side_effect: ApiSideEffect,
+    retry_action: ApiRetryAction,
+    receipt: Option<AgentPromptReceipt>,
 }
 
 impl ApiError {
@@ -33,6 +40,10 @@ impl ApiError {
         Self {
             code,
             message: message.into(),
+            stage: code.default_stage(),
+            side_effect: ApiSideEffect::None,
+            retry_action: code.default_retry_action(),
+            receipt: None,
         }
     }
 
@@ -40,9 +51,49 @@ impl ApiError {
         self.code.as_str()
     }
 
-    pub fn retryable(&self) -> bool {
-        self.code.retryable()
+    fn with_dispatch_context(
+        mut self,
+        stage: ApiErrorStage,
+        side_effect: ApiSideEffect,
+        retry_action: ApiRetryAction,
+        receipt: Option<AgentPromptReceipt>,
+    ) -> Self {
+        self.stage = stage;
+        self.side_effect = side_effect;
+        self.retry_action = retry_action;
+        self.receipt = receipt;
+        self
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiErrorStage {
+    RequestValidation,
+    TargetResolution,
+    Observation,
+    BeforeDispatch,
+    Dispatch,
+    AfterDispatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiSideEffect {
+    None,
+    Possible,
+    Confirmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiRetryAction {
+    RetrySameRequest,
+    RefreshTarget,
+    WaitThenRetry,
+    RestartObservation,
+    InspectManually,
+    Never,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -71,6 +122,13 @@ pub enum ApiErrorCode {
     ResourceLimit,
     InvalidDaemonResponse,
     CaptureFailed,
+    AgentBusy,
+    AgentBlocked,
+    PromptConfirmationUnavailable,
+    AgentNotInputOwner,
+    PromptDispatchBusy,
+    DispatchRejected,
+    DeliveryUnknown,
     DaemonError,
     InternalError,
 }
@@ -101,25 +159,65 @@ impl ApiErrorCode {
             Self::ResourceLimit => "resource_limit",
             Self::InvalidDaemonResponse => "invalid_daemon_response",
             Self::CaptureFailed => "capture_failed",
+            Self::AgentBusy => "agent_busy",
+            Self::AgentBlocked => "agent_blocked",
+            Self::PromptConfirmationUnavailable => "prompt_confirmation_unavailable",
+            Self::AgentNotInputOwner => "agent_not_input_owner",
+            Self::PromptDispatchBusy => "prompt_dispatch_busy",
+            Self::DispatchRejected => "dispatch_rejected",
+            Self::DeliveryUnknown => "delivery_unknown",
             Self::DaemonError => "daemon_error",
             Self::InternalError => "internal_error",
         }
     }
 
-    fn retryable(self) -> bool {
-        matches!(
-            self,
+    fn default_stage(self) -> ApiErrorStage {
+        match self {
+            Self::InvalidArguments | Self::InvalidTarget | Self::InvalidReference => {
+                ApiErrorStage::RequestValidation
+            }
+            Self::NoCurrentPane
+            | Self::PaneNotFound
+            | Self::AgentNotFound
+            | Self::ExactIdentityUnavailable
+            | Self::StaleReference => ApiErrorStage::TargetResolution,
+            Self::AgentBusy
+            | Self::AgentBlocked
+            | Self::PromptConfirmationUnavailable
+            | Self::AgentNotInputOwner
+            | Self::PromptDispatchBusy => ApiErrorStage::BeforeDispatch,
+            Self::DispatchRejected => ApiErrorStage::Dispatch,
+            Self::DeliveryUnknown => ApiErrorStage::AfterDispatch,
+            _ => ApiErrorStage::Observation,
+        }
+    }
+
+    fn default_retry_action(self) -> ApiRetryAction {
+        match self {
+            Self::PaneNotFound
+            | Self::AgentNotFound
+            | Self::StaleReference
+            | Self::DispatchRejected => ApiRetryAction::RefreshTarget,
             Self::ExactIdentityUnavailable
-                | Self::TmuxServerUnavailable
-                | Self::DaemonUnavailable
-                | Self::DaemonNotReady
-                | Self::DaemonQueryFailed
-                | Self::DaemonStreamError
-                | Self::StaleDaemon
-                | Self::Timeout
-                | Self::IdentityVerificationFailed
-                | Self::ControlUnavailable
-        )
+            | Self::DaemonNotReady
+            | Self::Timeout
+            | Self::IdentityVerificationFailed
+            | Self::ControlUnavailable
+            | Self::ResourceLimit
+            | Self::AgentBusy
+            | Self::AgentBlocked
+            | Self::PromptConfirmationUnavailable
+            | Self::AgentNotInputOwner
+            | Self::PromptDispatchBusy => ApiRetryAction::WaitThenRetry,
+            Self::TmuxServerUnavailable
+            | Self::DaemonUnavailable
+            | Self::DaemonQueryFailed
+            | Self::DaemonStreamError
+            | Self::StaleDaemon
+            | Self::EventHistoryLost => ApiRetryAction::RestartObservation,
+            Self::DeliveryUnknown => ApiRetryAction::InspectManually,
+            _ => ApiRetryAction::Never,
+        }
     }
 }
 
@@ -193,6 +291,27 @@ macro_rules! api_error {
     ("capture_failed", $message:expr $(,)?) => {
         ApiError::new(ApiErrorCode::CaptureFailed, $message)
     };
+    ("agent_busy", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::AgentBusy, $message)
+    };
+    ("agent_blocked", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::AgentBlocked, $message)
+    };
+    ("prompt_confirmation_unavailable", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::PromptConfirmationUnavailable, $message)
+    };
+    ("agent_not_input_owner", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::AgentNotInputOwner, $message)
+    };
+    ("prompt_dispatch_busy", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::PromptDispatchBusy, $message)
+    };
+    ("dispatch_rejected", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::DispatchRejected, $message)
+    };
+    ("delivery_unknown", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::DeliveryUnknown, $message)
+    };
     ("daemon_error", $message:expr $(,)?) => {
         ApiError::new(ApiErrorCode::DaemonError, $message)
     };
@@ -239,7 +358,11 @@ pub struct ApiErrorEnvelope {
 pub struct ApiErrorBody {
     pub code: ApiErrorCode,
     pub message: String,
-    pub retryable: bool,
+    pub stage: ApiErrorStage,
+    pub side_effect: ApiSideEffect,
+    pub retry_action: ApiRetryAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<AgentPromptReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -268,6 +391,16 @@ pub enum ApiResult {
     },
     AgentGet {
         agent: AgentDetail,
+    },
+    AgentPrompt {
+        receipt: AgentPromptReceipt,
+        dispatch: AgentPromptDispatch,
+        confirmation: AgentPromptConfirmation,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        observed_run_seq: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        observed_state_revision: Option<u64>,
+        wait_cursor: AgentWaitCursor,
     },
     AgentWait {
         target: AgentWaitTarget,
@@ -423,6 +556,8 @@ pub struct AgentDetail {
     pub started_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_digest: Option<String>,
     pub task_progress_done: u64,
     pub task_progress_total: u64,
     pub subagent_count: usize,
@@ -439,6 +574,33 @@ pub struct AgentWaitTarget {
     pub state_id: String,
     pub agent_epoch: u64,
     pub process_pid: u32,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AgentPromptReceipt {
+    pub target: AgentWaitTarget,
+    pub prompt_digest: String,
+    pub baseline_run_seq: u64,
+    pub baseline_completed_seq: u64,
+    pub expected_run_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPromptDispatch {
+    Submitted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPromptConfirmation {
+    DigestMatched,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AgentWaitCursor {
+    pub agent_ref: String,
+    pub after_completed_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -522,6 +684,10 @@ fn default_wait_timeout_ms() -> u64 {
     DEFAULT_WAIT_TIMEOUT.as_millis() as u64
 }
 
+fn default_prompt_confirm_timeout_ms() -> u64 {
+    DEFAULT_PROMPT_CONFIRM_TIMEOUT.as_millis() as u64
+}
+
 fn default_wait_statuses() -> BTreeSet<AgentStatus> {
     [AgentStatus::Done, AgentStatus::Blocked]
         .into_iter()
@@ -550,6 +716,12 @@ pub enum ApiRequest {
     },
     AgentGet {
         target: String,
+    },
+    AgentPrompt {
+        target: String,
+        #[serde(default = "default_prompt_confirm_timeout_ms")]
+        #[schemars(range(min = 1, max = 60_000))]
+        confirm_timeout_ms: u64,
     },
     AgentWait {
         target: String,
@@ -584,7 +756,16 @@ pub fn render_error(error: &anyhow::Error, started_at: i64) -> String {
         message: api_error
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("{error:#}")),
-        retryable: api_error.is_some_and(ApiError::retryable),
+        stage: api_error
+            .map(|error| error.stage)
+            .unwrap_or(ApiErrorStage::RequestValidation),
+        side_effect: api_error
+            .map(|error| error.side_effect)
+            .unwrap_or(ApiSideEffect::None),
+        retry_action: api_error
+            .map(|error| error.retry_action)
+            .unwrap_or(ApiRetryAction::Never),
+        receipt: api_error.and_then(|error| error.receipt.clone()),
     };
     serde_json::to_string(&ApiErrorEnvelope {
         meta: ApiMeta {
@@ -776,6 +957,564 @@ pub fn agent_get(
         observed_at,
         ApiResult::AgentGet { agent },
     )
+}
+
+pub fn agent_prompt(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    target: &str,
+    prompt: &str,
+    confirm_timeout: Duration,
+) -> Result<String> {
+    validate_prompt(prompt)?;
+    if !target.starts_with("vta1:") {
+        return Err(api_error!(
+            "invalid_arguments",
+            "agent prompt requires an exact agent_ref target",
+        )
+        .into());
+    }
+    if confirm_timeout.is_zero() || confirm_timeout > MAX_PROMPT_CONFIRM_TIMEOUT {
+        return Err(api_error!(
+            "invalid_arguments",
+            format!(
+                "--confirm-timeout-ms must be between 1 and {}",
+                MAX_PROMPT_CONFIRM_TIMEOUT.as_millis()
+            ),
+        )
+        .into());
+    }
+
+    let started_at = epoch_now();
+    let deadline = Instant::now() + confirm_timeout;
+    let mut connection = ApiConnection::connect(runner, env, Some(deadline))?;
+    if connection.client.hook_health() != HookHealth::Healthy {
+        return Err(api_error!(
+            "prompt_confirmation_unavailable",
+            "daemon hook health is degraded; no prompt bytes were sent",
+        )
+        .into());
+    }
+    let subscribed = connection.subscribe()?;
+    let (initial_pane, identity) =
+        resolve_wait_resume_agent(&subscribed, target, &connection.server_identity)?;
+    require_prompt_capable_agent(&identity)?;
+    let baseline = PromptBaseline::from_pane(initial_pane)?;
+    let prompt_digest = crate::pane_state::PromptState::digest_decoded_prompt(prompt);
+    let receipt = AgentPromptReceipt {
+        target: wait_target(
+            initial_pane,
+            &connection.server_identity,
+            &identity,
+            Some(target),
+        ),
+        prompt_digest: prompt_digest.clone(),
+        baseline_run_seq: baseline.run_seq,
+        baseline_completed_seq: baseline.completed_seq,
+        expected_run_seq: baseline.expected_run_seq,
+    };
+
+    let _lock = crate::runtime_dir::try_acquire_pane_dispatch_lock(
+        &connection.incarnation.identity,
+        &identity.pane_instance.pane_id,
+        identity.pane_instance.pane_pid,
+    )
+    .map_err(|error| {
+        ApiError::new(
+            ApiErrorCode::PromptDispatchBusy,
+            format!("could not acquire the guarded dispatch lock: {error:#}"),
+        )
+    })?
+    .ok_or_else(|| {
+        api_error!(
+            "prompt_dispatch_busy",
+            format!(
+                "another guarded dispatch is active for pane {}",
+                identity.pane_instance.pane_id
+            ),
+        )
+    })?;
+
+    let mut fence_connection = connection.reconnect()?;
+    let before_dispatch = fence_connection.query_snapshot()?;
+    let pane = require_same_agent(&before_dispatch, &identity).map_err(before_dispatch_error)?;
+    require_prompt_baseline(pane, &baseline).map_err(before_dispatch_error)?;
+    verify_live_pane(runner, env, &fence_connection, &identity.pane_instance)
+        .map_err(before_dispatch_error)?;
+    verify_live_agent_process(runner, &identity, pane).map_err(before_dispatch_error)?;
+    verify_agent_input_owner(runner, &identity).map_err(before_dispatch_error)?;
+
+    dispatch_prompt_guarded(
+        runner,
+        &connection.incarnation,
+        &identity.pane_instance,
+        prompt.as_bytes(),
+        &prompt_digest,
+        &receipt,
+    )?;
+
+    let mut after_connection = match connection.reconnect() {
+        Ok(connection) => connection,
+        Err(error) => {
+            return Err(delivery_unknown(
+                format!("prompt was submitted but daemon revalidation failed: {error:#}"),
+                receipt,
+            )
+            .into());
+        }
+    };
+    let after = match after_connection.query_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Err(delivery_unknown(
+                format!("prompt was submitted but the post-dispatch snapshot failed: {error:#}"),
+                receipt,
+            )
+            .into());
+        }
+    };
+    let after_pane = require_same_agent(&after, &identity).map_err(|error| {
+        delivery_unknown(
+            format!("prompt was submitted but the exact agent changed: {error:#}"),
+            receipt.clone(),
+        )
+    })?;
+    verify_live_pane(runner, env, &after_connection, &identity.pane_instance).map_err(|error| {
+        delivery_unknown(
+            format!("prompt was submitted but the live pane fence failed: {error:#}"),
+            receipt.clone(),
+        )
+    })?;
+    verify_live_agent_process(runner, &identity, after_pane).map_err(|error| {
+        delivery_unknown(
+            format!("prompt was submitted but the live agent fence failed: {error:#}"),
+            receipt.clone(),
+        )
+    })?;
+
+    let (confirmed_snapshot, observed_run_seq, observed_state_revision) =
+        confirm_prompt_digest(&mut connection, subscribed, &identity, &receipt, deadline)
+            .map_err(|message| delivery_unknown(message, receipt.clone()))?;
+    success_json(
+        &connection,
+        &confirmed_snapshot,
+        started_at,
+        ApiResult::AgentPrompt {
+            wait_cursor: AgentWaitCursor {
+                agent_ref: receipt.target.agent_ref.clone(),
+                after_completed_seq: receipt.baseline_completed_seq,
+            },
+            receipt,
+            dispatch: AgentPromptDispatch::Submitted,
+            confirmation: AgentPromptConfirmation::DigestMatched,
+            observed_run_seq: Some(observed_run_seq),
+            observed_state_revision: Some(observed_state_revision),
+        },
+    )
+}
+
+#[derive(Debug, Clone)]
+struct PromptBaseline {
+    state_id: String,
+    agent_epoch: u64,
+    run_seq: u64,
+    completed_seq: u64,
+    expected_run_seq: u64,
+}
+
+impl PromptBaseline {
+    fn from_pane(pane: &PanePresentation) -> Result<Self> {
+        let state = canonical_state(pane)
+            .ok_or_else(|| api_error!("agent_not_found", "agent state is unavailable"))?;
+        require_promptable_lifecycle(state)?;
+        let expected_run_seq = state
+            .run_seq
+            .checked_add(1)
+            .ok_or_else(|| api_error!("resource_limit", "run sequence overflow"))?;
+        Ok(Self {
+            state_id: state.state_id.as_str().to_string(),
+            agent_epoch: state.agent_epoch,
+            run_seq: state.run_seq,
+            completed_seq: state.completed_seq,
+            expected_run_seq,
+        })
+    }
+}
+
+fn validate_prompt(prompt: &str) -> Result<()> {
+    if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+        return Err(api_error!(
+            "invalid_arguments",
+            format!("prompt must contain between 1 and {MAX_PROMPT_BYTES} UTF-8 bytes"),
+        )
+        .into());
+    }
+    if prompt.chars().any(|character| {
+        matches!(character, '\r' | '\t' | '\u{7f}')
+            || (character.is_control() && character != '\n')
+            || ('\u{80}'..='\u{9f}').contains(&character)
+    }) {
+        return Err(api_error!(
+            "invalid_arguments",
+            "prompt may contain LF newlines but must not contain CR, TAB, C0, DEL, or C1 controls",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn require_prompt_capable_agent(identity: &AgentIdentity) -> Result<()> {
+    if matches!(identity.agent.as_str(), "claude" | "codex") {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            ApiErrorCode::PromptConfirmationUnavailable,
+            format!(
+                "agent kind {} has no supported prompt-bearing hook authority",
+                identity.agent
+            ),
+        )
+        .with_dispatch_context(
+            ApiErrorStage::BeforeDispatch,
+            ApiSideEffect::None,
+            ApiRetryAction::Never,
+            None,
+        )
+        .into())
+    }
+}
+
+fn before_dispatch_error(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast::<ApiError>() {
+        Ok(mut error) => {
+            error.stage = ApiErrorStage::BeforeDispatch;
+            error.side_effect = ApiSideEffect::None;
+            error.receipt = None;
+            error.into()
+        }
+        Err(error) => error,
+    }
+}
+
+fn require_promptable_lifecycle(state: AgentStateView<'_>) -> Result<()> {
+    match state.lifecycle {
+        LifecycleState::Running => {
+            Err(api_error!("agent_busy", "agent is working; no prompt bytes were sent",).into())
+        }
+        LifecycleState::Waiting { .. } | LifecycleState::Error { .. } => Err(api_error!(
+            "agent_blocked",
+            "agent is blocked; no prompt bytes were sent",
+        )
+        .into()),
+        LifecycleState::Idle => Ok(()),
+    }
+}
+
+fn require_prompt_baseline(pane: &PanePresentation, baseline: &PromptBaseline) -> Result<()> {
+    let state = canonical_state(pane)
+        .ok_or_else(|| api_error!("stale_reference", "agent state disappeared"))?;
+    require_promptable_lifecycle(state)?;
+    if state.state_id.as_str() != baseline.state_id
+        || state.agent_epoch != baseline.agent_epoch
+        || state.run_seq != baseline.run_seq
+        || state.completed_seq != baseline.completed_seq
+    {
+        return Err(api_error!(
+            "stale_reference",
+            "agent state changed after the prompt baseline was established",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_agent_input_owner(runner: &dyn TmuxRunner, identity: &AgentIdentity) -> Result<()> {
+    runner
+        .verify_agent_input_owner(identity.pane_instance.pane_pid, identity.agent_process.pid)
+        .map_err(|error| {
+            api_error!(
+                "agent_not_input_owner",
+                format!(
+                    "exact agent process is not the foreground input owner for pane {}: {error}",
+                    identity.pane_instance.pane_id
+                ),
+            )
+        })?;
+    Ok(())
+}
+
+fn delivery_unknown(message: impl Into<String>, receipt: AgentPromptReceipt) -> ApiError {
+    ApiError::new(ApiErrorCode::DeliveryUnknown, message).with_dispatch_context(
+        ApiErrorStage::AfterDispatch,
+        ApiSideEffect::Possible,
+        ApiRetryAction::InspectManually,
+        Some(receipt),
+    )
+}
+
+fn dispatch_prompt_guarded(
+    runner: &dyn TmuxRunner,
+    incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
+    pane: &PaneInstance,
+    prompt: &[u8],
+    prompt_digest: &str,
+    receipt: &AgentPromptReceipt,
+) -> Result<()> {
+    let nonce = format!(
+        "{}:{}:{}:{}:{}",
+        std::process::id(),
+        epoch_now(),
+        pane.pane_id,
+        pane.pane_pid,
+        prompt_digest
+    );
+    let nonce = format!("{:x}", Sha256::digest(nonce.as_bytes()));
+    dispatch_prompt_guarded_with_nonce(runner, incarnation, pane, prompt, receipt, &nonce)
+}
+
+struct GuardedPromptCommand {
+    args: Vec<String>,
+    buffer: String,
+    success: String,
+    server_mismatch: String,
+    pane_mismatch: String,
+}
+
+fn build_guarded_prompt_command(
+    incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
+    pane: &PaneInstance,
+    nonce: &str,
+) -> GuardedPromptCommand {
+    const SUCCESS_PREFIX: &str = "__vde_agent_prompt_submitted__";
+    const SERVER_MISMATCH_PREFIX: &str = "__vde_agent_prompt_server_mismatch__";
+    const PANE_MISMATCH_PREFIX: &str = "__vde_agent_prompt_pane_mismatch__";
+
+    let buffer = format!("vde-agent-prompt-{}", &nonce[..24]);
+    let success = format!("{SUCCESS_PREFIX}:{nonce}");
+    let server_mismatch = format!("{SERVER_MISMATCH_PREFIX}:{nonce}");
+    let pane_mismatch = format!("{PANE_MISMATCH_PREFIX}:{nonce}");
+
+    let delete_buffer = || {
+        vec![
+            "delete-buffer".to_string(),
+            "-b".to_string(),
+            buffer.clone(),
+        ]
+    };
+    let submitted_command = crate::pane_state::store::tmux_command_string(&[
+        "paste-buffer".to_string(),
+        "-p".to_string(),
+        "-r".to_string(),
+        "-d".to_string(),
+        "-b".to_string(),
+        buffer.clone(),
+        "-t".to_string(),
+        pane.pane_id.clone(),
+        ";".to_string(),
+        "send-keys".to_string(),
+        "-t".to_string(),
+        pane.pane_id.clone(),
+        "Enter".to_string(),
+        ";".to_string(),
+        "display-message".to_string(),
+        "-p".to_string(),
+        success.clone(),
+    ]);
+    let mut pane_mismatch_command = delete_buffer();
+    pane_mismatch_command.extend([
+        ";".to_string(),
+        "display-message".to_string(),
+        "-p".to_string(),
+        pane_mismatch.clone(),
+    ]);
+    let pane_guarded_command = crate::pane_state::store::tmux_command_string(&[
+        "if-shell".to_string(),
+        "-F".to_string(),
+        "-t".to_string(),
+        pane.pane_id.clone(),
+        format!("#{{==:#{{pane_pid}},{}}}", pane.pane_pid),
+        submitted_command,
+        crate::pane_state::store::tmux_command_string(&pane_mismatch_command),
+    ]);
+    let mut server_mismatch_command = delete_buffer();
+    server_mismatch_command.extend([
+        ";".to_string(),
+        "display-message".to_string(),
+        "-p".to_string(),
+        server_mismatch.clone(),
+    ]);
+    let server_guard = format!(
+        "#{{&&:#{{==:#{{pid}},{}}},#{{==:#{{start_time}},{}}}}}",
+        incarnation.identity.pid, incarnation.identity.start_time
+    );
+    let args = vec![
+        "load-buffer".to_string(),
+        "-b".to_string(),
+        buffer.clone(),
+        "-".to_string(),
+        ";".to_string(),
+        "if-shell".to_string(),
+        "-F".to_string(),
+        server_guard,
+        pane_guarded_command,
+        crate::pane_state::store::tmux_command_string(&server_mismatch_command),
+    ];
+    GuardedPromptCommand {
+        args,
+        buffer,
+        success,
+        server_mismatch,
+        pane_mismatch,
+    }
+}
+
+fn dispatch_prompt_guarded_with_nonce(
+    runner: &dyn TmuxRunner,
+    incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
+    pane: &PaneInstance,
+    prompt: &[u8],
+    receipt: &AgentPromptReceipt,
+    nonce: &str,
+) -> Result<()> {
+    let command = build_guarded_prompt_command(incarnation, pane, nonce);
+    let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
+    let result = runner.run_with_input(&args, prompt);
+    let _ = runner.run(&["delete-buffer", "-b", &command.buffer]);
+    let output = match result {
+        Ok(output) => output,
+        Err(error) => {
+            let side_effect = match error.stage {
+                crate::tmux::InputWriteStage::BeforeSpawn => ApiSideEffect::None,
+                crate::tmux::InputWriteStage::AfterSpawnBeforeWrite
+                | crate::tmux::InputWriteStage::AfterPartialWrite
+                | crate::tmux::InputWriteStage::AfterFullWrite => ApiSideEffect::Possible,
+            };
+            let retry_action = match error.stage {
+                crate::tmux::InputWriteStage::BeforeSpawn => ApiRetryAction::RetrySameRequest,
+                crate::tmux::InputWriteStage::AfterSpawnBeforeWrite
+                | crate::tmux::InputWriteStage::AfterPartialWrite
+                | crate::tmux::InputWriteStage::AfterFullWrite => ApiRetryAction::InspectManually,
+            };
+            return Err(ApiError::new(
+                if side_effect == ApiSideEffect::None {
+                    ApiErrorCode::DispatchRejected
+                } else {
+                    ApiErrorCode::DeliveryUnknown
+                },
+                format!("guarded tmux dispatch failed at {:?}: {error}", error.stage),
+            )
+            .with_dispatch_context(
+                ApiErrorStage::Dispatch,
+                side_effect,
+                retry_action,
+                (side_effect != ApiSideEffect::None).then(|| receipt.clone()),
+            )
+            .into());
+        }
+    };
+    let markers = output.lines().map(str::trim).collect::<BTreeSet<_>>();
+    if markers.contains(command.success.as_str()) {
+        return Ok(());
+    }
+    if markers.contains(command.server_mismatch.as_str())
+        || markers.contains(command.pane_mismatch.as_str())
+    {
+        return Err(ApiError::new(
+            ApiErrorCode::DispatchRejected,
+            "tmux server or pane identity changed before guarded dispatch",
+        )
+        .with_dispatch_context(
+            ApiErrorStage::Dispatch,
+            ApiSideEffect::None,
+            ApiRetryAction::RefreshTarget,
+            None,
+        )
+        .into());
+    }
+    Err(delivery_unknown(
+        "guarded dispatch returned without an unambiguous submission marker",
+        receipt.clone(),
+    )
+    .into())
+}
+
+fn confirm_prompt_digest(
+    connection: &mut ApiConnection,
+    mut snapshot: ResolvedSnapshot,
+    identity: &AgentIdentity,
+    receipt: &AgentPromptReceipt,
+    deadline: Instant,
+) -> std::result::Result<(ResolvedSnapshot, u64, u64), String> {
+    loop {
+        if let Some((run_seq, revision)) = observe_prompt_digest(&snapshot, identity, receipt)? {
+            return Ok((snapshot.clone(), run_seq, revision));
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "prompt digest was not confirmed before the deadline; do not resend automatically"
+                    .to_string(),
+            );
+        }
+        snapshot = connection
+            .next_snapshot()
+            .map_err(|error| format!("prompt confirmation stream failed: {error:#}"))?;
+    }
+}
+
+fn observe_prompt_digest(
+    snapshot: &ResolvedSnapshot,
+    identity: &AgentIdentity,
+    receipt: &AgentPromptReceipt,
+) -> std::result::Result<Option<(u64, u64)>, String> {
+    let pane = require_same_agent_state(snapshot, identity)
+        .map_err(|error| format!("exact agent changed before digest confirmation: {error:#}"))?;
+    let mut observed_mismatch = false;
+    for event in &snapshot.events {
+        let Some(version) = &event.state_version else {
+            continue;
+        };
+        if event.pane_instance == identity.pane_instance
+            && event.agent == identity.agent
+            && version.state_id.as_str() == identity.state_id
+            && version.agent_epoch == identity.agent_epoch
+            && event.run_seq == receipt.expected_run_seq
+            && event.prompt_submitted
+        {
+            if event.prompt_digest.as_deref() == Some(receipt.prompt_digest.as_str()) {
+                return Ok(Some((event.run_seq, version.revision)));
+            }
+            if event.prompt_digest.is_some() {
+                observed_mismatch = true;
+            }
+        }
+    }
+    if let Some(resolved) = &pane.resolved {
+        let state = &resolved.canonical;
+        if state.run_seq == receipt.expected_run_seq
+            && let Some(prompt) = state
+                .prompt
+                .as_ref()
+                .filter(|prompt| prompt.source == "user")
+            && let Some(digest) = prompt.digest.as_deref()
+        {
+            if digest == receipt.prompt_digest.as_str() {
+                return Ok(Some((state.run_seq, state.revision)));
+            }
+            observed_mismatch = true;
+        }
+        if state.run_seq > receipt.expected_run_seq {
+            return Err(format!(
+                "agent advanced to run {} before the expected user prompt digest was confirmed",
+                state.run_seq
+            ));
+        }
+    }
+    if observed_mismatch {
+        return Err(
+            "an observed user prompt digest did not match the dispatched prompt".to_string(),
+        );
+    }
+    Ok(None)
 }
 
 pub fn agent_read(
@@ -1303,6 +2042,11 @@ impl ApiConnection {
 }
 
 fn daemon_connect_error(error: anyhow::Error) -> ApiError {
+    if let Some(rejection) = error.chain().find_map(|source| {
+        source.downcast_ref::<crate::daemon::protocol::v2::DaemonHandshakeError>()
+    }) {
+        return daemon_api_error(rejection.code.clone(), rejection.message.clone());
+    }
     let code = if crate::daemon::protocol::v2::is_protocol_version_mismatch(&error) {
         ApiErrorCode::ProtocolMismatch
     } else {
@@ -1586,6 +2330,10 @@ fn agent_detail(
         completed_seq: state.completed_seq,
         started_at: state.started_at,
         prompt: state.prompt.as_ref().map(|prompt| prompt.text.clone()),
+        prompt_digest: state
+            .prompt
+            .as_ref()
+            .and_then(|prompt| prompt.digest.clone()),
         task_progress_done: state.tasks.progress.done,
         task_progress_total: state.tasks.progress.total,
         subagent_count: state.subagents.len(),
@@ -2379,6 +3127,254 @@ mod tests {
         }
     }
 
+    fn test_incarnation() -> crate::daemon::lifecycle::TmuxServerIncarnation {
+        crate::daemon::lifecycle::TmuxServerIncarnation {
+            socket_path: PathBuf::from("/tmp/test-tmux.sock"),
+            identity: crate::daemon::topology::ServerIdentity {
+                pid: 77,
+                start_time: 88,
+            },
+            hash: "server-hash".to_string(),
+        }
+    }
+
+    fn test_prompt_receipt() -> AgentPromptReceipt {
+        AgentPromptReceipt {
+            target: AgentWaitTarget {
+                agent_ref: "vta1:test".to_string(),
+                pane_ref: "vtp1:test".to_string(),
+                pane_id: "%1".to_string(),
+                pane_pid: 101,
+                agent: "codex".to_string(),
+                state_id: "00112233445566778899aabbccddeeff".to_string(),
+                agent_epoch: 1,
+                process_pid: 9001,
+            },
+            prompt_digest: crate::pane_state::PromptState::digest_decoded_prompt("review\nthis"),
+            baseline_run_seq: 1,
+            baseline_completed_seq: 1,
+            expected_run_seq: 2,
+        }
+    }
+
+    #[test]
+    fn prompt_input_contract_accepts_lf_and_rejects_unsafe_controls() {
+        validate_prompt("review\nthis").unwrap();
+        validate_prompt(&"x".repeat(MAX_PROMPT_BYTES)).unwrap();
+
+        for invalid in [
+            "",
+            "tab\there",
+            "cr\rhere",
+            "nul\0here",
+            "esc\u{1b}here",
+            "c1\u{85}here",
+        ] {
+            assert!(validate_prompt(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(validate_prompt(&"x".repeat(MAX_PROMPT_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn guarded_prompt_command_has_server_and_pane_fences_and_one_submit_queue() {
+        let nonce = "a".repeat(64);
+        let pane = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let command = build_guarded_prompt_command(&test_incarnation(), &pane, &nonce);
+        assert_eq!(
+            &command.args[..5],
+            ["load-buffer", "-b", &command.buffer, "-", ";"]
+        );
+        let serialized = command.args.join(" ");
+        assert!(serialized.contains("#{==:#{pid},77}"));
+        assert!(serialized.contains("#{==:#{start_time},88}"));
+        assert!(serialized.contains("#{==:#{pane_pid},101}"));
+        let paste = serialized.find("paste-buffer").unwrap();
+        let raw = serialized[paste..].find("-r").unwrap() + paste;
+        let enter = serialized.find("send-keys").unwrap();
+        let marker = serialized.find(&command.success).unwrap();
+        assert!(paste < raw && raw < enter && enter < marker);
+    }
+
+    #[test]
+    fn guarded_prompt_transport_keeps_prompt_out_of_argv() {
+        let runner = crate::tmux::mock::MockTmuxRunner::new();
+        let nonce = "b".repeat(64);
+        let pane = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let command = build_guarded_prompt_command(&test_incarnation(), &pane, &nonce);
+        let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
+        runner.stub(&args, &format!("{}\n", command.success));
+        runner.stub(&["delete-buffer", "-b", &command.buffer], "");
+        let receipt = test_prompt_receipt();
+
+        dispatch_prompt_guarded_with_nonce(
+            &runner,
+            &test_incarnation(),
+            &pane,
+            b"review\nthis",
+            &receipt,
+            &nonce,
+        )
+        .unwrap();
+
+        let calls = runner.input_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, b"review\nthis");
+        assert!(!calls[0].0.join(" ").contains("review"));
+    }
+
+    #[test]
+    fn guarded_prompt_transport_classifies_input_write_ambiguity() {
+        for (stage, side_effect, retry_action, has_receipt) in [
+            (
+                crate::tmux::InputWriteStage::BeforeSpawn,
+                ApiSideEffect::None,
+                ApiRetryAction::RetrySameRequest,
+                false,
+            ),
+            (
+                crate::tmux::InputWriteStage::AfterSpawnBeforeWrite,
+                ApiSideEffect::Possible,
+                ApiRetryAction::InspectManually,
+                true,
+            ),
+            (
+                crate::tmux::InputWriteStage::AfterPartialWrite,
+                ApiSideEffect::Possible,
+                ApiRetryAction::InspectManually,
+                true,
+            ),
+            (
+                crate::tmux::InputWriteStage::AfterFullWrite,
+                ApiSideEffect::Possible,
+                ApiRetryAction::InspectManually,
+                true,
+            ),
+        ] {
+            let runner = crate::tmux::mock::MockTmuxRunner::new();
+            let nonce = "c".repeat(64);
+            let pane = PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 101,
+            };
+            let command = build_guarded_prompt_command(&test_incarnation(), &pane, &nonce);
+            let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
+            runner.stub_input_error(&args, stage, "private transport failure");
+            runner.stub(&["delete-buffer", "-b", &command.buffer], "");
+
+            let error = dispatch_prompt_guarded_with_nonce(
+                &runner,
+                &test_incarnation(),
+                &pane,
+                b"review\nthis",
+                &test_prompt_receipt(),
+                &nonce,
+            )
+            .unwrap_err();
+            let api = error.downcast_ref::<ApiError>().unwrap();
+            assert_eq!(api.side_effect, side_effect);
+            assert_eq!(api.retry_action, retry_action);
+            assert_eq!(api.receipt.is_some(), has_receipt);
+            assert!(!format!("{error:#}").contains("review"));
+        }
+    }
+
+    #[test]
+    fn guarded_prompt_identity_mismatch_is_known_not_dispatched() {
+        let runner = crate::tmux::mock::MockTmuxRunner::new();
+        let nonce = "d".repeat(64);
+        let pane = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let command = build_guarded_prompt_command(&test_incarnation(), &pane, &nonce);
+        let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
+        runner.stub(&args, &format!("{}\n", command.pane_mismatch));
+        runner.stub(&["delete-buffer", "-b", &command.buffer], "");
+
+        let error = dispatch_prompt_guarded_with_nonce(
+            &runner,
+            &test_incarnation(),
+            &pane,
+            b"review\nthis",
+            &test_prompt_receipt(),
+            &nonce,
+        )
+        .unwrap_err();
+        let api = error.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.code, ApiErrorCode::DispatchRejected);
+        assert_eq!(api.side_effect, ApiSideEffect::None);
+        assert_eq!(api.retry_action, ApiRetryAction::RefreshTarget);
+        assert!(api.receipt.is_none());
+    }
+
+    #[test]
+    fn prompt_confirmation_accepts_only_expected_run_and_digest() {
+        let mut pane = test_agent_pane();
+        let identity = AgentIdentity::from_pane(&pane).unwrap();
+        let receipt = test_prompt_receipt();
+        let state = &mut pane.resolved.as_mut().unwrap().canonical;
+        state.revision = 2;
+        state.run_seq = 2;
+        state.prompt = Some(crate::pane_state::PromptState {
+            text: "review this".to_string(),
+            source: "user".to_string(),
+            digest: Some(receipt.prompt_digest.clone()),
+        });
+        assert_eq!(
+            observe_prompt_digest(&test_snapshot(pane.clone()), &identity, &receipt).unwrap(),
+            Some((2, 2))
+        );
+
+        pane.resolved.as_mut().unwrap().canonical.prompt = None;
+        let mut snapshot = test_snapshot(pane);
+        snapshot.events.push(crate::daemon::TransitionEvent {
+            pane_instance: identity.pane_instance.clone(),
+            agent: identity.agent.clone(),
+            state_version: Some(crate::pane_state::StateVersion {
+                state_id: crate::pane_state::StateId::parse(&identity.state_id).unwrap(),
+                revision: 3,
+                agent_epoch: identity.agent_epoch,
+            }),
+            run_seq: 2,
+            completed_seq: 1,
+            prompt_digest: Some(receipt.prompt_digest.clone()),
+            prompt_submitted: true,
+            from: Some(BadgeState::Idle),
+            to: BadgeState::Working,
+            at_epoch: 10,
+        });
+        assert_eq!(
+            observe_prompt_digest(&snapshot, &identity, &receipt).unwrap(),
+            Some((2, 3))
+        );
+
+        snapshot.events[0].prompt_submitted = false;
+        assert_eq!(
+            observe_prompt_digest(&snapshot, &identity, &receipt).unwrap(),
+            None
+        );
+
+        snapshot.events[0].prompt_submitted = true;
+        let current = &mut snapshot.panes[0].resolved.as_mut().unwrap().canonical;
+        current.prompt = Some(crate::pane_state::PromptState {
+            text: "goal replaced the preview".to_string(),
+            source: "goal".to_string(),
+            digest: Some(crate::pane_state::PromptState::digest_decoded_prompt(
+                "goal replaced the preview",
+            )),
+        });
+        assert_eq!(
+            observe_prompt_digest(&snapshot, &identity, &receipt).unwrap(),
+            Some((2, 3))
+        );
+    }
+
     #[test]
     fn generated_schema_contains_success_and_error_envelopes() {
         let value: serde_json::Value = serde_json::from_str(&schema_json(123).unwrap()).unwrap();
@@ -2393,7 +3389,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            25
+            32
         );
         let wait_schema = value["result"]["schemas"]["request"]["oneOf"]
             .as_array()
@@ -2406,15 +3402,51 @@ mod tests {
     }
 
     #[test]
-    fn error_retryability_distinguishes_temporary_and_terminal_wait_failures() {
-        assert!(api_error!("exact_identity_unavailable", "retry").retryable());
-        assert!(api_error!("identity_verification_failed", "retry").retryable());
-        assert!(!api_error!("event_history_lost", "restart observation").retryable());
-        assert!(!api_error!("stale_reference", "refresh reference").retryable());
+    fn error_retry_actions_distinguish_recovery_strategies() {
+        assert_eq!(
+            api_error!("exact_identity_unavailable", "wait").retry_action,
+            ApiRetryAction::WaitThenRetry
+        );
+        assert_eq!(
+            api_error!("event_history_lost", "restart").retry_action,
+            ApiRetryAction::RestartObservation
+        );
+        assert_eq!(
+            api_error!("stale_reference", "refresh").retry_action,
+            ApiRetryAction::RefreshTarget
+        );
+        assert_eq!(
+            api_error!("delivery_unknown", "inspect").retry_action,
+            ApiRetryAction::InspectManually
+        );
+        for code in [
+            ApiErrorCode::AgentBusy,
+            ApiErrorCode::AgentBlocked,
+            ApiErrorCode::PromptConfirmationUnavailable,
+            ApiErrorCode::AgentNotInputOwner,
+        ] {
+            assert_eq!(
+                ApiError::new(code, "transient pre-dispatch condition").retry_action,
+                ApiRetryAction::WaitThenRetry
+            );
+        }
     }
 
     #[test]
-    fn render_error_emits_the_closed_code_and_retryability() {
+    fn pre_dispatch_recontext_preserves_recovery_but_reports_the_actual_stage() {
+        let error = before_dispatch_error(anyhow::Error::new(api_error!(
+            "stale_reference",
+            "changed during fence"
+        )));
+        let error = error.downcast_ref::<ApiError>().unwrap();
+
+        assert_eq!(error.stage, ApiErrorStage::BeforeDispatch);
+        assert_eq!(error.side_effect, ApiSideEffect::None);
+        assert_eq!(error.retry_action, ApiRetryAction::RefreshTarget);
+    }
+
+    #[test]
+    fn render_error_emits_the_closed_code_and_recovery_contract() {
         let error = anyhow::Error::new(api_error!(
             "identity_verification_failed",
             "process scan unavailable"
@@ -2425,7 +3457,10 @@ mod tests {
         assert_eq!(value["meta"]["started_at"], 123);
         assert_eq!(value["error"]["code"], "identity_verification_failed");
         assert_eq!(value["error"]["message"], "process scan unavailable");
-        assert_eq!(value["error"]["retryable"], true);
+        assert_eq!(value["error"]["stage"], "observation");
+        assert_eq!(value["error"]["side_effect"], "none");
+        assert_eq!(value["error"]["retry_action"], "wait_then_retry");
+        assert!(value["error"].get("retryable").is_none());
     }
 
     #[test]
@@ -2437,6 +3472,17 @@ mod tests {
         });
 
         assert_eq!(daemon_connect_error(error).code(), "protocol_mismatch");
+    }
+
+    #[test]
+    fn daemon_handshake_overload_preserves_resource_limit_recovery() {
+        let error = anyhow::Error::new(crate::daemon::protocol::v2::DaemonHandshakeError {
+            code: crate::daemon::protocol::v2::ErrorCode::QueueFull,
+            message: "connection capacity is full".to_string(),
+        });
+        let error = daemon_connect_error(error);
+        assert_eq!(error.code(), "resource_limit");
+        assert_eq!(error.retry_action, ApiRetryAction::WaitThenRetry);
     }
 
     #[test]
@@ -2614,6 +3660,8 @@ mod tests {
             state_version: Some(completion_version),
             run_seq: 1,
             completed_seq: 1,
+            prompt_digest: None,
+            prompt_submitted: false,
             from: Some(BadgeState::Working),
             to: BadgeState::Idle,
             at_epoch: 2,
@@ -2649,6 +3697,8 @@ mod tests {
             state_version: Some(blocked_version),
             run_seq: 1,
             completed_seq: 0,
+            prompt_digest: None,
+            prompt_submitted: false,
             from: Some(BadgeState::Working),
             to: BadgeState::Blocked,
             at_epoch: 2,
@@ -2684,6 +3734,8 @@ mod tests {
             state_version: Some(blocked_version),
             run_seq: 2,
             completed_seq: 1,
+            prompt_digest: None,
+            prompt_submitted: false,
             from: Some(BadgeState::Working),
             to: BadgeState::Blocked,
             at_epoch: 3,
@@ -2722,6 +3774,8 @@ mod tests {
                     }),
                     run_seq: 1,
                     completed_seq: 0,
+                    prompt_digest: None,
+                    prompt_submitted: false,
                     from: Some(BadgeState::Working),
                     to: BadgeState::Working,
                     at_epoch: revision as i64,

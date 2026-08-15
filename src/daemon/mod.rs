@@ -25,6 +25,8 @@ pub struct TransitionEvent {
     pub state_version: Option<crate::pane_state::StateVersion>,
     pub run_seq: u64,
     pub completed_seq: u64,
+    pub prompt_digest: Option<String>,
+    pub prompt_submitted: bool,
     pub from: Option<BadgeState>,
     pub to: BadgeState,
     pub at_epoch: i64,

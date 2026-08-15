@@ -185,13 +185,20 @@ vt api schema --json
 vt agent list --status working --json
 vt agent wait %456 --until done,blocked --json
 vt pane read %456 --source latest --lines 120 --json
+
+AGENT_REF="$(vt agent get %456 --json | jq -r '.result.agent.summary.agent_ref')"
+printf '%s' '現在の差分をレビューしてください。' | vt agent prompt "$AGENT_REF" --stdin --json
 ```
 
 response envelope、occupant を固定する参照、filter、capture 上限については
 [Agent JSON API](./AGENT_API.md) を参照してください。PID と OS の process start token で一意な
 実プロセスを固定できる場合だけ exact `agent_ref` が発行されます。正確な lifecycle 表示には
 引き続き hook が必要ですが、実プロセスを一意に識別できれば hookless agent でも
-`agent wait` / `agent read` を利用できます。
+`agent wait` / `agent read` を利用できます。guarded prompt dispatch はさらに、daemon 管理下の
+tmux hook が healthy であること、Claude Code / Codex 向けの prompt adapter があること、対象が
+idle/done かつ foreground input owner であることを要求します。外部 provider hook は事前の
+health 値ではなく、送信後の digest event によって確認します。成功時は digest 確認済み receipt
+を返し、配送が曖昧な場合は自動再送しません。
 
 ## 状態の読み方
 
@@ -426,7 +433,7 @@ vt hook emit \
 ### pane state の永続化
 
 daemon は tmux server incarnation ごとに一つの private な full-state snapshot を
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v7.json` へ保存します。
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v8.json` へ保存します。
 daemon 再起動後も、pane ID と PID が一致する pane の prompt、task の進捗と項目、subagent、worktree activity、lifecycle、時刻、agent identity、Unread Spanのpin、Done と確認済み状態を復元します。
 
 snapshot が破損している、または権限が安全でない場合、daemon は修復や fallback を行わず起動を停止します。

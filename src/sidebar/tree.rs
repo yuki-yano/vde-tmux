@@ -1786,6 +1786,7 @@ mod tests {
             prompt: Some(PromptState {
                 text: "working".to_string(),
                 source: "test".to_string(),
+                digest: None,
             }),
             latest_response: None,
             task_context: crate::pane_state::TaskContextState::default(),

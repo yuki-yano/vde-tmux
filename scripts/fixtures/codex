@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+import termios
+import tty
+
+
+VT_BIN = os.environ["VT_BIN"]
+PROMPT_LOG = os.environ["PROMPT_LOG"]
+TRANSCRIPT_PATH = os.environ["CODEX_TRANSCRIPT_PATH"]
+SESSION_ID = "guarded-prompt-isolated"
+
+
+def emit_hook(event, **fields):
+    payload = {
+        "session_id": SESSION_ID,
+        "transcript_path": TRANSCRIPT_PATH,
+        **fields,
+    }
+    subprocess.run(
+        [VT_BIN, "hook", "codex", event],
+        input=json.dumps(payload),
+        text=True,
+        stdout=subprocess.DEVNULL,
+        check=True,
+    )
+
+
+emit_hook("SessionStart", source="startup")
+descriptor = sys.stdin.fileno()
+original = termios.tcgetattr(descriptor)
+tty.setraw(descriptor)
+sys.stdout.write("\x1b[?2004hREADY\r\n")
+sys.stdout.flush()
+
+buffer = bytearray()
+in_paste = False
+try:
+    while True:
+        byte = os.read(descriptor, 1)
+        if not byte:
+            break
+        buffer.extend(byte)
+        if not in_paste and buffer.endswith(b"\x1b[200~"):
+            del buffer[-6:]
+            in_paste = True
+            continue
+        if in_paste and buffer.endswith(b"\x1b[201~"):
+            del buffer[-6:]
+            in_paste = False
+            continue
+        if not in_paste and byte in (b"\r", b"\n"):
+            del buffer[-1:]
+            prompt = buffer.decode("utf-8")
+            buffer.clear()
+            with open(PROMPT_LOG, "a", encoding="utf-8") as output:
+                output.write(json.dumps(prompt, ensure_ascii=False) + "\n")
+            emit_hook("UserPromptSubmit", prompt=prompt)
+            emit_hook("Stop", last_assistant_message="isolated guarded prompt accepted")
+            sys.stdout.write("ACCEPTED\r\n")
+            sys.stdout.flush()
+finally:
+    sys.stdout.write("\x1b[?2004l")
+    sys.stdout.flush()
+    termios.tcsetattr(descriptor, termios.TCSADRAIN, original)

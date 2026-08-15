@@ -110,6 +110,8 @@ pub struct CanonicalTransition {
     pub state_version: Option<StateVersion>,
     pub run_seq: u64,
     pub completed_seq: u64,
+    pub prompt_digest: Option<String>,
+    pub prompt_submitted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -553,6 +555,7 @@ impl CanonicalStateRuntime {
             &envelope.pane_instance,
             previous.as_ref(),
             Some(&candidate),
+            &envelope.event,
             transition_at_epoch(&envelope.event, Some(&candidate)),
         );
         self.bump_snapshot_revision()?;
@@ -570,6 +573,7 @@ impl CanonicalStateRuntime {
         pane: &PaneInstance,
         previous: Option<&PaneState>,
         current: Option<&PaneState>,
+        event: &PaneEvent,
         at_epoch: i64,
     ) {
         let previous_badge = record_badge(previous);
@@ -607,6 +611,19 @@ impl CanonicalStateRuntime {
             state_version: state_version.clone(),
             run_seq: transition_state.map_or(0, |state| state.run_seq),
             completed_seq: transition_state.map_or(0, |state| state.completed_seq),
+            prompt_digest: match event {
+                PaneEvent::BeginRun { prompt, .. } => {
+                    prompt.as_ref().and_then(|prompt| prompt.digest.clone())
+                }
+                _ => None,
+            },
+            prompt_submitted: matches!(
+                event,
+                PaneEvent::BeginRun {
+                    prompt: Some(prompt),
+                    ..
+                } if prompt.source == "user" && prompt.digest.is_some()
+            ),
         });
         while self.transitions.len() > MAX_DIAGNOSTICS {
             self.transitions.pop_front();
@@ -872,6 +889,7 @@ mod tests {
                     prompt: Some(PromptState {
                         text: "preserve me".to_string(),
                         source: "test".to_string(),
+                        digest: None,
                     }),
                 }
             )
@@ -908,6 +926,50 @@ mod tests {
         );
         assert_eq!(runtime.record(&target), Some(&before));
         assert_eq!(runtime.snapshot_revision(), revision);
+    }
+
+    #[test]
+    fn begin_run_transition_retains_digest_and_user_submission_provenance() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = RecordingStore::default();
+        let target = pane(1);
+        let digest = PromptState::digest_decoded_prompt("raw\nprompt");
+
+        apply(
+            &mut runtime,
+            &mut io,
+            target,
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: Some(PromptState {
+                    text: "raw prompt".to_string(),
+                    source: "user".to_string(),
+                    digest: Some(digest.clone()),
+                }),
+            },
+        )
+        .unwrap();
+
+        let transition = runtime.transitions().back().unwrap();
+        assert_eq!(transition.prompt_digest, Some(digest));
+        assert!(transition.prompt_submitted);
+
+        let mut runtime = CanonicalStateRuntime::default();
+        apply(
+            &mut runtime,
+            &mut io,
+            pane(2),
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: Some(PromptState {
+                    text: "agent goal".to_string(),
+                    source: "goal".to_string(),
+                    digest: Some(PromptState::digest_decoded_prompt("agent goal")),
+                }),
+            },
+        )
+        .unwrap();
+        assert!(!runtime.transitions().back().unwrap().prompt_submitted);
     }
 
     #[test]
@@ -1086,6 +1148,7 @@ mod tests {
                     prompt: Some(PromptState {
                         text: format!("prompt-{index}"),
                         source: "load-test".to_string(),
+                        digest: None,
                     }),
                 },
             )

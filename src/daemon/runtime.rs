@@ -572,6 +572,8 @@ impl CanonicalCoordinatorState {
                     state_version: transition.state_version.clone(),
                     run_seq: transition.run_seq,
                     completed_seq: transition.completed_seq,
+                    prompt_digest: transition.prompt_digest.clone(),
+                    prompt_submitted: transition.prompt_submitted,
                     from: transition.from,
                     to,
                     at_epoch: transition.at_epoch,
@@ -1380,6 +1382,7 @@ mod tests {
                     prompt: Some(PromptState {
                         text: format!("prompt for {pane_id}"),
                         source: "test".to_string(),
+                        digest: None,
                     }),
                     latest_response: None,
                     task_context: crate::pane_state::TaskContextState::default(),
@@ -1716,6 +1719,39 @@ mod tests {
         assert_eq!(snapshot.events.len(), 256);
         assert_eq!(snapshot.events.first().unwrap().at_epoch, 2);
         assert_eq!(snapshot.events.last().unwrap().at_epoch, 257);
+
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    #[test]
+    fn resolved_history_exposes_begin_run_prompt_digest() {
+        use crate::pane_state::{PaneEvent, PromptState};
+
+        let (mut state, root) = canonical_sidebar_fixture();
+        state.leased.runtime = CanonicalPaneStateRuntime::default();
+        let digest = PromptState::digest_decoded_prompt("raw\nprompt");
+        apply_history_event(
+            &mut state,
+            "codex",
+            "same-session",
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: Some(PromptState {
+                    text: "raw prompt".to_string(),
+                    source: "user".to_string(),
+                    digest: Some(digest.clone()),
+                }),
+            },
+        );
+
+        assert_eq!(
+            state
+                .resolved_snapshot()
+                .events
+                .last()
+                .and_then(|event| event.prompt_digest.as_ref()),
+            Some(&digest)
+        );
 
         remove_canonical_sidebar_fixture(state, root);
     }
