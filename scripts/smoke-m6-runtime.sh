@@ -1502,10 +1502,10 @@ durations = [float(line) for line in open(sys.argv[1], encoding="utf-8") if line
 assert len(durations) == 33, durations
 ordered = sorted(durations)
 p95 = ordered[math.ceil(len(ordered) * 0.95) - 1]
-# This end-to-end sample includes CLI startup, session snapshot resolution, switch-client, and the
-# 5ms observer loop. Repeated local runs after quiet-period view-refresh coalescing stay at
-# 162-168ms p95, while the foreground hook is enforced separately above at 100ms.
-assert p95 <= 0.175, (p95, ordered)
+# This end-to-end sample includes CLI startup, canonical daemon snapshot resolution,
+# switch-client, and the 5ms observer loop. Category navigation must stay below the threshold
+# without returning to per-project Git probes or rebuilding category state in the CLI.
+assert p95 <= 0.125, (p95, ordered)
 print(f"category warm switch SLA ok: n={len(durations)} p95={p95 * 1000:.1f}ms max={ordered[-1] * 1000:.1f}ms")
 PY
 tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'

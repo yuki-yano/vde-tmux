@@ -647,6 +647,33 @@ pub(crate) fn use_category_for_client_from_sessions(
     switch_client_for_client(runner, client, &session.name)
 }
 
+pub(crate) fn use_category_for_client_from_status_snapshot(
+    runner: &dyn TmuxRunner,
+    snapshot: &crate::daemon::protocol::v2::StatusSnapshot,
+    category: &str,
+    client: &str,
+) -> Result<()> {
+    if snapshot.context != crate::daemon::protocol::v2::StatusContext::Global {
+        bail!("category navigation requires a global daemon status snapshot");
+    }
+    let category_sessions = snapshot
+        .sessions
+        .iter()
+        .filter(|session| session.category.as_deref() == Some(category))
+        .collect::<Vec<_>>();
+    if category_sessions.is_empty() {
+        bail!("no session in category: {category}");
+    }
+    if let Some(remembered) = remembered_session_for_client(runner, client, category)?
+        && let Some(session) = category_sessions
+            .iter()
+            .find(|session| session.session_name == remembered)
+    {
+        return switch_client_for_client(runner, client, &session.session_name);
+    }
+    switch_client_for_client(runner, client, &category_sessions[0].session_name)
+}
+
 pub fn use_adjacent_category(
     runner: &dyn TmuxRunner,
     config: &Config,

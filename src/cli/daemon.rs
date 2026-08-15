@@ -110,12 +110,41 @@ fn status_snapshot(
         &incarnation.hash,
         Duration::from_secs(2),
     )?;
-    match client.request(
+    status_snapshot_response(client.request(
         &crate::daemon::protocol::v2::ClientMessage::QueryStatusSnapshot {
             proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
             context,
         },
-    )? {
+    )?)
+}
+
+pub(super) fn active_status_snapshot(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    context: crate::daemon::protocol::v2::StatusContext,
+) -> Result<crate::daemon::protocol::v2::StatusSnapshot> {
+    let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
+    let socket = crate::daemon::daemon_socket_path_for_incarnation(env, None, &incarnation.hash);
+    let mut client = crate::daemon::protocol::v2::V2Client::connect_with_timeout(
+        &socket,
+        &incarnation.hash,
+        Duration::from_millis(500),
+    )?;
+    if client.phase() != crate::daemon::protocol::v2::DaemonPhase::Serving {
+        bail!("daemon is not serving category navigation queries");
+    }
+    status_snapshot_response(client.request(
+        &crate::daemon::protocol::v2::ClientMessage::QueryStatusSnapshot {
+            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            context,
+        },
+    )?)
+}
+
+fn status_snapshot_response(
+    response: crate::daemon::protocol::v2::ServerMessage,
+) -> Result<crate::daemon::protocol::v2::StatusSnapshot> {
+    match response {
         crate::daemon::protocol::v2::ServerMessage::StatusSnapshotResult { snapshot, .. } => {
             Ok(snapshot)
         }

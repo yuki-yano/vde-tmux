@@ -34,28 +34,7 @@ fn stub_shared_action_clients(mock: &MockTmuxRunner) {
     );
 }
 
-fn stub_category_switch(
-    mock: &MockTmuxRunner,
-    root: &std::path::Path,
-    client: &str,
-    category: &str,
-    target_session: &str,
-) {
-    let format = crate::session::session_list_format();
-    let a = root.join("repos/a");
-    let b = root.join("repos/b");
-    let c = root.join("repos/c");
-    mock.stub(
-        &["list-sessions", "-F", &format],
-        &format!(
-            "a\u{1f}1\u{1f}100\u{1f}\u{1f}{}\u{1f}\u{1f}$1\n\
-             b\u{1f}1\u{1f}90\u{1f}\u{1f}{}\u{1f}\u{1f}$2\n\
-             c\u{1f}1\u{1f}80\u{1f}\u{1f}{}\u{1f}\u{1f}$3\n",
-            a.display(),
-            b.display(),
-            c.display(),
-        ),
-    );
+fn stub_category_switch(mock: &MockTmuxRunner, client: &str, category: &str, target_session: &str) {
     let memory_key = crate::session::client_memory_key(client, category);
     mock.stub(&["show-option", "-gqv", &memory_key], "");
     let exact_target = crate::session::exact_session_target(target_session);
@@ -220,6 +199,20 @@ fn spawn_category_config_guard_fixture() -> V2QueryFixture {
         std::fs::create_dir_all(fixture.root.join("repos").join(repo)).unwrap();
     }
     fixture
+}
+
+fn spawn_category_navigation_fixture() -> V2QueryFixture {
+    let snapshot = category_navigation_status_snapshot();
+    spawn_v2_query_fixture(
+        crate::daemon::protocol::v2::ClientMessage::QueryStatusSnapshot {
+            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            context: crate::daemon::protocol::v2::StatusContext::Global,
+        },
+        crate::daemon::protocol::v2::ServerMessage::StatusSnapshotResult {
+            snapshot_revision: snapshot.snapshot_revision,
+            snapshot,
+        },
+    )
 }
 
 fn spawn_active_config_guard_fixture_with_yaml(yaml: &str) -> V2QueryFixture {
@@ -432,6 +425,57 @@ fn status_snapshot(
             reason: Some("permission_prompt".to_string()),
             elapsed_seconds: 120,
         }],
+    }
+}
+
+fn category_navigation_status_snapshot() -> crate::daemon::protocol::v2::StatusSnapshot {
+    use crate::daemon::protocol::v2::{CategoryStatusPresentation, SessionStatusPresentation};
+    use crate::daemon::session_badge::BadgeStateCounts;
+
+    let assignments = [
+        ("$1", "a", "alpha"),
+        ("$2", "b", "beta"),
+        ("$3", "c", "gamma"),
+        ("$4", "main", "work"),
+        ("$5", "sub", "work"),
+    ];
+    let sessions = assignments
+        .iter()
+        .map(
+            |(session_id, session_name, category)| SessionStatusPresentation {
+                session_id: (*session_id).to_string(),
+                session_name: (*session_name).to_string(),
+                category: Some((*category).to_string()),
+                attached: Some(true),
+                created_at: None,
+                active: false,
+                counts: BadgeStateCounts::default(),
+            },
+        )
+        .collect();
+    let categories = [
+        ("alpha", vec!["$1"]),
+        ("beta", vec!["$2"]),
+        ("gamma", vec!["$3"]),
+        ("work", vec!["$4", "$5"]),
+    ]
+    .into_iter()
+    .map(|(category, session_ids)| CategoryStatusPresentation {
+        category: category.to_string(),
+        session_ids: session_ids.into_iter().map(str::to_string).collect(),
+        active: false,
+        counts: BadgeStateCounts::default(),
+    })
+    .collect();
+    crate::daemon::protocol::v2::StatusSnapshot {
+        snapshot_revision: 7,
+        context: crate::daemon::protocol::v2::StatusContext::Global,
+        summary: BadgeStateCounts::default(),
+        session_zone_width: None,
+        sessions,
+        windows: Vec::new(),
+        categories,
+        attention: Vec::new(),
     }
 }
 
@@ -1140,7 +1184,7 @@ fn dispatch_category_cycle_uses_explicit_scope_when_a_pane_is_shared() {
     for (command, target_category, target_session) in
         [("next", "gamma", "c"), ("prev", "alpha", "a")]
     {
-        let mut fixture = spawn_category_config_guard_fixture();
+        let mut fixture = spawn_category_navigation_fixture();
         fixture
             .env
             .insert("TMUX_PANE".to_string(), "%1".to_string());
@@ -1156,13 +1200,7 @@ fn dispatch_category_cycle_uses_explicit_scope_when_a_pane_is_shared() {
             ],
             &rendered,
         );
-        stub_category_switch(
-            mock,
-            &fixture.root,
-            "client-2",
-            target_category,
-            target_session,
-        );
+        stub_category_switch(mock, "client-2", target_category, target_session);
 
         run_with(
             [
@@ -1195,13 +1233,13 @@ fn dispatch_category_cycle_uses_explicit_scope_when_a_pane_is_shared() {
 
 #[test]
 fn dispatch_category_click_uses_explicit_scope_when_a_pane_is_shared() {
-    let mut fixture = spawn_category_config_guard_fixture();
+    let mut fixture = spawn_category_navigation_fixture();
     fixture
         .env
         .insert("TMUX_PANE".to_string(), "%1".to_string());
     let mock = &fixture.mock;
     stub_shared_action_clients(mock);
-    stub_category_switch(mock, &fixture.root, "client-2", "alpha", "a");
+    stub_category_switch(mock, "client-2", "alpha", "a");
     let alpha = crate::statusline::category_target_key("alpha").unwrap();
 
     run_with(
@@ -1466,7 +1504,7 @@ fn dispatch_statusline_click_routes_attention_range_to_exact_pane_for_invoking_c
 #[test]
 fn dispatch_statusline_click_routes_active_and_inactive_category_targets() {
     for prefix in ["c:", "C:"] {
-        let mut fixture = spawn_category_config_guard_fixture();
+        let mut fixture = spawn_category_navigation_fixture();
         fixture
             .env
             .insert("TMUX_PANE".to_string(), "%1".to_string());
@@ -1518,7 +1556,7 @@ fn dispatch_statusline_click_ignores_empty_zero_and_unknown_ranges() {
 
 #[test]
 fn dispatch_category_use_switches_category() {
-    let mut fixture = spawn_category_config_guard_fixture();
+    let mut fixture = spawn_category_navigation_fixture();
     fixture
         .env
         .insert("TMUX_PANE".to_string(), "%1".to_string());
@@ -1998,36 +2036,41 @@ fn config_hash_guard_rejects_empty_and_mismatched_active_hashes_with_reload_guid
 }
 
 #[test]
-fn invalid_config_blocks_category_mutation_before_daemon_or_session_queries() {
-    let root = std::env::temp_dir().join(format!(
-        "vde-invalid-config-{}-{}",
-        std::process::id(),
-        V2_QUERY_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let config_dir = root.join("vde/tmux");
+fn category_navigation_uses_the_active_snapshot_when_disk_config_is_invalid() {
+    let mut fixture = spawn_category_navigation_fixture();
+    let config_root = fixture.root.join("config");
+    let config_dir = config_root.join("vde/tmux");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("config.yml"),
         "daemon:\n  poll_ms: [broken\n",
     )
     .unwrap();
-    let env = BTreeMap::from([
-        ("XDG_CONFIG_HOME".to_string(), root.display().to_string()),
-        ("TMUX_PANE".to_string(), "%1".to_string()),
-    ]);
-    let mock = MockTmuxRunner::new();
-    stub_action_client(&mock, "abc", "$1");
+    fixture.env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        config_root.display().to_string(),
+    );
+    fixture
+        .env
+        .insert("TMUX_PANE".to_string(), "%1".to_string());
+    stub_action_client(&fixture.mock, "abc", "$1");
+    stub_category_switch(&fixture.mock, "abc", "work", "main");
 
-    let error = run_with(["vt", "category", "use", "work"], &mock, &env).unwrap_err();
+    run_with(
+        ["vt", "category", "use", "work"],
+        &fixture.mock,
+        &fixture.env,
+    )
+    .unwrap();
 
-    assert!(error.to_string().contains("vt daemon reload"));
-    assert!(mock.calls().iter().all(|call| {
-        !matches!(
-            call.first().map(String::as_str),
-            Some("list-sessions" | "switch-client" | "set-option" | "display-message")
-        )
-    }));
-    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        fixture
+            .mock
+            .calls()
+            .iter()
+            .any(|call| { call == &vec!["switch-client", "-c", "abc", "-t", "=main:"] })
+    );
+    fixture.finish();
 }
 
 #[test]

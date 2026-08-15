@@ -947,11 +947,14 @@ where
                     client_name.as_deref(),
                     session_id.as_deref(),
                 )?;
-                let config = require_active_config(runner, env)?;
+                let snapshot = daemon::active_status_snapshot(
+                    runner,
+                    env,
+                    crate::daemon::protocol::v2::StatusContext::Global,
+                )?;
                 crate::statusline::switch_statusline_category(
                     runner,
-                    &config,
-                    env,
+                    &snapshot,
                     &context.client_name,
                     &context.session_id,
                     cli_index(index)?,
@@ -1072,13 +1075,18 @@ where
                 .as_deref()
                 .map(str::trim)
                 .is_some_and(|range| range.starts_with("c:") || range.starts_with("C:"));
-            let guarded_config = category_click
-                .then(|| require_active_config(runner, env))
+            let category_snapshot = category_click
+                .then(|| {
+                    daemon::active_status_snapshot(
+                        runner,
+                        env,
+                        crate::daemon::protocol::v2::StatusContext::Global,
+                    )
+                })
                 .transpose()?;
             crate::statusline::handle_statusline_click(
                 runner,
-                guarded_config.as_ref().unwrap_or(&config),
-                env,
+                category_snapshot.as_ref(),
                 context.as_ref().map(|context| context.client_name.as_str()),
                 range.as_deref(),
             )?;
@@ -1174,11 +1182,14 @@ where
                         scope.client_name.as_deref(),
                         scope.session_id.as_deref(),
                     )?;
-                    let config = require_active_config(runner, env)?;
+                    let snapshot = daemon::active_status_snapshot(
+                        runner,
+                        env,
+                        crate::daemon::protocol::v2::StatusContext::Global,
+                    )?;
                     crate::statusline::cycle_statusline_category(
                         runner,
-                        &config,
-                        env,
+                        &snapshot,
                         &context.client_name,
                         &context.session_id,
                         Direction::Next,
@@ -1191,11 +1202,14 @@ where
                         scope.client_name.as_deref(),
                         scope.session_id.as_deref(),
                     )?;
-                    let config = require_active_config(runner, env)?;
+                    let snapshot = daemon::active_status_snapshot(
+                        runner,
+                        env,
+                        crate::daemon::protocol::v2::StatusContext::Global,
+                    )?;
                     crate::statusline::cycle_statusline_category(
                         runner,
-                        &config,
-                        env,
+                        &snapshot,
                         &context.client_name,
                         &context.session_id,
                         Direction::Previous,
@@ -1208,11 +1222,14 @@ where
                         scope.client_name.as_deref(),
                         scope.session_id.as_deref(),
                     )?;
-                    let config = require_active_config(runner, env)?;
-                    crate::session::use_category_for_client(
+                    let snapshot = daemon::active_status_snapshot(
                         runner,
-                        &config,
                         env,
+                        crate::daemon::protocol::v2::StatusContext::Global,
+                    )?;
+                    crate::session::use_category_for_client_from_status_snapshot(
+                        runner,
+                        &snapshot,
                         &name,
                         &context.client_name,
                     )?;

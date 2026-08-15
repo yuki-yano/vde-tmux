@@ -92,8 +92,7 @@ pub fn switch_statusline_window(runner: &dyn TmuxRunner, target: &str) -> Result
 
 pub fn switch_statusline_category(
     runner: &dyn TmuxRunner,
-    config: &Config,
-    env: &std::collections::BTreeMap<String, String>,
+    snapshot: &crate::daemon::protocol::v2::StatusSnapshot,
     client_name: &str,
     session_id: &str,
     index: usize,
@@ -107,14 +106,10 @@ pub fn switch_statusline_category(
                 index + 1
             )
     })?;
-    let sessions = crate::session::list_sessions(runner)?;
-    let categories =
-        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
-    let category = resolve_category_target(&categories, &sessions, target)?;
-    crate::session::use_category_for_client_from_sessions(
+    let category = resolve_category_target(snapshot, target)?;
+    crate::session::use_category_for_client_from_status_snapshot(
         runner,
-        &categories,
-        &sessions,
+        snapshot,
         &category,
         client_name,
     )
@@ -122,39 +117,40 @@ pub fn switch_statusline_category(
 
 pub fn cycle_statusline_category(
     runner: &dyn TmuxRunner,
-    config: &Config,
-    env: &std::collections::BTreeMap<String, String>,
+    snapshot: &crate::daemon::protocol::v2::StatusSnapshot,
     client_name: &str,
     session_id: &str,
     direction: Direction,
 ) -> Result<()> {
-    let sessions = crate::session::list_sessions(runner)?;
-    let categories =
-        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
-    cycle_statusline_category_with_categories(
-        runner,
-        &categories,
-        &sessions,
-        client_name,
-        session_id,
-        direction,
-    )
+    cycle_statusline_category_with_snapshot(runner, snapshot, client_name, session_id, direction)
 }
 
-fn cycle_statusline_category_with_categories(
+fn cycle_statusline_category_with_snapshot(
     runner: &dyn TmuxRunner,
-    categories: &crate::category::ResolvedSessionCategories,
-    sessions: &[crate::session::SessionInfo],
+    snapshot: &crate::daemon::protocol::v2::StatusSnapshot,
     client_name: &str,
     session_id: &str,
     direction: Direction,
 ) -> Result<()> {
-    let current_session = sessions
+    if snapshot.context != crate::daemon::protocol::v2::StatusContext::Global {
+        return Err(anyhow!(
+            "category navigation requires a global daemon status snapshot"
+        ));
+    }
+    let current_session = snapshot
+        .sessions
         .iter()
-        .find(|session| session.id == session_id)
-        .ok_or_else(|| anyhow!("current session {session_id} is not present in tmux"))?;
-    let current_category = categories.category_for(current_session)?;
-    let targets = categories.categories_with_sessions(sessions);
+        .find(|session| session.session_id == session_id)
+        .ok_or_else(|| anyhow!("current session {session_id} is not present in daemon state"))?;
+    let current_category = current_session
+        .category
+        .as_deref()
+        .ok_or_else(|| anyhow!("current session {session_id} has no resolved category"))?;
+    let targets = snapshot
+        .categories
+        .iter()
+        .filter(|category| !category.session_ids.is_empty())
+        .collect::<Vec<_>>();
     if targets.len() <= 1 {
         return Err(anyhow!(
             "category cycle requires at least two categories with sessions"
@@ -162,7 +158,7 @@ fn cycle_statusline_category_with_categories(
     }
     let current_index = targets
         .iter()
-        .position(|category| category == current_category)
+        .position(|category| category.category == current_category)
         .ok_or_else(|| {
             anyhow!("current category {current_category} is not present in the category cycle")
         })?;
@@ -170,19 +166,17 @@ fn cycle_statusline_category_with_categories(
         Direction::Next => (current_index + 1) % targets.len(),
         Direction::Previous => (current_index + targets.len() - 1) % targets.len(),
     };
-    crate::session::use_category_for_client_from_sessions(
+    crate::session::use_category_for_client_from_status_snapshot(
         runner,
-        categories,
-        sessions,
-        targets[next].as_str(),
+        snapshot,
+        &targets[next].category,
         client_name,
     )
 }
 
 pub fn handle_statusline_click(
     runner: &dyn TmuxRunner,
-    config: &Config,
-    env: &std::collections::BTreeMap<String, String>,
+    category_snapshot: Option<&crate::daemon::protocol::v2::StatusSnapshot>,
     client_name: Option<&str>,
     range: Option<&str>,
 ) -> Result<()> {
@@ -205,12 +199,16 @@ pub fn handle_statusline_click(
     if let Some(target) = range.strip_prefix(CATEGORY_RANGE_PREFIX) {
         let client_name = client_name
             .ok_or_else(|| anyhow!("category click is missing an invoking tmux client"))?;
-        return switch_category_target(runner, config, env, client_name, target);
+        let snapshot = category_snapshot
+            .ok_or_else(|| anyhow!("category click is missing the canonical status snapshot"))?;
+        return switch_category_target(runner, snapshot, client_name, target);
     }
     if let Some(target) = range.strip_prefix(CURRENT_CATEGORY_RANGE_PREFIX) {
         let client_name = client_name
             .ok_or_else(|| anyhow!("category click is missing an invoking tmux client"))?;
-        return switch_category_target(runner, config, env, client_name, target);
+        let snapshot = category_snapshot
+            .ok_or_else(|| anyhow!("category click is missing the canonical status snapshot"))?;
+        return switch_category_target(runner, snapshot, client_name, target);
     }
     if range.starts_with('$') {
         validate_tmux_target(range, '$', "session")?;
@@ -271,20 +269,20 @@ fn validate_category_target(target: &str) -> Result<()> {
 }
 
 fn resolve_category_target(
-    categories: &crate::category::ResolvedSessionCategories,
-    sessions: &[crate::session::SessionInfo],
+    snapshot: &crate::daemon::protocol::v2::StatusSnapshot,
     target: &str,
 ) -> Result<String> {
     validate_category_target(target)?;
-    let matches = categories
-        .categories_with_sessions(sessions)
-        .into_iter()
+    let matches = snapshot
+        .categories
+        .iter()
+        .filter(|category| !category.session_ids.is_empty())
         .filter(|category| {
-            category_target_key(category.as_str()).is_ok_and(|candidate| candidate == target)
+            category_target_key(&category.category).is_ok_and(|candidate| candidate == target)
         })
         .collect::<Vec<_>>();
     match matches.as_slice() {
-        [category] => Ok(category.to_string()),
+        [category] => Ok(category.category.clone()),
         [] => Err(anyhow!(
             "displayed category target is no longer available; wait for the status line to redraw"
         )),
@@ -296,19 +294,14 @@ fn resolve_category_target(
 
 fn switch_category_target(
     runner: &dyn TmuxRunner,
-    config: &Config,
-    env: &std::collections::BTreeMap<String, String>,
+    snapshot: &crate::daemon::protocol::v2::StatusSnapshot,
     client_name: &str,
     target: &str,
 ) -> Result<()> {
-    let sessions = crate::session::list_sessions(runner)?;
-    let categories =
-        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
-    let category = resolve_category_target(&categories, &sessions, target)?;
-    crate::session::use_category_for_client_from_sessions(
+    let category = resolve_category_target(snapshot, target)?;
+    crate::session::use_category_for_client_from_status_snapshot(
         runner,
-        &categories,
-        &sessions,
+        snapshot,
         &category,
         client_name,
     )
@@ -1883,6 +1876,36 @@ mod tests {
         }
     }
 
+    fn category_navigation_snapshot(assignments: &[(&str, &str, &str)]) -> StatusSnapshot {
+        let mut snapshot = status_snapshot();
+        for (session_id, session_name, category) in assignments {
+            snapshot.sessions.push(SessionStatusPresentation {
+                session_id: (*session_id).to_string(),
+                session_name: (*session_name).to_string(),
+                category: Some((*category).to_string()),
+                attached: None,
+                created_at: None,
+                active: false,
+                counts: BadgeStateCounts::default(),
+            });
+            if let Some(existing) = snapshot
+                .categories
+                .iter_mut()
+                .find(|existing| existing.category == *category)
+            {
+                existing.session_ids.push((*session_id).to_string());
+            } else {
+                snapshot.categories.push(CategoryStatusPresentation {
+                    category: (*category).to_string(),
+                    session_ids: vec![(*session_id).to_string()],
+                    active: false,
+                    counts: BadgeStateCounts::default(),
+                });
+            }
+        }
+        snapshot
+    }
+
     fn status_window(id: &str, name: &str, index: i64, active: bool) -> WindowStatusPresentation {
         WindowStatusPresentation {
             window_id: id.to_string(),
@@ -3272,29 +3295,17 @@ mod tests {
     #[test]
     fn category_cycle_uses_all_effective_categories_in_current_mode() {
         let mock = MockTmuxRunner::new();
-        let format = crate::session::session_list_format();
-        let sessions = "one\u{1f}1\u{1f}100\u{1f}a\u{1f}\u{1f}\u{1f}$1\ntwo\u{1f}0\u{1f}101\u{1f}b\u{1f}\u{1f}\u{1f}$2\nthree\u{1f}0\u{1f}102\u{1f}c\u{1f}\u{1f}\u{1f}$3\n";
-        mock.stub(&["list-sessions", "-F", &format], sessions);
         let memory_key = crate::session::client_memory_key("client", "b");
         mock.stub(&["show-option", "-gqv", &memory_key], "");
         mock.stub(&["switch-client", "-c", "client", "-t", "=two:"], "");
-        mock.stub(&["set-option", "-g", &memory_key, "two"], "");
-        let sessions = crate::session::parse_sessions(sessions);
-        let categories = crate::category::ResolvedSessionCategories::from_assignments(&[
-            (&sessions[0], "a"),
-            (&sessions[1], "b"),
-            (&sessions[2], "c"),
+        let snapshot = category_navigation_snapshot(&[
+            ("$1", "one", "a"),
+            ("$2", "two", "b"),
+            ("$3", "three", "c"),
         ]);
 
-        cycle_statusline_category_with_categories(
-            &mock,
-            &categories,
-            &sessions,
-            "client",
-            "$1",
-            Direction::Next,
-        )
-        .unwrap();
+        cycle_statusline_category_with_snapshot(&mock, &snapshot, "client", "$1", Direction::Next)
+            .unwrap();
 
         assert!(mock.calls().iter().all(|call| {
             call.first().map(String::as_str) != Some("show-option")
@@ -3320,11 +3331,6 @@ mod tests {
     #[test]
     fn consecutive_category_cycles_preserve_next_and_previous_order() {
         let mock = MockTmuxRunner::new();
-        let format = crate::session::session_list_format();
-        mock.stub(
-            &["list-sessions", "-F", &format],
-            "one\u{1f}1\u{1f}100\u{1f}a\u{1f}\u{1f}\u{1f}$1\ntwo\u{1f}0\u{1f}101\u{1f}b\u{1f}\u{1f}\u{1f}$2\nthree\u{1f}0\u{1f}102\u{1f}c\u{1f}\u{1f}\u{1f}$3\n",
-        );
         for category in ["a", "b", "c"] {
             let key = crate::session::client_memory_key("client", category);
             mock.stub(&["show-option", "-gqv", &key], "");
@@ -3333,36 +3339,18 @@ mod tests {
         mock.stub(&["switch-client", "-c", "client", "-t", "=two:"], "");
         mock.stub(&["switch-client", "-c", "client", "-t", "=three:"], "");
 
-        let sessions = crate::session::parse_sessions(
-            "one\u{1f}1\u{1f}100\u{1f}a\u{1f}\u{1f}\u{1f}$1\ntwo\u{1f}0\u{1f}101\u{1f}b\u{1f}\u{1f}\u{1f}$2\nthree\u{1f}0\u{1f}102\u{1f}c\u{1f}\u{1f}\u{1f}$3\n",
-        );
-        let categories = crate::category::ResolvedSessionCategories::from_assignments(&[
-            (&sessions[0], "a"),
-            (&sessions[1], "b"),
-            (&sessions[2], "c"),
+        let snapshot = category_navigation_snapshot(&[
+            ("$1", "one", "a"),
+            ("$2", "two", "b"),
+            ("$3", "three", "c"),
         ]);
-        cycle_statusline_category_with_categories(
+        cycle_statusline_category_with_snapshot(&mock, &snapshot, "client", "$1", Direction::Next)
+            .unwrap();
+        cycle_statusline_category_with_snapshot(&mock, &snapshot, "client", "$2", Direction::Next)
+            .unwrap();
+        cycle_statusline_category_with_snapshot(
             &mock,
-            &categories,
-            &sessions,
-            "client",
-            "$1",
-            Direction::Next,
-        )
-        .unwrap();
-        cycle_statusline_category_with_categories(
-            &mock,
-            &categories,
-            &sessions,
-            "client",
-            "$2",
-            Direction::Next,
-        )
-        .unwrap();
-        cycle_statusline_category_with_categories(
-            &mock,
-            &categories,
-            &sessions,
+            &snapshot,
             "client",
             "$3",
             Direction::Previous,
@@ -3387,20 +3375,10 @@ mod tests {
     #[test]
     fn category_cycle_errors_when_only_one_effective_category_exists() {
         let mock = MockTmuxRunner::new();
-        let format = crate::session::session_list_format();
-        mock.stub(
-            &["list-sessions", "-F", &format],
-            "one\u{1f}1\u{1f}100\u{1f}a\u{1f}\u{1f}\u{1f}$1\n",
-        );
-
-        let sessions =
-            crate::session::parse_sessions("one\u{1f}1\u{1f}100\u{1f}a\u{1f}\u{1f}\u{1f}$1\n");
-        let categories =
-            crate::category::ResolvedSessionCategories::from_assignments(&[(&sessions[0], "a")]);
-        let error = cycle_statusline_category_with_categories(
+        let snapshot = category_navigation_snapshot(&[("$1", "one", "a")]);
+        let error = cycle_statusline_category_with_snapshot(
             &mock,
-            &categories,
-            &sessions,
+            &snapshot,
             "client",
             "$1",
             Direction::Next,
