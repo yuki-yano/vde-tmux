@@ -806,8 +806,18 @@ PY
   then break; fi
   sleep 0.05
 done
-capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-pinned.txt"
-capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-pinned.txt"
+for _ in $(seq 1 60); do
+  capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-pinned.txt"
+  capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-pinned.txt"
+  if grep -F 'PINNED' "$ARTIFACT_DIR/sidebar-1-pinned.txt" >/dev/null \
+    && grep -F '✦' "$ARTIFACT_DIR/sidebar-1-pinned.txt" >/dev/null \
+    && grep -F 'PINNED' "$ARTIFACT_DIR/sidebar-2-pinned.txt" >/dev/null \
+    && grep -F '✦' "$ARTIFACT_DIR/sidebar-2-pinned.txt" >/dev/null
+  then
+    break
+  fi
+  sleep 0.05
+done
 for artifact in "$ARTIFACT_DIR/sidebar-1-pinned.txt" "$ARTIFACT_DIR/sidebar-2-pinned.txt"; do
   grep -F 'PINNED' "$artifact" >/dev/null
   grep -F '✦' "$artifact" >/dev/null
