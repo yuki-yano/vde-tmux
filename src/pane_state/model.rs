@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::daemon::session_badge::BadgeState;
 
-pub const PANE_STATE_SCHEMA_VERSION: u16 = 8;
+pub const PANE_STATE_SCHEMA_VERSION: u16 = 9;
 pub const IDENTIFIER_MAX_BYTES: usize = 256;
 pub const BODY_MAX_BYTES: usize = 4096;
 pub const PATH_MAX_BYTES: usize = 8192;
@@ -446,6 +446,26 @@ pub struct AgentProcessIdentity {
     pub start_token: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentDurableRunProjection {
+    pub run_id: String,
+    pub run_seq: u64,
+    pub run_revision: u64,
+}
+
+impl CurrentDurableRunProjection {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        validate_random_id(&self.run_id, "durable run ID")?;
+        if self.run_seq == 0 || self.run_revision == 0 {
+            return Err(ModelError(
+                "durable run sequence and revision must be positive".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl AgentProcessIdentity {
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.pid == 0
@@ -669,6 +689,7 @@ pub struct PaneState {
     pub synthetic_completion_armed: bool,
     pub lifecycle: LifecycleState,
     pub run_seq: u64,
+    pub current_run: Option<CurrentDurableRunProjection>,
     pub completed_seq: u64,
     pub unread: UnreadState,
     pub started_at: Option<i64>,
@@ -712,6 +733,14 @@ impl PaneState {
             return Err(ModelError(
                 "pane state sequence order is invalid".to_string(),
             ));
+        }
+        if let Some(current_run) = &self.current_run {
+            current_run.validate()?;
+            if current_run.run_seq != self.run_seq {
+                return Err(ModelError(
+                    "durable current run sequence disagrees with pane state".to_string(),
+                ));
+            }
         }
         if self
             .run_seq
@@ -789,6 +818,109 @@ impl PaneState {
         .validate()?;
         self.unread.validate()?;
         Ok(())
+    }
+
+    pub fn reconcile_current_run(
+        &mut self,
+        projection: CurrentDurableRunProjection,
+        execution_active: bool,
+        observed_at: i64,
+        latest_unread_order: u64,
+    ) -> Result<bool, ModelError> {
+        projection.validate()?;
+        if observed_at < 0 {
+            return Err(ModelError(
+                "durable run projection timestamp must be non-negative".to_string(),
+            ));
+        }
+        if let Some(existing) = &self.current_run {
+            if existing.run_seq > projection.run_seq {
+                return Ok(false);
+            }
+            if existing.run_seq == projection.run_seq && existing.run_id != projection.run_id {
+                return Err(ModelError(
+                    "durable current run ID conflicts at the same run sequence".to_string(),
+                ));
+            }
+            if existing.run_id == projection.run_id
+                && existing.run_revision > projection.run_revision
+            {
+                return Ok(false);
+            }
+        }
+
+        let before = self.clone();
+        let run_advanced = projection.run_seq > self.run_seq;
+        let completion_advanced = !execution_active && self.completed_seq < projection.run_seq;
+        if run_advanced {
+            self.run_seq = projection.run_seq;
+            self.started_at = Some(observed_at);
+            self.completed_at =
+                (projection.run_seq > 1).then_some(self.completed_at.unwrap_or(observed_at));
+            self.prompt = None;
+            self.latest_response = None;
+            self.tasks = TaskState::default();
+            self.subagents.clear();
+            self.worktree_activity = None;
+        }
+        if execution_active {
+            self.completed_seq = projection.run_seq.saturating_sub(1);
+            if matches!(self.lifecycle, LifecycleState::Idle) {
+                self.lifecycle = LifecycleState::Running;
+            }
+        } else {
+            self.completed_seq = projection.run_seq;
+            self.lifecycle = LifecycleState::Idle;
+            self.completed_at = Some(self.completed_at.unwrap_or(observed_at));
+            self.subagents.clear();
+            self.worktree_activity = None;
+        }
+        if completion_advanced {
+            let seq = self
+                .unread
+                .occurrence_seq
+                .checked_add(1)
+                .ok_or_else(|| ModelError("unread occurrence sequence overflow".to_string()))?;
+            let previous_order = self
+                .unread
+                .latest
+                .as_ref()
+                .map(|latest| latest.order)
+                .unwrap_or_default();
+            let order = latest_unread_order
+                .max(previous_order)
+                .checked_add(1)
+                .ok_or_else(|| ModelError("unread occurrence order overflow".to_string()))?;
+            self.unread.occurrence_seq = seq;
+            self.unread.latest = Some(UnreadOccurrence {
+                seq,
+                order,
+                reason: UnreadReason::Completed,
+                occurred_at: self.completed_at.unwrap_or(observed_at),
+            });
+        }
+        self.current_run = Some(projection);
+        if self != &before {
+            self.revision = self
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| ModelError("pane revision overflow".to_string()))?;
+            self.validate()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub fn clear_current_run(&mut self) -> Result<bool, ModelError> {
+        if self.current_run.take().is_none() {
+            return Ok(false);
+        }
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| ModelError("pane revision overflow".to_string()))?;
+        self.validate()?;
+        Ok(true)
     }
 }
 
@@ -1213,6 +1345,7 @@ mod tests {
             synthetic_completion_armed: false,
             lifecycle: LifecycleState::Idle,
             run_seq: 0,
+            current_run: None,
             completed_seq: 0,
             unread: UnreadState::default(),
             started_at: None,
@@ -1239,6 +1372,60 @@ mod tests {
         assert_eq!(context.recent_prompts, ["two", "three", "four", "five"]);
         assert_eq!(context.context_fingerprint().unwrap().len(), 64);
         context.validate().unwrap();
+    }
+
+    #[test]
+    fn durable_run_projection_advances_sequence_and_rejects_same_sequence_rebinding() {
+        let mut state = valid_state();
+        state.prompt = Some(PromptState {
+            text: "old prompt".to_string(),
+            source: "user".to_string(),
+            digest: None,
+        });
+        state.latest_response = Some(ResponseState {
+            text: "old response".to_string(),
+            observed_at: 1,
+        });
+        let projection = CurrentDurableRunProjection {
+            run_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            run_seq: 3,
+            run_revision: 4,
+        };
+        assert!(
+            state
+                .reconcile_current_run(projection.clone(), true, 10, 0)
+                .unwrap()
+        );
+        assert_eq!(state.run_seq, 3);
+        assert_eq!(state.completed_seq, 2);
+        assert_eq!(state.current_run.as_ref(), Some(&projection));
+        assert!(matches!(state.lifecycle, LifecycleState::Running));
+        assert!(state.prompt.is_none());
+        assert!(state.latest_response.is_none());
+
+        let rebinding = CurrentDurableRunProjection {
+            run_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            run_seq: 3,
+            run_revision: 1,
+        };
+        assert!(state.reconcile_current_run(rebinding, true, 11, 0).is_err());
+
+        let completed = CurrentDurableRunProjection {
+            run_revision: 5,
+            ..projection
+        };
+        assert!(
+            state
+                .reconcile_current_run(completed, false, 12, 0)
+                .unwrap()
+        );
+        assert_eq!(state.completed_seq, 3);
+        assert!(matches!(state.lifecycle, LifecycleState::Idle));
+        assert_eq!(state.unread.occurrence_seq, 1);
+        assert_eq!(
+            state.unread.latest.as_ref().map(|latest| latest.reason),
+            Some(UnreadReason::Completed)
+        );
     }
 
     #[test]

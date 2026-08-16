@@ -75,6 +75,15 @@ fn spawn_v2_query_fixture_with_responses(
     expected: crate::daemon::protocol::v2::ClientMessage,
     responses: Vec<crate::daemon::protocol::v2::ServerMessage>,
 ) -> V2QueryFixture {
+    spawn_v2_query_fixture_with_exchanges(vec![(expected, responses)])
+}
+
+fn spawn_v2_query_fixture_with_exchanges(
+    exchanges: Vec<(
+        crate::daemon::protocol::v2::ClientMessage,
+        Vec<crate::daemon::protocol::v2::ServerMessage>,
+    )>,
+) -> V2QueryFixture {
     use std::io::{BufRead, Write};
 
     let root = std::env::temp_dir().join(format!(
@@ -128,53 +137,61 @@ fn spawn_v2_query_fixture_with_responses(
     let listener = std::os::unix::net::UnixListener::bind(&daemon_socket).unwrap();
     let server_identity = incarnation.hash;
     let server = std::thread::spawn(move || {
-        loop {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert_eq!(
-                serde_json::from_str::<crate::daemon::protocol::v2::ClientMessage>(line.trim())
-                    .unwrap(),
-                crate::daemon::protocol::v2::ClientMessage::Hello {
-                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-                }
-            );
-            serde_json::to_writer(
-                &mut stream,
-                &crate::daemon::protocol::v2::ServerMessage::HelloAck {
-                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-                    daemon_instance_id: crate::pane_state::DaemonInstanceId::parse(
-                        "ffeeddccbbaa99887766554433221100",
-                    )
-                    .unwrap(),
-                    server_identity: server_identity.clone(),
-                    phase: crate::daemon::protocol::v2::DaemonPhase::Serving,
-                    hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
-                },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
-            line.clear();
-            reader.read_line(&mut line).unwrap();
-            if line.is_empty() {
-                continue;
-            }
-            assert_eq!(
-                serde_json::from_str::<crate::daemon::protocol::v2::ClientMessage>(line.trim())
-                    .unwrap(),
-                expected
-            );
-            for response in &responses {
-                serde_json::to_writer(&mut stream, response).unwrap();
+        let mut peer_readers = Vec::with_capacity(exchanges.len());
+        for (expected, responses) in exchanges {
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<crate::daemon::protocol::v2::ClientMessage>(line.trim())
+                        .unwrap(),
+                    crate::daemon::protocol::v2::ClientMessage::Hello {
+                        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                    }
+                );
+                serde_json::to_writer(
+                    &mut stream,
+                    &crate::daemon::protocol::v2::ServerMessage::HelloAck {
+                        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                        daemon_instance_id: crate::pane_state::DaemonInstanceId::parse(
+                            "ffeeddccbbaa99887766554433221100",
+                        )
+                        .unwrap(),
+                        server_identity: server_identity.clone(),
+                        phase: crate::daemon::protocol::v2::DaemonPhase::Serving,
+                        hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
+                    },
+                )
+                .unwrap();
                 stream.write_all(b"\n").unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    serde_json::from_str::<crate::daemon::protocol::v2::ClientMessage>(line.trim())
+                        .unwrap(),
+                    expected
+                );
+                for response in responses {
+                    serde_json::to_writer(&mut stream, &response).unwrap();
+                    stream.write_all(b"\n").unwrap();
+                }
+                // A command may retain the completed snapshot connection while opening its next
+                // one-request connection. Keep every peer alive without blocking the accept loop.
+                peer_readers.push(reader);
+                break;
             }
+        }
+        for mut reader in peer_readers {
             // Keep the peer alive until the one-request client has consumed the response and
             // closed. Closing immediately after write races socket timeout setup on Darwin.
-            line.clear();
+            let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             assert!(line.is_empty());
-            break;
         }
     });
     V2QueryFixture {
@@ -557,6 +574,7 @@ fn agent_pane_presentation(pane_id: &str) -> crate::daemon::protocol::v2::PanePr
                 synthetic_completion_armed: false,
                 lifecycle: LifecycleState::Running,
                 run_seq: 1,
+                current_run: None,
                 completed_seq: 0,
                 unread: crate::pane_state::UnreadState::default(),
                 started_at: Some(crate::sidebar::tree::now_epoch_secs()),
@@ -580,29 +598,65 @@ fn agent_pane_presentation(pane_id: &str) -> crate::daemon::protocol::v2::PanePr
 }
 
 fn resolved_snapshot_query_fixture(subscribe: bool) -> V2QueryFixture {
+    let pane = agent_pane_presentation("%1");
+    let state = &pane.resolved.as_ref().unwrap().canonical;
+    let binding = crate::agent_state::AgentBinding {
+        server_identity: crate::daemon::topology::ServerIdentity {
+            pid: 321,
+            start_time: 654,
+        },
+        pane_instance: pane.pane_instance.clone(),
+        pane_state_id: state.state_id.clone(),
+        agent_epoch: state.agent_epoch,
+        agent_kind: state.agent.clone(),
+        provider_session_id: state.agent_session_id.clone().unwrap(),
+        process: state.agent_process.clone().unwrap(),
+    };
     let snapshot = crate::daemon::protocol::v2::ResolvedSnapshot {
         snapshot_revision: 7,
-        panes: vec![agent_pane_presentation("%1")],
+        panes: vec![pane],
         sidebar_model: crate::daemon::SidebarModel::default(),
         attention: Vec::new(),
         events: Vec::new(),
         diagnostics: Vec::new(),
     };
-    spawn_v2_query_fixture(
-        if subscribe {
+    if subscribe {
+        spawn_v2_query_fixture(
             crate::daemon::protocol::v2::ClientMessage::Subscribe {
                 proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-            }
-        } else {
-            crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot {
-                proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
-            }
-        },
-        crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
-            snapshot_revision: snapshot.snapshot_revision,
-            snapshot,
-        },
-    )
+            },
+            crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+                snapshot_revision: snapshot.snapshot_revision,
+                snapshot,
+            },
+        )
+    } else {
+        spawn_v2_query_fixture_with_exchanges(vec![
+            (
+                crate::daemon::protocol::v2::ClientMessage::QueryResolvedSnapshot {
+                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                },
+                vec![
+                    crate::daemon::protocol::v2::ServerMessage::ResolvedSnapshotResult {
+                        snapshot_revision: snapshot.snapshot_revision,
+                        snapshot,
+                    },
+                ],
+            ),
+            (
+                crate::daemon::protocol::v2::ClientMessage::QueryCurrentAgentRuns {
+                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                    bindings: vec![binding],
+                },
+                vec![
+                    crate::daemon::protocol::v2::ServerMessage::CurrentAgentRunsResult {
+                        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                        runs: Vec::new(),
+                    },
+                ],
+            ),
+        ])
+    }
 }
 
 fn agent_wait_transition_fixture(replaced: bool) -> V2QueryFixture {
@@ -2287,8 +2341,127 @@ fn prompt_cli_requires_exactly_one_private_input_source() {
             "--stdin",
             "--prompt-file",
             "/tmp/prompt",
+            "--operation-id",
+            "operation_123456",
         ])
         .is_err()
     );
-    assert!(Cli::try_parse_from(["vt", "agent", "prompt", "vta1:test", "--stdin"]).is_ok());
+    assert!(Cli::try_parse_from(["vt", "agent", "prompt", "vta1:test", "--stdin"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "vt",
+            "agent",
+            "prompt",
+            "vta1:test",
+            "--stdin",
+            "--operation-id",
+            "operation_123456",
+        ])
+        .is_ok()
+    );
+}
+
+#[test]
+fn durable_agent_cli_commands_are_nested_and_reference_scoped() {
+    for args in [
+        vec!["vt", "agent", "run", "get", "vtr3:test"],
+        vec!["vt", "agent", "run", "wait", "vtr3:test"],
+        vec![
+            "vt",
+            "agent",
+            "run",
+            "wait",
+            "vtr3:test",
+            "--until",
+            "completed",
+        ],
+        vec!["vt", "agent", "run", "response", "vtr3:test"],
+        vec!["vt", "agent", "run", "check", "vtr3:test", "--json"],
+        vec![
+            "vt",
+            "agent",
+            "run",
+            "resolve",
+            "vtr3:test",
+            "--outcome",
+            "completed",
+            "--precondition-file",
+            "/tmp/check.json",
+            "--resolution-id",
+            "resolution_123456",
+            "--reason",
+            "missing Stop hook",
+            "--json",
+        ],
+        vec![
+            "vt",
+            "agent",
+            "storage",
+            "reset",
+            "--recover-uninitialized",
+            "--confirm-reset",
+            "--json",
+        ],
+        vec!["vt", "agent", "operation", "get", "vto3:test"],
+        vec!["vt", "agent", "operation", "wait", "vto3:test"],
+        vec![
+            "vt",
+            "agent",
+            "operation",
+            "wait",
+            "vto3:test",
+            "--until",
+            "prompt-confirmed",
+            "--follow-unknown",
+        ],
+        vec!["vt", "agent", "storage", "status"],
+        vec![
+            "vt",
+            "agent",
+            "storage",
+            "reset",
+            "--expected-generation",
+            "00112233445566778899aabbccddeeff",
+            "--confirm-reset",
+            "--json",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(args).is_ok());
+    }
+    assert!(
+        Cli::try_parse_from([
+            "vt",
+            "agent",
+            "run",
+            "resolve",
+            "vtr3:test",
+            "--outcome",
+            "completed",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "vt",
+            "agent",
+            "storage",
+            "reset",
+            "--expected-generation",
+            "00112233445566778899aabbccddeeff",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "vt",
+            "agent",
+            "storage",
+            "reset",
+            "--expected-generation",
+            "00112233445566778899aabbccddeeff",
+            "--recover-uninitialized",
+            "--confirm-reset",
+        ])
+        .is_err()
+    );
 }

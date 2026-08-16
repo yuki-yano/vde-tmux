@@ -557,6 +557,7 @@ fn new_state(
         synthetic_completion_armed,
         lifecycle: LifecycleState::Idle,
         run_seq: 0,
+        current_run: None,
         completed_seq: 0,
         unread: UnreadState::default(),
         started_at: None,
@@ -846,6 +847,7 @@ fn begin_agent_epoch(
     state.synthetic_completion_armed = false;
     state.lifecycle = LifecycleState::Idle;
     state.run_seq = 0;
+    state.current_run = None;
     state.completed_seq = 0;
     state.started_at = None;
     state.completed_at = None;
@@ -866,6 +868,7 @@ fn start_new_run(state: &mut PaneState, started_at: i64) -> Result<(), ReduceErr
             .run_seq
             .checked_add(1)
             .ok_or(ReduceError::CounterOverflow("run sequence"))?;
+        state.current_run = None;
         state.started_at = Some(started_at);
         state.prompt = None;
         state.latest_response = None;

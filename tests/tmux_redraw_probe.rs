@@ -263,6 +263,7 @@ fn running_pane_presentation(epoch: i64) -> PanePresentation {
         synthetic_completion_armed: false,
         lifecycle: LifecycleState::Running,
         run_seq: 1,
+        current_run: None,
         completed_seq: 0,
         unread: vde_tmux::pane_state::UnreadState::default(),
         started_at: Some(epoch),

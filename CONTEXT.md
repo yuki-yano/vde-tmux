@@ -67,3 +67,55 @@ _Avoid_: Notification history, unread session
 **Priority Unread Pin**:
 Priority viewで現在のUnread Spanを`PINNED` zoneへ優先表示する一時的な共有マーカー。Pane Readを妨げず、Unread Spanの終了時に自動解除される。
 _Avoid_: Unread View, read lock, pane favorite, saved notification
+
+**Agent Occupant**:
+一つのPaneを占有している、種類とOS process identityを特定できるagent process。
+_Avoid_: Agent session, pane agent
+
+**Agent Epoch**:
+Agent OccupantとProvider Sessionのbindingが変わらない連続した識別期間。SessionStartまたは新しいoccupantの確定によって新しく始まる。
+_Avoid_: Process lifetime, tmux session
+
+**Provider Session**:
+providerが発行し、hook eventを一つの会話または実行文脈へ束縛するsession identity。
+_Avoid_: Agent Occupant, Agent Epoch, tmux session
+
+**Agent Binding**:
+Pane Instance、Agent Epoch、agent kind、provider session、OS process identityを組み合わせた、mutation対象の完全な識別条件。
+_Avoid_: Agent reference, process ID
+
+**Agent Run**:
+一つのAgent Epoch内で、promptの受理から応答の完了または未解決の終了までを表す一回の対話単位。
+_Avoid_: Dispatch operation, task, agent session
+
+**Provider Event**:
+provider hookから受け取り、provider session、eventまたはturn identity、payload digestとともに帰属を判定する観測入力。
+_Avoid_: Run Resolution, raw event bus
+
+**Dispatch Operation**:
+vde-tmuxが一つのpromptを一つのAgent Occupantへ渡すために受理した、再開可能な一回の依頼。
+_Avoid_: Agent Run, prompt, tmux input
+
+**Run Evidence**:
+Agent Runの活動、待機、process終了、provider通知、terminal状態について観測した事実。
+_Avoid_: Run outcome, completion
+
+**Execution Phase**:
+Agent Runの実行がrunning、waiting、error、endedのどこにあるかを表す、semantic outcomeとは独立した状態。
+_Avoid_: Run outcome, lifecycle
+
+**Run Resolution**:
+providerの完了通知またはoperatorの明示操作によって、Agent Runのsemantic outcomeを確定すること。
+_Avoid_: Stale inference, process exit, terminal ready
+
+**Response Artifact**:
+一つのAgent Runから得た応答本文と完全性を、canonical Pane状態とは分離して保持するbounded record。
+_Avoid_: Response preview, terminal capture, Pane snapshot
+
+**Recovery Precondition**:
+read-only診断時のRun revision、Agent Binding、activity evidenceを固定する、短命なoperator completion用CAS input。認証tokenではなく、resolve時に全条件を再検証する。
+_Avoid_: Completion evidence, recovery result
+
+**Resolution Audit Fields**:
+operator completionの依頼者、理由、pre/post revision、冪等性identityを同じRun Recordへ保存する監査field。
+_Avoid_: Separate audit store, diagnostic log

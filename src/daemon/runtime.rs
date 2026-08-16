@@ -1292,6 +1292,7 @@ mod tests {
                 synthetic_completion_armed: false,
                 lifecycle: crate::pane_state::LifecycleState::Idle,
                 run_seq: 1,
+                current_run: None,
                 completed_seq: 1,
                 unread: crate::pane_state::UnreadState::default(),
                 started_at: Some(1),
@@ -1366,6 +1367,7 @@ mod tests {
                         reason: WaitReason::PermissionPrompt,
                     },
                     run_seq: 1,
+                    current_run: None,
                     completed_seq: 0,
                     unread: crate::pane_state::UnreadState {
                         occurrence_seq: 1,

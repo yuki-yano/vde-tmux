@@ -3,19 +3,29 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use base64::Engine as _;
 use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::daemon::protocol::v2::{
-    CLIENT_REQUEST_TIMEOUT, ClientMessage, DaemonDiagnostic, HookHealth, PROTOCOL_VERSION,
-    PanePresentation, ResolvedSnapshot, ServerMessage, V2Client,
+    CLIENT_REQUEST_TIMEOUT, ClientMessage, CurrentAgentRun, DaemonDiagnostic, PROTOCOL_VERSION,
+    PanePresentation, ResolvedSnapshot, ServerMessage, V2Client, V2RequestFailureStage,
 };
 use crate::daemon::session_badge::BadgeState;
 use crate::pane_state::{LifecycleState, PaneInstance, WaitReason};
 use crate::tmux::TmuxRunner;
+use crate::{
+    agent_state::{
+        AgentBinding, AgentStateUsage, DispatchState, ExecutionPhase, OperationId, OperationRecord,
+        OperationRef, RecoveryPaneFence, RecoveryPrecondition, RecoveryProcessExpectation,
+        RecoveryViewportFingerprint, ResolutionId, ResponseArtifactMetadata, RunRecord, RunRef,
+        SemanticOutcome, Sha256Digest, VIEWPORT_FINGERPRINT_CONVENTION_VERSION,
+    },
+    pane_state::EventId,
+};
 
-pub const API_VERSION: u16 = 2;
+pub const API_VERSION: u16 = 3;
 pub const DEFAULT_READ_LINES: usize = 120;
 pub const MAX_READ_LINES: usize = 2_000;
 pub const MAX_READ_BYTES: usize = 1024 * 1024;
@@ -24,6 +34,8 @@ pub const DEFAULT_PROMPT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(7);
 pub const MAX_PROMPT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const WAIT_POLL_INITIAL_INTERVAL: Duration = Duration::from_millis(50);
+const WAIT_POLL_MAX_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -32,7 +44,7 @@ pub struct ApiError {
     stage: ApiErrorStage,
     side_effect: ApiSideEffect,
     retry_action: ApiRetryAction,
-    receipt: Option<AgentPromptReceipt>,
+    receipt: Option<OperationErrorReceipt>,
 }
 
 impl ApiError {
@@ -56,7 +68,7 @@ impl ApiError {
         stage: ApiErrorStage,
         side_effect: ApiSideEffect,
         retry_action: ApiRetryAction,
-        receipt: Option<AgentPromptReceipt>,
+        receipt: Option<OperationErrorReceipt>,
     ) -> Self {
         self.stage = stage;
         self.side_effect = side_effect;
@@ -129,6 +141,24 @@ pub enum ApiErrorCode {
     PromptDispatchBusy,
     DispatchRejected,
     DeliveryUnknown,
+    OperationConflict,
+    OperationNotFound,
+    OperationStoreFull,
+    OperationGenerationReplaced,
+    RunNotFound,
+    RunGenerationReplaced,
+    RunUnresolved,
+    StalePrecondition,
+    RecoveryNotAllowed,
+    ResolutionConflict,
+    RunAlreadyResolved,
+    TargetReplaced,
+    UnsupportedProvider,
+    ProviderEventConflict,
+    StorageCapacityExceeded,
+    StateUninitialized,
+    ArtifactUnavailable,
+    ArtifactExpired,
     DaemonError,
     InternalError,
 }
@@ -166,6 +196,24 @@ impl ApiErrorCode {
             Self::PromptDispatchBusy => "prompt_dispatch_busy",
             Self::DispatchRejected => "dispatch_rejected",
             Self::DeliveryUnknown => "delivery_unknown",
+            Self::OperationConflict => "operation_conflict",
+            Self::OperationNotFound => "operation_not_found",
+            Self::OperationStoreFull => "operation_store_full",
+            Self::OperationGenerationReplaced => "operation_generation_replaced",
+            Self::RunNotFound => "run_not_found",
+            Self::RunGenerationReplaced => "run_generation_replaced",
+            Self::RunUnresolved => "run_unresolved",
+            Self::StalePrecondition => "stale_precondition",
+            Self::RecoveryNotAllowed => "recovery_not_allowed",
+            Self::ResolutionConflict => "resolution_conflict",
+            Self::RunAlreadyResolved => "run_already_resolved",
+            Self::TargetReplaced => "target_replaced",
+            Self::UnsupportedProvider => "unsupported_provider",
+            Self::ProviderEventConflict => "provider_event_conflict",
+            Self::StorageCapacityExceeded => "storage_capacity_exceeded",
+            Self::StateUninitialized => "state_uninitialized",
+            Self::ArtifactUnavailable => "artifact_unavailable",
+            Self::ArtifactExpired => "artifact_expired",
             Self::DaemonError => "daemon_error",
             Self::InternalError => "internal_error",
         }
@@ -180,12 +228,18 @@ impl ApiErrorCode {
             | Self::PaneNotFound
             | Self::AgentNotFound
             | Self::ExactIdentityUnavailable
-            | Self::StaleReference => ApiErrorStage::TargetResolution,
+            | Self::StaleReference
+            | Self::TargetReplaced
+            | Self::UnsupportedProvider => ApiErrorStage::TargetResolution,
+            Self::OperationConflict | Self::ProviderEventConflict | Self::ResolutionConflict => {
+                ApiErrorStage::RequestValidation
+            }
             Self::AgentBusy
             | Self::AgentBlocked
             | Self::PromptConfirmationUnavailable
             | Self::AgentNotInputOwner
-            | Self::PromptDispatchBusy => ApiErrorStage::BeforeDispatch,
+            | Self::PromptDispatchBusy
+            | Self::OperationStoreFull => ApiErrorStage::BeforeDispatch,
             Self::DispatchRejected => ApiErrorStage::Dispatch,
             Self::DeliveryUnknown => ApiErrorStage::AfterDispatch,
             _ => ApiErrorStage::Observation,
@@ -197,6 +251,7 @@ impl ApiErrorCode {
             Self::PaneNotFound
             | Self::AgentNotFound
             | Self::StaleReference
+            | Self::TargetReplaced
             | Self::DispatchRejected => ApiRetryAction::RefreshTarget,
             Self::ExactIdentityUnavailable
             | Self::DaemonNotReady
@@ -208,7 +263,11 @@ impl ApiErrorCode {
             | Self::AgentBlocked
             | Self::PromptConfirmationUnavailable
             | Self::AgentNotInputOwner
-            | Self::PromptDispatchBusy => ApiRetryAction::WaitThenRetry,
+            | Self::PromptDispatchBusy
+            | Self::OperationStoreFull
+            | Self::RunUnresolved
+            | Self::RecoveryNotAllowed
+            | Self::StorageCapacityExceeded => ApiRetryAction::WaitThenRetry,
             Self::TmuxServerUnavailable
             | Self::DaemonUnavailable
             | Self::DaemonQueryFailed
@@ -216,6 +275,9 @@ impl ApiErrorCode {
             | Self::StaleDaemon
             | Self::EventHistoryLost => ApiRetryAction::RestartObservation,
             Self::DeliveryUnknown => ApiRetryAction::InspectManually,
+            Self::StalePrecondition
+            | Self::OperationGenerationReplaced
+            | Self::RunGenerationReplaced => ApiRetryAction::RestartObservation,
             _ => ApiRetryAction::Never,
         }
     }
@@ -312,6 +374,60 @@ macro_rules! api_error {
     ("delivery_unknown", $message:expr $(,)?) => {
         ApiError::new(ApiErrorCode::DeliveryUnknown, $message)
     };
+    ("operation_conflict", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::OperationConflict, $message)
+    };
+    ("operation_not_found", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::OperationNotFound, $message)
+    };
+    ("operation_store_full", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::OperationStoreFull, $message)
+    };
+    ("operation_generation_replaced", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::OperationGenerationReplaced, $message)
+    };
+    ("run_not_found", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::RunNotFound, $message)
+    };
+    ("run_generation_replaced", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::RunGenerationReplaced, $message)
+    };
+    ("run_unresolved", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::RunUnresolved, $message)
+    };
+    ("run_already_resolved", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::RunAlreadyResolved, $message)
+    };
+    ("target_replaced", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::TargetReplaced, $message)
+    };
+    ("unsupported_provider", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::UnsupportedProvider, $message)
+    };
+    ("provider_event_conflict", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::ProviderEventConflict, $message)
+    };
+    ("recovery_not_allowed", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::RecoveryNotAllowed, $message)
+    };
+    ("stale_precondition", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::StalePrecondition, $message)
+    };
+    ("resolution_conflict", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::ResolutionConflict, $message)
+    };
+    ("storage_capacity_exceeded", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::StorageCapacityExceeded, $message)
+    };
+    ("state_uninitialized", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::StateUninitialized, $message)
+    };
+    ("artifact_unavailable", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::ArtifactUnavailable, $message)
+    };
+    ("artifact_expired", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::ArtifactExpired, $message)
+    };
     ("daemon_error", $message:expr $(,)?) => {
         ApiError::new(ApiErrorCode::DaemonError, $message)
     };
@@ -362,7 +478,139 @@ pub struct ApiErrorBody {
     pub side_effect: ApiSideEffect,
     pub retry_action: ApiRetryAction,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt: Option<AgentPromptReceipt>,
+    pub receipt: Option<OperationErrorReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct OperationErrorReceipt {
+    pub operation_ref: String,
+    #[schemars(with = "serde_json::Value")]
+    pub operation: OperationRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunRecoveryStatus {
+    Completed,
+    ExactPresentStable,
+    ExactAbsent,
+    Replaced,
+    Unstable,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RunRecoveryDiagnostic {
+    pub status: RunRecoveryStatus,
+    pub first_revision: u64,
+    pub second_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ApiSchemaContract {
+    pub versions: ApiVersionContract,
+    pub hard_limits: ApiHardLimitContract,
+    pub providers: ApiProviderCompatibilityContract,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ApiVersionContract {
+    pub public_agent_api: u16,
+    pub daemon_protocol: u16,
+    pub pane_state_schema: u16,
+    pub private_state_format: u16,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ApiHardLimitContract {
+    pub pane_snapshot_max_bytes: u64,
+    pub pane_projection_max_bytes: u64,
+    pub historical_runs_max_per_pane: u64,
+    pub run_store_max_records: u64,
+    pub run_store_max_bytes: u64,
+    pub run_retention_days: u64,
+    pub run_record_max_bytes: u64,
+    pub run_evidence_max_bytes: u64,
+    pub run_event_reference_max_count: u64,
+    pub operation_store_max_records: u64,
+    pub operation_store_max_bytes: u64,
+    pub operation_record_max_bytes: u64,
+    pub prompt_body_max_bytes: u64,
+    pub prompt_store_max_records: u64,
+    pub prompt_store_max_bytes: u64,
+    pub response_artifact_body_max_bytes: u64,
+    pub artifact_store_max_files: u64,
+    pub artifact_store_max_bytes: u64,
+    pub concurrent_subscription_max_streams: u64,
+    pub wait_timeout_min_ms: u64,
+    pub wait_timeout_max_ms: u64,
+    pub daemon_request_frame_max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ApiProviderCompatibilityContract {
+    pub codex: ApiProviderContract,
+    pub claude_code: ApiProviderContract,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ApiProviderContract {
+    pub status: ApiProviderStatus,
+    pub recorded_version: String,
+    pub evidence_basis: ApiProviderEvidenceBasis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_observation_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<ApiProviderAttributionContract>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiProviderStatus {
+    Enabled,
+    DisabledPendingAuthenticatedP0,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiProviderEvidenceBasis {
+    AuthenticatedIsolatedRuntimeProbe,
+    IsolatedProbeBlockedByAuthentication,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ApiProviderAttributionContract {
+    pub stable_event_reference: Vec<ApiProviderAttributionField>,
+    pub prompt_event: ApiProviderHookEvent,
+    pub completion_event: ApiProviderHookEvent,
+    pub response_artifact_source: ApiResponseArtifactSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiProviderAttributionField {
+    Provider,
+    SessionId,
+    TurnId,
+    HookKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiProviderHookEvent {
+    UserPromptSubmit,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiResponseArtifactSource {
+    StopPayload,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -370,6 +618,7 @@ pub struct ApiErrorBody {
 pub enum ApiResult {
     Schema {
         schemas: BTreeMap<String, serde_json::Value>,
+        contract: ApiSchemaContract,
     },
     Snapshot {
         panes: Vec<PaneSummary>,
@@ -393,14 +642,55 @@ pub enum ApiResult {
         agent: AgentDetail,
     },
     AgentPrompt {
-        receipt: AgentPromptReceipt,
-        dispatch: AgentPromptDispatch,
-        confirmation: AgentPromptConfirmation,
+        operation_ref: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        observed_run_seq: Option<u64>,
+        run_ref: Option<String>,
+        #[schemars(with = "serde_json::Value")]
+        operation: OperationRecord,
+        waited_ms: u64,
+    },
+    AgentRun {
+        run_ref: String,
+        #[schemars(with = "serde_json::Value")]
+        run: RunRecord,
+        waited_ms: u64,
+    },
+    AgentRunCheck {
+        run_ref: String,
+        #[schemars(with = "serde_json::Value")]
+        run: Box<RunRecord>,
+        diagnostic: RunRecoveryDiagnostic,
         #[serde(skip_serializing_if = "Option::is_none")]
-        observed_state_revision: Option<u64>,
-        wait_cursor: AgentWaitCursor,
+        #[schemars(with = "Option<serde_json::Value>")]
+        recovery_precondition: Option<RecoveryPrecondition>,
+    },
+    AgentRunResolved {
+        run_ref: String,
+        #[schemars(with = "serde_json::Value")]
+        run: RunRecord,
+    },
+    AgentOperation {
+        operation_ref: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_ref: Option<String>,
+        #[schemars(with = "serde_json::Value")]
+        operation: OperationRecord,
+        waited_ms: u64,
+    },
+    AgentResponse {
+        run_ref: String,
+        #[schemars(with = "serde_json::Value")]
+        metadata: ResponseArtifactMetadata,
+        encoding: String,
+        body: String,
+    },
+    AgentStorage {
+        #[schemars(with = "serde_json::Value")]
+        usage: AgentStateUsage,
+    },
+    AgentStorageReset {
+        previous_generation: String,
+        generation: String,
     },
     AgentWait {
         target: AgentWaitTarget,
@@ -507,6 +797,25 @@ pub struct LifecycleSummary {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableRunStatus {
+    Working,
+    Blocked,
+    EndedUnconfirmed,
+    Done,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CurrentRunSummary {
+    pub run_ref: String,
+    #[schemars(with = "String")]
+    pub execution_phase: ExecutionPhase,
+    #[schemars(with = "String")]
+    pub semantic_outcome: SemanticOutcome,
+    pub status: DurableRunStatus,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct AgentSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -519,6 +828,8 @@ pub struct AgentSummary {
     pub status: AgentStatus,
     pub badge: AgentBadge,
     pub lifecycle: LifecycleSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_run: Option<CurrentRunSummary>,
     pub sessions: Vec<SessionLink>,
     pub window_id: String,
     pub window_name: String,
@@ -694,6 +1005,18 @@ fn default_wait_statuses() -> BTreeSet<AgentStatus> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunWaitUntil {
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationWaitUntil {
+    PromptConfirmed,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum ApiRequest {
@@ -719,10 +1042,50 @@ pub enum ApiRequest {
     },
     AgentPrompt {
         target: String,
+        operation_id: String,
         #[serde(default = "default_prompt_confirm_timeout_ms")]
         #[schemars(range(min = 1, max = 60_000))]
         confirm_timeout_ms: u64,
     },
+    AgentRunGet {
+        run_ref: String,
+    },
+    AgentRunWait {
+        run_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<RunWaitUntil>,
+        #[serde(default = "default_wait_timeout_ms")]
+        #[schemars(range(min = 1, max = 86_400_000))]
+        timeout_ms: u64,
+    },
+    AgentRunResponse {
+        run_ref: String,
+    },
+    AgentRunCheck {
+        run_ref: String,
+    },
+    AgentRunResolve {
+        run_ref: String,
+        outcome: String,
+        #[schemars(with = "serde_json::Value")]
+        precondition: Box<RecoveryPrecondition>,
+        resolution_id: String,
+        reason: String,
+    },
+    AgentOperationGet {
+        operation_ref: String,
+    },
+    AgentOperationWait {
+        operation_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<OperationWaitUntil>,
+        #[serde(default)]
+        follow_unknown: bool,
+        #[serde(default = "default_wait_timeout_ms")]
+        #[schemars(range(min = 1, max = 86_400_000))]
+        timeout_ms: u64,
+    },
+    AgentStorageStatus,
     AgentWait {
         target: String,
         #[serde(default = "default_wait_statuses")]
@@ -807,8 +1170,77 @@ pub fn schema_json(started_at: i64) -> Result<String> {
             emitted_at: epoch_now(),
             diagnostic_count: 0,
         },
-        result: ApiResult::Schema { schemas },
+        result: ApiResult::Schema {
+            schemas,
+            contract: api_schema_contract(),
+        },
     })?)
+}
+
+fn api_schema_contract() -> ApiSchemaContract {
+    ApiSchemaContract {
+        versions: ApiVersionContract {
+            public_agent_api: API_VERSION,
+            daemon_protocol: PROTOCOL_VERSION,
+            pane_state_schema: crate::pane_state::PANE_STATE_SCHEMA_VERSION,
+            private_state_format: crate::agent_state::PRIVATE_STATE_FORMAT_VERSION,
+        },
+        hard_limits: ApiHardLimitContract {
+            pane_snapshot_max_bytes: crate::pane_state::MAX_RESPONSE_FRAME_BYTES as u64,
+            pane_projection_max_bytes: 4 * 1024,
+            historical_runs_max_per_pane: 64,
+            run_store_max_records: crate::agent_state::RUN_STORE_MAX_RECORDS as u64,
+            run_store_max_bytes: crate::agent_state::RUN_STORE_MAX_BYTES,
+            run_retention_days: 30,
+            run_record_max_bytes: crate::agent_state::RUN_RECORD_MAX_BYTES as u64,
+            run_evidence_max_bytes: crate::agent_state::RUN_EVIDENCE_MAX_BYTES as u64,
+            run_event_reference_max_count: crate::agent_state::RUN_EVENT_REFERENCE_MAX_COUNT as u64,
+            operation_store_max_records: crate::agent_state::OPERATION_STORE_MAX_RECORDS as u64,
+            operation_store_max_bytes: crate::agent_state::OPERATION_STORE_MAX_BYTES,
+            operation_record_max_bytes: crate::agent_state::OPERATION_RECORD_MAX_BYTES as u64,
+            prompt_body_max_bytes: crate::agent_state::PROMPT_BODY_MAX_BYTES as u64,
+            prompt_store_max_records: crate::agent_state::PROMPT_STORE_MAX_RECORDS as u64,
+            prompt_store_max_bytes: crate::agent_state::PROMPT_STORE_MAX_BYTES,
+            response_artifact_body_max_bytes: crate::agent_state::RESPONSE_ARTIFACT_BODY_MAX_BYTES
+                as u64,
+            artifact_store_max_files: crate::agent_state::ARTIFACT_STORE_MAX_FILES as u64,
+            artifact_store_max_bytes: crate::agent_state::ARTIFACT_STORE_MAX_BYTES,
+            concurrent_subscription_max_streams: 48,
+            wait_timeout_min_ms: 1,
+            wait_timeout_max_ms: MAX_WAIT_TIMEOUT.as_millis() as u64,
+            daemon_request_frame_max_bytes: crate::pane_state::MAX_REQUEST_FRAME_BYTES as u64,
+        },
+        providers: ApiProviderCompatibilityContract {
+            codex: ApiProviderContract {
+                status: ApiProviderStatus::Enabled,
+                recorded_version: "0.147.0".to_string(),
+                evidence_basis: ApiProviderEvidenceBasis::AuthenticatedIsolatedRuntimeProbe,
+                observed_at: Some("2026-08-15".to_string()),
+                source_revision: Some("a4fb816a52fc4178ef3a01d285f0c6cc0191d7c0".to_string()),
+                probe_observation_count: Some(20),
+                attribution: Some(ApiProviderAttributionContract {
+                    stable_event_reference: vec![
+                        ApiProviderAttributionField::Provider,
+                        ApiProviderAttributionField::SessionId,
+                        ApiProviderAttributionField::TurnId,
+                        ApiProviderAttributionField::HookKind,
+                    ],
+                    prompt_event: ApiProviderHookEvent::UserPromptSubmit,
+                    completion_event: ApiProviderHookEvent::Stop,
+                    response_artifact_source: ApiResponseArtifactSource::StopPayload,
+                }),
+            },
+            claude_code: ApiProviderContract {
+                status: ApiProviderStatus::DisabledPendingAuthenticatedP0,
+                recorded_version: "2.1.227".to_string(),
+                evidence_basis: ApiProviderEvidenceBasis::IsolatedProbeBlockedByAuthentication,
+                observed_at: None,
+                source_revision: None,
+                probe_observation_count: None,
+                attribution: None,
+            },
+        },
+    }
 }
 
 pub fn snapshot(
@@ -926,10 +1358,15 @@ pub fn agent_list(
 ) -> Result<String> {
     let mut connection = ApiConnection::connect(runner, env, None)?;
     let snapshot = connection.query_snapshot()?;
+    let current_runs = query_current_agent_runs(&mut connection, &snapshot)?;
     let agents = snapshot
         .panes
         .iter()
-        .filter_map(|pane| agent_summary(pane, &snapshot, &connection.server_identity))
+        .filter_map(|pane| {
+            let mut summary = agent_summary(pane, &snapshot, &connection.server_identity)?;
+            summary.current_run = current_run_for_pane(pane, &current_runs);
+            Some(summary)
+        })
         .filter(|agent| matches_agent_filter(agent, filter))
         .collect();
     success_json(
@@ -949,8 +1386,10 @@ pub fn agent_get(
     let mut connection = ApiConnection::connect(runner, env, None)?;
     let snapshot = connection.query_snapshot()?;
     let pane = resolve_agent(&snapshot, target, &connection.server_identity)?;
-    let agent = agent_detail(pane, &snapshot, &connection.server_identity)
+    let current_runs = query_current_agent_runs(&mut connection, &snapshot)?;
+    let mut agent = agent_detail(pane, &snapshot, &connection.server_identity)
         .expect("resolve_agent only returns resolved agents");
+    agent.summary.current_run = current_run_for_pane(pane, &current_runs);
     success_json(
         &connection,
         &snapshot,
@@ -963,6 +1402,7 @@ pub fn agent_prompt(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
     target: &str,
+    operation_id: &str,
     prompt: &str,
     confirm_timeout: Duration,
 ) -> Result<String> {
@@ -974,6 +1414,12 @@ pub fn agent_prompt(
         )
         .into());
     }
+    let operation_id = OperationId::parse(operation_id.to_string()).map_err(|error| {
+        api_error!(
+            "invalid_arguments",
+            format!("invalid --operation-id: {error}")
+        )
+    })?;
     if confirm_timeout.is_zero() || confirm_timeout > MAX_PROMPT_CONFIRM_TIMEOUT {
         return Err(api_error!(
             "invalid_arguments",
@@ -986,158 +1432,1236 @@ pub fn agent_prompt(
     }
 
     let started_at = epoch_now();
+    let started = Instant::now();
     let deadline = Instant::now() + confirm_timeout;
-    let mut connection = ApiConnection::connect(runner, env, Some(deadline))?;
-    if connection.client.hook_health() != HookHealth::Healthy {
-        return Err(api_error!(
-            "prompt_confirmation_unavailable",
-            "daemon hook health is degraded; no prompt bytes were sent",
-        )
-        .into());
+    let prompt_digest = Sha256Digest::parse(crate::pane_state::PromptState::digest_decoded_prompt(
+        prompt,
+    ))
+    .expect("PromptState emits a valid SHA-256 digest");
+    let prompt_base64 = base64::engine::general_purpose::STANDARD.encode(prompt.as_bytes());
+    let observed_at = started_at;
+    let mut poll_interval = WAIT_POLL_INITIAL_INTERVAL;
+    let mut request_may_have_reached_daemon = false;
+
+    let (start_connection, operation_ref, operation) = loop {
+        if Instant::now() >= deadline {
+            let message = "daemon did not accept or recover the idempotent prompt operation before the deadline";
+            return Err(if request_may_have_reached_daemon {
+                prompt_wait_timeout(message)
+            } else {
+                prompt_before_dispatch_timeout(message)
+            }
+            .into());
+        }
+        let mut connection = match ApiConnection::connect(runner, env, Some(deadline)) {
+            Ok(connection) => connection,
+            Err(_) => {
+                sleep_until_next_poll(deadline, &mut poll_interval);
+                continue;
+            }
+        };
+        let event_id = EventId::generate()
+            .map_err(|error| api_error!("internal_error", format!("event ID: {error}")))?;
+        let request = ClientMessage::StartAgentPrompt {
+            proto: PROTOCOL_VERSION,
+            daemon_instance_id: connection.client.daemon_instance_id().clone(),
+            event_id,
+            target_agent_ref: target.to_string(),
+            operation_id: operation_id.clone(),
+            prompt_base64: prompt_base64.clone(),
+            prompt_digest: prompt_digest.clone(),
+            dispatch_option: "paste_enter".to_string(),
+            observed_at,
+        };
+        connection
+            .client
+            .set_deadline(deadline.min(Instant::now() + CLIENT_REQUEST_TIMEOUT));
+        match connection.client.request_with_stage(&request) {
+            Ok(ServerMessage::AgentPromptResult {
+                proto,
+                operation_ref,
+                operation,
+            }) if proto == PROTOCOL_VERSION => break (connection, operation_ref, operation),
+            Ok(ServerMessage::Error { code, message, .. }) => {
+                return Err(daemon_api_error(code, message).into());
+            }
+            Ok(other) => {
+                return Err(api_error!(
+                    "invalid_daemon_response",
+                    format!("unexpected prompt response: {other:?}"),
+                )
+                .into());
+            }
+            Err(error) => {
+                request_may_have_reached_daemon |=
+                    error.stage == V2RequestFailureStage::AfterFullWrite;
+                // The caller-supplied operation ID makes this exact request replay-safe.
+                sleep_until_next_poll(deadline, &mut poll_interval);
+            }
+        }
+    };
+
+    let (connection, operation) = if operation_is_terminal(&operation) {
+        (start_connection, operation)
+    } else {
+        let (connection, returned_ref, operation) =
+            wait_for_operation(runner, env, &operation_ref, deadline, false)?;
+        if returned_ref != operation_ref {
+            return Err(api_error!(
+                "invalid_daemon_response",
+                "operation query returned a different operation_ref",
+            )
+            .into());
+        }
+        (connection, operation)
+    };
+    if operation.dispatch_state != DispatchState::PromptConfirmed {
+        return Err(operation_terminal_error(&operation_ref, operation).into());
     }
-    let subscribed = connection.subscribe()?;
-    let (initial_pane, identity) =
-        resolve_wait_resume_agent(&subscribed, target, &connection.server_identity)?;
-    require_prompt_capable_agent(&identity)?;
-    let baseline = PromptBaseline::from_pane(initial_pane)?;
-    let prompt_digest = crate::pane_state::PromptState::digest_decoded_prompt(prompt);
-    let receipt = AgentPromptReceipt {
-        target: wait_target(
-            initial_pane,
-            &connection.server_identity,
-            &identity,
-            Some(target),
-        ),
-        prompt_digest: prompt_digest.clone(),
-        baseline_run_seq: baseline.run_seq,
-        baseline_completed_seq: baseline.completed_seq,
-        expected_run_seq: baseline.expected_run_seq,
-    };
-
-    let _lock = crate::runtime_dir::try_acquire_pane_dispatch_lock(
-        &connection.incarnation.identity,
-        &identity.pane_instance.pane_id,
-        identity.pane_instance.pane_pid,
-    )
-    .map_err(|error| {
-        ApiError::new(
-            ApiErrorCode::PromptDispatchBusy,
-            format!("could not acquire the guarded dispatch lock: {error:#}"),
-        )
-    })?
-    .ok_or_else(|| {
-        api_error!(
-            "prompt_dispatch_busy",
-            format!(
-                "another guarded dispatch is active for pane {}",
-                identity.pane_instance.pane_id
-            ),
-        )
-    })?;
-
-    let mut fence_connection = connection.reconnect()?;
-    let before_dispatch = fence_connection.query_snapshot()?;
-    let pane = require_same_agent(&before_dispatch, &identity).map_err(before_dispatch_error)?;
-    require_prompt_baseline(pane, &baseline).map_err(before_dispatch_error)?;
-    verify_live_pane(runner, env, &fence_connection, &identity.pane_instance)
-        .map_err(before_dispatch_error)?;
-    verify_live_agent_process(runner, &identity, pane).map_err(before_dispatch_error)?;
-    verify_agent_input_owner(runner, &identity).map_err(before_dispatch_error)?;
-
-    dispatch_prompt_guarded(
-        runner,
-        &connection.incarnation,
-        &identity.pane_instance,
-        prompt.as_bytes(),
-        &prompt_digest,
-        &receipt,
-    )?;
-
-    let mut after_connection = match connection.reconnect() {
-        Ok(connection) => connection,
-        Err(error) => {
-            return Err(delivery_unknown(
-                format!("prompt was submitted but daemon revalidation failed: {error:#}"),
-                receipt,
-            )
-            .into());
-        }
-    };
-    let after = match after_connection.query_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return Err(delivery_unknown(
-                format!("prompt was submitted but the post-dispatch snapshot failed: {error:#}"),
-                receipt,
-            )
-            .into());
-        }
-    };
-    let after_pane = require_same_agent(&after, &identity).map_err(|error| {
-        delivery_unknown(
-            format!("prompt was submitted but the exact agent changed: {error:#}"),
-            receipt.clone(),
-        )
-    })?;
-    verify_live_pane(runner, env, &after_connection, &identity.pane_instance).map_err(|error| {
-        delivery_unknown(
-            format!("prompt was submitted but the live pane fence failed: {error:#}"),
-            receipt.clone(),
-        )
-    })?;
-    verify_live_agent_process(runner, &identity, after_pane).map_err(|error| {
-        delivery_unknown(
-            format!("prompt was submitted but the live agent fence failed: {error:#}"),
-            receipt.clone(),
-        )
-    })?;
-
-    let (confirmed_snapshot, observed_run_seq, observed_state_revision) =
-        confirm_prompt_digest(&mut connection, subscribed, &identity, &receipt, deadline)
-            .map_err(|message| delivery_unknown(message, receipt.clone()))?;
-    success_json(
+    let run_ref = linked_run_ref(&operation_ref, &operation)?;
+    success_agent_json(
         &connection,
-        &confirmed_snapshot,
         started_at,
         ApiResult::AgentPrompt {
-            wait_cursor: AgentWaitCursor {
-                agent_ref: receipt.target.agent_ref.clone(),
-                after_completed_seq: receipt.baseline_completed_seq,
-            },
-            receipt,
-            dispatch: AgentPromptDispatch::Submitted,
-            confirmation: AgentPromptConfirmation::DigestMatched,
-            observed_run_seq: Some(observed_run_seq),
-            observed_state_revision: Some(observed_state_revision),
+            operation_ref,
+            run_ref,
+            operation,
+            waited_ms: elapsed_millis(started),
         },
     )
 }
 
-#[derive(Debug, Clone)]
-struct PromptBaseline {
-    state_id: String,
-    agent_epoch: u64,
-    run_seq: u64,
-    completed_seq: u64,
-    expected_run_seq: u64,
+pub fn agent_run_get(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    run_ref: &str,
+) -> Result<String> {
+    let (connection, returned_ref, run) = query_agent_run(runner, env, run_ref, None)?;
+    success_agent_json(
+        &connection,
+        observed_at,
+        ApiResult::AgentRun {
+            run_ref: returned_ref,
+            run,
+            waited_ms: 0,
+        },
+    )
 }
 
-impl PromptBaseline {
-    fn from_pane(pane: &PanePresentation) -> Result<Self> {
-        let state = canonical_state(pane)
-            .ok_or_else(|| api_error!("agent_not_found", "agent state is unavailable"))?;
-        require_promptable_lifecycle(state)?;
-        let expected_run_seq = state
-            .run_seq
-            .checked_add(1)
-            .ok_or_else(|| api_error!("resource_limit", "run sequence overflow"))?;
-        Ok(Self {
-            state_id: state.state_id.as_str().to_string(),
-            agent_epoch: state.agent_epoch,
-            run_seq: state.run_seq,
-            completed_seq: state.completed_seq,
-            expected_run_seq,
+pub fn agent_run_wait(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    run_ref: &str,
+    timeout: Duration,
+    until_completed: bool,
+) -> Result<String> {
+    validate_agent_wait_timeout(timeout)?;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let (connection, returned_ref, run) =
+        wait_for_run(runner, env, run_ref, deadline, until_completed)?;
+    success_agent_json(
+        &connection,
+        observed_at,
+        ApiResult::AgentRun {
+            run_ref: returned_ref,
+            run,
+            waited_ms: elapsed_millis(started),
+        },
+    )
+}
+
+pub fn agent_run_response(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    run_ref: &str,
+) -> Result<String> {
+    let mut connection = ApiConnection::connect(runner, env, None)?;
+    connection
+        .client
+        .set_deadline(Instant::now() + CLIENT_REQUEST_TIMEOUT);
+    let response = connection
+        .client
+        .request(&ClientMessage::QueryAgentResponse {
+            proto: PROTOCOL_VERSION,
+            run_ref: run_ref.to_string(),
         })
+        .map_err(|error| api_error!("daemon_query_failed", format!("{error:#}")))?;
+    let (returned_ref, metadata, body_base64) = match response {
+        ServerMessage::AgentResponseResult {
+            proto,
+            run_ref,
+            metadata,
+            body_base64,
+        } if proto == PROTOCOL_VERSION => (run_ref, metadata, body_base64),
+        ServerMessage::Error { code, message, .. } => {
+            return Err(daemon_api_error(code, message).into());
+        }
+        ServerMessage::AgentResponseResult { .. } => {
+            return Err(api_error!(
+                "invalid_daemon_response",
+                "response query returned a mismatched protocol version",
+            )
+            .into());
+        }
+        other => {
+            return Err(api_error!(
+                "invalid_daemon_response",
+                format!("unexpected agent response result: {other:?}"),
+            )
+            .into());
+        }
+    };
+    if returned_ref != run_ref {
+        return Err(api_error!(
+            "invalid_daemon_response",
+            "response query returned a different run_ref",
+        )
+        .into());
+    }
+    metadata.validate().map_err(|error| {
+        api_error!(
+            "invalid_daemon_response",
+            format!("invalid response metadata: {error}")
+        )
+    })?;
+    if metadata.encoding != "utf-8" {
+        return Err(api_error!(
+            "invalid_daemon_response",
+            format!("unsupported response encoding: {}", metadata.encoding),
+        )
+        .into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body_base64.as_bytes())
+        .map_err(|error| {
+            api_error!(
+                "invalid_daemon_response",
+                format!("response body is not valid base64: {error}")
+            )
+        })?;
+    if bytes.len() as u64 != metadata.stored_byte_count
+        || metadata.stored_digest.as_ref() != Some(&Sha256Digest::of(&bytes))
+    {
+        return Err(api_error!(
+            "invalid_daemon_response",
+            "response body does not match its stored byte count and digest",
+        )
+        .into());
+    }
+    let body = String::from_utf8(bytes).map_err(|error| {
+        api_error!(
+            "invalid_daemon_response",
+            format!("response body is not valid UTF-8: {error}")
+        )
+    })?;
+    success_agent_json(
+        &connection,
+        observed_at,
+        ApiResult::AgentResponse {
+            run_ref: returned_ref,
+            metadata,
+            encoding: "utf-8".to_string(),
+            body,
+        },
+    )
+}
+
+pub fn agent_run_check(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    run_ref: &str,
+) -> Result<String> {
+    agent_run_check_with_interval(runner, env, observed_at, run_ref, Duration::from_secs(2))
+}
+
+fn agent_run_check_with_interval(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    run_ref: &str,
+    interval: Duration,
+) -> Result<String> {
+    let first = observe_run_recovery_sample(runner, env, run_ref)?;
+    std::thread::sleep(interval);
+    let second = observe_run_recovery_sample(runner, env, run_ref)?;
+    if first.run_ref != run_ref
+        || second.run_ref != run_ref
+        || first.run.run_id != second.run.run_id
+    {
+        return Err(api_error!(
+            "invalid_daemon_response",
+            "run check returned a mismatched stable run identity",
+        )
+        .into());
+    }
+
+    let (status, message, process_expectation) = classify_run_recovery(&first, &second);
+    let recovery_precondition = if let Some(process_expectation) = process_expectation {
+        let issued_at = epoch_now();
+        Some(RecoveryPrecondition {
+            run_ref: run_ref.to_string(),
+            binding: second.run.binding.clone(),
+            run_revision: second.run.revision,
+            evidence_digest: crate::agent_state::runtime::AgentRuntime::evidence_digest(
+                &second.run,
+            )?,
+            pane: second.pane.clone(),
+            viewport_fingerprint: second.viewport_fingerprint.clone(),
+            process_expectation,
+            issued_at,
+            expires_at: issued_at.saturating_add(60),
+        })
+    } else {
+        None
+    };
+    success_agent_json(
+        &second.connection,
+        observed_at,
+        ApiResult::AgentRunCheck {
+            run_ref: second.run_ref.clone(),
+            run: Box::new(second.run.clone()),
+            diagnostic: RunRecoveryDiagnostic {
+                status,
+                first_revision: first.run.revision,
+                second_revision: second.run.revision,
+                message,
+            },
+            recovery_precondition,
+        },
+    )
+}
+
+struct RunRecoveryObservation {
+    connection: ApiConnection,
+    run_ref: String,
+    run: RunRecord,
+    pane: RecoveryPaneFence,
+    process: Option<crate::pane_state::AgentProcessIdentity>,
+    viewport_fingerprint: Option<RecoveryViewportFingerprint>,
+}
+
+fn observe_run_recovery_sample(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    run_ref: &str,
+) -> Result<RunRecoveryObservation> {
+    let (connection, returned_ref, run) = query_agent_run(runner, env, run_ref, None)?;
+    let mut snapshot_connection = connection.reconnect()?;
+    let snapshot = snapshot_connection.query_snapshot()?;
+    let pane = recovery_pane_fence(&snapshot, &run)?;
+    let process = observe_run_process(runner, &run)?;
+    let viewport_fingerprint = if process.as_ref() == Some(&run.binding.process) {
+        verify_recovery_foreground_owner(runner, &run.binding.pane_instance, &run.binding.process)
+            .map_err(|error| {
+                api_error!(
+                    "identity_verification_failed",
+                    format!("the exact bound process is not the foreground input owner: {error}"),
+                )
+            })?;
+        Some(capture_visible_viewport_fingerprint(
+            runner,
+            &run.binding.pane_instance,
+        )?)
+    } else {
+        None
+    };
+    Ok(RunRecoveryObservation {
+        connection,
+        run_ref: returned_ref,
+        run,
+        pane,
+        process,
+        viewport_fingerprint,
+    })
+}
+
+pub(crate) fn verify_recovery_foreground_owner(
+    runner: &dyn TmuxRunner,
+    pane: &PaneInstance,
+    process: &crate::pane_state::AgentProcessIdentity,
+) -> std::result::Result<(), String> {
+    runner
+        .verify_agent_input_owner(pane.pane_pid, process.pid)
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn recovery_pane_fence(snapshot: &ResolvedSnapshot, run: &RunRecord) -> Result<RecoveryPaneFence> {
+    let state = snapshot
+        .panes
+        .iter()
+        .find(|pane| pane.pane_instance == run.binding.pane_instance)
+        .and_then(|pane| pane.resolved.as_ref())
+        .map(|resolved| &resolved.canonical)
+        .ok_or_else(|| {
+            api_error!(
+                "stale_precondition",
+                "the pane bound to the run has no canonical state",
+            )
+        })?;
+    if state.state_id != run.binding.pane_state_id
+        || state.agent_epoch != run.binding.agent_epoch
+        || state.agent != run.binding.agent_kind
+        || state.agent_session_id.as_ref() != Some(&run.binding.provider_session_id)
+        || state.pane_instance != run.binding.pane_instance
+    {
+        return Err(api_error!(
+            "stale_precondition",
+            "the pane no longer has the complete binding recorded by the run",
+        )
+        .into());
+    }
+    let current_run = state.current_run.clone().ok_or_else(|| {
+        api_error!(
+            "stale_precondition",
+            "the pane no longer points at the checked durable run",
+        )
+    })?;
+    if current_run.run_id != run.run_id.as_str()
+        || current_run.run_seq != run.run_seq
+        || current_run.run_revision != run.revision
+    {
+        return Err(
+            api_error!("stale_precondition", "the pane durable-run pointer changed",).into(),
+        );
+    }
+    if matches!(state.lifecycle, LifecycleState::Waiting { .. }) {
+        return Err(api_error!(
+            "recovery_not_allowed",
+            "a pane waiting for permission or user input cannot be operator-completed",
+        )
+        .into());
+    }
+    if !state.subagents.is_empty() {
+        return Err(api_error!(
+            "recovery_not_allowed",
+            "a run with active subagents cannot be operator-completed",
+        )
+        .into());
+    }
+    Ok(RecoveryPaneFence {
+        state_id: state.state_id.clone(),
+        revision: state.revision,
+        current_run,
+        lifecycle: state.lifecycle.clone(),
+        subagent_count: 0,
+    })
+}
+
+pub(crate) fn capture_visible_viewport_fingerprint(
+    runner: &dyn TmuxRunner,
+    pane: &PaneInstance,
+) -> Result<RecoveryViewportFingerprint> {
+    let before = recovery_viewport_dimensions(runner, pane)?;
+    let output = runner
+        .run_bounded(
+            &["capture-pane", "-pJ", "-t", &pane.pane_id],
+            MAX_READ_BYTES,
+        )
+        .map_err(|error| {
+            api_error!(
+                "capture_failed",
+                format!("failed to capture the visible recovery viewport: {error:#}"),
+            )
+        })?;
+    if output.truncated {
+        return Err(api_error!(
+            "resource_limit",
+            "visible recovery viewport exceeded the capture limit",
+        )
+        .into());
+    }
+    let after = recovery_viewport_dimensions(runner, pane)?;
+    if before != after {
+        return Err(api_error!(
+            "stale_precondition",
+            "pane identity or dimensions changed during viewport capture",
+        )
+        .into());
+    }
+    let (pane_width, pane_height) = before;
+    let mut bytes = Vec::with_capacity(output.text.len() + 32);
+    bytes.extend_from_slice(b"vde-tmux-recovery-viewport-v1\0");
+    bytes.extend_from_slice(&pane_width.to_be_bytes());
+    bytes.extend_from_slice(&pane_height.to_be_bytes());
+    bytes.extend_from_slice(output.text.as_bytes());
+    Ok(RecoveryViewportFingerprint {
+        convention_version: VIEWPORT_FINGERPRINT_CONVENTION_VERSION,
+        pane_width,
+        pane_height,
+        digest: Sha256Digest::of(&bytes),
+    })
+}
+
+fn recovery_viewport_dimensions(
+    runner: &dyn TmuxRunner,
+    pane: &PaneInstance,
+) -> Result<(u16, u16)> {
+    let output = runner
+        .run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane.pane_id,
+            "#{pane_id}\t#{pane_pid}\t#{pane_width}\t#{pane_height}",
+        ])
+        .map_err(|error| {
+            api_error!(
+                "stale_precondition",
+                format!("failed to resolve the recovery pane viewport: {error:#}"),
+            )
+        })?;
+    let fields = output.trim_end().split('\t').collect::<Vec<_>>();
+    let width = fields.get(2).and_then(|value| value.parse().ok());
+    let height = fields.get(3).and_then(|value| value.parse().ok());
+    if fields.len() != 4
+        || fields[0] != pane.pane_id
+        || fields[1].parse::<u32>().ok() != Some(pane.pane_pid)
+        || width.is_none_or(|value: u16| value == 0)
+        || height.is_none_or(|value: u16| value == 0)
+    {
+        return Err(api_error!(
+            "stale_precondition",
+            "recovery pane identity or dimensions are invalid",
+        )
+        .into());
+    }
+    Ok((width.unwrap(), height.unwrap()))
+}
+
+fn classify_run_recovery(
+    first: &RunRecoveryObservation,
+    second: &RunRecoveryObservation,
+) -> (
+    RunRecoveryStatus,
+    Option<String>,
+    Option<RecoveryProcessExpectation>,
+) {
+    if second.run.semantic_outcome == SemanticOutcome::Completed {
+        return (
+            RunRecoveryStatus::Completed,
+            Some("run is already completed".to_string()),
+            None,
+        );
+    }
+    if first.run != second.run
+        || first.pane != second.pane
+        || first.process != second.process
+        || first.viewport_fingerprint != second.viewport_fingerprint
+    {
+        return (
+            RunRecoveryStatus::Unstable,
+            Some(
+                "run, pane, process, foreground ownership, or viewport changed between samples"
+                    .to_string(),
+            ),
+            None,
+        );
+    }
+    match &second.process {
+        Some(process) if process == &second.run.binding.process => (
+            RunRecoveryStatus::ExactPresentStable,
+            Some(
+                "the exact foreground process and content-agnostic viewport were stable"
+                    .to_string(),
+            ),
+            Some(RecoveryProcessExpectation::ExactPresentStable {
+                process: process.clone(),
+            }),
+        ),
+        None => (
+            RunRecoveryStatus::ExactAbsent,
+            None,
+            Some(RecoveryProcessExpectation::ExactAbsent),
+        ),
+        Some(process) => (
+            RunRecoveryStatus::Replaced,
+            None,
+            Some(RecoveryProcessExpectation::ReplacedBy {
+                process: process.clone(),
+            }),
+        ),
+    }
+}
+
+fn observe_run_process(
+    runner: &dyn TmuxRunner,
+    run: &RunRecord,
+) -> Result<Option<crate::pane_state::AgentProcessIdentity>> {
+    runner
+        .resolve_agent_process(run.binding.pane_instance.pane_pid, &run.binding.agent_kind)
+        .map_err(|error| {
+            api_error!(
+                "identity_verification_failed",
+                format!(
+                    "could not freshly resolve the process bound to pane {}: {error}",
+                    run.binding.pane_instance.pane_id
+                ),
+            )
+            .into()
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn agent_run_resolve(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    run_ref: &str,
+    outcome: &str,
+    precondition: RecoveryPrecondition,
+    resolution_id: &str,
+    reason: &str,
+) -> Result<String> {
+    if outcome != "completed" {
+        return Err(api_error!(
+            "invalid_arguments",
+            "API v3 only supports --outcome completed",
+        )
+        .into());
+    }
+    if reason.is_empty() || reason.len() > 1024 {
+        return Err(api_error!(
+            "invalid_arguments",
+            "operator completion reason must be 1 to 1,024 UTF-8 bytes",
+        )
+        .into());
+    }
+    let resolution_id = ResolutionId::parse(resolution_id.to_string())
+        .map_err(|error| api_error!("invalid_arguments", error.to_string()))?;
+    precondition
+        .validate()
+        .map_err(|error| api_error!("invalid_arguments", error.to_string()))?;
+    let mut connection = ApiConnection::connect(runner, env, None)?;
+    connection
+        .client
+        .set_deadline(Instant::now() + CLIENT_REQUEST_TIMEOUT);
+    let event_id =
+        EventId::generate().map_err(|error| api_error!("internal_error", error.to_string()))?;
+    let response = connection
+        .client
+        .request(&ClientMessage::ResolveAgentRun {
+            proto: PROTOCOL_VERSION,
+            daemon_instance_id: connection.client.daemon_instance_id().clone(),
+            event_id,
+            run_ref: run_ref.to_string(),
+            outcome: outcome.to_string(),
+            precondition,
+            resolution_id,
+            reason: reason.to_string(),
+            actor_pid: std::process::id(),
+        })
+        .map_err(|error| api_error!("daemon_query_failed", format!("{error:#}")))?;
+    match response {
+        ServerMessage::AgentRunResolved {
+            proto,
+            run_ref: returned_ref,
+            run,
+        } if proto == PROTOCOL_VERSION && returned_ref == run_ref => success_agent_json(
+            &connection,
+            observed_at,
+            ApiResult::AgentRunResolved {
+                run_ref: returned_ref,
+                run,
+            },
+        ),
+        ServerMessage::Error { code, message, .. } => Err(daemon_api_error(code, message).into()),
+        other => Err(api_error!(
+            "invalid_daemon_response",
+            format!("unexpected agent run resolve result: {other:?}"),
+        )
+        .into()),
+    }
+}
+
+pub fn agent_operation_get(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    operation_ref: &str,
+) -> Result<String> {
+    let (connection, returned_ref, operation) =
+        query_agent_operation(runner, env, operation_ref, None)?;
+    let run_ref = linked_run_ref(&returned_ref, &operation)?;
+    success_agent_json(
+        &connection,
+        observed_at,
+        ApiResult::AgentOperation {
+            operation_ref: returned_ref,
+            run_ref,
+            operation,
+            waited_ms: 0,
+        },
+    )
+}
+
+pub fn agent_operation_wait(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    operation_ref: &str,
+    timeout: Duration,
+    _until_prompt_confirmed: bool,
+    follow_unknown: bool,
+) -> Result<String> {
+    validate_agent_wait_timeout(timeout)?;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let (connection, returned_ref, operation) =
+        wait_for_operation(runner, env, operation_ref, deadline, follow_unknown)?;
+    if operation.dispatch_state != DispatchState::PromptConfirmed {
+        return Err(operation_terminal_error(&returned_ref, operation).into());
+    }
+    let run_ref = linked_run_ref(&returned_ref, &operation)?;
+    success_agent_json(
+        &connection,
+        observed_at,
+        ApiResult::AgentOperation {
+            operation_ref: returned_ref,
+            run_ref,
+            operation,
+            waited_ms: elapsed_millis(started),
+        },
+    )
+}
+
+pub fn agent_storage_status(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+) -> Result<String> {
+    let mut connection = ApiConnection::connect(runner, env, None)?;
+    connection
+        .client
+        .set_deadline(Instant::now() + CLIENT_REQUEST_TIMEOUT);
+    let response = connection
+        .client
+        .request(&ClientMessage::QueryAgentStorage {
+            proto: PROTOCOL_VERSION,
+        })
+        .map_err(|error| api_error!("daemon_query_failed", format!("{error:#}")))?;
+    let usage = match response {
+        ServerMessage::AgentStorageResult { proto, usage } if proto == PROTOCOL_VERSION => usage,
+        ServerMessage::Error { code, message, .. } => {
+            return Err(daemon_api_error(code, message).into());
+        }
+        other => {
+            return Err(api_error!(
+                "invalid_daemon_response",
+                format!("unexpected agent storage result: {other:?}"),
+            )
+            .into());
+        }
+    };
+    success_agent_json(&connection, observed_at, ApiResult::AgentStorage { usage })
+}
+
+pub fn agent_storage_reset_result(
+    observed_at: i64,
+    server_identity: String,
+    previous_generation: String,
+    generation: String,
+) -> Result<String> {
+    Ok(serde_json::to_string(&ApiSuccessEnvelope {
+        meta: ApiMeta {
+            api_version: API_VERSION,
+            server_identity: Some(server_identity),
+            daemon_instance_id: None,
+            snapshot_revision: None,
+            started_at: observed_at,
+            emitted_at: epoch_now(),
+            diagnostic_count: 0,
+        },
+        result: ApiResult::AgentStorageReset {
+            previous_generation,
+            generation,
+        },
+    })?)
+}
+
+fn query_agent_run(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    requested_run_ref: &str,
+    deadline: Option<Instant>,
+) -> Result<(ApiConnection, String, RunRecord)> {
+    let mut connection = ApiConnection::connect(runner, env, deadline)?;
+    let request_deadline = deadline
+        .map(|deadline| deadline.min(Instant::now() + CLIENT_REQUEST_TIMEOUT))
+        .unwrap_or_else(|| Instant::now() + CLIENT_REQUEST_TIMEOUT);
+    connection.client.set_deadline(request_deadline);
+    let response = connection
+        .client
+        .request(&ClientMessage::QueryAgentRun {
+            proto: PROTOCOL_VERSION,
+            run_ref: requested_run_ref.to_string(),
+        })
+        .map_err(|error| api_error!("daemon_query_failed", format!("{error:#}")))?;
+    match response {
+        ServerMessage::AgentRunResult {
+            proto,
+            run_ref,
+            run,
+        } if proto == PROTOCOL_VERSION && run_ref == requested_run_ref => {
+            Ok((connection, run_ref, run))
+        }
+        ServerMessage::AgentRunResult { .. } => Err(api_error!(
+            "invalid_daemon_response",
+            "run query returned a mismatched protocol version or run_ref",
+        )
+        .into()),
+        ServerMessage::Error { code, message, .. } => Err(daemon_api_error(code, message).into()),
+        other => Err(api_error!(
+            "invalid_daemon_response",
+            format!("unexpected agent run result: {other:?}"),
+        )
+        .into()),
+    }
+}
+
+fn exact_binding_for_pane(
+    pane: &PanePresentation,
+    server_identity: &crate::daemon::topology::ServerIdentity,
+) -> Option<AgentBinding> {
+    let state = &pane.resolved.as_ref()?.canonical;
+    if !state.agent_present {
+        return None;
+    }
+    let process = state.agent_process.clone()?;
+    if pane.agent_process.as_ref() != Some(&process) {
+        return None;
+    }
+    let binding = AgentBinding {
+        server_identity: server_identity.clone(),
+        pane_instance: pane.pane_instance.clone(),
+        pane_state_id: state.state_id.clone(),
+        agent_epoch: state.agent_epoch,
+        agent_kind: state.agent.clone(),
+        provider_session_id: state.agent_session_id.clone()?,
+        process,
+    };
+    binding.validate().ok()?;
+    Some(binding)
+}
+
+fn query_current_agent_runs(
+    connection: &mut ApiConnection,
+    snapshot: &ResolvedSnapshot,
+) -> Result<Vec<CurrentAgentRun>> {
+    let bindings = snapshot
+        .panes
+        .iter()
+        .filter_map(|pane| exact_binding_for_pane(pane, &connection.incarnation.identity))
+        .collect::<Vec<_>>();
+    // Runtime connections accept exactly one request after Hello. Keep the snapshot and
+    // current-run observations tied to the same daemon instance, but use a fresh connection for
+    // the second request instead of writing to the peer-closed snapshot connection.
+    let mut current_run_connection = connection.reconnect()?;
+    current_run_connection
+        .client
+        .set_deadline(Instant::now() + CLIENT_REQUEST_TIMEOUT);
+    let response = current_run_connection
+        .client
+        .request(&ClientMessage::QueryCurrentAgentRuns {
+            proto: PROTOCOL_VERSION,
+            bindings: bindings.clone(),
+        })
+        .map_err(|error| api_error!("daemon_query_failed", format!("{error:#}")))?;
+    let runs = match response {
+        ServerMessage::CurrentAgentRunsResult { proto, runs } if proto == PROTOCOL_VERSION => runs,
+        ServerMessage::Error { code, message, .. } => {
+            return Err(daemon_api_error(code, message).into());
+        }
+        other => {
+            return Err(api_error!(
+                "invalid_daemon_response",
+                format!("unexpected current agent runs result: {other:?}"),
+            )
+            .into());
+        }
+    };
+    let mut seen = Vec::<AgentBinding>::new();
+    for run in &runs {
+        if !bindings.contains(&run.binding) || seen.contains(&run.binding) {
+            return Err(api_error!(
+                "invalid_daemon_response",
+                "current run batch returned an unrequested or duplicate Agent Binding",
+            )
+            .into());
+        }
+        let reference = RunRef::decode(&run.run_ref).map_err(|error| {
+            api_error!(
+                "invalid_daemon_response",
+                format!("current run batch returned an invalid run_ref: {error}")
+            )
+        })?;
+        if reference.server_identity != connection.server_identity {
+            return Err(api_error!(
+                "invalid_daemon_response",
+                "current run batch returned a run_ref for another tmux server",
+            )
+            .into());
+        }
+        seen.push(run.binding.clone());
+    }
+    Ok(runs)
+}
+
+fn current_run_for_pane(
+    pane: &PanePresentation,
+    runs: &[CurrentAgentRun],
+) -> Option<CurrentRunSummary> {
+    let state = &pane.resolved.as_ref()?.canonical;
+    let process = state.agent_process.as_ref()?;
+    let run = runs.iter().find(|run| {
+        run.binding.pane_instance == pane.pane_instance
+            && run.binding.pane_state_id == state.state_id
+            && run.binding.agent_epoch == state.agent_epoch
+            && &run.binding.process == process
+    })?;
+    Some(CurrentRunSummary {
+        run_ref: run.run_ref.clone(),
+        execution_phase: run.execution_phase,
+        semantic_outcome: run.semantic_outcome,
+        status: durable_run_status(run.execution_phase, run.semantic_outcome),
+    })
+}
+
+fn durable_run_status(
+    execution_phase: ExecutionPhase,
+    semantic_outcome: SemanticOutcome,
+) -> DurableRunStatus {
+    if semantic_outcome == SemanticOutcome::Completed {
+        return DurableRunStatus::Done;
+    }
+    match execution_phase {
+        ExecutionPhase::Running => DurableRunStatus::Working,
+        ExecutionPhase::Waiting | ExecutionPhase::Error => DurableRunStatus::Blocked,
+        ExecutionPhase::Ended => DurableRunStatus::EndedUnconfirmed,
+    }
+}
+
+fn query_agent_operation(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    requested_operation_ref: &str,
+    deadline: Option<Instant>,
+) -> Result<(ApiConnection, String, OperationRecord)> {
+    let mut connection = ApiConnection::connect(runner, env, deadline)?;
+    let request_deadline = deadline
+        .map(|deadline| deadline.min(Instant::now() + CLIENT_REQUEST_TIMEOUT))
+        .unwrap_or_else(|| Instant::now() + CLIENT_REQUEST_TIMEOUT);
+    connection.client.set_deadline(request_deadline);
+    let response = connection
+        .client
+        .request(&ClientMessage::QueryAgentOperation {
+            proto: PROTOCOL_VERSION,
+            operation_ref: requested_operation_ref.to_string(),
+        })
+        .map_err(|error| api_error!("daemon_query_failed", format!("{error:#}")))?;
+    match response {
+        ServerMessage::AgentOperationResult {
+            proto,
+            operation_ref,
+            operation,
+        } if proto == PROTOCOL_VERSION && operation_ref == requested_operation_ref => {
+            Ok((connection, operation_ref, operation))
+        }
+        ServerMessage::AgentOperationResult { .. } => Err(api_error!(
+            "invalid_daemon_response",
+            "operation query returned a mismatched protocol version or operation_ref",
+        )
+        .into()),
+        ServerMessage::Error { code, message, .. } => Err(daemon_api_error(code, message).into()),
+        other => Err(api_error!(
+            "invalid_daemon_response",
+            format!("unexpected agent operation result: {other:?}"),
+        )
+        .into()),
+    }
+}
+
+fn wait_for_run(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    run_ref: &str,
+    deadline: Instant,
+    until_completed: bool,
+) -> Result<(ApiConnection, String, RunRecord)> {
+    let mut poll_interval = WAIT_POLL_INITIAL_INTERVAL;
+    loop {
+        match query_agent_run(runner, env, run_ref, Some(deadline)) {
+            Ok((connection, returned_ref, run)) if run_wait_matches(&run, until_completed) => {
+                return Ok((connection, returned_ref, run));
+            }
+            Ok(_) => {}
+            Err(error) if retryable_poll_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            let expected = if until_completed {
+                "semantic_outcome=completed"
+            } else {
+                "completed, waiting, error, or ended_unconfirmed"
+            };
+            return Err(api_error!(
+                "timeout",
+                format!("run {run_ref} did not reach {expected} before the deadline"),
+            )
+            .into());
+        }
+        sleep_until_next_poll(deadline, &mut poll_interval);
+    }
+}
+
+fn wait_for_operation(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    operation_ref: &str,
+    deadline: Instant,
+    follow_unknown: bool,
+) -> Result<(ApiConnection, String, OperationRecord)> {
+    let mut poll_interval = WAIT_POLL_INITIAL_INTERVAL;
+    let mut last_operation = None;
+    loop {
+        match query_agent_operation(runner, env, operation_ref, Some(deadline)) {
+            Ok((connection, returned_ref, operation))
+                if operation_wait_matches(&operation, follow_unknown) =>
+            {
+                return Ok((connection, returned_ref, operation));
+            }
+            Ok((_, _, operation)) => last_operation = Some(operation),
+            Err(error) if retryable_poll_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            if let Some(operation) = last_operation {
+                return Err(match operation.dispatch_state {
+                    DispatchState::Prepared => {
+                        operation_pre_dispatch_timeout(operation_ref, operation)
+                    }
+                    DispatchState::DispatchStarted => {
+                        operation_dispatch_started_timeout(operation_ref, operation)
+                    }
+                    DispatchState::DeliveryUnknown => {
+                        operation_terminal_error(operation_ref, operation)
+                    }
+                    DispatchState::PromptConfirmed | DispatchState::Rejected => ApiError::new(
+                        ApiErrorCode::InvalidDaemonResponse,
+                        "operation wait ignored a terminal operation",
+                    ),
+                }
+                .into());
+            }
+            let expected = if follow_unknown {
+                "prompt_confirmed or rejected after delivery_unknown"
+            } else {
+                "a terminal dispatch state"
+            };
+            return Err(prompt_wait_timeout(format!(
+                "operation {operation_ref} did not reach {expected} before the deadline"
+            ))
+            .into());
+        }
+        sleep_until_next_poll(deadline, &mut poll_interval);
+    }
+}
+
+fn run_wait_matches(run: &RunRecord, until_completed: bool) -> bool {
+    if until_completed {
+        return run.semantic_outcome == SemanticOutcome::Completed;
+    }
+    durable_run_status(run.execution_phase, run.semantic_outcome) != DurableRunStatus::Working
+}
+
+fn operation_wait_matches(operation: &OperationRecord, follow_unknown: bool) -> bool {
+    match operation.dispatch_state {
+        DispatchState::PromptConfirmed | DispatchState::Rejected => true,
+        DispatchState::DeliveryUnknown => !follow_unknown,
+        DispatchState::Prepared | DispatchState::DispatchStarted => false,
+    }
+}
+
+fn operation_is_terminal(operation: &OperationRecord) -> bool {
+    matches!(
+        operation.dispatch_state,
+        DispatchState::PromptConfirmed | DispatchState::DeliveryUnknown | DispatchState::Rejected
+    )
+}
+
+fn linked_run_ref(operation_ref: &str, operation: &OperationRecord) -> Result<Option<String>> {
+    let reference = OperationRef::decode(operation_ref).map_err(|error| {
+        api_error!(
+            "invalid_daemon_response",
+            format!("daemon returned an invalid operation_ref: {error}")
+        )
+    })?;
+    if reference.operation_id != operation.operation_id {
+        return Err(api_error!(
+            "invalid_daemon_response",
+            "operation_ref does not identify the returned operation record",
+        )
+        .into());
+    }
+    operation
+        .run_id
+        .as_ref()
+        .map(|run_id| {
+            RunRef {
+                server_identity: reference.server_identity,
+                generation: reference.generation,
+                run_id: run_id.clone(),
+            }
+            .encode()
+            .map_err(|error| {
+                api_error!(
+                    "invalid_daemon_response",
+                    format!("failed to derive linked run_ref: {error}")
+                )
+                .into()
+            })
+        })
+        .transpose()
+}
+
+fn validate_agent_wait_timeout(timeout: Duration) -> Result<()> {
+    if timeout.is_zero() || timeout > MAX_WAIT_TIMEOUT {
+        return Err(api_error!(
+            "invalid_arguments",
+            format!(
+                "--timeout-ms must be between 1 and {}",
+                MAX_WAIT_TIMEOUT.as_millis()
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn retryable_poll_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|source| source.downcast_ref::<ApiError>())
+        .is_some_and(|error| {
+            matches!(
+                error.code,
+                ApiErrorCode::DaemonUnavailable
+                    | ApiErrorCode::DaemonNotReady
+                    | ApiErrorCode::DaemonQueryFailed
+                    | ApiErrorCode::StaleDaemon
+            )
+        })
+}
+
+fn sleep_until_next_poll(deadline: Instant, interval: &mut Duration) {
+    if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        std::thread::sleep(remaining.min(*interval));
+        *interval = next_wait_poll_interval(*interval);
+    }
+}
+
+fn next_wait_poll_interval(interval: Duration) -> Duration {
+    interval
+        .checked_mul(2)
+        .unwrap_or(WAIT_POLL_MAX_INTERVAL)
+        .min(WAIT_POLL_MAX_INTERVAL)
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+fn prompt_wait_timeout(message: impl Into<String>) -> ApiError {
+    ApiError::new(ApiErrorCode::DeliveryUnknown, message).with_dispatch_context(
+        ApiErrorStage::AfterDispatch,
+        ApiSideEffect::Possible,
+        ApiRetryAction::InspectManually,
+        None,
+    )
+}
+
+fn prompt_before_dispatch_timeout(message: impl Into<String>) -> ApiError {
+    ApiError::new(ApiErrorCode::Timeout, message).with_dispatch_context(
+        ApiErrorStage::BeforeDispatch,
+        ApiSideEffect::None,
+        ApiRetryAction::RetrySameRequest,
+        None,
+    )
+}
+
+fn operation_pre_dispatch_timeout(operation_ref: &str, operation: OperationRecord) -> ApiError {
+    ApiError::new(
+        ApiErrorCode::Timeout,
+        "prompt operation remained prepared before the wait deadline",
+    )
+    .with_dispatch_context(
+        ApiErrorStage::BeforeDispatch,
+        ApiSideEffect::None,
+        ApiRetryAction::RetrySameRequest,
+        Some(OperationErrorReceipt {
+            operation_ref: operation_ref.to_string(),
+            operation,
+        }),
+    )
+}
+
+fn operation_dispatch_started_timeout(operation_ref: &str, operation: OperationRecord) -> ApiError {
+    ApiError::new(
+        ApiErrorCode::DeliveryUnknown,
+        "prompt dispatch started but was not confirmed before the wait deadline",
+    )
+    .with_dispatch_context(
+        ApiErrorStage::AfterDispatch,
+        ApiSideEffect::Possible,
+        ApiRetryAction::InspectManually,
+        Some(OperationErrorReceipt {
+            operation_ref: operation_ref.to_string(),
+            operation,
+        }),
+    )
+}
+
+fn operation_terminal_error(operation_ref: &str, operation: OperationRecord) -> ApiError {
+    let receipt_code = operation
+        .result_receipt
+        .as_ref()
+        .map(|receipt| receipt.code.as_str())
+        .unwrap_or("missing_receipt")
+        .to_string();
+    let dispatch_state = operation.dispatch_state;
+    let receipt = Some(OperationErrorReceipt {
+        operation_ref: operation_ref.to_string(),
+        operation,
+    });
+    match dispatch_state {
+        DispatchState::DeliveryUnknown => ApiError::new(
+            ApiErrorCode::DeliveryUnknown,
+            format!("prompt delivery is ambiguous: {receipt_code}"),
+        )
+        .with_dispatch_context(
+            ApiErrorStage::AfterDispatch,
+            ApiSideEffect::Possible,
+            ApiRetryAction::InspectManually,
+            receipt,
+        ),
+        DispatchState::Rejected => ApiError::new(
+            ApiErrorCode::DispatchRejected,
+            format!("prompt dispatch was rejected: {receipt_code}"),
+        )
+        .with_dispatch_context(
+            ApiErrorStage::Dispatch,
+            ApiSideEffect::None,
+            ApiRetryAction::RefreshTarget,
+            receipt,
+        ),
+        _ => ApiError::new(
+            ApiErrorCode::InvalidDaemonResponse,
+            "operation terminal error requested for a non-error state",
+        ),
     }
 }
 
@@ -1161,360 +2685,6 @@ fn validate_prompt(prompt: &str) -> Result<()> {
         .into());
     }
     Ok(())
-}
-
-fn require_prompt_capable_agent(identity: &AgentIdentity) -> Result<()> {
-    if matches!(identity.agent.as_str(), "claude" | "codex") {
-        Ok(())
-    } else {
-        Err(ApiError::new(
-            ApiErrorCode::PromptConfirmationUnavailable,
-            format!(
-                "agent kind {} has no supported prompt-bearing hook authority",
-                identity.agent
-            ),
-        )
-        .with_dispatch_context(
-            ApiErrorStage::BeforeDispatch,
-            ApiSideEffect::None,
-            ApiRetryAction::Never,
-            None,
-        )
-        .into())
-    }
-}
-
-fn before_dispatch_error(error: anyhow::Error) -> anyhow::Error {
-    match error.downcast::<ApiError>() {
-        Ok(mut error) => {
-            error.stage = ApiErrorStage::BeforeDispatch;
-            error.side_effect = ApiSideEffect::None;
-            error.receipt = None;
-            error.into()
-        }
-        Err(error) => error,
-    }
-}
-
-fn require_promptable_lifecycle(state: AgentStateView<'_>) -> Result<()> {
-    match state.lifecycle {
-        LifecycleState::Running => {
-            Err(api_error!("agent_busy", "agent is working; no prompt bytes were sent",).into())
-        }
-        LifecycleState::Waiting { .. } | LifecycleState::Error { .. } => Err(api_error!(
-            "agent_blocked",
-            "agent is blocked; no prompt bytes were sent",
-        )
-        .into()),
-        LifecycleState::Idle => Ok(()),
-    }
-}
-
-fn require_prompt_baseline(pane: &PanePresentation, baseline: &PromptBaseline) -> Result<()> {
-    let state = canonical_state(pane)
-        .ok_or_else(|| api_error!("stale_reference", "agent state disappeared"))?;
-    require_promptable_lifecycle(state)?;
-    if state.state_id.as_str() != baseline.state_id
-        || state.agent_epoch != baseline.agent_epoch
-        || state.run_seq != baseline.run_seq
-        || state.completed_seq != baseline.completed_seq
-    {
-        return Err(api_error!(
-            "stale_reference",
-            "agent state changed after the prompt baseline was established",
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn verify_agent_input_owner(runner: &dyn TmuxRunner, identity: &AgentIdentity) -> Result<()> {
-    runner
-        .verify_agent_input_owner(identity.pane_instance.pane_pid, identity.agent_process.pid)
-        .map_err(|error| {
-            api_error!(
-                "agent_not_input_owner",
-                format!(
-                    "exact agent process is not the foreground input owner for pane {}: {error}",
-                    identity.pane_instance.pane_id
-                ),
-            )
-        })?;
-    Ok(())
-}
-
-fn delivery_unknown(message: impl Into<String>, receipt: AgentPromptReceipt) -> ApiError {
-    ApiError::new(ApiErrorCode::DeliveryUnknown, message).with_dispatch_context(
-        ApiErrorStage::AfterDispatch,
-        ApiSideEffect::Possible,
-        ApiRetryAction::InspectManually,
-        Some(receipt),
-    )
-}
-
-fn dispatch_prompt_guarded(
-    runner: &dyn TmuxRunner,
-    incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
-    pane: &PaneInstance,
-    prompt: &[u8],
-    prompt_digest: &str,
-    receipt: &AgentPromptReceipt,
-) -> Result<()> {
-    let nonce = format!(
-        "{}:{}:{}:{}:{}",
-        std::process::id(),
-        epoch_now(),
-        pane.pane_id,
-        pane.pane_pid,
-        prompt_digest
-    );
-    let nonce = format!("{:x}", Sha256::digest(nonce.as_bytes()));
-    dispatch_prompt_guarded_with_nonce(runner, incarnation, pane, prompt, receipt, &nonce)
-}
-
-struct GuardedPromptCommand {
-    args: Vec<String>,
-    buffer: String,
-    success: String,
-    server_mismatch: String,
-    pane_mismatch: String,
-}
-
-fn build_guarded_prompt_command(
-    incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
-    pane: &PaneInstance,
-    nonce: &str,
-) -> GuardedPromptCommand {
-    const SUCCESS_PREFIX: &str = "__vde_agent_prompt_submitted__";
-    const SERVER_MISMATCH_PREFIX: &str = "__vde_agent_prompt_server_mismatch__";
-    const PANE_MISMATCH_PREFIX: &str = "__vde_agent_prompt_pane_mismatch__";
-
-    let buffer = format!("vde-agent-prompt-{}", &nonce[..24]);
-    let success = format!("{SUCCESS_PREFIX}:{nonce}");
-    let server_mismatch = format!("{SERVER_MISMATCH_PREFIX}:{nonce}");
-    let pane_mismatch = format!("{PANE_MISMATCH_PREFIX}:{nonce}");
-
-    let delete_buffer = || {
-        vec![
-            "delete-buffer".to_string(),
-            "-b".to_string(),
-            buffer.clone(),
-        ]
-    };
-    let submitted_command = crate::pane_state::store::tmux_command_string(&[
-        "paste-buffer".to_string(),
-        "-p".to_string(),
-        "-r".to_string(),
-        "-d".to_string(),
-        "-b".to_string(),
-        buffer.clone(),
-        "-t".to_string(),
-        pane.pane_id.clone(),
-        ";".to_string(),
-        "send-keys".to_string(),
-        "-t".to_string(),
-        pane.pane_id.clone(),
-        "Enter".to_string(),
-        ";".to_string(),
-        "display-message".to_string(),
-        "-p".to_string(),
-        success.clone(),
-    ]);
-    let mut pane_mismatch_command = delete_buffer();
-    pane_mismatch_command.extend([
-        ";".to_string(),
-        "display-message".to_string(),
-        "-p".to_string(),
-        pane_mismatch.clone(),
-    ]);
-    let pane_guarded_command = crate::pane_state::store::tmux_command_string(&[
-        "if-shell".to_string(),
-        "-F".to_string(),
-        "-t".to_string(),
-        pane.pane_id.clone(),
-        format!("#{{==:#{{pane_pid}},{}}}", pane.pane_pid),
-        submitted_command,
-        crate::pane_state::store::tmux_command_string(&pane_mismatch_command),
-    ]);
-    let mut server_mismatch_command = delete_buffer();
-    server_mismatch_command.extend([
-        ";".to_string(),
-        "display-message".to_string(),
-        "-p".to_string(),
-        server_mismatch.clone(),
-    ]);
-    let server_guard = format!(
-        "#{{&&:#{{==:#{{pid}},{}}},#{{==:#{{start_time}},{}}}}}",
-        incarnation.identity.pid, incarnation.identity.start_time
-    );
-    let args = vec![
-        "load-buffer".to_string(),
-        "-b".to_string(),
-        buffer.clone(),
-        "-".to_string(),
-        ";".to_string(),
-        "if-shell".to_string(),
-        "-F".to_string(),
-        server_guard,
-        pane_guarded_command,
-        crate::pane_state::store::tmux_command_string(&server_mismatch_command),
-    ];
-    GuardedPromptCommand {
-        args,
-        buffer,
-        success,
-        server_mismatch,
-        pane_mismatch,
-    }
-}
-
-fn dispatch_prompt_guarded_with_nonce(
-    runner: &dyn TmuxRunner,
-    incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
-    pane: &PaneInstance,
-    prompt: &[u8],
-    receipt: &AgentPromptReceipt,
-    nonce: &str,
-) -> Result<()> {
-    let command = build_guarded_prompt_command(incarnation, pane, nonce);
-    let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
-    let result = runner.run_with_input(&args, prompt);
-    let _ = runner.run(&["delete-buffer", "-b", &command.buffer]);
-    let output = match result {
-        Ok(output) => output,
-        Err(error) => {
-            let side_effect = match error.stage {
-                crate::tmux::InputWriteStage::BeforeSpawn => ApiSideEffect::None,
-                crate::tmux::InputWriteStage::AfterSpawnBeforeWrite
-                | crate::tmux::InputWriteStage::AfterPartialWrite
-                | crate::tmux::InputWriteStage::AfterFullWrite => ApiSideEffect::Possible,
-            };
-            let retry_action = match error.stage {
-                crate::tmux::InputWriteStage::BeforeSpawn => ApiRetryAction::RetrySameRequest,
-                crate::tmux::InputWriteStage::AfterSpawnBeforeWrite
-                | crate::tmux::InputWriteStage::AfterPartialWrite
-                | crate::tmux::InputWriteStage::AfterFullWrite => ApiRetryAction::InspectManually,
-            };
-            return Err(ApiError::new(
-                if side_effect == ApiSideEffect::None {
-                    ApiErrorCode::DispatchRejected
-                } else {
-                    ApiErrorCode::DeliveryUnknown
-                },
-                format!("guarded tmux dispatch failed at {:?}: {error}", error.stage),
-            )
-            .with_dispatch_context(
-                ApiErrorStage::Dispatch,
-                side_effect,
-                retry_action,
-                (side_effect != ApiSideEffect::None).then(|| receipt.clone()),
-            )
-            .into());
-        }
-    };
-    let markers = output.lines().map(str::trim).collect::<BTreeSet<_>>();
-    if markers.contains(command.success.as_str()) {
-        return Ok(());
-    }
-    if markers.contains(command.server_mismatch.as_str())
-        || markers.contains(command.pane_mismatch.as_str())
-    {
-        return Err(ApiError::new(
-            ApiErrorCode::DispatchRejected,
-            "tmux server or pane identity changed before guarded dispatch",
-        )
-        .with_dispatch_context(
-            ApiErrorStage::Dispatch,
-            ApiSideEffect::None,
-            ApiRetryAction::RefreshTarget,
-            None,
-        )
-        .into());
-    }
-    Err(delivery_unknown(
-        "guarded dispatch returned without an unambiguous submission marker",
-        receipt.clone(),
-    )
-    .into())
-}
-
-fn confirm_prompt_digest(
-    connection: &mut ApiConnection,
-    mut snapshot: ResolvedSnapshot,
-    identity: &AgentIdentity,
-    receipt: &AgentPromptReceipt,
-    deadline: Instant,
-) -> std::result::Result<(ResolvedSnapshot, u64, u64), String> {
-    loop {
-        if let Some((run_seq, revision)) = observe_prompt_digest(&snapshot, identity, receipt)? {
-            return Ok((snapshot.clone(), run_seq, revision));
-        }
-        if Instant::now() >= deadline {
-            return Err(
-                "prompt digest was not confirmed before the deadline; do not resend automatically"
-                    .to_string(),
-            );
-        }
-        snapshot = connection
-            .next_snapshot()
-            .map_err(|error| format!("prompt confirmation stream failed: {error:#}"))?;
-    }
-}
-
-fn observe_prompt_digest(
-    snapshot: &ResolvedSnapshot,
-    identity: &AgentIdentity,
-    receipt: &AgentPromptReceipt,
-) -> std::result::Result<Option<(u64, u64)>, String> {
-    let pane = require_same_agent_state(snapshot, identity)
-        .map_err(|error| format!("exact agent changed before digest confirmation: {error:#}"))?;
-    let mut observed_mismatch = false;
-    for event in &snapshot.events {
-        let Some(version) = &event.state_version else {
-            continue;
-        };
-        if event.pane_instance == identity.pane_instance
-            && event.agent == identity.agent
-            && version.state_id.as_str() == identity.state_id
-            && version.agent_epoch == identity.agent_epoch
-            && event.run_seq == receipt.expected_run_seq
-            && event.prompt_submitted
-        {
-            if event.prompt_digest.as_deref() == Some(receipt.prompt_digest.as_str()) {
-                return Ok(Some((event.run_seq, version.revision)));
-            }
-            if event.prompt_digest.is_some() {
-                observed_mismatch = true;
-            }
-        }
-    }
-    if let Some(resolved) = &pane.resolved {
-        let state = &resolved.canonical;
-        if state.run_seq == receipt.expected_run_seq
-            && let Some(prompt) = state
-                .prompt
-                .as_ref()
-                .filter(|prompt| prompt.source == "user")
-            && let Some(digest) = prompt.digest.as_deref()
-        {
-            if digest == receipt.prompt_digest.as_str() {
-                return Ok(Some((state.run_seq, state.revision)));
-            }
-            observed_mismatch = true;
-        }
-        if state.run_seq > receipt.expected_run_seq {
-            return Err(format!(
-                "agent advanced to run {} before the expected user prompt digest was confirmed",
-                state.run_seq
-            ));
-        }
-    }
-    if observed_mismatch {
-        return Err(
-            "an observed user prompt digest did not match the dispatched prompt".to_string(),
-        );
-    }
-    Ok(None)
 }
 
 pub fn agent_read(
@@ -2091,10 +3261,29 @@ fn daemon_api_error(code: crate::daemon::protocol::v2::ErrorCode, message: Strin
         | ErrorCode::InvalidPaneInstance
         | ErrorCode::InvalidProgressOperation => ApiErrorCode::DaemonInvalidRequest,
         ErrorCode::PaneNotFound => ApiErrorCode::PaneNotFound,
+        ErrorCode::PromptDispatchBusy => ApiErrorCode::PromptDispatchBusy,
+        ErrorCode::OperationConflict => ApiErrorCode::OperationConflict,
+        ErrorCode::OperationNotFound => ApiErrorCode::OperationNotFound,
+        ErrorCode::OperationStoreFull => ApiErrorCode::OperationStoreFull,
+        ErrorCode::OperationGenerationReplaced => ApiErrorCode::OperationGenerationReplaced,
+        ErrorCode::RunNotFound => ApiErrorCode::RunNotFound,
+        ErrorCode::RunGenerationReplaced => ApiErrorCode::RunGenerationReplaced,
+        ErrorCode::RunUnresolved => ApiErrorCode::RunUnresolved,
+        ErrorCode::TargetReplaced => ApiErrorCode::TargetReplaced,
+        ErrorCode::UnsupportedProvider => ApiErrorCode::UnsupportedProvider,
+        ErrorCode::ProviderEventConflict => ApiErrorCode::ProviderEventConflict,
         ErrorCode::StaleStateIdentity | ErrorCode::StaleSelection | ErrorCode::StaleAgentEvent => {
             ApiErrorCode::StaleReference
         }
         ErrorCode::StaleDaemonInstance => ApiErrorCode::StaleDaemon,
+        ErrorCode::StalePrecondition => ApiErrorCode::StalePrecondition,
+        ErrorCode::RecoveryNotAllowed => ApiErrorCode::RecoveryNotAllowed,
+        ErrorCode::ResolutionConflict => ApiErrorCode::ResolutionConflict,
+        ErrorCode::RunAlreadyResolved => ApiErrorCode::RunAlreadyResolved,
+        ErrorCode::StorageCapacityExceeded => ApiErrorCode::StorageCapacityExceeded,
+        ErrorCode::StateUninitialized => ApiErrorCode::StateUninitialized,
+        ErrorCode::ArtifactUnavailable => ApiErrorCode::ArtifactUnavailable,
+        ErrorCode::ArtifactExpired => ApiErrorCode::ArtifactExpired,
         ErrorCode::StateTooLarge | ErrorCode::FrameTooLarge | ErrorCode::QueueFull => {
             ApiErrorCode::ResourceLimit
         }
@@ -2123,6 +3312,25 @@ fn success_json(
             started_at,
             emitted_at: epoch_now(),
             diagnostic_count: snapshot.diagnostics.len(),
+        },
+        result,
+    })?)
+}
+
+fn success_agent_json(
+    connection: &ApiConnection,
+    started_at: i64,
+    result: ApiResult,
+) -> Result<String> {
+    Ok(serde_json::to_string(&ApiSuccessEnvelope {
+        meta: ApiMeta {
+            api_version: API_VERSION,
+            server_identity: Some(connection.server_identity.clone()),
+            daemon_instance_id: Some(connection.daemon_instance_id.clone()),
+            snapshot_revision: None,
+            started_at,
+            emitted_at: epoch_now(),
+            diagnostic_count: 0,
         },
         result,
     })?)
@@ -2277,6 +3485,7 @@ fn agent_summary(
         status: agent_status(state),
         badge: AgentBadge::from(resolved.badge),
         lifecycle: lifecycle_summary(&state.lifecycle),
+        current_run: None,
         sessions: session_links(pane),
         window_id: pane.window_id.clone(),
         window_name: pane.window_name.clone(),
@@ -3094,6 +4303,7 @@ mod tests {
                     synthetic_completion_armed: false,
                     lifecycle: LifecycleState::Running,
                     run_seq: 1,
+                    current_run: None,
                     completed_seq: 0,
                     unread: crate::pane_state::UnreadState::default(),
                     started_at: Some(1),
@@ -3127,36 +4337,6 @@ mod tests {
         }
     }
 
-    fn test_incarnation() -> crate::daemon::lifecycle::TmuxServerIncarnation {
-        crate::daemon::lifecycle::TmuxServerIncarnation {
-            socket_path: PathBuf::from("/tmp/test-tmux.sock"),
-            identity: crate::daemon::topology::ServerIdentity {
-                pid: 77,
-                start_time: 88,
-            },
-            hash: "server-hash".to_string(),
-        }
-    }
-
-    fn test_prompt_receipt() -> AgentPromptReceipt {
-        AgentPromptReceipt {
-            target: AgentWaitTarget {
-                agent_ref: "vta1:test".to_string(),
-                pane_ref: "vtp1:test".to_string(),
-                pane_id: "%1".to_string(),
-                pane_pid: 101,
-                agent: "codex".to_string(),
-                state_id: "00112233445566778899aabbccddeeff".to_string(),
-                agent_epoch: 1,
-                process_pid: 9001,
-            },
-            prompt_digest: crate::pane_state::PromptState::digest_decoded_prompt("review\nthis"),
-            baseline_run_seq: 1,
-            baseline_completed_seq: 1,
-            expected_run_seq: 2,
-        }
-    }
-
     #[test]
     fn prompt_input_contract_accepts_lf_and_rejects_unsafe_controls() {
         validate_prompt("review\nthis").unwrap();
@@ -3176,203 +4356,171 @@ mod tests {
     }
 
     #[test]
-    fn guarded_prompt_command_has_server_and_pane_fences_and_one_submit_queue() {
-        let nonce = "a".repeat(64);
-        let pane = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 101,
-        };
-        let command = build_guarded_prompt_command(&test_incarnation(), &pane, &nonce);
-        assert_eq!(
-            &command.args[..5],
-            ["load-buffer", "-b", &command.buffer, "-", ";"]
-        );
-        let serialized = command.args.join(" ");
-        assert!(serialized.contains("#{==:#{pid},77}"));
-        assert!(serialized.contains("#{==:#{start_time},88}"));
-        assert!(serialized.contains("#{==:#{pane_pid},101}"));
-        let paste = serialized.find("paste-buffer").unwrap();
-        let raw = serialized[paste..].find("-r").unwrap() + paste;
-        let enter = serialized.find("send-keys").unwrap();
-        let marker = serialized.find(&command.success).unwrap();
-        assert!(paste < raw && raw < enter && enter < marker);
-    }
-
-    #[test]
-    fn guarded_prompt_transport_keeps_prompt_out_of_argv() {
-        let runner = crate::tmux::mock::MockTmuxRunner::new();
-        let nonce = "b".repeat(64);
-        let pane = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 101,
-        };
-        let command = build_guarded_prompt_command(&test_incarnation(), &pane, &nonce);
-        let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
-        runner.stub(&args, &format!("{}\n", command.success));
-        runner.stub(&["delete-buffer", "-b", &command.buffer], "");
-        let receipt = test_prompt_receipt();
-
-        dispatch_prompt_guarded_with_nonce(
-            &runner,
-            &test_incarnation(),
-            &pane,
-            b"review\nthis",
-            &receipt,
-            &nonce,
-        )
-        .unwrap();
-
-        let calls = runner.input_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1, b"review\nthis");
-        assert!(!calls[0].0.join(" ").contains("review"));
-    }
-
-    #[test]
-    fn guarded_prompt_transport_classifies_input_write_ambiguity() {
-        for (stage, side_effect, retry_action, has_receipt) in [
-            (
-                crate::tmux::InputWriteStage::BeforeSpawn,
-                ApiSideEffect::None,
-                ApiRetryAction::RetrySameRequest,
-                false,
-            ),
-            (
-                crate::tmux::InputWriteStage::AfterSpawnBeforeWrite,
-                ApiSideEffect::Possible,
-                ApiRetryAction::InspectManually,
-                true,
-            ),
-            (
-                crate::tmux::InputWriteStage::AfterPartialWrite,
-                ApiSideEffect::Possible,
-                ApiRetryAction::InspectManually,
-                true,
-            ),
-            (
-                crate::tmux::InputWriteStage::AfterFullWrite,
-                ApiSideEffect::Possible,
-                ApiRetryAction::InspectManually,
-                true,
-            ),
-        ] {
-            let runner = crate::tmux::mock::MockTmuxRunner::new();
-            let nonce = "c".repeat(64);
-            let pane = PaneInstance {
-                pane_id: "%1".to_string(),
-                pane_pid: 101,
-            };
-            let command = build_guarded_prompt_command(&test_incarnation(), &pane, &nonce);
-            let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
-            runner.stub_input_error(&args, stage, "private transport failure");
-            runner.stub(&["delete-buffer", "-b", &command.buffer], "");
-
-            let error = dispatch_prompt_guarded_with_nonce(
-                &runner,
-                &test_incarnation(),
-                &pane,
-                b"review\nthis",
-                &test_prompt_receipt(),
-                &nonce,
-            )
-            .unwrap_err();
-            let api = error.downcast_ref::<ApiError>().unwrap();
-            assert_eq!(api.side_effect, side_effect);
-            assert_eq!(api.retry_action, retry_action);
-            assert_eq!(api.receipt.is_some(), has_receipt);
-            assert!(!format!("{error:#}").contains("review"));
+    fn operation_result_derives_the_linked_run_reference() {
+        let generation = crate::agent_state::StateGeneration::generate().unwrap();
+        let operation_id = OperationId::parse("operation_123456").unwrap();
+        let run_id = crate::agent_state::StableRunId::generate().unwrap();
+        let operation_ref = OperationRef {
+            server_identity: "server_identity".to_string(),
+            generation: generation.clone(),
+            operation_id: operation_id.clone(),
         }
-    }
-
-    #[test]
-    fn guarded_prompt_identity_mismatch_is_known_not_dispatched() {
-        let runner = crate::tmux::mock::MockTmuxRunner::new();
-        let nonce = "d".repeat(64);
-        let pane = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 101,
-        };
-        let command = build_guarded_prompt_command(&test_incarnation(), &pane, &nonce);
-        let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
-        runner.stub(&args, &format!("{}\n", command.pane_mismatch));
-        runner.stub(&["delete-buffer", "-b", &command.buffer], "");
-
-        let error = dispatch_prompt_guarded_with_nonce(
-            &runner,
-            &test_incarnation(),
-            &pane,
-            b"review\nthis",
-            &test_prompt_receipt(),
-            &nonce,
-        )
-        .unwrap_err();
-        let api = error.downcast_ref::<ApiError>().unwrap();
-        assert_eq!(api.code, ApiErrorCode::DispatchRejected);
-        assert_eq!(api.side_effect, ApiSideEffect::None);
-        assert_eq!(api.retry_action, ApiRetryAction::RefreshTarget);
-        assert!(api.receipt.is_none());
-    }
-
-    #[test]
-    fn prompt_confirmation_accepts_only_expected_run_and_digest() {
-        let mut pane = test_agent_pane();
-        let identity = AgentIdentity::from_pane(&pane).unwrap();
-        let receipt = test_prompt_receipt();
-        let state = &mut pane.resolved.as_mut().unwrap().canonical;
-        state.revision = 2;
-        state.run_seq = 2;
-        state.prompt = Some(crate::pane_state::PromptState {
-            text: "review this".to_string(),
-            source: "user".to_string(),
-            digest: Some(receipt.prompt_digest.clone()),
-        });
-        assert_eq!(
-            observe_prompt_digest(&test_snapshot(pane.clone()), &identity, &receipt).unwrap(),
-            Some((2, 2))
-        );
-
-        pane.resolved.as_mut().unwrap().canonical.prompt = None;
-        let mut snapshot = test_snapshot(pane);
-        snapshot.events.push(crate::daemon::TransitionEvent {
-            pane_instance: identity.pane_instance.clone(),
-            agent: identity.agent.clone(),
-            state_version: Some(crate::pane_state::StateVersion {
-                state_id: crate::pane_state::StateId::parse(&identity.state_id).unwrap(),
-                revision: 3,
-                agent_epoch: identity.agent_epoch,
+        .encode()
+        .unwrap();
+        let pane = test_agent_pane();
+        let state = &pane.resolved.as_ref().unwrap().canonical;
+        let mut operation = OperationRecord {
+            state_format_version: crate::agent_state::PRIVATE_STATE_FORMAT_VERSION,
+            generation,
+            operation_id,
+            revision: 3,
+            request_fingerprint: Sha256Digest::of(b"request"),
+            target_agent_ref: "vta1:test".to_string(),
+            prompt_digest: Sha256Digest::of(b"prompt"),
+            dispatch_option: "paste_enter".to_string(),
+            binding: crate::agent_state::AgentBinding {
+                server_identity: crate::daemon::topology::ServerIdentity {
+                    pid: 77,
+                    start_time: 88,
+                },
+                pane_instance: pane.pane_instance,
+                pane_state_id: state.state_id.clone(),
+                agent_epoch: state.agent_epoch,
+                agent_kind: state.agent.clone(),
+                provider_session_id: state.agent_session_id.clone().unwrap(),
+                process: state.agent_process.clone().unwrap(),
+            },
+            expected_pane_version: state.version(),
+            expected_current_run: state.current_run.clone(),
+            expected_run_seq: 2,
+            confirmation_deadline_at: 11,
+            dispatch_state: DispatchState::PromptConfirmed,
+            run_id: Some(run_id.clone()),
+            result_receipt: Some(crate::agent_state::OperationResultReceipt {
+                code: "prompt_confirmed".to_string(),
+                observed_at: 3,
+                confirmation_basis: Some("provider_prompt_digest".to_string()),
+                source_attribution: Some("user_prompt_submit".to_string()),
             }),
-            run_seq: 2,
-            completed_seq: 1,
-            prompt_digest: Some(receipt.prompt_digest.clone()),
-            prompt_submitted: true,
-            from: Some(BadgeState::Idle),
-            to: BadgeState::Working,
-            at_epoch: 10,
-        });
+            created_at: 1,
+            updated_at: 3,
+        };
+        operation.validate().unwrap();
+
+        let linked = linked_run_ref(&operation_ref, &operation).unwrap().unwrap();
+        let linked = RunRef::decode(&linked).unwrap();
+        assert_eq!(linked.server_identity, "server_identity");
+        assert_eq!(linked.generation, operation.generation);
+        assert_eq!(linked.run_id, run_id);
+
+        operation.dispatch_state = DispatchState::Prepared;
+        operation.run_id = None;
+        operation.result_receipt = None;
+        assert_eq!(linked_run_ref(&operation_ref, &operation).unwrap(), None);
+    }
+
+    #[test]
+    fn durable_status_and_unknown_follow_match_the_public_wait_contract() {
         assert_eq!(
-            observe_prompt_digest(&snapshot, &identity, &receipt).unwrap(),
-            Some((2, 3))
+            durable_run_status(ExecutionPhase::Running, SemanticOutcome::Unresolved),
+            DurableRunStatus::Working
+        );
+        assert_eq!(
+            durable_run_status(ExecutionPhase::Waiting, SemanticOutcome::Unresolved),
+            DurableRunStatus::Blocked
+        );
+        assert_eq!(
+            durable_run_status(ExecutionPhase::Error, SemanticOutcome::Unresolved),
+            DurableRunStatus::Blocked
+        );
+        assert_eq!(
+            durable_run_status(ExecutionPhase::Ended, SemanticOutcome::Unresolved),
+            DurableRunStatus::EndedUnconfirmed
+        );
+        assert_eq!(
+            durable_run_status(ExecutionPhase::Ended, SemanticOutcome::Completed),
+            DurableRunStatus::Done
         );
 
-        snapshot.events[0].prompt_submitted = false;
-        assert_eq!(
-            observe_prompt_digest(&snapshot, &identity, &receipt).unwrap(),
-            None
-        );
-
-        snapshot.events[0].prompt_submitted = true;
-        let current = &mut snapshot.panes[0].resolved.as_mut().unwrap().canonical;
-        current.prompt = Some(crate::pane_state::PromptState {
-            text: "goal replaced the preview".to_string(),
-            source: "goal".to_string(),
-            digest: Some(crate::pane_state::PromptState::digest_decoded_prompt(
-                "goal replaced the preview",
-            )),
+        let mut operation = {
+            let generation = crate::agent_state::StateGeneration::generate().unwrap();
+            let pane = test_agent_pane();
+            let state = &pane.resolved.as_ref().unwrap().canonical;
+            OperationRecord {
+                state_format_version: crate::agent_state::PRIVATE_STATE_FORMAT_VERSION,
+                generation,
+                operation_id: OperationId::parse("operation_wait_1234").unwrap(),
+                revision: 2,
+                request_fingerprint: Sha256Digest::of(b"request"),
+                target_agent_ref: "vta1:test".to_string(),
+                prompt_digest: Sha256Digest::of(b"prompt"),
+                dispatch_option: "paste_enter".to_string(),
+                binding: AgentBinding {
+                    server_identity: crate::daemon::topology::ServerIdentity {
+                        pid: 77,
+                        start_time: 88,
+                    },
+                    pane_instance: pane.pane_instance.clone(),
+                    pane_state_id: state.state_id.clone(),
+                    agent_epoch: state.agent_epoch,
+                    agent_kind: state.agent.clone(),
+                    provider_session_id: state.agent_session_id.clone().unwrap(),
+                    process: state.agent_process.clone().unwrap(),
+                },
+                expected_pane_version: state.version(),
+                expected_current_run: state.current_run.clone(),
+                expected_run_seq: 2,
+                confirmation_deadline_at: 11,
+                dispatch_state: DispatchState::DeliveryUnknown,
+                run_id: None,
+                result_receipt: None,
+                created_at: 1,
+                updated_at: 2,
+            }
+        };
+        assert!(operation_wait_matches(&operation, false));
+        assert!(!operation_wait_matches(&operation, true));
+        operation.result_receipt = Some(crate::agent_state::OperationResultReceipt {
+            code: "prompt_confirmation_timeout".to_string(),
+            observed_at: 2,
+            confirmation_basis: None,
+            source_attribution: None,
         });
+        let unknown = operation_terminal_error("vto3:test", operation.clone());
+        assert_eq!(unknown.code, ApiErrorCode::DeliveryUnknown);
+        assert_eq!(unknown.side_effect, ApiSideEffect::Possible);
+        assert_eq!(unknown.retry_action, ApiRetryAction::InspectManually);
         assert_eq!(
-            observe_prompt_digest(&snapshot, &identity, &receipt).unwrap(),
-            Some((2, 3))
+            unknown
+                .receipt
+                .as_ref()
+                .map(|receipt| receipt.operation_ref.as_str()),
+            Some("vto3:test")
         );
+        operation.dispatch_state = DispatchState::PromptConfirmed;
+        assert!(operation_wait_matches(&operation, true));
+        operation.dispatch_state = DispatchState::Rejected;
+        assert!(operation_wait_matches(&operation, true));
+        operation.result_receipt.as_mut().unwrap().code = "pane_precondition_changed".to_string();
+        let rejected = operation_terminal_error("vto3:test", operation);
+        assert_eq!(rejected.code, ApiErrorCode::DispatchRejected);
+        assert_eq!(rejected.side_effect, ApiSideEffect::None);
+        assert_eq!(rejected.retry_action, ApiRetryAction::RefreshTarget);
+    }
+
+    #[test]
+    fn durable_wait_polling_backs_off_to_one_second() {
+        let mut interval = WAIT_POLL_INITIAL_INTERVAL;
+        let mut observed = Vec::new();
+        for _ in 0..6 {
+            observed.push(interval);
+            interval = next_wait_poll_interval(interval);
+        }
+        assert_eq!(
+            observed,
+            [50, 100, 200, 400, 800, 1_000].map(Duration::from_millis)
+        );
+        assert_eq!(next_wait_poll_interval(interval), WAIT_POLL_MAX_INTERVAL);
     }
 
     #[test]
@@ -3389,8 +4537,36 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            32
+            50
         );
+        let error_codes = value["result"]["schemas"]["error"]["$defs"]["ApiErrorCode"]["enum"]
+            .as_array()
+            .unwrap();
+        for code in [
+            "operation_conflict",
+            "operation_not_found",
+            "operation_store_full",
+            "operation_generation_replaced",
+            "run_not_found",
+            "run_generation_replaced",
+            "run_unresolved",
+            "run_already_resolved",
+            "target_replaced",
+            "unsupported_provider",
+            "provider_event_conflict",
+            "recovery_not_allowed",
+            "stale_precondition",
+            "resolution_conflict",
+            "storage_capacity_exceeded",
+            "state_uninitialized",
+            "artifact_unavailable",
+            "artifact_expired",
+        ] {
+            assert!(
+                error_codes.contains(&serde_json::json!(code)),
+                "missing {code}"
+            );
+        }
         let wait_schema = value["result"]["schemas"]["request"]["oneOf"]
             .as_array()
             .unwrap()
@@ -3399,6 +4575,187 @@ mod tests {
             .unwrap();
         assert_eq!(wait_schema["properties"]["until"]["minItems"], 1);
         assert_eq!(wait_schema["properties"]["until"]["maxItems"], 4);
+    }
+
+    #[test]
+    fn generated_schema_exposes_version_limit_and_provider_contracts() {
+        let value: serde_json::Value = serde_json::from_str(&schema_json(123).unwrap()).unwrap();
+        let contract = &value["result"]["contract"];
+
+        assert_eq!(contract["versions"]["public_agent_api"], API_VERSION);
+        assert_eq!(contract["versions"]["daemon_protocol"], PROTOCOL_VERSION);
+        assert_eq!(
+            contract["versions"]["pane_state_schema"],
+            crate::pane_state::PANE_STATE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            contract["versions"]["private_state_format"],
+            crate::agent_state::PRIVATE_STATE_FORMAT_VERSION
+        );
+        assert_eq!(
+            contract["hard_limits"]["operation_store_max_records"],
+            crate::agent_state::OPERATION_STORE_MAX_RECORDS
+        );
+        assert_eq!(
+            contract["hard_limits"]["response_artifact_body_max_bytes"],
+            crate::agent_state::RESPONSE_ARTIFACT_BODY_MAX_BYTES
+        );
+        assert_eq!(
+            contract["hard_limits"]["concurrent_subscription_max_streams"],
+            48
+        );
+        assert_eq!(contract["providers"]["codex"]["status"], "enabled");
+        assert_eq!(
+            contract["providers"]["codex"]["recorded_version"],
+            "0.147.0"
+        );
+        assert_eq!(
+            contract["providers"]["codex"]["evidence_basis"],
+            "authenticated_isolated_runtime_probe"
+        );
+        assert_eq!(
+            contract["providers"]["codex"]["attribution"]["stable_event_reference"],
+            serde_json::json!(["provider", "session_id", "turn_id", "hook_kind"])
+        );
+        assert_eq!(
+            contract["providers"]["claude_code"]["status"],
+            "disabled_pending_authenticated_p0"
+        );
+        assert!(
+            contract["providers"]["claude_code"]
+                .get("attribution")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn daemon_typed_errors_preserve_public_recovery_contracts() {
+        use crate::daemon::protocol::v2::ErrorCode;
+
+        let cases = [
+            (
+                ErrorCode::PromptDispatchBusy,
+                ApiErrorCode::PromptDispatchBusy,
+                ApiErrorStage::BeforeDispatch,
+                ApiRetryAction::WaitThenRetry,
+            ),
+            (
+                ErrorCode::OperationConflict,
+                ApiErrorCode::OperationConflict,
+                ApiErrorStage::RequestValidation,
+                ApiRetryAction::Never,
+            ),
+            (
+                ErrorCode::OperationNotFound,
+                ApiErrorCode::OperationNotFound,
+                ApiErrorStage::Observation,
+                ApiRetryAction::Never,
+            ),
+            (
+                ErrorCode::OperationStoreFull,
+                ApiErrorCode::OperationStoreFull,
+                ApiErrorStage::BeforeDispatch,
+                ApiRetryAction::WaitThenRetry,
+            ),
+            (
+                ErrorCode::OperationGenerationReplaced,
+                ApiErrorCode::OperationGenerationReplaced,
+                ApiErrorStage::Observation,
+                ApiRetryAction::RestartObservation,
+            ),
+            (
+                ErrorCode::RunNotFound,
+                ApiErrorCode::RunNotFound,
+                ApiErrorStage::Observation,
+                ApiRetryAction::Never,
+            ),
+            (
+                ErrorCode::RunGenerationReplaced,
+                ApiErrorCode::RunGenerationReplaced,
+                ApiErrorStage::Observation,
+                ApiRetryAction::RestartObservation,
+            ),
+            (
+                ErrorCode::RunUnresolved,
+                ApiErrorCode::RunUnresolved,
+                ApiErrorStage::Observation,
+                ApiRetryAction::WaitThenRetry,
+            ),
+            (
+                ErrorCode::RunAlreadyResolved,
+                ApiErrorCode::RunAlreadyResolved,
+                ApiErrorStage::Observation,
+                ApiRetryAction::Never,
+            ),
+            (
+                ErrorCode::TargetReplaced,
+                ApiErrorCode::TargetReplaced,
+                ApiErrorStage::TargetResolution,
+                ApiRetryAction::RefreshTarget,
+            ),
+            (
+                ErrorCode::UnsupportedProvider,
+                ApiErrorCode::UnsupportedProvider,
+                ApiErrorStage::TargetResolution,
+                ApiRetryAction::Never,
+            ),
+            (
+                ErrorCode::ProviderEventConflict,
+                ApiErrorCode::ProviderEventConflict,
+                ApiErrorStage::RequestValidation,
+                ApiRetryAction::Never,
+            ),
+            (
+                ErrorCode::RecoveryNotAllowed,
+                ApiErrorCode::RecoveryNotAllowed,
+                ApiErrorStage::Observation,
+                ApiRetryAction::WaitThenRetry,
+            ),
+            (
+                ErrorCode::StalePrecondition,
+                ApiErrorCode::StalePrecondition,
+                ApiErrorStage::Observation,
+                ApiRetryAction::RestartObservation,
+            ),
+            (
+                ErrorCode::ResolutionConflict,
+                ApiErrorCode::ResolutionConflict,
+                ApiErrorStage::RequestValidation,
+                ApiRetryAction::Never,
+            ),
+            (
+                ErrorCode::StorageCapacityExceeded,
+                ApiErrorCode::StorageCapacityExceeded,
+                ApiErrorStage::Observation,
+                ApiRetryAction::WaitThenRetry,
+            ),
+            (
+                ErrorCode::StateUninitialized,
+                ApiErrorCode::StateUninitialized,
+                ApiErrorStage::Observation,
+                ApiRetryAction::Never,
+            ),
+            (
+                ErrorCode::ArtifactUnavailable,
+                ApiErrorCode::ArtifactUnavailable,
+                ApiErrorStage::Observation,
+                ApiRetryAction::Never,
+            ),
+            (
+                ErrorCode::ArtifactExpired,
+                ApiErrorCode::ArtifactExpired,
+                ApiErrorStage::Observation,
+                ApiRetryAction::Never,
+            ),
+        ];
+
+        for (daemon_code, public_code, stage, retry_action) in cases {
+            let error = daemon_api_error(daemon_code, "detail".to_string());
+            assert_eq!(error.code, public_code);
+            assert_eq!(error.stage, stage);
+            assert_eq!(error.side_effect, ApiSideEffect::None);
+            assert_eq!(error.retry_action, retry_action);
+        }
     }
 
     #[test]
@@ -3430,19 +4787,21 @@ mod tests {
                 ApiRetryAction::WaitThenRetry
             );
         }
-    }
 
-    #[test]
-    fn pre_dispatch_recontext_preserves_recovery_but_reports_the_actual_stage() {
-        let error = before_dispatch_error(anyhow::Error::new(api_error!(
-            "stale_reference",
-            "changed during fence"
-        )));
-        let error = error.downcast_ref::<ApiError>().unwrap();
+        let before_dispatch = prompt_before_dispatch_timeout("not written");
+        assert_eq!(before_dispatch.code, ApiErrorCode::Timeout);
+        assert_eq!(before_dispatch.stage, ApiErrorStage::BeforeDispatch);
+        assert_eq!(before_dispatch.side_effect, ApiSideEffect::None);
+        assert_eq!(
+            before_dispatch.retry_action,
+            ApiRetryAction::RetrySameRequest
+        );
 
-        assert_eq!(error.stage, ApiErrorStage::BeforeDispatch);
-        assert_eq!(error.side_effect, ApiSideEffect::None);
-        assert_eq!(error.retry_action, ApiRetryAction::RefreshTarget);
+        let ambiguous = prompt_wait_timeout("written without a response");
+        assert_eq!(ambiguous.code, ApiErrorCode::DeliveryUnknown);
+        assert_eq!(ambiguous.stage, ApiErrorStage::AfterDispatch);
+        assert_eq!(ambiguous.side_effect, ApiSideEffect::Possible);
+        assert_eq!(ambiguous.retry_action, ApiRetryAction::InspectManually);
     }
 
     #[test]
@@ -3572,6 +4931,53 @@ mod tests {
         assert_eq!(read.text, "three\n");
         assert_eq!(read.lines_requested, 1);
         assert_eq!(read.bytes_returned, 6);
+    }
+
+    #[test]
+    fn recovery_viewport_fingerprint_is_content_agnostic_and_dimension_bound() {
+        let runner = crate::tmux::mock::MockTmuxRunner::new();
+        let pane = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        runner.stub(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "%1",
+                "#{pane_id}\t#{pane_pid}\t#{pane_width}\t#{pane_height}",
+            ],
+            "%1\t101\t80\t24\n",
+        );
+        runner.stub(&["capture-pane", "-pJ", "-t", "%1"], "first screen\n");
+        let first = capture_visible_viewport_fingerprint(&runner, &pane).unwrap();
+
+        runner.stub(&["capture-pane", "-pJ", "-t", "%1"], "different screen\n");
+        let second = capture_visible_viewport_fingerprint(&runner, &pane).unwrap();
+
+        assert_eq!(
+            first.convention_version,
+            VIEWPORT_FINGERPRINT_CONVENTION_VERSION
+        );
+        assert_eq!((first.pane_width, first.pane_height), (80, 24));
+        assert_ne!(first.digest, second.digest);
+    }
+
+    #[test]
+    fn recovery_foreground_fence_rejects_a_non_owner() {
+        let runner = crate::tmux::mock::MockTmuxRunner::new();
+        let pane = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let process = crate::pane_state::AgentProcessIdentity {
+            pid: 9001,
+            start_token: "process-start".to_string(),
+        };
+        runner.stub_agent_input_owner(pane.pane_pid, process.pid, false);
+
+        assert!(verify_recovery_foreground_owner(&runner, &pane, &process).is_err());
     }
 
     #[test]

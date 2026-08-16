@@ -9,6 +9,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::agent_state::{
+    AgentBinding, AgentStateUsage, ExecutionPhase, OperationId, OperationRecord,
+    RecoveryPrecondition, ResolutionId, ResponseArtifactMetadata, RunRecord, SemanticOutcome,
+    Sha256Digest,
+};
 use crate::daemon::session_badge::{BadgeState, BadgeStateCounts};
 use crate::daemon::{SidebarModel, TransitionEvent};
 use crate::pane_state::{
@@ -17,7 +22,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +69,7 @@ pub struct V2Client {
     phase: DaemonPhase,
     hook_health: HookHealth,
     deadline: Instant,
+    request_sent: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +194,7 @@ impl V2Client {
             phase,
             hook_health,
             deadline,
+            request_sent: false,
         })
     }
 
@@ -219,6 +226,12 @@ impl V2Client {
         &mut self,
         message: &ClientMessage,
     ) -> std::result::Result<ServerMessage, V2RequestError> {
+        if self.request_sent {
+            return Err(V2RequestError {
+                stage: V2RequestFailureStage::BeforeFullWrite,
+                message: "daemon protocol permits one request per connection".to_string(),
+            });
+        }
         self.validate_request(message)
             .map_err(|error| V2RequestError {
                 stage: V2RequestFailureStage::BeforeFullWrite,
@@ -230,6 +243,7 @@ impl V2Client {
                 message: format!("failed to write v2 request frame: {error:#}"),
             }
         })?;
+        self.request_sent = true;
         read_server_message(&mut self.reader, self.deadline).map_err(|error| V2RequestError {
             stage: V2RequestFailureStage::AfterFullWrite,
             message: format!("failed to read v2 response frame: {error:#}"),
@@ -561,10 +575,15 @@ fn read_server_message(
 }
 
 fn server_response_error<T>(expected: &str, response: ServerMessage) -> Result<T> {
-    if let ServerMessage::Error { code, message, .. } = response {
-        bail!("daemon returned {code:?}: {message}");
+    match response {
+        ServerMessage::Error { code, message, .. } => {
+            bail!("daemon returned {code:?}: {message}")
+        }
+        ServerMessage::AgentResponseResult { .. } => {
+            bail!("expected {expected}, received AgentResponseResult")
+        }
+        response => bail!("expected {expected}, received {response:?}"),
     }
-    bail!("expected {expected}, received {response:?}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -808,6 +827,25 @@ pub enum ClientMessage {
     QueryRuntimeInfo {
         proto: u16,
     },
+    QueryAgentRun {
+        proto: u16,
+        run_ref: String,
+    },
+    QueryCurrentAgentRuns {
+        proto: u16,
+        bindings: Vec<AgentBinding>,
+    },
+    QueryAgentOperation {
+        proto: u16,
+        operation_ref: String,
+    },
+    QueryAgentResponse {
+        proto: u16,
+        run_ref: String,
+    },
+    QueryAgentStorage {
+        proto: u16,
+    },
     PaneSwitch {
         proto: u16,
         direction: crate::cli::pane_switch::PaneSwitchDirection,
@@ -819,6 +857,33 @@ pub enum ClientMessage {
     SubmitPaneEvent {
         proto: u16,
         envelope: PaneEventEnvelope,
+    },
+    SubmitProviderEvent {
+        proto: u16,
+        envelope: PaneEventEnvelope,
+        observation: crate::hook::provider::ProviderObservation,
+    },
+    StartAgentPrompt {
+        proto: u16,
+        daemon_instance_id: DaemonInstanceId,
+        event_id: EventId,
+        target_agent_ref: String,
+        operation_id: OperationId,
+        prompt_base64: String,
+        prompt_digest: Sha256Digest,
+        dispatch_option: String,
+        observed_at: i64,
+    },
+    ResolveAgentRun {
+        proto: u16,
+        daemon_instance_id: DaemonInstanceId,
+        event_id: EventId,
+        run_ref: String,
+        outcome: String,
+        precondition: RecoveryPrecondition,
+        resolution_id: ResolutionId,
+        reason: String,
+        actor_pid: u32,
     },
     SubmitViewEvent {
         proto: u16,
@@ -850,9 +915,17 @@ impl ClientMessage {
             | Self::QueryStatusSnapshot { proto, .. }
             | Self::QueryPane { proto, .. }
             | Self::QueryRuntimeInfo { proto }
+            | Self::QueryAgentRun { proto, .. }
+            | Self::QueryCurrentAgentRuns { proto, .. }
+            | Self::QueryAgentOperation { proto, .. }
+            | Self::QueryAgentResponse { proto, .. }
+            | Self::QueryAgentStorage { proto }
             | Self::PaneSwitch { proto, .. }
             | Self::Subscribe { proto }
             | Self::SubmitPaneEvent { proto, .. }
+            | Self::SubmitProviderEvent { proto, .. }
+            | Self::StartAgentPrompt { proto, .. }
+            | Self::ResolveAgentRun { proto, .. }
             | Self::SubmitViewEvent { proto, .. }
             | Self::SidebarCommand { proto, .. }
             | Self::RefreshTopology { proto, .. }
@@ -862,9 +935,17 @@ impl ClientMessage {
 
     pub fn mutation_instance_id(&self) -> Option<&DaemonInstanceId> {
         match self {
-            Self::SubmitPaneEvent { envelope, .. } => Some(&envelope.daemon_instance_id),
+            Self::SubmitPaneEvent { envelope, .. } | Self::SubmitProviderEvent { envelope, .. } => {
+                Some(&envelope.daemon_instance_id)
+            }
             Self::SubmitViewEvent { event, .. } => Some(&event.daemon_instance_id),
-            Self::SidebarCommand {
+            Self::StartAgentPrompt {
+                daemon_instance_id, ..
+            }
+            | Self::ResolveAgentRun {
+                daemon_instance_id, ..
+            }
+            | Self::SidebarCommand {
                 daemon_instance_id, ..
             }
             | Self::RefreshTopology {
@@ -879,9 +960,13 @@ impl ClientMessage {
 
     pub fn event_id(&self) -> Option<&EventId> {
         match self {
-            Self::SubmitPaneEvent { envelope, .. } => Some(&envelope.event_id),
+            Self::SubmitPaneEvent { envelope, .. } | Self::SubmitProviderEvent { envelope, .. } => {
+                Some(&envelope.event_id)
+            }
             Self::SubmitViewEvent { event, .. } => Some(&event.event_id),
-            Self::SidebarCommand { event_id, .. }
+            Self::StartAgentPrompt { event_id, .. }
+            | Self::ResolveAgentRun { event_id, .. }
+            | Self::SidebarCommand { event_id, .. }
             | Self::RefreshTopology { event_id, .. }
             | Self::Shutdown { event_id, .. } => Some(event_id),
             _ => None,
@@ -899,6 +984,11 @@ impl ClientMessage {
                 | Self::QueryStatusSnapshot { .. }
                 | Self::QueryPane { .. }
                 | Self::QueryRuntimeInfo { .. }
+                | Self::QueryAgentRun { .. }
+                | Self::QueryCurrentAgentRuns { .. }
+                | Self::QueryAgentOperation { .. }
+                | Self::QueryAgentResponse { .. }
+                | Self::QueryAgentStorage { .. }
                 | Self::PaneSwitch { .. }
                 | Self::Subscribe { .. }
         )
@@ -920,10 +1010,29 @@ pub enum ErrorCode {
     InvalidRequest,
     InvalidPaneInstance,
     PaneNotFound,
+    PromptDispatchBusy,
+    OperationConflict,
+    OperationNotFound,
+    OperationStoreFull,
+    OperationGenerationReplaced,
+    RunNotFound,
+    RunGenerationReplaced,
+    RunUnresolved,
+    TargetReplaced,
+    UnsupportedProvider,
+    ProviderEventConflict,
     StaleStateIdentity,
     StaleSelection,
     StaleAgentEvent,
     StaleDaemonInstance,
+    StalePrecondition,
+    RecoveryNotAllowed,
+    ResolutionConflict,
+    RunAlreadyResolved,
+    StorageCapacityExceeded,
+    StateUninitialized,
+    ArtifactUnavailable,
+    ArtifactExpired,
     InvalidProgressOperation,
     StateInvariantViolation,
     StateTooLarge,
@@ -937,6 +1046,15 @@ pub enum ErrorCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentAgentRun {
+    pub binding: AgentBinding,
+    pub run_ref: String,
+    pub execution_phase: ExecutionPhase,
+    pub semantic_outcome: SemanticOutcome,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum ServerMessage {
@@ -964,6 +1082,40 @@ pub enum ServerMessage {
     },
     PaneSwitchResult {
         outcome: crate::cli::pane_switch::PaneSwitchOutcome,
+    },
+    AgentPromptResult {
+        proto: u16,
+        operation_ref: String,
+        operation: OperationRecord,
+    },
+    AgentRunResult {
+        proto: u16,
+        run_ref: String,
+        run: RunRecord,
+    },
+    CurrentAgentRunsResult {
+        proto: u16,
+        runs: Vec<CurrentAgentRun>,
+    },
+    AgentRunResolved {
+        proto: u16,
+        run_ref: String,
+        run: RunRecord,
+    },
+    AgentOperationResult {
+        proto: u16,
+        operation_ref: String,
+        operation: OperationRecord,
+    },
+    AgentResponseResult {
+        proto: u16,
+        run_ref: String,
+        metadata: ResponseArtifactMetadata,
+        body_base64: String,
+    },
+    AgentStorageResult {
+        proto: u16,
+        usage: AgentStateUsage,
     },
     PaneEventResult {
         event_id: EventId,
@@ -994,6 +1146,30 @@ pub enum ServerMessage {
         message: String,
         event_id: Option<EventId>,
     },
+}
+
+impl std::fmt::Debug for ServerMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::AgentResponseResult {
+            proto,
+            run_ref,
+            metadata,
+            ..
+        } = self
+        {
+            return formatter
+                .debug_struct("AgentResponseResult")
+                .field("proto", proto)
+                .field("run_ref", run_ref)
+                .field("metadata", metadata)
+                .field("body_base64", &"<redacted>")
+                .finish();
+        }
+        match serde_json::to_string(self) {
+            Ok(message) => formatter.write_str(&message),
+            Err(_) => formatter.write_str("<unserializable ServerMessage>"),
+        }
+    }
 }
 
 impl ServerMessage {
@@ -1049,7 +1225,15 @@ pub fn encode_response_frame(message: &ServerMessage) -> Result<Vec<u8>, ServerM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pane_state::{AgentKind, AgentSessionId, PaneEvent, StateId};
+    use crate::agent_state::{
+        AgentBinding, ArtifactStoreCompleteness, DispatchState, ExecutionPhase,
+        PRIVATE_STATE_FORMAT_VERSION, ProviderCompleteness, RunEvidenceSummary, SemanticOutcome,
+        StableRunId, StoreRegionUsage,
+    };
+    use crate::daemon::topology::ServerIdentity;
+    use crate::pane_state::{
+        AgentKind, AgentProcessIdentity, AgentSessionId, PaneEvent, StateId, StateVersion,
+    };
 
     const EVENT_ID: &str = "102132435465768798a9bacbdcedfe0f";
     const DAEMON_ID: &str = "ffeeddccbbaa99887766554433221100";
@@ -1149,6 +1333,87 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn client_rejects_a_second_request_before_writing_it() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let event_id = EventId::generate().unwrap();
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/vt-one-request-{}-{}",
+            std::process::id(),
+            &event_id.as_str()[..8]
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut frame = String::new();
+            reader.read_line(&mut frame).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ClientMessage>(frame.trim()).unwrap(),
+                ClientMessage::Hello { .. }
+            ));
+            serde_json::to_writer(
+                &mut stream,
+                &ServerMessage::HelloAck {
+                    proto: PROTOCOL_VERSION,
+                    daemon_instance_id: daemon_id(),
+                    server_identity: "server".to_string(),
+                    phase: DaemonPhase::Serving,
+                    hook_health: HookHealth::Healthy,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+
+            frame.clear();
+            reader.read_line(&mut frame).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ClientMessage>(frame.trim()).unwrap(),
+                ClientMessage::QueryRuntimeInfo { .. }
+            ));
+            serde_json::to_writer(
+                &mut stream,
+                &ServerMessage::RuntimeInfoResult {
+                    info: RuntimeInfo {
+                        config_hash: "hash".to_string(),
+                        control_health: ControlHealth::Ready,
+                    },
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+
+            frame.clear();
+            reader.read_line(&mut frame).unwrap();
+            assert!(frame.is_empty(), "a second request reached the daemon");
+        });
+
+        let mut client =
+            V2Client::connect_with_timeout(&socket, "server", Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            client
+                .request(&ClientMessage::QueryRuntimeInfo {
+                    proto: PROTOCOL_VERSION,
+                })
+                .unwrap(),
+            ServerMessage::RuntimeInfoResult { .. }
+        ));
+        let error = client
+            .request_with_stage(&ClientMessage::QueryRuntimeInfo {
+                proto: PROTOCOL_VERSION,
+            })
+            .unwrap_err();
+        assert_eq!(error.stage, V2RequestFailureStage::BeforeFullWrite);
+        assert!(error.message.contains("one request per connection"));
+        drop(client);
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn pane_event() -> ClientMessage {
         ClientMessage::SubmitPaneEvent {
             proto: PROTOCOL_VERSION,
@@ -1163,6 +1428,120 @@ mod tests {
                     prompt: None,
                 },
             },
+        }
+    }
+
+    fn state_generation() -> crate::agent_state::StateGeneration {
+        crate::agent_state::StateGeneration::parse("1".repeat(32)).unwrap()
+    }
+
+    fn operation_id() -> OperationId {
+        OperationId::parse("operation_123456").unwrap()
+    }
+
+    fn agent_binding() -> AgentBinding {
+        AgentBinding {
+            server_identity: ServerIdentity {
+                pid: 10,
+                start_time: 20,
+            },
+            pane_instance: pane(),
+            pane_state_id: StateId::parse("2".repeat(32)).unwrap(),
+            agent_epoch: 1,
+            agent_kind: AgentKind::parse("codex").unwrap(),
+            provider_session_id: AgentSessionId::parse("session").unwrap(),
+            process: AgentProcessIdentity {
+                pid: 101,
+                start_token: "process-token".to_string(),
+            },
+        }
+    }
+
+    fn agent_run() -> RunRecord {
+        RunRecord {
+            state_format_version: PRIVATE_STATE_FORMAT_VERSION,
+            generation: state_generation(),
+            run_id: StableRunId::parse("3".repeat(32)).unwrap(),
+            run_seq: 1,
+            revision: 1,
+            binding: agent_binding(),
+            provider_turn_key: Some("turn-1".to_string()),
+            operation_id: None,
+            execution_phase: ExecutionPhase::Running,
+            semantic_outcome: SemanticOutcome::Unresolved,
+            evidence: RunEvidenceSummary::default(),
+            resolution: None,
+            artifact: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn agent_operation() -> OperationRecord {
+        OperationRecord {
+            state_format_version: PRIVATE_STATE_FORMAT_VERSION,
+            generation: state_generation(),
+            operation_id: operation_id(),
+            revision: 1,
+            request_fingerprint: Sha256Digest::of(b"request"),
+            target_agent_ref: "vta1:example".to_string(),
+            prompt_digest: Sha256Digest::of(b"prompt"),
+            dispatch_option: "guarded".to_string(),
+            binding: agent_binding(),
+            expected_pane_version: StateVersion {
+                state_id: StateId::parse("2".repeat(32)).unwrap(),
+                agent_epoch: 1,
+                revision: 1,
+            },
+            expected_current_run: None,
+            expected_run_seq: 1,
+            confirmation_deadline_at: 11,
+            dispatch_state: DispatchState::Prepared,
+            run_id: None,
+            result_receipt: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn response_metadata() -> ResponseArtifactMetadata {
+        ResponseArtifactMetadata {
+            run_id: StableRunId::parse("3".repeat(32)).unwrap(),
+            operation_id: None,
+            provider_session_id: AgentSessionId::parse("session").unwrap(),
+            observed_process: AgentProcessIdentity {
+                pid: 101,
+                start_token: "process-token".to_string(),
+            },
+            original_byte_count: 8,
+            stored_byte_count: 0,
+            original_digest: Sha256Digest::of(b"response"),
+            stored_digest: None,
+            provider_completeness: ProviderCompleteness::Unknown,
+            store_completeness: ArtifactStoreCompleteness::Unavailable,
+            source: "provider_hook".to_string(),
+            encoding: "utf-8".to_string(),
+            observed_at: 2,
+            file_name: None,
+        }
+    }
+
+    fn agent_state_usage() -> AgentStateUsage {
+        let empty_region = StoreRegionUsage {
+            records: 0,
+            bytes: 0,
+            record_limit: 1,
+            byte_limit: 1,
+            oldest_retained_at: None,
+        };
+        AgentStateUsage {
+            generation: state_generation(),
+            state_format_version: PRIVATE_STATE_FORMAT_VERSION,
+            runs: empty_region.clone(),
+            operations: empty_region.clone(),
+            prompts: empty_region.clone(),
+            artifacts: empty_region,
+            in_flight_operations: 0,
         }
     }
 
@@ -1187,6 +1566,25 @@ mod tests {
             ClientMessage::QueryRuntimeInfo {
                 proto: PROTOCOL_VERSION,
             },
+            ClientMessage::QueryAgentRun {
+                proto: PROTOCOL_VERSION,
+                run_ref: "vtr3:run".to_string(),
+            },
+            ClientMessage::QueryCurrentAgentRuns {
+                proto: PROTOCOL_VERSION,
+                bindings: vec![agent_binding()],
+            },
+            ClientMessage::QueryAgentOperation {
+                proto: PROTOCOL_VERSION,
+                operation_ref: "vto3:operation".to_string(),
+            },
+            ClientMessage::QueryAgentResponse {
+                proto: PROTOCOL_VERSION,
+                run_ref: "vtr3:run".to_string(),
+            },
+            ClientMessage::QueryAgentStorage {
+                proto: PROTOCOL_VERSION,
+            },
             ClientMessage::PaneSwitch {
                 proto: PROTOCOL_VERSION,
                 direction: crate::cli::pane_switch::PaneSwitchDirection::Left,
@@ -1196,6 +1594,49 @@ mod tests {
                 proto: PROTOCOL_VERSION,
             },
             pane_event(),
+            ClientMessage::StartAgentPrompt {
+                proto: PROTOCOL_VERSION,
+                daemon_instance_id: daemon_id(),
+                event_id: event_id(),
+                target_agent_ref: "vta1:agent".to_string(),
+                operation_id: operation_id(),
+                prompt_base64: "cHJvbXB0".to_string(),
+                prompt_digest: Sha256Digest::of(b"prompt"),
+                dispatch_option: "guarded".to_string(),
+                observed_at: 1,
+            },
+            ClientMessage::ResolveAgentRun {
+                proto: PROTOCOL_VERSION,
+                daemon_instance_id: daemon_id(),
+                event_id: event_id(),
+                run_ref: "vtr3:run".to_string(),
+                outcome: "completed".to_string(),
+                precondition: RecoveryPrecondition {
+                    run_ref: "vtr3:run".to_string(),
+                    binding: agent_binding(),
+                    run_revision: 1,
+                    evidence_digest: Sha256Digest::of(b"evidence"),
+                    pane: crate::agent_state::RecoveryPaneFence {
+                        state_id: StateId::parse("2".repeat(32)).unwrap(),
+                        revision: 1,
+                        current_run: crate::pane_state::CurrentDurableRunProjection {
+                            run_id: "3".repeat(32),
+                            run_seq: 1,
+                            run_revision: 1,
+                        },
+                        lifecycle: crate::pane_state::LifecycleState::Running,
+                        subagent_count: 0,
+                    },
+                    viewport_fingerprint: None,
+                    process_expectation:
+                        crate::agent_state::RecoveryProcessExpectation::ExactAbsent,
+                    issued_at: 1,
+                    expires_at: 61,
+                },
+                resolution_id: ResolutionId::parse("resolution_123456").unwrap(),
+                reason: "missing Stop hook".to_string(),
+                actor_pid: 42,
+            },
             ClientMessage::SubmitViewEvent {
                 proto: PROTOCOL_VERSION,
                 event: ViewEvent {
@@ -1270,6 +1711,35 @@ mod tests {
             let json = serde_json::to_vec(&message).unwrap();
             assert_eq!(decode_request_frame(&json).unwrap(), message);
         }
+    }
+
+    #[test]
+    fn agent_runtime_requests_have_expected_routing_metadata() {
+        let query = ClientMessage::QueryAgentRun {
+            proto: PROTOCOL_VERSION,
+            run_ref: "vtr3:run".to_string(),
+        };
+        assert!(query.is_query());
+        assert!(!query.is_mutation());
+        assert_eq!(query.event_id(), None);
+
+        let mutation_event_id = event_id();
+        let mutation_daemon_id = daemon_id();
+        let mutation = ClientMessage::StartAgentPrompt {
+            proto: PROTOCOL_VERSION,
+            daemon_instance_id: mutation_daemon_id.clone(),
+            event_id: mutation_event_id.clone(),
+            target_agent_ref: "vta1:agent".to_string(),
+            operation_id: operation_id(),
+            prompt_base64: "cHJvbXB0".to_string(),
+            prompt_digest: Sha256Digest::of(b"prompt"),
+            dispatch_option: "guarded".to_string(),
+            observed_at: 1,
+        };
+        assert!(!mutation.is_query());
+        assert!(mutation.is_mutation());
+        assert_eq!(mutation.mutation_instance_id(), Some(&mutation_daemon_id));
+        assert_eq!(mutation.event_id(), Some(&mutation_event_id));
     }
 
     #[test]
@@ -1398,6 +1868,24 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_response_error_does_not_render_artifact_body() {
+        let response = ServerMessage::AgentResponseResult {
+            proto: PROTOCOL_VERSION,
+            run_ref: "vtr1:unexpected".to_string(),
+            metadata: response_metadata(),
+            body_base64: "cHJpdmF0ZS1yZXNwb25zZQ==".to_string(),
+        };
+        let debug = format!("{response:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("cHJpdmF0ZS1yZXNwb25zZQ=="));
+
+        let error = server_response_error::<()>("HelloAck", response).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("AgentResponseResult"));
+        assert!(!message.contains("cHJpdmF0ZS1yZXNwb25zZQ=="));
+    }
+
+    #[test]
     fn every_server_message_roundtrips() {
         let pane_presentation = PanePresentation {
             pane_instance: pane(),
@@ -1494,6 +1982,40 @@ mod tests {
             ServerMessage::PaneSwitchResult {
                 outcome: crate::cli::pane_switch::PaneSwitchOutcome::Applied,
             },
+            ServerMessage::AgentPromptResult {
+                proto: PROTOCOL_VERSION,
+                operation_ref: "vto3:operation".to_string(),
+                operation: agent_operation(),
+            },
+            ServerMessage::AgentRunResult {
+                proto: PROTOCOL_VERSION,
+                run_ref: "vtr3:run".to_string(),
+                run: agent_run(),
+            },
+            ServerMessage::CurrentAgentRunsResult {
+                proto: PROTOCOL_VERSION,
+                runs: vec![CurrentAgentRun {
+                    binding: agent_binding(),
+                    run_ref: "vtr3:run".to_string(),
+                    execution_phase: ExecutionPhase::Running,
+                    semantic_outcome: SemanticOutcome::Unresolved,
+                }],
+            },
+            ServerMessage::AgentOperationResult {
+                proto: PROTOCOL_VERSION,
+                operation_ref: "vto3:operation".to_string(),
+                operation: agent_operation(),
+            },
+            ServerMessage::AgentResponseResult {
+                proto: PROTOCOL_VERSION,
+                run_ref: "vtr3:run".to_string(),
+                metadata: response_metadata(),
+                body_base64: "cmVzcG9uc2U=".to_string(),
+            },
+            ServerMessage::AgentStorageResult {
+                proto: PROTOCOL_VERSION,
+                usage: agent_state_usage(),
+            },
             ServerMessage::PaneEventResult {
                 event_id: event_id(),
                 accepted_seq: 1,
@@ -1537,10 +2059,29 @@ mod tests {
             ErrorCode::InvalidRequest,
             ErrorCode::InvalidPaneInstance,
             ErrorCode::PaneNotFound,
+            ErrorCode::PromptDispatchBusy,
+            ErrorCode::OperationConflict,
+            ErrorCode::OperationNotFound,
+            ErrorCode::OperationStoreFull,
+            ErrorCode::OperationGenerationReplaced,
+            ErrorCode::RunNotFound,
+            ErrorCode::RunGenerationReplaced,
+            ErrorCode::RunUnresolved,
+            ErrorCode::TargetReplaced,
+            ErrorCode::UnsupportedProvider,
+            ErrorCode::ProviderEventConflict,
             ErrorCode::StaleStateIdentity,
             ErrorCode::StaleSelection,
             ErrorCode::StaleAgentEvent,
             ErrorCode::StaleDaemonInstance,
+            ErrorCode::StalePrecondition,
+            ErrorCode::RecoveryNotAllowed,
+            ErrorCode::ResolutionConflict,
+            ErrorCode::RunAlreadyResolved,
+            ErrorCode::StorageCapacityExceeded,
+            ErrorCode::StateUninitialized,
+            ErrorCode::ArtifactUnavailable,
+            ErrorCode::ArtifactExpired,
             ErrorCode::InvalidProgressOperation,
             ErrorCode::StateInvariantViolation,
             ErrorCode::StateTooLarge,
@@ -1557,6 +2098,47 @@ mod tests {
             let encoded = serde_json::to_vec(&message).unwrap();
             assert_eq!(
                 serde_json::from_slice::<ServerMessage>(&encoded).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn agent_api_v3_error_codes_have_stable_wire_names() {
+        let codes = [
+            (ErrorCode::PromptDispatchBusy, "prompt_dispatch_busy"),
+            (ErrorCode::OperationConflict, "operation_conflict"),
+            (ErrorCode::OperationNotFound, "operation_not_found"),
+            (ErrorCode::OperationStoreFull, "operation_store_full"),
+            (
+                ErrorCode::OperationGenerationReplaced,
+                "operation_generation_replaced",
+            ),
+            (ErrorCode::RunNotFound, "run_not_found"),
+            (ErrorCode::RunGenerationReplaced, "run_generation_replaced"),
+            (ErrorCode::RunUnresolved, "run_unresolved"),
+            (ErrorCode::RunAlreadyResolved, "run_already_resolved"),
+            (ErrorCode::TargetReplaced, "target_replaced"),
+            (ErrorCode::UnsupportedProvider, "unsupported_provider"),
+            (ErrorCode::ProviderEventConflict, "provider_event_conflict"),
+            (ErrorCode::RecoveryNotAllowed, "recovery_not_allowed"),
+            (ErrorCode::StalePrecondition, "stale_precondition"),
+            (ErrorCode::ResolutionConflict, "resolution_conflict"),
+            (
+                ErrorCode::StorageCapacityExceeded,
+                "storage_capacity_exceeded",
+            ),
+            (ErrorCode::StateUninitialized, "state_uninitialized"),
+            (ErrorCode::ArtifactUnavailable, "artifact_unavailable"),
+            (ErrorCode::ArtifactExpired, "artifact_expired"),
+        ];
+
+        for (code, expected) in codes {
+            let message = ServerMessage::error(code, "detail", None);
+            let value = serde_json::to_value(&message).unwrap();
+            assert_eq!(value["code"], expected);
+            assert_eq!(
+                serde_json::from_value::<ServerMessage>(value).unwrap(),
                 message
             );
         }

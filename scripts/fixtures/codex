@@ -4,13 +4,25 @@ import os
 import subprocess
 import sys
 import termios
+import time
 import tty
 
 
 VT_BIN = os.environ["VT_BIN"]
 PROMPT_LOG = os.environ["PROMPT_LOG"]
 TRANSCRIPT_PATH = os.environ["CODEX_TRANSCRIPT_PATH"]
-SESSION_ID = "guarded-prompt-isolated"
+SESSION_ID = os.environ.get("CODEX_SESSION_ID", "guarded-prompt-isolated")
+PROMPT_HOOK_GATE = os.environ.get("PROMPT_HOOK_GATE")
+
+
+def wait_for_prompt_hook_gate():
+    if not PROMPT_HOOK_GATE:
+        return
+    deadline = time.monotonic() + 30
+    while not os.path.exists(PROMPT_HOOK_GATE):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"prompt hook gate was not released: {PROMPT_HOOK_GATE}")
+        time.sleep(0.02)
 
 
 def emit_hook(event, **fields):
@@ -37,6 +49,7 @@ sys.stdout.flush()
 
 buffer = bytearray()
 in_paste = False
+turn_index = 0
 try:
     while True:
         byte = os.read(descriptor, 1)
@@ -55,10 +68,17 @@ try:
             del buffer[-1:]
             prompt = buffer.decode("utf-8")
             buffer.clear()
+            turn_index += 1
+            turn_id = f"{SESSION_ID}-turn-{turn_index}"
             with open(PROMPT_LOG, "a", encoding="utf-8") as output:
                 output.write(json.dumps(prompt, ensure_ascii=False) + "\n")
-            emit_hook("UserPromptSubmit", prompt=prompt)
-            emit_hook("Stop", last_assistant_message="isolated guarded prompt accepted")
+            wait_for_prompt_hook_gate()
+            emit_hook("UserPromptSubmit", turn_id=turn_id, prompt=prompt)
+            emit_hook(
+                "Stop",
+                turn_id=turn_id,
+                last_assistant_message="isolated guarded prompt accepted",
+            )
             sys.stdout.write("ACCEPTED\r\n")
             sys.stdout.flush()
 finally:

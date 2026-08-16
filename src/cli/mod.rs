@@ -225,9 +225,12 @@ enum AgentCommand {
     },
     /// Get one current agent by %pane_id or exact agent_ref.
     Get { target: String },
-    /// Submit one guarded prompt to an exact idle/done Claude or Codex occupant.
+    /// Submit one guarded prompt to an exact idle/done Codex occupant.
     Prompt {
         target: String,
+        /// Caller-supplied idempotency key (16-128 ASCII [A-Za-z0-9_-]).
+        #[arg(long = "operation-id")]
+        operation_id: String,
         /// Read the prompt from stdin until EOF.
         #[arg(
             long,
@@ -242,7 +245,7 @@ enum AgentCommand {
             conflicts_with = "stdin"
         )]
         prompt_file: Option<PathBuf>,
-        /// Operation-wide deadline through preflight, dispatch, and raw hook digest confirmation.
+        /// Operation-wide deadline through daemon dispatch and durable hook confirmation.
         #[arg(
             long = "confirm-timeout-ms",
             default_value_t = crate::api::DEFAULT_PROMPT_CONFIRM_TIMEOUT.as_millis() as u64
@@ -269,6 +272,122 @@ enum AgentCommand {
         target: String,
         #[command(flatten)]
         read: ApiReadArgs,
+    },
+    /// Inspect and wait for durable agent runs.
+    Run {
+        #[command(subcommand)]
+        command: AgentRunCommand,
+    },
+    /// Inspect and wait for durable prompt operations.
+    Operation {
+        #[command(subcommand)]
+        command: AgentOperationCommand,
+    },
+    /// Inspect durable agent-state storage.
+    Storage {
+        #[command(subcommand)]
+        command: AgentStorageCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentRunCommand {
+    /// Get one run by exact run_ref.
+    Get { run_ref: String },
+    /// Wait for one exact run to reach a selected durable state.
+    Wait {
+        run_ref: String,
+        /// Wait only for semantic completion instead of any current non-running state.
+        #[arg(long, value_enum)]
+        until: Option<AgentRunWaitUntilArg>,
+        #[arg(
+            long = "timeout-ms",
+            default_value_t = crate::api::DEFAULT_WAIT_TIMEOUT.as_millis() as u64
+        )]
+        timeout_ms: u64,
+    },
+    /// Read the stored UTF-8 response body for one exact run.
+    Response { run_ref: String },
+    /// Observe a run twice and issue a short-lived recovery precondition when safe.
+    Check { run_ref: String },
+    /// Mark an unresolved historical run complete using a checked precondition.
+    Resolve {
+        run_ref: String,
+        #[arg(long, value_enum)]
+        outcome: AgentRunOutcomeArg,
+        #[arg(long = "precondition-file")]
+        precondition_file: PathBuf,
+        #[arg(long = "resolution-id")]
+        resolution_id: String,
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentRunWaitUntilArg {
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentRunOutcomeArg {
+    Completed,
+}
+
+impl AgentRunOutcomeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentOperationCommand {
+    /// Get one operation by exact operation_ref.
+    Get { operation_ref: String },
+    /// Wait until one exact operation reaches the requested dispatch state.
+    Wait {
+        operation_ref: String,
+        #[arg(long, value_enum)]
+        until: Option<AgentOperationWaitUntilArg>,
+        /// Keep following a delivery_unknown operation for late hook confirmation.
+        #[arg(long = "follow-unknown")]
+        follow_unknown: bool,
+        #[arg(
+            long = "timeout-ms",
+            default_value_t = crate::api::DEFAULT_WAIT_TIMEOUT.as_millis() as u64
+        )]
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentOperationWaitUntilArg {
+    PromptConfirmed,
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentStorageCommand {
+    /// Report bounded durable-state usage and limits.
+    Status,
+    /// Destructively reset durable agent state while the daemon and supported agents are stopped.
+    Reset {
+        #[arg(
+            long = "expected-generation",
+            required_unless_present = "recover_uninitialized",
+            conflicts_with = "recover_uninitialized"
+        )]
+        expected_generation: Option<String>,
+        /// Destructively replace missing, corrupt, or unsupported state metadata.
+        #[arg(
+            long = "recover-uninitialized",
+            conflicts_with = "expected_generation",
+            action = clap::ArgAction::SetTrue
+        )]
+        recover_uninitialized: bool,
+        #[arg(long = "confirm-reset", required = true, action = clap::ArgAction::SetTrue)]
+        confirm_reset: bool,
     },
 }
 
@@ -585,6 +704,54 @@ fn read_prompt_file(path: &Path) -> Result<String> {
     read_prompt_input(file)
 }
 
+fn read_recovery_precondition_file(
+    path: &Path,
+) -> Result<crate::agent_state::RecoveryPrecondition> {
+    const MAX_PRECONDITION_FILE_BYTES: usize = 64 * 1024;
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        crate::api::ApiError::new(
+            crate::api::ApiErrorCode::InvalidArguments,
+            format!(
+                "could not open recovery precondition file {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take((MAX_PRECONDITION_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_PRECONDITION_FILE_BYTES {
+        return Err(crate::api::ApiError::new(
+            crate::api::ApiErrorCode::InvalidArguments,
+            "recovery precondition file exceeds 65,536 bytes",
+        )
+        .into());
+    }
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        crate::api::ApiError::new(
+            crate::api::ApiErrorCode::InvalidArguments,
+            format!("recovery precondition file is not valid JSON: {error}"),
+        )
+    })?;
+    let value = envelope
+        .pointer("/result/recovery_precondition")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| {
+            crate::api::ApiError::new(
+                crate::api::ApiErrorCode::InvalidArguments,
+                "check output does not contain result.recovery_precondition",
+            )
+        })?;
+    serde_json::from_value(value.clone()).map_err(|error| {
+        crate::api::ApiError::new(
+            crate::api::ApiErrorCode::InvalidArguments,
+            format!("recovery precondition is invalid: {error}"),
+        )
+        .into()
+    })
+}
+
 fn finish_prompt_input(bytes: Vec<u8>) -> Result<String> {
     if bytes.len() > crate::api::MAX_PROMPT_BYTES {
         return Err(crate::api::ApiError::new(
@@ -882,6 +1049,7 @@ where
             )?)),
             AgentCommand::Prompt {
                 target,
+                operation_id,
                 stdin: _,
                 prompt_file,
                 confirm_timeout_ms,
@@ -894,6 +1062,7 @@ where
                     runner,
                     env,
                     &target,
+                    &operation_id,
                     &prompt,
                     Duration::from_millis(confirm_timeout_ms),
                 )?))
@@ -934,6 +1103,84 @@ where
                     ansi: read.ansi,
                 },
             )?)),
+            AgentCommand::Run { command } => match command {
+                AgentRunCommand::Get { run_ref } => Ok(Some(crate::api::agent_run_get(
+                    runner, env, now_epoch, &run_ref,
+                )?)),
+                AgentRunCommand::Wait {
+                    run_ref,
+                    until,
+                    timeout_ms,
+                } => Ok(Some(crate::api::agent_run_wait(
+                    runner,
+                    env,
+                    now_epoch,
+                    &run_ref,
+                    Duration::from_millis(timeout_ms),
+                    matches!(until, Some(AgentRunWaitUntilArg::Completed)),
+                )?)),
+                AgentRunCommand::Response { run_ref } => Ok(Some(crate::api::agent_run_response(
+                    runner, env, now_epoch, &run_ref,
+                )?)),
+                AgentRunCommand::Check { run_ref } => Ok(Some(crate::api::agent_run_check(
+                    runner, env, now_epoch, &run_ref,
+                )?)),
+                AgentRunCommand::Resolve {
+                    run_ref,
+                    outcome,
+                    precondition_file,
+                    resolution_id,
+                    reason,
+                } => {
+                    let precondition = read_recovery_precondition_file(&precondition_file)?;
+                    Ok(Some(crate::api::agent_run_resolve(
+                        runner,
+                        env,
+                        now_epoch,
+                        &run_ref,
+                        outcome.as_str(),
+                        precondition,
+                        &resolution_id,
+                        &reason,
+                    )?))
+                }
+            },
+            AgentCommand::Operation { command } => match command {
+                AgentOperationCommand::Get { operation_ref } => Ok(Some(
+                    crate::api::agent_operation_get(runner, env, now_epoch, &operation_ref)?,
+                )),
+                AgentOperationCommand::Wait {
+                    operation_ref,
+                    until,
+                    follow_unknown,
+                    timeout_ms,
+                } => Ok(Some(crate::api::agent_operation_wait(
+                    runner,
+                    env,
+                    now_epoch,
+                    &operation_ref,
+                    Duration::from_millis(timeout_ms),
+                    matches!(until, Some(AgentOperationWaitUntilArg::PromptConfirmed)),
+                    follow_unknown,
+                )?)),
+            },
+            AgentCommand::Storage { command } => match command {
+                AgentStorageCommand::Status => Ok(Some(crate::api::agent_storage_status(
+                    runner, env, now_epoch,
+                )?)),
+                AgentStorageCommand::Reset {
+                    expected_generation,
+                    recover_uninitialized,
+                    confirm_reset,
+                } => Ok(Some(reset_agent_storage_offline(
+                    runner,
+                    env,
+                    now_epoch,
+                    expected_generation.as_deref(),
+                    recover_uninitialized,
+                    confirm_reset,
+                )?)),
+            },
         },
         Command::StatuslineCategory {
             session_id,
@@ -1568,6 +1815,179 @@ fn query_active_config_hash(
         }
         other => bail!("unexpected daemon health response: {other:?}"),
     }
+}
+
+fn reset_agent_storage_offline(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    expected_generation: Option<&str>,
+    recover_uninitialized: bool,
+    confirm_reset: bool,
+) -> Result<String> {
+    if !confirm_reset {
+        return Err(crate::api::ApiError::new(
+            crate::api::ApiErrorCode::InvalidArguments,
+            "offline storage reset requires --confirm-reset",
+        )
+        .into());
+    }
+    let expected_generation = expected_generation
+        .map(crate::agent_state::StateGeneration::parse)
+        .transpose()
+        .map_err(|error| {
+            crate::api::ApiError::new(
+                crate::api::ApiErrorCode::InvalidArguments,
+                error.to_string(),
+            )
+        })?;
+    if expected_generation.is_some() == recover_uninitialized {
+        return Err(crate::api::ApiError::new(
+            crate::api::ApiErrorCode::InvalidArguments,
+            "offline storage reset requires exactly one of --expected-generation or --recover-uninitialized",
+        )
+        .into());
+    }
+    let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)
+        .map_err(|error| {
+            crate::api::ApiError::new(
+                crate::api::ApiErrorCode::TmuxServerUnavailable,
+                format!("could not resolve tmux server for offline reset: {error:#}"),
+            )
+        })?;
+    incarnation.verify(runner, env).map_err(|error| {
+        crate::api::ApiError::new(
+            crate::api::ApiErrorCode::StaleReference,
+            format!("tmux server changed before offline reset: {error:#}"),
+        )
+    })?;
+
+    let socket = crate::daemon::daemon_socket_path_for_incarnation(env, None, &incarnation.hash);
+    if let Some(parent) = socket.parent().filter(|path| !path.as_os_str().is_empty()) {
+        crate::daemon::lifecycle::ensure_secure_socket_dir(parent).map_err(|error| {
+            crate::api::ApiError::new(
+                crate::api::ApiErrorCode::RecoveryNotAllowed,
+                format!("could not secure the daemon lock directory: {error:#}"),
+            )
+        })?;
+    }
+    let _daemon_guard = crate::daemon::lifecycle::try_acquire_daemon_instance_lock(&socket)
+        .map_err(|error| {
+            crate::api::ApiError::new(
+                crate::api::ApiErrorCode::RecoveryNotAllowed,
+                format!("could not prove daemon quiescence: {error:#}"),
+            )
+        })?
+        .ok_or_else(|| {
+            crate::api::ApiError::new(
+                crate::api::ApiErrorCode::RecoveryNotAllowed,
+                "offline storage reset is forbidden while the daemon is running",
+            )
+        })?;
+    let lifecycle = crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash)
+        .map_err(|error| {
+            crate::api::ApiError::new(
+                crate::api::ApiErrorCode::RecoveryNotAllowed,
+                format!("could not inspect daemon lifecycle state: {error:#}"),
+            )
+        })?;
+    if lifecycle.process.as_ref().is_some_and(|process| {
+        crate::daemon::lifecycle::process_start_token(process.pid)
+            .is_ok_and(|token| token == process.start_token)
+    }) {
+        return Err(crate::api::ApiError::new(
+            crate::api::ApiErrorCode::RecoveryNotAllowed,
+            "offline storage reset is forbidden while the recorded daemon process is alive",
+        )
+        .into());
+    }
+
+    let framing = crate::daemon::topology::QueryFraming::generate().map_err(|error| {
+        crate::api::ApiError::new(
+            crate::api::ApiErrorCode::IdentityVerificationFailed,
+            error.to_string(),
+        )
+    })?;
+    let args = crate::daemon::topology::guarded_poll_query_args(&framing);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = runner.run(&refs).map_err(|error| {
+        crate::api::ApiError::new(
+            crate::api::ApiErrorCode::IdentityVerificationFailed,
+            format!("could not inspect live tmux panes before reset: {error:#}"),
+        )
+    })?;
+    let topology =
+        crate::daemon::topology::parse_topology(&output, &framing, &incarnation.identity).map_err(
+            |error| {
+                crate::api::ApiError::new(
+                    crate::api::ApiErrorCode::IdentityVerificationFailed,
+                    error.to_string(),
+                )
+            },
+        )?;
+    let processes =
+        crate::daemon::workers::read_agent_process_snapshot(Duration::from_secs(2), false);
+    let codex = crate::pane_state::AgentKind::parse("codex").expect("valid provider kind");
+    for pane in topology.panes {
+        let detection = processes.detect_from_pid_tree(pane.pane_instance.pane_pid);
+        if !detection.complete || !detection.process_identities_complete {
+            return Err(crate::api::ApiError::new(
+                crate::api::ApiErrorCode::IdentityVerificationFailed,
+                format!(
+                    "process scan for pane {} was incomplete; reset refused",
+                    pane.pane_instance.pane_id
+                ),
+            )
+            .into());
+        }
+        if detection.exact_agent_process(&codex).is_some() {
+            return Err(crate::api::ApiError::new(
+                crate::api::ApiErrorCode::RecoveryNotAllowed,
+                format!(
+                    "offline storage reset is forbidden while a supported Codex occupant is live in pane {}",
+                    pane.pane_instance.pane_id
+                ),
+            )
+            .into());
+        }
+    }
+
+    let root = crate::agent_state::state_root(env, &incarnation.hash);
+    let (previous_generation, generation) = if recover_uninitialized {
+        (
+            "uninitialized_or_unsupported".to_string(),
+            crate::agent_state::AgentStateStore::recover_uninitialized_offline(root)
+                .map_err(agent_storage_reset_error)?,
+        )
+    } else {
+        let expected_generation = expected_generation.expect("reset mode checked above");
+        let generation =
+            crate::agent_state::AgentStateStore::reset_offline(root, &expected_generation)
+                .map_err(agent_storage_reset_error)?;
+        (expected_generation.as_str().to_string(), generation)
+    };
+    crate::api::agent_storage_reset_result(
+        observed_at,
+        incarnation.hash,
+        previous_generation,
+        generation.as_str().to_string(),
+    )
+}
+
+fn agent_storage_reset_error(error: crate::agent_state::StoreError) -> crate::api::ApiError {
+    let code = match error {
+        crate::agent_state::StoreError::StalePrecondition(_) => {
+            crate::api::ApiErrorCode::StalePrecondition
+        }
+        crate::agent_state::StoreError::RecoveryNotAllowed(_) => {
+            crate::api::ApiErrorCode::RecoveryNotAllowed
+        }
+        crate::agent_state::StoreError::StateUninitialized => {
+            crate::api::ApiErrorCode::StateUninitialized
+        }
+        _ => crate::api::ApiErrorCode::DaemonError,
+    };
+    crate::api::ApiError::new(code, error.to_string())
 }
 
 fn should_wrap_session_manager_in_popup(env: &BTreeMap<String, String>) -> bool {

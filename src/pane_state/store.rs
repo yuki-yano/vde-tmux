@@ -416,6 +416,50 @@ impl CanonicalStateRuntime {
         Ok(result)
     }
 
+    pub fn project_current_run(
+        &mut self,
+        io: &mut dyn PaneSnapshotStoreIo,
+        pane: &PaneInstance,
+        projection: CurrentDurableRunProjection,
+        execution_active: bool,
+        observed_at: i64,
+    ) -> Result<bool, StoreError> {
+        if self.fail_stopped {
+            return Err(StoreError::FailStop("daemon is fail-stopped".to_string()));
+        }
+        let Some(current) = self.records.get(pane) else {
+            return Ok(false);
+        };
+        let mut candidate = current.clone();
+        let changed = candidate
+            .reconcile_current_run(
+                projection,
+                execution_active,
+                observed_at,
+                self.latest_unread_order,
+            )
+            .map_err(|error| StoreError::PersistFailed(error.to_string()))?;
+        if !changed {
+            return Ok(false);
+        }
+        let mut draft = self.clone();
+        draft.latest_unread_order = draft.latest_unread_order.max(
+            candidate
+                .unread
+                .latest
+                .as_ref()
+                .map(|latest| latest.order)
+                .unwrap_or_default(),
+        );
+        draft.records.insert(pane.clone(), candidate);
+        draft.bump_snapshot_revision()?;
+        draft.validate_projection()?;
+        let _ = draft.preflight_projection(super::MAX_RESPONSE_FRAME_BYTES)?;
+        io.save(&draft.records)?;
+        *self = draft;
+        Ok(true)
+    }
+
     pub fn apply_pane_reads(
         &mut self,
         io: &mut dyn PaneSnapshotStoreIo,

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: $0 OUTPUT" >&2
+  exit 2
+fi
+
+PYTHON="/usr/bin/python3"
+SOURCE="$(dirname "$0")/codex-embedded.c"
+PYTHON_INCLUDE="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("INCLUDEPY"))')"
+PYTHON_FRAMEWORK_PREFIX="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX"))')"
+PYTHON_FRAMEWORK="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("PYTHONFRAMEWORK"))')"
+
+cc \
+  -o "$1" \
+  "$SOURCE" \
+  -I "$PYTHON_INCLUDE" \
+  -F "$PYTHON_FRAMEWORK_PREFIX" \
+  "-Wl,-rpath,$PYTHON_FRAMEWORK_PREFIX" \
+  -framework "$PYTHON_FRAMEWORK"

@@ -45,7 +45,7 @@ pub(crate) enum HookCommand {
         /// Lifecycle state: running, waiting, idle, or error.
         #[arg(long, value_name = "STATE")]
         status: Option<String>,
-        /// Current prompt text; requires --prompt-source.
+        /// Public display text passed in argv; requires --prompt-source.
         #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
         /// Source label for --prompt.
@@ -147,13 +147,17 @@ pub(crate) fn run_hook_command(
                 },
                 &context,
             )?;
-            send_typed_hook_event_observed(&mut client, event, env, &server_hash)
+            send_typed_hook_event_observed(&mut client, event, None, env, &server_hash)
         }
         HookCommand::Claude { event } => {
             let (mut client, context, server_hash) =
                 typed_hook_context(runner, env, deadline, now_epoch)?;
-            let event = claude_typed_event_from_input(&event, input, &context)?;
-            send_typed_hook_event_observed(&mut client, event, env, &server_hash)
+            let requested_event = event;
+            let event = claude_typed_event_from_input(&requested_event, input, &context)?;
+            // Claude's authenticated disposable-profile P0 contract is not frozen yet. Keep its
+            // existing pane lifecycle hook healthy, but do not let unverified payloads create or
+            // resolve durable v3 Runs.
+            send_typed_hook_event_observed(&mut client, event, None, env, &server_hash)
         }
         HookCommand::Codex { arg } => {
             let Some(arg) = arg else {
@@ -166,7 +170,14 @@ pub(crate) fn run_hook_command(
             let (mut client, context, server_hash) =
                 typed_hook_context(runner, env, deadline, now_epoch)?;
             let event = codex_typed_event_from_input(&arg, input, &context, codex_home.as_deref())?;
-            send_typed_hook_event_observed(&mut client, event, env, &server_hash)
+            let observation = crate::hook::provider::observation_from_json(
+                "codex",
+                &arg,
+                input,
+                context.event_id.clone(),
+                context.observed_at,
+            )?;
+            send_typed_hook_event_observed(&mut client, event, observation, env, &server_hash)
         }
     }
 }
@@ -220,10 +231,11 @@ fn typed_hook_context(
 fn send_typed_hook_event_observed(
     client: &mut crate::daemon::protocol::v2::V2Client,
     event: Option<PaneEventEnvelope>,
+    observation: Option<crate::hook::provider::ProviderObservation>,
     env: &BTreeMap<String, String>,
     server_hash: &str,
 ) -> Result<()> {
-    match send_typed_hook_event(client, event) {
+    match send_typed_hook_event(client, event, observation) {
         Ok(()) => Ok(()),
         Err(error) => {
             record_agent_hook_delivery(env, server_hash, &error);
@@ -255,17 +267,24 @@ fn record_agent_hook_delivery(
 fn send_typed_hook_event(
     client: &mut crate::daemon::protocol::v2::V2Client,
     event: Option<PaneEventEnvelope>,
+    observation: Option<crate::hook::provider::ProviderObservation>,
 ) -> Result<()> {
     let Some(envelope) = event else {
         return Ok(());
     };
     let event_id = envelope.event_id.clone();
-    let response = client.request_with_stage(
-        &crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent {
+    let message = match observation {
+        Some(observation) => crate::daemon::protocol::v2::ClientMessage::SubmitProviderEvent {
+            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            envelope,
+            observation,
+        },
+        None => crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent {
             proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
             envelope,
         },
-    )?;
+    };
+    let response = client.request_with_stage(&message)?;
     match response {
         crate::daemon::protocol::v2::ServerMessage::PaneEventResult {
             event_id: response_id,
@@ -273,6 +292,9 @@ fn send_typed_hook_event(
         } if response_id == event_id => Ok(()),
         crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
             bail!("daemon returned {code:?}: {message}")
+        }
+        crate::daemon::protocol::v2::ServerMessage::AgentResponseResult { .. } => {
+            bail!("unexpected pane event response: AgentResponseResult")
         }
         response => bail!("unexpected pane event response: {response:?}"),
     }

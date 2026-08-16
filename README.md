@@ -189,18 +189,26 @@ vt agent wait %456 --until done,blocked --json
 vt pane read %456 --source latest --lines 120 --json
 
 AGENT_REF="$(vt agent get %456 --json | jq -r '.result.agent.summary.agent_ref')"
-printf '%s' 'Review the current diff.' | vt agent prompt "$AGENT_REF" --stdin --json
+OPERATION_ID="$(uuidgen)"
+PROMPT_JSON="$(printf '%s' 'Review the current diff.' \
+  | vt agent prompt "$AGENT_REF" --operation-id "$OPERATION_ID" --stdin --json)"
+OPERATION_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.operation_ref')"
+vt agent operation wait "$OPERATION_REF" --until prompt-confirmed --json
+RUN_REF="$(vt agent operation get "$OPERATION_REF" --json | jq -r '.result.run_ref')"
+vt agent run wait "$RUN_REF" --until completed --json
+vt agent run response "$RUN_REF" --json
 ```
 
 See [Agent JSON API](./AGENT_API.md) for the response envelope, stable occupant references,
 durable run completion, filters, and capture bounds. An exact `agent_ref` is emitted only when one
 unique live agent process can be pinned by PID and OS start token. Hooks remain necessary for
 accurate lifecycle details, but hookless agents can use `agent wait` and `agent read` when that live
-process identity is available. Guarded prompt dispatch additionally requires healthy daemon-owned
-tmux hook state, an available Claude Code/Codex prompt adapter, an idle/done occupant, and foreground
-input ownership. The external provider hook is proven by the post-submit digest event, not by the
-preflight health field. The command returns a digest-confirmed receipt for `agent wait`; ambiguous
-delivery is never auto-retried.
+process identity is available. API v3 stores durable Run and Operation records separately from the
+bounded pane projection. Guarded prompt dispatch is daemon-owned, requires healthy tmux hooks and
+foreground input ownership, and never places prompt bytes in argv. Reusing the same operation ID
+performs an idempotent lookup/resume; `delivery_unknown` is never auto-retried. Historical unresolved
+runs remain readable while retained. CAS recovery is restricted to the Pane's current durable Run,
+which is checked twice against Pane, process, foreground ownership, and visible viewport state.
 
 ## Agent states
 
@@ -435,6 +443,9 @@ vt hook emit \
 ```
 
 `--status` accepts `running`, `waiting`, `idle`, and `error`.
+`hook emit --prompt` is public display metadata and is passed in the process argv. Do not use it for
+secrets. Provider adapters should accept private bodies on stdin, and agent dispatch should use
+`vt agent prompt --stdin` or `--prompt-file`, which never places the prompt body in argv.
 A waiting event also needs a reason:
 
 ```bash
@@ -464,7 +475,7 @@ Use `disable` when the daemon must remain stopped.
 ### Pane-state persistence
 
 The daemon stores one private full-state snapshot per tmux server incarnation under
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v8.json`. A daemon restart restores the
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v9.json`. A daemon restart restores the
 prompt, task progress and items, subagents, worktree activity, lifecycle, timestamps, agent
 identity, task context and generated summaries, the latest response preview, explicitly reported
 background processes, listening ports, and Done/acknowledgement state for panes

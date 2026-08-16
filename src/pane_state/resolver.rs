@@ -44,6 +44,7 @@ mod tests {
             synthetic_completion_armed: false,
             lifecycle,
             run_seq: run,
+            current_run: None,
             completed_seq: completed,
             unread: if completed == 0 {
                 UnreadState::default()

@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod origin;
+pub mod provider;
 pub mod writer;
 
 use serde::{Deserialize, Serialize};

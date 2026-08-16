@@ -1,3 +1,4 @@
+pub(crate) mod agent_dispatch;
 pub mod lifecycle;
 pub mod protocol;
 pub mod runtime;

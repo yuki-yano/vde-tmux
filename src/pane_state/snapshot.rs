@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{PaneInstance, PaneState, StoreError};
 
-pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 8;
-pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v8.json";
+pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 9;
+pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v9.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,6 +282,7 @@ mod tests {
                 reason: super::super::WaitReason::PermissionPrompt,
             },
             run_seq: 2,
+            current_run: None,
             completed_seq: 1,
             unread: super::super::UnreadState {
                 occurrence_seq: 2,

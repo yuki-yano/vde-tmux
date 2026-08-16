@@ -1,5 +1,8 @@
 # Agent JSON API
 
+This document defines the current API v3 contract. The design rationale and complete rollout gates
+are maintained in [AGENT_API_V3.md](AGENT_API_V3.md).
+
 `vt` exposes a versioned JSON interface for terminal agents. The command tree is the public API.
 Most commands are read-only; `agent prompt` is the single guarded mutation. The daemon Unix-socket
 protocol is internal and changes independently.
@@ -24,10 +27,14 @@ vt agent wait %456 --until done,blocked --timeout-ms 120000 --json
 
 AGENT_JSON="$(vt agent get %456 --json)"
 AGENT_REF="$(printf '%s' "$AGENT_JSON" | jq -r '.result.agent.summary.agent_ref')"
-COMPLETED_SEQ="$(printf '%s' "$AGENT_JSON" | jq -r '.result.agent.completed_seq')"
-printf '%s' 'Review the current diff and report must-fix findings.' \
-  | vt agent prompt "$AGENT_REF" --stdin --json
-vt agent wait "$AGENT_REF" --until done --after-completed-seq "$COMPLETED_SEQ" --json
+OPERATION_ID="$(uuidgen)"
+PROMPT_JSON="$(printf '%s' 'Review the current diff and report must-fix findings.' \
+  | vt agent prompt "$AGENT_REF" --operation-id "$OPERATION_ID" --stdin --json)"
+OPERATION_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.operation_ref')"
+vt agent operation wait "$OPERATION_REF" --until prompt-confirmed --json
+RUN_REF="$(vt agent operation get "$OPERATION_REF" --json | jq -r '.result.run_ref')"
+vt agent run wait "$RUN_REF" --until completed --json
+vt agent run response "$RUN_REF" --json
 vt agent read %456 --source latest --lines 120 --json
 ```
 
@@ -39,7 +46,7 @@ the conceptual request command, success envelope, and error envelope.
 ```json
 {
   "meta": {
-    "api_version": 2,
+    "api_version": 3,
     "server_identity": "...",
     "daemon_instance_id": "...",
     "snapshot_revision": 42,
@@ -157,89 +164,140 @@ pane without accidentally targeting a replacement agent.
 
 ## Guarded prompt dispatch
 
-`agent prompt` submits one prompt to an exact idle/done Claude Code or Codex occupant. It accepts
-only an `agent_ref`; pane IDs and inferred identities are rejected. Supply the body through exactly
-one private input source:
+`agent prompt` submits one prompt to an exact Codex occupant. Claude Code remains visible through
+the legacy pane projection, but API v3 durable mutation is disabled until its isolated provider
+contract probe passes. The caller supplies a
+stable `operation_id` and exactly one private body source. The daemon, not the CLI, owns staging,
+fencing, and tmux dispatch:
 
 ```bash
+OPERATION_ID="$(uuidgen)"
 printf '%s' 'Review the current diff.' \
-  | vt agent prompt "$AGENT_REF" --stdin --confirm-timeout-ms 7000 --json
+  | vt agent prompt "$AGENT_REF" \
+      --operation-id "$OPERATION_ID" \
+      --stdin \
+      --json
 
-vt agent prompt "$AGENT_REF" --prompt-file /tmp/review-request.txt --json
+vt agent prompt "$AGENT_REF" \
+  --operation-id "$OPERATION_ID" \
+  --prompt-file /tmp/review-request.txt \
+  --json
 ```
 
-The prompt must be valid UTF-8 and 1..65,536 bytes. LF is the only allowed control character; CR,
-TAB, other C0 controls, DEL, and C1 controls are rejected. The body is never placed in the
-`agent prompt` argv, response envelope, or error. That response contains only a domain-separated
-SHA-256 digest. A later provider hook may store a bounded prompt preview in canonical agent state;
-that preview is intentionally visible through read-only `agent get` and snapshot responses.
+The prompt is valid UTF-8, non-empty, NUL-free, and at most 65,536 bytes. It is staged in a private
+0600 body file before the durable Operation becomes `prepared`; prompt bytes never appear in argv,
+the Operation record, JSON output, daemon errors, or logs. The stored request identity contains only
+the exact target, domain-separated prompt digest, dispatch option, and caller operation ID.
 
-Before writing any bytes, the command requires all of the following:
+Before dispatch the daemon re-resolves the exact Agent Binding, requires healthy daemon-owned tmux
+hooks, acquires the per-pane dispatch lock, and verifies that the agent process owns foreground
+input. It then persists `dispatch_started` before spawning tmux. A matching `UserPromptSubmit` hook
+creates the Run Record first and advances the Operation to `prompt_confirmed`.
 
-- the daemon-owned tmux observation hook health is `healthy`, and the agent kind has a
-  prompt-bearing hook adapter;
-- the exact state ID, epoch, live PID, and OS process start token still match the `agent_ref`;
-- lifecycle is idle/done, not working or blocked;
-- the exact agent process belongs to the pane's foreground terminal process group;
-- a nonblocking, secure lock for the exact tmux server/pane/PID tuple is held.
+The same `operation_id`, target, and prompt bytes are idempotent. A retry of an unexpired
+`prepared` Operation resumes the guarded dispatch. An unattended `prepared` Operation is rejected
+without a side effect when its original confirmation deadline expires. A settled Operation is
+returned without another side effect. Reusing an ID with a different request returns
+`operation_conflict`. After `dispatch_started`, restart or an ambiguous transport result advances
+the Operation to `delivery_unknown` and never resends it automatically.
 
-The command establishes its daemon subscription and run baseline before dispatch. It loads a unique
-named tmux buffer from stdin, then runs server-PID/start-time and pane-PID guards around
-`paste-buffer -p -d`, Enter, and a submission marker in one tmux command queue. The buffer is deleted
-on every observed path. Fresh live process fences run before and after that queue.
-
-Success requires a `UserPromptSubmit` hook transition for the same exact agent, expected
-`run_seq`, and raw decoded prompt digest. A successful result resembles:
-
-```json
-{
-  "result": {
-    "type": "agent_prompt",
-    "receipt": {
-      "target": { "agent_ref": "vta1:...", "pane_id": "%456" },
-      "prompt_digest": "...",
-      "baseline_run_seq": 4,
-      "baseline_completed_seq": 4,
-      "expected_run_seq": 5
-    },
-    "dispatch": "submitted",
-    "confirmation": "digest_matched",
-    "observed_run_seq": 5,
-    "observed_state_revision": 18,
-    "wait_cursor": {
-      "agent_ref": "vta1:...",
-      "after_completed_seq": 4
-    }
-  }
-}
-```
-
-Use `wait_cursor` to wait for that newly submitted run without resending it:
+Use the durable references instead of pane capture to follow the result:
 
 ```bash
-RECEIPT_JSON="$(printf '%s' 'Review the diff.' | vt agent prompt "$AGENT_REF" --stdin --json)"
-WAIT_REF="$(printf '%s' "$RECEIPT_JSON" | jq -r '.result.wait_cursor.agent_ref')"
-AFTER="$(printf '%s' "$RECEIPT_JSON" | jq -r '.result.wait_cursor.after_completed_seq')"
-vt agent wait "$WAIT_REF" --until done,blocked --after-completed-seq "$AFTER" --json
+OPERATION_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.operation_ref')"
+vt agent operation wait "$OPERATION_REF" --until prompt-confirmed --json
+
+RUN_REF="$(vt agent operation get "$OPERATION_REF" --json | jq -r '.result.run_ref')"
+vt agent run get "$RUN_REF" --json
+vt agent run wait "$RUN_REF" --until completed --json
+vt agent run response "$RUN_REF" --json
 ```
 
-There is no internal prompt retry after the tmux client is spawned. A missing/mismatched digest,
-post-dispatch fence failure, or any post-spawn transport failure—including failure before the first
-stdin byte—returns `delivery_unknown`, `side_effect: possible`, `retry_action: inspect_manually`, and
-a receipt. Only a failure before child creation can return `retry_same_request`. Do not rerun
-`agent prompt` after `delivery_unknown`; inspect the pane and continue waiting from the receipt if
-appropriate.
+`delivery_unknown` is a typed ambiguous result. Do not call `agent prompt` with a new operation ID.
+Use `agent operation get`; pass `--follow-unknown` only when waiting for a possible late matching
+provider hook. `agent prompt` and `agent operation wait` return non-zero typed error envelopes with
+the durable Operation receipt for `delivery_unknown` and `rejected`; `agent operation get` remains
+a successful state query. `agent run response` reads the bounded provider Response Artifact and
+never falls back to terminal capture.
 
-The daemon cannot prove the external Claude Code/Codex `UserPromptSubmit` hook configuration before
-the first dispatch: its `hook_health` field covers the daemon-owned tmux observation hook. A missing
-or misconfigured provider hook therefore fails closed at digest confirmation as `delivery_unknown`;
-the caller must inspect the pane and must not resend automatically.
+`agent list` and `agent get` expose the exact occupant's current durable `run_ref`, execution phase,
+semantic outcome, and public status. This is also how an agent discovers a manually-started Run.
+Historical Runs remain available to `run get` and `run wait` while retained. Run execution and
+semantic completion are separate: an ended process may remain `ended_unconfirmed` until a late
+provider completion or explicit operator recovery resolves it.
 
-The lock coordinates vde-tmux callers only. Direct human/tmux input can still race. The pre/post
-process fences and tmux PID guards shrink and detect that race but cannot make OS process identity
-and tmux input one atomic operation. Without a durable operation ledger, a CLI kill or daemon
-restart between tmux submission and envelope delivery is not recoverable, and caller retries are
-not deduplicated. These are explicit initial-version limits, not fallback behavior.
+Recovery uses a two-step compare-and-swap flow:
+
+```bash
+vt agent run check "$RUN_REF" --json > /tmp/run-check.json
+vt agent run resolve "$RUN_REF" \
+  --outcome completed \
+  --precondition-file /tmp/run-check.json \
+  --resolution-id "$(uuidgen)" \
+  --reason 'Provider completion was lost after the exact process exited.' \
+  --json
+```
+
+`check` only accepts the Run identified by the Pane's current durable-run pointer. Historical Runs
+are read-only after occupant replacement. For the current Run, `check` observes Run, Pane, and exact
+process state twice, two seconds apart. It issues a 60-second precondition for a stable absent or
+replaced process, or for the exact foreground process when the ANSI-free visible viewport and pane
+dimensions are unchanged across both observations. The latter is content-agnostic: it does not
+recognize provider prompt text and never infers semantic completion. The operator still decides
+whether the unchanged screen is sufficient evidence.
+
+`resolve` revalidates the generation, complete binding, Run revision, evidence digest, Pane state
+ID/revision/current Run pointer/lifecycle/subagent count, expiry, fresh process ownership, and any
+viewport fingerprint inside the daemon sequencer. It stores the auditable `operator_completed` Run
+first, then projects the completed current Run to the Pane. A matching resolution retry repairs a
+failed Pane projection without creating another resolution. It never sends a key or silently
+retargets a replacement.
+
+Provider prompt and response bodies are not projected into PaneState v9. Consequently,
+`agent list`, `agent get`, snapshots, statusline, and sidebar surfaces contain lifecycle metadata
+only. Response text is available solely through the explicit bounded `agent run response` read.
+
+## Storage status and offline reset
+
+`agent storage status` reports the private state generation, format version, bounded usage, and
+in-flight counts:
+
+```bash
+vt agent storage status --json
+```
+
+When the store cannot accept new records or a crash left a durable `resetting` marker, reset is an
+explicit offline operation. Stop the daemon and quiesce durable work first, then bind the request to
+the generation returned by the last status response:
+
+```bash
+vt agent storage reset \
+  --expected-generation "$GENERATION" \
+  --confirm-reset \
+  --json
+```
+
+Reset fails closed if the recorded daemon is live, a supported-provider process still occupies the
+tmux server, or the store contains an active Run or in-flight Operation. It writes a durable reset
+marker first and can resume the same generation-bound reset after interruption. It does not decode
+old formats, migrate references, or fall back to another state root.
+
+If metadata is missing, corrupt, or from an unsupported future format, the generation-bound command
+cannot authenticate the old generation. After the same daemon and supported-provider quiescence
+checks, explicitly discard that unreadable private state instead:
+
+```bash
+vt agent storage reset \
+  --recover-uninitialized \
+  --confirm-reset \
+  --json
+```
+
+This recovery does not decode or migrate the unreadable state. It creates only the exact private
+state root and its four `0700` regions when they are absent; existing paths must pass ownership,
+mode, and symlink validation. It then clears only those four bounded regions and publishes a fresh
+generation last. It refuses `--recover-uninitialized` when metadata is valid; use the generation-
+bound reset in that case.
 
 ## Terminal read
 
@@ -274,6 +332,11 @@ Every error contains a closed-enum `code`, human-readable `message`, `stage`, `s
   `event_history_lost`, `identity_verification_failed`, `control_unavailable`.
 - Contract/resource: `protocol_mismatch`, `invalid_daemon_response`, `resource_limit`,
   `capture_failed`, `daemon_error`, `internal_error`.
+- Durable state: `operation_conflict`, `operation_not_found`, `operation_store_full`,
+  `operation_generation_replaced`, `run_not_found`, `run_generation_replaced`, `run_unresolved`,
+  `run_already_resolved`, `target_replaced`, `unsupported_provider`, `provider_event_conflict`,
+  `recovery_not_allowed`, `stale_precondition`, `resolution_conflict`,
+  `storage_capacity_exceeded`, `state_uninitialized`, `artifact_unavailable`, `artifact_expired`.
 - Prompt mutation: `agent_busy`, `agent_blocked`, `prompt_confirmation_unavailable`,
   `agent_not_input_owner`, `prompt_dispatch_busy`, `dispatch_rejected`, `delivery_unknown`.
 
@@ -310,34 +373,42 @@ actually needed.
 The daemon accepts at most 64 simultaneous socket handlers. At most 48 may be streaming
 subscriptions, reserving 16 slots for short queries and hook/mutation traffic. Overload is returned
 as `resource_limit` with `wait_then_retry` without spawning another handler thread. The daemon
+durable Run and Operation waits use one-request query connections rather than streaming slots;
+their reconnect interval backs off from 50 ms to a one-second ceiling instead of polling at 20 Hz
+for the full timeout. The daemon
 observation capture coordinator has a separate bounded queue of eight requests; this does not bound
 the direct `capture-pane` subprocess used by `pane read` and `agent read`. Each daemon observation
 tmux process drains all output but retains at most 8 MiB stdout and 64 KiB stderr, and one coalesced
 observation group retains at most 16 MiB of parsed pane tails. Exceeding any of those bounds produces
 a typed capture output-limit failure.
 
-## Definition of Done for guarded dispatch
+## Definition of Done for API v3 rollout
 
 ### Functional completion
 
-- [x] Exact ref, supported agent kind, healthy daemon-owned hook state, idle/done lifecycle,
-  foreground ownership, secure lock, server/pane guards, and provider raw-digest confirmation are
-  mandatory.
-- [x] Prompt input is private, bounded, control-character checked, and absent from mutation
-  argv/responses/errors; later hook-derived previews remain observable state.
-- [x] Digest mismatch or post-side-effect ambiguity cannot be reported as success or auto-retried.
-- [x] The receipt connects directly to the existing completion cursor wait.
+- [x] Durable Run, Operation, prompt staging, and Response Artifact state is generation-bound and
+  bounded independently from the pane projection.
+- [x] Guarded dispatch is daemon-owned, idempotent before side effects, and never resends a
+  `dispatch_started` or `delivery_unknown` operation.
+- [x] Present agents expose their current durable Run, historical Run reads and waits survive
+  occupant replacement, and recovery mutation is restricted to the Pane's current Run.
+- [x] Recovery requires a two-observation process/Pane/viewport check and a short-lived CAS precondition, and
+  stores an operator audit.
 
 ### Test completion
 
-- [x] Input boundaries, digest normalization order/history, foreground process-group checks, secure
-  lock behavior, typed stdin stages, guarded queue ordering, connection caps, and capture queue
-  saturation have unit coverage.
-- [x] Full Rust tests and all three isolated tmux release scripts pass on the final diff.
-- [x] Isolated prompt dispatch and real Claude Code/Codex prompt-to-wait flows are verified.
+- [x] Run/Operation/store/reducer, idempotency, restart, ambiguity, and recovery tests pass.
+- [x] Codex provider P0 prompt, identity, queue, response, retry-window, and fan-out gates pass.
+- [x] Claude Code durable mutation remains disabled while its authenticated isolated P0 gate is
+  unavailable; no unverified adapter is enabled as a fallback.
+- [x] `cargo fmt --check`, clippy with warnings denied, full tests including ignored tests, all
+  three isolated tmux release scripts, durable prompt smoke, and operation crash smoke pass.
+- [ ] Independent reviewer and Fable report zero must-fix and must-simplify findings.
 
 ### Operational completion
 
-- [x] Public API, pane snapshot schema, and daemon protocol versions are bumped together.
-- [x] The locally installed binary and running daemon are replaced and their versions verified.
-- [x] Independent subagent and Fable reviews converge to zero must-fix findings.
+- [x] Public API 3, daemon protocol 15, PaneState 9, and private state format 1 are declared.
+- [ ] The local binary is installed, the old daemon is stopped, the new daemon is started, and all
+  running versions and hook ownership are verified.
+- [ ] No in-flight operation or unresolved Run is silently discarded during cutover.
+- [ ] The dotfiles bridge switches to durable dispatch only after the remaining rollout gates pass.

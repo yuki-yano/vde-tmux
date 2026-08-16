@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 
 use crate::daemon::protocol::v2::{
     ClientMessage, DaemonPhase, ErrorCode, HookHealth, ServerMessage,
@@ -345,6 +346,9 @@ pub(crate) enum V2InternalMutation {
         health: HookHealth,
         diagnostic: Option<String>,
     },
+    AgentPromptTimeouts {
+        observed_at: i64,
+    },
     TaskSummaryCompleted(crate::daemon::task_summary::TaskSummaryCompletion),
     SidebarEffectCompleted(SidebarEffectCompletion),
 }
@@ -672,6 +676,37 @@ fn validate_v2_origin(message: &ClientMessage) -> std::result::Result<(), Server
                 Some(envelope.event_id.clone()),
             ))
         }
+        ClientMessage::SubmitProviderEvent {
+            envelope,
+            observation,
+            ..
+        } => {
+            if !envelope.event.is_external() {
+                return Err(ServerMessage::error(
+                    ErrorCode::InvalidRequest,
+                    "provider pane event variant is internal-only",
+                    Some(envelope.event_id.clone()),
+                ));
+            }
+            observation.validate().map_err(|error| {
+                ServerMessage::error(
+                    ErrorCode::InvalidRequest,
+                    error.to_string(),
+                    Some(envelope.event_id.clone()),
+                )
+            })?;
+            if observation.ingress_request_id != envelope.event_id
+                || envelope.agent.as_ref() != Some(&observation.provider)
+                || envelope.agent_session_id.as_ref() != Some(&observation.session_id)
+            {
+                return Err(ServerMessage::error(
+                    ErrorCode::InvalidRequest,
+                    "provider observation identity does not match its pane event envelope",
+                    Some(envelope.event_id.clone()),
+                ));
+            }
+            Ok(())
+        }
         ClientMessage::SubmitViewEvent { event, .. } => event.validate().map_err(|error| {
             ServerMessage::error(
                 ErrorCode::InvalidRequest,
@@ -841,6 +876,7 @@ enum StatusPushTrigger {
 struct ProductionV2Coordinator {
     router: Mutex<V2Router>,
     state: Mutex<Option<super::runtime::CanonicalCoordinatorState>>,
+    agent_runtime: Mutex<Option<crate::agent_state::runtime::AgentRuntime>>,
     queue: Mutex<ProductionQueue>,
     queue_ready: Condvar,
     snapshot_cache: Mutex<Option<PublishedResolvedSnapshot>>,
@@ -1215,6 +1251,7 @@ impl ProductionV2Coordinator {
                 incarnation.hash.clone(),
             )),
             state: Mutex::new(None),
+            agent_runtime: Mutex::new(None),
             queue: Mutex::new(ProductionQueue::default()),
             queue_ready: Condvar::new(),
             snapshot_cache: Mutex::new(None),
@@ -1774,6 +1811,213 @@ impl ProductionV2Coordinator {
                     control_health: self.control_health(),
                 },
             },
+            ClientMessage::QueryAgentRun { run_ref, .. } => {
+                let reference = match crate::agent_state::RunRef::decode(&run_ref) {
+                    Ok(reference) => reference,
+                    Err(error) => {
+                        return ServerMessage::error(
+                            ErrorCode::InvalidRequest,
+                            error.to_string(),
+                            None,
+                        );
+                    }
+                };
+                let runtime = self
+                    .agent_runtime
+                    .lock()
+                    .expect("agent runtime lock poisoned");
+                let Some(runtime) = runtime.as_ref() else {
+                    return ServerMessage::error(
+                        ErrorCode::NotReady,
+                        "agent runtime is hydrating",
+                        None,
+                    );
+                };
+                match runtime.get_run(&reference) {
+                    Ok(run) => ServerMessage::AgentRunResult {
+                        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                        run_ref,
+                        run,
+                    },
+                    Err(error) => agent_state_query_error(error),
+                }
+            }
+            ClientMessage::QueryCurrentAgentRuns { bindings, .. } => {
+                if bindings.len() > 4096 {
+                    return ServerMessage::error(
+                        ErrorCode::InvalidRequest,
+                        "current run batch exceeds 4096 Agent Bindings",
+                        None,
+                    );
+                }
+                let live_bindings = {
+                    let state = self.state.lock().expect("canonical state lock poisoned");
+                    let Some(state) = state.as_ref() else {
+                        return ServerMessage::error(
+                            ErrorCode::NotReady,
+                            "daemon is hydrating",
+                            None,
+                        );
+                    };
+                    bindings
+                        .into_iter()
+                        .filter(|binding| {
+                            binding.server_identity == self.incarnation.identity
+                                && state
+                                    .leased
+                                    .runtime
+                                    .record(&binding.pane_instance)
+                                    .is_some_and(|record| {
+                                        record.agent_present
+                                            && record.state_id == binding.pane_state_id
+                                            && record.agent_epoch == binding.agent_epoch
+                                            && record.agent_process.as_ref()
+                                                == Some(&binding.process)
+                                    })
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let runtime = self
+                    .agent_runtime
+                    .lock()
+                    .expect("agent runtime lock poisoned");
+                let Some(runtime) = runtime.as_ref() else {
+                    return ServerMessage::error(
+                        ErrorCode::NotReady,
+                        "agent runtime is hydrating",
+                        None,
+                    );
+                };
+                let mut runs = Vec::with_capacity(live_bindings.len());
+                for binding in live_bindings {
+                    let run = match runtime.current_run_for_binding(&binding) {
+                        Ok(Some(run)) => run,
+                        Ok(None) => continue,
+                        Err(error) => return agent_state_query_error(error),
+                    };
+                    let run_ref = match runtime.run_ref(run.run_id.clone()).encode() {
+                        Ok(run_ref) => run_ref,
+                        Err(error) => {
+                            return ServerMessage::error(
+                                ErrorCode::InternalError,
+                                error.to_string(),
+                                None,
+                            );
+                        }
+                    };
+                    runs.push(crate::daemon::protocol::v2::CurrentAgentRun {
+                        binding,
+                        run_ref,
+                        execution_phase: run.execution_phase,
+                        semantic_outcome: run.semantic_outcome,
+                    });
+                }
+                ServerMessage::CurrentAgentRunsResult {
+                    proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                    runs,
+                }
+            }
+            ClientMessage::QueryAgentOperation { operation_ref, .. } => {
+                let reference = match crate::agent_state::OperationRef::decode(&operation_ref) {
+                    Ok(reference) => reference,
+                    Err(error) => {
+                        return ServerMessage::error(
+                            ErrorCode::InvalidRequest,
+                            error.to_string(),
+                            None,
+                        );
+                    }
+                };
+                let runtime = self
+                    .agent_runtime
+                    .lock()
+                    .expect("agent runtime lock poisoned");
+                let Some(runtime) = runtime.as_ref() else {
+                    return ServerMessage::error(
+                        ErrorCode::NotReady,
+                        "agent runtime is hydrating",
+                        None,
+                    );
+                };
+                match runtime.get_operation(&reference) {
+                    Ok(operation) => ServerMessage::AgentOperationResult {
+                        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                        operation_ref,
+                        operation,
+                    },
+                    Err(error) => agent_state_query_error(error),
+                }
+            }
+            ClientMessage::QueryAgentResponse { run_ref, .. } => {
+                let reference = match crate::agent_state::RunRef::decode(&run_ref) {
+                    Ok(reference) => reference,
+                    Err(error) => {
+                        return ServerMessage::error(
+                            ErrorCode::InvalidRequest,
+                            error.to_string(),
+                            None,
+                        );
+                    }
+                };
+                let runtime = self
+                    .agent_runtime
+                    .lock()
+                    .expect("agent runtime lock poisoned");
+                let Some(runtime) = runtime.as_ref() else {
+                    return ServerMessage::error(
+                        ErrorCode::NotReady,
+                        "agent runtime is hydrating",
+                        None,
+                    );
+                };
+                let run = match runtime.get_run(&reference) {
+                    Ok(run) => run,
+                    Err(error) => return agent_state_query_error(error),
+                };
+                let Some(metadata) = run.artifact else {
+                    let (code, message) = if run.semantic_outcome
+                        == crate::agent_state::SemanticOutcome::Unresolved
+                    {
+                        (ErrorCode::RunUnresolved, "run is not completed")
+                    } else {
+                        (
+                            ErrorCode::ArtifactUnavailable,
+                            "completed run has no available response artifact",
+                        )
+                    };
+                    return ServerMessage::error(code, message, None);
+                };
+                match runtime.read_response(&reference) {
+                    Ok(body) => ServerMessage::AgentResponseResult {
+                        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                        run_ref,
+                        metadata,
+                        body_base64: base64::engine::general_purpose::STANDARD
+                            .encode(body.as_bytes()),
+                    },
+                    Err(error) => agent_state_query_error(error),
+                }
+            }
+            ClientMessage::QueryAgentStorage { .. } => {
+                let runtime = self
+                    .agent_runtime
+                    .lock()
+                    .expect("agent runtime lock poisoned");
+                let Some(runtime) = runtime.as_ref() else {
+                    return ServerMessage::error(
+                        ErrorCode::NotReady,
+                        "agent runtime is hydrating",
+                        None,
+                    );
+                };
+                match runtime.store().usage() {
+                    Ok(usage) => ServerMessage::AgentStorageResult {
+                        proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                        usage,
+                    },
+                    Err(error) => agent_state_query_error(error),
+                }
+            }
             ClientMessage::PaneSwitch {
                 direction,
                 source_pane,
@@ -2830,6 +3074,37 @@ fn start_task_summary_completion_forwarder(coordinator: Arc<ProductionV2Coordina
     });
 }
 
+fn start_agent_prompt_timeout_worker(coordinator: Arc<ProductionV2Coordinator>) {
+    thread::spawn(move || {
+        while !coordinator.shutdown.load(Ordering::SeqCst) {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(250)
+                && !coordinator.shutdown.load(Ordering::SeqCst)
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            if coordinator.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            let observed_at = epoch_seconds();
+            let expired = coordinator
+                .agent_runtime
+                .lock()
+                .expect("agent runtime lock poisoned")
+                .as_ref()
+                .is_some_and(|runtime| runtime.has_expired_dispatch(observed_at).unwrap_or(true));
+            if !expired {
+                continue;
+            }
+            if !coordinator
+                .enqueue_internal(V2InternalMutation::AgentPromptTimeouts { observed_at })
+            {
+                break;
+            }
+        }
+    });
+}
+
 fn mutation_changes_topology_targets(mutation: &V2SequencedMutation) -> bool {
     match &mutation.mutation {
         V2AcceptedMutation::External(ClientMessage::RefreshTopology { .. })
@@ -3140,6 +3415,49 @@ fn apply_production_mutation(
         V2AcceptedMutation::External(ClientMessage::SubmitPaneEvent { envelope, .. }) => {
             apply_external_pane_event(coordinator, accepted_seq, envelope)
         }
+        V2AcceptedMutation::External(ClientMessage::SubmitProviderEvent {
+            envelope,
+            observation,
+            ..
+        }) => apply_external_provider_event(coordinator, accepted_seq, envelope, observation),
+        V2AcceptedMutation::External(ClientMessage::StartAgentPrompt {
+            event_id,
+            target_agent_ref,
+            operation_id,
+            prompt_base64,
+            prompt_digest,
+            dispatch_option,
+            observed_at,
+            ..
+        }) => apply_start_agent_prompt(
+            coordinator,
+            event_id,
+            target_agent_ref,
+            operation_id,
+            prompt_base64,
+            prompt_digest,
+            dispatch_option,
+            observed_at,
+        ),
+        V2AcceptedMutation::External(ClientMessage::ResolveAgentRun {
+            event_id,
+            run_ref,
+            outcome,
+            precondition,
+            resolution_id,
+            reason,
+            actor_pid,
+            ..
+        }) => apply_resolve_agent_run(
+            coordinator,
+            event_id,
+            run_ref,
+            outcome,
+            precondition,
+            resolution_id,
+            reason,
+            actor_pid,
+        ),
         V2AcceptedMutation::External(ClientMessage::SubmitViewEvent { event, .. }) => {
             apply_external_view_event(coordinator, accepted_seq, event)
         }
@@ -3322,6 +3640,11 @@ fn apply_production_mutation(
             | ClientMessage::QueryStatusSnapshot { .. }
             | ClientMessage::QueryPane { .. }
             | ClientMessage::QueryRuntimeInfo { .. }
+            | ClientMessage::QueryAgentRun { .. }
+            | ClientMessage::QueryCurrentAgentRuns { .. }
+            | ClientMessage::QueryAgentOperation { .. }
+            | ClientMessage::QueryAgentResponse { .. }
+            | ClientMessage::QueryAgentStorage { .. }
             | ClientMessage::PaneSwitch { .. }
             | ClientMessage::Subscribe { .. },
         ) => unreachable!("v2 router cannot sequence a read-only request"),
@@ -3448,6 +3771,29 @@ fn apply_production_mutation(
                     .expect("OS random source failed after daemon startup"),
                 accepted_seq,
                 snapshot_revision: state.leased.runtime.snapshot_revision(),
+            }
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::AgentPromptTimeouts { observed_at }) => {
+            let settled = coordinator
+                .agent_runtime
+                .lock()
+                .expect("agent runtime lock poisoned")
+                .as_mut()
+                .expect("agent runtime initialized before timeout worker")
+                .settle_expired_dispatches(observed_at);
+            match settled {
+                Ok(_) => ServerMessage::SnapshotAck {
+                    event_id: EventId::generate()
+                        .expect("OS random source failed after daemon startup"),
+                    accepted_seq,
+                    snapshot_revision: coordinator
+                        .state
+                        .lock()
+                        .expect("canonical state lock poisoned")
+                        .as_ref()
+                        .map_or(0, |state| state.leased.runtime.snapshot_revision()),
+                },
+                Err(error) => agent_state_query_error(error),
             }
         }
         V2AcceptedMutation::Internal(V2InternalMutation::TaskSummaryCompleted(completion)) => {
@@ -3815,9 +4161,1240 @@ fn apply_sidebar_navigation(
 fn apply_external_pane_event(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
-    envelope: PaneEventEnvelope,
+    mut envelope: PaneEventEnvelope,
 ) -> ServerMessage {
-    apply_pane_event_mutation(coordinator, accepted_seq, envelope, false)
+    redact_pane_body(&mut envelope.event);
+    apply_pane_event_mutation(coordinator, accepted_seq, envelope, false, None)
+}
+
+fn apply_external_provider_event(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    mut envelope: PaneEventEnvelope,
+    mut observation: crate::hook::provider::ProviderObservation,
+) -> ServerMessage {
+    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+    use crate::hook::provider::ProviderHookKind;
+
+    if observation.provider.as_str() != "codex" {
+        return ServerMessage::error(
+            ErrorCode::UnsupportedProvider,
+            "durable provider observations are enabled only for the authenticated Codex adapter",
+            Some(envelope.event_id),
+        );
+    }
+    if envelope.agent.as_ref() != Some(&observation.provider)
+        || envelope.agent_session_id.as_ref() != Some(&observation.session_id)
+    {
+        return ServerMessage::error(
+            ErrorCode::InvalidRequest,
+            "provider observation identity does not match the pane event envelope",
+            Some(envelope.event_id),
+        );
+    }
+    if !provider_event_matches_pane_event(&observation, &envelope.event) {
+        return ServerMessage::error(
+            ErrorCode::InvalidRequest,
+            "provider hook kind does not match the pane event transition",
+            Some(envelope.event_id),
+        );
+    }
+
+    let received_at = epoch_seconds();
+    observation.observed_at = received_at;
+    normalize_provider_pane_event(&mut envelope.event, received_at);
+    redact_pane_body(&mut envelope.event);
+
+    if observation.hook_kind == ProviderHookKind::SessionStart {
+        return apply_external_pane_event(coordinator, accepted_seq, envelope);
+    }
+
+    let duplicate = {
+        let runtime_guard = coordinator
+            .agent_runtime
+            .lock()
+            .expect("agent runtime lock poisoned");
+        let Some(runtime) = runtime_guard.as_ref() else {
+            return ServerMessage::error(
+                ErrorCode::NotReady,
+                "agent runtime is hydrating",
+                Some(envelope.event_id),
+            );
+        };
+        match runtime.provider_event_run(&observation) {
+            Ok(value) => value,
+            Err(error) => {
+                return ServerMessage::error(
+                    ErrorCode::PersistFailed,
+                    error.to_string(),
+                    Some(envelope.event_id),
+                );
+            }
+        }
+    };
+
+    let (binding, run_seq) = if let Some(run) = duplicate {
+        (run.binding, run.run_seq)
+    } else {
+        let record = {
+            let state_guard = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned");
+            let Some(state) = state_guard.as_ref() else {
+                return ServerMessage::error(
+                    ErrorCode::NotReady,
+                    "daemon is hydrating",
+                    Some(envelope.event_id),
+                );
+            };
+            state
+                .leased
+                .runtime
+                .record(&envelope.pane_instance)
+                .cloned()
+        };
+        let Some(record) = record else {
+            return ServerMessage::error(
+                ErrorCode::PaneNotFound,
+                "provider event has no canonical pane state",
+                Some(envelope.event_id),
+            );
+        };
+        let Some(process) = record.agent_process.clone() else {
+            return ServerMessage::error(
+                ErrorCode::StaleAgentEvent,
+                "provider event has no exact agent process identity",
+                Some(envelope.event_id),
+            );
+        };
+        if record.agent != observation.provider
+            || record.agent_session_id.as_ref() != Some(&observation.session_id)
+            || !record.agent_present
+        {
+            return ServerMessage::error(
+                ErrorCode::StaleAgentEvent,
+                "provider event no longer matches the live Agent Binding",
+                Some(envelope.event_id),
+            );
+        }
+        let run_seq = if observation.hook_kind == ProviderHookKind::UserPromptSubmit {
+            match record.run_seq.checked_add(1) {
+                Some(value) => value,
+                None => {
+                    return ServerMessage::error(
+                        ErrorCode::StateInvariantViolation,
+                        "agent run sequence overflow",
+                        Some(envelope.event_id),
+                    );
+                }
+            }
+        } else {
+            record.run_seq
+        };
+        (
+            crate::agent_state::AgentBinding {
+                server_identity: coordinator.incarnation.identity.clone(),
+                pane_instance: record.pane_instance,
+                pane_state_id: record.state_id,
+                agent_epoch: record.agent_epoch,
+                agent_kind: record.agent,
+                provider_session_id: observation.session_id.clone(),
+                process,
+            },
+            run_seq,
+        )
+    };
+
+    let apply_result = coordinator
+        .agent_runtime
+        .lock()
+        .expect("agent runtime lock poisoned")
+        .as_mut()
+        .expect("agent runtime checked above")
+        .apply_provider_observation(binding, run_seq, &observation);
+    let apply_result = match apply_result {
+        Ok(result) => result,
+        Err(error) => {
+            if matches!(error, crate::agent_state::StoreError::NotFound(_)) {
+                let message = format!("provider_attribution_unresolved: {error}");
+                let snapshot_revision = {
+                    let mut state = coordinator
+                        .state
+                        .lock()
+                        .expect("canonical state lock poisoned");
+                    let state = state
+                        .as_mut()
+                        .expect("state initialized before provider event");
+                    match state.add_global_diagnostic(ErrorCode::StaleAgentEvent, message) {
+                        Ok(revision) => revision,
+                        Err(store_error) => {
+                            return production_store_error_response(
+                                coordinator,
+                                store_error,
+                                Some(envelope.event_id),
+                            );
+                        }
+                    }
+                };
+                return ServerMessage::SnapshotAck {
+                    event_id: envelope.event_id,
+                    accepted_seq,
+                    snapshot_revision,
+                };
+            }
+            return agent_state_query_error_with_event(error, Some(envelope.event_id));
+        }
+    };
+
+    if apply_result.disposition == crate::agent_state::reducer::ApplyDisposition::Duplicate
+        && let Some(run) = apply_result.run.as_ref()
+    {
+        let projection_check = {
+            let state = coordinator
+                .state
+                .lock()
+                .expect("canonical state lock poisoned");
+            let Some(state) = state.as_ref() else {
+                return ServerMessage::error(
+                    ErrorCode::NotReady,
+                    "daemon is hydrating",
+                    Some(envelope.event_id),
+                );
+            };
+            let pane = state.leased.runtime.record(&envelope.pane_instance);
+            pane.map_or(Ok(false), |pane| {
+                pane_needs_durable_run_projection(pane, run)
+            })
+            .map(|needed| {
+                (
+                    needed,
+                    pane.map(crate::pane_state::PaneState::version),
+                    state.leased.runtime.snapshot_revision(),
+                )
+            })
+        };
+        let (projection_is_current, state_version, snapshot_revision) = match projection_check {
+            Ok(result) => result,
+            Err(message) => {
+                coordinator.fail_stop(message.clone());
+                return ServerMessage::error(
+                    ErrorCode::StateInvariantViolation,
+                    message,
+                    Some(envelope.event_id),
+                );
+            }
+        };
+        if !projection_is_current {
+            return ServerMessage::PaneEventResult {
+                event_id: envelope.event_id,
+                accepted_seq,
+                state_version,
+                snapshot_revision,
+                outcome: crate::daemon::protocol::v2::PaneApplyOutcome::Noop,
+            };
+        }
+    }
+
+    apply_pane_event_mutation(coordinator, accepted_seq, envelope, false, apply_result.run)
+}
+
+fn normalize_provider_pane_event(event: &mut PaneEvent, observed_at: i64) {
+    match event {
+        PaneEvent::AgentSessionStarted {
+            observed_at: event_at,
+            ..
+        }
+        | PaneEvent::ActivityObserved {
+            observed_at: event_at,
+        }
+        | PaneEvent::ActivityAndProgressObserved {
+            observed_at: event_at,
+            ..
+        }
+        | PaneEvent::WaitRequested {
+            observed_at: event_at,
+            ..
+        }
+        | PaneEvent::FailRun {
+            observed_at: event_at,
+            ..
+        }
+        | PaneEvent::ProgressUpdated {
+            observed_at: event_at,
+            ..
+        } => *event_at = observed_at,
+        PaneEvent::BeginRun { started_at, .. } => *started_at = observed_at,
+        PaneEvent::CompleteRun { completed_at }
+        | PaneEvent::ResponseAndCompleteRun { completed_at, .. }
+        | PaneEvent::MarkDone { completed_at, .. } => *completed_at = observed_at,
+        PaneEvent::ExplicitStateReported { report } => report.observed_at = observed_at,
+        PaneEvent::ObservationBatch { .. }
+        | PaneEvent::MarkPaneRead { .. }
+        | PaneEvent::TaskSummaryGenerated { .. }
+        | PaneEvent::PaneRemoved { .. } => {}
+    }
+}
+
+fn redact_pane_body(event: &mut PaneEvent) {
+    match event {
+        PaneEvent::AgentSessionStarted { resumed_prompt, .. } => *resumed_prompt = None,
+        PaneEvent::BeginRun { prompt, .. } => *prompt = None,
+        PaneEvent::ActivityAndProgressObserved { operations, .. }
+        | PaneEvent::ProgressUpdated { operations, .. } => {
+            operations.retain(|operation| {
+                !matches!(
+                    operation,
+                    crate::pane_state::ProgressOperation::SetPrompt(_)
+                )
+            });
+        }
+        PaneEvent::ExplicitStateReported { report } => report.prompt = None,
+        PaneEvent::ResponseAndCompleteRun { completed_at, .. } => {
+            *event = PaneEvent::CompleteRun {
+                completed_at: *completed_at,
+            };
+        }
+        _ => {}
+    }
+}
+
+fn provider_event_matches_pane_event(
+    observation: &crate::hook::provider::ProviderObservation,
+    event: &PaneEvent,
+) -> bool {
+    use crate::hook::provider::ProviderHookKind;
+
+    match (observation.hook_kind, event) {
+        (ProviderHookKind::SessionStart, PaneEvent::AgentSessionStarted { .. }) => true,
+        (
+            ProviderHookKind::UserPromptSubmit,
+            PaneEvent::BeginRun {
+                prompt:
+                    Some(crate::pane_state::PromptState {
+                        digest: Some(digest),
+                        ..
+                    }),
+                ..
+            },
+        ) => observation.prompt_digest.as_deref() == Some(digest),
+        (
+            ProviderHookKind::Activity,
+            PaneEvent::ActivityObserved { .. } | PaneEvent::ActivityAndProgressObserved { .. },
+        )
+        | (ProviderHookKind::Waiting, PaneEvent::WaitRequested { .. }) => true,
+        (ProviderHookKind::Stop, PaneEvent::ResponseAndCompleteRun { .. }) => {
+            observation.response.is_some()
+        }
+        (ProviderHookKind::Stop, PaneEvent::CompleteRun { .. }) => observation.response.is_none(),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_start_agent_prompt(
+    coordinator: &ProductionV2Coordinator,
+    event_id: EventId,
+    target_agent_ref: String,
+    operation_id: crate::agent_state::OperationId,
+    prompt_base64: String,
+    prompt_digest: crate::agent_state::Sha256Digest,
+    dispatch_option: String,
+    observed_at: i64,
+) -> ServerMessage {
+    let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3));
+    apply_start_agent_prompt_with_runner(
+        coordinator,
+        &runner,
+        event_id,
+        target_agent_ref,
+        operation_id,
+        prompt_base64,
+        prompt_digest,
+        dispatch_option,
+        observed_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_start_agent_prompt_with_runner(
+    coordinator: &ProductionV2Coordinator,
+    runner: &dyn crate::tmux::TmuxRunner,
+    event_id: EventId,
+    target_agent_ref: String,
+    operation_id: crate::agent_state::OperationId,
+    prompt_base64: String,
+    prompt_digest: crate::agent_state::Sha256Digest,
+    dispatch_option: String,
+    observed_at: i64,
+) -> ServerMessage {
+    use crate::agent_state::runtime::PrepareOperationResult;
+    use crate::daemon::agent_dispatch::DispatchOutcome;
+    use crate::daemon::protocol::v2::{ErrorCode, PROTOCOL_VERSION, ServerMessage};
+
+    let operation_result = |runtime: &crate::agent_state::runtime::AgentRuntime,
+                            operation: crate::agent_state::OperationRecord|
+     -> ServerMessage {
+        let reference = runtime.operation_ref(operation.operation_id.clone());
+        match reference.encode() {
+            Ok(operation_ref) => ServerMessage::AgentPromptResult {
+                proto: PROTOCOL_VERSION,
+                operation_ref,
+                operation,
+            },
+            Err(error) => ServerMessage::error(
+                ErrorCode::InternalError,
+                error.to_string(),
+                Some(event_id.clone()),
+            ),
+        }
+    };
+
+    if observed_at < 0 || dispatch_option != "paste_enter" {
+        return ServerMessage::error(
+            ErrorCode::InvalidRequest,
+            "agent prompt requires a non-negative timestamp and dispatch_option=paste_enter",
+            Some(event_id),
+        );
+    }
+    let observed_at = epoch_seconds();
+    let prompt = match base64::engine::general_purpose::STANDARD.decode(&prompt_base64) {
+        Ok(prompt)
+            if !prompt.is_empty()
+                && prompt.len() <= crate::agent_state::PROMPT_BODY_MAX_BYTES
+                && !prompt.contains(&0)
+                && std::str::from_utf8(&prompt).is_ok() =>
+        {
+            prompt
+        }
+        _ => {
+            return ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                "agent prompt must be non-empty UTF-8 without NUL and at most 65,536 bytes",
+                Some(event_id),
+            );
+        }
+    };
+    let decoded_prompt = std::str::from_utf8(&prompt).expect("prompt UTF-8 checked above");
+    let observed_digest = crate::agent_state::Sha256Digest::parse(
+        crate::pane_state::PromptState::digest_decoded_prompt(decoded_prompt),
+    )
+    .expect("PromptState emits a valid SHA-256 digest");
+    if observed_digest != prompt_digest {
+        return ServerMessage::error(
+            ErrorCode::InvalidRequest,
+            "agent prompt body does not match prompt_digest",
+            Some(event_id),
+        );
+    }
+
+    let request_fingerprint = crate::agent_state::runtime::AgentRuntime::request_fingerprint(
+        &target_agent_ref,
+        &prompt_digest,
+        &dispatch_option,
+    );
+    let existing_prepared = {
+        let runtime = coordinator
+            .agent_runtime
+            .lock()
+            .expect("agent runtime lock poisoned");
+        let Some(runtime) = runtime.as_ref() else {
+            return ServerMessage::error(
+                ErrorCode::NotReady,
+                "agent runtime is hydrating",
+                Some(event_id),
+            );
+        };
+        match runtime.lookup_operation_request(&operation_id, &request_fingerprint) {
+            Ok(Some(existing))
+                if existing.dispatch_state == crate::agent_state::DispatchState::Prepared =>
+            {
+                Some(existing)
+            }
+            Ok(Some(existing)) => return operation_result(runtime, existing),
+            Ok(None) => None,
+            Err(error) => return agent_state_query_error_with_event(error, Some(event_id)),
+        }
+    };
+
+    if let Some(existing) = existing_prepared.as_ref() {
+        let expired = {
+            let mut runtime = coordinator
+                .agent_runtime
+                .lock()
+                .expect("agent runtime lock poisoned");
+            let runtime = runtime.as_mut().expect("agent runtime checked above");
+            runtime.reject_prepared_retry_if_expired(&existing.operation_id, observed_at)
+        };
+        match expired {
+            Ok(Some(operation)) => {
+                let runtime = coordinator
+                    .agent_runtime
+                    .lock()
+                    .expect("agent runtime lock poisoned");
+                let runtime = runtime.as_ref().expect("agent runtime checked above");
+                return operation_result(runtime, operation);
+            }
+            Ok(None) => {}
+            Err(error) => return agent_state_query_error_with_event(error, Some(event_id)),
+        }
+    }
+
+    if coordinator
+        .router
+        .lock()
+        .expect("v2 router lock poisoned")
+        .hook_health()
+        != HookHealth::Healthy
+    {
+        return ServerMessage::error(
+            ErrorCode::HookCollision,
+            "hook health is degraded; prompt was not staged or sent",
+            Some(event_id),
+        );
+    }
+
+    let (binding, expected_run_seq, pane, expected_pane_version, expected_current_run) =
+        match resolve_agent_prompt_target(coordinator, &target_agent_ref) {
+            Ok(value) => value,
+            Err(message) => {
+                if let Some(rejection_code) =
+                    prepared_target_rejection_code(existing_prepared.is_some(), None)
+                {
+                    let mut runtime = coordinator
+                        .agent_runtime
+                        .lock()
+                        .expect("agent runtime lock poisoned");
+                    let runtime = runtime.as_mut().expect("agent runtime checked above");
+                    return match runtime.settle_dispatch(
+                        &operation_id,
+                        crate::agent_state::DispatchState::Rejected,
+                        rejection_code,
+                        observed_at,
+                    ) {
+                        Ok(operation) => operation_result(runtime, operation),
+                        Err(error) => agent_state_query_error_with_event(error, Some(event_id)),
+                    };
+                }
+                let code = if message.starts_with("unsupported provider:") {
+                    ErrorCode::UnsupportedProvider
+                } else {
+                    ErrorCode::StaleAgentEvent
+                };
+                return ServerMessage::error(code, message, Some(event_id));
+            }
+        };
+    let operation = if let Some(existing) = existing_prepared {
+        let target_matches = prepared_operation_matches_target(
+            &existing,
+            &binding,
+            expected_pane_version,
+            expected_current_run.as_ref(),
+            expected_run_seq,
+        );
+        if let Some(rejection_code) = prepared_target_rejection_code(true, Some(target_matches)) {
+            let mut runtime = coordinator
+                .agent_runtime
+                .lock()
+                .expect("agent runtime lock poisoned");
+            let runtime = runtime.as_mut().expect("agent runtime checked above");
+            return match runtime.settle_dispatch(
+                &operation_id,
+                crate::agent_state::DispatchState::Rejected,
+                rejection_code,
+                observed_at,
+            ) {
+                Ok(operation) => operation_result(runtime, operation),
+                Err(error) => agent_state_query_error_with_event(error, Some(event_id)),
+            };
+        }
+        existing
+    } else {
+        let mut runtime = coordinator
+            .agent_runtime
+            .lock()
+            .expect("agent runtime lock poisoned");
+        let runtime = runtime.as_mut().expect("agent runtime checked above");
+        match runtime.prepare_operation(
+            operation_id.clone(),
+            target_agent_ref,
+            &prompt,
+            prompt_digest,
+            dispatch_option,
+            binding.clone(),
+            expected_pane_version,
+            expected_current_run,
+            expected_run_seq,
+            observed_at,
+        ) {
+            Ok(PrepareOperationResult::Existing(existing)) => {
+                return operation_result(runtime, existing);
+            }
+            Ok(PrepareOperationResult::Created(created)) => created,
+            Err(error) => return agent_state_query_error_with_event(error, Some(event_id)),
+        }
+    };
+    maybe_crash_agent_operation("after_prepared", &operation.operation_id);
+
+    let reject_pre_dispatch = |code: &str, message: String| -> ServerMessage {
+        let mut runtime = coordinator
+            .agent_runtime
+            .lock()
+            .expect("agent runtime lock poisoned");
+        let runtime = runtime.as_mut().expect("agent runtime initialized");
+        match runtime.settle_dispatch(
+            &operation.operation_id,
+            crate::agent_state::DispatchState::Rejected,
+            code,
+            observed_at,
+        ) {
+            Ok(operation) => operation_result(runtime, operation),
+            Err(error) => ServerMessage::error(
+                ErrorCode::PersistFailed,
+                format!("{message}; failed to persist rejection: {error}"),
+                Some(event_id.clone()),
+            ),
+        }
+    };
+
+    let dispatch_lock =
+        match acquire_agent_prompt_dispatch_lock(&coordinator.incarnation.identity, &pane) {
+            Ok(lock) => lock,
+            Err(rejection) => return reject_pre_dispatch(rejection.code, rejection.message),
+        };
+
+    if let Err(rejection) = verify_agent_prompt_process_and_owner(runner, &pane, &binding) {
+        return reject_pre_dispatch(rejection.code, rejection.message);
+    }
+    if let Err(message) = verify_agent_prompt_precondition(coordinator, &operation) {
+        return reject_pre_dispatch("pane_precondition_changed", message);
+    }
+    let staged = {
+        let mut runtime = coordinator
+            .agent_runtime
+            .lock()
+            .expect("agent runtime lock poisoned");
+        let runtime = runtime.as_mut().expect("agent runtime initialized");
+        if let Err(error) = runtime.mark_dispatch_started(&operation_id, observed_at) {
+            return agent_state_query_error_with_event(error, Some(event_id));
+        }
+        match runtime.store().read_prompt(&operation_id) {
+            Ok(prompt) => prompt,
+            Err(error) => return agent_state_query_error_with_event(error, Some(event_id)),
+        }
+    };
+    let dispatch = crate::daemon::agent_dispatch::dispatch_prompt_guarded(
+        runner,
+        &coordinator.incarnation,
+        &pane,
+        &staged,
+        operation_id.as_str(),
+    );
+    if matches!(dispatch, DispatchOutcome::Submitted) {
+        maybe_crash_agent_operation("after_dispatch_submitted", &operation_id);
+    }
+    drop(dispatch_lock);
+
+    let mut runtime = coordinator
+        .agent_runtime
+        .lock()
+        .expect("agent runtime lock poisoned");
+    let runtime = runtime.as_mut().expect("agent runtime initialized");
+    let operation = match dispatch {
+        DispatchOutcome::Submitted => match runtime.store().load_operation(&operation_id) {
+            Ok(Some(operation)) => operation,
+            Ok(None) => {
+                return ServerMessage::error(
+                    ErrorCode::InternalError,
+                    "submitted operation disappeared",
+                    Some(event_id),
+                );
+            }
+            Err(error) => return agent_state_query_error_with_event(error, Some(event_id)),
+        },
+        DispatchOutcome::Rejected(message) => match runtime.settle_dispatch(
+            &operation_id,
+            crate::agent_state::DispatchState::Rejected,
+            "guarded_dispatch_rejected",
+            observed_at,
+        ) {
+            Ok(operation) => operation,
+            Err(error) => {
+                return ServerMessage::error(
+                    ErrorCode::PersistFailed,
+                    format!("{message}; failed to persist rejection: {error}"),
+                    Some(event_id),
+                );
+            }
+        },
+        DispatchOutcome::DeliveryUnknown(message) => match runtime.settle_dispatch(
+            &operation_id,
+            crate::agent_state::DispatchState::DeliveryUnknown,
+            "guarded_dispatch_ambiguous",
+            observed_at,
+        ) {
+            Ok(operation) => operation,
+            Err(error) => {
+                return ServerMessage::error(
+                    ErrorCode::PersistFailed,
+                    format!("{message}; failed to persist ambiguity: {error}"),
+                    Some(event_id),
+                );
+            }
+        },
+    };
+    operation_result(runtime, operation)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentPromptPreDispatchRejection {
+    code: &'static str,
+    message: String,
+}
+
+fn acquire_agent_prompt_dispatch_lock(
+    server_identity: &crate::daemon::topology::ServerIdentity,
+    pane: &crate::pane_state::PaneInstance,
+) -> std::result::Result<crate::runtime_dir::PaneDispatchLock, AgentPromptPreDispatchRejection> {
+    match crate::runtime_dir::try_acquire_pane_dispatch_lock(
+        server_identity,
+        &pane.pane_id,
+        pane.pane_pid,
+    ) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => Err(AgentPromptPreDispatchRejection {
+            code: "dispatch_lock_busy",
+            message: "another guarded dispatch owns this pane".to_string(),
+        }),
+        Err(error) => Err(AgentPromptPreDispatchRejection {
+            code: "dispatch_lock_error",
+            message: format!("could not acquire guarded dispatch lock: {error:#}"),
+        }),
+    }
+}
+
+fn verify_agent_prompt_process_and_owner(
+    runner: &dyn crate::tmux::TmuxRunner,
+    pane: &crate::pane_state::PaneInstance,
+    binding: &crate::agent_state::AgentBinding,
+) -> std::result::Result<(), AgentPromptPreDispatchRejection> {
+    match runner.resolve_agent_process(pane.pane_pid, &binding.agent_kind) {
+        Ok(Some(process)) if process == binding.process => {}
+        Ok(Some(_)) => {
+            return Err(AgentPromptPreDispatchRejection {
+                code: "target_process_replaced",
+                message: "exact agent process identity changed before guarded dispatch".to_string(),
+            });
+        }
+        Ok(None) => {
+            return Err(AgentPromptPreDispatchRejection {
+                code: "target_process_absent",
+                message: "exact agent process disappeared before guarded dispatch".to_string(),
+            });
+        }
+        Err(error) => {
+            return Err(AgentPromptPreDispatchRejection {
+                code: "target_process_unverifiable",
+                message: format!(
+                    "could not re-resolve exact agent process before dispatch: {error:#}"
+                ),
+            });
+        }
+    }
+    runner
+        .verify_agent_input_owner(pane.pane_pid, binding.process.pid)
+        .map_err(|error| AgentPromptPreDispatchRejection {
+            code: "agent_not_input_owner",
+            message: format!("exact agent process is not the foreground input owner: {error:#}"),
+        })
+}
+
+fn prepared_operation_matches_target(
+    existing: &crate::agent_state::OperationRecord,
+    binding: &crate::agent_state::AgentBinding,
+    expected_pane_version: crate::pane_state::StateVersion,
+    expected_current_run: Option<&crate::pane_state::CurrentDurableRunProjection>,
+    expected_run_seq: u64,
+) -> bool {
+    existing.binding == *binding
+        && existing.expected_pane_version == expected_pane_version
+        && existing.expected_current_run.as_ref() == expected_current_run
+        && existing.expected_run_seq == expected_run_seq
+}
+
+fn prepared_target_rejection_code(
+    has_existing_prepared: bool,
+    resolved_target_matches: Option<bool>,
+) -> Option<&'static str> {
+    match (has_existing_prepared, resolved_target_matches) {
+        (true, None) => Some("target_no_longer_current"),
+        (true, Some(false)) => Some("binding_changed_before_dispatch"),
+        (true, Some(true)) | (false, _) => None,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn maybe_crash_agent_operation(point: &str, operation_id: &crate::agent_state::OperationId) {
+    let Some(root) = std::env::var_os("VDE_TMUX_TEST_AGENT_OPERATION_FAULT_DIR") else {
+        return;
+    };
+    let marker = PathBuf::from(root).join(format!("{}.{}", operation_id.as_str(), point));
+    if fs::remove_file(marker).is_ok() {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn maybe_crash_agent_operation(_point: &str, _operation_id: &crate::agent_state::OperationId) {}
+
+fn resolve_agent_prompt_target(
+    coordinator: &ProductionV2Coordinator,
+    target_agent_ref: &str,
+) -> std::result::Result<
+    (
+        crate::agent_state::AgentBinding,
+        u64,
+        crate::pane_state::PaneInstance,
+        crate::pane_state::StateVersion,
+        Option<crate::pane_state::CurrentDurableRunProjection>,
+    ),
+    String,
+> {
+    use sha2::{Digest as _, Sha256};
+
+    let parts = target_agent_ref.split(':').collect::<Vec<_>>();
+    if parts.len() != 8 || parts[0] != "vta1" || parts[1] != coordinator.incarnation.hash {
+        return Err("invalid or stale exact agent_ref".to_string());
+    }
+    let pane = crate::pane_state::PaneInstance {
+        pane_id: format!("%{}", parts[2]),
+        pane_pid: parts[3]
+            .parse::<u32>()
+            .map_err(|_| "invalid agent_ref pane PID".to_string())?,
+    };
+    pane.validate().map_err(|error| error.to_string())?;
+    let expected_epoch = parts[5]
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "invalid agent_ref epoch".to_string())?;
+    let expected_process_pid = parts[6]
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "invalid agent_ref process PID".to_string())?;
+    if parts[7].len() != 64
+        || !parts[7]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("invalid agent_ref process start token digest".to_string());
+    }
+    let record = {
+        let state = coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned");
+        let state = state
+            .as_ref()
+            .ok_or_else(|| "daemon is hydrating".to_string())?;
+        state
+            .leased
+            .runtime
+            .record(&pane)
+            .cloned()
+            .ok_or_else(|| "agent pane is not retained".to_string())?
+    };
+    let process = record
+        .agent_process
+        .clone()
+        .ok_or_else(|| "agent process identity is unavailable".to_string())?;
+    let process_digest = format!("{:x}", Sha256::digest(process.start_token.as_bytes()));
+    if record.state_id.as_str() != parts[4]
+        || record.agent_epoch != expected_epoch
+        || process.pid != expected_process_pid
+        || process_digest != parts[7]
+        || !record.agent_present
+    {
+        return Err("agent_ref was replaced before dispatch".to_string());
+    }
+    if record.agent.as_str() != "codex" {
+        return Err(format!(
+            "unsupported provider: durable guarded prompt dispatch is enabled only for Codex, not {}",
+            record.agent.as_str()
+        ));
+    }
+    if !matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle) {
+        return Err("agent is busy or blocked".to_string());
+    }
+    let provider_session_id = record
+        .agent_session_id
+        .clone()
+        .ok_or_else(|| "agent provider session is unavailable".to_string())?;
+    let expected_run_seq = record
+        .run_seq
+        .checked_add(1)
+        .ok_or_else(|| "agent run sequence overflow".to_string())?;
+    let expected_pane_version = record.version();
+    let expected_current_run = record.current_run.clone();
+    Ok((
+        crate::agent_state::AgentBinding {
+            server_identity: coordinator.incarnation.identity.clone(),
+            pane_instance: pane.clone(),
+            pane_state_id: record.state_id,
+            agent_epoch: record.agent_epoch,
+            agent_kind: record.agent,
+            provider_session_id,
+            process,
+        },
+        expected_run_seq,
+        pane,
+        expected_pane_version,
+        expected_current_run,
+    ))
+}
+
+fn verify_agent_prompt_precondition(
+    coordinator: &ProductionV2Coordinator,
+    operation: &crate::agent_state::OperationRecord,
+) -> std::result::Result<(), String> {
+    let state = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let state = state
+        .as_ref()
+        .ok_or_else(|| "daemon is hydrating".to_string())?;
+    let record = state
+        .leased
+        .runtime
+        .record(&operation.binding.pane_instance)
+        .ok_or_else(|| "agent pane is no longer retained".to_string())?;
+    let exact_binding_matches = agent_prompt_precondition_matches(record, operation);
+    if exact_binding_matches {
+        Ok(())
+    } else {
+        Err(
+            "pane revision, lifecycle, current run, session, or process changed before dispatch"
+                .to_string(),
+        )
+    }
+}
+
+fn agent_prompt_precondition_matches(
+    record: &crate::pane_state::PaneState,
+    operation: &crate::agent_state::OperationRecord,
+) -> bool {
+    record.agent_present
+        && record.version() == operation.expected_pane_version
+        && record.current_run == operation.expected_current_run
+        && record.agent == operation.binding.agent_kind
+        && record.agent_session_id.as_ref() == Some(&operation.binding.provider_session_id)
+        && record.agent_process.as_ref() == Some(&operation.binding.process)
+        && record.run_seq.checked_add(1) == Some(operation.expected_run_seq)
+        && matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_resolve_agent_run(
+    coordinator: &ProductionV2Coordinator,
+    event_id: EventId,
+    run_ref: String,
+    outcome: String,
+    precondition: crate::agent_state::RecoveryPrecondition,
+    resolution_id: crate::agent_state::ResolutionId,
+    reason: String,
+    actor_pid: u32,
+) -> ServerMessage {
+    use crate::daemon::protocol::v2::{ErrorCode, PROTOCOL_VERSION, ServerMessage};
+    use crate::tmux::TmuxRunner as _;
+
+    if outcome != "completed" || actor_pid == 0 {
+        return ServerMessage::error(
+            ErrorCode::InvalidRequest,
+            "agent run resolve requires outcome=completed and a positive actor PID",
+            Some(event_id),
+        );
+    }
+    let observed_at = epoch_seconds();
+    let reference = match crate::agent_state::RunRef::decode(&run_ref) {
+        Ok(reference) => reference,
+        Err(error) => {
+            return ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                error.to_string(),
+                Some(event_id),
+            );
+        }
+    };
+    let (run, already_resolved) = {
+        let runtime = coordinator
+            .agent_runtime
+            .lock()
+            .expect("agent runtime lock poisoned");
+        let Some(runtime) = runtime.as_ref() else {
+            return ServerMessage::error(
+                ErrorCode::NotReady,
+                "agent runtime is hydrating",
+                Some(event_id),
+            );
+        };
+        let existing = match runtime.lookup_operator_completion(&reference, &resolution_id, &reason)
+        {
+            Ok(existing) => existing,
+            Err(error) => return agent_state_query_error_with_event(error, Some(event_id)),
+        };
+        if let Some(run) = existing {
+            (run, true)
+        } else {
+            match runtime.get_run(&reference) {
+                Ok(run) => (run, false),
+                Err(error) => return agent_state_query_error_with_event(error, Some(event_id)),
+            }
+        }
+    };
+    if already_resolved {
+        if let Err(error) = project_operator_completed_run(coordinator, &run) {
+            return production_store_error_response(coordinator, error, Some(event_id));
+        }
+        return ServerMessage::AgentRunResolved {
+            proto: PROTOCOL_VERSION,
+            run_ref,
+            run,
+        };
+    }
+    let runner = coordinator.status_push_runner(Duration::from_secs(3));
+    let first_process = match runner
+        .resolve_agent_process(run.binding.pane_instance.pane_pid, &run.binding.agent_kind)
+    {
+        Ok(process) => process,
+        Err(error) => {
+            return ServerMessage::error(
+                ErrorCode::StalePrecondition,
+                format!("fresh process observation failed: {error}"),
+                Some(event_id),
+            );
+        }
+    };
+    let fresh_viewport_fingerprint =
+        if let crate::agent_state::RecoveryProcessExpectation::ExactPresentStable {
+            process: expected,
+        } = &precondition.process_expectation
+        {
+            if first_process.as_ref() != Some(expected) || expected != &run.binding.process {
+                return ServerMessage::error(
+                    ErrorCode::StalePrecondition,
+                    "the exact bound process is no longer present",
+                    Some(event_id),
+                );
+            }
+            if let Err(error) = crate::api::verify_recovery_foreground_owner(
+                &runner,
+                &run.binding.pane_instance,
+                &run.binding.process,
+            ) {
+                return ServerMessage::error(
+                    ErrorCode::StalePrecondition,
+                    format!("the exact bound process is no longer the foreground owner: {error}"),
+                    Some(event_id),
+                );
+            }
+            let fingerprint = match crate::api::capture_visible_viewport_fingerprint(
+                &runner,
+                &run.binding.pane_instance,
+            ) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    return ServerMessage::error(
+                        ErrorCode::StalePrecondition,
+                        format!("fresh viewport capture failed: {error:#}"),
+                        Some(event_id),
+                    );
+                }
+            };
+            let second_process = match runner
+                .resolve_agent_process(run.binding.pane_instance.pane_pid, &run.binding.agent_kind)
+            {
+                Ok(process) => process,
+                Err(error) => {
+                    return ServerMessage::error(
+                        ErrorCode::StalePrecondition,
+                        format!("second fresh process observation failed: {error}"),
+                        Some(event_id),
+                    );
+                }
+            };
+            if second_process != first_process
+                || crate::api::verify_recovery_foreground_owner(
+                    &runner,
+                    &run.binding.pane_instance,
+                    &run.binding.process,
+                )
+                .is_err()
+            {
+                return ServerMessage::error(
+                    ErrorCode::StalePrecondition,
+                    "process identity or foreground ownership changed during viewport capture",
+                    Some(event_id),
+                );
+            }
+            Some(fingerprint)
+        } else {
+            None
+        };
+    let fresh_pane = match recovery_pane_fence_for_run(coordinator, &run) {
+        Ok(pane) => pane,
+        Err(message) => {
+            return ServerMessage::error(ErrorCode::StalePrecondition, message, Some(event_id));
+        }
+    };
+    let resolved = {
+        let mut runtime = coordinator
+            .agent_runtime
+            .lock()
+            .expect("agent runtime lock poisoned");
+        let Some(runtime) = runtime.as_mut() else {
+            return ServerMessage::error(
+                ErrorCode::NotReady,
+                "agent runtime is hydrating",
+                Some(event_id),
+            );
+        };
+        match runtime.resolve_operator_completed(
+            &reference,
+            &precondition,
+            resolution_id,
+            reason,
+            // The daemon socket is private to this user's runtime directory. Record the
+            // effective daemon UID and the caller-reported PID in the durable audit.
+            unsafe { libc::geteuid() },
+            actor_pid,
+            observed_at,
+            &fresh_pane,
+            first_process,
+            fresh_viewport_fingerprint.as_ref(),
+        ) {
+            Ok(run) => run,
+            Err(error) => return agent_state_query_error_with_event(error, Some(event_id)),
+        }
+    };
+    if let Err(error) = project_operator_completed_run(coordinator, &resolved) {
+        return production_store_error_response(coordinator, error, Some(event_id));
+    }
+    ServerMessage::AgentRunResolved {
+        proto: PROTOCOL_VERSION,
+        run_ref,
+        run: resolved,
+    }
+}
+
+fn project_operator_completed_run(
+    coordinator: &ProductionV2Coordinator,
+    run: &crate::agent_state::RunRecord,
+) -> std::result::Result<(), crate::pane_state::store::StoreError> {
+    let mut state = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let Some(state) = state.as_mut() else {
+        return Err(crate::pane_state::store::StoreError::PersistFailed(
+            "canonical pane state is hydrating".to_string(),
+        ));
+    };
+    if !state
+        .leased
+        .runtime
+        .record(&run.binding.pane_instance)
+        .is_some_and(|pane| pane_belongs_to_run_epoch(pane, run))
+    {
+        // A replacement pane must never receive a historical run projection. The
+        // durable Run is already complete, so there is nothing to repair here.
+        return Ok(());
+    }
+    let projection = crate::pane_state::CurrentDurableRunProjection {
+        run_id: run.run_id.as_str().to_string(),
+        run_seq: run.run_seq,
+        run_revision: run.revision,
+    };
+    let mut io = pane_snapshot_store(coordinator);
+    if state.leased.runtime.project_current_run(
+        &mut io,
+        &run.binding.pane_instance,
+        projection,
+        false,
+        run.updated_at,
+    )? {
+        let _ = state.checked_resolved_snapshot()?;
+    }
+    Ok(())
+}
+
+fn recovery_pane_fence_for_run(
+    coordinator: &ProductionV2Coordinator,
+    run: &crate::agent_state::RunRecord,
+) -> std::result::Result<crate::agent_state::RecoveryPaneFence, String> {
+    let state = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    let canonical = state
+        .as_ref()
+        .and_then(|state| state.leased.runtime.record(&run.binding.pane_instance))
+        .ok_or_else(|| "the pane bound to the run has no canonical state".to_string())?;
+    if canonical.state_id != run.binding.pane_state_id
+        || canonical.agent_epoch != run.binding.agent_epoch
+        || canonical.agent != run.binding.agent_kind
+        || canonical.agent_session_id.as_ref() != Some(&run.binding.provider_session_id)
+        || canonical.pane_instance != run.binding.pane_instance
+    {
+        return Err("the pane no longer has the complete binding recorded by the run".to_string());
+    }
+    let current_run = canonical
+        .current_run
+        .clone()
+        .ok_or_else(|| "the pane no longer points at a durable run".to_string())?;
+    let subagent_count = u32::try_from(canonical.subagents.len())
+        .map_err(|_| "pane subagent count overflow".to_string())?;
+    Ok(crate::agent_state::RecoveryPaneFence {
+        state_id: canonical.state_id.clone(),
+        revision: canonical.revision,
+        current_run,
+        lifecycle: canonical.lifecycle.clone(),
+        subagent_count,
+    })
+}
+
+fn agent_state_query_error(error: crate::agent_state::StoreError) -> ServerMessage {
+    agent_state_query_error_with_event(error, None)
+}
+
+fn agent_state_query_error_with_event(
+    error: crate::agent_state::StoreError,
+    event_id: Option<EventId>,
+) -> ServerMessage {
+    use crate::agent_state::StoreError;
+    let code = match error {
+        StoreError::StalePrecondition(_) => ErrorCode::StalePrecondition,
+        StoreError::RecoveryNotAllowed(_) => ErrorCode::RecoveryNotAllowed,
+        StoreError::ResolutionConflict(_) => ErrorCode::ResolutionConflict,
+        StoreError::RunAlreadyResolved(_) => ErrorCode::RunAlreadyResolved,
+        StoreError::PromptDispatchBusy(_) => ErrorCode::PromptDispatchBusy,
+        StoreError::OperationConflict(_) => ErrorCode::OperationConflict,
+        StoreError::OperationStoreFull(_) => ErrorCode::OperationStoreFull,
+        StoreError::OperationNotFound(_) => ErrorCode::OperationNotFound,
+        StoreError::OperationGenerationReplaced(_) => ErrorCode::OperationGenerationReplaced,
+        StoreError::RunNotFound(_) => ErrorCode::RunNotFound,
+        StoreError::RunGenerationReplaced(_) => ErrorCode::RunGenerationReplaced,
+        StoreError::ProviderEventConflict(_) => ErrorCode::ProviderEventConflict,
+        StoreError::ArtifactUnavailable => ErrorCode::ArtifactUnavailable,
+        StoreError::ArtifactExpired => ErrorCode::ArtifactExpired,
+        StoreError::StateUninitialized => ErrorCode::StateUninitialized,
+        StoreError::Capacity(_) => ErrorCode::StorageCapacityExceeded,
+        StoreError::NotFound(_) => ErrorCode::RunNotFound,
+        StoreError::Invalid(_) | StoreError::Conflict(_) => ErrorCode::InvalidRequest,
+        StoreError::Io(_) | StoreError::Corrupt(_) => ErrorCode::PersistFailed,
+    };
+    ServerMessage::error(code, error.to_string(), event_id)
 }
 
 fn apply_diagnostic_projection(
@@ -3878,7 +5455,7 @@ fn apply_observation_batch(
         // Nonfatal per-pane failures keep processing the remaining panes, same
         // as the standalone mutation queue did; fail-stop conditions raise the
         // shutdown flag inside the helper and abort the rest of the batch.
-        let _ = apply_pane_event_mutation(coordinator, accepted_seq, envelope, true);
+        let _ = apply_pane_event_mutation(coordinator, accepted_seq, envelope, true, None);
         if coordinator.shutdown.load(Ordering::SeqCst) {
             return ServerMessage::error(
                 ErrorCode::NotReady,
@@ -3907,10 +5484,24 @@ fn apply_pane_event_mutation(
     accepted_seq: u64,
     envelope: PaneEventEnvelope,
     defer_full_preflight: bool,
+    durable_run: Option<crate::agent_state::RunRecord>,
 ) -> ServerMessage {
     use crate::daemon::protocol::v2::{PaneApplyOutcome, ServerMessage};
 
     let event_id = envelope.event_id.clone();
+    let durable_run = match durable_run {
+        Some(run) => Some(run),
+        None => match reconcile_run_for_pane_event(coordinator, &envelope) {
+            Ok(run) => run,
+            Err(error) => {
+                return ServerMessage::error(
+                    ErrorCode::PersistFailed,
+                    error.to_string(),
+                    Some(event_id),
+                );
+            }
+        },
+    };
     if let PaneEvent::PaneRemoved { expected } = &envelope.event {
         return apply_pane_removal(
             coordinator,
@@ -3946,7 +5537,34 @@ fn apply_pane_event_mutation(
             .leased
             .runtime
             .apply_event(&mut io, &envelope, &visibility)
-            .and_then(|result| {
+            .and_then(|mut result| {
+                if let Some(run) = durable_run.as_ref()
+                    && state
+                        .leased
+                        .runtime
+                        .record(&envelope.pane_instance)
+                        .is_some_and(|pane| pane_belongs_to_run_epoch(pane, run))
+                {
+                    let projection = crate::pane_state::CurrentDurableRunProjection {
+                        run_id: run.run_id.as_str().to_string(),
+                        run_seq: run.run_seq,
+                        run_revision: run.revision,
+                    };
+                    if state.leased.runtime.project_current_run(
+                        &mut io,
+                        &envelope.pane_instance,
+                        projection,
+                        run.execution_active(),
+                        run.updated_at,
+                    )? {
+                        result.state_version = state
+                            .leased
+                            .runtime
+                            .record(&envelope.pane_instance)
+                            .map(crate::pane_state::PaneState::version);
+                        result.snapshot_revision = state.leased.runtime.snapshot_revision();
+                    }
+                }
                 let result = finish_pane_event_projection(
                     coordinator,
                     state,
@@ -3984,6 +5602,66 @@ fn apply_pane_event_mutation(
             }
             production_store_error_response(coordinator, error, Some(event_id))
         }
+    }
+}
+
+fn reconcile_run_for_pane_event(
+    coordinator: &ProductionV2Coordinator,
+    envelope: &PaneEventEnvelope,
+) -> Result<Option<crate::agent_state::RunRecord>, crate::agent_state::StoreError> {
+    let (checked, process, observed_at) = match &envelope.event {
+        PaneEvent::ObservationBatch {
+            process: Some(process),
+            observed_at,
+            ..
+        } => (
+            process.agent_process_checked,
+            process.agent_process.as_ref(),
+            *observed_at,
+        ),
+        PaneEvent::PaneRemoved { .. } => (true, None, epoch_seconds()),
+        _ => return Ok(None),
+    };
+    coordinator
+        .agent_runtime
+        .lock()
+        .expect("agent runtime lock poisoned")
+        .as_mut()
+        .map_or(Ok(None), |runtime| {
+            runtime.reconcile_process_for_pane(
+                &envelope.pane_instance,
+                checked,
+                process,
+                observed_at,
+            )
+        })
+}
+
+fn pane_belongs_to_run_epoch(
+    pane: &crate::pane_state::PaneState,
+    run: &crate::agent_state::RunRecord,
+) -> bool {
+    pane.pane_instance == run.binding.pane_instance
+        && pane.state_id == run.binding.pane_state_id
+        && pane.agent_epoch == run.binding.agent_epoch
+        && pane.agent == run.binding.agent_kind
+        && pane.agent_session_id.as_ref() == Some(&run.binding.provider_session_id)
+}
+
+fn pane_needs_durable_run_projection(
+    pane: &crate::pane_state::PaneState,
+    run: &crate::agent_state::RunRecord,
+) -> std::result::Result<bool, String> {
+    if !pane_belongs_to_run_epoch(pane, run) {
+        return Ok(false);
+    }
+    match pane.current_run.as_ref() {
+        Some(current) if current.run_id == run.run_id.as_str() => Ok(true),
+        Some(_) if pane.run_seq == run.run_seq => Err(
+            "Pane current durable run identity conflicts with a duplicate provider Run".to_string(),
+        ),
+        Some(_) => Ok(pane.run_seq < run.run_seq),
+        None => Ok(pane.run_seq <= run.run_seq),
     }
 }
 
@@ -4865,6 +6543,7 @@ pub fn run_runtime_daemon_server(
     start_pane_switch_trigger_worker(coordinator.clone());
     start_tmux_server_liveness_monitor(coordinator.clone())?;
     start_v2_mutation_worker(coordinator.clone());
+    start_agent_prompt_timeout_worker(coordinator.clone());
     start_sidebar_completion_forwarder(coordinator.clone());
     start_task_summary_completion_forwarder(coordinator.clone());
     let capture = crate::daemon::workers::start_capture_coordinator(
@@ -5119,8 +6798,26 @@ fn bootstrap_v2_runtime(
     env: &std::collections::BTreeMap<String, String>,
     config: &crate::config::Config,
 ) -> Result<()> {
+    let agent_state_root = crate::agent_state::state_root(env, &coordinator.incarnation.hash);
+    let agent_runtime = crate::agent_state::runtime::AgentRuntime::open(
+        agent_state_root.clone(),
+        coordinator.incarnation.hash.clone(),
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "agent state {} is invalid: {error}; use the explicit agent storage recovery command",
+            agent_state_root.display()
+        )
+    })?;
+    *coordinator
+        .agent_runtime
+        .lock()
+        .expect("agent runtime lock poisoned") = Some(agent_runtime);
     let runner = crate::tmux::SystemTmuxRunner::from_env(Duration::from_secs(3))
         .with_max_output_bytes(crate::daemon::topology::MAX_TMUX_QUERY_OUTPUT_BYTES);
+    crate::daemon::agent_dispatch::cleanup_stale_prompt_buffers(&runner).map_err(|error| {
+        anyhow::anyhow!("failed to clean stale guarded prompt buffers: {error}")
+    })?;
     crate::daemon::view_hooks::install_hooks(&runner, &coordinator.incarnation.identity)
         .map_err(|error| anyhow::anyhow!("failed to install pane-state hooks: {error}"))?;
     coordinator
@@ -5170,7 +6867,52 @@ fn bootstrap_v2_runtime(
         &mut records,
         topology.panes.iter().map(|pane| pane.pane_instance.clone()),
     );
-    if records.len() != record_count {
+    let mut records_changed = records.len() != record_count;
+    let reconciled_runs = coordinator
+        .agent_runtime
+        .lock()
+        .expect("agent runtime lock poisoned")
+        .as_mut()
+        .expect("agent runtime initialized before pane reconciliation")
+        .reconcile_panes_after_restart(&records, epoch_seconds())
+        .map_err(|error| anyhow::anyhow!("failed to reconcile durable runs at startup: {error}"))?;
+    let mut latest_unread_order = records
+        .values()
+        .filter_map(|pane| pane.unread.latest.as_ref().map(|latest| latest.order))
+        .max()
+        .unwrap_or_default();
+    for pane in records.values_mut() {
+        let current = reconciled_runs
+            .iter()
+            .filter(|run| pane_belongs_to_run_epoch(pane, run))
+            .max_by_key(|run| run.run_seq);
+        let changed = if let Some(run) = current {
+            pane.reconcile_current_run(
+                crate::pane_state::CurrentDurableRunProjection {
+                    run_id: run.run_id.as_str().to_string(),
+                    run_seq: run.run_seq,
+                    run_revision: run.revision,
+                },
+                run.execution_active(),
+                run.updated_at,
+                latest_unread_order,
+            )
+        } else {
+            pane.clear_current_run()
+        }
+        .map_err(|error| {
+            anyhow::anyhow!("failed to repair pane durable run projection: {error}")
+        })?;
+        latest_unread_order = latest_unread_order.max(
+            pane.unread
+                .latest
+                .as_ref()
+                .map(|latest| latest.order)
+                .unwrap_or_default(),
+        );
+        records_changed |= changed;
+    }
+    if records_changed {
         crate::pane_state::snapshot::save_snapshot(
             &snapshot_path,
             &coordinator.incarnation.identity,
@@ -5532,6 +7274,360 @@ mod tests {
     const POLL_TOKEN: &str = "00112233445566778899aabbccddeeff";
 
     #[test]
+    fn provider_hook_kind_must_match_the_pane_transition_before_run_mutation() {
+        let observation = crate::hook::provider::observation_from_json(
+            "codex",
+            "UserPromptSubmit",
+            r#"{"session_id":"session","turn_id":"turn","prompt":"hello"}"#,
+            EventId::parse(V2_EVENT_ID).unwrap(),
+            10,
+        )
+        .unwrap()
+        .unwrap();
+        let begin = PaneEvent::BeginRun {
+            started_at: 10,
+            prompt: Some(crate::pane_state::PromptState {
+                text: "hello".to_string(),
+                source: "user".to_string(),
+                digest: observation.prompt_digest.clone(),
+            }),
+        };
+        assert!(provider_event_matches_pane_event(&observation, &begin));
+        assert!(!provider_event_matches_pane_event(
+            &observation,
+            &PaneEvent::CompleteRun { completed_at: 10 }
+        ));
+
+        let stop = crate::hook::provider::observation_from_json(
+            "codex",
+            "Stop",
+            r#"{"session_id":"session","turn_id":"turn","last_assistant_message":"done"}"#,
+            EventId::parse(V2_EVENT_ID).unwrap(),
+            11,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(provider_event_matches_pane_event(
+            &stop,
+            &PaneEvent::ResponseAndCompleteRun {
+                completed_at: 11,
+                response: crate::pane_state::ResponseState {
+                    text: "done".to_string(),
+                    observed_at: 11,
+                },
+            }
+        ));
+        assert!(!provider_event_matches_pane_event(
+            &stop,
+            &PaneEvent::CompleteRun { completed_at: 11 }
+        ));
+    }
+
+    #[test]
+    fn claude_provider_observation_is_rejected_before_mutation() {
+        let root = test_root("claude-provider-rejection");
+        let coordinator = test_coordinator(&root, "c".repeat(64));
+        let observation = crate::hook::provider::observation_from_json(
+            "claude",
+            "Stop",
+            r#"{"session_id":"session","prompt_id":"prompt","last_assistant_message":"private"}"#,
+            v2_event_id(),
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let envelope = PaneEventEnvelope {
+            daemon_instance_id: v2_daemon_id(),
+            event_id: v2_event_id(),
+            pane_instance: PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 100,
+            },
+            agent: Some(crate::pane_state::AgentKind::parse("claude").unwrap()),
+            agent_session_id: Some(crate::pane_state::AgentSessionId::parse("session").unwrap()),
+            event: PaneEvent::ResponseAndCompleteRun {
+                completed_at: 1,
+                response: crate::pane_state::ResponseState {
+                    text: "private".to_string(),
+                    observed_at: 1,
+                },
+            },
+        };
+
+        assert!(matches!(
+            apply_external_provider_event(&coordinator, 1, envelope, observation),
+            ServerMessage::Error {
+                code: ErrorCode::UnsupportedProvider,
+                ..
+            }
+        ));
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn durable_provider_projection_redacts_prompt_and_response_bodies() {
+        let mut begin = PaneEvent::BeginRun {
+            started_at: 1,
+            prompt: Some(crate::pane_state::PromptState {
+                text: "private prompt".to_string(),
+                source: "user".to_string(),
+                digest: Some("a".repeat(64)),
+            }),
+        };
+        redact_pane_body(&mut begin);
+        assert_eq!(
+            begin,
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: None,
+            }
+        );
+
+        let mut stop = PaneEvent::ResponseAndCompleteRun {
+            completed_at: 2,
+            response: crate::pane_state::ResponseState {
+                text: "private response".to_string(),
+                observed_at: 2,
+            },
+        };
+        redact_pane_body(&mut stop);
+        assert_eq!(stop, PaneEvent::CompleteRun { completed_at: 2 });
+
+        let mut progress = PaneEvent::ProgressUpdated {
+            observed_at: 3,
+            operations: vec![
+                crate::pane_state::ProgressOperation::SetPrompt(crate::pane_state::PromptState {
+                    text: "private progress prompt".to_string(),
+                    source: "generic_hook".to_string(),
+                    digest: None,
+                }),
+                crate::pane_state::ProgressOperation::TaskCreated,
+            ],
+        };
+        redact_pane_body(&mut progress);
+        assert!(matches!(
+            progress,
+            PaneEvent::ProgressUpdated { operations, .. }
+                if operations == vec![crate::pane_state::ProgressOperation::TaskCreated]
+        ));
+
+        let mut report = PaneEvent::ExplicitStateReported {
+            report: crate::pane_state::ExplicitStateReport {
+                observed_at: 4,
+                lifecycle: None,
+                started_at: None,
+                completed_at: None,
+                prompt: Some(crate::pane_state::FieldUpdate::Set(
+                    crate::pane_state::PromptState {
+                        text: "private report prompt".to_string(),
+                        source: "generic_hook".to_string(),
+                        digest: None,
+                    },
+                )),
+                tasks: None,
+                subagents: None,
+                attention: false,
+            },
+        };
+        redact_pane_body(&mut report);
+        assert!(matches!(
+            report,
+            PaneEvent::ExplicitStateReported { report } if report.prompt.is_none()
+        ));
+    }
+
+    fn guarded_prompt_test_binding() -> crate::agent_state::AgentBinding {
+        crate::agent_state::AgentBinding {
+            server_identity: crate::daemon::topology::ServerIdentity {
+                pid: std::process::id(),
+                start_time: 424_242,
+            },
+            pane_instance: crate::pane_state::PaneInstance {
+                pane_id: "%4242".to_string(),
+                pane_pid: 42_424,
+            },
+            pane_state_id: crate::pane_state::StateId::parse("1".repeat(32)).unwrap(),
+            agent_epoch: 1,
+            agent_kind: crate::pane_state::AgentKind::parse("codex").unwrap(),
+            provider_session_id: crate::pane_state::AgentSessionId::parse("session-guarded")
+                .unwrap(),
+            process: crate::pane_state::AgentProcessIdentity {
+                pid: 52_424,
+                start_token: "guarded-process-start".to_string(),
+            },
+        }
+    }
+
+    fn guarded_prompt_test_operation(
+        binding: crate::agent_state::AgentBinding,
+    ) -> crate::agent_state::OperationRecord {
+        crate::agent_state::OperationRecord {
+            state_format_version: crate::agent_state::PRIVATE_STATE_FORMAT_VERSION,
+            generation: crate::agent_state::StateGeneration::parse("2".repeat(32)).unwrap(),
+            operation_id: crate::agent_state::OperationId::parse("operation_guarded_test").unwrap(),
+            revision: 1,
+            request_fingerprint: crate::agent_state::Sha256Digest::of(b"request"),
+            target_agent_ref: "vta1:guarded-target".to_string(),
+            prompt_digest: crate::agent_state::Sha256Digest::of(b"prompt"),
+            dispatch_option: "paste_enter".to_string(),
+            expected_pane_version: crate::pane_state::StateVersion {
+                state_id: binding.pane_state_id.clone(),
+                agent_epoch: binding.agent_epoch,
+                revision: 7,
+            },
+            expected_current_run: None,
+            expected_run_seq: 4,
+            confirmation_deadline_at: 20,
+            dispatch_state: crate::agent_state::DispatchState::Prepared,
+            run_id: None,
+            result_receipt: None,
+            created_at: 10,
+            updated_at: 10,
+            binding,
+        }
+    }
+
+    fn guarded_prompt_test_pane_state(
+        binding: &crate::agent_state::AgentBinding,
+    ) -> crate::pane_state::PaneState {
+        crate::pane_state::PaneState {
+            schema_version: crate::pane_state::PANE_STATE_SCHEMA_VERSION,
+            state_id: binding.pane_state_id.clone(),
+            revision: 7,
+            pane_instance: binding.pane_instance.clone(),
+            agent: binding.agent_kind.clone(),
+            agent_session_id: Some(binding.provider_session_id.clone()),
+            agent_process: Some(binding.process.clone()),
+            agent_epoch: binding.agent_epoch,
+            agent_present: true,
+            scan_verified: true,
+            synthetic_completion_armed: false,
+            lifecycle: crate::pane_state::LifecycleState::Idle,
+            run_seq: 3,
+            current_run: None,
+            completed_seq: 0,
+            unread: crate::pane_state::UnreadState::default(),
+            started_at: None,
+            completed_at: None,
+            prompt: None,
+            latest_response: None,
+            task_context: crate::pane_state::TaskContextState::default(),
+            tasks: crate::pane_state::TaskState::default(),
+            subagents: Vec::new(),
+            worktree_activity: None,
+            background_process: None,
+            listening_ports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn guarded_prompt_process_owner_rejections_cover_every_fail_closed_branch() {
+        let binding = guarded_prompt_test_binding();
+        let pane = binding.pane_instance.clone();
+
+        let replaced = crate::tmux::mock::MockTmuxRunner::new();
+        let mut other_process = binding.process.clone();
+        other_process.pid += 1;
+        replaced.stub_agent_process(
+            pane.pane_pid,
+            binding.agent_kind.as_str(),
+            Some(other_process),
+        );
+        assert_eq!(
+            verify_agent_prompt_process_and_owner(&replaced, &pane, &binding)
+                .unwrap_err()
+                .code,
+            "target_process_replaced"
+        );
+
+        let absent = crate::tmux::mock::MockTmuxRunner::new();
+        absent.stub_agent_process(pane.pane_pid, binding.agent_kind.as_str(), None);
+        assert_eq!(
+            verify_agent_prompt_process_and_owner(&absent, &pane, &binding)
+                .unwrap_err()
+                .code,
+            "target_process_absent"
+        );
+
+        let unverifiable = crate::tmux::mock::MockTmuxRunner::new();
+        assert_eq!(
+            verify_agent_prompt_process_and_owner(&unverifiable, &pane, &binding)
+                .unwrap_err()
+                .code,
+            "target_process_unverifiable"
+        );
+
+        let not_owner = crate::tmux::mock::MockTmuxRunner::new();
+        not_owner.stub_agent_process(
+            pane.pane_pid,
+            binding.agent_kind.as_str(),
+            Some(binding.process.clone()),
+        );
+        not_owner.stub_agent_input_owner(pane.pane_pid, binding.process.pid, false);
+        assert_eq!(
+            verify_agent_prompt_process_and_owner(&not_owner, &pane, &binding)
+                .unwrap_err()
+                .code,
+            "agent_not_input_owner"
+        );
+
+        let accepted = crate::tmux::mock::MockTmuxRunner::new();
+        accepted.stub_agent_process(
+            pane.pane_pid,
+            binding.agent_kind.as_str(),
+            Some(binding.process.clone()),
+        );
+        accepted.stub_agent_input_owner(pane.pane_pid, binding.process.pid, true);
+        verify_agent_prompt_process_and_owner(&accepted, &pane, &binding).unwrap();
+    }
+
+    #[test]
+    fn guarded_prompt_lock_binding_and_pane_preconditions_are_fail_closed() {
+        let binding = guarded_prompt_test_binding();
+        let pane = binding.pane_instance.clone();
+        let first = acquire_agent_prompt_dispatch_lock(&binding.server_identity, &pane).unwrap();
+        assert_eq!(
+            acquire_agent_prompt_dispatch_lock(&binding.server_identity, &pane)
+                .unwrap_err()
+                .code,
+            "dispatch_lock_busy"
+        );
+        drop(first);
+
+        let operation = guarded_prompt_test_operation(binding.clone());
+        assert!(prepared_operation_matches_target(
+            &operation,
+            &binding,
+            operation.expected_pane_version.clone(),
+            None,
+            operation.expected_run_seq,
+        ));
+        assert!(!prepared_operation_matches_target(
+            &operation,
+            &binding,
+            operation.expected_pane_version.clone(),
+            None,
+            operation.expected_run_seq + 1,
+        ));
+        assert_eq!(
+            prepared_target_rejection_code(true, None),
+            Some("target_no_longer_current")
+        );
+        assert_eq!(
+            prepared_target_rejection_code(true, Some(false)),
+            Some("binding_changed_before_dispatch")
+        );
+        assert_eq!(prepared_target_rejection_code(true, Some(true)), None);
+        assert_eq!(prepared_target_rejection_code(false, None), None);
+
+        let mut pane_state = guarded_prompt_test_pane_state(&binding);
+        assert!(agent_prompt_precondition_matches(&pane_state, &operation));
+        pane_state.revision += 1;
+        assert!(!agent_prompt_precondition_matches(&pane_state, &operation));
+    }
+
+    #[test]
     fn nvim_marker_parser_ignores_empty_and_malformed_values() {
         let output = "%6\u{1f}94451\u{1f}68736\n%8\u{1f}95025\u{1f}\ninvalid\n";
         assert_eq!(
@@ -5622,6 +7718,198 @@ mod tests {
                 views,
                 crate::sidebar::state::SidebarPreferences::default(),
             ));
+    }
+
+    #[test]
+    fn duplicate_operator_resolution_repairs_a_failed_completed_pane_projection() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::agent_state::{
+            AgentBinding, ExecutionPhase, PRIVATE_STATE_FORMAT_VERSION, ResolutionId,
+            ResolutionKind, RunEvidenceSummary, RunRecord, RunResolution, SemanticOutcome,
+            StableRunId, StateGeneration,
+        };
+        use crate::pane_state::{
+            AgentKind, AgentProcessIdentity, AgentSessionId, CurrentDurableRunProjection,
+            LifecycleState, PANE_STATE_SCHEMA_VERSION, PaneState, StateId, TaskContextState,
+            TaskState, UnreadState,
+        };
+
+        let root = test_root("operator-projection-repair");
+        let hash = "operator-projection-repair-hash";
+        let env = BTreeMap::from([(
+            "XDG_STATE_HOME".to_string(),
+            root.to_string_lossy().into_owned(),
+        )]);
+        let coordinator =
+            ProductionV2Coordinator::new(test_incarnation(&root, hash), env.clone(), None).unwrap();
+        let pane = PaneInstance {
+            pane_id: "%7".to_string(),
+            pane_pid: 77,
+        };
+        let state_id = StateId::parse("1".repeat(32)).unwrap();
+        let run_id = StableRunId::parse("2".repeat(32)).unwrap();
+        let agent = AgentKind::parse("codex").unwrap();
+        let session_id = AgentSessionId::parse("session-projection-repair").unwrap();
+        let process = AgentProcessIdentity {
+            pid: 88,
+            start_token: "process-start-token".to_string(),
+        };
+        let pane_state = PaneState {
+            schema_version: PANE_STATE_SCHEMA_VERSION,
+            state_id: state_id.clone(),
+            revision: 1,
+            pane_instance: pane.clone(),
+            agent: agent.clone(),
+            agent_session_id: Some(session_id.clone()),
+            agent_process: Some(process.clone()),
+            agent_epoch: 1,
+            agent_present: true,
+            scan_verified: true,
+            synthetic_completion_armed: false,
+            lifecycle: LifecycleState::Running,
+            run_seq: 1,
+            current_run: Some(CurrentDurableRunProjection {
+                run_id: run_id.as_str().to_string(),
+                run_seq: 1,
+                run_revision: 1,
+            }),
+            completed_seq: 0,
+            unread: UnreadState::default(),
+            started_at: Some(1),
+            completed_at: None,
+            prompt: None,
+            latest_response: None,
+            task_context: TaskContextState::default(),
+            tasks: TaskState::default(),
+            subagents: Vec::new(),
+            worktree_activity: None,
+            background_process: None,
+            listening_ports: Vec::new(),
+        };
+        let mut leased =
+            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
+                .unwrap();
+        leased
+            .hydrate(BTreeMap::from([(pane.clone(), pane_state.clone())]))
+            .unwrap();
+        *coordinator.state.lock().unwrap() =
+            Some(super::super::runtime::CanonicalCoordinatorState::new(
+                leased,
+                crate::daemon::topology::TopologySnapshot {
+                    server_identity: coordinator.incarnation.identity.clone(),
+                    panes: Vec::new(),
+                },
+                crate::daemon::view_hooks::CurrentClientViews::default(),
+                crate::sidebar::state::SidebarPreferences::default(),
+            ));
+        let run = RunRecord {
+            state_format_version: PRIVATE_STATE_FORMAT_VERSION,
+            generation: StateGeneration::parse("3".repeat(32)).unwrap(),
+            run_id,
+            run_seq: 1,
+            revision: 2,
+            binding: AgentBinding {
+                server_identity: coordinator.incarnation.identity.clone(),
+                pane_instance: pane.clone(),
+                pane_state_id: state_id,
+                agent_epoch: 1,
+                agent_kind: agent,
+                provider_session_id: session_id,
+                process,
+            },
+            provider_turn_key: Some("turn-projection-repair".to_string()),
+            operation_id: None,
+            execution_phase: ExecutionPhase::Ended,
+            semantic_outcome: SemanticOutcome::Completed,
+            evidence: RunEvidenceSummary::default(),
+            resolution: Some(RunResolution {
+                resolution_id: ResolutionId::parse("resolution_projection_repair").unwrap(),
+                kind: ResolutionKind::ProviderCompleted,
+                resolved_at: 2,
+                operator_audit: None,
+            }),
+            artifact: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        run.validate().unwrap();
+        assert!(pane_needs_durable_run_projection(&pane_state, &run).unwrap());
+        let mut newer_pane_run = pane_state.clone();
+        newer_pane_run.run_seq = 2;
+        newer_pane_run.current_run = Some(CurrentDurableRunProjection {
+            run_id: "4".repeat(32),
+            run_seq: 2,
+            run_revision: 1,
+        });
+        assert!(!pane_needs_durable_run_projection(&newer_pane_run, &run).unwrap());
+        let mut lagging_projection = pane_state.clone();
+        lagging_projection.run_seq = 0;
+        lagging_projection.current_run = None;
+        assert!(pane_needs_durable_run_projection(&lagging_projection, &run).unwrap());
+        let mut equal_sequence_without_pointer = pane_state.clone();
+        equal_sequence_without_pointer.current_run = None;
+        assert!(pane_needs_durable_run_projection(&equal_sequence_without_pointer, &run).unwrap());
+        let mut conflicting_projection = pane_state.clone();
+        conflicting_projection.current_run = Some(CurrentDurableRunProjection {
+            run_id: "4".repeat(32),
+            run_seq: 1,
+            run_revision: 1,
+        });
+        assert!(pane_needs_durable_run_projection(&conflicting_projection, &run).is_err());
+
+        let snapshot_dir = crate::daemon::lifecycle::incarnation_log_directory(&env, hash);
+        std::fs::create_dir_all(snapshot_dir.parent().unwrap()).unwrap();
+        std::fs::write(&snapshot_dir, b"block snapshot directory").unwrap();
+        assert!(project_operator_completed_run(&coordinator, &run).is_err());
+        {
+            let state = coordinator.state.lock().unwrap();
+            let unchanged = state
+                .as_ref()
+                .unwrap()
+                .leased
+                .runtime
+                .record(&pane)
+                .unwrap();
+            assert!(matches!(unchanged.lifecycle, LifecycleState::Running));
+            assert_eq!(unchanged.current_run.as_ref().unwrap().run_revision, 1);
+        }
+
+        std::fs::remove_file(&snapshot_dir).unwrap();
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::set_permissions(&snapshot_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        project_operator_completed_run(&coordinator, &run).unwrap();
+        let repaired_revision = {
+            let state = coordinator.state.lock().unwrap();
+            let repaired = state
+                .as_ref()
+                .unwrap()
+                .leased
+                .runtime
+                .record(&pane)
+                .unwrap();
+            assert!(matches!(repaired.lifecycle, LifecycleState::Idle));
+            assert_eq!(repaired.current_run.as_ref().unwrap().run_revision, 2);
+            repaired.revision
+        };
+        project_operator_completed_run(&coordinator, &run).unwrap();
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .leased
+                .runtime
+                .record(&pane)
+                .unwrap()
+                .revision,
+            repaired_revision
+        );
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6305,6 +8593,7 @@ mod tests {
                 reason: WaitReason::PermissionPrompt,
             },
             run_seq: 1,
+            current_run: None,
             completed_seq: 0,
             unread: UnreadState::default(),
             started_at: Some(1),

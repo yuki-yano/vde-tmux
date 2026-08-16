@@ -3,9 +3,12 @@ set -euo pipefail
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vde-agent-prompt.XXXXXX")"
 TMUX_SOCKET="vde-agent-prompt-$$"
-BIN="$PWD/target/debug/vt"
+BUILD_BIN="$PWD/target/debug/vt"
+BIN="$ROOT/bin/vt"
 FIXTURE="$PWD/scripts/fixtures/codex"
+FIXTURE_BUILDER="$PWD/scripts/fixtures/build-codex-embedded"
 PYTHON="/usr/bin/python3"
+CODEX_FIXTURE="$ROOT/bin/codex"
 PROMPT_FILE="$ROOT/prompt.txt"
 PROMPT_LOG="$ROOT/prompts.jsonl"
 CODEX_SESSION_ID="guarded-prompt-isolated"
@@ -29,18 +32,21 @@ export CODEX_TRANSCRIPT_PATH
 export VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET"
 export VT_BIN="$BIN"
 export PROMPT_LOG
-mkdir -p "$XDG_CONFIG_HOME/vde-tmux" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$(dirname "$CODEX_TRANSCRIPT_PATH")"
+mkdir -p "$XDG_CONFIG_HOME/vde-tmux" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$(dirname "$CODEX_FIXTURE")" "$(dirname "$CODEX_TRANSCRIPT_PATH")"
 printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"id\":\"$CODEX_SESSION_ID\",\"thread_source\":\"user\"}}" >"$CODEX_TRANSCRIPT_PATH"
 
+"$FIXTURE_BUILDER" "$CODEX_FIXTURE"
 cargo build --bin vt >/dev/null
+cp "$BUILD_BIN" "$BIN"
 tmux -L "$TMUX_SOCKET" -f /dev/null new-session -d -s guarded 'exec sleep 300'
+tmux -L "$TMUX_SOCKET" set-option -g remain-on-exit on
 TMUX_SOCKET_PATH="$(tmux -L "$TMUX_SOCKET" display-message -p '#{socket_path}')"
 TMUX_SERVER_PID="$(tmux -L "$TMUX_SOCKET" display-message -p '#{pid}')"
 export TMUX="$TMUX_SOCKET_PATH,$TMUX_SERVER_PID,0"
 
 "$BIN" daemon start >/dev/null
 PANE_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t guarded: '#{pane_id}')"
-tmux -L "$TMUX_SOCKET" respawn-pane -k -t "$PANE_ID" "exec '$PYTHON' '$FIXTURE'"
+tmux -L "$TMUX_SOCKET" respawn-pane -k -t "$PANE_ID" "exec '$CODEX_FIXTURE' '$FIXTURE'"
 
 AGENT_JSON=""
 for _ in $(seq 1 100); do
@@ -63,19 +69,21 @@ fi
 AGENT_REF="$("$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["result"]["agent"]["summary"]["agent_ref"])' <<<"$AGENT_JSON")"
 
 printf 'first line\nsecond line' >"$PROMPT_FILE"
-if ! RESULT="$("$BIN" agent prompt "$AGENT_REF" --prompt-file "$PROMPT_FILE" --confirm-timeout-ms 5000 --json 2>"$ROOT/prompt-error.json")"; then
+OPERATION_ID="isolated_prompt_$(printf '%08d' $$)"
+if ! RESULT="$("$BIN" agent prompt "$AGENT_REF" --operation-id "$OPERATION_ID" --prompt-file "$PROMPT_FILE" --confirm-timeout-ms 5000 --json 2>"$ROOT/prompt-error.json")"; then
   cat "$ROOT/prompt-error.json" >&2
   tmux -L "$TMUX_SOCKET" list-panes -a -F '#{pane_id} pid=#{pane_pid} dead=#{pane_dead} command=#{pane_current_command}' >&2 || true
   tmux -L "$TMUX_SOCKET" capture-pane -p -t "$PANE_ID" -S -100 >&2 || true
   "$BIN" agent get "$PANE_ID" --json >&2 || true
   exit 1
 fi
-"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); result=value["result"]; assert value["meta"]["api_version"] == 2; assert result["type"] == "agent_prompt"; assert result["dispatch"] == "submitted"; assert result["confirmation"] == "digest_matched"; assert result["observed_run_seq"] == result["receipt"]["expected_run_seq"]' <<<"$RESULT"
+"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); result=value["result"]; assert value["meta"]["api_version"] == 3; assert result["type"] == "agent_prompt"; assert result["operation"]["dispatch_state"] == "prompt_confirmed"; assert result["operation_ref"].startswith("vto3:"); assert result["run_ref"].startswith("vtr3:")' <<<"$RESULT"
 
-WAIT_REF="$("$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["result"]["wait_cursor"]["agent_ref"])' <<<"$RESULT")"
-AFTER="$("$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["result"]["wait_cursor"]["after_completed_seq"])' <<<"$RESULT")"
-WAIT_RESULT="$("$BIN" agent wait "$WAIT_REF" --until done --after-completed-seq "$AFTER" --timeout-ms 5000 --json)"
-"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); assert value["result"]["matched_status"] == "done"' <<<"$WAIT_RESULT"
+RUN_REF="$("$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["result"]["run_ref"])' <<<"$RESULT")"
+WAIT_RESULT="$("$BIN" agent run wait "$RUN_REF" --timeout-ms 5000 --json)"
+"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); result=value["result"]; assert result["run_ref"] == sys.argv[1]; assert result["run"]["execution_phase"] == "ended"; assert result["run"]["semantic_outcome"] == "completed"' "$RUN_REF" <<<"$WAIT_RESULT"
+RESPONSE_RESULT="$("$BIN" agent run response "$RUN_REF" --json)"
+"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); assert value["result"]["body"] == "isolated guarded prompt accepted"; assert value["result"]["metadata"]["store_completeness"] == "complete"' <<<"$RESPONSE_RESULT"
 
 "$PYTHON" - "$PROMPT_LOG" <<'PY'
 import json, sys
@@ -89,4 +97,4 @@ if tmux -L "$TMUX_SOCKET" list-buffers -F '#{buffer_name}' 2>/dev/null | grep -F
   exit 1
 fi
 
-echo "isolated guarded agent prompt, digest confirmation, wait cursor, and buffer cleanup ok"
+echo "isolated durable agent prompt, run wait, response artifact, and buffer cleanup ok"

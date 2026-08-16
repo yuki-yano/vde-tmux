@@ -1386,6 +1386,7 @@ mod tests {
             synthetic_completion_armed: false,
             lifecycle: LifecycleState::Idle,
             run_seq: 1,
+            current_run: None,
             completed_seq: 1,
             unread: UnreadState {
                 occurrence_seq: 1,

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Privacy-preserving Claude Code/Codex hook observation probe."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import stat
+import sys
+import time
+from pathlib import Path
+from typing import Any, Iterable
+
+
+MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
+ID_FIELDS = (
+    "session_id",
+    "conversation_id",
+    "thread_id",
+    "turn_id",
+    "prompt_id",
+    "event_id",
+    "uuid",
+    "cursor",
+    "transcript_cursor",
+    "sequence",
+    "turn_index",
+)
+BODY_FIELDS = {
+    "prompt": "prompt",
+    "last_assistant_message": "response",
+}
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def metric(value: str | bytes) -> dict[str, int | str]:
+    encoded = value.encode("utf-8") if isinstance(value, str) else value
+    return {
+        "byte_length": len(encoded),
+        "lf_count": encoded.count(b"\n"),
+        "sha256": sha256_bytes(encoded),
+    }
+
+
+def scalar_hash(value: Any) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (str, int, float)):
+        encoded = str(value).encode("utf-8")
+        return sha256_bytes(encoded)
+    return None
+
+
+def first_string(payload: dict[str, Any], field: str) -> str | None:
+    value = payload.get(field)
+    return value if isinstance(value, str) else None
+
+
+def content_text(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict):
+            text = item.get("text")
+            if isinstance(text, str) and item.get("type") in {
+                None,
+                "text",
+                "output_text",
+            }:
+                parts.append(text)
+    return "".join(parts) if parts else None
+
+
+def assistant_candidates(value: Any) -> Iterable[str]:
+    if isinstance(value, list):
+        for item in value:
+            yield from assistant_candidates(item)
+        return
+    if not isinstance(value, dict):
+        return
+
+    if value.get("role") == "assistant":
+        text = content_text(value.get("content"))
+        if text is not None:
+            yield text
+
+    message = value.get("message")
+    if isinstance(message, dict) and message.get("role") == "assistant":
+        text = content_text(message.get("content"))
+        if text is not None:
+            yield text
+
+    for nested in value.values():
+        if nested is not message:
+            yield from assistant_candidates(nested)
+
+
+def latest_transcript_response(payload: dict[str, Any]) -> str | None:
+    raw_path = payload.get("transcript_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    path = Path(raw_path)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024 * 1024:
+            return None
+        with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+            descriptor = -1
+            latest = None
+            for line in source:
+                try:
+                    value = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                for candidate in assistant_candidates(value):
+                    latest = candidate
+            return latest
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def append_private_jsonl(path: Path, value: dict[str, Any]) -> None:
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError("probe output is not a regular file")
+        if info.st_uid != os.getuid():
+            raise RuntimeError("probe output is not owned by the current user")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            raise RuntimeError("probe output permissions must be 0600")
+        encoded = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            if written == 0:
+                raise RuntimeError("short write while appending probe observation")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--provider", choices=("claude", "codex"), required=True)
+    parser.add_argument("--provider-version", required=True)
+    parser.add_argument("--git-head", required=True)
+    parser.add_argument(
+        "--event",
+        choices=("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"),
+        required=True,
+    )
+    parser.add_argument("--mode", choices=("fail-first", "collector"), required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if not args.event or any(character in args.event for character in "\r\n"):
+        print("invalid event name", file=sys.stderr)
+        return 64
+    if any(character in args.provider_version for character in "\r\n"):
+        print("invalid provider version", file=sys.stderr)
+        return 64
+    if len(args.git_head) not in {40, 64} or not all(
+        character in "0123456789abcdef" for character in args.git_head.lower()
+    ):
+        print("invalid git HEAD", file=sys.stderr)
+        return 64
+
+    payload_bytes = sys.stdin.buffer.read(MAX_PAYLOAD_BYTES + 1)
+    if len(payload_bytes) > MAX_PAYLOAD_BYTES:
+        print("hook payload exceeds probe limit", file=sys.stderr)
+        return 65
+    try:
+        decoded = payload_bytes.decode("utf-8")
+        payload = json.loads(decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+
+    observation: dict[str, Any] = {
+        "provider": args.provider,
+        "provider_version": args.provider_version,
+        "git_head": args.git_head.lower(),
+        "event": f"{args.event}:{args.mode}",
+        "monotonic_ns": time.monotonic_ns(),
+        "input": metric(payload_bytes),
+    }
+    if isinstance(payload, dict):
+        for source_field, metric_name in BODY_FIELDS.items():
+            body = first_string(payload, source_field)
+            if body is not None:
+                observation[metric_name] = metric(body)
+
+        response = latest_transcript_response(payload)
+        if response is not None:
+            observation["transcript_response"] = metric(response)
+
+        stable_id_hashes = {
+            field: hashed
+            for field in ID_FIELDS
+            if (hashed := scalar_hash(payload.get(field))) is not None
+        }
+        if stable_id_hashes:
+            observation["stable_id_hashes"] = stable_id_hashes
+
+    append_private_jsonl(args.output, observation)
+    if payload is None:
+        print("hook payload was not a JSON object", file=sys.stderr)
+        return 65
+    return 23 if args.mode == "fail-first" else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

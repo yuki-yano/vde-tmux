@@ -1979,6 +1979,7 @@ mod tests {
                 synthetic_completion_armed: false,
                 lifecycle,
                 run_seq: 1,
+                current_run: None,
                 completed_seq: 0,
                 unread: crate::pane_state::UnreadState::default(),
                 started_at: Some(60),
