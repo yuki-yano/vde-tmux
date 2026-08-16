@@ -64,6 +64,7 @@ pub struct SidebarState {
     pub return_target: Option<crate::pane_state::PaneInstance>,
     pub current_session_id: Option<String>,
     pub current_category: Option<String>,
+    pub current_agents: BTreeSet<crate::pane_state::PaneInstance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -733,6 +733,66 @@ mod local_state_tests {
     }
 
     #[test]
+    fn current_agent_tracks_exact_focus_and_clears_on_non_agent_panes() {
+        let first = resolved_pane("%1", 10, "$1");
+        let mut second = resolved_pane("%2", 20, "$2");
+        second.active = false;
+        second.session_links[0].window_active = false;
+        let mut non_agent = pane(90);
+        non_agent.pane_instance.pane_id = "%9".to_string();
+        non_agent.active = false;
+        let mut snapshot = ResolvedSnapshot {
+            panes: vec![first.clone(), second.clone(), non_agent.clone()],
+            ..snapshot(10)
+        };
+        snapshot.sidebar_model.active_sessions = BTreeSet::from(["$1".to_string()]);
+        let mut state = SidebarState::default();
+
+        assert!(refresh_current_agents(&snapshot, &mut state));
+        assert_eq!(
+            state.current_agents,
+            BTreeSet::from([first.pane_instance.clone()])
+        );
+        assert!(!refresh_current_agents(&snapshot, &mut state));
+
+        snapshot.panes[1].active = true;
+        snapshot.panes[1].session_links[0].window_active = true;
+        snapshot.sidebar_model.active_sessions =
+            BTreeSet::from(["$1".to_string(), "$2".to_string()]);
+        assert!(refresh_current_agents(&snapshot, &mut state));
+        assert_eq!(
+            state.current_agents,
+            BTreeSet::from([first.pane_instance.clone(), second.pane_instance.clone()])
+        );
+
+        snapshot.panes[0].active = false;
+        snapshot.panes[1].active = false;
+        snapshot.panes[2].active = true;
+        snapshot.sidebar_model.active_sessions = BTreeSet::from(["$1".to_string()]);
+        assert!(refresh_current_agents(&snapshot, &mut state));
+        assert!(state.current_agents.is_empty());
+
+        snapshot.panes[1].active = true;
+        snapshot.panes[1].session_links[0].window_active = true;
+        snapshot.panes[2].active = false;
+        snapshot.sidebar_model.active_sessions = BTreeSet::from(["$2".to_string()]);
+        assert!(refresh_current_agents(&snapshot, &mut state));
+        assert_eq!(
+            state.current_agents,
+            BTreeSet::from([second.pane_instance.clone()])
+        );
+
+        snapshot.panes[1]
+            .resolved
+            .as_mut()
+            .expect("second pane is an agent")
+            .canonical
+            .agent_present = false;
+        assert!(refresh_current_agents(&snapshot, &mut state));
+        assert!(state.current_agents.is_empty());
+    }
+
+    #[test]
     fn direct_agent_match_wins_over_same_session_fallback() {
         let first = resolved_pane("%2", 20, "$1");
         let direct = resolved_pane("%3", 30, "$1");
@@ -2840,6 +2900,7 @@ fn run_loop<B: Backend>(
         }
         if let Some(snapshot) = current.as_ref() {
             render_gate.mark_dirty_if(refresh_current_category(snapshot, &mut sidebar_state));
+            render_gate.mark_dirty_if(refresh_current_agents(snapshot, &mut sidebar_state));
             render_gate.mark_dirty_if(clear_stale_pane_selection(snapshot, &mut sidebar_state));
         }
         render_gate.mark_dirty_if(drain_mark_complete_results(&mark_result_rx, &mut mark_ui));
@@ -3456,6 +3517,34 @@ fn refresh_current_category(snapshot: &ResolvedSnapshot, state: &mut SidebarStat
         return false;
     }
     state.current_category = next;
+    state.version = state.version.saturating_add(1);
+    true
+}
+
+fn refresh_current_agents(snapshot: &ResolvedSnapshot, state: &mut SidebarState) -> bool {
+    let next = snapshot
+        .panes
+        .iter()
+        .filter(|pane| {
+            pane.active
+                && pane
+                    .resolved
+                    .as_ref()
+                    .is_some_and(|resolved| resolved.canonical.agent_present)
+                && pane.session_links.iter().any(|link| {
+                    link.window_active
+                        && snapshot
+                            .sidebar_model
+                            .active_sessions
+                            .contains(&link.session_id)
+                })
+        })
+        .map(|pane| pane.pane_instance.clone())
+        .collect::<BTreeSet<_>>();
+    if state.current_agents == next {
+        return false;
+    }
+    state.current_agents = next;
     state.version = state.version.saturating_add(1);
     true
 }

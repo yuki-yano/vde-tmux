@@ -800,13 +800,14 @@ fn render_closed_chat_summary_line(
     theme: &SidebarRenderTheme,
 ) -> Line<'static> {
     let selected = row_is_selected(row, state);
+    let current_agent = row_is_current_agent(row, state);
     let indent = "  ".repeat(row.depth);
     let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
     let glyph = theme.badge_glyph(badge_state);
     let agent_source = chat_agent_label(row);
 
     let mut prefix = Vec::new();
-    push_leading_marker_span(&mut prefix, row, selected, theme, &indent);
+    push_leading_marker_span(&mut prefix, row, current_agent, theme, &indent);
     prefix.push(pin_marker_span(row, state, theme));
     prefix.push(Span::styled("▸ ".to_string(), toggle_marker_style(theme)));
     prefix.push(Span::styled(
@@ -908,7 +909,7 @@ fn render_row_line(
     theme: &SidebarRenderTheme,
 ) -> Line<'static> {
     let selected = row_is_selected(row, state);
-    let selected_marker = selected && row.kind != SidebarRowKind::Detail;
+    let current_agent_marker = row.kind == SidebarRowKind::Chat && row_is_current_agent(row, state);
     if row.kind == SidebarRowKind::Zone {
         let text = truncate_display(
             &format!(" ▍{} {}", row.label, row.chat_count),
@@ -981,7 +982,7 @@ fn render_row_line(
     let mut spans = Vec::new();
     if row.kind == SidebarRowKind::Chat {
         let marker = if row.expanded { "▾" } else { "▸" };
-        push_leading_marker_span(&mut spans, row, selected_marker, theme, &indent);
+        push_leading_marker_span(&mut spans, row, current_agent_marker, theme, &indent);
         spans.push(pin_marker_span(row, state, theme));
         spans.push(Span::styled(
             format!("{marker} "),
@@ -989,19 +990,19 @@ fn render_row_line(
         ));
     } else if matches!(row.kind, SidebarRowKind::Category | SidebarRowKind::Repo) {
         let marker = if row.expanded { "▾" } else { "▸" };
-        push_leading_marker_span(&mut spans, row, selected_marker, theme, &indent);
+        push_leading_marker_span(&mut spans, row, current_agent_marker, theme, &indent);
         spans.push(Span::styled(
             format!("{marker} "),
             toggle_marker_style(theme),
         ));
     } else if row.kind == SidebarRowKind::Detail && row.id.starts_with("meta::") {
-        push_leading_marker_span(&mut spans, row, selected_marker, theme, &indent);
+        push_leading_marker_span(&mut spans, row, current_agent_marker, theme, &indent);
         spans.push(Span::styled(
             "  ".to_string(),
             Style::default().fg(theme.marker),
         ));
     } else {
-        push_leading_marker_span(&mut spans, row, selected_marker, theme, &head);
+        push_leading_marker_span(&mut spans, row, current_agent_marker, theme, &head);
     }
     if let Some((glyph, color)) = badge {
         spans.push(Span::styled(glyph, badge_style(color, row)));
@@ -1070,14 +1071,22 @@ fn row_is_selected(row: &SidebarRow, state: &SidebarState) -> bool {
     crate::sidebar::tree::pane_instance_from_row_id(&row.id).as_ref() == Some(&selected_pane)
 }
 
+fn row_is_current_agent(row: &SidebarRow, state: &SidebarState) -> bool {
+    if row.kind != SidebarRowKind::Chat {
+        return false;
+    }
+    crate::sidebar::tree::pane_instance_from_row_id(&row.id)
+        .is_some_and(|pane| state.current_agents.contains(&pane))
+}
+
 fn push_leading_marker_span(
     spans: &mut Vec<Span<'static>>,
     row: &SidebarRow,
-    selected: bool,
+    current_agent: bool,
     theme: &SidebarRenderTheme,
     tail: &str,
 ) {
-    spans.push(row_leading_marker_span(row, selected, theme));
+    spans.push(row_leading_marker_span(row, current_agent, theme));
     if !tail.is_empty() {
         spans.push(Span::styled(
             tail.to_string(),
@@ -1088,10 +1097,10 @@ fn push_leading_marker_span(
 
 fn row_leading_marker_span(
     row: &SidebarRow,
-    selected: bool,
+    current_agent: bool,
     theme: &SidebarRenderTheme,
 ) -> Span<'static> {
-    let (marker, style) = match (row.active, selected) {
+    let (marker, style) = match (row.active, current_agent) {
         (_, true) => (
             "▎",
             Style::default()
@@ -1398,7 +1407,7 @@ fn render_group_dense_line(
     if selected {
         style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
     }
-    leading_marker_line(row, selected, theme, pad_to_width(text, width), style)
+    leading_marker_line(row, false, theme, pad_to_width(text, width), style)
 }
 
 fn render_chat_dense_line(
@@ -1408,6 +1417,7 @@ fn render_chat_dense_line(
     theme: &SidebarRenderTheme,
 ) -> Line<'static> {
     let selected = state.selection.as_deref() == Some(row.id.as_str());
+    let current_agent = row_is_current_agent(row, state);
     let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
     let glyph = theme.badge_glyph(badge_state);
     let agent_source = row
@@ -1462,7 +1472,7 @@ fn render_chat_dense_line(
     if row_flash(row) {
         right_status_style = right_status_style.add_modifier(Modifier::REVERSED);
     }
-    let mut spans = vec![row_leading_marker_span(row, selected, theme)];
+    let mut spans = vec![row_leading_marker_span(row, current_agent, theme)];
     if show_pin_cell {
         spans.push(pin_marker_span(row, state, theme));
     }
@@ -1494,17 +1504,17 @@ fn render_chat_dense_line(
 
 fn leading_marker_line(
     row: &SidebarRow,
-    selected: bool,
+    current_agent: bool,
     theme: &SidebarRenderTheme,
     text: String,
     style: Style,
 ) -> Line<'static> {
-    if !row.active && !selected {
+    if !row.active && !current_agent {
         return Line::from(Span::styled(text, style));
     }
     let rest = text.chars().skip(1).collect::<String>();
     Line::from(vec![
-        row_leading_marker_span(row, selected, theme),
+        row_leading_marker_span(row, current_agent, theme),
         Span::styled(rest, style),
     ])
 }
@@ -1525,7 +1535,7 @@ fn render_micro_lines(
         let glyph = theme.badge_glyph(badge_state);
         let right = right_label(row).unwrap_or_default();
         let selected = state.selection.as_deref() == Some(row.id.as_str());
-        let marker = row_leading_marker_span(row, selected, theme);
+        let marker = row_leading_marker_span(row, row_is_current_agent(row, state), theme);
         let pinned = row_pinned(row);
         let pin_width = usize::from(pinned);
         let text = if right.is_empty() {
@@ -1623,7 +1633,7 @@ fn render_rail_lines(
             style
         };
         lines.push(Line::from(vec![
-            row_leading_marker_span(row, selected, theme),
+            row_leading_marker_span(row, row_is_current_agent(row, state), theme),
             Span::styled(visible_glyph.to_string(), glyph_style),
         ]));
         row_indices.push(Some(index));
@@ -2141,6 +2151,8 @@ fn slice_display(text: &str, start: u16, end: u16) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::hook::RollupLevel;
     use crate::sidebar::state::SidebarState;
@@ -2569,7 +2581,7 @@ mod tests {
     }
 
     #[test]
-    fn render_rows_includes_selection_indentation_and_rollup() {
+    fn render_rows_includes_current_agent_indentation_and_rollup() {
         let rows = vec![
             row(
                 "repo::misc::app",
@@ -2579,7 +2591,7 @@ mod tests {
                 RollupLevel::Running,
             ),
             row(
-                "chat::%1",
+                "chat::%1::10",
                 SidebarRowKind::Chat,
                 1,
                 "codex %1",
@@ -2587,7 +2599,11 @@ mod tests {
             ),
         ];
         let state = SidebarState {
-            selection: Some("chat::%1".to_string()),
+            selection: Some("chat::%1::10".to_string()),
+            current_agents: BTreeSet::from([crate::pane_state::PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 10,
+            }]),
             ..SidebarState::default()
         };
 
@@ -2844,7 +2860,7 @@ sidebar:
         let mut category = category_row("dev", RollupLevel::Idle);
         category.active = true;
         let mut chat = row(
-            "chat::%1",
+            "chat::%1::10",
             SidebarRowKind::Chat,
             1,
             "codex: active prompt",
@@ -2877,7 +2893,11 @@ sidebar:
         assert_eq!(lines[2].style.bg, None);
 
         let selected = SidebarState {
-            selection: Some("chat::%1".to_string()),
+            selection: Some("chat::%1::10".to_string()),
+            current_agents: BTreeSet::from([crate::pane_state::PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 10,
+            }]),
             ..SidebarState::default()
         };
         let selected_lines = render_lines(&[chat], &selected, 40, &theme);
@@ -2935,7 +2955,7 @@ sidebar:
         assert_eq!(lines[0].style.bg, Some(theme.selection_bg));
         assert_eq!(lines[1].style.bg, Some(theme.selection_bg));
         assert_eq!(lines[2].style.bg, None);
-        assert_eq!(line_to_string(lines[0].clone()).chars().next(), Some('▎'));
+        assert_eq!(line_to_string(lines[0].clone()).chars().next(), Some(' '));
         assert_eq!(line_to_string(lines[1].clone()).chars().next(), Some(' '));
     }
 
@@ -4101,7 +4121,7 @@ badge:
     }
 
     #[test]
-    fn selected_rows_have_a_selection_bar_marker_and_horizontal_padding() {
+    fn selected_group_uses_background_without_a_current_agent_marker() {
         let rows = vec![row(
             "repo::misc::app",
             SidebarRowKind::Repo,
@@ -4114,20 +4134,23 @@ badge:
             ..SidebarState::default()
         };
         let rendered = render_rows(&rows, &state, 40);
-        assert!(rendered.starts_with("▎▾ app"), "{rendered:?}");
+        assert!(rendered.starts_with(" ▾ app"), "{rendered:?}");
         assert_eq!(display_width(&rendered), 40, "{rendered:?}");
     }
 
     #[test]
-    fn selected_chat_has_a_selection_bar_marker_in_every_width_tier() {
+    fn current_agent_has_a_yellow_marker_in_every_width_tier() {
         let chat = chat_row(
-            "chat::%1",
+            "chat::%1::10",
             "codex",
             RollupLevel::Running,
             BadgeState::Working,
         );
         let state = SidebarState {
-            selection: Some("chat::%1".to_string()),
+            current_agents: BTreeSet::from([crate::pane_state::PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 10,
+            }]),
             ..SidebarState::default()
         };
 
@@ -4151,13 +4174,46 @@ badge:
     }
 
     #[test]
+    fn selected_chat_without_a_current_agent_has_no_yellow_marker() {
+        let chat = chat_row(
+            "chat::%1::10",
+            "codex",
+            RollupLevel::Running,
+            BadgeState::Working,
+        );
+        let state = SidebarState {
+            selection: Some("chat::%1::10".to_string()),
+            ..SidebarState::default()
+        };
+        let theme = SidebarRenderTheme::default();
+
+        let lines = render_lines(&[chat], &state, 40, &theme);
+
+        assert_eq!(lines[0].style.bg, Some(theme.selection_bg));
+        assert!(
+            lines.iter().flat_map(|line| &line.spans).all(|span| {
+                span.content != "▎" || span.style.fg != Some(theme.selection_bar)
+            })
+        );
+    }
+
+    #[test]
     fn boundary_width_ascii_cjk_emoji_golden() {
         let state = SidebarState {
-            selection: Some("chat::%1".to_string()),
+            selection: Some("chat::%1::10".to_string()),
+            current_agents: BTreeSet::from([crate::pane_state::PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 10,
+            }]),
             ..SidebarState::default()
         };
         for label in ["Codex: fix sidebar", "Codex: 修正確認", "Codex: fix 🧭✨"] {
-            let mut chat = chat_row("chat::%1", label, RollupLevel::Running, BadgeState::Working);
+            let mut chat = chat_row(
+                "chat::%1::10",
+                label,
+                RollupLevel::Running,
+                BadgeState::Working,
+            );
             chat.expanded = false;
             chat.pane_id = Some("%1".to_string());
             chat.meta = Some(crate::sidebar::tree::RowMeta {
@@ -4459,7 +4515,7 @@ badge:
                 .iter()
                 .all(|line| { line.style.bg == Some(SidebarRenderTheme::default().selection_bg) })
         );
-        assert_eq!(line_to_string(lines[0].clone()).chars().next(), Some('▎'));
+        assert_eq!(line_to_string(lines[0].clone()).chars().next(), Some(' '));
         assert_eq!(line_to_string(lines[1].clone()).chars().next(), Some(' '));
         assert!(line_to_string(lines[0].clone()).ends_with("8m42s "));
         assert_span_fg(

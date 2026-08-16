@@ -686,13 +686,13 @@ rollbackはquiesced状態で旧binaryとoperator backupを戻す運用手順と�
 
 ## Pre-cutover evidence (2026-08-16)
 
-- release candidate: `vt` SHA-256 `808893fa32fbef61302939a7bcdbc0cbdd6a69a0cef3e85e70f1c70401f9076f`
-- release candidate: `vde-tmux` SHA-256 `44c0d10885079630b5d40dc95bb6bff6416ff9a001da90c41a8c94b50ff85a72`
+- release candidate: `vt` SHA-256 `5d396e41f8b39c1703784bf8e3e648cbb605621c7714ae4a036843f42e6ae11a`
+- release candidate: `vde-tmux` SHA-256 `c02439143e18ce27471b03c3b48a48cc507d5b3ed008b5f29dca9f4e3a7e153c`
 - candidate schema: Agent API 3、daemon protocol 15、PaneState 9、private state 1
 - provider contract: Codex 0.147.0はenabled、Claude Code 2.1.227はauthenticated P0未完了のためdisabled
-- source gates: format、Clippy、通常test 1,034件、ignored tmux test 2件が成功
+- source gates: format、Clippy、通常test 1,036件、ignored tmux test 2件が成功
 - isolated gates: 3本のrelease smoke、prompt smoke、operation crash smoke、P0 verify、staged install、external hook integrationが成功
-- runtime smokeのcategory warm switchは33回でp95 95.4ms、max 97.6ms。125msの性能gateを維持したままsemantic waitだけを最大5秒へ分離
+- runtime smokeのcategory warm switchは33回でp95 99.8ms、max 101.7ms。125msの性能gateを維持したままsemantic waitだけを最大5秒へ分離
 - independent review R1: `MUST_FIX=0`、`MUST_SIMPLIFY=0`。R1のshould-fix 7件とnit 4件は修正・回帰検証済み。R2はreviewerの利用上限到達により未回収のため、完了済みとは扱わない
 - 常用serverは意図的に未変更。確認時点ではv14 daemon、API v2、working Agent 3件（`%3`、`%6`、`%45`）、sidebar 15件のため、quiesce前のinstallを実施していない
 
@@ -717,6 +717,7 @@ rollbackはquiesced状態で旧binaryとoperator backupを戻す運用手順と�
 - [x] `api schema`と`agent storage status`がprovider contract、generation、state format、usage、hard limitをmachine-readableに返す。
 - [x] vde-monitor raw hookとvde-notifier通知を維持し、unsupported providerへraw tmux fallbackしない。
 - [x] Claude CodeとCodexの利用上限を`blocked` / `waiting` / `usage_limit`として公開し、process終了後もopen runとAgent Summaryを保持する。
+- [x] sidebarの黄色いcurrent-agent markerがpane、session、category移動へ追従し、focus先がlive agentでない場合は消える。
 
 ### テスト完了条件
 
@@ -738,12 +739,14 @@ rollbackはquiesced状態で旧binaryとoperator backupを戻す運用手順と�
 - [x] dotfiles bridge、vde-monitor、vde-notifierをscratch環境で回帰確認する。
 - [x] 独立レビューでmust-fixとmust-simplifyが0件になる。
 - [x] Claude Codeのrate-limit hook、Claude Code/Codexの厳密なlimit文、誤検知除外、scan throttle、process終了後の状態保持をunit testで検証する。
+- [x] current-agent markerのexact pane解決、non-agent消灯、複数幅tierの色、selectionとの分離をunit testとUI/UX preflightで検証する。
 
 ### 運用反映条件
 
 - [x] P0結果、adapter有効化判断、Response Artifact source、candidate limitのfreeze結果を記録する。
 - [x] API、daemon protocol、PaneState、private state formatのversionをrelease文書へ記載する。
 - [x] Claude Codeの`StopFailure` hook設定、`usage_limit`のJSON表現、原文確認と回復の運用経路をREADMEへ記載する。
+- [x] sidebarのactive-session、current-agent、keyboard selectionの視覚的な役割をREADMEへ記載する。
 - [ ] in-flight operation、active execution、waitが0であることを記録する。
 - [ ] `delivery_unknown`とunresolved runをoperatorが確認し、旧generationのsupported-provider sessionを終了する。
 - [ ] 必要なexternal backupとoffline resetの結果を記録する。

@@ -684,14 +684,33 @@ record sidebar-open-focus PASS-explicit-open-selects-created-sidebar
 REVISION_BEFORE_LOCAL="$(stable_snapshot_revision)"
 capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-before.txt"
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-before.txt"
-SIDE2_STABLE="$(fingerprint "$ARTIFACT_DIR/sidebar-2-before.txt")"
+query_snapshot
+cp "$QUERY_JSON" "$ARTIFACT_DIR/sidebar-navigation-before.json"
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input j
-sleep 0.15
+for _ in $(seq 1 60); do
+  query_snapshot
+  if python3 - "$ARTIFACT_DIR/sidebar-navigation-before.json" "$QUERY_JSON" <<'PY'
+import json, sys
+before = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["navigation"]
+after = json.load(open(sys.argv[2], encoding="utf-8"))["snapshot"]["sidebar_model"]["navigation"]
+raise SystemExit(0 if after["revision"] > before["revision"] and after["selection"] != before["selection"] else 1)
+PY
+  then
+    break
+  fi
+  sleep 0.05
+done
+cp "$QUERY_JSON" "$ARTIFACT_DIR/sidebar-navigation-after.json"
+python3 - "$ARTIFACT_DIR/sidebar-navigation-before.json" "$ARTIFACT_DIR/sidebar-navigation-after.json" <<'PY'
+import json, sys
+before = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["navigation"]
+after = json.load(open(sys.argv[2], encoding="utf-8"))["snapshot"]["sidebar_model"]["navigation"]
+assert after["revision"] > before["revision"], (before, after)
+assert after["selection"] != before["selection"], (before, after)
+PY
 capture_sidebar_normalized "$SIDEBAR_1" "$ARTIFACT_DIR/sidebar-1-selection.txt"
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-selection.txt"
-[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-1-selection.txt")" != "$(fingerprint "$ARTIFACT_DIR/sidebar-1-before.txt")" ]]
-[[ "$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-selection.txt")" != "$SIDE2_STABLE" ]]
 SIDE2_SHARED_SELECTION="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-selection.txt")"
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input "toggle:chat::$S2_AGENT::$S2_AGENT_PID"

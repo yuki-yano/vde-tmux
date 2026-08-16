@@ -283,7 +283,11 @@ vt sidebar close
 | `J` / `K` | Change manual ordering |
 | `q` / `Esc` | Close the sidebar |
 
-Agents belonging to the active session have a `▎` marker on the left.
+Agents belonging to an active session have a cyan `▎` marker on the left. The exact agent pane
+focused by an eligible tmux client uses the yellow `selection_bar` color instead; this marker follows
+pane, session, and category changes and disappears when the focused pane is not a live agent.
+Keyboard selection remains visible through the row background and does not create a current-agent
+marker by itself.
 Click the first rendered line of an agent to expand or collapse it. Click its
 second or later line to jump to the agent pane without selecting it first.
 Use `Space` to expand or collapse the selected agent from the keyboard.
