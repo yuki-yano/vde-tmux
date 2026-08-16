@@ -204,6 +204,10 @@ pub fn build_rows_from_presentations(
                 crate::pane_state::WaitReason::PermissionPrompt => {
                     (RollupLevel::Permission, "permission_prompt".to_string())
                 }
+                reason if reason.is_usage_limit() => (
+                    RollupLevel::Waiting,
+                    crate::pane_state::USAGE_LIMIT_WAIT_REASON.to_string(),
+                ),
                 crate::pane_state::WaitReason::Other(reason) => {
                     (RollupLevel::Waiting, reason.clone())
                 }

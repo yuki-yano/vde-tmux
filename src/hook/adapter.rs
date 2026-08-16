@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::detect::detect_usage_limit;
 use crate::hook::origin::{HookOrigin, claude_hook_origin, codex_hook_origin_from_payload};
 use crate::pane_state::{
     AgentKind, AgentSessionId, AgentSessionSource, BODY_MAX_BYTES, DaemonInstanceId, EventId,
@@ -111,6 +112,11 @@ pub fn claude_typed_event_from_json(
             payload.last_assistant_message.as_deref(),
             context.observed_at,
         ),
+        "StopFailure" if claude_stop_failure_is_usage_limit(&payload) => PaneEvent::WaitRequested {
+            observed_at: context.observed_at,
+            reason: WaitReason::usage_limit(),
+        },
+        "StopFailure" => return Ok(None),
         _ => return Ok(None),
     };
     Ok(Some(context.envelope(
@@ -310,6 +316,7 @@ fn parse_session_source(source: Option<&str>) -> Result<AgentSessionSource> {
 fn parse_wait_reason(reason: Option<&str>) -> Result<WaitReason> {
     match reason {
         Some("permission_prompt") => Ok(WaitReason::PermissionPrompt),
+        Some("usage_limit") => Ok(WaitReason::usage_limit()),
         Some(reason) if reason.starts_with("other:") => {
             let reason = normalize_text(&reason["other:".len()..]);
             let parsed = WaitReason::Other(reason);
@@ -317,7 +324,7 @@ fn parse_wait_reason(reason: Option<&str>) -> Result<WaitReason> {
             Ok(parsed)
         }
         _ => bail!(
-            "InvalidRequest: waiting status requires permission_prompt or other:<text> wait reason"
+            "InvalidRequest: waiting status requires permission_prompt, usage_limit, or other:<text> wait reason"
         ),
     }
 }
@@ -361,6 +368,10 @@ fn normalize_subagents(subagents: &mut [SubagentState]) {
 #[derive(Debug, Deserialize, Default)]
 struct ClaudeHookPayload {
     agent_transcript_path: Option<String>,
+    error: Option<String>,
+    error_details: Option<String>,
+    error_message: Option<String>,
+    error_type: Option<String>,
     hook_event_name: Option<String>,
     last_assistant_message: Option<String>,
     notification_type: Option<String>,
@@ -387,10 +398,25 @@ fn is_guarded_claude_lifecycle_event(event: &str) -> bool {
         "UserPromptSubmit"
             | "SessionStart"
             | "Stop"
+            | "StopFailure"
             | "Notification"
             | "PreToolUse"
             | "PostToolUse"
     )
+}
+
+fn claude_stop_failure_is_usage_limit(payload: &ClaudeHookPayload) -> bool {
+    if payload.error_type.as_deref() == Some("rate_limit") {
+        return true;
+    }
+    [
+        payload.error.as_deref(),
+        payload.error_details.as_deref(),
+        payload.error_message.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(detect_usage_limit)
 }
 
 fn is_guarded_codex_lifecycle_event(event: &str) -> bool {
@@ -568,6 +594,39 @@ mod tests {
             assert_eq!(envelope.agent_session_id.unwrap().as_str(), "session-1");
             assert_eq!(envelope.event, expected);
         }
+    }
+
+    #[test]
+    fn claude_stop_failure_maps_rate_limit_to_usage_limit_wait() {
+        let payload = r#"{"session_id":"session-1","error_type":"rate_limit","error_message":"too many requests"}"#;
+        let envelope = claude_typed_event_from_json("StopFailure", payload, &typed_context())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            envelope.event,
+            PaneEvent::WaitRequested {
+                observed_at: 123,
+                reason: WaitReason::usage_limit(),
+            }
+        );
+    }
+
+    #[test]
+    fn claude_stop_failure_ignores_non_limit_failures() {
+        let payload =
+            r#"{"session_id":"session-1","error_type":"network_error","error_message":"offline"}"#;
+        assert!(
+            claude_typed_event_from_json("StopFailure", payload, &typed_context())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generic_wait_reason_accepts_usage_limit_as_a_first_class_value() {
+        let reason = parse_wait_reason(Some("usage_limit")).unwrap();
+        assert!(reason.is_usage_limit());
     }
 
     #[test]

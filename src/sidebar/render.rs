@@ -1893,6 +1893,7 @@ fn short_wait_reason(reason: &str) -> String {
         "permission_prompt" | "permission" => "permission".to_string(),
         "waiting_input" | "input" | "user_input" => "input".to_string(),
         "rate_limit" | "rate_limited" => "rate-limit".to_string(),
+        "usage_limit" => "usage-limit".to_string(),
         "network_error" => "network".to_string(),
         _ => truncate_display(&reason.replace('_', "-"), 16),
     }
@@ -3863,6 +3864,12 @@ sidebar:
         assert_span_fg(chat_spans, "2m 00s", theme.badge_color(BadgeState::Blocked));
         assert!(line_to_string(lines[0].clone()).ends_with("2m 00s "));
         assert!(!line_to_string(lines[0].clone()).contains("permission_prompt"));
+    }
+
+    #[test]
+    fn usage_limit_wait_reason_has_a_distinct_compact_label() {
+        assert_eq!(short_wait_reason("usage_limit"), "usage-limit");
+        assert_ne!(short_wait_reason("usage_limit"), "rate-limit");
     }
 
     #[test]

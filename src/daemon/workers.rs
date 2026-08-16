@@ -9,7 +9,7 @@ use anyhow::Result;
 use sha2::{Digest, Sha256};
 
 use crate::daemon::topology::ServerIdentity;
-use crate::detect::detect_codex_wait_reason;
+use crate::detect::{detect_codex_wait_reason, detect_usage_limit};
 use crate::git::SystemGitRunner;
 use crate::pane_state::ObservationDispatchSnapshot;
 use crate::tmux::SystemTmuxRunner;
@@ -25,6 +25,7 @@ use crate::{
 
 pub const CAPTURE_HISTORY_LINES: &str = "-80";
 pub const STALE_CAPTURE_SECONDS: i64 = 300;
+pub const USAGE_LIMIT_CAPTURE_INTERVAL_SECONDS: i64 = 5;
 pub const OBSERVATION_CAPTURE_STDOUT_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const OBSERVATION_CAPTURE_STDERR_MAX_BYTES: usize = 64 * 1024;
 pub const OBSERVATION_CAPTURE_GROUP_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -1119,7 +1120,11 @@ pub fn infer_capture(
     observed_at: i64,
 ) -> CaptureObservation {
     let observed_fingerprint = capture_sha256(tail);
-    let inference = if observed_fingerprint.is_none()
+    let inference = if state.is_some_and(|state| {
+        matches!(state.agent.as_str(), "claude" | "codex") && detect_usage_limit(tail)
+    }) {
+        CaptureInference::UsageLimit
+    } else if observed_fingerprint.is_none()
         || tracker.rebaseline_pending
         || tracker.fingerprint.is_none()
     {
@@ -1152,6 +1157,17 @@ pub fn infer_capture(
     CaptureObservation {
         inference,
         observed_fingerprint,
+    }
+}
+
+fn infer_usage_limit_capture(tail: &str) -> CaptureObservation {
+    CaptureObservation {
+        inference: if detect_usage_limit(tail) {
+            CaptureInference::UsageLimit
+        } else {
+            CaptureInference::NoChange
+        },
+        observed_fingerprint: capture_sha256(tail),
     }
 }
 
@@ -1258,15 +1274,19 @@ pub fn run_observation_poll(
             ))
         })
         .collect::<Vec<_>>();
-    let capture_indices = observations
+    let capture_modes = observations
         .iter()
         .enumerate()
-        .filter_map(|(index, presence)| {
+        .map(|(index, presence)| {
             presence
                 .as_ref()
-                .is_some_and(|presence| needs_fallback_capture(&dispatch[index], presence))
-                .then_some(index)
+                .and_then(|presence| capture_mode(&dispatch[index], presence, observed_at))
         })
+        .collect::<Vec<_>>();
+    let capture_indices = capture_modes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mode)| mode.is_some().then_some(index))
         .collect::<Vec<_>>();
     let capture_panes = capture_indices
         .iter()
@@ -1303,12 +1323,15 @@ pub fn run_observation_poll(
             continue;
         };
         let capture = tails_by_index[index].as_deref().map(|tail| {
-            infer_capture(
-                snapshot.state.as_ref(),
-                &snapshot.tracker,
-                tail,
-                observed_at,
-            )
+            match capture_modes[index].expect("a captured tail has an inference mode") {
+                CaptureMode::FullInference => infer_capture(
+                    snapshot.state.as_ref(),
+                    &snapshot.tracker,
+                    tail,
+                    observed_at,
+                ),
+                CaptureMode::UsageLimitOnly => infer_usage_limit_capture(tail),
+            }
         });
         let process = processes.process_observation(
             snapshot.pane_instance.pane_pid,
@@ -1347,27 +1370,59 @@ pub fn run_observation_poll(
     })
 }
 
-fn needs_fallback_capture(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureMode {
+    FullInference,
+    UsageLimitOnly,
+}
+
+fn capture_mode(
     snapshot: &ObservationDispatchSnapshot,
     presence: &AgentPresenceObservation,
-) -> bool {
-    let AgentPresenceObservation::Present(observed_agent) = presence else {
-        return false;
+    observed_at: i64,
+) -> Option<CaptureMode> {
+    let fallback_needed = match presence {
+        AgentPresenceObservation::Present(observed_agent) => {
+            snapshot.state.as_ref().is_none_or(|state| {
+                let tracker_matches_epoch =
+                    snapshot
+                        .tracker
+                        .epoch
+                        .as_ref()
+                        .is_some_and(|(state_id, agent_epoch)| {
+                            state_id == &state.state_id && *agent_epoch == state.agent_epoch
+                        });
+                !state.agent_present
+                    || &state.agent != observed_agent
+                    || !tracker_matches_epoch
+                    || !snapshot.tracker.hook_authoritative
+            })
+        }
+        AgentPresenceObservation::Absent | AgentPresenceObservation::Unknown => false,
     };
-    snapshot.state.as_ref().is_none_or(|state| {
-        let tracker_matches_epoch =
-            snapshot
-                .tracker
-                .epoch
-                .as_ref()
-                .is_some_and(|(state_id, agent_epoch)| {
-                    state_id == &state.state_id && *agent_epoch == state.agent_epoch
-                });
-        !state.agent_present
-            || &state.agent != observed_agent
-            || !tracker_matches_epoch
-            || !snapshot.tracker.hook_authoritative
-    })
+    if fallback_needed {
+        return Some(CaptureMode::FullInference);
+    }
+
+    let state = snapshot.state.as_ref()?;
+    if !matches!(state.agent.as_str(), "claude" | "codex")
+        || state.run_seq == state.completed_seq
+        || state.lifecycle.is_usage_limited()
+    {
+        return None;
+    }
+    if matches!(presence, AgentPresenceObservation::Absent) {
+        return Some(CaptureMode::UsageLimitOnly);
+    }
+    (matches!(presence, AgentPresenceObservation::Present(agent) if agent == &state.agent)
+        && matches!(state.lifecycle, LifecycleState::Running)
+        && snapshot
+            .tracker
+            .last_semantic_scan_at
+            .is_none_or(|last_scan| {
+                observed_at.saturating_sub(last_scan) >= USAGE_LIMIT_CAPTURE_INTERVAL_SECONDS
+            }))
+    .then_some(CaptureMode::UsageLimitOnly)
 }
 
 pub fn pane_removal_envelopes(
@@ -2886,6 +2941,68 @@ mod tests {
     }
 
     #[test]
+    fn usage_limit_inference_is_direct_evidence_even_without_a_capture_baseline() {
+        let state = canonical_state("codex");
+        let observed = infer_capture(
+            Some(&state),
+            &CaptureTrackerSnapshot::default(),
+            "You've hit your usage limit. Try again at 6:15 PM.\n",
+            100,
+        );
+
+        assert_eq!(observed.inference, CaptureInference::UsageLimit);
+        assert!(observed.observed_fingerprint.is_some());
+        let opencode = canonical_state("opencode");
+        assert_eq!(
+            infer_capture(
+                Some(&opencode),
+                &CaptureTrackerSnapshot::default(),
+                "You've hit your usage limit.\n",
+                100,
+            )
+            .inference,
+            CaptureInference::NoChange
+        );
+        assert_eq!(
+            infer_usage_limit_capture("Allow command execution?\n1. Yes\n2. No\n").inference,
+            CaptureInference::NoChange
+        );
+        assert_eq!(
+            infer_usage_limit_capture("unchanged output\n").inference,
+            CaptureInference::NoChange
+        );
+    }
+
+    #[test]
+    fn usage_limit_supplementary_capture_is_throttled_but_absence_is_immediate() {
+        let state = canonical_state("codex");
+        let present = AgentPresenceObservation::Present(state.agent.clone());
+        let dispatch = ObservationDispatchSnapshot {
+            pane_instance: state.pane_instance.clone(),
+            base: Some(StoredStateDescriptor::Canonical {
+                version: state.version(),
+            }),
+            tracker: CaptureTrackerSnapshot {
+                epoch: Some((state.state_id.clone(), state.agent_epoch)),
+                hook_authoritative: true,
+                last_semantic_scan_at: Some(100),
+                ..CaptureTrackerSnapshot::default()
+            },
+            state: Some(state),
+        };
+
+        assert_eq!(capture_mode(&dispatch, &present, 104), None);
+        assert_eq!(
+            capture_mode(&dispatch, &present, 105),
+            Some(CaptureMode::UsageLimitOnly)
+        );
+        assert_eq!(
+            capture_mode(&dispatch, &AgentPresenceObservation::Absent, 101),
+            Some(CaptureMode::UsageLimitOnly)
+        );
+    }
+
+    #[test]
     fn unknown_presence_drops_capture_from_observation_envelope() {
         let tracker = CaptureTrackerSnapshot::default();
         let envelope = observation_envelope(
@@ -2987,6 +3104,7 @@ mod tests {
                 tracker: CaptureTrackerSnapshot {
                     epoch: Some((hook_managed.state_id.clone(), hook_managed.agent_epoch)),
                     hook_authoritative: true,
+                    last_semantic_scan_at: Some(199),
                     ..CaptureTrackerSnapshot::default()
                 },
                 state: Some(hook_managed),
@@ -3057,6 +3175,7 @@ mod tests {
                 tracker: CaptureTrackerSnapshot {
                     epoch: Some((hook_managed.state_id.clone(), hook_managed.agent_epoch)),
                     hook_authoritative: true,
+                    last_semantic_scan_at: Some(199),
                     ..CaptureTrackerSnapshot::default()
                 },
                 state: Some(hook_managed),

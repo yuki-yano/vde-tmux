@@ -1296,6 +1296,9 @@ fn structured_pane_status_label(
     match state.lifecycle {
         crate::pane_state::LifecycleState::Idle => "Idle",
         crate::pane_state::LifecycleState::Running => "Running",
+        crate::pane_state::LifecycleState::Waiting { ref reason } if reason.is_usage_limit() => {
+            "Limited"
+        }
         crate::pane_state::LifecycleState::Waiting { .. } => "Waiting",
         crate::pane_state::LifecycleState::Error { .. } => "Error",
     }
@@ -2301,6 +2304,13 @@ mod tests {
                 },
                 BadgeState::Blocked,
                 "Waiting",
+            ),
+            (
+                crate::pane_state::LifecycleState::Waiting {
+                    reason: crate::pane_state::WaitReason::usage_limit(),
+                },
+                BadgeState::Blocked,
+                "Limited",
             ),
             (
                 crate::pane_state::LifecycleState::Error { reason: None },

@@ -381,6 +381,7 @@ fn reduce_observation(
             .as_ref()
             .and_then(|capture| capture.observed_fingerprint);
         tracker.last_change_at = tracker.fingerprint.map(|_| *observed_at);
+        tracker.last_semantic_scan_at = capture.as_ref().map(|_| *observed_at);
         bump_tracker(&mut tracker)?;
         return finish_state_reduction(current, state, tracker, Some(context.tracker));
     }
@@ -396,6 +397,13 @@ fn reduce_observation(
             tracker.agent_process = None;
             tracker.replacement_kind = None;
             tracker.replacement_streak = 0;
+            apply_capture(
+                &mut state,
+                capture.as_ref(),
+                &mut tracker,
+                *observed_at,
+                context.visibility,
+            )?;
             if state.scan_verified && supports_process_detection(&state.agent) {
                 tracker.absence_count = tracker
                     .absence_count
@@ -435,6 +443,7 @@ fn reduce_observation(
                         .as_ref()
                         .and_then(|capture| capture.observed_fingerprint);
                     tracker.last_change_at = tracker.fingerprint.map(|_| *observed_at);
+                    tracker.last_semantic_scan_at = capture.as_ref().map(|_| *observed_at);
                 } else {
                     state.scan_verified = true;
                     if process
@@ -471,6 +480,7 @@ fn reduce_observation(
                     .as_ref()
                     .and_then(|capture| capture.observed_fingerprint);
                 tracker.last_change_at = tracker.fingerprint.map(|_| *observed_at);
+                tracker.last_semantic_scan_at = capture.as_ref().map(|_| *observed_at);
             }
         }
         AgentPresenceObservation::Present(observed_agent) => {
@@ -511,6 +521,7 @@ fn reduce_observation(
                     .as_ref()
                     .and_then(|capture| capture.observed_fingerprint);
                 tracker.last_change_at = tracker.fingerprint.map(|_| *observed_at);
+                tracker.last_semantic_scan_at = capture.as_ref().map(|_| *observed_at);
             }
         }
     }
@@ -1084,7 +1095,7 @@ fn confirm_absent(
     observed_at: i64,
     visibility: &VisibilitySnapshot,
 ) -> Result<(), ReduceError> {
-    if state.run_seq > state.completed_seq {
+    if state.run_seq > state.completed_seq && !state.lifecycle.is_usage_limited() {
         complete_run(state, observed_at, visibility, false)?;
     }
     state.agent_present = false;
@@ -1308,17 +1319,25 @@ fn apply_capture(
     };
     let fingerprint_changed = capture.observed_fingerprint.is_some()
         && capture.observed_fingerprint != tracker.fingerprint;
+    tracker.last_semantic_scan_at = Some(observed_at);
     if tracker.rebaseline_pending {
-        if capture.observed_fingerprint.is_some() {
-            tracker.fingerprint = capture.observed_fingerprint;
-            tracker.last_change_at = Some(observed_at);
+        if matches!(capture.inference, CaptureInference::UsageLimit) {
             tracker.rebaseline_pending = false;
+        } else {
+            if capture.observed_fingerprint.is_some() {
+                tracker.fingerprint = capture.observed_fingerprint;
+                tracker.last_change_at = Some(observed_at);
+                tracker.rebaseline_pending = false;
+            }
+            return Ok(());
         }
-        return Ok(());
     }
     match &capture.inference {
         CaptureInference::PermissionWait { reason } => {
             wait_requested(state, observed_at, reason.clone())?;
+        }
+        CaptureInference::UsageLimit => {
+            wait_requested(state, observed_at, WaitReason::usage_limit())?;
         }
         CaptureInference::ActivityObserved => {
             if tracker.fingerprint.is_some() && state.run_seq > state.completed_seq {
@@ -1364,6 +1383,7 @@ fn reset_tracker_for_state(
         replacement_streak: 0,
         fingerprint: None,
         last_change_at: None,
+        last_semantic_scan_at: None,
         rebaseline_pending: false,
     })
 }
@@ -3061,6 +3081,50 @@ mod tests {
         );
         assert!(!active(&second).agent_present);
         assert_eq!(resolve_badge(active(&second)), BadgeState::Done);
+    }
+
+    #[test]
+    fn confirmed_absence_preserves_usage_limit_as_blocked_state() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let mut discovered = reduce_once(
+            None,
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: None,
+            },
+            &tracker,
+        );
+        discovered.record.as_mut().unwrap().scan_verified = true;
+        let first_tracker = discovered.tracker_delta.as_ref().unwrap().next.clone();
+        let first = observe(
+            discovered.record.as_ref(),
+            &first_tracker,
+            AgentPresenceObservation::Absent,
+            Some(CaptureObservation {
+                inference: CaptureInference::UsageLimit,
+                observed_fingerprint: Some([7; 32]),
+            }),
+            2,
+        );
+
+        assert!(active(&first).agent_present);
+        assert!(active(&first).lifecycle.is_usage_limited());
+        assert_eq!(resolve_badge(active(&first)), BadgeState::Blocked);
+
+        let second = observe(
+            first.record.as_ref(),
+            &first.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Absent,
+            None,
+            3,
+        );
+        let limited = active(&second);
+        assert!(!limited.agent_present);
+        assert!(limited.scan_verified);
+        assert!(limited.lifecycle.is_usage_limited());
+        assert_eq!(limited.completed_seq, 0);
+        assert_eq!(resolve_badge(limited), BadgeState::Blocked);
+        limited.validate().unwrap();
     }
 
     #[test]

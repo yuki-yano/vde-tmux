@@ -1,6 +1,16 @@
 // capture-pane may include deeper scrollback; only recent screen lines should drive waiting state.
 const WAIT_REASON_SCAN_TAIL_LINES: usize = 30;
 
+pub fn detect_usage_limit(screen_tail: &str) -> bool {
+    recent_wait_reason_lines(screen_tail).iter().any(|line| {
+        let line = line
+            .trim_start_matches(['•', '■', '*', '-', '!', '✕', '│', '╰', '─'])
+            .trim();
+        line.starts_with("you've hit your session limit")
+            || line.starts_with("you've hit your usage limit")
+    })
+}
+
 pub fn detect_codex_wait_reason(screen_tail: &str) -> Option<&'static str> {
     let lines = recent_wait_reason_lines(screen_tail);
 
@@ -28,7 +38,7 @@ fn recent_wait_reason_lines(screen_tail: &str) -> Vec<String> {
     let scan_start = raw_lines.len().saturating_sub(WAIT_REASON_SCAN_TAIL_LINES);
     raw_lines[scan_start..]
         .iter()
-        .map(|line| line.trim().to_ascii_lowercase())
+        .map(|line| line.trim().to_ascii_lowercase().replace(['’', '‘'], "'"))
         .filter(|line| !line.is_empty())
         .collect()
 }
@@ -121,6 +131,33 @@ fn consume_ascii_digits(input: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_claude_session_limit_from_recent_screen_tail() {
+        let text = "background agent failed\nYou've hit your session limit · resets 5:40pm\n";
+        assert!(detect_usage_limit(text));
+    }
+
+    #[test]
+    fn detects_codex_usage_limit_with_curly_apostrophe() {
+        let text = "■ You’ve hit your usage limit. Try again at 6:15 PM.\n";
+        assert!(detect_usage_limit(text));
+    }
+
+    #[test]
+    fn does_not_treat_generic_rate_limit_or_status_text_as_usage_limit() {
+        let text = "rate limit exceeded\nusage remaining: 3%\ncontext window limit warning\n";
+        assert!(!detect_usage_limit(text));
+    }
+
+    #[test]
+    fn does_not_detect_stale_usage_limit_outside_recent_tail() {
+        let mut text = String::from("You've hit your usage limit.\n");
+        for index in 0..30 {
+            text.push_str(&format!("new output {index}\n"));
+        }
+        assert!(!detect_usage_limit(&text));
+    }
 
     #[test]
     fn detects_codex_permission_prompt_from_screen_tail() {

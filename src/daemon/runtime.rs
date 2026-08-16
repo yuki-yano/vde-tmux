@@ -240,7 +240,9 @@ impl CanonicalCoordinatorState {
                 matches!(
                     self.leased.runtime.record(&topology.pane_instance),
                     Some(state)
-                        if state.agent_present || state.unread.is_unread()
+                        if state.agent_present
+                            || state.unread.is_unread()
+                            || state.lifecycle.is_usage_limited()
                 )
             })
             .map(|topology| topology.current_path.clone())
@@ -477,7 +479,11 @@ impl CanonicalCoordinatorState {
             let stored = runtime.descriptor(&topology.pane_instance);
             let record = runtime.record(&topology.pane_instance);
             let resolved = match record {
-                Some(state) if state.agent_present || state.unread.is_unread() => {
+                Some(state)
+                    if state.agent_present
+                        || state.unread.is_unread()
+                        || state.lifecycle.is_usage_limited() =>
+                {
                     Some(ResolvedPaneState {
                         canonical: state.clone(),
                         window_id: topology.window_id.clone(),
@@ -501,6 +507,9 @@ impl CanonicalCoordinatorState {
                     Some(LifecycleState::Waiting {
                         reason: WaitReason::PermissionPrompt,
                     }) => Some("permission_prompt".to_string()),
+                    Some(LifecycleState::Waiting { reason }) if reason.is_usage_limit() => {
+                        Some(crate::pane_state::USAGE_LIMIT_WAIT_REASON.to_string())
+                    }
                     Some(LifecycleState::Waiting {
                         reason: WaitReason::Other(_),
                     }) => Some("Other(wait)".to_string()),

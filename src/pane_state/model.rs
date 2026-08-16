@@ -17,6 +17,7 @@ pub const MAX_TASK_CONTEXT_PROMPTS: usize = 4;
 pub const TASK_CONTEXT_PROMPT_MAX_BYTES: usize = 1_200;
 pub const TASK_SUMMARY_MAX_BYTES: usize = 256;
 pub const RESPONSE_PREVIEW_MAX_BYTES: usize = 1_200;
+pub const USAGE_LIMIT_WAIT_REASON: &str = "usage_limit";
 pub const MAX_LISTENING_PORTS: usize = 64;
 pub const MAX_STORED_RECORD_BYTES: usize = 256 * 1024;
 pub const MAX_REQUEST_FRAME_BYTES: usize = 1024 * 1024;
@@ -278,6 +279,14 @@ pub enum WaitReason {
 }
 
 impl WaitReason {
+    pub fn usage_limit() -> Self {
+        Self::Other(USAGE_LIMIT_WAIT_REASON.to_string())
+    }
+
+    pub fn is_usage_limit(&self) -> bool {
+        matches!(self, Self::Other(reason) if reason == USAGE_LIMIT_WAIT_REASON)
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         if let Self::Other(reason) = self {
             validate_required_text(reason, "wait reason", IDENTIFIER_MAX_BYTES)?;
@@ -293,6 +302,12 @@ pub enum LifecycleState {
     Running,
     Waiting { reason: WaitReason },
     Error { reason: Option<String> },
+}
+
+impl LifecycleState {
+    pub fn is_usage_limited(&self) -> bool {
+        matches!(self, Self::Waiting { reason } if reason.is_usage_limit())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -757,9 +772,11 @@ impl PaneState {
                 "lifecycle and run sequence disagree".to_string(),
             ));
         }
-        if !self.agent_present && (!idle || !self.scan_verified) {
+        if !self.agent_present
+            && (!self.scan_verified || (!idle && !self.lifecycle.is_usage_limited()))
+        {
             return Err(ModelError(
-                "absent agent must be scan-verified and idle".to_string(),
+                "absent agent must be scan-verified and idle or usage-limited".to_string(),
             ));
         }
         if self.synthetic_completion_armed
@@ -1017,6 +1034,7 @@ pub struct CaptureObservation {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CaptureInference {
     PermissionWait { reason: WaitReason },
+    UsageLimit,
     ActivityObserved,
     StaleRunCompleted,
     NoChange,
@@ -1307,6 +1325,7 @@ pub struct CaptureTrackerSnapshot {
     pub replacement_streak: u8,
     pub fingerprint: Option<[u8; 32]>,
     pub last_change_at: Option<i64>,
+    pub last_semantic_scan_at: Option<i64>,
     pub rebaseline_pending: bool,
 }
 

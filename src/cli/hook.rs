@@ -54,7 +54,7 @@ pub(crate) enum HookCommand {
         /// Clear the current prompt instead of setting one.
         #[arg(long = "clear-prompt")]
         clear_prompt: bool,
-        /// Waiting reason: permission_prompt or other:TEXT.
+        /// Waiting reason: permission_prompt, usage_limit, or other:TEXT.
         #[arg(long = "wait-reason", value_name = "REASON")]
         wait_reason: Option<String>,
         /// Mark an idle completion as requiring attention.

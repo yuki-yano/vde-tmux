@@ -111,6 +111,14 @@ state resetによってgenerationが変わった場合、以前の`operation_ref
 
 ## Agent Run state
 
+### Usage-limit lifecycle
+
+Claude CodeまたはCodexが利用上限へ到達したPaneは、occupantの公開statusを`blocked`、lifecycleを`waiting`、reasonを`usage_limit`として投影する。
+
+Claude Codeの`StopFailure(error_type=rate_limit)`を一次情報とする。Codexには同等のfailure hookがないため、daemonは実行中のClaude Code/Codex paneだけを5秒間隔で一括captureし、直近30行の行頭にある`You've hit your session limit`または`You've hit your usage limit`を補助証拠として扱う。通常のrate-limit文、statuslineの残量警告、古いscrollbackは状態を変更しない。
+
+利用上限はsemantic completionではない。processが終了した場合もopen runと`usage_limit`を保持し、`present=false`のAgent Summaryとして参照できる。時刻到達だけではproviderの回復を証明できないため自動retryや時計ベースの解除は行わず、後続の`SessionStart`または`UserPromptSubmit`を回復証拠とする。reset時刻を必要とするcallerは`vt pane read`でprovider原文を取得する。
+
 Runはexecutionとsemantic outcomeを別fieldとして持つ。
 
 `execution_phase`は`running`、`waiting`、`error`、`ended`のいずれかとする。
@@ -678,11 +686,11 @@ rollbackはquiesced状態で旧binaryとoperator backupを戻す運用手順と�
 
 ## Pre-cutover evidence (2026-08-16)
 
-- release candidate: `vt` SHA-256 `4d5bfee376be358216d05ede8db9b593819c1a9b0ccb0aa0845aae05baccbd86`
-- release candidate: `vde-tmux` SHA-256 `107300f7b8ee9609161336cc172b4d06a823a7eb314275e9cf4d0029847b8d37`
+- release candidate: `vt` SHA-256 `808893fa32fbef61302939a7bcdbc0cbdd6a69a0cef3e85e70f1c70401f9076f`
+- release candidate: `vde-tmux` SHA-256 `44c0d10885079630b5d40dc95bb6bff6416ff9a001da90c41a8c94b50ff85a72`
 - candidate schema: Agent API 3、daemon protocol 15、PaneState 9、private state 1
 - provider contract: Codex 0.147.0はenabled、Claude Code 2.1.227はauthenticated P0未完了のためdisabled
-- source gates: format、Clippy、通常test 1,022件、ignored tmux test 2件が成功
+- source gates: format、Clippy、通常test 1,034件、ignored tmux test 2件が成功
 - isolated gates: 3本のrelease smoke、prompt smoke、operation crash smoke、P0 verify、staged install、external hook integrationが成功
 - runtime smokeのcategory warm switchは33回でp95 95.4ms、max 97.6ms。125msの性能gateを維持したままsemantic waitだけを最大5秒へ分離
 - independent review R1: `MUST_FIX=0`、`MUST_SIMPLIFY=0`。R1のshould-fix 7件とnit 4件は修正・回帰検証済み。R2はreviewerの利用上限到達により未回収のため、完了済みとは扱わない
@@ -708,6 +716,7 @@ rollbackはquiesced状態で旧binaryとoperator backupを戻す運用手順と�
 - [x] Pane snapshot、Run Store、Operation Store、body directoriesだけでrestart recoveryできる。
 - [x] `api schema`と`agent storage status`がprovider contract、generation、state format、usage、hard limitをmachine-readableに返す。
 - [x] vde-monitor raw hookとvde-notifier通知を維持し、unsupported providerへraw tmux fallbackしない。
+- [x] Claude CodeとCodexの利用上限を`blocked` / `waiting` / `usage_limit`として公開し、process終了後もopen runとAgent Summaryを保持する。
 
 ### テスト完了条件
 
@@ -728,11 +737,13 @@ rollbackはquiesced状態で旧binaryとoperator backupを戻す運用手順と�
 - [x] 既存3 smoke scriptと新しいoperation crash smokeが成功する。
 - [x] dotfiles bridge、vde-monitor、vde-notifierをscratch環境で回帰確認する。
 - [x] 独立レビューでmust-fixとmust-simplifyが0件になる。
+- [x] Claude Codeのrate-limit hook、Claude Code/Codexの厳密なlimit文、誤検知除外、scan throttle、process終了後の状態保持をunit testで検証する。
 
 ### 運用反映条件
 
 - [x] P0結果、adapter有効化判断、Response Artifact source、candidate limitのfreeze結果を記録する。
 - [x] API、daemon protocol、PaneState、private state formatのversionをrelease文書へ記載する。
+- [x] Claude Codeの`StopFailure` hook設定、`usage_limit`のJSON表現、原文確認と回復の運用経路をREADMEへ記載する。
 - [ ] in-flight operation、active execution、waitが0であることを記録する。
 - [ ] `delivery_unknown`とunresolved runをoperatorが確認し、旧generationのsupported-provider sessionを終了する。
 - [ ] 必要なexternal backupとoffline resetの結果を記録する。

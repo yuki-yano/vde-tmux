@@ -3467,7 +3467,7 @@ fn agent_summary(
 ) -> Option<AgentSummary> {
     let resolved = pane.resolved.as_ref()?;
     let state = &resolved.canonical;
-    if !state.agent_present {
+    if !state.agent_present && !state.lifecycle.is_usage_limited() {
         return None;
     }
     let exact_identity = pane.agent_process.is_some();
@@ -5300,6 +5300,27 @@ mod tests {
 
         assert!(agent_summary(&pane, &snapshot, "server").is_none());
         assert!(pane_summary(&pane, "server").agent_ref.is_none());
+    }
+
+    #[test]
+    fn absent_usage_limited_agent_remains_queryable_as_blocked() {
+        let mut pane = test_agent_pane();
+        pane.agent_process = None;
+        let state = &mut pane.resolved.as_mut().unwrap().canonical;
+        state.agent_process = None;
+        state.agent_present = false;
+        state.lifecycle = LifecycleState::Waiting {
+            reason: WaitReason::usage_limit(),
+        };
+        pane.resolved.as_mut().unwrap().badge = BadgeState::Blocked;
+        let snapshot = test_snapshot(pane.clone());
+
+        let summary = agent_summary(&pane, &snapshot, "server").unwrap();
+        assert_eq!(summary.status, AgentStatus::Blocked);
+        assert_eq!(summary.lifecycle.state, "waiting");
+        assert_eq!(summary.lifecycle.reason.as_deref(), Some("usage_limit"));
+        assert!(!summary.present);
+        assert!(summary.agent_ref.is_none());
     }
 
     #[test]

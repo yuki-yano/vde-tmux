@@ -111,7 +111,8 @@ Add these hooks to `~/.claude/settings.json`:
     "PreToolUse": [{ "hooks": [{ "type": "command", "command": "vt hook claude PreToolUse" }] }],
     "PostToolUse": [{ "hooks": [{ "type": "command", "command": "vt hook claude PostToolUse" }] }],
     "Notification": [{ "hooks": [{ "type": "command", "command": "vt hook claude Notification" }] }],
-    "Stop": [{ "hooks": [{ "type": "command", "command": "vt hook claude Stop" }] }]
+    "Stop": [{ "hooks": [{ "type": "command", "command": "vt hook claude Stop" }] }],
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "vt hook claude StopFailure" }] }]
   }
 }
 ```
@@ -210,11 +211,20 @@ performs an idempotent lookup/resume; `delivery_unknown` is never auto-retried. 
 runs remain readable while retained. CAS recovery is restricted to the Pane's current durable Run,
 which is checked twice against Pane, process, foreground ownership, and visible viewport state.
 
+When Claude Code or Codex exhausts its allowance, the pane remains queryable as
+`status=blocked`, `lifecycle.state=waiting`, and `lifecycle.reason=usage_limit`, even if the agent
+process exits. Claude Code's `StopFailure` rate-limit event is authoritative. A bounded,
+five-second supplementary pane-tail scan recognizes only the provider messages `You've hit your
+session limit` and `You've hit your usage limit`; generic rate-limit text and status-line warnings
+do not change state. Use `vt pane read` to inspect the provider's reset text. vde-tmux does not
+retry automatically or infer recovery from the clock; a later `SessionStart` or
+`UserPromptSubmit` is recovery evidence.
+
 ## Agent states
 
 | Badge | State | Meaning |
 | --- | --- | --- |
-| `▲` | Blocked | The agent is waiting for permission or an answer |
+| `▲` | Blocked | The agent needs input, hit an error, or exhausted its usage allowance |
 | `●` | Working | The agent is running |
 | `✓` | Done | The run completed and has not been acknowledged |
 | `○` | Idle | No work is active, or the completed run was acknowledged |
@@ -455,6 +465,8 @@ vt hook emit \
   --status waiting \
   --wait-reason permission_prompt
 ```
+
+Provider integrations can report exhausted usage explicitly with `--wait-reason usage_limit`.
 
 ## Daemon operations
 
