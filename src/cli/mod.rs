@@ -231,14 +231,14 @@ enum AgentCommand {
         /// Caller-supplied idempotency key (16-128 ASCII [A-Za-z0-9_-]).
         #[arg(long = "operation-id")]
         operation_id: String,
-        /// Read the prompt from stdin until EOF.
+        /// Read the prompt from stdin until EOF, removing one terminal LF or CRLF.
         #[arg(
             long,
             required_unless_present = "prompt_file",
             conflicts_with = "prompt_file"
         )]
         stdin: bool,
-        /// Read the prompt from a file without placing it in argv.
+        /// Read the prompt from a file, removing one terminal LF or CRLF, without using argv.
         #[arg(
             long = "prompt-file",
             required_unless_present = "stdin",
@@ -689,7 +689,7 @@ fn read_prompt_input(mut input: impl Read) -> Result<String> {
     let mut bytes = Vec::new();
     input
         .by_ref()
-        .take((crate::api::MAX_PROMPT_BYTES + 1) as u64)
+        .take((crate::api::MAX_PROMPT_BYTES + 3) as u64)
         .read_to_end(&mut bytes)?;
     finish_prompt_input(bytes)
 }
@@ -752,7 +752,12 @@ fn read_recovery_precondition_file(
     })
 }
 
-fn finish_prompt_input(bytes: Vec<u8>) -> Result<String> {
+fn finish_prompt_input(mut bytes: Vec<u8>) -> Result<String> {
+    if bytes.ends_with(b"\r\n") {
+        bytes.truncate(bytes.len() - 2);
+    } else if bytes.ends_with(b"\n") {
+        bytes.pop();
+    }
     if bytes.len() > crate::api::MAX_PROMPT_BYTES {
         return Err(crate::api::ApiError::new(
             crate::api::ApiErrorCode::InvalidArguments,

@@ -2320,6 +2320,27 @@ fn prompt_input_reader_enforces_utf8_and_the_byte_limit() {
     let accepted =
         super::read_prompt_input(std::io::Cursor::new(b"review\nthis".to_vec())).unwrap();
     assert_eq!(accepted, "review\nthis");
+    assert_eq!(
+        super::read_prompt_input(std::io::Cursor::new(b"review\nthis\n".to_vec())).unwrap(),
+        "review\nthis"
+    );
+    assert_eq!(
+        super::read_prompt_input(std::io::Cursor::new(b"review\r\n".to_vec())).unwrap(),
+        "review"
+    );
+    assert_eq!(
+        super::read_prompt_input(std::io::Cursor::new(b"review\n\n".to_vec())).unwrap(),
+        "review\n"
+    );
+
+    let mut maximum_with_terminator = vec![b'x'; crate::api::MAX_PROMPT_BYTES];
+    maximum_with_terminator.push(b'\n');
+    assert_eq!(
+        super::read_prompt_input(std::io::Cursor::new(maximum_with_terminator))
+            .unwrap()
+            .len(),
+        crate::api::MAX_PROMPT_BYTES
+    );
 
     let too_large = vec![b'x'; crate::api::MAX_PROMPT_BYTES + 1];
     let error = super::read_prompt_input(std::io::Cursor::new(too_large)).unwrap_err();

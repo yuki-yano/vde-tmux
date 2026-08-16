@@ -210,6 +210,8 @@ foreground input ownership, and never places prompt bytes in argv. Reusing the s
 performs an idempotent lookup/resume; `delivery_unknown` is never auto-retried. Historical unresolved
 runs remain readable while retained. CAS recovery is restricted to the Pane's current durable Run,
 which is checked twice against Pane, process, foreground ownership, and visible viewport state.
+Prompt input treats one terminal LF or CRLF from stdin or a file as a text-record terminator and
+removes it before hashing and dispatch, while preserving all internal line breaks.
 
 When Claude Code or Codex exhausts its allowance, the pane remains queryable as
 `status=blocked`, `lifecycle.state=waiting`, and `lifecycle.reason=usage_limit`, even if the agent

@@ -393,20 +393,24 @@ fn detect_process_agent(command: &str) -> Option<DetectedProcessAgent> {
     let mut fields = command.split_whitespace();
     let executable = fields.next()?.rsplit('/').next()?;
     if matches!(executable, "claude" | "codex" | "opencode") {
+        // Codex may spawn ChatGPT's non-interactive app server as a descendant.
+        // It is not a pane occupant and must not make the interactive Codex
+        // process identity ambiguous.
+        if executable == "codex" && fields.next() == Some("app-server") {
+            return None;
+        }
         return Some(DetectedProcessAgent {
             agent: AgentKind::parse(executable).ok()?,
             source: AgentProcessSource::Direct,
         });
     }
     let executable = executable.to_ascii_lowercase();
-    let interpreted = matches!(
+    let interpreted = if matches!(
         executable.as_str(),
         "node" | "bun" | "deno" | "python" | "python3"
-    )
-    .then(|| fields.next())
-    .flatten()
-    .and_then(|script| {
-        script
+    ) {
+        let script = fields.next()?;
+        let agent = script
             .split(['/', '\\'])
             .map(str::to_ascii_lowercase)
             .find_map(|component| match component.as_str() {
@@ -414,8 +418,14 @@ fn detect_process_agent(command: &str) -> Option<DetectedProcessAgent> {
                 "codex" | "codex-cli" => Some("codex"),
                 "opencode" => Some("opencode"),
                 _ => None,
-            })
-    });
+            })?;
+        if agent == "codex" && fields.next() == Some("app-server") {
+            return None;
+        }
+        Some(agent)
+    } else {
+        None
+    };
     Some(DetectedProcessAgent {
         agent: AgentKind::parse(interpreted?).ok()?,
         source: AgentProcessSource::Interpreted,
@@ -2867,6 +2877,18 @@ mod tests {
         assert_eq!(launcher.source, AgentProcessSource::Interpreted);
         assert_eq!(native.agent.as_str(), "codex");
         assert_eq!(native.source, AgentProcessSource::Direct);
+        assert!(
+            detect_process_agent(
+                "/Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://"
+            )
+            .is_none()
+        );
+        assert!(
+            detect_process_agent(
+                "node /opt/node_modules/@openai/codex/bin/codex.js app-server --listen stdio://"
+            )
+            .is_none()
+        );
         assert!(
             detect_process_agent(
                 "/Users/example/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/client"

@@ -184,10 +184,13 @@ vt agent prompt "$AGENT_REF" \
   --json
 ```
 
-The prompt is valid UTF-8, non-empty, NUL-free, and at most 65,536 bytes. It is staged in a private
-0600 body file before the durable Operation becomes `prepared`; prompt bytes never appear in argv,
-the Operation record, JSON output, daemon errors, or logs. The stored request identity contains only
-the exact target, domain-separated prompt digest, dispatch option, and caller operation ID.
+The prompt is valid UTF-8, non-empty, NUL-free, and at most 65,536 bytes. One terminal LF or CRLF
+from stdin or a prompt file is treated as a text-record terminator and removed before hashing and
+dispatch; internal line breaks and an additional trailing line break are preserved. The prompt is
+staged in a private 0600 body file before the durable Operation becomes `prepared`; prompt bytes
+never appear in argv, the Operation record, JSON output, daemon errors, or logs. The stored request
+identity contains only the exact target, domain-separated prompt digest, dispatch option, and caller
+operation ID.
 
 Before dispatch the daemon re-resolves the exact Agent Binding, requires healthy daemon-owned tmux
 hooks, acquires the per-pane dispatch lock, and verifies that the agent process owns foreground
