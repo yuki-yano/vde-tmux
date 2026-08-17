@@ -260,8 +260,24 @@ fn record_agent_hook_delivery(
     let _ = crate::daemon::lifecycle::append_daemon_log(
         env,
         server_hash,
-        &format!("hook_delivery: agent hook delivery failed: {code}"),
+        &format!(
+            "hook_delivery: agent hook delivery failed: {code}: {}",
+            hook_delivery_log_detail(&message)
+        ),
     );
+}
+
+fn hook_delivery_log_detail(message: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 512;
+
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let detail = chars.by_ref().take(MAX_DETAIL_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{detail}...")
+    } else {
+        detail
+    }
 }
 
 fn send_typed_hook_event(
@@ -285,11 +301,22 @@ fn send_typed_hook_event(
         },
     };
     let response = client.request_with_stage(&message)?;
+    validate_typed_hook_response(response, &event_id)
+}
+
+fn validate_typed_hook_response(
+    response: crate::daemon::protocol::v2::ServerMessage,
+    event_id: &crate::pane_state::EventId,
+) -> Result<()> {
     match response {
         crate::daemon::protocol::v2::ServerMessage::PaneEventResult {
             event_id: response_id,
             ..
-        } if response_id == event_id => Ok(()),
+        }
+        | crate::daemon::protocol::v2::ServerMessage::SnapshotAck {
+            event_id: response_id,
+            ..
+        } if response_id == *event_id => Ok(()),
         crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
             bail!("daemon returned {code:?}: {message}")
         }
@@ -1047,9 +1074,71 @@ fn codex_subagent_stop_event(payload: &Value) -> Result<Option<ProgressEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::protocol::v2::{ErrorCode, PaneApplyOutcome, ServerMessage};
     use crate::pane_state::{DaemonInstanceId, EventId, ProgressOperation};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn typed_hook_accepts_matching_pane_result_and_diagnostic_ack() {
+        let event_id = EventId::generate().unwrap();
+        for response in [
+            ServerMessage::PaneEventResult {
+                event_id: event_id.clone(),
+                accepted_seq: 1,
+                state_version: None,
+                snapshot_revision: 2,
+                outcome: PaneApplyOutcome::Noop,
+            },
+            ServerMessage::SnapshotAck {
+                event_id: event_id.clone(),
+                accepted_seq: 1,
+                snapshot_revision: 2,
+            },
+        ] {
+            validate_typed_hook_response(response, &event_id).unwrap();
+        }
+    }
+
+    #[test]
+    fn typed_hook_rejects_mismatched_ack_and_server_error() {
+        let event_id = EventId::generate().unwrap();
+        let other_event_id = EventId::generate().unwrap();
+        let mismatch = validate_typed_hook_response(
+            ServerMessage::SnapshotAck {
+                event_id: other_event_id,
+                accepted_seq: 1,
+                snapshot_revision: 2,
+            },
+            &event_id,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mismatch.contains("unexpected pane event response"));
+
+        let daemon_error = validate_typed_hook_response(
+            ServerMessage::error(
+                ErrorCode::StaleAgentEvent,
+                "provider identity is stale",
+                Some(event_id.clone()),
+            ),
+            &event_id,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(daemon_error.contains("StaleAgentEvent"));
+    }
+
+    #[test]
+    fn hook_delivery_log_detail_is_single_line_and_bounded() {
+        assert_eq!(
+            hook_delivery_log_detail(" daemon returned\nStaleAgentEvent:  no process "),
+            "daemon returned StaleAgentEvent: no process"
+        );
+        let detail = hook_delivery_log_detail(&"x".repeat(600));
+        assert_eq!(detail.chars().count(), 515);
+        assert!(detail.ends_with("..."));
+    }
 
     #[test]
     fn codex_subagent_start_uses_agent_nickname_from_session_meta() {

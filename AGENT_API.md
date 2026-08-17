@@ -256,9 +256,11 @@ first, then projects the completed current Run to the Pane. A matching resolutio
 failed Pane projection without creating another resolution. It never sends a key or silently
 retargets a replacement.
 
-Provider prompt and response bodies are not projected into PaneState v9. Consequently,
-`agent list`, `agent get`, snapshots, statusline, and sidebar surfaces contain lifecycle metadata
-only. Response text is available solely through the explicit bounded `agent run response` read.
+Provider adapters project only bounded, normalized UI previews into PaneState v9: a manually entered
+prompt can feed the sidebar prompt and task-summary context, and a completion can feed the latest
+response preview. The full response body remains available solely through the explicit bounded
+`agent run response` read. A prompt linked to guarded dispatch is omitted from PaneState and every
+public snapshot; its private body contract is unchanged.
 
 ## Storage status and offline reset
 

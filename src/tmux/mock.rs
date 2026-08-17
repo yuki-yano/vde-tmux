@@ -1,15 +1,20 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use anyhow::{Result, bail};
 
 use super::{InputCommandError, InputWriteStage, TmuxRunner};
 
+type AgentProcessKey = (u32, String);
+type StubAgentProcessResult =
+    std::result::Result<Option<crate::pane_state::AgentProcessIdentity>, String>;
+
 #[derive(Debug, Default)]
 pub struct MockTmuxRunner {
     responses: RefCell<HashMap<Vec<String>, String>>,
     agent_processes:
-        RefCell<HashMap<(u32, String), Option<crate::pane_state::AgentProcessIdentity>>>,
+        RefCell<HashMap<AgentProcessKey, Option<crate::pane_state::AgentProcessIdentity>>>,
+    agent_process_sequences: RefCell<HashMap<AgentProcessKey, VecDeque<StubAgentProcessResult>>>,
     calls: RefCell<Vec<Vec<String>>>,
     input_calls: RefCell<Vec<(Vec<String>, Vec<u8>)>>,
     agent_input_owners: RefCell<HashMap<(u32, u32), std::result::Result<bool, String>>>,
@@ -65,6 +70,18 @@ impl MockTmuxRunner {
             .borrow_mut()
             .insert((root_pid, agent.to_string()), identity);
     }
+
+    pub fn stub_agent_process_sequence(
+        &self,
+        root_pid: u32,
+        agent: &str,
+        identities: impl IntoIterator<Item = StubAgentProcessResult>,
+    ) {
+        self.agent_process_sequences.borrow_mut().insert(
+            (root_pid, agent.to_string()),
+            identities.into_iter().collect(),
+        );
+    }
 }
 
 impl TmuxRunner for MockTmuxRunner {
@@ -118,9 +135,18 @@ impl TmuxRunner for MockTmuxRunner {
         root_pid: u32,
         agent: &crate::pane_state::AgentKind,
     ) -> Result<Option<crate::pane_state::AgentProcessIdentity>> {
+        let key = (root_pid, agent.as_str().to_string());
+        if let Some(result) = self
+            .agent_process_sequences
+            .borrow_mut()
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+        {
+            return result.map_err(anyhow::Error::msg);
+        }
         self.agent_processes
             .borrow()
-            .get(&(root_pid, agent.as_str().to_string()))
+            .get(&key)
             .cloned()
             .ok_or_else(|| {
                 anyhow::anyhow!(

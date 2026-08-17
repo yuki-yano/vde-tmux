@@ -1105,9 +1105,10 @@ echo "checking sidebar snapshot surface"
 VT_PANE="$OTHER_PANE" run_vt sidebar attach --once >/dev/null
 sleep 6
 
-# Build a separate Blocked pane carrying non-body full-state details, then compare its canonical
-# JSON byte-for-byte across daemon restart. Prompt/response bodies are intentionally redacted from
-# PaneState v9. The pane process stays alive so PaneInstance is unchanged.
+# Build a separate Blocked pane carrying bounded display metadata, then compare its canonical JSON
+# byte-for-byte across daemon restart. Generic hook prompts are public UI previews; guarded-dispatch
+# prompts and full provider response artifacts stay outside PaneState v9. The pane process stays
+# alive so PaneInstance is unchanged.
 DETAIL_PANE_ROW="$(tmux -L "$TMUX_SOCKET" split-window -d -P -F '#{pane_id}	#{pane_pid}' \
   -t "$WINDOW_ID" "sleep 600")"
 DETAIL_PANE="${DETAIL_PANE_ROW%%$'\t'*}"
@@ -1196,7 +1197,8 @@ while True:
     assert time.time() < deadline, reply
     time.sleep(0.05)
 assert record["lifecycle"] == {"waiting":{"reason":"permission_prompt"}}, record
-assert record["prompt"] is None, record
+assert record["prompt"]["text"] == "full snapshot prompt", record
+assert record["prompt"]["source"] == "smoke", record
 assert record["tasks"]["progress"] == {"done":1,"total":2}, record
 assert len(record["tasks"]["items"]) == 2, record
 assert record["subagents"][0]["agent_id"] == "worker-1", record

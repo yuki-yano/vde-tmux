@@ -43,7 +43,7 @@ API v3に含めない機能は次のとおりとする。
 - provider hookを無損失WALとして扱わない。hook処理中のcrashでcompletionを失った場合は、unresolved runと明示的なrecovery経路で回収する。
 - dispatchのat-most-onceは弱めない。`dispatch_started`のdurable化後は自動再送しない。
 - process absence、terminal静止、ready表示をsemantic completionへ昇格させない。
-- canonical Pane snapshotへ履歴、prompt、response、event ledgerを埋め込まない。
+- canonical Pane snapshotへ履歴、guarded dispatch prompt、full response、event ledgerを埋め込まない。手入力promptとresponseはsidebar表示に必要なbounded one-line previewだけを保持する。
 - private stateは同じstate format versionで一体管理し、storeごとの公開versionを増やさない。
 - runtime fallbackとv2/v3併存を設けない。
 
@@ -544,9 +544,9 @@ typed error envelopeとして返す。`agent operation get`だけはterminal sta
 
 Run Storeの96 MiBはhistorical record最大32 MiBに、Pane snapshot上限から導かれるcurrent execution-active record最大64 MiBを加えた上限である。Operation Storeのrecord数とbyte数は独立した上限であり、大きいrecordでは128 MiBが先に適用される。
 
-prompt、provider ingress、artifact bodyをPane snapshot、global snapshot、list/get summary、operation indexへ埋め込まない。
+guarded dispatch prompt、unbounded provider ingress、artifact bodyをPane snapshot、global snapshot、list/get summary、operation indexへ埋め込まない。手入力promptとresponseのbounded one-line UI previewはPane snapshotへ保持できる。
 
-bodyはrequest処理中だけbounded readし、request完了後にdaemon cacheへ保持しない。
+private full bodyはrequest処理中だけbounded readし、request完了後にdaemon cacheへ保持しない。
 
 historical Run event dedupe indexは2048 records x 16 eventsから導かれる32,768 entriesを超えない。current Run RecordはPaneのcurrent stable run pointerから直接lookupし、このindexへ重複保持しない。
 
@@ -712,7 +712,7 @@ rollbackはquiesced状態で旧binaryとoperator backupを戻す運用手順と�
 - [x] checkがplain CAS preconditionを返し、resolveがfresh observationを再検証して同じRun Recordへaudit fieldsを保存する。
 - [x] matching resolution retryが既存receiptを返し、stale preconditionと二重resolutionを拒否する。
 - [x] Response Artifactがrunへ結び付き、完全性、truncation、digest、expiryを返す。
-- [x] guarded dispatchのprompt bodyとdurable response bodyがPane snapshot、Operation record、argv、error、logへ出ない。
+- [x] guarded dispatchのprompt bodyとdurable responseのfull bodyがPane snapshot、Operation record、argv、error、logへ出ない。Pane snapshotにはbounded response previewだけを許可する。
 - [x] Pane snapshot、Run Store、Operation Store、body directoriesだけでrestart recoveryできる。
 - [x] `api schema`と`agent storage status`がprovider contract、generation、state format、usage、hard limitをmachine-readableに返す。
 - [x] vde-monitor raw hookとvde-notifier通知を維持し、unsupported providerへraw tmux fallbackしない。

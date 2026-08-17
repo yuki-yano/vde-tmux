@@ -4161,17 +4161,33 @@ fn apply_sidebar_navigation(
 fn apply_external_pane_event(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
-    mut envelope: PaneEventEnvelope,
+    envelope: PaneEventEnvelope,
 ) -> ServerMessage {
-    redact_pane_body(&mut envelope.event);
     apply_pane_event_mutation(coordinator, accepted_seq, envelope, false, None)
 }
 
 fn apply_external_provider_event(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
+    envelope: PaneEventEnvelope,
+    observation: crate::hook::provider::ProviderObservation,
+) -> ServerMessage {
+    let runner = coordinator.status_push_runner(Duration::from_secs(1));
+    apply_external_provider_event_with_runner(
+        coordinator,
+        accepted_seq,
+        envelope,
+        observation,
+        &runner,
+    )
+}
+
+fn apply_external_provider_event_with_runner(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
     mut envelope: PaneEventEnvelope,
     mut observation: crate::hook::provider::ProviderObservation,
+    process_runner: &dyn crate::tmux::TmuxRunner,
 ) -> ServerMessage {
     use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
     use crate::hook::provider::ProviderHookKind;
@@ -4203,9 +4219,11 @@ fn apply_external_provider_event(
     let received_at = epoch_seconds();
     observation.observed_at = received_at;
     normalize_provider_pane_event(&mut envelope.event, received_at);
-    redact_pane_body(&mut envelope.event);
 
     if observation.hook_kind == ProviderHookKind::SessionStart {
+        // A resumed prompt cannot be attributed to a durable Run, so keep it
+        // outside the public Pane snapshot to preserve guarded-dispatch privacy.
+        redact_private_provider_prompt(&mut envelope.event, true);
         return apply_external_pane_event(coordinator, accepted_seq, envelope);
     }
 
@@ -4236,48 +4254,31 @@ fn apply_external_provider_event(
     let (binding, run_seq) = if let Some(run) = duplicate {
         (run.binding, run.run_seq)
     } else {
-        let record = {
-            let state_guard = coordinator
-                .state
-                .lock()
-                .expect("canonical state lock poisoned");
-            let Some(state) = state_guard.as_ref() else {
-                return ServerMessage::error(
-                    ErrorCode::NotReady,
-                    "daemon is hydrating",
-                    Some(envelope.event_id),
-                );
-            };
-            state
-                .leased
-                .runtime
-                .record(&envelope.pane_instance)
-                .cloned()
+        let record = match provider_binding_record(coordinator, &envelope, &observation) {
+            Ok(record) => record,
+            Err(response) => return response,
         };
-        let Some(record) = record else {
-            return ServerMessage::error(
-                ErrorCode::PaneNotFound,
-                "provider event has no canonical pane state",
-                Some(envelope.event_id),
-            );
+        let record = if record.agent_process.is_none() {
+            match refresh_provider_process_identity(
+                coordinator,
+                accepted_seq,
+                &envelope,
+                &observation,
+                process_runner,
+            ) {
+                Ok(record) => record,
+                Err(response) => return response,
+            }
+        } else {
+            record
         };
         let Some(process) = record.agent_process.clone() else {
             return ServerMessage::error(
                 ErrorCode::StaleAgentEvent,
-                "provider event has no exact agent process identity",
+                "provider event has no exact agent process identity after a fresh process scan",
                 Some(envelope.event_id),
             );
         };
-        if record.agent != observation.provider
-            || record.agent_session_id.as_ref() != Some(&observation.session_id)
-            || !record.agent_present
-        {
-            return ServerMessage::error(
-                ErrorCode::StaleAgentEvent,
-                "provider event no longer matches the live Agent Binding",
-                Some(envelope.event_id),
-            );
-        }
         let run_seq = if observation.hook_kind == ProviderHookKind::UserPromptSubmit {
             match record.run_seq.checked_add(1) {
                 Some(value) => value,
@@ -4347,6 +4348,15 @@ fn apply_external_provider_event(
         }
     };
 
+    // Provider adapters already reduce human-entered prompts and responses to
+    // bounded, single-line UI previews. Keep those previews for the sidebar,
+    // but never project the prompt of a guarded dispatch into PaneState.
+    let private_prompt = apply_result
+        .run
+        .as_ref()
+        .is_some_and(|run| run.operation_id.is_some());
+    redact_private_provider_prompt(&mut envelope.event, private_prompt);
+
     if apply_result.disposition == crate::agent_state::reducer::ApplyDisposition::Duplicate
         && let Some(run) = apply_result.run.as_ref()
     {
@@ -4399,6 +4409,179 @@ fn apply_external_provider_event(
     apply_pane_event_mutation(coordinator, accepted_seq, envelope, false, apply_result.run)
 }
 
+#[allow(clippy::result_large_err)]
+fn provider_binding_record(
+    coordinator: &ProductionV2Coordinator,
+    envelope: &PaneEventEnvelope,
+    observation: &crate::hook::provider::ProviderObservation,
+) -> std::result::Result<crate::pane_state::PaneState, ServerMessage> {
+    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+
+    let record = {
+        let state_guard = coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned");
+        let Some(state) = state_guard.as_ref() else {
+            return Err(ServerMessage::error(
+                ErrorCode::NotReady,
+                "daemon is hydrating",
+                Some(envelope.event_id.clone()),
+            ));
+        };
+        state
+            .leased
+            .runtime
+            .record(&envelope.pane_instance)
+            .cloned()
+    };
+    let Some(record) = record else {
+        return Err(ServerMessage::error(
+            ErrorCode::PaneNotFound,
+            "provider event has no canonical pane state",
+            Some(envelope.event_id.clone()),
+        ));
+    };
+    if record.agent != observation.provider
+        || record.agent_session_id.as_ref() != Some(&observation.session_id)
+        || !record.agent_present
+    {
+        return Err(ServerMessage::error(
+            ErrorCode::StaleAgentEvent,
+            "provider event no longer matches the live Agent Binding",
+            Some(envelope.event_id.clone()),
+        ));
+    }
+    Ok(record)
+}
+
+#[allow(clippy::result_large_err)]
+fn refresh_provider_process_identity(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    envelope: &PaneEventEnvelope,
+    observation: &crate::hook::provider::ProviderObservation,
+    runner: &dyn crate::tmux::TmuxRunner,
+) -> std::result::Result<crate::pane_state::PaneState, ServerMessage> {
+    use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
+
+    const RESOLVE_ATTEMPTS: usize = 4;
+    const RETRY_DELAY: Duration = Duration::from_millis(20);
+
+    let mut last_error = None;
+    let mut process = None;
+    for attempt in 0..RESOLVE_ATTEMPTS {
+        match runner.resolve_agent_process(envelope.pane_instance.pane_pid, &observation.provider) {
+            Ok(Some(resolved)) => {
+                process = Some(resolved);
+                break;
+            }
+            Ok(None) => last_error = None,
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        if attempt + 1 < RESOLVE_ATTEMPTS {
+            thread::sleep(RETRY_DELAY);
+        }
+    }
+    let Some(process) = process else {
+        let message = last_error.map_or_else(
+            || {
+                format!(
+                    "fresh pane process scans found no exact provider process identity after {RESOLVE_ATTEMPTS} attempts"
+                )
+            },
+            |error| {
+                format!(
+                    "fresh pane process scans could not verify provider identity after {RESOLVE_ATTEMPTS} attempts: {error}"
+                )
+            },
+        );
+        return Err(ServerMessage::error(
+            ErrorCode::StaleAgentEvent,
+            message,
+            Some(envelope.event_id.clone()),
+        ));
+    };
+    let dispatch = {
+        let state_guard = coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned");
+        let Some(state) = state_guard.as_ref() else {
+            return Err(ServerMessage::error(
+                ErrorCode::NotReady,
+                "daemon is hydrating",
+                Some(envelope.event_id.clone()),
+            ));
+        };
+        state
+            .leased
+            .runtime
+            .freeze_observation_dispatch([envelope.pane_instance.clone()])
+            .into_iter()
+            .next()
+            .expect("one requested pane produces one observation dispatch snapshot")
+    };
+    let daemon_instance_id = coordinator
+        .router
+        .lock()
+        .expect("v2 router lock poisoned")
+        .daemon_instance_id()
+        .clone();
+    let process_envelope = crate::daemon::workers::observation_envelope(
+        daemon_instance_id,
+        envelope.pane_instance.clone(),
+        dispatch.base,
+        &dispatch.tracker,
+        crate::daemon::workers::ObservationSample {
+            observed_at: epoch_seconds(),
+            presence: crate::pane_state::AgentPresenceObservation::Present(
+                observation.provider.clone(),
+            ),
+            capture: None,
+            process: Some(crate::pane_state::ProcessObservation {
+                agent_process_checked: true,
+                agent_process: Some(process.clone()),
+                background_process_alive: None,
+                listening_ports: None,
+            }),
+        },
+    )
+    .map_err(|error| {
+        ServerMessage::error(
+            ErrorCode::InternalError,
+            format!("could not build provider process observation: {error:#}"),
+            Some(envelope.event_id.clone()),
+        )
+    })?;
+    match apply_pane_event_mutation(coordinator, accepted_seq, process_envelope, false, None) {
+        ServerMessage::PaneEventResult { .. } => {}
+        ServerMessage::Error { code, message, .. } => {
+            return Err(ServerMessage::error(
+                code,
+                message,
+                Some(envelope.event_id.clone()),
+            ));
+        }
+        response => {
+            return Err(ServerMessage::error(
+                ErrorCode::InternalError,
+                format!("unexpected provider process refresh response: {response:?}"),
+                Some(envelope.event_id.clone()),
+            ));
+        }
+    }
+    let record = provider_binding_record(coordinator, envelope, observation)?;
+    if record.agent_process.as_ref() != Some(&process) || !record.scan_verified {
+        return Err(ServerMessage::error(
+            ErrorCode::StaleAgentEvent,
+            "fresh pane process identity did not become the live Agent Binding",
+            Some(envelope.event_id.clone()),
+        ));
+    }
+    Ok(record)
+}
+
 fn normalize_provider_pane_event(event: &mut PaneEvent, observed_at: i64) {
     match event {
         PaneEvent::AgentSessionStarted {
@@ -4436,7 +4619,10 @@ fn normalize_provider_pane_event(event: &mut PaneEvent, observed_at: i64) {
     }
 }
 
-fn redact_pane_body(event: &mut PaneEvent) {
+fn redact_private_provider_prompt(event: &mut PaneEvent, private_prompt: bool) {
+    if !private_prompt {
+        return;
+    }
     match event {
         PaneEvent::AgentSessionStarted { resumed_prompt, .. } => *resumed_prompt = None,
         PaneEvent::BeginRun { prompt, .. } => *prompt = None,
@@ -4450,11 +4636,6 @@ fn redact_pane_body(event: &mut PaneEvent) {
             });
         }
         PaneEvent::ExplicitStateReported { report } => report.prompt = None,
-        PaneEvent::ResponseAndCompleteRun { completed_at, .. } => {
-            *event = PaneEvent::CompleteRun {
-                completed_at: *completed_at,
-            };
-        }
         _ => {}
     }
 }
@@ -7273,6 +7454,73 @@ mod tests {
     const V2_DAEMON_ID: &str = "ffeeddccbbaa99887766554433221100";
     const POLL_TOKEN: &str = "00112233445566778899aabbccddeeff";
 
+    fn codex_provider_test_event(
+        daemon_instance_id: DaemonInstanceId,
+        pane_instance: PaneInstance,
+        event: &str,
+        payload: &str,
+        observed_at: i64,
+    ) -> (
+        PaneEventEnvelope,
+        crate::hook::provider::ProviderObservation,
+    ) {
+        use crate::hook::provider::ProviderHookKind;
+        use crate::pane_state::{AgentSessionSource, PromptState, ResponseState};
+
+        let event_id = EventId::generate().unwrap();
+        let observation = crate::hook::provider::observation_from_json(
+            "codex",
+            event,
+            payload,
+            event_id.clone(),
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let pane_event = match observation.hook_kind {
+            ProviderHookKind::SessionStart => PaneEvent::AgentSessionStarted {
+                observed_at,
+                source: AgentSessionSource::Startup,
+                resumed_prompt: None,
+            },
+            ProviderHookKind::UserPromptSubmit => PaneEvent::BeginRun {
+                started_at: observed_at,
+                prompt: payload
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|text| PromptState {
+                        text: text.to_string(),
+                        source: "user".to_string(),
+                        digest: observation.prompt_digest.clone(),
+                    }),
+            },
+            ProviderHookKind::Stop => PaneEvent::ResponseAndCompleteRun {
+                completed_at: observed_at,
+                response: ResponseState {
+                    text: payload
+                        .get("last_assistant_message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    observed_at,
+                },
+            },
+            _ => panic!("unsupported provider test hook {event}"),
+        };
+        (
+            PaneEventEnvelope {
+                daemon_instance_id,
+                event_id,
+                pane_instance,
+                agent: Some(observation.provider.clone()),
+                agent_session_id: Some(observation.session_id.clone()),
+                event: pane_event,
+            },
+            observation,
+        )
+    }
+
     #[test]
     fn provider_hook_kind_must_match_the_pane_transition_before_run_mutation() {
         let observation = crate::hook::provider::observation_from_json(
@@ -7366,33 +7614,270 @@ mod tests {
     }
 
     #[test]
-    fn durable_provider_projection_redacts_prompt_and_response_bodies() {
-        let mut begin = PaneEvent::BeginRun {
+    fn immediate_codex_prompt_retries_transient_process_scan_after_session_start() {
+        use crate::agent_state::{ExecutionPhase, SemanticOutcome};
+        use crate::pane_state::{AgentProcessIdentity, LifecycleState};
+
+        let root = test_root("codex-session-start-process-race");
+        let hash = "codex-session-start-process-race";
+        let env = BTreeMap::from([(
+            "XDG_STATE_HOME".to_string(),
+            root.to_string_lossy().into_owned(),
+        )]);
+        let coordinator =
+            ProductionV2Coordinator::new(test_incarnation(&root, hash), env, None).unwrap();
+        install_test_state(
+            &coordinator,
+            &root,
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+        );
+        *coordinator.agent_runtime.lock().unwrap() = Some(
+            crate::agent_state::runtime::AgentRuntime::open(
+                root.join("agent-state"),
+                hash.to_string(),
+            )
+            .unwrap(),
+        );
+        let pane = PaneInstance {
+            pane_id: "%537".to_string(),
+            pane_pid: 53_700,
+        };
+        let daemon_instance_id = coordinator
+            .router
+            .lock()
+            .unwrap()
+            .daemon_instance_id()
+            .clone();
+        let make_event = |event: &str, payload: &str, observed_at: i64| {
+            codex_provider_test_event(
+                daemon_instance_id.clone(),
+                pane.clone(),
+                event,
+                payload,
+                observed_at,
+            )
+        };
+        let runner = crate::tmux::mock::MockTmuxRunner::new();
+
+        let (session_envelope, session_observation) = make_event(
+            "SessionStart",
+            r#"{"session_id":"session-537","source":"startup"}"#,
+            1,
+        );
+        assert!(matches!(
+            apply_external_provider_event_with_runner(
+                &coordinator,
+                1,
+                session_envelope,
+                session_observation,
+                &runner,
+            ),
+            ServerMessage::PaneEventResult { .. }
+        ));
+        let started = coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .leased
+            .runtime
+            .record(&pane)
+            .unwrap()
+            .clone();
+        assert!(started.agent_process.is_none());
+        assert!(!started.scan_verified);
+
+        let process = AgentProcessIdentity {
+            pid: 53_762,
+            start_token: "codex-process-start".to_string(),
+        };
+        runner.stub_agent_process_sequence(
+            pane.pane_pid,
+            "codex",
+            [
+                Ok(None),
+                Err("transient process identity race".to_string()),
+                Ok(Some(process.clone())),
+            ],
+        );
+        let (prompt_envelope, prompt_observation) = make_event(
+            "UserPromptSubmit",
+            r#"{"session_id":"session-537","turn_id":"turn-1","prompt":"hello"}"#,
+            2,
+        );
+        assert!(matches!(
+            apply_external_provider_event_with_runner(
+                &coordinator,
+                2,
+                prompt_envelope,
+                prompt_observation.clone(),
+                &runner,
+            ),
+            ServerMessage::PaneEventResult { .. }
+        ));
+        let running = coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .leased
+            .runtime
+            .record(&pane)
+            .unwrap()
+            .clone();
+        assert_eq!(running.agent_process.as_ref(), Some(&process));
+        assert!(running.scan_verified);
+        assert_eq!(running.run_seq, 1);
+        assert!(matches!(running.lifecycle, LifecycleState::Running));
+        assert!(running.current_run.is_some());
+        assert_eq!(
+            running.prompt.as_ref().map(|prompt| prompt.text.as_str()),
+            Some("hello")
+        );
+        assert_eq!(running.task_context.origin_prompt.as_deref(), Some("hello"));
+        assert_eq!(running.task_context.recent_prompts, ["hello"]);
+        let durable_run = coordinator
+            .agent_runtime
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .provider_event_run(&prompt_observation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_run.execution_phase, ExecutionPhase::Running);
+        assert_eq!(durable_run.semantic_outcome, SemanticOutcome::Unresolved);
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_provider_process_refresh_remains_fail_closed() {
+        let root = test_root("codex-process-refresh-fail-closed");
+        let hash = "codex-process-refresh-fail-closed";
+        let env = BTreeMap::from([(
+            "XDG_STATE_HOME".to_string(),
+            root.to_string_lossy().into_owned(),
+        )]);
+        let coordinator =
+            ProductionV2Coordinator::new(test_incarnation(&root, hash), env, None).unwrap();
+        install_test_state(
+            &coordinator,
+            &root,
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+        );
+        *coordinator.agent_runtime.lock().unwrap() = Some(
+            crate::agent_state::runtime::AgentRuntime::open(
+                root.join("agent-state"),
+                hash.to_string(),
+            )
+            .unwrap(),
+        );
+        let pane = PaneInstance {
+            pane_id: "%538".to_string(),
+            pane_pid: 53_800,
+        };
+        let daemon_instance_id = coordinator
+            .router
+            .lock()
+            .unwrap()
+            .daemon_instance_id()
+            .clone();
+        let make_event = |event: &str, payload: &str, observed_at: i64| {
+            codex_provider_test_event(
+                daemon_instance_id.clone(),
+                pane.clone(),
+                event,
+                payload,
+                observed_at,
+            )
+        };
+        let runner = crate::tmux::mock::MockTmuxRunner::new();
+        let (session_envelope, session_observation) = make_event(
+            "SessionStart",
+            r#"{"session_id":"session-538","source":"startup"}"#,
+            1,
+        );
+        assert!(matches!(
+            apply_external_provider_event_with_runner(
+                &coordinator,
+                1,
+                session_envelope,
+                session_observation,
+                &runner,
+            ),
+            ServerMessage::PaneEventResult { .. }
+        ));
+        runner.stub_agent_process(pane.pane_pid, "codex", None);
+        let (prompt_envelope, prompt_observation) = make_event(
+            "UserPromptSubmit",
+            r#"{"session_id":"session-538","turn_id":"turn-1","prompt":"hello"}"#,
+            2,
+        );
+        assert!(matches!(
+            apply_external_provider_event_with_runner(
+                &coordinator,
+                2,
+                prompt_envelope,
+                prompt_observation,
+                &runner,
+            ),
+            ServerMessage::Error {
+                code: ErrorCode::StaleAgentEvent,
+                ..
+            }
+        ));
+        let state = coordinator.state.lock().unwrap();
+        let record = state
+            .as_ref()
+            .unwrap()
+            .leased
+            .runtime
+            .record(&pane)
+            .unwrap();
+        assert!(record.agent_process.is_none());
+        assert_eq!(record.run_seq, 0);
+        assert!(record.current_run.is_none());
+
+        drop(state);
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_projection_keeps_ui_previews_but_redacts_guarded_prompts() {
+        let begin = PaneEvent::BeginRun {
             started_at: 1,
             prompt: Some(crate::pane_state::PromptState {
-                text: "private prompt".to_string(),
+                text: "human prompt preview".to_string(),
                 source: "user".to_string(),
                 digest: Some("a".repeat(64)),
             }),
         };
-        redact_pane_body(&mut begin);
-        assert_eq!(
-            begin,
-            PaneEvent::BeginRun {
-                started_at: 1,
-                prompt: None,
-            }
-        );
+        let mut public_begin = begin.clone();
+        redact_private_provider_prompt(&mut public_begin, false);
+        assert_eq!(public_begin, begin);
+
+        let mut guarded_begin = begin;
+        redact_private_provider_prompt(&mut guarded_begin, true);
+        assert!(matches!(
+            guarded_begin,
+            PaneEvent::BeginRun { prompt: None, .. }
+        ));
 
         let mut stop = PaneEvent::ResponseAndCompleteRun {
             completed_at: 2,
             response: crate::pane_state::ResponseState {
-                text: "private response".to_string(),
+                text: "response preview".to_string(),
                 observed_at: 2,
             },
         };
-        redact_pane_body(&mut stop);
-        assert_eq!(stop, PaneEvent::CompleteRun { completed_at: 2 });
+        let expected_stop = stop.clone();
+        redact_private_provider_prompt(&mut stop, true);
+        assert_eq!(stop, expected_stop);
 
         let mut progress = PaneEvent::ProgressUpdated {
             observed_at: 3,
@@ -7405,7 +7890,7 @@ mod tests {
                 crate::pane_state::ProgressOperation::TaskCreated,
             ],
         };
-        redact_pane_body(&mut progress);
+        redact_private_provider_prompt(&mut progress, true);
         assert!(matches!(
             progress,
             PaneEvent::ProgressUpdated { operations, .. }
@@ -7430,7 +7915,7 @@ mod tests {
                 attention: false,
             },
         };
-        redact_pane_body(&mut report);
+        redact_private_provider_prompt(&mut report, true);
         assert!(matches!(
             report,
             PaneEvent::ExplicitStateReported { report } if report.prompt.is_none()

@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 
 pub const INPUT_COMMAND_MAX_STDOUT_BYTES: usize = 16 * 1024;
 pub const INPUT_COMMAND_MAX_STDERR_BYTES: usize = 16 * 1024;
+const AGENT_PROCESS_RESOLVE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputWriteStage {
@@ -81,8 +82,10 @@ pub trait TmuxRunner {
         root_pid: u32,
         agent: &crate::pane_state::AgentKind,
     ) -> Result<Option<crate::pane_state::AgentProcessIdentity>> {
-        let processes =
-            crate::daemon::workers::read_agent_process_snapshot(Duration::from_secs(1), false);
+        let processes = crate::daemon::workers::read_agent_process_snapshot(
+            AGENT_PROCESS_RESOLVE_TIMEOUT,
+            false,
+        );
         let detection = processes.detect_from_pid_tree(root_pid);
         if !detection.complete || !detection.process_identities_complete {
             bail!("agent process scan was incomplete");
