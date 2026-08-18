@@ -11,7 +11,7 @@ It tracks Claude Code, Codex, and opencode panes and renders their state in the 
 
 - Classifies agents across all tmux sessions as `Blocked`, `Working`, `Done`, or `Idle`
 - Shows agents that need attention directly in the tmux status line
-- Displays prompts, elapsed time, tasks, subagents, and worktree activity in a sidebar
+- Displays task summaries, elapsed time, tasks, subagents, and worktree activity in a sidebar
 - Jumps to agent panes directly from the sidebar
 - Groups sessions into categories and switches them from the keyboard or status line
 - Runs a notification command when an agent starts waiting for input
@@ -300,7 +300,7 @@ ahead/behind counts, and listening TCP ports. Claude Bash calls are shown as bac
 only when the hook explicitly reports `run_in_background`; command text is never guessed, and the
 process row clears after the command leaves the pane process tree. Codex does not currently report a
 background flag, but its listening ports are still discovered from the pane process tree. A Stop
-payload's `last_assistant_message` appears as a muted `▷` response preview below the latest prompt.
+payload's `last_assistant_message` appears as a muted `▷` response preview in the expanded details.
 Category scope, presentation, filter, manual order, expansion state, selection, and scrolling are
 synchronized across all open sidebars on the same tmux server. The concrete Current category and
 return target remain local to each sidebar and follow its source session.
@@ -412,13 +412,13 @@ badge:
 `statusline.summary.format` supports the `{badge}` and `{count}` placeholders, such as `{badge}{count}` or `{badge}: {count}`.
 Zero-count states remain visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
 
-`sidebar.task_summary.enabled` replaces the collapsed agent row's latest-prompt line with a short
-persistent-task summary. The daemon generates it asynchronously with an isolated CLI matching the
-pane agent (`codex exec` for Codex and `claude -p` for Claude). Expanded rows keep the summary on
-the second line and show the latest prompt below it. No cross-provider fallback is used. Prompt
-evidence is bounded and best-effort redacted before the additional model request; keep the feature
-disabled if that extra request is not acceptable. Model names are optional and otherwise follow the
-installed CLI's default.
+`sidebar.task_summary.enabled` adds a short persistent-task summary to collapsed and expanded agent
+rows. The daemon generates it asynchronously with an isolated CLI matching the pane agent (`codex
+exec` for Codex and `claude -p` for Claude). The raw latest prompt remains available in pane state
+and the JSON API but is intentionally not rendered in the sidebar. No cross-provider fallback is
+used. Prompt evidence is bounded and best-effort redacted before the additional model request; keep
+the feature disabled if that extra request is not acceptable. Model names are optional and
+otherwise follow the installed CLI's default.
 
 The category segment publishes every category that contains a session, including categories with no agent panes. Each category keeps its full label and action target; category entries are never collapsed into `+N` or `cat:N`, even when the segment exceeds the shared status width budget.
 

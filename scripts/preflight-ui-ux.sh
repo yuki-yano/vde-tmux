@@ -985,6 +985,10 @@ def cells(text):
     return total
 for line in raw.splitlines():
     assert cells(line) <= limit, (limit, cells(line), line)
+assert " tasks " not in raw, raw
+assert "Task -" not in raw, raw
+for prompt in ("ASCII live target", "漢字の確認", "emoji fleet"):
+    assert prompt not in raw, (limit, prompt, raw)
 PY
 done
 

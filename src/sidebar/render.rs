@@ -293,7 +293,7 @@ pub fn build_header_layout_with_counts(
     }
 
     let section = build_header_section_line(width as usize, theme);
-    let title = build_header_title_line(state, width as usize, theme, counts);
+    let title = build_header_title_line(state, width as usize, theme);
     let chips = build_header_chip_line(state, width as usize, theme, counts);
     HeaderLayout {
         lines: vec![section, title, chips],
@@ -323,7 +323,6 @@ fn build_header_title_line(
     state: &SidebarState,
     width: usize,
     theme: &SidebarRenderTheme,
-    counts: BadgeCounts,
 ) -> HeaderLine {
     let mode_pieces = format_header_mode_pieces(state, theme);
     let mode_body = mode_pieces
@@ -333,20 +332,12 @@ fn build_header_title_line(
     let mode_prefix = theme.header_prefix.as_str();
     let mode_text = format!("{mode_prefix}{mode_body}");
     let mode_suffix = theme.header_suffix.as_str();
-    let count_text = format!(" {}", counts.total);
-    let task_label = if counts.total == 1 { "task" } else { "tasks" };
-    let total_label_text = format!(" {task_label} ");
-    let total_bg = theme.header_total_bg.unwrap_or(theme.active_bg);
-    let total_flat = total_bg == Color::Reset;
-    let total_suffix = if total_flat {
-        ""
-    } else {
-        header_total_suffix(theme)
-    };
-    let full_text = format!("{mode_text}{mode_suffix}{count_text}{total_label_text}{total_suffix}");
-    let include_total = display_width(&full_text) <= width;
-    let text = if include_total {
+    let full_text = format!("{mode_text}{mode_suffix}");
+    let include_suffix = display_width(&full_text) <= width;
+    let text = if include_suffix {
         full_text
+    } else if display_width(&mode_text) <= width {
+        mode_text
     } else {
         truncate_display(&mode_text, width)
     };
@@ -364,33 +355,12 @@ fn build_header_title_line(
             .into_iter()
             .map(|(text, action)| (text, mode_segment_style(theme), action)),
     );
-    if include_total {
-        if !mode_suffix.is_empty() {
-            let mut suffix_style = Style::default().fg(mode_bg(theme));
-            if !total_flat {
-                suffix_style = suffix_style.bg(total_bg);
-            }
-            pieces.push((mode_suffix.to_string(), suffix_style, None));
+    if include_suffix && !mode_suffix.is_empty() {
+        let mut suffix_style = Style::default().fg(mode_bg(theme));
+        if let Some(outer_bg) = theme.header_outer_bg.filter(|color| *color != Color::Reset) {
+            suffix_style = suffix_style.bg(outer_bg);
         }
-        let mut count_style = Style::default()
-            .fg(Color::Reset)
-            .add_modifier(Modifier::BOLD);
-        if !total_flat {
-            count_style = count_style.bg(total_bg);
-        }
-        pieces.push((count_text, count_style, None));
-        let mut label_style = Style::default().fg(theme.header_total_fg.unwrap_or(theme.detail));
-        if !total_flat {
-            label_style = label_style.bg(total_bg);
-        }
-        pieces.push((total_label_text, label_style, None));
-        if !total_suffix.is_empty() {
-            pieces.push((
-                total_suffix.to_string(),
-                Style::default().fg(total_bg),
-                None,
-            ));
-        }
+        pieces.push((mode_suffix.to_string(), suffix_style, None));
     }
 
     let mut segments = Vec::new();
@@ -456,10 +426,6 @@ fn format_header_mode_pieces(
         pieces.push((formatted[presentation_end..].to_string(), None));
     }
     pieces
-}
-
-fn header_total_suffix(theme: &SidebarRenderTheme) -> &str {
-    theme.header_suffix.as_str()
 }
 
 #[derive(Clone, Copy)]
@@ -784,7 +750,7 @@ fn render_closed_chat_digest_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = vec![render_closed_chat_summary_line(row, state, width, theme)];
     if closed_chat_has_detail_line(row) {
-        lines.push(render_closed_chat_prompt_line(row, state, width, theme));
+        lines.push(render_closed_chat_detail_line(row, state, width, theme));
     }
     lines
 }
@@ -848,7 +814,7 @@ fn render_closed_chat_summary_line(
     style_chat_digest_line(Line::from(spans), selected, theme)
 }
 
-fn render_closed_chat_prompt_line(
+fn render_closed_chat_detail_line(
     row: &SidebarRow,
     state: &SidebarState,
     width: usize,
@@ -862,13 +828,13 @@ fn render_closed_chat_prompt_line(
     let available = width.saturating_sub(1).saturating_sub(prefix_width);
     let reason = closed_chat_reason_token(row);
     let reason_width = reason.as_deref().map(display_width).unwrap_or(0);
-    let (prompt_budget, reason) = match reason {
+    let (summary_budget, reason) = match reason {
         Some(reason) if available > reason_width + 1 => {
             (available - reason_width - 1, Some(reason))
         }
         _ => (available, None),
     };
-    let summary = truncate_display(&chat_task_summary_label(row), prompt_budget);
+    let summary = truncate_display(&chat_task_summary_label(row), summary_budget);
     spans.push(Span::styled(summary, row_style(row, theme)));
     let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
     let reason_width = reason.as_deref().map(display_width).unwrap_or(0);
@@ -1435,13 +1401,13 @@ fn render_chat_dense_line(
         .unwrap_or("");
     let origin = origin.chars().take(3).collect::<String>();
     let right = right_label(row).unwrap_or_default();
-    let body = row
-        .label
-        .split_once(':')
-        .map(|(_, body)| body.trim())
-        .unwrap_or(row.label.as_str());
+    let body = chat_task_summary_label(row);
     let agent_cell = format!(" {agent:<7}");
-    let origin_cell = format!(" {origin:<3} ");
+    let origin_cell = if origin.is_empty() {
+        String::new()
+    } else {
+        format!(" {origin:<3} ")
+    };
     let prefix_after_glyph = format!("{agent_cell}{origin_cell}");
     let show_pin_cell = state.presentation_mode == PresentationMode::Priority || row_pinned(row);
     let pin_width = usize::from(show_pin_cell);
@@ -1454,7 +1420,7 @@ fn render_chat_dense_line(
         .saturating_sub(display_width(&prefix_after_glyph))
         .saturating_sub(right_reserved)
         .saturating_sub(1);
-    let label = truncate_display(body, label_budget);
+    let label = truncate_display(&body, label_budget);
     let used = 1
         + pin_width
         + display_width(glyph)
@@ -2569,14 +2535,14 @@ mod tests {
         });
         let detail = detail_row(
             "detail::%1::task::0::in_progress",
-            "\u{2514} ● Task - Build",
+            "\u{2514} ● Build",
             RollupLevel::Running,
         );
         let rows = vec![chat, detail];
 
         for width in [2, 12, 30] {
             let rendered = render_rows(&rows, &SidebarState::default(), width);
-            assert!(!rendered.contains("Task - Build"), "{width}: {rendered:?}");
+            assert!(!rendered.contains("Build"), "{width}: {rendered:?}");
         }
     }
 
@@ -2744,7 +2710,7 @@ mod tests {
         assert!(mode_style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(
             build_header_layout(&state, 80).lines[1].text,
-            format!(" ◉ Current · ≣ Tree     ▾ \u{e0b0} 0 tasks \u{e0b0}")
+            format!(" ◉ Current · ≣ Tree     ▾ \u{e0b0}")
         );
     }
 
@@ -3034,21 +3000,17 @@ sidebar:
         assert_eq!(header.lines[0].text, " SIDEBAR");
         assert_eq!(
             header.lines[1].text,
-            format!(" ◉ All     · ≣ Tree     ▾ \u{e0b0} 7 tasks \u{e0b0}")
+            format!(" ◉ All     · ≣ Tree     ▾ \u{e0b0}")
         );
         assert_eq!(header.lines[2].text, " ≡ 7  ▲ 1  ● 1  ✓ 0  ○ 5 ");
         let section = style_for_segment(&header, 0, "SIDEBAR");
         assert_eq!(section.fg, Some(SidebarRenderTheme::default().category));
         assert!(section.add_modifier.contains(Modifier::BOLD));
-        let total = style_for_segment(&header, 1, " 7");
-        assert_eq!(total.fg, Some(Color::Reset));
-        assert!(total.add_modifier.contains(Modifier::BOLD));
-        let task_label = style_for_segment(&header, 1, " tasks ");
-        assert_eq!(task_label.fg, Some(SidebarRenderTheme::default().detail));
+        assert!(!header.lines[1].text.contains("tasks"));
     }
 
     #[test]
-    fn header_title_uses_singular_task_label_for_one_agent() {
+    fn header_title_leaves_counts_to_the_filter_chip_row() {
         let counts = BadgeCounts {
             total: 1,
             idle: 1,
@@ -3062,14 +3024,12 @@ sidebar:
             counts,
         );
 
-        assert_eq!(
-            header.lines[1].text,
-            format!(" ◉ Current · ≣ Tree     ▾ \u{e0b0} 1 task \u{e0b0}")
-        );
+        assert!(!header.lines[1].text.contains('1'));
+        assert!(header.lines[2].text.contains("≡ 1"));
     }
 
     #[test]
-    fn header_hit_test_ignores_total_segment_and_zero_count_chips() {
+    fn header_hit_test_targets_modes_and_available_filter_chips() {
         let state = SidebarState {
             category_scope: CategoryScope::All,
             presentation_mode: PresentationMode::Tree,
@@ -3248,7 +3208,7 @@ badge:
     }
 
     #[test]
-    fn custom_header_suffix_is_rendered_after_total_segment() {
+    fn custom_header_suffix_is_rendered_after_mode_segment() {
         let config = serde_yaml_ng::from_str::<crate::config::Config>(
             r##"
 sidebar:
@@ -3267,7 +3227,7 @@ sidebar:
         );
 
         assert!(
-            header.lines[1].text.ends_with("7 tasks "),
+            header.lines[1].text.ends_with("▾ "),
             "{:?}",
             header.lines[1].text
         );
@@ -3380,11 +3340,11 @@ sidebar:
 
         assert_eq!(theme.header_suffix, "");
         assert!(!header.lines[1].text.contains('\u{e0b0}'));
-        assert_eq!(header.lines[1].text, " ◉ Current · ≣ Tree     ▾  7 tasks ");
+        assert_eq!(header.lines[1].text, " ◉ Current · ≣ Tree     ▾ ");
     }
 
     #[test]
-    fn header_width_fallback_drops_total_before_truncating_mode() {
+    fn header_width_truncates_mode_without_rendering_duplicate_total() {
         let state = SidebarState {
             category_scope: CategoryScope::All,
             presentation_mode: PresentationMode::Tree,
@@ -3448,7 +3408,7 @@ sidebar:
         let mode = style_for_segment(&header, 1, "≣ Tree");
         let suffix = style_for_segment(&header, 1, "]");
 
-        assert_eq!(header.lines[1].text, "[ ◉ Current · ≣ Tree     ] 7 tasks ]");
+        assert_eq!(header.lines[1].text, "[ ◉ Current · ≣ Tree     ]");
         assert_eq!(mode.fg, Some(Color::White));
         assert_eq!(mode.bg, Some(Color::Indexed(24)));
         assert!(mode.add_modifier.contains(Modifier::BOLD));
@@ -3493,9 +3453,8 @@ sidebar:
             ..Default::default()
         });
         let detail = detail_row("detail::%1::note", "plain detail", RollupLevel::Running);
-        let prompt_detail = detail_row("detail::%1::prompt", "fix flicker", RollupLevel::Running);
         let lines = render_lines(
-            &[chat, detail, prompt_detail],
+            &[chat, detail],
             &SidebarState::default(),
             40,
             &SidebarRenderTheme::default(),
@@ -3550,15 +3509,6 @@ sidebar:
                     && !span.style.add_modifier.contains(Modifier::DIM)),
             "{detail_spans:?}"
         );
-        let prompt_detail_spans = &lines[3].spans;
-        assert!(
-            prompt_detail_spans
-                .iter()
-                .any(|span| span.content.as_ref().contains("fix flicker")
-                    && span.style.fg == Some(Color::Indexed(246))
-                    && !span.style.add_modifier.contains(Modifier::DIM)),
-            "{prompt_detail_spans:?}"
-        );
     }
 
     #[test]
@@ -3567,17 +3517,17 @@ sidebar:
         let rows = vec![
             detail_row(
                 "detail::%1::task::0::completed",
-                "\u{251c} ✓ Task - Explore",
+                "\u{251c} ✓ Explore",
                 RollupLevel::Running,
             ),
             detail_row(
                 "detail::%1::task::1::in_progress",
-                "\u{251c} ● Task - Build",
+                "\u{251c} ● Build",
                 RollupLevel::Running,
             ),
             detail_row(
                 "detail::%1::task::2::pending",
-                "\u{2514} ○ Task - Verify",
+                "\u{2514} ○ Verify",
                 RollupLevel::Running,
             ),
         ];
@@ -3587,7 +3537,7 @@ sidebar:
         assert_span_fg(&lines[0].spans, "✓", theme.task_done);
         assert_span_fg(&lines[1].spans, "●", theme.task_working);
         assert_span_fg(&lines[2].spans, "○", theme.task_pending);
-        assert_span_fg(&lines[0].spans, " Task - Explore", theme.task_label);
+        assert_span_fg(&lines[0].spans, " Explore", theme.task_label);
         assert_span_fg(&lines[0].spans, "\u{251c} ", theme.marker);
     }
 
@@ -3632,23 +3582,16 @@ sidebar:
     }
 
     #[test]
-    fn summary_is_white_and_latest_prompt_is_detail_gray() {
+    fn summary_is_rendered_as_primary_detail_text() {
         let theme = SidebarRenderTheme::default();
         let summary = detail_row(
             "detail::%1::summary",
             "sidebar task summary",
             RollupLevel::Running,
         );
-        let prompt = detail_row(
-            "detail::%1::prompt",
-            "latest user prompt",
-            RollupLevel::Running,
-        );
-
-        let lines = render_lines(&[summary, prompt], &SidebarState::default(), 60, &theme);
+        let lines = render_lines(&[summary], &SidebarState::default(), 60, &theme);
 
         assert_span_fg(&lines[0].spans, "sidebar task summary", Color::Reset);
-        assert_span_fg(&lines[1].spans, "latest user prompt", theme.detail);
     }
 
     #[test]
@@ -3784,7 +3727,7 @@ sidebar:
     fn narrow_width_truncates_task_detail_without_panicking() {
         let detail = detail_row(
             "detail::%1::task::0::in_progress",
-            "\u{2514} ● Task - Implement an extremely long task label",
+            "\u{2514} ● Implement an extremely long task label",
             RollupLevel::Running,
         );
 
@@ -4242,27 +4185,27 @@ badge:
                 assert!(rendered.iter().any(|line| line.contains('▎')));
                 let expected = match (label, width) {
                     ("Codex: fix sidebar", 16) => vec!["▎● 1m30s        "],
-                    ("Codex: fix sidebar", 24) => vec!["▎● Codex       f… 1m30s "],
+                    ("Codex: fix sidebar", 24) => vec!["▎● Codex  fix si… 1m30s "],
                     ("Codex: fix sidebar", 35) => {
-                        vec!["▎● Codex       fix sidebar   1m30s "]
+                        vec!["▎● Codex  fix sidebar        1m30s "]
                     }
                     ("Codex: fix sidebar", 36) => vec![
                         "▎ ▸ ● Codex                   1m30s ",
                         "     fix sidebar                    ",
                     ],
                     ("Codex: 修正確認", 16) => vec!["▎● 1m30s        "],
-                    ("Codex: 修正確認", 24) => vec!["▎● Codex       …  1m30s "],
+                    ("Codex: 修正確認", 24) => vec!["▎● Codex  修正確… 1m30s "],
                     ("Codex: 修正確認", 35) => {
-                        vec!["▎● Codex       修正確認      1m30s "]
+                        vec!["▎● Codex  修正確認           1m30s "]
                     }
                     ("Codex: 修正確認", 36) => vec![
                         "▎ ▸ ● Codex                   1m30s ",
                         "     修正確認                       ",
                     ],
                     ("Codex: fix 🧭✨", 16) => vec!["▎● 1m30s        "],
-                    ("Codex: fix 🧭✨", 24) => vec!["▎● Codex       f… 1m30s "],
+                    ("Codex: fix 🧭✨", 24) => vec!["▎● Codex  fix 🧭… 1m30s "],
                     ("Codex: fix 🧭✨", 35) => {
-                        vec!["▎● Codex       fix 🧭✨      1m30s "]
+                        vec!["▎● Codex  fix 🧭✨           1m30s "]
                     }
                     ("Codex: fix 🧭✨", 36) => vec![
                         "▎ ▸ ● Codex                   1m30s ",
@@ -4712,17 +4655,23 @@ badge:
     }
 
     #[test]
-    fn long_cjk_label_is_truncated_with_ellipsis_keeping_right_column() {
+    fn long_cjk_summary_is_truncated_with_ellipsis_keeping_right_column() {
         let mut chat = chat_row(
             "chat::%1",
-            "codex: 日本語のとても長いプロンプトを表示する",
+            "codex",
             RollupLevel::Permission,
             BadgeState::Blocked,
         );
         chat.expanded = false;
+        chat.meta = Some(crate::sidebar::tree::RowMeta {
+            agent: Some("codex".to_string()),
+            task_summary: Some("日本語のとても長いタスク要約を表示する".to_string()),
+            elapsed_secs: Some(13 * 60),
+            ..Default::default()
+        });
         let rendered = render_rows(&[chat], &SidebarState::default(), 24);
         assert!(rendered.contains('…'), "{rendered:?}");
-        assert!(rendered.ends_with("  "), "{rendered:?}");
+        assert!(rendered.ends_with("13m "), "{rendered:?}");
         assert_eq!(display_width(&rendered), 24, "{rendered:?}");
     }
 

@@ -11,7 +11,7 @@ Claude Code、Codex、opencode の pane を追跡し、tmux の status line と�
 
 - すべての tmux session にいるエージェントを `Blocked`、`Working`、`Done`、`Idle` に分類する
 - 対応が必要なエージェントを status line に表示する
-- prompt、経過時間、task、subagent、worktree activity をサイドバーに表示する
+- task要約、経過時間、task、subagent、worktree activity をサイドバーに表示する
 - サイドバーからエージェントの pane へ直接移動する
 - session をカテゴリで整理し、キーボードや status line のクリックで切り替える
 - エージェントが入力待ちになったとき、任意の通知コマンドを実行する
@@ -337,6 +337,12 @@ vt project selector --popup
 sidebar:
   width: "20%"
   min_width: 40
+  task_summary:
+    enabled: false
+    debounce_ms: 750
+    timeout_ms: 90000
+    # codex_model: optional-model-name
+    # claude_model: optional-model-name
 
 statusline:
   sessions:
@@ -360,6 +366,11 @@ badge:
 `statusline.summary.format` では `{badge}` と `{count}` の placeholder を使えます（`{badge}{count}`、`{badge}: {count}` など）。
 件数が 0 の状態も表示するため、summary の表示幅は安定します。
 Idle を表示したくない場合は `hide_idle: true` を指定します。
+
+`sidebar.task_summary.enabled`を有効にすると、閉じたagent行と展開した詳細へ短いtask要約を表示します。
+daemonはpaneのagentに対応する独立CLI（Codexは`codex exec`、Claudeは`claude -p`）で要約を非同期生成します。
+最新のraw promptはpane stateとJSON APIには保持しますが、サイドバーには表示しません。
+providerをまたぐfallbackは行いません。追加のmodel requestを許容できない場合は無効のままにしてください。
 
 category segmentでは、agent paneが0件の場合も、sessionを持つすべてのカテゴリを表示します。
 各カテゴリは、共有status幅のbudgetを超える場合も完全なラベルと操作targetをpublishし、`+N`や`cat:N`へ省略しません。

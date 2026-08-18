@@ -669,7 +669,7 @@ fn repo_rows_from_keyed_map(
         });
         if expanded {
             for pane in &panes {
-                push_chat_row(pane, depth + 1, state, now, false, &mut rows);
+                push_chat_row(pane, depth + 1, state, now, false, false, &mut rows);
             }
         }
     }
@@ -720,7 +720,7 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
         });
         if expanded {
             rows.push(detail_row(pane, 2, "origin", format!("origin: {origin}")));
-            push_chat_detail_rows(pane, 2, &mut rows);
+            push_chat_detail_rows(pane, 2, true, &mut rows);
         }
     }
     rows
@@ -831,7 +831,7 @@ fn push_priority_chat_row(
         meta: Some(meta),
     });
     if expanded {
-        push_chat_detail_rows(pane, 2, rows);
+        push_chat_detail_rows(pane, 2, true, rows);
     }
 }
 
@@ -846,7 +846,7 @@ fn flat_rows(
     let mut panes = groups.into_values().flatten().collect::<Vec<_>>();
     order_agent_panes(&mut panes, order);
     for pane in &panes {
-        push_chat_row(pane, 0, state, now, show_origin, &mut rows);
+        push_chat_row(pane, 0, state, now, show_origin, true, &mut rows);
     }
     rows
 }
@@ -857,6 +857,7 @@ fn push_chat_row(
     state: &SidebarState,
     now: i64,
     show_origin: bool,
+    include_repo_git: bool,
     rows: &mut Vec<SidebarRow>,
 ) {
     let id = chat_row_id(&pane.pane_instance);
@@ -888,7 +889,7 @@ fn push_chat_row(
         meta: Some(meta),
     });
     if expanded {
-        push_chat_detail_rows(pane, depth + 1, rows);
+        push_chat_detail_rows(pane, depth + 1, include_repo_git, rows);
     }
 }
 
@@ -912,11 +913,16 @@ fn detail_row(pane: &AgentPane, depth: usize, suffix: &str, label: String) -> Si
     }
 }
 
-fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarRow>) {
+fn push_chat_detail_rows(
+    pane: &AgentPane,
+    depth: usize,
+    include_repo_git: bool,
+    rows: &mut Vec<SidebarRow>,
+) {
     if let Some(summary) = non_empty(&pane.task_summary) {
         rows.push(detail_row(pane, depth, "summary", summary.to_string()));
     }
-    if let Some(signal) = agent_signal_label(pane) {
+    if let Some(signal) = agent_signal_label(pane, include_repo_git) {
         let mut row = detail_row(pane, depth, "signal", signal);
         if let Some((done, total)) = parse_tasks(&pane.tasks) {
             row.meta = Some(RowMeta {
@@ -926,9 +932,6 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
             });
         }
         rows.push(row);
-    }
-    if let Some(prompt) = non_empty(&pane.prompt) {
-        rows.push(detail_row(pane, depth, "prompt", prompt.to_string()));
     }
     if let Some(process) = &pane.background_process {
         rows.push(detail_row(
@@ -983,7 +986,7 @@ fn push_chat_detail_rows(pane: &AgentPane, depth: usize, rows: &mut Vec<SidebarR
     }
 }
 
-fn agent_signal_label(pane: &AgentPane) -> Option<String> {
+fn agent_signal_label(pane: &AgentPane, include_repo_git: bool) -> Option<String> {
     const MAX_SIGNAL_PORTS: usize = 3;
 
     let mut parts = Vec::new();
@@ -992,7 +995,13 @@ fn agent_signal_label(pane: &AgentPane) -> Option<String> {
         .as_ref()
         .and_then(|worktree| worktree.branch.as_deref());
     let branch = worktree_branch
-        .or_else(|| pane.git.as_ref().map(|git| git.branch.as_str()))
+        .or_else(|| {
+            if include_repo_git {
+                pane.git.as_ref().map(|git| git.branch.as_str())
+            } else {
+                None
+            }
+        })
         .or_else(|| {
             pane.worktree
                 .as_ref()
@@ -1002,7 +1011,11 @@ fn agent_signal_label(pane: &AgentPane) -> Option<String> {
         let marker = if pane.worktree.is_some() { "+ " } else { "" };
         parts.push(format!("{marker}{}", sanitize_detail_label(branch)));
     }
-    if let Some(git) = &pane.git {
+    if let Some(git) = pane
+        .git
+        .as_ref()
+        .filter(|_| include_repo_git || pane.worktree.is_some())
+    {
         if git.ahead > 0 {
             parts.push(format!("↑ {}", git.ahead));
         }
@@ -1060,7 +1073,7 @@ fn same_worktree_path(worktree: Option<&WorktreeInfo>, activity: &WorktreeActivi
 
 fn task_detail_label(index: usize, last_index: usize, item: &TaskItem) -> String {
     format!(
-        "{} {} Task - {}",
+        "{} {} {}",
         tree_connector(index, last_index),
         task_status_icon(item.status),
         sanitize_detail_label(&item.step)
@@ -1207,11 +1220,7 @@ fn subagent_id_suffix(agent_id: &str) -> String {
 
 fn chat_label(pane: &AgentPane) -> String {
     let agent = display_agent_name(&pane.agent);
-    let base = if let Some(prompt) = non_empty(&pane.prompt) {
-        format!("{agent}: {prompt}")
-    } else {
-        format!("{agent} ({})", pane.pane_id)
-    };
+    let base = format!("{agent} ({})", pane.pane_id);
     if let Some((done, total)) = parse_tasks(&pane.tasks).filter(|(_, total)| *total > 0) {
         format!("{base} {done}/{total}")
     } else {
@@ -1488,7 +1497,7 @@ mod tests {
                 meta: None,
             },
             SidebarRow {
-                id: "detail::%1::prompt".to_string(),
+                id: "detail::%1::note".to_string(),
                 kind: SidebarRowKind::Detail,
                 depth: 1,
                 label: "fix bug".to_string(),
@@ -1888,18 +1897,18 @@ mod tests {
     }
 
     #[test]
-    fn expanded_chat_places_summary_before_latest_prompt() {
+    fn expanded_chat_omits_raw_prompt_and_keeps_summary() {
         let mut pane = agent_pane(BadgeState::Working, "");
         pane.task_summary = "サイドバー要約表示".to_string();
         pane.prompt = "実装してlocal installして".to_string();
         let mut rows = Vec::new();
 
-        push_chat_detail_rows(&pane, 1, &mut rows);
+        push_chat_detail_rows(&pane, 1, true, &mut rows);
 
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "detail::%1::1::summary");
         assert_eq!(rows[0].label, "サイドバー要約表示");
-        assert_eq!(rows[1].id, "detail::%1::1::prompt");
-        assert_eq!(rows[1].label, "実装してlocal installして");
+        assert!(rows.iter().all(|row| !row.id.ends_with("::prompt")));
     }
 
     #[test]
@@ -1933,7 +1942,7 @@ mod tests {
         pane.latest_response = "server is ready".to_string();
         let mut rows = Vec::new();
 
-        push_chat_detail_rows(&pane, 1, &mut rows);
+        push_chat_detail_rows(&pane, 1, true, &mut rows);
 
         assert_eq!(rows[0].id, "detail::%1::1::signal");
         assert_eq!(
@@ -1942,6 +1951,46 @@ mod tests {
         );
         assert!(rows.iter().any(|row| row.label == "◎ $ pnpm dev"));
         assert!(rows.iter().any(|row| row.label == "▷ server is ready"));
+    }
+
+    #[test]
+    fn nested_chat_signal_omits_repo_git_but_keeps_runtime_signal() {
+        let mut pane = agent_pane(BadgeState::Working, "");
+        pane.git = Some(crate::git::GitBadge {
+            branch: "main".to_string(),
+            ahead: 2,
+            behind: 1,
+        });
+        pane.tasks = "1/3".to_string();
+        pane.listening_ports = vec![3000];
+        let mut rows = Vec::new();
+
+        push_chat_detail_rows(&pane, 1, false, &mut rows);
+
+        assert_eq!(rows[0].label, "☑ 1/3  :3000");
+    }
+
+    #[test]
+    fn nested_chat_signal_keeps_distinct_worktree_branch() {
+        let mut pane = agent_pane(BadgeState::Working, "");
+        pane.git = Some(crate::git::GitBadge {
+            branch: "main".to_string(),
+            ahead: 2,
+            behind: 1,
+        });
+        pane.worktree = Some(WorktreeInfo {
+            name: "feature-sidebar".to_string(),
+            path: "/tmp/feature-sidebar".to_string(),
+            source: crate::git::WorktreeSource::GitLinked,
+            branch: Some("feature/sidebar".to_string()),
+            dirty: None,
+            locked: None,
+        });
+        let mut rows = Vec::new();
+
+        push_chat_detail_rows(&pane, 1, false, &mut rows);
+
+        assert_eq!(rows[0].label, "+ feature/sidebar  ↑ 2  ↓ 1");
     }
 
     #[test]
@@ -2341,8 +2390,9 @@ mod tests {
     }
 
     #[test]
-    fn chat_label_omits_empty_task_progress() {
-        let pane = agent_pane(BadgeState::Working, "");
+    fn chat_label_omits_raw_prompt_and_empty_task_progress() {
+        let mut pane = agent_pane(BadgeState::Working, "");
+        pane.prompt = "raw prompt must stay out of the sidebar label".to_string();
 
         assert_eq!(chat_label(&pane), "Codex (%1)");
     }
