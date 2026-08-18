@@ -2,9 +2,9 @@
 
 ## Status
 
-実装・Codex P0実測・isolated runtime検証・独立レビューまで完了。常用server cutoverは未完了。
+履歴仕様。API v4で置換済みであり、runtimeを併存させない。v4の追加契約とrollout gateは[AGENT_API_V4.md](AGENT_API_V4.md)を参照する。
 
-API v2はv3 cutoverまでの公開契約とし、cutover後にruntime併存させない。
+API v2はv3 cutoverまでの公開契約であり、v3はv4 cutoverまでの公開契約だった。
 
 Codex 0.147.0のprovider境界は実測済みでadapterを有効化した。Claude Codeはauthenticated isolated P0を通過していないため、durable mutationを有効化しない。
 
@@ -35,7 +35,7 @@ API v3に含めない機能は次のとおりとする。
 - failedまたはcancelledへのoperator resolution
 - 汎用provider adapter framework
 
-これらを追加する場合はAPI v4以降の公開契約として設計する。
+これらのうちpane split、agent start、provider capability契約、guarded terminal mutationはAPI v4で追加した。残りは引き続き非対応とする。
 
 ## Design principles
 

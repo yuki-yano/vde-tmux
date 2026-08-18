@@ -194,9 +194,8 @@ OPERATION_ID="$(uuidgen)"
 PROMPT_JSON="$(printf '%s' 'Review the current diff.' \
   | vt agent prompt "$AGENT_REF" --operation-id "$OPERATION_ID" --stdin --json)"
 OPERATION_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.operation_ref')"
-vt agent operation wait "$OPERATION_REF" --until prompt-confirmed --json
-RUN_REF="$(vt agent operation get "$OPERATION_REF" --json | jq -r '.result.run_ref')"
-vt agent run wait "$RUN_REF" --until completed --json
+RUN_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.run_ref')"
+vt agent run wait "$RUN_REF" --json
 vt agent run response "$RUN_REF" --json
 ```
 
@@ -204,7 +203,7 @@ See [Agent JSON API](./AGENT_API.md) for the response envelope, stable occupant 
 durable run completion, filters, and capture bounds. An exact `agent_ref` is emitted only when one
 unique live agent process can be pinned by PID and OS start token. Hooks remain necessary for
 accurate lifecycle details, but hookless agents can use `agent wait` and `agent read` when that live
-process identity is available. API v3 stores durable Run and Operation records separately from the
+process identity is available. API v4 stores durable Run and Operation records separately from the
 bounded pane projection. Guarded prompt dispatch is daemon-owned, requires healthy tmux hooks and
 foreground input ownership, and never places prompt bytes in argv. Reusing the same operation ID
 performs an idempotent lookup/resume; `delivery_unknown` is never auto-retried. Historical unresolved
@@ -212,6 +211,12 @@ runs remain readable while retained. CAS recovery is restricted to the Pane's cu
 which is checked twice against Pane, process, foreground ownership, and visible viewport state.
 Prompt input treats one terminal LF or CRLF from stdin or a file as a text-record terminator and
 removes it before hashing and dispatch, while preserving all internal line breaks.
+
+API v4 also exposes provider capabilities, `pane split`, `agent start`, guarded terminal
+`agent send`, and blocked-agent `agent send-keys`. These mutations require exact references and revalidate
+the tmux server, pane/process identity, and foreground input ownership. Guarded terminal input
+leaves copy-mode before revalidation. A successful `agent send` receipt means tmux applied the
+input; callers must use its lifecycle cursor with `agent wait` before claiming provider acceptance.
 
 When Claude Code or Codex exhausts its allowance, the pane remains queryable as
 `status=blocked`, `lifecycle.state=waiting`, and `lifecycle.reason=usage_limit`, even if the agent

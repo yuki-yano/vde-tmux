@@ -1,11 +1,13 @@
 # Agent JSON API
 
-This document defines the current API v3 contract. The design rationale and complete rollout gates
-are maintained in [AGENT_API_V3.md](AGENT_API_V3.md).
+This document defines the current API v4 contract. The v4 mutation boundary and rollout gates are
+maintained in [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is
+recorded in [AGENT_API_V3.md](AGENT_API_V3.md).
 
 `vt` exposes a versioned JSON interface for terminal agents. The command tree is the public API.
-Most commands are read-only; `agent prompt` is the single guarded mutation. The daemon Unix-socket
-protocol is internal and changes independently.
+Read-only topology and state commands coexist with exact-reference mutations for durable prompt
+dispatch, guarded terminal input, pane split, and agent start. The daemon Unix-socket protocol is
+internal and changes independently.
 
 Compatibility exists only within the same `api_version`. Breaking public changes increment that
 version; old versions and fallback behavior are not kept in parallel. Callers must reject an
@@ -20,6 +22,12 @@ vt pane get %456 --json
 vt pane current --json
 vt pane read %456 --source latest --lines 120 --json
 
+PANE_JSON="$(vt pane get %456 --json)"
+PANE_REF="$(printf '%s' "$PANE_JSON" | jq -r '.result.pane.summary.pane_ref')"
+SPLIT_JSON="$(vt pane split "$PANE_REF" --direction right --size-percent 50 --json)"
+NEW_PANE_REF="$(printf '%s' "$SPLIT_JSON" | jq -r '.result.split.pane_ref')"
+vt agent start "$NEW_PANE_REF" --agent claude --json
+
 vt agent list --status working --json
 vt agent list --needs-action --json
 vt agent get %456 --json
@@ -31,11 +39,23 @@ OPERATION_ID="$(uuidgen)"
 PROMPT_JSON="$(printf '%s' 'Review the current diff and report must-fix findings.' \
   | vt agent prompt "$AGENT_REF" --operation-id "$OPERATION_ID" --stdin --json)"
 OPERATION_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.operation_ref')"
-vt agent operation wait "$OPERATION_REF" --until prompt-confirmed --json
-RUN_REF="$(vt agent operation get "$OPERATION_REF" --json | jq -r '.result.run_ref')"
-vt agent run wait "$RUN_REF" --until completed --json
+RUN_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.run_ref')"
+vt agent run wait "$RUN_REF" --json
 vt agent run response "$RUN_REF" --json
 vt agent read %456 --source latest --lines 120 --json
+
+CLAUDE_JSON="$(vt agent get %537 --json)"
+CLAUDE_REF="$(printf '%s' "$CLAUDE_JSON" | jq -r '.result.agent.summary.agent_ref')"
+SEND_JSON="$(printf '%s' 'Inspect the current diff.' \
+  | vt agent send "$CLAUDE_REF" --stdin --json)"
+SEND_BASELINE="$(printf '%s' "$SEND_JSON" | jq -r '.result.send.baseline_completed_seq')"
+vt agent wait "$CLAUDE_REF" \
+  --until working --until blocked --until done \
+  --after-completed-seq "$SEND_BASELINE" --timeout-ms 10000 --json
+
+# For an independently resolved exact blocked occupant only:
+BLOCKED_REF="$(vt agent get %538 --json | jq -r '.result.agent.summary.agent_ref')"
+vt agent send-keys "$BLOCKED_REF" --key y --key Enter --json
 ```
 
 API commands always emit JSON. `--json` is accepted so callers can state the expected format. A
@@ -46,7 +66,7 @@ the conceptual request command, success envelope, and error envelope.
 ```json
 {
   "meta": {
-    "api_version": 3,
+    "api_version": 4,
     "server_identity": "...",
     "daemon_instance_id": "...",
     "snapshot_revision": 42,
@@ -93,7 +113,8 @@ projection:
 `badge: idle`, and `unread: false`. `needs_action` is derived from canonical triage state and does
 not disappear merely because a pane is visible.
 
-`agent list` returns only present agents. Historical records retained for unread/sidebar behavior
+`agent list` returns present agents plus an absent retained occupant only while its canonical
+lifecycle reason is `usage_limit`. Other historical records retained for unread/sidebar behavior
 are not reported as current occupants. Results are ordered by canonical pane identity; consumers
 must not infer activity order from array position.
 
@@ -101,8 +122,8 @@ A tmux pane is emitted once per server even when its window is linked into multi
 `sessions[]` describes those session views; `window_active` and `window_last` apply to each view.
 Pane-level `active` is the selected pane within the shared window, not a particular client's focus.
 `pane current` and `pane read` with no target read `TMUX_PANE`; `pane current` returns the same
-`pane_get` result shape as `pane get`. Every agent list/get result has `present: true` by
-construction.
+`pane_get` result shape as `pane get`. An absent usage-limited result has `present: false`, inferred
+identity, and no `agent_ref`; it is read-only and can be queried again by pane ID.
 
 Filters are exact except for `--cwd-prefix`, which compares normalized path components:
 
@@ -165,7 +186,7 @@ pane without accidentally targeting a replacement agent.
 ## Guarded prompt dispatch
 
 `agent prompt` submits one prompt to an exact Codex occupant. Claude Code remains visible through
-the legacy pane projection, but API v3 durable mutation is disabled until its isolated provider
+the legacy pane projection, but durable mutation is disabled until its isolated provider
 contract probe passes. The caller supplies a
 stable `operation_id` and exactly one private body source. The daemon, not the CLI, owns staging,
 fencing, and tmux dispatch:
@@ -392,33 +413,8 @@ tmux process drains all output but retains at most 8 MiB stdout and 64 KiB stder
 observation group retains at most 16 MiB of parsed pane tails. Exceeding any of those bounds produces
 a typed capture output-limit failure.
 
-## Definition of Done for API v3 rollout
+## Definition of Done for API v4 rollout
 
-### Functional completion
-
-- [x] Durable Run, Operation, prompt staging, and Response Artifact state is generation-bound and
-  bounded independently from the pane projection.
-- [x] Guarded dispatch is daemon-owned, idempotent before side effects, and never resends a
-  `dispatch_started` or `delivery_unknown` operation.
-- [x] Present agents expose their current durable Run, historical Run reads and waits survive
-  occupant replacement, and recovery mutation is restricted to the Pane's current Run.
-- [x] Recovery requires a two-observation process/Pane/viewport check and a short-lived CAS precondition, and
-  stores an operator audit.
-
-### Test completion
-
-- [x] Run/Operation/store/reducer, idempotency, restart, ambiguity, and recovery tests pass.
-- [x] Codex provider P0 prompt, identity, queue, response, retry-window, and fan-out gates pass.
-- [x] Claude Code durable mutation remains disabled while its authenticated isolated P0 gate is
-  unavailable; no unverified adapter is enabled as a fallback.
-- [x] `cargo fmt --check`, clippy with warnings denied, full tests including ignored tests, all
-  three isolated tmux release scripts, durable prompt smoke, and operation crash smoke pass.
-- [ ] Independent reviewer and Fable report zero must-fix and must-simplify findings.
-
-### Operational completion
-
-- [x] Public API 3, daemon protocol 16, PaneState 9, and private state format 1 are declared.
-- [x] The local binary is installed, the old daemon is stopped, the new daemon is started, and all
-  running versions and hook ownership are verified.
-- [ ] No in-flight operation or unresolved Run is silently discarded during cutover.
-- [x] The dotfiles bridge version gate matches the installed durable-dispatch protocol.
+The measurable functional, test, and operational completion checklist is maintained in
+[AGENT_API_V4.md](AGENT_API_V4.md#definition-of-done). The API is not rollout-complete while any
+item in that checklist remains unchecked.

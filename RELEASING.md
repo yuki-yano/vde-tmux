@@ -2,20 +2,26 @@
 
 Publishing is driven by Git tags.
 
-## Local protocol 16 upgrade
+## Local API v4 upgrade
 
-Protocol 16 allows a durable Codex prompt Operation to stage an exact process binding before its
-provider session is known. Existing private state format 1 records remain readable and do not need
-to be reset. Because protocol 15 and 16 reject each other, stop the old daemon before replacing the
-installed binaries and reopen running sidebars afterward.
+API v4 replaces public API 3 with provider capabilities, guarded terminal mutations, exact pane
+split, and agent start. Daemon protocol 16, PaneState 9, and private state format 1 do not change;
+existing state remains readable and must not be reset. Public API 3 is not retained in parallel.
 
-Before replacement, pass the release gates listed below and confirm
-`vt agent storage status --json` reports zero `in_flight_operations`. Stage both binaries with
-`cargo install --path . --locked --root <temporary-root>`, verify protocol 16 in the staged schema,
-then back up and replace the installed binaries only while the daemon is stopped. Finally run
-`vt daemon ensure`, reopen sidebars, and verify the installed schema, hook health, and a scratch
-SessionStart-free first-prompt dispatch. Do not reset PaneState or private Agent state for this
-upgrade.
+Before replacement, pass the release gates listed below plus
+`scripts/test-agent-api-v4-isolated.sh`, `scripts/test-agent-prompt-isolated.sh`, and
+`scripts/test-agent-operation-crash-isolated.sh`. Confirm `vt agent storage status --json` reports
+zero `in_flight_operations`. Stage both binaries with
+`cargo install --path . --locked --root <temporary-root>` and verify the staged schema reports API
+4, protocol 16, PaneState 9, and private state 1.
+
+Close running sidebars and run `vt daemon disable` before copying either executable so hooks cannot
+restart a mixed binary generation during replacement. Back up both installed executables, replace
+them from the staged root, verify their SHA-256 hashes, then run `vt daemon enable`. Reopen sidebars
+and verify the installed schema, daemon health, hook ownership, one guarded copy-mode send on a
+scratch server, and a SessionStart-free first Codex prompt. Do not reset PaneState or private Agent
+state for this upgrade. On a failed copy or version check, keep the daemon disabled and restore both
+executables from the same backup before re-enabling it.
 
 ## Historical initial API v3 cutover
 

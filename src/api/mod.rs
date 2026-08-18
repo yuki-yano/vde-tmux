@@ -25,7 +25,9 @@ use crate::{
     pane_state::EventId,
 };
 
-pub const API_VERSION: u16 = 3;
+mod terminal_mutation;
+
+pub const API_VERSION: u16 = 4;
 pub const DEFAULT_READ_LINES: usize = 120;
 pub const MAX_READ_LINES: usize = 2_000;
 pub const MAX_READ_BYTES: usize = 1024 * 1024;
@@ -36,6 +38,7 @@ pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const WAIT_POLL_INITIAL_INTERVAL: Duration = Duration::from_millis(50);
 const WAIT_POLL_MAX_INTERVAL: Duration = Duration::from_secs(1);
+const MUTATION_PROJECTION_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -511,7 +514,7 @@ pub struct RunRecoveryDiagnostic {
 pub struct ApiSchemaContract {
     pub versions: ApiVersionContract,
     pub hard_limits: ApiHardLimitContract,
-    pub providers: ApiProviderCompatibilityContract,
+    pub providers: BTreeMap<String, ApiProviderContract>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -549,14 +552,10 @@ pub struct ApiHardLimitContract {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct ApiProviderCompatibilityContract {
-    pub codex: ApiProviderContract,
-    pub claude_code: ApiProviderContract,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ApiProviderContract {
-    pub status: ApiProviderStatus,
+    pub agent_kind: String,
+    pub durable_adapter_status: ApiProviderStatus,
+    pub capabilities: ApiProviderCapabilities,
     pub recorded_version: String,
     pub evidence_basis: ApiProviderEvidenceBasis,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -574,6 +573,7 @@ pub struct ApiProviderContract {
 pub enum ApiProviderStatus {
     Enabled,
     DisabledPendingAuthenticatedP0,
+    NotAvailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -581,6 +581,49 @@ pub enum ApiProviderStatus {
 pub enum ApiProviderEvidenceBasis {
     AuthenticatedIsolatedRuntimeProbe,
     IsolatedProbeBlockedByAuthentication,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ApiProviderCapabilities {
+    pub prompt_dispatch: ApiPromptDispatchCapability,
+    pub prompt_confirmation: ApiPromptConfirmationCapability,
+    pub response: ApiResponseCapability,
+    pub interactive_keys: bool,
+    pub start: ApiAgentStartCapability,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiPromptDispatchCapability {
+    Durable,
+    GuardedTerminal,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiPromptConfirmationCapability {
+    ProviderDigest,
+    LifecycleCursor,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiResponseCapability {
+    Artifact,
+    TerminalRead,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiAgentStartCapability {
+    DurableInitialPrompt,
+    ProviderSession,
+    InputOwnerOnly,
+    Disabled,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -635,6 +678,9 @@ pub enum ApiResult {
         pane: PaneSummary,
         read: ReadResult,
     },
+    PaneSplit {
+        split: PaneSplitReceipt,
+    },
     AgentList {
         agents: Vec<AgentSummary>,
     },
@@ -647,6 +693,17 @@ pub enum ApiResult {
         run_ref: Option<String>,
         #[schemars(with = "serde_json::Value")]
         operation: OperationRecord,
+        waited_ms: u64,
+    },
+    AgentSend {
+        send: AgentTerminalSendReceipt,
+    },
+    AgentSendKeys {
+        send: AgentKeySendReceipt,
+    },
+    AgentStart {
+        start: AgentStartReceipt,
+        agent: AgentDetail,
         waited_ms: u64,
     },
     AgentRun {
@@ -898,6 +955,70 @@ pub struct AgentPromptReceipt {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum PaneSplitDirection {
+    Right,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PaneSplitOptions<'a> {
+    pub direction: PaneSplitDirection,
+    pub size_percent: Option<u8>,
+    pub cwd: Option<&'a str>,
+    pub focus: bool,
+}
+
+impl PaneSplitDirection {
+    fn tmux_flag(self) -> &'static str {
+        match self {
+            Self::Right => "-h",
+            Self::Down => "-v",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PaneSplitReceipt {
+    pub target_pane_ref: String,
+    pub pane_ref: String,
+    pub pane_id: String,
+    pub pane_pid: u32,
+    pub direction: PaneSplitDirection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_percent: Option<u8>,
+    pub cwd: String,
+    pub focused: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AgentTerminalSendReceipt {
+    pub target: AgentWaitTarget,
+    pub prompt_digest: String,
+    pub baseline_state_revision: u64,
+    pub baseline_run_seq: u64,
+    pub baseline_completed_seq: u64,
+    pub dispatch: ApiPromptDispatchCapability,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AgentKeySendReceipt {
+    pub target: AgentWaitTarget,
+    pub keys: Vec<String>,
+    pub baseline_state_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AgentStartReceipt {
+    pub target_pane_ref: String,
+    pub pane_ref: String,
+    pub agent_ref: String,
+    pub agent: String,
+    pub readiness: ApiAgentStartCapability,
+    pub command_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentPromptDispatch {
     Submitted,
 }
@@ -1033,6 +1154,16 @@ pub enum ApiRequest {
         #[serde(default)]
         read: ReadOptions,
     },
+    PaneSplit {
+        target: String,
+        direction: PaneSplitDirection,
+        #[serde(default)]
+        size_percent: Option<u8>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        focus: bool,
+    },
     AgentList {
         #[serde(default)]
         filter: AgentListFilter,
@@ -1046,6 +1177,22 @@ pub enum ApiRequest {
         #[serde(default = "default_prompt_confirm_timeout_ms")]
         #[schemars(range(min = 1, max = 60_000))]
         confirm_timeout_ms: u64,
+    },
+    AgentSend {
+        target: String,
+    },
+    AgentSendKeys {
+        target: String,
+        keys: Vec<String>,
+    },
+    AgentStart {
+        target: String,
+        agent: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default = "default_wait_timeout_ms")]
+        #[schemars(range(min = 1, max = 86_400_000))]
+        timeout_ms: u64,
     },
     AgentRunGet {
         run_ref: String,
@@ -1210,36 +1357,78 @@ fn api_schema_contract() -> ApiSchemaContract {
             wait_timeout_max_ms: MAX_WAIT_TIMEOUT.as_millis() as u64,
             daemon_request_frame_max_bytes: crate::pane_state::MAX_REQUEST_FRAME_BYTES as u64,
         },
-        providers: ApiProviderCompatibilityContract {
-            codex: ApiProviderContract {
-                status: ApiProviderStatus::Enabled,
-                recorded_version: "0.147.0".to_string(),
-                evidence_basis: ApiProviderEvidenceBasis::AuthenticatedIsolatedRuntimeProbe,
-                observed_at: Some("2026-08-15".to_string()),
-                source_revision: Some("a4fb816a52fc4178ef3a01d285f0c6cc0191d7c0".to_string()),
-                probe_observation_count: Some(20),
-                attribution: Some(ApiProviderAttributionContract {
-                    stable_event_reference: vec![
-                        ApiProviderAttributionField::Provider,
-                        ApiProviderAttributionField::SessionId,
-                        ApiProviderAttributionField::TurnId,
-                        ApiProviderAttributionField::HookKind,
-                    ],
-                    prompt_event: ApiProviderHookEvent::UserPromptSubmit,
-                    completion_event: ApiProviderHookEvent::Stop,
-                    response_artifact_source: ApiResponseArtifactSource::StopPayload,
-                }),
-            },
-            claude_code: ApiProviderContract {
-                status: ApiProviderStatus::DisabledPendingAuthenticatedP0,
-                recorded_version: "2.1.227".to_string(),
-                evidence_basis: ApiProviderEvidenceBasis::IsolatedProbeBlockedByAuthentication,
-                observed_at: None,
-                source_revision: None,
-                probe_observation_count: None,
-                attribution: None,
-            },
-        },
+        providers: BTreeMap::from([
+            (
+                "codex".to_string(),
+                ApiProviderContract {
+                    agent_kind: "codex".to_string(),
+                    durable_adapter_status: ApiProviderStatus::Enabled,
+                    capabilities: ApiProviderCapabilities {
+                        prompt_dispatch: ApiPromptDispatchCapability::Durable,
+                        prompt_confirmation: ApiPromptConfirmationCapability::ProviderDigest,
+                        response: ApiResponseCapability::Artifact,
+                        interactive_keys: true,
+                        start: ApiAgentStartCapability::DurableInitialPrompt,
+                    },
+                    recorded_version: "0.147.0".to_string(),
+                    evidence_basis: ApiProviderEvidenceBasis::AuthenticatedIsolatedRuntimeProbe,
+                    observed_at: Some("2026-08-15".to_string()),
+                    source_revision: Some("a4fb816a52fc4178ef3a01d285f0c6cc0191d7c0".to_string()),
+                    probe_observation_count: Some(20),
+                    attribution: Some(ApiProviderAttributionContract {
+                        stable_event_reference: vec![
+                            ApiProviderAttributionField::Provider,
+                            ApiProviderAttributionField::SessionId,
+                            ApiProviderAttributionField::TurnId,
+                            ApiProviderAttributionField::HookKind,
+                        ],
+                        prompt_event: ApiProviderHookEvent::UserPromptSubmit,
+                        completion_event: ApiProviderHookEvent::Stop,
+                        response_artifact_source: ApiResponseArtifactSource::StopPayload,
+                    }),
+                },
+            ),
+            (
+                "claude".to_string(),
+                ApiProviderContract {
+                    agent_kind: "claude".to_string(),
+                    durable_adapter_status: ApiProviderStatus::DisabledPendingAuthenticatedP0,
+                    capabilities: ApiProviderCapabilities {
+                        prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
+                        prompt_confirmation: ApiPromptConfirmationCapability::LifecycleCursor,
+                        response: ApiResponseCapability::TerminalRead,
+                        interactive_keys: true,
+                        start: ApiAgentStartCapability::ProviderSession,
+                    },
+                    recorded_version: "2.1.227".to_string(),
+                    evidence_basis: ApiProviderEvidenceBasis::IsolatedProbeBlockedByAuthentication,
+                    observed_at: None,
+                    source_revision: None,
+                    probe_observation_count: None,
+                    attribution: None,
+                },
+            ),
+            (
+                "opencode".to_string(),
+                ApiProviderContract {
+                    agent_kind: "opencode".to_string(),
+                    durable_adapter_status: ApiProviderStatus::NotAvailable,
+                    capabilities: ApiProviderCapabilities {
+                        prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
+                        prompt_confirmation: ApiPromptConfirmationCapability::None,
+                        response: ApiResponseCapability::TerminalRead,
+                        interactive_keys: true,
+                        start: ApiAgentStartCapability::InputOwnerOnly,
+                    },
+                    recorded_version: "unverified".to_string(),
+                    evidence_basis: ApiProviderEvidenceBasis::NotApplicable,
+                    observed_at: None,
+                    source_revision: None,
+                    probe_observation_count: None,
+                    attribution: None,
+                },
+            ),
+        ]),
     }
 }
 
@@ -1350,6 +1539,137 @@ pub fn pane_read(
     )
 }
 
+pub fn pane_split(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    target: &str,
+    options: PaneSplitOptions<'_>,
+) -> Result<String> {
+    let PaneSplitOptions {
+        direction,
+        size_percent,
+        cwd,
+        focus,
+    } = options;
+    if !target.starts_with("vtp1:") {
+        return Err(api_error!(
+            "invalid_arguments",
+            "pane split requires an exact pane_ref target",
+        )
+        .into());
+    }
+    if size_percent.is_some_and(|percent| !(1..=99).contains(&percent)) {
+        return Err(api_error!(
+            "invalid_arguments",
+            "--size-percent must be between 1 and 99",
+        )
+        .into());
+    }
+    let mut connection = ApiConnection::connect(runner, env, None)?;
+    let snapshot = connection.query_snapshot()?;
+    let pane = resolve_pane(&snapshot, target, &connection.server_identity)?;
+    let expected = pane.pane_instance.clone();
+    let cwd = cwd.unwrap_or(&pane.current_path);
+    validate_split_cwd(cwd)?;
+    verify_live_pane(runner, env, &connection, &expected)?;
+    let nonce = EventId::generate()
+        .map_err(|error| api_error!("internal_error", format!("split request ID: {error}")))?;
+    let created = match terminal_mutation::split_pane_guarded(
+        runner,
+        &connection.incarnation,
+        &expected,
+        terminal_mutation::SplitMutation {
+            direction_flag: direction.tmux_flag(),
+            size_percent,
+            cwd,
+            focus,
+            nonce_seed: nonce.as_str(),
+        },
+    ) {
+        terminal_mutation::SplitMutationOutcome::Applied(created) => created,
+        terminal_mutation::SplitMutationOutcome::Rejected(message) => {
+            return Err(api_error!("dispatch_rejected", message)
+                .with_dispatch_context(
+                    ApiErrorStage::BeforeDispatch,
+                    ApiSideEffect::None,
+                    ApiRetryAction::RefreshTarget,
+                    None,
+                )
+                .into());
+        }
+        terminal_mutation::SplitMutationOutcome::DeliveryUnknown(message) => {
+            return Err(api_error!("delivery_unknown", message)
+                .with_dispatch_context(
+                    ApiErrorStage::AfterDispatch,
+                    ApiSideEffect::Possible,
+                    ApiRetryAction::InspectManually,
+                    None,
+                )
+                .into());
+        }
+    };
+    require_live_pane_instance(runner, &created).map_err(|error| {
+        api_error!(
+            "delivery_unknown",
+            format!(
+                "split reported pane {} but its live identity could not be confirmed: {error:#}",
+                created.pane_id
+            ),
+        )
+        .with_dispatch_context(
+            ApiErrorStage::AfterDispatch,
+            ApiSideEffect::Confirmed,
+            ApiRetryAction::InspectManually,
+            None,
+        )
+    })?;
+    let projection_deadline = Instant::now() + MUTATION_PROJECTION_TIMEOUT;
+    let mut after_connection = connection.reconnect()?;
+    let after = loop {
+        let after = after_connection.query_snapshot()?;
+        if require_same_pane(&after, &created).is_ok() {
+            break after;
+        }
+        if Instant::now() >= projection_deadline {
+            return Err(ApiError::new(
+                ApiErrorCode::Timeout,
+                format!(
+                    "pane {} was created but did not enter canonical topology within {} ms",
+                    created.pane_id,
+                    MUTATION_PROJECTION_TIMEOUT.as_millis()
+                ),
+            )
+            .with_dispatch_context(
+                ApiErrorStage::AfterDispatch,
+                ApiSideEffect::Confirmed,
+                ApiRetryAction::InspectManually,
+                None,
+            )
+            .into());
+        }
+        std::thread::sleep(WAIT_POLL_INITIAL_INTERVAL);
+        after_connection = connection.reconnect()?;
+    };
+    success_json(
+        &after_connection,
+        &after,
+        observed_at,
+        ApiResult::PaneSplit {
+            split: PaneSplitReceipt {
+                target_pane_ref: target.to_string(),
+                pane_ref: pane_ref(&connection.server_identity, &created),
+                pane_id: created.pane_id,
+                pane_pid: created.pane_pid,
+                direction,
+                size_percent,
+                cwd: cwd.to_string(),
+                focused: focus,
+            },
+        },
+    )
+}
+
 pub fn agent_list(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
@@ -1396,6 +1716,447 @@ pub fn agent_get(
         observed_at,
         ApiResult::AgentGet { agent },
     )
+}
+
+pub fn agent_send(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    target: &str,
+    prompt: &str,
+) -> Result<String> {
+    validate_prompt(prompt)?;
+    if !target.starts_with("vta1:") {
+        return Err(api_error!(
+            "invalid_arguments",
+            "agent send requires an exact agent_ref target",
+        )
+        .into());
+    }
+    let mut connection = ApiConnection::connect(runner, env, None)?;
+    let before = connection.query_snapshot()?;
+    let pane = resolve_agent(&before, target, &connection.server_identity)?;
+    let identity = AgentIdentity::from_pane(pane)?;
+    let state = &pane
+        .resolved
+        .as_ref()
+        .expect("resolve_agent requires resolved state")
+        .canonical;
+    match agent_status(state) {
+        AgentStatus::Working => {
+            return Err(api_error!(
+                "agent_busy",
+                format!(
+                    "agent in pane {} is already working",
+                    pane.pane_instance.pane_id
+                ),
+            )
+            .into());
+        }
+        AgentStatus::Blocked => {
+            return Err(api_error!(
+                "agent_blocked",
+                format!("agent in pane {} is blocked", pane.pane_instance.pane_id),
+            )
+            .into());
+        }
+        AgentStatus::Done | AgentStatus::Idle => {}
+    }
+    let capability = provider_capabilities(state.agent.as_str()).ok_or_else(|| {
+        api_error!(
+            "unsupported_provider",
+            format!(
+                "agent {} has no public transport contract",
+                state.agent.as_str()
+            ),
+        )
+    })?;
+    if capability.prompt_dispatch != ApiPromptDispatchCapability::GuardedTerminal {
+        return Err(api_error!(
+            "unsupported_provider",
+            format!(
+                "agent {} requires {:?} prompt dispatch instead of guarded terminal send",
+                state.agent.as_str(),
+                capability.prompt_dispatch
+            ),
+        )
+        .into());
+    }
+    verify_agent_input_target(runner, env, &connection, pane, &identity)?;
+    let prompt_digest = Sha256Digest::parse(crate::pane_state::PromptState::digest_decoded_prompt(
+        prompt,
+    ))
+    .expect("PromptState emits a valid SHA-256 digest");
+    let nonce = EventId::generate()
+        .map_err(|error| api_error!("internal_error", format!("send request ID: {error}")))?;
+    apply_terminal_mutation(terminal_mutation::submit_text_guarded(
+        runner,
+        &connection.incarnation,
+        &pane.pane_instance,
+        &pane.current_command,
+        prompt.as_bytes(),
+        nonce.as_str(),
+    ))?;
+    let mut after_connection = connection.reconnect()?;
+    let after = after_connection.query_snapshot()?;
+    let after_pane = require_same_agent(&after, &identity).map_err(after_dispatch_error)?;
+    verify_live_agent_process(runner, &identity, after_pane).map_err(after_dispatch_error)?;
+    let target_receipt = wait_target(pane, &connection.server_identity, &identity, Some(target));
+    success_json(
+        &after_connection,
+        &after,
+        observed_at,
+        ApiResult::AgentSend {
+            send: AgentTerminalSendReceipt {
+                target: target_receipt,
+                prompt_digest: prompt_digest.as_str().to_string(),
+                baseline_state_revision: state.revision,
+                baseline_run_seq: state.run_seq,
+                baseline_completed_seq: state.completed_seq,
+                dispatch: ApiPromptDispatchCapability::GuardedTerminal,
+            },
+        },
+    )
+}
+
+pub fn agent_send_keys(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    target: &str,
+    keys: &[String],
+) -> Result<String> {
+    validate_terminal_keys(keys)?;
+    if !target.starts_with("vta1:") {
+        return Err(api_error!(
+            "invalid_arguments",
+            "agent send-keys requires an exact agent_ref target",
+        )
+        .into());
+    }
+    let mut connection = ApiConnection::connect(runner, env, None)?;
+    let before = connection.query_snapshot()?;
+    let pane = resolve_agent(&before, target, &connection.server_identity)?;
+    let identity = AgentIdentity::from_pane(pane)?;
+    let state = &pane
+        .resolved
+        .as_ref()
+        .expect("resolve_agent requires resolved state")
+        .canonical;
+    if agent_status(state) != AgentStatus::Blocked {
+        return Err(api_error!(
+            "invalid_target",
+            format!(
+                "agent send-keys requires a blocked agent; pane {} is {}",
+                pane.pane_instance.pane_id,
+                agent_status(state).as_str()
+            ),
+        )
+        .into());
+    }
+    let capability = provider_capabilities(state.agent.as_str()).ok_or_else(|| {
+        api_error!(
+            "unsupported_provider",
+            format!(
+                "agent {} has no public transport contract",
+                state.agent.as_str()
+            ),
+        )
+    })?;
+    if !capability.interactive_keys {
+        return Err(api_error!(
+            "unsupported_provider",
+            format!(
+                "agent {} does not support interactive keys",
+                state.agent.as_str()
+            ),
+        )
+        .into());
+    }
+    verify_agent_input_target(runner, env, &connection, pane, &identity)?;
+    let nonce = EventId::generate()
+        .map_err(|error| api_error!("internal_error", format!("key request ID: {error}")))?;
+    apply_terminal_mutation(terminal_mutation::send_keys_guarded(
+        runner,
+        &connection.incarnation,
+        &pane.pane_instance,
+        &pane.current_command,
+        keys,
+        nonce.as_str(),
+    ))?;
+    let target_receipt = wait_target(pane, &connection.server_identity, &identity, Some(target));
+    success_json(
+        &connection,
+        &before,
+        observed_at,
+        ApiResult::AgentSendKeys {
+            send: AgentKeySendReceipt {
+                target: target_receipt,
+                keys: keys.to_vec(),
+                baseline_state_revision: state.revision,
+            },
+        },
+    )
+}
+
+pub fn agent_start(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    target: &str,
+    agent: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<String> {
+    if !target.starts_with("vtp1:") {
+        return Err(api_error!(
+            "invalid_arguments",
+            "agent start requires an exact pane_ref target",
+        )
+        .into());
+    }
+    if timeout.is_zero() || timeout > MAX_WAIT_TIMEOUT {
+        return Err(api_error!(
+            "invalid_arguments",
+            format!(
+                "--timeout-ms must be between 1 and {}",
+                MAX_WAIT_TIMEOUT.as_millis()
+            ),
+        )
+        .into());
+    }
+    let normalized_agent = crate::pane_state::AgentKind::parse(agent)
+        .map_err(|error| api_error!("invalid_arguments", error.to_string()))?;
+    let capabilities = provider_capabilities(normalized_agent.as_str()).ok_or_else(|| {
+        api_error!(
+            "unsupported_provider",
+            format!(
+                "agent {} has no public start contract",
+                normalized_agent.as_str()
+            ),
+        )
+    })?;
+    if capabilities.start == ApiAgentStartCapability::Disabled {
+        return Err(api_error!(
+            "unsupported_provider",
+            format!(
+                "agent {} cannot be started by this API",
+                normalized_agent.as_str()
+            ),
+        )
+        .into());
+    }
+    let program = provider_program(normalized_agent.as_str()).ok_or_else(|| {
+        api_error!(
+            "unsupported_provider",
+            format!(
+                "agent {} has no executable mapping",
+                normalized_agent.as_str()
+            ),
+        )
+    })?;
+    validate_start_args(args)?;
+    let command = render_shell_command(program, args);
+    let command_digest = format!("{:x}", Sha256::digest(command.as_bytes()));
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut connection = ApiConnection::connect(runner, env, Some(deadline))?;
+    let before = connection.subscribe()?;
+    let pane = resolve_pane(&before, target, &connection.server_identity)?;
+    if pane
+        .resolved
+        .as_ref()
+        .is_some_and(|resolved| resolved.canonical.agent_present)
+    {
+        return Err(api_error!(
+            "agent_busy",
+            format!(
+                "pane {} already contains an agent",
+                pane.pane_instance.pane_id
+            ),
+        )
+        .into());
+    }
+    if !supported_shell(&pane.current_command) {
+        return Err(api_error!(
+            "invalid_target",
+            format!(
+                "pane {} foreground command {} is not a supported interactive shell",
+                pane.pane_instance.pane_id, pane.current_command
+            ),
+        )
+        .into());
+    }
+    let expected_pane = pane.pane_instance.clone();
+    verify_live_pane(runner, env, &connection, &expected_pane)?;
+    let nonce = EventId::generate()
+        .map_err(|error| api_error!("internal_error", format!("start request ID: {error}")))?;
+    apply_terminal_mutation(terminal_mutation::submit_text_guarded(
+        runner,
+        &connection.incarnation,
+        &expected_pane,
+        &pane.current_command,
+        command.as_bytes(),
+        nonce.as_str(),
+    ))?;
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err(
+                agent_start_timeout(&expected_pane, normalized_agent.as_str(), timeout).into(),
+            );
+        }
+        let snapshot = match connection.next_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_error) if Instant::now() >= deadline => {
+                return Err(agent_start_timeout(
+                    &expected_pane,
+                    normalized_agent.as_str(),
+                    timeout,
+                )
+                .into());
+            }
+            Err(error) => return Err(after_dispatch_error(error).into()),
+        };
+        let current = require_same_pane(&snapshot, &expected_pane).map_err(after_dispatch_error)?;
+        let Some(resolved) = current.resolved.as_ref() else {
+            continue;
+        };
+        if !resolved.canonical.agent_present {
+            continue;
+        }
+        if resolved.canonical.agent != normalized_agent {
+            return Err(api_error!(
+                "target_replaced",
+                format!(
+                    "pane {} started {} instead of {}",
+                    expected_pane.pane_id,
+                    resolved.canonical.agent.as_str(),
+                    normalized_agent.as_str()
+                ),
+            )
+            .with_dispatch_context(
+                ApiErrorStage::AfterDispatch,
+                ApiSideEffect::Confirmed,
+                ApiRetryAction::InspectManually,
+                None,
+            )
+            .into());
+        }
+        if !agent_start_readiness_matches(capabilities.start, &resolved.canonical) {
+            continue;
+        }
+        let identity = match AgentIdentity::from_pane(current) {
+            Ok(identity) => identity,
+            Err(_) => continue,
+        };
+        verify_live_agent_process(runner, &identity, current).map_err(after_dispatch_error)?;
+        runner
+            .verify_agent_input_owner(expected_pane.pane_pid, identity.agent_process.pid)
+            .map_err(|error| {
+                api_error!(
+                    "agent_not_input_owner",
+                    format!(
+                        "started agent {} is not the foreground input owner: {error:#}",
+                        expected_pane.pane_id
+                    ),
+                )
+                .with_dispatch_context(
+                    ApiErrorStage::AfterDispatch,
+                    ApiSideEffect::Confirmed,
+                    ApiRetryAction::InspectManually,
+                    None,
+                )
+            })?;
+        if Instant::now() + WAIT_POLL_INITIAL_INTERVAL >= deadline {
+            return Err(
+                agent_start_timeout(&expected_pane, normalized_agent.as_str(), timeout).into(),
+            );
+        }
+        std::thread::sleep(WAIT_POLL_INITIAL_INTERVAL);
+        let mut confirmation_connection = connection.reconnect().map_err(after_dispatch_error)?;
+        let confirmation = confirmation_connection
+            .query_snapshot()
+            .map_err(after_dispatch_error)?;
+        let confirmed =
+            require_same_pane(&confirmation, &expected_pane).map_err(after_dispatch_error)?;
+        let Some(confirmed_resolved) = confirmed.resolved.as_ref() else {
+            continue;
+        };
+        if confirmed_resolved.canonical.agent != normalized_agent {
+            return Err(api_error!(
+                "target_replaced",
+                format!(
+                    "pane {} changed to {} while confirming {} readiness",
+                    expected_pane.pane_id,
+                    confirmed_resolved.canonical.agent.as_str(),
+                    normalized_agent.as_str()
+                ),
+            )
+            .with_dispatch_context(
+                ApiErrorStage::AfterDispatch,
+                ApiSideEffect::Confirmed,
+                ApiRetryAction::InspectManually,
+                None,
+            )
+            .into());
+        }
+        if !agent_start_readiness_matches(capabilities.start, &confirmed_resolved.canonical) {
+            continue;
+        }
+        let Ok(confirmed_identity) = AgentIdentity::from_pane(confirmed) else {
+            continue;
+        };
+        if confirmed_identity.state_id != identity.state_id
+            || confirmed_identity.agent_epoch != identity.agent_epoch
+            || confirmed_identity.agent_process != identity.agent_process
+        {
+            continue;
+        }
+        verify_live_agent_process(runner, &confirmed_identity, confirmed)
+            .map_err(after_dispatch_error)?;
+        runner
+            .verify_agent_input_owner(expected_pane.pane_pid, confirmed_identity.agent_process.pid)
+            .map_err(|error| {
+                api_error!(
+                    "agent_not_input_owner",
+                    format!(
+                        "started agent {} lost foreground input ownership: {error:#}",
+                        expected_pane.pane_id
+                    ),
+                )
+                .with_dispatch_context(
+                    ApiErrorStage::AfterDispatch,
+                    ApiSideEffect::Confirmed,
+                    ApiRetryAction::InspectManually,
+                    None,
+                )
+            })?;
+        let agent_ref = agent_ref(&confirmation_connection.server_identity, confirmed);
+        let detail = agent_detail(
+            confirmed,
+            &confirmation,
+            &confirmation_connection.server_identity,
+        )
+        .expect("started exact agent has public detail");
+        return success_json(
+            &confirmation_connection,
+            &confirmation,
+            observed_at,
+            ApiResult::AgentStart {
+                start: AgentStartReceipt {
+                    target_pane_ref: target.to_string(),
+                    pane_ref: pane_ref(&confirmation_connection.server_identity, &expected_pane),
+                    agent_ref,
+                    agent: normalized_agent.as_str().to_string(),
+                    readiness: capabilities.start,
+                    command_digest,
+                },
+                agent: detail,
+                waited_ms: elapsed_millis(started),
+            },
+        );
+    }
 }
 
 pub fn agent_prompt(
@@ -2020,7 +2781,7 @@ pub fn agent_run_resolve(
     if outcome != "completed" {
         return Err(api_error!(
             "invalid_arguments",
-            "API v3 only supports --outcome completed",
+            "agent run resolve only supports --outcome completed",
         )
         .into());
     }
@@ -2685,6 +3446,234 @@ fn validate_prompt(prompt: &str) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+fn provider_capabilities(agent: &str) -> Option<ApiProviderCapabilities> {
+    match agent {
+        "codex" => Some(ApiProviderCapabilities {
+            prompt_dispatch: ApiPromptDispatchCapability::Durable,
+            prompt_confirmation: ApiPromptConfirmationCapability::ProviderDigest,
+            response: ApiResponseCapability::Artifact,
+            interactive_keys: true,
+            start: ApiAgentStartCapability::DurableInitialPrompt,
+        }),
+        "claude" => Some(ApiProviderCapabilities {
+            prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
+            prompt_confirmation: ApiPromptConfirmationCapability::LifecycleCursor,
+            response: ApiResponseCapability::TerminalRead,
+            interactive_keys: true,
+            start: ApiAgentStartCapability::ProviderSession,
+        }),
+        "opencode" => Some(ApiProviderCapabilities {
+            prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
+            prompt_confirmation: ApiPromptConfirmationCapability::None,
+            response: ApiResponseCapability::TerminalRead,
+            interactive_keys: true,
+            start: ApiAgentStartCapability::InputOwnerOnly,
+        }),
+        _ => None,
+    }
+}
+
+fn agent_start_readiness_matches(
+    readiness: ApiAgentStartCapability,
+    state: &crate::pane_state::PaneState,
+) -> bool {
+    match readiness {
+        ApiAgentStartCapability::DurableInitialPrompt | ApiAgentStartCapability::InputOwnerOnly => {
+            true
+        }
+        ApiAgentStartCapability::ProviderSession => {
+            state.agent_session_id.is_some() && state.scan_verified && state.agent_process.is_some()
+        }
+        ApiAgentStartCapability::Disabled => false,
+    }
+}
+
+fn validate_split_cwd(cwd: &str) -> Result<()> {
+    let path = std::path::Path::new(cwd);
+    if !path.is_absolute() {
+        return Err(api_error!("invalid_arguments", "split cwd must be absolute").into());
+    }
+    if !path.is_dir() {
+        return Err(api_error!(
+            "invalid_arguments",
+            format!("split cwd is not an existing directory: {cwd}"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_terminal_keys(keys: &[String]) -> Result<()> {
+    const NAMED_KEYS: [&str; 23] = [
+        "Enter", "Escape", "Tab", "BSpace", "Up", "Down", "Left", "Right", "Home", "End", "PPage",
+        "NPage", "IC", "DC", "C-c", "C-d", "C-g", "C-z", "Space", "F1", "F2", "F3", "F4",
+    ];
+    if keys.is_empty() || keys.len() > 16 {
+        return Err(api_error!(
+            "invalid_arguments",
+            "agent send-keys requires between 1 and 16 keys",
+        )
+        .into());
+    }
+    for key in keys {
+        let single_literal = {
+            let mut chars = key.chars();
+            chars
+                .next()
+                .is_some_and(|character| !character.is_control())
+                && chars.next().is_none()
+        };
+        if !single_literal && !NAMED_KEYS.contains(&key.as_str()) {
+            return Err(api_error!(
+                "invalid_arguments",
+                format!("unsupported logical key: {key}"),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_start_args(args: &[String]) -> Result<()> {
+    if args.len() > 64 {
+        return Err(api_error!(
+            "invalid_arguments",
+            "agent start accepts at most 64 arguments",
+        )
+        .into());
+    }
+    let mut total = 0_usize;
+    for arg in args {
+        if arg.len() > 4_096
+            || arg.chars().any(|character| {
+                character == '\0'
+                    || character == '\r'
+                    || character == '\n'
+                    || character.is_control()
+            })
+        {
+            return Err(api_error!(
+                "invalid_arguments",
+                "agent start arguments must be at most 4,096 bytes and contain no controls",
+            )
+            .into());
+        }
+        total = total.saturating_add(arg.len());
+    }
+    if total > MAX_PROMPT_BYTES {
+        return Err(api_error!(
+            "invalid_arguments",
+            format!("agent start arguments exceed {MAX_PROMPT_BYTES} bytes"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn provider_program(agent: &str) -> Option<&'static str> {
+    match agent {
+        "codex" => Some("codex"),
+        "claude" => Some("claude"),
+        "opencode" => Some("opencode"),
+        _ => None,
+    }
+}
+
+fn supported_shell(command: &str) -> bool {
+    matches!(command, "bash" | "dash" | "fish" | "sh" | "zsh")
+}
+
+fn render_shell_command(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn verify_agent_input_target(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    connection: &ApiConnection,
+    pane: &PanePresentation,
+    identity: &AgentIdentity,
+) -> Result<()> {
+    verify_live_pane(runner, env, connection, &identity.pane_instance)?;
+    verify_live_agent_process(runner, identity, pane)?;
+    runner
+        .verify_agent_input_owner(identity.pane_instance.pane_pid, identity.agent_process.pid)
+        .map_err(|error| {
+            api_error!(
+                "agent_not_input_owner",
+                format!(
+                    "agent in pane {} is not the foreground input owner: {error:#}",
+                    identity.pane_instance.pane_id
+                ),
+            )
+        })?;
+    Ok(())
+}
+
+fn apply_terminal_mutation(outcome: terminal_mutation::TerminalMutationOutcome) -> Result<()> {
+    match outcome {
+        terminal_mutation::TerminalMutationOutcome::Applied => Ok(()),
+        terminal_mutation::TerminalMutationOutcome::Rejected(message) => {
+            Err(api_error!("dispatch_rejected", message)
+                .with_dispatch_context(
+                    ApiErrorStage::BeforeDispatch,
+                    ApiSideEffect::None,
+                    ApiRetryAction::RefreshTarget,
+                    None,
+                )
+                .into())
+        }
+        terminal_mutation::TerminalMutationOutcome::DeliveryUnknown(message) => {
+            Err(api_error!("delivery_unknown", message)
+                .with_dispatch_context(
+                    ApiErrorStage::AfterDispatch,
+                    ApiSideEffect::Possible,
+                    ApiRetryAction::InspectManually,
+                    None,
+                )
+                .into())
+        }
+    }
+}
+
+fn after_dispatch_error(error: anyhow::Error) -> ApiError {
+    ApiError::new(
+        ApiErrorCode::DeliveryUnknown,
+        format!("terminal mutation was applied but target revalidation failed: {error:#}"),
+    )
+    .with_dispatch_context(
+        ApiErrorStage::AfterDispatch,
+        ApiSideEffect::Confirmed,
+        ApiRetryAction::InspectManually,
+        None,
+    )
+}
+
+fn agent_start_timeout(pane: &PaneInstance, agent: &str, timeout: Duration) -> ApiError {
+    ApiError::new(
+        ApiErrorCode::Timeout,
+        format!(
+            "agent {agent} was submitted to pane {} but did not become exactly ready within {} ms",
+            pane.pane_id,
+            timeout.as_millis()
+        ),
+    )
+    .with_dispatch_context(
+        ApiErrorStage::AfterDispatch,
+        ApiSideEffect::Confirmed,
+        ApiRetryAction::InspectManually,
+        None,
+    )
 }
 
 pub fn agent_read(
@@ -3577,11 +4566,14 @@ fn resolve_agent<'a>(
         return require_same_agent(snapshot, &identity);
     }
     let pane = resolve_pane(snapshot, target, server_identity)?;
-    if pane
-        .resolved
-        .as_ref()
-        .is_none_or(|resolved| !resolved.canonical.agent_present)
-    {
+    let Some(resolved) = pane.resolved.as_ref() else {
+        return Err(api_error!(
+            "agent_not_found",
+            format!("pane {} has no present agent", pane.pane_instance.pane_id),
+        )
+        .into());
+    };
+    if !resolved.canonical.agent_present && !resolved.canonical.lifecycle.is_usage_limited() {
         return Err(api_error!(
             "agent_not_found",
             format!("pane {} has no present agent", pane.pane_instance.pane_id),
@@ -4606,7 +5598,14 @@ mod tests {
             contract["hard_limits"]["concurrent_subscription_max_streams"],
             48
         );
-        assert_eq!(contract["providers"]["codex"]["status"], "enabled");
+        assert_eq!(
+            contract["providers"]["codex"]["durable_adapter_status"],
+            "enabled"
+        );
+        assert_eq!(
+            contract["providers"]["codex"]["capabilities"]["prompt_dispatch"],
+            "durable"
+        );
         assert_eq!(
             contract["providers"]["codex"]["recorded_version"],
             "0.147.0"
@@ -4620,14 +5619,25 @@ mod tests {
             serde_json::json!(["provider", "session_id", "turn_id", "hook_kind"])
         );
         assert_eq!(
-            contract["providers"]["claude_code"]["status"],
+            contract["providers"]["claude"]["durable_adapter_status"],
             "disabled_pending_authenticated_p0"
         );
-        assert!(
-            contract["providers"]["claude_code"]
-                .get("attribution")
-                .is_none()
+        assert!(contract["providers"]["claude"].get("attribution").is_none());
+        assert_eq!(
+            contract["providers"]["claude"]["capabilities"]["prompt_dispatch"],
+            "guarded_terminal"
         );
+        assert_eq!(
+            contract["providers"]["opencode"]["capabilities"]["prompt_confirmation"],
+            "none"
+        );
+        for agent in ["codex", "claude", "opencode"] {
+            assert_eq!(
+                contract["providers"][agent]["capabilities"],
+                serde_json::to_value(provider_capabilities(agent).unwrap()).unwrap(),
+                "schema and runtime capabilities drifted for {agent}"
+            );
+        }
     }
 
     #[test]
@@ -5302,6 +6312,14 @@ mod tests {
 
         assert!(agent_summary(&pane, &snapshot, "server").is_none());
         assert!(pane_summary(&pane, "server").agent_ref.is_none());
+        assert_eq!(
+            resolve_agent(&snapshot, "%1", "server")
+                .unwrap_err()
+                .downcast_ref::<ApiError>()
+                .unwrap()
+                .code(),
+            "agent_not_found"
+        );
     }
 
     #[test]
@@ -5323,6 +6341,11 @@ mod tests {
         assert_eq!(summary.lifecycle.reason.as_deref(), Some("usage_limit"));
         assert!(!summary.present);
         assert!(summary.agent_ref.is_none());
+        let resolved = resolve_agent(&snapshot, "%1", "server").unwrap();
+        let detail = agent_detail(resolved, &snapshot, "server").unwrap();
+        assert_eq!(detail.summary.status, AgentStatus::Blocked);
+        assert!(!detail.summary.present);
+        assert!(detail.summary.agent_ref.is_none());
     }
 
     #[test]

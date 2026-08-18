@@ -204,6 +204,21 @@ enum PaneCommand {
         #[command(flatten)]
         read: ApiReadArgs,
     },
+    /// Split an exact pane without changing client focus by default.
+    Split {
+        /// Exact pane_ref returned by pane list/get/current.
+        target: String,
+        #[arg(long, value_enum)]
+        direction: ApiPaneSplitDirectionArg,
+        #[arg(long = "size-percent")]
+        size_percent: Option<u8>,
+        /// Absolute cwd for the new pane; defaults to the target pane cwd.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Select the created pane. Omitted by default so agent automation does not steal focus.
+        #[arg(long)]
+        focus: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -251,6 +266,50 @@ enum AgentCommand {
             default_value_t = crate::api::DEFAULT_PROMPT_CONFIRM_TIMEOUT.as_millis() as u64
         )]
         confirm_timeout_ms: u64,
+    },
+    /// Submit one guarded terminal prompt to an exact idle/done occupant.
+    Send {
+        /// Exact agent_ref returned by agent get/list/start.
+        target: String,
+        /// Read the prompt from stdin until EOF, removing one terminal LF or CRLF.
+        #[arg(
+            long,
+            required_unless_present = "prompt_file",
+            conflicts_with = "prompt_file"
+        )]
+        stdin: bool,
+        /// Read the prompt from a file without putting prompt bytes in argv.
+        #[arg(
+            long = "prompt-file",
+            required_unless_present = "stdin",
+            conflicts_with = "stdin"
+        )]
+        prompt_file: Option<PathBuf>,
+    },
+    /// Send validated logical keys to an exact blocked agent occupant.
+    SendKeys {
+        /// Exact agent_ref for the blocked occupant.
+        target: String,
+        /// One allow-listed logical key or one literal Unicode character; repeat as needed.
+        #[arg(long = "key", required = true)]
+        keys: Vec<String>,
+    },
+    /// Start a supported provider in an exact shell pane and wait for provider-specific readiness.
+    Start {
+        /// Exact pane_ref returned by pane get/list/current/split.
+        target: String,
+        /// Provider kind advertised by the API schema.
+        #[arg(long)]
+        agent: String,
+        /// One provider argv value; repeat for each argument.
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Deadline for process, provider-readiness, and input-owner confirmation.
+        #[arg(
+            long = "timeout-ms",
+            default_value_t = crate::api::DEFAULT_WAIT_TIMEOUT.as_millis() as u64
+        )]
+        timeout_ms: u64,
     },
     /// Wait on daemon snapshot events while pinning the exact agent occupant.
     Wait {
@@ -414,6 +473,21 @@ impl From<ApiAgentStatusArg> for crate::api::AgentStatus {
 enum ApiReadSourceArg {
     Visible,
     Latest,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ApiPaneSplitDirectionArg {
+    Right,
+    Down,
+}
+
+impl From<ApiPaneSplitDirectionArg> for crate::api::PaneSplitDirection {
+    fn from(value: ApiPaneSplitDirectionArg) -> Self {
+        match value {
+            ApiPaneSplitDirectionArg::Right => Self::Right,
+            ApiPaneSplitDirectionArg::Down => Self::Down,
+        }
+    }
 }
 
 impl From<ApiReadSourceArg> for crate::api::ReadSource {
@@ -634,7 +708,7 @@ pub fn run() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
-        None if agent_prompt_requires_stdin(&args) => match read_prompt_input(std::io::stdin()) {
+        None if agent_body_requires_stdin(&args) => match read_prompt_input(std::io::stdin()) {
             Ok(input) => input,
             Err(error) => {
                 eprintln!("{}", crate::api::render_error(&error, observed_at));
@@ -668,9 +742,12 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn agent_prompt_requires_stdin(args: &[OsString]) -> bool {
+fn agent_body_requires_stdin(args: &[OsString]) -> bool {
     args.get(1).and_then(|arg| arg.to_str()) == Some("agent")
-        && args.get(2).and_then(|arg| arg.to_str()) == Some("prompt")
+        && matches!(
+            args.get(2).and_then(|arg| arg.to_str()),
+            Some("prompt" | "send")
+        )
         && args
             .iter()
             .skip(3)
@@ -1027,6 +1104,24 @@ where
                     },
                 )?))
             }
+            PaneCommand::Split {
+                target,
+                direction,
+                size_percent,
+                cwd,
+                focus,
+            } => Ok(Some(crate::api::pane_split(
+                runner,
+                env,
+                now_epoch,
+                &target,
+                crate::api::PaneSplitOptions {
+                    direction: direction.into(),
+                    size_percent,
+                    cwd: cwd.as_deref(),
+                    focus,
+                },
+            )?)),
         },
         Command::Agent { command, json: _ } => match command {
             AgentCommand::List {
@@ -1072,6 +1167,36 @@ where
                     Duration::from_millis(confirm_timeout_ms),
                 )?))
             }
+            AgentCommand::Send {
+                target,
+                stdin: _,
+                prompt_file,
+            } => {
+                let prompt = match prompt_file {
+                    Some(path) => read_prompt_file(&path)?,
+                    None => input.to_string(),
+                };
+                Ok(Some(crate::api::agent_send(
+                    runner, env, now_epoch, &target, &prompt,
+                )?))
+            }
+            AgentCommand::SendKeys { target, keys } => Ok(Some(crate::api::agent_send_keys(
+                runner, env, now_epoch, &target, &keys,
+            )?)),
+            AgentCommand::Start {
+                target,
+                agent,
+                args,
+                timeout_ms,
+            } => Ok(Some(crate::api::agent_start(
+                runner,
+                env,
+                now_epoch,
+                &target,
+                &agent,
+                &args,
+                Duration::from_millis(timeout_ms),
+            )?)),
             AgentCommand::Wait {
                 target,
                 until,

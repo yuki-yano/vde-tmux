@@ -562,7 +562,7 @@ wait_badge Done
 run_vt api schema --json | python3 -c '
 import json, sys
 reply = json.load(sys.stdin)
-assert reply["meta"]["api_version"] == 3, reply
+assert reply["meta"]["api_version"] == 4, reply
 assert reply["result"]["type"] == "schema", reply
 assert set(reply["result"]["schemas"]) == {"request", "success", "error"}, reply
 '

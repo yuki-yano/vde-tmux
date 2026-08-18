@@ -13,6 +13,41 @@ fn tmux_env() -> BTreeMap<String, String> {
     BTreeMap::from([("TMUX_PANE".to_string(), "%1".to_string())])
 }
 
+#[test]
+fn agent_start_accepts_hyphenated_provider_arguments() {
+    let cli = Cli::try_parse_from([
+        "vt",
+        "agent",
+        "start",
+        "vtp1:target",
+        "--agent",
+        "codex",
+        "--arg",
+        "--model",
+        "--arg",
+        "gpt-5",
+        "--timeout-ms",
+        "1000",
+    ])
+    .unwrap();
+    let Command::Agent {
+        command:
+            AgentCommand::Start {
+                agent,
+                args,
+                timeout_ms,
+                ..
+            },
+        ..
+    } = cli.command
+    else {
+        panic!("expected agent start command");
+    };
+    assert_eq!(agent, "codex");
+    assert_eq!(args, ["--model", "gpt-5"]);
+    assert_eq!(timeout_ms, 1000);
+}
+
 fn stub_action_client(mock: &MockTmuxRunner, client: &str, session_id: &str) {
     let format = crate::session::client_session_context_format();
     let sep = '\u{1f}';

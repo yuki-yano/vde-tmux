@@ -87,7 +87,7 @@ if ! RESULT="$("$BIN" agent prompt "$AGENT_REF" --operation-id "$OPERATION_ID" -
   "$BIN" agent get "$PANE_ID" --json >&2 || true
   exit 1
 fi
-"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); result=value["result"]; assert value["meta"]["api_version"] == 3; assert result["type"] == "agent_prompt"; assert result["operation"]["dispatch_state"] == "prompt_confirmed"; assert result["operation"]["binding"]["provider_session_id"] == "guarded-prompt-isolated"; assert result["operation_ref"].startswith("vto3:"); assert result["run_ref"].startswith("vtr3:")' <<<"$RESULT"
+"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); result=value["result"]; assert value["meta"]["api_version"] == 4; assert result["type"] == "agent_prompt"; assert result["operation"]["dispatch_state"] == "prompt_confirmed"; assert result["operation"]["binding"]["provider_session_id"] == "guarded-prompt-isolated"; assert result["operation_ref"].startswith("vto3:"); assert result["run_ref"].startswith("vtr3:")' <<<"$RESULT"
 if [[ "$(tmux -L "$TMUX_SOCKET" display-message -p -t "$PANE_ID" '#{pane_in_mode}')" != "0" ]]; then
   echo "guarded prompt did not leave copy mode" >&2
   exit 1
