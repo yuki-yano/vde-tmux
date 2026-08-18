@@ -77,11 +77,11 @@ Dispatch Operationが`delivery_unknown`になっても、対応するAgent Run�
 
 mutationの内部preconditionには、公開referenceとは別に完全なAgent Bindingを使う。
 
-Agent Bindingはtmux server identity、Pane instance、pane-state ID、Agent Epoch、agent kind、provider session ID、agent PID、process start tokenを固定する。
+RunのAgent Bindingはtmux server identity、Pane instance、pane-state ID、Agent Epoch、agent kind、provider session ID、agent PID、process start tokenを固定する。
 
-prompt dispatchは、current Agent EpochでSessionStartを観測し、provider session IDとprocess identityが一致するP0通過済みCodexだけを対象にする。
+Dispatch OperationのOperation Bindingは同じidentityを使うが、SessionStartが未観測のCodexに限りprovider session IDを未確定でstageできる。guarded dispatch前にexact process identityとinput ownerを再検証し、同じpane-state ID、agent kind、process identity、prompt digestを持つ最初の`UserPromptSubmit`だけで実sessionへ一度だけ確定する。SessionStartがdispatchと競合した場合は、同じprocessに対するAgent Epochの1増加だけを許可する。
 
-process scanだけで発見したoccupantは一覧と診断には表示できるが、prompt dispatchとoperator completionのpreconditionを発行しない。
+process scanだけで発見したoccupantもguarded prompt dispatchのpreconditionを発行できるが、未確定Operation BindingをRunへ保存せず、provider hookでsessionを確認できなければ`delivery_unknown`のまま保持する。operator completionのpreconditionには引き続き完全なRun Agent Bindingを要求する。
 
 ### Agent reference
 
@@ -636,7 +636,7 @@ vde-monitor field棚卸しとdotfiles compact-guard修正は並行タスクと�
 | Contract | Before v3 | Implemented v3 |
 | --- | ---: | ---: |
 | Public Agent API | 2 | 3 |
-| Daemon protocol | 14 | 15 |
+| Daemon protocol | 14 | 16 |
 | PaneState / snapshot schema | 8 | 9 |
 | Private state format | none | 1 |
 
@@ -708,6 +708,8 @@ rollbackはquiesced状態で旧binaryとoperator backupを戻す運用手順と�
 - [x] Run Record内のevent referenceによりresponse loss後のprovider retryが同じreceiptを返す。
 - [x] restart後の未期限`prepared` operationは同一requestで再開でき、期限切れはside effectなしでrejectされ、`dispatch_started`後はtmux inputを再送しない。
 - [x] 同じ`operation_id`はstate generation内でCLI終了、daemon restart、response loss後も高々一回しかdispatchされない。
+- [x] SessionStart未観測のexact Codex processへ最初のpromptをguarded dispatchでき、同一processの最初の`UserPromptSubmit`だけでOperation Bindingのprovider sessionを確定する。
+- [x] 未確定provider sessionはRunへ保存されず、process、pane-state ID、agent kind、prompt digest、許可されたAgent Epoch遷移のいずれかが不一致ならOperationへ帰属しない。
 - [x] `delivery_unknown`から自動再送せず、confirmationの非排他的性質をreceiptへ返す。
 - [x] checkがplain CAS preconditionを返し、resolveがfresh observationを再検証して同じRun Recordへaudit fieldsを保存する。
 - [x] matching resolution retryが既存receiptを返し、stale preconditionと二重resolutionを拒否する。
@@ -740,6 +742,7 @@ rollbackはquiesced状態で旧binaryとoperator backupを戻す運用手順と�
 - [x] 独立レビューでmust-fixとmust-simplifyが0件になる。
 - [x] Claude Codeのrate-limit hook、Claude Code/Codexの厳密なlimit文、誤検知除外、scan throttle、process終了後の状態保持をunit testで検証する。
 - [x] current-agent markerのexact pane解決、non-agent消灯、複数幅tierの色、selectionとの分離をunit testとUI/UX preflightで検証する。
+- [x] SessionStartを省略した隔離Codexで初回prompt、copy mode解除、operation confirmation、Run wait、Response Artifact回収を検証する。
 
 ### 運用反映条件
 
@@ -751,7 +754,8 @@ rollbackはquiesced状態で旧binaryとoperator backupを戻す運用手順と�
 - [ ] `delivery_unknown`とunresolved runをoperatorが確認し、旧generationのsupported-provider sessionを終了する。
 - [ ] 必要なexternal backupとoffline resetの結果を記録する。
 - [ ] 旧daemon停止、新binary install、新daemon起動、SessionStart再観測、実server smoke、dotfiles切替の順で反映する。
-- [ ] installed binary、running daemon、API、Pane schema、private state format、hook configのversion一致を確認する。
+- [x] installed binary、running daemon、API、Pane schema、private state format、hook configのversion一致を確認する。
+- [x] daemon protocol 16のbinaryへ安全に差し替え、dotfiles bridgeのversion gateと一致することを確認する。
 - [ ] 常用serverで二重dispatchがなく、restart resume、run recovery、artifact readが成功する。
 - [ ] Codex template applyとClaude Code、Codex session restartを完了する。
 - [ ] rollback用binary、external state backup、発動条件、復旧確認手順を記録する。

@@ -197,6 +197,11 @@ hooks, acquires the per-pane dispatch lock, and verifies that the agent process 
 input. It then persists `dispatch_started` before spawning tmux. A matching `UserPromptSubmit` hook
 creates the Run Record first and advances the Operation to `prompt_confirmed`.
 
+If the exact Codex process is present but its startup `SessionStart` was not observed, the Operation
+is staged with a pending provider session. The daemon still fences the exact pane, process, input
+owner, and prompt digest. Only the first matching `UserPromptSubmit` from that same process may bind
+the real session and confirm the Operation; an unbound session is never stored in a Run Record.
+
 The same `operation_id`, target, and prompt bytes are idempotent. A retry of an unexpired
 `prepared` Operation resumes the guarded dispatch. An unattended `prepared` Operation is rejected
 without a side effect when its original confirmation deadline expires. A settled Operation is
@@ -412,8 +417,8 @@ a typed capture output-limit failure.
 
 ### Operational completion
 
-- [x] Public API 3, daemon protocol 15, PaneState 9, and private state format 1 are declared.
-- [ ] The local binary is installed, the old daemon is stopped, the new daemon is started, and all
+- [x] Public API 3, daemon protocol 16, PaneState 9, and private state format 1 are declared.
+- [x] The local binary is installed, the old daemon is stopped, the new daemon is started, and all
   running versions and hook ownership are verified.
 - [ ] No in-flight operation or unresolved Run is silently discarded during cutover.
-- [ ] The dotfiles bridge switches to durable dispatch only after the remaining rollout gates pass.
+- [x] The dotfiles bridge version gate matches the installed durable-dispatch protocol.

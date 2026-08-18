@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vde-agent-prompt.XXXXXX")"
 TMUX_SOCKET="vde-agent-prompt-$$"
-BUILD_BIN="$PWD/target/debug/vt"
+BUILD_BIN="${VDE_TMUX_TEST_BUILD_BIN:-$PWD/target/debug/vt}"
 BIN="$ROOT/bin/vt"
 FIXTURE="$PWD/scripts/fixtures/codex"
 FIXTURE_BUILDER="$PWD/scripts/fixtures/build-codex-embedded"
@@ -32,11 +32,14 @@ export CODEX_TRANSCRIPT_PATH
 export VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET"
 export VT_BIN="$BIN"
 export PROMPT_LOG
+export CODEX_SKIP_SESSION_START=1
 mkdir -p "$XDG_CONFIG_HOME/vde-tmux" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$(dirname "$CODEX_FIXTURE")" "$(dirname "$CODEX_TRANSCRIPT_PATH")"
 printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"id\":\"$CODEX_SESSION_ID\",\"thread_source\":\"user\"}}" >"$CODEX_TRANSCRIPT_PATH"
 
 "$FIXTURE_BUILDER" "$CODEX_FIXTURE"
-cargo build --bin vt >/dev/null
+if [[ -z "${VDE_TMUX_TEST_BUILD_BIN:-}" ]]; then
+  cargo build --bin vt >/dev/null
+fi
 cp "$BUILD_BIN" "$BIN"
 tmux -L "$TMUX_SOCKET" -f /dev/null new-session -d -s guarded 'exec sleep 300'
 tmux -L "$TMUX_SOCKET" set-option -g remain-on-exit on
@@ -66,7 +69,14 @@ if [[ -z "$AGENT_JSON" ]]; then
   "$BIN" agent list --json >&2 || true
   exit 1
 fi
+"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); assert value["result"]["agent"].get("agent_session_id") is None' <<<"$AGENT_JSON"
 AGENT_REF="$("$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["result"]["agent"]["summary"]["agent_ref"])' <<<"$AGENT_JSON")"
+
+tmux -L "$TMUX_SOCKET" copy-mode -t "$PANE_ID"
+if [[ "$(tmux -L "$TMUX_SOCKET" display-message -p -t "$PANE_ID" '#{pane_in_mode}')" == "0" ]]; then
+  echo "failed to enter copy mode before guarded prompt" >&2
+  exit 1
+fi
 
 printf 'first line\nsecond line' >"$PROMPT_FILE"
 OPERATION_ID="isolated_prompt_$(printf '%08d' $$)"
@@ -77,7 +87,11 @@ if ! RESULT="$("$BIN" agent prompt "$AGENT_REF" --operation-id "$OPERATION_ID" -
   "$BIN" agent get "$PANE_ID" --json >&2 || true
   exit 1
 fi
-"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); result=value["result"]; assert value["meta"]["api_version"] == 3; assert result["type"] == "agent_prompt"; assert result["operation"]["dispatch_state"] == "prompt_confirmed"; assert result["operation_ref"].startswith("vto3:"); assert result["run_ref"].startswith("vtr3:")' <<<"$RESULT"
+"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); result=value["result"]; assert value["meta"]["api_version"] == 3; assert result["type"] == "agent_prompt"; assert result["operation"]["dispatch_state"] == "prompt_confirmed"; assert result["operation"]["binding"]["provider_session_id"] == "guarded-prompt-isolated"; assert result["operation_ref"].startswith("vto3:"); assert result["run_ref"].startswith("vtr3:")' <<<"$RESULT"
+if [[ "$(tmux -L "$TMUX_SOCKET" display-message -p -t "$PANE_ID" '#{pane_in_mode}')" != "0" ]]; then
+  echo "guarded prompt did not leave copy mode" >&2
+  exit 1
+fi
 
 RUN_REF="$("$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["result"]["run_ref"])' <<<"$RESULT")"
 WAIT_RESULT="$("$BIN" agent run wait "$RUN_REF" --timeout-ms 5000 --json)"

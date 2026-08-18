@@ -187,13 +187,38 @@ fn build_guarded_prompt_command(
     let pane_pid_guard = ["#{==:#{pane_pid},", &pane.pane_pid.to_string(), "}"].concat();
     let pane_command_guard = ["#{==:#{pane_current_command},", expected_pane_command, "}"].concat();
     let exact_pane_guard = ["#{&&:", &pane_pid_guard, ",", &pane_command_guard, "}"].concat();
+    let ready_after_mode_cancel_guard =
+        ["#{&&:", &exact_pane_guard, ",#{==:#{pane_in_mode},0}}"].concat();
+    let submit_after_mode_cancel = crate::pane_state::store::tmux_command_string(&[
+        "copy-mode".to_string(),
+        "-q".to_string(),
+        "-t".to_string(),
+        pane.pane_id.clone(),
+        ";".to_string(),
+        "if-shell".to_string(),
+        "-F".to_string(),
+        "-t".to_string(),
+        pane.pane_id.clone(),
+        ready_after_mode_cancel_guard,
+        submitted.clone(),
+        crate::pane_state::store::tmux_command_string(&pane_mismatch_args),
+    ]);
+    let submit_with_mode_cancel = crate::pane_state::store::tmux_command_string(&[
+        "if-shell".to_string(),
+        "-F".to_string(),
+        "-t".to_string(),
+        pane.pane_id.clone(),
+        "#{>:#{pane_in_mode},0}".to_string(),
+        submit_after_mode_cancel,
+        submitted,
+    ]);
     let pane_guard = crate::pane_state::store::tmux_command_string(&[
         "if-shell".to_string(),
         "-F".to_string(),
         "-t".to_string(),
         pane.pane_id.clone(),
         exact_pane_guard,
-        submitted,
+        submit_with_mode_cancel,
         crate::pane_state::store::tmux_command_string(&pane_mismatch_args),
     ]);
     let mut server_mismatch_args = delete_buffer();
@@ -270,6 +295,10 @@ mod tests {
         assert!(rendered.contains("#{==:#{pane_current_command},codex}"));
         assert!(rendered.contains("#{==:#{pid},123}"));
         assert!(rendered.contains("#{==:#{start_time},456}"));
+        assert!(rendered.contains("#{>:#{pane_in_mode},0}"));
+        assert!(rendered.contains("#{==:#{pane_in_mode},0}"));
+        assert!(rendered.contains("copy-mode"));
+        assert!(rendered.contains("'-q'"));
         assert!(rendered.contains("send-keys"));
         assert!(!rendered.contains("secret prompt"));
     }

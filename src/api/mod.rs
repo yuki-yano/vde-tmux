@@ -4389,7 +4389,8 @@ mod tests {
                 agent_kind: state.agent.clone(),
                 provider_session_id: state.agent_session_id.clone().unwrap(),
                 process: state.agent_process.clone().unwrap(),
-            },
+            }
+            .into(),
             expected_pane_version: state.version(),
             expected_current_run: state.current_run.clone(),
             expected_run_seq: 2,
@@ -4466,7 +4467,8 @@ mod tests {
                     agent_kind: state.agent.clone(),
                     provider_session_id: state.agent_session_id.clone().unwrap(),
                     process: state.agent_process.clone().unwrap(),
-                },
+                }
+                .into(),
                 expected_pane_version: state.version(),
                 expected_current_run: state.current_run.clone(),
                 expected_run_seq: 2,

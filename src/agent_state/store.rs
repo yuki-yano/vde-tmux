@@ -1328,14 +1328,33 @@ fn validate_operation_replacement(
     existing: &OperationRecord,
     next: &OperationRecord,
 ) -> Result<(), StoreError> {
+    let provider_session_bound = existing.binding.provider_session_id.is_none()
+        && next.binding.provider_session_id.is_some()
+        && matches!(
+            (existing.dispatch_state, next.dispatch_state),
+            (
+                DispatchState::DispatchStarted | DispatchState::DeliveryUnknown,
+                DispatchState::PromptConfirmed
+            )
+        )
+        && existing.binding.server_identity == next.binding.server_identity
+        && existing.binding.pane_instance == next.binding.pane_instance
+        && existing.binding.pane_state_id == next.binding.pane_state_id
+        && existing.binding.agent_kind == next.binding.agent_kind
+        && existing.binding.process == next.binding.process
+        && (existing.binding.agent_epoch == next.binding.agent_epoch
+            || existing.binding.agent_epoch.checked_add(1) == Some(next.binding.agent_epoch))
+        && existing.expected_pane_version.state_id == next.expected_pane_version.state_id
+        && existing.expected_pane_version.revision == next.expected_pane_version.revision
+        && next.expected_pane_version.agent_epoch == next.binding.agent_epoch;
     if existing.generation != next.generation
         || existing.operation_id != next.operation_id
         || existing.request_fingerprint != next.request_fingerprint
         || existing.target_agent_ref != next.target_agent_ref
         || existing.prompt_digest != next.prompt_digest
         || existing.dispatch_option != next.dispatch_option
-        || existing.binding != next.binding
-        || existing.expected_pane_version != next.expected_pane_version
+        || (existing.binding != next.binding && !provider_session_bound)
+        || (existing.expected_pane_version != next.expected_pane_version && !provider_session_bound)
         || existing.expected_current_run != next.expected_current_run
         || existing.expected_run_seq != next.expected_run_seq
         || existing.confirmation_deadline_at != next.confirmation_deadline_at
@@ -1948,7 +1967,7 @@ mod tests {
             target_agent_ref: "vta3-example".to_string(),
             prompt_digest: prompt_digest("ship it"),
             dispatch_option: "stdin".to_string(),
-            binding: binding(),
+            binding: binding().into(),
             expected_pane_version: expected_pane_version(),
             expected_current_run: None,
             expected_run_seq: 2,
@@ -2041,7 +2060,7 @@ mod tests {
             target_agent_ref: "vta3-example".to_string(),
             prompt_digest: prompt_digest("ship it"),
             dispatch_option: "stdin".to_string(),
-            binding: binding(),
+            binding: binding().into(),
             expected_pane_version: expected_pane_version(),
             expected_current_run: None,
             expected_run_seq: 2,
@@ -2219,7 +2238,7 @@ mod tests {
             target_agent_ref: "vta3-example".to_string(),
             prompt_digest: prompt_digest("private prompt"),
             dispatch_option: "stdin".to_string(),
-            binding: binding(),
+            binding: binding().into(),
             expected_pane_version: expected_pane_version(),
             expected_current_run: None,
             expected_run_seq: 2,

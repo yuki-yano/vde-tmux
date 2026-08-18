@@ -4442,10 +4442,11 @@ fn provider_binding_record(
             Some(envelope.event_id.clone()),
         ));
     };
-    if record.agent != observation.provider
-        || record.agent_session_id.as_ref() != Some(&observation.session_id)
-        || !record.agent_present
-    {
+    let provider_session_matches = match record.agent_session_id.as_ref() {
+        Some(session) => session == &observation.session_id,
+        None => observation.hook_kind == crate::hook::provider::ProviderHookKind::UserPromptSubmit,
+    };
+    if record.agent != observation.provider || !provider_session_matches || !record.agent_present {
         return Err(ServerMessage::error(
             ErrorCode::StaleAgentEvent,
             "provider event no longer matches the live Agent Binding",
@@ -5057,7 +5058,7 @@ fn acquire_agent_prompt_dispatch_lock(
 fn verify_agent_prompt_process_and_owner(
     runner: &dyn crate::tmux::TmuxRunner,
     pane: &crate::pane_state::PaneInstance,
-    binding: &crate::agent_state::AgentBinding,
+    binding: &crate::agent_state::OperationBinding,
 ) -> std::result::Result<(), AgentPromptPreDispatchRejection> {
     match runner.resolve_agent_process(pane.pane_pid, &binding.agent_kind) {
         Ok(Some(process)) if process == binding.process => {}
@@ -5092,7 +5093,7 @@ fn verify_agent_prompt_process_and_owner(
 
 fn prepared_operation_matches_target(
     existing: &crate::agent_state::OperationRecord,
-    binding: &crate::agent_state::AgentBinding,
+    binding: &crate::agent_state::OperationBinding,
     expected_pane_version: crate::pane_state::StateVersion,
     expected_current_run: Option<&crate::pane_state::CurrentDurableRunProjection>,
     expected_run_seq: u64,
@@ -5133,7 +5134,7 @@ fn resolve_agent_prompt_target(
     target_agent_ref: &str,
 ) -> std::result::Result<
     (
-        crate::agent_state::AgentBinding,
+        crate::agent_state::OperationBinding,
         u64,
         crate::pane_state::PaneInstance,
         crate::pane_state::StateVersion,
@@ -5208,10 +5209,7 @@ fn resolve_agent_prompt_target(
     if !matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle) {
         return Err("agent is busy or blocked".to_string());
     }
-    let provider_session_id = record
-        .agent_session_id
-        .clone()
-        .ok_or_else(|| "agent provider session is unavailable".to_string())?;
+    let provider_session_id = record.agent_session_id.clone();
     let expected_run_seq = record
         .run_seq
         .checked_add(1)
@@ -5219,7 +5217,7 @@ fn resolve_agent_prompt_target(
     let expected_pane_version = record.version();
     let expected_current_run = record.current_run.clone();
     Ok((
-        crate::agent_state::AgentBinding {
+        crate::agent_state::OperationBinding {
             server_identity: coordinator.incarnation.identity.clone(),
             pane_instance: pane.clone(),
             pane_state_id: record.state_id,
@@ -5270,7 +5268,7 @@ fn agent_prompt_precondition_matches(
         && record.version() == operation.expected_pane_version
         && record.current_run == operation.expected_current_run
         && record.agent == operation.binding.agent_kind
-        && record.agent_session_id.as_ref() == Some(&operation.binding.provider_session_id)
+        && record.agent_session_id == operation.binding.provider_session_id
         && record.agent_process.as_ref() == Some(&operation.binding.process)
         && record.run_seq.checked_add(1) == Some(operation.expected_run_seq)
         && matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle)
@@ -7969,7 +7967,7 @@ mod tests {
             result_receipt: None,
             created_at: 10,
             updated_at: 10,
-            binding,
+            binding: binding.into(),
         }
     }
 
@@ -8009,6 +8007,7 @@ mod tests {
     #[test]
     fn guarded_prompt_process_owner_rejections_cover_every_fail_closed_branch() {
         let binding = guarded_prompt_test_binding();
+        let operation_binding = crate::agent_state::OperationBinding::from(binding.clone());
         let pane = binding.pane_instance.clone();
 
         let replaced = crate::tmux::mock::MockTmuxRunner::new();
@@ -8020,7 +8019,7 @@ mod tests {
             Some(other_process),
         );
         assert_eq!(
-            verify_agent_prompt_process_and_owner(&replaced, &pane, &binding)
+            verify_agent_prompt_process_and_owner(&replaced, &pane, &operation_binding)
                 .unwrap_err()
                 .code,
             "target_process_replaced"
@@ -8029,7 +8028,7 @@ mod tests {
         let absent = crate::tmux::mock::MockTmuxRunner::new();
         absent.stub_agent_process(pane.pane_pid, binding.agent_kind.as_str(), None);
         assert_eq!(
-            verify_agent_prompt_process_and_owner(&absent, &pane, &binding)
+            verify_agent_prompt_process_and_owner(&absent, &pane, &operation_binding)
                 .unwrap_err()
                 .code,
             "target_process_absent"
@@ -8037,7 +8036,7 @@ mod tests {
 
         let unverifiable = crate::tmux::mock::MockTmuxRunner::new();
         assert_eq!(
-            verify_agent_prompt_process_and_owner(&unverifiable, &pane, &binding)
+            verify_agent_prompt_process_and_owner(&unverifiable, &pane, &operation_binding)
                 .unwrap_err()
                 .code,
             "target_process_unverifiable"
@@ -8051,7 +8050,7 @@ mod tests {
         );
         not_owner.stub_agent_input_owner(pane.pane_pid, binding.process.pid, false);
         assert_eq!(
-            verify_agent_prompt_process_and_owner(&not_owner, &pane, &binding)
+            verify_agent_prompt_process_and_owner(&not_owner, &pane, &operation_binding)
                 .unwrap_err()
                 .code,
             "agent_not_input_owner"
@@ -8064,7 +8063,7 @@ mod tests {
             Some(binding.process.clone()),
         );
         accepted.stub_agent_input_owner(pane.pane_pid, binding.process.pid, true);
-        verify_agent_prompt_process_and_owner(&accepted, &pane, &binding).unwrap();
+        verify_agent_prompt_process_and_owner(&accepted, &pane, &operation_binding).unwrap();
     }
 
     #[test]
@@ -8081,16 +8080,17 @@ mod tests {
         drop(first);
 
         let operation = guarded_prompt_test_operation(binding.clone());
+        let operation_binding = crate::agent_state::OperationBinding::from(binding.clone());
         assert!(prepared_operation_matches_target(
             &operation,
-            &binding,
+            &operation_binding,
             operation.expected_pane_version.clone(),
             None,
             operation.expected_run_seq,
         ));
         assert!(!prepared_operation_matches_target(
             &operation,
-            &binding,
+            &operation_binding,
             operation.expected_pane_version.clone(),
             None,
             operation.expected_run_seq + 1,

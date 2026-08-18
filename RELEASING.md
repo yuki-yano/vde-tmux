@@ -2,7 +2,22 @@
 
 Publishing is driven by Git tags.
 
-## Local API v3 cutover
+## Local protocol 16 upgrade
+
+Protocol 16 allows a durable Codex prompt Operation to stage an exact process binding before its
+provider session is known. Existing private state format 1 records remain readable and do not need
+to be reset. Because protocol 15 and 16 reject each other, stop the old daemon before replacing the
+installed binaries and reopen running sidebars afterward.
+
+Before replacement, pass the release gates listed below and confirm
+`vt agent storage status --json` reports zero `in_flight_operations`. Stage both binaries with
+`cargo install --path . --locked --root <temporary-root>`, verify protocol 16 in the staged schema,
+then back up and replace the installed binaries only while the daemon is stopped. Finally run
+`vt daemon ensure`, reopen sidebars, and verify the installed schema, hook health, and a scratch
+SessionStart-free first-prompt dispatch. Do not reset PaneState or private Agent state for this
+upgrade.
+
+## Historical initial API v3 cutover
 
 The first API v3 cutover is a coordinated restart, not an in-place binary replacement. It changes
 the public Agent API from 2 to 3, daemon protocol from 14 to 15, PaneState schema from 8 to 9, and

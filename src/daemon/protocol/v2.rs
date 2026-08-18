@@ -22,7 +22,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1487,7 +1487,7 @@ mod tests {
             target_agent_ref: "vta1:example".to_string(),
             prompt_digest: Sha256Digest::of(b"prompt"),
             dispatch_option: "guarded".to_string(),
-            binding: agent_binding(),
+            binding: agent_binding().into(),
             expected_pane_version: StateVersion {
                 state_id: StateId::parse("2".repeat(32)).unwrap(),
                 agent_epoch: 1,

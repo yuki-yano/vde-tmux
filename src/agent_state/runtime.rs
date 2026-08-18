@@ -4,10 +4,11 @@ use std::path::PathBuf;
 use sha2::{Digest as _, Sha256};
 
 use super::model::{
-    AgentBinding, DispatchState, ExecutionPhase, OperationId, OperationRecord, OperationRef,
-    OperationResultReceipt, OperatorAudit, PRIVATE_STATE_FORMAT_VERSION, RecoveryPaneFence,
-    RecoveryPrecondition, RecoveryProcessExpectation, RecoveryViewportFingerprint, ResolutionId,
-    ResolutionKind, RunRecord, RunRef, RunResolution, SemanticOutcome, Sha256Digest, StableRunId,
+    AgentBinding, DispatchState, ExecutionPhase, OperationBinding, OperationId, OperationRecord,
+    OperationRef, OperationResultReceipt, OperatorAudit, PRIVATE_STATE_FORMAT_VERSION,
+    RecoveryPaneFence, RecoveryPrecondition, RecoveryProcessExpectation,
+    RecoveryViewportFingerprint, ResolutionId, ResolutionKind, RunRecord, RunRef, RunResolution,
+    SemanticOutcome, Sha256Digest, StableRunId,
 };
 use super::reducer::{ApplyDisposition, apply_observation, artifact_metadata, new_run_from_prompt};
 use super::store::{AgentStateStore, RUN_STORE_MAX_RECORDS, RunRetentionReserve, StoreError};
@@ -108,19 +109,20 @@ impl AgentRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn prepare_operation(
+    pub fn prepare_operation<B: Into<OperationBinding>>(
         &mut self,
         operation_id: OperationId,
         target_agent_ref: String,
         prompt: &[u8],
         prompt_digest: Sha256Digest,
         dispatch_option: String,
-        binding: AgentBinding,
+        binding: B,
         expected_pane_version: crate::pane_state::StateVersion,
         expected_current_run: Option<crate::pane_state::CurrentDurableRunProjection>,
         expected_run_seq: u64,
         observed_at: i64,
     ) -> Result<PrepareOperationResult, StoreError> {
+        let binding = binding.into();
         let decoded_prompt = std::str::from_utf8(prompt)
             .map_err(|_| StoreError::Invalid("prompt staging must be UTF-8".to_string()))?;
         let expected_prompt_digest = Sha256Digest::parse(
@@ -139,7 +141,7 @@ impl AgentRuntime {
         {
             return Ok(PrepareOperationResult::Existing(existing));
         }
-        let key = binding_key(&binding)?;
+        let key = operation_target_key(&binding)?;
         if self.in_flight_by_binding.contains_key(&key) {
             return Err(StoreError::PromptDispatchBusy(
                 "another dispatch operation is active or delivery-ambiguous for this Agent Binding"
@@ -241,7 +243,7 @@ impl AgentRuntime {
         if record.dispatch_state == state {
             if state == DispatchState::Rejected {
                 self.in_flight_by_binding
-                    .remove(&binding_key(&record.binding)?);
+                    .remove(&operation_target_key(&record.binding)?);
             }
             self.store.delete_prompt(operation_id)?;
             return Ok(record);
@@ -270,10 +272,10 @@ impl AgentRuntime {
         self.store.save_operation(&record)?;
         if state == DispatchState::Rejected {
             self.in_flight_by_binding
-                .remove(&binding_key(&record.binding)?);
+                .remove(&operation_target_key(&record.binding)?);
         } else {
             self.in_flight_by_binding
-                .insert(binding_key(&record.binding)?, operation_id.clone());
+                .insert(operation_target_key(&record.binding)?, operation_id.clone());
         }
         self.store.delete_prompt(operation_id)?;
         Ok(record)
@@ -801,7 +803,7 @@ impl AgentRuntime {
                     | DispatchState::DeliveryUnknown
             ) {
                 self.in_flight_by_binding.insert(
-                    binding_key(&operation.binding)?,
+                    operation_target_key(&operation.binding)?,
                     operation.operation_id.clone(),
                 );
             }
@@ -977,7 +979,7 @@ impl AgentRuntime {
     }
 
     fn matching_operation(
-        &self,
+        &mut self,
         binding: &AgentBinding,
         run_seq: u64,
         observation: &ProviderObservation,
@@ -986,12 +988,12 @@ impl AgentRuntime {
             .prompt_digest
             .as_ref()
             .ok_or_else(|| StoreError::Invalid("prompt digest is absent".to_string()))?;
-        let key = binding_key(binding)?;
+        let key = operation_target_key_for_agent(binding)?;
         let Some(operation_id) = self.in_flight_by_binding.get(&key) else {
             return Ok(None);
         };
         let operation = self.required_operation(operation_id)?;
-        let matches = operation.binding == *binding
+        let matches = operation_binding_matches_agent(&operation.binding, binding)
             && operation.expected_run_seq == run_seq
             && operation.prompt_digest.as_str() == prompt_digest
             && observation.observed_at >= operation.updated_at
@@ -1000,7 +1002,10 @@ impl AgentRuntime {
                 operation.dispatch_state,
                 DispatchState::DispatchStarted | DispatchState::DeliveryUnknown
             );
-        Ok(matches.then_some(operation))
+        if !matches {
+            return Ok(None);
+        }
+        Ok(Some(operation))
     }
 
     fn confirm_linked_operation(
@@ -1019,7 +1024,7 @@ impl AgentRuntime {
                 ));
             }
             self.in_flight_by_binding
-                .remove(&binding_key(&operation.binding)?);
+                .remove(&operation_target_key(&operation.binding)?);
             self.store.delete_prompt(operation_id)?;
             return Ok(Some(operation));
         }
@@ -1032,6 +1037,19 @@ impl AgentRuntime {
                 operation.dispatch_state
             )));
         }
+        if operation.binding.is_provider_session_pending() {
+            if !operation_binding_matches_agent(&operation.binding, &run.binding) {
+                return Err(StoreError::OperationConflict(
+                    "pending provider session does not match the confirmed run binding".to_string(),
+                ));
+            }
+            operation.binding = OperationBinding::from(run.binding.clone());
+            operation.expected_pane_version = crate::pane_state::StateVersion {
+                state_id: run.binding.pane_state_id.clone(),
+                agent_epoch: run.binding.agent_epoch,
+                revision: operation.expected_pane_version.revision,
+            };
+        }
         operation.dispatch_state = DispatchState::PromptConfirmed;
         operation.run_id = Some(run.run_id.clone());
         operation.result_receipt = Some(OperationResultReceipt {
@@ -1043,7 +1061,7 @@ impl AgentRuntime {
         advance_operation_revision(&mut operation, observed_at)?;
         self.store.save_operation(&operation)?;
         self.in_flight_by_binding
-            .remove(&binding_key(&operation.binding)?);
+            .remove(&operation_target_key(&operation.binding)?);
         self.store.delete_prompt(operation_id)?;
         Ok(Some(operation))
     }
@@ -1105,6 +1123,45 @@ fn binding_key(binding: &AgentBinding) -> Result<String, StoreError> {
     serde_json::to_vec(binding)
         .map(|encoded| format!("{:x}", Sha256::digest(encoded)))
         .map_err(|error| StoreError::Invalid(format!("failed to encode Agent Binding: {error}")))
+}
+
+fn operation_target_key(binding: &OperationBinding) -> Result<String, StoreError> {
+    serde_json::to_vec(&(
+        &binding.server_identity,
+        &binding.pane_instance,
+        &binding.pane_state_id,
+        &binding.agent_kind,
+        &binding.process,
+    ))
+    .map(|encoded| format!("{:x}", Sha256::digest(encoded)))
+    .map_err(|error| {
+        StoreError::Invalid(format!(
+            "failed to encode operation dispatch target: {error}"
+        ))
+    })
+}
+
+fn operation_target_key_for_agent(binding: &AgentBinding) -> Result<String, StoreError> {
+    operation_target_key(&OperationBinding::from(binding.clone()))
+}
+
+fn operation_binding_matches_agent(operation: &OperationBinding, agent: &AgentBinding) -> bool {
+    let epoch_matches = if operation.provider_session_id.is_some() {
+        operation.agent_epoch == agent.agent_epoch
+    } else {
+        operation.agent_epoch == agent.agent_epoch
+            || operation.agent_epoch.checked_add(1) == Some(agent.agent_epoch)
+    };
+    operation.server_identity == agent.server_identity
+        && operation.pane_instance == agent.pane_instance
+        && operation.pane_state_id == agent.pane_state_id
+        && epoch_matches
+        && operation.agent_kind == agent.agent_kind
+        && operation
+            .provider_session_id
+            .as_ref()
+            .is_none_or(|session| session == &agent.provider_session_id)
+        && operation.process == agent.process
 }
 
 fn turn_index_key(observation: &ProviderObservation, turn_key: &str) -> String {
@@ -1333,6 +1390,77 @@ mod tests {
         assert_eq!(
             reopened.get_run(&reference).unwrap().semantic_outcome,
             super::super::SemanticOutcome::Completed
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn first_prompt_binds_a_pending_provider_session_to_the_same_process() {
+        let root = temp_root();
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
+        let mut confirmed_binding = binding();
+        confirmed_binding.agent_kind = AgentKind::parse("codex").unwrap();
+        confirmed_binding.agent_epoch = 2;
+        let mut pending_binding = OperationBinding::from(confirmed_binding.clone());
+        pending_binding.agent_epoch = 1;
+        pending_binding.provider_session_id = None;
+        let prompt = b"first prompt";
+        let operation_id = OperationId::parse("operation_pending_session_0001").unwrap();
+        runtime
+            .prepare_operation(
+                operation_id.clone(),
+                "vta1:unbound-exact-target".to_string(),
+                prompt,
+                prompt_digest(prompt),
+                "paste_enter".to_string(),
+                pending_binding,
+                StateVersion {
+                    state_id: confirmed_binding.pane_state_id.clone(),
+                    agent_epoch: 1,
+                    revision: 7,
+                },
+                None,
+                1,
+                10,
+            )
+            .unwrap();
+        runtime.mark_dispatch_started(&operation_id, 11).unwrap();
+
+        let mut first_prompt = observation(
+            ProviderHookKind::UserPromptSubmit,
+            "turn-first",
+            Some(prompt),
+            None,
+            12,
+        );
+        first_prompt.provider = confirmed_binding.agent_kind.clone();
+        first_prompt.session_id = confirmed_binding.provider_session_id.clone();
+        let applied = runtime
+            .apply_provider_observation(confirmed_binding.clone(), 1, &first_prompt)
+            .unwrap();
+        let operation = applied.operation.unwrap();
+        assert_eq!(operation.dispatch_state, DispatchState::PromptConfirmed);
+        assert_eq!(
+            operation.binding.provider_session_id.as_ref(),
+            Some(&confirmed_binding.provider_session_id)
+        );
+        assert_eq!(operation.binding.agent_epoch, confirmed_binding.agent_epoch);
+        assert_eq!(
+            operation.expected_pane_version.agent_epoch,
+            confirmed_binding.agent_epoch
+        );
+        assert_eq!(
+            applied.run.unwrap().binding.provider_session_id,
+            confirmed_binding.provider_session_id
+        );
+
+        drop(runtime);
+        let reopened = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
+        let reference = reopened.operation_ref(operation_id);
+        assert_eq!(
+            reopened.get_operation(&reference).unwrap().dispatch_state,
+            DispatchState::PromptConfirmed
         );
         drop(reopened);
         std::fs::remove_dir_all(root).unwrap();

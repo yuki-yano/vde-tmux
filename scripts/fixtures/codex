@@ -13,6 +13,7 @@ PROMPT_LOG = os.environ["PROMPT_LOG"]
 TRANSCRIPT_PATH = os.environ["CODEX_TRANSCRIPT_PATH"]
 SESSION_ID = os.environ.get("CODEX_SESSION_ID", "guarded-prompt-isolated")
 PROMPT_HOOK_GATE = os.environ.get("PROMPT_HOOK_GATE")
+SKIP_SESSION_START = os.environ.get("CODEX_SKIP_SESSION_START") == "1"
 
 
 def wait_for_prompt_hook_gate():
@@ -40,7 +41,8 @@ def emit_hook(event, **fields):
     )
 
 
-emit_hook("SessionStart", source="startup")
+if not SKIP_SESSION_START:
+    emit_hook("SessionStart", source="startup")
 descriptor = sys.stdin.fileno()
 original = termios.tcgetattr(descriptor)
 tty.setraw(descriptor)

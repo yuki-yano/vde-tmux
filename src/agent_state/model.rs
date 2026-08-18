@@ -307,6 +307,53 @@ impl AgentBinding {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationBinding {
+    pub server_identity: ServerIdentity,
+    pub pane_instance: PaneInstance,
+    pub pane_state_id: StateId,
+    pub agent_epoch: u64,
+    pub agent_kind: AgentKind,
+    pub provider_session_id: Option<AgentSessionId>,
+    pub process: AgentProcessIdentity,
+}
+
+impl OperationBinding {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.server_identity.pid == 0 || self.server_identity.start_time < 0 {
+            return Err(ModelError("invalid tmux server identity".to_string()));
+        }
+        self.pane_instance
+            .validate()
+            .map_err(|error| ModelError(error.to_string()))?;
+        if self.agent_epoch == 0 {
+            return Err(ModelError("agent epoch must be positive".to_string()));
+        }
+        self.process
+            .validate()
+            .map_err(|error| ModelError(error.to_string()))
+    }
+
+    pub fn is_provider_session_pending(&self) -> bool {
+        self.provider_session_id.is_none()
+    }
+}
+
+impl From<AgentBinding> for OperationBinding {
+    fn from(binding: AgentBinding) -> Self {
+        Self {
+            server_identity: binding.server_identity,
+            pane_instance: binding.pane_instance,
+            pane_state_id: binding.pane_state_id,
+            agent_epoch: binding.agent_epoch,
+            agent_kind: binding.agent_kind,
+            provider_session_id: Some(binding.provider_session_id),
+            process: binding.process,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionPhase {
@@ -793,7 +840,7 @@ pub struct OperationRecord {
     pub target_agent_ref: String,
     pub prompt_digest: Sha256Digest,
     pub dispatch_option: String,
-    pub binding: AgentBinding,
+    pub binding: OperationBinding,
     pub expected_pane_version: StateVersion,
     pub expected_current_run: Option<CurrentDurableRunProjection>,
     pub expected_run_seq: u64,
@@ -855,6 +902,15 @@ impl OperationRecord {
                     "invalid operation state/receipt combination".to_string(),
                 ));
             }
+        }
+        if self.binding.provider_session_id.is_none()
+            && (self.binding.agent_kind.as_str() != "codex"
+                || self.dispatch_state == DispatchState::PromptConfirmed)
+        {
+            return Err(ModelError(
+                "only an unconfirmed Codex operation may have a pending provider session"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
