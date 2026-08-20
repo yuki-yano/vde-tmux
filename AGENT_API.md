@@ -53,6 +53,12 @@ vt agent wait "$CLAUDE_REF" \
   --until working --until blocked --until done \
   --after-completed-seq "$SEND_BASELINE" --timeout-ms 10000 --json
 
+# Best-effort input while the exact Codex or Claude occupant is working.
+# A concurrent completion may cause this to start the next turn.
+WORKING_REF="$(vt agent get %539 --json | jq -r '.result.agent.summary.agent_ref')"
+printf '%s' 'Also check the error path.' \
+  | vt agent steer "$WORKING_REF" --stdin --json
+
 # For an independently resolved exact blocked occupant only:
 BLOCKED_REF="$(vt agent get %538 --json | jq -r '.result.agent.summary.agent_ref')"
 vt agent send-keys "$BLOCKED_REF" --key y --key Enter --json
@@ -96,6 +102,14 @@ bytes are supplied out-of-band through stdin or a file and therefore do not appe
 request schema. Repeated and comma-separated `--until` argv forms normalize to the same set.
 The prompt deadline covers the whole operation from daemon connection and preflight through digest
 confirmation; it does not start only after submission.
+
+`agent steer` accepts only an exact Codex or Claude occupant whose initial canonical status is
+`working`. It uses the same guarded copy-mode exit, pane/process identity, and foreground input-owner
+fences as `agent send`. It does not wait for provider hooks or prove active-turn attribution. Its
+receipt therefore reports `dispatch=guarded_terminal_best_effort` and
+`race_policy=may_start_next_turn`: a completion racing with input may make the text the next turn.
+Success means tmux applied the input, not that the provider accepted it or interrupted the current
+turn. `opencode` advertises `steer=disabled` until its behavior is verified.
 
 ## Agent state
 

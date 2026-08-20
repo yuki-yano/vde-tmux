@@ -85,6 +85,46 @@ assert result["agent"]["summary"]["pane_id"] == sys.argv[1], result
 print(result["start"]["agent_ref"])
 ' "$SPLIT_PANE")"
 
+printf 'best effort codex steer' >"$ROOT/steer.txt"
+if "$BIN" agent steer "$CODEX_REF" --prompt-file "$ROOT/steer.txt" --json \
+  >"$ROOT/steer-idle.json" 2>"$ROOT/steer-idle-error.json"; then
+  echo "agent steer unexpectedly accepted an idle agent" >&2
+  exit 1
+fi
+"$PYTHON" - "$ROOT/steer-idle-error.json" <<'PY'
+import json, sys
+error = json.load(open(sys.argv[1], encoding="utf-8"))["error"]
+assert error["code"] == "invalid_target", error
+assert error["side_effect"] == "none", error
+PY
+
+TMUX_PANE="$SPLIT_PANE" "$BIN" hook emit --agent codex --session-id api-v4-codex \
+  --status running --started-at "$(date +%s)"
+for _ in $(seq 1 100); do
+  if "$BIN" agent get "$CODEX_REF" --json 2>/dev/null | "$PYTHON" -c '
+import json, sys
+agent = json.load(sys.stdin)["result"]["agent"]["summary"]
+assert agent["status"] == "working", agent
+' 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+tmux -L "$TMUX_SOCKET" copy-mode -t "$SPLIT_PANE"
+STEER_JSON="$("$BIN" agent steer "$CODEX_REF" --prompt-file "$ROOT/steer.txt" --json)"
+printf '%s' "$STEER_JSON" | "$PYTHON" -c '
+import json, sys
+result = json.load(sys.stdin)["result"]
+assert result["type"] == "agent_steer", result
+steer = result["steer"]
+assert steer["dispatch"] == "guarded_terminal_best_effort", steer
+assert steer["race_policy"] == "may_start_next_turn", steer
+assert steer["target"]["agent"] == "codex", steer
+assert len(steer["prompt_digest"]) == 64, steer
+assert "best effort codex steer" not in str(result), result
+'
+[[ "$(tmux -L "$TMUX_SOCKET" display-message -p -t "$SPLIT_PANE" '#{pane_in_mode}')" == "0" ]]
+
 if "$BIN" agent start "$SPLIT_REF" --agent codex --arg 600 --timeout-ms 1000 --json \
   >"$ROOT/start-busy.json" 2>"$ROOT/start-busy-error.json"; then
   echo "agent start unexpectedly accepted an occupied pane" >&2
@@ -177,9 +217,12 @@ reply = json.load(sys.stdin)
 providers = reply["result"]["contract"]["providers"]
 assert reply["meta"]["api_version"] == 4, reply
 assert providers["codex"]["capabilities"]["prompt_dispatch"] == "durable", providers
+assert providers["codex"]["capabilities"]["steer"] == "guarded_terminal_best_effort", providers
 assert providers["claude"]["capabilities"]["prompt_dispatch"] == "guarded_terminal", providers
+assert providers["claude"]["capabilities"]["steer"] == "guarded_terminal_best_effort", providers
 assert providers["claude"]["capabilities"]["start"] == "provider_session", providers
 assert providers["opencode"]["capabilities"]["prompt_confirmation"] == "none", providers
+assert providers["opencode"]["capabilities"]["steer"] == "disabled", providers
 '
 
-echo "isolated API v4 split/start/send/send-keys and copy-mode guards ok"
+echo "isolated API v4 split/start/send/steer/send-keys and copy-mode guards ok"

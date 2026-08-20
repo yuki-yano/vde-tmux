@@ -587,6 +587,7 @@ pub enum ApiProviderEvidenceBasis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ApiProviderCapabilities {
     pub prompt_dispatch: ApiPromptDispatchCapability,
+    pub steer: ApiAgentSteerCapability,
     pub prompt_confirmation: ApiPromptConfirmationCapability,
     pub response: ApiResponseCapability,
     pub interactive_keys: bool,
@@ -598,6 +599,13 @@ pub struct ApiProviderCapabilities {
 pub enum ApiPromptDispatchCapability {
     Durable,
     GuardedTerminal,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiAgentSteerCapability {
+    GuardedTerminalBestEffort,
     Disabled,
 }
 
@@ -697,6 +705,9 @@ pub enum ApiResult {
     },
     AgentSend {
         send: AgentTerminalSendReceipt,
+    },
+    AgentSteer {
+        steer: AgentSteerReceipt,
     },
     AgentSendKeys {
         send: AgentKeySendReceipt,
@@ -1001,6 +1012,23 @@ pub struct AgentTerminalSendReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AgentSteerReceipt {
+    pub target: AgentWaitTarget,
+    pub prompt_digest: String,
+    pub baseline_state_revision: u64,
+    pub baseline_run_seq: u64,
+    pub baseline_completed_seq: u64,
+    pub dispatch: ApiAgentSteerCapability,
+    pub race_policy: ApiSteerRacePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiSteerRacePolicy {
+    MayStartNextTurn,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct AgentKeySendReceipt {
     pub target: AgentWaitTarget,
     pub keys: Vec<String>,
@@ -1179,6 +1207,9 @@ pub enum ApiRequest {
         confirm_timeout_ms: u64,
     },
     AgentSend {
+        target: String,
+    },
+    AgentSteer {
         target: String,
     },
     AgentSendKeys {
@@ -1365,6 +1396,7 @@ fn api_schema_contract() -> ApiSchemaContract {
                     durable_adapter_status: ApiProviderStatus::Enabled,
                     capabilities: ApiProviderCapabilities {
                         prompt_dispatch: ApiPromptDispatchCapability::Durable,
+                        steer: ApiAgentSteerCapability::GuardedTerminalBestEffort,
                         prompt_confirmation: ApiPromptConfirmationCapability::ProviderDigest,
                         response: ApiResponseCapability::Artifact,
                         interactive_keys: true,
@@ -1395,6 +1427,7 @@ fn api_schema_contract() -> ApiSchemaContract {
                     durable_adapter_status: ApiProviderStatus::DisabledPendingAuthenticatedP0,
                     capabilities: ApiProviderCapabilities {
                         prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
+                        steer: ApiAgentSteerCapability::GuardedTerminalBestEffort,
                         prompt_confirmation: ApiPromptConfirmationCapability::LifecycleCursor,
                         response: ApiResponseCapability::TerminalRead,
                         interactive_keys: true,
@@ -1415,6 +1448,7 @@ fn api_schema_contract() -> ApiSchemaContract {
                     durable_adapter_status: ApiProviderStatus::NotAvailable,
                     capabilities: ApiProviderCapabilities {
                         prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
+                        steer: ApiAgentSteerCapability::Disabled,
                         prompt_confirmation: ApiPromptConfirmationCapability::None,
                         response: ApiResponseCapability::TerminalRead,
                         interactive_keys: true,
@@ -1624,6 +1658,10 @@ pub fn pane_split(
             None,
         )
     })?;
+    let _refresh_revision = refresh_canonical_topology_after_dispatch(
+        &connection,
+        format!("pane {} was created", created.pane_id),
+    )?;
     let projection_deadline = Instant::now() + MUTATION_PROJECTION_TIMEOUT;
     let mut after_connection = connection.reconnect()?;
     let after = loop {
@@ -1819,6 +1857,108 @@ pub fn agent_send(
     )
 }
 
+pub fn agent_steer(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    target: &str,
+    prompt: &str,
+) -> Result<String> {
+    validate_prompt(prompt)?;
+    if !target.starts_with("vta1:") {
+        return Err(api_error!(
+            "invalid_arguments",
+            "agent steer requires an exact agent_ref target",
+        )
+        .into());
+    }
+    let mut connection = ApiConnection::connect(runner, env, None)?;
+    let before = connection.query_snapshot()?;
+    let pane = resolve_agent(&before, target, &connection.server_identity)?;
+    let identity = AgentIdentity::from_pane(pane)?;
+    let state = &pane
+        .resolved
+        .as_ref()
+        .expect("resolve_agent requires resolved state")
+        .canonical;
+    match agent_status(state) {
+        AgentStatus::Working => {}
+        AgentStatus::Blocked => {
+            return Err(api_error!(
+                "agent_blocked",
+                format!("agent in pane {} is blocked", pane.pane_instance.pane_id),
+            )
+            .into());
+        }
+        status @ (AgentStatus::Done | AgentStatus::Idle) => {
+            return Err(api_error!(
+                "invalid_target",
+                format!(
+                    "agent steer requires a working agent; pane {} is {}",
+                    pane.pane_instance.pane_id,
+                    status.as_str()
+                ),
+            )
+            .into());
+        }
+    }
+    let capability = provider_capabilities(state.agent.as_str()).ok_or_else(|| {
+        api_error!(
+            "unsupported_provider",
+            format!(
+                "agent {} has no public transport contract",
+                state.agent.as_str()
+            ),
+        )
+    })?;
+    if capability.steer != ApiAgentSteerCapability::GuardedTerminalBestEffort {
+        return Err(api_error!(
+            "unsupported_provider",
+            format!(
+                "agent {} does not support guarded terminal steering",
+                state.agent.as_str()
+            ),
+        )
+        .into());
+    }
+    verify_agent_input_target(runner, env, &connection, pane, &identity)?;
+    let prompt_digest = Sha256Digest::parse(crate::pane_state::PromptState::digest_decoded_prompt(
+        prompt,
+    ))
+    .expect("PromptState emits a valid SHA-256 digest");
+    let nonce = EventId::generate()
+        .map_err(|error| api_error!("internal_error", format!("steer request ID: {error}")))?;
+    apply_terminal_mutation(terminal_mutation::submit_text_guarded(
+        runner,
+        &connection.incarnation,
+        &pane.pane_instance,
+        &pane.current_command,
+        prompt.as_bytes(),
+        nonce.as_str(),
+    ))?;
+    let mut after_connection = connection.reconnect()?;
+    let after = after_connection.query_snapshot()?;
+    let after_pane = require_same_agent(&after, &identity).map_err(after_dispatch_error)?;
+    verify_live_agent_process(runner, &identity, after_pane).map_err(after_dispatch_error)?;
+    let target_receipt = wait_target(pane, &connection.server_identity, &identity, Some(target));
+    success_json(
+        &after_connection,
+        &after,
+        observed_at,
+        ApiResult::AgentSteer {
+            steer: AgentSteerReceipt {
+                target: target_receipt,
+                prompt_digest: prompt_digest.as_str().to_string(),
+                baseline_state_revision: state.revision,
+                baseline_run_seq: state.run_seq,
+                baseline_completed_seq: state.completed_seq,
+                dispatch: ApiAgentSteerCapability::GuardedTerminalBestEffort,
+                race_policy: ApiSteerRacePolicy::MayStartNextTurn,
+            },
+        },
+    )
+}
+
 pub fn agent_send_keys(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
@@ -1999,6 +2139,14 @@ pub fn agent_start(
         command.as_bytes(),
         nonce.as_str(),
     ))?;
+    let mut refresh_revision = refresh_canonical_topology_after_dispatch(
+        &connection,
+        format!(
+            "agent {} was started in pane {}",
+            normalized_agent.as_str(),
+            expected_pane.pane_id
+        ),
+    )?;
 
     loop {
         if Instant::now() >= deadline {
@@ -2018,7 +2166,25 @@ pub fn agent_start(
             }
             Err(error) => return Err(after_dispatch_error(error).into()),
         };
-        let current = require_same_pane(&snapshot, &expected_pane).map_err(after_dispatch_error)?;
+        if snapshot.snapshot_revision < refresh_revision {
+            continue;
+        }
+        let current = match require_same_pane(&snapshot, &expected_pane) {
+            Ok(current) => current,
+            Err(error) => {
+                require_live_pane_instance(runner, &expected_pane)
+                    .map_err(|_| after_dispatch_error(error))?;
+                refresh_revision = refresh_canonical_topology_after_dispatch(
+                    &connection,
+                    format!(
+                        "agent {} was started in live pane {}",
+                        normalized_agent.as_str(),
+                        expected_pane.pane_id
+                    ),
+                )?;
+                continue;
+            }
+        };
         let Some(resolved) = current.resolved.as_ref() else {
             continue;
         };
@@ -3452,6 +3618,7 @@ fn provider_capabilities(agent: &str) -> Option<ApiProviderCapabilities> {
     match agent {
         "codex" => Some(ApiProviderCapabilities {
             prompt_dispatch: ApiPromptDispatchCapability::Durable,
+            steer: ApiAgentSteerCapability::GuardedTerminalBestEffort,
             prompt_confirmation: ApiPromptConfirmationCapability::ProviderDigest,
             response: ApiResponseCapability::Artifact,
             interactive_keys: true,
@@ -3459,6 +3626,7 @@ fn provider_capabilities(agent: &str) -> Option<ApiProviderCapabilities> {
         }),
         "claude" => Some(ApiProviderCapabilities {
             prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
+            steer: ApiAgentSteerCapability::GuardedTerminalBestEffort,
             prompt_confirmation: ApiPromptConfirmationCapability::LifecycleCursor,
             response: ApiResponseCapability::TerminalRead,
             interactive_keys: true,
@@ -3466,6 +3634,7 @@ fn provider_capabilities(agent: &str) -> Option<ApiProviderCapabilities> {
         }),
         "opencode" => Some(ApiProviderCapabilities {
             prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
+            steer: ApiAgentSteerCapability::Disabled,
             prompt_confirmation: ApiPromptConfirmationCapability::None,
             response: ApiResponseCapability::TerminalRead,
             interactive_keys: true,
@@ -3644,6 +3813,52 @@ fn apply_terminal_mutation(outcome: terminal_mutation::TerminalMutationOutcome) 
                 .into())
         }
     }
+}
+
+fn refresh_canonical_topology_after_dispatch(
+    connection: &ApiConnection,
+    applied_effect: String,
+) -> Result<u64> {
+    let refresh = (|| -> Result<u64> {
+        let mut client = V2Client::connect(&connection.socket, &connection.server_identity)?;
+        if client.daemon_instance_id().as_str() != connection.daemon_instance_id {
+            return Err(anyhow::anyhow!(
+                "daemon instance changed before canonical topology refresh"
+            ));
+        }
+        let event_id = EventId::generate()?;
+        let response = client.request(&ClientMessage::RefreshTopology {
+            proto: PROTOCOL_VERSION,
+            daemon_instance_id: client.daemon_instance_id().clone(),
+            event_id: event_id.clone(),
+        })?;
+        match response {
+            ServerMessage::SnapshotAck {
+                event_id: acknowledged,
+                snapshot_revision,
+                ..
+            } if acknowledged == event_id => Ok(snapshot_revision),
+            ServerMessage::Error { code, message, .. } => {
+                Err(anyhow::anyhow!("{code:?}: {message}"))
+            }
+            other => Err(anyhow::anyhow!(
+                "unexpected topology refresh response: {other:?}"
+            )),
+        }
+    })();
+    refresh.map_err(|error| {
+        api_error!(
+            "delivery_unknown",
+            format!("{applied_effect} but canonical topology refresh failed: {error:#}"),
+        )
+        .with_dispatch_context(
+            ApiErrorStage::AfterDispatch,
+            ApiSideEffect::Confirmed,
+            ApiRetryAction::InspectManually,
+            None,
+        )
+        .into()
+    })
 }
 
 fn after_dispatch_error(error: anyhow::Error) -> ApiError {
@@ -5607,6 +5822,10 @@ mod tests {
             "durable"
         );
         assert_eq!(
+            contract["providers"]["codex"]["capabilities"]["steer"],
+            "guarded_terminal_best_effort"
+        );
+        assert_eq!(
             contract["providers"]["codex"]["recorded_version"],
             "0.147.0"
         );
@@ -5628,8 +5847,16 @@ mod tests {
             "guarded_terminal"
         );
         assert_eq!(
+            contract["providers"]["claude"]["capabilities"]["steer"],
+            "guarded_terminal_best_effort"
+        );
+        assert_eq!(
             contract["providers"]["opencode"]["capabilities"]["prompt_confirmation"],
             "none"
+        );
+        assert_eq!(
+            contract["providers"]["opencode"]["capabilities"]["steer"],
+            "disabled"
         );
         for agent in ["codex", "claude", "opencode"] {
             assert_eq!(

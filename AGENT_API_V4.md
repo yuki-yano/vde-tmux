@@ -6,7 +6,7 @@
 
 ## Goal
 
-Agent API v4は、既存のcanonical topology、durable Codex dispatch、Run/Operation/Response Artifactに加え、agent bridgeがraw tmux入力を使わずにpane分割、agent起動、guarded terminal prompt、blocked promptへのlogical key入力を行えるJSON契約を提供する。
+Agent API v4は、既存のcanonical topology、durable Codex dispatch、Run/Operation/Response Artifactに加え、agent bridgeがraw tmux入力を使わずにpane分割、agent起動、guarded terminal prompt、実行中agentへのbest-effort steer、blocked promptへのlogical key入力を行えるJSON契約を提供する。
 
 ## Scope
 
@@ -16,6 +16,7 @@ v4で追加する公開契約は次のとおりとする。
 - exact `pane_ref`を起点にする`pane split`
 - exact shell paneへproviderを起動し、exact readinessまで待つ`agent start`
 - exact idle/done agentへguarded terminal入力する`agent send`
+- exact working Codex/Claudeへbest-effort入力する`agent steer`
 - exact blocked agentへallowlisted logical keyを入力する`agent send-keys`
 - mutation receiptから同じoccupantのlifecycle cursorへ接続する運用契約
 
@@ -32,11 +33,11 @@ v4で追加する公開契約は次のとおりとする。
 
 `vt api schema --json`の`result.contract.providers`はagent kindを直接keyにする。callerは独自のprovider名変換表を持たず、resolved agentのkindで参照する。
 
-| agent kind | prompt dispatch | confirmation | response | logical keys | start readiness |
-| --- | --- | --- | --- | --- | --- |
-| `codex` | `durable` | `provider_digest` | `artifact` | yes | `durable_initial_prompt` |
-| `claude` | `guarded_terminal` | `lifecycle_cursor` | `terminal_read` | yes | `provider_session` |
-| `opencode` | `guarded_terminal` | `none` | `terminal_read` | yes | `input_owner_only` |
+| agent kind | prompt dispatch | steer | confirmation | response | logical keys | start readiness |
+| --- | --- | --- | --- | --- | --- | --- |
+| `codex` | `durable` | `guarded_terminal_best_effort` | `provider_digest` | `artifact` | yes | `durable_initial_prompt` |
+| `claude` | `guarded_terminal` | `guarded_terminal_best_effort` | `lifecycle_cursor` | `terminal_read` | yes | `provider_session` |
+| `opencode` | `guarded_terminal` | `disabled` | `none` | `terminal_read` | yes | `input_owner_only` |
 
 `prompt_confirmation=none`はmutation primitiveの存在だけを示し、自動agent bridgeの受理契約を満たさない。bridgeは送信せず停止する。
 
@@ -45,6 +46,8 @@ v4で追加する公開契約は次のとおりとする。
 すべてのmutationはraw pane IDではなくexact public referenceを要求する。server incarnation、pane ID/PID、agent process identity、foreground input ownerを必要なfenceで再検証し、copy-mode中の入力は同じguarded tmux command内でcopy-mode解除後に再検証してから適用する。
 
 prompt bodyはstdinまたはfileから読み、argv、receipt、canonical snapshotへ格納しない。`agent send`成功はtmux input適用を示すだけでprovider受理を示さない。callerはreceiptの`baseline_completed_seq`とexact `agent_ref`を`agent wait`へ渡し、新しい`working`、`blocked`、またはcursorより新しい`done`を確認する。
+
+`agent steer`は開始snapshotで`working`なexact Codex/Claudeだけを受け付け、同じguarded terminal mutationを適用する。active turnへの帰属確認やhook待ちは行わない。入力と同時にturnが完了した場合は次turnとして開始され得るため、receiptは`race_policy=may_start_next_turn`を返す。成功はtmux input適用だけを示し、現在turnへの割り込みやprovider受理を保証しない。
 
 `pane split`は既定でfocusを移さず、cwdを起点paneから継承する。成功は作成paneのlive identityとdaemon canonical topologyへの反映を含む。
 
@@ -73,13 +76,14 @@ API v3をruntimeで受け付けるcompatibility modeやraw tmux fallbackは設�
 - [x] exact pane splitがcwd、方向、比率、focus policyをreceiptへ返し、canonical projection後だけ成功する。
 - [x] agent startが固定providerをexact shell paneで起動し、provider別readinessとinput ownershipを返す。
 - [x] guarded terminal sendがcopy-mode解除、identity/input-owner fence、private body入力を一つのmutationとして行う。
+- [x] best-effort steerがworking gate、provider capability、copy-mode解除、exact occupant/input-owner fenceとnext-turn race policyを公開する。
 - [x] blocked agentへのlogical key入力がclosed validationと同じguardを使う。
 - [x] bridge skillがcapabilityからtransportを選び、raw tmuxへfallbackしない。
 
 ### テスト完了条件
 
 - [x] terminal mutationのargv非露出、copy-mode、logical key、detached splitをunit testで検証する。
-- [x] isolated tmuxでsplit、start、copy-mode中send、blocked send-keys、schema contractを検証する。
+- [x] isolated tmuxでsplit、start、copy-mode中send/steer、steer status gate、blocked send-keys、schema contractを検証する。
 - [x] `cargo fmt --check`、warnings denied clippy、full test、ignored testがpassする。
 - [x] runtime smoke、UI/UX preflight、kill-server isolated testがpassする。
 - [x] durable prompt、operation crashのisolated testがpassする。
@@ -90,3 +94,4 @@ API v3をruntimeで受け付けるcompatibility modeやraw tmux fallbackは設�
 - [x] daemon停止後にlocal binaryを差し替え、新daemonを起動する。
 - [x] installed `vt api schema`がAPI 4 / protocol 16 / PaneState 9 / private state 1を返す。
 - [x] dotfiles管理下の`tmux-agent-bridge`がAPI v4 gateと同じprovider capability contractを使う。
+- [x] bridgeが`steer` capabilityとnext-turn race policyを検査し、通常sendやraw tmux入力へfallbackしない。

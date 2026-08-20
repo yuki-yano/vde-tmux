@@ -2418,6 +2418,24 @@ fn prompt_cli_requires_exactly_one_private_input_source() {
 }
 
 #[test]
+fn steer_cli_requires_exactly_one_private_input_source() {
+    assert!(Cli::try_parse_from(["vt", "agent", "steer", "vta1:test"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "vt",
+            "agent",
+            "steer",
+            "vta1:test",
+            "--stdin",
+            "--prompt-file",
+            "/tmp/prompt",
+        ])
+        .is_err()
+    );
+    assert!(Cli::try_parse_from(["vt", "agent", "steer", "vta1:test", "--stdin"]).is_ok());
+}
+
+#[test]
 fn durable_agent_cli_commands_are_nested_and_reference_scoped() {
     for args in [
         vec!["vt", "agent", "run", "get", "vtr3:test"],

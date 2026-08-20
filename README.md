@@ -213,10 +213,12 @@ Prompt input treats one terminal LF or CRLF from stdin or a file as a text-recor
 removes it before hashing and dispatch, while preserving all internal line breaks.
 
 API v4 also exposes provider capabilities, `pane split`, `agent start`, guarded terminal
-`agent send`, and blocked-agent `agent send-keys`. These mutations require exact references and revalidate
+`agent send`, best-effort working-agent `agent steer`, and blocked-agent `agent send-keys`. These mutations require exact references and revalidate
 the tmux server, pane/process identity, and foreground input ownership. Guarded terminal input
 leaves copy-mode before revalidation. A successful `agent send` receipt means tmux applied the
 input; callers must use its lifecycle cursor with `agent wait` before claiming provider acceptance.
+`agent steer` is available for exact working Codex/Claude occupants. It applies the same guards but
+does not prove active-turn attribution; a concurrent completion may start a new turn instead.
 
 When Claude Code or Codex exhausts its allowance, the pane remains queryable as
 `status=blocked`, `lifecycle.state=waiting`, and `lifecycle.reason=usage_limit`, even if the agent

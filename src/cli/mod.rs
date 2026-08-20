@@ -286,6 +286,27 @@ enum AgentCommand {
         )]
         prompt_file: Option<PathBuf>,
     },
+    /// Best-effort steer an exact working Codex or Claude occupant.
+    ///
+    /// If the active turn completes concurrently, the prompt may start the next turn.
+    Steer {
+        /// Exact agent_ref returned by agent get/list/start.
+        target: String,
+        /// Read the prompt from stdin until EOF, removing one terminal LF or CRLF.
+        #[arg(
+            long,
+            required_unless_present = "prompt_file",
+            conflicts_with = "prompt_file"
+        )]
+        stdin: bool,
+        /// Read the prompt from a file without putting prompt bytes in argv.
+        #[arg(
+            long = "prompt-file",
+            required_unless_present = "stdin",
+            conflicts_with = "stdin"
+        )]
+        prompt_file: Option<PathBuf>,
+    },
     /// Send validated logical keys to an exact blocked agent occupant.
     SendKeys {
         /// Exact agent_ref for the blocked occupant.
@@ -746,7 +767,7 @@ fn agent_body_requires_stdin(args: &[OsString]) -> bool {
     args.get(1).and_then(|arg| arg.to_str()) == Some("agent")
         && matches!(
             args.get(2).and_then(|arg| arg.to_str()),
-            Some("prompt" | "send")
+            Some("prompt" | "send" | "steer")
         )
         && args
             .iter()
@@ -1177,6 +1198,19 @@ where
                     None => input.to_string(),
                 };
                 Ok(Some(crate::api::agent_send(
+                    runner, env, now_epoch, &target, &prompt,
+                )?))
+            }
+            AgentCommand::Steer {
+                target,
+                stdin: _,
+                prompt_file,
+            } => {
+                let prompt = match prompt_file {
+                    Some(path) => read_prompt_file(&path)?,
+                    None => input.to_string(),
+                };
+                Ok(Some(crate::api::agent_steer(
                     runner, env, now_epoch, &target, &prompt,
                 )?))
             }
