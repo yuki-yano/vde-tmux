@@ -22,7 +22,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 16;
+pub const PROTOCOL_VERSION: u16 = 17;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -645,6 +645,7 @@ pub struct PanePresentation {
     pub current_command: String,
     pub pane_width: u16,
     pub active: bool,
+    pub focused: bool,
     pub stored: Option<StoredStateDescriptor>,
     pub resolved: Option<ResolvedPaneState>,
     pub retained_state: Option<RetainedAgentState>,
@@ -1896,6 +1897,7 @@ mod tests {
             current_command: "zsh".to_string(),
             pane_width: 80,
             active: true,
+            focused: true,
             agent_process: None,
             stored: None,
             resolved: None,

@@ -1037,6 +1037,7 @@ mod tests {
             current_command: "codex#[fg=red]".to_string(),
             pane_width: 80,
             active: true,
+            focused: true,
             agent_process: None,
             stored: None,
             resolved: Some(ResolvedPaneState {
@@ -1092,6 +1093,7 @@ mod tests {
             current_command: "zsh#[fg=red]\n".to_string(),
             pane_width: 80,
             active: false,
+            focused: false,
             agent_process: None,
             stored: None,
             resolved: None,

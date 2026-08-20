@@ -8,7 +8,7 @@ use crate::daemon::protocol::v2::SessionLinkPresentation;
 use crate::pane_state::{EventId, PaneInstance};
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
-pub const TOPOLOGY_FIELD_COUNT: usize = 13;
+pub const TOPOLOGY_FIELD_COUNT: usize = 16;
 pub const MAX_TMUX_QUERY_OUTPUT_BYTES: usize = crate::pane_state::MAX_RESPONSE_FRAME_BYTES;
 pub const TARGETED_REFRESH_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -98,6 +98,9 @@ impl QueryFraming {
             "#{pane_current_command}",
             "#{pane_width}",
             "#{pane_active}",
+            "#{@editprompt_is_editor}",
+            "#{@editprompt_target_panes}",
+            "#{@editprompt_editor_pane}",
         ];
         format!("{}{}", FIELDS.join(&self.field), self.row)
     }
@@ -152,12 +155,48 @@ pub struct TopologyPane {
     pub current_command: String,
     pub pane_width: u16,
     pub active: bool,
+    pub editprompt_is_editor: bool,
+    pub editprompt_target_panes: Vec<String>,
+    pub editprompt_editor_pane: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologySnapshot {
     pub server_identity: ServerIdentity,
     pub panes: Vec<TopologyPane>,
+}
+
+impl TopologySnapshot {
+    pub fn focus_proxy_target(&self, source: &PaneInstance) -> Option<&PaneInstance> {
+        let editor = self
+            .panes
+            .iter()
+            .find(|pane| pane.pane_instance == *source)?;
+        if !editor.editprompt_is_editor || editor.editprompt_target_panes.len() != 1 {
+            return None;
+        }
+        let target_id = &editor.editprompt_target_panes[0];
+        if target_id == &source.pane_id {
+            return None;
+        }
+        let target = self
+            .panes
+            .iter()
+            .find(|pane| pane.pane_instance.pane_id == *target_id)?;
+        (target.editprompt_editor_pane.as_deref() == Some(source.pane_id.as_str()))
+            .then_some(&target.pane_instance)
+    }
+
+    pub fn focus_proxy_sources(&self, target: &PaneInstance) -> Vec<PaneInstance> {
+        self.panes
+            .iter()
+            .filter_map(|pane| {
+                self.focus_proxy_target(&pane.pane_instance)
+                    .is_some_and(|candidate| candidate == target)
+                    .then_some(pane.pane_instance.clone())
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,7 +301,7 @@ impl TargetedRefreshIo for SystemTargetedRefreshIo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetedRefreshOutcome {
-    Found(TopologyPane),
+    Found(Box<TopologyPane>),
     NotFound,
 }
 
@@ -306,9 +345,9 @@ fn targeted_refresh_with_framings(
     let mut snapshot = parse_topology(&panes, pane_framing, expected_identity)?;
     match snapshot.panes.len() {
         0 => Ok(TargetedRefreshOutcome::NotFound),
-        1 if snapshot.panes[0].pane_instance.pane_id == pane_id => {
-            Ok(TargetedRefreshOutcome::Found(snapshot.panes.remove(0)))
-        }
+        1 if snapshot.panes[0].pane_instance.pane_id == pane_id => Ok(
+            TargetedRefreshOutcome::Found(Box::new(snapshot.panes.remove(0))),
+        ),
         _ => Err(TopologyError::InvalidRow(
             "targeted pane query returned unrelated panes".to_string(),
         )),
@@ -559,6 +598,14 @@ pub fn parse_topology(
             .filter(|width| *width > 0)
             .ok_or_else(|| TopologyError::InvalidRow("invalid pane width".to_string()))?;
         let active = parse_bool(fields[12], "pane active")?;
+        let editprompt_is_editor = parse_optional_bool(fields[13], "editprompt editor marker")?;
+        let editprompt_target_panes = parse_pane_id_list(fields[14], "editprompt target panes")?;
+        let editprompt_editor_pane = if fields[15].is_empty() {
+            None
+        } else {
+            validate_pane_id(fields[15])?;
+            Some(fields[15].to_string())
+        };
         let pane_instance = PaneInstance {
             pane_id: fields[7].to_string(),
             pane_pid,
@@ -588,6 +635,9 @@ pub fn parse_topology(
             current_command: fields[10].to_string(),
             pane_width,
             active,
+            editprompt_is_editor,
+            editprompt_target_panes,
+            editprompt_editor_pane,
         };
         match panes.get_mut(&pane_instance) {
             Some(existing) => {
@@ -597,6 +647,9 @@ pub fn parse_topology(
                     || existing.current_command != pane.current_command
                     || existing.pane_width != pane.pane_width
                     || existing.active != pane.active
+                    || existing.editprompt_is_editor != pane.editprompt_is_editor
+                    || existing.editprompt_target_panes != pane.editprompt_target_panes
+                    || existing.editprompt_editor_pane != pane.editprompt_editor_pane
                 {
                     return Err(TopologyError::InvalidRow(format!(
                         "linked rows disagree for pane {}",
@@ -632,6 +685,34 @@ pub fn parse_topology(
         server_identity: identity,
         panes,
     })
+}
+
+fn parse_optional_bool(value: &str, field: &str) -> Result<bool, TopologyError> {
+    match value {
+        "" | "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(TopologyError::InvalidRow(format!(
+            "invalid {field}: {value}"
+        ))),
+    }
+}
+
+fn parse_pane_id_list(value: &str, field: &str) -> Result<Vec<String>, TopologyError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut panes = Vec::new();
+    let mut seen = BTreeSet::new();
+    for pane_id in value.split(',') {
+        validate_pane_id(pane_id)?;
+        if !seen.insert(pane_id) {
+            return Err(TopologyError::InvalidRow(format!(
+                "duplicate {field} pane ID: {pane_id}"
+            )));
+        }
+        panes.push(pane_id.to_string());
+    }
+    Ok(panes)
 }
 
 fn parse_envelope<'a>(
@@ -801,6 +882,10 @@ mod tests {
             framing.header, framing.field, framing.field, framing.row
         );
         for fields in rows {
+            let mut fields = fields.clone();
+            if fields.len() == 13 {
+                fields.extend(["", "", ""]);
+            }
             output.push_str(&fields.join(&framing.field));
             output.push_str(&framing.row);
             output.push('\n');
@@ -815,6 +900,10 @@ mod tests {
             framing.header, framing.field, framing.field, framing.row
         );
         for fields in rows {
+            let mut fields = fields.clone();
+            if fields.len() == 13 {
+                fields.extend([String::new(), String::new(), String::new()]);
+            }
             output.push_str(&fields.join(&framing.field));
             output.push_str(&framing.row);
             output.push('\n');
@@ -1047,6 +1136,74 @@ mod tests {
         assert_eq!(snapshot.panes[0].session_links.len(), 2);
         assert_eq!(snapshot.panes[0].session_links[0].session_id, "$1");
         assert_eq!(snapshot.panes[0].session_links[1].session_id, "$2");
+    }
+
+    #[test]
+    fn editprompt_focus_proxy_requires_a_live_bidirectional_single_target() {
+        let rows = vec![
+            vec![
+                "$1", "main", "@1", "0", "1", "0", "work", "%10", "110", "/tmp", "node", "80", "1",
+                "1", "%20", "",
+            ],
+            vec![
+                "$1", "main", "@1", "0", "1", "0", "work", "%20", "120", "/tmp", "codex", "80",
+                "0", "", "", "%10",
+            ],
+        ];
+        let snapshot = parse_topology(&output(&rows), &framing(), &identity()).unwrap();
+        let editor = PaneInstance {
+            pane_id: "%10".to_string(),
+            pane_pid: 110,
+        };
+        let target = PaneInstance {
+            pane_id: "%20".to_string(),
+            pane_pid: 120,
+        };
+
+        assert_eq!(snapshot.focus_proxy_target(&editor), Some(&target));
+        assert_eq!(snapshot.focus_proxy_sources(&target), vec![editor.clone()]);
+        assert_eq!(
+            snapshot.focus_proxy_target(&PaneInstance {
+                pane_id: "%10".to_string(),
+                pane_pid: 999,
+            }),
+            None
+        );
+
+        let mut inconsistent = snapshot.clone();
+        inconsistent
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_instance == target)
+            .unwrap()
+            .editprompt_editor_pane = Some("%99".to_string());
+        assert_eq!(inconsistent.focus_proxy_target(&editor), None);
+
+        let mut ambiguous = snapshot;
+        ambiguous
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_instance == editor)
+            .unwrap()
+            .editprompt_target_panes
+            .push("%21".to_string());
+        assert_eq!(ambiguous.focus_proxy_target(&editor), None);
+    }
+
+    #[test]
+    fn invalid_editprompt_option_values_reject_the_topology_batch() {
+        for options in [
+            ["yes", "%20", ""],
+            ["1", "%20,%20", ""],
+            ["1", "20", ""],
+            ["1", "%20", "10"],
+        ] {
+            let mut row = vec![
+                "$1", "main", "@1", "0", "1", "0", "work", "%10", "110", "/tmp", "node", "80", "1",
+            ];
+            row.extend(options);
+            assert!(parse_topology(&output(&[row]), &framing(), &identity()).is_err());
+        }
     }
 
     #[test]

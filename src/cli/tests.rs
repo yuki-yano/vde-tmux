@@ -584,6 +584,7 @@ fn agent_pane_presentation(pane_id: &str) -> crate::daemon::protocol::v2::PanePr
         current_command: "node".to_string(),
         pane_width: 80,
         active: true,
+        focused: true,
         agent_process: Some(AgentProcessIdentity {
             pid: 9001,
             start_token: "fixture-process-start".to_string(),

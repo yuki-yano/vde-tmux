@@ -420,6 +420,7 @@ mod local_state_tests {
             current_command: "zsh".to_string(),
             pane_width: 80,
             active: true,
+            focused: true,
             agent_process: None,
             stored: None,
             resolved: None,
@@ -489,6 +490,7 @@ mod local_state_tests {
             current_command: "codex".to_string(),
             pane_width: 80,
             active: true,
+            focused: true,
             agent_process: None,
             stored: Some(StoredStateDescriptor::Canonical {
                 version: canonical.version(),
@@ -733,14 +735,16 @@ mod local_state_tests {
     }
 
     #[test]
-    fn current_agent_tracks_exact_focus_and_clears_on_non_agent_panes() {
+    fn current_agent_tracks_logical_focus_and_clears_on_non_agent_panes() {
         let first = resolved_pane("%1", 10, "$1");
         let mut second = resolved_pane("%2", 20, "$2");
         second.active = false;
+        second.focused = false;
         second.session_links[0].window_active = false;
         let mut non_agent = pane(90);
         non_agent.pane_instance.pane_id = "%9".to_string();
         non_agent.active = false;
+        non_agent.focused = false;
         let mut snapshot = ResolvedSnapshot {
             panes: vec![first.clone(), second.clone(), non_agent.clone()],
             ..snapshot(10)
@@ -755,7 +759,7 @@ mod local_state_tests {
         );
         assert!(!refresh_current_agents(&snapshot, &mut state));
 
-        snapshot.panes[1].active = true;
+        snapshot.panes[1].focused = true;
         snapshot.panes[1].session_links[0].window_active = true;
         snapshot.sidebar_model.active_sessions =
             BTreeSet::from(["$1".to_string(), "$2".to_string()]);
@@ -765,16 +769,16 @@ mod local_state_tests {
             BTreeSet::from([first.pane_instance.clone(), second.pane_instance.clone()])
         );
 
-        snapshot.panes[0].active = false;
-        snapshot.panes[1].active = false;
-        snapshot.panes[2].active = true;
+        snapshot.panes[0].focused = false;
+        snapshot.panes[1].focused = false;
+        snapshot.panes[2].focused = true;
         snapshot.sidebar_model.active_sessions = BTreeSet::from(["$1".to_string()]);
         assert!(refresh_current_agents(&snapshot, &mut state));
         assert!(state.current_agents.is_empty());
 
-        snapshot.panes[1].active = true;
+        snapshot.panes[1].focused = true;
         snapshot.panes[1].session_links[0].window_active = true;
-        snapshot.panes[2].active = false;
+        snapshot.panes[2].focused = false;
         snapshot.sidebar_model.active_sessions = BTreeSet::from(["$2".to_string()]);
         assert!(refresh_current_agents(&snapshot, &mut state));
         assert_eq!(
@@ -3526,18 +3530,11 @@ fn refresh_current_agents(snapshot: &ResolvedSnapshot, state: &mut SidebarState)
         .panes
         .iter()
         .filter(|pane| {
-            pane.active
+            pane.focused
                 && pane
                     .resolved
                     .as_ref()
                     .is_some_and(|resolved| resolved.canonical.agent_present)
-                && pane.session_links.iter().any(|link| {
-                    link.window_active
-                        && snapshot
-                            .sidebar_model
-                            .active_sessions
-                            .contains(&link.session_id)
-                })
         })
         .map(|pane| pane.pane_instance.clone())
         .collect::<BTreeSet<_>>();

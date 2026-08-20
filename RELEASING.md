@@ -5,15 +5,16 @@ Publishing is driven by Git tags.
 ## Local API v4 upgrade
 
 API v4 replaces public API 3 with provider capabilities, guarded terminal mutations, exact pane
-split, and agent start. Daemon protocol 16, PaneState 9, and private state format 1 do not change;
-existing state remains readable and must not be reset. Public API 3 is not retained in parallel.
+split, and agent start. Daemon protocol 17 carries editprompt logical focus, while PaneState 9 and
+private state format 1 do not change; existing state remains readable and must not be reset. Public
+API 3 is not retained in parallel.
 
 Before replacement, pass the release gates listed below plus
 `scripts/test-agent-api-v4-isolated.sh`, `scripts/test-agent-prompt-isolated.sh`, and
 `scripts/test-agent-operation-crash-isolated.sh`. Confirm `vt agent storage status --json` reports
 zero `in_flight_operations`. Stage both binaries with
 `cargo install --path . --locked --root <temporary-root>` and verify the staged schema reports API
-4, protocol 16, PaneState 9, and private state 1.
+4, protocol 17, PaneState 9, and private state 1.
 
 Close running sidebars and run `vt daemon disable` before copying either executable so hooks cannot
 restart a mixed binary generation during replacement. Back up both installed executables, replace

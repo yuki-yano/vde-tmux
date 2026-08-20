@@ -286,6 +286,7 @@ fn running_pane_presentation(epoch: i64) -> PanePresentation {
         current_command: "codex".to_string(),
         pane_width: 80,
         active: true,
+        focused: true,
         agent_process: None,
         stored: None,
         resolved: Some(ResolvedPaneState {

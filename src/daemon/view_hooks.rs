@@ -729,12 +729,26 @@ pub fn pane_read_intents(
     through_order: u64,
     records: &BTreeMap<PaneInstance, PaneState>,
 ) -> Result<Vec<PaneReadIntent>, ViewError> {
+    pane_read_intents_with_additional_focus(witnesses, &BTreeSet::new(), through_order, records)
+}
+
+pub fn pane_read_intents_with_additional_focus(
+    witnesses: &[ClientWitness],
+    additional_focused_panes: &BTreeSet<PaneInstance>,
+    through_order: u64,
+    records: &BTreeMap<PaneInstance, PaneState>,
+) -> Result<Vec<PaneReadIntent>, ViewError> {
     validate_witnesses(witnesses)?;
-    let targets = witnesses
+    for pane in additional_focused_panes {
+        pane.validate()
+            .map_err(|error| ViewError::InvalidEvent(error.to_string()))?;
+    }
+    let mut targets = witnesses
         .iter()
         .filter(|witness| witness.is_eligible())
         .map(|witness| witness.active_pane.clone())
         .collect::<BTreeSet<_>>();
+    targets.extend(additional_focused_panes.iter().cloned());
     let mut intents = Vec::new();
     for pane in targets {
         let Some(state) = records.get(&pane) else {
@@ -763,19 +777,42 @@ pub fn pane_read_envelopes(
     through_order: u64,
     records: &BTreeMap<PaneInstance, PaneState>,
 ) -> Result<Vec<crate::pane_state::PaneEventEnvelope>, ViewError> {
-    Ok(pane_read_intents(witnesses, through_order, records)?
-        .into_iter()
-        .map(|intent| crate::pane_state::PaneEventEnvelope {
-            daemon_instance_id: daemon_instance_id.clone(),
-            event_id: event_id.clone(),
-            pane_instance: intent.pane_instance,
-            agent: None,
-            agent_session_id: None,
-            event: crate::pane_state::PaneEvent::MarkPaneRead {
-                through_order: intent.through_order,
-            },
-        })
-        .collect())
+    pane_read_envelopes_with_additional_focus(
+        daemon_instance_id,
+        event_id,
+        witnesses,
+        &BTreeSet::new(),
+        through_order,
+        records,
+    )
+}
+
+pub fn pane_read_envelopes_with_additional_focus(
+    daemon_instance_id: &DaemonInstanceId,
+    event_id: &EventId,
+    witnesses: &[ClientWitness],
+    additional_focused_panes: &BTreeSet<PaneInstance>,
+    through_order: u64,
+    records: &BTreeMap<PaneInstance, PaneState>,
+) -> Result<Vec<crate::pane_state::PaneEventEnvelope>, ViewError> {
+    Ok(pane_read_intents_with_additional_focus(
+        witnesses,
+        additional_focused_panes,
+        through_order,
+        records,
+    )?
+    .into_iter()
+    .map(|intent| crate::pane_state::PaneEventEnvelope {
+        daemon_instance_id: daemon_instance_id.clone(),
+        event_id: event_id.clone(),
+        pane_instance: intent.pane_instance,
+        agent: None,
+        agent_session_id: None,
+        event: crate::pane_state::PaneEvent::MarkPaneRead {
+            through_order: intent.through_order,
+        },
+    })
+    .collect())
 }
 
 pub fn reconcile_current_views(
@@ -1152,10 +1189,30 @@ pub fn query_fresh_visibility(
     io: &dyn FreshVisibilityIo,
     pane: &PaneInstance,
 ) -> Result<VisibilitySnapshot, FreshVisibilityError> {
+    query_fresh_visibility_for_panes(io, &BTreeSet::from([pane.clone()]))
+}
+
+pub fn query_fresh_visibility_for_panes(
+    io: &dyn FreshVisibilityIo,
+    panes: &BTreeSet<PaneInstance>,
+) -> Result<VisibilitySnapshot, FreshVisibilityError> {
+    if panes.is_empty() {
+        return Err(FreshVisibilityError::Parse(
+            "fresh visibility pane set is empty".to_string(),
+        ));
+    }
+    for pane in panes {
+        pane.validate()
+            .map_err(|error| FreshVisibilityError::Parse(error.to_string()))?;
+    }
     let witnesses = io.query_witnesses(FRESH_VISIBILITY_TIMEOUT)?;
     validate_witnesses(&witnesses)
         .map_err(|error| FreshVisibilityError::Parse(error.to_string()))?;
-    Ok(visibility_snapshot(pane, &witnesses))
+    Ok(VisibilitySnapshot {
+        pane_visible_to_eligible_client: witnesses
+            .iter()
+            .any(|witness| witness.is_eligible() && panes.contains(&witness.active_pane)),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1168,7 +1225,14 @@ pub fn completion_visibility(
     io: &dyn FreshVisibilityIo,
     pane: &PaneInstance,
 ) -> Result<CompletionVisibility, FreshVisibilityError> {
-    match query_fresh_visibility(io, pane) {
+    completion_visibility_for_panes(io, &BTreeSet::from([pane.clone()]))
+}
+
+pub fn completion_visibility_for_panes(
+    io: &dyn FreshVisibilityIo,
+    panes: &BTreeSet<PaneInstance>,
+) -> Result<CompletionVisibility, FreshVisibilityError> {
+    match query_fresh_visibility_for_panes(io, panes) {
         Ok(snapshot) => Ok(CompletionVisibility {
             snapshot,
             diagnostic: None,
@@ -1524,6 +1588,32 @@ mod tests {
     }
 
     #[test]
+    fn pane_read_intents_include_additional_logical_focus() {
+        let editor = pane("%9", 109);
+        let target = pane("%1", 101);
+        let records = [(target.clone(), state(target.clone(), 2, false))]
+            .into_iter()
+            .collect();
+        let witnesses = [witness(10, editor, false)];
+
+        let intents = pane_read_intents_with_additional_focus(
+            &witnesses,
+            &BTreeSet::from([target.clone()]),
+            2,
+            &records,
+        )
+        .unwrap();
+
+        assert_eq!(
+            intents,
+            vec![PaneReadIntent {
+                pane_instance: target,
+                through_order: 2,
+            }]
+        );
+    }
+
+    #[test]
     fn sequencer_position_freezes_unread_order_upper_bound() {
         let target = pane("%1", 101);
         let records = [(target.clone(), state(target.clone(), 4, false))]
@@ -1634,6 +1724,23 @@ mod tests {
         .unwrap();
         assert!(visibility.snapshot.pane_visible_to_eligible_client);
         assert_eq!(visibility.diagnostic, None);
+
+        let editor = pane("%9", 109);
+        let visibility = completion_visibility_for_panes(
+            &Fresh {
+                witnesses: vec![ClientWitness {
+                    client_pid: 10,
+                    session_id: "$1".to_string(),
+                    window_id: "@1".to_string(),
+                    active_pane: editor.clone(),
+                    control_mode: false,
+                    active_pane_flag: false,
+                }],
+            },
+            &BTreeSet::from([target, editor]),
+        )
+        .unwrap();
+        assert!(visibility.snapshot.pane_visible_to_eligible_client);
     }
 
     #[test]

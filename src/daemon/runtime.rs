@@ -9,11 +9,38 @@ use crate::daemon::topology::TopologySnapshot;
 use crate::daemon::{SidebarModel, TransitionEvent};
 use crate::git::{GitBadge, WorktreeInfo};
 pub use crate::pane_state::CanonicalStateRuntime as CanonicalPaneStateRuntime;
-use crate::pane_state::{PaneInstance, PaneState, StoreError, StoredStateDescriptor, WaitReason};
+use crate::pane_state::{
+    ClientWitness, PaneInstance, PaneState, StoreError, StoredStateDescriptor, WaitReason,
+};
 use crate::sidebar::state::{SidebarIntentDedupe, SidebarNavigation, SidebarPreferences};
 use crate::sidebar::tree::now_epoch_secs;
 
 const EVENT_CAP: usize = crate::pane_state::store::MAX_DIAGNOSTICS;
+
+fn effective_focused_panes(
+    runtime: &CanonicalPaneStateRuntime,
+    topology: &TopologySnapshot,
+    witnesses: &[ClientWitness],
+) -> BTreeSet<PaneInstance> {
+    let direct = witnesses
+        .iter()
+        .filter(|witness| witness.is_eligible())
+        .map(|witness| witness.active_pane.clone())
+        .collect::<BTreeSet<_>>();
+    let mut focused = direct.clone();
+    for source in direct {
+        let Some(target) = topology.focus_proxy_target(&source) else {
+            continue;
+        };
+        if runtime
+            .record(target)
+            .is_some_and(|state| state.agent_present)
+        {
+            focused.insert(target.clone());
+        }
+    }
+    focused
+}
 
 pub(crate) struct LeasedCanonicalPaneStateRuntime {
     pub runtime: CanonicalPaneStateRuntime,
@@ -301,6 +328,23 @@ impl CanonicalCoordinatorState {
         windows
     }
 
+    pub fn effective_focused_panes(&self, witnesses: &[ClientWitness]) -> BTreeSet<PaneInstance> {
+        effective_focused_panes(&self.leased.runtime, &self.topology, witnesses)
+    }
+
+    pub fn focus_equivalent_panes(&self, target: &PaneInstance) -> BTreeSet<PaneInstance> {
+        let mut panes = BTreeSet::from([target.clone()]);
+        if self
+            .leased
+            .runtime
+            .record(target)
+            .is_some_and(|state| state.agent_present)
+        {
+            panes.extend(self.topology.focus_proxy_sources(target));
+        }
+        panes
+    }
+
     pub fn replace_topology(&mut self, topology: TopologySnapshot) -> Result<bool, StoreError> {
         if self.topology == topology {
             return Ok(false);
@@ -464,13 +508,8 @@ impl CanonicalCoordinatorState {
 
         let mut panes = Vec::with_capacity(topology_snapshot.panes.len());
         let mut attention = Vec::new();
-        let visible_instances = self
-            .views
-            .clients()
-            .values()
-            .filter(|witness| witness.is_eligible())
-            .map(|witness| witness.active_pane.clone())
-            .collect::<BTreeSet<_>>();
+        let witnesses = self.views.clients().values().cloned().collect::<Vec<_>>();
+        let focused_instances = effective_focused_panes(runtime, topology_snapshot, &witnesses);
         let triage = runtime
             .triage_entries()
             .map(|(pane, badge)| (pane.clone(), badge))
@@ -500,7 +539,7 @@ impl CanonicalCoordinatorState {
                 None
             };
             if let Some(badge) = triage.get(&topology.pane_instance)
-                && !visible_instances.contains(&topology.pane_instance)
+                && !focused_instances.contains(&topology.pane_instance)
             {
                 let active = record;
                 let reason = match active.map(|state| &state.lifecycle) {
@@ -540,6 +579,7 @@ impl CanonicalCoordinatorState {
                 current_command: topology.current_command.clone(),
                 pane_width: topology.pane_width,
                 active: topology.active,
+                focused: focused_instances.contains(&topology.pane_instance),
                 stored,
                 resolved,
                 retained_state,
@@ -1329,6 +1369,7 @@ mod tests {
             current_command: if resolved.is_some() { "codex" } else { "zsh" }.to_string(),
             pane_width: 80,
             active,
+            focused: active,
             agent_process: None,
             stored: resolved
                 .as_ref()
@@ -1429,6 +1470,9 @@ mod tests {
                 },
                 pane_width: 80,
                 active: true,
+                editprompt_is_editor: false,
+                editprompt_target_panes: Vec::new(),
+                editprompt_editor_pane: None,
             }
         };
         let topology = TopologySnapshot {
@@ -1945,6 +1989,105 @@ mod tests {
                 .any(|entry| entry.pane_instance.pane_id == "%2"),
             "a blocked non-focus split in the same window remains attention-worthy"
         );
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    #[test]
+    fn editprompt_target_is_focused_and_suppresses_attention_without_changing_physical_active() {
+        use crate::pane_state::ClientWitness;
+
+        let (mut state, root) = canonical_sidebar_fixture();
+        let target = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let editor = PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 109,
+        };
+        state
+            .topology
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_instance == target)
+            .unwrap()
+            .editprompt_editor_pane = Some(editor.pane_id.clone());
+        state
+            .topology
+            .panes
+            .push(crate::daemon::topology::TopologyPane {
+                pane_instance: editor.clone(),
+                session_links: vec![status_link("$1", "main", 0, true)],
+                window_id: "@1".to_string(),
+                window_name: "@1".to_string(),
+                current_path: "/tmp/alpha".to_string(),
+                current_command: "node".to_string(),
+                pane_width: 80,
+                active: true,
+                editprompt_is_editor: true,
+                editprompt_target_panes: vec![target.pane_id.clone()],
+                editprompt_editor_pane: None,
+            });
+        state
+            .topology
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_instance == target)
+            .unwrap()
+            .active = false;
+        state
+            .views
+            .reconcile(
+                &[ClientWitness {
+                    client_pid: 10,
+                    session_id: "$1".to_string(),
+                    window_id: "@1".to_string(),
+                    active_pane: editor.clone(),
+                    control_mode: false,
+                    active_pane_flag: false,
+                }],
+                &BTreeMap::from([("@1".to_string(), vec![target.clone(), editor.clone()])]),
+            )
+            .unwrap();
+
+        let snapshot = state.resolved_snapshot();
+        let target_presentation = snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.pane_instance == target)
+            .unwrap();
+        assert!(!target_presentation.active);
+        assert!(target_presentation.focused);
+        assert!(
+            snapshot
+                .attention
+                .iter()
+                .all(|entry| entry.pane_instance != target)
+        );
+
+        state
+            .topology
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_instance == target)
+            .unwrap()
+            .editprompt_editor_pane = Some("%99".to_string());
+        let snapshot = state.resolved_snapshot();
+        assert!(
+            !snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.pane_instance == target)
+                .unwrap()
+                .focused
+        );
+        assert!(
+            snapshot
+                .attention
+                .iter()
+                .any(|entry| entry.pane_instance == target)
+        );
+
         remove_canonical_sidebar_fixture(state, root);
     }
 

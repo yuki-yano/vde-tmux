@@ -5484,6 +5484,7 @@ mod tests {
             current_command: "codex".to_string(),
             pane_width: 80,
             active: true,
+            focused: true,
             agent_process: Some(crate::pane_state::AgentProcessIdentity {
                 pid: 9001,
                 start_token: "test-process-start".to_string(),

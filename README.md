@@ -302,6 +302,10 @@ vt sidebar close
 Agents belonging to an active session have a cyan `▎` marker on the left. The exact agent pane
 focused by an eligible tmux client uses the yellow `selection_bar` color instead; this marker follows
 pane, session, and category changes and disappears when the focused pane is not a live agent.
+An editprompt editor pane is treated as logically focusing its single live agent target when the
+`@editprompt_is_editor`, `@editprompt_target_panes`, and reverse `@editprompt_editor_pane` options
+form a valid bidirectional link. The target pane remains physically inactive; logical focus only
+drives current-agent, attention, and read/Done handling.
 Keyboard selection remains visible through the row background and does not create a current-agent
 marker by itself.
 Click the first rendered line of an agent to expand or collapse it. Click its

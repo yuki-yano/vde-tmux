@@ -1825,6 +1825,7 @@ mod tests {
             current_command: "codex".to_string(),
             pane_width: 80,
             active: true,
+            focused: true,
             agent_process: None,
             stored: Some(crate::pane_state::StoredStateDescriptor::Canonical {
                 version: canonical.version(),

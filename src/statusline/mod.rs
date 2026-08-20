@@ -2010,6 +2010,7 @@ mod tests {
             current_command: command.to_string(),
             pane_width: 80,
             active,
+            focused: active,
             agent_process: None,
             stored: None,
             resolved,

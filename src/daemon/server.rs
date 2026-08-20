@@ -6014,7 +6014,7 @@ fn unread_visibility_for_event(
 > {
     use crate::pane_state::{PaneEvent, ReportedLifecycle};
 
-    let (current, tracker) = {
+    let (current, tracker, focus_equivalent_panes) = {
         let state_guard = coordinator
             .state
             .lock()
@@ -6026,7 +6026,11 @@ fn unread_visibility_for_event(
         let tracker = state
             .map(|state| state.leased.runtime.tracker(&envelope.pane_instance))
             .unwrap_or_default();
-        (current, tracker)
+        let focus_equivalent_panes = state.map_or_else(
+            || BTreeSet::from([envelope.pane_instance.clone()]),
+            |state| state.focus_equivalent_panes(&envelope.pane_instance),
+        );
+        (current, tracker, focus_equivalent_panes)
     };
     let may_create_unread = match &envelope.event {
         PaneEvent::WaitRequested { .. } | PaneEvent::FailRun { .. } => true,
@@ -6072,7 +6076,7 @@ fn unread_visibility_for_event(
             .filter(|value| !value.trim().is_empty()),
         coordinator.incarnation.identity.clone(),
     );
-    match crate::daemon::view_hooks::completion_visibility(&io, &envelope.pane_instance) {
+    match crate::daemon::view_hooks::completion_visibility_for_panes(&io, &focus_equivalent_panes) {
         Ok(result) => Ok((result.snapshot, result.diagnostic)),
         Err(error) => Err(crate::pane_state::store::StoreError::FailStop(
             error.to_string(),
@@ -6543,7 +6547,7 @@ fn targeted_pane_refresh_outcome_response(
             topology
                 .panes
                 .retain(|existing| existing.pane_instance.pane_id != pane_id);
-            topology.panes.push(pane);
+            topology.panes.push(*pane);
             topology
                 .panes
                 .sort_by(|left, right| left.pane_instance.cmp(&right.pane_instance));
@@ -7244,10 +7248,12 @@ fn reconcile_views_with_witnesses(
         return Ok(());
     }
     let read_event_id = EventId::generate()?;
-    let pane_reads = crate::daemon::view_hooks::pane_read_envelopes(
+    let focused_panes = state.effective_focused_panes(witnesses);
+    let pane_reads = crate::daemon::view_hooks::pane_read_envelopes_with_additional_focus(
         &daemon_instance_id,
         &read_event_id,
         witnesses,
+        &focused_panes,
         through_unread_order,
         &state.records_snapshot(),
     )?;
@@ -8567,7 +8573,8 @@ mod tests {
             .replace("#{pid}", "123")
             .replace("#{start_time}", "456");
         let topology = [
-            "$1", "main", "@1", "0", "1", "0", "window", "%1", "100", "/tmp", "zsh", "80", "1",
+            "$1", "main", "@1", "0", "1", "0", "window", "%1", "100", "/tmp", "zsh", "80", "1", "",
+            "", "",
         ]
         .join(field);
         let status_session = [
@@ -9558,6 +9565,9 @@ mod tests {
                         current_command: "codex".to_string(),
                         pane_width: 80,
                         active: false,
+                        editprompt_is_editor: false,
+                        editprompt_target_panes: Vec::new(),
+                        editprompt_editor_pane: None,
                     }],
                 })
                 .unwrap();
@@ -10402,7 +10412,7 @@ mod tests {
     #[test]
     fn query_pane_cache_miss_waits_for_targeted_refresh_and_returns_found() {
         let (response, diagnostics) = query_pane_cache_miss_with_refresh_outcome(Ok(
-            crate::daemon::topology::TargetedRefreshOutcome::Found(
+            crate::daemon::topology::TargetedRefreshOutcome::Found(Box::new(
                 crate::daemon::topology::TopologyPane {
                     pane_instance: PaneInstance {
                         pane_id: "%7".to_string(),
@@ -10415,8 +10425,11 @@ mod tests {
                     current_command: "zsh".to_string(),
                     pane_width: 80,
                     active: true,
+                    editprompt_is_editor: false,
+                    editprompt_target_panes: Vec::new(),
+                    editprompt_editor_pane: None,
                 },
-            ),
+            )),
         ));
         assert!(diagnostics.is_empty());
         assert!(matches!(
@@ -10523,6 +10536,9 @@ mod tests {
                     current_command: "zsh".to_string(),
                     pane_width: 80,
                     active: false,
+                    editprompt_is_editor: false,
+                    editprompt_target_panes: Vec::new(),
+                    editprompt_editor_pane: None,
                 }],
             })
             .unwrap();
