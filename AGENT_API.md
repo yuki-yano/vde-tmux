@@ -64,6 +64,15 @@ BLOCKED_REF="$(vt agent get %538 --json | jq -r '.result.agent.summary.agent_ref
 vt agent send-keys "$BLOCKED_REF" --key y --key Enter --json
 ```
 
+`api snapshot` is the one-call inventory endpoint. It groups the live canonical panes, resolved
+agent occupants, and daemon diagnostics from one snapshot revision. Prefer it over composing raw
+`tmux list-panes` output with separate `pane list` and `agent list` calls, which can observe
+different revisions. Use the narrower list commands when their filters are useful.
+
+The snapshot does not inspect arbitrary paths supplied to `--prompt-file`. Those files are request
+inputs owned by the caller, not transport or delivery state. After dispatch, use the returned
+Operation, Run, or terminal-send receipt instead of file metadata as the acceptance signal.
+
 API commands always emit JSON. `--json` is accepted so callers can state the expected format. A
 successful command writes one envelope to stdout. A failed command writes one error envelope to
 stderr and exits non-zero. `api schema` uses the same success envelope and includes JSON Schemas for

@@ -185,6 +185,7 @@ agent occupants without polling tmux topology:
 
 ```bash
 vt api schema --json
+vt api snapshot --json
 vt agent list --status working --json
 vt agent wait %456 --until done,blocked --json
 vt pane read %456 --source latest --lines 120 --json
@@ -198,6 +199,12 @@ RUN_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.run_ref')"
 vt agent run wait "$RUN_REF" --json
 vt agent run response "$RUN_REF" --json
 ```
+
+Use `vt api snapshot --json` for one-shot inventory and diagnostics instead of composing
+`tmux list-panes` with separate `vt pane list` and `vt agent list` calls. It returns the live
+canonical panes, resolved agents, and grouped daemon diagnostics under one `snapshot_revision`.
+Prompt files passed through `--prompt-file` are request inputs rather than delivery state; use the
+returned Operation, Run, or terminal-send receipt to verify dispatch.
 
 See [Agent JSON API](./AGENT_API.md) for the response envelope, stable occupant references,
 durable run completion, filters, and capture bounds. An exact `agent_ref` is emitted only when one
