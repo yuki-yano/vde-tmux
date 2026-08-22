@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(
             badge_value_from_counts(counts, &glyphs, SessionBadgeMode::Counts, "", false,)
                 .as_deref(),
-            Some("◆ 1 ● 1 ○ 1")
+            Some("⋄ 1 ● 1 ○ 1")
         );
     }
 

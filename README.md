@@ -241,7 +241,7 @@ retry automatically or infer recovery from the clock; a later `SessionStart` or
 | Badge | State | Meaning |
 | --- | --- | --- |
 | `▲` | Blocked | The agent needs input or hit an error |
-| `◆` | Limited | The provider usage or session allowance is exhausted; shown in orange and excluded from Needs action |
+| `⋄` | Limited | The provider usage or session allowance is exhausted; shown in orange and excluded from Needs action |
 | `●` | Working | The agent is running |
 | `✓` | Done | The run completed and has not been acknowledged |
 | `○` | Idle | No work is active, or the completed run was acknowledged |
@@ -450,7 +450,7 @@ statusline:
 badge:
   glyphs:
     blocked: "▲"
-    limited: "◆"
+    limited: "⋄"
     working: "●"
     done: "✓"
     idle: "○"

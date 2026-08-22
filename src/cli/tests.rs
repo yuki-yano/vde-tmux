@@ -2170,7 +2170,7 @@ fn dispatch_statusline_summary_renders_v2_status_snapshot() {
     assert_eq!(
         output,
         Some(
-            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#f5a742,dim]◆ 0#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2,dim]○ 0#[default]"
+            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#f5a742,dim]⋄ 0#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2,dim]○ 0#[default]"
                 .to_string()
         )
     );

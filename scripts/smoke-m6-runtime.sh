@@ -1073,7 +1073,7 @@ grep -F main <<<"$MAIN_SESSIONS" >/dev/null
 grep -F aux <<<"$MAIN_SESSIONS" >/dev/null
 SUMMARY_VALUE="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_status_summary)"
 echo "display summary: $SUMMARY_VALUE"
-for token in '▲ 0' '◆ 0' '● 0' '✓ 1' '○ 0'; do
+for token in '▲ 0' '⋄ 0' '● 0' '✓ 1' '○ 0'; do
   grep -F "$token" <<<"$SUMMARY_VALUE" >/dev/null
 done
 CLIENT_ATTACHMENTS="$(tmux -L "$TMUX_SOCKET" list-clients -F '#{client_name} #{client_session}')"

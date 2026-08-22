@@ -2578,7 +2578,7 @@ mod tests {
         let default_summary = render_structured_summary(&config, counts);
         assert_eq!(
             default_summary,
-            "#[fg=#ff6b6b]▲ 1#[default] #[fg=#f5a742]◆ 1#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6]✓ 1#[default] #[fg=#a8a8b2]○ 1#[default]"
+            "#[fg=#ff6b6b]▲ 1#[default] #[fg=#f5a742]⋄ 1#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6]✓ 1#[default] #[fg=#a8a8b2]○ 1#[default]"
         );
         assert_eq!(tmux_display_width(&default_summary), 19);
 
@@ -2586,7 +2586,7 @@ mod tests {
         let custom_summary = render_structured_summary(&config, counts);
         assert_eq!(
             custom_summary,
-            "#[fg=#ff6b6b]1▲#[default] #[fg=#f5a742]1◆#[default] #[fg=#4fd08a]1●#[default] #[fg=#45cbe6]1✓#[default] #[fg=#a8a8b2]1○#[default]"
+            "#[fg=#ff6b6b]1▲#[default] #[fg=#f5a742]1⋄#[default] #[fg=#4fd08a]1●#[default] #[fg=#45cbe6]1✓#[default] #[fg=#a8a8b2]1○#[default]"
         );
         assert_eq!(tmux_display_width(&custom_summary), 14);
     }
@@ -2597,7 +2597,7 @@ mod tests {
         let empty_summary = render_structured_summary(&config, BadgeStateCounts::default());
         assert_eq!(
             empty_summary,
-            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#f5a742,dim]◆ 0#[default] #[fg=#4fd08a,dim]● 0#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2,dim]○ 0#[default]"
+            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#f5a742,dim]⋄ 0#[default] #[fg=#4fd08a,dim]● 0#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2,dim]○ 0#[default]"
         );
 
         let mixed_summary = render_structured_summary(
@@ -2612,7 +2612,7 @@ mod tests {
         );
         assert_eq!(
             mixed_summary,
-            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#f5a742,dim]◆ 0#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2]○ 9#[default]"
+            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#f5a742,dim]⋄ 0#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2]○ 9#[default]"
         );
         assert_eq!(tmux_display_width(&empty_summary), 19);
         assert_eq!(tmux_display_width(&mixed_summary), 19);
@@ -2621,7 +2621,7 @@ mod tests {
         let without_idle = render_structured_summary(&config, BadgeStateCounts::default());
         assert_eq!(
             without_idle,
-            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#f5a742,dim]◆ 0#[default] #[fg=#4fd08a,dim]● 0#[default] #[fg=#45cbe6,dim]✓ 0#[default]"
+            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#f5a742,dim]⋄ 0#[default] #[fg=#4fd08a,dim]● 0#[default] #[fg=#45cbe6,dim]✓ 0#[default]"
         );
         assert_eq!(tmux_display_width(&without_idle), 15);
     }

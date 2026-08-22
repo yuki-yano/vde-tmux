@@ -411,7 +411,7 @@ impl Default for BadgeGlyphs {
     fn default() -> Self {
         Self {
             blocked: "▲".to_string(),
-            limited: "◆".to_string(),
+            limited: "⋄".to_string(),
             working: "●".to_string(),
             done: "✓".to_string(),
             idle: "○".to_string(),
@@ -1111,7 +1111,7 @@ categories:
         assert_eq!(config.suffix, "");
         assert!(!config.hide_idle);
         assert_eq!(badge.glyphs.blocked, "▲");
-        assert_eq!(badge.glyphs.limited, "◆");
+        assert_eq!(badge.glyphs.limited, "⋄");
         assert_eq!(badge.glyphs.working, "●");
         assert_eq!(badge.glyphs.done, "✓");
         assert_eq!(badge.glyphs.idle, "○");

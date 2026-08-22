@@ -2796,8 +2796,8 @@ sidebar:
         let dense = render_rows(&[category], &SidebarState::default(), 30);
 
         assert!(standard.contains("▾ dev"), "{standard:?}");
-        assert!(!standard.contains("◆"), "{standard:?}");
-        assert!(!dense.contains("◆"), "{dense:?}");
+        assert!(!standard.contains("⋄"), "{standard:?}");
+        assert!(!dense.contains("⋄"), "{dense:?}");
     }
 
     #[test]
@@ -3018,7 +3018,7 @@ sidebar:
             header.lines[1].text,
             " ◉ All     · ≣ Tree     ▾ \u{e0b0}".to_string()
         );
-        assert_eq!(header.lines[2].text, " ≡ 7  ▲ 1  ◆ 0  ● 1  ✓ 0  ○ 5 ");
+        assert_eq!(header.lines[2].text, " ≡ 7  ▲ 1  ⋄ 0  ● 1  ✓ 0  ○ 5 ");
         let section = style_for_segment(&header, 0, "SIDEBAR");
         assert_eq!(section.fg, Some(SidebarRenderTheme::default().category));
         assert!(section.add_modifier.contains(Modifier::BOLD));
@@ -3274,7 +3274,7 @@ sidebar:
 
         assert_eq!(
             line.text,
-            "\u{e0b6} ≡ 3 \u{e0b4} \u{e0b6} ▲ 1 \u{e0b4}  ◆ 0   ● 0   ✓ 0  \u{e0b6} ○ 2 \u{e0b4}"
+            "\u{e0b6} ≡ 3 \u{e0b4} \u{e0b6} ▲ 1 \u{e0b4}  ⋄ 0   ● 0   ✓ 0  \u{e0b6} ○ 2 \u{e0b4}"
         );
         let cap = style_for_segment(&header, 2, "\u{e0b6}");
         assert_eq!(cap.fg, Some(theme.header_mode));
