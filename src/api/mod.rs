@@ -139,6 +139,7 @@ pub enum ApiErrorCode {
     CaptureFailed,
     AgentBusy,
     AgentBlocked,
+    AgentLimited,
     PromptConfirmationUnavailable,
     AgentNotInputOwner,
     PromptDispatchBusy,
@@ -194,6 +195,7 @@ impl ApiErrorCode {
             Self::CaptureFailed => "capture_failed",
             Self::AgentBusy => "agent_busy",
             Self::AgentBlocked => "agent_blocked",
+            Self::AgentLimited => "agent_limited",
             Self::PromptConfirmationUnavailable => "prompt_confirmation_unavailable",
             Self::AgentNotInputOwner => "agent_not_input_owner",
             Self::PromptDispatchBusy => "prompt_dispatch_busy",
@@ -239,6 +241,7 @@ impl ApiErrorCode {
             }
             Self::AgentBusy
             | Self::AgentBlocked
+            | Self::AgentLimited
             | Self::PromptConfirmationUnavailable
             | Self::AgentNotInputOwner
             | Self::PromptDispatchBusy
@@ -264,6 +267,7 @@ impl ApiErrorCode {
             | Self::ResourceLimit
             | Self::AgentBusy
             | Self::AgentBlocked
+            | Self::AgentLimited
             | Self::PromptConfirmationUnavailable
             | Self::AgentNotInputOwner
             | Self::PromptDispatchBusy
@@ -361,6 +365,9 @@ macro_rules! api_error {
     };
     ("agent_blocked", $message:expr $(,)?) => {
         ApiError::new(ApiErrorCode::AgentBlocked, $message)
+    };
+    ("agent_limited", $message:expr $(,)?) => {
+        ApiError::new(ApiErrorCode::AgentLimited, $message)
     };
     ("prompt_confirmation_unavailable", $message:expr $(,)?) => {
         ApiError::new(ApiErrorCode::PromptConfirmationUnavailable, $message)
@@ -822,6 +829,7 @@ pub struct PaneDetail {
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Blocked,
+    Limited,
     Working,
     Done,
     Idle,
@@ -831,6 +839,7 @@ impl AgentStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Blocked => "blocked",
+            Self::Limited => "limited",
             Self::Working => "working",
             Self::Done => "done",
             Self::Idle => "idle",
@@ -842,6 +851,7 @@ impl AgentStatus {
 #[serde(rename_all = "snake_case")]
 pub enum AgentBadge {
     Blocked,
+    Limited,
     Working,
     Done,
     Idle,
@@ -851,6 +861,7 @@ impl From<BadgeState> for AgentBadge {
     fn from(value: BadgeState) -> Self {
         match value {
             BadgeState::Blocked => Self::Blocked,
+            BadgeState::Limited => Self::Limited,
             BadgeState::Working => Self::Working,
             BadgeState::Done => Self::Done,
             BadgeState::Idle => Self::Idle,
@@ -1149,9 +1160,13 @@ fn default_prompt_confirm_timeout_ms() -> u64 {
 }
 
 fn default_wait_statuses() -> BTreeSet<AgentStatus> {
-    [AgentStatus::Done, AgentStatus::Blocked]
-        .into_iter()
-        .collect()
+    [
+        AgentStatus::Done,
+        AgentStatus::Blocked,
+        AgentStatus::Limited,
+    ]
+    .into_iter()
+    .collect()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
@@ -1267,7 +1282,7 @@ pub enum ApiRequest {
     AgentWait {
         target: String,
         #[serde(default = "default_wait_statuses")]
-        #[schemars(length(min = 1, max = 4))]
+        #[schemars(length(min = 1, max = 5))]
         until: BTreeSet<AgentStatus>,
         #[serde(default = "default_wait_timeout_ms")]
         #[schemars(range(min = 1, max = 86_400_000))]
@@ -1798,6 +1813,16 @@ pub fn agent_send(
             )
             .into());
         }
+        AgentStatus::Limited => {
+            return Err(api_error!(
+                "agent_limited",
+                format!(
+                    "agent in pane {} is usage limited",
+                    pane.pane_instance.pane_id
+                ),
+            )
+            .into());
+        }
         AgentStatus::Done | AgentStatus::Idle => {}
     }
     let capability = provider_capabilities(state.agent.as_str()).ok_or_else(|| {
@@ -1887,6 +1912,16 @@ pub fn agent_steer(
             return Err(api_error!(
                 "agent_blocked",
                 format!("agent in pane {} is blocked", pane.pane_instance.pane_id),
+            )
+            .into());
+        }
+        AgentStatus::Limited => {
+            return Err(api_error!(
+                "agent_limited",
+                format!(
+                    "agent in pane {} is usage limited",
+                    pane.pane_instance.pane_id
+                ),
             )
             .into());
         }
@@ -4024,7 +4059,10 @@ pub fn agent_wait(
             };
             let matched_at = match status {
                 AgentStatus::Done => state.completed_at,
-                AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Idle => None,
+                AgentStatus::Working
+                | AgentStatus::Blocked
+                | AgentStatus::Limited
+                | AgentStatus::Idle => None,
             };
             return success_json(
                 &connection,
@@ -4164,6 +4202,7 @@ fn match_wait_event(
         }
         let badge_status = match event.to {
             BadgeState::Blocked => AgentStatus::Blocked,
+            BadgeState::Limited => AgentStatus::Limited,
             BadgeState::Working => AgentStatus::Working,
             BadgeState::Done => AgentStatus::Done,
             BadgeState::Idle if event.completed_seq == 0 => AgentStatus::Idle,
@@ -4203,6 +4242,7 @@ fn match_current_wait_status(
         return Some(AgentStatus::Done);
     }
     let current = match state.lifecycle {
+        LifecycleState::Waiting { reason } if reason.is_usage_limit() => AgentStatus::Limited,
         LifecycleState::Waiting { .. } | LifecycleState::Error { .. } => AgentStatus::Blocked,
         LifecycleState::Running => AgentStatus::Working,
         LifecycleState::Idle if state.completed_seq > 0 => AgentStatus::Done,
@@ -4716,6 +4756,7 @@ fn agent_summary(
 
 fn agent_status(state: &crate::pane_state::PaneState) -> AgentStatus {
     match state.lifecycle {
+        LifecycleState::Waiting { ref reason } if reason.is_usage_limit() => AgentStatus::Limited,
         LifecycleState::Waiting { .. } | LifecycleState::Error { .. } => AgentStatus::Blocked,
         LifecycleState::Running => AgentStatus::Working,
         LifecycleState::Idle if state.completed_seq > 0 => AgentStatus::Done,
@@ -5747,12 +5788,13 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            50
+            51
         );
         let error_codes = value["result"]["schemas"]["error"]["$defs"]["ApiErrorCode"]["enum"]
             .as_array()
             .unwrap();
         for code in [
+            "agent_limited",
             "operation_conflict",
             "operation_not_found",
             "operation_store_full",
@@ -5784,7 +5826,17 @@ mod tests {
             .find(|schema| schema["properties"]["command"]["const"] == "agent_wait")
             .unwrap();
         assert_eq!(wait_schema["properties"]["until"]["minItems"], 1);
-        assert_eq!(wait_schema["properties"]["until"]["maxItems"], 4);
+        assert_eq!(wait_schema["properties"]["until"]["maxItems"], 5);
+        assert_eq!(
+            default_wait_statuses(),
+            [
+                AgentStatus::Blocked,
+                AgentStatus::Limited,
+                AgentStatus::Done,
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]
@@ -6551,7 +6603,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_usage_limited_agent_remains_queryable_as_blocked() {
+    fn absent_usage_limited_agent_remains_queryable_as_limited() {
         let mut pane = test_agent_pane();
         pane.agent_process = None;
         let state = &mut pane.resolved.as_mut().unwrap().canonical;
@@ -6560,18 +6612,20 @@ mod tests {
         state.lifecycle = LifecycleState::Waiting {
             reason: WaitReason::usage_limit(),
         };
-        pane.resolved.as_mut().unwrap().badge = BadgeState::Blocked;
+        pane.resolved.as_mut().unwrap().badge = BadgeState::Limited;
         let snapshot = test_snapshot(pane.clone());
 
         let summary = agent_summary(&pane, &snapshot, "server").unwrap();
-        assert_eq!(summary.status, AgentStatus::Blocked);
+        assert_eq!(summary.status, AgentStatus::Limited);
+        assert_eq!(summary.badge, AgentBadge::Limited);
         assert_eq!(summary.lifecycle.state, "waiting");
         assert_eq!(summary.lifecycle.reason.as_deref(), Some("usage_limit"));
         assert!(!summary.present);
         assert!(summary.agent_ref.is_none());
         let resolved = resolve_agent(&snapshot, "%1", "server").unwrap();
         let detail = agent_detail(resolved, &snapshot, "server").unwrap();
-        assert_eq!(detail.summary.status, AgentStatus::Blocked);
+        assert_eq!(detail.summary.status, AgentStatus::Limited);
+        assert!(!detail.summary.needs_action);
         assert!(!detail.summary.present);
         assert!(detail.summary.agent_ref.is_none());
     }

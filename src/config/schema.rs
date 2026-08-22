@@ -39,6 +39,7 @@ pub fn config_schema() -> Value {
                         "additionalProperties": true,
                         "properties": {
                             "blocked": { "type": "string" },
+                            "limited": { "type": "string" },
                             "working": { "type": "string" },
                             "done": { "type": "string" },
                             "idle": { "type": "string" }
@@ -49,6 +50,7 @@ pub fn config_schema() -> Value {
                         "additionalProperties": true,
                         "properties": {
                             "blocked": { "type": "string" },
+                            "limited": { "type": "string" },
                             "working": { "type": "string" },
                             "done": { "type": "string" },
                             "idle": { "type": "string" }
@@ -321,6 +323,7 @@ pub fn config_schema() -> Value {
                             "selection_bg": { "type": "string" },
                             "selection_bar": { "type": "string" },
                             "badge_blocked": { "type": "string" },
+                            "badge_limited": { "type": "string" },
                             "badge_working": { "type": "string" },
                             "badge_done": { "type": "string" },
                             "badge_idle": { "type": "string" },
@@ -446,7 +449,13 @@ mod tests {
         assert_eq!(colors["header_filter_bg"]["type"], "string");
         assert_eq!(colors["selection_bg"]["type"], "string");
         assert_eq!(colors["selection_bar"]["type"], "string");
-        for key in ["badge_blocked", "badge_working", "badge_done", "badge_idle"] {
+        for key in [
+            "badge_blocked",
+            "badge_limited",
+            "badge_working",
+            "badge_done",
+            "badge_idle",
+        ] {
             assert_eq!(colors[key]["type"], "string", "{key}");
         }
         for key in [

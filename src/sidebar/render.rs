@@ -33,6 +33,7 @@ pub struct SidebarRenderTheme {
     pub header_chip_suffix: String,
     pub badge_glyphs: crate::config::BadgeGlyphs,
     pub badge_blocked: Color,
+    pub badge_limited: Color,
     pub badge_working: Color,
     pub badge_done: Color,
     pub badge_idle: Color,
@@ -76,6 +77,7 @@ impl Default for SidebarRenderTheme {
             header_chip_suffix: String::new(),
             badge_glyphs: crate::config::BadgeGlyphs::default(),
             badge_blocked: Color::Red,
+            badge_limited: Color::Rgb(0xf5, 0xa7, 0x42),
             badge_working: Color::Green,
             badge_done: Color::Cyan,
             badge_idle: Color::Indexed(248),
@@ -125,6 +127,8 @@ impl SidebarRenderTheme {
             badge_glyphs: default.badge_glyphs,
             badge_blocked: parse_color(config.badge_blocked.as_deref())
                 .unwrap_or(default.badge_blocked),
+            badge_limited: parse_color(config.badge_limited.as_deref())
+                .unwrap_or(default.badge_limited),
             badge_working: parse_color(config.badge_working.as_deref())
                 .unwrap_or(default.badge_working),
             badge_done: parse_color(config.badge_done.as_deref()).unwrap_or(default.badge_done),
@@ -178,6 +182,9 @@ impl SidebarRenderTheme {
         theme.badge_blocked = parse_color(overrides.badge_blocked.as_deref())
             .or_else(|| parse_color(Some(&badge.blocked)))
             .unwrap_or(theme.badge_blocked);
+        theme.badge_limited = parse_color(overrides.badge_limited.as_deref())
+            .or_else(|| parse_color(Some(&badge.limited)))
+            .unwrap_or(theme.badge_limited);
         theme.badge_working = parse_color(overrides.badge_working.as_deref())
             .or_else(|| parse_color(Some(&badge.working)))
             .unwrap_or(theme.badge_working);
@@ -195,6 +202,7 @@ impl SidebarRenderTheme {
             RollupLevel::Error | RollupLevel::Permission | RollupLevel::Waiting => {
                 self.badge_color(BadgeState::Blocked)
             }
+            RollupLevel::Limited => self.badge_color(BadgeState::Limited),
             RollupLevel::Running => self.badge_color(BadgeState::Working),
             RollupLevel::Background | RollupLevel::Idle => self.badge_color(BadgeState::Idle),
         }
@@ -207,6 +215,7 @@ impl SidebarRenderTheme {
     pub(crate) fn badge_color(&self, state: BadgeState) -> Color {
         match state {
             BadgeState::Blocked => self.badge_blocked,
+            BadgeState::Limited => self.badge_limited,
             BadgeState::Working => self.badge_working,
             BadgeState::Done => self.badge_done,
             BadgeState::Idle => self.badge_idle,
@@ -451,6 +460,11 @@ fn build_header_chip_line(
             filter: StatusFilter::AttentionOnly,
             count: counts.blocked,
             badge_state: Some(BadgeState::Blocked),
+        },
+        HeaderChipSpec {
+            filter: StatusFilter::LimitedOnly,
+            count: counts.limited,
+            badge_state: Some(BadgeState::Limited),
         },
         HeaderChipSpec {
             filter: StatusFilter::WorkingOnly,
@@ -1553,6 +1567,7 @@ fn render_rail_lines(
     let mut row_indices = Vec::new();
     for state in [
         BadgeState::Blocked,
+        BadgeState::Limited,
         BadgeState::Working,
         BadgeState::Done,
         BadgeState::Idle,
@@ -1810,7 +1825,7 @@ fn closed_chat_right_parts(row: &SidebarRow) -> Vec<ClosedChatRightPart> {
 
 fn closed_chat_state_or_time_label(row: &SidebarRow) -> Option<String> {
     match row.badge_state? {
-        BadgeState::Blocked | BadgeState::Working => row
+        BadgeState::Blocked | BadgeState::Limited | BadgeState::Working => row
             .meta
             .as_ref()
             .and_then(|meta| meta.elapsed_secs)
@@ -1852,7 +1867,7 @@ fn subagent_count_token(row: &SidebarRow) -> Option<ClosedChatRightPart> {
 fn closed_chat_reason_token(row: &SidebarRow) -> Option<String> {
     if !matches!(
         row.rollup,
-        RollupLevel::Permission | RollupLevel::Waiting | RollupLevel::Error
+        RollupLevel::Permission | RollupLevel::Waiting | RollupLevel::Limited | RollupLevel::Error
     ) {
         return None;
     }
@@ -1934,7 +1949,7 @@ fn elapsed_full_label(secs: i64) -> String {
 
 fn expanded_chat_right_label(row: &SidebarRow) -> Option<String> {
     match row.badge_state? {
-        BadgeState::Blocked | BadgeState::Working => row
+        BadgeState::Blocked | BadgeState::Limited | BadgeState::Working => row
             .meta
             .as_ref()
             .and_then(|meta| meta.elapsed_secs)
@@ -2948,6 +2963,7 @@ sidebar:
         BadgeCounts {
             total: 7,
             blocked: 1,
+            limited: 0,
             working: 1,
             done: 0,
             idle: 5,
@@ -3002,7 +3018,7 @@ sidebar:
             header.lines[1].text,
             " ◉ All     · ≣ Tree     ▾ \u{e0b0}".to_string()
         );
-        assert_eq!(header.lines[2].text, " ≡ 7  ▲ 1  ● 1  ✓ 0  ○ 5 ");
+        assert_eq!(header.lines[2].text, " ≡ 7  ▲ 1  ◆ 0  ● 1  ✓ 0  ○ 5 ");
         let section = style_for_segment(&header, 0, "SIDEBAR");
         assert_eq!(section.fg, Some(SidebarRenderTheme::default().category));
         assert!(section.add_modifier.contains(Modifier::BOLD));
@@ -3062,12 +3078,13 @@ sidebar:
             Some(HeaderAction::SetFilter(StatusFilter::AttentionOnly))
         );
         assert_eq!(
-            header_hit_test(&header, 2, 11),
+            header_hit_test(&header, 2, 16),
             Some(HeaderAction::SetFilter(StatusFilter::WorkingOnly))
         );
-        assert_eq!(header_hit_test(&header, 2, 16), None);
+        assert_eq!(header_hit_test(&header, 2, 11), None);
+        assert_eq!(header_hit_test(&header, 2, 21), None);
         assert_eq!(
-            header_hit_test(&header, 2, 21),
+            header_hit_test(&header, 2, 26),
             Some(HeaderAction::SetFilter(StatusFilter::IdleOnly))
         );
     }
@@ -3111,6 +3128,7 @@ sidebar:
         let counts = BadgeCounts {
             total: 3,
             blocked: 1,
+            limited: 0,
             working: 1,
             done: 0,
             idle: 1,
@@ -3141,6 +3159,7 @@ sidebar:
         let counts = BadgeCounts {
             total: 3,
             blocked: 1,
+            limited: 0,
             working: 1,
             done: 0,
             idle: 1,
@@ -3243,6 +3262,7 @@ sidebar:
         let counts = BadgeCounts {
             total: 3,
             blocked: 1,
+            limited: 0,
             working: 0,
             done: 0,
             idle: 2,
@@ -3254,7 +3274,7 @@ sidebar:
 
         assert_eq!(
             line.text,
-            "\u{e0b6} ≡ 3 \u{e0b4} \u{e0b6} ▲ 1 \u{e0b4}  ● 0   ✓ 0  \u{e0b6} ○ 2 \u{e0b4}"
+            "\u{e0b6} ≡ 3 \u{e0b4} \u{e0b6} ▲ 1 \u{e0b4}  ◆ 0   ● 0   ✓ 0  \u{e0b6} ○ 2 \u{e0b4}"
         );
         let cap = style_for_segment(&header, 2, "\u{e0b6}");
         assert_eq!(cap.fg, Some(theme.header_mode));
@@ -3278,6 +3298,7 @@ sidebar:
         let counts = BadgeCounts {
             total: 7,
             blocked: 0,
+            limited: 0,
             working: 2,
             done: 0,
             idle: 5,
@@ -3938,6 +3959,10 @@ sidebar:
     fn theme_maps_badge_states_to_default_colors() {
         let theme = SidebarRenderTheme::default();
         assert_eq!(theme.badge_color(BadgeState::Blocked), Color::Red);
+        assert_eq!(
+            theme.badge_color(BadgeState::Limited),
+            Color::Rgb(0xf5, 0xa7, 0x42)
+        );
         assert_eq!(theme.badge_color(BadgeState::Working), Color::Green);
         assert_eq!(theme.badge_color(BadgeState::Done), Color::Cyan);
         assert_eq!(theme.badge_color(BadgeState::Idle), Color::Indexed(248));
@@ -4029,6 +4054,7 @@ badge_working: "#3fae7a"
             r##"
 badge:
   colors:
+    limited: "#f5a742"
     blocked: "#ff1111"
     working: "#22ff22"
     idle: "#999999"
@@ -4037,6 +4063,10 @@ badge:
         .unwrap();
         let theme = SidebarRenderTheme::from_app_config(&config);
 
+        assert_eq!(
+            theme.rollup_color(RollupLevel::Limited),
+            Color::Rgb(0xf5, 0xa7, 0x42)
+        );
         assert_eq!(
             theme.rollup_color(RollupLevel::Running),
             Color::Rgb(0x22, 0xff, 0x22)

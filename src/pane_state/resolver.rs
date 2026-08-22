@@ -4,6 +4,7 @@ use super::model::{LifecycleState, PaneState, UnreadReason};
 
 pub fn resolve_badge(state: &PaneState) -> BadgeState {
     match state.lifecycle {
+        LifecycleState::Waiting { ref reason } if reason.is_usage_limit() => BadgeState::Limited,
         LifecycleState::Waiting { .. } | LifecycleState::Error { .. } => BadgeState::Blocked,
         LifecycleState::Running => BadgeState::Working,
         LifecycleState::Idle
@@ -101,6 +102,17 @@ mod tests {
                 false,
             )),
             BadgeState::Blocked
+        );
+        assert_eq!(
+            resolve_badge(&state(
+                LifecycleState::Waiting {
+                    reason: crate::pane_state::model::WaitReason::usage_limit(),
+                },
+                1,
+                0,
+                false,
+            )),
+            BadgeState::Limited
         );
     }
 }

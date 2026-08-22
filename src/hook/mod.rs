@@ -29,22 +29,28 @@ impl AgentStatus {
 #[serde(rename_all = "snake_case")]
 pub enum RollupLevel {
     Error,
-    Running,
     Permission,
-    Background,
     Waiting,
+    Limited,
+    Running,
+    Background,
     Idle,
 }
 
 pub fn pane_rollup_level(status: Option<AgentStatus>, wait_reason: Option<&str>) -> RollupLevel {
     match status {
         Some(AgentStatus::Error) => RollupLevel::Error,
-        Some(AgentStatus::Running) => RollupLevel::Running,
         Some(AgentStatus::Waiting) if is_permission_wait(wait_reason) => RollupLevel::Permission,
+        Some(AgentStatus::Waiting) if is_usage_limit_wait(wait_reason) => RollupLevel::Limited,
         Some(AgentStatus::Waiting) => RollupLevel::Waiting,
+        Some(AgentStatus::Running) => RollupLevel::Running,
         Some(AgentStatus::Idle) => RollupLevel::Idle,
         None => RollupLevel::Background,
     }
+}
+
+fn is_usage_limit_wait(wait_reason: Option<&str>) -> bool {
+    matches!(wait_reason, Some(reason) if reason.eq_ignore_ascii_case("usage_limit"))
 }
 
 fn is_permission_wait(wait_reason: Option<&str>) -> bool {
@@ -127,9 +133,10 @@ mod tests {
     #[test]
     fn rollup_level_order_matches_attention_priority() {
         assert!(RollupLevel::Error < RollupLevel::Running);
-        assert!(RollupLevel::Running < RollupLevel::Permission);
-        assert!(RollupLevel::Permission < RollupLevel::Background);
-        assert!(RollupLevel::Background < RollupLevel::Waiting);
+        assert!(RollupLevel::Permission < RollupLevel::Limited);
+        assert!(RollupLevel::Waiting < RollupLevel::Limited);
+        assert!(RollupLevel::Limited < RollupLevel::Running);
+        assert!(RollupLevel::Running < RollupLevel::Background);
         assert!(RollupLevel::Waiting < RollupLevel::Idle);
     }
 
@@ -138,6 +145,10 @@ mod tests {
         assert_eq!(
             pane_rollup_level(Some(AgentStatus::Waiting), Some("permission_prompt")),
             RollupLevel::Permission
+        );
+        assert_eq!(
+            pane_rollup_level(Some(AgentStatus::Waiting), Some("usage_limit")),
+            RollupLevel::Limited
         );
         assert_eq!(
             pane_rollup_level(Some(AgentStatus::Waiting), None),

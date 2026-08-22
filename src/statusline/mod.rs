@@ -539,6 +539,7 @@ fn pane_border_highlight_color(config: &Config, pane: &PanePresentation) -> Opti
     let badge = pane.resolved.as_ref()?.badge;
     let color = match badge {
         BadgeState::Blocked => &config.badge.colors.blocked,
+        BadgeState::Limited => &config.badge.colors.limited,
         BadgeState::Working => &config.badge.colors.working,
         BadgeState::Done => &config.badge.colors.done,
         BadgeState::Idle => return None,
@@ -552,12 +553,13 @@ fn render_structured_summary(config: &Config, counts: BadgeStateCounts) -> Strin
     }
     let state_counts = [
         (BadgeState::Blocked, counts.blocked),
+        (BadgeState::Limited, counts.limited),
         (BadgeState::Working, counts.working),
         (BadgeState::Done, counts.done),
         (BadgeState::Idle, counts.idle),
     ];
     let visible_counts = if config.statusline.summary.hide_idle {
-        &state_counts[..3]
+        &state_counts[..4]
     } else {
         &state_counts[..]
     };
@@ -1288,7 +1290,7 @@ fn structured_pane_time_label(
 ) -> Option<String> {
     let (epoch, suffix) = match badge {
         BadgeState::Done | BadgeState::Idle => (state.completed_at?, " ago"),
-        BadgeState::Blocked | BadgeState::Working => (state.started_at?, ""),
+        BadgeState::Blocked | BadgeState::Limited | BadgeState::Working => (state.started_at?, ""),
     };
     Some(format!("{}{suffix}", tmux_bounded_duration(epoch)))
 }
@@ -1605,6 +1607,7 @@ fn counts_badge_fragment(badge: &str, restore_fg: &str, badge_config: &BadgeConf
         {
             let color = match state {
                 BadgeState::Blocked => &badge_config.colors.blocked,
+                BadgeState::Limited => &badge_config.colors.limited,
                 BadgeState::Working => &badge_config.colors.working,
                 BadgeState::Done => &badge_config.colors.done,
                 BadgeState::Idle => &badge_config.colors.idle,
@@ -1668,6 +1671,7 @@ fn agent_badge_fragment(
 fn count_glyph_state(token: &str, glyphs: &BadgeGlyphs) -> Option<BadgeState> {
     [
         BadgeState::Blocked,
+        BadgeState::Limited,
         BadgeState::Working,
         BadgeState::Done,
         BadgeState::Idle,
@@ -1811,6 +1815,7 @@ mod tests {
             active,
             counts: BadgeStateCounts {
                 blocked: 1,
+                limited: 0,
                 working: 1,
                 done: 1,
                 idle: 1,
@@ -2002,6 +2007,7 @@ mod tests {
             },
             summary: BadgeStateCounts {
                 blocked: 1,
+                limited: 0,
                 working: 2,
                 done: 0,
                 idle: 1,
@@ -2208,11 +2214,13 @@ mod tests {
     fn pane_border_highlight_uses_non_idle_badge_colors_only() {
         let mut config = Config::default();
         config.badge.colors.blocked = "ff0000".to_string();
+        config.badge.colors.limited = "#f5a742".to_string();
         config.badge.colors.working = "#00ff00".to_string();
         config.badge.colors.done = "cyan".to_string();
 
         for (badge, expected) in [
             (BadgeState::Blocked, Some("#ff0000")),
+            (BadgeState::Limited, Some("#f5a742")),
             (BadgeState::Working, Some("#00ff00")),
             (BadgeState::Done, Some("cyan")),
             (BadgeState::Idle, None),
@@ -2274,7 +2282,7 @@ mod tests {
                 crate::pane_state::LifecycleState::Waiting {
                     reason: crate::pane_state::WaitReason::usage_limit(),
                 },
-                BadgeState::Blocked,
+                BadgeState::Limited,
                 "Limited",
             ),
             (
@@ -2561,6 +2569,7 @@ mod tests {
         let mut config = Config::default();
         let counts = BadgeStateCounts {
             blocked: 1,
+            limited: 1,
             working: 1,
             done: 1,
             idle: 1,
@@ -2569,17 +2578,17 @@ mod tests {
         let default_summary = render_structured_summary(&config, counts);
         assert_eq!(
             default_summary,
-            "#[fg=#ff6b6b]▲ 1#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6]✓ 1#[default] #[fg=#a8a8b2]○ 1#[default]"
+            "#[fg=#ff6b6b]▲ 1#[default] #[fg=#f5a742]◆ 1#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6]✓ 1#[default] #[fg=#a8a8b2]○ 1#[default]"
         );
-        assert_eq!(tmux_display_width(&default_summary), 15);
+        assert_eq!(tmux_display_width(&default_summary), 19);
 
         config.statusline.summary.format = "{count}{badge}".to_string();
         let custom_summary = render_structured_summary(&config, counts);
         assert_eq!(
             custom_summary,
-            "#[fg=#ff6b6b]1▲#[default] #[fg=#4fd08a]1●#[default] #[fg=#45cbe6]1✓#[default] #[fg=#a8a8b2]1○#[default]"
+            "#[fg=#ff6b6b]1▲#[default] #[fg=#f5a742]1◆#[default] #[fg=#4fd08a]1●#[default] #[fg=#45cbe6]1✓#[default] #[fg=#a8a8b2]1○#[default]"
         );
-        assert_eq!(tmux_display_width(&custom_summary), 11);
+        assert_eq!(tmux_display_width(&custom_summary), 14);
     }
 
     #[test]
@@ -2588,13 +2597,14 @@ mod tests {
         let empty_summary = render_structured_summary(&config, BadgeStateCounts::default());
         assert_eq!(
             empty_summary,
-            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#4fd08a,dim]● 0#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2,dim]○ 0#[default]"
+            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#f5a742,dim]◆ 0#[default] #[fg=#4fd08a,dim]● 0#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2,dim]○ 0#[default]"
         );
 
         let mixed_summary = render_structured_summary(
             &config,
             BadgeStateCounts {
                 blocked: 0,
+                limited: 0,
                 working: 1,
                 done: 0,
                 idle: 9,
@@ -2602,18 +2612,18 @@ mod tests {
         );
         assert_eq!(
             mixed_summary,
-            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2]○ 9#[default]"
+            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#f5a742,dim]◆ 0#[default] #[fg=#4fd08a]● 1#[default] #[fg=#45cbe6,dim]✓ 0#[default] #[fg=#a8a8b2]○ 9#[default]"
         );
-        assert_eq!(tmux_display_width(&empty_summary), 15);
-        assert_eq!(tmux_display_width(&mixed_summary), 15);
+        assert_eq!(tmux_display_width(&empty_summary), 19);
+        assert_eq!(tmux_display_width(&mixed_summary), 19);
 
         config.statusline.summary.hide_idle = true;
         let without_idle = render_structured_summary(&config, BadgeStateCounts::default());
         assert_eq!(
             without_idle,
-            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#4fd08a,dim]● 0#[default] #[fg=#45cbe6,dim]✓ 0#[default]"
+            "#[fg=#ff6b6b,dim]▲ 0#[default] #[fg=#f5a742,dim]◆ 0#[default] #[fg=#4fd08a,dim]● 0#[default] #[fg=#45cbe6,dim]✓ 0#[default]"
         );
-        assert_eq!(tmux_display_width(&without_idle), 11);
+        assert_eq!(tmux_display_width(&without_idle), 15);
     }
 
     #[test]
@@ -2623,13 +2633,14 @@ mod tests {
             &config,
             BadgeStateCounts {
                 blocked: 1,
+                limited: 0,
                 working: 1,
                 done: 1,
                 idle: 1,
             },
         );
         let mut category_tokens = [StatusToken {
-            rendered: "c".repeat(65),
+            rendered: "c".repeat(61),
             compact: String::new(),
             current: true,
         }];

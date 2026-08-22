@@ -31,7 +31,7 @@ vt agent start "$NEW_PANE_REF" --agent claude --json
 vt agent list --status working --json
 vt agent list --needs-action --json
 vt agent get %456 --json
-vt agent wait %456 --until done,blocked --timeout-ms 120000 --json
+vt agent wait %456 --until done,blocked,limited --timeout-ms 120000 --json
 
 AGENT_JSON="$(vt agent get %456 --json)"
 AGENT_REF="$(printf '%s' "$AGENT_JSON" | jq -r '.result.agent.summary.agent_ref')"
@@ -105,7 +105,7 @@ snapshot_revision)` and reject an identity change.
 
 The request schema describes the normalized command contract rather than raw argv syntax. Defaults
 and limits match the CLI: pane-read target is optional, read defaults are `latest`, 120 lines, and no
-ANSI, wait defaults are `done,blocked` and 120,000 ms, read lines are 1..2,000, and wait timeout is
+ANSI, wait defaults are `done,blocked,limited` and 120,000 ms, read lines are 1..2,000, and wait timeout is
 1..86,400,000 ms. Prompt confirmation defaults to 7,000 ms and is limited to 1..60,000 ms. Prompt
 bytes are supplied out-of-band through stdin or a file and therefore do not appear in the conceptual
 request schema. Repeated and comma-separated `--until` argv forms normalize to the same set.
@@ -127,13 +127,15 @@ projection:
 
 | Status | Meaning |
 | --- | --- |
-| `blocked` | The lifecycle is Waiting or Error |
+| `blocked` | The lifecycle is Waiting for user action, or Error |
+| `limited` | The lifecycle is Waiting because provider usage is exhausted |
 | `working` | A run is active |
 | `done` | At least one run completed and no run is active, whether read or unread |
 | `idle` | No run has started in the current agent epoch |
 
 `badge` contains the current sidebar badge. A read completion therefore has `status: done`,
-`badge: idle`, and `unread: false`. `needs_action` is derived from canonical triage state and does
+`badge: idle`, and `unread: false`. A limited agent has `status: limited`, `badge: limited`, and
+`needs_action: false`. `needs_action` is derived from canonical triage state and does
 not disappear merely because a pane is visible.
 
 `agent list` returns present agents plus an absent retained occupant only while its canonical
@@ -183,11 +185,11 @@ resolve the original occupant without ever rebinding the wait to its replacement
 `agent wait` subscribes to daemon revisions and never polls topology. The initially resolved exact
 occupant stays pinned. `done` follows the baseline run through `run_seq` and `completed_seq`, so a
 completion remains detectable after it is read or after the next run starts. Identity-bearing
-transition history preserves transient `blocked`, `working`, and `idle` matches across coalesced
+transition history preserves transient `blocked`, `limited`, `working`, and `idle` matches across coalesced
 snapshots. If bounded history can no longer prove a transient result, the command fails with
 `event_history_lost` instead of silently timing out.
 
-If `--until` is omitted, the completion set is `done,blocked`. The initial state is tested before
+If `--until` is omitted, the completion set is `done,blocked,limited`. The initial state is tested before
 waiting, so an already completed run matches `done` immediately. Pass `--after-completed-seq N` to
 require completion sequence `N + 1` or later instead of matching that existing completion. This
 cursor is useful after `agent get`, because it closes the race between observing `completed_seq` and
@@ -391,7 +393,7 @@ Every error contains a closed-enum `code`, human-readable `message`, `stage`, `s
   `run_already_resolved`, `target_replaced`, `unsupported_provider`, `provider_event_conflict`,
   `recovery_not_allowed`, `stale_precondition`, `resolution_conflict`,
   `storage_capacity_exceeded`, `state_uninitialized`, `artifact_unavailable`, `artifact_expired`.
-- Prompt mutation: `agent_busy`, `agent_blocked`, `prompt_confirmation_unavailable`,
+- Prompt mutation: `agent_busy`, `agent_blocked`, `agent_limited`, `prompt_confirmation_unavailable`,
   `agent_not_input_owner`, `prompt_dispatch_busy`, `dispatch_rejected`, `delivery_unknown`.
 
 `stage` is one of `request_validation`, `target_resolution`, `observation`, `before_dispatch`,

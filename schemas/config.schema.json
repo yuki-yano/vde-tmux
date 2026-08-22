@@ -11,6 +11,9 @@
             "blocked": {
               "type": "string"
             },
+            "limited": {
+              "type": "string"
+            },
             "done": {
               "type": "string"
             },
@@ -27,6 +30,9 @@
           "additionalProperties": true,
           "properties": {
             "blocked": {
+              "type": "string"
+            },
+            "limited": {
               "type": "string"
             },
             "done": {
@@ -157,6 +163,9 @@
           "additionalProperties": true,
           "properties": {
             "badge_blocked": {
+              "type": "string"
+            },
+            "badge_limited": {
               "type": "string"
             },
             "badge_done": {

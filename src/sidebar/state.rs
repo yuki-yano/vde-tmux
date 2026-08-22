@@ -46,6 +46,7 @@ pub enum StatusFilter {
     #[default]
     All,
     AttentionOnly,
+    LimitedOnly,
     WorkingOnly,
     DoneOnly,
     IdleOnly,
@@ -502,7 +503,8 @@ impl StatusFilter {
     pub fn next(self) -> Self {
         match self {
             StatusFilter::All => StatusFilter::AttentionOnly,
-            StatusFilter::AttentionOnly => StatusFilter::WorkingOnly,
+            StatusFilter::AttentionOnly => StatusFilter::LimitedOnly,
+            StatusFilter::LimitedOnly => StatusFilter::WorkingOnly,
             StatusFilter::WorkingOnly => StatusFilter::DoneOnly,
             StatusFilter::DoneOnly => StatusFilter::IdleOnly,
             StatusFilter::IdleOnly => StatusFilter::All,
@@ -513,7 +515,8 @@ impl StatusFilter {
         match self {
             StatusFilter::All => StatusFilter::IdleOnly,
             StatusFilter::AttentionOnly => StatusFilter::All,
-            StatusFilter::WorkingOnly => StatusFilter::AttentionOnly,
+            StatusFilter::LimitedOnly => StatusFilter::AttentionOnly,
+            StatusFilter::WorkingOnly => StatusFilter::LimitedOnly,
             StatusFilter::DoneOnly => StatusFilter::WorkingOnly,
             StatusFilter::IdleOnly => StatusFilter::DoneOnly,
         }
@@ -523,6 +526,7 @@ impl StatusFilter {
         match self {
             StatusFilter::All => "all",
             StatusFilter::AttentionOnly => "attn",
+            StatusFilter::LimitedOnly => "limited",
             StatusFilter::WorkingOnly => "working",
             StatusFilter::DoneOnly => "done",
             StatusFilter::IdleOnly => "idle",
@@ -533,6 +537,7 @@ impl StatusFilter {
         match self {
             StatusFilter::All => "All",
             StatusFilter::AttentionOnly => "Needs action",
+            StatusFilter::LimitedOnly => "Limited",
             StatusFilter::WorkingOnly => "Working",
             StatusFilter::DoneOnly => "Done",
             StatusFilter::IdleOnly => "Idle",
@@ -627,6 +632,8 @@ mod tests {
         assert!(state.apply(SidebarAction::CycleFilterForward, &[]));
         assert_eq!(state.filter, StatusFilter::AttentionOnly);
         assert!(state.apply(SidebarAction::CycleFilterForward, &[]));
+        assert_eq!(state.filter, StatusFilter::LimitedOnly);
+        assert!(state.apply(SidebarAction::CycleFilterForward, &[]));
         assert_eq!(state.filter, StatusFilter::WorkingOnly);
         assert!(state.apply(SidebarAction::CycleFilterForward, &[]));
         assert_eq!(state.filter, StatusFilter::DoneOnly);
@@ -644,7 +651,7 @@ mod tests {
         let mut filter = StatusFilter::All;
         let mut seen = Vec::new();
 
-        for _ in 0..6 {
+        for _ in 0..7 {
             seen.push(filter);
             filter = filter.next();
         }
@@ -654,6 +661,7 @@ mod tests {
             vec![
                 StatusFilter::All,
                 StatusFilter::AttentionOnly,
+                StatusFilter::LimitedOnly,
                 StatusFilter::WorkingOnly,
                 StatusFilter::DoneOnly,
                 StatusFilter::IdleOnly,
@@ -667,7 +675,7 @@ mod tests {
         let mut filter = StatusFilter::All;
         let mut seen = Vec::new();
 
-        for _ in 0..6 {
+        for _ in 0..7 {
             seen.push(filter);
             filter = filter.previous();
         }
@@ -679,6 +687,7 @@ mod tests {
                 StatusFilter::IdleOnly,
                 StatusFilter::DoneOnly,
                 StatusFilter::WorkingOnly,
+                StatusFilter::LimitedOnly,
                 StatusFilter::AttentionOnly,
                 StatusFilter::All,
             ]
@@ -689,6 +698,7 @@ mod tests {
     fn status_filter_key_is_shared_by_filter_ui() {
         assert_eq!(StatusFilter::All.key(), "all");
         assert_eq!(StatusFilter::AttentionOnly.key(), "attn");
+        assert_eq!(StatusFilter::LimitedOnly.key(), "limited");
         assert_eq!(StatusFilter::WorkingOnly.key(), "working");
         assert_eq!(StatusFilter::DoneOnly.key(), "done");
         assert_eq!(StatusFilter::IdleOnly.key(), "idle");

@@ -104,6 +104,10 @@ _Avoid_: Run outcome, completion
 Agent Runの実行がrunning、waiting、error、endedのどこにあるかを表す、semantic outcomeとは独立した状態。
 _Avoid_: Run outcome, lifecycle
 
+**Limited**:
+providerのusageまたはsession allowanceを使い切ったためAgent Runが待機していることを表す表示状態。semantic completionでも、即時のユーザー操作を必要とする状態でもなく、再開には実行可能になったことを示す新しいprovider evidenceが必要になる。
+_Avoid_: Done, Blocked, rate-limit error
+
 **Run Resolution**:
 providerの完了通知またはoperatorの明示操作によって、Agent Runのsemantic outcomeを確定すること。
 _Avoid_: Stale inference, process exit, terminal ready

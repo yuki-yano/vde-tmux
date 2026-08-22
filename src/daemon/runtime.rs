@@ -2397,6 +2397,10 @@ mod tests {
         assert_eq!(projection.counts.total, 1);
         assert_eq!(projection.counts.blocked, 0);
         assert_eq!(
+            projection.counts.limited,
+            usize::from(expected == BadgeState::Limited)
+        );
+        assert_eq!(
             projection.counts.working,
             usize::from(expected == BadgeState::Working)
         );

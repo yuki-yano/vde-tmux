@@ -74,6 +74,7 @@ pub fn parse_key(key: &str) -> Option<SidebarInputAction> {
         )),
         "all" => Some(SidebarInputAction::SetFilter(StatusFilter::All)),
         "attn" => Some(SidebarInputAction::SetFilter(StatusFilter::AttentionOnly)),
+        "limited" => Some(SidebarInputAction::SetFilter(StatusFilter::LimitedOnly)),
         "working" => Some(SidebarInputAction::SetFilter(StatusFilter::WorkingOnly)),
         "done" => Some(SidebarInputAction::SetFilter(StatusFilter::DoneOnly)),
         "idle" => Some(SidebarInputAction::SetFilter(StatusFilter::IdleOnly)),

@@ -932,6 +932,7 @@ mod tests {
             context: StatusContext::Global,
             summary: crate::daemon::session_badge::BadgeStateCounts {
                 blocked: 1,
+                limited: 0,
                 working: 1,
                 done: 0,
                 idle: 1,

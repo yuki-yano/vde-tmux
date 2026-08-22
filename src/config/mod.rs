@@ -401,6 +401,7 @@ pub struct BadgeConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct BadgeGlyphs {
     pub blocked: String,
+    pub limited: String,
     pub working: String,
     pub done: String,
     pub idle: String,
@@ -410,6 +411,7 @@ impl Default for BadgeGlyphs {
     fn default() -> Self {
         Self {
             blocked: "▲".to_string(),
+            limited: "◆".to_string(),
             working: "●".to_string(),
             done: "✓".to_string(),
             idle: "○".to_string(),
@@ -421,6 +423,7 @@ impl Default for BadgeGlyphs {
 #[serde(default, deny_unknown_fields)]
 pub struct BadgeColors {
     pub blocked: String,
+    pub limited: String,
     pub working: String,
     pub done: String,
     pub idle: String,
@@ -430,6 +433,7 @@ impl Default for BadgeColors {
     fn default() -> Self {
         Self {
             blocked: "#ff6b6b".to_string(),
+            limited: "#f5a742".to_string(),
             working: "#4fd08a".to_string(),
             done: "#45cbe6".to_string(),
             idle: "#a8a8b2".to_string(),
@@ -441,6 +445,7 @@ impl BadgeColors {
     pub fn for_state(&self, state: &str) -> Option<&str> {
         match state {
             "blocked" => Some(self.blocked.as_str()),
+            "limited" => Some(self.limited.as_str()),
             "working" => Some(self.working.as_str()),
             "done" => Some(self.done.as_str()),
             "idle" => Some(self.idle.as_str()),
@@ -499,6 +504,7 @@ pub struct SidebarColorsConfig {
     pub selection_bg: Option<String>,
     pub selection_bar: Option<String>,
     pub badge_blocked: Option<String>,
+    pub badge_limited: Option<String>,
     pub badge_working: Option<String>,
     pub badge_done: Option<String>,
     pub badge_idle: Option<String>,
@@ -1105,10 +1111,12 @@ categories:
         assert_eq!(config.suffix, "");
         assert!(!config.hide_idle);
         assert_eq!(badge.glyphs.blocked, "▲");
+        assert_eq!(badge.glyphs.limited, "◆");
         assert_eq!(badge.glyphs.working, "●");
         assert_eq!(badge.glyphs.done, "✓");
         assert_eq!(badge.glyphs.idle, "○");
         assert_eq!(badge.colors.blocked, "#ff6b6b");
+        assert_eq!(badge.colors.limited, "#f5a742");
         assert_eq!(badge.colors.working, "#4fd08a");
         assert_eq!(badge.colors.done, "#45cbe6");
         assert_eq!(badge.colors.idle, "#a8a8b2");
@@ -1240,6 +1248,7 @@ badge:
         .unwrap();
         assert_eq!(config.badge.colors.working, "#00ff00");
         assert_eq!(config.badge.colors.blocked, "#ff6b6b");
+        assert_eq!(config.badge.colors.limited, "#f5a742");
     }
 
     #[test]

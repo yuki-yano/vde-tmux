@@ -67,6 +67,7 @@ pub fn render_summary(
             let glyph = glyph_for_state(*state, &badge.glyphs);
             let color = match state {
                 BadgeState::Blocked => &badge.colors.blocked,
+                BadgeState::Limited => &badge.colors.limited,
                 BadgeState::Working => &badge.colors.working,
                 BadgeState::Done => &badge.colors.done,
                 BadgeState::Idle => &badge.colors.idle,

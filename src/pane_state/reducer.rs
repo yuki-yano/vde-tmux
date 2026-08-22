@@ -3084,7 +3084,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_absence_preserves_usage_limit_as_blocked_state() {
+    fn confirmed_absence_preserves_usage_limit_as_limited_state() {
         let tracker = CaptureTrackerSnapshot::default();
         let mut discovered = reduce_once(
             None,
@@ -3109,7 +3109,7 @@ mod tests {
 
         assert!(active(&first).agent_present);
         assert!(active(&first).lifecycle.is_usage_limited());
-        assert_eq!(resolve_badge(active(&first)), BadgeState::Blocked);
+        assert_eq!(resolve_badge(active(&first)), BadgeState::Limited);
 
         let second = observe(
             first.record.as_ref(),
@@ -3123,7 +3123,7 @@ mod tests {
         assert!(limited.scan_verified);
         assert!(limited.lifecycle.is_usage_limited());
         assert_eq!(limited.completed_seq, 0);
-        assert_eq!(resolve_badge(limited), BadgeState::Blocked);
+        assert_eq!(resolve_badge(limited), BadgeState::Limited);
         limited.validate().unwrap();
     }
 

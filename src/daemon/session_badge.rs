@@ -5,6 +5,7 @@ use crate::config::{AgentBadgeConfig, BadgeGlyphs, SessionBadgeMode};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum BadgeState {
     Blocked,
+    Limited,
     Working,
     Done,
     Idle,
@@ -14,6 +15,7 @@ impl BadgeState {
     pub fn as_str(self) -> &'static str {
         match self {
             BadgeState::Blocked => "blocked",
+            BadgeState::Limited => "limited",
             BadgeState::Working => "working",
             BadgeState::Done => "done",
             BadgeState::Idle => "idle",
@@ -25,6 +27,7 @@ impl BadgeState {
 #[serde(default)]
 pub struct BadgeStateCounts {
     pub blocked: usize,
+    pub limited: usize,
     pub working: usize,
     pub done: usize,
     pub idle: usize,
@@ -42,6 +45,7 @@ impl BadgeStateCounts {
     pub fn push(&mut self, state: BadgeState) {
         match state {
             BadgeState::Blocked => self.blocked += 1,
+            BadgeState::Limited => self.limited += 1,
             BadgeState::Working => self.working += 1,
             BadgeState::Done => self.done += 1,
             BadgeState::Idle => self.idle += 1,
@@ -50,18 +54,20 @@ impl BadgeStateCounts {
 
     pub fn merge(&mut self, other: Self) {
         self.blocked += other.blocked;
+        self.limited += other.limited;
         self.working += other.working;
         self.done += other.done;
         self.idle += other.idle;
     }
 
     pub fn total(self) -> usize {
-        self.blocked + self.working + self.done + self.idle
+        self.blocked + self.limited + self.working + self.done + self.idle
     }
 
     pub fn rollup_state(self) -> Option<BadgeState> {
         [
             (BadgeState::Blocked, self.blocked),
+            (BadgeState::Limited, self.limited),
             (BadgeState::Working, self.working),
             (BadgeState::Done, self.done),
             (BadgeState::Idle, self.idle),
@@ -117,6 +123,7 @@ fn badge_counts_value(
 ) -> Option<String> {
     let parts = [
         (BadgeState::Blocked, counts.blocked),
+        (BadgeState::Limited, counts.limited),
         (BadgeState::Working, counts.working),
         (BadgeState::Done, counts.done),
         (BadgeState::Idle, counts.idle),
@@ -134,6 +141,7 @@ fn badge_counts_value(
 pub fn glyph_for_state(state: BadgeState, glyphs: &BadgeGlyphs) -> &str {
     match state {
         BadgeState::Blocked => &glyphs.blocked,
+        BadgeState::Limited => &glyphs.limited,
         BadgeState::Working => &glyphs.working,
         BadgeState::Done => &glyphs.done,
         BadgeState::Idle => &glyphs.idle,
@@ -160,6 +168,24 @@ mod tests {
             false,
         );
         assert_eq!(value.as_deref(), Some("▲"));
+    }
+
+    #[test]
+    fn limited_rollup_outranks_working_without_becoming_blocked() {
+        let glyphs = BadgeGlyphs::default();
+        let counts = BadgeStateCounts::from_states([
+            BadgeState::Working,
+            BadgeState::Limited,
+            BadgeState::Idle,
+        ]);
+
+        assert_eq!(counts.rollup_state(), Some(BadgeState::Limited));
+        assert_eq!(counts.total(), 3);
+        assert_eq!(
+            badge_value_from_counts(counts, &glyphs, SessionBadgeMode::Counts, "", false,)
+                .as_deref(),
+            Some("◆ 1 ● 1 ○ 1")
+        );
     }
 
     #[test]

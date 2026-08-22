@@ -4,7 +4,7 @@ const WAIT_REASON_SCAN_TAIL_LINES: usize = 30;
 pub fn detect_usage_limit(screen_tail: &str) -> bool {
     recent_wait_reason_lines(screen_tail).iter().any(|line| {
         let line = line
-            .trim_start_matches(['•', '■', '*', '-', '!', '✕', '│', '╰', '─'])
+            .trim_start_matches(['•', '■', '*', '-', '!', '✕', '│', '╰', '─', '⎿'])
             .trim();
         line.starts_with("you've hit your session limit")
             || line.starts_with("you've hit your usage limit")
@@ -135,6 +135,12 @@ mod tests {
     #[test]
     fn detects_claude_session_limit_from_recent_screen_tail() {
         let text = "background agent failed\nYou've hit your session limit · resets 5:40pm\n";
+        assert!(detect_usage_limit(text));
+    }
+
+    #[test]
+    fn detects_claude_session_limit_after_tool_result_prefix() {
+        let text = "  ⎿ \u{a0}You've hit your session limit · resets 12am (Asia/Tokyo)\n";
         assert!(detect_usage_limit(text));
     }
 

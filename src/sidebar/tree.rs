@@ -67,6 +67,7 @@ pub struct RowMeta {
 pub struct BadgeCounts {
     pub total: usize,
     pub blocked: usize,
+    pub limited: usize,
     pub working: usize,
     pub done: usize,
     pub idle: usize,
@@ -77,6 +78,7 @@ impl BadgeCounts {
         match filter {
             StatusFilter::All => self.total,
             StatusFilter::AttentionOnly => self.blocked,
+            StatusFilter::LimitedOnly => self.limited,
             StatusFilter::WorkingOnly => self.working,
             StatusFilter::DoneOnly => self.done,
             StatusFilter::IdleOnly => self.idle,
@@ -209,7 +211,7 @@ pub fn build_rows_from_presentations(
                     (RollupLevel::Permission, "permission_prompt".to_string())
                 }
                 reason if reason.is_usage_limit() => (
-                    RollupLevel::Waiting,
+                    RollupLevel::Limited,
                     crate::pane_state::USAGE_LIMIT_WAIT_REASON.to_string(),
                 ),
                 crate::pane_state::WaitReason::Other(reason) => {
@@ -398,6 +400,7 @@ fn badge_counts_from_agent_panes<'a>(
         counts.total += 1;
         match pane.badge_state {
             BadgeState::Blocked => counts.blocked += 1,
+            BadgeState::Limited => counts.limited += 1,
             BadgeState::Working => counts.working += 1,
             BadgeState::Done => counts.done += 1,
             BadgeState::Idle => counts.idle += 1,
@@ -775,6 +778,7 @@ fn priority_rows(
     }
     for (badge, key, label) in [
         (BadgeState::Blocked, "needs-input", "NEEDS INPUT"),
+        (BadgeState::Limited, "limited", "LIMITED"),
         (BadgeState::Done, "unread-done", "UNREAD DONE"),
         (BadgeState::Working, "running", "RUNNING"),
         (BadgeState::Idle, "idle", "IDLE"),
@@ -1243,6 +1247,7 @@ fn pane_matches_filter(pane: &AgentPane, filter: StatusFilter) -> bool {
     match filter {
         StatusFilter::All => true,
         StatusFilter::AttentionOnly => pane_matches_attention_filter(pane),
+        StatusFilter::LimitedOnly => pane.badge_state == BadgeState::Limited,
         StatusFilter::WorkingOnly => pane.badge_state == BadgeState::Working,
         StatusFilter::DoneOnly => pane.badge_state == BadgeState::Done,
         StatusFilter::IdleOnly => pane.badge_state == BadgeState::Idle,
@@ -1335,6 +1340,7 @@ fn compare_agent_panes(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ChatSortBucket {
     NeedsAttention,
+    Limited,
     Running,
     Done,
     Idle,
@@ -1343,6 +1349,7 @@ enum ChatSortBucket {
 fn chat_sort_bucket(pane: &AgentPane) -> ChatSortBucket {
     match pane.badge_state {
         BadgeState::Blocked => ChatSortBucket::NeedsAttention,
+        BadgeState::Limited => ChatSortBucket::Limited,
         BadgeState::Working => ChatSortBucket::Running,
         BadgeState::Done => ChatSortBucket::Done,
         BadgeState::Idle => ChatSortBucket::Idle,
@@ -1937,7 +1944,12 @@ mod tests {
 
         let done = agent_pane(BadgeState::Done, "200");
         assert!(!pane_matches_attention_filter(&done));
+        let limited = agent_pane(BadgeState::Limited, "");
+        assert!(!pane_matches_attention_filter(&limited));
+        assert!(pane_matches_filter(&limited, StatusFilter::LimitedOnly));
+        assert_eq!(chat_sort_bucket(&limited), ChatSortBucket::Limited);
         assert!(badge_needs_user_input(BadgeState::Blocked));
+        assert!(!badge_needs_user_input(BadgeState::Limited));
         assert!(!badge_needs_user_input(BadgeState::Done));
         assert!(!badge_needs_user_input(BadgeState::Working));
         assert!(!badge_needs_user_input(BadgeState::Idle));
@@ -2115,7 +2127,7 @@ mod tests {
     }
 
     #[test]
-    fn priority_groups_all_categories_by_attention_then_done_running_and_idle() {
+    fn priority_groups_all_categories_by_attention_limited_done_running_and_idle() {
         let mut blocked = agent_pane(BadgeState::Blocked, "");
         blocked.pane_instance = PaneInstance {
             pane_id: "%4".to_string(),
@@ -2126,6 +2138,17 @@ mod tests {
         blocked.repo = "frontend".to_string();
         blocked.repo_key = crate::category::RepoKey::path("/frontend");
         blocked.rollup = RollupLevel::Permission;
+
+        let mut limited = agent_pane(BadgeState::Limited, "");
+        limited.pane_instance = PaneInstance {
+            pane_id: "%5".to_string(),
+            pane_pid: 5,
+        };
+        limited.pane_id = "%5".to_string();
+        limited.category = "work".to_string();
+        limited.repo = "limits".to_string();
+        limited.repo_key = crate::category::RepoKey::path("/limits");
+        limited.rollup = RollupLevel::Limited;
 
         let mut done = agent_pane(BadgeState::Done, "300");
         done.pane_instance = PaneInstance {
@@ -2168,6 +2191,10 @@ mod tests {
                 vec![done.clone()],
             ),
             (
+                (limited.category.clone(), limited.repo_key.to_string()),
+                vec![limited.clone()],
+            ),
+            (
                 (working.category.clone(), working.repo_key.to_string()),
                 vec![working.clone()],
             ),
@@ -2200,7 +2227,7 @@ mod tests {
                 .filter(|row| row.kind == SidebarRowKind::Zone)
                 .map(|row| row.label.as_str())
                 .collect::<Vec<_>>(),
-            vec!["NEEDS INPUT", "UNREAD DONE", "RUNNING", "IDLE"]
+            vec!["NEEDS INPUT", "LIMITED", "UNREAD DONE", "RUNNING", "IDLE"]
         );
         assert!(!rows.iter().any(|row| row.id == "zone::triage"));
         assert_eq!(
@@ -2208,19 +2235,21 @@ mod tests {
                 .filter(|row| row.kind == SidebarRowKind::Chat)
                 .map(|row| row.pane_id.as_deref().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["%4", "%3", "%2", "%1"]
+            vec!["%4", "%5", "%3", "%2", "%1"]
         );
         assert!(rows.iter().any(|row| {
             row.pane_id.as_deref() == Some("%3")
                 && row.meta.as_ref().and_then(|meta| meta.origin.as_deref())
                     == Some("private/dotfiles")
         }));
-        assert_eq!(counts.total, 4);
+        assert_eq!(counts.total, 5);
         assert_eq!(counts.blocked, 1);
+        assert_eq!(counts.limited, 1);
         assert_eq!(counts.done, 1);
 
         for (filter, expected) in [
             (StatusFilter::AttentionOnly, vec!["%4"]),
+            (StatusFilter::LimitedOnly, vec!["%5"]),
             (StatusFilter::WorkingOnly, vec!["%2"]),
             (StatusFilter::DoneOnly, vec!["%3"]),
             (StatusFilter::IdleOnly, vec!["%1"]),

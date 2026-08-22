@@ -474,6 +474,7 @@ enum AgentStorageCommand {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ApiAgentStatusArg {
     Blocked,
+    Limited,
     Working,
     Done,
     Idle,
@@ -483,6 +484,7 @@ impl From<ApiAgentStatusArg> for crate::api::AgentStatus {
     fn from(value: ApiAgentStatusArg) -> Self {
         match value {
             ApiAgentStatusArg::Blocked => Self::Blocked,
+            ApiAgentStatusArg::Limited => Self::Limited,
             ApiAgentStatusArg::Working => Self::Working,
             ApiAgentStatusArg::Done => Self::Done,
             ApiAgentStatusArg::Idle => Self::Idle,
@@ -1246,6 +1248,7 @@ where
                     [
                         crate::api::AgentStatus::Done,
                         crate::api::AgentStatus::Blocked,
+                        crate::api::AgentStatus::Limited,
                     ]
                     .into_iter()
                     .collect()

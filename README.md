@@ -9,7 +9,7 @@ It tracks Claude Code, Codex, and opencode panes and renders their state in the 
 
 ## Features
 
-- Classifies agents across all tmux sessions as `Blocked`, `Working`, `Done`, or `Idle`
+- Classifies agents across all tmux sessions as `Blocked`, `Limited`, `Working`, `Done`, or `Idle`
 - Shows agents that need attention directly in the tmux status line
 - Displays task summaries, elapsed time, tasks, subagents, and worktree activity in a sidebar
 - Jumps to agent panes directly from the sidebar
@@ -69,7 +69,7 @@ Notes:
 - The daemon stores the absolute path of the running `vt` executable in `@vde_executable`. Neovim pane navigation uses that exact binary instead of searching `PATH`.
 - vde-tmux pushes rendered text into the `@vde_status_*` options, so tmux does not start a process on every status redraw.
 - `@vde_status_now_format` is required for the elapsed time shown on pane borders.
-- `Blocked`, `Working`, and `Done` agent panes fill the unused pane-statusline width with a plain single-line rail in the badge color. With `pane-border-status bottom`, only the bottom edge is highlighted and no content cells on the left or right are covered. `Idle` and non-agent panes get no additional rail.
+- `Blocked`, `Limited`, `Working`, and `Done` agent panes fill the unused pane-statusline width with a plain single-line rail in the badge color. With `pane-border-status bottom`, only the bottom edge is highlighted and no content cells on the left or right are covered. `Idle` and non-agent panes get no additional rail.
 - The `window-status-*` settings replace tmux's native window list with the vde-tmux session and window segments.
 - `--client-name` and `--session-id` keep session and category bindings scoped to the client that triggered them, which matters when multiple tmux clients are attached.
 
@@ -187,7 +187,7 @@ agent occupants without polling tmux topology:
 vt api schema --json
 vt api snapshot --json
 vt agent list --status working --json
-vt agent wait %456 --until done,blocked --json
+vt agent wait %456 --until done,blocked,limited --json
 vt pane read %456 --source latest --lines 120 --json
 
 AGENT_REF="$(vt agent get %456 --json | jq -r '.result.agent.summary.agent_ref')"
@@ -228,7 +228,7 @@ input; callers must use its lifecycle cursor with `agent wait` before claiming p
 does not prove active-turn attribution; a concurrent completion may start a new turn instead.
 
 When Claude Code or Codex exhausts its allowance, the pane remains queryable as
-`status=blocked`, `lifecycle.state=waiting`, and `lifecycle.reason=usage_limit`, even if the agent
+`status=limited`, `lifecycle.state=waiting`, and `lifecycle.reason=usage_limit`, even if the agent
 process exits. Claude Code's `StopFailure` rate-limit event is authoritative. A bounded,
 five-second supplementary pane-tail scan recognizes only the provider messages `You've hit your
 session limit` and `You've hit your usage limit`; generic rate-limit text and status-line warnings
@@ -240,7 +240,8 @@ retry automatically or infer recovery from the clock; a later `SessionStart` or
 
 | Badge | State | Meaning |
 | --- | --- | --- |
-| `▲` | Blocked | The agent needs input, hit an error, or exhausted its usage allowance |
+| `▲` | Blocked | The agent needs input or hit an error |
+| `◆` | Limited | The provider usage or session allowance is exhausted; shown in orange and excluded from Needs action |
 | `●` | Working | The agent is running |
 | `✓` | Done | The run completed and has not been acknowledged |
 | `○` | Idle | No work is active, or the completed run was acknowledged |
@@ -449,13 +450,14 @@ statusline:
 badge:
   glyphs:
     blocked: "▲"
+    limited: "◆"
     working: "●"
     done: "✓"
     idle: "○"
 ```
 
 `statusline.summary.format` supports the `{badge}` and `{count}` placeholders, such as `{badge}{count}` or `{badge}: {count}`.
-Zero-count states remain visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
+Zero-count states, including `Limited`, remain visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
 When enabled, the summary remains visible even when category or window content is long.
 
 `sidebar.task_summary.enabled` adds a short persistent-task summary to collapsed and expanded agent

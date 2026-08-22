@@ -617,6 +617,7 @@ mod local_state_tests {
             counts: BadgeCounts {
                 total: 6,
                 blocked: 0,
+                limited: 0,
                 working: 2,
                 done: 0,
                 idle: 4,
