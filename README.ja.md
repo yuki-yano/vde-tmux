@@ -274,6 +274,10 @@ window IDの不正、window不存在、non-sidebar content pane不在、tmux操�
 | `n` / `N` | 次または前の要対応エージェントへ移動する |
 | `p` | Priorityで選択中の未読agentをpinまたはunpinする |
 | `d` | 選択中の run を完了としてマークする |
+| `a` | category追加dialogを開く |
+| `m` | 選択中のRepositoryを移動するdialogを開く |
+| `r` | 選択中の動的categoryをrenameするdialogを開く |
+| `D` | 選択中の動的categoryを削除するdialogを開く |
 | `J` / `K` | 手動順序を変更する |
 | `q` / `Esc` | サイドバーを閉じる |
 
@@ -283,6 +287,8 @@ window IDの不正、window不存在、non-sidebar content pane不在、tmux操�
 キーボードでは選択中のエージェントを`Space`で開閉します。
 マウスホイールは選択カーソルを動かさず、はみ出した表示範囲をスクロールします。
 起動後にまだ操作されていないエージェントは、閉じている間は1行だけ表示します。
+category編集dialogはheaderを残してrows領域に表示されます。`m`と`D`では`j`/`k`、矢印、`gg`/`G`で移動先を選び、`Enter`で保存、`Esc`でキャンセルします。
+保存中もdialogを表示し続け、成功時に閉じます。失敗時は入力内容と選択位置を保持し、dialog内にエラーを表示します。
 category scope、presentation、filter、手動順序、開閉状態、選択位置、スクロールは、
 同じtmux serverの全サイドバーで同期します。具体的なCurrent categoryとreturn targetだけは
 sidebar instanceごとに保持し、そのサイドバーへ入力した起点sessionへ追従します。

@@ -315,6 +315,10 @@ operation produce a non-zero exit status; there is no fallback response.
 | `n` / `N` | Move to the next or previous Blocked agent waiting for user input |
 | `p` | Pin or unpin the selected agent |
 | `d` | Mark the selected run as complete |
+| `a` | Open the add-category dialog |
+| `m` | Open the dialog for moving the selected repository |
+| `r` | Open the dialog for renaming the selected dynamic category |
+| `D` | Open the dialog for deleting the selected dynamic category |
 | `J` / `K` | Change manual ordering |
 | `q` / `Esc` | Close the sidebar |
 
@@ -332,6 +336,10 @@ second or later line to jump to the agent pane without selecting it first.
 Use `Space` to expand or collapse the selected agent from the keyboard.
 The mouse wheel scrolls overflow without moving the selected cursor.
 An agent with no activity yet uses a single line while collapsed.
+Category edit dialogs keep the header visible and replace the rows area. In the move and delete
+dialogs, use `j`/`k`, the arrow keys, or `gg`/`G` to choose the destination, `Enter` to save, and
+`Esc` to cancel. The dialog remains visible while saving. A successful save closes it; a failed
+save keeps the input and selection in place and shows the error inside the dialog.
 Expanded agents show a compact signal row with the pane branch or worktree, task status glyphs,
 ahead/behind counts, and listening TCP ports. Claude Bash calls are shown as background processes
 only when the hook explicitly reports `run_in_background`; command text is never guessed, and the

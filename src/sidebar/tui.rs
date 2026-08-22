@@ -217,34 +217,125 @@ mod local_state_tests {
     }
 
     #[test]
-    fn category_text_editor_emits_create_intent() {
+    fn category_text_dialog_waits_for_save_result_and_preserves_input_on_failure() {
         let (tx, rx) = mpsc::channel();
-        let mut mode = Some(CategoryEditMode::Add {
+        let mut dialog = Some(CategoryDialog::editing(CategoryEditMode::Add {
             input: String::new(),
-        });
+        }));
+        let mut next_request_id = 7;
         let mut ui = MarkCompleteUi::default();
         for key in ['n', 'e', 'w'] {
             handle_category_edit_key(
                 crossterm::event::KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
-                &mut mode,
+                &mut dialog,
                 &tx,
+                &mut next_request_id,
                 &mut ui,
             );
         }
         handle_category_edit_key(
             crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut mode,
+            &mut dialog,
             &tx,
+            &mut next_request_id,
             &mut ui,
         );
 
-        assert!(mode.is_none());
         assert_eq!(
-            rx.recv().unwrap().intent,
+            dialog.as_ref().unwrap().phase,
+            CategoryDialogPhase::Saving { request_id: 7 }
+        );
+        let request = rx.recv().unwrap();
+        assert_eq!(request.dialog_request_id, Some(7));
+        assert_eq!(
+            request.intent,
             crate::category::CategoryIntent::CreateCategory {
                 name: crate::category::CategoryName::parse("new").unwrap(),
             }
         );
+
+        apply_category_intent_result(
+            CategoryIntentResult {
+                dialog_request_id: Some(7),
+                result: Err(anyhow::anyhow!("state changed")),
+            },
+            &mut dialog,
+            &mut ui,
+        );
+        let dialog_ref = dialog.as_ref().unwrap();
+        assert_eq!(dialog_ref.phase, CategoryDialogPhase::Editing);
+        assert_eq!(dialog_ref.error.as_deref(), Some("state changed"));
+        assert!(matches!(
+            &dialog_ref.edit,
+            CategoryEditMode::Add { input } if input == "new"
+        ));
+
+        handle_category_edit_key(
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut dialog,
+            &tx,
+            &mut next_request_id,
+            &mut ui,
+        );
+        assert_eq!(rx.recv().unwrap().dialog_request_id, Some(8));
+        apply_category_intent_result(
+            CategoryIntentResult {
+                dialog_request_id: Some(8),
+                result: Ok(()),
+            },
+            &mut dialog,
+            &mut ui,
+        );
+        assert!(dialog.is_none());
+        assert_eq!(ui.notice().unwrap().message, "category created");
+    }
+
+    #[test]
+    fn category_dialog_renders_delete_impact_choices_and_explicit_action() {
+        let dialog = CategoryDialog::editing(CategoryEditMode::Delete {
+            category: crate::category::CategoryName::parse("scratch").unwrap(),
+            repository_count: 2,
+            choices: vec![
+                MembershipChoice::Automatic,
+                MembershipChoice::Category(crate::category::CategoryName::parse("work").unwrap()),
+            ],
+            selected: 1,
+            pending_g: false,
+        });
+
+        let lines = category_dialog_lines(&dialog, 38, 10, &SidebarRenderTheme::default());
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Delete “scratch”?"));
+        assert!(rendered.contains("2 repositories will be reassigned."));
+        assert!(rendered.contains("Automatic (config)"));
+        assert!(rendered.contains("› work"));
+        assert!(rendered.contains("Enter Delete & move · Esc Cancel"));
+        assert!(lines.iter().all(|line| {
+            line.spans
+                .iter()
+                .map(|span| display_width(span.content.as_ref()))
+                .sum::<usize>()
+                <= 38
+        }));
+
+        let compact = category_dialog_lines(&dialog, 24, 3, &SidebarRenderTheme::default())
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(compact.contains("› work"));
+        assert!(compact.contains("Enter Delete & move"));
+    }
+
+    #[test]
+    fn category_dialog_keeps_the_input_cursor_visible_at_narrow_widths() {
+        assert_eq!(tail_display("› long-category-name_", 10), "…ory-name_");
     }
 
     #[test]
@@ -1934,9 +2025,11 @@ struct PreferenceIntentResult {
 
 struct CategoryIntentRequest {
     intent: crate::category::CategoryIntent,
+    dialog_request_id: Option<u64>,
 }
 
 struct CategoryIntentResult {
+    dialog_request_id: Option<u64>,
     result: Result<()>,
 }
 
@@ -1952,7 +2045,7 @@ struct NavigationResult {
     result: Result<()>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CategoryEditMode {
     Add {
         input: String,
@@ -1963,22 +2056,84 @@ enum CategoryEditMode {
     },
     MoveRepo {
         repo: crate::category::RepoKey,
+        repo_label: String,
         choices: Vec<MembershipChoice>,
         selected: usize,
         pending_g: bool,
     },
     Delete {
         category: crate::category::CategoryName,
+        repository_count: usize,
         choices: Vec<MembershipChoice>,
         selected: usize,
         pending_g: bool,
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum MembershipChoice {
     Automatic,
     Category(crate::category::CategoryName),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CategoryDialogPhase {
+    Editing,
+    Saving { request_id: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CategoryDialog {
+    edit: CategoryEditMode,
+    phase: CategoryDialogPhase,
+    error: Option<String>,
+}
+
+impl CategoryDialog {
+    fn editing(edit: CategoryEditMode) -> Self {
+        Self {
+            edit,
+            phase: CategoryDialogPhase::Editing,
+            error: None,
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match &self.edit {
+            CategoryEditMode::Add { .. } => " ADD CATEGORY ",
+            CategoryEditMode::Rename { .. } => " RENAME CATEGORY ",
+            CategoryEditMode::MoveRepo { .. } => " MOVE REPOSITORY ",
+            CategoryEditMode::Delete { .. } => " DELETE CATEGORY ",
+        }
+    }
+
+    fn action_hint(&self) -> &'static str {
+        match self.phase {
+            CategoryDialogPhase::Saving { .. } => "Saving…",
+            CategoryDialogPhase::Editing => match &self.edit {
+                CategoryEditMode::Add { .. } => "Enter Create · Esc Cancel",
+                CategoryEditMode::Rename { .. } => "Enter Rename · Esc Cancel",
+                CategoryEditMode::MoveRepo { .. } => "Enter Move · Esc Cancel",
+                CategoryEditMode::Delete { .. } => "Enter Delete & move · Esc Cancel",
+            },
+        }
+    }
+
+    fn success_message(&self) -> &'static str {
+        match &self.edit {
+            CategoryEditMode::Add { .. } => "category created",
+            CategoryEditMode::Rename { .. } => "category renamed",
+            CategoryEditMode::MoveRepo { .. } => "repository moved",
+            CategoryEditMode::Delete { .. } => "category deleted",
+        }
+    }
+
+    fn saving_request_id(&self) -> Option<u64> {
+        match self.phase {
+            CategoryDialogPhase::Editing => None,
+            CategoryDialogPhase::Saving { request_id } => Some(request_id),
+        }
+    }
 }
 
 impl MembershipChoice {
@@ -2058,7 +2213,7 @@ fn begin_category_edit(
     key: char,
     snapshot: &ResolvedSnapshot,
     sidebar: &SidebarView,
-    mode: &mut Option<CategoryEditMode>,
+    dialog: &mut Option<CategoryDialog>,
     ui: &mut MarkCompleteUi,
 ) -> bool {
     let selected = sidebar
@@ -2066,13 +2221,18 @@ fn begin_category_edit(
         .selection
         .as_deref()
         .and_then(|selection| sidebar.rows.iter().find(|row| row.id == selection));
-    *mode = match key {
-        'a' => Some(CategoryEditMode::Add {
+    let edit = match key {
+        'a' => CategoryEditMode::Add {
             input: String::new(),
-        }),
+        },
         'r' => {
             let Some(category) = selected.and_then(|row| category_name_from_row_id(&row.id)) else {
-                return false;
+                ui.set_toast(
+                    "select a category to rename".to_string(),
+                    NoticeLevel::Warning,
+                    Duration::from_secs(4),
+                );
+                return true;
             };
             let editable = snapshot
                 .sidebar_model
@@ -2089,26 +2249,44 @@ fn begin_category_edit(
                 );
                 return true;
             }
-            Some(CategoryEditMode::Rename {
+            CategoryEditMode::Rename {
                 current: category,
                 input: String::new(),
-            })
+            }
         }
         'm' => {
-            let Some((_, repo)) = selected.and_then(|row| category_repo_from_row_id(&row.id))
-            else {
-                return false;
+            let Some(row) = selected else {
+                ui.set_toast(
+                    "select a repository to move".to_string(),
+                    NoticeLevel::Warning,
+                    Duration::from_secs(4),
+                );
+                return true;
             };
-            Some(CategoryEditMode::MoveRepo {
+            let Some((_, repo)) = category_repo_from_row_id(&row.id) else {
+                ui.set_toast(
+                    "select a repository to move".to_string(),
+                    NoticeLevel::Warning,
+                    Duration::from_secs(4),
+                );
+                return true;
+            };
+            CategoryEditMode::MoveRepo {
                 repo,
+                repo_label: row.label.clone(),
                 choices: membership_choices(snapshot, None),
                 selected: 0,
                 pending_g: false,
-            })
+            }
         }
         'D' => {
             let Some(category) = selected.and_then(|row| category_name_from_row_id(&row.id)) else {
-                return false;
+                ui.set_toast(
+                    "select a category to delete".to_string(),
+                    NoticeLevel::Warning,
+                    Duration::from_secs(4),
+                );
+                return true;
             };
             let editable = snapshot
                 .sidebar_model
@@ -2125,16 +2303,24 @@ fn begin_category_edit(
                 );
                 return true;
             }
-            Some(CategoryEditMode::Delete {
+            let repository_count = snapshot
+                .sidebar_model
+                .categories
+                .placements
+                .values()
+                .filter(|placement| placement.category == category)
+                .count();
+            CategoryEditMode::Delete {
                 choices: membership_choices(snapshot, Some(&category)),
                 category,
+                repository_count,
                 selected: 0,
                 pending_g: false,
-            })
+            }
         }
         _ => return false,
     };
-    refresh_category_edit_notice(mode.as_ref(), ui);
+    *dialog = Some(CategoryDialog::editing(edit));
     true
 }
 
@@ -2157,15 +2343,19 @@ fn membership_choices(
 
 fn handle_category_edit_key(
     key: crossterm::event::KeyEvent,
-    mode: &mut Option<CategoryEditMode>,
+    dialog: &mut Option<CategoryDialog>,
     tx: &mpsc::Sender<CategoryIntentRequest>,
+    next_request_id: &mut u64,
     ui: &mut MarkCompleteUi,
 ) -> bool {
-    let Some(current) = mode.as_mut() else {
+    let Some(current) = dialog.as_mut() else {
         return false;
     };
+    if matches!(current.phase, CategoryDialogPhase::Saving { .. }) {
+        return true;
+    }
     if key.code == KeyCode::Esc {
-        *mode = None;
+        *dialog = None;
         ui.set_toast(
             "category edit cancelled".to_string(),
             NoticeLevel::Warning,
@@ -2173,13 +2363,14 @@ fn handle_category_edit_key(
         );
         return true;
     }
+    current.error = None;
     let mut intent = None;
-    match current {
+    match &mut current.edit {
         CategoryEditMode::Add { input } => match key.code {
             KeyCode::Enter => match crate::category::CategoryName::parse(input.as_str()) {
                 Ok(name) => intent = Some(crate::category::CategoryIntent::CreateCategory { name }),
                 Err(error) => {
-                    ui.set_toast(error, NoticeLevel::Failure, Duration::from_secs(5));
+                    current.error = Some(error);
                     return true;
                 }
             },
@@ -2189,16 +2380,19 @@ fn handle_category_edit_key(
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => input.push(ch),
             _ => {}
         },
-        CategoryEditMode::Rename { current, input } => match key.code {
+        CategoryEditMode::Rename {
+            current: current_name,
+            input,
+        } => match key.code {
             KeyCode::Enter => match crate::category::CategoryName::parse(input.as_str()) {
                 Ok(replacement) => {
                     intent = Some(crate::category::CategoryIntent::RenameCategory {
-                        current: current.clone(),
+                        current: current_name.clone(),
                         replacement,
                     })
                 }
                 Err(error) => {
-                    ui.set_toast(error, NoticeLevel::Failure, Duration::from_secs(5));
+                    current.error = Some(error);
                     return true;
                 }
             },
@@ -2213,6 +2407,7 @@ fn handle_category_edit_key(
             choices,
             selected,
             pending_g,
+            ..
         } => match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 *selected = selected.saturating_sub(1);
@@ -2254,6 +2449,7 @@ fn handle_category_edit_key(
             choices,
             selected,
             pending_g,
+            ..
         } => match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 *selected = selected.saturating_sub(1);
@@ -2287,62 +2483,21 @@ fn handle_category_edit_key(
         },
     }
     if let Some(intent) = intent {
-        if tx.send(CategoryIntentRequest { intent }).is_err() {
-            ui.set_toast(
-                "category worker unavailable".to_string(),
-                NoticeLevel::Failure,
-                Duration::from_secs(5),
-            );
+        let request_id = *next_request_id;
+        *next_request_id = (*next_request_id).saturating_add(1);
+        if tx
+            .send(CategoryIntentRequest {
+                intent,
+                dialog_request_id: Some(request_id),
+            })
+            .is_err()
+        {
+            current.error = Some("category worker unavailable".to_string());
         } else {
-            ui.set_toast(
-                "saving category...".to_string(),
-                NoticeLevel::Progress,
-                Duration::from_secs(3),
-            );
+            current.phase = CategoryDialogPhase::Saving { request_id };
         }
-        *mode = None;
-    } else {
-        refresh_category_edit_notice(mode.as_ref(), ui);
     }
     true
-}
-
-fn refresh_category_edit_notice(mode: Option<&CategoryEditMode>, ui: &mut MarkCompleteUi) {
-    let Some(mode) = mode else {
-        return;
-    };
-    let message = match mode {
-        CategoryEditMode::Add { input } => format!("add category: {input}_"),
-        CategoryEditMode::Rename { current, input } => {
-            format!("rename {current} to: {input}_")
-        }
-        CategoryEditMode::MoveRepo {
-            choices, selected, ..
-        } => format!(
-            "move repo to: {}  [j/k, Enter]",
-            choices
-                .get(*selected)
-                .map(MembershipChoice::label)
-                .unwrap_or("-")
-        ),
-        CategoryEditMode::Delete {
-            category,
-            choices,
-            selected,
-            ..
-        } => format!(
-            "delete {category}; move repos to: {}  [j/k, Enter]",
-            choices
-                .get(*selected)
-                .map(MembershipChoice::label)
-                .unwrap_or("-")
-        ),
-    };
-    ui.set_toast(
-        message,
-        NoticeLevel::Progress,
-        Duration::from_secs(24 * 60 * 60),
-    );
 }
 
 fn spawn_mark_complete_worker(
@@ -2438,20 +2593,77 @@ fn spawn_category_intent_worker(
 ) {
     std::thread::spawn(move || {
         while let Ok(request) = rx.recv() {
+            let dialog_request_id = request.dialog_request_id;
             let result = crate::sidebar::client::send_category_intent_v2(
                 &socket,
                 &server_identity,
                 request.intent,
             );
             let failed = result.is_err();
-            if tx.send(CategoryIntentResult { result }).is_err() {
+            if tx
+                .send(CategoryIntentResult {
+                    dialog_request_id,
+                    result,
+                })
+                .is_err()
+            {
                 return;
             }
             if failed {
-                while rx.try_recv().is_ok() {}
+                while let Ok(dropped) = rx.try_recv() {
+                    if tx
+                        .send(CategoryIntentResult {
+                            dialog_request_id: dropped.dialog_request_id,
+                            result: Err(anyhow::anyhow!(
+                                "category request cancelled after an earlier save failure"
+                            )),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
         }
     });
+}
+
+fn apply_category_intent_result(
+    result: CategoryIntentResult,
+    dialog: &mut Option<CategoryDialog>,
+    ui: &mut MarkCompleteUi,
+) {
+    let is_dialog_result = result.dialog_request_id.is_some_and(|request_id| {
+        dialog.as_ref().and_then(CategoryDialog::saving_request_id) == Some(request_id)
+    });
+    if !is_dialog_result {
+        if let Err(error) = result.result {
+            ui.set_toast(
+                format!("category save failed: {error}"),
+                NoticeLevel::Failure,
+                Duration::from_secs(5),
+            );
+        }
+        return;
+    }
+
+    match result.result {
+        Ok(()) => {
+            let message = dialog
+                .as_ref()
+                .map(CategoryDialog::success_message)
+                .unwrap_or("category saved")
+                .to_string();
+            *dialog = None;
+            ui.set_toast(message, NoticeLevel::Success, Duration::from_secs(3));
+        }
+        Err(error) => {
+            if let Some(dialog) = dialog.as_mut() {
+                dialog.phase = CategoryDialogPhase::Editing;
+                dialog.error = Some(error.to_string());
+            }
+        }
+    }
 }
 
 fn spawn_navigation_worker(
@@ -2621,6 +2833,7 @@ fn queue_reorder(
     if category_tx
         .send(CategoryIntentRequest {
             intent: category_intent,
+            dialog_request_id: None,
         })
         .is_err()
     {
@@ -2828,7 +3041,8 @@ fn run_loop<B: Backend>(
     let mut render_gate = RenderGate::new();
     let mut last_frame: Option<DrawnFrame> = None;
     let mut pending_g = false;
-    let mut category_edit_mode: Option<CategoryEditMode> = None;
+    let mut category_dialog: Option<CategoryDialog> = None;
+    let mut next_category_dialog_request_id = 1_u64;
     loop {
         render_gate.mark_dirty_if(drain_snapshot_updates(rx, &mut current, &mut connection));
         if let ConnectionState::ConfigChanged(active_config_hash) = &connection {
@@ -2924,13 +3138,7 @@ fn run_loop<B: Backend>(
         }
         while let Ok(result) = category_result_rx.try_recv() {
             render_gate.mark_dirty();
-            if let Err(error) = result.result {
-                mark_ui.set_toast(
-                    format!("category save failed: {error}"),
-                    NoticeLevel::Failure,
-                    Duration::from_secs(5),
-                );
-            }
+            apply_category_intent_result(result, &mut category_dialog, &mut mark_ui);
         }
         while let Ok(result) = navigation_result_rx.try_recv() {
             if let Err(error) = result.result {
@@ -3144,6 +3352,7 @@ fn run_loop<B: Backend>(
                         scroll: frame_scroll,
                         connection: &connection,
                         toast: mark_ui.notice(),
+                        category_dialog: category_dialog.as_ref(),
                         rendered: Some(&rendered),
                     },
                 )?;
@@ -3155,12 +3364,13 @@ fn run_loop<B: Backend>(
         if event::poll(Duration::from_millis(50))? {
             let state_before = sidebar_state.clone();
             match event::read()? {
-                Event::Key(key) if category_edit_mode.is_some() => {
+                Event::Key(key) if category_dialog.is_some() => {
                     pending_g = false;
                     handle_category_edit_key(
                         key,
-                        &mut category_edit_mode,
+                        &mut category_dialog,
                         &category_intent_tx,
+                        &mut next_category_dialog_request_id,
                         &mut mark_ui,
                     );
                     render_gate.mark_dirty();
@@ -3258,7 +3468,7 @@ fn run_loop<B: Backend>(
                                     ch,
                                     snapshot,
                                     &sidebar,
-                                    &mut category_edit_mode,
+                                    &mut category_dialog,
                                     &mut mark_ui,
                                 )
                             {
@@ -3338,6 +3548,9 @@ fn run_loop<B: Backend>(
                     }
                     _ => pending_g = false,
                 },
+                Event::Mouse(_) if category_dialog.is_some() => {
+                    pending_g = false;
+                }
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                     pending_g = false;
                     if let (Some(snapshot), Some(frame)) = (&current, last_frame.as_ref()) {
@@ -4402,6 +4615,7 @@ fn draw_snapshot_with_theme_and_scroll<B: Backend>(
             scroll,
             connection: &ConnectionState::Connected,
             toast: None,
+            category_dialog: None,
             rendered: None,
         },
     )
@@ -4413,6 +4627,7 @@ struct DrawOptions<'a> {
     scroll: usize,
     connection: &'a ConnectionState,
     toast: Option<Notice<'a>>,
+    category_dialog: Option<&'a CategoryDialog>,
     /// Rows already rendered by the caller for scroll resolution; when present
     /// the draw path reuses them instead of rendering the same rows again.
     rendered: Option<&'a RenderedLines>,
@@ -4465,6 +4680,7 @@ fn draw_snapshot_in_area(
         scroll,
         connection,
         toast,
+        category_dialog,
         rendered,
     } = options;
     let header = build_header_layout_with_counts(&sidebar.state, area.width, theme, sidebar.counts);
@@ -4478,6 +4694,15 @@ fn draw_snapshot_in_area(
             Paragraph::new(render_header_lines(&header, theme)),
             header_area,
         );
+    }
+    if let Some(dialog) = category_dialog {
+        let dialog_area = Rect {
+            y: area.y + areas.header_rows,
+            height: area.height.saturating_sub(areas.header_rows),
+            ..area
+        };
+        draw_category_dialog(frame, dialog_area, dialog, theme);
+        return;
     }
     let rows_area = Rect {
         y: area.y + areas.header_rows,
@@ -4531,6 +4756,282 @@ fn draw_snapshot_in_area(
         let footer = contextual_footer_line(area.width as usize, theme, toast, connection);
         frame.render_widget(Paragraph::new(footer), footer_area);
     }
+}
+
+fn draw_category_dialog(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    dialog: &CategoryDialog,
+    theme: &SidebarRenderTheme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if area.width < 4 || area.height < 3 {
+        let message = match dialog.phase {
+            CategoryDialogPhase::Editing => dialog.title().trim(),
+            CategoryDialogPhase::Saving { .. } => "Saving…",
+        };
+        frame.render_widget(
+            Paragraph::new(crate::sidebar::render::truncate_display(
+                message,
+                area.width as usize,
+            )),
+            area,
+        );
+        return;
+    }
+
+    let popup = category_dialog_area(area, dialog);
+    let accent = if matches!(&dialog.edit, CategoryEditMode::Delete { .. }) {
+        theme.badge_blocked
+    } else {
+        theme.category
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent))
+        .title(Span::styled(
+            dialog.title(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(category_dialog_lines(
+            dialog,
+            inner.width as usize,
+            inner.height as usize,
+            theme,
+        )),
+        inner,
+    );
+}
+
+fn category_dialog_area(area: Rect, dialog: &CategoryDialog) -> Rect {
+    let horizontal_margin = u16::from(area.width >= 28);
+    let width = area.width.saturating_sub(horizontal_margin * 2);
+    let desired_height = match &dialog.edit {
+        CategoryEditMode::Add { .. } => 8,
+        CategoryEditMode::Rename { .. } => 9,
+        CategoryEditMode::MoveRepo { choices, .. } => {
+            (choices.len().min(7) as u16).saturating_add(7)
+        }
+        CategoryEditMode::Delete { choices, .. } => (choices.len().min(6) as u16).saturating_add(9),
+    };
+    let height = desired_height.min(area.height);
+    Rect {
+        x: area.x + horizontal_margin,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn category_dialog_lines(
+    dialog: &CategoryDialog,
+    width: usize,
+    height: usize,
+    theme: &SidebarRenderTheme,
+) -> Vec<Line<'static>> {
+    if height == 0 {
+        return Vec::new();
+    }
+
+    let label_style = Style::default()
+        .fg(theme.marker)
+        .add_modifier(Modifier::DIM);
+    let value_style = Style::default().fg(theme.category);
+    let mut header = Vec::new();
+    let choices = match &dialog.edit {
+        CategoryEditMode::Add { input } => {
+            header.push(Line::from(Span::styled("Name", label_style)));
+            header.push(Line::from(Span::styled(
+                tail_display(&format!("› {input}_"), width),
+                value_style,
+            )));
+            None
+        }
+        CategoryEditMode::Rename { current, input } => {
+            header.push(Line::from(vec![
+                Span::styled("Current  ", label_style),
+                Span::styled(current.to_string(), value_style),
+            ]));
+            header.push(Line::from(Span::styled("New name", label_style)));
+            header.push(Line::from(Span::styled(
+                tail_display(&format!("› {input}_"), width),
+                value_style,
+            )));
+            None
+        }
+        CategoryEditMode::MoveRepo {
+            repo_label,
+            choices,
+            selected,
+            ..
+        } => {
+            header.push(Line::from(Span::styled("Repository", label_style)));
+            header.push(Line::from(Span::styled(
+                crate::sidebar::render::truncate_display(repo_label, width),
+                Style::default().fg(theme.repo),
+            )));
+            header.push(Line::from(Span::styled("Move to", label_style)));
+            Some((choices.as_slice(), *selected))
+        }
+        CategoryEditMode::Delete {
+            category,
+            repository_count,
+            choices,
+            selected,
+            ..
+        } => {
+            header.push(Line::from(Span::styled(
+                format!("Delete “{category}”?"),
+                Style::default()
+                    .fg(theme.badge_blocked)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            let noun = if *repository_count == 1 {
+                "repository"
+            } else {
+                "repositories"
+            };
+            header.push(Line::from(Span::styled(
+                format!("{repository_count} {noun} will be reassigned."),
+                Style::default().fg(theme.detail),
+            )));
+            header.push(Line::from(Span::styled("Move to", label_style)));
+            Some((choices.as_slice(), *selected))
+        }
+    };
+
+    let mut footer = Vec::new();
+    if let Some(error) = &dialog.error {
+        footer.push(Line::from(Span::styled(
+            crate::sidebar::render::truncate_display(error, width),
+            Style::default().fg(theme.badge_blocked),
+        )));
+    }
+    if choices.is_some() && matches!(dialog.phase, CategoryDialogPhase::Editing) {
+        footer.push(Line::from(Span::styled(
+            "j/k Select · gg/G Ends",
+            label_style,
+        )));
+    }
+    let action_color = match dialog.phase {
+        CategoryDialogPhase::Saving { .. } => theme.badge_working,
+        CategoryDialogPhase::Editing if matches!(&dialog.edit, CategoryEditMode::Delete { .. }) => {
+            theme.badge_blocked
+        }
+        CategoryDialogPhase::Editing => theme.badge_done,
+    };
+    footer.push(Line::from(Span::styled(
+        dialog.action_hint(),
+        Style::default()
+            .fg(action_color)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if footer.len() > height {
+        footer = footer.split_off(footer.len() - height);
+    }
+
+    let body_height = height.saturating_sub(footer.len());
+    let header_limit = if choices.is_some() && body_height > 0 {
+        body_height.saturating_sub(1)
+    } else {
+        body_height
+    };
+    let mut lines = header
+        .into_iter()
+        .take(header_limit)
+        .map(|line| fit_line_to_width(line, width))
+        .collect::<Vec<_>>();
+    if let Some((choices, selected)) = choices {
+        let capacity = body_height.saturating_sub(lines.len());
+        lines.extend(category_choice_lines(
+            choices, selected, capacity, width, theme,
+        ));
+    }
+    while lines.len() < body_height {
+        lines.push(Line::default());
+    }
+    lines.extend(
+        footer
+            .into_iter()
+            .map(|line| fit_line_to_width(line, width)),
+    );
+    lines
+}
+
+fn category_choice_lines(
+    choices: &[MembershipChoice],
+    selected: usize,
+    capacity: usize,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> Vec<Line<'static>> {
+    if choices.is_empty() || capacity == 0 {
+        return Vec::new();
+    }
+    let visible = capacity.min(choices.len());
+    let start = selected
+        .saturating_sub(visible / 2)
+        .min(choices.len().saturating_sub(visible));
+    choices
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, choice)| {
+            let text = crate::sidebar::render::truncate_display(
+                &format!(
+                    "{} {}",
+                    if index == selected { '›' } else { ' ' },
+                    choice.label()
+                ),
+                width,
+            );
+            let style = if index == selected {
+                Style::default()
+                    .fg(theme.selection_bar)
+                    .bg(theme.selection_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.detail)
+            };
+            Line::from(Span::styled(pad_display(text, width), style))
+        })
+        .collect()
+}
+
+fn tail_display(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let target = width.saturating_sub(1);
+    let mut used = 0;
+    let mut suffix = Vec::new();
+    for ch in text.chars().rev() {
+        let char_width = display_width(&ch.to_string());
+        if used + char_width > target {
+            break;
+        }
+        suffix.push(ch);
+        used += char_width;
+    }
+    suffix.reverse();
+    format!("…{}", suffix.into_iter().collect::<String>())
+}
+
+fn pad_display(mut text: String, width: usize) -> String {
+    let used = display_width(&text);
+    if used < width {
+        text.push_str(&" ".repeat(width - used));
+    }
+    text
 }
 
 fn contextual_footer_line(
