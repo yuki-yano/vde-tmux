@@ -281,6 +281,25 @@ vt sidebar close
 
 `vt sidebar focus-toggle` opens a missing sidebar, focuses a visible one, and closes it when it already has focus.
 
+Layout managers can synchronously reserve the vde-tmux sidebar before applying a pane layout:
+
+```bash
+vt sidebar prepare-layout --window @12 --json
+```
+
+The command prints exactly one JSON object such as
+`{"window_id":"@12","status":"ready","reserved_panes":[{"pane_id":"%23","role":"sidebar"}],"content_anchor":"%22"}`.
+`ready` means that every returned sidebar pane exists, has `@vde_sidebar=1`, and has completed its
+width reconciliation. It does not wait for the first TUI render or a daemon snapshot. The command
+does not start or wait for the vde-tmux daemon, so an active daemon configuration is required. If
+the daemon is not running or its configuration has not been applied, the command fails closed with
+a non-zero exit status. Run `vt daemon reload` first when the active configuration needs to be
+applied. When the auto-all hook is disabled and no marked sidebar exists, the command returns `absent`, an empty
+`reserved_panes`, and an existing non-sidebar pane as `content_anchor` without creating a sidebar.
+The operation is serialized per tmux window and is idempotent with the auto-all new-window hook.
+Invalid or missing windows, a window without a non-sidebar content pane, and any failed tmux or JSON
+operation produce a non-zero exit status; there is no fallback response.
+
 | Key | Action |
 | --- | --- |
 | `j` / `k`, `↓` / `↑` | Move between rows |

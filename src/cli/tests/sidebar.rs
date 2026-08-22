@@ -178,9 +178,22 @@ fn dispatch_sidebar_open_uses_layout_operations() {
         "layout-before\n",
     );
     mock.stub(
-        &["split-window", "-t", "@1", "-hbf", "-l", "40", &command],
-        "",
+        &[
+            "split-window",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "@1",
+            "-hbf",
+            "-l",
+            "40",
+            &command,
+        ],
+        "%9\n",
     );
+    mock.stub(&["set-option", "-p", "-t", "%9", "@vde_sidebar", "1"], "");
+    mock.stub(&["resize-pane", "-t", "%9", "-x", "40"], "");
     mock.stub(
         &[
             "set-hook",
@@ -216,7 +229,7 @@ fn dispatch_sidebar_open_uses_layout_operations() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 4);
+    assert_eq!(mock.calls().len(), 6);
 }
 
 #[test]
@@ -397,9 +410,22 @@ fn dispatch_sidebar_open_accepts_percent_width() {
         &format!("{layout}\n"),
     );
     mock.stub(
-        &["split-window", "-t", "@1", "-hbf", "-l", "64", &command],
-        "",
+        &[
+            "split-window",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "@1",
+            "-hbf",
+            "-l",
+            "64",
+            &command,
+        ],
+        "%9\n",
     );
+    mock.stub(&["set-option", "-p", "-t", "%9", "@vde_sidebar", "1"], "");
+    mock.stub(&["resize-pane", "-t", "%9", "-x", "64"], "");
 
     crate::cli::sidebar::run_sidebar_command_with_ensure(
         crate::cli::sidebar::SidebarCommand::Open {
@@ -419,7 +445,7 @@ fn dispatch_sidebar_open_accepts_percent_width() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 4);
+    assert_eq!(mock.calls().len(), 6);
 }
 
 #[test]
@@ -462,6 +488,9 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
         &[
             "split-window",
             "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
             "-t",
             "@1",
             "-hbf",
@@ -469,8 +498,10 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
             "40",
             &command,
         ],
-        "",
+        "%9\n",
     );
+    mock.stub(&["set-option", "-p", "-t", "%9", "@vde_sidebar", "1"], "");
+    mock.stub(&["resize-pane", "-t", "%9", "-x", "40"], "");
     mock.stub(
         &[
             "set-hook",
@@ -523,7 +554,7 @@ fn dispatch_sidebar_toggle_all_uses_all_windows() {
     )
     .unwrap();
 
-    assert_eq!(mock.calls().len(), 8);
+    assert_eq!(mock.calls().len(), 10);
     assert!(mock.calls().iter().any(|call| {
         call == &vec![
             "list-panes".to_string(),
@@ -914,7 +945,11 @@ fn sidebar_layout_applied_ensures_daemon_started() {
         "{} sidebar attach",
         shell_quote_for_test(&exe.display().to_string())
     );
-    mock.stub(&["display-message", "-p", "#{window_id}"], "@1\n");
+    mock.stub(&["display-message", "-p", "#{pid}"], "424243\n");
+    mock.stub(
+        &["display-message", "-p", "-t", "@1", "-F", "#{window_id}"],
+        "@1\n",
+    );
     mock.stub(
         &[
             "list-panes",
@@ -936,11 +971,13 @@ fn sidebar_layout_applied_ensures_daemon_started() {
         ],
         "layout-before\n",
     );
-    mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
     mock.stub(
         &[
             "split-window",
             "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
             "-t",
             "@1",
             "-hbf",
@@ -948,8 +985,10 @@ fn sidebar_layout_applied_ensures_daemon_started() {
             "40",
             &command,
         ],
-        "",
+        "%9\n",
     );
+    mock.stub(&["set-option", "-p", "-t", "%9", "@vde_sidebar", "1"], "");
+    mock.stub(&["resize-pane", "-t", "%9", "-x", "40"], "");
     let called = Cell::new(false);
 
     crate::cli::sidebar::run_sidebar_command_with_ensure(
@@ -971,7 +1010,135 @@ fn sidebar_layout_applied_ensures_daemon_started() {
     .unwrap();
 
     assert!(called.get());
-    assert_eq!(mock.calls().len(), 4);
+    assert_eq!(mock.calls().len(), 7);
+}
+
+#[test]
+fn prepare_layout_cli_requires_window_and_json_flags() {
+    assert!(
+        Cli::try_parse_from([
+            "vt",
+            "sidebar",
+            "prepare-layout",
+            "--window",
+            "@12",
+            "--json",
+        ])
+        .is_ok()
+    );
+    assert!(Cli::try_parse_from(["vt", "sidebar", "prepare-layout", "--window", "@12"]).is_err());
+    assert!(Cli::try_parse_from(["vt", "sidebar", "prepare-layout", "--json"]).is_err());
+}
+
+#[test]
+fn prepare_layout_cli_serializes_the_fixed_ready_schema_without_daemon_ensure() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(&["display-message", "-p", "#{pid}"], "424244\n");
+    mock.stub(
+        &["display-message", "-p", "-t", "@12", "-F", "#{window_id}"],
+        "@12\n",
+    );
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@12",
+            "-F",
+            crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+        ],
+        "%23\t1\t40\n%22\t\t80\n",
+    );
+    mock.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "@12",
+            "-F",
+            "#{window_layout}",
+        ],
+        "layout-before\n",
+    );
+    let mut config = crate::config::Config::default();
+    config.sidebar.width = crate::config::SidebarWidth::Columns(40);
+
+    let output = crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::PrepareLayout {
+            window: "@12".to_string(),
+            json: true,
+        },
+        &mock,
+        &env(),
+        &config,
+        |_, _| panic!("prepare-layout must not start or wait for the sidebar daemon"),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        output,
+        r#"{"window_id":"@12","status":"ready","reserved_panes":[{"pane_id":"%23","role":"sidebar"}],"content_anchor":"%22"}"#
+    );
+}
+
+#[test]
+fn prepare_layout_cli_serializes_absent_without_creating_a_sidebar() {
+    let mock = MockTmuxRunner::new();
+    mock.stub(&["display-message", "-p", "#{pid}"], "424245\n");
+    mock.stub(
+        &["display-message", "-p", "-t", "@12", "-F", "#{window_id}"],
+        "@12\n",
+    );
+    mock.stub(
+        &[
+            "list-panes",
+            "-t",
+            "@12",
+            "-F",
+            crate::sidebar::layout::SIDEBAR_PANE_FORMAT,
+        ],
+        "%22\t\t80\n",
+    );
+    mock.stub(
+        &["show-hooks", "-g", "after-new-window[90]"],
+        "after-new-window[90] \n",
+    );
+    let mut config = crate::config::Config::default();
+    config.sidebar.width = crate::config::SidebarWidth::Columns(40);
+
+    let output = crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::PrepareLayout {
+            window: "@12".to_string(),
+            json: true,
+        },
+        &mock,
+        &env(),
+        &config,
+        |_, _| panic!("absent prepare-layout must not ensure the daemon"),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        output,
+        r#"{"window_id":"@12","status":"absent","reserved_panes":[],"content_anchor":"%22"}"#
+    );
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|call| { call.first().map(String::as_str) == Some("split-window") })
+    );
+}
+
+#[test]
+fn prepare_layout_requires_active_config() {
+    let command = crate::cli::sidebar::SidebarCommand::PrepareLayout {
+        window: "@12".to_string(),
+        json: true,
+    };
+
+    assert!(command.requires_active_config());
 }
 
 #[test]
@@ -1091,9 +1258,22 @@ fn focus_toggle_loads_active_config_only_when_opening_a_missing_sidebar() {
     let exe = std::env::current_exe().unwrap();
     let command = sidebar_attach_command_for_selection_test(&exe);
     mock.stub(
-        &["split-window", "-t", "@1", "-hbf", "-l", "52", &command],
-        "",
+        &[
+            "split-window",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "@1",
+            "-hbf",
+            "-l",
+            "52",
+            &command,
+        ],
+        "%9\n",
     );
+    mock.stub(&["set-option", "-p", "-t", "%9", "@vde_sidebar", "1"], "");
+    mock.stub(&["resize-pane", "-t", "%9", "-x", "52"], "");
     let config_loaded = std::cell::Cell::new(0_u8);
 
     crate::cli::sidebar::run_focus_toggle_command(
@@ -1113,6 +1293,9 @@ fn focus_toggle_loads_active_config_only_when_opening_a_missing_sidebar() {
     assert_eq!(config_loaded.get(), 1);
     assert!(mock.calls().contains(&vec![
         "split-window".to_string(),
+        "-P".to_string(),
+        "-F".to_string(),
+        "#{pane_id}".to_string(),
         "-t".to_string(),
         "@1".to_string(),
         "-hbf".to_string(),

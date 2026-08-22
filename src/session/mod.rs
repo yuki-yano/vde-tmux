@@ -1199,6 +1199,11 @@ mod tests {
             &["show-hooks", "-g", "after-new-window[90]"],
             "after-new-window[90] run-shell 'vt sidebar layout-applied'\n",
         );
+        mock.stub(&["display-message", "-p", "#{pid}"], "424246\n");
+        mock.stub(
+            &["display-message", "-p", "-t", "@9", "-F", "#{window_id}"],
+            "@9\n",
+        );
         mock.stub(
             &[
                 "list-panes",
@@ -1224,6 +1229,9 @@ mod tests {
             &[
                 "split-window",
                 "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
                 "-t",
                 "@9",
                 "-hbf",
@@ -1231,8 +1239,20 @@ mod tests {
                 "40",
                 &attach_command,
             ],
+            "%9\n",
+        );
+        mock.stub(
+            &[
+                "set-option",
+                "-p",
+                "-t",
+                "%9",
+                crate::options::KEY_SIDEBAR_MARKER,
+                "1",
+            ],
             "",
         );
+        mock.stub(&["resize-pane", "-t", "%9", "-x", "40"], "");
         mock.stub(
             &["set-option", "-g", "@vde_client_636c69656e74_public", "zsh"],
             "",
@@ -1243,8 +1263,9 @@ mod tests {
 
         assert!(mock.calls().iter().any(|call| {
             call.first().map(String::as_str) == Some("split-window")
-                && call.get(2).map(String::as_str) == Some("-t")
-                && call.get(3).map(String::as_str) == Some("@9")
+                && call
+                    .windows(2)
+                    .any(|pair| pair[0] == "-t" && pair[1] == "@9")
         }));
         let calls = mock.calls();
         let switch_index = calls

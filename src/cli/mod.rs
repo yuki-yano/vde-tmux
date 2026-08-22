@@ -1087,7 +1087,12 @@ where
     let loaded = load_config(env);
     let is_json_api = matches!(
         &cli.command,
-        Command::Api { .. } | Command::Pane { .. } | Command::Agent { .. }
+        Command::Api { .. }
+            | Command::Pane { .. }
+            | Command::Agent { .. }
+            | Command::Sidebar {
+                command: sidebar::SidebarCommand::PrepareLayout { .. }
+            }
     );
     if !is_json_api {
         emit_config_warnings(&loaded.warnings, warning_writer)?;

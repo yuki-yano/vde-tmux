@@ -1,4 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,6 +18,7 @@ pub(crate) const ENV_SELECTION_SESSION: &str = "VDE_TMUX_SELECTION_SESSION";
 const RAIL_WIDTH: u16 = 3;
 const AFTER_NEW_WINDOW_HOOK: &str = "after-new-window[90]";
 const PANE_EXIT_HOOK: &str = "pane-exited[90]";
+const PREPARE_LOCK_DIR: &str = "sidebar-prepare-locks-v1";
 pub(crate) const SOURCE_CLIENT_MISMATCH_SENTINEL: &str = "__vde_source_client_mismatch__";
 const TARGET_PANE_MISMATCH_SENTINEL: &str = "__vde_target_pane_mismatch__";
 
@@ -21,6 +26,48 @@ const TARGET_PANE_MISMATCH_SENTINEL: &str = "__vde_target_pane_mismatch__";
 struct SidebarPane {
     pane_id: String,
     width: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrepareLayoutStatus {
+    Ready,
+    Absent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrepareLayoutResult {
+    pub window_id: String,
+    pub status: PrepareLayoutStatus,
+    pub reserved_panes: Vec<String>,
+    pub content_anchor: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparePurpose {
+    Public,
+    LayoutApplied,
+    AutoAll,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparePane {
+    pane_id: String,
+    sidebar: bool,
+    width: u16,
+}
+
+#[derive(Debug)]
+struct PrepareLock {
+    file: File,
+}
+
+impl Drop for PrepareLock {
+    fn drop(&mut self) {
+        // SAFETY: `file` owns a valid descriptor until after this Drop returns.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +146,8 @@ pub(crate) fn open_with_attach_context(
         min_width,
         attach_context,
         SidebarOpenMode::Focused,
-    )
+    )?;
+    Ok(())
 }
 
 pub fn open_if_auto_all_enabled(
@@ -112,18 +160,15 @@ pub fn open_if_auto_all_enabled(
     if !auto_all_enabled(runner)? {
         return Ok(());
     }
-    if find_sidebar_pane(runner, target)?.is_some() {
-        return Ok(());
-    }
-    open_unchecked(
+    let _ = prepare_layout_inner(
         runner,
         target,
         self_exe,
         width,
         min_width,
-        None,
-        SidebarOpenMode::Detached,
-    )
+        PreparePurpose::AutoAll,
+    )?;
+    Ok(())
 }
 
 pub fn close(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
@@ -176,7 +221,8 @@ pub(crate) fn toggle_with_attach_context(
             min_width,
             attach_context,
             SidebarOpenMode::Focused,
-        )
+        )?;
+        Ok(())
     }
 }
 
@@ -460,21 +506,148 @@ pub fn layout_applied(
     width: SidebarWidth,
     min_width: u16,
 ) -> Result<()> {
-    let Some(panes) = capture_existing_pane_ids(runner, target)? else {
-        return Ok(());
-    };
-    if let Some(sidebar) = find_sidebar_pane(runner, target)? {
-        return reconcile_existing_sidebar(runner, &panes, &sidebar);
-    }
-    open_unchecked(
+    let _ = prepare_layout_inner(
         runner,
         target,
         self_exe,
         width,
         min_width,
-        None,
-        SidebarOpenMode::Detached,
-    )
+        PreparePurpose::LayoutApplied,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn prepare_layout(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    self_exe: &Path,
+    width: SidebarWidth,
+    min_width: u16,
+) -> Result<PrepareLayoutResult> {
+    prepare_layout_inner(
+        runner,
+        target,
+        self_exe,
+        width,
+        min_width,
+        PreparePurpose::Public,
+    )?
+    .context("target window disappeared while preparing its sidebar layout")
+}
+
+fn prepare_layout_inner(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    self_exe: &Path,
+    width: SidebarWidth,
+    min_width: u16,
+    purpose: PreparePurpose,
+) -> Result<Option<PrepareLayoutResult>> {
+    validate_window_id(target)?;
+    let server_pid = resolve_tmux_server_pid(runner)?;
+    let _lock = acquire_prepare_lock(server_pid, target)?;
+
+    let window_id = match resolve_exact_window_id(runner, target) {
+        Ok(window_id) => window_id,
+        Err(_) if purpose == PreparePurpose::LayoutApplied => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut panes = match capture_prepare_panes(runner, &window_id) {
+        Ok(panes) => panes,
+        Err(_) if purpose == PreparePurpose::LayoutApplied => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    panes.sort_by(|left, right| left.pane_id.cmp(&right.pane_id));
+
+    let content_anchor = panes
+        .iter()
+        .find(|pane| !pane.sidebar)
+        .map(|pane| pane.pane_id.clone());
+    let mut sidebars = panes
+        .iter()
+        .filter(|pane| pane.sidebar)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let Some(content_anchor) = content_anchor else {
+        if purpose == PreparePurpose::LayoutApplied && panes.len() == 1 && sidebars.len() == 1 {
+            let sidebar = sidebars.remove(0);
+            close_lonely_sidebar_pane(
+                runner,
+                &SidebarPane {
+                    pane_id: sidebar.pane_id,
+                    width: sidebar.width,
+                },
+            )?;
+            return Ok(None);
+        }
+        if purpose == PreparePurpose::AutoAll && !panes.is_empty() {
+            return Ok(None);
+        }
+        bail!("window {window_id} has no non-sidebar content pane");
+    };
+
+    if sidebars.is_empty() {
+        let create = match purpose {
+            PreparePurpose::LayoutApplied | PreparePurpose::AutoAll => true,
+            PreparePurpose::Public => auto_all_enabled(runner)?,
+        };
+        if !create {
+            return Ok(Some(PrepareLayoutResult {
+                window_id,
+                status: PrepareLayoutStatus::Absent,
+                reserved_panes: Vec::new(),
+                content_anchor,
+            }));
+        }
+        sidebars.push(PreparePane {
+            pane_id: open_unchecked(
+                runner,
+                &window_id,
+                self_exe,
+                width,
+                min_width,
+                None,
+                SidebarOpenMode::Detached,
+            )?
+            .pane_id,
+            sidebar: true,
+            width: 0,
+        });
+    } else {
+        reconcile_sidebar_widths(runner, &window_id, &sidebars, width, min_width)?;
+    }
+
+    let mut reserved_panes = sidebars
+        .into_iter()
+        .map(|pane| pane.pane_id)
+        .collect::<Vec<_>>();
+    reserved_panes.sort();
+    reserved_panes.dedup();
+    Ok(Some(PrepareLayoutResult {
+        window_id,
+        status: PrepareLayoutStatus::Ready,
+        reserved_panes,
+        content_anchor,
+    }))
+}
+
+fn reconcile_sidebar_widths(
+    runner: &dyn TmuxRunner,
+    target: &str,
+    sidebars: &[PreparePane],
+    width: SidebarWidth,
+    min_width: u16,
+) -> Result<()> {
+    let layout = capture_window_layout(runner, target)?;
+    let width = resolve_width(&layout, width, min_width)?;
+    let width_arg = width.to_string();
+    for sidebar in sidebars {
+        if sidebar.width != width {
+            runner.run(&["resize-pane", "-t", &sidebar.pane_id, "-x", &width_arg])?;
+        }
+    }
+    Ok(())
 }
 
 pub fn layout_changed(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
@@ -511,7 +684,7 @@ fn open_unchecked(
     min_width: u16,
     attach_context: Option<&SidebarAttachContext>,
     mode: SidebarOpenMode,
-) -> Result<()> {
+) -> Result<SidebarPane> {
     let layout = capture_window_layout(runner, target)?;
     let width = resolve_width(&layout, width, min_width)?;
     let socket_name = std::env::var("VDE_TMUX_SOCKET_NAME")
@@ -523,9 +696,30 @@ fn open_unchecked(
     if mode == SidebarOpenMode::Detached {
         args.push("-d");
     }
+    args.extend(["-P", "-F", "#{pane_id}"]);
     args.extend(["-t", target, "-hbf", "-l", &width, &command]);
-    runner.run(&args)?;
-    Ok(())
+    let pane_id = parse_created_pane_id(&runner.run(&args)?)?;
+    runner.run(&["set-option", "-p", "-t", &pane_id, KEY_SIDEBAR_MARKER, "1"])?;
+    runner.run(&["resize-pane", "-t", &pane_id, "-x", &width])?;
+    Ok(SidebarPane {
+        pane_id,
+        width: width
+            .parse()
+            .context("resolved sidebar width is not a valid pane width")?,
+    })
+}
+
+fn parse_created_pane_id(output: &str) -> Result<String> {
+    let panes = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let [pane_id] = panes.as_slice() else {
+        bail!("tmux did not return exactly one created sidebar pane ID");
+    };
+    validate_pane_id(pane_id).context("tmux returned an invalid created sidebar pane ID")?;
+    Ok((*pane_id).to_string())
 }
 
 fn resolve_width(layout: &str, width: SidebarWidth, min_width: u16) -> Result<u16> {
@@ -577,6 +771,139 @@ fn parse_sidebar_pane_line(line: &str) -> Option<SidebarPane> {
         pane_id: pane_id.to_string(),
         width,
     })
+}
+
+fn validate_window_id(window_id: &str) -> Result<()> {
+    validate_tmux_id(window_id, '@', "window")
+}
+
+fn validate_pane_id(pane_id: &str) -> Result<()> {
+    validate_tmux_id(pane_id, '%', "pane")
+}
+
+fn validate_tmux_id(value: &str, prefix: char, kind: &str) -> Result<()> {
+    let Some(number) = value.strip_prefix(prefix) else {
+        bail!("invalid tmux {kind} ID: {value:?}");
+    };
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("invalid tmux {kind} ID: {value:?}");
+    }
+    Ok(())
+}
+
+fn resolve_tmux_server_pid(runner: &dyn TmuxRunner) -> Result<u32> {
+    let output = runner.run(&["display-message", "-p", "#{pid}"])?;
+    let value = output.trim();
+    if value.is_empty() || value.lines().count() != 1 {
+        bail!("tmux did not return exactly one server PID");
+    }
+    value.parse().context("tmux returned an invalid server PID")
+}
+
+fn resolve_exact_window_id(runner: &dyn TmuxRunner, target: &str) -> Result<String> {
+    let output = runner.run(&["display-message", "-p", "-t", target, "-F", "#{window_id}"])?;
+    let window_id = output.trim();
+    validate_window_id(window_id).context("tmux returned an invalid target window ID")?;
+    if window_id != target {
+        bail!("tmux target {target} resolved to unexpected window {window_id}");
+    }
+    Ok(window_id.to_string())
+}
+
+fn capture_prepare_panes(runner: &dyn TmuxRunner, target: &str) -> Result<Vec<PreparePane>> {
+    let output = runner.run(&["list-panes", "-t", target, "-F", SIDEBAR_PANE_FORMAT])?;
+    let panes = output
+        .lines()
+        .map(parse_prepare_pane_line)
+        .collect::<Result<Vec<_>>>()?;
+    if panes.is_empty() {
+        bail!("window {target} has no panes");
+    }
+    let mut ids = BTreeSet::new();
+    if panes.iter().any(|pane| !ids.insert(pane.pane_id.clone())) {
+        bail!("tmux returned duplicate pane IDs for window {target}");
+    }
+    Ok(panes)
+}
+
+fn parse_prepare_pane_line(line: &str) -> Result<PreparePane> {
+    let mut fields = line.split('\t');
+    let pane_id = fields.next().context("tmux pane row is missing pane_id")?;
+    let marker = fields
+        .next()
+        .context("tmux pane row is missing sidebar marker")?;
+    let width = fields
+        .next()
+        .context("tmux pane row is missing pane width")?;
+    if fields.next().is_some() {
+        bail!("tmux pane row contains unexpected fields");
+    }
+    validate_pane_id(pane_id)?;
+    let width = width
+        .parse::<u16>()
+        .context("tmux pane row contains an invalid pane width")?;
+    Ok(PreparePane {
+        pane_id: pane_id.to_string(),
+        sidebar: marker == "1",
+        width,
+    })
+}
+
+fn acquire_prepare_lock(server_pid: u32, window_id: &str) -> Result<PrepareLock> {
+    let directory = crate::runtime_dir::per_user_runtime_root().join(PREPARE_LOCK_DIR);
+    crate::runtime_dir::ensure_secure_runtime_dir(&directory)?;
+    let window_number = window_id
+        .strip_prefix('@')
+        .context("validated window ID lost its prefix")?;
+    let path = directory.join(format!("{server_pid}-{window_number}.lock"));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("failed to open sidebar prepare lock {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat sidebar prepare lock {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "sidebar prepare lock is not a regular file: {}",
+            path.display()
+        );
+    }
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid {
+        bail!(
+            "sidebar prepare lock owner mismatch for {}: expected uid {}, got {}",
+            path.display(),
+            euid,
+            metadata.uid()
+        );
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        bail!(
+            "sidebar prepare lock mode mismatch for {}: expected 600, got {:o}",
+            path.display(),
+            mode
+        );
+    }
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the duration of this call.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != -1 {
+            return Ok(PrepareLock { file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(error).with_context(|| {
+                format!("failed to lock sidebar prepare lock {}", path.display())
+            });
+        }
+    }
 }
 
 fn capture_window_layout(runner: &dyn TmuxRunner, target: &str) -> Result<String> {
@@ -1191,8 +1518,79 @@ mod tests {
     use super::*;
     use crate::options::KEY_SIDEBAR_MARKER;
     use crate::tmux::mock::MockTmuxRunner;
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    #[derive(Debug, Default)]
+    struct ReentrantPrepareState {
+        calls: Vec<Vec<String>>,
+        sidebar_marked: bool,
+        sidebar_width: u16,
+        split_count: usize,
+    }
+
+    #[derive(Debug, Default)]
+    struct ReentrantPrepareRunner {
+        state: RefCell<ReentrantPrepareState>,
+    }
+
+    impl TmuxRunner for ReentrantPrepareRunner {
+        fn run(&self, args: &[&str]) -> Result<String> {
+            let mut state = self.state.borrow_mut();
+            state.calls.push(
+                args.iter()
+                    .map(|argument| (*argument).to_string())
+                    .collect(),
+            );
+            match args {
+                ["display-message", "-p", "#{pid}"] => Ok("424248\n".to_string()),
+                ["display-message", "-p", "-t", "@12", "-F", "#{window_id}"] => {
+                    Ok("@12\n".to_string())
+                }
+                ["list-panes", "-t", "@12", "-F", format] if *format == SIDEBAR_PANE_FORMAT => {
+                    if state.sidebar_marked {
+                        Ok(format!("%22\t\t80\n%23\t1\t{}\n", state.sidebar_width))
+                    } else {
+                        Ok("%22\t\t80\n".to_string())
+                    }
+                }
+                [
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "@12",
+                    "-F",
+                    "#{window_layout}",
+                ] => Ok("layout-before\n".to_string()),
+                [
+                    "split-window",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    "@12",
+                    "-hbf",
+                    "-l",
+                    "40",
+                    _,
+                ] => {
+                    state.split_count += 1;
+                    Ok("%23\n".to_string())
+                }
+                ["set-option", "-p", "-t", "%23", marker, "1"] if *marker == KEY_SIDEBAR_MARKER => {
+                    state.sidebar_marked = true;
+                    Ok(String::new())
+                }
+                ["resize-pane", "-t", "%23", "-x", "40"] => {
+                    state.sidebar_width = 40;
+                    Ok(String::new())
+                }
+                _ => bail!("unexpected reentrant prepare tmux call: {args:?}"),
+            }
+        }
+    }
 
     fn exe() -> PathBuf {
         PathBuf::from("/tmp/vt")
@@ -1219,10 +1617,21 @@ mod tests {
         );
     }
 
+    fn stub_prepare_context(mock: &MockTmuxRunner, target: &str) {
+        mock.stub(&["display-message", "-p", "#{pid}"], "424242\n");
+        mock.stub(
+            &["display-message", "-p", "-t", target, "-F", "#{window_id}"],
+            &format!("{target}\n"),
+        );
+    }
+
     fn stub_split(mock: &MockTmuxRunner, target: &str, width: &str) {
         mock.stub(
             &[
                 "split-window",
+                "-P",
+                "-F",
+                "#{pane_id}",
                 "-t",
                 target,
                 "-hbf",
@@ -1230,8 +1639,13 @@ mod tests {
                 width,
                 "'/tmp/vt' sidebar attach",
             ],
+            "%9\n",
+        );
+        mock.stub(
+            &["set-option", "-p", "-t", "%9", KEY_SIDEBAR_MARKER, "1"],
             "",
         );
+        mock.stub(&["resize-pane", "-t", "%9", "-x", width], "");
     }
 
     fn stub_detached_split(mock: &MockTmuxRunner, target: &str, width: &str) {
@@ -1239,6 +1653,9 @@ mod tests {
             &[
                 "split-window",
                 "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
                 "-t",
                 target,
                 "-hbf",
@@ -1246,8 +1663,13 @@ mod tests {
                 width,
                 "'/tmp/vt' sidebar attach",
             ],
+            "%9\n",
+        );
+        mock.stub(
+            &["set-option", "-p", "-t", "%9", KEY_SIDEBAR_MARKER, "1"],
             "",
         );
+        mock.stub(&["resize-pane", "-t", "%9", "-x", width], "");
     }
 
     fn called(mock: &MockTmuxRunner, expected: &[&str]) -> bool {
@@ -1313,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    fn open_splits_sidebar_pane_without_saving_baseline() {
+    fn open_marks_and_resizes_the_created_sidebar_without_saving_a_baseline() {
         let mock = MockTmuxRunner::new();
         stub_sidebar_panes(&mock, "@1", "%1\t\t80\n");
         stub_window_layout(&mock, "@1", "layout-before\n");
@@ -1322,12 +1744,12 @@ mod tests {
         open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
         let calls = mock.calls();
-        assert_eq!(calls.len(), 3);
-        assert!(
-            !calls
-                .iter()
-                .any(|call| call.first().map(String::as_str) == Some("set-option"))
-        );
+        assert_eq!(calls.len(), 5);
+        assert!(called(
+            &mock,
+            &["set-option", "-p", "-t", "%9", KEY_SIDEBAR_MARKER, "1"]
+        ));
+        assert!(called(&mock, &["resize-pane", "-t", "%9", "-x", "40"]));
     }
 
     #[test]
@@ -1343,6 +1765,9 @@ mod tests {
             &mock,
             &[
                 "split-window",
+                "-P",
+                "-F",
+                "#{pane_id}",
                 "-t",
                 "@1",
                 "-hbf",
@@ -1400,6 +1825,9 @@ mod tests {
             &mock,
             &[
                 "split-window",
+                "-P",
+                "-F",
+                "#{pane_id}",
                 "-t",
                 "@1",
                 "-hbf",
@@ -1412,6 +1840,9 @@ mod tests {
             &mock,
             &[
                 "split-window",
+                "-P",
+                "-F",
+                "#{pane_id}",
                 "-t",
                 "@1",
                 "-hbf",
@@ -1475,7 +1906,7 @@ mod tests {
         focus_toggle(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
         let calls = mock.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 5);
         assert!(calls.iter().any(|call| {
             call.first().map(String::as_str) == Some("split-window")
                 && !call.iter().any(|argument| argument == "-d")
@@ -1502,11 +1933,10 @@ mod tests {
                 .iter()
                 .any(|call| call.first().map(String::as_str) == Some("select-layout"))
         );
-        assert!(
-            !calls
-                .iter()
-                .any(|call| call.first().map(String::as_str) == Some("set-option"))
-        );
+        assert!(called(
+            &mock,
+            &["set-option", "-p", "-t", "%9", KEY_SIDEBAR_MARKER, "1"]
+        ));
     }
 
     #[test]
@@ -1550,11 +1980,10 @@ mod tests {
                 .iter()
                 .any(|call| call.first().map(String::as_str) == Some("select-layout"))
         );
-        assert!(
-            !calls
-                .iter()
-                .any(|call| call.first().map(String::as_str) == Some("set-option"))
-        );
+        assert!(called(
+            &mock,
+            &["set-option", "-p", "-t", "%9", KEY_SIDEBAR_MARKER, "1"]
+        ));
     }
 
     #[test]
@@ -1700,7 +2129,7 @@ mod tests {
         toggle_all(&mock, &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
         let calls = mock.calls();
-        assert_eq!(calls.len(), 9);
+        assert_eq!(calls.len(), 13);
         assert!(calls.iter().any(|call| {
             call.first().map(String::as_str) == Some("set-hook")
                 && call.get(2).map(String::as_str) == Some("pane-exited[90]")
@@ -1793,20 +2222,20 @@ mod tests {
     #[test]
     fn layout_applied_opens_when_sidebar_is_absent() {
         let mock = MockTmuxRunner::new();
-        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n");
+        stub_prepare_context(&mock, "@1");
         stub_sidebar_panes(&mock, "@1", "%1\t\t80\n");
         stub_window_layout(&mock, "@1", "layout-before\n");
         stub_detached_split(&mock, "@1", "32");
 
         layout_applied(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
 
-        assert_eq!(mock.calls().len(), 4);
+        assert_eq!(mock.calls().len(), 7);
     }
 
     #[test]
     fn layout_applied_closes_window_when_only_sidebar_remains() {
         let mock = MockTmuxRunner::new();
-        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%9\n");
+        stub_prepare_context(&mock, "@1");
         stub_sidebar_panes(&mock, "@1", "%9\t1\t40\n");
         mock.stub(&["kill-pane", "-t", "%9"], "");
 
@@ -1817,7 +2246,7 @@ mod tests {
         assert!(
             !calls
                 .iter()
-                .any(|call| call.first().map(String::as_str) == Some("display-message")),
+                .any(|call| call.first().map(String::as_str) == Some("split-window")),
             "{calls:?}"
         );
     }
@@ -1855,8 +2284,10 @@ mod tests {
     #[test]
     fn layout_applied_keeps_existing_sidebar_when_non_sidebar_pane_remains() {
         let mock = MockTmuxRunner::new();
-        mock.stub(&["list-panes", "-t", "@1", "-F", "#{pane_id}"], "%1\n%9\n");
+        stub_prepare_context(&mock, "@1");
         stub_sidebar_panes(&mock, "@1", "%1\t\t80\n%9\t1\t40\n");
+        stub_window_layout(&mock, "@1", "layout-before\n");
+        mock.stub(&["resize-pane", "-t", "%9", "-x", "32"], "");
 
         layout_applied(&mock, "@1", &exe(), SidebarWidth::Columns(32), 40).unwrap();
 
@@ -1867,12 +2298,259 @@ mod tests {
                 .any(|call| call.first().map(String::as_str) == Some("kill-pane")),
             "{calls:?}"
         );
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 5);
         assert!(
             !calls
                 .iter()
                 .any(|call| call.first().map(String::as_str) == Some("set-option"))
         );
+    }
+
+    #[test]
+    fn prepare_layout_reuses_and_reconciles_existing_sidebars_in_stable_order() {
+        let mock = MockTmuxRunner::new();
+        stub_prepare_context(&mock, "@12");
+        stub_sidebar_panes(&mock, "@12", "%30\t1\t20\n%22\t\t80\n%23\t1\t30\n");
+        stub_window_layout(&mock, "@12", "layout-before\n");
+        mock.stub(&["resize-pane", "-t", "%23", "-x", "40"], "");
+        mock.stub(&["resize-pane", "-t", "%30", "-x", "40"], "");
+
+        let result = prepare_layout(&mock, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        assert_eq!(
+            result,
+            PrepareLayoutResult {
+                window_id: "@12".to_string(),
+                status: PrepareLayoutStatus::Ready,
+                reserved_panes: vec!["%23".to_string(), "%30".to_string()],
+                content_anchor: "%22".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn prepare_layout_creates_marks_then_resizes_sidebar_when_auto_all_is_enabled() {
+        let mock = MockTmuxRunner::new();
+        stub_prepare_context(&mock, "@12");
+        stub_sidebar_panes(&mock, "@12", "%22\t\t80\n");
+        mock.stub(
+            &["show-hooks", "-g", AFTER_NEW_WINDOW_HOOK],
+            "after-new-window[90] run-shell 'vt sidebar layout-applied'\n",
+        );
+        stub_window_layout(&mock, "@12", "layout-before\n");
+        stub_detached_split(&mock, "@12", "40");
+
+        let result = prepare_layout(&mock, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        assert_eq!(result.status, PrepareLayoutStatus::Ready);
+        assert_eq!(result.reserved_panes, ["%9"]);
+        assert_eq!(result.content_anchor, "%22");
+        let calls = mock.calls();
+        let split = calls
+            .iter()
+            .position(|call| call.first().map(String::as_str) == Some("split-window"))
+            .unwrap();
+        let marker = calls
+            .iter()
+            .position(|call| {
+                call.iter().map(String::as_str).eq([
+                    "set-option",
+                    "-p",
+                    "-t",
+                    "%9",
+                    KEY_SIDEBAR_MARKER,
+                    "1",
+                ])
+            })
+            .unwrap();
+        let resize = calls
+            .iter()
+            .position(|call| {
+                call.iter()
+                    .map(String::as_str)
+                    .eq(["resize-pane", "-t", "%9", "-x", "40"])
+            })
+            .unwrap();
+        assert!(split < marker && marker < resize, "{calls:?}");
+    }
+
+    #[test]
+    fn prepare_layout_returns_absent_without_creating_when_auto_all_is_disabled() {
+        let mock = MockTmuxRunner::new();
+        stub_prepare_context(&mock, "@12");
+        stub_sidebar_panes(&mock, "@12", "%22\t\t80\n");
+        mock.stub(
+            &["show-hooks", "-g", AFTER_NEW_WINDOW_HOOK],
+            "after-new-window[90] \n",
+        );
+
+        let result = prepare_layout(&mock, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        assert_eq!(
+            result,
+            PrepareLayoutResult {
+                window_id: "@12".to_string(),
+                status: PrepareLayoutStatus::Absent,
+                reserved_panes: Vec::new(),
+                content_anchor: "%22".to_string(),
+            }
+        );
+        assert!(
+            !mock
+                .calls()
+                .iter()
+                .any(|call| { call.first().map(String::as_str) == Some("split-window") })
+        );
+    }
+
+    #[test]
+    fn prepare_layout_errors_when_no_content_anchor_exists() {
+        let mock = MockTmuxRunner::new();
+        stub_prepare_context(&mock, "@12");
+        stub_sidebar_panes(&mock, "@12", "%23\t1\t40\n");
+
+        let error =
+            prepare_layout(&mock, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap_err();
+
+        assert!(error.to_string().contains("no non-sidebar content pane"));
+        assert!(!called(&mock, &["kill-pane", "-t", "%23"]));
+    }
+
+    #[test]
+    fn prepare_layout_propagates_window_lookup_failure() {
+        let mock = MockTmuxRunner::new();
+        mock.stub(&["display-message", "-p", "#{pid}"], "424249\n");
+
+        let error =
+            prepare_layout(&mock, "@404", &exe(), SidebarWidth::Columns(40), 40).unwrap_err();
+
+        assert!(error.to_string().contains("no stub registered"));
+        assert!(!mock.calls().iter().any(|call| {
+            matches!(
+                call.first().map(String::as_str),
+                Some("split-window" | "set-option" | "resize-pane")
+            )
+        }));
+    }
+
+    #[test]
+    fn prepare_layout_fails_before_width_reconcile_when_marker_setting_fails() {
+        let mock = MockTmuxRunner::new();
+        stub_prepare_context(&mock, "@12");
+        stub_sidebar_panes(&mock, "@12", "%22\t\t80\n");
+        mock.stub(
+            &["show-hooks", "-g", AFTER_NEW_WINDOW_HOOK],
+            "after-new-window[90] run-shell 'vt sidebar layout-applied'\n",
+        );
+        stub_window_layout(&mock, "@12", "layout-before\n");
+        mock.stub(
+            &[
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "@12",
+                "-hbf",
+                "-l",
+                "40",
+                "'/tmp/vt' sidebar attach",
+            ],
+            "%23\n",
+        );
+
+        let error =
+            prepare_layout(&mock, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap_err();
+
+        assert!(error.to_string().contains("no stub registered"));
+        assert!(!called(&mock, &["resize-pane", "-t", "%23", "-x", "40"]));
+    }
+
+    #[test]
+    fn prepare_layout_propagates_width_reconcile_failure_after_marking() {
+        let mock = MockTmuxRunner::new();
+        stub_prepare_context(&mock, "@12");
+        stub_sidebar_panes(&mock, "@12", "%22\t\t80\n");
+        mock.stub(
+            &["show-hooks", "-g", AFTER_NEW_WINDOW_HOOK],
+            "after-new-window[90] run-shell 'vt sidebar layout-applied'\n",
+        );
+        stub_window_layout(&mock, "@12", "layout-before\n");
+        mock.stub(
+            &[
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "@12",
+                "-hbf",
+                "-l",
+                "40",
+                "'/tmp/vt' sidebar attach",
+            ],
+            "%23\n",
+        );
+        mock.stub(
+            &["set-option", "-p", "-t", "%23", KEY_SIDEBAR_MARKER, "1"],
+            "",
+        );
+
+        let error =
+            prepare_layout(&mock, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap_err();
+
+        assert!(error.to_string().contains("no stub registered"));
+        assert!(called(
+            &mock,
+            &["set-option", "-p", "-t", "%23", KEY_SIDEBAR_MARKER, "1"]
+        ));
+    }
+
+    #[test]
+    fn prepare_layout_reentry_returns_the_same_sidebar_without_another_split() {
+        let mock = MockTmuxRunner::new();
+        stub_prepare_context(&mock, "@12");
+        stub_sidebar_panes(&mock, "@12", "%22\t\t80\n%23\t1\t40\n");
+        stub_window_layout(&mock, "@12", "layout-before\n");
+
+        let first = prepare_layout(&mock, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+        let second = prepare_layout(&mock, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        assert_eq!(first, second);
+        assert!(
+            !mock
+                .calls()
+                .iter()
+                .any(|call| { call.first().map(String::as_str) == Some("split-window") })
+        );
+    }
+
+    #[test]
+    fn layout_applied_then_prepare_layout_reuses_the_synchronously_marked_sidebar() {
+        let runner = ReentrantPrepareRunner::default();
+
+        layout_applied(&runner, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+        let result = prepare_layout(&runner, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+
+        let state = runner.state.borrow();
+        assert_eq!(state.split_count, 1);
+        assert!(state.sidebar_marked);
+        assert_eq!(state.sidebar_width, 40);
+        assert_eq!(result.reserved_panes, ["%23"]);
+        assert_eq!(result.content_anchor, "%22");
+    }
+
+    #[test]
+    fn prepare_layout_rejects_invalid_window_ids_before_tmux_mutation() {
+        let mock = MockTmuxRunner::new();
+
+        let error =
+            prepare_layout(&mock, "main:1", &exe(), SidebarWidth::Columns(40), 40).unwrap_err();
+
+        assert!(error.to_string().contains("invalid tmux window ID"));
+        assert!(mock.calls().is_empty());
     }
 
     #[test]

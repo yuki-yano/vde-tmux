@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
+use serde::Serialize;
 
 use crate::config::SidebarWidth;
 use crate::tmux::TmuxRunner;
@@ -62,6 +63,13 @@ pub(crate) enum SidebarCommand {
         #[arg(long, value_parser = parse_sidebar_width)]
         width: Option<SidebarWidth>,
     },
+    #[command(name = "prepare-layout")]
+    PrepareLayout {
+        #[arg(long)]
+        window: String,
+        #[arg(long, required = true)]
+        json: bool,
+    },
     #[command(name = "layout-changed")]
     LayoutChanged {
         #[arg(long)]
@@ -85,7 +93,53 @@ impl SidebarCommand {
                 | Self::Toggle { .. }
                 | Self::Rail { .. }
                 | Self::LayoutApplied { .. }
+                | Self::PrepareLayout { .. }
         )
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct PrepareLayoutOutput {
+    window_id: String,
+    status: PrepareLayoutOutputStatus,
+    reserved_panes: Vec<ReservedPaneOutput>,
+    content_anchor: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum PrepareLayoutOutputStatus {
+    Ready,
+    Absent,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ReservedPaneOutput {
+    pane_id: String,
+    role: &'static str,
+}
+
+impl From<crate::sidebar::layout::PrepareLayoutResult> for PrepareLayoutOutput {
+    fn from(result: crate::sidebar::layout::PrepareLayoutResult) -> Self {
+        let status = match result.status {
+            crate::sidebar::layout::PrepareLayoutStatus::Ready => PrepareLayoutOutputStatus::Ready,
+            crate::sidebar::layout::PrepareLayoutStatus::Absent => {
+                PrepareLayoutOutputStatus::Absent
+            }
+        };
+        Self {
+            window_id: result.window_id,
+            status,
+            reserved_panes: result
+                .reserved_panes
+                .into_iter()
+                .map(|pane_id| ReservedPaneOutput {
+                    pane_id,
+                    role: "sidebar",
+                })
+                .collect(),
+            content_anchor: result.content_anchor,
+        }
     }
 }
 
@@ -239,6 +293,22 @@ where
                 config.sidebar.min_width,
             )?;
             Ok(None)
+        }
+        SidebarCommand::PrepareLayout { window, json } => {
+            if !json {
+                bail!("--json is required for sidebar prepare-layout");
+            }
+            let result = crate::sidebar::layout::prepare_layout(
+                runner,
+                &window,
+                &std::env::current_exe()?,
+                config.sidebar.width,
+                config.sidebar.min_width,
+            )?;
+            let output = PrepareLayoutOutput::from(result);
+            Ok(Some(serde_json::to_string(&output).context(
+                "failed to serialize sidebar prepare-layout response",
+            )?))
         }
         SidebarCommand::LayoutChanged { window } => {
             let target = resolve_window_target(runner, window)?;
