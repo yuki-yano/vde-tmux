@@ -1856,7 +1856,7 @@ fn missing_reference_error(error: StoreError, context: &str) -> StoreError {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     use super::*;
     use crate::agent_state::{

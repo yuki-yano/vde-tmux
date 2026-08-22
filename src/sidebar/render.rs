@@ -2710,7 +2710,7 @@ mod tests {
         assert!(mode_style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(
             build_header_layout(&state, 80).lines[1].text,
-            format!(" ◉ Current · ≣ Tree     ▾ \u{e0b0}")
+            " ◉ Current · ≣ Tree     ▾ \u{e0b0}".to_string()
         );
     }
 
@@ -3000,7 +3000,7 @@ sidebar:
         assert_eq!(header.lines[0].text, " SIDEBAR");
         assert_eq!(
             header.lines[1].text,
-            format!(" ◉ All     · ≣ Tree     ▾ \u{e0b0}")
+            " ◉ All     · ≣ Tree     ▾ \u{e0b0}".to_string()
         );
         assert_eq!(header.lines[2].text, " ≡ 7  ▲ 1  ● 1  ✓ 0  ○ 5 ");
         let section = style_for_segment(&header, 0, "SIDEBAR");
