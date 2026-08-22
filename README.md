@@ -456,6 +456,7 @@ badge:
 
 `statusline.summary.format` supports the `{badge}` and `{count}` placeholders, such as `{badge}{count}` or `{badge}: {count}`.
 Zero-count states remain visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
+When enabled, the summary remains visible even when category or window content is long.
 
 `sidebar.task_summary.enabled` adds a short persistent-task summary to collapsed and expanded agent
 rows. The daemon generates it asynchronously with an isolated CLI matching the pane agent (`codex

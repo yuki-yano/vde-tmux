@@ -172,23 +172,9 @@ pub fn build_display_frame(
     );
 
     for (session_id, mut rendered) in rendered_sessions {
-        // The ordered session action model is deliberately complete and may exceed the visual
-        // target. Keep the intrinsic guard for the remaining status content only; tmux clips the
-        // full session list to the actual terminal width without replacing targets with `+N`.
-        let bounded_status_width = [
-            &rendered.summary,
-            &rendered.category,
-            &rendered.windows,
-            &rendered.attention,
-        ]
-        .into_iter()
-        .map(|segment| crate::statusline::structured_status_display_width(segment))
-        .sum::<usize>();
-        if bounded_status_width > crate::statusline::STATUS_OPTION_CELL_BUDGET {
-            return Err(StatusPushError::InvalidDisplaySnapshot(format!(
-                "session {session_id} non-session status projection exceeds the 80-cell budget"
-            )));
-        }
+        // The complete session/category action model and persistent summary may exceed the visual
+        // target. The renderer still uses the target to compact windows and attention, while tmux
+        // performs the final clipping against the actual terminal width.
         if let Some(target_width) = fixed_status_left_width {
             let padding = target_width.saturating_sub(rendered_status_left_width(&rendered));
             if padding > 0 {
@@ -1301,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_budget_is_scoped_to_each_session() {
+    fn summary_is_published_for_every_session_when_projection_overflows() {
         let mut config = Config::default();
         config.badge.glyphs.blocked = "B".repeat(60);
         let mut global = global_snapshot(11);
@@ -1337,7 +1323,9 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(crowded_summary, &DisplayOptionValue::Set(String::new()));
+        assert!(
+            matches!(crowded_summary, DisplayOptionValue::Set(value) if value.contains(&"B".repeat(60)))
+        );
         assert!(matches!(roomy_summary, DisplayOptionValue::Set(value) if !value.is_empty()));
         assert_eq!(
             frame.values().get(&DisplayOptionKey::LegacyGlobalSummary),

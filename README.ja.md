@@ -390,6 +390,7 @@ badge:
 `statusline.summary.format` では `{badge}` と `{count}` の placeholder を使えます（`{badge}{count}`、`{badge}: {count}` など）。
 件数が 0 の状態も表示するため、summary の表示幅は安定します。
 Idle を表示したくない場合は `hide_idle: true` を指定します。
+summary が有効な場合は、category や window の表示が長いときも常に表示します。
 
 `sidebar.task_summary.enabled`を有効にすると、閉じたagent行と展開した詳細へ短いtask要約を表示します。
 daemonはpaneのagentに対応する独立CLI（Codexは`codex exec`、Claudeは`claude -p`）で要約を非同期生成します。

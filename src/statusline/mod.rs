@@ -946,27 +946,11 @@ fn render_bounded_status_snapshot(
     let (attention_full, attention_compact) =
         structured_attention_variants(config, &snapshot.attention);
     let mut attention = attention_full;
-    let summary_candidate = render_structured_summary(config, snapshot.summary);
-    let mut summary = summary_candidate.clone();
+    let summary = render_structured_summary(config, snapshot.summary);
 
     // Keep the complete session action model independent from the bounded status content.
-    // Within the remaining options, summary is useful context but must never displace attention
-    // or the current category/window identities.
-    if status_projection_width(
-        &summary,
-        &category_tokens,
-        &category_included,
-        &session_tokens,
-        &session_included,
-        &window_tokens,
-        &window_included,
-        &attention,
-        config,
-    ) > STATUS_OPTION_CELL_BUDGET
-    {
-        summary.clear();
-    }
-
+    // Summary is the persistent aggregate state indicator. Keep it visible even when category
+    // styling or content makes the bounded projection exceed the shared budget.
     if status_projection_width(
         &summary,
         &category_tokens,
@@ -994,26 +978,6 @@ fn render_bounded_status_snapshot(
     ) > STATUS_OPTION_CELL_BUDGET
     {
         attention = attention_compact;
-    }
-
-    // Compaction can make room for summary again. Reconsider it before any inactive peer so the
-    // published projection continues to follow the documented semantic priority.
-    if summary.is_empty() && !summary_candidate.is_empty() {
-        summary = summary_candidate;
-        if status_projection_width(
-            &summary,
-            &category_tokens,
-            &category_included,
-            &session_tokens,
-            &session_included,
-            &window_tokens,
-            &window_included,
-            &attention,
-            config,
-        ) > STATUS_OPTION_CELL_BUDGET
-        {
-            summary.clear();
-        }
     }
 
     for index in 0..window_tokens.len() {
@@ -2552,6 +2516,7 @@ mod tests {
         assert!(tmux_display_width(&rendered.category) > 80);
         assert_eq!(top_level_user_ranges(&rendered.category).unwrap().len(), 12);
         assert!(!rendered.category.contains("+"), "{}", rendered.category);
+        assert!(!rendered.summary.is_empty(), "{rendered:?}");
         assert!(tmux_display_width(&rendered.windows) <= 80);
         assert!(rendered.windows.contains("+"), "{}", rendered.windows);
         let total = [
@@ -2703,7 +2668,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_summary_never_displaces_attention_or_current_identities() {
+    fn oversized_summary_remains_visible_with_current_action_targets() {
         let mut config = Config::default();
         config.badge.glyphs.blocked = "B".repeat(70);
         let snapshot = StatusSnapshot {
@@ -2728,9 +2693,13 @@ mod tests {
 
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
 
-        assert!(rendered.summary.is_empty(), "{}", rendered.summary);
         assert!(
-            rendered.attention.contains("review"),
+            rendered.summary.contains(&"B".repeat(70)),
+            "{}",
+            rendered.summary
+        );
+        assert!(
+            rendered.attention.contains("▲ blocked"),
             "{}",
             rendered.attention
         );
@@ -2747,7 +2716,7 @@ mod tests {
         .into_iter()
         .map(|segment| tmux_display_width(segment))
         .sum::<usize>();
-        assert!(total <= STATUS_OPTION_CELL_BUDGET, "{total}: {rendered:?}");
+        assert!(total > STATUS_OPTION_CELL_BUDGET, "{total}: {rendered:?}");
     }
 
     #[test]
@@ -2817,7 +2786,7 @@ mod tests {
 
         let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
 
-        assert!(rendered.summary.is_empty(), "{rendered:?}");
+        assert!(!rendered.summary.is_empty(), "{rendered:?}");
         assert!(rendered.category.contains(&"分類🚀".repeat(25)));
         assert!(rendered.sessions.contains(&"界🚀".repeat(100)));
         assert!(rendered.sessions.contains("inactive-peer"));
