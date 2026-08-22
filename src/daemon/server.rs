@@ -3980,6 +3980,7 @@ fn apply_sidebar_preference_intent(
         &state.projection_config,
         &snapshot.panes,
         &snapshot.sidebar_model,
+        &snapshot.events,
         &crate::sidebar::state::SidebarState {
             category_scope: crate::sidebar::state::CategoryScope::All,
             ..crate::sidebar::state::SidebarState::default()

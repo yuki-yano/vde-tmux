@@ -2962,6 +2962,7 @@ fn project_view(snapshot: &ResolvedSnapshot, config: &Config, state: &SidebarSta
         config,
         &snapshot.panes,
         &snapshot.sidebar_model,
+        &snapshot.events,
         state,
         crate::sidebar::tree::now_epoch_secs(),
     );

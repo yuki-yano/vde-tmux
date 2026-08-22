@@ -102,6 +102,7 @@ struct AgentPane {
     wait_reason: String,
     started_at: String,
     completed_at: String,
+    last_activity_at: Option<i64>,
     tasks: String,
     task_items: Vec<TaskItem>,
     subagents: Vec<SubagentDetail>,
@@ -132,6 +133,7 @@ pub struct RowBuildContext {
     pub category_state: crate::category::CategoryState,
     pub categories: crate::category::EffectiveCategoryModel,
     pub repo_identities: BTreeMap<String, crate::category::RepoIdentity>,
+    pub recent_activity: BTreeMap<PaneInstance, i64>,
     pub now: i64,
 }
 
@@ -145,6 +147,7 @@ pub fn project_sidebar(
     config: &Config,
     panes: &[crate::daemon::protocol::v2::PanePresentation],
     model: &crate::daemon::SidebarModel,
+    events: &[crate::daemon::TransitionEvent],
     state: &SidebarState,
     now: i64,
 ) -> SidebarProjection {
@@ -158,6 +161,7 @@ pub fn project_sidebar(
         category_state: model.category_state.clone(),
         categories: model.categories.clone(),
         repo_identities: model.repo_identities.clone(),
+        recent_activity: latest_activity_by_pane(events),
         now,
     };
     let (rows, counts) =
@@ -282,6 +286,8 @@ pub fn build_rows_from_presentations(
                 completed_at: canonical
                     .completed_at
                     .map_or_else(String::new, |value| value.to_string()),
+                last_activity_at: canonical_last_activity_at(canonical)
+                    .max(ctx.recent_activity.get(&pane.pane_instance).copied()),
                 tasks: format!(
                     "{}/{}",
                     canonical.tasks.progress.done, canonical.tasks.progress.total
@@ -1344,15 +1350,52 @@ fn chat_sort_bucket(pane: &AgentPane) -> ChatSortBucket {
 }
 
 fn chat_sort_time(pane: &AgentPane) -> Option<i64> {
-    match chat_sort_bucket(pane) {
-        ChatSortBucket::NeedsAttention | ChatSortBucket::Running => parse_epoch(&pane.started_at),
-        ChatSortBucket::Done => parse_epoch(&pane.completed_at),
-        ChatSortBucket::Idle => None,
-    }
+    pane.last_activity_at
 }
 
-fn parse_epoch(raw: &str) -> Option<i64> {
-    raw.trim().parse().ok()
+fn latest_activity_by_pane(
+    events: &[crate::daemon::TransitionEvent],
+) -> BTreeMap<PaneInstance, i64> {
+    let mut latest: BTreeMap<PaneInstance, i64> = BTreeMap::new();
+    for event in events {
+        latest
+            .entry(event.pane_instance.clone())
+            .and_modify(|current| *current = (*current).max(event.at_epoch))
+            .or_insert(event.at_epoch);
+    }
+    latest
+}
+
+fn canonical_last_activity_at(canonical: &crate::pane_state::PaneState) -> Option<i64> {
+    [
+        canonical.started_at,
+        canonical.completed_at,
+        canonical
+            .unread
+            .latest
+            .as_ref()
+            .map(|occurrence| occurrence.occurred_at),
+        canonical
+            .latest_response
+            .as_ref()
+            .map(|response| response.observed_at),
+        canonical
+            .task_context
+            .summary
+            .as_ref()
+            .map(|summary| summary.generated_at),
+        canonical
+            .worktree_activity
+            .as_ref()
+            .map(|activity| activity.observed_at),
+        canonical
+            .background_process
+            .as_ref()
+            .map(|process| process.observed_at),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
 }
 
 fn repo_id(category: &str, repo: &crate::category::RepoKey) -> String {
@@ -1410,6 +1453,7 @@ mod tests {
             wait_reason: String::new(),
             started_at: "100".to_string(),
             completed_at: completed_at.to_string(),
+            last_activity_at: completed_at.parse().ok().or(Some(100)),
             tasks: "0/0".to_string(),
             task_items: Vec::new(),
             subagents: Vec::new(),
@@ -1857,6 +1901,7 @@ mod tests {
             &Config::default(),
             &snapshot.panes,
             &snapshot.sidebar_model,
+            &snapshot.events,
             &state,
             1_059,
         );
@@ -1864,6 +1909,7 @@ mod tests {
             &Config::default(),
             &snapshot.panes,
             &snapshot.sidebar_model,
+            &snapshot.events,
             &state,
             1_060,
         );
@@ -1895,6 +1941,80 @@ mod tests {
         assert!(!badge_needs_user_input(BadgeState::Done));
         assert!(!badge_needs_user_input(BadgeState::Working));
         assert!(!badge_needs_user_input(BadgeState::Idle));
+    }
+
+    #[test]
+    fn priority_orders_running_and_idle_by_latest_activity() {
+        let make_pane = |pane_id: &str, pane_pid: u32, badge, last_activity_at| {
+            let mut pane = agent_pane(badge, "");
+            pane.pane_instance = PaneInstance {
+                pane_id: pane_id.to_string(),
+                pane_pid,
+            };
+            pane.pane_id = pane_id.to_string();
+            pane.repo = pane_id.to_string();
+            pane.repo_key = crate::category::RepoKey::path(format!("/{pane_pid}"));
+            pane.last_activity_at = Some(last_activity_at);
+            pane
+        };
+        let groups = [
+            make_pane("%1", 1, BadgeState::Working, 200),
+            make_pane("%2", 2, BadgeState::Working, 300),
+            make_pane("%3", 3, BadgeState::Idle, 400),
+            make_pane("%4", 4, BadgeState::Idle, 350),
+        ]
+        .into_iter()
+        .map(|pane| {
+            (
+                (pane.category.clone(), pane.repo_key.to_string()),
+                vec![pane],
+            )
+        })
+        .collect();
+        let state = SidebarState {
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Priority,
+            ..SidebarState::default()
+        };
+
+        let (rows, _) = build_rows_from_groups(
+            groups,
+            &state,
+            &SidebarPreferences::default(),
+            &RowBuildContext::default(),
+        );
+
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == SidebarRowKind::Chat)
+                .map(|row| row.pane_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["%2", "%1", "%3", "%4"]
+        );
+    }
+
+    #[test]
+    fn latest_activity_uses_the_newest_transition_per_pane() {
+        let pane = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 1,
+        };
+        let event = |at_epoch| crate::daemon::TransitionEvent {
+            pane_instance: pane.clone(),
+            agent: "codex".to_string(),
+            state_version: None,
+            run_seq: 1,
+            completed_seq: 0,
+            prompt_digest: None,
+            prompt_submitted: false,
+            from: Some(BadgeState::Working),
+            to: BadgeState::Working,
+            at_epoch,
+        };
+
+        let latest = latest_activity_by_pane(&[event(300), event(200), event(400)]);
+
+        assert_eq!(latest.get(&pane), Some(&400));
     }
 
     #[test]

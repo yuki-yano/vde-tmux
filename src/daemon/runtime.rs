@@ -2387,6 +2387,7 @@ mod tests {
             &state.projection_config,
             &resolved.panes,
             &resolved.sidebar_model,
+            &resolved.events,
             &SidebarState {
                 category_scope: crate::sidebar::state::CategoryScope::All,
                 ..SidebarState::default()

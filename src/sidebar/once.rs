@@ -22,6 +22,7 @@ fn render_snapshot(snapshot: &ResolvedSnapshot, config: &Config) -> String {
         config,
         &snapshot.panes,
         &snapshot.sidebar_model,
+        &snapshot.events,
         &state,
         crate::sidebar::tree::now_epoch_secs(),
     );
