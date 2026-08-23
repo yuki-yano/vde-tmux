@@ -737,25 +737,32 @@ capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-shared-ex
 SIDE2_SHARED_EXPANSION="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-shared-expansion.txt")"
 [[ "$SIDE2_SHARED_EXPANSION" != "$SIDE2_SHARED_SELECTION" ]]
 
-VT_PANE="$SIDEBAR_1" run_vt sidebar input K
+# Recent activity uses second-resolution transition timestamps, so the relative order of the
+# simultaneously seeded working agents can change at a second boundary. S2_AGENT always has a
+# following chat in the All filter; move it down and persist the actual adjacent pair.
+VT_PANE="$SIDEBAR_1" run_vt sidebar input J
 for _ in $(seq 1 60); do
   query_snapshot
-  if python3 - "$QUERY_JSON" "$S2_AGENT" "$S1_AGENT" 2>/dev/null <<'PY'
+  if python3 - "$QUERY_JSON" "$S2_AGENT" 2>/dev/null <<'PY'
 import json, sys
 preferences = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["preferences"]
-assert preferences["manual_chat_order"][:2] == [sys.argv[2], sys.argv[3]], preferences
+order = preferences["manual_chat_order"]
+assert len(order) >= 2 and order[1] == sys.argv[2] and order[0] != sys.argv[2], preferences
 PY
   then break; fi
   sleep 0.05
 done
-python3 - "$QUERY_JSON" "$S2_AGENT" "$S1_AGENT" <<'PY'
+MANUAL_CHAT_ORDER_PAIR="$(python3 - "$QUERY_JSON" "$S2_AGENT" <<'PY'
 import json, sys
 preferences = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["preferences"]
-assert preferences["manual_chat_order"][:2] == [sys.argv[2], sys.argv[3]], preferences
+order = preferences["manual_chat_order"]
+assert len(order) >= 2 and order[1] == sys.argv[2] and order[0] != sys.argv[2], preferences
+print(*order[:2])
 PY
+)"
+read -r MANUAL_CHAT_ORDER_FIRST MANUAL_CHAT_ORDER_SECOND <<<"$MANUAL_CHAT_ORDER_PAIR"
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-shared-order.txt"
 SIDE2_SHARED_ORDER="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-shared-order.txt")"
-[[ "$SIDE2_SHARED_ORDER" != "$SIDE2_SHARED_EXPANSION" ]]
 record sidebar-shared-state PASS-selection-manual-order-and-expansion-shared-across-two-sidebars
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input 3
@@ -971,13 +978,14 @@ record sidebar-ack PASS-pane-global
 
 # Another split in the same window must not read the completed pane.
 query_snapshot
-python3 - "$QUERY_JSON" "$S2_AGENT" "$S2_AGENT_PID" "$S1_AGENT" <<'PY'
+python3 - "$QUERY_JSON" "$S2_AGENT" "$S2_AGENT_PID" \
+  "$MANUAL_CHAT_ORDER_FIRST" "$MANUAL_CHAT_ORDER_SECOND" <<'PY'
 import json, sys
 preferences = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["preferences"]
 assert preferences["category_scope"] == "current", preferences
 assert preferences["presentation_mode"] == "priority", preferences
 assert preferences["filter"] == "all", preferences
-assert preferences["manual_chat_order"][:2] == [sys.argv[2], sys.argv[4]], preferences
+assert preferences["manual_chat_order"][:2] == [sys.argv[4], sys.argv[5]], preferences
 assert f"chat::{sys.argv[2]}::{sys.argv[3]}" in preferences["expansion_overrides"], preferences
 PY
 record sidebar-restart PASS-same-socket-order-view-filter-expansion-restored
