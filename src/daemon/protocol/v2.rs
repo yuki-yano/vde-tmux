@@ -22,7 +22,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 20;
+pub const PROTOCOL_VERSION: u16 = 21;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1078,6 +1078,14 @@ pub struct CurrentAgentRun {
     pub semantic_outcome: SemanticOutcome,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CategoryRepoMutationEffect {
+    pub repo: crate::category::RepoKey,
+    pub before_override: Option<crate::category::CategoryName>,
+    pub after_override: Option<crate::category::CategoryName>,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
@@ -1160,6 +1168,14 @@ pub enum ServerMessage {
         event_id: EventId,
         accepted_seq: u64,
         snapshot_revision: u64,
+    },
+    CategoryMutationResult {
+        event_id: EventId,
+        accepted_seq: u64,
+        snapshot_revision: u64,
+        category_state_revision: u64,
+        changed: bool,
+        repo_effect: Option<CategoryRepoMutationEffect>,
     },
     SidebarPeekResult {
         event_id: EventId,
@@ -1584,7 +1600,7 @@ mod tests {
 
     #[test]
     fn every_client_message_roundtrips() {
-        assert_eq!(PROTOCOL_VERSION, 20);
+        assert_eq!(PROTOCOL_VERSION, 21);
         let state_id = StateId::parse("00112233445566778899aabbccddeeff").unwrap();
         let messages = vec![
             ClientMessage::Hello {
@@ -2100,6 +2116,18 @@ mod tests {
                 event_id: event_id(),
                 accepted_seq: 7,
                 snapshot_revision: 1,
+            },
+            ServerMessage::CategoryMutationResult {
+                event_id: event_id(),
+                accepted_seq: 8,
+                snapshot_revision: 2,
+                category_state_revision: 3,
+                changed: true,
+                repo_effect: Some(CategoryRepoMutationEffect {
+                    repo: crate::category::RepoKey::path("/tmp/repo"),
+                    before_override: None,
+                    after_override: Some(crate::category::CategoryName::parse("work").unwrap()),
+                }),
             },
             ServerMessage::SidebarPeekResult {
                 event_id: event_id(),

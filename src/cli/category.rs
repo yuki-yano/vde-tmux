@@ -29,7 +29,7 @@ pub fn send_intent(
     let (incarnation, socket) =
         crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, None)
             .context("failed to ensure daemon for category mutation")?;
-    crate::sidebar::client::send_category_intent_v2(&socket, &incarnation.hash, intent)
+    crate::sidebar::client::send_category_intent_v2(&socket, &incarnation.hash, intent).map(|_| ())
 }
 
 pub fn repo_identity(path: &str) -> Result<crate::category::RepoIdentity> {
@@ -65,6 +65,34 @@ pub fn list(
         })
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+pub fn get(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    config: &Config,
+    repo_path: &str,
+) -> Result<String> {
+    let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
+    let path = crate::category::store::state_path(env, &incarnation.socket_path);
+    let state = crate::category::store::load_state(&path)?;
+    let repo = repo_identity(repo_path)?;
+    let model = EffectiveCategoryModel::build(config, &state, [repo.clone()])
+        .map_err(anyhow::Error::msg)?;
+    let placement = model
+        .placements
+        .get(&repo.key)
+        .with_context(|| format!("category was not resolved for repository {}", repo.key))?;
+    Ok(format!(
+        "{}\t{}\t{}",
+        repo.key,
+        placement.category,
+        if placement.explicit {
+            "explicit"
+        } else {
+            "automatic"
+        }
+    ))
 }
 
 pub fn delete_target(move_to: Option<&str>, automatic: bool) -> Result<MembershipTarget> {

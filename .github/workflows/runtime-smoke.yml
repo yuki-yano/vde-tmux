@@ -49,5 +49,8 @@ jobs:
           test "$(tmux -V)" = "tmux 3.7b"
           cargo test --locked -- --ignored
 
+      - name: Run isolated Category Agent API test
+        run: scripts/test-category-api-isolated.sh
+
       - name: Run isolated runtime smoke
         run: scripts/smoke-m6-runtime.sh

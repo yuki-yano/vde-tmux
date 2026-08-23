@@ -2667,7 +2667,8 @@ fn spawn_category_intent_worker(
                 &socket,
                 &server_identity,
                 request.intent,
-            );
+            )
+            .map(|_| ());
             let failed = result.is_err();
             if tx
                 .send(CategoryIntentResult {

@@ -854,6 +854,37 @@ fn daemon_lifecycle_commands_parse_with_force_scoped_to_stop() {
 }
 
 #[test]
+fn category_json_flags_are_scoped_to_the_four_agent_api_commands() {
+    for command in [
+        vec!["vt", "category", "list", "--json"],
+        vec!["vt", "category", "get", "--repo", "/tmp", "--json"],
+        vec![
+            "vt", "category", "assign", "work", "--repo", "/tmp", "--json",
+        ],
+        vec!["vt", "category", "automatic", "--repo", "/tmp", "--json"],
+    ] {
+        Cli::try_parse_from(command.clone())
+            .unwrap_or_else(|error| panic!("{command:?} must parse: {error}"));
+        let args = command.into_iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(is_json_api_args(&args));
+    }
+    for command in [
+        vec!["vt", "category", "create", "work", "--json"],
+        vec!["vt", "category", "rename", "work", "misc", "--json"],
+        vec!["vt", "category", "delete", "work", "--automatic", "--json"],
+    ] {
+        assert!(Cli::try_parse_from(command.clone()).is_err());
+        let args = command.into_iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(!is_json_api_args(&args));
+    }
+    let help = ["vt", "category", "list", "--json", "--help"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    assert!(!is_json_api_args(&help));
+}
+
+#[test]
 fn agent_json_list_projects_the_cached_resolved_snapshot() {
     let fixture = resolved_snapshot_query_fixture(false);
     let calls_before = fixture.mock.calls().len();

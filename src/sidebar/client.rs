@@ -146,18 +146,55 @@ pub fn send_sidebar_preference_intent_v2(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryMutationAck {
+    pub accepted_seq: u64,
+    pub snapshot_revision: u64,
+    pub category_state_revision: u64,
+    pub changed: bool,
+    pub repo_effect: Option<crate::daemon::protocol::v2::CategoryRepoMutationEffect>,
+}
+
 pub fn send_category_intent_v2(
     socket: &Path,
     server_identity: &str,
     intent: crate::category::CategoryIntent,
-) -> Result<()> {
-    request_v2_sidebar(
+) -> Result<CategoryMutationAck> {
+    let (event_id, response) = request_v2_sidebar_message(
         socket,
         server_identity,
         V2SidebarCommand::CategoryIntent { intent },
-        V2SidebarResponse::SnapshotAck,
     )?;
-    Ok(())
+    match response {
+        V2ServerMessage::CategoryMutationResult {
+            event_id: response_event_id,
+            accepted_seq,
+            snapshot_revision,
+            category_state_revision,
+            changed,
+            repo_effect,
+        } if response_event_id == event_id => Ok(CategoryMutationAck {
+            accepted_seq,
+            snapshot_revision,
+            category_state_revision,
+            changed,
+            repo_effect,
+        }),
+        V2ServerMessage::CategoryMutationResult {
+            event_id: response_event_id,
+            ..
+        } => bail!(
+            "daemon response event ID mismatch: expected {event_id:?}, received {response_event_id:?}"
+        ),
+        V2ServerMessage::Error {
+            event_id: Some(response_event_id),
+            ..
+        } if response_event_id != event_id => bail!(
+            "daemon response event ID mismatch: expected {event_id:?}, received {response_event_id:?}"
+        ),
+        V2ServerMessage::Error { code, message, .. } => bail!("{code:?}: {message}"),
+        other => bail!("unexpected daemon category response: {other:?}"),
+    }
 }
 
 pub fn send_sidebar_navigation_v2(

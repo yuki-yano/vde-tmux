@@ -591,7 +591,16 @@ enum CategoryCommand {
         #[command(flatten)]
         scope: ClientActionScope,
     },
-    List,
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Get {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        json: bool,
+    },
     Create {
         name: String,
     },
@@ -610,10 +619,14 @@ enum CategoryCommand {
         category: String,
         #[arg(long)]
         repo: String,
+        #[arg(long)]
+        json: bool,
     },
     Automatic {
         #[arg(long)]
         repo: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -882,10 +895,18 @@ fn is_json_api_args(args: &[OsString]) -> bool {
         .iter()
         .skip(2)
         .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
-        && matches!(
+        && (matches!(
             args.get(1).and_then(|arg| arg.to_str()),
             Some("api" | "pane" | "agent")
-        )
+        ) || (args.get(1).and_then(|arg| arg.to_str()) == Some("category")
+            && matches!(
+                args.get(2).and_then(|arg| arg.to_str()),
+                Some("list" | "get" | "assign" | "automatic")
+            )
+            && args
+                .iter()
+                .skip(3)
+                .any(|arg| arg.to_str() == Some("--json"))))
 }
 
 fn agent_hook_requires_stdin(args: &[OsString]) -> bool {
@@ -1095,6 +1116,14 @@ where
             | Command::Sidebar {
                 command: sidebar::SidebarCommand::PrepareLayout { .. }
             }
+    ) || matches!(
+        &cli.command,
+        Command::Category {
+            command: CategoryCommand::List { json: true }
+                | CategoryCommand::Get { json: true, .. }
+                | CategoryCommand::Assign { json: true, .. }
+                | CategoryCommand::Automatic { json: true, .. }
+        }
     );
     if !is_json_api {
         emit_config_warnings(&loaded.warnings, warning_writer)?;
@@ -1653,9 +1682,19 @@ where
                         &context.client_name,
                     )?;
                 }
-                CategoryCommand::List => {
+                CategoryCommand::List { json } => {
+                    if json {
+                        return crate::api::category_list(runner, env, now_epoch).map(Some);
+                    }
                     let config = require_active_config(runner, env)?;
                     return category::list(runner, env, &config).map(Some);
+                }
+                CategoryCommand::Get { repo, json } => {
+                    if json {
+                        return crate::api::category_get(runner, env, now_epoch, &repo).map(Some);
+                    }
+                    let config = require_active_config(runner, env)?;
+                    return category::get(runner, env, &config, &repo).map(Some);
                 }
                 CategoryCommand::Create { name } => {
                     category::send_intent(
@@ -1693,7 +1732,18 @@ where
                 CategoryCommand::Assign {
                     category: target,
                     repo,
+                    json,
                 } => {
+                    if json {
+                        let target = category::parse_category(&target).map_err(|error| {
+                            crate::api::ApiError::new(
+                                crate::api::ApiErrorCode::InvalidArguments,
+                                error.to_string(),
+                            )
+                        })?;
+                        return crate::api::category_assign(runner, env, now_epoch, target, &repo)
+                            .map(Some);
+                    }
                     let repo = category::repo_identity(&repo)?;
                     category::send_intent(
                         runner,
@@ -1704,7 +1754,11 @@ where
                         },
                     )?;
                 }
-                CategoryCommand::Automatic { repo } => {
+                CategoryCommand::Automatic { repo, json } => {
+                    if json {
+                        return crate::api::category_automatic(runner, env, now_epoch, &repo)
+                            .map(Some);
+                    }
                     let repo = category::repo_identity(&repo)?;
                     category::send_intent(
                         runner,

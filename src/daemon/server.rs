@@ -4626,10 +4626,17 @@ fn apply_category_intent(
         .as_mut()
         .expect("state initialized before category intent");
     if !state.sidebar_intent_dedupe.accept(event_id.clone()) {
-        return ServerMessage::SnapshotAck {
+        return ServerMessage::CategoryMutationResult {
             event_id,
             accepted_seq,
             snapshot_revision: state.leased.runtime.snapshot_revision(),
+            category_state_revision: state.category_state.revision,
+            changed: false,
+            repo_effect: category_repo_mutation_effect(
+                &intent,
+                &state.category_state,
+                &state.category_state,
+            ),
         };
     }
     let model = state.effective_category_model();
@@ -4641,12 +4648,17 @@ fn apply_category_intent(
         }
     };
     if !changed {
-        return ServerMessage::SnapshotAck {
+        return ServerMessage::CategoryMutationResult {
             event_id,
             accepted_seq,
             snapshot_revision: state.leased.runtime.snapshot_revision(),
+            category_state_revision: candidate.revision,
+            changed: false,
+            repo_effect: category_repo_mutation_effect(&intent, &state.category_state, &candidate),
         };
     }
+    let repo_effect = category_repo_mutation_effect(&intent, &state.category_state, &candidate);
+    let category_state_revision = candidate.revision;
     let path =
         crate::category::store::state_path(&coordinator.env, &coordinator.incarnation.socket_path);
     if let Err(error) = crate::category::store::save_state(&path, &candidate) {
@@ -4688,11 +4700,31 @@ fn apply_category_intent(
             ));
         }
     }
-    ServerMessage::SnapshotAck {
+    ServerMessage::CategoryMutationResult {
         event_id,
         accepted_seq,
         snapshot_revision,
+        category_state_revision,
+        changed: true,
+        repo_effect,
     }
+}
+
+fn category_repo_mutation_effect(
+    intent: &crate::category::CategoryIntent,
+    before: &crate::category::CategoryState,
+    after: &crate::category::CategoryState,
+) -> Option<crate::daemon::protocol::v2::CategoryRepoMutationEffect> {
+    let repo = match intent {
+        crate::category::CategoryIntent::AssignRepo { repo, .. }
+        | crate::category::CategoryIntent::SetRepoAutomatic { repo } => repo,
+        _ => return None,
+    };
+    Some(crate::daemon::protocol::v2::CategoryRepoMutationEffect {
+        repo: repo.clone(),
+        before_override: before.repo_overrides.get(repo).cloned(),
+        after_override: after.repo_overrides.get(repo).cloned(),
+    })
 }
 
 fn apply_sidebar_navigation(
@@ -10610,6 +10642,162 @@ mod tests {
         assert_eq!(
             persisted.presentation_mode,
             crate::sidebar::state::PresentationMode::Flat
+        );
+
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn category_intents_return_persisted_repo_effects_and_stable_noop_revisions() {
+        let root = test_root("category-receipts");
+        let env = BTreeMap::from([(
+            "XDG_STATE_HOME".to_string(),
+            root.to_string_lossy().into_owned(),
+        )]);
+        let coordinator = ProductionV2Coordinator::new(
+            test_incarnation(&root, "category-receipts"),
+            env.clone(),
+            None,
+        )
+        .unwrap();
+        install_test_state(
+            &coordinator,
+            &root,
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+        );
+        let repo = crate::category::RepoKey::path("/tmp/category-receipt-repo");
+        let work = crate::category::CategoryName::parse("work").unwrap();
+        {
+            let mut guard = coordinator.state.lock().unwrap();
+            guard
+                .as_mut()
+                .unwrap()
+                .projection_config
+                .categories
+                .display_names
+                .insert("work".to_string(), "Work".to_string());
+        }
+
+        let assign = apply_category_intent(
+            &coordinator,
+            1,
+            EventId::generate().unwrap(),
+            crate::category::CategoryIntent::AssignRepo {
+                repo: repo.clone(),
+                category: work.clone(),
+            },
+        );
+        assert!(matches!(
+            assign,
+            ServerMessage::CategoryMutationResult {
+                accepted_seq: 1,
+                snapshot_revision: 1,
+                category_state_revision: 1,
+                changed: true,
+                repo_effect: Some(
+                    crate::daemon::protocol::v2::CategoryRepoMutationEffect {
+                        ref repo,
+                        before_override: None,
+                        after_override: Some(ref after),
+                    }
+                ),
+                ..
+            } if repo == &crate::category::RepoKey::path("/tmp/category-receipt-repo")
+                && after == &work
+        ));
+
+        let noop_assign = apply_category_intent(
+            &coordinator,
+            2,
+            EventId::generate().unwrap(),
+            crate::category::CategoryIntent::AssignRepo {
+                repo: repo.clone(),
+                category: work.clone(),
+            },
+        );
+        assert!(matches!(
+            noop_assign,
+            ServerMessage::CategoryMutationResult {
+                snapshot_revision: 1,
+                category_state_revision: 1,
+                changed: false,
+                ..
+            }
+        ));
+
+        let automatic = apply_category_intent(
+            &coordinator,
+            3,
+            EventId::generate().unwrap(),
+            crate::category::CategoryIntent::SetRepoAutomatic { repo: repo.clone() },
+        );
+        assert!(matches!(
+            automatic,
+            ServerMessage::CategoryMutationResult {
+                snapshot_revision: 2,
+                category_state_revision: 2,
+                changed: true,
+                repo_effect: Some(
+                    crate::daemon::protocol::v2::CategoryRepoMutationEffect {
+                        before_override: Some(ref before),
+                        after_override: None,
+                        ..
+                    }
+                ),
+                ..
+            } if before == &work
+        ));
+
+        let noop_automatic = apply_category_intent(
+            &coordinator,
+            4,
+            EventId::generate().unwrap(),
+            crate::category::CategoryIntent::SetRepoAutomatic { repo: repo.clone() },
+        );
+        assert!(matches!(
+            noop_automatic,
+            ServerMessage::CategoryMutationResult {
+                snapshot_revision: 2,
+                category_state_revision: 2,
+                changed: false,
+                ..
+            }
+        ));
+        let persisted = crate::category::store::load_state(&crate::category::store::state_path(
+            &env,
+            &coordinator.incarnation.socket_path,
+        ))
+        .unwrap();
+        assert_eq!(persisted.revision, 2);
+        assert!(!persisted.repo_overrides.contains_key(&repo));
+
+        let unknown = apply_category_intent(
+            &coordinator,
+            5,
+            EventId::generate().unwrap(),
+            crate::category::CategoryIntent::AssignRepo {
+                repo,
+                category: crate::category::CategoryName::parse("missing").unwrap(),
+            },
+        );
+        assert!(matches!(
+            unknown,
+            ServerMessage::Error {
+                code: ErrorCode::InvalidRequest,
+                ..
+            }
+        ));
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .category_state
+                .revision,
+            2
         );
 
         drop(coordinator);
