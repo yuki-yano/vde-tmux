@@ -162,6 +162,7 @@ terminal fingerprintの静止はevidenceだけを追加し、execution phaseとs
 | From | Event | To |
 | --- | --- | --- |
 | current execution-active runなし | attributed UserPromptSubmit | new runの`running + unresolved` |
+| execution-active run | 同じturnの新しいUserPromptSubmit occurrence | run identityとsequenceを維持してprompt evidenceを更新 |
 | `running`または`error` | permission / user-input request | `waiting + unresolved` |
 | `waiting`または`error` | attributed activity | `running + unresolved` |
 | unresolvedの任意phase | exact occupant exit / replacement | `ended + unresolved` |
@@ -189,7 +190,7 @@ Run RecordはAgent Binding、stable run ID、run sequence、execution phase、se
 
 resolutionのoperator audit fieldsはresolution ID、actor UIDとPID、reasonとdigest、pre/post revision、observed timeとする。
 
-run attributionへ影響するUserPromptSubmitとStopのreference、ingress request ID、payload digest、disposition、receiptは、一つのrunにつき新しい16件までRun Record内へ保存する。同種のretryはcountとfirst/last observed timeへcompactする。
+run attributionへ影響するUserPromptSubmitとStopのreference、ingress request ID、payload digest、disposition、receiptは、一つのrunにつき新しい16件までRun Record内へ保存する。同種のretryはcountとfirst/last observed timeへcompactする。同一turnのsteerが上限へ達した場合は`run_created`とStopを保持し、古い`prompt_updated` referenceから入れ替える。入れ替え済みoccurrenceの遅延retryはcompact保証の対象外とする。
 
 activity、permission、user-input requestはdedupe slotを消費せず、Run Evidence summaryへ集約する。
 
@@ -268,7 +269,7 @@ v3 durable mutationはP0で実測済みのCodex adapterだけを有効にする�
 
 hook CLIはinvocationごとにrandom ingress request IDを発行し、daemon responseを失った同一invocationのretryにだけ再利用する。
 
-providerがstable event ID、turn ID、一意なtranscript cursorを提供する場合、それをprovider、session key、hook kindと組み合わせて`provider_event_ref`とする。
+Stopはproviderのturn IDをprovider、session key、hook kindと組み合わせて`provider_event_ref`とする。UserPromptSubmitは同じturn内のsteerを区別するため、hook invocationで発行したingress request IDをprovider、session key、hook kindと組み合わせてoccurrence referenceとする。
 
 同一referenceと同一payload digestのretryは以前のreceiptを返し、同一referenceと異なるdigestまたはrun bindingは`provider_event_conflict`として状態を変更しない。
 
@@ -280,7 +281,7 @@ stable referenceがないadapterは、UserPromptSubmitとStopのretryが次のli
 
 stable referenceもこのretry contractも確認できないadapterは有効にしない。
 
-同一provider sessionで新しいUserPromptSubmitが届いた場合、実証済みevent orderingに基づき旧runのexecutionを`ended`へ進め、新しいstable run IDを作る。
+同一provider sessionで異なるturn keyのUserPromptSubmitが届いた場合、実証済みevent orderingに基づき旧runのexecutionを`ended`へ進め、新しいstable run IDを作る。同じturn keyの新しいoccurrenceはcurrent runへ帰属させ、別runを作らない。Stop後に遅れて届いた同じturnのoccurrenceはevidenceだけを更新し、Pane lifecycleを再開しない。
 
 stable referenceがないUserPromptSubmitのimmediate retryは、次のlifecycle event前でAgent Binding、prompt digest、current stable run IDが一致する場合だけduplicateとして扱う。
 
@@ -622,7 +623,7 @@ schema freezeと運用有効化前に次の実測を完了する。model、store
 
 - Gate 1：元prompt fileとhook payloadのbyte count、SHA-256、LF数が1行・複数行の両方で一致する。いずれかが一致しなければadapterを有効化しない。
 - Gate 2：同じstable turn identityのStop payloadとprovider transcriptの最終assistant textがbyte countとSHA-256で一致する。body欠落時はcompletionを保持してartifactを`unavailable`とし、terminal captureへfallbackしない。
-- Gate 3：Codexは`provider + session_id + turn_id + hook_kind`をstable event referenceにでき、queued turnでidentityを再利用せず、通常経路のStopを同じturnへ一意に帰属できる。Claude Codeは同等のauthenticated isolated evidenceが得られるまでdisabledとする。
+- Gate 3：CodexはStopを`provider + session_id + turn_id + hook_kind`で一意に帰属でき、queued turnでturn identityを再利用しない。UserPromptSubmit occurrenceはingress request IDで区別し、同じturnのactive steerはcurrent runへ更新として帰属する。Claude Codeは同等のauthenticated isolated evidenceが得られるまでdisabledとする。
 - Gate 4：同じhook eventにexit 1とexit 0のcollectorを登録し、失敗側の有無にかかわらず成功側markerがUserPromptSubmitとStopの両方で記録される。
 
 probeはraw promptとresponse bodyを保存せず、event、byte count、SHA-256、stable identity hash、monotonic timeだけを0600の結果へ記録する。source schemaだけの確認や非interactive CLIの結果を実機passへ代用しない。

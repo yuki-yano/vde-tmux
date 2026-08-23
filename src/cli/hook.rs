@@ -91,6 +91,19 @@ pub(crate) enum HookCommand {
     },
 }
 
+pub(crate) fn delivery_timeout(command: &HookCommand) -> Duration {
+    let event = match command {
+        HookCommand::Claude { event } => Some(event.as_str()),
+        HookCommand::Codex { arg } => arg.as_deref(),
+        HookCommand::Emit { .. } => None,
+    };
+    if matches!(event, Some("UserPromptSubmit" | "Stop")) {
+        Duration::from_secs(8)
+    } else {
+        Duration::from_secs(2)
+    }
+}
+
 pub(crate) fn run_hook_command(
     command: HookCommand,
     input: &str,
@@ -116,8 +129,9 @@ pub(crate) fn run_hook_command(
             subagents,
             clear_subagents,
         } => {
+            let event_id = crate::pane_state::EventId::generate()?;
             let (mut client, context, server_hash) =
-                typed_hook_context(runner, env, deadline, now_epoch)?;
+                typed_hook_context(runner, env, deadline, now_epoch, event_id)?;
             let event = generic_typed_event(
                 GenericEmitInput {
                     agent,
@@ -150,8 +164,9 @@ pub(crate) fn run_hook_command(
             send_typed_hook_event_observed(&mut client, event, None, env, &server_hash)
         }
         HookCommand::Claude { event } => {
+            let event_id = crate::pane_state::EventId::generate()?;
             let (mut client, context, server_hash) =
-                typed_hook_context(runner, env, deadline, now_epoch)?;
+                typed_hook_context(runner, env, deadline, now_epoch, event_id)?;
             let requested_event = event;
             let event = claude_typed_event_from_input(&requested_event, input, &context)?;
             // Claude's authenticated disposable-profile P0 contract is not frozen yet. Keep its
@@ -167,17 +182,37 @@ pub(crate) fn run_hook_command(
                 return Ok(());
             }
             let codex_home = codex_home_from_env(env);
-            let (mut client, context, server_hash) =
-                typed_hook_context(runner, env, deadline, now_epoch)?;
-            let event = codex_typed_event_from_input(&arg, input, &context, codex_home.as_deref())?;
-            let observation = crate::hook::provider::observation_from_json(
-                "codex",
-                &arg,
-                input,
-                context.event_id.clone(),
-                context.observed_at,
-            )?;
-            send_typed_hook_event_observed(&mut client, event, observation, env, &server_hash)
+            let event_id = crate::pane_state::EventId::generate()?;
+            let retry_before_write = matches!(arg.as_str(), "UserPromptSubmit" | "Stop");
+            loop {
+                let (mut client, context, server_hash) =
+                    typed_hook_context(runner, env, deadline, now_epoch, event_id.clone())?;
+                let event =
+                    codex_typed_event_from_input(&arg, input, &context, codex_home.as_deref())?;
+                let observation = crate::hook::provider::observation_from_json(
+                    "codex",
+                    &arg,
+                    input,
+                    context.event_id.clone(),
+                    context.observed_at,
+                )?;
+                match send_typed_hook_event(&mut client, event, observation) {
+                    Ok(()) => return Ok(()),
+                    Err(error)
+                        if retry_before_write
+                            && error.stage
+                                == crate::daemon::protocol::v2::V2RequestFailureStage::BeforeFullWrite
+                            && Instant::now() < deadline =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        let error = anyhow::Error::new(error);
+                        record_agent_hook_delivery(env, &server_hash, &error);
+                        return Err(error);
+                    }
+                }
+            }
         }
     }
 }
@@ -187,6 +222,7 @@ fn typed_hook_context(
     env: &BTreeMap<String, String>,
     deadline: Instant,
     observed_at: i64,
+    event_id: crate::pane_state::EventId,
 ) -> Result<(
     crate::daemon::protocol::v2::V2Client,
     TypedAdapterContext,
@@ -221,7 +257,7 @@ fn typed_hook_context(
     })?;
     let context = TypedAdapterContext {
         daemon_instance_id: client.daemon_instance_id().clone(),
-        event_id: crate::pane_state::EventId::generate()?,
+        event_id,
         pane_instance,
         observed_at,
     };
@@ -238,6 +274,7 @@ fn send_typed_hook_event_observed(
     match send_typed_hook_event(client, event, observation) {
         Ok(()) => Ok(()),
         Err(error) => {
+            let error = anyhow::Error::new(error);
             record_agent_hook_delivery(env, server_hash, &error);
             Err(error)
         }
@@ -284,7 +321,7 @@ fn send_typed_hook_event(
     client: &mut crate::daemon::protocol::v2::V2Client,
     event: Option<PaneEventEnvelope>,
     observation: Option<crate::hook::provider::ProviderObservation>,
-) -> Result<()> {
+) -> std::result::Result<(), crate::daemon::protocol::v2::V2RequestError> {
     let Some(envelope) = event else {
         return Ok(());
     };
@@ -307,7 +344,9 @@ fn send_typed_hook_event(
 fn validate_typed_hook_response(
     response: crate::daemon::protocol::v2::ServerMessage,
     event_id: &crate::pane_state::EventId,
-) -> Result<()> {
+) -> std::result::Result<(), crate::daemon::protocol::v2::V2RequestError> {
+    use crate::daemon::protocol::v2::{V2RequestError, V2RequestFailureStage};
+
     match response {
         crate::daemon::protocol::v2::ServerMessage::PaneEventResult {
             event_id: response_id,
@@ -318,12 +357,21 @@ fn validate_typed_hook_response(
             ..
         } if response_id == *event_id => Ok(()),
         crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
-            bail!("daemon returned {code:?}: {message}")
+            Err(V2RequestError {
+                stage: V2RequestFailureStage::AfterFullWrite,
+                message: format!("daemon returned {code:?}: {message}"),
+            })
         }
         crate::daemon::protocol::v2::ServerMessage::AgentResponseResult { .. } => {
-            bail!("unexpected pane event response: AgentResponseResult")
+            Err(V2RequestError {
+                stage: V2RequestFailureStage::AfterFullWrite,
+                message: "unexpected pane event response: AgentResponseResult".to_string(),
+            })
         }
-        response => bail!("unexpected pane event response: {response:?}"),
+        response => Err(V2RequestError {
+            stage: V2RequestFailureStage::AfterFullWrite,
+            message: format!("unexpected pane event response: {response:?}"),
+        }),
     }
 }
 
@@ -1127,6 +1175,28 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(daemon_error.contains("StaleAgentEvent"));
+    }
+
+    #[test]
+    fn lifecycle_hook_commands_receive_the_extended_delivery_deadline() {
+        assert_eq!(
+            delivery_timeout(&HookCommand::Codex {
+                arg: Some("UserPromptSubmit".to_string()),
+            }),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            delivery_timeout(&HookCommand::Claude {
+                event: "Stop".to_string(),
+            }),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            delivery_timeout(&HookCommand::Codex {
+                arg: Some("AfterToolUse".to_string()),
+            }),
+            Duration::from_secs(2)
+        );
     }
 
     #[test]

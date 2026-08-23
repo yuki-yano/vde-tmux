@@ -355,6 +355,24 @@ impl AgentRuntime {
 
         let key = binding_key(&binding)?;
         let run_id = if observation.hook_kind == ProviderHookKind::UserPromptSubmit {
+            if let Some(turn_key) = observation.provider_turn_key.as_deref()
+                && let Some(attributed_id) = self
+                    .turn_index
+                    .get(&turn_index_key_for_binding(&binding, turn_key))
+                    .cloned()
+            {
+                let mut attributed = self.required_run(&attributed_id)?;
+                let disposition = apply_observation(&mut attributed, observation)
+                    .map_err(|error| StoreError::ProviderEventConflict(error.to_string()))?;
+                self.store.save_run(&attributed)?;
+                self.index_run(&attributed)?;
+                let disposition = if attributed.execution_active() {
+                    disposition
+                } else {
+                    ApplyDisposition::EvidenceOnly
+                };
+                return self.finish_provider_observation(attributed, observation, disposition);
+            }
             if let Some(previous_id) = self.current_by_binding.get(&key).cloned() {
                 let mut previous = self.required_run(&previous_id)?;
                 if previous.run_seq >= run_seq {
@@ -887,6 +905,15 @@ impl AgentRuntime {
     }
 
     fn index_run(&mut self, run: &RunRecord) -> Result<(), StoreError> {
+        let current_event_references = run
+            .evidence
+            .provider_events
+            .iter()
+            .map(|event| event.event_ref.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        self.event_index.retain(|event_ref, run_id| {
+            run_id != &run.run_id || current_event_references.contains(event_ref.as_str())
+        });
         let key = binding_key(&run.binding)?;
         let replace_current = match self.current_by_binding.get(&key) {
             Some(existing_id) => match self.store.load_run(existing_id)? {
@@ -948,13 +975,13 @@ impl AgentRuntime {
                     Some(existing) => {
                         (
                             existing.binding.agent_epoch,
-                            existing.updated_at,
                             existing.run_seq,
+                            existing.updated_at,
                             existing.run_id.as_str(),
                         ) <= (
                             run.binding.agent_epoch,
-                            run.updated_at,
                             run.run_seq,
+                            run.updated_at,
                             run.run_id.as_str(),
                         )
                     }
@@ -1286,6 +1313,240 @@ mod tests {
             std::process::id(),
             u64::from_be_bytes(random)
         ))
+    }
+
+    #[test]
+    fn same_turn_prompt_updates_the_active_run_without_allocating_a_new_sequence() {
+        let root = temp_root();
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
+        let agent_binding = binding();
+        let first = observation(
+            ProviderHookKind::UserPromptSubmit,
+            "turn-steered",
+            Some(b"first task"),
+            None,
+            10,
+        );
+        let created = runtime
+            .apply_provider_observation(agent_binding.clone(), 1, &first)
+            .unwrap()
+            .run
+            .unwrap();
+
+        let mut steered = observation(
+            ProviderHookKind::UserPromptSubmit,
+            "turn-steered",
+            Some(b"review with pane five"),
+            None,
+            11,
+        );
+        steered.provider_event_ref = Some(
+            Sha256Digest::of(b"same-turn-second-ingress")
+                .as_str()
+                .to_string(),
+        );
+        steered.payload_digest = Sha256Digest::of(b"same-turn-second-payload")
+            .as_str()
+            .to_string();
+        let updated = runtime
+            .apply_provider_observation(agent_binding.clone(), 2, &steered)
+            .unwrap()
+            .run
+            .unwrap();
+
+        assert_eq!(updated.run_id, created.run_id);
+        assert_eq!(updated.run_seq, 1);
+        assert_eq!(updated.evidence.provider_events.len(), 2);
+        assert_eq!(
+            updated.evidence.provider_events[1].disposition,
+            "prompt_updated"
+        );
+        assert_eq!(
+            runtime
+                .current_run_for_binding(&agent_binding)
+                .unwrap()
+                .unwrap()
+                .run_id,
+            created.run_id
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delayed_same_turn_prompt_is_recorded_without_reopening_the_completed_run() {
+        let root = temp_root();
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
+        let agent_binding = binding();
+        let first = observation(
+            ProviderHookKind::UserPromptSubmit,
+            "turn-completed",
+            Some(b"first task"),
+            None,
+            10,
+        );
+        let created = runtime
+            .apply_provider_observation(agent_binding.clone(), 1, &first)
+            .unwrap()
+            .run
+            .unwrap();
+        runtime
+            .apply_provider_observation(
+                agent_binding.clone(),
+                1,
+                &observation(
+                    ProviderHookKind::Stop,
+                    "turn-completed",
+                    None,
+                    Some("done"),
+                    11,
+                ),
+            )
+            .unwrap();
+
+        let mut delayed = observation(
+            ProviderHookKind::UserPromptSubmit,
+            "turn-completed",
+            Some(b"late callback"),
+            None,
+            12,
+        );
+        delayed.provider_event_ref = Some(
+            Sha256Digest::of(b"late-same-turn-ingress")
+                .as_str()
+                .to_string(),
+        );
+        delayed.payload_digest = Sha256Digest::of(b"late-same-turn-payload")
+            .as_str()
+            .to_string();
+        let result = runtime
+            .apply_provider_observation(agent_binding, 2, &delayed)
+            .unwrap();
+        let run = result.run.unwrap();
+
+        assert_eq!(result.disposition, ApplyDisposition::EvidenceOnly);
+        assert_eq!(run.run_id, created.run_id);
+        assert_eq!(run.run_seq, 1);
+        assert_eq!(run.execution_phase, ExecutionPhase::Ended);
+        assert_eq!(run.semantic_outcome, SemanticOutcome::Completed);
+        assert_eq!(run.evidence.provider_events.len(), 3);
+        assert_eq!(
+            run.evidence.provider_events.last().unwrap().disposition,
+            "prompt_updated"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delayed_previous_turn_prompt_does_not_replace_the_active_next_turn() {
+        let root = temp_root();
+        let agent_binding = binding();
+        let first_run_id;
+        let second_run_id;
+        {
+            let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
+            let first = observation(
+                ProviderHookKind::UserPromptSubmit,
+                "turn-before-reload",
+                Some(b"first task"),
+                None,
+                10,
+            );
+            first_run_id = runtime
+                .apply_provider_observation(agent_binding.clone(), 1, &first)
+                .unwrap()
+                .run
+                .unwrap()
+                .run_id;
+            runtime
+                .apply_provider_observation(
+                    agent_binding.clone(),
+                    1,
+                    &observation(
+                        ProviderHookKind::Stop,
+                        "turn-before-reload",
+                        None,
+                        Some("first response"),
+                        11,
+                    ),
+                )
+                .unwrap();
+
+            let second = observation(
+                ProviderHookKind::UserPromptSubmit,
+                "turn-after-reload",
+                Some(b"second task"),
+                None,
+                12,
+            );
+            second_run_id = runtime
+                .apply_provider_observation(agent_binding.clone(), 2, &second)
+                .unwrap()
+                .run
+                .unwrap()
+                .run_id;
+
+            let mut delayed = observation(
+                ProviderHookKind::UserPromptSubmit,
+                "turn-before-reload",
+                Some(b"delayed steer for first task"),
+                None,
+                13,
+            );
+            delayed.provider_event_ref = Some(
+                Sha256Digest::of(b"delayed-previous-turn-ingress")
+                    .as_str()
+                    .to_string(),
+            );
+            delayed.payload_digest = Sha256Digest::of(b"delayed-previous-turn-payload")
+                .as_str()
+                .to_string();
+            let result = runtime
+                .apply_provider_observation(agent_binding.clone(), 3, &delayed)
+                .unwrap();
+
+            assert_eq!(result.disposition, ApplyDisposition::EvidenceOnly);
+            assert_eq!(result.run.as_ref().unwrap().run_id, first_run_id);
+            assert_eq!(
+                result.run.as_ref().unwrap().execution_phase,
+                ExecutionPhase::Ended
+            );
+            let current = runtime
+                .current_run_for_binding(&agent_binding)
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.run_id, second_run_id);
+            assert_eq!(current.run_seq, 2);
+            assert!(current.execution_active());
+            assert_eq!(runtime.store.list_runs().unwrap().len(), 2);
+
+            let first_record = runtime.store.load_run(&first_run_id).unwrap().unwrap();
+            let second_record = runtime.store.load_run(&second_run_id).unwrap().unwrap();
+            runtime.current_by_binding.clear();
+            runtime.current_by_pane.clear();
+            runtime.turn_index.clear();
+            runtime.event_index.clear();
+            runtime.index_run(&first_record).unwrap();
+            runtime.index_run(&second_record).unwrap();
+
+            let rebuilt_current = runtime
+                .current_run_for_binding(&agent_binding)
+                .unwrap()
+                .unwrap();
+            assert_eq!(rebuilt_current.run_id, second_run_id);
+            assert!(rebuilt_current.execution_active());
+        }
+
+        let reopened = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
+        let current = reopened
+            .current_run_for_binding(&agent_binding)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.run_id, second_run_id);
+        assert!(current.execution_active());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn pane_fence(run: &RunRecord) -> RecoveryPaneFence {

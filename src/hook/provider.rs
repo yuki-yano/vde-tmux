@@ -211,16 +211,18 @@ pub fn observation_from_json(
         })
         .flatten()
         .map(|body| ResponseCandidate::from_body(body, ProviderCompleteness::Complete));
-    let provider_event_ref = matches!(
-        hook_kind,
-        ProviderHookKind::UserPromptSubmit | ProviderHookKind::Stop
-    )
-    .then(|| {
-        provider_turn_key
+    let provider_event_ref = match hook_kind {
+        ProviderHookKind::UserPromptSubmit => Some(ingress_event_reference(
+            provider,
+            session_id,
+            hook_kind,
+            &ingress_request_id,
+        )),
+        ProviderHookKind::Stop => provider_turn_key
             .as_deref()
-            .map(|turn| event_reference(provider, session_id, hook_kind, turn))
-    })
-    .flatten();
+            .map(|turn| turn_event_reference(provider, session_id, hook_kind, turn)),
+        _ => None,
+    };
     let payload_digest = observation_payload_digest(
         provider,
         session_id,
@@ -247,7 +249,7 @@ pub fn observation_from_json(
     Ok(Some(observation))
 }
 
-fn event_reference(
+fn turn_event_reference(
     provider: &str,
     session_id: &str,
     hook_kind: ProviderHookKind,
@@ -260,6 +262,22 @@ fn event_reference(
         session_id.as_bytes(),
         kind.as_bytes(),
         turn_key.as_bytes(),
+    ])
+}
+
+fn ingress_event_reference(
+    provider: &str,
+    session_id: &str,
+    hook_kind: ProviderHookKind,
+    ingress_request_id: &EventId,
+) -> String {
+    let kind = serde_json::to_string(&hook_kind).expect("provider hook kind serializes");
+    digest_fields(&[
+        b"vde-tmux:provider-event-ref:v2:ingress",
+        provider.as_bytes(),
+        session_id.as_bytes(),
+        kind.as_bytes(),
+        ingress_request_id.as_str().as_bytes(),
     ])
 }
 
@@ -316,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_prompt_id_and_codex_turn_id_are_stable_event_references() {
+    fn prompt_event_references_use_the_ingress_occurrence_not_the_turn_key() {
         let claude = observation_from_json(
             "claude",
             "UserPromptSubmit",
@@ -339,6 +357,44 @@ mod tests {
         assert_eq!(codex.provider_turn_key.as_deref(), Some("t1"));
         assert_ne!(claude.provider_event_ref, codex.provider_event_ref);
         assert_eq!(claude.prompt_digest, codex.prompt_digest);
+
+        let second_codex = observation_from_json(
+            "codex",
+            "UserPromptSubmit",
+            r#"{"session_id":"s1","turn_id":"t1","prompt":"hello"}"#,
+            EventId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second_codex.provider_turn_key, codex.provider_turn_key);
+        assert_ne!(second_codex.provider_event_ref, codex.provider_event_ref);
+        assert_eq!(second_codex.prompt_digest, codex.prompt_digest);
+    }
+
+    #[test]
+    fn retrying_one_prompt_ingress_reuses_the_same_event_reference() {
+        let first = observation_from_json(
+            "codex",
+            "UserPromptSubmit",
+            r#"{"session_id":"s1","turn_id":"t1","prompt":"hello"}"#,
+            event_id(),
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let retry = observation_from_json(
+            "codex",
+            "UserPromptSubmit",
+            r#"{"session_id":"s1","turn_id":"t1","prompt":"hello"}"#,
+            event_id(),
+            2,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(first.provider_event_ref, retry.provider_event_ref);
+        assert_eq!(first.payload_digest, retry.payload_digest);
     }
 
     #[test]

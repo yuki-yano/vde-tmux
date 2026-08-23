@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::daemon::session_badge::BadgeState;
 
-pub const PANE_STATE_SCHEMA_VERSION: u16 = 9;
+pub const PANE_STATE_SCHEMA_VERSION: u16 = 10;
 pub const IDENTIFIER_MAX_BYTES: usize = 256;
 pub const BODY_MAX_BYTES: usize = 4096;
 pub const PATH_MAX_BYTES: usize = 8192;
@@ -533,6 +533,15 @@ pub struct TaskSummaryState {
     pub text: Option<String>,
     pub context_fingerprint: String,
     pub generated_at: i64,
+    pub outcome: TaskSummaryOutcome,
+    pub failure_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSummaryOutcome {
+    Generated,
+    Failed,
 }
 
 impl TaskSummaryState {
@@ -558,6 +567,23 @@ impl TaskSummaryState {
                 "task summary timestamp must be non-negative".to_string(),
             ));
         }
+        match self.outcome {
+            TaskSummaryOutcome::Generated if self.failure_code.is_none() => {}
+            TaskSummaryOutcome::Failed
+                if self.text.is_none()
+                    && self.failure_code.as_ref().is_some_and(|code| {
+                        !code.is_empty()
+                            && code.len() <= IDENTIFIER_MAX_BYTES
+                            && code
+                                .bytes()
+                                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                    }) => {}
+            _ => {
+                return Err(ModelError(
+                    "task summary outcome metadata is inconsistent".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -565,8 +591,8 @@ impl TaskSummaryState {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskContextState {
-    pub origin_prompt: Option<String>,
     pub recent_prompts: Vec<String>,
+    pub reference_response: Option<String>,
     pub summary: Option<TaskSummaryState>,
 }
 
@@ -575,9 +601,6 @@ impl TaskContextState {
         let prompt = truncate_utf8(prompt.trim(), TASK_CONTEXT_PROMPT_MAX_BYTES);
         if prompt.is_empty() {
             return;
-        }
-        if self.origin_prompt.is_none() {
-            self.origin_prompt = Some(prompt.clone());
         }
         if self.recent_prompts.last() == Some(&prompt) {
             return;
@@ -588,33 +611,52 @@ impl TaskContextState {
         }
     }
 
+    pub fn observe_prompt_with_reference(&mut self, prompt: &str, response: Option<&str>) {
+        self.reference_response = response
+            .map(str::trim)
+            .filter(|response| !response.is_empty())
+            .map(|response| truncate_utf8(response, RESPONSE_PREVIEW_MAX_BYTES));
+        self.observe_prompt(prompt);
+    }
+
     pub fn context_fingerprint(&self) -> Option<String> {
         use sha2::{Digest, Sha256};
 
-        if self.origin_prompt.is_none() && self.recent_prompts.is_empty() {
+        if self.recent_prompts.is_empty() {
             return None;
         }
         let mut digest = Sha256::new();
-        if let Some(origin) = &self.origin_prompt {
-            digest.update(b"origin\0");
-            digest.update(origin.as_bytes());
-        }
         for prompt in &self.recent_prompts {
             digest.update(b"\0recent\0");
             digest.update(prompt.as_bytes());
         }
+        if let Some(response) = &self.reference_response {
+            digest.update(b"\0reference-response\0");
+            digest.update(response.as_bytes());
+        }
         Some(format!("{:x}", digest.finalize()))
+    }
+
+    pub fn current_summary(&self) -> Option<&TaskSummaryState> {
+        let fingerprint = self.context_fingerprint()?;
+        self.summary
+            .as_ref()
+            .filter(|summary| summary.context_fingerprint == fingerprint)
     }
 
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.recent_prompts.len() > MAX_TASK_CONTEXT_PROMPTS {
             return Err(ModelError("too many task context prompts".to_string()));
         }
-        if let Some(origin) = &self.origin_prompt {
-            validate_required_text(origin, "task context origin", TASK_CONTEXT_PROMPT_MAX_BYTES)?;
-        }
         for prompt in &self.recent_prompts {
             validate_required_text(prompt, "task context prompt", TASK_CONTEXT_PROMPT_MAX_BYTES)?;
+        }
+        if let Some(response) = &self.reference_response {
+            validate_required_text(
+                response,
+                "task context reference response",
+                RESPONSE_PREVIEW_MAX_BYTES,
+            )?;
         }
         if let Some(summary) = &self.summary {
             summary.validate()?;
@@ -1381,15 +1423,55 @@ mod tests {
     }
 
     #[test]
-    fn task_context_keeps_origin_and_bounded_recent_prompts() {
+    fn task_context_keeps_bounded_recent_prompts_and_reference_response() {
         let mut context = TaskContextState::default();
         for prompt in ["origin", "one", "two", "three", "four", "five", "five"] {
             context.observe_prompt(prompt);
         }
+        context.observe_prompt_with_reference("six", Some("next task is RC-01"));
 
-        assert_eq!(context.origin_prompt.as_deref(), Some("origin"));
-        assert_eq!(context.recent_prompts, ["two", "three", "four", "five"]);
+        assert_eq!(context.recent_prompts, ["three", "four", "five", "six"]);
+        assert_eq!(
+            context.reference_response.as_deref(),
+            Some("next task is RC-01")
+        );
         assert_eq!(context.context_fingerprint().unwrap().len(), 64);
+        context.validate().unwrap();
+    }
+
+    #[test]
+    fn task_context_exposes_only_the_summary_for_its_current_fingerprint() {
+        let mut context = TaskContextState::default();
+        context.observe_prompt("古い依頼");
+        let old_fingerprint = context.context_fingerprint().unwrap();
+        context.summary = Some(TaskSummaryState {
+            text: Some("古い要約".to_string()),
+            context_fingerprint: old_fingerprint,
+            generated_at: 1,
+            outcome: TaskSummaryOutcome::Generated,
+            failure_code: None,
+        });
+        assert_eq!(
+            context
+                .current_summary()
+                .and_then(|summary| summary.text.as_deref()),
+            Some("古い要約")
+        );
+
+        context.observe_prompt("新しい依頼");
+        assert!(context.current_summary().is_none());
+
+        context.summary = Some(TaskSummaryState {
+            text: None,
+            context_fingerprint: context.context_fingerprint().unwrap(),
+            generated_at: 2,
+            outcome: TaskSummaryOutcome::Failed,
+            failure_code: Some("timeout".to_string()),
+        });
+        assert_eq!(
+            context.current_summary().unwrap().failure_code.as_deref(),
+            Some("timeout")
+        );
         context.validate().unwrap();
     }
 

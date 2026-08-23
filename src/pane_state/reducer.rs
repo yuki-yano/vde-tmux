@@ -896,11 +896,26 @@ fn begin_run(
     started_at: i64,
     prompt: Option<PromptState>,
 ) -> Result<(), ReduceError> {
+    let starts_new_run = state.run_seq == state.completed_seq;
+    let reference_response = starts_new_run
+        .then(|| {
+            state
+                .latest_response
+                .as_ref()
+                .map(|response| response.text.clone())
+        })
+        .flatten();
     start_new_run(state, started_at)?;
     state.lifecycle = LifecycleState::Running;
     state.prompt = prompt;
     if let Some(prompt) = &state.prompt {
-        state.task_context.observe_prompt(&prompt.text);
+        if starts_new_run {
+            state
+                .task_context
+                .observe_prompt_with_reference(&prompt.text, reference_response.as_deref());
+        } else {
+            state.task_context.observe_prompt(&prompt.text);
+        }
     }
     Ok(())
 }
@@ -3251,6 +3266,8 @@ mod tests {
                     text: Some("サイドバー要約表示".to_string()),
                     context_fingerprint: fingerprint.clone(),
                     generated_at: 2,
+                    outcome: crate::pane_state::TaskSummaryOutcome::Generated,
+                    failure_code: None,
                 },
             },
             &current_tracker,
@@ -3292,6 +3309,8 @@ mod tests {
                     text: Some("古い要約".to_string()),
                     context_fingerprint: fingerprint,
                     generated_at: 4,
+                    outcome: crate::pane_state::TaskSummaryOutcome::Generated,
+                    failure_code: None,
                 },
             },
             changed_tracker,
@@ -3354,12 +3373,20 @@ mod tests {
             completed.record.as_ref(),
             PaneEvent::BeginRun {
                 started_at: 4,
-                prompt: None,
+                prompt: Some(PromptState {
+                    text: "continue with the next task".to_string(),
+                    source: "user".to_string(),
+                    digest: None,
+                }),
             },
             &completed_tracker,
         );
         assert!(active(&next_run).latest_response.is_none());
         assert!(active(&next_run).background_process.is_some());
+        assert_eq!(
+            active(&next_run).task_context.reference_response.as_deref(),
+            Some("server is ready")
+        );
 
         let next_tracker = next_run.tracker_delta.as_ref().unwrap().next.clone();
         let observation = PaneEvent::ObservationBatch {

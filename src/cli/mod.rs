@@ -721,8 +721,8 @@ pub fn run() -> ExitCode {
         Duration::from_secs(3)
     };
     let reads_agent_hook_stdin = agent_hook_requires_stdin(&args);
-    let agent_hook_deadline =
-        reads_agent_hook_stdin.then(|| Instant::now() + Duration::from_secs(2));
+    let agent_hook_deadline = reads_agent_hook_stdin
+        .then(|| Instant::now() + agent_hook_delivery_timeout_from_args(&args));
     let input = match agent_hook_deadline {
         Some(deadline) => match read_agent_hook_input_until(deadline) {
             Ok(input) => input,
@@ -927,7 +927,7 @@ where
             PollOutcome::Closed => return finish_agent_hook_input(bytes),
             PollOutcome::TimedOut => {
                 if bytes.is_empty() {
-                    bail!("agent hook 2s deadline exceeded while reading stdin");
+                    bail!("agent hook delivery deadline exceeded while reading stdin");
                 }
                 // Keep whatever fully arrived; a slow sender that never closes
                 // stdin must not discard an already-complete payload.
@@ -1914,16 +1914,26 @@ where
             Ok(None)
         }
         Command::Hook { command } => {
+            let default_timeout = hook::delivery_timeout(&command);
             hook::run_hook_command(
                 command,
                 input,
                 runner,
                 env,
                 now_epoch,
-                hook_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(2)),
+                hook_deadline.unwrap_or_else(|| Instant::now() + default_timeout),
             )?;
             Ok(None)
         }
+    }
+}
+
+fn agent_hook_delivery_timeout_from_args(args: &[OsString]) -> Duration {
+    let event = args.get(3).and_then(|arg| arg.to_str());
+    if matches!(event, Some("UserPromptSubmit" | "Stop")) {
+        Duration::from_secs(8)
+    } else {
+        Duration::from_secs(2)
     }
 }
 

@@ -484,6 +484,16 @@ used. Prompt evidence is bounded and best-effort redacted before the additional 
 the feature disabled if that extra request is not acceptable. Model names are optional and
 otherwise follow the installed CLI's default.
 
+The summary context follows the latest four prompt occurrences for the current agent epoch. A
+second `UserPromptSubmit` with the same provider turn updates the active run instead of conflicting
+or allocating another run. While the current context is awaiting generation, or if generation
+fails, an older summary is not rendered. `agent list/get` reports `task_summary_status` as
+`current` or `failed` once the current-context attempt finishes; failed entries also include a
+bounded `task_summary_error` code. An absent status can mean generation is pending or the feature is
+disabled. A failed fingerprint is not retried until another prompt changes the context.
+`UserPromptSubmit` and `Stop` hook delivery use an eight-second deadline so a daemon reload can
+finish without dropping the lifecycle event.
+
 The category segment publishes every category that contains a session, including categories with no agent panes. Each category keeps its full label and action target; category entries are never collapsed into `+N` or `cat:N`, even when the segment exceeds the shared status width budget.
 
 `statusline.sessions.fixed_width: true` pads the active category's session segment to the widest category and keeps the combined category/session/window area at the same width across sessions. Session content is left-aligned within that fixed area by default; set `fixed_width_alignment: center` to center it. This keeps a centered status block stable when switching between sessions whose window names or process names have different lengths. Widths for inactive categories use the `other` session style; if `current.format` and `other.format` have different visual widths, the fixed width may differ by a few cells.
@@ -557,7 +567,7 @@ Use `disable` when the daemon must remain stopped.
 ### Pane-state persistence
 
 The daemon stores one private full-state snapshot per tmux server incarnation under
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v9.json`. A daemon restart restores the
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v10.json`. A daemon restart restores the
 prompt, task progress and items, subagents, worktree activity, lifecycle, timestamps, agent
 identity, task context and generated summaries, the latest response preview, explicitly reported
 background processes, listening ports, and Done/acknowledgement state for panes

@@ -4158,18 +4158,13 @@ fn apply_production_mutation(
                         "task summary generation failed for pane {}: {error}",
                         completion.pane_instance.pane_id
                     ));
-                    let revision = coordinator
-                        .state
-                        .lock()
-                        .expect("canonical state lock poisoned")
-                        .as_ref()
-                        .map_or(0, |state| state.leased.runtime.snapshot_revision());
-                    return ServerMessage::SnapshotAck {
-                        event_id: EventId::generate()
-                            .expect("OS random source failed after daemon startup"),
-                        accepted_seq,
-                        snapshot_revision: revision,
-                    };
+                    crate::pane_state::TaskSummaryState {
+                        text: None,
+                        context_fingerprint: completion.context_fingerprint,
+                        generated_at: epoch_seconds(),
+                        outcome: crate::pane_state::TaskSummaryOutcome::Failed,
+                        failure_code: Some(task_summary_failure_code(&error).to_string()),
+                    }
                 }
             };
             let envelope = PaneEventEnvelope {
@@ -4393,6 +4388,20 @@ fn apply_production_mutation(
         coordinator.fail_stop(message.clone());
     }
     response
+}
+
+fn task_summary_failure_code(error: &str) -> &'static str {
+    if error.contains("timed out") || error.contains("timeout") {
+        "timeout"
+    } else if error.contains("failed to start") || error.contains("No such file") {
+        "process_start"
+    } else if error.contains("queue") {
+        "queue_full"
+    } else if error.contains("invalid") || error.contains("exceeded") || error.contains("empty") {
+        "invalid_output"
+    } else {
+        "process_failed"
+    }
 }
 
 fn unique_eligible_client_pid(
@@ -4912,10 +4921,12 @@ fn apply_external_provider_event_with_runner(
     // Provider adapters already reduce human-entered prompts and responses to
     // bounded, single-line UI previews. Keep those previews for the sidebar,
     // but never project the prompt of a guarded dispatch into PaneState.
-    let private_prompt = apply_result
-        .run
-        .as_ref()
-        .is_some_and(|run| run.operation_id.is_some());
+    let private_prompt = apply_result.run.as_ref().is_some_and(|run| {
+        run.operation_id.is_some()
+            && apply_result.operation.as_ref().is_none_or(|operation| {
+                observation.prompt_digest.as_deref() == Some(operation.prompt_digest.as_str())
+            })
+    });
     redact_private_provider_prompt(&mut envelope.event, private_prompt);
 
     if apply_result.disposition == crate::agent_state::reducer::ApplyDisposition::Duplicate
@@ -4967,7 +4978,102 @@ fn apply_external_provider_event_with_runner(
         }
     }
 
+    if apply_result.disposition == crate::agent_state::reducer::ApplyDisposition::EvidenceOnly
+        && let Some(run) = apply_result.run.as_ref()
+    {
+        return project_provider_run_evidence_only(
+            coordinator,
+            accepted_seq,
+            envelope.event_id,
+            &envelope.pane_instance,
+            run,
+        );
+    }
+
     apply_pane_event_mutation(coordinator, accepted_seq, envelope, false, apply_result.run)
+}
+
+fn project_provider_run_evidence_only(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    event_id: EventId,
+    pane_instance: &PaneInstance,
+    run: &crate::agent_state::RunRecord,
+) -> ServerMessage {
+    use crate::daemon::protocol::v2::{PaneApplyOutcome, ServerMessage};
+    use crate::pane_state::reducer::ReductionOutcome;
+
+    let result = (|| -> Result<
+        crate::pane_state::store::ApplyResult,
+        crate::pane_state::store::StoreError,
+    > {
+        let mut state_guard = coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned");
+        let state = state_guard.as_mut().ok_or_else(|| {
+            crate::pane_state::store::StoreError::PersistFailed("daemon is hydrating".to_string())
+        })?;
+        let revision_before = state.leased.runtime.snapshot_revision();
+        let mut io = pane_snapshot_store(coordinator);
+        let changed = if state
+            .leased
+            .runtime
+            .record(pane_instance)
+            .is_some_and(|pane| pane_belongs_to_run_epoch(pane, run))
+        {
+            state.leased.runtime.project_current_run(
+                &mut io,
+                pane_instance,
+                crate::pane_state::CurrentDurableRunProjection {
+                    run_id: run.run_id.as_str().to_string(),
+                    run_seq: run.run_seq,
+                    run_revision: run.revision,
+                },
+                run.execution_active(),
+                run.updated_at,
+            )?
+        } else {
+            false
+        };
+        let result = crate::pane_state::store::ApplyResult {
+            outcome: if changed {
+                ReductionOutcome::CanonicalChanged
+            } else {
+                ReductionOutcome::Noop
+            },
+            state_version: state
+                .leased
+                .runtime
+                .record(pane_instance)
+                .map(crate::pane_state::PaneState::version),
+            snapshot_revision: state.leased.runtime.snapshot_revision(),
+        };
+        finish_pane_event_projection(
+            coordinator,
+            state,
+            pane_instance,
+            None,
+            revision_before,
+            result,
+            false,
+        )
+    })();
+
+    match result {
+        Ok(result) => ServerMessage::PaneEventResult {
+            event_id,
+            accepted_seq,
+            state_version: result.state_version,
+            snapshot_revision: result.snapshot_revision,
+            outcome: if result.outcome == ReductionOutcome::CanonicalChanged {
+                PaneApplyOutcome::Committed
+            } else {
+                PaneApplyOutcome::Noop
+            },
+        },
+        Err(error) => production_store_error_response(coordinator, error, Some(event_id)),
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -8360,7 +8466,6 @@ mod tests {
             running.prompt.as_ref().map(|prompt| prompt.text.as_str()),
             Some("hello")
         );
-        assert_eq!(running.task_context.origin_prompt.as_deref(), Some("hello"));
         assert_eq!(running.task_context.recent_prompts, ["hello"]);
         let durable_run = coordinator
             .agent_runtime
@@ -8373,6 +8478,62 @@ mod tests {
             .unwrap();
         assert_eq!(durable_run.execution_phase, ExecutionPhase::Running);
         assert_eq!(durable_run.semantic_outcome, SemanticOutcome::Unresolved);
+
+        let (steer_envelope, steer_observation) = make_event(
+            "UserPromptSubmit",
+            r#"{"session_id":"session-537","turn_id":"turn-1","prompt":"review with pane five"}"#,
+            3,
+        );
+        assert!(matches!(
+            apply_external_provider_event_with_runner(
+                &coordinator,
+                3,
+                steer_envelope,
+                steer_observation.clone(),
+                &runner,
+            ),
+            ServerMessage::PaneEventResult { .. }
+        ));
+        let steered = coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .leased
+            .runtime
+            .record(&pane)
+            .unwrap()
+            .clone();
+        assert_eq!(steered.run_seq, 1);
+        assert_eq!(
+            steered.prompt.as_ref().map(|prompt| prompt.text.as_str()),
+            Some("review with pane five")
+        );
+        assert_eq!(
+            steered.task_context.recent_prompts,
+            ["hello", "review with pane five"]
+        );
+        let steered_run = coordinator
+            .agent_runtime
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .provider_event_run(&steer_observation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(steered_run.run_id, durable_run.run_id);
+        assert_eq!(steered_run.run_seq, durable_run.run_seq);
+        assert_eq!(
+            steered_run
+                .evidence
+                .provider_events
+                .last()
+                .unwrap()
+                .disposition,
+            "prompt_updated"
+        );
 
         drop(coordinator);
         std::fs::remove_dir_all(root).unwrap();

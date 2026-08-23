@@ -31,6 +31,13 @@ The probe stores only allow-listed hashes, byte lengths, versions, and event ord
 Provider-native runtime data was removed after verification. The retained hashed result satisfies
 the strengthened LF-count and no-callback-replay-through-`SessionEnd` gates.
 
+Runtime same-turn handling is intentionally broader than the queued-turn probe above. Codex may
+emit another `UserPromptSubmit` occurrence with the current `turn_id` when an active turn is
+steered. The hook invocation's ingress event ID, rather than the turn ID alone, identifies that
+prompt occurrence. Reusing the ingress ID with the same payload is a delivery retry; a new ingress
+ID on the same turn updates the existing run. A same-turn occurrence observed after `Stop` is kept
+as evidence and never reopens the completed run.
+
 ## Claude Code
 
 The isolated probe has not passed yet. Claude Code 2.1.227 did not reuse the

@@ -277,8 +277,10 @@ pub fn build_rows_from_presentations(
                     .unwrap_or_default(),
                 task_summary: canonical
                     .task_context
-                    .summary
-                    .as_ref()
+                    .current_summary()
+                    .filter(|summary| {
+                        summary.outcome == crate::pane_state::TaskSummaryOutcome::Generated
+                    })
                     .and_then(|summary| summary.text.clone())
                     .unwrap_or_default(),
                 wait_reason,

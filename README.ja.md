@@ -416,6 +416,13 @@ daemonはpaneのagentに対応する独立CLI（Codexは`codex exec`、Claudeは
 最新のraw promptはpane stateとJSON APIには保持しますが、サイドバーには表示しません。
 providerをまたぐfallbackは行いません。追加のmodel requestを許容できない場合は無効のままにしてください。
 
+要約contextは、現在のagent epochに届いた直近4件のprompt occurrenceへ追従します。
+同じprovider turnで2件目以降の`UserPromptSubmit`が届いた場合は、conflictや別runの作成ではなくactive runを更新します。
+現在のcontextに対する生成待ちまたは生成失敗中は、古い要約を表示しません。
+`agent list/get`は現在contextの生成完了後に`task_summary_status`を`current`または`failed`で返し、失敗時はboundedな`task_summary_error` codeも返します。
+statusがない場合は生成待ちまたは機能無効のいずれかです。同じfingerprintの失敗は、次のpromptでcontextが変わるまで再試行しません。
+`UserPromptSubmit`と`Stop`のhook配送には8秒のdeadlineを使い、daemon reloadの完了待ちによるlifecycle eventの欠落を防ぎます。
+
 category segmentでは、agent paneが0件の場合も、sessionを持つすべてのカテゴリを表示します。
 各カテゴリは、共有status幅のbudgetを超える場合も完全なラベルと操作targetをpublishし、`+N`や`cat:N`へ省略しません。
 
@@ -488,7 +495,7 @@ vt hook emit \
 ### pane state の永続化
 
 daemon は tmux server incarnation ごとに一つの private な full-state snapshot を
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v8.json` へ保存します。
+`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v10.json` へ保存します。
 daemon 再起動後も、pane ID と PID が一致する pane の prompt、task の進捗と項目、subagent、worktree activity、lifecycle、時刻、agent identity、Unread Spanのpin、Done と確認済み状態を復元します。
 
 snapshot が破損している、または権限が安全でない場合、daemon は修復や fallback を行わず起動を停止します。

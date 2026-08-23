@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{PaneInstance, PaneState, StoreError};
 
-pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 9;
-pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v9.json";
+pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 10;
+pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v10.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

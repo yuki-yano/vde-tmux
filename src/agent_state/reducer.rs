@@ -15,6 +15,7 @@ use super::model::{AgentBinding, ModelError};
 pub enum ApplyDisposition {
     Applied,
     Duplicate,
+    EvidenceOnly,
 }
 
 pub fn new_run_from_prompt(
@@ -93,11 +94,7 @@ pub fn apply_observation(
                 "SessionStart cannot be attributed to an Agent Run".to_string(),
             ));
         }
-        ProviderHookKind::UserPromptSubmit => {
-            return Err(ModelError(
-                "a distinct UserPromptSubmit must allocate a new run".to_string(),
-            ));
-        }
+        ProviderHookKind::UserPromptSubmit => {}
         ProviderHookKind::Activity => {
             record.evidence.activity_count = record
                 .evidence
@@ -135,7 +132,12 @@ pub fn apply_observation(
             }
         }
     }
-    append_provider_reference(record, observation, "applied")?;
+    let disposition = if observation.hook_kind == ProviderHookKind::UserPromptSubmit {
+        "prompt_updated"
+    } else {
+        "applied"
+    };
+    append_provider_reference(record, observation, disposition)?;
     record.updated_at = record.updated_at.max(observation.observed_at);
     record.revision = record
         .revision
@@ -237,9 +239,18 @@ fn append_provider_reference(
         if record.evidence.provider_events.len()
             >= crate::agent_state::model::RUN_EVENT_REFERENCE_MAX_COUNT
         {
-            return Err(ModelError(
-                "run provider event reference capacity exceeded".to_string(),
-            ));
+            let replaceable = record
+                .evidence
+                .provider_events
+                .iter()
+                .position(|event| event.disposition == "prompt_updated");
+            if let Some(index) = replaceable {
+                record.evidence.provider_events.remove(index);
+            } else {
+                return Err(ModelError(
+                    "run provider event reference capacity exceeded".to_string(),
+                ));
+            }
         }
         record
             .evidence
@@ -515,5 +526,53 @@ mod tests {
         assert_eq!(stop_reference.count, 2);
         assert_eq!(stop_reference.first_observed_at, 2);
         assert_eq!(stop_reference.last_observed_at, 4);
+    }
+
+    #[test]
+    fn same_turn_prompt_evidence_rotates_without_discarding_run_start_or_stop() {
+        let mut record = run();
+        for ordinal in 0..(crate::agent_state::model::RUN_EVENT_REFERENCE_MAX_COUNT + 4) {
+            let ingress = format!("{ordinal:032x}");
+            let prompt = observation(
+                ProviderHookKind::UserPromptSubmit,
+                &ingress,
+                &format!("prompt-event-{ordinal}"),
+                &format!("prompt-payload-{ordinal}"),
+                2 + ordinal as i64,
+            );
+            assert_eq!(
+                apply_observation(&mut record, &prompt).unwrap(),
+                ApplyDisposition::Applied
+            );
+        }
+
+        assert_eq!(
+            record.evidence.provider_events.len(),
+            crate::agent_state::model::RUN_EVENT_REFERENCE_MAX_COUNT
+        );
+        assert!(
+            record
+                .evidence
+                .provider_events
+                .iter()
+                .any(|event| event.disposition == "run_created")
+        );
+
+        let stop = observation(
+            ProviderHookKind::Stop,
+            "ffffffffffffffffffffffffffffffff",
+            "stop-event-after-many-prompts",
+            "stop-payload-after-many-prompts",
+            100,
+        );
+        apply_observation(&mut record, &stop).unwrap();
+        assert_eq!(
+            record.evidence.provider_events.len(),
+            crate::agent_state::model::RUN_EVENT_REFERENCE_MAX_COUNT
+        );
+        assert!(record.evidence.provider_events.iter().any(|event| {
+            event.event_ref == stop.provider_event_ref.as_deref().unwrap()
+                && event.disposition == "applied"
+        }));
     }
 }

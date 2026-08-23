@@ -5,24 +5,26 @@ Publishing is driven by Git tags.
 ## Local API v4 upgrade
 
 API v4 replaces public API 3 with provider capabilities, guarded terminal mutations, exact pane
-split, and agent start. Daemon protocol 19 carries editprompt logical focus, the Limited display
-state, and client-scoped sidebar peek navigation, while PaneState 9 and private state format 1 do
-not change; existing state remains readable and must not be reset. Public API 3 is not retained in
-parallel.
+split, and agent start. Daemon protocol 20 carries editprompt logical focus, the Limited display
+state, client-scoped sidebar peek navigation, and current-context task-summary outcomes. PaneState
+10 replaces PaneState 9 so task-summary context can follow same-turn prompt updates; the v9 file is
+left untouched and v10 starts empty. Private state format 1 does not change. Public API 3 is not
+retained in parallel.
 
 Before replacement, pass the release gates listed below plus
 `scripts/test-agent-api-v4-isolated.sh`, `scripts/test-agent-prompt-isolated.sh`, and
 `scripts/test-agent-operation-crash-isolated.sh`. Confirm `vt agent storage status --json` reports
 zero `in_flight_operations`. Stage both binaries with
 `cargo install --path . --locked --root <temporary-root>` and verify the staged schema reports API
-4, protocol 19, PaneState 9, and private state 1.
+4, protocol 20, PaneState 10, and private state 1.
 
 Close running sidebars and run `vt daemon disable` before copying either executable so hooks cannot
 restart a mixed binary generation during replacement. Back up both installed executables, replace
 them from the staged root, verify their SHA-256 hashes, then run `vt daemon enable`. Reopen sidebars
 and verify the installed schema, daemon health, hook ownership, one guarded copy-mode send on a
-scratch server, and a SessionStart-free first Codex prompt. Do not reset PaneState or private Agent
-state for this upgrade. On a failed copy or version check, keep the daemon disabled and restore both
+scratch server, a same-turn Codex steer, and a SessionStart-free first Codex prompt. Do not reset
+private Agent state or delete the untouched PaneState v9 snapshot for this upgrade. On a failed copy
+or version check, keep the daemon disabled and restore both
 executables from the same backup before re-enabling it.
 
 ## Historical initial API v3 cutover

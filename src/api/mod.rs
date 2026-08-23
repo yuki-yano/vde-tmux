@@ -920,9 +920,20 @@ pub struct AgentSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_summary_status: Option<TaskSummaryStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_summary_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_response: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSummaryStatus {
+    Current,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -4715,6 +4726,12 @@ fn agent_summary(
         return None;
     }
     let exact_identity = pane.agent_process.is_some();
+    let task_summary = state.task_context.current_summary();
+    let task_summary_status = match task_summary.map(|summary| summary.outcome) {
+        Some(crate::pane_state::TaskSummaryOutcome::Generated) => Some(TaskSummaryStatus::Current),
+        Some(crate::pane_state::TaskSummaryOutcome::Failed) => Some(TaskSummaryStatus::Failed),
+        None => None,
+    };
     Some(AgentSummary {
         agent_ref: exact_identity.then(|| agent_ref(server_identity, pane)),
         identity: if exact_identity {
@@ -4741,11 +4758,13 @@ fn agent_summary(
             .sidebar_model
             .needs_action
             .contains(&pane.pane_instance),
-        task_summary: state
-            .task_context
-            .summary
-            .as_ref()
+        task_summary: task_summary
+            .filter(|summary| summary.outcome == crate::pane_state::TaskSummaryOutcome::Generated)
             .and_then(|summary| summary.text.clone()),
+        task_summary_status,
+        task_summary_error: task_summary
+            .filter(|summary| summary.outcome == crate::pane_state::TaskSummaryOutcome::Failed)
+            .and_then(|summary| summary.failure_code.clone()),
         latest_response: state
             .latest_response
             .as_ref()
@@ -6628,6 +6647,27 @@ mod tests {
         assert!(!detail.summary.needs_action);
         assert!(!detail.summary.present);
         assert!(detail.summary.agent_ref.is_none());
+    }
+
+    #[test]
+    fn agent_summary_never_exposes_a_stale_task_summary() {
+        let mut pane = test_agent_pane();
+        let state = &mut pane.resolved.as_mut().unwrap().canonical;
+        state.task_context.observe_prompt("最初の古い依頼");
+        state.task_context.summary = Some(crate::pane_state::TaskSummaryState {
+            text: Some("古い要約".to_string()),
+            context_fingerprint: state.task_context.context_fingerprint().unwrap(),
+            generated_at: 1,
+            outcome: crate::pane_state::TaskSummaryOutcome::Generated,
+            failure_code: None,
+        });
+        state.task_context.observe_prompt("現在の新しい依頼");
+        let snapshot = test_snapshot(pane.clone());
+
+        let summary = agent_summary(&pane, &snapshot, "server").unwrap();
+        assert_eq!(summary.task_summary, None);
+        assert_eq!(summary.task_summary_status, None);
+        assert_eq!(summary.task_summary_error, None);
     }
 
     #[test]

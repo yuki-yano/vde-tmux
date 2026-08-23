@@ -48,6 +48,29 @@ fn agent_start_accepts_hyphenated_provider_arguments() {
     assert_eq!(timeout_ms, 1000);
 }
 
+#[test]
+fn lifecycle_agent_hooks_receive_the_extended_delivery_deadline() {
+    let args = |provider: &str, event: &str| {
+        ["vt", "hook", provider, event]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        agent_hook_delivery_timeout_from_args(&args("codex", "UserPromptSubmit")),
+        Duration::from_secs(8)
+    );
+    assert_eq!(
+        agent_hook_delivery_timeout_from_args(&args("claude", "Stop")),
+        Duration::from_secs(8)
+    );
+    assert_eq!(
+        agent_hook_delivery_timeout_from_args(&args("codex", "AfterToolUse")),
+        Duration::from_secs(2)
+    );
+}
+
 fn stub_action_client(mock: &MockTmuxRunner, client: &str, session_id: &str) {
     let format = crate::session::client_session_context_format();
     let sep = '\u{1f}';
