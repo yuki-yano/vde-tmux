@@ -714,13 +714,45 @@ capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-selection
 SIDE2_SHARED_SELECTION="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-selection.txt")"
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input "toggle:chat::$S2_AGENT::$S2_AGENT_PID"
-sleep 0.3
+for _ in $(seq 1 60); do
+  query_snapshot
+  if python3 - "$QUERY_JSON" "$S2_AGENT" "$S2_AGENT_PID" 2>/dev/null <<'PY'
+import json, sys
+model = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]
+row_id = f"chat::{sys.argv[2]}::{sys.argv[3]}"
+assert model["navigation"]["selection"] == row_id, model["navigation"]
+assert row_id in model["preferences"]["expansion_overrides"], model["preferences"]
+PY
+  then break; fi
+  sleep 0.05
+done
+python3 - "$QUERY_JSON" "$S2_AGENT" "$S2_AGENT_PID" <<'PY'
+import json, sys
+model = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]
+row_id = f"chat::{sys.argv[2]}::{sys.argv[3]}"
+assert model["navigation"]["selection"] == row_id, model["navigation"]
+assert row_id in model["preferences"]["expansion_overrides"], model["preferences"]
+PY
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-shared-expansion.txt"
 SIDE2_SHARED_EXPANSION="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-shared-expansion.txt")"
 [[ "$SIDE2_SHARED_EXPANSION" != "$SIDE2_SHARED_SELECTION" ]]
 
 VT_PANE="$SIDEBAR_1" run_vt sidebar input K
-sleep 0.3
+for _ in $(seq 1 60); do
+  query_snapshot
+  if python3 - "$QUERY_JSON" "$S2_AGENT" "$S1_AGENT" 2>/dev/null <<'PY'
+import json, sys
+preferences = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["preferences"]
+assert preferences["manual_chat_order"][:2] == [sys.argv[2], sys.argv[3]], preferences
+PY
+  then break; fi
+  sleep 0.05
+done
+python3 - "$QUERY_JSON" "$S2_AGENT" "$S1_AGENT" <<'PY'
+import json, sys
+preferences = json.load(open(sys.argv[1], encoding="utf-8"))["snapshot"]["sidebar_model"]["preferences"]
+assert preferences["manual_chat_order"][:2] == [sys.argv[2], sys.argv[3]], preferences
+PY
 capture_sidebar_normalized "$SIDEBAR_2" "$ARTIFACT_DIR/sidebar-2-after-shared-order.txt"
 SIDE2_SHARED_ORDER="$(fingerprint "$ARTIFACT_DIR/sidebar-2-after-shared-order.txt")"
 [[ "$SIDE2_SHARED_ORDER" != "$SIDE2_SHARED_EXPANSION" ]]
@@ -780,8 +812,9 @@ PY
 record sidebar-state PASS-navigation-view-filter-shared-and-defaults-persisted
 
 # A regular pane can address the sidebar in its own window without first focusing it. Presentation
-# changes are then shared with every sidebar. Semantic navigation selects a visible agent and jumps
-# the invoking client in one action; unread-latest scans the full snapshot and may cross windows.
+# changes are then shared with every sidebar. Priority peek navigation jumps the exact invoking
+# client while preserving unread; read-current acknowledges it explicitly. unread-latest remains a
+# normal auto-read jump and may cross windows.
 tmux_cmd switch-client -c "$CLIENT_1" -t "$S1_WINDOW"
 tmux_cmd select-pane -t "$S1_AGENT"
 wait_client_pane "$CLIENT_1" "$S1_AGENT"
@@ -845,14 +878,21 @@ done
 [[ "$(wc -l <"$NOTIFY_LOG" | tr -d ' ')" == "$PIN_NOTIFICATIONS_BEFORE" ]]
 record sidebar-pin PASS-nonfocus-control-shared-projection-badge-attention-notification-stable
 
-# Move the shared cursor off the sole Done row so the existing agent-next scenario still
-# exercises selection of the first row admitted by the Done filter.
+# Move the shared cursor off the sole Done row. The peek anchor is the source pane rather than this
+# shared cursor, so a source omitted by the Done filter selects the first visible agent.
 VT_PANE="$S1_AGENT" run_vt sidebar input j --window "$S1_WINDOW"
 sleep 0.1
 VT_PANE="$S1_AGENT" run_vt sidebar input done --window "$S1_WINDOW"
 sleep 0.15
-VT_PANE="$S1_AGENT" run_vt sidebar input agent-next --window "$S1_WINDOW"
+TMUX_CLIENT_PID_1="$(client_field "$CLIENT_1" client_pid)"
+[[ "$TMUX_CLIENT_PID_1" =~ ^[1-9][0-9]*$ ]]
+VT_PANE="$S1_AGENT" run_vt sidebar input agent-next --window "$S1_WINDOW" \
+  --client-pid "$TMUX_CLIENT_PID_1"
 wait_client_pane "$CLIENT_1" "$S1_PEER"
+sleep 0.2
+wait_badge "$S1_PEER" Done
+VT_PANE="$S1_PEER" run_vt sidebar input read-current --window "$S1_WINDOW" \
+  --client-pid "$TMUX_CLIENT_PID_1"
 wait_badge "$S1_PEER" Idle
 query_snapshot
 python3 - "$QUERY_JSON" "$S1_PEER" <<'PY'
@@ -877,7 +917,7 @@ wait_badge "$S2_AGENT" Done
 VT_PANE="$S1_AGENT" run_vt sidebar input unread-latest --window "$S1_WINDOW"
 wait_client_pane "$CLIENT_1" "$S2_AGENT"
 wait_badge "$S2_AGENT" Idle
-record sidebar-nonfocus PASS-shared-view-agent-next-and-cross-window-unread-latest
+record sidebar-nonfocus PASS-priority-peek-explicit-read-and-cross-window-unread-latest
 
 tmux_cmd switch-client -c "$CLIENT_1" -t "$S1_WINDOW"
 tmux_cmd select-pane -t "$S1_AGENT"

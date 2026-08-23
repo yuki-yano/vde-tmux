@@ -981,6 +981,74 @@ mod local_state_tests {
     }
 
     #[test]
+    fn read_current_candidates_are_subsequent_visible_unread_chats_without_wrapping() {
+        let chat = |pane_id: &str, pane_pid: u32, unread: bool| SidebarRow {
+            id: chat_row_id(&PaneInstance {
+                pane_id: pane_id.to_string(),
+                pane_pid,
+            }),
+            kind: SidebarRowKind::Chat,
+            depth: 0,
+            label: pane_id.to_string(),
+            chat_count: 1,
+            rollup: RollupLevel::Idle,
+            badge_state: Some(BadgeState::Idle),
+            expanded: true,
+            pane_id: Some(pane_id.to_string()),
+            git: None,
+            active: false,
+            meta: Some(crate::sidebar::tree::RowMeta {
+                is_unread: unread,
+                ..crate::sidebar::tree::RowMeta::default()
+            }),
+        };
+        let rows = vec![
+            chat("%0", 100, true),
+            chat("%1", 101, true),
+            chat("%2", 102, false),
+            SidebarRow {
+                id: "zone::idle".to_string(),
+                kind: SidebarRowKind::Zone,
+                depth: 0,
+                label: "IDLE".to_string(),
+                chat_count: 0,
+                rollup: RollupLevel::Idle,
+                badge_state: None,
+                expanded: true,
+                pane_id: None,
+                git: None,
+                active: false,
+                meta: None,
+            },
+            chat("%3", 103, true),
+        ];
+
+        assert_eq!(
+            unread_advance_candidates(
+                &PaneInstance {
+                    pane_id: "%1".to_string(),
+                    pane_pid: 101,
+                },
+                &rows,
+            ),
+            vec![PaneInstance {
+                pane_id: "%3".to_string(),
+                pane_pid: 103,
+            }]
+        );
+        assert!(
+            unread_advance_candidates(
+                &PaneInstance {
+                    pane_id: "%3".to_string(),
+                    pane_pid: 103,
+                },
+                &rows,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn persisted_preferences_seed_axes_filter_and_global_expansion() {
         let mut snapshot = snapshot(10);
         snapshot.sidebar_model.preferences.category_scope = CategoryScope::All;
@@ -3975,6 +4043,7 @@ fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &SidebarView, key:
         | SidebarInputAction::PageUp
         | SidebarInputAction::AgentNext
         | SidebarInputAction::AgentPrevious
+        | SidebarInputAction::ReadCurrent
         | SidebarInputAction::UnreadLatest
         | SidebarInputAction::TogglePanePin
         | SidebarInputAction::ReorderUp
@@ -4006,16 +4075,21 @@ fn adjacent_agent_target(
     Some(agents[index].clone())
 }
 
-fn jump_from_control(
+struct PeekSource<'a> {
+    pane: &'a PaneInstance,
+    client_pid: u32,
+}
+
+fn peek_from_control(
     socket: &Path,
     server_identity: &str,
     snapshot: &ResolvedSnapshot,
-    source_pane: &PaneInstance,
+    source: PeekSource<'_>,
     target: Option<(String, PaneInstance)>,
     state: &mut SidebarState,
     ui: &mut MarkCompleteUi,
 ) {
-    if let Err(error) = source_pane.validate() {
+    if let Err(error) = source.pane.validate() {
         ui.set_toast(
             format!("invalid jump source: {error}"),
             NoticeLevel::Failure,
@@ -4023,7 +4097,7 @@ fn jump_from_control(
         );
         return;
     }
-    let Some((row_id, pane_instance)) = target else {
+    let Some((_row_id, pane_instance)) = target else {
         return;
     };
     if !snapshot
@@ -4038,20 +4112,94 @@ fn jump_from_control(
         );
         return;
     }
-    if state.selection.as_deref() != Some(row_id.as_str()) || state.manual_scroll {
-        state.selection = Some(row_id);
-        state.manual_scroll = false;
-        state.version = state.version.saturating_add(1);
+    match crate::sidebar::client::send_sidebar_peek_v2(
+        socket,
+        server_identity,
+        pane_instance,
+        source.pane.clone(),
+        source.client_pid,
+    ) {
+        Ok(actual) => {
+            let actual_row_id = chat_row_id(&actual);
+            if state.selection.as_deref() != Some(actual_row_id.as_str()) || state.manual_scroll {
+                state.selection = Some(actual_row_id);
+                state.manual_scroll = false;
+                state.version = state.version.saturating_add(1);
+            }
+        }
+        Err(error) => ui.set_toast(
+            format!("peek failed: {error}"),
+            NoticeLevel::Failure,
+            Duration::from_secs(5),
+        ),
     }
-    dispatch_click_action(
-        &ClickContext {
-            socket,
-            server_identity,
-            source_pane,
-        },
-        ui,
-        ClickAction::JumpPane(pane_instance),
-    );
+}
+
+fn unread_advance_candidates(source_pane: &PaneInstance, rows: &[SidebarRow]) -> Vec<PaneInstance> {
+    let Some(current) = rows.iter().position(|row| {
+        row.kind == SidebarRowKind::Chat
+            && pane_instance_from_row_id(&row.id).as_ref() == Some(source_pane)
+    }) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    rows.iter()
+        .skip(current + 1)
+        .filter(|row| row.kind == SidebarRowKind::Chat)
+        .filter(|row| row.meta.as_ref().is_some_and(|meta| meta.is_unread))
+        .filter_map(|row| pane_instance_from_row_id(&row.id))
+        .filter(|pane| seen.insert(pane.clone()))
+        .take(crate::pane_state::MAX_VIEW_PANES)
+        .collect()
+}
+
+fn read_current_from_control(
+    socket: &Path,
+    server_identity: &str,
+    source_pane: &PaneInstance,
+    client_pid: u32,
+    rows: &[SidebarRow],
+    state: &mut SidebarState,
+    ui: &mut MarkCompleteUi,
+) {
+    let candidates = unread_advance_candidates(source_pane, rows);
+    match crate::sidebar::client::send_sidebar_read_peek_v2(
+        socket,
+        server_identity,
+        source_pane.clone(),
+        client_pid,
+        candidates,
+    ) {
+        Ok(result) => {
+            let (advance, level) = match result.advance_outcome {
+                crate::daemon::protocol::v2::PeekAdvanceOutcome::Jumped { pane_instance } => {
+                    let row_id = chat_row_id(&pane_instance);
+                    if state.selection.as_deref() != Some(row_id.as_str()) || state.manual_scroll {
+                        state.selection = Some(row_id);
+                        state.manual_scroll = false;
+                        state.version = state.version.saturating_add(1);
+                    }
+                    ("; advanced to next unread", NoticeLevel::Success)
+                }
+                crate::daemon::protocol::v2::PeekAdvanceOutcome::Stayed => {
+                    ("; stayed on current pane", NoticeLevel::Success)
+                }
+                crate::daemon::protocol::v2::PeekAdvanceOutcome::Failed => {
+                    ("; advance failed", NoticeLevel::Warning)
+                }
+            };
+            let read = match result.read_outcome {
+                crate::daemon::protocol::v2::PaneApplyOutcome::Committed => "marked pane read",
+                crate::daemon::protocol::v2::PaneApplyOutcome::Noop => "pane was already read",
+            };
+            ui.set_toast(format!("{read}{advance}"), level, Duration::from_secs(3));
+        }
+        Err(error) => ui.set_toast(
+            format!("read-current failed: {error}"),
+            NoticeLevel::Failure,
+            Duration::from_secs(5),
+        ),
+    }
 }
 
 fn jump_latest_unread_from_control(
@@ -4280,6 +4428,7 @@ fn drain_control_messages(
                     match crate::sidebar::input::parse_key(&key) {
                         Some(crate::sidebar::input::SidebarInputAction::AgentNext)
                         | Some(crate::sidebar::input::SidebarInputAction::AgentPrevious)
+                        | Some(crate::sidebar::input::SidebarInputAction::ReadCurrent)
                         | Some(crate::sidebar::input::SidebarInputAction::UnreadLatest)
                         | Some(crate::sidebar::input::SidebarInputAction::TogglePanePin)
                             if !daemon_connected =>
@@ -4291,35 +4440,24 @@ fn drain_control_messages(
                             );
                         }
                         Some(crate::sidebar::input::SidebarInputAction::AgentNext) => {
-                            let target = adjacent_agent_target(
-                                state.selection.as_deref(),
-                                &sidebar.rows,
-                                true,
-                            );
-                            jump_from_control(
-                                socket,
-                                server_identity,
-                                snapshot,
-                                &source_pane,
-                                target,
-                                state,
-                                ui,
+                            ui.set_toast(
+                                "agent-next requires --client-pid".to_string(),
+                                NoticeLevel::Failure,
+                                Duration::from_secs(5),
                             );
                         }
                         Some(crate::sidebar::input::SidebarInputAction::AgentPrevious) => {
-                            let target = adjacent_agent_target(
-                                state.selection.as_deref(),
-                                &sidebar.rows,
-                                false,
+                            ui.set_toast(
+                                "agent-prev requires --client-pid".to_string(),
+                                NoticeLevel::Failure,
+                                Duration::from_secs(5),
                             );
-                            jump_from_control(
-                                socket,
-                                server_identity,
-                                snapshot,
-                                &source_pane,
-                                target,
-                                state,
-                                ui,
+                        }
+                        Some(crate::sidebar::input::SidebarInputAction::ReadCurrent) => {
+                            ui.set_toast(
+                                "read-current requires --client-pid".to_string(),
+                                NoticeLevel::Failure,
+                                Duration::from_secs(5),
                             );
                         }
                         Some(crate::sidebar::input::SidebarInputAction::UnreadLatest) => {
@@ -4394,6 +4532,7 @@ fn drain_control_messages(
                     crate::sidebar::input::parse_key(&key),
                     Some(crate::sidebar::input::SidebarInputAction::AgentNext)
                         | Some(crate::sidebar::input::SidebarInputAction::AgentPrevious)
+                        | Some(crate::sidebar::input::SidebarInputAction::ReadCurrent)
                         | Some(crate::sidebar::input::SidebarInputAction::UnreadLatest)
                         | Some(crate::sidebar::input::SidebarInputAction::TogglePanePin)
                 ) {
@@ -4402,6 +4541,99 @@ fn drain_control_messages(
                         NoticeLevel::Warning,
                         Duration::from_secs(5),
                     );
+                }
+            }
+            crate::sidebar::control::ControlMessage::PeekInput {
+                key,
+                source_pane,
+                session_id,
+                client_pid,
+            } => {
+                let action = crate::sidebar::input::parse_key(&key);
+                if !matches!(
+                    action,
+                    Some(crate::sidebar::input::SidebarInputAction::AgentNext)
+                        | Some(crate::sidebar::input::SidebarInputAction::AgentPrevious)
+                        | Some(crate::sidebar::input::SidebarInputAction::ReadCurrent)
+                ) {
+                    ui.set_toast(
+                        "invalid peek control input".to_string(),
+                        NoticeLevel::Failure,
+                        Duration::from_secs(5),
+                    );
+                    continue;
+                }
+                let Some(snapshot) = snapshot else {
+                    ui.set_toast(
+                        "peek unavailable before the first snapshot".to_string(),
+                        NoticeLevel::Warning,
+                        Duration::from_secs(5),
+                    );
+                    continue;
+                };
+                if !daemon_connected {
+                    ui.set_toast(
+                        "peek unavailable while sidebar is degraded".to_string(),
+                        NoticeLevel::Warning,
+                        Duration::from_secs(5),
+                    );
+                    continue;
+                }
+                set_sidebar_context(snapshot, state, &source_pane, &session_id);
+                let priority_navigation = matches!(
+                    action,
+                    Some(crate::sidebar::input::SidebarInputAction::AgentNext)
+                        | Some(crate::sidebar::input::SidebarInputAction::AgentPrevious)
+                );
+                if priority_navigation && state.presentation_mode != PresentationMode::Priority {
+                    ui.set_toast(
+                        "peek navigation requires Priority view".to_string(),
+                        NoticeLevel::Warning,
+                        Duration::from_secs(5),
+                    );
+                    continue;
+                }
+                let sidebar = project_view(snapshot, config, state);
+                match action {
+                    Some(crate::sidebar::input::SidebarInputAction::AgentNext)
+                    | Some(crate::sidebar::input::SidebarInputAction::AgentPrevious) => {
+                        let forward = matches!(
+                            action,
+                            Some(crate::sidebar::input::SidebarInputAction::AgentNext)
+                        );
+                        let anchor = chat_row_id(&source_pane);
+                        let target =
+                            adjacent_agent_target(Some(anchor.as_str()), &sidebar.rows, forward);
+                        peek_from_control(
+                            socket,
+                            server_identity,
+                            snapshot,
+                            PeekSource {
+                                pane: &source_pane,
+                                client_pid,
+                            },
+                            target,
+                            state,
+                            ui,
+                        );
+                    }
+                    Some(crate::sidebar::input::SidebarInputAction::ReadCurrent) => {
+                        let rows = if state.presentation_mode == PresentationMode::Priority {
+                            sidebar.rows.as_slice()
+                        } else {
+                            &[]
+                        };
+                        read_current_from_control(
+                            socket,
+                            server_identity,
+                            &source_pane,
+                            client_pid,
+                            rows,
+                            state,
+                            ui,
+                        );
+                    }
+                    _ => unreachable!("peek input was validated"),
                 }
             }
             crate::sidebar::control::ControlMessage::Focus {

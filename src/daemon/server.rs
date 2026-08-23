@@ -327,6 +327,7 @@ pub(crate) enum V2InternalMutation {
     },
     ReconcileViews,
     CurrentViewsReplacement {
+        observation_seq: u64,
         witnesses: Vec<crate::pane_state::ClientWitness>,
         through_unread_order: u64,
     },
@@ -355,6 +356,7 @@ pub(crate) enum V2InternalMutation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObservationPollProjection {
+    observation_seq: u64,
     topology: crate::daemon::topology::TopologySnapshot,
     status_metadata: super::runtime::StatusProjectionMetadata,
     witnesses: Vec<crate::pane_state::ClientWitness>,
@@ -714,6 +716,77 @@ fn validate_v2_origin(message: &ClientMessage) -> std::result::Result<(), Server
                 Some(event.event_id.clone()),
             )
         }),
+        ClientMessage::SidebarCommand {
+            event_id,
+            command:
+                crate::daemon::protocol::v2::SidebarCommand::PeekPane {
+                    pane_instance,
+                    source_pane,
+                    client_pid,
+                },
+            ..
+        } => {
+            if *client_pid == 0 {
+                return Err(ServerMessage::error(
+                    ErrorCode::InvalidRequest,
+                    "peek client PID must be positive",
+                    Some(event_id.clone()),
+                ));
+            }
+            for pane in [pane_instance, source_pane] {
+                if let Err(error) = pane.validate() {
+                    return Err(ServerMessage::error(
+                        ErrorCode::InvalidPaneInstance,
+                        error.to_string(),
+                        Some(event_id.clone()),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        ClientMessage::SidebarCommand {
+            event_id,
+            command:
+                crate::daemon::protocol::v2::SidebarCommand::ReadPeek {
+                    source_pane,
+                    client_pid,
+                    advance_candidates,
+                },
+            ..
+        } => {
+            if *client_pid == 0 || advance_candidates.len() > crate::pane_state::MAX_VIEW_PANES {
+                return Err(ServerMessage::error(
+                    ErrorCode::InvalidRequest,
+                    "read-current client PID or advance candidate list is invalid",
+                    Some(event_id.clone()),
+                ));
+            }
+            if let Err(error) = source_pane.validate() {
+                return Err(ServerMessage::error(
+                    ErrorCode::InvalidPaneInstance,
+                    error.to_string(),
+                    Some(event_id.clone()),
+                ));
+            }
+            let mut seen = BTreeSet::new();
+            for pane in advance_candidates {
+                if let Err(error) = pane.validate() {
+                    return Err(ServerMessage::error(
+                        ErrorCode::InvalidPaneInstance,
+                        error.to_string(),
+                        Some(event_id.clone()),
+                    ));
+                }
+                if !seen.insert(pane) {
+                    return Err(ServerMessage::error(
+                        ErrorCode::InvalidRequest,
+                        "read-current advance candidates must be unique",
+                        Some(event_id.clone()),
+                    ));
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -828,12 +901,14 @@ pub(crate) struct SidebarEffectCompletion {
     original_accepted_seq: u64,
     event_id: EventId,
     snapshot_revision: u64,
+    witness_observation_floor: u64,
     result: SidebarEffectResult,
+    effect: super::runtime::CanonicalSidebarEffect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidebarEffectResult {
-    Succeeded,
+    Succeeded(PaneInstance),
     ServerIncarnationMismatch,
     PaneInstanceMismatch,
     NoAvailablePane,
@@ -901,6 +976,7 @@ struct ProductionV2Coordinator {
     status_push_driver: Mutex<()>,
     status_push_started: Instant,
     config_hash: Mutex<String>,
+    witness_observation_seq: Arc<AtomicU64>,
     current_view_refresh_generation: AtomicU64,
     current_view_refresh_running: AtomicBool,
 }
@@ -913,6 +989,7 @@ fn start_notification_worker(command: String) -> SyncSender<NotificationWorkerJo
 fn start_sidebar_tmux_worker(
     env: &BTreeMap<String, String>,
     expected_server: crate::daemon::topology::ServerIdentity,
+    witness_observation_seq: Arc<AtomicU64>,
 ) -> (
     SyncSender<SidebarTmuxJob>,
     mpsc::Receiver<SidebarEffectCompletion>,
@@ -931,21 +1008,40 @@ fn start_sidebar_tmux_worker(
                 socket_name.clone(),
                 expected_server.clone(),
             );
-            let (candidates, client_pid, source_pane) = match job.effect {
+            let (candidates, client_pid, source_pane) = match &job.effect {
                 super::runtime::CanonicalSidebarEffect::JumpPane {
                     pane_instance,
                     client_pid,
                     source_pane,
-                } => (vec![pane_instance], client_pid, source_pane),
+                } => (
+                    vec![pane_instance.clone()],
+                    *client_pid,
+                    source_pane.clone(),
+                ),
                 super::runtime::CanonicalSidebarEffect::JumpLatestUnread {
                     candidates,
                     client_pid,
                     source_pane,
-                } => (candidates, client_pid, source_pane),
+                }
+                | super::runtime::CanonicalSidebarEffect::ReadPeekAdvance {
+                    candidates,
+                    client_pid,
+                    source_pane,
+                    ..
+                } => (candidates.clone(), *client_pid, source_pane.clone()),
+                super::runtime::CanonicalSidebarEffect::PeekPane {
+                    pane_instance,
+                    client_pid,
+                    source_pane,
+                } => (
+                    vec![pane_instance.clone()],
+                    *client_pid,
+                    source_pane.clone(),
+                ),
             };
             let result = io.jump_to_first_available_pane(&candidates, client_pid, &source_pane);
             let result = match result {
-                Ok(_) => SidebarEffectResult::Succeeded,
+                Ok(pane_instance) => SidebarEffectResult::Succeeded(pane_instance),
                 Err(crate::daemon::workers::SidebarTmuxError::ServerIncarnationMismatch) => {
                     SidebarEffectResult::ServerIncarnationMismatch
                 }
@@ -960,11 +1056,14 @@ fn start_sidebar_tmux_worker(
                 }
                 Err(error) => SidebarEffectResult::Failed(error.to_string()),
             };
+            let witness_observation_floor = witness_observation_seq.load(Ordering::SeqCst);
             let _ = completion_tx.send(SidebarEffectCompletion {
                 original_accepted_seq: job.original_accepted_seq,
                 event_id: job.event_id,
                 snapshot_revision: job.snapshot_revision,
+                witness_observation_floor,
                 result,
+                effect: job.effect,
             });
         }
     });
@@ -1238,8 +1337,12 @@ impl ProductionV2Coordinator {
             .map_or((None, None), |worker| {
                 (Some(worker.sender), Some(worker.completions))
             });
-        let (sidebar_tmux_tx, sidebar_completion_rx) =
-            start_sidebar_tmux_worker(&env, incarnation.identity.clone());
+        let witness_observation_seq = Arc::new(AtomicU64::new(0));
+        let (sidebar_tmux_tx, sidebar_completion_rx) = start_sidebar_tmux_worker(
+            &env,
+            incarnation.identity.clone(),
+            witness_observation_seq.clone(),
+        );
         let status_push = crate::daemon::status_push::StatusPushState::new(
             incarnation.identity.clone(),
             Duration::ZERO,
@@ -1277,6 +1380,7 @@ impl ProductionV2Coordinator {
             config_hash: Mutex::new(crate::daemon::lifecycle::config_hash(
                 &crate::config::Config::default(),
             )),
+            witness_observation_seq,
             current_view_refresh_generation: AtomicU64::new(0),
             current_view_refresh_running: AtomicBool::new(false),
         })
@@ -1489,6 +1593,12 @@ impl ProductionV2Coordinator {
             crate::daemon::lifecycle::config_hash(config);
     }
 
+    fn begin_witness_observation(&self) -> u64 {
+        self.witness_observation_seq
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1)
+    }
+
     fn schedule_current_view_refresh(self: &Arc<Self>) {
         self.current_view_refresh_generation
             .fetch_add(1, Ordering::SeqCst);
@@ -1520,10 +1630,11 @@ impl ProductionV2Coordinator {
                     .as_ref()
                     .map_or(0, |state| state.leased.runtime.latest_unread_order());
                 match query_client_witnesses(&coordinator, Duration::from_millis(100)) {
-                    Ok(witnesses) => {
+                    Ok(observation) => {
                         let _ = coordinator.enqueue_internal(
                             V2InternalMutation::CurrentViewsReplacement {
-                                witnesses,
+                                observation_seq: observation.seq,
+                                witnesses: observation.witnesses,
                                 through_unread_order,
                             },
                         );
@@ -2653,10 +2764,12 @@ impl ProductionV2Coordinator {
         snapshot_revision: u64,
     ) -> std::result::Result<(), ErrorCode> {
         let expected_pane = match &effect {
-            super::runtime::CanonicalSidebarEffect::JumpPane { pane_instance, .. } => {
+            super::runtime::CanonicalSidebarEffect::JumpPane { pane_instance, .. }
+            | super::runtime::CanonicalSidebarEffect::PeekPane { pane_instance, .. } => {
                 Some(pane_instance.clone())
             }
-            super::runtime::CanonicalSidebarEffect::JumpLatestUnread { candidates, .. } => {
+            super::runtime::CanonicalSidebarEffect::JumpLatestUnread { candidates, .. }
+            | super::runtime::CanonicalSidebarEffect::ReadPeekAdvance { candidates, .. } => {
                 if candidates.is_empty() {
                     return Err(ErrorCode::StaleSelection);
                 }
@@ -3608,6 +3721,245 @@ fn apply_production_mutation(
                     }
                 }
             }
+            crate::daemon::protocol::v2::SidebarCommand::PeekPane {
+                pane_instance,
+                source_pane,
+                client_pid,
+            } => {
+                let observation =
+                    match query_client_witnesses(coordinator, Duration::from_millis(250)) {
+                        Ok(observation) => observation,
+                        Err(error) if error.requires_daemon_exit() => {
+                            coordinator.fail_stop(error.to_string());
+                            return ServerMessage::error(
+                                ErrorCode::InternalError,
+                                error.to_string(),
+                                Some(event_id),
+                            );
+                        }
+                        Err(error) => {
+                            return ServerMessage::error(
+                                ErrorCode::StaleSelection,
+                                format!("peek client witness is unavailable: {error}"),
+                                Some(event_id),
+                            );
+                        }
+                    };
+                let revision = {
+                    let mut guard = coordinator
+                        .state
+                        .lock()
+                        .expect("canonical state lock poisoned");
+                    let state = guard
+                        .as_mut()
+                        .expect("state initialized before sidebar command");
+                    state.reconcile_peek_leases(&observation.witnesses, observation.seq);
+                    if !eligible_witness_matches(&observation.witnesses, client_pid, &source_pane) {
+                        return ServerMessage::error(
+                            ErrorCode::StaleSelection,
+                            "peek source does not match the requested tmux client",
+                            Some(event_id),
+                        );
+                    }
+                    if !state.contains_pane(&pane_instance) {
+                        return ServerMessage::error(
+                            ErrorCode::StaleSelection,
+                            "peek target is stale",
+                            Some(event_id),
+                        );
+                    }
+                    if !state.begin_peek(
+                        client_pid,
+                        source_pane.clone(),
+                        [pane_instance.clone()],
+                        accepted_seq,
+                    ) {
+                        return ServerMessage::error(
+                            ErrorCode::QueueFull,
+                            "a peek operation is already in flight for this client",
+                            Some(event_id),
+                        );
+                    }
+                    state.leased.runtime.snapshot_revision()
+                };
+                let effect = super::runtime::CanonicalSidebarEffect::PeekPane {
+                    pane_instance,
+                    client_pid,
+                    source_pane,
+                };
+                if let Err(code) = coordinator.schedule_sidebar_effect(
+                    effect,
+                    accepted_seq,
+                    event_id.clone(),
+                    revision,
+                ) {
+                    if let Some(state) = coordinator
+                        .state
+                        .lock()
+                        .expect("canonical state lock poisoned")
+                        .as_mut()
+                    {
+                        state.restore_peek_after_failure(
+                            client_pid,
+                            accepted_seq,
+                            &observation.witnesses,
+                            observation.seq,
+                        );
+                    }
+                    ServerMessage::error(code, "peek target is stale", Some(event_id))
+                } else {
+                    ServerMessage::SnapshotAck {
+                        event_id,
+                        accepted_seq,
+                        snapshot_revision: revision,
+                    }
+                }
+            }
+            crate::daemon::protocol::v2::SidebarCommand::ReadPeek {
+                source_pane,
+                client_pid,
+                advance_candidates,
+            } => {
+                let observation =
+                    match query_client_witnesses(coordinator, Duration::from_millis(250)) {
+                        Ok(observation) => observation,
+                        Err(error) if error.requires_daemon_exit() => {
+                            coordinator.fail_stop(error.to_string());
+                            return ServerMessage::error(
+                                ErrorCode::InternalError,
+                                error.to_string(),
+                                Some(event_id),
+                            );
+                        }
+                        Err(error) => {
+                            return ServerMessage::error(
+                                ErrorCode::StaleSelection,
+                                format!("read-current client witness is unavailable: {error}"),
+                                Some(event_id),
+                            );
+                        }
+                    };
+                let daemon_instance_id = coordinator
+                    .router
+                    .lock()
+                    .expect("v2 router lock poisoned")
+                    .daemon_instance_id()
+                    .clone();
+                let (revision, read_outcome, candidates) = {
+                    let mut guard = coordinator
+                        .state
+                        .lock()
+                        .expect("canonical state lock poisoned");
+                    let state = guard
+                        .as_mut()
+                        .expect("state initialized before sidebar command");
+                    state.reconcile_peek_leases(&observation.witnesses, observation.seq);
+                    if !eligible_witness_matches(&observation.witnesses, client_pid, &source_pane) {
+                        return ServerMessage::error(
+                            ErrorCode::StaleSelection,
+                            "read source does not match the requested tmux client",
+                            Some(event_id),
+                        );
+                    }
+                    let Some(target) = state.active_peek_target(client_pid).cloned() else {
+                        return ServerMessage::error(
+                            ErrorCode::StaleSelection,
+                            "read-current requires an active peek lease",
+                            Some(event_id),
+                        );
+                    };
+                    if target != source_pane {
+                        return ServerMessage::error(
+                            ErrorCode::StaleSelection,
+                            "active peek target no longer matches the client focus",
+                            Some(event_id),
+                        );
+                    }
+                    let mut io = pane_snapshot_store(coordinator);
+                    match commit_read_peek_state(
+                        state,
+                        &mut io,
+                        &daemon_instance_id,
+                        &event_id,
+                        &target,
+                        client_pid,
+                        advance_candidates,
+                        accepted_seq,
+                    ) {
+                        Ok(result) => {
+                            if result.candidates.is_empty() {
+                                let witness_observation_floor =
+                                    coordinator.witness_observation_seq.load(Ordering::SeqCst);
+                                let renewed = state.renew_active_peek(
+                                    client_pid,
+                                    &target,
+                                    witness_observation_floor,
+                                );
+                                debug_assert!(
+                                    renewed,
+                                    "read-current without advance starts a new active lease interval"
+                                );
+                            }
+                            (result.revision, result.read_outcome, result.candidates)
+                        }
+                        Err(error) => {
+                            return production_store_error_response(
+                                coordinator,
+                                error,
+                                Some(event_id),
+                            );
+                        }
+                    }
+                };
+                if candidates.is_empty() {
+                    ServerMessage::SidebarReadPeekResult {
+                        event_id,
+                        accepted_seq,
+                        snapshot_revision: revision,
+                        read_outcome,
+                        advance_outcome: crate::daemon::protocol::v2::PeekAdvanceOutcome::Stayed,
+                    }
+                } else {
+                    let effect = super::runtime::CanonicalSidebarEffect::ReadPeekAdvance {
+                        candidates,
+                        client_pid,
+                        source_pane,
+                        read_outcome,
+                    };
+                    if coordinator
+                        .schedule_sidebar_effect(effect, accepted_seq, event_id.clone(), revision)
+                        .is_err()
+                    {
+                        if let Some(state) = coordinator
+                            .state
+                            .lock()
+                            .expect("canonical state lock poisoned")
+                            .as_mut()
+                        {
+                            state.restore_peek_after_failure(
+                                client_pid,
+                                accepted_seq,
+                                &observation.witnesses,
+                                observation.seq,
+                            );
+                        }
+                        ServerMessage::SidebarReadPeekResult {
+                            event_id,
+                            accepted_seq,
+                            snapshot_revision: revision,
+                            read_outcome,
+                            advance_outcome:
+                                crate::daemon::protocol::v2::PeekAdvanceOutcome::Failed,
+                        }
+                    } else {
+                        ServerMessage::SnapshotAck {
+                            event_id,
+                            accepted_seq,
+                            snapshot_revision: revision,
+                        }
+                    }
+                }
+            }
             crate::daemon::protocol::v2::SidebarCommand::PreferenceIntent { intent } => {
                 apply_sidebar_preference_intent(coordinator, accepted_seq, event_id, intent)
             }
@@ -3682,11 +4034,13 @@ fn apply_production_mutation(
             }
         }
         V2AcceptedMutation::Internal(V2InternalMutation::CurrentViewsReplacement {
+            observation_seq,
             witnesses,
             through_unread_order,
         }) => {
             match reconcile_views_with_witnesses(
                 coordinator,
+                observation_seq,
                 &witnesses,
                 through_unread_order,
                 None,
@@ -3839,37 +4193,141 @@ fn apply_production_mutation(
             apply_external_pane_event(coordinator, accepted_seq, envelope)
         }
         V2AcceptedMutation::Internal(V2InternalMutation::SidebarEffectCompleted(completion)) => {
+            let restores_previous_peek = matches!(
+                &completion.effect,
+                super::runtime::CanonicalSidebarEffect::PeekPane { .. }
+                    | super::runtime::CanonicalSidebarEffect::ReadPeekAdvance { .. }
+            ) && !matches!(
+                &completion.result,
+                SidebarEffectResult::Succeeded(_)
+                    | SidebarEffectResult::SourceClientMismatch
+                    | SidebarEffectResult::ServerIncarnationMismatch
+            );
+            let failure_observation = if restores_previous_peek {
+                match query_client_witnesses(coordinator, Duration::from_millis(250)) {
+                    Ok(observation) => Some(observation),
+                    Err(error) => {
+                        if error.requires_daemon_exit() {
+                            coordinator.fail_stop(error.to_string());
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let fail_stop = matches!(
-                completion.result,
+                &completion.result,
                 SidebarEffectResult::ServerIncarnationMismatch
             );
-            let original_response = match completion.result {
-                SidebarEffectResult::Succeeded => ServerMessage::SnapshotAck {
+            let succeeded_target = match &completion.result {
+                SidebarEffectResult::Succeeded(target) => Some(target.clone()),
+                _ => None,
+            };
+            let mut reconcile_after_success = false;
+            {
+                let mut guard = coordinator
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned");
+                if let Some(state) = guard.as_mut() {
+                    match (&completion.effect, succeeded_target.as_ref()) {
+                        (
+                            super::runtime::CanonicalSidebarEffect::PeekPane { client_pid, .. }
+                            | super::runtime::CanonicalSidebarEffect::ReadPeekAdvance {
+                                client_pid,
+                                ..
+                            },
+                            Some(target),
+                        ) => state.activate_peek(
+                            *client_pid,
+                            completion.original_accepted_seq,
+                            target.clone(),
+                            completion.witness_observation_floor,
+                        ),
+                        (
+                            super::runtime::CanonicalSidebarEffect::PeekPane { client_pid, .. }
+                            | super::runtime::CanonicalSidebarEffect::ReadPeekAdvance {
+                                client_pid,
+                                ..
+                            },
+                            None,
+                        ) => state.restore_peek_after_failure(
+                            *client_pid,
+                            completion.original_accepted_seq,
+                            failure_observation
+                                .as_ref()
+                                .map_or(&[], |observation| observation.witnesses.as_slice()),
+                            failure_observation
+                                .as_ref()
+                                .map_or(0, |observation| observation.seq),
+                        ),
+                        (
+                            super::runtime::CanonicalSidebarEffect::JumpPane { client_pid, .. }
+                            | super::runtime::CanonicalSidebarEffect::JumpLatestUnread {
+                                client_pid,
+                                ..
+                            },
+                            Some(_),
+                        ) => {
+                            state.clear_peek(*client_pid);
+                            reconcile_after_success = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if reconcile_after_success {
+                let _ = coordinator.enqueue_internal(V2InternalMutation::ReconcileViews);
+            }
+            let original_response = match (&completion.effect, &completion.result) {
+                (
+                    super::runtime::CanonicalSidebarEffect::PeekPane { .. },
+                    SidebarEffectResult::Succeeded(pane_instance),
+                ) => ServerMessage::SidebarPeekResult {
+                    event_id: completion.event_id.clone(),
+                    accepted_seq: completion.original_accepted_seq,
+                    snapshot_revision: completion.snapshot_revision,
+                    pane_instance: pane_instance.clone(),
+                },
+                (
+                    super::runtime::CanonicalSidebarEffect::ReadPeekAdvance {
+                        read_outcome, ..
+                    },
+                    result,
+                ) => ServerMessage::SidebarReadPeekResult {
+                    event_id: completion.event_id.clone(),
+                    accepted_seq: completion.original_accepted_seq,
+                    snapshot_revision: completion.snapshot_revision,
+                    read_outcome: *read_outcome,
+                    advance_outcome: read_peek_advance_outcome(result),
+                },
+                (_, SidebarEffectResult::Succeeded(_)) => ServerMessage::SnapshotAck {
                     event_id: completion.event_id.clone(),
                     accepted_seq: completion.original_accepted_seq,
                     snapshot_revision: completion.snapshot_revision,
                 },
-                SidebarEffectResult::PaneInstanceMismatch => ServerMessage::error(
+                (_, SidebarEffectResult::PaneInstanceMismatch) => ServerMessage::error(
                     ErrorCode::StaleSelection,
                     "sidebar pane selection became stale before tmux mutation",
                     Some(completion.event_id.clone()),
                 ),
-                SidebarEffectResult::NoAvailablePane => ServerMessage::error(
+                (_, SidebarEffectResult::NoAvailablePane) => ServerMessage::error(
                     ErrorCode::StaleSelection,
                     "no unread pane remained available before tmux mutation",
                     Some(completion.event_id.clone()),
                 ),
-                SidebarEffectResult::SourceClientMismatch => ServerMessage::error(
+                (_, SidebarEffectResult::SourceClientMismatch) => ServerMessage::error(
                     ErrorCode::StaleSelection,
                     "source sidebar focus changed before tmux mutation",
                     Some(completion.event_id.clone()),
                 ),
-                SidebarEffectResult::ServerIncarnationMismatch => ServerMessage::error(
+                (_, SidebarEffectResult::ServerIncarnationMismatch) => ServerMessage::error(
                     ErrorCode::InternalError,
                     "tmux server incarnation changed during sidebar command",
                     Some(completion.event_id.clone()),
                 ),
-                SidebarEffectResult::Failed(message) => {
+                (_, SidebarEffectResult::Failed(message)) => {
                     eprintln!("[vde-tmux] sidebar tmux command failed: {message}");
                     ServerMessage::error(
                         ErrorCode::InternalError,
@@ -3952,6 +4410,108 @@ fn unique_eligible_client_pid(
     } else {
         Err(clients.len())
     }
+}
+
+fn eligible_witness_matches(
+    witnesses: &[crate::pane_state::ClientWitness],
+    client_pid: u32,
+    source_pane: &PaneInstance,
+) -> bool {
+    witnesses.iter().any(|witness| {
+        witness.client_pid == client_pid
+            && witness.is_eligible()
+            && &witness.active_pane == source_pane
+    })
+}
+
+fn read_peek_advance_outcome(
+    result: &SidebarEffectResult,
+) -> crate::daemon::protocol::v2::PeekAdvanceOutcome {
+    match result {
+        SidebarEffectResult::Succeeded(pane_instance) => {
+            crate::daemon::protocol::v2::PeekAdvanceOutcome::Jumped {
+                pane_instance: pane_instance.clone(),
+            }
+        }
+        SidebarEffectResult::NoAvailablePane => {
+            crate::daemon::protocol::v2::PeekAdvanceOutcome::Stayed
+        }
+        _ => crate::daemon::protocol::v2::PeekAdvanceOutcome::Failed,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadPeekCommitResult {
+    revision: u64,
+    read_outcome: crate::daemon::protocol::v2::PaneApplyOutcome,
+    candidates: Vec<PaneInstance>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_read_peek_state(
+    state: &mut super::runtime::CanonicalCoordinatorState,
+    io: &mut dyn crate::pane_state::snapshot::PaneSnapshotStoreIo,
+    daemon_instance_id: &DaemonInstanceId,
+    event_id: &EventId,
+    target: &PaneInstance,
+    client_pid: u32,
+    advance_candidates: Vec<PaneInstance>,
+    accepted_seq: u64,
+) -> Result<ReadPeekCommitResult, crate::pane_state::store::StoreError> {
+    let through_order = state
+        .leased
+        .runtime
+        .record(target)
+        .and_then(|pane| pane.unread.latest_unread())
+        .map(|occurrence| occurrence.order);
+    let read_outcome = if let Some(through_order) = through_order {
+        let envelope = PaneEventEnvelope {
+            daemon_instance_id: daemon_instance_id.clone(),
+            event_id: event_id.clone(),
+            pane_instance: target.clone(),
+            agent: None,
+            agent_session_id: None,
+            event: PaneEvent::MarkPaneRead { through_order },
+        };
+        let result = state.leased.runtime.apply_pane_reads(io, &[envelope])?;
+        if result.committed > 0 {
+            crate::daemon::protocol::v2::PaneApplyOutcome::Committed
+        } else {
+            crate::daemon::protocol::v2::PaneApplyOutcome::Noop
+        }
+    } else {
+        crate::daemon::protocol::v2::PaneApplyOutcome::Noop
+    };
+
+    state.clear_peeks_for_read_panes_except(&BTreeSet::from([target.clone()]), Some(client_pid));
+    let mut seen = BTreeSet::new();
+    let candidates = advance_candidates
+        .into_iter()
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .filter(|candidate| {
+            state.contains_pane(candidate)
+                && state
+                    .leased
+                    .runtime
+                    .record(candidate)
+                    .is_some_and(|pane| pane.unread.is_unread())
+        })
+        .collect::<Vec<_>>();
+    let revision = state.leased.runtime.snapshot_revision();
+    if !candidates.is_empty() {
+        let began = state.begin_peek(
+            client_pid,
+            target.clone(),
+            candidates.iter().cloned(),
+            accepted_seq,
+        );
+        debug_assert!(began, "read-current starts from an active lease");
+    }
+    Ok(ReadPeekCommitResult {
+        revision,
+        read_outcome,
+        candidates,
+    })
 }
 
 fn apply_sidebar_preference_intent(
@@ -6077,10 +6637,38 @@ fn unread_visibility_for_event(
             .filter(|value| !value.trim().is_empty()),
         coordinator.incarnation.identity.clone(),
     );
-    match crate::daemon::view_hooks::completion_visibility_for_panes(&io, &focus_equivalent_panes) {
-        Ok(result) => Ok((result.snapshot, result.diagnostic)),
-        Err(error) => Err(crate::pane_state::store::StoreError::FailStop(
-            error.to_string(),
+    use crate::daemon::view_hooks::FreshVisibilityIo as _;
+    let observation_seq = coordinator.begin_witness_observation();
+    match io.query_witnesses(crate::daemon::view_hooks::FRESH_VISIBILITY_TIMEOUT) {
+        Ok(witnesses) => {
+            let pane_visible_to_eligible_client = {
+                let mut guard = coordinator
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned");
+                guard.as_mut().is_some_and(|state| {
+                    state.reconcile_peek_leases(&witnesses, observation_seq);
+                    let authorized =
+                        state.has_read_authority_for(&witnesses, &focus_equivalent_panes);
+                    if authorized {
+                        state.clear_peeks_for_read_panes(&focus_equivalent_panes);
+                    }
+                    authorized
+                })
+            };
+            Ok((
+                crate::pane_state::VisibilitySnapshot {
+                    pane_visible_to_eligible_client,
+                },
+                None,
+            ))
+        }
+        Err(error) if error.requires_daemon_exit() => Err(
+            crate::pane_state::store::StoreError::FailStop(error.to_string()),
+        ),
+        Err(error) => Ok((
+            crate::pane_state::VisibilitySnapshot::default(),
+            Some(format!("fresh_visibility_unavailable: {error}")),
         )),
     }
 }
@@ -6287,6 +6875,7 @@ fn query_observation_poll_projection(
     coordinator: &ProductionV2Coordinator,
     timeout: Duration,
 ) -> Result<ObservationPollProjection, ObservationPollQueryError> {
+    let observation_seq = coordinator.begin_witness_observation();
     let framing =
         ObservationPollFraming::generate().map_err(ObservationPollQueryError::Topology)?;
     let args = framing.query_args();
@@ -6298,7 +6887,10 @@ fn query_observation_poll_projection(
             error.to_string(),
         ))
     })?;
-    parse_observation_poll_projection(&output, &framing, &coordinator.incarnation.identity)
+    let mut projection =
+        parse_observation_poll_projection(&output, &framing, &coordinator.incarnation.identity)?;
+    projection.observation_seq = observation_seq;
+    Ok(projection)
 }
 
 fn parse_observation_poll_projection(
@@ -6341,6 +6933,7 @@ fn parse_observation_poll_projection(
     .map_err(ObservationPollQueryError::Client)?;
 
     Ok(ObservationPollProjection {
+        observation_seq: 0,
         topology,
         status_metadata: status_projection_metadata(status, &witnesses),
         witnesses,
@@ -6421,11 +7014,17 @@ fn status_projection_metadata(
     metadata
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WitnessObservation {
+    seq: u64,
+    witnesses: Vec<crate::pane_state::ClientWitness>,
+}
+
 fn query_client_witnesses(
     coordinator: &ProductionV2Coordinator,
     timeout: Duration,
-) -> Result<Vec<crate::pane_state::ClientWitness>, crate::daemon::view_hooks::FreshVisibilityError>
-{
+) -> Result<WitnessObservation, crate::daemon::view_hooks::FreshVisibilityError> {
+    let seq = coordinator.begin_witness_observation();
     let token = EventId::generate()
         .map_err(|error| crate::daemon::view_hooks::FreshVisibilityError::Query(error.to_string()))?
         .as_str()
@@ -6436,11 +7035,12 @@ fn query_client_witnesses(
     let output = runner.run(&refs).map_err(|error| {
         crate::daemon::view_hooks::FreshVisibilityError::Query(error.to_string())
     })?;
-    crate::daemon::view_hooks::parse_client_view_query(
+    let witnesses = crate::daemon::view_hooks::parse_client_view_query(
         &output,
         &token,
         &coordinator.incarnation.identity,
-    )
+    )?;
+    Ok(WitnessObservation { seq, witnesses })
 }
 
 fn refresh_full_topology(
@@ -6453,6 +7053,7 @@ fn refresh_full_topology(
             crate::pane_state::store::StoreError::PersistFailed(error.to_string())
         }
     })?;
+    let observation_floor = coordinator.witness_observation_seq.load(Ordering::SeqCst);
     let mut state_guard = coordinator
         .state
         .lock()
@@ -6460,7 +7061,7 @@ fn refresh_full_topology(
     let state = state_guard.as_mut().ok_or_else(|| {
         crate::pane_state::store::StoreError::PersistFailed("daemon is hydrating".to_string())
     })?;
-    state.replace_topology(topology)?;
+    state.replace_topology_and_fence_observations(topology, observation_floor)?;
     persist_pruned_sidebar_pins(coordinator, state)?;
     Ok(state.leased.runtime.snapshot_revision())
 }
@@ -6477,12 +7078,14 @@ fn apply_observation_poll_projection(
         let state = state_guard
             .as_mut()
             .context("state initialized before observation projection")?;
-        state.replace_topology(projection.topology)?;
-        persist_pruned_sidebar_pins(coordinator, state)?;
-        state.replace_status_metadata(projection.status_metadata)?;
+        if state.apply_topology_observation(projection.topology, projection.observation_seq)? {
+            persist_pruned_sidebar_pins(coordinator, state)?;
+            state.replace_status_metadata(projection.status_metadata)?;
+        }
     }
     reconcile_views_with_witnesses(
         coordinator,
+        projection.observation_seq,
         &projection.witnesses,
         projection.through_unread_order,
         Some(&projection.observation_bases),
@@ -6537,6 +7140,7 @@ fn targeted_pane_refresh_outcome_response(
             ServerMessage::error(ErrorCode::PaneNotFound, "pane was not found", None)
         }
         Ok(crate::daemon::topology::TargetedRefreshOutcome::Found(pane)) => {
+            let observation_floor = coordinator.witness_observation_seq.load(Ordering::SeqCst);
             let mut state_guard = coordinator
                 .state
                 .lock()
@@ -6552,7 +7156,9 @@ fn targeted_pane_refresh_outcome_response(
             topology
                 .panes
                 .sort_by(|left, right| left.pane_instance.cmp(&right.pane_instance));
-            if let Err(error) = state.replace_topology(topology) {
+            if let Err(error) =
+                state.replace_topology_and_fence_observations(topology, observation_floor)
+            {
                 return production_store_error_response(coordinator, error, None);
             }
             match state.pane_presentation(pane_id) {
@@ -7030,8 +7636,8 @@ fn bootstrap_v2_runtime(
         )
     } else {
         let topology = query_full_topology(coordinator, Duration::from_secs(1))?;
-        let witnesses = query_client_witnesses(coordinator, Duration::from_secs(1))?;
-        (topology, witnesses)
+        let observation = query_client_witnesses(coordinator, Duration::from_secs(1))?;
+        (topology, observation.witnesses)
     };
     let snapshot_path =
         crate::pane_state::snapshot::snapshot_path(env, &coordinator.incarnation.hash);
@@ -7201,8 +7807,8 @@ fn initial_view_reconciliation(coordinator: &ProductionV2Coordinator) -> Result<
         .expect("canonical state lock poisoned")
         .as_ref()
         .map_or(0, |state| state.leased.runtime.latest_unread_order());
-    let witnesses = match query_client_witnesses(coordinator, Duration::from_millis(250)) {
-        Ok(witnesses) => witnesses,
+    let observation = match query_client_witnesses(coordinator, Duration::from_millis(250)) {
+        Ok(observation) => observation,
         Err(error) if error.requires_daemon_exit() => return Err(error.into()),
         Err(error) => {
             let mut state_guard = coordinator
@@ -7220,11 +7826,19 @@ fn initial_view_reconciliation(coordinator: &ProductionV2Coordinator) -> Result<
             return Ok(());
         }
     };
-    reconcile_views_with_witnesses(coordinator, &witnesses, through_unread_order, None, None)
+    reconcile_views_with_witnesses(
+        coordinator,
+        observation.seq,
+        &observation.witnesses,
+        through_unread_order,
+        None,
+        None,
+    )
 }
 
 fn reconcile_views_with_witnesses(
     coordinator: &ProductionV2Coordinator,
+    observation_seq: u64,
     witnesses: &[crate::pane_state::ClientWitness],
     through_unread_order: u64,
     _observation_bases: Option<
@@ -7248,12 +7862,12 @@ fn reconcile_views_with_witnesses(
     if !observation_view_base_matches(&state.views, view_base) {
         return Ok(());
     }
+    state.reconcile_peek_leases(witnesses, observation_seq);
     let read_event_id = EventId::generate()?;
-    let focused_panes = state.effective_focused_panes(witnesses);
-    let pane_reads = crate::daemon::view_hooks::pane_read_envelopes_with_additional_focus(
+    let focused_panes = state.read_authorized_panes(witnesses);
+    let pane_reads = crate::daemon::view_hooks::pane_read_envelopes_for_panes(
         &daemon_instance_id,
         &read_event_id,
-        witnesses,
         &focused_panes,
         through_unread_order,
         &state.records_snapshot(),
@@ -7261,11 +7875,16 @@ fn reconcile_views_with_witnesses(
     let window_panes = state.window_panes();
     let revision_before = state.leased.runtime.snapshot_revision();
     if !pane_reads.is_empty() {
+        let read_panes = pane_reads
+            .iter()
+            .map(|envelope| envelope.pane_instance.clone())
+            .collect::<BTreeSet<_>>();
         let mut io = pane_snapshot_store(coordinator);
         state
             .leased
             .runtime
             .apply_pane_reads(&mut io, &pane_reads)?;
+        state.clear_peeks_for_read_panes(&read_panes);
     }
     let mut next_views = state.views.clone();
     let registry_changed = crate::daemon::view_hooks::reconcile_current_views(
@@ -8212,6 +8831,211 @@ mod tests {
             ));
     }
 
+    fn read_peek_test_pane_state(
+        pane_instance: PaneInstance,
+        state_id: &str,
+        order: u64,
+    ) -> crate::pane_state::PaneState {
+        crate::pane_state::PaneState {
+            schema_version: crate::pane_state::PANE_STATE_SCHEMA_VERSION,
+            state_id: crate::pane_state::StateId::parse(state_id).unwrap(),
+            revision: 1,
+            pane_instance,
+            agent: crate::pane_state::AgentKind::parse("codex").unwrap(),
+            agent_session_id: Some(
+                crate::pane_state::AgentSessionId::parse("read-peek-session").unwrap(),
+            ),
+            agent_process: None,
+            agent_epoch: 1,
+            agent_present: true,
+            scan_verified: true,
+            synthetic_completion_armed: false,
+            lifecycle: crate::pane_state::LifecycleState::Idle,
+            run_seq: 1,
+            current_run: None,
+            completed_seq: 1,
+            unread: crate::pane_state::UnreadState {
+                occurrence_seq: 1,
+                read_seq: 0,
+                latest: Some(crate::pane_state::UnreadOccurrence {
+                    seq: 1,
+                    order,
+                    reason: crate::pane_state::UnreadReason::Completed,
+                    occurred_at: 1,
+                }),
+            },
+            started_at: Some(1),
+            completed_at: Some(1),
+            prompt: None,
+            latest_response: None,
+            task_context: crate::pane_state::TaskContextState::default(),
+            tasks: crate::pane_state::TaskState::default(),
+            subagents: Vec::new(),
+            worktree_activity: None,
+            background_process: None,
+            listening_ports: Vec::new(),
+        }
+    }
+
+    fn read_peek_test_topology_pane(
+        pane_instance: PaneInstance,
+        active: bool,
+    ) -> crate::daemon::topology::TopologyPane {
+        crate::daemon::topology::TopologyPane {
+            pane_instance,
+            session_links: Vec::new(),
+            window_id: "@1".to_string(),
+            window_name: "peek".to_string(),
+            current_path: "/tmp".to_string(),
+            current_command: "codex".to_string(),
+            pane_width: 80,
+            active,
+            editprompt_is_editor: false,
+            editprompt_target_panes: Vec::new(),
+            editprompt_editor_pane: None,
+        }
+    }
+
+    fn read_peek_test_state(
+        root: &Path,
+    ) -> (
+        super::super::runtime::CanonicalCoordinatorState,
+        PaneInstance,
+        PaneInstance,
+    ) {
+        let target = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let candidate = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 102,
+        };
+        let mut leased =
+            super::super::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
+                .unwrap();
+        leased
+            .hydrate(BTreeMap::from([
+                (
+                    target.clone(),
+                    read_peek_test_pane_state(
+                        target.clone(),
+                        "11111111111111111111111111111111",
+                        1,
+                    ),
+                ),
+                (
+                    candidate.clone(),
+                    read_peek_test_pane_state(
+                        candidate.clone(),
+                        "22222222222222222222222222222222",
+                        2,
+                    ),
+                ),
+            ]))
+            .unwrap();
+        let mut state = super::super::runtime::CanonicalCoordinatorState::new(
+            leased,
+            crate::daemon::topology::TopologySnapshot {
+                server_identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 2,
+                },
+                panes: vec![
+                    read_peek_test_topology_pane(target.clone(), true),
+                    read_peek_test_topology_pane(candidate.clone(), false),
+                ],
+            },
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+            crate::sidebar::state::SidebarPreferences::default(),
+        );
+        assert!(state.begin_peek(10, target.clone(), [target.clone()], 1));
+        state.activate_peek(10, 1, target.clone(), 0);
+        (state, target, candidate)
+    }
+
+    fn read_peek_test_witness(
+        client_pid: u32,
+        pane: &PaneInstance,
+    ) -> crate::pane_state::ClientWitness {
+        crate::pane_state::ClientWitness {
+            client_pid,
+            session_id: format!("${client_pid}"),
+            window_id: "@1".to_string(),
+            active_pane: pane.clone(),
+            control_mode: false,
+            active_pane_flag: false,
+        }
+    }
+
+    struct ReadPeekStoreIo {
+        fail: bool,
+    }
+
+    impl crate::pane_state::snapshot::PaneSnapshotStoreIo for ReadPeekStoreIo {
+        fn save(
+            &mut self,
+            _records: &BTreeMap<PaneInstance, crate::pane_state::PaneState>,
+        ) -> Result<(), crate::pane_state::store::StoreError> {
+            if self.fail {
+                Err(crate::pane_state::store::StoreError::PersistFailed(
+                    "injected read failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn emit_read_peek_waiting_occurrence(
+        state: &mut super::super::runtime::CanonicalCoordinatorState,
+        target: &PaneInstance,
+    ) {
+        for event in [
+            PaneEvent::BeginRun {
+                started_at: 2,
+                prompt: None,
+            },
+            PaneEvent::WaitRequested {
+                observed_at: 3,
+                reason: crate::pane_state::WaitReason::PermissionPrompt,
+            },
+        ] {
+            apply_read_peek_event(
+                state,
+                target,
+                event,
+                &crate::pane_state::VisibilitySnapshot::default(),
+            );
+        }
+    }
+
+    fn apply_read_peek_event(
+        state: &mut super::super::runtime::CanonicalCoordinatorState,
+        target: &PaneInstance,
+        event: PaneEvent,
+        visibility: &crate::pane_state::VisibilitySnapshot,
+    ) {
+        state
+            .leased
+            .runtime
+            .apply_event(
+                &mut ReadPeekStoreIo { fail: false },
+                &PaneEventEnvelope {
+                    daemon_instance_id: v2_daemon_id(),
+                    event_id: EventId::generate().unwrap(),
+                    pane_instance: target.clone(),
+                    agent: Some(crate::pane_state::AgentKind::parse("codex").unwrap()),
+                    agent_session_id: Some(
+                        crate::pane_state::AgentSessionId::parse("read-peek-session").unwrap(),
+                    ),
+                    event,
+                },
+                visibility,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn duplicate_operator_resolution_repairs_a_failed_completed_pane_projection() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -8731,6 +9555,96 @@ mod tests {
 
     fn v2_event_id() -> EventId {
         EventId::parse(V2_EVENT_ID).unwrap()
+    }
+
+    fn v2_sidebar_command(command: crate::daemon::protocol::v2::SidebarCommand) -> ClientMessage {
+        ClientMessage::SidebarCommand {
+            proto: PROTOCOL_VERSION,
+            daemon_instance_id: v2_daemon_id(),
+            event_id: v2_event_id(),
+            command,
+        }
+    }
+
+    #[test]
+    fn peek_protocol_origin_rejects_invalid_identity_candidates_and_bounds() {
+        let pane = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 100,
+        };
+        let invalid = PaneInstance {
+            pane_id: "1".to_string(),
+            pane_pid: 0,
+        };
+        let peek_with_zero_client =
+            v2_sidebar_command(crate::daemon::protocol::v2::SidebarCommand::PeekPane {
+                pane_instance: pane.clone(),
+                source_pane: pane.clone(),
+                client_pid: 0,
+            });
+        assert!(matches!(
+            validate_v2_origin(&peek_with_zero_client),
+            Err(ServerMessage::Error {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        let peek_with_invalid_pane =
+            v2_sidebar_command(crate::daemon::protocol::v2::SidebarCommand::PeekPane {
+                pane_instance: invalid.clone(),
+                source_pane: pane.clone(),
+                client_pid: 10,
+            });
+        assert!(matches!(
+            validate_v2_origin(&peek_with_invalid_pane),
+            Err(ServerMessage::Error {
+                code: ErrorCode::InvalidPaneInstance,
+                ..
+            })
+        ));
+
+        let read_with_duplicate =
+            v2_sidebar_command(crate::daemon::protocol::v2::SidebarCommand::ReadPeek {
+                source_pane: pane.clone(),
+                client_pid: 10,
+                advance_candidates: vec![pane.clone(), pane.clone()],
+            });
+        assert!(matches!(
+            validate_v2_origin(&read_with_duplicate),
+            Err(ServerMessage::Error {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        let read_with_invalid =
+            v2_sidebar_command(crate::daemon::protocol::v2::SidebarCommand::ReadPeek {
+                source_pane: pane.clone(),
+                client_pid: 10,
+                advance_candidates: vec![invalid],
+            });
+        assert!(matches!(
+            validate_v2_origin(&read_with_invalid),
+            Err(ServerMessage::Error {
+                code: ErrorCode::InvalidPaneInstance,
+                ..
+            })
+        ));
+
+        let read_above_bound =
+            v2_sidebar_command(crate::daemon::protocol::v2::SidebarCommand::ReadPeek {
+                source_pane: pane.clone(),
+                client_pid: 10,
+                advance_candidates: vec![pane; crate::pane_state::MAX_VIEW_PANES + 1],
+            });
+        assert!(matches!(
+            validate_v2_origin(&read_above_bound),
+            Err(ServerMessage::Error {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
     }
 
     fn v2_pane_event(event: PaneEvent) -> ClientMessage {
@@ -9306,6 +10220,7 @@ mod tests {
                 coordinator.enqueue_internal(V2InternalMutation::ObservationBatch(Box::new(
                     ObservationBatchPayload {
                         projection: Box::new(ObservationPollProjection {
+                            observation_seq: 1,
                             topology: crate::daemon::topology::TopologySnapshot {
                                 server_identity,
                                 panes: Vec::new(),
@@ -9407,6 +10322,7 @@ mod tests {
                     mutation: V2AcceptedMutation::Internal(V2InternalMutation::ObservationBatch(
                         Box::new(ObservationBatchPayload {
                             projection: Box::new(ObservationPollProjection {
+                                observation_seq: 1,
                                 topology: crate::daemon::topology::TopologySnapshot {
                                     server_identity: server_identity.clone(),
                                     panes: Vec::new(),
@@ -10179,6 +11095,7 @@ mod tests {
             coordinator.enqueue_internal(V2InternalMutation::ObservationBatch(Box::new(
                 ObservationBatchPayload {
                     projection: Box::new(ObservationPollProjection {
+                        observation_seq: 1,
                         topology: crate::daemon::topology::TopologySnapshot {
                             server_identity,
                             panes: Vec::new(),
@@ -10752,6 +11669,360 @@ mod tests {
     }
 
     #[test]
+    fn read_peek_commit_fences_the_old_occurrence_and_protects_the_source_during_advance() {
+        let root = test_root("read-peek-fence");
+        let (mut state, target, candidate) = read_peek_test_state(&root);
+        assert!(state.begin_peek(20, target.clone(), [target.clone()], 3));
+        state.activate_peek(20, 3, target.clone(), 0);
+
+        let result = commit_read_peek_state(
+            &mut state,
+            &mut ReadPeekStoreIo { fail: false },
+            &v2_daemon_id(),
+            &v2_event_id(),
+            &target,
+            10,
+            vec![candidate.clone()],
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.read_outcome,
+            crate::daemon::protocol::v2::PaneApplyOutcome::Committed
+        );
+        assert_eq!(result.candidates, vec![candidate.clone()]);
+        assert!(
+            !state
+                .leased
+                .runtime
+                .record(&target)
+                .unwrap()
+                .unread
+                .is_unread()
+        );
+        assert!(matches!(
+            state.peek_leases.get(&10),
+            Some(super::super::runtime::PeekLease::Pending {
+                operation_seq: 2,
+                previous_target: Some(previous),
+                candidates,
+                ..
+            }) if previous == &target && candidates == &BTreeSet::from([candidate])
+        ));
+        assert!(state.active_peek_target(20).is_none());
+
+        let owner = read_peek_test_witness(10, &target);
+        assert!(
+            !state
+                .read_authorized_panes(std::slice::from_ref(&owner))
+                .contains(&target)
+        );
+        emit_read_peek_waiting_occurrence(&mut state, &target);
+        let unread = &state.leased.runtime.record(&target).unwrap().unread;
+        assert!(unread.is_unread());
+        assert!(unread.latest_unread().unwrap().order > 1);
+
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_peek_without_an_advance_candidate_keeps_a_new_active_source_lease() {
+        let root = test_root("read-peek-stayed");
+        let (mut state, target, _) = read_peek_test_state(&root);
+        let result = commit_read_peek_state(
+            &mut state,
+            &mut ReadPeekStoreIo { fail: false },
+            &v2_daemon_id(),
+            &v2_event_id(),
+            &target,
+            10,
+            Vec::new(),
+            2,
+        )
+        .unwrap();
+
+        assert!(result.candidates.is_empty());
+        assert_eq!(state.active_peek_target(10), Some(&target));
+        let owner = read_peek_test_witness(10, &target);
+        assert!(
+            !state
+                .read_authorized_panes(std::slice::from_ref(&owner))
+                .contains(&target)
+        );
+        emit_read_peek_waiting_occurrence(&mut state, &target);
+        assert!(
+            state
+                .leased
+                .runtime
+                .record(&target)
+                .unwrap()
+                .unread
+                .is_unread()
+        );
+
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_peek_advance_failure_restores_the_source_without_rolling_back_read() {
+        let root = test_root("read-peek-advance-failure");
+        let (mut state, target, candidate) = read_peek_test_state(&root);
+        commit_read_peek_state(
+            &mut state,
+            &mut ReadPeekStoreIo { fail: false },
+            &v2_daemon_id(),
+            &v2_event_id(),
+            &target,
+            10,
+            vec![candidate],
+            2,
+        )
+        .unwrap();
+        state.restore_peek_after_failure(10, 2, &[read_peek_test_witness(10, &target)], 3);
+
+        assert_eq!(state.active_peek_target(10), Some(&target));
+        assert!(
+            !state
+                .leased
+                .runtime
+                .record(&target)
+                .unwrap()
+                .unread
+                .is_unread()
+        );
+
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_peek_persist_failure_preserves_the_unread_occurrence_and_active_lease() {
+        let root = test_root("read-peek-persist-failure");
+        let (mut state, target, candidate) = read_peek_test_state(&root);
+        let result = commit_read_peek_state(
+            &mut state,
+            &mut ReadPeekStoreIo { fail: true },
+            &v2_daemon_id(),
+            &v2_event_id(),
+            &target,
+            10,
+            vec![candidate],
+            2,
+        );
+
+        assert!(matches!(
+            result,
+            Err(crate::pane_state::store::StoreError::PersistFailed(_))
+        ));
+        assert_eq!(state.active_peek_target(10), Some(&target));
+        assert!(
+            state
+                .leased
+                .runtime
+                .record(&target)
+                .unwrap()
+                .unread
+                .is_unread()
+        );
+
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_peek_terminal_occurrences_use_client_scoped_born_read_authority() {
+        let scenarios = [
+            (
+                "waiting",
+                PaneEvent::WaitRequested {
+                    observed_at: 3,
+                    reason: crate::pane_state::WaitReason::PermissionPrompt,
+                },
+                crate::pane_state::UnreadReason::Waiting,
+            ),
+            (
+                "error",
+                PaneEvent::FailRun {
+                    observed_at: 3,
+                    reason: Some("failed".to_string()),
+                },
+                crate::pane_state::UnreadReason::Error,
+            ),
+            (
+                "completed",
+                PaneEvent::CompleteRun { completed_at: 3 },
+                crate::pane_state::UnreadReason::Completed,
+            ),
+        ];
+
+        for (label, terminal_event, expected_reason) in scenarios {
+            for observer_visible in [false, true] {
+                let root = test_root(&format!(
+                    "read-peek-born-{label}-{}",
+                    if observer_visible {
+                        "observer"
+                    } else {
+                        "owner"
+                    }
+                ));
+                let (mut state, target, _) = read_peek_test_state(&root);
+                commit_read_peek_state(
+                    &mut state,
+                    &mut ReadPeekStoreIo { fail: false },
+                    &v2_daemon_id(),
+                    &v2_event_id(),
+                    &target,
+                    10,
+                    Vec::new(),
+                    2,
+                )
+                .unwrap();
+                apply_read_peek_event(
+                    &mut state,
+                    &target,
+                    PaneEvent::BeginRun {
+                        started_at: 2,
+                        prompt: None,
+                    },
+                    &crate::pane_state::VisibilitySnapshot::default(),
+                );
+
+                let owner = read_peek_test_witness(10, &target);
+                let mut witnesses = vec![owner];
+                if observer_visible {
+                    witnesses.push(read_peek_test_witness(20, &target));
+                }
+                let panes = BTreeSet::from([target.clone()]);
+                let authorized = state.has_read_authority_for(&witnesses, &panes);
+                assert_eq!(authorized, observer_visible, "{label}");
+                if authorized {
+                    state.clear_peeks_for_read_panes(&panes);
+                }
+                apply_read_peek_event(
+                    &mut state,
+                    &target,
+                    terminal_event.clone(),
+                    &crate::pane_state::VisibilitySnapshot {
+                        pane_visible_to_eligible_client: authorized,
+                    },
+                );
+
+                let unread = &state.leased.runtime.record(&target).unwrap().unread;
+                if observer_visible {
+                    assert!(!unread.is_unread(), "{label}");
+                    assert!(state.active_peek_target(10).is_none(), "{label}");
+                } else {
+                    assert_eq!(
+                        unread.latest_unread().map(|occurrence| occurrence.reason),
+                        Some(expected_reason),
+                        "{label}"
+                    );
+                    assert_eq!(state.active_peek_target(10), Some(&target), "{label}");
+                }
+
+                drop(state);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn peek_observations_are_causal_across_effect_completion_orderings() {
+        for observation_before_completion in [false, true] {
+            let root = test_root(if observation_before_completion {
+                "peek-observation-before-completion"
+            } else {
+                "peek-completion-before-observation"
+            });
+            let (mut state, source, target) = read_peek_test_state(&root);
+            assert!(state.begin_peek(10, source.clone(), [target.clone()], 2));
+            let source_witness = read_peek_test_witness(10, &source);
+            let target_witness = read_peek_test_witness(10, &target);
+
+            if observation_before_completion {
+                state.reconcile_peek_leases(std::slice::from_ref(&target_witness), 4);
+                assert!(matches!(
+                    state.peek_leases.get(&10),
+                    Some(super::super::runtime::PeekLease::Pending {
+                        operation_seq: 2,
+                        ..
+                    })
+                ));
+            }
+            let coordinator = test_coordinator(&root, "causal-completion");
+            *coordinator.state.lock().unwrap() = Some(state);
+            let response = apply_production_mutation(
+                &coordinator,
+                V2SequencedMutation {
+                    accepted_seq: 3,
+                    mutation: V2AcceptedMutation::Internal(
+                        V2InternalMutation::SidebarEffectCompleted(SidebarEffectCompletion {
+                            original_accepted_seq: 2,
+                            event_id: v2_event_id(),
+                            snapshot_revision: 7,
+                            witness_observation_floor: 5,
+                            result: SidebarEffectResult::Succeeded(target.clone()),
+                            effect: super::super::runtime::CanonicalSidebarEffect::PeekPane {
+                                pane_instance: target.clone(),
+                                client_pid: 10,
+                                source_pane: source.clone(),
+                            },
+                        }),
+                    ),
+                },
+            );
+            assert!(matches!(
+                response,
+                ServerMessage::SnapshotAck {
+                    accepted_seq: 3,
+                    ..
+                }
+            ));
+
+            {
+                let mut guard = coordinator.state.lock().unwrap();
+                let state = guard.as_mut().unwrap();
+                state.reconcile_peek_leases(std::slice::from_ref(&source_witness), 4);
+                assert_eq!(state.active_peek_target(10), Some(&target));
+                state.reconcile_peek_leases(std::slice::from_ref(&target_witness), 6);
+                assert_eq!(state.active_peek_target(10), Some(&target));
+                state.reconcile_peek_leases(std::slice::from_ref(&source_witness), 4);
+                assert_eq!(state.active_peek_target(10), Some(&target));
+
+                state.reconcile_peek_leases(std::slice::from_ref(&source_witness), 7);
+                assert!(state.active_peek_target(10).is_none());
+            }
+            drop(coordinator);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn read_peek_stale_advance_is_stayed_and_other_failures_remain_failed() {
+        let pane = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        assert_eq!(
+            read_peek_advance_outcome(&SidebarEffectResult::Succeeded(pane.clone())),
+            crate::daemon::protocol::v2::PeekAdvanceOutcome::Jumped {
+                pane_instance: pane,
+            }
+        );
+        assert_eq!(
+            read_peek_advance_outcome(&SidebarEffectResult::NoAvailablePane),
+            crate::daemon::protocol::v2::PeekAdvanceOutcome::Stayed
+        );
+        assert_eq!(
+            read_peek_advance_outcome(&SidebarEffectResult::SourceClientMismatch),
+            crate::daemon::protocol::v2::PeekAdvanceOutcome::Failed
+        );
+    }
+
+    #[test]
     fn sidebar_jump_requires_one_eligible_client_for_source_pane() {
         let source = PaneInstance {
             pane_id: "%9".to_string(),
@@ -10813,7 +12084,22 @@ mod tests {
             original_accepted_seq: external.accepted_seq,
             event_id: v2_event_id(),
             snapshot_revision: 7,
-            result: SidebarEffectResult::Succeeded,
+            witness_observation_floor: 0,
+            result: SidebarEffectResult::Succeeded(PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 101,
+            }),
+            effect: super::super::runtime::CanonicalSidebarEffect::JumpPane {
+                pane_instance: PaneInstance {
+                    pane_id: "%1".to_string(),
+                    pane_pid: 101,
+                },
+                client_pid: 10,
+                source_pane: PaneInstance {
+                    pane_id: "%9".to_string(),
+                    pane_pid: 909,
+                },
+            },
         };
         let V2Route::Mutation(internal) =
             router.accept_internal(V2InternalMutation::SidebarEffectCompleted(completion))
@@ -10882,7 +12168,12 @@ mod tests {
                         original_accepted_seq: pending.original_accepted_seq,
                         event_id: pending.event_id,
                         snapshot_revision: pending.snapshot_revision,
-                        result: SidebarEffectResult::Succeeded,
+                        witness_observation_floor: 0,
+                        result: SidebarEffectResult::Succeeded(PaneInstance {
+                            pane_id: "%1".to_string(),
+                            pane_pid: 101,
+                        }),
+                        effect: pending.effect,
                     },
                 )),
             },

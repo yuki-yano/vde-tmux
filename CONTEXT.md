@@ -53,8 +53,21 @@ Paneで新しく発生したWaiting、Error、Completedの通知単位。Pane内
 _Avoid_: Unread Done, notification flag
 
 **Pane Read**:
-eligibleなtmux clientでexact Paneがactiveになった事実に基づき、そのPaneの観測時点までのUnread Occurrenceを既読にする操作。Window内の他Paneには波及しない。
+eligibleなtmux clientでexact Paneがactiveになった事実、または利用者の明示操作に基づき、そのPaneの観測時点までのUnread Occurrenceを既読にする操作。
+Peek Navigation中の操作元clientによる表示は根拠から除くが、別clientによる表示は引き続き根拠になる。
+Window内の他Paneには波及しない。
 _Avoid_: Window acknowledgment, focus clear
+
+**Peek Navigation**:
+Priority view内の前後Agentへ表示Paneを移しながら、操作元clientによる表示だけをPane Readの根拠から一時的に除くトリアージ操作。
+通常のPane移動、click、Enter、Latest Unread Jumpは含まない。
+_Avoid_: Read lock, selection-only move, normal jump
+
+**Explicit Pane Read**:
+Peek Navigation中の操作元clientが、現在表示しているexact PaneのUnread Occurrenceを意図して既読にする操作。
+共有sidebar selectionではなく、そのclientのPeek Navigation対象を操作する。
+daemonが受理した発生順までを既読にし、受理後のOccurrenceは同じPaneに留まる間も新しいPeek Lease区間で保護する。
+_Avoid_: Mark Done, complete agent, read shared selection
 
 **Latest Unread Jump**:
 global orderが最新のeligibleなUnread Occurrenceへ移動するdaemon action。移動自体はPane Readを行わず、移動後のview観測が既読化する。
@@ -64,9 +77,10 @@ _Avoid_: Latest Done jump, sidebar-local selection
 Paneが既読状態から最初のUnread Occurrenceを生成してから、Pane Readによって再び既読になるまでの連続した期間。一つのUnread Span内で複数のUnread Occurrenceが発生し得る。
 _Avoid_: Notification history, unread session
 
-**Priority Unread Pin**:
-Priority viewで現在のUnread Spanを`PINNED` zoneへ優先表示する一時的な共有マーカー。Pane Readを妨げず、Unread Spanの終了時に自動解除される。
-_Avoid_: Unread View, read lock, pane favorite, saved notification
+**Pane Pin**:
+exact Paneをsidebarの優先位置へ固定する、tmux server内で共有される永続的な表示設定。
+Unread、badge、notification、Pane Readとは独立し、対象Paneが消滅すると解除される。
+_Avoid_: Priority Unread Pin, read lock, unread marker, saved notification
 
 **Agent Occupant**:
 一つのPaneを占有している、種類とOS process identityを特定できるagent process。

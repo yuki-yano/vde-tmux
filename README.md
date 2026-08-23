@@ -249,12 +249,15 @@ retry automatically or infer recovery from the clock; a later `SessionStart` or
 A `Done` agent becomes `Idle` when its exact pane is active for an eligible tmux client.
 Viewing another split in the same window does not acknowledge it. Read state survives daemon
 restarts and is shared by every tmux client and sidebar. The daemon periodically reconciles current
-client views, so a missed view hook is repaired by the next observation poll.
+client views, so a missed view hook is repaired by the next observation poll. Priority peek
+navigation is the exception: it keeps unread while its owning client moves between agents. Peek
+leases are in-memory only, so restarting the daemon ends peek mode and the initial view reconcile
+applies the normal active-pane read rule.
 
 `unread-latest` jumps to the newest unread Waiting, Error, or Completed occurrence across all panes.
 The daemon owns the global ordering and retries the next unread pane if the newest target disappears
 during the jump. The jump itself does not mark anything read; the destination becomes read after it
-is observed as the active pane.
+is observed as the active pane. It does not enter peek mode.
 
 ## Sidebar
 
@@ -357,11 +360,21 @@ Current category context; axis, filter, selection, and scrolling changes use sha
 ```tmux
 bind-key -n M-v run-shell "vt sidebar input v --window #{q:window_id}"
 bind-key -n M-f run-shell "vt sidebar input tab --window #{q:window_id}"
-bind-key -n M-j run-shell "vt sidebar input agent-next --window #{q:window_id}"
-bind-key -n M-k run-shell "vt sidebar input agent-prev --window #{q:window_id}"
+bind-key -n C-M-j run-shell "vt sidebar input agent-next --window #{q:window_id} --client-pid #{client_pid}"
+bind-key -n C-M-k run-shell "vt sidebar input agent-prev --window #{q:window_id} --client-pid #{client_pid}"
+bind-key -n C-M-e run-shell "vt sidebar input read-current --window #{q:window_id} --client-pid #{client_pid}"
 bind-key -n M-u run-shell "vt sidebar input unread-latest --window #{q:window_id}"
 bind-key -n M-p run-shell "vt sidebar input pin-toggle --window #{q:window_id}"
 ```
+
+`C-M-j` and `C-M-k` work only in Priority view. They move the invoking tmux client to the next or
+previous visible agent without wrapping and preserve unread. `C-M-e` explicitly marks the current
+peek target read through the occurrence accepted by the daemon, then advances to the next visible
+unread agent below it when one is still available. Occurrences created on the source pane after
+acceptance remain unread. `C-M-e` can acknowledge the active peek target from Tree or Flat as well,
+but does not auto-advance outside Priority. Normal sidebar activation, pane focus, and
+`unread-latest` retain the ordinary auto-read behavior. Peek state belongs to the exact tmux client;
+another client viewing the same pane may acknowledge it globally.
 
 ## Sessions and categories
 

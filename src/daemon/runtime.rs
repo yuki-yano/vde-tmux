@@ -111,15 +111,55 @@ pub(crate) enum CanonicalSidebarEffect {
         client_pid: u32,
         source_pane: PaneInstance,
     },
+    PeekPane {
+        pane_instance: PaneInstance,
+        client_pid: u32,
+        source_pane: PaneInstance,
+    },
+    ReadPeekAdvance {
+        candidates: Vec<PaneInstance>,
+        client_pid: u32,
+        source_pane: PaneInstance,
+        read_outcome: crate::daemon::protocol::v2::PaneApplyOutcome,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PeekLease {
+    Pending {
+        operation_seq: u64,
+        source_pane: PaneInstance,
+        previous_target: Option<PaneInstance>,
+        candidates: BTreeSet<PaneInstance>,
+    },
+    Active {
+        target: PaneInstance,
+        last_observation_seq: u64,
+    },
+}
+
+impl PeekLease {
+    fn protects(&self, pane: &PaneInstance) -> bool {
+        match self {
+            Self::Pending {
+                previous_target,
+                candidates,
+                ..
+            } => previous_target.as_ref() == Some(pane) || candidates.contains(pane),
+            Self::Active { target, .. } => target == pane,
+        }
+    }
 }
 
 pub(crate) struct CanonicalCoordinatorState {
     pub leased: LeasedCanonicalPaneStateRuntime,
     pub topology: TopologySnapshot,
+    topology_observation_floor: u64,
     pub views: crate::daemon::view_hooks::CurrentClientViews,
     pub sidebar_preferences: SidebarPreferences,
     pub sidebar_navigation: SidebarNavigation,
     pub sidebar_intent_dedupe: SidebarIntentDedupe,
+    pub peek_leases: BTreeMap<u32, PeekLease>,
     pub hook_health: HookHealth,
     pub hook_diagnostic: Option<DaemonDiagnostic>,
     pub global_diagnostics: VecDeque<DaemonDiagnostic>,
@@ -141,10 +181,12 @@ impl CanonicalCoordinatorState {
         Self {
             leased,
             topology,
+            topology_observation_floor: 0,
             views,
             sidebar_preferences,
             sidebar_navigation: SidebarNavigation::default(),
             sidebar_intent_dedupe: SidebarIntentDedupe::default(),
+            peek_leases: BTreeMap::new(),
             hook_health: HookHealth::Healthy,
             hook_diagnostic: None,
             global_diagnostics: VecDeque::new(),
@@ -255,6 +297,240 @@ impl CanonicalCoordinatorState {
         self.leased.runtime.records_snapshot()
     }
 
+    pub fn active_peek_target(&self, client_pid: u32) -> Option<&PaneInstance> {
+        match self.peek_leases.get(&client_pid) {
+            Some(PeekLease::Active { target, .. }) => Some(target),
+            _ => None,
+        }
+    }
+
+    pub fn begin_peek(
+        &mut self,
+        client_pid: u32,
+        source_pane: PaneInstance,
+        candidates: impl IntoIterator<Item = PaneInstance>,
+        operation_seq: u64,
+    ) -> bool {
+        if matches!(
+            self.peek_leases.get(&client_pid),
+            Some(PeekLease::Pending { .. })
+        ) {
+            return false;
+        }
+        let previous_target = match self.peek_leases.get(&client_pid) {
+            Some(PeekLease::Active { target, .. }) => Some(target.clone()),
+            Some(PeekLease::Pending { .. }) => unreachable!("pending peek was rejected above"),
+            None => None,
+        };
+        self.peek_leases.insert(
+            client_pid,
+            PeekLease::Pending {
+                operation_seq,
+                source_pane,
+                previous_target: previous_target.clone(),
+                candidates: candidates.into_iter().collect(),
+            },
+        );
+        true
+    }
+
+    pub fn activate_peek(
+        &mut self,
+        client_pid: u32,
+        operation_seq: u64,
+        target: PaneInstance,
+        witness_observation_floor: u64,
+    ) {
+        let matches_pending = match self.peek_leases.get(&client_pid) {
+            Some(PeekLease::Pending {
+                operation_seq: pending,
+                ..
+            }) => *pending == operation_seq,
+            _ => false,
+        };
+        if matches_pending && self.contains_pane(&target) {
+            self.peek_leases.insert(
+                client_pid,
+                PeekLease::Active {
+                    target,
+                    last_observation_seq: witness_observation_floor,
+                },
+            );
+        }
+    }
+
+    pub fn renew_active_peek(
+        &mut self,
+        client_pid: u32,
+        target: &PaneInstance,
+        witness_observation_floor: u64,
+    ) -> bool {
+        let matches_active = matches!(
+            self.peek_leases.get(&client_pid),
+            Some(PeekLease::Active { target: active, .. }) if active == target
+        );
+        if matches_active && self.contains_pane(target) {
+            self.peek_leases.insert(
+                client_pid,
+                PeekLease::Active {
+                    target: target.clone(),
+                    last_observation_seq: witness_observation_floor,
+                },
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn restore_peek_after_failure(
+        &mut self,
+        client_pid: u32,
+        operation_seq: u64,
+        witnesses: &[ClientWitness],
+        observation_seq: u64,
+    ) {
+        let previous = match self.peek_leases.get(&client_pid) {
+            Some(PeekLease::Pending {
+                operation_seq: pending,
+                previous_target,
+                ..
+            }) if *pending == operation_seq => previous_target.clone(),
+            _ => return,
+        };
+        let fresh_active = witnesses
+            .iter()
+            .find(|witness| witness.client_pid == client_pid && witness.is_eligible())
+            .map(|witness| &witness.active_pane);
+        match previous.filter(|pane| {
+            self.contains_pane(pane) && fresh_active.is_some_and(|active| active == pane)
+        }) {
+            Some(target) => {
+                self.peek_leases.insert(
+                    client_pid,
+                    PeekLease::Active {
+                        target,
+                        last_observation_seq: observation_seq,
+                    },
+                );
+            }
+            None => {
+                self.peek_leases.remove(&client_pid);
+            }
+        }
+    }
+
+    pub fn clear_peek(&mut self, client_pid: u32) {
+        self.peek_leases.remove(&client_pid);
+    }
+
+    pub fn clear_peeks_for_read_panes(&mut self, panes: &BTreeSet<PaneInstance>) {
+        self.clear_peeks_for_read_panes_except(panes, None);
+    }
+
+    pub fn clear_peeks_for_read_panes_except(
+        &mut self,
+        panes: &BTreeSet<PaneInstance>,
+        excluded_client_pid: Option<u32>,
+    ) {
+        self.peek_leases.retain(|client_pid, lease| {
+            excluded_client_pid == Some(*client_pid)
+                || !panes.iter().any(|pane| lease.protects(pane))
+        });
+    }
+
+    pub fn reconcile_peek_leases(&mut self, witnesses: &[ClientWitness], observation_seq: u64) {
+        let eligible = witnesses
+            .iter()
+            .filter(|witness| witness.is_eligible())
+            .map(|witness| (witness.client_pid, &witness.active_pane))
+            .collect::<BTreeMap<_, _>>();
+        let present = self
+            .topology
+            .panes
+            .iter()
+            .map(|pane| pane.pane_instance.clone())
+            .collect::<BTreeSet<_>>();
+        self.peek_leases.retain(|client_pid, lease| {
+            let Some(active) = eligible.get(client_pid) else {
+                return false;
+            };
+            match lease {
+                PeekLease::Active {
+                    target,
+                    last_observation_seq,
+                } => {
+                    if !present.contains(target) {
+                        return false;
+                    }
+                    if observation_seq <= *last_observation_seq {
+                        // Queries can complete out of order. An observation that began no
+                        // later than the latest decisive one cannot change this lease.
+                        true
+                    } else if *active == target {
+                        *last_observation_seq = observation_seq;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                PeekLease::Pending {
+                    previous_target,
+                    candidates,
+                    ..
+                } => {
+                    // tmux can expose a transient source/target mismatch while a queued
+                    // select-pane or switch-client operation is still in flight. The
+                    // worker completion, not that intermediate witness, resolves Pending.
+                    candidates.retain(|candidate| present.contains(candidate));
+                    let previous_is_present = previous_target
+                        .as_ref()
+                        .is_some_and(|target| present.contains(target));
+                    if !previous_is_present {
+                        *previous_target = None;
+                    }
+                    !candidates.is_empty() || previous_target.is_some()
+                }
+            }
+        });
+    }
+
+    pub fn read_authorized_panes(&self, witnesses: &[ClientWitness]) -> BTreeSet<PaneInstance> {
+        let mut authorized = BTreeSet::new();
+        for witness in witnesses.iter().filter(|witness| witness.is_eligible()) {
+            let mut targets = BTreeSet::from([witness.active_pane.clone()]);
+            if let Some(target) = self.topology.focus_proxy_target(&witness.active_pane)
+                && self
+                    .leased
+                    .runtime
+                    .record(target)
+                    .is_some_and(|state| state.agent_present)
+            {
+                targets.insert(target.clone());
+            }
+            for target in targets {
+                if !self
+                    .peek_leases
+                    .get(&witness.client_pid)
+                    .is_some_and(|lease| lease.protects(&target))
+                {
+                    authorized.insert(target);
+                }
+            }
+        }
+        authorized
+    }
+
+    pub fn has_read_authority_for(
+        &self,
+        witnesses: &[ClientWitness],
+        panes: &BTreeSet<PaneInstance>,
+    ) -> bool {
+        self.read_authorized_panes(witnesses)
+            .iter()
+            .any(|pane| panes.contains(pane))
+    }
+
     /// Distinct non-empty pane paths that carry a resolved agent, used to drive
     /// git polling without building the full resolved snapshot. Mirrors the
     /// `resolved.is_some()` filter in `resolved_snapshot_with_git_at`.
@@ -328,10 +604,6 @@ impl CanonicalCoordinatorState {
         windows
     }
 
-    pub fn effective_focused_panes(&self, witnesses: &[ClientWitness]) -> BTreeSet<PaneInstance> {
-        effective_focused_panes(&self.leased.runtime, &self.topology, witnesses)
-    }
-
     pub fn focus_equivalent_panes(&self, target: &PaneInstance) -> BTreeSet<PaneInstance> {
         let mut panes = BTreeSet::from([target.clone()]);
         if self
@@ -360,7 +632,54 @@ impl CanonicalCoordinatorState {
         preflight_resolved_snapshot(&snapshot)?;
         self.leased.runtime = runtime;
         self.topology = topology;
+        let present = self
+            .topology
+            .panes
+            .iter()
+            .map(|pane| pane.pane_instance.clone())
+            .collect::<BTreeSet<_>>();
+        self.peek_leases.retain(|_, lease| match lease {
+            PeekLease::Active { target, .. } => present.contains(target),
+            PeekLease::Pending {
+                previous_target,
+                candidates,
+                ..
+            } => {
+                candidates.retain(|candidate| present.contains(candidate));
+                if previous_target
+                    .as_ref()
+                    .is_some_and(|target| !present.contains(target))
+                {
+                    *previous_target = None;
+                }
+                !candidates.is_empty() || previous_target.is_some()
+            }
+        });
         Ok(true)
+    }
+
+    pub fn apply_topology_observation(
+        &mut self,
+        topology: TopologySnapshot,
+        observation_seq: u64,
+    ) -> Result<bool, StoreError> {
+        debug_assert!(observation_seq > 0);
+        if observation_seq <= self.topology_observation_floor {
+            return Ok(false);
+        }
+        self.replace_topology(topology)?;
+        self.topology_observation_floor = observation_seq;
+        Ok(true)
+    }
+
+    pub fn replace_topology_and_fence_observations(
+        &mut self,
+        topology: TopologySnapshot,
+        observation_floor: u64,
+    ) -> Result<bool, StoreError> {
+        let changed = self.replace_topology(topology)?;
+        self.topology_observation_floor = self.topology_observation_floor.max(observation_floor);
+        Ok(changed)
     }
 
     #[cfg(test)]
@@ -1535,6 +1854,340 @@ mod tests {
             pane_id: "%missing".to_string(),
             pane_pid: 999,
         }));
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    fn client_witness(client_pid: u32, pane_id: &str, pane_pid: u32) -> ClientWitness {
+        ClientWitness {
+            client_pid,
+            session_id: "$1".to_string(),
+            window_id: "@1".to_string(),
+            active_pane: PaneInstance {
+                pane_id: pane_id.to_string(),
+                pane_pid,
+            },
+            control_mode: false,
+            active_pane_flag: false,
+        }
+    }
+
+    #[test]
+    fn active_peek_suppresses_only_the_owning_clients_read_authority() {
+        let (mut state, root) = canonical_sidebar_fixture();
+        let first = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let second = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 102,
+        };
+        state.begin_peek(10, first, [second.clone()], 1);
+        state.activate_peek(10, 1, second.clone(), 0);
+
+        let owner = client_witness(10, "%2", 102);
+        state.reconcile_peek_leases(std::slice::from_ref(&owner), 1);
+        assert!(
+            !state
+                .read_authorized_panes(std::slice::from_ref(&owner))
+                .contains(&second)
+        );
+
+        let observer = client_witness(20, "%2", 102);
+        state.reconcile_peek_leases(&[owner.clone(), observer.clone()], 2);
+        assert!(
+            state
+                .read_authorized_panes(&[owner.clone(), observer.clone()])
+                .contains(&second)
+        );
+
+        state.begin_peek(20, second.clone(), [second.clone()], 2);
+        state.activate_peek(20, 2, second.clone(), 0);
+        state.reconcile_peek_leases(&[owner.clone(), observer.clone()], 3);
+        assert!(
+            !state
+                .read_authorized_panes(&[owner.clone(), observer.clone()])
+                .contains(&second)
+        );
+
+        let mut control = client_witness(30, "%2", 102);
+        control.control_mode = true;
+        let mut active_pane = client_witness(40, "%2", 102);
+        active_pane.active_pane_flag = true;
+        assert!(
+            !state
+                .read_authorized_panes(&[owner.clone(), observer.clone(), control, active_pane])
+                .contains(&second)
+        );
+
+        let normal = client_witness(50, "%2", 102);
+        assert!(
+            state
+                .read_authorized_panes(&[owner, observer, normal])
+                .contains(&second)
+        );
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    #[test]
+    fn focus_proxy_uses_the_same_client_scoped_peek_read_authority() {
+        let (mut state, root) = canonical_sidebar_fixture();
+        let target = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 102,
+        };
+        let editor = state
+            .topology
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_instance.pane_id == "%shell")
+            .unwrap();
+        editor.editprompt_is_editor = true;
+        editor.editprompt_target_panes = vec![target.pane_id.clone()];
+        state
+            .topology
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_instance == target)
+            .unwrap()
+            .editprompt_editor_pane = Some("%shell".to_string());
+
+        let proxy_owner = client_witness(10, "%shell", 103);
+        state.begin_peek(10, proxy_owner.active_pane.clone(), [target.clone()], 1);
+        state.activate_peek(10, 1, target.clone(), 0);
+        assert!(
+            !state
+                .read_authorized_panes(std::slice::from_ref(&proxy_owner))
+                .contains(&target)
+        );
+
+        let proxy_observer = client_witness(20, "%shell", 103);
+        assert!(
+            state
+                .read_authorized_panes(&[proxy_owner, proxy_observer])
+                .contains(&target)
+        );
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    #[test]
+    fn pending_peek_protects_previous_and_candidate_until_completion() {
+        let (mut state, root) = canonical_sidebar_fixture();
+        let first = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let second = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 102,
+        };
+        state.begin_peek(10, first.clone(), [first.clone()], 1);
+        state.activate_peek(10, 1, first.clone(), 0);
+        state.begin_peek(10, first.clone(), [second.clone()], 2);
+
+        state.reconcile_peek_leases(&[client_witness(10, "%shell", 103)], 1);
+        assert!(matches!(
+            state.peek_leases.get(&10),
+            Some(PeekLease::Pending {
+                operation_seq: 2,
+                ..
+            })
+        ));
+        let owner = client_witness(10, "%1", 101);
+        state.reconcile_peek_leases(std::slice::from_ref(&owner), 2);
+        let authorized = state.read_authorized_panes(std::slice::from_ref(&owner));
+        assert!(!authorized.contains(&first));
+        let landed = client_witness(10, "%2", 102);
+        state.reconcile_peek_leases(std::slice::from_ref(&landed), 3);
+        assert!(!state.read_authorized_panes(&[landed]).contains(&second));
+
+        state
+            .topology
+            .panes
+            .retain(|pane| pane.pane_instance != second);
+        state.reconcile_peek_leases(std::slice::from_ref(&owner), 4);
+        assert!(matches!(
+            state.peek_leases.get(&10),
+            Some(PeekLease::Pending {
+                previous_target: Some(previous),
+                candidates,
+                ..
+            }) if previous == &first && candidates.is_empty()
+        ));
+
+        state.restore_peek_after_failure(10, 2, &[owner], 5);
+        assert_eq!(state.active_peek_target(10), Some(&first));
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    #[test]
+    fn pending_peek_cannot_be_overwritten_by_a_concurrent_operation() {
+        let (mut state, root) = canonical_sidebar_fixture();
+        let source = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let first_target = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 102,
+        };
+        let second_target = PaneInstance {
+            pane_id: "%shell".to_string(),
+            pane_pid: 103,
+        };
+
+        assert!(state.begin_peek(10, source.clone(), [first_target.clone()], 1));
+        assert!(!state.begin_peek(10, source, [second_target], 2));
+        assert!(matches!(
+            state.peek_leases.get(&10),
+            Some(PeekLease::Pending {
+                operation_seq: 1,
+                candidates,
+                ..
+            }) if candidates == &BTreeSet::from([first_target])
+        ));
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    #[test]
+    fn failed_peek_restores_previous_target_only_with_a_matching_fresh_witness() {
+        let (mut state, root) = canonical_sidebar_fixture();
+        let previous = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let candidate = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 102,
+        };
+
+        assert!(state.begin_peek(10, previous.clone(), [previous.clone()], 1));
+        state.activate_peek(10, 1, previous.clone(), 0);
+        assert!(state.begin_peek(10, previous.clone(), [candidate.clone()], 2));
+        state.restore_peek_after_failure(10, 2, &[client_witness(10, "%shell", 103)], 1);
+        assert!(state.active_peek_target(10).is_none());
+
+        assert!(state.begin_peek(10, previous.clone(), [previous.clone()], 3));
+        state.activate_peek(10, 3, previous.clone(), 0);
+        assert!(state.begin_peek(10, previous.clone(), [candidate], 4));
+        state.restore_peek_after_failure(10, 4, &[client_witness(10, "%1", 101)], 2);
+        assert_eq!(state.active_peek_target(10), Some(&previous));
+        state.reconcile_peek_leases(&[client_witness(10, "%shell", 103)], 1);
+        assert_eq!(state.active_peek_target(10), Some(&previous));
+        state.reconcile_peek_leases(&[client_witness(10, "%shell", 103)], 3);
+        assert!(state.active_peek_target(10).is_none());
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    #[test]
+    fn renewing_an_active_peek_starts_a_new_observation_interval() {
+        let (mut state, root) = canonical_sidebar_fixture();
+        let target = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        assert!(state.begin_peek(10, target.clone(), [target.clone()], 1));
+        state.activate_peek(10, 1, target.clone(), 3);
+
+        assert!(state.renew_active_peek(10, &target, 7));
+        state.reconcile_peek_leases(&[client_witness(10, "%shell", 103)], 6);
+        assert_eq!(state.active_peek_target(10), Some(&target));
+
+        state.reconcile_peek_leases(&[client_witness(10, "%shell", 103)], 8);
+        assert!(state.active_peek_target(10).is_none());
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    #[test]
+    fn authoritative_topology_refresh_fences_older_observation_projections() {
+        let (mut state, root) = canonical_sidebar_fixture();
+        let stale = state.topology.clone();
+        let mut refreshed = stale.clone();
+        let mut created = refreshed.panes[0].clone();
+        created.pane_instance = PaneInstance {
+            pane_id: "%9".to_string(),
+            pane_pid: 109,
+        };
+        created.window_id = "@9".to_string();
+        refreshed.panes.push(created.clone());
+        refreshed
+            .panes
+            .sort_by(|left, right| left.pane_instance.cmp(&right.pane_instance));
+
+        state
+            .replace_topology_and_fence_observations(refreshed, 5)
+            .unwrap();
+        assert!(state.contains_pane(&created.pane_instance));
+        assert!(!state.apply_topology_observation(stale.clone(), 4).unwrap());
+        assert!(state.contains_pane(&created.pane_instance));
+        assert!(!state.apply_topology_observation(stale.clone(), 5).unwrap());
+        assert!(state.contains_pane(&created.pane_instance));
+
+        assert!(state.apply_topology_observation(stale, 6).unwrap());
+        assert!(!state.contains_pane(&created.pane_instance));
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    #[test]
+    fn manual_focus_change_and_detach_end_the_peek_lease() {
+        let (mut state, root) = canonical_sidebar_fixture();
+        let first = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let second = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 102,
+        };
+        state.begin_peek(10, first, [second.clone()], 1);
+        state.activate_peek(10, 1, second, 1);
+        state.reconcile_peek_leases(&[client_witness(10, "%shell", 103)], 2);
+        assert!(state.active_peek_target(10).is_none());
+
+        let first = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let second = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 102,
+        };
+        state.begin_peek(10, first.clone(), [second.clone()], 2);
+        state.activate_peek(10, 2, second, 5);
+        let source = client_witness(10, "%1", 101);
+        state.reconcile_peek_leases(std::slice::from_ref(&source), 5);
+        assert!(state.active_peek_target(10).is_some());
+        state.reconcile_peek_leases(std::slice::from_ref(&source), 5);
+        assert!(state.active_peek_target(10).is_some());
+        let landed = client_witness(10, "%2", 102);
+        state.reconcile_peek_leases(std::slice::from_ref(&landed), 6);
+        assert!(state.active_peek_target(10).is_some());
+        state.reconcile_peek_leases(std::slice::from_ref(&source), 5);
+        assert!(state.active_peek_target(10).is_some());
+        state.reconcile_peek_leases(std::slice::from_ref(&source), 7);
+        assert!(state.active_peek_target(10).is_none());
+
+        let first = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        state.begin_peek(10, first.clone(), [first.clone()], 3);
+        state.activate_peek(10, 3, first, 0);
+        state.reconcile_peek_leases(&[], 1);
+        assert!(state.active_peek_target(10).is_none());
+
+        let first = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let second = PaneInstance {
+            pane_id: "%2".to_string(),
+            pane_pid: 102,
+        };
+        state.begin_peek(10, first, [second.clone()], 4);
+        state.activate_peek(10, 4, second.clone(), 0);
+        state.clear_peeks_for_read_panes(&BTreeSet::from([second]));
+        assert!(state.active_peek_target(10).is_none());
         remove_canonical_sidebar_fixture(state, root);
     }
 

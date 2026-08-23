@@ -21,14 +21,20 @@ export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_STATE_HOME="$ROOT/state"
 export XDG_RUNTIME_DIR="$ROOT/runtime"
 export VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET"
-mkdir -p "$ROOT/bin" "$XDG_CONFIG_HOME/vde-tmux" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+export ZDOTDIR="$ROOT/zdot"
+mkdir -p \
+  "$ROOT/bin" \
+  "$ZDOTDIR" \
+  "$XDG_CONFIG_HOME/vde-tmux" \
+  "$XDG_STATE_HOME" \
+  "$XDG_RUNTIME_DIR"
 
 if [[ -z "${VDE_TMUX_TEST_BUILD_BIN:-}" ]]; then
   cargo build --bin vt >/dev/null
 fi
 cp "$BUILD_BIN" "$BIN"
-cp "$(command -v sleep)" "$ROOT/bin/codex"
-cp "$(command -v sleep)" "$ROOT/bin/claude"
+ln -s "$(command -v sleep)" "$ROOT/bin/codex"
+ln -s "$(command -v sleep)" "$ROOT/bin/claude"
 export PATH="$ROOT/bin:$PATH"
 
 tmux -L "$TMUX_SOCKET" -f /dev/null new-session -d -s api4 -n work -c "$ROOT"

@@ -213,11 +213,14 @@ health 値ではなく、送信後の digest event によって確認します�
 同じ window の別 split を見ても既読にはなりません。
 既読状態は daemon の再起動後も保持され、すべての tmux client とサイドバーで共有されます。
 daemon は現在の client view を定期的に再照合するため、view hook を一度取りこぼしても次の
-observation pollで修復されます。
+observation pollで修復されます。Priorityのpeek navigationだけは例外で、操作元clientが
+agent間を移動している間も未読を維持します。Peek Leaseはmemory内だけに保持されるため、
+daemonを再起動するとpeekは終了し、初回のview reconcileで通常のactive-pane既読規則が適用されます。
 
 `unread-latest` は全paneを横断し、未読のWaiting、Error、Completedのうち最新の発生へ移動します。
 globalな発生順はdaemonが管理し、移動中に最新paneが消えた場合は次の未読paneを試します。
 移動操作そのものは既読化せず、移動先がactive paneとして観測された後に既読になります。
+この操作はpeekには入りません。
 
 ## サイドバー
 
@@ -226,9 +229,10 @@ globalな発生順はdaemonが管理し、移動中に最新paneが消えた場�
 `Tree`はCurrentではRepository→Agent、AllではCategory→Repository→Agentの階層表示です。
 `Priority`は選択中のscopeをPinned、Needs Input、Unread Done、Running、Idleの順にまとめ、
 `Flat`はgroupingを外します。
-Priorityで未読agentを選択して`p`を押すと、共有されたUnread Spanのpinを切り替えます。
-pinされたagentは先頭の`PINNED` zoneへ移動しますが、未読順、badge、notificationは変わりません。
-exact paneを表示した場合は通常どおり既読になり、pinも解除されます。
+任意のagentで`p`を押すと、未読、badge、notificationとは独立した永続pane pinを切り替えます。
+Priorityではpinされたagentが先頭の`PINNED` zoneへ移動し、Flatでは先頭へ移動します。
+Treeでは階層を維持したまま所属するCategoryとRepositoryが優先されます。
+pinは既読化やlifecycle変更では解除されず、paneが消えたときに削除されます。
 
 ```bash
 vt sidebar open --width 40
@@ -292,11 +296,23 @@ category編集dialogはheaderを残してrows領域に表示されます。`m`�
 category scope、presentation、filter、手動順序、開閉状態、選択位置、スクロールは、
 同じtmux serverの全サイドバーで同期します。具体的なCurrent categoryとreturn targetだけは
 sidebar instanceごとに保持し、そのサイドバーへ入力した起点sessionへ追従します。
-開いているサイドバーへ非focus状態でpin操作を送る場合は`pin-toggle`を使えます。
+開いているサイドバーはfocusを移さずに操作できます。
 
 ```tmux
+bind-key -n C-M-j run-shell "vt sidebar input agent-next --window #{q:window_id} --client-pid #{client_pid}"
+bind-key -n C-M-k run-shell "vt sidebar input agent-prev --window #{q:window_id} --client-pid #{client_pid}"
+bind-key -n C-M-e run-shell "vt sidebar input read-current --window #{q:window_id} --client-pid #{client_pid}"
+bind-key -n M-u run-shell "vt sidebar input unread-latest --window #{q:window_id}"
 bind-key -n M-p run-shell "vt sidebar input pin-toggle --window #{q:window_id}"
 ```
+
+`C-M-j`と`C-M-k`はPriority表示でだけ動作します。表示中のagentをwrapせずに前後移動し、
+操作元tmux clientのpane focusも移しますが、未読は維持します。`C-M-e`は現在のpeek対象を、
+daemonが受理した時点の発生まで明示的に既読にし、その下に表示中の未読agentが残っていれば
+次へ進みます。受理後に元paneで発生した新しい通知は未読のまま残ります。`C-M-e`はTreeやFlatでも
+現在のpeek対象を既読にできますが、その場合は自動移動しません。通常のsidebar activation、pane focus、
+`unread-latest`は従来どおりauto-readです。
+Peek状態はexact tmux clientごとに保持され、別clientが同じpaneを通常表示するとglobalに既読になります。
 
 ## session とカテゴリ
 

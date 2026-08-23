@@ -19,6 +19,12 @@ pub enum ControlMessage {
         source_pane: PaneInstance,
         session_id: String,
     },
+    PeekInput {
+        key: String,
+        source_pane: PaneInstance,
+        session_id: String,
+        client_pid: u32,
+    },
     Focus {
         pane_instance: PaneInstance,
         session_id: String,
@@ -260,6 +266,26 @@ mod tests {
             session_id: "$1".to_string(),
         };
         send("test_input_server", &sidebar, &message).unwrap();
+        assert_eq!(listener.try_recv().unwrap(), Some(message));
+    }
+
+    #[test]
+    fn control_socket_roundtrips_peek_input_client_identity() {
+        let sidebar = PaneInstance {
+            pane_id: "%987650".to_string(),
+            pane_pid: std::process::id(),
+        };
+        let listener = ControlListener::bind("test_peek_input_server", &sidebar).unwrap();
+        let message = ControlMessage::PeekInput {
+            key: "read-current".to_string(),
+            source_pane: PaneInstance {
+                pane_id: "%1".to_string(),
+                pane_pid: 7,
+            },
+            session_id: "$1".to_string(),
+            client_pid: 4242,
+        };
+        send("test_peek_input_server", &sidebar, &message).unwrap();
         assert_eq!(listener.try_recv().unwrap(), Some(message));
     }
 

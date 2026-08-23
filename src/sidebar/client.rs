@@ -50,6 +50,70 @@ pub fn send_latest_unread_jump_v2(
     Ok(())
 }
 
+pub fn send_sidebar_peek_v2(
+    socket: &Path,
+    server_identity: &str,
+    pane_instance: PaneInstance,
+    source_pane: PaneInstance,
+    client_pid: u32,
+) -> Result<PaneInstance> {
+    let (event_id, response) = request_v2_sidebar_message(
+        socket,
+        server_identity,
+        V2SidebarCommand::PeekPane {
+            pane_instance,
+            source_pane,
+            client_pid,
+        },
+    )?;
+    match response {
+        V2ServerMessage::SidebarPeekResult {
+            event_id: response_event_id,
+            pane_instance,
+            ..
+        } if response_event_id == event_id => Ok(pane_instance),
+        V2ServerMessage::Error { code, message, .. } => bail!("{code:?}: {message}"),
+        other => bail!("unexpected daemon peek response: {other:?}"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadPeekResult {
+    pub read_outcome: crate::daemon::protocol::v2::PaneApplyOutcome,
+    pub advance_outcome: crate::daemon::protocol::v2::PeekAdvanceOutcome,
+}
+
+pub fn send_sidebar_read_peek_v2(
+    socket: &Path,
+    server_identity: &str,
+    source_pane: PaneInstance,
+    client_pid: u32,
+    advance_candidates: Vec<PaneInstance>,
+) -> Result<ReadPeekResult> {
+    let (event_id, response) = request_v2_sidebar_message(
+        socket,
+        server_identity,
+        V2SidebarCommand::ReadPeek {
+            source_pane,
+            client_pid,
+            advance_candidates,
+        },
+    )?;
+    match response {
+        V2ServerMessage::SidebarReadPeekResult {
+            event_id: response_event_id,
+            read_outcome,
+            advance_outcome,
+            ..
+        } if response_event_id == event_id => Ok(ReadPeekResult {
+            read_outcome,
+            advance_outcome,
+        }),
+        V2ServerMessage::Error { code, message, .. } => bail!("{code:?}: {message}"),
+        other => bail!("unexpected daemon read-current response: {other:?}"),
+    }
+}
+
 pub fn send_sidebar_mark_complete_v2(
     socket: &Path,
     server_identity: &str,
@@ -274,6 +338,15 @@ fn request_v2_sidebar(
     command: V2SidebarCommand,
     expected_response: V2SidebarResponse,
 ) -> Result<u64> {
+    let (event_id, response) = request_v2_sidebar_message(socket, server_identity, command)?;
+    expect_v2_mutation_response(response, &event_id, expected_response)
+}
+
+fn request_v2_sidebar_message(
+    socket: &Path,
+    server_identity: &str,
+    command: V2SidebarCommand,
+) -> Result<(EventId, V2ServerMessage)> {
     let deadline = Instant::now() + V2_SIDEBAR_COMMAND_TIMEOUT;
     let mut stream = UnixStream::connect(socket)?;
     stream.set_write_timeout(Some(V2_SIDEBAR_COMMAND_TIMEOUT))?;
@@ -317,7 +390,7 @@ fn request_v2_sidebar(
     )?;
     let response = read_v2_server_frame(&mut reader, Some(deadline))?
         .ok_or_else(|| anyhow::anyhow!("daemon closed the connection before responding"))?;
-    expect_v2_mutation_response(response, &event_id, expected_response)
+    Ok((event_id, response))
 }
 
 fn expect_v2_mutation_response(

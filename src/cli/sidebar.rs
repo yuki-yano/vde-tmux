@@ -22,6 +22,8 @@ pub(crate) enum SidebarCommand {
         key: String,
         #[arg(long)]
         window: Option<String>,
+        #[arg(long)]
+        client_pid: Option<u32>,
     },
     Open {
         #[arg(long)]
@@ -175,7 +177,21 @@ where
             }
             crate::sidebar::tui::run_live_tui(env, config, &socket, &server_identity)
         }
-        SidebarCommand::Input { key, window } => {
+        SidebarCommand::Input {
+            key,
+            window,
+            client_pid,
+        } => {
+            let is_peek_input =
+                matches!(key.as_str(), "agent-next" | "agent-prev" | "read-current");
+            match (is_peek_input, client_pid) {
+                (true, None) => bail!("{key} requires --client-pid"),
+                (true, Some(0)) => bail!("--client-pid must be greater than zero"),
+                (false, Some(_)) => {
+                    bail!("--client-pid is only valid for agent-next, agent-prev, or read-current")
+                }
+                _ => {}
+            }
             let (server_identity, socket) = ensure_daemon(runner, env)?;
             let source_context = resolve_selection_context(runner, env)
                 .context("failed to resolve the sidebar input source context")?;
@@ -199,15 +215,20 @@ where
                 None => resolve_source_window_target(runner, &source_pane)?,
             };
             let sidebar = resolve_sidebar_instance(runner, Some(&target))?;
-            crate::sidebar::control::send(
-                &server_identity,
-                &sidebar,
-                &crate::sidebar::control::ControlMessage::Input {
+            let message = match client_pid {
+                Some(client_pid) => crate::sidebar::control::ControlMessage::PeekInput {
+                    key,
+                    source_pane,
+                    session_id,
+                    client_pid,
+                },
+                None => crate::sidebar::control::ControlMessage::Input {
                     key,
                     source_pane,
                     session_id,
                 },
-            )?;
+            };
+            crate::sidebar::control::send(&server_identity, &sidebar, &message)?;
             Ok(None)
         }
         SidebarCommand::Open {

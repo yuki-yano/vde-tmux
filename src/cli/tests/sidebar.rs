@@ -660,6 +660,7 @@ fn dispatch_sidebar_input_targets_the_invoking_sidebar_instance() {
         crate::cli::sidebar::SidebarCommand::Input {
             key: "j".to_string(),
             window: None,
+            client_pid: None,
         },
         &mock,
         &env,
@@ -730,6 +731,7 @@ fn dispatch_sidebar_input_separates_nonfocused_source_from_target_sidebar() {
         crate::cli::sidebar::SidebarCommand::Input {
             key: "agent-next".to_string(),
             window: None,
+            client_pid: Some(4242),
         },
         &mock,
         &env,
@@ -740,12 +742,51 @@ fn dispatch_sidebar_input_separates_nonfocused_source_from_target_sidebar() {
 
     assert_eq!(
         listener.try_recv().unwrap(),
-        Some(crate::sidebar::control::ControlMessage::Input {
+        Some(crate::sidebar::control::ControlMessage::PeekInput {
             key: "agent-next".to_string(),
             source_pane: source,
             session_id: "$1".to_string(),
+            client_pid: 4242,
         })
     );
+}
+
+#[test]
+fn dispatch_sidebar_peek_input_requires_a_positive_client_pid_before_daemon_ensure() {
+    for client_pid in [None, Some(0)] {
+        let error = crate::cli::sidebar::run_sidebar_command_with_ensure(
+            crate::cli::sidebar::SidebarCommand::Input {
+                key: "agent-next".to_string(),
+                window: None,
+                client_pid,
+            },
+            &MockTmuxRunner::new(),
+            &BTreeMap::new(),
+            &crate::config::Config::default(),
+            |_, _| panic!("invalid input must not start the daemon"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("client-pid"));
+    }
+}
+
+#[test]
+fn dispatch_sidebar_regular_input_rejects_client_pid_before_daemon_ensure() {
+    let error = crate::cli::sidebar::run_sidebar_command_with_ensure(
+        crate::cli::sidebar::SidebarCommand::Input {
+            key: "j".to_string(),
+            window: None,
+            client_pid: Some(4242),
+        },
+        &MockTmuxRunner::new(),
+        &BTreeMap::new(),
+        &crate::config::Config::default(),
+        |_, _| panic!("invalid input must not start the daemon"),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("only valid"));
 }
 
 #[test]
@@ -779,6 +820,7 @@ fn dispatch_sidebar_input_rejects_reused_source_pane() {
         crate::cli::sidebar::SidebarCommand::Input {
             key: "v".to_string(),
             window: None,
+            client_pid: None,
         },
         &mock,
         &env,
@@ -820,6 +862,7 @@ fn dispatch_sidebar_input_rejects_a_window_without_a_sidebar() {
         crate::cli::sidebar::SidebarCommand::Input {
             key: "v".to_string(),
             window: Some("@2".to_string()),
+            client_pid: None,
         },
         &mock,
         &env,
@@ -861,6 +904,7 @@ fn dispatch_sidebar_input_rejects_multiple_sidebars_in_the_requested_window() {
         crate::cli::sidebar::SidebarCommand::Input {
             key: "v".to_string(),
             window: Some("@2".to_string()),
+            client_pid: None,
         },
         &mock,
         &env,
@@ -917,6 +961,7 @@ fn dispatch_sidebar_input_targets_an_explicit_different_window() {
         crate::cli::sidebar::SidebarCommand::Input {
             key: "agent-next".to_string(),
             window: Some("@2".to_string()),
+            client_pid: Some(4242),
         },
         &mock,
         &env,
@@ -927,10 +972,11 @@ fn dispatch_sidebar_input_targets_an_explicit_different_window() {
 
     assert_eq!(
         listener.try_recv().unwrap(),
-        Some(crate::sidebar::control::ControlMessage::Input {
+        Some(crate::sidebar::control::ControlMessage::PeekInput {
             key: "agent-next".to_string(),
             source_pane: source,
             session_id: "$1".to_string(),
+            client_pid: 4242,
         })
     );
 }

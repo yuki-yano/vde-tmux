@@ -22,7 +22,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 18;
+pub const PROTOCOL_VERSION: u16 = 19;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -790,6 +790,16 @@ pub enum SidebarCommand {
     JumpLatestUnread {
         source_pane: PaneInstance,
     },
+    PeekPane {
+        pane_instance: PaneInstance,
+        source_pane: PaneInstance,
+        client_pid: u32,
+    },
+    ReadPeek {
+        source_pane: PaneInstance,
+        client_pid: u32,
+        advance_candidates: Vec<PaneInstance>,
+    },
     MarkComplete {
         pane_instance: PaneInstance,
         expected: StateVersion,
@@ -1004,6 +1014,19 @@ pub enum PaneApplyOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum PeekAdvanceOutcome {
+    Jumped { pane_instance: PaneInstance },
+    Stayed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ErrorCode {
     UnsupportedProtocol,
@@ -1137,6 +1160,19 @@ pub enum ServerMessage {
         event_id: EventId,
         accepted_seq: u64,
         snapshot_revision: u64,
+    },
+    SidebarPeekResult {
+        event_id: EventId,
+        accepted_seq: u64,
+        snapshot_revision: u64,
+        pane_instance: PaneInstance,
+    },
+    SidebarReadPeekResult {
+        event_id: EventId,
+        accepted_seq: u64,
+        snapshot_revision: u64,
+        read_outcome: PaneApplyOutcome,
+        advance_outcome: PeekAdvanceOutcome,
     },
     Heartbeat {
         daemon_instance_id: DaemonInstanceId,
@@ -1548,6 +1584,7 @@ mod tests {
 
     #[test]
     fn every_client_message_roundtrips() {
+        assert_eq!(PROTOCOL_VERSION, 19);
         let state_id = StateId::parse("00112233445566778899aabbccddeeff").unwrap();
         let messages = vec![
             ClientMessage::Hello {
@@ -1650,6 +1687,32 @@ mod tests {
                         pane_visible: false,
                         window_visible: false,
                     },
+                },
+            },
+            ClientMessage::SidebarCommand {
+                proto: PROTOCOL_VERSION,
+                daemon_instance_id: daemon_id(),
+                event_id: event_id(),
+                command: SidebarCommand::PeekPane {
+                    pane_instance: pane(),
+                    source_pane: PaneInstance {
+                        pane_id: "%2".to_string(),
+                        pane_pid: 20,
+                    },
+                    client_pid: 4242,
+                },
+            },
+            ClientMessage::SidebarCommand {
+                proto: PROTOCOL_VERSION,
+                daemon_instance_id: daemon_id(),
+                event_id: event_id(),
+                command: SidebarCommand::ReadPeek {
+                    source_pane: pane(),
+                    client_pid: 4242,
+                    advance_candidates: vec![PaneInstance {
+                        pane_id: "%2".to_string(),
+                        pane_pid: 20,
+                    }],
                 },
             },
             ClientMessage::SidebarCommand {
@@ -2037,6 +2100,21 @@ mod tests {
                 event_id: event_id(),
                 accepted_seq: 7,
                 snapshot_revision: 1,
+            },
+            ServerMessage::SidebarPeekResult {
+                event_id: event_id(),
+                accepted_seq: 8,
+                snapshot_revision: 2,
+                pane_instance: pane(),
+            },
+            ServerMessage::SidebarReadPeekResult {
+                event_id: event_id(),
+                accepted_seq: 9,
+                snapshot_revision: 3,
+                read_outcome: PaneApplyOutcome::Committed,
+                advance_outcome: PeekAdvanceOutcome::Jumped {
+                    pane_instance: pane(),
+                },
             },
             ServerMessage::Heartbeat {
                 daemon_instance_id: daemon_id(),

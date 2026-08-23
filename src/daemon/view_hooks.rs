@@ -724,34 +724,18 @@ impl fmt::Display for ViewError {
 
 impl std::error::Error for ViewError {}
 
-pub fn pane_read_intents(
-    witnesses: &[ClientWitness],
+pub fn pane_read_intents_for_panes(
+    focused_panes: &BTreeSet<PaneInstance>,
     through_order: u64,
     records: &BTreeMap<PaneInstance, PaneState>,
 ) -> Result<Vec<PaneReadIntent>, ViewError> {
-    pane_read_intents_with_additional_focus(witnesses, &BTreeSet::new(), through_order, records)
-}
-
-pub fn pane_read_intents_with_additional_focus(
-    witnesses: &[ClientWitness],
-    additional_focused_panes: &BTreeSet<PaneInstance>,
-    through_order: u64,
-    records: &BTreeMap<PaneInstance, PaneState>,
-) -> Result<Vec<PaneReadIntent>, ViewError> {
-    validate_witnesses(witnesses)?;
-    for pane in additional_focused_panes {
+    for pane in focused_panes {
         pane.validate()
             .map_err(|error| ViewError::InvalidEvent(error.to_string()))?;
     }
-    let mut targets = witnesses
-        .iter()
-        .filter(|witness| witness.is_eligible())
-        .map(|witness| witness.active_pane.clone())
-        .collect::<BTreeSet<_>>();
-    targets.extend(additional_focused_panes.iter().cloned());
     let mut intents = Vec::new();
-    for pane in targets {
-        let Some(state) = records.get(&pane) else {
+    for pane in focused_panes {
+        let Some(state) = records.get(pane) else {
             continue;
         };
         if state
@@ -761,7 +745,7 @@ pub fn pane_read_intents_with_additional_focus(
             .is_some_and(|latest| state.unread.is_unread() && latest.order <= through_order)
         {
             intents.push(PaneReadIntent {
-                pane_instance: pane,
+                pane_instance: pane.clone(),
                 through_order,
             });
         }
@@ -770,49 +754,28 @@ pub fn pane_read_intents_with_additional_focus(
     Ok(intents)
 }
 
-pub fn pane_read_envelopes(
+pub fn pane_read_envelopes_for_panes(
     daemon_instance_id: &DaemonInstanceId,
     event_id: &EventId,
-    witnesses: &[ClientWitness],
+    focused_panes: &BTreeSet<PaneInstance>,
     through_order: u64,
     records: &BTreeMap<PaneInstance, PaneState>,
 ) -> Result<Vec<crate::pane_state::PaneEventEnvelope>, ViewError> {
-    pane_read_envelopes_with_additional_focus(
-        daemon_instance_id,
-        event_id,
-        witnesses,
-        &BTreeSet::new(),
-        through_order,
-        records,
+    Ok(
+        pane_read_intents_for_panes(focused_panes, through_order, records)?
+            .into_iter()
+            .map(|intent| crate::pane_state::PaneEventEnvelope {
+                daemon_instance_id: daemon_instance_id.clone(),
+                event_id: event_id.clone(),
+                pane_instance: intent.pane_instance,
+                agent: None,
+                agent_session_id: None,
+                event: crate::pane_state::PaneEvent::MarkPaneRead {
+                    through_order: intent.through_order,
+                },
+            })
+            .collect(),
     )
-}
-
-pub fn pane_read_envelopes_with_additional_focus(
-    daemon_instance_id: &DaemonInstanceId,
-    event_id: &EventId,
-    witnesses: &[ClientWitness],
-    additional_focused_panes: &BTreeSet<PaneInstance>,
-    through_order: u64,
-    records: &BTreeMap<PaneInstance, PaneState>,
-) -> Result<Vec<crate::pane_state::PaneEventEnvelope>, ViewError> {
-    Ok(pane_read_intents_with_additional_focus(
-        witnesses,
-        additional_focused_panes,
-        through_order,
-        records,
-    )?
-    .into_iter()
-    .map(|intent| crate::pane_state::PaneEventEnvelope {
-        daemon_instance_id: daemon_instance_id.clone(),
-        event_id: event_id.clone(),
-        pane_instance: intent.pane_instance,
-        agent: None,
-        agent_session_id: None,
-        event: crate::pane_state::PaneEvent::MarkPaneRead {
-            through_order: intent.through_order,
-        },
-    })
-    .collect())
 }
 
 pub fn reconcile_current_views(
@@ -1475,17 +1438,6 @@ mod tests {
         }
     }
 
-    fn witness(client_pid: u32, active_pane: PaneInstance, control_mode: bool) -> ClientWitness {
-        ClientWitness {
-            client_pid,
-            session_id: format!("${client_pid}"),
-            window_id: "@2".to_string(),
-            active_pane,
-            control_mode,
-            active_pane_flag: false,
-        }
-    }
-
     #[test]
     fn hook_snapshot_builds_small_immutable_visibility_proof() {
         let first = pane("%1", 101);
@@ -1563,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_read_intents_only_include_exact_panes_visible_to_eligible_clients() {
+    fn pane_read_intents_only_include_authorized_exact_panes() {
         let first = pane("%1", 101);
         let second = pane("%2", 202);
         let records = [
@@ -1572,12 +1524,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let witnesses = [
-            witness(10, first.clone(), false),
-            witness(11, second.clone(), true),
-        ];
-
-        let intents = pane_read_intents(&witnesses, 2, &records).unwrap();
+        let intents =
+            pane_read_intents_for_panes(&BTreeSet::from([first.clone()]), 2, &records).unwrap();
         assert_eq!(
             intents
                 .iter()
@@ -1588,21 +1536,13 @@ mod tests {
     }
 
     #[test]
-    fn pane_read_intents_include_additional_logical_focus() {
-        let editor = pane("%9", 109);
+    fn pane_read_intents_include_runtime_authorized_logical_focus() {
         let target = pane("%1", 101);
         let records = [(target.clone(), state(target.clone(), 2, false))]
             .into_iter()
             .collect();
-        let witnesses = [witness(10, editor, false)];
-
-        let intents = pane_read_intents_with_additional_focus(
-            &witnesses,
-            &BTreeSet::from([target.clone()]),
-            2,
-            &records,
-        )
-        .unwrap();
+        let intents =
+            pane_read_intents_for_panes(&BTreeSet::from([target.clone()]), 2, &records).unwrap();
 
         assert_eq!(
             intents,
@@ -1619,14 +1559,12 @@ mod tests {
         let records = [(target.clone(), state(target.clone(), 4, false))]
             .into_iter()
             .collect();
-        let witnesses = [witness(10, target, false)];
-
         assert!(
-            pane_read_intents(&witnesses, 3, &records)
+            pane_read_intents_for_panes(&BTreeSet::from([target.clone()]), 3, &records)
                 .unwrap()
                 .is_empty()
         );
-        let intents = pane_read_intents(&witnesses, 4, &records).unwrap();
+        let intents = pane_read_intents_for_panes(&BTreeSet::from([target]), 4, &records).unwrap();
         assert_eq!(
             intents,
             vec![PaneReadIntent {
