@@ -112,6 +112,46 @@ request schema. Repeated and comma-separated `--until` argv forms normalize to t
 The prompt deadline covers the whole operation from daemon connection and preflight through digest
 confirmation; it does not start only after submission.
 
+## Repository category membership
+
+The Category Agent API exposes the ordered catalog and repository membership without exposing
+catalog mutation or manual ordering:
+
+```bash
+vt category list --json
+vt category get --repo /absolute/project/path --json
+vt category assign work --repo /absolute/project/path --json
+vt category automatic --repo /absolute/project/path --json
+```
+
+`list` returns one-based `index`, `name`, `display_name`, the closed `source` enum
+(`configured`, `dynamic`, or `system`), and `category_state_revision`. `get` returns the canonical
+repository `key`, rule path, display name, effective category, and `explicit`. A Git main worktree
+and linked worktrees that share the same common directory return the same repository key.
+
+JSON `list` and `get` require an already-Serving daemon and never start it. All four commands
+require the strictly loaded disk config to match the daemon's active config hash; a mismatch is
+`stale_precondition` with reload guidance. A missing or non-directory path is `invalid_target`, and
+failure to establish its canonical Git or path identity is `identity_verification_failed`.
+
+`assign` sets an explicit membership in an existing category. `automatic` removes that override so
+config rules, the configured default, and finally `Uncategorized` determine the effective
+category. Both mutations ensure the daemon and return a `category_mutation` receipt containing
+`accepted_seq`, canonical `repo`, typed `requested`, effective `before` and `after`, `changed`, and
+the persisted `category_state_revision`. Reapplying the current explicit category or automatic
+state succeeds with `changed: false` and does not advance the Category state revision.
+`meta.snapshot_revision` is the daemon revision carried by the same mutation result.
+
+An unknown category is `daemon_invalid_request` with `side_effect: none`. If the complete mutation
+request was sent but its receipt could not be read, the result is `delivery_unknown` at
+`after_dispatch`, with `side_effect: possible` and `retry_action: inspect_manually`. Do not resend
+automatically. Run `category get` once to inspect current membership, while retaining that the
+original receipt was not recovered.
+
+Category creation, rename, deletion, catalog/repository ordering, category navigation, session
+switching, and pane Agent operations are outside this API boundary. They do not gain JSON behavior
+through the Category commands above.
+
 `agent steer` accepts only an exact Codex or Claude occupant whose initial canonical status is
 `working`. It uses the same guarded copy-mode exit, pane/process identity, and foreground input-owner
 fences as `agent send`. It does not wait for provider hooks or prove active-turn attribution. Its
@@ -307,7 +347,7 @@ first, then projects the completed current Run to the Pane. A matching resolutio
 failed Pane projection without creating another resolution. It never sends a key or silently
 retargets a replacement.
 
-Provider adapters project only bounded, normalized UI previews into PaneState v9: a manually entered
+Provider adapters project only bounded, normalized UI previews into PaneState v10: a manually entered
 prompt can feed the sidebar prompt and task-summary context, and a completion can feed the latest
 response preview. The full response body remains available solely through the explicit bounded
 `agent run response` read. A prompt linked to guarded dispatch is omitted from PaneState and every

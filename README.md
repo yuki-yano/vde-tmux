@@ -400,6 +400,7 @@ vt category next
 vt category prev
 vt category use work
 vt category list
+vt category get --repo ~/src/temporary-project
 vt category create scratch
 vt category assign scratch --repo ~/src/temporary-project
 vt category automatic --repo ~/src/temporary-project
@@ -417,6 +418,21 @@ rename a dynamic category, `D` to delete one, and `J`/`K` to reorder categories
 or repositories. All × Tree keeps repositories from managed sessions visible
 even when they currently have no agent panes. `@vde_category` remains a derived,
 write-only mirror for external tmux formats.
+
+Terminal agents can use the versioned JSON membership boundary without gaining Category catalog
+mutation privileges:
+
+```bash
+vt category list --json
+vt category get --repo ~/src/temporary-project --json
+vt category assign scratch --repo ~/src/temporary-project --json
+vt category automatic --repo ~/src/temporary-project --json
+```
+
+The mutation receipt reports the canonical Repository identity, effective before/after placement,
+whether the request changed state, and the persisted Category revision. JSON reads never start a
+stopped daemon. JSON mutations ensure it, reject disk/active config drift, and operate on the shared
+Repository identity, so linked worktrees move together.
 
 With fzf installed, open a popup for switching or removing sessions, windows, and panes:
 

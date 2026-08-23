@@ -338,6 +338,7 @@ vt category next
 vt category prev
 vt category use work
 vt category list
+vt category get --repo ~/src/temporary-project
 vt category create scratch
 vt category assign scratch --repo ~/src/temporary-project
 vt category automatic --repo ~/src/temporary-project
@@ -352,6 +353,20 @@ configのカテゴリはread-onlyな最低限の定義として残ります。
 サイドバーでは`a`でカテゴリ追加、`m`でRepository移動、`r`で動的カテゴリ名変更、`D`で削除、`J`/`K`でカテゴリまたはRepositoryを並べ替えられます。
 All × Treeでは、管理対象sessionのRepositoryはagent paneがない場合も表示されます。
 `@vde_category`は外部tmux format向けの導出済みwrite-only mirrorです。
+
+Agentは、Category catalogを変更する権限を広げずに、versioned JSON APIでRepository所属を操作できます。
+
+```bash
+vt category list --json
+vt category get --repo ~/src/temporary-project --json
+vt category assign scratch --repo ~/src/temporary-project --json
+vt category automatic --repo ~/src/temporary-project --json
+```
+
+mutation receiptにはcanonical Repository identity、変更前後のeffective placement、実際に状態が変わったか、persist済みCategory revisionが含まれます。
+JSON readは停止中のdaemonを起動しません。
+JSON mutationはdaemonをensureし、disk configとactive configの不一致を拒否します。
+操作単位は共有Repository identityなので、linked worktreeも同時に移動します。
 
 fzf をインストールすると、session、window、pane を切り替えたり削除したりする popup を利用できます。
 
