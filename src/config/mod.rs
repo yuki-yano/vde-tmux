@@ -523,6 +523,10 @@ pub struct SidebarColorsConfig {
     pub active_bar: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
+    pub git_ahead: Option<String>,
+    pub git_behind: Option<String>,
+    pub git_insertions: Option<String>,
+    pub git_deletions: Option<String>,
     pub task_done: Option<String>,
     pub task_working: Option<String>,
     pub task_pending: Option<String>,
@@ -815,6 +819,10 @@ mod tests {
             r##"
 sidebar:
   colors:
+    git_ahead: "108"
+    git_behind: "179"
+    git_insertions: "78"
+    git_deletions: "#d78787"
     task_done: "220"
     task_working: "221"
     task_pending: darkgray
@@ -827,6 +835,13 @@ sidebar:
         )
         .unwrap();
 
+        assert_eq!(config.sidebar.colors.git_ahead.as_deref(), Some("108"));
+        assert_eq!(config.sidebar.colors.git_behind.as_deref(), Some("179"));
+        assert_eq!(config.sidebar.colors.git_insertions.as_deref(), Some("78"));
+        assert_eq!(
+            config.sidebar.colors.git_deletions.as_deref(),
+            Some("#d78787")
+        );
         assert_eq!(config.sidebar.colors.task_done.as_deref(), Some("220"));
         assert_eq!(config.sidebar.colors.task_working.as_deref(), Some("221"));
         assert_eq!(

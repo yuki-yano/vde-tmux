@@ -46,6 +46,10 @@ pub struct SidebarRenderTheme {
     pub active_bar: Color,
     pub repo: Color,
     pub branch: Color,
+    pub git_ahead: Color,
+    pub git_behind: Color,
+    pub git_insertions: Color,
+    pub git_deletions: Color,
     pub task_done: Color,
     pub task_working: Color,
     pub task_pending: Color,
@@ -90,6 +94,10 @@ impl Default for SidebarRenderTheme {
             active_bar: Color::Indexed(147),
             repo: Color::LightCyan,
             branch: Color::Indexed(73),
+            git_ahead: Color::Indexed(108),
+            git_behind: Color::Indexed(179),
+            git_insertions: Color::Indexed(78),
+            git_deletions: Color::Indexed(174),
             task_done: Color::Indexed(220),
             task_working: Color::Indexed(220),
             task_pending: Color::DarkGray,
@@ -142,6 +150,12 @@ impl SidebarRenderTheme {
             active_bar: parse_color(config.active_bar.as_deref()).unwrap_or(default.active_bar),
             repo: parse_color(config.repo.as_deref()).unwrap_or(default.repo),
             branch: parse_color(config.branch.as_deref()).unwrap_or(default.branch),
+            git_ahead: parse_color(config.git_ahead.as_deref()).unwrap_or(default.git_ahead),
+            git_behind: parse_color(config.git_behind.as_deref()).unwrap_or(default.git_behind),
+            git_insertions: parse_color(config.git_insertions.as_deref())
+                .unwrap_or(default.git_insertions),
+            git_deletions: parse_color(config.git_deletions.as_deref())
+                .unwrap_or(default.git_deletions),
             task_done: parse_color(config.task_done.as_deref()).unwrap_or(default.task_done),
             task_working: parse_color(config.task_working.as_deref())
                 .unwrap_or(default.task_working),
@@ -996,25 +1010,25 @@ fn render_row_line(
         if let Some(ahead) = &git.ahead {
             spans.push(Span::styled(
                 format!(" {ahead}"),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.git_ahead),
             ));
         }
         if let Some(behind) = &git.behind {
             spans.push(Span::styled(
                 format!(" {behind}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.git_behind),
             ));
         }
         if let Some(insertions) = &git.insertions {
             spans.push(Span::styled(
                 format!(" {insertions}"),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.git_insertions),
             ));
         }
         if let Some(deletions) = &git.deletions {
             spans.push(Span::styled(
                 format!(" {deletions}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.git_deletions),
             ));
         }
     }
@@ -1209,23 +1223,39 @@ fn signal_label_spans(
     theme: &SidebarRenderTheme,
 ) -> Vec<Span<'static>> {
     let branch_style = Style::default().fg(theme.branch);
-    let Some(task) = task_progress_token(row) else {
-        return vec![Span::styled(label.to_string(), branch_style)];
-    };
-    let Some(start) = label.find(&task.text) else {
-        return vec![Span::styled(label.to_string(), branch_style)];
-    };
-    let end = start + task.text.len();
+    let task = task_progress_token(row);
+    let git = row.git.as_ref();
+    let ahead = git
+        .filter(|git| git.ahead > 0)
+        .map(|git| format!("↑ {}", git.ahead));
+    let behind = git
+        .filter(|git| git.behind > 0)
+        .map(|git| format!("↓ {}", git.behind));
+    let insertions = git
+        .filter(|git| git.insertions > 0)
+        .map(|git| format!("+{}", git.insertions));
+    let deletions = git
+        .filter(|git| git.deletions > 0)
+        .map(|git| format!("-{}", git.deletions));
     let mut spans = Vec::new();
-    if start > 0 {
-        spans.push(Span::styled(label[..start].to_string(), branch_style));
-    }
-    spans.push(Span::styled(
-        task.text,
-        closed_chat_right_tone_style(task.tone, row, theme),
-    ));
-    if end < label.len() {
-        spans.push(Span::styled(label[end..].to_string(), branch_style));
+    for (index, part) in label.split("  ").enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ".to_string(), branch_style));
+        }
+        let style = if ahead.as_deref() == Some(part) {
+            Style::default().fg(theme.git_ahead)
+        } else if behind.as_deref() == Some(part) {
+            Style::default().fg(theme.git_behind)
+        } else if insertions.as_deref() == Some(part) {
+            Style::default().fg(theme.git_insertions)
+        } else if deletions.as_deref() == Some(part) {
+            Style::default().fg(theme.git_deletions)
+        } else if let Some(task) = task.as_ref().filter(|task| task.text == part) {
+            closed_chat_right_tone_style(task.tone, row, theme)
+        } else {
+            branch_style
+        };
+        spans.push(Span::styled(part.to_string(), style));
     }
     spans
 }
@@ -2295,8 +2325,12 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_render_theme_reads_task_subagent_and_worktree_detail_colors() {
+    fn sidebar_render_theme_reads_git_task_subagent_and_worktree_detail_colors() {
         let config = crate::config::SidebarColorsConfig {
+            git_ahead: Some("109".to_string()),
+            git_behind: Some("180".to_string()),
+            git_insertions: Some("79".to_string()),
+            git_deletions: Some("#d98b8b".to_string()),
             task_done: Some("220".to_string()),
             task_working: Some("221".to_string()),
             task_pending: Some("darkgray".to_string()),
@@ -2309,6 +2343,10 @@ mod tests {
         };
         let theme = SidebarRenderTheme::from_config(&config);
 
+        assert_eq!(theme.git_ahead, Color::Indexed(109));
+        assert_eq!(theme.git_behind, Color::Indexed(180));
+        assert_eq!(theme.git_insertions, Color::Indexed(79));
+        assert_eq!(theme.git_deletions, Color::Rgb(217, 139, 139));
         assert_eq!(theme.task_done, Color::Indexed(220));
         assert_eq!(theme.task_working, Color::Indexed(221));
         assert_eq!(theme.task_pending, Color::DarkGray);
@@ -2319,6 +2357,10 @@ mod tests {
         assert_eq!(theme.worktree_activity, Color::Rgb(79, 208, 138));
 
         let default = SidebarRenderTheme::default();
+        assert_eq!(default.git_ahead, Color::Indexed(108));
+        assert_eq!(default.git_behind, Color::Indexed(179));
+        assert_eq!(default.git_insertions, Color::Indexed(78));
+        assert_eq!(default.git_deletions, Color::Indexed(174));
         assert_eq!(default.task_done, Color::Indexed(220));
         assert_eq!(default.task_working, Color::Indexed(220));
         assert_eq!(default.task_pending, Color::DarkGray);
@@ -2681,12 +2723,8 @@ mod tests {
             ..SidebarState::default()
         };
 
-        let lines = render_lines(
-            &[category, repo],
-            &state,
-            80,
-            &SidebarRenderTheme::default(),
-        );
+        let theme = SidebarRenderTheme::default();
+        let lines = render_lines(&[category, repo], &state, 80, &theme);
 
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::DarkGray));
         assert!(
@@ -2710,28 +2748,18 @@ mod tests {
             lines[0]
         );
         assert_eq!(lines[1].style.bg, Some(Color::Rgb(0x30, 0x30, 0x34)));
-        assert!(
-            lines[1].spans.iter().any(|span| {
-                span.content.trim() == "↑2" && span.style.fg == Some(Color::Green)
-            })
-        );
-        assert!(
-            lines[1]
-                .spans
-                .iter()
-                .any(|span| { span.content.trim() == "↓1" && span.style.fg == Some(Color::Red) })
-        );
-        assert!(
-            lines[1].spans.iter().any(|span| {
-                span.content.trim() == "+12" && span.style.fg == Some(Color::Green)
-            })
-        );
-        assert!(
-            lines[1]
-                .spans
-                .iter()
-                .any(|span| { span.content.trim() == "-3" && span.style.fg == Some(Color::Red) })
-        );
+        assert!(lines[1].spans.iter().any(|span| {
+            span.content.trim() == "↑2" && span.style.fg == Some(theme.git_ahead)
+        }));
+        assert!(lines[1].spans.iter().any(|span| {
+            span.content.trim() == "↓1" && span.style.fg == Some(theme.git_behind)
+        }));
+        assert!(lines[1].spans.iter().any(|span| {
+            span.content.trim() == "+12" && span.style.fg == Some(theme.git_insertions)
+        }));
+        assert!(lines[1].spans.iter().any(|span| {
+            span.content.trim() == "-3" && span.style.fg == Some(theme.git_deletions)
+        }));
     }
 
     #[test]
@@ -3730,9 +3758,16 @@ sidebar:
         let theme = SidebarRenderTheme::default();
         let mut signal = detail_row(
             "detail::%1::signal",
-            "feature  ☑ 1/3  :3000",
+            "feature  ↑ 2  ↓ 1  +184  -37  ☑ 1/3  :3000",
             RollupLevel::Running,
         );
+        signal.git = Some(crate::git::GitBadge {
+            branch: "feature".to_string(),
+            ahead: 2,
+            behind: 1,
+            insertions: 184,
+            deletions: 37,
+        });
         signal.meta = Some(crate::sidebar::tree::RowMeta {
             tasks_done: Some(1),
             tasks_total: Some(3),
@@ -3754,9 +3789,13 @@ sidebar:
 
         let lines = render_lines(&rows, &SidebarState::default(), 60, &theme);
 
-        assert_span_fg(&lines[0].spans, "feature  ", theme.branch);
+        assert_span_fg(&lines[0].spans, "feature", theme.branch);
+        assert_span_fg(&lines[0].spans, "↑ 2", theme.git_ahead);
+        assert_span_fg(&lines[0].spans, "↓ 1", theme.git_behind);
+        assert_span_fg(&lines[0].spans, "+184", theme.git_insertions);
+        assert_span_fg(&lines[0].spans, "-37", theme.git_deletions);
         assert_span_fg(&lines[0].spans, "☑ 1/3", theme.task_working);
-        assert_span_fg(&lines[0].spans, "  :3000", theme.branch);
+        assert_span_fg(&lines[0].spans, ":3000", theme.branch);
         assert_span_fg(&lines[1].spans, "◎ $ pnpm dev", theme.badge_working);
         assert_span_fg(&lines[2].spans, "▷ ", theme.branch);
         assert_span_fg(&lines[2].spans, "server is ready", RESPONSE_PREVIEW_COLOR);

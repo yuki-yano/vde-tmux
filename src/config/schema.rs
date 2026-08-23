@@ -330,6 +330,10 @@ pub fn config_schema() -> Value {
                             "header_active_bg": { "type": "string" },
                             "header_active_fg": { "type": "string" },
                             "header_filter_bg": { "type": "string" },
+                            "git_ahead": { "type": "string" },
+                            "git_behind": { "type": "string" },
+                            "git_insertions": { "type": "string" },
+                            "git_deletions": { "type": "string" },
                             "task_done": { "type": "string" },
                             "task_working": { "type": "string" },
                             "task_pending": { "type": "string" },
@@ -473,11 +477,15 @@ mod tests {
     }
 
     #[test]
-    fn schema_contains_sidebar_task_subagent_and_worktree_detail_colors() {
+    fn schema_contains_sidebar_git_task_subagent_and_worktree_detail_colors() {
         let schema = config_schema();
         let colors = &schema["properties"]["sidebar"]["properties"]["colors"]["properties"];
 
         for key in [
+            "git_ahead",
+            "git_behind",
+            "git_insertions",
+            "git_deletions",
             "task_done",
             "task_working",
             "task_pending",

@@ -186,6 +186,18 @@
             "header_filter_bg": {
               "type": "string"
             },
+            "git_ahead": {
+              "type": "string"
+            },
+            "git_behind": {
+              "type": "string"
+            },
+            "git_deletions": {
+              "type": "string"
+            },
+            "git_insertions": {
+              "type": "string"
+            },
             "selection_bar": {
               "type": "string"
             },

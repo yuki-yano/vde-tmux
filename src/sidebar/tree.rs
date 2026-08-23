@@ -934,6 +934,11 @@ fn push_chat_detail_rows(
     }
     if let Some(signal) = agent_signal_label(pane, include_repo_git) {
         let mut row = detail_row(pane, depth, "signal", signal);
+        row.git = pane
+            .git
+            .as_ref()
+            .filter(|_| include_repo_git || pane.worktree.is_some())
+            .cloned();
         if let Some((done, total)) = parse_tasks(&pane.tasks) {
             row.meta = Some(RowMeta {
                 tasks_done: Some(done),
@@ -2090,6 +2095,7 @@ mod tests {
             rows[0].label,
             "feature/sidebar  ↑ 2  ↓ 1  +184  -37  ☑ 1/3  :3000 :5173"
         );
+        assert_eq!(rows[0].git, pane.git);
         assert!(rows.iter().any(|row| row.label == "◎ $ pnpm dev"));
         assert!(rows.iter().any(|row| row.label == "▷ server is ready"));
     }
@@ -2111,6 +2117,7 @@ mod tests {
         push_chat_detail_rows(&pane, 1, false, &mut rows);
 
         assert_eq!(rows[0].label, "☑ 1/3  :3000");
+        assert_eq!(rows[0].git, None);
     }
 
     #[test]
@@ -2136,6 +2143,7 @@ mod tests {
         push_chat_detail_rows(&pane, 1, false, &mut rows);
 
         assert_eq!(rows[0].label, "+ feature/sidebar  ↑ 2  ↓ 1  +184  -37");
+        assert_eq!(rows[0].git, pane.git);
     }
 
     #[test]
