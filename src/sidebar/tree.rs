@@ -1032,6 +1032,12 @@ fn agent_signal_label(pane: &AgentPane, include_repo_git: bool) -> Option<String
         if git.behind > 0 {
             parts.push(format!("↓ {}", git.behind));
         }
+        if git.insertions > 0 {
+            parts.push(format!("+{}", git.insertions));
+        }
+        if git.deletions > 0 {
+            parts.push(format!("-{}", git.deletions));
+        }
     }
 
     let progress = parse_tasks(&pane.tasks).unwrap_or((0, 0));
@@ -2051,6 +2057,8 @@ mod tests {
             branch: "feature/sidebar".to_string(),
             ahead: 2,
             behind: 1,
+            insertions: 184,
+            deletions: 37,
         });
         pane.tasks = "1/3".to_string();
         pane.task_items = vec![
@@ -2080,7 +2088,7 @@ mod tests {
         assert_eq!(rows[0].id, "detail::%1::1::signal");
         assert_eq!(
             rows[0].label,
-            "feature/sidebar  ↑ 2  ↓ 1  ☑ 1/3  :3000 :5173"
+            "feature/sidebar  ↑ 2  ↓ 1  +184  -37  ☑ 1/3  :3000 :5173"
         );
         assert!(rows.iter().any(|row| row.label == "◎ $ pnpm dev"));
         assert!(rows.iter().any(|row| row.label == "▷ server is ready"));
@@ -2093,6 +2101,8 @@ mod tests {
             branch: "main".to_string(),
             ahead: 2,
             behind: 1,
+            insertions: 184,
+            deletions: 37,
         });
         pane.tasks = "1/3".to_string();
         pane.listening_ports = vec![3000];
@@ -2110,6 +2120,8 @@ mod tests {
             branch: "main".to_string(),
             ahead: 2,
             behind: 1,
+            insertions: 184,
+            deletions: 37,
         });
         pane.worktree = Some(WorktreeInfo {
             name: "feature-sidebar".to_string(),
@@ -2123,7 +2135,7 @@ mod tests {
 
         push_chat_detail_rows(&pane, 1, false, &mut rows);
 
-        assert_eq!(rows[0].label, "+ feature/sidebar  ↑ 2  ↓ 1");
+        assert_eq!(rows[0].label, "+ feature/sidebar  ↑ 2  ↓ 1  +184  -37");
     }
 
     #[test]

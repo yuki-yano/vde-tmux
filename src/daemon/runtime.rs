@@ -2473,6 +2473,8 @@ mod tests {
                 branch: "main".to_string(),
                 ahead: 1,
                 behind: 0,
+                insertions: 12,
+                deletions: 3,
             },
         )]);
         assert!(
@@ -2496,6 +2498,8 @@ mod tests {
                 branch: "stale".to_string(),
                 ahead: 0,
                 behind: 0,
+                insertions: 0,
+                deletions: 0,
             },
         );
         assert!(
@@ -2512,6 +2516,8 @@ mod tests {
                 branch: "x".repeat(crate::pane_state::MAX_RESPONSE_FRAME_BYTES),
                 ahead: 0,
                 behind: 0,
+                insertions: 0,
+                deletions: 0,
             },
         )]);
         assert!(

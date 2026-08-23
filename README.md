@@ -270,6 +270,9 @@ notification state. `Priority` places pinned agents in the first `PINNED` zone, 
 first, and `Tree` promotes their enclosing Category and Repository while keeping the hierarchy.
 Pinned agents remain pinned when they become read or their lifecycle changes, and stale pins are
 removed when the pane disappears.
+Repository and linked-worktree branch labels show upstream divergence as `↑N` / `↓N`, followed by
+tracked staged and unstaged line changes from `HEAD` as `+N` / `-N`. Zero counts are omitted.
+Untracked and binary files do not contribute line counts.
 The Needs action filter and red triangle match only Blocked agents waiting for user input.
 Unread Done agents remain separate under the Done filter. `unread-latest` navigation also includes
 unread Blocked occurrences.

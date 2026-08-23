@@ -233,6 +233,9 @@ globalな発生順はdaemonが管理し、移動中に最新paneが消えた場�
 Priorityではpinされたagentが先頭の`PINNED` zoneへ移動し、Flatでは先頭へ移動します。
 Treeでは階層を維持したまま所属するCategoryとRepositoryが優先されます。
 pinは既読化やlifecycle変更では解除されず、paneが消えたときに削除されます。
+Repositoryとlinked worktreeのbranch labelには、upstreamとの差を`↑N` / `↓N`、
+`HEAD`からのtrackedなstagedおよびunstaged差分行数を`+N` / `-N`で続けて表示します。
+0件は省略し、untracked fileとbinary fileは差分行数へ含めません。
 
 ```bash
 vt sidebar open --width 40

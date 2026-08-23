@@ -11,6 +11,8 @@ pub struct GitBadge {
     pub branch: String,
     pub ahead: u32,
     pub behind: u32,
+    pub insertions: u64,
+    pub deletions: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +133,52 @@ pub struct PorcelainBranchStatus {
     pub branch: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GitDiffStat {
+    pub insertions: u64,
+    pub deletions: u64,
+}
+
+pub fn parse_numstat(raw: &str) -> Result<GitDiffStat> {
+    let mut stat = GitDiffStat::default();
+    for line in raw.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let insertions = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("numstat line lacks insertions: {line:?}"))?;
+        let deletions = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("numstat line lacks deletions: {line:?}"))?;
+        let path = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("numstat line lacks path: {line:?}"))?;
+        if path.is_empty() {
+            bail!("numstat line has an empty path: {line:?}");
+        }
+        if insertions == "-" && deletions == "-" {
+            continue;
+        }
+        if insertions == "-" || deletions == "-" {
+            bail!("numstat line mixes binary and text counts: {line:?}");
+        }
+        let insertions = insertions
+            .parse::<u64>()
+            .with_context(|| format!("invalid numstat insertions: {line:?}"))?;
+        let deletions = deletions
+            .parse::<u64>()
+            .with_context(|| format!("invalid numstat deletions: {line:?}"))?;
+        stat.insertions = stat
+            .insertions
+            .checked_add(insertions)
+            .ok_or_else(|| anyhow::anyhow!("numstat insertion total overflowed"))?;
+        stat.deletions = stat
+            .deletions
+            .checked_add(deletions)
+            .ok_or_else(|| anyhow::anyhow!("numstat deletion total overflowed"))?;
+    }
+    Ok(stat)
 }
 
 pub fn parse_porcelain_branch_status(raw: &str) -> Result<PorcelainBranchStatus> {
@@ -331,12 +379,22 @@ impl GitPoller {
             ) && let Ok(status) = parse_porcelain_branch_status(&output)
                 && let Some(branch) = status.branch
             {
+                let diff = runner
+                    .run(
+                        top_level,
+                        &["diff", "--no-ext-diff", "--numstat", "HEAD", "--"],
+                    )
+                    .ok()
+                    .and_then(|output| parse_numstat(&output).ok())
+                    .unwrap_or_default();
                 top_badges.insert(
                     (*top_level).to_string(),
                     GitBadge {
                         branch,
                         ahead: status.ahead,
                         behind: status.behind,
+                        insertions: diff.insertions,
+                        deletions: diff.deletions,
                     },
                 );
             }
@@ -617,6 +675,15 @@ mod tests {
                 .count()
         }
 
+        fn diff_calls(&self) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.get(1).map(String::as_str) == Some("diff"))
+                .count()
+        }
+
         fn vw_call_count(&self) -> usize {
             self.vw_calls.lock().unwrap().len()
         }
@@ -693,6 +760,14 @@ mod tests {
             ],
             body,
         );
+        stub_diff(runner, cwd, "");
+    }
+
+    fn stub_diff(runner: &mut MockGitRunner, cwd: &str, body: &str) {
+        runner.stub(
+            &[cwd, "diff", "--no-ext-diff", "--numstat", "HEAD", "--"],
+            body,
+        );
     }
 
     #[test]
@@ -766,6 +841,30 @@ mod tests {
         assert!(parse_porcelain_branch_status("# branch.head main\n# branch.ab +2 3\n").is_err());
     }
 
+    #[test]
+    fn numstat_sums_text_changes_and_ignores_binary_files() {
+        let stat = parse_numstat(
+            "12\t3\tsrc/lib.rs\n4\t9\told name => new name\n-\t-\tassets/image.png\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            stat,
+            GitDiffStat {
+                insertions: 16,
+                deletions: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn numstat_rejects_malformed_or_overflowing_counts() {
+        assert!(parse_numstat("1\t2\n").is_err());
+        assert!(parse_numstat("-\t2\tfile\n").is_err());
+        assert!(parse_numstat("x\t2\tfile\n").is_err());
+        assert!(parse_numstat(&format!("{}\t0\ta\n1\t0\tb\n", u64::MAX)).is_err());
+    }
+
     fn main_and_linked_runner() -> MockGitRunner {
         let mut runner = MockGitRunner::default();
         stub_identity_probe(
@@ -797,10 +896,16 @@ mod tests {
             "/tmp/main",
             "# branch.head main\n# branch.upstream origin/main\n# branch.ab +1 -2\n",
         );
+        stub_diff(&mut runner, "/tmp/main", "12\t3\tsrc/lib.rs\n");
         stub_status(
             &mut runner,
             "/tmp/worktrees/feature",
             "# branch.head feature\n",
+        );
+        stub_diff(
+            &mut runner,
+            "/tmp/worktrees/feature",
+            "4\t9\tsrc/sidebar.rs\n",
         );
         runner.stub_vw(
             &["/tmp/worktrees/feature", "list", "--json"],
@@ -823,7 +928,11 @@ mod tests {
         assert_eq!(badges["/tmp/main"].branch, "main");
         assert_eq!(badges["/tmp/main"].ahead, 1);
         assert_eq!(badges["/tmp/main"].behind, 2);
+        assert_eq!(badges["/tmp/main"].insertions, 12);
+        assert_eq!(badges["/tmp/main"].deletions, 3);
         assert_eq!(badges["/tmp/worktrees/feature"].branch, "feature");
+        assert_eq!(badges["/tmp/worktrees/feature"].insertions, 4);
+        assert_eq!(badges["/tmp/worktrees/feature"].deletions, 9);
         assert_eq!(worktrees.len(), 1);
         assert_eq!(
             worktrees["/tmp/worktrees/feature"].source,
@@ -833,6 +942,7 @@ mod tests {
         // Cold cache: one probe per unique path, one status per worktree.
         assert_eq!(runner.probe_calls(), 3);
         assert_eq!(runner.status_calls(), 2);
+        assert_eq!(runner.diff_calls(), 2);
         assert_eq!(runner.vw_call_count(), 1);
 
         let (warm_badges, warm_worktrees) =
@@ -843,11 +953,12 @@ mod tests {
         // Warm cache: no probes, one status per worktree, one vw per common dir.
         assert_eq!(runner.probe_calls(), 3);
         assert_eq!(runner.status_calls(), 4);
+        assert_eq!(runner.diff_calls(), 4);
         assert_eq!(runner.vw_call_count(), 2);
     }
 
     #[test]
-    fn nine_worktrees_cost_one_status_command_each_per_poll_when_warm() {
+    fn nine_worktrees_cost_one_status_and_diff_command_each_per_poll_when_warm() {
         let mut runner = MockGitRunner::default();
         let mut paths = Vec::new();
         for index in 0..9 {
@@ -880,18 +991,20 @@ mod tests {
         let (badges, worktrees) = poller.poll(&runner, paths.iter().map(String::as_str), now);
         assert_eq!(badges.len(), 18);
         assert_eq!(worktrees.len(), 18);
-        // Cold: 18 probes + 9 status commands.
+        // Cold: 18 probes + one status and one diff command per worktree.
         assert_eq!(runner.probe_calls(), 18);
         assert_eq!(runner.status_calls(), 9);
+        assert_eq!(runner.diff_calls(), 9);
 
         poller.poll(
             &runner,
             paths.iter().map(String::as_str),
             now + Duration::from_secs(10),
         );
-        // Warm: exactly one git command per worktree per poll.
+        // Warm: exactly one status and one diff command per worktree per poll.
         assert_eq!(runner.probe_calls(), 18);
         assert_eq!(runner.status_calls(), 18);
+        assert_eq!(runner.diff_calls(), 18);
         // vw is shared per common git dir: one probe per poll.
         assert_eq!(runner.vw_call_count(), 2);
     }

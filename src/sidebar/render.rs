@@ -1005,6 +1005,18 @@ fn render_row_line(
                 Style::default().fg(Color::Red),
             ));
         }
+        if let Some(insertions) = &git.insertions {
+            spans.push(Span::styled(
+                format!(" {insertions}"),
+                Style::default().fg(Color::Green),
+            ));
+        }
+        if let Some(deletions) = &git.deletions {
+            spans.push(Span::styled(
+                format!(" {deletions}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
     }
     let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
     let filler = width
@@ -1320,6 +1332,8 @@ struct GitBadgeText {
     branch: String,
     ahead: Option<String>,
     behind: Option<String>,
+    insertions: Option<String>,
+    deletions: Option<String>,
 }
 
 fn format_git_badge_parts(badge: &crate::git::GitBadge) -> GitBadgeText {
@@ -1327,8 +1341,10 @@ fn format_git_badge_parts(badge: &crate::git::GitBadge) -> GitBadgeText {
     let branch = parts.remove(0);
     GitBadgeText {
         branch,
-        ahead: (badge.ahead > 0).then(|| format!("+{}", badge.ahead)),
-        behind: (badge.behind > 0).then(|| format!("-{}", badge.behind)),
+        ahead: (badge.ahead > 0).then(|| format!("↑{}", badge.ahead)),
+        behind: (badge.behind > 0).then(|| format!("↓{}", badge.behind)),
+        insertions: (badge.insertions > 0).then(|| format!("+{}", badge.insertions)),
+        deletions: (badge.deletions > 0).then(|| format!("-{}", badge.deletions)),
     }
 }
 
@@ -2002,6 +2018,12 @@ fn git_badge_width(git: &GitBadgeText) -> usize {
     if let Some(behind) = &git.behind {
         width += 1 + display_width(behind);
     }
+    if let Some(insertions) = &git.insertions {
+        width += 1 + display_width(insertions);
+    }
+    if let Some(deletions) = &git.deletions {
+        width += 1 + display_width(deletions);
+    }
     width
 }
 
@@ -2614,11 +2636,13 @@ mod tests {
             branch: "main".to_string(),
             ahead: 2,
             behind: 1,
+            insertions: 184,
+            deletions: 37,
         });
 
         let rendered = render_rows(&[repo], &SidebarState::default(), 80);
 
-        assert!(rendered.contains("main +2 -1"));
+        assert!(rendered.contains("main ↑2 ↓1 +184 -37"));
     }
 
     #[test]
@@ -2628,6 +2652,8 @@ mod tests {
             branch: "main".to_string(),
             ahead: 0,
             behind: 0,
+            insertions: 0,
+            deletions: 0,
         });
 
         let rendered = render_rows(&[repo], &SidebarState::default(), 80);
@@ -2635,6 +2661,8 @@ mod tests {
         assert!(rendered.contains("▾ app main"));
         assert!(!rendered.contains("+0"));
         assert!(!rendered.contains("-0"));
+        assert!(!rendered.contains("↑0"));
+        assert!(!rendered.contains("↓0"));
     }
 
     #[test]
@@ -2644,6 +2672,8 @@ mod tests {
             branch: "main".to_string(),
             ahead: 2,
             behind: 1,
+            insertions: 12,
+            deletions: 3,
         });
         let category = category_row("misc", RollupLevel::Idle);
         let state = SidebarState {
@@ -2681,16 +2711,26 @@ mod tests {
         );
         assert_eq!(lines[1].style.bg, Some(Color::Rgb(0x30, 0x30, 0x34)));
         assert!(
-            lines[1]
-                .spans
-                .iter()
-                .any(|span| { span.content.trim() == "+2" && span.style.fg == Some(Color::Green) })
+            lines[1].spans.iter().any(|span| {
+                span.content.trim() == "↑2" && span.style.fg == Some(Color::Green)
+            })
         );
         assert!(
             lines[1]
                 .spans
                 .iter()
-                .any(|span| { span.content.trim() == "-1" && span.style.fg == Some(Color::Red) })
+                .any(|span| { span.content.trim() == "↓1" && span.style.fg == Some(Color::Red) })
+        );
+        assert!(
+            lines[1].spans.iter().any(|span| {
+                span.content.trim() == "+12" && span.style.fg == Some(Color::Green)
+            })
+        );
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| { span.content.trim() == "-3" && span.style.fg == Some(Color::Red) })
         );
     }
 
@@ -3909,6 +3949,8 @@ sidebar:
             branch: "main".to_string(),
             ahead: 0,
             behind: 0,
+            insertions: 0,
+            deletions: 0,
         });
         let lines = render_lines(
             &[repo],
