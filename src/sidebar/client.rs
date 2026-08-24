@@ -790,34 +790,43 @@ mod tests {
 
     #[test]
     fn subscription_ignores_heartbeats_without_producing_snapshots() {
-        let (mut server, client) = UnixStream::pair().unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
         let mut subscription = subscription_over(client, Some(5));
-
-        write_frame(
-            &mut server,
-            &V2ServerMessage::Heartbeat {
-                daemon_instance_id: daemon_instance_id(),
-                snapshot_revision: 5,
-            },
-        );
-        write_frame(
-            &mut server,
-            &V2ServerMessage::Heartbeat {
-                daemon_instance_id: daemon_instance_id(),
-                snapshot_revision: 5,
-            },
-        );
-        write_frame(
-            &mut server,
-            &V2ServerMessage::ResolvedSnapshotResult {
-                snapshot_revision: 6,
-                snapshot: empty_snapshot(6),
-            },
-        );
+        server
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut server = server;
+            write_frame(
+                &mut server,
+                &V2ServerMessage::Heartbeat {
+                    daemon_instance_id: daemon_instance_id(),
+                    snapshot_revision: 5,
+                },
+            );
+            write_frame(
+                &mut server,
+                &V2ServerMessage::Heartbeat {
+                    daemon_instance_id: daemon_instance_id(),
+                    snapshot_revision: 5,
+                },
+            );
+            write_frame(
+                &mut server,
+                &V2ServerMessage::ResolvedSnapshotResult {
+                    snapshot_revision: 6,
+                    snapshot: empty_snapshot(6),
+                },
+            );
+        });
 
         // Both heartbeats are consumed silently; only the real revision comes
         // out of the subscription, so the sidebar never redraws for keepalives.
-        let snapshot = subscription.read_next_snapshot().unwrap().unwrap();
+        let snapshot = subscription
+            .read_next_snapshot_until(Some(Instant::now() + Duration::from_secs(1)))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
         assert_eq!(snapshot.snapshot_revision, 6);
     }
 

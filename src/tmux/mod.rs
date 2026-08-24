@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -149,7 +150,8 @@ fn run_command_with_optional_input(
     timeout: Option<Duration>,
     max_stdout_bytes: Option<usize>,
 ) -> Result<String> {
-    let mut child = Command::new(program)
+    let mut command = command_with_timeout_group(program, timeout);
+    let mut child = command
         .args(args)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -215,7 +217,8 @@ fn run_command_with_input_limits(
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
 ) -> std::result::Result<String, InputCommandError> {
-    let mut child = Command::new(program)
+    let mut command = command_with_timeout_group(program, timeout);
+    let mut child = command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -438,7 +441,8 @@ fn run_command_bounded_with_retention(
     max_stdout_bytes: usize,
     retention: Retention,
 ) -> Result<BoundedOutput> {
-    let mut child = Command::new(program)
+    let mut command = command_with_timeout_group(program, timeout);
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -482,21 +486,21 @@ fn wait_for_child(
         None => child
             .wait()
             .with_context(|| format!("failed to wait {program}")),
-        Some(limit) => {
-            let deadline = Instant::now() + limit;
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    return Ok(status);
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!("{program} timed out after {limit:?}");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
+        Some(limit) => match crate::proc::await_exit_then_kill_group(child, limit)
+            .with_context(|| format!("failed to wait {program}"))?
+        {
+            Some(status) => Ok(status),
+            None => bail!("{program} timed out after {limit:?}"),
+        },
     }
+}
+
+fn command_with_timeout_group(program: &str, timeout: Option<Duration>) -> Command {
+    let mut command = Command::new(program);
+    if timeout.is_some() {
+        command.process_group(0);
+    }
+    command
 }
 
 fn bound_string(mut text: String, max_bytes: usize) -> BoundedOutput {
@@ -795,7 +799,7 @@ pub fn tmux_args(socket_name: Option<&str>, args: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn run_command_captures_stdout() {
@@ -1050,11 +1054,11 @@ mod tests {
     }
 
     #[test]
-    fn run_command_times_out_and_kills() {
+    fn run_command_timeout_kills_descendants_and_unblocks_pipe_readers() {
         let started = std::time::Instant::now();
         let err = run_command(
             "/bin/sh",
-            &["-c", "sleep 5"],
+            &["-c", "sleep 5 & wait"],
             Some(Duration::from_millis(100)),
         )
         .unwrap_err();
