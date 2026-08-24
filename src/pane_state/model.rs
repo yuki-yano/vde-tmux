@@ -924,6 +924,8 @@ impl PaneState {
         }
         if execution_active {
             self.completed_seq = projection.run_seq.saturating_sub(1);
+            self.completed_at =
+                (self.completed_seq > 0).then_some(self.completed_at.unwrap_or(observed_at));
             if matches!(self.lifecycle, LifecycleState::Idle) {
                 self.lifecycle = LifecycleState::Running;
             }
@@ -1527,6 +1529,35 @@ mod tests {
             state.unread.latest.as_ref().map(|latest| latest.reason),
             Some(UnreadReason::Completed)
         );
+    }
+
+    #[test]
+    fn active_durable_projection_reopens_completed_first_run_consistently() {
+        let mut state = valid_state();
+        let projection = CurrentDurableRunProjection {
+            run_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            run_seq: 1,
+            run_revision: 1,
+        };
+        state
+            .reconcile_current_run(projection.clone(), true, 10, 0)
+            .unwrap();
+        state
+            .reconcile_current_run(projection.clone(), false, 12, 0)
+            .unwrap();
+        assert_eq!(state.completed_seq, 1);
+        assert_eq!(state.completed_at, Some(12));
+
+        assert!(
+            state
+                .reconcile_current_run(projection, true, 13, 1)
+                .unwrap()
+        );
+        assert_eq!(state.run_seq, 1);
+        assert_eq!(state.completed_seq, 0);
+        assert_eq!(state.completed_at, None);
+        assert!(matches!(state.lifecycle, LifecycleState::Running));
+        state.validate().unwrap();
     }
 
     #[test]
