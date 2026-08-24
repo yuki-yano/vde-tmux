@@ -1183,6 +1183,9 @@ fn allocate_proportional(sizes: &[u32], total: u32) -> Result<Vec<u32>> {
     }
 
     let sum = sizes.iter().copied().sum::<u32>();
+    if sum == total && sizes.iter().all(|size| *size > 0) {
+        return Ok(sizes.to_vec());
+    }
     if sum == 0 {
         return allocate_evenly(sizes.len(), total);
     }
@@ -1678,6 +1681,10 @@ mod tests {
             .any(|call| call.iter().map(String::as_str).eq(expected.iter().copied()))
     }
 
+    fn checked_layout(body: &str) -> String {
+        format!("{:04x},{body}", tmux_layout_checksum(body))
+    }
+
     #[test]
     fn attach_shell_command_propagates_tmux_socket_name() {
         assert_eq!(
@@ -1949,6 +1956,58 @@ mod tests {
             layout_without_sidebar(layout, "%9").unwrap(),
             Some(expected.to_string())
         );
+    }
+
+    #[test]
+    fn allocate_proportional_preserves_sizes_when_total_is_unchanged() {
+        assert_eq!(
+            allocate_proportional(&[119, 12], 131).unwrap(),
+            vec![119, 12]
+        );
+    }
+
+    #[test]
+    fn allocate_proportional_keeps_scaling_when_total_changes() {
+        assert_eq!(
+            allocate_proportional(&[119, 12], 150).unwrap(),
+            vec![135, 15]
+        );
+        assert_eq!(
+            allocate_proportional(&[119, 12], 100).unwrap(),
+            vec![90, 10]
+        );
+        assert_eq!(allocate_proportional(&[119, 0], 131).unwrap(), vec![130, 1]);
+    }
+
+    #[test]
+    fn layout_without_full_height_sidebar_preserves_nested_pane_heights() {
+        let layouts = [
+            checked_layout(
+                "200x132,0,0{20x132,0,0,9,179x132,21,0[179x119,21,0,1,179x12,21,120,2]}",
+            ),
+            checked_layout("200x132,0,0{179x132,0,0[179x119,0,0,1,179x12,0,120,2],20x132,180,0,9}"),
+        ];
+        let expected = checked_layout("200x132,0,0[200x119,0,0,1,200x12,0,120,2]");
+
+        for layout in layouts {
+            assert_eq!(
+                layout_without_sidebar(&layout, "%9").unwrap(),
+                Some(expected.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn resize_layout_cell_is_idempotent_for_unchanged_dimensions() {
+        let layout = checked_layout("200x132,0,0[200x119,0,0,1,200x12,0,120,2]");
+        let mut cell = parse_tmux_layout(&layout).unwrap();
+
+        resize_layout_cell(&mut cell, 200, 132, 0, 0).unwrap();
+        let once = format_tmux_layout(&cell);
+        resize_layout_cell(&mut cell, 200, 132, 0, 0).unwrap();
+
+        assert_eq!(format_tmux_layout(&cell), once);
+        assert_eq!(once, layout);
     }
 
     #[test]
