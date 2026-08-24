@@ -178,17 +178,15 @@ projection:
 `needs_action: false`. `needs_action` is derived from canonical triage state and does
 not disappear merely because a pane is visible.
 
-`agent list` returns present agents plus an absent retained occupant only while its canonical
-lifecycle reason is `usage_limit`. Other historical records retained for unread/sidebar behavior
-are not reported as current occupants. Results are ordered by canonical pane identity; consumers
-must not infer activity order from array position.
+`agent list` returns present agents. Historical records retained for unread/sidebar behavior are
+not reported as current occupants. Results are ordered by canonical pane identity; consumers must
+not infer activity order from array position.
 
 A tmux pane is emitted once per server even when its window is linked into multiple sessions.
 `sessions[]` describes those session views; `window_active` and `window_last` apply to each view.
 Pane-level `active` is the selected pane within the shared window, not a particular client's focus.
 `pane current` and `pane read` with no target read `TMUX_PANE`; `pane current` returns the same
-`pane_get` result shape as `pane get`. An absent usage-limited result has `present: false`, inferred
-identity, and no `agent_ref`; it is read-only and can be queried again by pane ID.
+`pane_get` result shape as `pane get`.
 
 Filters are exact except for `--cwd-prefix`, which compares normalized path components:
 

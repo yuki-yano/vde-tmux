@@ -542,10 +542,7 @@ impl CanonicalCoordinatorState {
             .filter(|topology| {
                 matches!(
                     self.leased.runtime.record(&topology.pane_instance),
-                    Some(state)
-                        if state.agent_present
-                            || state.unread.is_unread()
-                            || state.lifecycle.is_usage_limited()
+                    Some(state) if state.agent_present || state.unread.is_unread()
                 )
             })
             .map(|topology| topology.current_path.clone())
@@ -837,11 +834,7 @@ impl CanonicalCoordinatorState {
             let stored = runtime.descriptor(&topology.pane_instance);
             let record = runtime.record(&topology.pane_instance);
             let resolved = match record {
-                Some(state)
-                    if state.agent_present
-                        || state.unread.is_unread()
-                        || state.lifecycle.is_usage_limited() =>
-                {
+                Some(state) if state.agent_present || state.unread.is_unread() => {
                     Some(ResolvedPaneState {
                         canonical: state.clone(),
                         window_id: topology.window_id.clone(),
@@ -1840,6 +1833,36 @@ mod tests {
         assert!(expected.contains("/tmp/alpha"));
         assert!(expected.contains("/tmp/beta"));
         assert!(!expected.contains("/tmp/shell"));
+        remove_canonical_sidebar_fixture(state, root);
+    }
+
+    #[test]
+    fn absent_usage_limited_state_is_retained_but_not_resolved() {
+        let (mut state, root) = canonical_sidebar_fixture();
+        let pane = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 101,
+        };
+        let mut records = state.leased.runtime.records_snapshot();
+        let limited = records.get_mut(&pane).unwrap();
+        limited.agent_present = false;
+        limited.scan_verified = true;
+        limited.lifecycle = crate::pane_state::LifecycleState::Waiting {
+            reason: crate::pane_state::WaitReason::usage_limit(),
+        };
+        limited.unread = crate::pane_state::UnreadState::default();
+        state.leased.hydrate(records).unwrap();
+
+        let snapshot = state.resolved_snapshot();
+        let retained = snapshot
+            .panes
+            .iter()
+            .find(|candidate| candidate.pane_instance == pane)
+            .unwrap();
+        assert!(retained.resolved.is_none());
+        assert!(retained.retained_state.is_some());
+        assert!(!state.git_polling_paths().contains("/tmp/alpha"));
+
         remove_canonical_sidebar_fixture(state, root);
     }
 

@@ -227,14 +227,15 @@ input; callers must use its lifecycle cursor with `agent wait` before claiming p
 `agent steer` is available for exact working Codex/Claude occupants. It applies the same guards but
 does not prove active-turn attribution; a concurrent completion may start a new turn instead.
 
-When Claude Code or Codex exhausts its allowance, the pane remains queryable as
-`status=limited`, `lifecycle.state=waiting`, and `lifecycle.reason=usage_limit`, even if the agent
-process exits. Claude Code's `StopFailure` rate-limit event is authoritative. A bounded,
-five-second supplementary pane-tail scan recognizes only the provider messages `You've hit your
-session limit` and `You've hit your usage limit`; generic rate-limit text and status-line warnings
-do not change state. Use `vt pane read` to inspect the provider's reset text. vde-tmux does not
-retry automatically or infer recovery from the clock; a later `SessionStart` or
-`UserPromptSubmit` is recovery evidence.
+When Claude Code or Codex exhausts its allowance, the active agent is queryable as
+`status=limited`, `lifecycle.state=waiting`, and `lifecycle.reason=usage_limit`. Claude Code's
+`StopFailure` rate-limit event is authoritative. A bounded, five-second supplementary pane-tail
+scan recognizes only the provider messages `You've hit your session limit` and `You've hit your
+usage limit`; generic rate-limit text and status-line warnings do not change state. Use
+`vt pane read` to inspect the provider's reset text. vde-tmux does not retry automatically or
+infer recovery from the clock; a later `SessionStart` or `UserPromptSubmit` is recovery evidence.
+When process scanning confirms that the agent exited, the open run is completed and the pane is no
+longer exposed as a current Limited agent.
 
 ## Agent states
 

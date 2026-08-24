@@ -1110,7 +1110,7 @@ fn confirm_absent(
     observed_at: i64,
     visibility: &VisibilitySnapshot,
 ) -> Result<(), ReduceError> {
-    if state.run_seq > state.completed_seq && !state.lifecycle.is_usage_limited() {
+    if state.run_seq > state.completed_seq {
         complete_run(state, observed_at, visibility, false)?;
     }
     state.agent_present = false;
@@ -3099,7 +3099,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_absence_preserves_usage_limit_as_limited_state() {
+    fn confirmed_absence_completes_usage_limited_run() {
         let tracker = CaptureTrackerSnapshot::default();
         let mut discovered = reduce_once(
             None,
@@ -3133,13 +3133,13 @@ mod tests {
             None,
             3,
         );
-        let limited = active(&second);
-        assert!(!limited.agent_present);
-        assert!(limited.scan_verified);
-        assert!(limited.lifecycle.is_usage_limited());
-        assert_eq!(limited.completed_seq, 0);
-        assert_eq!(resolve_badge(limited), BadgeState::Limited);
-        limited.validate().unwrap();
+        let completed = active(&second);
+        assert!(!completed.agent_present);
+        assert!(completed.scan_verified);
+        assert!(matches!(completed.lifecycle, LifecycleState::Idle));
+        assert_eq!(completed.completed_seq, 1);
+        assert_eq!(resolve_badge(completed), BadgeState::Done);
+        completed.validate().unwrap();
     }
 
     #[test]

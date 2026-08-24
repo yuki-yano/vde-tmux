@@ -5181,7 +5181,7 @@ fn agent_summary(
 ) -> Option<AgentSummary> {
     let resolved = pane.resolved.as_ref()?;
     let state = &resolved.canonical;
-    if !state.agent_present && !state.lifecycle.is_usage_limited() {
+    if !state.agent_present {
         return None;
     }
     let exact_identity = pane.agent_process.is_some();
@@ -5307,7 +5307,7 @@ fn resolve_agent<'a>(
         )
         .into());
     };
-    if !resolved.canonical.agent_present && !resolved.canonical.lifecycle.is_usage_limited() {
+    if !resolved.canonical.agent_present {
         return Err(api_error!(
             "agent_not_found",
             format!("pane {} has no present agent", pane.pane_instance.pane_id),
@@ -7181,7 +7181,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_usage_limited_agent_remains_queryable_as_limited() {
+    fn absent_usage_limited_agent_is_not_exposed_as_a_current_occupant() {
         let mut pane = test_agent_pane();
         pane.agent_process = None;
         let state = &mut pane.resolved.as_mut().unwrap().canonical;
@@ -7193,19 +7193,15 @@ mod tests {
         pane.resolved.as_mut().unwrap().badge = BadgeState::Limited;
         let snapshot = test_snapshot(pane.clone());
 
-        let summary = agent_summary(&pane, &snapshot, "server").unwrap();
-        assert_eq!(summary.status, AgentStatus::Limited);
-        assert_eq!(summary.badge, AgentBadge::Limited);
-        assert_eq!(summary.lifecycle.state, "waiting");
-        assert_eq!(summary.lifecycle.reason.as_deref(), Some("usage_limit"));
-        assert!(!summary.present);
-        assert!(summary.agent_ref.is_none());
-        let resolved = resolve_agent(&snapshot, "%1", "server").unwrap();
-        let detail = agent_detail(resolved, &snapshot, "server").unwrap();
-        assert_eq!(detail.summary.status, AgentStatus::Limited);
-        assert!(!detail.summary.needs_action);
-        assert!(!detail.summary.present);
-        assert!(detail.summary.agent_ref.is_none());
+        assert!(agent_summary(&pane, &snapshot, "server").is_none());
+        assert_eq!(
+            resolve_agent(&snapshot, "%1", "server")
+                .unwrap_err()
+                .downcast_ref::<ApiError>()
+                .unwrap()
+                .code(),
+            "agent_not_found"
+        );
     }
 
     #[test]
