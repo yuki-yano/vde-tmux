@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::category::ResolvedSessionCategories;
 use crate::config::Config;
 use crate::options::{
     KEY_CATEGORY, KEY_PROJECT_PATH, set_global_option, set_session_option, show_global_option,
+    show_session_option,
 };
 use crate::tmux::TmuxRunner;
 
@@ -755,8 +756,6 @@ fn cycle_session_resolved(
 
 pub fn on_client_session_changed(
     runner: &dyn TmuxRunner,
-    config: &Config,
-    env: &BTreeMap<String, String>,
     client_pid: Option<u32>,
     session_name: Option<&str>,
 ) -> Result<()> {
@@ -769,16 +768,18 @@ pub fn on_client_session_changed(
         },
         _ => (current_client_name(runner)?, current_session_name(runner)?),
     };
-    let sessions = list_sessions(runner)?;
-    let categories =
-        crate::category::resolve_session_categories_from_server(runner, config, env, &sessions)?;
-    remember_client_session_for_session_resolved(
-        runner,
-        &categories,
-        &sessions,
-        &client_name,
-        &session_name,
-    )
+    // Category mirrors are synchronized whenever effective placement changes. This hook runs in
+    // tmux's foreground command queue, so resolving every repository here would make each client
+    // switch O(number of sessions).
+    let target = exact_session_target(&session_name);
+    let mirrored = show_session_option(runner, &target, KEY_CATEGORY)?
+        .with_context(|| format!("session {session_name} has no Category mirror"))?;
+    let category = if mirrored.trim() == crate::category::UNCATEGORIZED {
+        crate::category::CategoryName::uncategorized()
+    } else {
+        crate::category::CategoryName::parse(mirrored).map_err(anyhow::Error::msg)?
+    };
+    remember_session_for_client(runner, &client_name, category.as_str(), &session_name)
 }
 
 fn adjacent_resolved_category<'a>(
@@ -1396,42 +1397,30 @@ mod tests {
     fn hook_with_args_remembers_given_client_session() {
         let mock = MockTmuxRunner::new();
         let client_format = client_pid_name_format();
-        let session_format = session_list_format();
         mock.stub(
             &["list-clients", "-F", &client_format],
             "123\u{1f}abc\u{1f}/dev/ttys001\u{1f}0\n",
         );
         mock.stub(
-            &["list-sessions", "-F", &session_format],
-            "main\u{1f}1\u{1f}100\u{1f}work\u{1f}\u{1f}\u{1f}$1\n",
+            &["show-option", "-qv", "-t", "=main:", KEY_CATEGORY],
+            "work\n",
         );
         mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
-        let client = regular_client_name_for_pid(&mock, 123).unwrap();
-        let sessions = list_sessions(&mock).unwrap();
-        let categories = categories_for_sessions(&sessions, &[("main", "work")]);
-        remember_client_session_for_session_resolved(
-            &mock,
-            &categories,
-            &sessions,
-            &client,
-            "main",
-        )
-        .unwrap();
+        on_client_session_changed(&mock, Some(123), Some("main")).unwrap();
         assert_eq!(mock.calls().len(), 3);
     }
 
     #[test]
-    fn hook_uses_uncategorized_when_session_has_no_repository_path() {
+    fn hook_uses_uncategorized_category_mirror() {
         let mock = MockTmuxRunner::new();
         let client_format = client_pid_name_format();
-        let session_format = session_list_format();
         mock.stub(
             &["list-clients", "-F", &client_format],
             "123\u{1f}abc\u{1f}/dev/ttys001\u{1f}0\n",
         );
         mock.stub(
-            &["list-sessions", "-F", &session_format],
-            "dotfiles\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
+            &["show-option", "-qv", "-t", "=dotfiles:", KEY_CATEGORY],
+            "Uncategorized\n",
         );
         mock.stub(
             &[
@@ -1442,18 +1431,7 @@ mod tests {
             ],
             "",
         );
-        let client = regular_client_name_for_pid(&mock, 123).unwrap();
-        let sessions = list_sessions(&mock).unwrap();
-        let categories =
-            categories_for_sessions(&sessions, &[("dotfiles", crate::category::UNCATEGORIZED)]);
-        remember_client_session_for_session_resolved(
-            &mock,
-            &categories,
-            &sessions,
-            &client,
-            "dotfiles",
-        )
-        .unwrap();
+        on_client_session_changed(&mock, Some(123), Some("dotfiles")).unwrap();
 
         assert_eq!(
             mock.calls().last().unwrap(),
@@ -1464,6 +1442,32 @@ mod tests {
                 "dotfiles",
             ]
         );
+    }
+
+    #[test]
+    fn hook_fails_closed_without_a_valid_category_mirror() {
+        for (mirrored, expected) in [
+            ("", "has no Category mirror"),
+            ("Automatic (config)\n", "category name is reserved"),
+        ] {
+            let mock = MockTmuxRunner::new();
+            let client_format = client_pid_name_format();
+            mock.stub(
+                &["list-clients", "-F", &client_format],
+                "123\u{1f}abc\u{1f}/dev/ttys001\u{1f}0\n",
+            );
+            mock.stub(
+                &["show-option", "-qv", "-t", "=main:", KEY_CATEGORY],
+                mirrored,
+            );
+
+            let error = on_client_session_changed(&mock, Some(123), Some("main"))
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(mock.calls().len(), 2);
+        }
     }
 
     #[test]
@@ -1501,14 +1505,7 @@ mod tests {
             &["list-clients", "-F", &format],
             "123\u{1f}control\u{1f}\u{1f}1\n",
         );
-        on_client_session_changed(
-            &control_hook,
-            &crate::config::Config::default(),
-            &BTreeMap::new(),
-            Some(123),
-            Some("main"),
-        )
-        .unwrap();
+        on_client_session_changed(&control_hook, Some(123), Some("main")).unwrap();
         assert_eq!(control_hook.calls().len(), 1);
 
         let duplicate = MockTmuxRunner::new();

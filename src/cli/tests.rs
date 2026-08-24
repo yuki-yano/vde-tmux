@@ -266,16 +266,6 @@ fn spawn_active_config_guard_fixture() -> V2QueryFixture {
     spawn_active_config_guard_fixture_with_yaml("")
 }
 
-fn spawn_category_config_guard_fixture() -> V2QueryFixture {
-    let fixture = spawn_active_config_guard_fixture_with_yaml(
-        "categories:\n  rules:\n    - category: alpha\n      path_patterns: ['*/repos/a']\n    - category: beta\n      path_patterns: ['*/repos/b']\n    - category: gamma\n      path_patterns: ['*/repos/c']\n    - category: work\n      path_patterns: ['*/repos/main', '*/repos/sub']\n",
-    );
-    for repo in ["a", "b", "c", "main", "sub"] {
-        std::fs::create_dir_all(fixture.root.join("repos").join(repo)).unwrap();
-    }
-    fixture
-}
-
 fn spawn_category_navigation_fixture() -> V2QueryFixture {
     let snapshot = category_navigation_status_snapshot();
     spawn_v2_query_fixture(
@@ -1740,49 +1730,47 @@ fn dispatch_category_use_switches_category() {
 
 #[test]
 fn dispatch_client_session_changed_only_updates_memory() {
-    let fixture = spawn_category_config_guard_fixture();
-    let mock = &fixture.mock;
+    let mock = MockTmuxRunner::new();
     let client_format = crate::session::client_pid_name_format();
-    let session_format = crate::session::session_list_format();
-    let main = fixture.root.join("repos/main");
     mock.stub(
         &["list-clients", "-F", &client_format],
         "123\u{1f}abc\u{1f}/dev/ttys001\u{1f}0\n",
     );
     mock.stub(
-        &["list-sessions", "-F", &session_format],
-        &format!(
-            "main\u{1f}1\u{1f}100\u{1f}\u{1f}{}\u{1f}\u{1f}$1\n",
-            main.display()
-        ),
+        &[
+            "show-option",
+            "-qv",
+            "-t",
+            "=main:",
+            crate::options::KEY_CATEGORY,
+        ],
+        "work\n",
     );
     mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
 
     run_with(
         ["vt", "hooks", "on-client-session-changed", "123", "main"],
-        mock,
-        &fixture.env,
+        &mock,
+        &tmux_env(),
     )
     .unwrap();
 
     let calls = mock.calls();
-    assert!(
-        calls
-            .iter()
-            .any(|call| call == &["list-sessions", "-F", session_format.as_str()])
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls[1],
+        [
+            "show-option",
+            "-qv",
+            "-t",
+            "=main:",
+            crate::options::KEY_CATEGORY,
+        ]
     );
     assert_eq!(
         calls.last().unwrap(),
         &["set-option", "-g", "@vde_client_616263_work", "main"]
     );
-    assert!(calls.iter().all(|call| {
-        !matches!(
-            call.as_slice(),
-            [command, quiet_value, ..]
-                if command == "show-option" && quiet_value == "-qv"
-        )
-    }));
-    fixture.finish();
 }
 
 #[test]
