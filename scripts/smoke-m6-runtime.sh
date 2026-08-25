@@ -2075,6 +2075,34 @@ echo "same-socket incarnation guard ok"
 
 # A persist failure returns a normal hook failure and never commits the candidate state. Run this
 # final fault after the lifecycle scenarios so an intentionally unavailable store cannot mask them.
+# Serving only confirms daemon readiness; wait until the recreated pane has entered the canonical
+# snapshot before injecting the store failure, otherwise the hook can race initial topology scan and
+# be accepted as an event for a pane that is not projected yet.
+for _ in $(seq 1 80); do
+  query_v21 '{"op":"query_resolved_snapshot","proto":21}'
+  if python3 - "$QUERY_JSON" "$NEW_PANE" "$NEW_PANE_PID" <<'PY'
+import json, sys
+reply = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if any(
+    pane["pane_instance"]["pane_id"] == sys.argv[2]
+    and str(pane["pane_instance"]["pane_pid"]) == sys.argv[3]
+    for pane in reply["snapshot"]["panes"]
+) else 1)
+PY
+  then
+    break
+  fi
+  sleep 0.1
+done
+python3 - "$QUERY_JSON" "$NEW_PANE" "$NEW_PANE_PID" <<'PY'
+import json, sys
+reply = json.load(open(sys.argv[1], encoding="utf-8"))
+assert any(
+    pane["pane_instance"]["pane_id"] == sys.argv[2]
+    and str(pane["pane_instance"]["pane_pid"]) == sys.argv[3]
+    for pane in reply["snapshot"]["panes"]
+), reply
+PY
 SNAPSHOT_FILE="$STATE_HOME/vde-tmux/$SERVER_HASH/pane-state-v10.json"
 SNAPSHOT_DIR="$(dirname "$SNAPSHOT_FILE")"
 chmod 500 "$SNAPSHOT_DIR"
