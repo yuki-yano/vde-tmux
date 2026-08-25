@@ -21,18 +21,32 @@ UNKNOWN_TRANSCRIPT="$ROOT/codex/sessions/unknown/rollout-$UNKNOWN_SESSION_ID.jso
 UNKNOWN_HOOK_GATE="$ROOT/release-unknown-hook"
 
 cleanup() {
+  original_status=$?
+  cleanup_status=0
+  trap - EXIT INT TERM
+  set +e
   if [[ "${KEEP_ARTIFACTS:-0}" == "1" ]]; then
     tmux -L "$TMUX_SOCKET" capture-pane -p -t prepared: -S -100 >"$ROOT/prepared-pane.txt" 2>/dev/null || true
     tmux -L "$TMUX_SOCKET" capture-pane -p -t unknown: -S -100 >"$ROOT/unknown-pane.txt" 2>/dev/null || true
+  fi
+  if [[ -x "$BIN" ]] && tmux -L "$TMUX_SOCKET" display-message -p '#{pid}' >/dev/null 2>&1; then
+    # A fault abort disconnects the daemon control client. Let any hook-started replacement
+    # finish bootstrap before stopping it, so cleanup does not race a replaced socket identity.
+    "$BIN" daemon start >/dev/null 2>&1 || cleanup_status=1
+    "$BIN" daemon stop --force >/dev/null 2>&1 || cleanup_status=1
   fi
   tmux -L "$TMUX_SOCKET" kill-server 2>/dev/null || true
   if [[ "${KEEP_ARTIFACTS:-0}" == "1" ]]; then
     echo "kept isolated operation crash artifacts at $ROOT" >&2
   else
-    rm -rf "$ROOT"
+    rm -rf -- "$ROOT"
   fi
+  if [[ "$original_status" -ne 0 ]]; then
+    exit "$original_status"
+  fi
+  exit "$cleanup_status"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_STATE_HOME="$ROOT/state"
@@ -114,6 +128,10 @@ expect_prompt_connection_loss() {
 }
 
 restart_after_fault() {
+  # Aborting the daemon disconnects its tmux control client, which can fire an installed hook and
+  # start a replacement. Await that replacement (or start one when no hook won the race) before
+  # stopping it; stopping during Hydrating can observe a new socket with the old process record.
+  "$BIN" daemon start >/dev/null
   "$BIN" daemon stop >/dev/null
   tmux -L "$TMUX_SOCKET" set-buffer \
     -b vde-agent-prompt-0123456789abcdef01234567 \
