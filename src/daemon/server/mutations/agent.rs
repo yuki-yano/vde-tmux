@@ -1,4 +1,6 @@
+#[cfg(debug_assertions)]
 use std::fs;
+#[cfg(debug_assertions)]
 use std::path::PathBuf;
 use std::time::Duration;
 
