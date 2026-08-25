@@ -6,16 +6,41 @@ TMUX_SOCKET="vde-agent-api-v4-$$"
 BUILD_BIN="${VDE_TMUX_TEST_BUILD_BIN:-$PWD/target/debug/vt}"
 BIN="$ROOT/bin/vt"
 PYTHON="/usr/bin/python3"
+SCRATCH_TMUX_ENV=""
+SCRATCH_DAEMON_SOCKET=""
+SCRATCH_DAEMON_PID=""
+DAEMON_MAY_BE_RUNNING=0
 
 cleanup() {
+  original_status=$?
+  cleanup_status=0
+  trap - EXIT INT TERM
+  set +e
+  if [[ "$DAEMON_MAY_BE_RUNNING" == "1" && -n "$SCRATCH_TMUX_ENV" ]]; then
+    env -u TMUX_PANE TMUX="$SCRATCH_TMUX_ENV" VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET" \
+      "$BIN" daemon stop >/dev/null 2>&1 || cleanup_status=1
+  fi
+  if [[ -n "$SCRATCH_DAEMON_SOCKET" && -S "$SCRATCH_DAEMON_SOCKET" ]]; then
+    echo "scratch daemon socket remains: $SCRATCH_DAEMON_SOCKET" >&2
+    cleanup_status=1
+  fi
+  if [[ -n "$SCRATCH_DAEMON_PID" ]] \
+    && kill -0 "$SCRATCH_DAEMON_PID" >/dev/null 2>&1; then
+    echo "scratch daemon process remains: $SCRATCH_DAEMON_PID" >&2
+    cleanup_status=1
+  fi
   tmux -L "$TMUX_SOCKET" kill-server 2>/dev/null || true
   if [[ "${KEEP_ARTIFACTS:-0}" == "1" ]]; then
     echo "kept isolated API v4 artifacts at $ROOT" >&2
   else
-    rm -rf "$ROOT"
+    rm -rf -- "$ROOT"
   fi
+  if [[ "$original_status" -ne 0 ]]; then
+    exit "$original_status"
+  fi
+  exit "$cleanup_status"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_STATE_HOME="$ROOT/state"
@@ -25,7 +50,7 @@ export ZDOTDIR="$ROOT/zdot"
 mkdir -p \
   "$ROOT/bin" \
   "$ZDOTDIR" \
-  "$XDG_CONFIG_HOME/vde-tmux" \
+  "$XDG_CONFIG_HOME/vde/tmux" \
   "$XDG_STATE_HOME" \
   "$XDG_RUNTIME_DIR"
 
@@ -33,17 +58,27 @@ if [[ -z "${VDE_TMUX_TEST_BUILD_BIN:-}" ]]; then
   cargo build --bin vt >/dev/null
 fi
 cp "$BUILD_BIN" "$BIN"
-ln -s "$(command -v sleep)" "$ROOT/bin/codex"
-ln -s "$(command -v sleep)" "$ROOT/bin/claude"
+cp "$PWD/scripts/fixtures/fake-agent.py" "$ROOT/bin/codex"
+cp "$PWD/scripts/fixtures/fake-agent.py" "$ROOT/bin/claude"
+chmod 700 "$ROOT/bin/codex" "$ROOT/bin/claude"
 export PATH="$ROOT/bin:$PATH"
 
-tmux -L "$TMUX_SOCKET" -f /dev/null new-session -d -s api4 -n work -c "$ROOT"
+tmux -L "$TMUX_SOCKET" -f /dev/null new-session -d -s api4 -n work -c "$ROOT" \
+  /bin/bash --noprofile --norc
+tmux -L "$TMUX_SOCKET" set-option -g default-shell /bin/bash
+tmux -L "$TMUX_SOCKET" set-option -g default-command '/bin/bash --noprofile --norc'
 tmux -L "$TMUX_SOCKET" set-option -g remain-on-exit on
 TMUX_SOCKET_PATH="$(tmux -L "$TMUX_SOCKET" display-message -p '#{socket_path}')"
 TMUX_SERVER_PID="$(tmux -L "$TMUX_SOCKET" display-message -p '#{pid}')"
 export TMUX="$TMUX_SOCKET_PATH,$TMUX_SERVER_PID,0"
+SCRATCH_TMUX_ENV="$TMUX"
 
+DAEMON_MAY_BE_RUNNING=1
 "$BIN" daemon start >/dev/null
+DAEMON_STATUS="$($BIN daemon status)"
+SCRATCH_DAEMON_SOCKET="$(printf '%s\n' "$DAEMON_STATUS" | sed -n 's/^socket: //p')"
+SCRATCH_DAEMON_PID="$(printf '%s\n' "$DAEMON_STATUS" | sed -n 's/^process: pid=\([0-9][0-9]*\).*/\1/p')"
+[[ -n "$SCRATCH_DAEMON_SOCKET" && -n "$SCRATCH_DAEMON_PID" ]]
 SOURCE_PANE="$(tmux -L "$TMUX_SOCKET" display-message -p -t api4:work '#{pane_id}')"
 
 SOURCE_JSON=""
