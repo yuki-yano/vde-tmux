@@ -95,28 +95,28 @@ impl Drop for V2ConnectionThreadPermit {
     }
 }
 
-pub struct V2FrameReader {
+pub(super) struct V2FrameReader {
     reader: BufReader<UnixStream>,
 }
 
 impl V2FrameReader {
-    pub fn new(stream: UnixStream) -> Self {
+    pub(super) fn new(stream: UnixStream) -> Self {
         Self {
             reader: BufReader::new(stream),
         }
     }
 
-    pub fn stream_mut(&mut self) -> &mut UnixStream {
+    pub(super) fn stream_mut(&mut self) -> &mut UnixStream {
         self.reader.get_mut()
     }
 
-    pub fn into_stream(self) -> UnixStream {
+    pub(super) fn into_stream(self) -> UnixStream {
         self.reader.into_inner()
     }
 }
 
 #[allow(clippy::result_large_err)]
-pub fn read_v2_request_frame(
+pub(super) fn read_v2_request_frame(
     connection: &mut V2FrameReader,
 ) -> std::result::Result<Vec<u8>, ServerMessage> {
     use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
@@ -198,7 +198,7 @@ pub(super) fn request_frame_body_bytes(
 }
 
 #[allow(clippy::result_large_err)]
-pub fn write_v2_response(
+pub(super) fn write_v2_response(
     stream: &mut UnixStream,
     message: &ServerMessage,
 ) -> std::result::Result<(), ServerMessage> {

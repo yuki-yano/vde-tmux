@@ -10,25 +10,25 @@ use super::contracts::SidebarEffectCompletion;
 mod tests;
 
 #[derive(Debug, Clone, Default)]
-pub struct V2ConnectionState {
+pub(super) struct V2ConnectionState {
     pub(super) hello_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct V2SequencedMutation {
-    pub accepted_seq: u64,
-    pub mutation: V2AcceptedMutation,
+pub(super) struct V2SequencedMutation {
+    pub(super) accepted_seq: u64,
+    pub(super) mutation: V2AcceptedMutation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum V2AcceptedMutation {
+pub(super) enum V2AcceptedMutation {
     External(ClientMessage),
     Internal(V2InternalMutation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum V2InternalMutation {
+pub(super) enum V2InternalMutation {
     PaneEvent(Box<PaneEventEnvelope>),
     ObservationBatch(Box<ObservationBatchPayload>),
     RefreshTopology,
@@ -65,7 +65,7 @@ pub(crate) enum V2InternalMutation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ObservationPollProjection {
+pub(super) struct ObservationPollProjection {
     pub(super) observation_seq: u64,
     pub(super) topology: crate::daemon::topology::TopologySnapshot,
     pub(super) status_metadata: crate::daemon::runtime::StatusProjectionMetadata,
@@ -81,7 +81,7 @@ pub(crate) struct ObservationPollProjection {
 /// diagnostics, then a trailing triage pass; the snapshot is published once
 /// after the whole batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ObservationBatchPayload {
+pub(super) struct ObservationBatchPayload {
     pub(super) projection: Box<ObservationPollProjection>,
     pub(super) observations: Vec<PaneEventEnvelope>,
     pub(super) removals: Vec<PaneEventEnvelope>,
@@ -90,7 +90,7 @@ pub(crate) struct ObservationBatchPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum V2Route {
+pub(super) enum V2Route {
     Response(ServerMessage),
     Fatal(ServerMessage),
     Query(ClientMessage),
@@ -100,7 +100,7 @@ pub(crate) enum V2Route {
 }
 
 #[derive(Debug, Clone)]
-pub struct V2Router {
+pub(super) struct V2Router {
     pub(super) daemon_instance_id: DaemonInstanceId,
     pub(super) server_identity: String,
     pub(super) phase: DaemonPhase,
@@ -111,7 +111,10 @@ pub struct V2Router {
 }
 
 impl V2Router {
-    pub fn new(daemon_instance_id: DaemonInstanceId, server_identity: impl Into<String>) -> Self {
+    pub(super) fn new(
+        daemon_instance_id: DaemonInstanceId,
+        server_identity: impl Into<String>,
+    ) -> Self {
         Self {
             daemon_instance_id,
             server_identity: server_identity.into(),
@@ -123,20 +126,20 @@ impl V2Router {
         }
     }
 
-    pub fn phase(&self) -> DaemonPhase {
+    pub(super) fn phase(&self) -> DaemonPhase {
         self.phase
     }
 
-    pub fn daemon_instance_id(&self) -> &DaemonInstanceId {
+    pub(super) fn daemon_instance_id(&self) -> &DaemonInstanceId {
         &self.daemon_instance_id
     }
 
     #[cfg(test)]
-    pub fn set_phase(&mut self, phase: DaemonPhase) {
+    pub(super) fn set_phase(&mut self, phase: DaemonPhase) {
         self.phase = phase;
     }
 
-    pub fn begin_hydration(&mut self) -> Result<(), &'static str> {
+    pub(super) fn begin_hydration(&mut self) -> Result<(), &'static str> {
         if self.phase != DaemonPhase::InstallingHooks {
             return Err("daemon may enter hydration only after hook installation");
         }
@@ -144,23 +147,24 @@ impl V2Router {
         Ok(())
     }
 
-    pub fn set_hook_health(&mut self, health: HookHealth) {
+    pub(super) fn set_hook_health(&mut self, health: HookHealth) {
         self.hook_health = health;
     }
 
-    pub fn hook_health(&self) -> HookHealth {
+    pub(super) fn hook_health(&self) -> HookHealth {
         self.hook_health
     }
 
-    pub fn is_fatal(&self) -> bool {
+    #[cfg(test)]
+    pub(super) fn is_fatal(&self) -> bool {
         self.fatal
     }
 
-    pub fn mark_fatal(&mut self) {
+    pub(super) fn mark_fatal(&mut self) {
         self.fatal = true;
     }
 
-    pub(crate) fn route(
+    pub(super) fn route(
         &mut self,
         connection: &mut V2ConnectionState,
         message: ClientMessage,
@@ -288,7 +292,7 @@ impl V2Router {
     }
 
     #[cfg(test)]
-    pub(crate) fn finish_bootstrap<E>(
+    pub(super) fn finish_bootstrap<E>(
         &mut self,
         apply_fifo_and_reconcile: impl FnOnce(Vec<V2SequencedMutation>) -> Result<(), E>,
     ) -> Result<(), E> {
@@ -303,7 +307,7 @@ impl V2Router {
         Ok(())
     }
 
-    pub(crate) fn take_bootstrap_fifo(&mut self) -> Vec<V2SequencedMutation> {
+    pub(super) fn take_bootstrap_fifo(&mut self) -> Vec<V2SequencedMutation> {
         assert_ne!(
             self.phase,
             DaemonPhase::Serving,
@@ -312,7 +316,7 @@ impl V2Router {
         self.bootstrap_fifo.drain(..).collect()
     }
 
-    pub(crate) fn enter_serving_if_bootstrap_empty(&mut self) -> bool {
+    pub(super) fn enter_serving_if_bootstrap_empty(&mut self) -> bool {
         if self.phase == DaemonPhase::Hydrating && self.bootstrap_fifo.is_empty() {
             self.phase = DaemonPhase::Serving;
             true
@@ -321,7 +325,7 @@ impl V2Router {
         }
     }
 
-    pub(crate) fn accept_internal(&mut self, mutation: V2InternalMutation) -> V2Route {
+    pub(super) fn accept_internal(&mut self, mutation: V2InternalMutation) -> V2Route {
         use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
 
         if self.fatal {

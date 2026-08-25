@@ -1,7 +1,7 @@
 use crate::pane_state::{EventId, PaneInstance};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SidebarEffectCompletion {
+pub(super) struct SidebarEffectCompletion {
     pub(super) original_accepted_seq: u64,
     pub(super) event_id: EventId,
     pub(super) snapshot_revision: u64,

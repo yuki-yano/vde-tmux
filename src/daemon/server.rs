@@ -29,9 +29,9 @@ const V2_MUTATION_QUEUE_CAPACITY: usize = 1024;
 // mutation, and query traffic retains capacity under a subscriber burst.
 const V2_CONNECTION_THREAD_CAPACITY: usize = 64;
 const V2_RESERVED_NON_STREAMING_CONNECTION_CAPACITY: usize = 16;
-pub const V2_FRAME_START_TIMEOUT: Duration = Duration::from_secs(2);
-pub const V2_FRAME_BODY_TIMEOUT: Duration = Duration::from_millis(100);
-pub const V2_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+const V2_FRAME_START_TIMEOUT: Duration = Duration::from_secs(2);
+const V2_FRAME_BODY_TIMEOUT: Duration = Duration::from_millis(100);
+const V2_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 const V2_OVERLOAD_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(25);
 const TMUX_SERVER_LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CURRENT_VIEW_REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -46,7 +46,7 @@ mod observation;
 mod router;
 mod state_helpers;
 
-pub(crate) use contracts::SidebarEffectCompletion;
+use contracts::SidebarEffectCompletion;
 use contracts::SidebarEffectResult;
 use effects::{
     NVIM_PROCESS_PID_OPTION, NotificationWorkerJob, NvimPaneMarker, SidebarTmuxJob,
@@ -62,16 +62,14 @@ use observation::{
 };
 use state_helpers::{pane_snapshot_store, production_store_error_response};
 
-pub use bootstrap::run_runtime_daemon_server;
-pub use framing::{V2FrameReader, read_v2_request_frame, write_v2_response};
-// Preserve the existing crate-visible server paths while production children
-// depend on the router owner directly.
-#[allow(unused_imports)]
-pub(crate) use router::{
-    ObservationBatchPayload, ObservationPollProjection, V2AcceptedMutation, V2InternalMutation,
-    V2Route, V2SequencedMutation,
+pub(crate) use bootstrap::run_runtime_daemon_server;
+use framing::{V2FrameReader, read_v2_request_frame, write_v2_response};
+#[cfg(test)]
+use router::{ObservationBatchPayload, ObservationPollProjection};
+use router::{
+    V2AcceptedMutation, V2ConnectionState, V2InternalMutation, V2Route, V2Router,
+    V2SequencedMutation,
 };
-pub use router::{V2ConnectionState, V2Router};
 
 use bootstrap::initial_view_reconciliation;
 use mutations::agent::{

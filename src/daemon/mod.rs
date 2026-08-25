@@ -2,7 +2,7 @@ pub(crate) mod agent_dispatch;
 pub mod lifecycle;
 pub mod protocol;
 pub mod runtime;
-pub mod server;
+pub(crate) mod server;
 pub mod session_badge;
 pub mod status_push;
 pub(crate) mod task_summary;
