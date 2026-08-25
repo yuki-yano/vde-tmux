@@ -423,6 +423,19 @@ pub fn run() -> ExitCode {
         }
         Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
+            if let Some(clap_error) = error.downcast_ref::<clap::Error>() {
+                let use_stderr = clap_error.use_stderr();
+                if is_json_api && use_stderr {
+                    eprintln!("{}", crate::api::render_error(&error, observed_at));
+                } else {
+                    let _ = clap_error.print();
+                }
+                return if use_stderr {
+                    ExitCode::from(2)
+                } else {
+                    ExitCode::SUCCESS
+                };
+            }
             if is_json_api {
                 eprintln!("{}", crate::api::render_error(&error, observed_at));
             } else {
