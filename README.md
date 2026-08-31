@@ -191,9 +191,11 @@ vt agent wait %456 --until done,blocked,limited --json
 vt pane read %456 --source latest --lines 120 --json
 
 AGENT_REF="$(vt agent get %456 --json | jq -r '.result.agent.summary.agent_ref')"
-OPERATION_ID="$(uuidgen)"
-PROMPT_JSON="$(printf '%s' 'Review the current diff.' \
-  | vt agent prompt "$AGENT_REF" --operation-id "$OPERATION_ID" --stdin --json)"
+REQUEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vt-request.XXXXXX")"
+printf '%s' 'Review the current diff.' >"$REQUEST_DIR/prompt.txt"
+PROMPT_JSON="$(vt agent request "$AGENT_REF" \
+  --state-file "$REQUEST_DIR/request.json" \
+  --prompt-file "$REQUEST_DIR/prompt.txt" --json)"
 OPERATION_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.operation_ref')"
 RUN_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.run_ref')"
 vt agent run wait "$RUN_REF" --json
@@ -203,8 +205,11 @@ vt agent run response "$RUN_REF" --json
 Use `vt api snapshot --json` for one-shot inventory and diagnostics instead of composing
 `tmux list-panes` with separate `vt pane list` and `vt agent list` calls. It returns the live
 canonical panes, resolved agents, and grouped daemon diagnostics under one `snapshot_revision`.
-Prompt files passed through `--prompt-file` are request inputs rather than delivery state; use the
-returned Operation, Run, or terminal-send receipt to verify dispatch.
+Prompt files passed through `--prompt-file` are request inputs rather than delivery state. For
+durable Codex dispatch, `agent request` stores the generated operation ID, byte-identical retry
+body, and recovered operation reference in the vt-owned state file. Reinvoke it with the same
+exact target and `--state-file`, without a body source, after response loss. Use a new private
+state-file path for every new prompt intent.
 
 See [Agent JSON API](./AGENT_API.md) for the response envelope, stable occupant references,
 durable run completion, filters, and capture bounds. An exact `agent_ref` is emitted only when one
@@ -212,8 +217,11 @@ unique live agent process can be pinned by PID and OS start token. Hooks remain 
 accurate lifecycle details, but hookless agents can use `agent wait` and `agent read` when that live
 process identity is available. API v4 stores durable Run and Operation records separately from the
 bounded pane projection. Guarded prompt dispatch is daemon-owned, requires healthy tmux hooks and
-foreground input ownership, and never places prompt bytes in argv. Reusing the same operation ID
-performs an idempotent lookup/resume; `delivery_unknown` is never auto-retried. Historical unresolved
+foreground input ownership, and never places prompt bytes in argv. `agent request` persists the
+same operation ID before daemon mutation and performs an idempotent lookup/resume;
+`delivery_unknown` is never converted into a new dispatch. The lower-level `agent prompt` remains
+available to callers that deliberately manage a stable operation ID and byte-identical retry body.
+Historical unresolved
 runs remain readable while retained. CAS recovery is restricted to the Pane's current durable Run,
 which is checked twice against Pane, process, foreground ownership, and visible viewport state.
 Prompt input treats one terminal LF or CRLF from stdin or a file as a text-record terminator and
@@ -551,8 +559,9 @@ vt hook emit \
 
 `--status` accepts `running`, `waiting`, `idle`, and `error`.
 `hook emit --prompt` is public display metadata and is passed in the process argv. Do not use it for
-secrets. Provider adapters should accept private bodies on stdin, and agent dispatch should use
-`vt agent prompt --stdin` or `--prompt-file`, which never places the prompt body in argv.
+secrets. Provider adapters should accept private bodies on stdin. Durable Codex callers should use
+`vt agent request` with a private state path and `--stdin` or `--prompt-file`; low-level adapters
+may use `vt agent prompt`. Neither command places the prompt body in argv.
 A waiting event also needs a reason:
 
 ```bash

@@ -35,9 +35,11 @@ vt agent wait %456 --until done,blocked,limited --timeout-ms 120000 --json
 
 AGENT_JSON="$(vt agent get %456 --json)"
 AGENT_REF="$(printf '%s' "$AGENT_JSON" | jq -r '.result.agent.summary.agent_ref')"
-OPERATION_ID="$(uuidgen)"
-PROMPT_JSON="$(printf '%s' 'Review the current diff and report must-fix findings.' \
-  | vt agent prompt "$AGENT_REF" --operation-id "$OPERATION_ID" --stdin --json)"
+REQUEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vt-request.XXXXXX")"
+printf '%s' 'Review the current diff and report must-fix findings.' >"$REQUEST_DIR/prompt.txt"
+PROMPT_JSON="$(vt agent request "$AGENT_REF" \
+  --state-file "$REQUEST_DIR/request.json" \
+  --prompt-file "$REQUEST_DIR/prompt.txt" --json)"
 OPERATION_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.operation_ref')"
 RUN_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.run_ref')"
 vt agent run wait "$RUN_REF" --json
@@ -70,8 +72,10 @@ agent occupants, and daemon diagnostics from one snapshot revision. Prefer it ov
 different revisions. Use the narrower list commands when their filters are useful.
 
 The snapshot does not inspect arbitrary paths supplied to `--prompt-file`. Those files are request
-inputs owned by the caller, not transport or delivery state. After dispatch, use the returned
-Operation, Run, or terminal-send receipt instead of file metadata as the acceptance signal.
+inputs owned by the caller, not transport or delivery state. `--state-file` is different: its path
+is the caller-chosen intent handle, while vt exclusively owns its opaque contents and update order.
+After dispatch, use the returned Operation, Run, or terminal-send receipt instead of prompt-file
+metadata as the acceptance signal.
 
 API commands always emit JSON. `--json` is accepted so callers can state the expected format. A
 successful command writes one envelope to stdout. A failed command writes one error envelope to
@@ -108,7 +112,9 @@ and limits match the CLI: pane-read target is optional, read defaults are `lates
 ANSI, wait defaults are `done,blocked,limited` and 120,000 ms, read lines are 1..2,000, and wait timeout is
 1..86,400,000 ms. Prompt confirmation defaults to 7,000 ms and is limited to 1..60,000 ms. Prompt
 bytes are supplied out-of-band through stdin or a file and therefore do not appear in the conceptual
-request schema. Repeated and comma-separated `--until` argv forms normalize to the same set.
+request schema. The `agent_request` schema includes `state_file` because the stable path identifies
+one logical intent; it does not expose the input source or state contents. Repeated and comma-separated
+`--until` argv forms normalize to the same set.
 The prompt deadline covers the whole operation from daemon connection and preflight through digest
 confirmation; it does not start only after submission.
 
@@ -248,11 +254,44 @@ pane without accidentally targeting a replacement agent.
 
 ## Guarded prompt dispatch
 
-`agent prompt` submits one prompt to an exact Codex occupant. Claude Code remains visible through
-the legacy pane projection, but durable mutation is disabled until its isolated provider
-contract probe passes. The caller supplies a
-stable `operation_id` and exactly one private body source. The daemon, not the CLI, owns staging,
-fencing, and tmux dispatch:
+`agent request` is the normal durable submission command for an exact Codex occupant. Claude Code
+remains visible through the legacy pane projection, but durable mutation is disabled until its
+isolated provider contract probe passes. Give each new prompt intent a new file path inside a
+caller-owned directory with mode 0700:
+
+```bash
+REQUEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vt-request.XXXXXX")"
+printf '%s' 'Review the current diff.' >"$REQUEST_DIR/prompt.txt"
+
+PROMPT_JSON="$(vt agent request "$AGENT_REF" \
+  --state-file "$REQUEST_DIR/request.json" \
+  --prompt-file "$REQUEST_DIR/prompt.txt" \
+  --json)"
+
+# Resume the same logical request after CLI exit or response loss.
+PROMPT_JSON="$(vt agent request "$AGENT_REF" \
+  --state-file "$REQUEST_DIR/request.json" \
+  --json)"
+```
+
+The first call requires `--stdin` or `--prompt-file`. A later call may omit the body. If it is
+supplied again, its normalized digest must match. vt creates a 0600 state file and a stable 0600
+sidecar lock, persists the generated Operation ID and body before daemon mutation, and uses that
+same request for safe replay. Once an Operation receipt is known, vt records its reference and
+removes the body, except for a retryable pre-dispatch timeout, which keeps the request active. The
+state contents are opaque: callers choose and retain the path, but must not
+read, edit, copy between intents, or reuse it for a new prompt. A private directory can be removed
+after the Operation and any linked Run have reached the caller's required terminal state.
+
+`request_state_busy` asks the caller to wait before reusing the same path.
+`request_state_mismatch` and `request_state_invalid` are fail-closed request-validation errors and
+must be corrected rather than retried as a different Operation. A receiptless transport error keeps
+the request active; only an explicit invocation with the same state path replays the same ID/body.
+Once the state holds an Operation reference, resume is observation-only and never terminal dispatch.
+
+`agent prompt` is the lower-level primitive for callers that deliberately manage a stable
+`operation_id` and a byte-identical private body source themselves. The daemon, not either CLI
+surface, owns staging, fencing, and tmux dispatch:
 
 ```bash
 OPERATION_ID="$(uuidgen)"
@@ -427,7 +466,8 @@ Every error contains a closed-enum `code`, human-readable `message`, `stage`, `s
 - Contract/resource: `protocol_mismatch`, `invalid_daemon_response`, `resource_limit`,
   `capture_failed`, `daemon_error`, `internal_error`.
 - Durable state: `operation_conflict`, `operation_not_found`, `operation_store_full`,
-  `operation_generation_replaced`, `run_not_found`, `run_generation_replaced`, `run_unresolved`,
+  `operation_generation_replaced`, `request_state_busy`, `request_state_mismatch`,
+  `request_state_invalid`, `run_not_found`, `run_generation_replaced`, `run_unresolved`,
   `run_already_resolved`, `target_replaced`, `unsupported_provider`, `provider_event_conflict`,
   `recovery_not_allowed`, `stale_precondition`, `resolution_conflict`,
   `storage_capacity_exceeded`, `state_uninitialized`, `artifact_unavailable`, `artifact_expired`.

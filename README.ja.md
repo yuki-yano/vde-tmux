@@ -187,7 +187,14 @@ vt agent wait %456 --until done,blocked --json
 vt pane read %456 --source latest --lines 120 --json
 
 AGENT_REF="$(vt agent get %456 --json | jq -r '.result.agent.summary.agent_ref')"
-printf '%s' '現在の差分をレビューしてください。' | vt agent prompt "$AGENT_REF" --stdin --json
+REQUEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vt-request.XXXXXX")"
+printf '%s' '現在の差分をレビューしてください。' >"$REQUEST_DIR/prompt.txt"
+PROMPT_JSON="$(vt agent request "$AGENT_REF" \
+  --state-file "$REQUEST_DIR/request.json" \
+  --prompt-file "$REQUEST_DIR/prompt.txt" --json)"
+RUN_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.run_ref')"
+vt agent run wait "$RUN_REF" --json
+vt agent run response "$RUN_REF" --json
 ```
 
 response envelope、occupant を固定する参照、filter、capture 上限については
@@ -197,8 +204,12 @@ response envelope、occupant を固定する参照、filter、capture 上限に�
 `agent wait` / `agent read` を利用できます。guarded prompt dispatch はさらに、daemon 管理下の
 tmux hook が healthy であること、Claude Code / Codex 向けの prompt adapter があること、対象が
 idle/done かつ foreground input owner であることを要求します。外部 provider hook は事前の
-health 値ではなく、送信後の digest event によって確認します。成功時は digest 確認済み receipt
-を返し、配送が曖昧な場合は自動再送しません。
+health 値ではなく、送信後の digest event によって確認します。`agent request`はdaemon mutation
+より前にOperation IDと同一byteのretry bodyをvt管理stateへ保存します。応答を失った場合は、同じ
+exact targetと`--state-file`だけで再実行します。新しいprompt intentには新しいprivate state-file
+pathを使います。成功時はdigest確認済みreceiptを返し、配送が曖昧な場合も新しいOperationへ
+自動変換しません。Operation IDとretry bodyをcallerが明示管理する低レベルprimitiveとして
+`agent prompt`も残ります。
 
 ## 状態の読み方
 

@@ -2426,6 +2426,36 @@ fn prompt_cli_requires_exactly_one_private_input_source() {
 }
 
 #[test]
+fn request_cli_requires_state_and_allows_bodyless_resume() {
+    assert!(Cli::try_parse_from(["vt", "agent", "request", "vta1:test"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "vt",
+            "agent",
+            "request",
+            "vta1:test",
+            "--state-file",
+            "/tmp/request.json",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "vt",
+            "agent",
+            "request",
+            "vta1:test",
+            "--state-file",
+            "/tmp/request.json",
+            "--stdin",
+            "--prompt-file",
+            "/tmp/prompt",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
 fn steer_cli_requires_exactly_one_private_input_source() {
     assert!(Cli::try_parse_from(["vt", "agent", "steer", "vta1:test"]).is_err());
     assert!(

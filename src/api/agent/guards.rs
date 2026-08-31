@@ -15,7 +15,7 @@ use crate::daemon::protocol::v2::{PanePresentation, ResolvedSnapshot};
 use crate::pane_state::PaneInstance;
 use crate::tmux::TmuxRunner;
 
-pub(in crate::api) fn validate_prompt(prompt: &str) -> Result<()> {
+pub(crate) fn validate_prompt(prompt: &str) -> Result<()> {
     if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
         return Err(api_error!(
             "invalid_arguments",

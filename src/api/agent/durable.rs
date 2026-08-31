@@ -262,9 +262,10 @@ pub(in crate::api) fn wait_for_operation(
     operation_ref: &str,
     deadline: Instant,
     follow_unknown: bool,
+    initial_operation: Option<OperationRecord>,
 ) -> Result<(ApiConnection, String, OperationRecord)> {
     let mut poll_interval = WAIT_POLL_INITIAL_INTERVAL;
-    let mut last_operation = None;
+    let mut last_operation = initial_operation;
     loop {
         match query_agent_operation(runner, env, operation_ref, Some(deadline)) {
             Ok((connection, returned_ref, operation))

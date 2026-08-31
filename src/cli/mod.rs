@@ -13,6 +13,7 @@ use crate::session::Direction;
 use crate::tmux::{SystemTmuxRunner, TmuxRunner};
 
 mod agent;
+mod agent_request;
 mod api;
 mod category;
 mod daemon;

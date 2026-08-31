@@ -56,6 +56,26 @@ pub(super) enum AgentCommand {
         )]
         confirm_timeout_ms: u64,
     },
+    /// Submit or resume one durable prompt using a vt-managed request-state file.
+    Request {
+        /// Exact agent_ref returned by agent get/list/start.
+        target: String,
+        /// Stable intent handle whose contents and lifecycle are owned by vt.
+        #[arg(long = "state-file")]
+        state_file: PathBuf,
+        /// Read the initial prompt from stdin until EOF, removing one terminal LF or CRLF.
+        #[arg(long, conflicts_with = "prompt_file")]
+        stdin: bool,
+        /// Read the initial prompt from a file, removing one terminal LF or CRLF.
+        #[arg(long = "prompt-file", conflicts_with = "stdin")]
+        prompt_file: Option<PathBuf>,
+        /// Operation-wide deadline through daemon dispatch and durable hook confirmation.
+        #[arg(
+            long = "confirm-timeout-ms",
+            default_value_t = crate::api::DEFAULT_PROMPT_CONFIRM_TIMEOUT.as_millis() as u64
+        )]
+        confirm_timeout_ms: u64,
+    },
     /// Submit one guarded terminal prompt to an exact idle/done occupant.
     Send {
         /// Exact agent_ref returned by agent get/list/start.
@@ -285,7 +305,7 @@ pub(super) fn body_requires_stdin(args: &[OsString]) -> bool {
     args.get(1).and_then(|arg| arg.to_str()) == Some("agent")
         && matches!(
             args.get(2).and_then(|arg| arg.to_str()),
-            Some("prompt" | "send" | "steer")
+            Some("prompt" | "request" | "send" | "steer")
         )
         && args
             .iter()
@@ -310,7 +330,7 @@ pub(super) fn read_prompt_input(mut input: impl Read) -> Result<String> {
     finish_prompt_input(bytes)
 }
 
-fn read_prompt_file(path: &Path) -> Result<String> {
+pub(super) fn read_prompt_file(path: &Path) -> Result<String> {
     let file = std::fs::File::open(path).map_err(|error| {
         crate::api::ApiError::new(
             crate::api::ApiErrorCode::InvalidArguments,
@@ -439,6 +459,30 @@ pub(super) fn dispatch(
                 &target,
                 &operation_id,
                 &prompt,
+                Duration::from_millis(confirm_timeout_ms),
+            )
+        }
+        AgentCommand::Request {
+            target,
+            state_file,
+            stdin,
+            prompt_file,
+            confirm_timeout_ms,
+        } => {
+            let prompt = if let Some(path) = prompt_file {
+                Some(read_prompt_file(&path)?)
+            } else if stdin {
+                Some(input.to_string())
+            } else {
+                None
+            };
+            super::agent_request::execute(
+                runner,
+                env,
+                observed_at,
+                &target,
+                &state_file,
+                prompt.as_deref(),
                 Duration::from_millis(confirm_timeout_ms),
             )
         }
@@ -807,5 +851,35 @@ mod tests {
 
         let error = super::read_prompt_input(std::io::Cursor::new(vec![0xff])).unwrap_err();
         assert!(error.to_string().contains("valid UTF-8"));
+    }
+
+    #[test]
+    fn request_stdin_is_pre_read_only_when_explicitly_selected() {
+        let with_stdin = [
+            "vt",
+            "agent",
+            "request",
+            "vta1:test",
+            "--state-file",
+            "/private/request.json",
+            "--stdin",
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+        assert!(super::body_requires_stdin(&with_stdin));
+
+        let resume = [
+            "vt",
+            "agent",
+            "request",
+            "vta1:test",
+            "--state-file",
+            "/private/request.json",
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+        assert!(!super::body_requires_stdin(&resume));
     }
 }

@@ -49,7 +49,11 @@ impl ApiError {
         self.code.as_str()
     }
 
-    pub(super) fn with_dispatch_context(
+    pub(crate) fn operation_receipt(&self) -> Option<OperationErrorReceipt> {
+        self.receipt.clone()
+    }
+
+    pub(crate) fn with_dispatch_context(
         mut self,
         stage: ApiErrorStage,
         side_effect: ApiSideEffect,
@@ -132,6 +136,9 @@ pub enum ApiErrorCode {
     OperationNotFound,
     OperationStoreFull,
     OperationGenerationReplaced,
+    RequestStateBusy,
+    RequestStateMismatch,
+    RequestStateInvalid,
     RunNotFound,
     RunGenerationReplaced,
     RunUnresolved,
@@ -188,6 +195,9 @@ impl ApiErrorCode {
             Self::OperationNotFound => "operation_not_found",
             Self::OperationStoreFull => "operation_store_full",
             Self::OperationGenerationReplaced => "operation_generation_replaced",
+            Self::RequestStateBusy => "request_state_busy",
+            Self::RequestStateMismatch => "request_state_mismatch",
+            Self::RequestStateInvalid => "request_state_invalid",
             Self::RunNotFound => "run_not_found",
             Self::RunGenerationReplaced => "run_generation_replaced",
             Self::RunUnresolved => "run_unresolved",
@@ -209,9 +219,12 @@ impl ApiErrorCode {
 
     fn default_stage(self) -> ApiErrorStage {
         match self {
-            Self::InvalidArguments | Self::InvalidTarget | Self::InvalidReference => {
-                ApiErrorStage::RequestValidation
-            }
+            Self::InvalidArguments
+            | Self::InvalidTarget
+            | Self::InvalidReference
+            | Self::RequestStateBusy
+            | Self::RequestStateMismatch
+            | Self::RequestStateInvalid => ApiErrorStage::RequestValidation,
             Self::NoCurrentPane
             | Self::PaneNotFound
             | Self::AgentNotFound
@@ -255,6 +268,7 @@ impl ApiErrorCode {
             | Self::AgentNotInputOwner
             | Self::PromptDispatchBusy
             | Self::OperationStoreFull
+            | Self::RequestStateBusy
             | Self::RunUnresolved
             | Self::RecoveryNotAllowed
             | Self::StorageCapacityExceeded => ApiRetryAction::WaitThenRetry,
@@ -1124,6 +1138,13 @@ pub enum ApiRequest {
         #[schemars(range(min = 1, max = 60_000))]
         confirm_timeout_ms: u64,
     },
+    AgentRequest {
+        target: String,
+        state_file: String,
+        #[serde(default = "default_prompt_confirm_timeout_ms")]
+        #[schemars(range(min = 1, max = 60_000))]
+        confirm_timeout_ms: u64,
+    },
     AgentSend {
         target: String,
     },
@@ -1417,7 +1438,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            51
+            54
         );
         let error_codes = value["result"]["schemas"]["error"]["$defs"]["ApiErrorCode"]["enum"]
             .as_array()
@@ -1428,6 +1449,9 @@ mod tests {
             "operation_not_found",
             "operation_store_full",
             "operation_generation_replaced",
+            "request_state_busy",
+            "request_state_mismatch",
+            "request_state_invalid",
             "run_not_found",
             "run_generation_replaced",
             "run_unresolved",
@@ -1456,6 +1480,19 @@ mod tests {
             .unwrap();
         assert_eq!(wait_schema["properties"]["until"]["minItems"], 1);
         assert_eq!(wait_schema["properties"]["until"]["maxItems"], 5);
+        let request_schema = value["result"]["schemas"]["request"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|schema| schema["properties"]["command"]["const"] == "agent_request")
+            .unwrap();
+        assert!(
+            request_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("state_file"))
+        );
+        assert!(request_schema["properties"].get("operation_id").is_none());
         assert_eq!(
             default_wait_statuses(),
             [
@@ -1577,6 +1614,23 @@ mod tests {
                 ApiError::new(code, "transient pre-dispatch condition").retry_action,
                 ApiRetryAction::WaitThenRetry
             );
+        }
+
+        let request_state_busy = ApiError::new(ApiErrorCode::RequestStateBusy, "busy");
+        assert_eq!(request_state_busy.stage, ApiErrorStage::RequestValidation);
+        assert_eq!(request_state_busy.side_effect, ApiSideEffect::None);
+        assert_eq!(
+            request_state_busy.retry_action,
+            ApiRetryAction::WaitThenRetry
+        );
+        for code in [
+            ApiErrorCode::RequestStateMismatch,
+            ApiErrorCode::RequestStateInvalid,
+        ] {
+            let error = ApiError::new(code, "invalid request-state");
+            assert_eq!(error.stage, ApiErrorStage::RequestValidation);
+            assert_eq!(error.side_effect, ApiSideEffect::None);
+            assert_eq!(error.retry_action, ApiRetryAction::Never);
         }
 
         let before_dispatch = prompt_before_dispatch_timeout("not written");

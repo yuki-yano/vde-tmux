@@ -101,6 +101,10 @@ random_id_type!(StableRunId, "stable run ID");
 pub struct OperationId(String);
 
 impl OperationId {
+    pub fn generate() -> Result<Self, ModelError> {
+        Ok(Self(random_hex_128()?))
+    }
+
     pub fn parse(value: impl Into<String>) -> Result<Self, ModelError> {
         let value = value.into();
         validate_caller_id(&value, "operation ID")?;

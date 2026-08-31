@@ -735,8 +735,14 @@ pub fn agent_prompt(
     let (connection, operation) = if operation_is_terminal(&operation) {
         (start_connection, operation)
     } else {
-        let (connection, returned_ref, operation) =
-            wait_for_operation(runner, env, &operation_ref, deadline, false)?;
+        let (connection, returned_ref, operation) = wait_for_operation(
+            runner,
+            env,
+            &operation_ref,
+            deadline,
+            false,
+            Some(operation),
+        )?;
         if returned_ref != operation_ref {
             return Err(api_error!(
                 "invalid_daemon_response",

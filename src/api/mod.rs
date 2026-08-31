@@ -212,5 +212,9 @@ pub use agent::{
     run::{agent_run_check, agent_run_get, agent_run_resolve, agent_run_response, agent_run_wait},
     storage::{agent_storage_reset_result, agent_storage_status},
 };
+pub(crate) use agent::{
+    guards::validate_prompt,
+    operation::{PromptRequestIdentity, agent_prompt_resume},
+};
 #[cfg(test)]
 mod test_support;
