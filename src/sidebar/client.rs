@@ -1,5 +1,3 @@
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::thread;
@@ -11,9 +9,7 @@ use crate::daemon::protocol::v2::{
     ClientMessage as V2ClientMessage, PROTOCOL_VERSION, ResolvedSnapshot,
     ServerMessage as V2ServerMessage, SidebarCommand as V2SidebarCommand, V2Client,
 };
-use crate::pane_state::{
-    EventId, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, PaneInstance, StateVersion,
-};
+use crate::pane_state::{EventId, PaneInstance, StateVersion};
 
 const V2_SIDEBAR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const V2_SUBSCRIBE_INITIAL_TIMEOUT: Duration = Duration::from_millis(500);
@@ -384,49 +380,16 @@ fn request_v2_sidebar_message(
     server_identity: &str,
     command: V2SidebarCommand,
 ) -> Result<(EventId, V2ServerMessage)> {
-    let deadline = Instant::now() + V2_SIDEBAR_COMMAND_TIMEOUT;
-    let mut stream = UnixStream::connect(socket)?;
-    stream.set_write_timeout(Some(V2_SIDEBAR_COMMAND_TIMEOUT))?;
-    write_v2_client_frame(
-        &mut stream,
-        &V2ClientMessage::Hello {
-            proto: PROTOCOL_VERSION,
-        },
-        deadline,
-    )?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let hello = read_v2_server_frame(&mut reader, Some(deadline))?
-        .ok_or_else(|| anyhow::anyhow!("daemon closed the connection before HelloAck"))?;
-    let V2ServerMessage::HelloAck {
-        proto,
-        daemon_instance_id,
-        server_identity: actual_server_identity,
-        ..
-    } = hello
-    else {
-        return v2_server_error("HelloAck", hello);
-    };
-    if proto != PROTOCOL_VERSION {
-        bail!("daemon returned unsupported protocol version {proto}");
-    }
-    if actual_server_identity != server_identity {
-        bail!(
-            "daemon server identity mismatch: expected {server_identity}, received {actual_server_identity}"
-        );
-    }
+    let mut client =
+        V2Client::connect_with_timeout(socket, server_identity, V2_SIDEBAR_COMMAND_TIMEOUT)?;
+    let daemon_instance_id = client.daemon_instance_id().clone();
     let event_id = EventId::generate()?;
-    write_v2_client_frame(
-        &mut stream,
-        &V2ClientMessage::SidebarCommand {
-            proto: PROTOCOL_VERSION,
-            daemon_instance_id,
-            event_id: event_id.clone(),
-            command,
-        },
-        deadline,
-    )?;
-    let response = read_v2_server_frame(&mut reader, Some(deadline))?
-        .ok_or_else(|| anyhow::anyhow!("daemon closed the connection before responding"))?;
+    let response = client.request(&V2ClientMessage::SidebarCommand {
+        proto: PROTOCOL_VERSION,
+        daemon_instance_id,
+        event_id: event_id.clone(),
+        command,
+    })?;
     Ok((event_id, response))
 }
 
@@ -489,8 +452,10 @@ enum V2SidebarResponse {
 }
 
 struct V2SnapshotSubscription {
-    reader: BufReader<UnixStream>,
-    daemon_instance_id: crate::pane_state::DaemonInstanceId,
+    client: V2Client,
+    /// The first post-`Subscribe` frame arrives as the request response; it is
+    /// held here so the streaming reader never loses it.
+    pending: Option<V2ServerMessage>,
     last_revision: Option<u64>,
     initial_deadline: Instant,
     initial_degraded: Option<String>,
@@ -498,53 +463,46 @@ struct V2SnapshotSubscription {
 
 impl V2SnapshotSubscription {
     fn connect(socket: &Path, server_identity: &str, expected_config_hash: &str) -> Result<Self> {
+        // The config-hash guard runs on its own budget; the subscription
+        // deadline starts only after it completes, so a slow guard never
+        // shrinks the connect/handshake/subscribe budget.
         verify_active_config_hash(socket, server_identity, expected_config_hash)?;
-        let mut stream = UnixStream::connect(socket)?;
-        stream.set_write_timeout(Some(V2_SUBSCRIBE_INITIAL_TIMEOUT))?;
-        let deadline = Instant::now() + V2_SUBSCRIBE_INITIAL_TIMEOUT;
-        write_v2_client_frame(
-            &mut stream,
-            &V2ClientMessage::Hello {
-                proto: PROTOCOL_VERSION,
-            },
-            deadline,
-        )?;
-        let mut reader = BufReader::new(stream);
-        let hello = read_v2_server_frame(&mut reader, Some(deadline))?
-            .ok_or_else(|| anyhow::anyhow!("daemon closed the connection before HelloAck"))?;
-        let V2ServerMessage::HelloAck {
-            proto,
-            daemon_instance_id,
-            server_identity: actual_server_identity,
-            phase,
-            hook_health,
-        } = hello
-        else {
-            return v2_server_error("HelloAck", hello);
-        };
-        if proto != PROTOCOL_VERSION {
-            bail!("daemon returned unsupported protocol version {proto}");
-        }
-        if actual_server_identity != server_identity {
-            bail!(
-                "daemon server identity mismatch: expected {server_identity}, received {actual_server_identity}"
-            );
-        }
-        write_v2_client_frame(
-            reader.get_mut(),
-            &V2ClientMessage::Subscribe {
-                proto: PROTOCOL_VERSION,
-            },
-            deadline,
-        )?;
+        Self::connect_config_verified_with_deadline(
+            socket,
+            server_identity,
+            Instant::now() + V2_SUBSCRIBE_INITIAL_TIMEOUT,
+        )
+    }
+
+    /// Connect, handshake, and read the `Subscribe` response under one shared
+    /// absolute deadline, assuming the daemon's active config hash was already
+    /// verified: the stages have no per-step budgets, so time spent in an
+    /// earlier stage shrinks what the later ones may use.
+    fn connect_config_verified_with_deadline(
+        socket: &Path,
+        server_identity: &str,
+        deadline: Instant,
+    ) -> Result<Self> {
+        let mut client = V2Client::connect_with_deadline(socket, server_identity, deadline)?;
+        let first = client.request(&V2ClientMessage::Subscribe {
+            proto: PROTOCOL_VERSION,
+        })?;
+        let initial_degraded = (client.phase()
+            != crate::daemon::protocol::v2::DaemonPhase::Serving
+            || client.hook_health() != crate::daemon::protocol::v2::HookHealth::Healthy)
+            .then(|| {
+                format!(
+                    "daemon health is {:?}/{:?}",
+                    client.phase(),
+                    client.hook_health()
+                )
+            });
         Ok(Self {
-            reader,
-            daemon_instance_id,
+            client,
+            pending: Some(first),
             last_revision: None,
             initial_deadline: deadline,
-            initial_degraded: (phase != crate::daemon::protocol::v2::DaemonPhase::Serving
-                || hook_health != crate::daemon::protocol::v2::HookHealth::Healthy)
-                .then(|| format!("daemon health is {phase:?}/{hook_health:?}")),
+            initial_degraded,
         })
     }
 
@@ -561,7 +519,10 @@ impl V2SnapshotSubscription {
         deadline: Option<Instant>,
     ) -> Result<Option<ResolvedSnapshot>> {
         loop {
-            let message = read_v2_server_frame(&mut self.reader, deadline)?;
+            let message = match self.pending.take() {
+                Some(message) => Some(message),
+                None => self.client.receive_streamed_until(deadline)?,
+            };
             let Some(message) = message else {
                 return Ok(None);
             };
@@ -592,10 +553,10 @@ impl V2SnapshotSubscription {
                     // A heartbeat only proves the connection is alive; it never
                     // adopts a snapshot or triggers a redraw. Identity and
                     // revision regressions are protocol errors that reconnect.
-                    if daemon_instance_id != self.daemon_instance_id {
+                    if &daemon_instance_id != self.client.daemon_instance_id() {
                         bail!(
                             "daemon instance changed during subscription: expected {}, received {}",
-                            self.daemon_instance_id.as_str(),
+                            self.client.daemon_instance_id().as_str(),
                             daemon_instance_id.as_str()
                         );
                     }
@@ -642,85 +603,6 @@ fn verify_active_config_hash(
     Ok(())
 }
 
-fn write_v2_client_frame(
-    stream: &mut UnixStream,
-    message: &V2ClientMessage,
-    deadline: Instant,
-) -> Result<()> {
-    let mut frame = serde_json::to_vec(message)?;
-    if frame.len() > MAX_REQUEST_FRAME_BYTES {
-        bail!("request frame exceeds 1 MiB");
-    }
-    frame.push(b'\n');
-    let mut written = 0;
-    while written < frame.len() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!("daemon request write deadline exceeded");
-        }
-        stream.set_write_timeout(Some(remaining.max(Duration::from_millis(1))))?;
-        match stream.write(&frame[written..]) {
-            Ok(0) => bail!("daemon closed the connection while reading the request"),
-            Ok(count) => written += count,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                bail!("daemon request write deadline exceeded")
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
-fn read_v2_server_frame(
-    reader: &mut BufReader<UnixStream>,
-    deadline: Option<Instant>,
-) -> Result<Option<V2ServerMessage>> {
-    let mut frame = Vec::new();
-    loop {
-        if let Some(deadline) = deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                bail!("daemon response read deadline exceeded");
-            }
-            crate::daemon::protocol::v2::wait_for_unix_readable(reader.get_ref(), deadline)?;
-        }
-        let available = match reader.fill_buf() {
-            Ok(available) => available,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                bail!("daemon response read deadline exceeded")
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if available.is_empty() {
-            if frame.is_empty() {
-                return Ok(None);
-            }
-            bail!("daemon closed the connection before completing a response frame");
-        }
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let take = newline.map_or(available.len(), |index| index + 1);
-        if frame.len().saturating_add(take) > MAX_RESPONSE_FRAME_BYTES.saturating_add(1) {
-            bail!("daemon response frame exceeds 16 MiB");
-        }
-        frame.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if newline.is_some() {
-            frame.pop();
-            return serde_json::from_slice(&frame).map(Some).map_err(Into::into);
-        }
-    }
-}
-
 fn v2_server_error<T>(expected: &str, response: V2ServerMessage) -> Result<T> {
     match response {
         V2ServerMessage::Error { code, message, .. } => bail!("{code:?}: {message}"),
@@ -732,7 +614,7 @@ fn v2_server_error<T>(expected: &str, response: V2ServerMessage) -> Result<T> {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -758,8 +640,8 @@ mod tests {
 
     fn subscription_over(stream: UnixStream, last_revision: Option<u64>) -> V2SnapshotSubscription {
         V2SnapshotSubscription {
-            reader: BufReader::new(stream),
-            daemon_instance_id: daemon_instance_id(),
+            client: V2Client::from_subscribed_stream_for_test(stream, daemon_instance_id()),
+            pending: None,
             last_revision,
             initial_deadline: Instant::now() + Duration::from_secs(1),
             initial_degraded: None,
@@ -861,6 +743,60 @@ mod tests {
         );
         let error = subscription.read_next_snapshot().unwrap_err();
         assert!(error.to_string().contains("regressed"), "{error}");
+    }
+
+    #[test]
+    fn subscription_partial_frame_eof_is_an_error_not_a_clean_disconnect() {
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let mut subscription = subscription_over(client, None);
+        server
+            .write_all(b"{\"type\":\"resolved_snapshot_result\"")
+            .unwrap();
+        drop(server);
+
+        // A peer that dies mid-frame must surface as a protocol error, never as
+        // the clean `Ok(None)` disconnect that a whole-frame EOF produces.
+        let error = subscription.read_next_snapshot().unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("closed the connection"), "{rendered}");
+    }
+
+    #[test]
+    fn subscription_stream_read_survives_idle_gaps_longer_than_the_initial_budget() {
+        let socket = unique_socket_path("vt2-sub-idle-gap");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let idle_gap = V2_SUBSCRIBE_INITIAL_TIMEOUT + Duration::from_millis(200);
+        let handle = std::thread::spawn(move || {
+            let mut stream = accept_guarded_subscription(&listener, "scratch", "hash");
+            write_frame(
+                &mut stream,
+                &V2ServerMessage::ResolvedSnapshotResult {
+                    snapshot_revision: 1,
+                    snapshot: empty_snapshot(1),
+                },
+            );
+            std::thread::sleep(idle_gap);
+            write_frame(
+                &mut stream,
+                &V2ServerMessage::ResolvedSnapshotResult {
+                    snapshot_revision: 2,
+                    snapshot: empty_snapshot(2),
+                },
+            );
+        });
+
+        // The real connection's initial deadline is spent long before the
+        // second frame arrives, so the established stream must read without a
+        // deadline: a silence longer than the whole initial budget neither
+        // disconnects nor errors the reader. A regression back to a
+        // deadline-bound read fails here.
+        let mut subscription = V2SnapshotSubscription::connect(&socket, "scratch", "hash").unwrap();
+        let first = subscription.read_initial_snapshot().unwrap().unwrap();
+        assert_eq!(first.snapshot_revision, 1);
+        let second = subscription.read_next_snapshot().unwrap().unwrap();
+        assert_eq!(second.snapshot_revision, 2);
+        handle.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
     }
 
     fn accept_config_guard(listener: &UnixListener, server_identity: &str, config_hash: &str) {
@@ -1421,8 +1357,127 @@ mod tests {
         });
         let mut subscription = V2SnapshotSubscription::connect(&socket, "scratch", "hash").unwrap();
         assert!(subscription.read_initial_snapshot().unwrap().is_some());
-        assert_eq!(subscription.reader.get_ref().read_timeout().unwrap(), None);
+        assert_eq!(
+            subscription
+                .client
+                .reader_stream_for_test()
+                .read_timeout()
+                .unwrap(),
+            None
+        );
         release_tx.send(()).unwrap();
+        handle.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn v2_subscription_initial_budget_is_one_absolute_deadline_across_handshake_and_subscribe() {
+        let socket = unique_socket_path("vt2-sub-deadline");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let budget = Duration::from_millis(600);
+        let stage_delay = Duration::from_millis(450);
+        // Each stage on its own fits the whole budget; only their sum exceeds
+        // it, so a per-stage budget would succeed where the shared absolute
+        // deadline must fail.
+        assert!(stage_delay < budget && stage_delay * 2 > budget);
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert!(matches!(
+                read_client_frame(&mut reader),
+                V2ClientMessage::Hello { .. }
+            ));
+            thread::sleep(stage_delay);
+            write_hello_ack(&mut stream, "scratch");
+            assert!(matches!(
+                read_client_frame(&mut reader),
+                V2ClientMessage::Subscribe { .. }
+            ));
+            thread::sleep(stage_delay);
+            // The client is already past its deadline and gone; this write may
+            // fail with a broken pipe.
+            let mut frame = serde_json::to_vec(&V2ServerMessage::ResolvedSnapshotResult {
+                snapshot_revision: 1,
+                snapshot: empty_snapshot(1),
+            })
+            .unwrap();
+            frame.push(b'\n');
+            let _ = stream.write_all(&frame);
+        });
+
+        let error = match V2SnapshotSubscription::connect_config_verified_with_deadline(
+            &socket,
+            "scratch",
+            Instant::now() + budget,
+        ) {
+            Ok(_) => panic!("cumulative stage delays unexpectedly fit the shared deadline"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("deadline"), "{error}");
+        handle.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn v2_subscription_config_guard_does_not_consume_the_subscribe_budget() {
+        let socket = unique_socket_path("vt2-sub-guard-budget");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // Each stage alone fits the production budget, but their sum exceeds
+        // it: a connect() that starts the subscription deadline before the
+        // config-hash guard completes must fail here.
+        let stage_delay = Duration::from_millis(350);
+        assert!(
+            stage_delay < V2_SUBSCRIBE_INITIAL_TIMEOUT
+                && stage_delay * 2 > V2_SUBSCRIBE_INITIAL_TIMEOUT
+        );
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert!(matches!(
+                read_client_frame(&mut reader),
+                V2ClientMessage::Hello { .. }
+            ));
+            write_hello_ack(&mut stream, "scratch");
+            assert!(matches!(
+                read_client_frame(&mut reader),
+                V2ClientMessage::QueryRuntimeInfo { .. }
+            ));
+            thread::sleep(stage_delay);
+            write_frame(
+                &mut stream,
+                &V2ServerMessage::RuntimeInfoResult {
+                    info: crate::daemon::protocol::v2::RuntimeInfo {
+                        config_hash: "hash".to_string(),
+                        control_health: crate::daemon::protocol::v2::ControlHealth::Ready,
+                    },
+                },
+            );
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert!(matches!(
+                read_client_frame(&mut reader),
+                V2ClientMessage::Hello { .. }
+            ));
+            thread::sleep(stage_delay);
+            write_hello_ack(&mut stream, "scratch");
+            assert!(matches!(
+                read_client_frame(&mut reader),
+                V2ClientMessage::Subscribe { .. }
+            ));
+            write_frame(
+                &mut stream,
+                &V2ServerMessage::ResolvedSnapshotResult {
+                    snapshot_revision: 1,
+                    snapshot: empty_snapshot(1),
+                },
+            );
+        });
+
+        let mut subscription = V2SnapshotSubscription::connect(&socket, "scratch", "hash").unwrap();
+        let first = subscription.read_initial_snapshot().unwrap().unwrap();
+        assert_eq!(first.snapshot_revision, 1);
         handle.join().unwrap();
         std::fs::remove_file(socket).unwrap();
     }

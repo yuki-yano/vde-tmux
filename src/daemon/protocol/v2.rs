@@ -256,6 +256,16 @@ impl V2Client {
             .context("failed to read v2 streaming response frame")
     }
 
+    /// Read the next server-pushed frame after a streaming request such as `Subscribe`,
+    /// waiting without a deadline when none is given and reporting a clean EOF as `None`.
+    pub(crate) fn receive_streamed_until(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<ServerMessage>> {
+        read_server_message_streamed(&mut self.reader, deadline)
+            .context("failed to read v2 streaming response frame")
+    }
+
     fn validate_request(&self, message: &ClientMessage) -> Result<()> {
         if message.proto() != PROTOCOL_VERSION {
             bail!("client request must use protocol version {PROTOCOL_VERSION}");
@@ -270,6 +280,37 @@ impl V2Client {
             bail!("client request uses a stale daemon instance ID");
         }
         Ok(())
+    }
+
+    /// Wraps one half of a `UnixStream::pair` as a client whose handshake and
+    /// streaming request (such as `Subscribe`) already completed, so
+    /// transport-level tests can drive post-request streaming reads without a
+    /// daemon socket. The one request per connection is considered spent.
+    #[cfg(test)]
+    pub(crate) fn from_subscribed_stream_for_test(
+        stream: UnixStream,
+        daemon_instance_id: DaemonInstanceId,
+    ) -> Self {
+        let reader = BufReader::new(
+            stream
+                .try_clone()
+                .expect("failed to clone the test stream for response reads"),
+        );
+        Self {
+            writer: stream,
+            reader,
+            daemon_instance_id,
+            server_identity: String::new(),
+            phase: DaemonPhase::Serving,
+            hook_health: HookHealth::Healthy,
+            deadline: Instant::now() + CLIENT_REQUEST_TIMEOUT,
+            request_sent: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reader_stream_for_test(&self) -> &UnixStream {
+        self.reader.get_ref()
     }
 }
 
@@ -533,15 +574,25 @@ fn read_server_message(
     reader: &mut BufReader<UnixStream>,
     deadline: Instant,
 ) -> Result<ServerMessage> {
+    read_server_message_streamed(reader, Some(deadline))?
+        .ok_or_else(|| anyhow::anyhow!("daemon closed the connection before responding"))
+}
+
+fn read_server_message_streamed(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Option<Instant>,
+) -> Result<Option<ServerMessage>> {
     let mut frame = Vec::new();
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!("daemon response read deadline exceeded");
-        }
-        if reader.buffer().is_empty() {
-            wait_for_unix_readable(reader.get_ref(), deadline)
-                .context("failed to wait for daemon response readability")?;
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("daemon response read deadline exceeded");
+            }
+            if reader.buffer().is_empty() {
+                wait_for_unix_readable(reader.get_ref(), deadline)
+                    .context("failed to wait for daemon response readability")?;
+            }
         }
         let chunk = match reader.fill_buf() {
             Ok(chunk) => chunk,
@@ -556,6 +607,9 @@ fn read_server_message(
             Err(error) => return Err(error.into()),
         };
         if chunk.is_empty() {
+            if frame.is_empty() {
+                return Ok(None);
+            }
             bail!("daemon closed the connection before responding");
         }
         let consumed = chunk
@@ -571,7 +625,7 @@ fn read_server_message(
             break;
         }
     }
-    Ok(serde_json::from_slice(&frame)?)
+    Ok(Some(serde_json::from_slice(&frame)?))
 }
 
 fn server_response_error<T>(expected: &str, response: ServerMessage) -> Result<T> {
