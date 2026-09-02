@@ -325,6 +325,13 @@ is staged with a pending provider session. The daemon still fences the exact pan
 owner, and prompt digest. Only the first matching `UserPromptSubmit` from that same process may bind
 the real session and confirm the Operation; an unbound session is never stored in a Run Record.
 
+Codex may also emit `SessionStart` for a fresh provider session in the same TUI process as the
+dispatched prompt arrives. That event advances the canonical Agent epoch and resets its run sequence.
+The immediately following epoch's first `UserPromptSubmit` may still confirm the Operation only when
+the server, pane instance, pane state, agent kind, process identity, prompt digest, and confirmation
+window all match. Confirmation records the new provider session and epoch. A process replacement,
+skipped epoch, later run in the new epoch, or prompt mismatch never crosses this fence.
+
 The same `operation_id`, target, and prompt bytes are idempotent. A retry of an unexpired
 `prepared` Operation resumes the guarded dispatch. An unattended `prepared` Operation is rejected
 without a side effect when its original confirmation deadline expires. A settled Operation is

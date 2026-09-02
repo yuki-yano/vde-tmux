@@ -1021,7 +1021,7 @@ impl AgentRuntime {
         };
         let operation = self.required_operation(operation_id)?;
         let matches = operation_binding_matches_agent(&operation.binding, binding)
-            && operation.expected_run_seq == run_seq
+            && operation_run_sequence_matches_agent(&operation, binding, run_seq)
             && operation.prompt_digest.as_str() == prompt_digest
             && observation.observed_at >= operation.updated_at
             && observation.observed_at <= operation.confirmation_deadline_at
@@ -1064,13 +1064,17 @@ impl AgentRuntime {
                 operation.dispatch_state
             )));
         }
-        if operation.binding.is_provider_session_pending() {
-            if !operation_binding_matches_agent(&operation.binding, &run.binding) {
+        let confirmed_binding = OperationBinding::from(run.binding.clone());
+        if operation.binding != confirmed_binding {
+            if !operation_binding_matches_agent(&operation.binding, &run.binding)
+                || !operation_run_sequence_matches_agent(&operation, &run.binding, run.run_seq)
+            {
                 return Err(StoreError::OperationConflict(
-                    "pending provider session does not match the confirmed run binding".to_string(),
+                    "provider session rollover does not match the confirmed run binding"
+                        .to_string(),
                 ));
             }
-            operation.binding = OperationBinding::from(run.binding.clone());
+            operation.binding = confirmed_binding;
             operation.expected_pane_version = crate::pane_state::StateVersion {
                 state_id: run.binding.pane_state_id.clone(),
                 agent_epoch: run.binding.agent_epoch,
@@ -1173,22 +1177,41 @@ fn operation_target_key_for_agent(binding: &AgentBinding) -> Result<String, Stor
 }
 
 fn operation_binding_matches_agent(operation: &OperationBinding, agent: &AgentBinding) -> bool {
-    let epoch_matches = if operation.provider_session_id.is_some() {
-        operation.agent_epoch == agent.agent_epoch
+    // Codex can open a fresh provider session in the same TUI process when the
+    // dispatched prompt arrives. PaneState represents that SessionStart as the
+    // immediately following Agent epoch, so let only that adjacent epoch cross
+    // the confirmation fence. Pane/process replacement remains excluded below.
+    let session_epoch_matches = if operation.agent_epoch == agent.agent_epoch {
+        operation
+            .provider_session_id
+            .as_ref()
+            .is_none_or(|session| session == &agent.provider_session_id)
     } else {
-        operation.agent_epoch == agent.agent_epoch
-            || operation.agent_epoch.checked_add(1) == Some(agent.agent_epoch)
+        operation.agent_kind.as_str() == "codex"
+            && operation.agent_epoch.checked_add(1) == Some(agent.agent_epoch)
     };
     operation.server_identity == agent.server_identity
         && operation.pane_instance == agent.pane_instance
         && operation.pane_state_id == agent.pane_state_id
-        && epoch_matches
+        && session_epoch_matches
         && operation.agent_kind == agent.agent_kind
-        && operation
-            .provider_session_id
-            .as_ref()
-            .is_none_or(|session| session == &agent.provider_session_id)
         && operation.process == agent.process
+}
+
+fn operation_run_sequence_matches_agent(
+    operation: &OperationRecord,
+    agent: &AgentBinding,
+    run_seq: u64,
+) -> bool {
+    if operation.binding.agent_epoch == agent.agent_epoch {
+        operation.expected_run_seq == run_seq
+    } else {
+        // A new Agent epoch resets its PaneState run sequence. Only its first
+        // prompt can be the dispatch that crossed the SessionStart boundary.
+        operation.binding.agent_kind.as_str() == "codex"
+            && operation.binding.agent_epoch.checked_add(1) == Some(agent.agent_epoch)
+            && run_seq == 1
+    }
 }
 
 fn turn_index_key(observation: &ProviderObservation, turn_key: &str) -> String {
@@ -1724,6 +1747,125 @@ mod tests {
             DispatchState::PromptConfirmed
         );
         drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prompt_after_same_process_session_rollover_confirms_the_operation() {
+        let root = temp_root();
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
+        let mut original_binding = binding();
+        original_binding.agent_kind = AgentKind::parse("codex").unwrap();
+        original_binding.agent_epoch = 2;
+        original_binding.provider_session_id =
+            AgentSessionId::parse("session-before-rollover").unwrap();
+
+        let mut previous_prompt = observation(
+            ProviderHookKind::UserPromptSubmit,
+            "turn-before-rollover",
+            Some(b"previous task"),
+            None,
+            8,
+        );
+        previous_prompt.provider = original_binding.agent_kind.clone();
+        previous_prompt.session_id = original_binding.provider_session_id.clone();
+        runtime
+            .apply_provider_observation(original_binding.clone(), 1, &previous_prompt)
+            .unwrap()
+            .run
+            .unwrap();
+        let mut previous_stop = observation(
+            ProviderHookKind::Stop,
+            "turn-before-rollover",
+            None,
+            Some("previous response"),
+            9,
+        );
+        previous_stop.provider = original_binding.agent_kind.clone();
+        previous_stop.session_id = original_binding.provider_session_id.clone();
+        let previous_run = runtime
+            .apply_provider_observation(original_binding.clone(), 1, &previous_stop)
+            .unwrap()
+            .run
+            .unwrap();
+        assert_eq!(previous_run.semantic_outcome, SemanticOutcome::Completed);
+
+        let prompt = b"task after session rollover";
+        let operation_id = OperationId::parse("operation_session_rollover_0001").unwrap();
+        runtime
+            .prepare_operation(
+                operation_id.clone(),
+                "vta1:exact-target-before-rollover".to_string(),
+                prompt,
+                prompt_digest(prompt),
+                "paste_enter".to_string(),
+                original_binding.clone(),
+                pane_version(&original_binding),
+                Some(CurrentDurableRunProjection {
+                    run_id: previous_run.run_id.as_str().to_string(),
+                    run_seq: previous_run.run_seq,
+                    run_revision: previous_run.revision,
+                }),
+                2,
+                10,
+            )
+            .unwrap();
+        runtime.mark_dispatch_started(&operation_id, 11).unwrap();
+
+        let mut rollover_binding = original_binding.clone();
+        rollover_binding.agent_epoch = 3;
+        rollover_binding.provider_session_id =
+            AgentSessionId::parse("session-after-rollover").unwrap();
+        let mut rollover_prompt = observation(
+            ProviderHookKind::UserPromptSubmit,
+            "turn-after-rollover",
+            Some(prompt),
+            None,
+            12,
+        );
+        rollover_prompt.provider = rollover_binding.agent_kind.clone();
+        rollover_prompt.session_id = rollover_binding.provider_session_id.clone();
+
+        let pending = runtime.required_operation(&operation_id).unwrap();
+        assert!(operation_binding_matches_agent(
+            &pending.binding,
+            &rollover_binding
+        ));
+        assert!(operation_run_sequence_matches_agent(
+            &pending,
+            &rollover_binding,
+            1
+        ));
+        assert!(!operation_run_sequence_matches_agent(
+            &pending,
+            &rollover_binding,
+            2
+        ));
+        let mut replaced_process = rollover_binding.clone();
+        replaced_process.process.pid += 1;
+        assert!(!operation_binding_matches_agent(
+            &pending.binding,
+            &replaced_process
+        ));
+        let mut skipped_epoch = rollover_binding.clone();
+        skipped_epoch.agent_epoch += 1;
+        assert!(!operation_binding_matches_agent(
+            &pending.binding,
+            &skipped_epoch
+        ));
+
+        let applied = runtime
+            .apply_provider_observation(rollover_binding.clone(), 1, &rollover_prompt)
+            .unwrap();
+        let operation = applied.operation.unwrap();
+        let run = applied.run.unwrap();
+        assert_eq!(operation.dispatch_state, DispatchState::PromptConfirmed);
+        assert_eq!(operation.binding, OperationBinding::from(rollover_binding));
+        assert_eq!(operation.expected_pane_version.agent_epoch, 3);
+        assert_eq!(operation.expected_run_seq, 2);
+        assert_eq!(run.operation_id.as_ref(), Some(&operation_id));
+
+        drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -197,6 +197,215 @@ fn immediate_codex_prompt_retries_transient_process_scan_after_session_start() {
 }
 
 #[test]
+fn durable_prompt_confirms_across_an_in_process_codex_session_rollover() {
+    use crate::agent_state::{DispatchState, OperationId, Sha256Digest};
+    use crate::pane_state::{AgentProcessIdentity, LifecycleState};
+
+    let root = test_root("codex-session-rollover-confirmation");
+    let hash = "codex-session-rollover-confirmation";
+    let env = BTreeMap::from([(
+        "XDG_STATE_HOME".to_string(),
+        root.to_string_lossy().into_owned(),
+    )]);
+    let coordinator =
+        ProductionV2Coordinator::new(test_incarnation(&root, hash), env, None).unwrap();
+    install_test_state(
+        &coordinator,
+        &root,
+        crate::daemon::view_hooks::CurrentClientViews::default(),
+    );
+    *coordinator.agent_runtime.lock().unwrap() = Some(
+        crate::agent_state::runtime::AgentRuntime::open(root.join("agent-state"), hash.to_string())
+            .unwrap(),
+    );
+    let pane = PaneInstance {
+        pane_id: "%539".to_string(),
+        pane_pid: 53_900,
+    };
+    let daemon_instance_id = coordinator
+        .router
+        .lock()
+        .unwrap()
+        .daemon_instance_id()
+        .clone();
+    let make_event = |event: &str, payload: &str, observed_at: i64| {
+        codex_provider_test_event(
+            daemon_instance_id.clone(),
+            pane.clone(),
+            event,
+            payload,
+            observed_at,
+        )
+    };
+    let runner = crate::tmux::mock::MockTmuxRunner::new();
+    let process = AgentProcessIdentity {
+        pid: 53_962,
+        start_token: "codex-session-rollover-process".to_string(),
+    };
+
+    let (session_envelope, session_observation) = make_event(
+        "SessionStart",
+        r#"{"session_id":"session-before-rollover","source":"startup"}"#,
+        1,
+    );
+    assert!(matches!(
+        apply_external_provider_event_with_runner(
+            &coordinator,
+            1,
+            session_envelope,
+            session_observation,
+            &runner,
+        ),
+        ServerMessage::PaneEventResult { .. }
+    ));
+    runner.stub_agent_process(pane.pane_pid, "codex", Some(process.clone()));
+
+    let (previous_envelope, previous_observation) = make_event(
+        "UserPromptSubmit",
+        r#"{"session_id":"session-before-rollover","turn_id":"turn-before-rollover","prompt":"previous task"}"#,
+        2,
+    );
+    assert!(matches!(
+        apply_external_provider_event_with_runner(
+            &coordinator,
+            2,
+            previous_envelope,
+            previous_observation,
+            &runner,
+        ),
+        ServerMessage::PaneEventResult { .. }
+    ));
+    let before_rollover = coordinator
+        .state
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .leased
+        .runtime
+        .record(&pane)
+        .unwrap()
+        .clone();
+    assert_eq!(before_rollover.agent_epoch, 1);
+    assert_eq!(before_rollover.run_seq, 1);
+    assert!(matches!(before_rollover.lifecycle, LifecycleState::Running));
+    let operation_id = OperationId::parse("operation_session_rollover_server_0001").unwrap();
+    let operation_prompt = "task after session rollover";
+    let operation_digest = Sha256Digest::parse(
+        crate::pane_state::PromptState::digest_decoded_prompt(operation_prompt),
+    )
+    .unwrap();
+    let binding = crate::agent_state::AgentBinding {
+        server_identity: coordinator.incarnation.identity.clone(),
+        pane_instance: pane.clone(),
+        pane_state_id: before_rollover.state_id.clone(),
+        agent_epoch: before_rollover.agent_epoch,
+        agent_kind: before_rollover.agent.clone(),
+        provider_session_id: before_rollover.agent_session_id.clone().unwrap(),
+        process: before_rollover.agent_process.clone().unwrap(),
+    };
+    let operation_observed_at = epoch_seconds();
+    {
+        let mut runtime = coordinator.agent_runtime.lock().unwrap();
+        let runtime = runtime.as_mut().unwrap();
+        runtime
+            .prepare_operation(
+                operation_id.clone(),
+                "vta1:session-rollover-target".to_string(),
+                operation_prompt.as_bytes(),
+                operation_digest,
+                "paste_enter".to_string(),
+                binding,
+                before_rollover.version(),
+                before_rollover.current_run.clone(),
+                2,
+                operation_observed_at,
+            )
+            .unwrap();
+        runtime
+            .mark_dispatch_started(&operation_id, operation_observed_at)
+            .unwrap();
+    }
+
+    let (rollover_envelope, rollover_observation) = make_event(
+        "SessionStart",
+        r#"{"session_id":"session-after-rollover","source":"startup"}"#,
+        4,
+    );
+    assert!(matches!(
+        apply_external_provider_event_with_runner(
+            &coordinator,
+            4,
+            rollover_envelope,
+            rollover_observation,
+            &runner,
+        ),
+        ServerMessage::PaneEventResult { .. }
+    ));
+    runner.stub_agent_process(pane.pane_pid, "codex", Some(process));
+
+    let (prompt_envelope, prompt_observation) = make_event(
+        "UserPromptSubmit",
+        r#"{"session_id":"session-after-rollover","turn_id":"turn-after-rollover","prompt":"task after session rollover"}"#,
+        5,
+    );
+    assert!(matches!(
+        apply_external_provider_event_with_runner(
+            &coordinator,
+            5,
+            prompt_envelope,
+            prompt_observation,
+            &runner,
+        ),
+        ServerMessage::PaneEventResult { .. }
+    ));
+
+    {
+        let runtime = coordinator.agent_runtime.lock().unwrap();
+        let runtime = runtime.as_ref().unwrap();
+        let operation = runtime
+            .get_operation(&runtime.operation_ref(operation_id.clone()))
+            .unwrap();
+        assert_eq!(operation.dispatch_state, DispatchState::PromptConfirmed);
+        assert_eq!(operation.binding.agent_epoch, 2);
+        assert_eq!(
+            operation
+                .binding
+                .provider_session_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "session-after-rollover"
+        );
+        assert_eq!(operation.expected_run_seq, 2);
+        let run = runtime
+            .get_run(&runtime.run_ref(operation.run_id.unwrap()))
+            .unwrap();
+        assert_eq!(run.run_seq, 1);
+        assert_eq!(run.operation_id.as_ref(), Some(&operation_id));
+    }
+
+    let after_rollover = coordinator
+        .state
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .leased
+        .runtime
+        .record(&pane)
+        .unwrap()
+        .clone();
+    assert_eq!(after_rollover.agent_epoch, 2);
+    assert_eq!(after_rollover.run_seq, 1);
+    assert!(matches!(after_rollover.lifecycle, LifecycleState::Running));
+    assert!(after_rollover.prompt.is_none());
+
+    drop(coordinator);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn guarded_prompt_process_owner_rejections_cover_every_fail_closed_branch() {
     let binding = guarded_prompt_test_binding();
     let operation_binding = crate::agent_state::OperationBinding::from(binding.clone());

@@ -1328,8 +1328,10 @@ fn validate_operation_replacement(
     existing: &OperationRecord,
     next: &OperationRecord,
 ) -> Result<(), StoreError> {
-    let provider_session_bound = existing.binding.provider_session_id.is_none()
-        && next.binding.provider_session_id.is_some()
+    // Confirmation may supply an initially pending provider session or move an
+    // in-process Codex dispatch into the immediately following SessionStart
+    // epoch. All stable pane and process identity fields stay immutable.
+    let provider_session_rebound = next.binding.provider_session_id.is_some()
         && matches!(
             (existing.dispatch_state, next.dispatch_state),
             (
@@ -1342,8 +1344,10 @@ fn validate_operation_replacement(
         && existing.binding.pane_state_id == next.binding.pane_state_id
         && existing.binding.agent_kind == next.binding.agent_kind
         && existing.binding.process == next.binding.process
-        && (existing.binding.agent_epoch == next.binding.agent_epoch
-            || existing.binding.agent_epoch.checked_add(1) == Some(next.binding.agent_epoch))
+        && ((existing.binding.provider_session_id.is_none()
+            && existing.binding.agent_epoch == next.binding.agent_epoch)
+            || (existing.binding.agent_kind.as_str() == "codex"
+                && existing.binding.agent_epoch.checked_add(1) == Some(next.binding.agent_epoch)))
         && existing.expected_pane_version.state_id == next.expected_pane_version.state_id
         && existing.expected_pane_version.revision == next.expected_pane_version.revision
         && next.expected_pane_version.agent_epoch == next.binding.agent_epoch;
@@ -1353,8 +1357,9 @@ fn validate_operation_replacement(
         || existing.target_agent_ref != next.target_agent_ref
         || existing.prompt_digest != next.prompt_digest
         || existing.dispatch_option != next.dispatch_option
-        || (existing.binding != next.binding && !provider_session_bound)
-        || (existing.expected_pane_version != next.expected_pane_version && !provider_session_bound)
+        || (existing.binding != next.binding && !provider_session_rebound)
+        || (existing.expected_pane_version != next.expected_pane_version
+            && !provider_session_rebound)
         || existing.expected_current_run != next.expected_current_run
         || existing.expected_run_seq != next.expected_run_seq
         || existing.confirmation_deadline_at != next.confirmation_deadline_at
