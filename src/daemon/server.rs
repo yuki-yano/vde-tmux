@@ -1914,14 +1914,12 @@ fn stream_v2_subscription_with_heartbeat_interval(
     {
         match outcome {
             SnapshotWaitOutcome::Published(published) => {
-                if let Err(error) = write_v2_frame(&mut stream, &published.frame) {
-                    let _ =
-                        coordinator.enqueue_internal(V2InternalMutation::DiagnosticProjection {
-                            pane_instance: None,
-                            message: format!(
-                                "subscriber_write_failed: after_revision={last_revision} error={error:?}"
-                            ),
-                        });
+                if write_v2_frame(&mut stream, &published.frame).is_err() {
+                    // Subscription clients close the stream as soon as their
+                    // wait condition is satisfied. A later publish can race
+                    // with that normal close, so feeding the write failure
+                    // back into canonical diagnostics would create another
+                    // revision and amplify expected disconnects.
                     break;
                 }
                 last_revision = published.revision;

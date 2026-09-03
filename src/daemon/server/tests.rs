@@ -250,6 +250,58 @@ fn idle_subscription_stream_sends_heartbeats_and_new_revisions_still_flow() {
 }
 
 #[test]
+fn closed_subscription_does_not_enqueue_a_diagnostic_revision() {
+    use std::net::Shutdown;
+
+    let root = test_root("closed-subscription");
+    let coordinator = Arc::new(initialized_test_coordinator(
+        &root,
+        "closed-subscription".to_string(),
+        crate::daemon::view_hooks::CurrentClientViews::default(),
+    ));
+    let baseline = coordinator.publish_resolved_snapshot().unwrap();
+    coordinator
+        .state
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .leased
+        .runtime
+        .mark_projection_changed()
+        .unwrap();
+    let published = coordinator.publish_resolved_snapshot().unwrap();
+    assert_eq!(published.revision, baseline.revision + 1);
+
+    let (server, client) = UnixStream::pair().unwrap();
+    client.shutdown(Shutdown::Both).unwrap();
+    drop(client);
+    stream_v2_subscription_with_heartbeat_interval(
+        coordinator.clone(),
+        server,
+        baseline.revision,
+        Duration::from_millis(10),
+    )
+    .unwrap();
+
+    assert!(
+        coordinator
+            .queue
+            .lock()
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| !matches!(
+                item.sequenced.mutation,
+                V2AcceptedMutation::Internal(V2InternalMutation::DiagnosticProjection { .. })
+            ))
+    );
+
+    drop(coordinator);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn observation_batch_keeps_sequence_order_with_following_mutations() {
     let root = test_root("batch-sequence");
     let server_identity = crate::daemon::topology::ServerIdentity {
