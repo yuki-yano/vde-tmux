@@ -585,7 +585,19 @@ pub(in crate::daemon::server) fn observation_may_create_unread(
             })
         )
         && !matches!(state.lifecycle, LifecycleState::Waiting { .. });
-    confirmed_absence_can_complete || stale_capture_can_complete || permission_wait_can_create
+    let provider_error_can_create = capture_is_applied
+        && matches!(
+            capture,
+            Some(crate::pane_state::CaptureObservation {
+                inference: CaptureInference::ProviderError { .. },
+                ..
+            })
+        )
+        && !matches!(state.lifecycle, LifecycleState::Error { .. });
+    confirmed_absence_can_complete
+        || stale_capture_can_complete
+        || permission_wait_can_create
+        || provider_error_can_create
 }
 
 pub(in crate::daemon::server) fn apply_external_view_event(

@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::detect::detect_usage_limit;
+use crate::detect::{PROVIDER_OVERLOADED_REASON, is_provider_overloaded_error};
 use crate::hook::origin::{HookOrigin, claude_hook_origin, codex_hook_origin_from_payload};
 use crate::pane_state::{
     AgentKind, AgentSessionId, AgentSessionSource, BODY_MAX_BYTES, DaemonInstanceId, EventId,
@@ -112,11 +112,7 @@ pub fn claude_typed_event_from_json(
             payload.last_assistant_message.as_deref(),
             context.observed_at,
         ),
-        "StopFailure" if claude_stop_failure_is_usage_limit(&payload) => PaneEvent::WaitRequested {
-            observed_at: context.observed_at,
-            reason: WaitReason::usage_limit(),
-        },
-        "StopFailure" => return Ok(None),
+        "StopFailure" => claude_stop_failure_event(&payload, context.observed_at)?,
         _ => return Ok(None),
     };
     Ok(Some(context.envelope(
@@ -370,8 +366,6 @@ struct ClaudeHookPayload {
     agent_transcript_path: Option<String>,
     error: Option<String>,
     error_details: Option<String>,
-    error_message: Option<String>,
-    error_type: Option<String>,
     hook_event_name: Option<String>,
     last_assistant_message: Option<String>,
     notification_type: Option<String>,
@@ -405,18 +399,46 @@ fn is_guarded_claude_lifecycle_event(event: &str) -> bool {
     )
 }
 
-fn claude_stop_failure_is_usage_limit(payload: &ClaudeHookPayload) -> bool {
-    if payload.error_type.as_deref() == Some("rate_limit") {
-        return true;
+fn claude_stop_failure_event(payload: &ClaudeHookPayload, observed_at: i64) -> Result<PaneEvent> {
+    let error = payload
+        .error
+        .as_deref()
+        .filter(|error| !error.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("InvalidRequest: StopFailure requires error"))?;
+    if error == "rate_limit" {
+        return Ok(PaneEvent::WaitRequested {
+            observed_at,
+            reason: WaitReason::usage_limit(),
+        });
     }
-    [
-        payload.error.as_deref(),
-        payload.error_details.as_deref(),
-        payload.error_message.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(detect_usage_limit)
+    let rendered_as_overload = matches!(error, "server_error" | "unknown")
+        && [
+            payload.error_details.as_deref(),
+            payload.last_assistant_message.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(is_provider_overloaded_error);
+    let reason = if error == "overloaded" || rendered_as_overload {
+        PROVIDER_OVERLOADED_REASON
+    } else {
+        match error {
+            "authentication_failed"
+            | "oauth_org_not_allowed"
+            | "account_on_hold"
+            | "billing_error"
+            | "invalid_request"
+            | "model_not_found"
+            | "server_error"
+            | "max_output_tokens"
+            | "unknown" => error,
+            _ => bail!("InvalidRequest: unsupported Claude StopFailure error {error}"),
+        }
+    };
+    Ok(PaneEvent::FailRun {
+        observed_at,
+        reason: Some(reason.to_string()),
+    })
 }
 
 fn is_guarded_codex_lifecycle_event(event: &str) -> bool {
@@ -598,7 +620,7 @@ mod tests {
 
     #[test]
     fn claude_stop_failure_maps_rate_limit_to_usage_limit_wait() {
-        let payload = r#"{"session_id":"session-1","error_type":"rate_limit","error_message":"too many requests"}"#;
+        let payload = r#"{"session_id":"session-1","error":"rate_limit","error_details":"429 Too Many Requests","last_assistant_message":"API Error: Rate limit reached"}"#;
         let envelope = claude_typed_event_from_json("StopFailure", payload, &typed_context())
             .unwrap()
             .unwrap();
@@ -613,13 +635,70 @@ mod tests {
     }
 
     #[test]
-    fn claude_stop_failure_ignores_non_limit_failures() {
-        let payload =
-            r#"{"session_id":"session-1","error_type":"network_error","error_message":"offline"}"#;
-        assert!(
-            claude_typed_event_from_json("StopFailure", payload, &typed_context())
+    fn claude_stop_failure_maps_overloads_to_provider_overloaded() {
+        for payload in [
+            r#"{"session_id":"session-1","error":"overloaded"}"#,
+            r#"{"session_id":"session-1","error":"server_error","error_details":"529 Overloaded","last_assistant_message":"API Error: 529 Overloaded"}"#,
+        ] {
+            let envelope = claude_typed_event_from_json("StopFailure", payload, &typed_context())
                 .unwrap()
-                .is_none()
+                .unwrap();
+
+            assert_eq!(
+                envelope.event,
+                PaneEvent::FailRun {
+                    observed_at: 123,
+                    reason: Some(PROVIDER_OVERLOADED_REASON.to_string()),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn claude_stop_failure_maps_other_official_errors_to_failed_runs() {
+        for error in [
+            "authentication_failed",
+            "oauth_org_not_allowed",
+            "account_on_hold",
+            "billing_error",
+            "invalid_request",
+            "model_not_found",
+            "server_error",
+            "max_output_tokens",
+            "unknown",
+        ] {
+            let payload = serde_json::json!({
+                "session_id": "session-1",
+                "error": error,
+            })
+            .to_string();
+            let envelope = claude_typed_event_from_json("StopFailure", &payload, &typed_context())
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                envelope.event,
+                PaneEvent::FailRun {
+                    observed_at: 123,
+                    reason: Some(error.to_string()),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn claude_stop_failure_does_not_override_specific_errors_from_rendered_text() {
+        let payload = r#"{"session_id":"session-1","error":"billing_error","last_assistant_message":"API Error: 529 Overloaded"}"#;
+        let envelope = claude_typed_event_from_json("StopFailure", payload, &typed_context())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            envelope.event,
+            PaneEvent::FailRun {
+                observed_at: 123,
+                reason: Some("billing_error".to_string()),
+            }
         );
     }
 

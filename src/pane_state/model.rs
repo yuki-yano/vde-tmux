@@ -1079,6 +1079,7 @@ pub struct CaptureObservation {
 pub enum CaptureInference {
     PermissionWait { reason: WaitReason },
     UsageLimit,
+    ProviderError { reason: String },
     ActivityObserved,
     StaleRunCompleted,
     NoChange,

@@ -66,6 +66,10 @@ fn lifecycle_agent_hooks_receive_the_extended_delivery_deadline() {
         Duration::from_secs(8)
     );
     assert_eq!(
+        agent_hook_delivery_timeout_from_args(&args("claude", "StopFailure")),
+        Duration::from_secs(8)
+    );
+    assert_eq!(
         agent_hook_delivery_timeout_from_args(&args("codex", "AfterToolUse")),
         Duration::from_secs(2)
     );

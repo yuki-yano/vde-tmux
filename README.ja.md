@@ -111,7 +111,8 @@ pane移動はdaemonが所有する1つの常駐tmux control-mode clientを通し
     "PreToolUse": [{ "hooks": [{ "type": "command", "command": "vt hook claude PreToolUse" }] }],
     "PostToolUse": [{ "hooks": [{ "type": "command", "command": "vt hook claude PostToolUse" }] }],
     "Notification": [{ "hooks": [{ "type": "command", "command": "vt hook claude Notification" }] }],
-    "Stop": [{ "hooks": [{ "type": "command", "command": "vt hook claude Stop" }] }]
+    "Stop": [{ "hooks": [{ "type": "command", "command": "vt hook claude Stop" }] }],
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "vt hook claude StopFailure" }] }]
   }
 }
 ```
@@ -216,6 +217,7 @@ pathを使います。成功時はdigest確認済みreceiptを返し、配送が
 | 表示 | 状態 | 意味 |
 | --- | --- | --- |
 | `▲` | Blocked | 許可や回答など、利用者の入力を待っている |
+| `⋄` | Limited | providerの利用量またはsession上限に達している |
 | `●` | Working | エージェントが作業している |
 | `✓` | Done | 作業が完了し、まだ確認されていない |
 | `○` | Idle | 作業がない、または完了を確認済み |
@@ -232,6 +234,12 @@ daemonを再起動するとpeekは終了し、初回のview reconcileで通常�
 globalな発生順はdaemonが管理し、移動中に最新paneが消えた場合は次の未読paneを試します。
 移動操作そのものは既読化せず、移動先がactive paneとして観測された後に既読になります。
 この操作はpeekには入りません。
+
+Claude CodeのturnがAPIエラーで終了した場合、`StopFailure` を一次情報として扱います。
+`error=rate_limit` は `Limited`、それ以外は `Blocked` / `lifecycle.state=error` になり、`error=overloaded` と529 overloadのreasonは `provider_overloaded` です。
+hookを取りこぼした場合に限り、daemonは5秒間隔の補助scanで、`⏺ API Error:` の後にある `· done` turn summaryが入力欄より前の最新semantic行になった状態を検出します。
+古いエラー、通常のログ本文、新しいprompt、retry spinner、tool出力、assistant出力がエラー後に続いている画面は検出しません。
+途中で副作用が発生済みの可能性があるため自動再送は行わず、後続の `SessionStart` または `UserPromptSubmit` を回復証拠とします。
 
 ## サイドバー
 

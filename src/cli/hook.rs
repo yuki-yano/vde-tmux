@@ -97,7 +97,7 @@ pub(crate) fn delivery_timeout(command: &HookCommand) -> Duration {
         HookCommand::Codex { arg } => arg.as_deref(),
         HookCommand::Emit { .. } => None,
     };
-    if matches!(event, Some("UserPromptSubmit" | "Stop")) {
+    if matches!(event, Some("UserPromptSubmit" | "Stop" | "StopFailure")) {
         Duration::from_secs(8)
     } else {
         Duration::from_secs(2)
@@ -1188,6 +1188,12 @@ mod tests {
         assert_eq!(
             delivery_timeout(&HookCommand::Claude {
                 event: "Stop".to_string(),
+            }),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            delivery_timeout(&HookCommand::Claude {
+                event: "StopFailure".to_string(),
             }),
             Duration::from_secs(8)
         );

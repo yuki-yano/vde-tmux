@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use crate::detect::{detect_codex_wait_reason, detect_usage_limit};
+use crate::detect::{detect_claude_terminal_error, detect_codex_wait_reason, detect_usage_limit};
 use crate::pane_state::{
     AgentKind, AgentPresenceObservation, CaptureInference, CaptureObservation,
     CaptureTrackerSnapshot, DaemonInstanceId, EventId, LifecycleState, ObservationDispatchSnapshot,
@@ -58,6 +58,13 @@ pub fn infer_capture(
         matches!(state.agent.as_str(), "claude" | "codex") && detect_usage_limit(tail)
     }) {
         CaptureInference::UsageLimit
+    } else if let Some(reason) = state
+        .filter(|state| state.agent.as_str() == "claude")
+        .and_then(|_| detect_claude_terminal_error(tail))
+    {
+        CaptureInference::ProviderError {
+            reason: reason.to_string(),
+        }
     } else if observed_fingerprint.is_none()
         || tracker.rebaseline_pending
         || tracker.fingerprint.is_none()
@@ -91,6 +98,24 @@ pub fn infer_capture(
     CaptureObservation {
         inference,
         observed_fingerprint,
+    }
+}
+
+fn infer_active_terminal_capture(agent: &AgentKind, tail: &str) -> CaptureObservation {
+    let inference = if detect_usage_limit(tail) {
+        CaptureInference::UsageLimit
+    } else if agent.as_str() == "claude"
+        && let Some(reason) = detect_claude_terminal_error(tail)
+    {
+        CaptureInference::ProviderError {
+            reason: reason.to_string(),
+        }
+    } else {
+        CaptureInference::NoChange
+    };
+    CaptureObservation {
+        inference,
+        observed_fingerprint: capture_sha256(tail),
     }
 }
 
@@ -264,6 +289,14 @@ pub fn run_observation_poll(
                     tail,
                     observed_at,
                 ),
+                CaptureMode::ActiveTerminalSignals => infer_active_terminal_capture(
+                    &snapshot
+                        .state
+                        .as_ref()
+                        .expect("active terminal capture has canonical state")
+                        .agent,
+                    tail,
+                ),
                 CaptureMode::UsageLimitOnly => infer_usage_limit_capture(tail),
             }
         });
@@ -307,6 +340,7 @@ pub fn run_observation_poll(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureMode {
     FullInference,
+    ActiveTerminalSignals,
     UsageLimitOnly,
 }
 
@@ -356,7 +390,7 @@ fn capture_mode(
             .is_none_or(|last_scan| {
                 observed_at.saturating_sub(last_scan) >= USAGE_LIMIT_CAPTURE_INTERVAL_SECONDS
             }))
-    .then_some(CaptureMode::UsageLimitOnly)
+    .then_some(CaptureMode::ActiveTerminalSignals)
 }
 
 pub fn pane_removal_envelopes(
@@ -551,6 +585,41 @@ mod tests {
     }
 
     #[test]
+    fn claude_terminal_error_inference_requires_a_finished_turn() {
+        let state = canonical_state("claude");
+        let observed = infer_capture(
+            Some(&state),
+            &CaptureTrackerSnapshot::default(),
+            "⏺ API Error: 529 Overloaded. This is a server-side issue.\n✻ Worked for 2s · done 22:28\n❯\n",
+            100,
+        );
+
+        assert_eq!(
+            observed.inference,
+            CaptureInference::ProviderError {
+                reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
+            }
+        );
+        assert_eq!(
+            infer_active_terminal_capture(
+                &state.agent,
+                "⏺ API Error: 529 Overloaded. This is a server-side issue.\n✻ Worked for 2s · done 22:28\n❯ retry this request\n✽ Waddling…\n────────\n❯\n",
+            )
+            .inference,
+            CaptureInference::NoChange
+        );
+        let codex = canonical_state("codex");
+        assert_eq!(
+            infer_active_terminal_capture(
+                &codex.agent,
+                "⏺ API Error: 529 Overloaded. This is a server-side issue.\n❯\n",
+            )
+            .inference,
+            CaptureInference::NoChange
+        );
+    }
+
+    #[test]
     fn usage_limit_supplementary_capture_is_throttled_but_absence_is_immediate() {
         let state = canonical_state("codex");
         let present = AgentPresenceObservation::Present(state.agent.clone());
@@ -571,7 +640,7 @@ mod tests {
         assert_eq!(capture_mode(&dispatch, &present, 104), None);
         assert_eq!(
             capture_mode(&dispatch, &present, 105),
-            Some(CaptureMode::UsageLimitOnly)
+            Some(CaptureMode::ActiveTerminalSignals)
         );
         assert_eq!(
             capture_mode(&dispatch, &AgentPresenceObservation::Absent, 101),

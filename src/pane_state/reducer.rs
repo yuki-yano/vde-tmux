@@ -1336,7 +1336,10 @@ fn apply_capture(
         && capture.observed_fingerprint != tracker.fingerprint;
     tracker.last_semantic_scan_at = Some(observed_at);
     if tracker.rebaseline_pending {
-        if matches!(capture.inference, CaptureInference::UsageLimit) {
+        if matches!(
+            capture.inference,
+            CaptureInference::UsageLimit | CaptureInference::ProviderError { .. }
+        ) {
             tracker.rebaseline_pending = false;
         } else {
             if capture.observed_fingerprint.is_some() {
@@ -1353,6 +1356,9 @@ fn apply_capture(
         }
         CaptureInference::UsageLimit => {
             wait_requested(state, observed_at, WaitReason::usage_limit())?;
+        }
+        CaptureInference::ProviderError { reason } => {
+            fail_run(state, observed_at, Some(reason.clone()))?;
         }
         CaptureInference::ActivityObserved => {
             if tracker.fingerprint.is_some() && state.run_seq > state.completed_seq {
@@ -3140,6 +3146,86 @@ mod tests {
         assert_eq!(completed.completed_seq, 1);
         assert_eq!(resolve_badge(completed), BadgeState::Done);
         completed.validate().unwrap();
+    }
+
+    #[test]
+    fn provider_error_capture_blocks_the_open_run_without_completing_it() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let begun = begin(None, &tracker);
+        let result = observe(
+            begun.record.as_ref(),
+            &begun.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
+            Some(CaptureObservation {
+                inference: CaptureInference::ProviderError {
+                    reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
+                },
+                observed_fingerprint: Some([7; 32]),
+            }),
+            2,
+        );
+        let state = active(&result);
+
+        assert_eq!(state.run_seq, 1);
+        assert_eq!(state.completed_seq, 0);
+        assert_eq!(
+            state.lifecycle,
+            LifecycleState::Error {
+                reason: Some(crate::detect::PROVIDER_OVERLOADED_REASON.to_string()),
+            }
+        );
+        assert_eq!(resolve_badge(state), BadgeState::Blocked);
+        assert_eq!(
+            state.unread.latest_unread().map(|latest| latest.reason),
+            Some(UnreadReason::Error)
+        );
+    }
+
+    #[test]
+    fn new_prompt_recovers_provider_error_and_a_later_failure_is_a_new_occurrence() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let begun = begin(None, &tracker);
+        let failed = reduce_once(
+            begun.record.as_ref(),
+            PaneEvent::FailRun {
+                observed_at: 11,
+                reason: Some(crate::detect::PROVIDER_OVERLOADED_REASON.to_string()),
+            },
+            &begun.tracker_delta.as_ref().unwrap().next,
+        );
+        assert_eq!(active(&failed).unread.occurrence_seq, 1);
+
+        let recovered = reduce_once(
+            failed.record.as_ref(),
+            PaneEvent::BeginRun {
+                started_at: 12,
+                prompt: None,
+            },
+            &failed.tracker_delta.as_ref().unwrap().next,
+        );
+        assert!(matches!(
+            active(&recovered).lifecycle,
+            LifecycleState::Running
+        ));
+        assert_eq!(active(&recovered).run_seq, 1);
+        assert_eq!(active(&recovered).completed_seq, 0);
+
+        let failed_again = reduce_once(
+            recovered.record.as_ref(),
+            PaneEvent::FailRun {
+                observed_at: 13,
+                reason: Some(crate::detect::PROVIDER_OVERLOADED_REASON.to_string()),
+            },
+            &recovered.tracker_delta.as_ref().unwrap().next,
+        );
+        assert_eq!(active(&failed_again).unread.occurrence_seq, 2);
+        assert_eq!(
+            active(&failed_again)
+                .unread
+                .latest_unread()
+                .map(|latest| latest.reason),
+            Some(UnreadReason::Error)
+        );
     }
 
     #[test]

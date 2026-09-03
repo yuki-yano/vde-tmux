@@ -147,6 +147,12 @@ fn repeated_permission_wait_observation_skips_fresh_visibility_query() {
     };
     let tracker = CaptureTrackerSnapshot::default();
     let present = AgentPresenceObservation::Present(agent);
+    let provider_error = CaptureObservation {
+        inference: CaptureInference::ProviderError {
+            reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
+        },
+        observed_fingerprint: Some([2; 32]),
+    };
 
     assert!(!observation_may_create_unread(
         &state,
@@ -161,6 +167,24 @@ fn repeated_permission_wait_observation_skips_fresh_visibility_query() {
         &tracker,
         &present,
         Some(&permission_wait),
+    ));
+
+    state.lifecycle = LifecycleState::Running;
+    assert!(observation_may_create_unread(
+        &state,
+        &tracker,
+        &present,
+        Some(&provider_error),
+    ));
+
+    state.lifecycle = LifecycleState::Error {
+        reason: Some(crate::detect::PROVIDER_OVERLOADED_REASON.to_string()),
+    };
+    assert!(!observation_may_create_unread(
+        &state,
+        &tracker,
+        &present,
+        Some(&provider_error),
     ));
 
     state.lifecycle = LifecycleState::Waiting {

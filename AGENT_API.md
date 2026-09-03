@@ -184,6 +184,15 @@ projection:
 `needs_action: false`. `needs_action` is derived from canonical triage state and does
 not disappear merely because a pane is visible.
 
+For Claude Code, `StopFailure(error=rate_limit)` projects the open run as Limited. Other official
+`StopFailure` errors project it as Blocked with `lifecycle.state=error`; `error=overloaded` and a
+529 overload have the stable reason `provider_overloaded`. Other hook reasons preserve the official
+`error` value. If the hook is missing or lost, the daemon's five-second supplementary scan uses
+`provider_api_error` for a provider-rendered `⏺ API Error:` only when its `· done` turn summary is
+the latest semantic line before the input area. A later prompt, retry spinner, tool output, or
+assistant output suppresses the inference. Neither path marks the run completed or automatically
+retries it.
+
 `agent list` returns present agents. Historical records retained for unread/sidebar behavior are
 not reported as current occupants. Results are ordered by canonical pane identity; consumers must
 not infer activity order from array position.

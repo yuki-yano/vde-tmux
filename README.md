@@ -237,11 +237,15 @@ does not prove active-turn attribution; a concurrent completion may start a new 
 
 When Claude Code or Codex exhausts its allowance, the active agent is queryable as
 `status=limited`, `lifecycle.state=waiting`, and `lifecycle.reason=usage_limit`. Claude Code's
-`StopFailure` rate-limit event is authoritative. A bounded, five-second supplementary pane-tail
-scan recognizes only the provider messages `You've hit your session limit` and `You've hit your
-usage limit`; generic rate-limit text and status-line warnings do not change state. Use
-`vt pane read` to inspect the provider's reset text. vde-tmux does not retry automatically or
-infer recovery from the clock; a later `SessionStart` or `UserPromptSubmit` is recovery evidence.
+`StopFailure` event is authoritative: `error=rate_limit` becomes Limited, while other API failures
+become `status=blocked` with `lifecycle.state=error`. `error=overloaded` and a 529 overload use the stable reason
+`provider_overloaded`. A bounded, five-second supplementary pane-tail scan recognizes only the
+provider's usage-limit messages and a Claude `⏺ API Error:` whose `· done` turn summary is the
+latest semantic line before the input area. Generic rate-limit text, status-line warnings, stale
+errors, and API-error text followed by a new prompt, retry spinner, tool output, or assistant output
+do not change state. Use `vt pane read` to inspect the provider text.
+vde-tmux does not retry automatically because the failed turn may already have performed side
+effects; a later `SessionStart` or `UserPromptSubmit` is recovery evidence.
 When process scanning confirms that the agent exited, the open run is completed and the pane is no
 longer exposed as a current Limited agent.
 

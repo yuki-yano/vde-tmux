@@ -1294,7 +1294,7 @@ where
 
 fn agent_hook_delivery_timeout_from_args(args: &[OsString]) -> Duration {
     let event = args.get(3).and_then(|arg| arg.to_str());
-    if matches!(event, Some("UserPromptSubmit" | "Stop")) {
+    if matches!(event, Some("UserPromptSubmit" | "Stop" | "StopFailure")) {
         Duration::from_secs(8)
     } else {
         Duration::from_secs(2)

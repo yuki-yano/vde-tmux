@@ -251,6 +251,48 @@ assert result["type"] == "agent_send_keys", result
 assert result["send"]["keys"] == ["y", "Enter"], result
 '
 
+TMUX_PANE="$CLAUDE_PANE" "$BIN" hook emit --agent claude --session-id api-v4-claude \
+  --status running --started-at "$(date +%s)"
+printf '%s' '{"session_id":"api-v4-claude","hook_event_name":"StopFailure","error":"overloaded","error_details":"529 Overloaded","last_assistant_message":"API Error: 529 Overloaded"}' \
+  | TMUX_PANE="$CLAUDE_PANE" "$BIN" hook claude StopFailure
+OVERLOADED_JSON="$($BIN agent get "$CLAUDE_PANE" --json)"
+printf '%s' "$OVERLOADED_JSON" | "$PYTHON" -c '
+import json, sys
+agent = json.load(sys.stdin)["result"]["agent"]
+assert agent["summary"]["status"] == "blocked", agent
+assert agent["summary"]["lifecycle"] == {
+    "state": "error",
+    "reason": "provider_overloaded",
+}, agent
+assert agent["run_seq"] > agent["completed_seq"], agent
+'
+OVERLOADED_RUN_SEQ="$(printf '%s' "$OVERLOADED_JSON" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["result"]["agent"]["run_seq"])')"
+
+printf '%s' '{"session_id":"api-v4-claude","hook_event_name":"UserPromptSubmit","prompt":"retry after overload"}' \
+  | TMUX_PANE="$CLAUDE_PANE" "$BIN" hook claude UserPromptSubmit
+RECOVERED_JSON="$($BIN agent get "$CLAUDE_PANE" --json)"
+printf '%s' "$RECOVERED_JSON" | "$PYTHON" -c '
+import json, sys
+agent = json.load(sys.stdin)["result"]["agent"]
+assert agent["summary"]["status"] == "working", agent
+assert agent["summary"]["lifecycle"] == {"state": "running"}, agent
+assert agent["run_seq"] == int(sys.argv[1]), agent
+assert agent["run_seq"] > agent["completed_seq"], agent
+' "$OVERLOADED_RUN_SEQ"
+
+printf '%s' '{"session_id":"api-v4-claude","hook_event_name":"StopFailure","error":"overloaded","error_details":"529 Overloaded"}' \
+  | TMUX_PANE="$CLAUDE_PANE" "$BIN" hook claude StopFailure
+REPEATED_ERROR_JSON="$($BIN agent get "$CLAUDE_PANE" --json)"
+printf '%s' "$REPEATED_ERROR_JSON" | "$PYTHON" -c '
+import json, sys
+agent = json.load(sys.stdin)["result"]["agent"]
+assert agent["summary"]["status"] == "blocked", agent
+assert agent["summary"]["lifecycle"] == {
+    "state": "error",
+    "reason": "provider_overloaded",
+}, agent
+'
+
 SCHEMA_JSON="$("$BIN" api schema --json)"
 printf '%s' "$SCHEMA_JSON" | "$PYTHON" -c '
 import json, sys
@@ -266,4 +308,4 @@ assert providers["opencode"]["capabilities"]["prompt_confirmation"] == "none", p
 assert providers["opencode"]["capabilities"]["steer"] == "disabled", providers
 '
 
-echo "isolated API v4 split/start/send/steer/send-keys and copy-mode guards ok"
+echo "isolated API v4 split/start/send/steer/send-keys, StopFailure recovery, and copy-mode guards ok"
