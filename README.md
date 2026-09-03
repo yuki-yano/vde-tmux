@@ -237,9 +237,12 @@ does not prove active-turn attribution; a concurrent completion may start a new 
 
 When Claude Code or Codex exhausts its allowance, the active agent is queryable as
 `status=limited`, `lifecycle.state=waiting`, and `lifecycle.reason=usage_limit`. Claude Code's
-`StopFailure` event is authoritative: `error=rate_limit` becomes Limited, while other API failures
-become `status=blocked` with `lifecycle.state=error`. `error=overloaded` and a 529 overload use the stable reason
-`provider_overloaded`. A bounded, five-second supplementary pane-tail scan recognizes only the
+`StopFailure` event is authoritative for an open run: `error=rate_limit` becomes Limited, while
+other API failures become `status=blocked` with `lifecycle.state=error`. `error=overloaded` and a
+529 overload use the stable reason `provider_overloaded`. If the same session reports a failure
+after its run already completed, vde-tmux performs one terminal check before opening another run;
+this keeps delayed or ancillary failures from replacing a successful completion. A bounded,
+five-second supplementary pane-tail scan recognizes only the
 provider's usage-limit messages and a Claude `⏺ API Error:` whose `· done` turn summary is the
 latest semantic line before the input area. Generic rate-limit text, status-line warnings, stale
 errors, and API-error text followed by a new prompt, retry spinner, tool output, or assistant output

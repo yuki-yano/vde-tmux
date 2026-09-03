@@ -235,8 +235,9 @@ globalな発生順はdaemonが管理し、移動中に最新paneが消えた場�
 移動操作そのものは既読化せず、移動先がactive paneとして観測された後に既読になります。
 この操作はpeekには入りません。
 
-Claude CodeのturnがAPIエラーで終了した場合、`StopFailure` を一次情報として扱います。
+Claude Codeのopen runがAPIエラーで終了した場合、`StopFailure` を一次情報として扱います。
 `error=rate_limit` は `Limited`、それ以外は `Blocked` / `lifecycle.state=error` になり、`error=overloaded` と529 overloadのreasonは `provider_overloaded` です。
+同じsessionからrun完了後にfailureが届いた場合は、遅延イベントや補助処理の失敗で正常完了を上書きしないよう、terminalを1回確認して現在のエラー表示と一致した場合だけ次のrunを開きます。
 hookを取りこぼした場合に限り、daemonは5秒間隔の補助scanで、`⏺ API Error:` の後にある `· done` turn summaryが入力欄より前の最新semantic行になった状態を検出します。
 古いエラー、通常のログ本文、新しいprompt、retry spinner、tool出力、assistant出力がエラー後に続いている画面は検出しません。
 途中で副作用が発生済みの可能性があるため自動再送は行わず、後続の `SessionStart` または `UserPromptSubmit` を回復証拠とします。

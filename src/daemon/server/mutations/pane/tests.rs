@@ -98,7 +98,7 @@ fn observation_batch_applies_all_stages_and_publishes_one_snapshot_build() {
 }
 
 #[test]
-fn repeated_permission_wait_observation_skips_fresh_visibility_query() {
+fn observation_unread_preflight_matches_state_creating_inferences() {
     use crate::pane_state::{
         AgentKind, AgentPresenceObservation, CaptureInference, CaptureObservation,
         CaptureTrackerSnapshot, LifecycleState, PANE_STATE_SCHEMA_VERSION, PaneInstance, PaneState,
@@ -153,6 +153,10 @@ fn repeated_permission_wait_observation_skips_fresh_visibility_query() {
         },
         observed_fingerprint: Some([2; 32]),
     };
+    let usage_limit = CaptureObservation {
+        inference: CaptureInference::UsageLimit,
+        observed_fingerprint: Some([3; 32]),
+    };
 
     assert!(!observation_may_create_unread(
         &state,
@@ -185,6 +189,36 @@ fn repeated_permission_wait_observation_skips_fresh_visibility_query() {
         &tracker,
         &present,
         Some(&provider_error),
+    ));
+
+    state.lifecycle = LifecycleState::Running;
+    assert!(observation_may_create_unread(
+        &state,
+        &tracker,
+        &present,
+        Some(&usage_limit),
+    ));
+    assert!(observation_may_create_unread(
+        &state,
+        &tracker,
+        &AgentPresenceObservation::Absent,
+        Some(&usage_limit),
+    ));
+    assert!(observation_may_create_unread(
+        &state,
+        &tracker,
+        &AgentPresenceObservation::Absent,
+        Some(&provider_error),
+    ));
+
+    state.lifecycle = LifecycleState::Waiting {
+        reason: WaitReason::Other("usage_limit".to_string()),
+    };
+    assert!(!observation_may_create_unread(
+        &state,
+        &tracker,
+        &present,
+        Some(&usage_limit),
     ));
 
     state.lifecycle = LifecycleState::Waiting {

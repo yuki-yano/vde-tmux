@@ -1361,6 +1361,8 @@ pub struct CaptureTrackerSnapshot {
     pub generation: u64,
     pub epoch: Option<(StateId, u64)>,
     pub hook_authoritative: bool,
+    /// A same-session interruption received after completion awaits one terminal check.
+    pub interruption_verification_pending: bool,
     /// Currently verified exact identity exposed through the daemon projection.
     pub agent_process: Option<AgentProcessIdentity>,
     /// Last exact identity, retained across temporary ambiguity for replacement detection.

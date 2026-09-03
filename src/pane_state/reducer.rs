@@ -233,6 +233,15 @@ fn reduce_explicit(
     let epoch_evidence = is_epoch_start_evidence(&envelope.event);
     let completion = is_completion_for_state(&state, &envelope.event);
     let completed_before = state.completed_seq;
+    if interruption_needs_terminal_verification(&state, identity, &envelope.event) {
+        if context.tracker.interruption_verification_pending {
+            return Ok(Reduction::unchanged(current));
+        }
+        let mut tracker = context.tracker.clone();
+        tracker.interruption_verification_pending = true;
+        bump_tracker(&mut tracker)?;
+        return finish_state_reduction(current, state, tracker, Some(context.tracker));
+    }
     match identity {
         ExistingIdentity::ExactPresent => {
             apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
@@ -311,6 +320,7 @@ fn reduce_explicit(
     } else {
         context.tracker.clone()
     };
+    tracker.interruption_verification_pending = false;
     tracker.absence_count = 0;
     tracker.replacement_kind = None;
     tracker.replacement_streak = 0;
@@ -830,6 +840,25 @@ fn is_completion_for_state(state: &PaneState, event: &PaneEvent) -> bool {
     )
 }
 
+fn interruption_needs_terminal_verification(
+    state: &PaneState,
+    identity: ExistingIdentity,
+    event: &PaneEvent,
+) -> bool {
+    state.agent.as_str() == "claude"
+        && matches!(
+            identity,
+            ExistingIdentity::ExactPresent | ExistingIdentity::ExactAbsent
+        )
+        && state.completed_seq > 0
+        && state.run_seq == state.completed_seq
+        && match event {
+            PaneEvent::FailRun { .. } => true,
+            PaneEvent::WaitRequested { reason, .. } => reason.is_usage_limit(),
+            _ => false,
+        }
+}
+
 fn begin_agent_epoch(
     state: &mut PaneState,
     agent: AgentKind,
@@ -1334,6 +1363,7 @@ fn apply_capture(
     };
     let fingerprint_changed = capture.observed_fingerprint.is_some()
         && capture.observed_fingerprint != tracker.fingerprint;
+    tracker.interruption_verification_pending = false;
     tracker.last_semantic_scan_at = Some(observed_at);
     if tracker.rebaseline_pending {
         if matches!(
@@ -1397,6 +1427,7 @@ fn reset_tracker_for_state(
         generation: tracker.generation,
         epoch: Some((state.state_id.clone(), state.agent_epoch)),
         hook_authoritative: false,
+        interruption_verification_pending: false,
         agent_process: None,
         last_agent_process: state.agent_process.clone(),
         absence_count: 0,
@@ -3179,6 +3210,326 @@ mod tests {
             state.unread.latest_unread().map(|latest| latest.reason),
             Some(UnreadReason::Error)
         );
+    }
+
+    #[test]
+    fn closed_claude_run_verifies_interruptions_before_opening_a_new_run() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let begun = reduce_explicit_once(
+            None,
+            "claude",
+            "session-1",
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: None,
+            },
+            &tracker,
+        )
+        .unwrap();
+        let completed = reduce_explicit_once(
+            begun.record.as_ref(),
+            "claude",
+            "session-1",
+            PaneEvent::CompleteRun { completed_at: 2 },
+            &begun.tracker_delta.as_ref().unwrap().next,
+        )
+        .unwrap();
+        let completed_tracker = &completed.tracker_delta.as_ref().unwrap().next;
+        let expected = active(&completed);
+
+        for event in [
+            PaneEvent::WaitRequested {
+                observed_at: 3,
+                reason: WaitReason::usage_limit(),
+            },
+            PaneEvent::FailRun {
+                observed_at: 3,
+                reason: Some(crate::detect::PROVIDER_OVERLOADED_REASON.to_string()),
+            },
+        ] {
+            let late = reduce_explicit_once(
+                completed.record.as_ref(),
+                "claude",
+                "session-1",
+                event,
+                completed_tracker,
+            )
+            .unwrap();
+            let state = active(&late);
+
+            assert_eq!(state.run_seq, expected.run_seq);
+            assert_eq!(state.completed_seq, expected.completed_seq);
+            assert_eq!(state.started_at, expected.started_at);
+            assert_eq!(state.completed_at, expected.completed_at);
+            assert!(matches!(state.lifecycle, LifecycleState::Idle));
+            assert_eq!(resolve_badge(state), BadgeState::Done);
+            assert_eq!(state.unread, expected.unread);
+            assert!(
+                late.tracker_delta
+                    .as_ref()
+                    .unwrap()
+                    .next
+                    .interruption_verification_pending
+            );
+        }
+
+        let permission = reduce_explicit_once(
+            completed.record.as_ref(),
+            "claude",
+            "session-1",
+            PaneEvent::WaitRequested {
+                observed_at: 3,
+                reason: WaitReason::PermissionPrompt,
+            },
+            completed_tracker,
+        )
+        .unwrap();
+        assert_eq!(active(&permission).run_seq, expected.run_seq + 1);
+        assert!(matches!(
+            active(&permission).lifecycle,
+            LifecycleState::Waiting {
+                reason: WaitReason::PermissionPrompt
+            }
+        ));
+        assert!(
+            !permission
+                .tracker_delta
+                .as_ref()
+                .unwrap()
+                .next
+                .interruption_verification_pending
+        );
+
+        let pending = reduce_explicit_once(
+            completed.record.as_ref(),
+            "claude",
+            "session-1",
+            PaneEvent::FailRun {
+                observed_at: 3,
+                reason: Some(crate::detect::PROVIDER_OVERLOADED_REASON.to_string()),
+            },
+            completed_tracker,
+        )
+        .unwrap();
+        let pending_tracker = &pending.tracker_delta.as_ref().unwrap().next;
+        let duplicate = reduce_explicit_once(
+            pending.record.as_ref(),
+            "claude",
+            "session-1",
+            PaneEvent::FailRun {
+                observed_at: 4,
+                reason: Some(crate::detect::PROVIDER_OVERLOADED_REASON.to_string()),
+            },
+            pending_tracker,
+        )
+        .unwrap();
+        assert_eq!(duplicate.outcome, ReductionOutcome::Noop);
+        assert!(duplicate.tracker_delta.is_none());
+        assert_eq!(duplicate.record, pending.record);
+
+        let next_run_while_pending = reduce_explicit_once(
+            pending.record.as_ref(),
+            "claude",
+            "session-1",
+            PaneEvent::BeginRun {
+                started_at: 4,
+                prompt: None,
+            },
+            pending_tracker,
+        )
+        .unwrap();
+        assert_eq!(
+            active(&next_run_while_pending).run_seq,
+            expected.run_seq + 1
+        );
+        assert!(matches!(
+            active(&next_run_while_pending).lifecycle,
+            LifecycleState::Running
+        ));
+        assert!(
+            !next_run_while_pending
+                .tracker_delta
+                .as_ref()
+                .unwrap()
+                .next
+                .interruption_verification_pending
+        );
+
+        let verified = observe(
+            pending.record.as_ref(),
+            pending_tracker,
+            AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
+            Some(CaptureObservation {
+                inference: CaptureInference::ProviderError {
+                    reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
+                },
+                observed_fingerprint: Some([9; 32]),
+            }),
+            4,
+        );
+        let verified_state = active(&verified);
+        assert_eq!(verified_state.run_seq, expected.run_seq + 1);
+        assert_eq!(verified_state.completed_seq, expected.completed_seq);
+        assert!(matches!(
+            &verified_state.lifecycle,
+            LifecycleState::Error { reason }
+                if reason.as_deref() == Some(crate::detect::PROVIDER_OVERLOADED_REASON)
+        ));
+        assert!(
+            !verified
+                .tracker_delta
+                .as_ref()
+                .unwrap()
+                .next
+                .interruption_verification_pending
+        );
+
+        let pending_limit = reduce_explicit_once(
+            completed.record.as_ref(),
+            "claude",
+            "session-1",
+            PaneEvent::WaitRequested {
+                observed_at: 3,
+                reason: WaitReason::usage_limit(),
+            },
+            completed_tracker,
+        )
+        .unwrap();
+        let verified_limit = observe(
+            pending_limit.record.as_ref(),
+            &pending_limit.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
+            Some(CaptureObservation {
+                inference: CaptureInference::UsageLimit,
+                observed_fingerprint: Some([6; 32]),
+            }),
+            4,
+        );
+        assert_eq!(active(&verified_limit).run_seq, expected.run_seq + 1);
+        assert!(active(&verified_limit).lifecycle.is_usage_limited());
+
+        let pending = reduce_explicit_once(
+            completed.record.as_ref(),
+            "claude",
+            "session-1",
+            PaneEvent::FailRun {
+                observed_at: 3,
+                reason: Some(crate::detect::PROVIDER_OVERLOADED_REASON.to_string()),
+            },
+            completed_tracker,
+        )
+        .unwrap();
+        let unconfirmed = observe(
+            pending.record.as_ref(),
+            &pending.tracker_delta.as_ref().unwrap().next,
+            AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
+            Some(CaptureObservation {
+                inference: CaptureInference::NoChange,
+                observed_fingerprint: Some([8; 32]),
+            }),
+            4,
+        );
+        assert_eq!(active(&unconfirmed).run_seq, expected.run_seq);
+        assert!(matches!(
+            active(&unconfirmed).lifecycle,
+            LifecycleState::Idle
+        ));
+        assert!(
+            !unconfirmed
+                .tracker_delta
+                .as_ref()
+                .unwrap()
+                .next
+                .interruption_verification_pending
+        );
+
+        let next_run = reduce_explicit_once(
+            unconfirmed.record.as_ref(),
+            "claude",
+            "session-1",
+            PaneEvent::BeginRun {
+                started_at: 5,
+                prompt: None,
+            },
+            &unconfirmed.tracker_delta.as_ref().unwrap().next,
+        )
+        .unwrap();
+        let next_failure = reduce_explicit_once(
+            next_run.record.as_ref(),
+            "claude",
+            "session-1",
+            PaneEvent::FailRun {
+                observed_at: 6,
+                reason: Some(crate::detect::PROVIDER_OVERLOADED_REASON.to_string()),
+            },
+            &next_run.tracker_delta.as_ref().unwrap().next,
+        )
+        .unwrap();
+        assert_eq!(active(&next_failure).run_seq, expected.run_seq + 1);
+        assert!(matches!(
+            active(&next_failure).lifecycle,
+            LifecycleState::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_report_and_capture_can_open_an_error_after_completion() {
+        let tracker = CaptureTrackerSnapshot::default();
+        let begun = reduce_explicit_once(
+            None,
+            "claude",
+            "session-1",
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: None,
+            },
+            &tracker,
+        )
+        .unwrap();
+        let completed = reduce_explicit_once(
+            begun.record.as_ref(),
+            "claude",
+            "session-1",
+            PaneEvent::CompleteRun { completed_at: 2 },
+            &begun.tracker_delta.as_ref().unwrap().next,
+        )
+        .unwrap();
+        let completed_tracker = &completed.tracker_delta.as_ref().unwrap().next;
+
+        let reported = reduce_explicit_once(
+            completed.record.as_ref(),
+            "claude",
+            "session-1",
+            report(Some(ReportedLifecycle::Error {
+                reason: Some("reported".to_string()),
+            })),
+            completed_tracker,
+        )
+        .unwrap();
+        assert_eq!(active(&reported).run_seq, 2);
+        assert!(matches!(
+            &active(&reported).lifecycle,
+            LifecycleState::Error { reason } if reason.as_deref() == Some("reported")
+        ));
+
+        let captured = observe(
+            completed.record.as_ref(),
+            completed_tracker,
+            AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
+            Some(CaptureObservation {
+                inference: CaptureInference::ProviderError {
+                    reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
+                },
+                observed_fingerprint: Some([7; 32]),
+            }),
+            3,
+        );
+        assert_eq!(active(&captured).run_seq, 2);
+        assert!(matches!(
+            &active(&captured).lifecycle,
+            LifecycleState::Error { reason }
+                if reason.as_deref() == Some(crate::detect::PROVIDER_OVERLOADED_REASON)
+        ));
     }
 
     #[test]

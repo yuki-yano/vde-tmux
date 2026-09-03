@@ -187,7 +187,9 @@ not disappear merely because a pane is visible.
 For Claude Code, `StopFailure(error=rate_limit)` projects the open run as Limited. Other official
 `StopFailure` errors project it as Blocked with `lifecycle.state=error`; `error=overloaded` and a
 529 overload have the stable reason `provider_overloaded`. Other hook reasons preserve the official
-`error` value. If the hook is missing or lost, the daemon's five-second supplementary scan uses
+`error` value. A same-session failure received after canonical completion schedules one terminal
+verification and opens a new failed run only when the current pane still confirms the failure. If
+the hook is missing or lost, the daemon's five-second supplementary scan uses
 `provider_api_error` for a provider-rendered `⏺ API Error:` only when its `· done` turn summary is
 the latest semantic line before the input area. A later prompt, retry spinner, tool output, or
 assistant output suppresses the inference. Neither path marks the run completed or automatically

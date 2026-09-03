@@ -349,6 +349,15 @@ fn capture_mode(
     presence: &AgentPresenceObservation,
     observed_at: i64,
 ) -> Option<CaptureMode> {
+    if snapshot.tracker.interruption_verification_pending
+        && !matches!(presence, AgentPresenceObservation::Unknown)
+        && snapshot
+            .state
+            .as_ref()
+            .is_some_and(|state| state.agent.as_str() == "claude")
+    {
+        return Some(CaptureMode::ActiveTerminalSignals);
+    }
     let fallback_needed = match presence {
         AgentPresenceObservation::Present(observed_agent) => {
             snapshot.state.as_ref().is_none_or(|state| {
@@ -645,6 +654,42 @@ mod tests {
         assert_eq!(
             capture_mode(&dispatch, &AgentPresenceObservation::Absent, 101),
             Some(CaptureMode::UsageLimitOnly)
+        );
+    }
+
+    #[test]
+    fn pending_closed_run_interruption_gets_one_terminal_verification_capture() {
+        let mut state = canonical_state("claude");
+        state.lifecycle = LifecycleState::Idle;
+        state.completed_seq = state.run_seq;
+        state.completed_at = Some(101);
+        let present = AgentPresenceObservation::Present(state.agent.clone());
+        let dispatch = ObservationDispatchSnapshot {
+            pane_instance: state.pane_instance.clone(),
+            base: Some(StoredStateDescriptor::Canonical {
+                version: state.version(),
+            }),
+            tracker: CaptureTrackerSnapshot {
+                epoch: Some((state.state_id.clone(), state.agent_epoch)),
+                hook_authoritative: true,
+                interruption_verification_pending: true,
+                last_semantic_scan_at: Some(100),
+                ..CaptureTrackerSnapshot::default()
+            },
+            state: Some(state),
+        };
+
+        assert_eq!(
+            capture_mode(&dispatch, &present, 101),
+            Some(CaptureMode::ActiveTerminalSignals)
+        );
+        assert_eq!(
+            capture_mode(&dispatch, &AgentPresenceObservation::Absent, 101),
+            Some(CaptureMode::ActiveTerminalSignals)
+        );
+        assert_eq!(
+            capture_mode(&dispatch, &AgentPresenceObservation::Unknown, 101),
+            None
         );
     }
 

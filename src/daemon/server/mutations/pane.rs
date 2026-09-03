@@ -566,7 +566,11 @@ pub(in crate::daemon::server) fn observation_may_create_unread(
         && state.scan_verified
         && !matches!(state.lifecycle, LifecycleState::Idle);
     let capture_is_applied = state.agent_present
-        && matches!(presence, AgentPresenceObservation::Present(kind) if kind == &state.agent);
+        && match presence {
+            AgentPresenceObservation::Present(kind) => kind == &state.agent,
+            AgentPresenceObservation::Absent => true,
+            AgentPresenceObservation::Unknown => false,
+        };
     let stale_capture_can_complete = capture_is_applied
         && matches!(
             capture,
@@ -594,10 +598,20 @@ pub(in crate::daemon::server) fn observation_may_create_unread(
             })
         )
         && !matches!(state.lifecycle, LifecycleState::Error { .. });
+    let usage_limit_can_create = capture_is_applied
+        && matches!(
+            capture,
+            Some(crate::pane_state::CaptureObservation {
+                inference: CaptureInference::UsageLimit,
+                ..
+            })
+        )
+        && !state.lifecycle.is_usage_limited();
     confirmed_absence_can_complete
         || stale_capture_can_complete
         || permission_wait_can_create
         || provider_error_can_create
+        || usage_limit_can_create
 }
 
 pub(in crate::daemon::server) fn apply_external_view_event(

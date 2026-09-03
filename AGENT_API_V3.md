@@ -115,7 +115,7 @@ state resetによってgenerationが変わった場合、以前の`operation_ref
 
 Claude CodeまたはCodexが利用上限へ到達したPaneは、occupantの公開statusを`blocked`、lifecycleを`waiting`、reasonを`usage_limit`として投影する。
 
-Claude Codeの`StopFailure(error=rate_limit)`を利用上限の一次情報とする。その他の`StopFailure`はopen runを`error + unresolved`へ遷移させ、`error=overloaded`と529 overloadはreason `provider_overloaded`とする。Codexには同等のfailure hookがないため、daemonは実行中のClaude Code/Codex paneを5秒間隔で一括captureし、直近30行の行頭にある`You've hit your session limit`または`You've hit your usage limit`を補助証拠として扱う。Claude Codeについては、`⏺ API Error:`の後にある`· done` turn summaryが入力欄より前の最新semantic行になった状態も補助証拠とする。新しいprompt、retry spinner、tool出力、assistant出力が後続する場合、通常のrate-limit文、statuslineの残量警告、古いscrollbackは状態を変更しない。APIエラーはsemantic completionではなく、自動再送も行わない。
+Claude Codeの`StopFailure(error=rate_limit)`を利用上限の一次情報とする。その他の`StopFailure`はopen runを`error + unresolved`へ遷移させ、`error=overloaded`と529 overloadはreason `provider_overloaded`とする。同じsessionのrunがすでに完了している場合はterminalを1回確認し、現在の表示がfailureを裏付けた場合だけ新しいrunを開く。Codexには同等のfailure hookがないため、daemonは実行中のClaude Code/Codex paneを5秒間隔で一括captureし、直近30行の行頭にある`You've hit your session limit`または`You've hit your usage limit`を補助証拠として扱う。Claude Codeについては、`⏺ API Error:`の後にある`· done` turn summaryが入力欄より前の最新semantic行になった状態も補助証拠とする。新しいprompt、retry spinner、tool出力、assistant出力が後続する場合、通常のrate-limit文、statuslineの残量警告、古いscrollbackは状態を変更しない。APIエラーはsemantic completionではなく、自動再送も行わない。
 
 利用上限はsemantic completionではない。processが終了した場合もopen runと`usage_limit`を保持し、`present=false`のAgent Summaryとして参照できる。時刻到達だけではproviderの回復を証明できないため自動retryや時計ベースの解除は行わず、後続の`SessionStart`または`UserPromptSubmit`を回復証拠とする。reset時刻を必要とするcallerは`vt pane read`でprovider原文を取得する。
 
