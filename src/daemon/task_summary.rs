@@ -342,7 +342,7 @@ fn run_codex_with_binary(
         "-c",
         "project_doc_max_bytes=0",
         "-c",
-        "model_reasoning_effort=\"none\"",
+        "model_reasoning_effort=\"low\"",
         "--output-schema",
     ]);
     command.arg(&temp.schema_path);
