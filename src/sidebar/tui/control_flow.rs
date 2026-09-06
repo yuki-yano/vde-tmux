@@ -69,6 +69,7 @@ pub(super) struct RenderGate {
     dirty: bool,
     last_elapsed_second: Option<i64>,
     last_toast: Option<(String, NoticeLevel)>,
+    last_summary_animation_tick: Option<u128>,
 }
 
 impl RenderGate {
@@ -77,6 +78,7 @@ impl RenderGate {
             dirty: true,
             last_elapsed_second: None,
             last_toast: None,
+            last_summary_animation_tick: None,
         }
     }
 
@@ -96,6 +98,15 @@ impl RenderGate {
             self.last_toast = current;
             self.dirty = true;
         }
+    }
+
+    pub(super) fn note_summary_animation(&mut self, elapsed: Duration, visible: bool) -> usize {
+        let tick = elapsed.as_millis() / 100;
+        if visible && self.last_summary_animation_tick != Some(tick) {
+            self.last_summary_animation_tick = Some(tick);
+            self.dirty = true;
+        }
+        tick as usize
     }
 
     pub(super) fn take_draw_decision(

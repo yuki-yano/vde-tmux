@@ -858,6 +858,86 @@ fn summary_is_rendered_as_primary_detail_text() {
 }
 
 #[test]
+fn summary_loading_uses_animated_glyphs_in_closed_and_expanded_rows() {
+    let mut chat = chat_row(
+        "chat::%1::101",
+        "Codex",
+        RollupLevel::Running,
+        BadgeState::Working,
+    );
+    chat.expanded = false;
+    chat.meta = Some(crate::sidebar::tree::RowMeta {
+        agent: Some("Codex".to_string()),
+        task_summary_loading: true,
+        ..Default::default()
+    });
+    let detail = detail_row("detail::%1::101::summary-loading", "", RollupLevel::Running);
+    for width in [24, 35, 36, 60] {
+        for frame in [0, 1, 9] {
+            let state = SidebarState {
+                summary_spinner_frame: frame,
+                ..Default::default()
+            };
+            let closed = render_rows(std::slice::from_ref(&chat), &state, width);
+            assert!(closed.contains(task_summary_spinner(&state)), "{closed:?}");
+            assert!(!closed.contains("Loading"));
+            if width >= 36 {
+                let expanded = render_rows(std::slice::from_ref(&detail), &state, width);
+                assert!(
+                    expanded.contains(task_summary_spinner(&state)),
+                    "{expanded:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn closed_response_preview_is_colored_truncated_and_part_of_the_selected_agent() {
+    let theme = SidebarRenderTheme::default();
+    let mut chat = chat_row(
+        "chat::%1::101",
+        "Codex",
+        RollupLevel::Idle,
+        BadgeState::Done,
+    );
+    chat.expanded = false;
+    chat.meta = Some(crate::sidebar::tree::RowMeta {
+        agent: Some("Codex".to_string()),
+        task_summary: Some("変更内容".to_string()),
+        response_preview: Some("実装を完了しました。テストも成功しました。".to_string()),
+        ..Default::default()
+    });
+    let state = SidebarState {
+        selection: Some(chat.id.clone()),
+        ..Default::default()
+    };
+    for width in [24, 35, 36, 60] {
+        let rendered =
+            render_lines_with_indices(std::slice::from_ref(&chat), &state, width, &theme);
+        let response = rendered.lines.last().unwrap();
+        let text = line_to_string(response.clone());
+        assert!(text.contains("▷ 実装"), "{text:?}");
+        assert_eq!(display_width(&text), width);
+        assert_eq!(response.style.bg, Some(theme.selection_bg));
+        assert!(
+            response
+                .spans
+                .iter()
+                .any(|span| span.content.contains("実装")
+                    && span.style.fg == Some(RESPONSE_PREVIEW_COLOR))
+        );
+        assert!(rendered.row_indices.iter().all(|index| *index == Some(0)));
+    }
+    chat.meta.as_mut().unwrap().task_summary = None;
+    let text = render_rows(std::slice::from_ref(&chat), &state, 60);
+    assert_eq!(text.lines().count(), 2);
+    assert!(text.contains("▷ 実装"));
+    chat.meta.as_mut().unwrap().response_preview = None;
+    assert_eq!(render_rows(&[chat], &state, 60).lines().count(), 1);
+}
+
+#[test]
 fn expanded_agent_header_separates_identity_origin_and_summary_colors() {
     let theme = SidebarRenderTheme::default();
     let mut chat = row(

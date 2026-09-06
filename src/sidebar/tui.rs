@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -244,6 +244,8 @@ fn run_loop<B: Backend>(
     );
     let mut mark_ui = MarkCompleteUi::default();
     let mut render_gate = RenderGate::new();
+    let animation_started = Instant::now();
+    let mut summary_spinner_visible = false;
     let mut last_frame: Option<DrawnFrame> = None;
     let mut pending_g = false;
     let mut category_dialog: Option<CategoryDialog> = None;
@@ -487,6 +489,12 @@ fn run_loop<B: Backend>(
         let elapsed_clock_visible = current
             .as_ref()
             .is_some_and(|snapshot| sidebar_elapsed_clock_visible(snapshot, sidebar_instance));
+        sidebar_state.summary_spinner_frame = render_gate.note_summary_animation(
+            animation_started.elapsed(),
+            summary_spinner_visible
+                && elapsed_clock_visible
+                && matches!(connection, ConnectionState::Connected),
+        );
         let draw_this_loop = render_gate.take_draw_decision(
             crate::sidebar::tree::now_epoch_secs(),
             elapsed_clock_visible,
@@ -540,6 +548,23 @@ fn run_loop<B: Backend>(
                         areas.rows_height as usize,
                     )
                 };
+                summary_spinner_visible = category_dialog.is_none()
+                    && rendered
+                        .row_indices
+                        .iter()
+                        .skip(frame_scroll)
+                        .take(areas.rows_height as usize)
+                        .flatten()
+                        .any(|index| {
+                            let row = &sidebar.rows[*index];
+                            row.id.ends_with("::summary-loading")
+                                || area.width >= 24
+                                    && (!row.expanded || area.width < 36)
+                                    && row
+                                        .meta
+                                        .as_ref()
+                                        .is_some_and(|meta| meta.task_summary_loading)
+                        });
                 last_frame = Some(DrawnFrame {
                     header,
                     header_rows: areas.header_rows,

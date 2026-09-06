@@ -104,11 +104,20 @@ fn render_closed_chat_digest_lines(
     if closed_chat_has_detail_line(row) {
         lines.push(render_closed_chat_detail_line(row, state, width, theme));
     }
+    if let Some(line) = render_chat_response_line(row, state, width, theme) {
+        lines.push(line);
+    }
     lines
 }
 
 fn closed_chat_has_detail_line(row: &SidebarRow) -> bool {
-    !chat_task_summary_label(row).trim().is_empty() || closed_chat_reason_token(row).is_some()
+    row.meta.as_ref().is_some_and(|meta| {
+        meta.task_summary_loading
+            || meta
+                .task_summary
+                .as_ref()
+                .is_some_and(|summary| !summary.trim().is_empty())
+    }) || closed_chat_reason_token(row).is_some()
 }
 
 fn render_closed_chat_summary_line(
@@ -186,8 +195,17 @@ fn render_closed_chat_detail_line(
         }
         _ => (available, None),
     };
-    let summary = truncate_display(&chat_task_summary_label(row), summary_budget);
-    spans.push(Span::styled(summary, row_style(row, theme)));
+    let summary = truncate_display(&chat_task_summary_label(row, state), summary_budget);
+    let summary_style = if row
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.task_summary_loading)
+    {
+        Style::default().fg(theme.detail)
+    } else {
+        row_style(row, theme)
+    };
+    spans.push(Span::styled(summary, summary_style));
     let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
     let reason_width = reason.as_deref().map(display_width).unwrap_or(0);
     let filler = width
@@ -203,6 +221,38 @@ fn render_closed_chat_detail_line(
     }
     spans.push(Span::raw(" ".to_string()));
     style_chat_digest_line(Line::from(spans), selected, theme)
+}
+
+fn render_chat_response_line(
+    row: &SidebarRow,
+    state: &SidebarState,
+    width: usize,
+    theme: &SidebarRenderTheme,
+) -> Option<Line<'static>> {
+    let response = row.meta.as_ref()?.response_preview.as_deref()?.trim();
+    if response.is_empty() {
+        return None;
+    }
+    let indent = if WidthTier::from_width(width) == WidthTier::Standard {
+        format!("{}    ", "  ".repeat(row.depth))
+    } else {
+        "  ".to_string()
+    };
+    let mut spans = Vec::new();
+    push_leading_marker_span(&mut spans, row, false, theme, &indent);
+    let prefix_width: usize = spans.iter().map(|span| display_width(&span.content)).sum();
+    let label = truncate_display(
+        &format!("▷ {response}"),
+        width.saturating_sub(prefix_width + 1),
+    );
+    spans.extend(response_label_spans(&label, theme));
+    let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    Some(style_chat_digest_line(
+        Line::from(spans),
+        row_is_selected(row, state),
+        theme,
+    ))
 }
 
 fn style_chat_digest_line(
@@ -293,6 +343,9 @@ fn render_row_line(
     let label_source = match row.kind {
         SidebarRowKind::Category => row.label.clone(),
         SidebarRowKind::Chat => chat_display_label(row),
+        SidebarRowKind::Detail if row.id.ends_with("::summary-loading") => {
+            task_summary_spinner(state).to_string()
+        }
         _ => row.label.clone(),
     };
     let label = truncate_display(&label_source, label_budget);
@@ -506,19 +559,7 @@ fn detail_label_spans(
         )]);
     }
     if row.id.ends_with("::response") {
-        let body = label.strip_prefix("▷ ").unwrap_or(label);
-        return Some(vec![
-            Span::styled(
-                "▷ ".to_string(),
-                Style::default()
-                    .fg(theme.branch)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                body.to_string(),
-                Style::default().fg(RESPONSE_PREVIEW_COLOR),
-            ),
-        ]);
+        return Some(response_label_spans(label, theme));
     }
     if row.id.contains("::task::") {
         return task_detail_label_spans(label, row, theme);
@@ -539,6 +580,27 @@ fn detail_label_spans(
         )]);
     }
     None
+}
+
+fn response_label_spans(label: &str, theme: &SidebarRenderTheme) -> Vec<Span<'static>> {
+    let Some(body) = label.strip_prefix("▷ ") else {
+        return vec![Span::styled(
+            label.to_string(),
+            Style::default().fg(RESPONSE_PREVIEW_COLOR),
+        )];
+    };
+    vec![
+        Span::styled(
+            "▷ ",
+            Style::default()
+                .fg(theme.branch)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            body.to_string(),
+            Style::default().fg(RESPONSE_PREVIEW_COLOR),
+        ),
+    ]
 }
 
 fn signal_label_spans(
@@ -723,6 +785,12 @@ fn render_dense_lines(
             lines.push(line);
             row_indices.push(Some(index));
         }
+        if row.kind == SidebarRowKind::Chat
+            && let Some(line) = render_chat_response_line(row, state, width, theme)
+        {
+            lines.push(line);
+            row_indices.push(Some(index));
+        }
     }
     RenderedLines { lines, row_indices }
 }
@@ -785,7 +853,7 @@ fn render_chat_dense_line(
         .unwrap_or("");
     let origin = origin.chars().take(3).collect::<String>();
     let right = right_label(row).unwrap_or_default();
-    let body = chat_task_summary_label(row);
+    let body = chat_task_summary_label(row, state);
     let agent_cell = format!(" {agent:<7}");
     let origin_cell = if origin.is_empty() {
         String::new()
@@ -1262,7 +1330,19 @@ fn chat_display_label(row: &SidebarRow) -> String {
     display_agent_label_prefix(&row.label)
 }
 
-fn chat_task_summary_label(row: &SidebarRow) -> String {
+fn task_summary_spinner(state: &SidebarState) -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    FRAMES[state.summary_spinner_frame % FRAMES.len()]
+}
+
+fn chat_task_summary_label(row: &SidebarRow, state: &SidebarState) -> String {
+    if row
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.task_summary_loading)
+    {
+        return task_summary_spinner(state).to_string();
+    }
     row.meta
         .as_ref()
         .and_then(|meta| meta.task_summary.as_deref())

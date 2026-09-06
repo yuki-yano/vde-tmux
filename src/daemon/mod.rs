@@ -54,6 +54,7 @@ pub struct SidebarModel {
     pub needs_action: BTreeSet<crate::pane_state::PaneInstance>,
     #[serde(default)]
     pub flashing: BTreeSet<crate::pane_state::PaneInstance>,
+    pub task_summary_loading: BTreeSet<crate::pane_state::PaneInstance>,
 }
 
 pub fn render_summary(

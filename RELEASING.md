@@ -5,9 +5,10 @@ Publishing is driven by Git tags.
 ## Local API v4 upgrade
 
 API v4 replaces public API 3 with provider capabilities, guarded terminal mutations, exact pane
-split, agent start, and Repository Category membership. Daemon protocol 21 carries persisted
+split, agent start, and Repository Category membership. Daemon protocol 22 carries persisted
 Category mutation receipts in addition to editprompt logical focus, the Limited display state,
-client-scoped sidebar peek navigation, and current-context task-summary outcomes. PaneState
+client-scoped sidebar peek navigation, current-context task-summary outcomes, and transient
+task-summary loading state. PaneState
 10 replaces PaneState 9 so task-summary context can follow same-turn prompt updates; the v9 file is
 left untouched and v10 starts empty. Private state format 1 does not change. Public API 3 is not
 retained in parallel.
@@ -18,7 +19,7 @@ Before replacement, pass the release gates listed below plus
 `scripts/test-agent-operation-crash-isolated.sh`. Confirm `vt agent storage status --json` reports
 zero `in_flight_operations`. Stage both binaries with
 `cargo install --path . --locked --root <temporary-root>` and verify the staged schema reports API
-4, protocol 21, PaneState 10, and private state 1.
+4, protocol 22, PaneState 10, and private state 1.
 
 Close running sidebars and run `vt daemon disable` before copying either executable so hooks cannot
 restart a mixed binary generation during replacement. Back up both installed executables, replace

@@ -5,6 +5,25 @@ use crate::sidebar::state::StatusFilter;
 use std::collections::BTreeSet;
 
 #[test]
+fn summary_animation_redraws_at_ten_fps_only_while_visible() {
+    let mut gate = RenderGate::new();
+    assert!(gate.take_draw_decision(100, false));
+    assert_eq!(gate.note_summary_animation(Duration::ZERO, true), 0);
+    assert!(gate.take_draw_decision(100, false));
+    gate.note_summary_animation(Duration::from_millis(99), true);
+    assert!(!gate.take_draw_decision(100, false));
+    assert_eq!(
+        gate.note_summary_animation(Duration::from_millis(100), true),
+        1
+    );
+    assert!(gate.take_draw_decision(100, false));
+    for millis in [200, 300, 1000] {
+        gate.note_summary_animation(Duration::from_millis(millis), false);
+        assert!(!gate.take_draw_decision(100, false));
+    }
+}
+
+#[test]
 fn render_gate_draws_once_per_second_when_visible_and_idle() {
     let mut gate = RenderGate::new();
 

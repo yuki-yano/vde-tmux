@@ -189,6 +189,18 @@ pub(in crate::daemon::server) fn apply_pane_event_mutation(
                         result.snapshot_revision = state.leased.runtime.snapshot_revision();
                     }
                 }
+                if matches!(envelope.event, PaneEvent::BeginRun { .. })
+                    && let Some(record) = state.leased.runtime.record(&envelope.pane_instance)
+                    && let Some(request) = coordinator.schedule_task_summary(
+                        record,
+                        state.pending_task_summaries.get(&envelope.pane_instance),
+                    )
+                {
+                    state
+                        .pending_task_summaries
+                        .insert(envelope.pane_instance.clone(), request);
+                    state.leased.runtime.mark_projection_changed()?;
+                }
                 let result = finish_pane_event_projection(
                     coordinator,
                     state,
@@ -198,11 +210,6 @@ pub(in crate::daemon::server) fn apply_pane_event_mutation(
                     result,
                     defer_full_preflight,
                 )?;
-                if matches!(envelope.event, PaneEvent::BeginRun { .. })
-                    && let Some(record) = state.leased.runtime.record(&envelope.pane_instance)
-                {
-                    coordinator.schedule_task_summary(record);
-                }
                 Ok(result)
             })
     };
@@ -428,6 +435,7 @@ pub(in crate::daemon::server) fn apply_pane_removal(
     {
         return production_store_error_response(coordinator, error, Some(event_id));
     }
+    state.pending_task_summaries.remove(&pane);
     ServerMessage::PaneEventResult {
         event_id,
         accepted_seq,

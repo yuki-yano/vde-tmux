@@ -117,6 +117,8 @@ pub(crate) struct CanonicalCoordinatorState {
     pub repo_identities: BTreeMap<String, crate::category::RepoIdentity>,
     pub category_state: crate::category::CategoryState,
     pub projection_config: Config,
+    pub pending_task_summaries:
+        BTreeMap<PaneInstance, crate::daemon::task_summary::TaskSummaryRequestKey>,
 }
 
 impl CanonicalCoordinatorState {
@@ -144,6 +146,7 @@ impl CanonicalCoordinatorState {
             repo_identities: BTreeMap::new(),
             category_state: crate::category::CategoryState::default(),
             projection_config: Config::default(),
+            pending_task_summaries: BTreeMap::new(),
         }
     }
 

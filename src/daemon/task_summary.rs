@@ -27,6 +27,23 @@ const SUMMARY_MAX_DISPLAY_WIDTH: usize = 80;
 const WORKER_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskSummaryRequestKey {
+    pub state_id: StateId,
+    pub agent_epoch: u64,
+    pub context_fingerprint: String,
+}
+
+impl TaskSummaryRequestKey {
+    pub fn from_state(state: &crate::pane_state::PaneState) -> Option<Self> {
+        Some(Self {
+            state_id: state.state_id.clone(),
+            agent_epoch: state.agent_epoch,
+            context_fingerprint: state.task_context.context_fingerprint()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TaskSummaryJob {
     pub pane_instance: PaneInstance,
     pub state_id: StateId,

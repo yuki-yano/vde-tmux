@@ -48,6 +48,8 @@ pub struct RowMeta {
     pub agent: Option<String>,
     pub prompt: Option<String>,
     pub task_summary: Option<String>,
+    pub task_summary_loading: bool,
+    pub response_preview: Option<String>,
     pub wait_reason: Option<String>,
     pub elapsed_secs: Option<i64>,
     pub completed_age_secs: Option<i64>,
@@ -101,6 +103,7 @@ struct AgentPane {
     prompt: String,
     latest_response: String,
     task_summary: String,
+    task_summary_loading: bool,
     wait_reason: String,
     started_at: String,
     completed_at: String,
@@ -130,6 +133,7 @@ pub struct RowBuildContext {
     pub worktrees: BTreeMap<String, crate::git::WorktreeInfo>,
     pub triage: BTreeSet<PaneInstance>,
     pub flash: BTreeSet<PaneInstance>,
+    pub task_summary_loading: BTreeSet<PaneInstance>,
     pub active_sessions: BTreeSet<String>,
     pub active_categories: BTreeSet<String>,
     pub category_state: crate::category::CategoryState,
@@ -158,6 +162,7 @@ pub fn project_sidebar(
         worktrees: model.worktrees.clone(),
         triage: model.needs_action.clone(),
         flash: model.flashing.clone(),
+        task_summary_loading: model.task_summary_loading.clone(),
         active_sessions: model.active_sessions.clone(),
         active_categories: model.active_categories.clone(),
         category_state: model.category_state.clone(),
@@ -283,6 +288,7 @@ pub fn build_rows_from_presentations(
                     })
                     .and_then(|summary| summary.text.clone())
                     .unwrap_or_default(),
+                task_summary_loading: ctx.task_summary_loading.contains(&pane.pane_instance),
                 wait_reason,
                 started_at: canonical
                     .started_at
@@ -931,7 +937,9 @@ fn push_chat_detail_rows(
     include_repo_git: bool,
     rows: &mut Vec<SidebarRow>,
 ) {
-    if let Some(summary) = non_empty(&pane.task_summary) {
+    if pane.task_summary_loading {
+        rows.push(detail_row(pane, depth, "summary-loading", String::new()));
+    } else if let Some(summary) = non_empty(&pane.task_summary) {
         rows.push(detail_row(pane, depth, "summary", summary.to_string()));
     }
     if let Some(signal) = agent_signal_label(pane, include_repo_git) {
@@ -1155,6 +1163,8 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
         agent: Some(display_agent_name(&pane.agent)),
         prompt: non_empty(&pane.prompt).map(str::to_string),
         task_summary: non_empty(&pane.task_summary).map(str::to_string),
+        task_summary_loading: pane.task_summary_loading,
+        response_preview: non_empty(&pane.latest_response).map(sanitize_detail_label),
         wait_reason: non_empty(&pane.wait_reason).map(str::to_string),
         elapsed_secs: pane
             .started_at
@@ -1470,6 +1480,7 @@ mod tests {
             prompt: String::new(),
             latest_response: String::new(),
             task_summary: String::new(),
+            task_summary_loading: false,
             wait_reason: String::new(),
             started_at: "100".to_string(),
             completed_at: completed_at.to_string(),

@@ -277,6 +277,21 @@ impl CanonicalCoordinatorState {
                 worktrees: worktrees.clone(),
                 needs_action: runtime.triage_panes().cloned().collect(),
                 flashing: runtime.flashing_panes().cloned().collect(),
+                task_summary_loading: self
+                    .pending_task_summaries
+                    .iter()
+                    .filter(|(pane, request)| {
+                        runtime.record(pane).is_some_and(|record| {
+                            record.task_context.current_summary().is_none()
+                                && crate::daemon::task_summary::TaskSummaryRequestKey::from_state(
+                                    record,
+                                )
+                                .as_ref()
+                                    == Some(*request)
+                        })
+                    })
+                    .map(|(pane, _)| pane.clone())
+                    .collect(),
             },
             attention,
             events,

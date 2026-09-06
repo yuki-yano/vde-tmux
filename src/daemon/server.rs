@@ -245,23 +245,18 @@ impl ProductionV2Coordinator {
         })
     }
 
-    fn schedule_task_summary(&self, state: &crate::pane_state::PaneState) {
-        let Some(sender) = &self.task_summary_tx else {
-            return;
-        };
+    fn schedule_task_summary(
+        &self,
+        state: &crate::pane_state::PaneState,
+        pending: Option<&crate::daemon::task_summary::TaskSummaryRequestKey>,
+    ) -> Option<crate::daemon::task_summary::TaskSummaryRequestKey> {
+        let sender = self.task_summary_tx.as_ref()?;
         if !matches!(state.agent.as_str(), "codex" | "claude") {
-            return;
+            return None;
         }
-        let Some(fingerprint) = state.task_context.context_fingerprint() else {
-            return;
-        };
-        if state
-            .task_context
-            .summary
-            .as_ref()
-            .is_some_and(|summary| summary.context_fingerprint == fingerprint)
-        {
-            return;
+        let request = crate::daemon::task_summary::TaskSummaryRequestKey::from_state(state)?;
+        if state.task_context.current_summary().is_some() || pending == Some(&request) {
+            return None;
         }
         let job = crate::daemon::task_summary::TaskSummaryJob {
             pane_instance: state.pane_instance.clone(),
@@ -275,7 +270,9 @@ impl ProductionV2Coordinator {
                 "task summary dispatch failed for pane {}: {error}",
                 state.pane_instance.pane_id
             ));
+            return None;
         }
+        Some(request)
     }
 
     fn start_tmux_control(&self) {
@@ -2651,6 +2648,28 @@ fn apply_production_mutation(
             }
         }
         V2AcceptedMutation::Internal(V2InternalMutation::TaskSummaryCompleted(completion)) => {
+            {
+                let mut state_guard = coordinator
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned");
+                let state = state_guard
+                    .as_mut()
+                    .expect("state initialized before task summary completion");
+                let request = crate::daemon::task_summary::TaskSummaryRequestKey {
+                    state_id: completion.state_id.clone(),
+                    agent_epoch: completion.agent_epoch,
+                    context_fingerprint: completion.context_fingerprint.clone(),
+                };
+                if state.pending_task_summaries.get(&completion.pane_instance) == Some(&request) {
+                    state
+                        .pending_task_summaries
+                        .remove(&completion.pane_instance);
+                    if let Err(error) = state.leased.runtime.mark_projection_changed() {
+                        return production_store_error_response(coordinator, error, None);
+                    }
+                }
+            }
             let summary = match completion.result {
                 Ok(summary) => summary,
                 Err(error) => {

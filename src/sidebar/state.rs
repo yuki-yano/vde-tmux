@@ -55,6 +55,7 @@ pub enum StatusFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SidebarState {
     pub version: u64,
+    pub summary_spinner_frame: usize,
     pub category_scope: CategoryScope,
     pub presentation_mode: PresentationMode,
     pub filter: StatusFilter,
