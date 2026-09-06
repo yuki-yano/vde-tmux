@@ -111,4 +111,47 @@ if tmux -L "$TMUX_SOCKET" list-buffers -F '#{buffer_name}' 2>/dev/null | grep -F
   exit 1
 fi
 
-echo "isolated durable agent prompt, run wait, response artifact, and buffer cleanup ok"
+"$PYTHON" - "$BIN" "$PANE_ID" "$CODEX_SESSION_ID" "$CODEX_TRANSCRIPT_PATH" <<'PY'
+import json, os, subprocess, sys
+
+binary, pane, session, transcript = sys.argv[1:]
+env = dict(os.environ, TMUX_PANE=pane)
+
+def query(*args):
+    return json.loads(subprocess.check_output([binary, *args, "--json"], env=env))["result"]
+
+def hook(event, turn, **fields):
+    payload = dict(session_id=session, transcript_path=transcript, turn_id=turn, **fields)
+    subprocess.run([binary, "hook", "codex", event], input=json.dumps(payload),
+                   text=True, env=env, check=True)
+
+agent_ref = query("agent", "get", pane)["agent"]["summary"]["agent_ref"]
+baseline = query("agent", "get", agent_ref)["agent"]["run_seq"]
+for index, first_hook in enumerate(["PreToolUse", "PermissionRequest"], 1):
+    turn = f"isolated-goal-{index}"
+    # Goal continuations do not emit UserPromptSubmit.
+    hook(first_hook, turn)
+    agent = query("agent", "get", agent_ref)["agent"]
+    assert agent["run_seq"] == baseline + index, agent
+    assert agent["summary"]["status"] == ("working" if first_hook == "PreToolUse" else "blocked"), agent
+    run_ref = agent["summary"]["current_run"]["run_ref"]
+    hook("PermissionRequest", turn)
+    assert query("agent", "get", agent_ref)["agent"]["summary"]["status"] == "blocked"
+    hook("PostToolUse", turn, tool_name="create_goal", tool_input={"objective": "continue the goal"})
+    agent = query("agent", "get", agent_ref)["agent"]
+    assert agent["summary"]["status"] == "working", agent
+    assert agent["prompt"] == "continue the goal", agent
+    assert agent["run_seq"] == baseline + index, agent
+    assert agent["summary"]["current_run"]["run_ref"] == run_ref, agent
+    hook("Stop", turn, last_assistant_message="goal turn completed")
+    agent = query("agent", "get", agent_ref)["agent"]
+    assert agent["summary"]["status"] == "done", agent
+    assert agent["completed_seq"] == baseline + index, agent
+    assert query("agent", "run", "response", run_ref)["body"] == "goal turn completed"
+    hook("PostToolUse", turn)
+    agent = query("agent", "get", agent_ref)["agent"]
+    assert agent["summary"]["status"] == "done", agent
+    assert agent["run_seq"] == agent["completed_seq"] == baseline + index, agent
+PY
+
+echo "isolated durable prompt, goal continuation lifecycle, response artifacts, and buffer cleanup ok"

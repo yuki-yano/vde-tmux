@@ -604,9 +604,9 @@ pub(crate) fn codex_typed_event_from_input(
                 Ok(Some(context.envelope(
                     AgentKind::parse("codex")?,
                     AgentSessionId::parse(session_id)?,
-                    PaneEvent::BeginRun {
-                        started_at: event.started_at.unwrap_or(context.observed_at),
-                        prompt: Some(prompt),
+                    PaneEvent::ActivityAndProgressObserved {
+                        observed_at: context.observed_at,
+                        operations: vec![crate::pane_state::ProgressOperation::SetPrompt(prompt)],
                     },
                 )))
             }
@@ -1509,10 +1509,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_goal_fixture_maps_to_begin_run_and_legacy_notify_is_ignored() {
+    fn codex_goal_fixture_maps_to_activity_and_legacy_notify_is_ignored() {
         let (root, transcript) = codex_root_session("codex-goal", "codex-session");
         let payload = serde_json::json!({
             "session_id": "codex-session",
+            "turn_id": "goal-turn",
             "transcript_path": transcript,
             "tool_name": "create_goal",
             "tool_input": {"objective": "ship\nthe change"},
@@ -1524,15 +1525,29 @@ mod tests {
                 .unwrap();
         assert_eq!(
             envelope.event,
-            PaneEvent::BeginRun {
-                started_at: 123,
-                prompt: Some(PromptState {
+            PaneEvent::ActivityAndProgressObserved {
+                observed_at: 123,
+                operations: vec![ProgressOperation::SetPrompt(PromptState {
                     text: "ship the change".to_string(),
                     source: "goal".to_string(),
                     digest: Some(PromptState::digest_decoded_prompt("ship\nthe change")),
-                }),
+                })],
             }
         );
+        let observation = crate::hook::provider::observation_from_json(
+            "codex",
+            "PostToolUse",
+            &payload,
+            typed_context().event_id,
+            123,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            observation.hook_kind,
+            crate::hook::provider::ProviderHookKind::Activity
+        );
+        assert!(observation.prompt_digest.is_none());
 
         let event = codex_typed_event_from_input(
             r#"{"type":"agent-turn-complete"}"#,

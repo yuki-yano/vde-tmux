@@ -10,7 +10,9 @@ use super::model::{
     RecoveryViewportFingerprint, ResolutionId, ResolutionKind, RunRecord, RunRef, RunResolution,
     SemanticOutcome, Sha256Digest, StableRunId,
 };
-use super::reducer::{ApplyDisposition, apply_observation, artifact_metadata, new_run_from_prompt};
+use super::reducer::{
+    ApplyDisposition, apply_observation, artifact_metadata, new_run_from_observation,
+};
 use super::store::{AgentStateStore, RUN_STORE_MAX_RECORDS, RunRetentionReserve, StoreError};
 use crate::hook::provider::{ProviderHookKind, ProviderObservation};
 
@@ -354,7 +356,10 @@ impl AgentRuntime {
         self.retire_replaced_bindings_for_pane(&binding, observation.observed_at)?;
 
         let key = binding_key(&binding)?;
-        let run_id = if observation.hook_kind == ProviderHookKind::UserPromptSubmit {
+        // Goal continuations can emit tool/permission hooks without a user
+        // prompt. Attribute those turns directly, without inventing a prompt
+        // or confirming a pending dispatch operation.
+        let run_id = if observation.can_start_run() {
             if let Some(turn_key) = observation.provider_turn_key.as_deref()
                 && let Some(attributed_id) = self
                     .turn_index
@@ -391,7 +396,12 @@ impl AgentRuntime {
                     self.store.save_run(&previous)?;
                 }
             }
-            let matching_operation = self.matching_operation(&binding, run_seq, observation)?;
+            let matching_operation = if observation.hook_kind == ProviderHookKind::UserPromptSubmit
+            {
+                self.matching_operation(&binding, run_seq, observation)?
+            } else {
+                None
+            };
             self.collect_run_retention(
                 observation.observed_at,
                 RunRetentionReserve {
@@ -400,7 +410,7 @@ impl AgentRuntime {
                 },
                 Some(&binding.pane_instance),
             )?;
-            let run = new_run_from_prompt(
+            let run = new_run_from_observation(
                 self.store.generation().clone(),
                 binding,
                 run_seq,
@@ -410,10 +420,9 @@ impl AgentRuntime {
                 observation,
             )
             .map_err(|error| StoreError::Invalid(error.to_string()))?;
-            let run_id = run.run_id.clone();
             self.store.save_run(&run)?;
             self.index_run(&run)?;
-            run_id
+            return self.finish_provider_observation(run, observation, ApplyDisposition::Applied);
         } else if let Some(turn_key) = observation.provider_turn_key.as_deref() {
             self.turn_index
                 .get(&turn_index_key(observation, turn_key))
@@ -432,16 +441,10 @@ impl AgentRuntime {
         };
 
         let mut run = self.required_run(&run_id)?;
-        let disposition = if observation.hook_kind == ProviderHookKind::UserPromptSubmit {
-            ApplyDisposition::Applied
-        } else {
-            apply_observation(&mut run, observation)
-                .map_err(|error| StoreError::ProviderEventConflict(error.to_string()))?
-        };
-        if observation.hook_kind != ProviderHookKind::UserPromptSubmit {
-            self.store.save_run(&run)?;
-            self.index_run(&run)?;
-        }
+        let disposition = apply_observation(&mut run, observation)
+            .map_err(|error| StoreError::ProviderEventConflict(error.to_string()))?;
+        self.store.save_run(&run)?;
+        self.index_run(&run)?;
 
         self.finish_provider_observation(run, observation, disposition)
     }
@@ -1336,6 +1339,140 @@ mod tests {
             std::process::id(),
             u64::from_be_bytes(random)
         ))
+    }
+
+    #[test]
+    fn codex_goal_turn_is_tracked_without_confirming_a_pending_prompt() {
+        let root = temp_root();
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
+        let mut agent_binding = binding();
+        agent_binding.agent_kind = AgentKind::parse("codex").unwrap();
+        let operation_id = OperationId::parse("operation_goal_race_0001").unwrap();
+        runtime
+            .prepare_operation(
+                operation_id.clone(),
+                "vta1:goal-target".to_string(),
+                b"pending prompt",
+                prompt_digest(b"pending prompt"),
+                "paste_enter".to_string(),
+                agent_binding.clone(),
+                pane_version(&agent_binding),
+                None,
+                1,
+                10,
+            )
+            .unwrap();
+        runtime.mark_dispatch_started(&operation_id, 11).unwrap();
+        let make_observation = |kind, response, observed_at| {
+            let mut value = observation(kind, "goal-turn", None, response, observed_at);
+            value.provider = agent_binding.agent_kind.clone();
+            // Real tool hooks have no stable event reference.
+            if kind != ProviderHookKind::Stop {
+                value.provider_event_ref = None;
+            }
+            value
+        };
+        let started = runtime
+            .apply_provider_observation(
+                agent_binding.clone(),
+                1,
+                &make_observation(ProviderHookKind::Activity, None, 12),
+            )
+            .unwrap();
+        assert!(started.operation.is_none());
+        let run = started.run.unwrap();
+        assert!(run.operation_id.is_none());
+        assert_eq!(run.execution_phase, ExecutionPhase::Running);
+        assert_eq!(run.evidence.activity_count, 1);
+        assert!(run.evidence.provider_events.is_empty());
+        assert_eq!(
+            runtime
+                .get_operation(&runtime.operation_ref(operation_id.clone()))
+                .unwrap()
+                .dispatch_state,
+            DispatchState::DispatchStarted
+        );
+
+        // The turn index must survive restart even without a prompt event.
+        drop(runtime);
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
+        for (kind, phase, at) in [
+            (ProviderHookKind::Waiting, ExecutionPhase::Waiting, 13),
+            (ProviderHookKind::Activity, ExecutionPhase::Running, 14),
+        ] {
+            let updated = runtime
+                .apply_provider_observation(
+                    agent_binding.clone(),
+                    2,
+                    &make_observation(kind, None, at),
+                )
+                .unwrap()
+                .run
+                .unwrap();
+            assert_eq!(updated.run_id, run.run_id);
+            assert_eq!(updated.run_seq, 1);
+            assert_eq!(updated.execution_phase, phase);
+        }
+        let completed = runtime
+            .apply_provider_observation(
+                agent_binding.clone(),
+                1,
+                &make_observation(ProviderHookKind::Stop, Some("goal turn finished"), 15),
+            )
+            .unwrap()
+            .run
+            .unwrap();
+        assert_eq!(completed.semantic_outcome, SemanticOutcome::Completed);
+        assert_eq!(completed.execution_phase, ExecutionPhase::Ended);
+        assert_eq!(completed.evidence.activity_count, 2);
+        assert_eq!(completed.evidence.permission_request_count, 1);
+        assert!(completed.artifact.is_some());
+        let late = runtime
+            .apply_provider_observation(
+                agent_binding.clone(),
+                2,
+                &make_observation(ProviderHookKind::Activity, None, 16),
+            )
+            .unwrap();
+        assert_eq!(late.disposition, ApplyDisposition::EvidenceOnly);
+        assert_eq!(late.run.unwrap().execution_phase, ExecutionPhase::Ended);
+        assert_ne!(
+            runtime
+                .get_operation(&runtime.operation_ref(operation_id))
+                .unwrap()
+                .dispatch_state,
+            DispatchState::PromptConfirmed
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unattributed_stop_or_non_codex_activity_does_not_allocate_a_run() {
+        let root = temp_root();
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
+        for (provider, kind) in [
+            ("codex", ProviderHookKind::Stop),
+            ("claude", ProviderHookKind::Activity),
+            ("claude", ProviderHookKind::Waiting),
+        ] {
+            let mut agent_binding = binding();
+            agent_binding.agent_kind = AgentKind::parse(provider).unwrap();
+            let mut event = observation(kind, "unknown-turn", None, None, 1);
+            event.provider = agent_binding.agent_kind.clone();
+            assert!(matches!(
+                runtime.apply_provider_observation(agent_binding.clone(), 1, &event),
+                Err(StoreError::NotFound(_))
+            ));
+            assert!(
+                runtime
+                    .current_run_for_binding(&agent_binding)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2259,7 +2396,7 @@ mod tests {
 
         // Reproduce a crash after the completed Run and Stop evidence are durable,
         // but before the linked Operation and response artifact are repaired.
-        let mut partial = new_run_from_prompt(
+        let mut partial = new_run_from_observation(
             runtime.store.generation().clone(),
             agent_binding.clone(),
             1,
@@ -2333,7 +2470,7 @@ mod tests {
             None,
             12,
         );
-        let run = new_run_from_prompt(
+        let run = new_run_from_observation(
             runtime.store.generation().clone(),
             agent_binding,
             1,
@@ -2468,7 +2605,7 @@ mod tests {
                 None,
                 1,
             );
-            let mut run = new_run_from_prompt(
+            let mut run = new_run_from_observation(
                 runtime.store.generation().clone(),
                 agent_binding,
                 1,
@@ -2517,7 +2654,7 @@ mod tests {
             None,
             1,
         );
-        let extra_run = new_run_from_prompt(
+        let extra_run = new_run_from_observation(
             runtime.store.generation().clone(),
             extra_binding,
             1,

@@ -56,7 +56,11 @@ fn codex_provider_test_event(
                 observed_at,
             },
         },
-        _ => panic!("unsupported provider test hook {event}"),
+        ProviderHookKind::Activity => PaneEvent::ActivityObserved { observed_at },
+        ProviderHookKind::Waiting => PaneEvent::WaitRequested {
+            observed_at,
+            reason: crate::pane_state::WaitReason::PermissionPrompt,
+        },
     };
     (
         PaneEventEnvelope {

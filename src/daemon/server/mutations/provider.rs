@@ -138,7 +138,7 @@ pub(in crate::daemon::server) fn apply_external_provider_event_with_runner(
                 Some(envelope.event_id),
             );
         };
-        let run_seq = if observation.hook_kind == ProviderHookKind::UserPromptSubmit {
+        let run_seq = if observation.can_start_run() {
             match record.run_seq.checked_add(1) {
                 Some(value) => value,
                 None => {
@@ -212,9 +212,10 @@ pub(in crate::daemon::server) fn apply_external_provider_event_with_runner(
     // but never project the prompt of a guarded dispatch into PaneState.
     let private_prompt = apply_result.run.as_ref().is_some_and(|run| {
         run.operation_id.is_some()
-            && apply_result.operation.as_ref().is_none_or(|operation| {
-                observation.prompt_digest.as_deref() == Some(operation.prompt_digest.as_str())
-            })
+            && (observation.hook_kind != ProviderHookKind::UserPromptSubmit
+                || apply_result.operation.as_ref().is_none_or(|operation| {
+                    observation.prompt_digest.as_deref() == Some(operation.prompt_digest.as_str())
+                }))
     });
     redact_private_provider_prompt(&mut envelope.event, private_prompt);
 

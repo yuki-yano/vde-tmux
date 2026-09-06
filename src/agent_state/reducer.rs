@@ -18,16 +18,21 @@ pub enum ApplyDisposition {
     EvidenceOnly,
 }
 
-pub fn new_run_from_prompt(
+pub fn new_run_from_observation(
     generation: StateGeneration,
     binding: AgentBinding,
     run_seq: u64,
     operation_id: Option<OperationId>,
     observation: &ProviderObservation,
 ) -> Result<RunRecord, ModelError> {
-    if observation.hook_kind != ProviderHookKind::UserPromptSubmit {
+    if !observation.can_start_run() {
         return Err(ModelError(
-            "new run allocation requires UserPromptSubmit".to_string(),
+            "new run allocation requires a prompt or a Codex turn activity/wait hook".to_string(),
+        ));
+    }
+    if operation_id.is_some() && observation.hook_kind != ProviderHookKind::UserPromptSubmit {
+        return Err(ModelError(
+            "only a user prompt can link an operation to a new run".to_string(),
         ));
     }
     require_observation_binding(&binding, observation)?;
@@ -48,7 +53,11 @@ pub fn new_run_from_prompt(
         created_at: observation.observed_at,
         updated_at: observation.observed_at,
     };
-    append_provider_reference(&mut record, observation, "run_created")?;
+    if observation.hook_kind == ProviderHookKind::UserPromptSubmit {
+        append_provider_reference(&mut record, observation, "run_created")?;
+    } else {
+        apply_observation(&mut record, observation)?;
+    }
     record.validate()?;
     Ok(record)
 }
@@ -357,7 +366,7 @@ mod tests {
             "prompt-payload",
             1,
         );
-        new_run_from_prompt(
+        new_run_from_observation(
             StateGeneration::generate().unwrap(),
             binding(),
             1,

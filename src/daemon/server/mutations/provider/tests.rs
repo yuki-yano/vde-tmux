@@ -2,6 +2,137 @@ use super::super::super::*;
 use super::*;
 
 #[test]
+fn codex_goal_continuations_project_working_waiting_and_completion() {
+    use crate::agent_state::{ExecutionPhase, SemanticOutcome};
+    use crate::pane_state::{AgentProcessIdentity, LifecycleState};
+
+    for first_hook in ["PreToolUse", "PermissionRequest"] {
+        let root = test_root(&format!("codex-goal-{first_hook}"));
+        let hash = "codex-goal-continuation";
+        let env = BTreeMap::from([
+            (
+                "XDG_STATE_HOME".to_string(),
+                root.to_string_lossy().into_owned(),
+            ),
+            // No real tmux server participates in this coordinator test.
+            (
+                "VDE_TMUX_SOCKET_NAME".to_string(),
+                format!("vde-goal-test-{}-{first_hook}", std::process::id()),
+            ),
+        ]);
+        let coordinator =
+            ProductionV2Coordinator::new(test_incarnation(&root, hash), env, None).unwrap();
+        install_test_state(
+            &coordinator,
+            &root,
+            crate::daemon::view_hooks::CurrentClientViews::default(),
+        );
+        *coordinator.agent_runtime.lock().unwrap() = Some(
+            crate::agent_state::runtime::AgentRuntime::open(
+                root.join("agent-state"),
+                hash.to_string(),
+            )
+            .unwrap(),
+        );
+        let pane = PaneInstance {
+            pane_id: "%539".to_string(),
+            pane_pid: 53_900,
+        };
+        let daemon_id = coordinator
+            .router
+            .lock()
+            .unwrap()
+            .daemon_instance_id()
+            .clone();
+        let runner = crate::tmux::mock::MockTmuxRunner::new();
+        runner.stub_agent_process(
+            pane.pane_pid,
+            "codex",
+            Some(AgentProcessIdentity {
+                pid: 53_962,
+                start_token: "goal-process-start".to_string(),
+            }),
+        );
+        let send = |event, turn, at| {
+            let payload = serde_json::json!({
+                "session_id": "session-goal", "turn_id": turn,
+                "source": "startup", "prompt": "original user prompt",
+                "last_assistant_message": "turn completed",
+            })
+            .to_string();
+            let (envelope, observation) =
+                codex_provider_test_event(daemon_id.clone(), pane.clone(), event, &payload, at);
+            let response = apply_external_provider_event_with_runner(
+                &coordinator,
+                at as u64,
+                envelope,
+                observation,
+                &runner,
+            );
+            assert!(
+                matches!(response, ServerMessage::PaneEventResult { .. }),
+                "{response:?}"
+            );
+        };
+        let record = || {
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .leased
+                .runtime
+                .record(&pane)
+                .unwrap()
+                .clone()
+        };
+
+        send("SessionStart", "", 1);
+        send("UserPromptSubmit", "manual-turn", 2);
+        send("Stop", "manual-turn", 3);
+        assert_eq!(record().completed_seq, 1);
+        send(first_hook, "goal-turn", 4);
+        let started = record();
+        assert_eq!(started.run_seq, 2);
+        assert_eq!(started.completed_seq, 1);
+        assert!(started.prompt.is_none());
+        if first_hook == "PermissionRequest" {
+            assert!(matches!(started.lifecycle, LifecycleState::Waiting { .. }));
+        } else {
+            assert_eq!(started.lifecycle, LifecycleState::Running);
+        }
+        let run_id = started.current_run.unwrap().run_id;
+        send("PostToolUse", "goal-turn", 5);
+        assert_eq!(record().run_seq, 2);
+        assert_eq!(record().lifecycle, LifecycleState::Running);
+        assert_eq!(record().current_run.unwrap().run_id, run_id);
+        send("PermissionRequest", "goal-turn", 6);
+        assert!(matches!(record().lifecycle, LifecycleState::Waiting { .. }));
+        send("PreToolUse", "goal-turn", 7);
+        assert_eq!(record().lifecycle, LifecycleState::Running);
+        send("Stop", "goal-turn", 8);
+        assert_eq!(record().lifecycle, LifecycleState::Idle);
+        assert_eq!(record().completed_seq, 2);
+        send("PostToolUse", "goal-turn", 9);
+        assert_eq!(record().lifecycle, LifecycleState::Idle);
+        assert_eq!(record().run_seq, 2);
+        assert_eq!(record().completed_seq, 2);
+        let runtime_guard = coordinator.agent_runtime.lock().unwrap();
+        let runtime = runtime_guard.as_ref().unwrap();
+        let completed = runtime
+            .get_run(&runtime.run_ref(crate::agent_state::StableRunId::parse(run_id).unwrap()))
+            .unwrap();
+        assert_eq!(completed.execution_phase, ExecutionPhase::Ended);
+        assert_eq!(completed.semantic_outcome, SemanticOutcome::Completed);
+        assert!(completed.artifact.is_some());
+        drop(runtime_guard);
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn provider_hook_kind_must_match_the_pane_transition_before_run_mutation() {
     let observation = crate::hook::provider::observation_from_json(
         "codex",
@@ -226,6 +357,18 @@ fn provider_projection_keeps_ui_previews_but_redacts_guarded_prompts() {
             crate::pane_state::ProgressOperation::TaskCreated,
         ],
     };
+    let PaneEvent::ProgressUpdated { operations, .. } = &progress else {
+        unreachable!();
+    };
+    let mut goal = PaneEvent::ActivityAndProgressObserved {
+        observed_at: 3,
+        operations: operations.clone(),
+    };
+    redact_private_provider_prompt(&mut goal, true);
+    assert!(
+        matches!(goal, PaneEvent::ActivityAndProgressObserved { operations, .. }
+        if operations == vec![crate::pane_state::ProgressOperation::TaskCreated])
+    );
     redact_private_provider_prompt(&mut progress, true);
     assert!(matches!(
         progress,

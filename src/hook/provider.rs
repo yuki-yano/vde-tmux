@@ -84,6 +84,16 @@ pub struct ProviderObservation {
 }
 
 impl ProviderObservation {
+    pub fn can_start_run(&self) -> bool {
+        self.hook_kind == ProviderHookKind::UserPromptSubmit
+            || (self.provider.as_str() == "codex"
+                && self.provider_turn_key.is_some()
+                && matches!(
+                    self.hook_kind,
+                    ProviderHookKind::Activity | ProviderHookKind::Waiting
+                ))
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.observed_at < 0 {
             return Err(ModelError(
