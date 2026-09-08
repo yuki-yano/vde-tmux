@@ -1287,6 +1287,13 @@ impl Drop for DaemonFileLock {
     }
 }
 
+pub(crate) fn acquire_daemon_start_lock(socket: &Path) -> Result<DaemonFileLock> {
+    if let Some(parent) = socket.parent().filter(|path| !path.as_os_str().is_empty()) {
+        ensure_secure_socket_dir(parent)?;
+    }
+    acquire_daemon_start_lock_until(socket, Instant::now() + DAEMON_START_TIMEOUT)
+}
+
 fn acquire_daemon_start_lock_until(socket: &Path, deadline: Instant) -> Result<DaemonFileLock> {
     let path = daemon_lock_path(socket, ".start.lock");
     loop {

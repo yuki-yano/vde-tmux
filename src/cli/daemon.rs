@@ -758,6 +758,9 @@ pub(crate) fn reload_daemon(
     }
     let socket_path =
         crate::daemon::daemon_socket_path_for_incarnation(env, socket, &incarnation.hash);
+    // Detaching the old control client emits hooks that can start a replacement.
+    // Hold the startup lock until shutdown has been observed and recorded.
+    let start_lock = crate::daemon::lifecycle::acquire_daemon_start_lock(&socket_path)?;
     crate::daemon::lifecycle::update_lifecycle_record(env, &incarnation.hash, |record| {
         record.begin_transition(crate::daemon::lifecycle::DesiredMode::Enabled)
     })?;
@@ -790,6 +793,7 @@ pub(crate) fn reload_daemon(
         _ => {}
     }
     clear_process_identity(env, &incarnation.hash);
+    drop(start_lock);
     match crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, socket) {
         Ok((_, socket_path)) => Ok(Some(format!("daemon reloaded: {}", socket_path.display()))),
         Err(error) => {
