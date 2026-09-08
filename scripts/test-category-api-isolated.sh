@@ -8,6 +8,7 @@ RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vde-category-api-test.XXXXXX")"
 STATE_HOME="$RUNTIME_DIR/state"
 CONFIG_HOME="$RUNTIME_DIR/config"
 HOME_DIR="$RUNTIME_DIR/home"
+HOOK_BIN_DIR="$RUNTIME_DIR/bin"
 REPO="$RUNTIME_DIR/repo"
 LINKED="$RUNTIME_DIR/linked"
 BIN="${VDE_TMUX_BIN:-$ROOT/target/debug/vt}"
@@ -30,8 +31,11 @@ if [[ -z "${VDE_TMUX_BIN:-}" ]]; then
 fi
 [[ -x "$BIN" ]]
 
-mkdir -p "$STATE_HOME" "$CONFIG_HOME/vde/tmux" "$HOME_DIR" "$REPO"
+mkdir -p "$STATE_HOME" "$CONFIG_HOME/vde/tmux" "$HOME_DIR" "$REPO" "$HOOK_BIN_DIR"
 chmod 700 "$RUNTIME_DIR" "$STATE_HOME" "$CONFIG_HOME" "$HOME_DIR"
+ln -s "$BIN" "$HOOK_BIN_DIR/vt"
+export PATH="$HOOK_BIN_DIR:$PATH"
+export ZDOTDIR="$HOME_DIR"
 cat >"$CONFIG_HOME/vde/tmux/config.yml" <<'YAML'
 categories:
   default_category: misc
@@ -51,7 +55,9 @@ git -C "$REPO" add README
 git -C "$REPO" commit --quiet -m initial
 git -C "$REPO" worktree add --quiet -b linked "$LINKED"
 
-"$SYSTEM_TMUX" -L "$SOCKET_NAME" -f /dev/null new-session -d -s main -c "$REPO"
+env HOME="$HOME_DIR" XDG_CONFIG_HOME="$CONFIG_HOME" XDG_STATE_HOME="$STATE_HOME" \
+  VDE_TMUX_SOCKET_NAME="$SOCKET_NAME" \
+  "$SYSTEM_TMUX" -L "$SOCKET_NAME" -f /dev/null new-session -d -s main -c "$REPO"
 TMUX_PATH="$($SYSTEM_TMUX -L "$SOCKET_NAME" display-message -p '#{socket_path}')"
 TMUX_PID="$($SYSTEM_TMUX -L "$SOCKET_NAME" display-message -p '#{pid}')"
 TMUX_ENV="$TMUX_PATH,$TMUX_PID,0"
