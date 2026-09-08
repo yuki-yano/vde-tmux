@@ -55,7 +55,12 @@ export CODEX_HOME="$ROOT/codex"
 export VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET"
 export VDE_TMUX_TEST_AGENT_OPERATION_FAULT_DIR="$FAULT_DIR"
 export VT_BIN="$BIN"
+# Owned tmux hooks resolve vt through PATH after the injected daemon crash.
+# Keep their binary and shell startup environment inside this fixture.
+export PATH="$ROOT/bin:$PATH"
+export ZDOTDIR="$ROOT/zdot"
 mkdir -p \
+  "$ZDOTDIR" \
   "$XDG_CONFIG_HOME/vde-tmux" \
   "$XDG_STATE_HOME" \
   "$XDG_RUNTIME_DIR" \
