@@ -404,11 +404,21 @@ impl CanonicalStateRuntime {
         envelope: &PaneEventEnvelope,
         visibility: &VisibilitySnapshot,
     ) -> Result<ApplyResult, StoreError> {
+        self.apply_event_with_private_task_prompt(io, envelope, visibility, None)
+    }
+
+    pub(crate) fn apply_event_with_private_task_prompt(
+        &mut self,
+        io: &mut dyn PaneSnapshotStoreIo,
+        envelope: &PaneEventEnvelope,
+        visibility: &VisibilitySnapshot,
+        private_task_prompt: Option<&str>,
+    ) -> Result<ApplyResult, StoreError> {
         if self.fail_stopped {
             return Err(StoreError::FailStop("daemon is fail-stopped".to_string()));
         }
         let mut draft = self.clone();
-        let result = draft.apply_event_in_memory(envelope, visibility)?;
+        let result = draft.apply_event_in_memory(envelope, visibility, private_task_prompt)?;
         if result.outcome == ReductionOutcome::CanonicalChanged {
             io.save(&draft.records)?;
         }
@@ -479,7 +489,7 @@ impl CanonicalStateRuntime {
                     "pane read commit accepts only MarkPaneRead events".to_string(),
                 )));
             }
-            match working.apply_event_in_memory(envelope, &VisibilitySnapshot::default()) {
+            match working.apply_event_in_memory(envelope, &VisibilitySnapshot::default(), None) {
                 Ok(result) => {
                     projection_changed |= result.outcome != ReductionOutcome::Noop;
                     if result.outcome == ReductionOutcome::CanonicalChanged {
@@ -531,6 +541,7 @@ impl CanonicalStateRuntime {
         &mut self,
         envelope: &PaneEventEnvelope,
         visibility: &VisibilitySnapshot,
+        private_task_prompt: Option<&str>,
     ) -> Result<ApplyResult, StoreError> {
         let current = self.records.get(&envelope.pane_instance);
         let tracker = self.tracker(&envelope.pane_instance);
@@ -543,6 +554,7 @@ impl CanonicalStateRuntime {
             current,
             envelope,
             ReductionContext {
+                private_task_prompt,
                 visibility,
                 tracker: &tracker,
                 new_state_id,

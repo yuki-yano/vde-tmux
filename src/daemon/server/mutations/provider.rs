@@ -22,7 +22,7 @@ pub(in crate::daemon::server) fn apply_external_pane_event(
     accepted_seq: u64,
     envelope: PaneEventEnvelope,
 ) -> ServerMessage {
-    apply_pane_event_mutation(coordinator, accepted_seq, envelope, false, None)
+    apply_pane_event_mutation(coordinator, accepted_seq, envelope, false, None, None)
 }
 
 pub(in crate::daemon::server) fn apply_external_provider_event(
@@ -209,7 +209,7 @@ pub(in crate::daemon::server) fn apply_external_provider_event_with_runner(
 
     // Provider adapters already reduce human-entered prompts and responses to
     // bounded, single-line UI previews. Keep those previews for the sidebar,
-    // but never project the prompt of a guarded dispatch into PaneState.
+    // but never serialize dispatched prompts with the public PaneState previews.
     let private_prompt = apply_result.run.as_ref().is_some_and(|run| {
         run.operation_id.is_some()
             && (observation.hook_kind != ProviderHookKind::UserPromptSubmit
@@ -217,6 +217,15 @@ pub(in crate::daemon::server) fn apply_external_provider_event_with_runner(
                     observation.prompt_digest.as_deref() == Some(operation.prompt_digest.as_str())
                 }))
     });
+    // Pass private summary evidence separately so neither the persisted record
+    // nor the public event projection can contain the dispatch body.
+    let private_task_prompt = match &envelope.event {
+        PaneEvent::BeginRun {
+            prompt: Some(prompt),
+            ..
+        } if private_prompt => Some(prompt.text.clone()),
+        _ => None,
+    };
     redact_private_provider_prompt(&mut envelope.event, private_prompt);
 
     if apply_result.disposition == crate::agent_state::reducer::ApplyDisposition::Duplicate
@@ -280,7 +289,14 @@ pub(in crate::daemon::server) fn apply_external_provider_event_with_runner(
         );
     }
 
-    apply_pane_event_mutation(coordinator, accepted_seq, envelope, false, apply_result.run)
+    apply_pane_event_mutation(
+        coordinator,
+        accepted_seq,
+        envelope,
+        false,
+        apply_result.run,
+        private_task_prompt.as_deref(),
+    )
 }
 
 pub(in crate::daemon::server) fn project_provider_run_evidence_only(
@@ -512,7 +528,14 @@ pub(in crate::daemon::server) fn refresh_provider_process_identity(
             Some(envelope.event_id.clone()),
         )
     })?;
-    match apply_pane_event_mutation(coordinator, accepted_seq, process_envelope, false, None) {
+    match apply_pane_event_mutation(
+        coordinator,
+        accepted_seq,
+        process_envelope,
+        false,
+        None,
+        None,
+    ) {
         ServerMessage::PaneEventResult { .. } => {}
         ServerMessage::Error { code, message, .. } => {
             return Err(ServerMessage::error(

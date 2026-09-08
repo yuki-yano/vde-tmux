@@ -594,43 +594,127 @@ pub struct TaskContextState {
     pub recent_prompts: Vec<String>,
     pub reference_response: Option<String>,
     pub summary: Option<TaskSummaryState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    private_context_fingerprint: Option<String>,
+    #[serde(skip)]
+    private_input: Option<PrivateTaskContext>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PrivateTaskContext {
+    recent_prompts: Vec<String>,
+    reference_response: Option<String>,
+}
+
+impl fmt::Debug for PrivateTaskContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PrivateTaskContext([redacted])")
+    }
 }
 
 impl TaskContextState {
     pub fn observe_prompt(&mut self, prompt: &str) {
+        if self.private_context_fingerprint.is_some() {
+            self.observe_private_prompt(prompt);
+            return;
+        }
+        Self::push_prompt(&mut self.recent_prompts, prompt);
+    }
+
+    fn push_prompt(prompts: &mut Vec<String>, prompt: &str) {
         let prompt = truncate_utf8(prompt.trim(), TASK_CONTEXT_PROMPT_MAX_BYTES);
         if prompt.is_empty() {
             return;
         }
-        if self.recent_prompts.last() == Some(&prompt) {
+        if prompts.last() == Some(&prompt) {
             return;
         }
-        self.recent_prompts.push(prompt);
-        if self.recent_prompts.len() > MAX_TASK_CONTEXT_PROMPTS {
-            self.recent_prompts.remove(0);
+        prompts.push(prompt);
+        if prompts.len() > MAX_TASK_CONTEXT_PROMPTS {
+            prompts.remove(0);
         }
     }
 
     pub fn observe_prompt_with_reference(&mut self, prompt: &str, response: Option<&str>) {
-        self.reference_response = response
+        if prompt.trim().is_empty() {
+            return;
+        }
+        let response = response
             .map(str::trim)
             .filter(|response| !response.is_empty())
             .map(|response| truncate_utf8(response, RESPONSE_PREVIEW_MAX_BYTES));
+        if self.private_context_fingerprint.is_some() {
+            self.private_input().reference_response = response;
+        } else {
+            self.reference_response = response;
+        }
         self.observe_prompt(prompt);
     }
 
+    fn private_input(&mut self) -> &mut PrivateTaskContext {
+        self.private_input
+            .get_or_insert_with(|| PrivateTaskContext {
+                recent_prompts: std::mem::take(&mut self.recent_prompts),
+                reference_response: self.reference_response.take(),
+            })
+    }
+
+    pub(crate) fn observe_private_prompt(&mut self, prompt: &str) {
+        if prompt.trim().is_empty() {
+            return;
+        }
+        let input = self.private_input();
+        Self::push_prompt(&mut input.recent_prompts, prompt);
+        self.private_context_fingerprint =
+            Self::fingerprint(&input.recent_prompts, input.reference_response.as_deref());
+    }
+
+    pub(crate) fn observe_private_prompt_with_reference(
+        &mut self,
+        prompt: &str,
+        response: Option<&str>,
+    ) {
+        if prompt.trim().is_empty() {
+            return;
+        }
+        self.private_input().reference_response = response
+            .map(str::trim)
+            .filter(|response| !response.is_empty())
+            .map(|response| truncate_utf8(response, RESPONSE_PREVIEW_MAX_BYTES));
+        self.observe_private_prompt(prompt);
+    }
+
+    /// Private evidence exists only in daemon memory. A restored fingerprint
+    /// can identify an existing summary, but cannot recreate its input.
+    pub(crate) fn summary_input(&self) -> Option<Self> {
+        let mut input = self.clone();
+        if self.private_context_fingerprint.is_some() {
+            let private = input.private_input.take()?;
+            input.recent_prompts = private.recent_prompts;
+            input.reference_response = private.reference_response;
+            input.private_context_fingerprint = None;
+        }
+        Some(input)
+    }
+
     pub fn context_fingerprint(&self) -> Option<String> {
+        self.private_context_fingerprint
+            .clone()
+            .or_else(|| Self::fingerprint(&self.recent_prompts, self.reference_response.as_deref()))
+    }
+
+    fn fingerprint(prompts: &[String], response: Option<&str>) -> Option<String> {
         use sha2::{Digest, Sha256};
 
-        if self.recent_prompts.is_empty() {
+        if prompts.is_empty() {
             return None;
         }
         let mut digest = Sha256::new();
-        for prompt in &self.recent_prompts {
+        for prompt in prompts {
             digest.update(b"\0recent\0");
             digest.update(prompt.as_bytes());
         }
-        if let Some(response) = &self.reference_response {
+        if let Some(response) = response {
             digest.update(b"\0reference-response\0");
             digest.update(response.as_bytes());
         }
@@ -645,6 +729,23 @@ impl TaskContextState {
     }
 
     pub fn validate(&self) -> Result<(), ModelError> {
+        if let Some(fingerprint) = &self.private_context_fingerprint {
+            if fingerprint.len() != 64
+                || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || !self.recent_prompts.is_empty()
+                || self.reference_response.is_some()
+            {
+                return Err(ModelError("invalid private task context".to_string()));
+            }
+            if let Some(input) = self.summary_input() {
+                input.validate()?;
+                if input.context_fingerprint().as_ref() != Some(fingerprint) {
+                    return Err(ModelError(
+                        "private task context fingerprint mismatch".to_string(),
+                    ));
+                }
+            }
+        }
         if self.recent_prompts.len() > MAX_TASK_CONTEXT_PROMPTS {
             return Err(ModelError("too many task context prompts".to_string()));
         }
@@ -1387,6 +1488,7 @@ pub struct ReductionContext<'a> {
     pub tracker: &'a CaptureTrackerSnapshot,
     pub new_state_id: Option<StateId>,
     pub latest_unread_order: u64,
+    pub private_task_prompt: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -1477,6 +1579,77 @@ mod tests {
             context.current_summary().unwrap().failure_code.as_deref(),
             Some("timeout")
         );
+        context.validate().unwrap();
+    }
+
+    #[test]
+    fn private_task_context_serializes_only_its_fingerprint_and_summary() {
+        let mut context = TaskContextState::default();
+        context.observe_prompt("public request");
+        context
+            .observe_private_prompt_with_reference("private request", Some("response reference"));
+        context.observe_prompt("manual follow-up");
+        context.validate().unwrap();
+        let input = context.summary_input().unwrap();
+        assert_eq!(
+            input.recent_prompts,
+            ["public request", "private request", "manual follow-up"]
+        );
+        assert_eq!(
+            input.reference_response.as_deref(),
+            Some("response reference")
+        );
+        assert_eq!(input.context_fingerprint(), context.context_fingerprint());
+        context.summary = Some(TaskSummaryState {
+            text: Some("Task overview".to_string()),
+            context_fingerprint: context.context_fingerprint().unwrap(),
+            generated_at: 1,
+            outcome: TaskSummaryOutcome::Generated,
+            failure_code: None,
+        });
+        let encoded = serde_json::to_string(&context).unwrap();
+        for text in [
+            "public request",
+            "private request",
+            "manual follow-up",
+            "response reference",
+        ] {
+            assert!(!encoded.contains(text));
+            assert!(!format!("{context:?}").contains(text));
+        }
+        let mut restored: TaskContextState = serde_json::from_str(&encoded).unwrap();
+        restored.validate().unwrap();
+        assert!(restored.summary_input().is_none());
+        assert_eq!(restored.current_summary(), context.current_summary());
+        restored.observe_private_prompt_with_reference("next request", Some("next reference"));
+        restored.validate().unwrap();
+        assert!(restored.current_summary().is_none());
+        assert_eq!(
+            restored.summary_input().unwrap().recent_prompts,
+            ["next request"]
+        );
+    }
+
+    #[test]
+    fn private_task_context_is_bounded_and_tracks_reference_changes() {
+        let mut context = TaskContextState::default();
+        context.observe_private_prompt_with_reference("", Some("ignored"));
+        assert_eq!(context, TaskContextState::default());
+        for prompt in ["one", "two", "three", "four", "five"] {
+            context.observe_private_prompt(prompt);
+        }
+        let previous = context.context_fingerprint();
+        context.observe_prompt_with_reference(" ", Some("ignored reference"));
+        assert_eq!(context.context_fingerprint(), previous);
+        context.validate().unwrap();
+        context.observe_prompt_with_reference("five", Some("new reference"));
+        assert_ne!(context.context_fingerprint(), previous);
+        let long = "あ".repeat(TASK_CONTEXT_PROMPT_MAX_BYTES);
+        context.observe_private_prompt(&long);
+        let input = context.summary_input().unwrap();
+        assert_eq!(input.recent_prompts.len(), MAX_TASK_CONTEXT_PROMPTS);
+        assert!(input.recent_prompts.last().unwrap().len() <= TASK_CONTEXT_PROMPT_MAX_BYTES);
+        assert_eq!(input.reference_response.as_deref(), Some("new reference"));
         context.validate().unwrap();
     }
 

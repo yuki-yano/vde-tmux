@@ -448,7 +448,11 @@ summary が有効な場合は、category や window の表示が長いときも�
 
 `sidebar.task_summary.enabled`を有効にすると、閉じたagent行と展開した詳細へ短いtask要約を表示します。
 daemonはpaneのagentに対応する独立CLI（Codexは`codex exec`、Claudeは`claude -p`）で要約を非同期生成します。
-最新のraw promptはpane stateとJSON APIには保持しますが、サイドバーには表示しません。
+手入力された最新のraw promptはpane stateとJSON APIには保持しますが、サイドバーには表示しません。
+API経由で送信されたpromptは、要約用のboundedな入力をdaemonのメモリ内だけで保持し、pane stateの保存ファイルやJSON APIには本文を含めません。
+この場合も生成待ち・生成中はspinnerを表示し、完了後に短いtask要約を表示します。
+生成済みの要約とcontextのハッシュは保存するため、daemon再起動後も要約を表示できます。
+再起動時に生成が未完了だった場合は入力が残らないため、次のpromptを受け取ったときに生成します。
 providerをまたぐfallbackは行いません。追加のmodel requestを許容できない場合は無効のままにしてください。
 
 要約contextは、現在のagent epochに届いた直近4件のprompt occurrenceへ追従します。

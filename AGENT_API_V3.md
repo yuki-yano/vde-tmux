@@ -393,6 +393,10 @@ callerはdispatch開始からconfirmationまで対象Paneへ直接入力しな�
 
 `prompt_confirmed`、`delivery_unknown`、`rejected`のいずれかをdurable化した後にstaging blobを削除してdirectory fsyncする。
 
+sidebarのtask要約は、受理済みprovider hookのboundedなprompt previewをdaemonのメモリ内で利用する。
+private promptを含む要約contextは、本文や参照応答をPane snapshotへserializeせず、context fingerprintと生成結果だけを保存する。
+daemon再起動後は保存済みの要約を表示できるが、未完了の生成は次のpromptを受け取るまで再開しない。
+
 ## Diagnostic and recovery
 
 ### Read-only check

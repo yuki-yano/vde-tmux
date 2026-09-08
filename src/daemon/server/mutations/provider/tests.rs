@@ -2,6 +2,273 @@ use super::super::super::*;
 use super::*;
 
 #[test]
+fn dispatched_prompt_generates_summary_without_publishing_or_persisting_its_input() {
+    use crate::agent_state::{AgentBinding, OperationId, Sha256Digest};
+    use crate::daemon::task_summary::{TaskSummaryCompletion, TaskSummaryJob};
+    use crate::pane_state::{AgentProcessIdentity, TaskSummaryOutcome, TaskSummaryState};
+
+    let root = test_root("private-task-summary");
+    let hash = "private-task-summary";
+    let env = BTreeMap::from([
+        ("XDG_STATE_HOME".to_string(), root.display().to_string()),
+        (
+            "VDE_TMUX_SOCKET_NAME".to_string(),
+            format!("vde-private-summary-{}", std::process::id()),
+        ),
+    ]);
+    let mut coordinator =
+        ProductionV2Coordinator::new(test_incarnation(&root, hash), env, None).unwrap();
+    install_test_state(&coordinator, &root, Default::default());
+    *coordinator.agent_runtime.lock().unwrap() = Some(
+        crate::agent_state::runtime::AgentRuntime::open(root.join("agent-state"), hash.to_string())
+            .unwrap(),
+    );
+    let (sender, receiver) = mpsc::sync_channel(4);
+    coordinator.task_summary_tx = Some(sender);
+    let pane = PaneInstance {
+        pane_id: "%540".to_string(),
+        pane_pid: 54_000,
+    };
+    coordinator
+        .state
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .topology
+        .panes = vec![read_peek_test_topology_pane(pane.clone(), false)];
+    let daemon_id = coordinator
+        .router
+        .lock()
+        .unwrap()
+        .daemon_instance_id()
+        .clone();
+    let runner = crate::tmux::mock::MockTmuxRunner::new();
+    runner.stub_agent_process(
+        pane.pane_pid,
+        "codex",
+        Some(AgentProcessIdentity {
+            pid: 54_062,
+            start_token: "private-summary-process".to_string(),
+        }),
+    );
+    let event =
+        |kind, prompt: &str, at| {
+            codex_provider_test_event(
+        daemon_id.clone(), pane.clone(), kind,
+        &serde_json::json!({
+            "session_id": "private-summary-session", "turn_id": "private-summary-turn",
+            "source": "startup", "prompt": prompt, "last_assistant_message": "response preview",
+        }).to_string(), at,
+    )
+        };
+    let apply = |envelope, observation, at| {
+        let response = apply_external_provider_event_with_runner(
+            &coordinator,
+            at,
+            envelope,
+            observation,
+            &runner,
+        );
+        assert!(
+            matches!(response, ServerMessage::PaneEventResult { .. }),
+            "{response:?}"
+        );
+    };
+    let (session, observation) = event("SessionStart", "", 1);
+    apply(session, observation, 1);
+
+    let private_prompt = "private dispatch body: investigate the missing sidebar summary";
+    let (begin, observation) = event("UserPromptSubmit", private_prompt, 2);
+    let record =
+        refresh_provider_process_identity(&coordinator, 2, &begin, &observation, &runner).unwrap();
+    let operation_id = OperationId::parse("private_summary_operation_0001").unwrap();
+    let binding = AgentBinding {
+        server_identity: coordinator.incarnation.identity.clone(),
+        pane_instance: pane.clone(),
+        pane_state_id: record.state_id.clone(),
+        agent_epoch: record.agent_epoch,
+        agent_kind: record.agent.clone(),
+        provider_session_id: record.agent_session_id.clone().unwrap(),
+        process: record.agent_process.clone().unwrap(),
+    };
+    {
+        let mut guard = coordinator.agent_runtime.lock().unwrap();
+        let runtime = guard.as_mut().unwrap();
+        runtime
+            .prepare_operation(
+                operation_id.clone(),
+                "vta1:private-summary-target".to_string(),
+                private_prompt.as_bytes(),
+                Sha256Digest::parse(crate::pane_state::PromptState::digest_decoded_prompt(
+                    private_prompt,
+                ))
+                .unwrap(),
+                "paste_enter".to_string(),
+                binding,
+                record.version(),
+                record.current_run.clone(),
+                record.run_seq + 1,
+                epoch_seconds(),
+            )
+            .unwrap();
+        runtime
+            .mark_dispatch_started(&operation_id, epoch_seconds())
+            .unwrap();
+    }
+    apply(begin.clone(), observation.clone(), 3);
+    let first = receiver.try_recv().unwrap();
+    assert_eq!(first.task_context.recent_prompts, [private_prompt]);
+    apply(begin, observation, 4);
+    assert!(
+        receiver.try_recv().is_err(),
+        "duplicate hook must not enqueue a second job"
+    );
+    let snapshot = || {
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .resolved_snapshot()
+    };
+    let current_record = || {
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .leased
+            .runtime
+            .record(&pane)
+            .unwrap()
+            .clone()
+    };
+    assert!(
+        snapshot()
+            .sidebar_model
+            .task_summary_loading
+            .contains(&pane)
+    );
+    assert!(current_record().prompt.is_none());
+    assert!(current_record().task_context.recent_prompts.is_empty());
+    assert!(
+        !serde_json::to_string(&snapshot())
+            .unwrap()
+            .contains(private_prompt)
+    );
+    let snapshot_path = crate::pane_state::snapshot::snapshot_path(&coordinator.env, hash);
+    assert!(
+        !std::fs::read_to_string(&snapshot_path)
+            .unwrap()
+            .contains(private_prompt)
+    );
+
+    let complete = |job: TaskSummaryJob, result: Result<&str, &str>| {
+        let fingerprint = job.task_context.context_fingerprint().unwrap();
+        let completion = TaskSummaryCompletion {
+            pane_instance: job.pane_instance,
+            state_id: job.state_id,
+            agent_epoch: job.agent_epoch,
+            context_fingerprint: fingerprint.clone(),
+            result: result
+                .map(|text| TaskSummaryState {
+                    text: Some(text.to_string()),
+                    context_fingerprint: fingerprint,
+                    generated_at: epoch_seconds(),
+                    outcome: TaskSummaryOutcome::Generated,
+                    failure_code: None,
+                })
+                .map_err(str::to_string),
+        };
+        let response = apply_production_mutation(
+            &coordinator,
+            V2SequencedMutation {
+                accepted_seq: 10,
+                mutation: V2AcceptedMutation::Internal(V2InternalMutation::TaskSummaryCompleted(
+                    completion,
+                )),
+            },
+        );
+        assert!(
+            matches!(response, ServerMessage::PaneEventResult { .. }),
+            "{response:?}"
+        );
+    };
+    // A same-turn human follow-up must keep private evidence out of public
+    // context while superseding the queued summary.
+    let (follow_up, observation) = event("UserPromptSubmit", "also test the loading indicator", 5);
+    apply(follow_up, observation, 5);
+    let second = receiver.try_recv().unwrap();
+    assert_eq!(
+        second.task_context.recent_prompts,
+        [private_prompt, "also test the loading indicator"]
+    );
+    complete(first, Ok("outdated summary"));
+    assert!(
+        snapshot()
+            .sidebar_model
+            .task_summary_loading
+            .contains(&pane)
+    );
+    assert!(current_record().task_context.current_summary().is_none());
+    complete(second, Ok("Sidebar summary repair"));
+    assert!(snapshot().sidebar_model.task_summary_loading.is_empty());
+    assert_eq!(
+        current_record()
+            .task_context
+            .current_summary()
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("Sidebar summary repair")
+    );
+
+    let restored = crate::pane_state::snapshot::load_snapshot(
+        &snapshot_path,
+        &coordinator.incarnation.identity,
+    )
+    .unwrap();
+    let restored = restored.get(&pane).unwrap();
+    assert!(restored.task_context.summary_input().is_none());
+    assert_eq!(
+        restored.task_context.current_summary(),
+        current_record().task_context.current_summary()
+    );
+    assert!(coordinator.schedule_task_summary(restored, None).is_none());
+
+    let (follow_up, observation) = event("UserPromptSubmit", "check a newer task", 6);
+    apply(follow_up, observation, 6);
+    complete(receiver.try_recv().unwrap(), Err("process timed out"));
+    assert!(snapshot().sidebar_model.task_summary_loading.is_empty());
+    assert_eq!(
+        current_record()
+            .task_context
+            .current_summary()
+            .unwrap()
+            .failure_code
+            .as_deref(),
+        Some("timeout")
+    );
+
+    let (follow_up, observation) = event("UserPromptSubmit", "task before session replacement", 7);
+    apply(follow_up, observation, 7);
+    let obsolete = receiver.try_recv().unwrap();
+    let (session, observation) = event("SessionStart", "", 8);
+    apply(session, observation, 8);
+    complete(obsolete, Ok("obsolete epoch summary"));
+    assert_eq!(
+        current_record().task_context,
+        crate::pane_state::TaskContextState::default()
+    );
+    assert!(snapshot().sidebar_model.task_summary_loading.is_empty());
+    drop(coordinator);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn codex_goal_continuations_project_working_waiting_and_completion() {
     use crate::agent_state::{ExecutionPhase, SemanticOutcome};
     use crate::pane_state::{AgentProcessIdentity, LifecycleState};

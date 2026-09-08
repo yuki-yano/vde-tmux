@@ -79,7 +79,7 @@ pub(in crate::daemon::server) fn apply_observation_batch(
         // Nonfatal per-pane failures keep processing the remaining panes, same
         // as the standalone mutation queue did; fail-stop conditions raise the
         // shutdown flag inside the helper and abort the rest of the batch.
-        let _ = apply_pane_event_mutation(coordinator, accepted_seq, envelope, true, None);
+        let _ = apply_pane_event_mutation(coordinator, accepted_seq, envelope, true, None, None);
         if coordinator.shutdown.load(Ordering::SeqCst) {
             return ServerMessage::error(
                 ErrorCode::NotReady,
@@ -109,6 +109,7 @@ pub(in crate::daemon::server) fn apply_pane_event_mutation(
     envelope: PaneEventEnvelope,
     defer_full_preflight: bool,
     durable_run: Option<crate::agent_state::RunRecord>,
+    private_task_prompt: Option<&str>,
 ) -> ServerMessage {
     use crate::daemon::protocol::v2::{PaneApplyOutcome, ServerMessage};
 
@@ -160,7 +161,12 @@ pub(in crate::daemon::server) fn apply_pane_event_mutation(
         state
             .leased
             .runtime
-            .apply_event(&mut io, &envelope, &visibility)
+            .apply_event_with_private_task_prompt(
+                &mut io,
+                &envelope,
+                &visibility,
+                private_task_prompt,
+            )
             .and_then(|mut result| {
                 if let Some(run) = durable_run.as_ref()
                     && state

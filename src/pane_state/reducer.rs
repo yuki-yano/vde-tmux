@@ -203,7 +203,12 @@ fn reduce_explicit(
             else {
                 return Ok(Reduction::unchanged(current));
             };
-            apply_initial_explicit_event(&mut state, &envelope.event, context.visibility)?;
+            apply_initial_explicit_event(
+                &mut state,
+                &envelope.event,
+                context.visibility,
+                context.private_task_prompt,
+            )?;
             let completed_outside_capture = state.completed_seq > 0;
             let mut tracker = reset_tracker_for_state(context.tracker, &state)?;
             tracker.hook_authoritative =
@@ -244,7 +249,12 @@ fn reduce_explicit(
     }
     match identity {
         ExistingIdentity::ExactPresent => {
-            apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+            apply_regular_explicit_event(
+                &mut state,
+                &envelope.event,
+                context.visibility,
+                context.private_task_prompt,
+            )?;
         }
         ExistingIdentity::ExactAbsent => {
             if epoch_evidence {
@@ -254,9 +264,19 @@ fn reduce_explicit(
                     Some(session.clone()),
                     EpochSource::Explicit,
                 )?;
-                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+                apply_regular_explicit_event(
+                    &mut state,
+                    &envelope.event,
+                    context.visibility,
+                    context.private_task_prompt,
+                )?;
             } else if completion {
-                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+                apply_regular_explicit_event(
+                    &mut state,
+                    &envelope.event,
+                    context.visibility,
+                    context.private_task_prompt,
+                )?;
                 state.agent_present = false;
                 state.scan_verified = true;
             } else {
@@ -266,7 +286,12 @@ fn reduce_explicit(
         ExistingIdentity::UnboundPresent => {
             if epoch_evidence || (completion && state.synthetic_completion_armed) {
                 state.agent_session_id = Some(session.clone());
-                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+                apply_regular_explicit_event(
+                    &mut state,
+                    &envelope.event,
+                    context.visibility,
+                    context.private_task_prompt,
+                )?;
             }
         }
         ExistingIdentity::UnboundAbsent => {
@@ -277,7 +302,12 @@ fn reduce_explicit(
                     Some(session.clone()),
                     EpochSource::Explicit,
                 )?;
-                apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+                apply_regular_explicit_event(
+                    &mut state,
+                    &envelope.event,
+                    context.visibility,
+                    context.private_task_prompt,
+                )?;
             } else {
                 return Err(ReduceError::StaleAgentEvent);
             }
@@ -296,7 +326,12 @@ fn reduce_explicit(
                 Some(session.clone()),
                 EpochSource::ProcessVerifiedExplicitHandover,
             )?;
-            apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+            apply_regular_explicit_event(
+                &mut state,
+                &envelope.event,
+                context.visibility,
+                context.private_task_prompt,
+            )?;
         }
         ExistingIdentity::MismatchAbsent => {
             if !epoch_evidence {
@@ -308,7 +343,12 @@ fn reduce_explicit(
                 Some(session.clone()),
                 EpochSource::Explicit,
             )?;
-            apply_regular_explicit_event(&mut state, &envelope.event, context.visibility)?;
+            apply_regular_explicit_event(
+                &mut state,
+                &envelope.event,
+                context.visibility,
+                context.private_task_prompt,
+            )?;
         }
     }
 
@@ -602,6 +642,7 @@ fn apply_initial_explicit_event(
     state: &mut PaneState,
     event: &PaneEvent,
     visibility: &VisibilitySnapshot,
+    private_task_prompt: Option<&str>,
 ) -> Result<(), ReduceError> {
     match event {
         PaneEvent::AgentSessionStarted { .. } => apply_agent_session_started(state, event),
@@ -623,7 +664,7 @@ fn apply_initial_explicit_event(
             )?;
             apply_report_fields(state, report)
         }
-        _ => apply_regular_explicit_event(state, event, visibility),
+        _ => apply_regular_explicit_event(state, event, visibility, private_task_prompt),
     }
 }
 
@@ -631,10 +672,13 @@ fn apply_regular_explicit_event(
     state: &mut PaneState,
     event: &PaneEvent,
     visibility: &VisibilitySnapshot,
+    private_task_prompt: Option<&str>,
 ) -> Result<(), ReduceError> {
     match event {
         PaneEvent::AgentSessionStarted { .. } => apply_agent_session_started(state, event),
-        PaneEvent::BeginRun { started_at, prompt } => begin_run(state, *started_at, prompt.clone()),
+        PaneEvent::BeginRun { started_at, prompt } => {
+            begin_run(state, *started_at, prompt.clone(), private_task_prompt)
+        }
         PaneEvent::ActivityObserved { observed_at } => activity_observed(state, *observed_at),
         PaneEvent::ActivityAndProgressObserved {
             observed_at,
@@ -924,6 +968,7 @@ fn begin_run(
     state: &mut PaneState,
     started_at: i64,
     prompt: Option<PromptState>,
+    private_task_prompt: Option<&str>,
 ) -> Result<(), ReduceError> {
     let starts_new_run = state.run_seq == state.completed_seq;
     let reference_response = starts_new_run
@@ -937,6 +982,16 @@ fn begin_run(
     start_new_run(state, started_at)?;
     state.lifecycle = LifecycleState::Running;
     state.prompt = prompt;
+    if let Some(prompt) = private_task_prompt {
+        state.prompt = None;
+        if starts_new_run {
+            state
+                .task_context
+                .observe_private_prompt_with_reference(prompt, reference_response.as_deref());
+        } else {
+            state.task_context.observe_private_prompt(prompt);
+        }
+    }
     if let Some(prompt) = &state.prompt {
         if starts_new_run {
             state
@@ -1531,6 +1586,7 @@ mod tests {
         visibility: &'a VisibilitySnapshot,
     ) -> ReductionContext<'a> {
         ReductionContext {
+            private_task_prompt: None,
             visibility,
             tracker,
             new_state_id: Some(StateId::parse(STATE_ID).unwrap()),
@@ -3018,6 +3074,7 @@ mod tests {
             begun.record.as_ref(),
             &event,
             ReductionContext {
+                private_task_prompt: None,
                 visibility: &other_split_visible,
                 tracker: &begun_tracker,
                 new_state_id: Some(StateId::parse(STATE_ID).unwrap()),

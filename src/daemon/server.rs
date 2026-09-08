@@ -263,7 +263,7 @@ impl ProductionV2Coordinator {
             state_id: state.state_id.clone(),
             agent_epoch: state.agent_epoch,
             agent: state.agent.clone(),
-            task_context: state.task_context.clone(),
+            task_context: state.task_context.summary_input()?,
         };
         if let Err(error) = sender.try_send(job) {
             self.log_daemon_error(&format!(

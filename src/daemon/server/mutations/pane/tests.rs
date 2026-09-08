@@ -49,7 +49,8 @@ fn task_summary_loading_tracks_dispatch_completion_and_superseded_requests() {
                 }),
             },
         };
-        let result = apply_pane_event_mutation(&coordinator, at as u64, envelope, false, None);
+        let result =
+            apply_pane_event_mutation(&coordinator, at as u64, envelope, false, None, None);
         assert!(
             matches!(result, ServerMessage::PaneEventResult { .. }),
             "{result:?}"
