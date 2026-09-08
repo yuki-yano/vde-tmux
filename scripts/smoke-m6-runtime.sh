@@ -703,14 +703,15 @@ API_WAIT_JSON="$RUNTIME_DIR/api-agent-wait.json"
 API_WAIT_ERROR="$RUNTIME_DIR/api-agent-wait.error"
 API_DAEMON_PID="$(lsof -t "$DAEMON_SOCKET" 2>/dev/null | head -n 1 || true)"
 [[ -n "$API_DAEMON_PID" ]]
-API_DAEMON_UNIX_FDS_BEFORE="$(lsof -a -p "$API_DAEMON_PID" -U -Fn 2>/dev/null | grep -c '^f' || true)"
+# Request file-descriptor fields explicitly; Linux lsof omits them with -Fn.
+API_DAEMON_UNIX_FDS_BEFORE="$(lsof -a -p "$API_DAEMON_PID" -U -Ffn 2>/dev/null | grep -c '^f' || true)"
 VT_PANE="$API_AGENT_PANE" run_vt agent wait "$API_AGENT_REF" \
   --until 'done' --after-completed-seq "$API_AGENT_COMPLETED_SEQ" --timeout-ms 5000 \
   --json >"$API_WAIT_JSON" 2>"$API_WAIT_ERROR" &
 API_WAIT_PID=$!
 API_WAIT_CONNECTED=0
 for _ in $(seq 1 100); do
-  API_DAEMON_UNIX_FDS_AFTER="$(lsof -a -p "$API_DAEMON_PID" -U -Fn 2>/dev/null | grep -c '^f' || true)"
+  API_DAEMON_UNIX_FDS_AFTER="$(lsof -a -p "$API_DAEMON_PID" -U -Ffn 2>/dev/null | grep -c '^f' || true)"
   if (( API_DAEMON_UNIX_FDS_AFTER > API_DAEMON_UNIX_FDS_BEFORE )); then
     API_WAIT_CONNECTED=1
     break
@@ -1149,10 +1150,14 @@ lines = []
 for line in sys.stdin.read().splitlines():
     line = re.sub(duration, "<elapsed>", line)
     if "<elapsed>" in line:
-        # Elapsed labels are right-aligned. Their changing width may move an
+        # Elapsed metadata is right-aligned. Its changing width may move an
         # adjacent ellipsis by one cell without changing the projected row.
         line = re.sub(r"(· )\S*…", r"\1<truncated>", line)
-        line = re.sub(r" +<elapsed>", " <elapsed>", line)
+        line = re.sub(
+            r" +((?:☑ [0-9]+/[0-9]+ · )?(?:↳ [0-9]+ · )?<elapsed>)",
+            r" \1",
+            line,
+        )
     lines.append(line)
 sys.stdout.write("\n".join(lines))
 '
