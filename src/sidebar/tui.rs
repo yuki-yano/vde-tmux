@@ -37,6 +37,7 @@ mod draw;
 mod effects;
 mod mouse;
 mod projection;
+mod question;
 mod terminal;
 mod types;
 
@@ -243,6 +244,10 @@ fn run_loop<B: Backend>(
         navigation_result_tx,
     );
     let mut mark_ui = MarkCompleteUi::default();
+    let (question_tx, question_rx) =
+        question::spawn_worker(socket.to_path_buf(), server_identity.to_string());
+    let mut question_pending = false;
+    let mut displayed_question = None;
     let mut render_gate = RenderGate::new();
     let animation_started = Instant::now();
     let mut summary_spinner_visible = false;
@@ -329,6 +334,11 @@ fn run_loop<B: Backend>(
             render_gate.mark_dirty_if(clear_stale_pane_selection(snapshot, &mut sidebar_state));
         }
         render_gate.mark_dirty_if(drain_mark_complete_results(&mark_result_rx, &mut mark_ui));
+        render_gate.mark_dirty_if(question::drain(
+            &question_rx,
+            &mut question_pending,
+            &mut mark_ui,
+        ));
         render_gate.mark_dirty_if(drain_pane_pin_results(&pin_result_rx, &mut mark_ui));
         while let Ok(result) = preference_result_rx.try_recv() {
             render_gate.mark_dirty();
@@ -471,6 +481,9 @@ fn run_loop<B: Backend>(
             &pin_request_tx,
             &mut mark_ui,
             ControlMessageContext {
+                question_target: displayed_question.as_ref(),
+                question_tx: &question_tx,
+                question_pending: &mut question_pending,
                 snapshot: current.as_ref(),
                 config: config.app,
                 daemon_connected: matches!(connection, ConnectionState::Connected),
@@ -502,6 +515,7 @@ fn run_loop<B: Backend>(
         if draw_this_loop {
             if let Some(snapshot) = &current {
                 let mut sidebar = project_view(snapshot, config.app, &sidebar_state);
+                displayed_question = question::displayed_target(snapshot, &sidebar);
                 if sidebar.rows.is_empty() && matches!(connection, ConnectionState::Degraded(_)) {
                     if let Some((rows, counts)) = &last_known_rows {
                         sidebar.rows = rows.clone();
@@ -670,6 +684,17 @@ fn run_loop<B: Backend>(
                                 &mut mark_ui,
                             );
                         }
+                    }
+                    KeyCode::Char('Q') => {
+                        pending_g = false;
+                        question::queue(
+                            displayed_question.as_ref(),
+                            matches!(connection, ConnectionState::Connected),
+                            &mut question_pending,
+                            &question_tx,
+                            &mut mark_ui,
+                        );
+                        render_gate.mark_dirty();
                     }
                     KeyCode::Char(' ') => {
                         pending_g = false;

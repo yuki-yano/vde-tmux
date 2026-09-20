@@ -8,6 +8,7 @@ pub(super) fn test_agent_pane() -> PanePresentation {
         pane_pid: 101,
     };
     PanePresentation {
+        question_notice: None,
         pane_instance: pane_instance.clone(),
         session_links: Vec::new(),
         window_id: "@1".to_string(),

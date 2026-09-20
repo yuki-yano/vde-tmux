@@ -1,6 +1,6 @@
 # Agent JSON API
 
-This document defines the current API v4 contract. The v4 mutation boundary and rollout gates are
+This document defines the current API v5 contract (daemon protocol 24, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
 maintained in [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is
 recorded in [AGENT_API_V3.md](AGENT_API_V3.md).
 
@@ -85,7 +85,7 @@ the conceptual request command, success envelope, and error envelope.
 ```json
 {
   "meta": {
-    "api_version": 4,
+    "api_version": 5,
     "server_identity": "...",
     "daemon_instance_id": "...",
     "snapshot_revision": 42,
@@ -181,8 +181,11 @@ projection:
 
 `badge` contains the current sidebar badge. A read completion therefore has `status: done`,
 `badge: idle`, and `unread: false`. A limited agent has `status: limited`, `badge: limited`, and
-`needs_action: false`. `needs_action` is derived from canonical triage state and does
-not disappear merely because a pane is visible.
+`needs_action: false` unless it also has an unacknowledged question notice. In API v5,
+`needs_action` is the union of current Blocked panes and unacknowledged question-notice panes.
+It excludes the two-poll visual TRIAGE retention after Blocked clears and does not disappear
+merely because a pane is visible. Badge totals remain mutually exclusive; notices are not an
+additional execution status.
 
 For Claude Code, `StopFailure(error=rate_limit)` projects the open run as Limited. Other official
 `StopFailure` errors project it as Blocked with `lifecycle.state=error`; `error=overloaded` and a
@@ -508,6 +511,39 @@ Every error contains a closed-enum `code`, human-readable `message`, `stage`, `s
 `event_history_lost` requires a new observation. `delivery_unknown` always requires manual
 inspection; it is never permission to resend the prompt.
 
+## Question notices (API v5)
+
+Stock Codex's successful `request_user_input_async` PostToolUse issues a notification.
+`PaneSummary` and `AgentSummary` expose `question_notice` for live Codex panes, with
+`unacknowledged`, `owner_ref`, `latest_order`, `acknowledged_order`, `last_issued_at`,
+`tracking_health` (`healthy` / `degraded`), and `reason`. No question text, answers, tool identifiers,
+or pending count is exposed. Absence of a notice is not proof that there are no unanswered questions.
+
+```bash
+PANE_JSON="$(vt pane get %456 --json)"
+PANE_REF="$(printf '%s' "$PANE_JSON" | jq -r '.result.pane.summary.pane_ref')"
+OWNER_REF="$(printf '%s' "$PANE_JSON" | jq -r '.result.pane.summary.question_notice.owner_ref')"
+ORDER="$(printf '%s' "$PANE_JSON" | jq -r '.result.pane.summary.question_notice.latest_order')"
+vt pane question-notice ack "$PANE_REF" --owner-ref "$OWNER_REF" --through-order "$ORDER" --json
+```
+
+Use one snapshot for all three arguments. The exact owner is the server incarnation, PaneInstance,
+and Codex PID/start token; agent epoch/session changes do not invalidate it. The daemon rechecks
+process ownership. Future orders, replaced owners, and unverified owners are rejected. Repeating
+the same acknowledgement is harmless. Newer notices stay visible. Acknowledgement does not send
+input, read an unread occurrence, or change lifecycle/Run completion. Answer/skip/focus/turn completion
+never acknowledges a notice automatically. Only Embedded mode is supported; shared LocalDaemon and
+Remote app-server hooks cannot be bound to a pane by ancestry.
+
+Notifications and their deduplication keys persist in private `question-notices-v1.json` under the
+server incarnation state directory, independently of Pane State schema 10 and durable Runs. Limits
+are 4096 keys/owner, 65536 total keys, 512 owners, and a 16 MiB sidecar. Confirmed dead owners are
+reclaimed; acknowledged keys are retained until then. Invalid/version-mismatched sidecars are not
+reset or overwritten automatically. Disk failure retains new notices in memory with
+`persistence_pending`, with at most one retry per five seconds; a crash before retry can lose them.
+Acknowledgement is shown only after saving succeeds. API 5 / protocol 24 must be installed together;
+there is no old-protocol fallback.
+
 ## Query cost
 
 `api snapshot`, `pane list/get/current`, and `agent list/get` project the daemon's cached canonical
@@ -539,3 +575,27 @@ a typed capture output-limit failure.
 The measurable functional, test, and operational completion checklist is maintained in
 [AGENT_API_V4.md](AGENT_API_V4.md#definition-of-done). The API is not rollout-complete while any
 item in that checklist remains unchecked.
+
+## API v5 question-notice completion checklist
+
+### 機能完了条件
+
+- [x] Existing stock Codex PostToolUse detects issuance and a fenced acknowledgement clears only displayed notices.
+- [x] Sidebar/API agree on current needs-action membership; lifecycle, unread, Runs, statusline, and OS notifications retain their contracts.
+
+### テスト完了条件
+
+- [x] Parser/owner guards, restart/dedup, persistence failure, capacity, stale/future fences, and multi-client rendering pass.
+- [x] Isolated runtime smoke, UI preflight, and real stock Codex Embedded hook acceptance pass; fixture and real-CLI evidence are recorded separately.
+
+Verified on 2026-09-20. The stock CLI 0.155.1 Embedded acceptance covered real issuance,
+answer/skip retention, and physical/remote `Q` across two sidebars. The separate
+`scripts/test-question-notice-isolated.py --extended` fixture measures API and two-sidebar
+frames with 58 agent panes, two attached clients, and 100 issue/ack cycles at `poll_ms=1000`.
+Timing begins before launching the hook process or sending the Q control request, so it
+includes more work than the daemon-ingress bound; it excludes Codex's pre-hook delay.
+
+### 運用反映条件
+
+- [ ] CLI/daemon/sidebar are deployed together with API 5 / protocol 24 while retaining existing Pane State schema 10.
+- [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.

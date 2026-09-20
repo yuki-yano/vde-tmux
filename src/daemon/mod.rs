@@ -52,6 +52,7 @@ pub struct SidebarModel {
     pub worktrees: BTreeMap<String, crate::git::WorktreeInfo>,
     #[serde(default)]
     pub needs_action: BTreeSet<crate::pane_state::PaneInstance>,
+    pub triage_panes: BTreeSet<crate::pane_state::PaneInstance>,
     #[serde(default)]
     pub flashing: BTreeSet<crate::pane_state::PaneInstance>,
     pub task_summary_loading: BTreeSet<crate::pane_state::PaneInstance>,

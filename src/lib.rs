@@ -14,6 +14,7 @@ pub mod options;
 pub mod pane_state;
 pub mod proc;
 pub mod project;
+pub mod question_notice;
 pub mod runtime_dir;
 pub mod session;
 pub mod session_manager;

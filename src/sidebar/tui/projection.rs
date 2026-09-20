@@ -400,9 +400,13 @@ pub(super) fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &Sideba
                 .iter()
                 .filter(|row| {
                     row.kind == SidebarRowKind::Chat
-                        && row
+                        && (row
                             .badge_state
                             .is_some_and(crate::sidebar::tree::badge_needs_user_input)
+                            || row
+                                .meta
+                                .as_ref()
+                                .is_some_and(|meta| meta.question_count > 0))
                 })
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>();
@@ -436,6 +440,7 @@ pub(super) fn apply_local_sidebar_key(state: &mut SidebarState, sidebar: &Sideba
         | SidebarInputAction::AgentNext
         | SidebarInputAction::AgentPrevious
         | SidebarInputAction::ReadCurrent
+        | SidebarInputAction::AckQuestionNotice
         | SidebarInputAction::UnreadLatest
         | SidebarInputAction::TogglePanePin
         | SidebarInputAction::ReorderUp

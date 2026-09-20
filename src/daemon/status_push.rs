@@ -1016,6 +1016,7 @@ mod tests {
 
         let pane_instance = pane(700);
         PanePresentation {
+            question_notice: None,
             pane_instance: pane_instance.clone(),
             session_links: Vec::new(),
             window_id: "@1".to_string(),
@@ -1069,6 +1070,7 @@ mod tests {
 
     fn non_agent_pane_presentation() -> PanePresentation {
         PanePresentation {
+            question_notice: None,
             pane_instance: PaneInstance {
                 pane_id: "%2".to_string(),
                 pane_pid: 701,

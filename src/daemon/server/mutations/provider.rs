@@ -30,15 +30,50 @@ pub(in crate::daemon::server) fn apply_external_provider_event(
     accepted_seq: u64,
     envelope: PaneEventEnvelope,
     observation: crate::hook::provider::ProviderObservation,
+    question_notice: Option<crate::question_notice::QuestionNoticeInput>,
 ) -> ServerMessage {
     let runner = coordinator.status_push_runner(Duration::from_secs(1));
-    apply_external_provider_event_with_runner(
+    apply_external_provider_notice_with_runner(
         coordinator,
         accepted_seq,
         envelope,
         observation,
+        question_notice,
         &runner,
     )
+}
+
+pub(in crate::daemon::server) fn apply_external_provider_notice_with_runner(
+    coordinator: &ProductionV2Coordinator,
+    accepted_seq: u64,
+    envelope: PaneEventEnvelope,
+    observation: crate::hook::provider::ProviderObservation,
+    question_notice: Option<crate::question_notice::QuestionNoticeInput>,
+    runner: &dyn crate::tmux::TmuxRunner,
+) -> ServerMessage {
+    let notice = question_notice
+        .filter(|_| {
+            envelope.agent.as_ref() == Some(&observation.provider)
+                && envelope.agent_session_id.as_ref() == Some(&observation.session_id)
+                && provider_event_matches_pane_event(&observation, &envelope.event)
+        })
+        .map(|notice| super::question::apply(coordinator, &envelope, &observation, notice, runner));
+    let event_id = envelope.event_id.clone();
+    let lifecycle = apply_external_provider_event_with_runner(
+        coordinator,
+        accepted_seq,
+        envelope,
+        observation,
+        runner,
+    );
+    match notice {
+        Some(question_notice) => ServerMessage::ProviderEventResult {
+            event_id,
+            question_notice,
+            lifecycle: Box::new(lifecycle),
+        },
+        None => lifecycle,
+    }
 }
 
 pub(in crate::daemon::server) fn apply_external_provider_event_with_runner(

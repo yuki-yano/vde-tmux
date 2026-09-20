@@ -172,6 +172,17 @@ impl CanonicalCoordinatorState {
                 });
             }
             panes.push(PanePresentation {
+                question_notice: record
+                    .filter(|state| state.agent.as_str() == "codex" && state.agent_present)
+                    .map(|_| {
+                        self.question_notices.summary(
+                            &topology.pane_instance,
+                            runtime
+                                .tracker(&topology.pane_instance)
+                                .agent_process
+                                .as_ref(),
+                        )
+                    }),
                 pane_instance: topology.pane_instance.clone(),
                 agent_process: runtime.tracker(&topology.pane_instance).agent_process,
                 session_links: topology.session_links.clone(),
@@ -261,6 +272,18 @@ impl CanonicalCoordinatorState {
             .iter()
             .filter_map(|session_id| session_categories.get(session_id).cloned())
             .collect();
+        let needs_action = panes
+            .iter()
+            .filter(|pane| {
+                pane.resolved.as_ref().is_some_and(|resolved| {
+                    resolved.badge == crate::daemon::session_badge::BadgeState::Blocked
+                }) || pane
+                    .question_notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.unacknowledged)
+            })
+            .map(|pane| pane.pane_instance.clone())
+            .collect();
         ResolvedSnapshot {
             snapshot_revision,
             panes,
@@ -275,7 +298,8 @@ impl CanonicalCoordinatorState {
                 session_categories,
                 git: git_badges.clone(),
                 worktrees: worktrees.clone(),
-                needs_action: runtime.triage_panes().cloned().collect(),
+                needs_action,
+                triage_panes: runtime.triage_panes().cloned().collect(),
                 flashing: runtime.flashing_panes().cloned().collect(),
                 task_summary_loading: self
                     .pending_task_summaries

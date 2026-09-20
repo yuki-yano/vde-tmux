@@ -218,7 +218,7 @@ fn build_header_chip_line(
         },
         HeaderChipSpec {
             filter: StatusFilter::AttentionOnly,
-            count: counts.blocked,
+            count: counts.needs_action,
             badge_state: Some(BadgeState::Blocked),
         },
         HeaderChipSpec {
@@ -416,12 +416,14 @@ pub fn render_header_lines(
 }
 
 pub fn build_footer_line(width: usize) -> Line<'static> {
-    let help = if width >= 64 {
-        " j/k move  gg/G ends  C-d/u half  C-f/b page  enter jump"
+    let help = if width >= 96 {
+        " Q: 質問通知を確認済みにする  j/k move  gg/G ends  C-d/u half  C-f/b page  enter jump"
+    } else if width >= 64 {
+        " j/k move  gg/G ends  C-d/u half  C-f/b page  Q confirm notice"
     } else if width >= 36 {
-        " j/k move  gg/G ends  enter jump"
+        " Q: 質問通知を確認済みにする"
     } else if width >= 24 {
-        " j/k  gg/G  enter jump"
+        " Q confirm notice  j/k"
     } else {
         " j/k  gg/G"
     };

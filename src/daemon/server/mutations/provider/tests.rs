@@ -2,6 +2,323 @@ use super::super::super::*;
 use super::*;
 
 #[test]
+fn question_notice_survives_stop_first_and_session_binding_rejection_without_changing_run_state() {
+    use crate::question_notice::{NoticeDisposition, QuestionNoticeInput};
+    let root = test_root("question-provider");
+    let coordinator = ProductionV2Coordinator::new(
+        test_incarnation(&root, "question-provider"),
+        BTreeMap::from([
+            ("XDG_STATE_HOME".into(), root.display().to_string()),
+            (
+                "VDE_TMUX_SOCKET_NAME".into(),
+                format!("vde-question-test-{}", std::process::id()),
+            ),
+        ]),
+        None,
+    )
+    .unwrap();
+    install_test_state(&coordinator, &root, Default::default());
+    *coordinator.agent_runtime.lock().unwrap() = Some(
+        crate::agent_state::runtime::AgentRuntime::open(
+            root.join("agent-state"),
+            "question-provider".into(),
+        )
+        .unwrap(),
+    );
+    let pane = PaneInstance {
+        pane_id: "%541".into(),
+        pane_pid: 54100,
+    };
+    coordinator
+        .state
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .topology
+        .panes = vec![read_peek_test_topology_pane(pane.clone(), false)];
+    let process = crate::pane_state::AgentProcessIdentity {
+        pid: 54101,
+        start_token: "question-process".into(),
+    };
+    let runner = crate::tmux::mock::MockTmuxRunner::new();
+    runner.stub_agent_process(pane.pane_pid, "codex", Some(process.clone()));
+    let daemon_id = coordinator
+        .router
+        .lock()
+        .unwrap()
+        .daemon_instance_id()
+        .clone();
+    let event = |kind, session: &str| {
+        codex_provider_test_event(daemon_id.clone(), pane.clone(), kind, &serde_json::json!({
+        "session_id": session, "turn_id": "question-turn", "source": "startup", "prompt":"question test", "last_assistant_message":"done",
+    }).to_string(), 42)
+    };
+    for kind in ["SessionStart", "UserPromptSubmit", "Stop"] {
+        let (envelope, observation) = event(kind, "session-one");
+        let response = apply_external_provider_event_with_runner(
+            &coordinator,
+            1,
+            envelope,
+            observation,
+            &runner,
+        );
+        assert!(
+            matches!(response, ServerMessage::PaneEventResult { .. }),
+            "{kind}: {response:?}"
+        );
+    }
+    let before = coordinator
+        .state
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .leased
+        .runtime
+        .record(&pane)
+        .unwrap()
+        .clone();
+    let input = |tool: &str| QuestionNoticeInput::Issued {
+        session_id: "session-one".into(),
+        turn_id: "question-turn".into(),
+        tool_use_id: tool.into(),
+        ancestors: vec![process.clone()],
+    };
+    let (envelope, observation) = event("PostToolUse", "session-one");
+    let response = apply_external_provider_notice_with_runner(
+        &coordinator,
+        2,
+        envelope,
+        observation,
+        Some(input("call-1")),
+        &runner,
+    );
+    assert!(
+        matches!(
+            response,
+            ServerMessage::ProviderEventResult {
+                question_notice: crate::question_notice::NoticeResult {
+                    disposition: NoticeDisposition::Persisted,
+                    ..
+                },
+                ..
+            }
+        ),
+        "{response:?}"
+    );
+    let displayed = {
+        let guard = coordinator.state.lock().unwrap();
+        let state = guard.as_ref().unwrap();
+        let current = state.leased.runtime.record(&pane).unwrap();
+        assert_eq!(current.lifecycle, before.lifecycle);
+        assert_eq!(current.completed_seq, before.completed_seq);
+        assert_eq!(current.run_seq, before.run_seq);
+        assert_eq!(current.unread, before.unread);
+        let snapshot = state.resolved_snapshot();
+        assert!(snapshot.sidebar_model.needs_action.contains(&pane));
+        assert!(!snapshot.sidebar_model.triage_panes.contains(&pane));
+        assert!(snapshot.attention.is_empty());
+        snapshot.panes[0].question_notice.clone().unwrap()
+    };
+    // /new changes agent epoch and removes the cached process; notification ownership survives.
+    let (envelope, observation) = event("SessionStart", "session-two");
+    apply_external_provider_event_with_runner(&coordinator, 3, envelope, observation, &runner);
+    let before_mismatch = coordinator
+        .state
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .leased
+        .runtime
+        .record(&pane)
+        .unwrap()
+        .clone();
+    let (envelope, observation) = event("PostToolUse", "session-one");
+    let response = apply_external_provider_notice_with_runner(
+        &coordinator,
+        4,
+        envelope,
+        observation,
+        Some(input("call-2")),
+        &runner,
+    );
+    match response {
+        ServerMessage::ProviderEventResult {
+            question_notice,
+            lifecycle,
+            ..
+        } => {
+            assert_eq!(question_notice.disposition, NoticeDisposition::Persisted);
+            assert!(matches!(
+                *lifecycle,
+                ServerMessage::Error {
+                    code: ErrorCode::StaleAgentEvent,
+                    ..
+                }
+            ));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .leased
+            .runtime
+            .record(&pane)
+            .unwrap(),
+        &before_mismatch
+    );
+    let ack = super::super::question::acknowledge_with_runner(
+        &coordinator,
+        5,
+        EventId::generate().unwrap(),
+        pane.clone(),
+        displayed.owner_ref.unwrap(),
+        displayed.latest_order,
+        &runner,
+    );
+    assert!(matches!(ack, ServerMessage::SnapshotAck { .. }), "{ack:?}");
+    let snapshot = coordinator
+        .state
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .resolved_snapshot();
+    let notice = snapshot.panes[0].question_notice.as_ref().unwrap();
+    assert_eq!((notice.latest_order, notice.acknowledged_order), (2, 1));
+    assert!(notice.unacknowledged);
+
+    // A new session has no cached process or Run: notice scan and normal Activity both succeed.
+    let (envelope, observation) = event("PostToolUse", "session-two");
+    let second_session_input = |tool: &str| QuestionNoticeInput::Issued {
+        session_id: "session-two".into(),
+        turn_id: "question-turn".into(),
+        tool_use_id: tool.into(),
+        ancestors: vec![process.clone()],
+    };
+    let response = apply_external_provider_notice_with_runner(
+        &coordinator,
+        6,
+        envelope.clone(),
+        observation.clone(),
+        Some(second_session_input("call-3")),
+        &runner,
+    );
+    assert!(
+        matches!(response, ServerMessage::ProviderEventResult {
+        question_notice: crate::question_notice::NoticeResult { disposition: NoticeDisposition::Persisted, .. },
+        ref lifecycle, ..
+    } if matches!(**lifecycle, ServerMessage::PaneEventResult { .. })),
+        "{response:?}"
+    );
+
+    // Even an unavailable durable runtime returns its error separately from the saved notice.
+    let runtime = coordinator.agent_runtime.lock().unwrap().take();
+    let response = apply_external_provider_notice_with_runner(
+        &coordinator,
+        7,
+        envelope.clone(),
+        observation.clone(),
+        Some(second_session_input("call-4")),
+        &runner,
+    );
+    assert!(
+        matches!(response, ServerMessage::ProviderEventResult {
+        question_notice: crate::question_notice::NoticeResult { disposition: NoticeDisposition::Persisted, .. },
+        ref lifecycle, ..
+    } if matches!(**lifecycle, ServerMessage::Error { code: ErrorCode::NotReady, .. })),
+        "{response:?}"
+    );
+    *coordinator.agent_runtime.lock().unwrap() = runtime;
+    let response = apply_external_provider_notice_with_runner(
+        &coordinator,
+        8,
+        envelope.clone(),
+        observation.clone(),
+        Some(second_session_input("call-4")),
+        &runner,
+    );
+    assert!(
+        matches!(
+            response,
+            ServerMessage::ProviderEventResult {
+                question_notice: crate::question_notice::NoticeResult {
+                    disposition: NoticeDisposition::Duplicate,
+                    ..
+                },
+                ..
+            }
+        ),
+        "{response:?}"
+    );
+
+    // Missing scans and a reused PID/start identity never accept the old hook or its ack.
+    for (replacement, reason) in [
+        (None, crate::question_notice::NoticeReason::OwnerUnverified),
+        (
+            Some(crate::pane_state::AgentProcessIdentity {
+                start_token: "reused-process".into(),
+                ..process.clone()
+            }),
+            crate::question_notice::NoticeReason::AncestorNotInPane,
+        ),
+    ] {
+        runner.stub_agent_process(pane.pane_pid, "codex", replacement);
+        let response = apply_external_provider_notice_with_runner(
+            &coordinator,
+            9,
+            envelope.clone(),
+            observation.clone(),
+            Some(second_session_input("rejected")),
+            &runner,
+        );
+        assert!(
+            matches!(response, ServerMessage::ProviderEventResult {
+            question_notice: crate::question_notice::NoticeResult { disposition: NoticeDisposition::Rejected, reason: Some(actual) }, ..
+        } if actual == reason),
+            "{response:?}"
+        );
+        let response = super::super::question::acknowledge_with_runner(
+            &coordinator,
+            10,
+            EventId::generate().unwrap(),
+            pane.clone(),
+            notice.owner_ref.clone().unwrap(),
+            4,
+            &runner,
+        );
+        assert!(matches!(
+            response,
+            ServerMessage::Error {
+                code: ErrorCode::StaleAgentEvent,
+                ..
+            }
+        ));
+    }
+    let final_snapshot = coordinator
+        .state
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .resolved_snapshot();
+    let final_notice = final_snapshot.panes[0].question_notice.as_ref().unwrap();
+    assert_eq!(
+        (final_notice.latest_order, final_notice.acknowledged_order),
+        (4, 1)
+    );
+    drop(coordinator);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn dispatched_prompt_generates_summary_without_publishing_or_persisting_its_input() {
     use crate::agent_state::{AgentBinding, OperationId, Sha256Digest};
     use crate::daemon::task_summary::{TaskSummaryCompletion, TaskSummaryJob};
@@ -481,7 +798,7 @@ fn claude_provider_observation_is_rejected_before_mutation() {
     };
 
     assert!(matches!(
-        apply_external_provider_event(&coordinator, 1, envelope, observation),
+        apply_external_provider_event(&coordinator, 1, envelope, observation, None),
         ServerMessage::Error {
             code: ErrorCode::UnsupportedProvider,
             ..

@@ -198,7 +198,9 @@ mod mutation;
 mod pane;
 
 pub use category::{category_assign, category_automatic, category_get, category_list};
-pub use pane::{pane_current, pane_get, pane_list, pane_read, pane_split, snapshot};
+pub use pane::{
+    pane_current, pane_get, pane_list, pane_read, pane_split, question_notice_ack, snapshot,
+};
 mod agent;
 
 pub(crate) use agent::run::{

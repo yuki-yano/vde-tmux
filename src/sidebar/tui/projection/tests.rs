@@ -9,6 +9,7 @@ fn filter_cycles_in_both_directions_and_skips_empty_filters() {
     let view = SidebarView {
         counts: BadgeCounts {
             total: 6,
+            needs_action: 0,
             blocked: 0,
             limited: 0,
             working: 2,

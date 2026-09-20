@@ -7,6 +7,11 @@ use crate::tmux::TmuxRunner;
 
 #[derive(Debug, Subcommand)]
 pub(super) enum PaneCommand {
+    /// Manage unacknowledged question-issued notifications (does not answer Codex).
+    QuestionNotice {
+        #[command(subcommand)]
+        command: QuestionNoticeCommand,
+    },
     /// List panes from the daemon's cached canonical snapshot.
     List,
     /// Get one pane by %pane_id or pane_ref.
@@ -34,6 +39,18 @@ pub(super) enum PaneCommand {
         /// Select the created pane. Omitted by default so agent automation does not steal focus.
         #[arg(long)]
         focus: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum QuestionNoticeCommand {
+    /// Acknowledge only the notice order seen in an exact pane snapshot.
+    Ack {
+        target: String,
+        #[arg(long)]
+        owner_ref: String,
+        #[arg(long)]
+        through_order: u64,
     },
 }
 
@@ -84,6 +101,21 @@ pub(super) fn dispatch(
     observed_at: i64,
 ) -> Result<String> {
     match command {
+        PaneCommand::QuestionNotice {
+            command:
+                QuestionNoticeCommand::Ack {
+                    target,
+                    owner_ref,
+                    through_order,
+                },
+        } => crate::api::question_notice_ack(
+            runner,
+            env,
+            observed_at,
+            &target,
+            &owner_ref,
+            through_order,
+        ),
         PaneCommand::List => crate::api::pane_list(runner, env, observed_at),
         PaneCommand::Get { target } => crate::api::pane_get(runner, env, observed_at, &target),
         PaneCommand::Current => crate::api::pane_current(runner, env, observed_at),

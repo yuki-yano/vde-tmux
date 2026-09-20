@@ -17,6 +17,64 @@ use crate::daemon::protocol::v2::{PanePresentation, ResolvedSnapshot};
 use crate::pane_state::{EventId, PaneInstance};
 use crate::tmux::TmuxRunner;
 
+pub fn question_notice_ack(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    target: &str,
+    owner_ref: &str,
+    through_order: u64,
+) -> Result<String> {
+    use crate::daemon::protocol::v2::{
+        ClientMessage, PROTOCOL_VERSION, ServerMessage, SidebarCommand,
+    };
+    if !target.starts_with("vtp1:") || !owner_ref.starts_with("vtqn1:") || owner_ref.len() != 70 {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidReference,
+            "question notice ack requires exact pane_ref and owner_ref",
+        )
+        .into());
+    }
+    let mut connection = ApiConnection::connect(runner, env, None)?;
+    let before = connection.query_snapshot()?;
+    let pane = resolve_pane(&before, target, &connection.server_identity)?;
+    let pane_instance = pane.pane_instance.clone();
+    let event_id = EventId::generate()?;
+    let mut mutation = connection.reconnect()?;
+    let client = &mut mutation.client;
+    let response = client.request(&ClientMessage::SidebarCommand {
+        proto: PROTOCOL_VERSION,
+        daemon_instance_id: client.daemon_instance_id().clone(),
+        event_id: event_id.clone(),
+        command: SidebarCommand::AckQuestionNotice {
+            pane_instance,
+            owner_ref: owner_ref.to_string(),
+            through_order,
+        },
+    })?;
+    match response {
+        ServerMessage::SnapshotAck {
+            event_id: returned, ..
+        } if returned == event_id => {}
+        ServerMessage::Error { code, message, .. } => {
+            return Err(super::connection::daemon_api_error(code, message).into());
+        }
+        _ => anyhow::bail!("unexpected question notice acknowledgement response"),
+    }
+    let mut connection = connection.reconnect()?;
+    let snapshot = connection.query_snapshot()?;
+    success_json(
+        &connection,
+        &snapshot,
+        observed_at,
+        ApiResult::QuestionNoticeAck {
+            pane_ref: target.to_string(),
+            owner_ref: owner_ref.to_string(),
+            through_order,
+        },
+    )
+}
+
 pub fn snapshot(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,

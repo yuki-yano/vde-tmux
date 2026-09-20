@@ -196,7 +196,7 @@ fn validate_records(records: &BTreeMap<PaneInstance, PaneState>) -> Result<(), S
     Ok(())
 }
 
-fn ensure_private_parent(path: &Path) -> Result<(), StoreError> {
+pub(crate) fn ensure_private_parent(path: &Path) -> Result<(), StoreError> {
     let parent = path
         .parent()
         .ok_or_else(|| StoreError::PersistFailed("pane snapshot path has no parent".into()))?;
@@ -234,7 +234,10 @@ fn validate_private_directory(path: &Path, metadata: &std::fs::Metadata) -> Resu
     Ok(())
 }
 
-fn validate_private_file(path: &Path, metadata: &std::fs::Metadata) -> Result<(), StoreError> {
+pub(crate) fn validate_private_file(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), StoreError> {
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }

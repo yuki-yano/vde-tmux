@@ -73,6 +73,26 @@ pub fn render_lines_with_indices(
     }
 }
 
+fn question_marks(row: &SidebarRow) -> String {
+    let Some(meta) = &row.meta else {
+        return String::new();
+    };
+    let mut marks = String::new();
+    for (glyph, count) in [
+        ("?", meta.question_count),
+        ("!", meta.question_degraded_count),
+    ] {
+        if count > 0 {
+            if row.kind == SidebarRowKind::Chat {
+                marks.push_str(glyph);
+            } else {
+                marks.push_str(&format!("{glyph} {count} "));
+            }
+        }
+    }
+    marks
+}
+
 fn render_standard_lines(
     rows: &[SidebarRow],
     state: &SidebarState,
@@ -130,7 +150,7 @@ fn render_closed_chat_summary_line(
     let current_agent = row_is_current_agent(row, state);
     let indent = "  ".repeat(row.depth);
     let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
-    let glyph = theme.badge_glyph(badge_state);
+    let glyph = format!("{}{}", theme.badge_glyph(badge_state), question_marks(row));
     let agent_source = chat_agent_label(row);
 
     let mut prefix = Vec::new();
@@ -280,7 +300,7 @@ fn render_row_line(
     let current_agent_marker = row.kind == SidebarRowKind::Chat && row_is_current_agent(row, state);
     if row.kind == SidebarRowKind::Zone {
         let text = truncate_display(
-            &format!(" ▍{} {}", row.label, row.chat_count),
+            &format!(" ▍{}{} {}", question_marks(row), row.label, row.chat_count),
             width.saturating_sub(1),
         );
         let zone_color = if row.id == PRIORITY_PINNED_ZONE_ID {
@@ -311,7 +331,7 @@ fn render_row_line(
     let badge = if row.kind == SidebarRowKind::Chat {
         row.badge_state.map(|state| {
             (
-                format!("{} ", theme.badge_glyph(state)),
+                format!("{}{} ", theme.badge_glyph(state), question_marks(row)),
                 theme.badge_color(state),
             )
         })
@@ -341,7 +361,9 @@ fn render_row_line(
         .saturating_sub(git_width)
         .saturating_sub(right_reserved);
     let label_source = match row.kind {
-        SidebarRowKind::Category => row.label.clone(),
+        SidebarRowKind::Category | SidebarRowKind::Repo => {
+            format!("{}{}", question_marks(row), row.label)
+        }
         SidebarRowKind::Chat => chat_display_label(row),
         SidebarRowKind::Detail if row.id.ends_with("::summary-loading") => {
             task_summary_spinner(state).to_string()
@@ -800,7 +822,10 @@ fn render_zone_dense_line(
     width: usize,
     theme: &SidebarRenderTheme,
 ) -> Line<'static> {
-    let text = truncate_display(&format!(" ▍{} {}", row.label, row.chat_count), width);
+    let text = truncate_display(
+        &format!(" ▍{}{} {}", question_marks(row), row.label, row.chat_count),
+        width,
+    );
     let color = if row.id == PRIORITY_PINNED_ZONE_ID {
         theme.toggle
     } else {
@@ -820,7 +845,10 @@ fn render_group_dense_line(
 ) -> Line<'static> {
     let selected = state.selection.as_deref() == Some(row.id.as_str());
     let marker = if row.expanded { "▾" } else { "▸" };
-    let text = truncate_display(&format!(" {marker} {}", row.label), width);
+    let text = truncate_display(
+        &format!(" {marker} {}{}", question_marks(row), row.label),
+        width,
+    );
     let mut style = row_style(row, theme);
     if selected {
         style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
@@ -837,7 +865,7 @@ fn render_chat_dense_line(
     let selected = state.selection.as_deref() == Some(row.id.as_str());
     let current_agent = row_is_current_agent(row, state);
     let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
-    let glyph = theme.badge_glyph(badge_state);
+    let glyph = format!("{}{}", theme.badge_glyph(badge_state), question_marks(row));
     let agent_source = row
         .meta
         .as_ref()
@@ -868,14 +896,14 @@ fn render_chat_dense_line(
     let label_budget = width
         .saturating_sub(1)
         .saturating_sub(pin_width)
-        .saturating_sub(display_width(glyph))
+        .saturating_sub(display_width(&glyph))
         .saturating_sub(display_width(&prefix_after_glyph))
         .saturating_sub(right_reserved)
         .saturating_sub(1);
     let label = truncate_display(&body, label_budget);
     let used = 1
         + pin_width
-        + display_width(glyph)
+        + display_width(&glyph)
         + display_width(&prefix_after_glyph)
         + display_width(&label);
     let filler = width
@@ -950,7 +978,7 @@ fn render_micro_lines(
             continue;
         }
         let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
-        let glyph = theme.badge_glyph(badge_state);
+        let glyph = format!("{}{}", theme.badge_glyph(badge_state), question_marks(row));
         let right = right_label(row).unwrap_or_default();
         let selected = state.selection.as_deref() == Some(row.id.as_str());
         let marker = row_leading_marker_span(row, row_is_current_agent(row, state), theme);
@@ -1040,6 +1068,19 @@ fn render_rail_lines(
             style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
         }
         let glyph = row.badge_state.expect("rail rows must carry badge_state");
+        let marks = question_marks(row);
+        if !marks.is_empty() {
+            lines.push(Line::from(Span::styled(
+                super::text::slice_display(
+                    &format!("{}{marks}", theme.badge_glyph(glyph)),
+                    0,
+                    width as u16,
+                ),
+                style,
+            )));
+            row_indices.push(Some(index));
+            continue;
+        }
         let pinned = row_pinned(row);
         let visible_glyph = if pinned {
             "✦"

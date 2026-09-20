@@ -2028,8 +2028,15 @@ fn apply_production_mutation(
         V2AcceptedMutation::External(ClientMessage::SubmitProviderEvent {
             envelope,
             observation,
+            question_notice,
             ..
-        }) => apply_external_provider_event(coordinator, accepted_seq, envelope, observation),
+        }) => apply_external_provider_event(
+            coordinator,
+            accepted_seq,
+            envelope,
+            observation,
+            question_notice,
+        ),
         V2AcceptedMutation::External(ClientMessage::StartAgentPrompt {
             event_id,
             target_agent_ref,
@@ -2084,6 +2091,18 @@ fn apply_production_mutation(
         V2AcceptedMutation::External(ClientMessage::SidebarCommand {
             event_id, command, ..
         }) => match command {
+            crate::daemon::protocol::v2::SidebarCommand::AckQuestionNotice {
+                pane_instance,
+                owner_ref,
+                through_order,
+            } => mutations::question::acknowledge(
+                coordinator,
+                accepted_seq,
+                event_id,
+                pane_instance,
+                owner_ref,
+                through_order,
+            ),
             crate::daemon::protocol::v2::SidebarCommand::MarkComplete {
                 pane_instance,
                 expected,
@@ -2892,6 +2911,7 @@ fn apply_production_mutation(
             }
         }
     };
+    mutations::question::maintain(coordinator);
     if let ServerMessage::Error {
         code: ErrorCode::InternalError,
         message,

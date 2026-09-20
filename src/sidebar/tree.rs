@@ -45,6 +45,9 @@ pub struct SidebarRow {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RowMeta {
+    pub question_notice: Option<crate::question_notice::QuestionNoticeSummary>,
+    pub question_count: usize,
+    pub question_degraded_count: usize,
     pub agent: Option<String>,
     pub prompt: Option<String>,
     pub task_summary: Option<String>,
@@ -67,6 +70,7 @@ pub struct RowMeta {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BadgeCounts {
+    pub needs_action: usize,
     pub total: usize,
     pub blocked: usize,
     pub limited: usize,
@@ -79,7 +83,7 @@ impl BadgeCounts {
     pub fn count_for_filter(self, filter: StatusFilter) -> usize {
         match filter {
             StatusFilter::All => self.total,
-            StatusFilter::AttentionOnly => self.blocked,
+            StatusFilter::AttentionOnly => self.needs_action,
             StatusFilter::LimitedOnly => self.limited,
             StatusFilter::WorkingOnly => self.working,
             StatusFilter::DoneOnly => self.done,
@@ -94,6 +98,7 @@ impl BadgeCounts {
 
 #[derive(Debug, Clone)]
 struct AgentPane {
+    question_notice: Option<crate::question_notice::QuestionNoticeSummary>,
     pane_instance: PaneInstance,
     pane_id: String,
     repo: String,
@@ -160,7 +165,7 @@ pub fn project_sidebar(
     let context = RowBuildContext {
         git: model.git.clone(),
         worktrees: model.worktrees.clone(),
-        triage: model.needs_action.clone(),
+        triage: model.triage_panes.clone(),
         flash: model.flashing.clone(),
         task_summary_loading: model.task_summary_loading.clone(),
         active_sessions: model.active_sessions.clone(),
@@ -264,6 +269,7 @@ pub fn build_rows_from_presentations(
             .entry((category.clone(), repo_key.to_string()))
             .or_default()
             .push(AgentPane {
+                question_notice: pane.question_notice.clone(),
                 pane_instance: pane.pane_instance.clone(),
                 pane_id: pane.pane_instance.pane_id.clone(),
                 repo,
@@ -368,6 +374,7 @@ fn build_rows_from_groups(
         }
     }
     order_agent_panes(&mut triage_panes, order);
+    triage_panes.retain(|pane| pane_matches_filter(pane, state.filter));
     for panes in groups.values_mut() {
         panes.retain(|pane| pane_matches_filter(pane, state.filter));
     }
@@ -406,6 +413,7 @@ fn badge_counts_from_agent_panes<'a>(
     let mut counts = BadgeCounts::default();
     for pane in panes {
         counts.total += 1;
+        counts.needs_action += usize::from(pane_matches_attention_filter(pane));
         match pane.badge_state {
             BadgeState::Blocked => counts.blocked += 1,
             BadgeState::Limited => counts.limited += 1,
@@ -709,7 +717,7 @@ fn triage_zone_rows(panes: &[AgentPane], state: &SidebarState, now: i64) -> Vec<
         pane_id: None,
         git: None,
         active: false,
-        meta: None,
+        meta: Some(group_meta(panes)),
     }];
     for pane in panes {
         let id = chat_row_id(&pane.pane_instance);
@@ -761,40 +769,35 @@ fn priority_rows(
             true
         }
     });
-    if !pinned.is_empty() {
-        rows.push(SidebarRow {
-            id: PRIORITY_PINNED_ZONE_ID.to_string(),
-            kind: SidebarRowKind::Zone,
-            depth: 0,
-            label: "PINNED".to_string(),
-            chat_count: pinned.len(),
-            rollup: pinned
-                .iter()
-                .map(|pane| pane.rollup)
-                .min()
-                .unwrap_or(RollupLevel::Idle),
-            badge_state: None,
-            expanded: true,
-            pane_id: None,
-            git: None,
-            active: false,
-            meta: None,
-        });
-        for pane in &pinned {
-            push_priority_chat_row(pane, state, now, &mut rows);
-        }
-    }
-    for (badge, key, label) in [
-        (BadgeState::Blocked, "needs-input", "NEEDS INPUT"),
-        (BadgeState::Limited, "limited", "LIMITED"),
-        (BadgeState::Done, "unread-done", "UNREAD DONE"),
-        (BadgeState::Working, "running", "RUNNING"),
-        (BadgeState::Idle, "idle", "IDLE"),
+    for (key, label, badge) in [
+        ("pinned", "PINNED", None),
+        ("needs-input", "NEEDS INPUT", Some(BadgeState::Blocked)),
+        ("questions", "QUESTIONS", None),
+        ("limited", "LIMITED", Some(BadgeState::Limited)),
+        ("unread-done", "UNREAD DONE", Some(BadgeState::Done)),
+        ("running", "RUNNING", Some(BadgeState::Working)),
+        ("idle", "IDLE", Some(BadgeState::Idle)),
     ] {
-        let section = panes
-            .iter()
-            .filter(|pane| pane.badge_state == badge)
-            .collect::<Vec<_>>();
+        let section = if key == "pinned" {
+            pinned.clone()
+        } else {
+            panes
+                .iter()
+                .filter(|pane| {
+                    let question = pane
+                        .question_notice
+                        .as_ref()
+                        .is_some_and(|notice| notice.unacknowledged);
+                    if key == "questions" {
+                        question && pane.badge_state != BadgeState::Blocked
+                    } else {
+                        Some(pane.badge_state) == badge
+                            && (badge == Some(BadgeState::Blocked) || !question)
+                    }
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         if section.is_empty() {
             continue;
         }
@@ -804,19 +807,15 @@ fn priority_rows(
             depth: 0,
             label: label.to_string(),
             chat_count: section.len(),
-            rollup: section
-                .iter()
-                .map(|pane| pane.rollup)
-                .min()
-                .unwrap_or(RollupLevel::Idle),
-            badge_state: Some(badge),
+            rollup: rollup(&section),
+            badge_state: badge,
             expanded: true,
             pane_id: None,
             git: None,
             active: false,
-            meta: None,
+            meta: Some(group_meta(&section)),
         });
-        for pane in section {
+        for pane in &section {
             push_priority_chat_row(pane, state, now, &mut rows);
         }
     }
@@ -937,6 +936,20 @@ fn push_chat_detail_rows(
     include_repo_git: bool,
     rows: &mut Vec<SidebarRow>,
 ) {
+    if let Some(notice) = &pane.question_notice {
+        if notice.unacknowledged {
+            rows.push(detail_row(pane, depth, "question-notice", "? Codexから質問が発行されました。回答済みでも通知は残ります。Qで確認済みにできます。".to_string()));
+        }
+        if let Some(reason) = notice.reason {
+            rows.push(detail_row(
+                pane,
+                depth,
+                "question-health",
+                format!("! question notice tracking: {reason:?}"),
+            ));
+        }
+    }
+
     if pane.task_summary_loading {
         rows.push(detail_row(pane, depth, "summary-loading", String::new()));
     } else if let Some(summary) = non_empty(&pane.task_summary) {
@@ -1160,6 +1173,17 @@ fn expanded_chat_label(pane: &AgentPane) -> String {
 fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
     let tasks = parse_tasks(&pane.tasks);
     RowMeta {
+        question_notice: pane.question_notice.clone(),
+        question_count: usize::from(
+            pane.question_notice
+                .as_ref()
+                .is_some_and(|notice| notice.unacknowledged),
+        ),
+        question_degraded_count: usize::from(
+            pane.question_notice
+                .as_ref()
+                .is_some_and(|notice| notice.degraded()),
+        ),
         agent: Some(display_agent_name(&pane.agent)),
         prompt: non_empty(&pane.prompt).map(str::to_string),
         task_summary: non_empty(&pane.task_summary).map(str::to_string),
@@ -1191,6 +1215,22 @@ fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
 
 fn group_meta(panes: &[AgentPane]) -> RowMeta {
     RowMeta {
+        question_count: panes
+            .iter()
+            .filter(|pane| {
+                pane.question_notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.unacknowledged)
+            })
+            .count(),
+        question_degraded_count: panes
+            .iter()
+            .filter(|pane| {
+                pane.question_notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.degraded())
+            })
+            .count(),
         attention_count: Some(
             panes
                 .iter()
@@ -1279,6 +1319,10 @@ fn pane_matches_filter(pane: &AgentPane, filter: StatusFilter) -> bool {
 
 fn pane_matches_attention_filter(pane: &AgentPane) -> bool {
     badge_needs_user_input(pane.badge_state)
+        || pane
+            .question_notice
+            .as_ref()
+            .is_some_and(|notice| notice.unacknowledged)
 }
 
 pub(crate) fn badge_needs_user_input(badge: BadgeState) -> bool {
@@ -1466,8 +1510,96 @@ fn non_empty(raw: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn question_notice_attention_priority_and_structural_triage_are_independent() {
+        let mut panes = Vec::new();
+        for (index, badge) in [
+            BadgeState::Blocked,
+            BadgeState::Limited,
+            BadgeState::Working,
+            BadgeState::Done,
+            BadgeState::Idle,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut pane = agent_pane(badge, "100");
+            pane.pane_instance = PaneInstance {
+                pane_id: format!("%{}", index + 1),
+                pane_pid: index as u32 + 1,
+            };
+            pane.pane_id = pane.pane_instance.pane_id.clone();
+            pane.question_notice = Some(crate::question_notice::QuestionNoticeSummary {
+                unacknowledged: true,
+                owner_ref: Some("owner".into()),
+                latest_order: 1,
+                tracking_health: crate::question_notice::TrackingHealth::Degraded,
+                reason: Some(crate::question_notice::NoticeReason::PersistencePending),
+                ..Default::default()
+            });
+            panes.push(pane);
+        }
+        let groups = BTreeMap::from([(("misc".into(), "repo".into()), panes.clone())]);
+        let state = SidebarState {
+            category_scope: CategoryScope::All,
+            presentation_mode: PresentationMode::Priority,
+            ..Default::default()
+        };
+        let (rows, counts) = build_rows_from_groups(
+            groups.clone(),
+            &state,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(counts.total, 5);
+        assert_eq!(counts.blocked, 1);
+        assert_eq!(counts.count_for_filter(StatusFilter::AttentionOnly), 5);
+        let zones: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == SidebarRowKind::Zone)
+            .map(|row| (row.label.as_str(), row.chat_count))
+            .collect();
+        assert_eq!(zones, vec![("NEEDS INPUT", 1), ("QUESTIONS", 4)]);
+        for row in rows.iter().filter(|row| row.kind == SidebarRowKind::Zone) {
+            assert_eq!(row.meta.as_ref().unwrap().question_count, row.chat_count);
+            assert_eq!(
+                row.meta.as_ref().unwrap().question_degraded_count,
+                row.chat_count
+            );
+        }
+        let context = RowBuildContext {
+            triage: BTreeSet::from([
+                panes[0].pane_instance.clone(),
+                panes[2].pane_instance.clone(),
+            ]),
+            ..Default::default()
+        };
+        for mode in [PresentationMode::Tree, PresentationMode::Flat] {
+            let state = SidebarState {
+                presentation_mode: mode,
+                filter: StatusFilter::IdleOnly,
+                ..state.clone()
+            };
+            let (rows, _) =
+                build_rows_from_groups(groups.clone(), &state, &Default::default(), &context);
+            assert!(!rows.iter().any(|row| row.id == "zone::triage"));
+            assert!(
+                rows.iter()
+                    .filter(|row| row.kind == SidebarRowKind::Chat)
+                    .all(|row| row.badge_state == Some(BadgeState::Idle))
+            );
+        }
+        let mut pinned = panes[2].clone();
+        pinned.pinned = true;
+        let groups = BTreeMap::from([(("misc".into(), "repo".into()), vec![pinned])]);
+        let (rows, _) = build_rows_from_groups(groups, &state, &Default::default(), &context);
+        assert_eq!(rows[0].id, PRIORITY_PINNED_ZONE_ID);
+        assert_eq!(rows[0].meta.as_ref().unwrap().question_count, 1);
+    }
+
     fn agent_pane(badge_state: BadgeState, completed_at: &str) -> AgentPane {
         AgentPane {
+            question_notice: None,
             pane_instance: PaneInstance {
                 pane_id: "%1".to_string(),
                 pane_pid: 1,
@@ -1886,6 +2018,7 @@ mod tests {
             listening_ports: Vec::new(),
         };
         let pane = crate::daemon::protocol::v2::PanePresentation {
+            question_notice: None,
             pane_instance: pane_instance.clone(),
             session_links: vec![crate::daemon::protocol::v2::SessionLinkPresentation {
                 session_id: "$1".to_string(),

@@ -278,6 +278,7 @@ fn running_pane_presentation(epoch: i64) -> PanePresentation {
         listening_ports: Vec::new(),
     };
     PanePresentation {
+        question_notice: None,
         pane_instance: pane_instance.clone(),
         session_links: Vec::new(),
         window_id: "@1".to_string(),

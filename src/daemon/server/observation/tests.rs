@@ -137,6 +137,7 @@ fn query_pane_cache_miss_waits_for_targeted_refresh_and_returns_found() {
         response,
         ServerMessage::PaneResult {
             pane: crate::daemon::protocol::v2::PanePresentation {
+                question_notice: None,
                 pane_instance: PaneInstance {
                     pane_id,
                     pane_pid: 700,

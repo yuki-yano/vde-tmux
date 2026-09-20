@@ -14,7 +14,7 @@ use crate::daemon::session_badge::BadgeState;
 
 use super::common::epoch_now;
 
-pub const API_VERSION: u16 = 4;
+pub const API_VERSION: u16 = 5;
 pub const DEFAULT_READ_LINES: usize = 120;
 pub const MAX_READ_LINES: usize = 2_000;
 pub const MAX_READ_BYTES: usize = 1024 * 1024;
@@ -537,6 +537,11 @@ pub enum ApiResult {
     PaneSplit {
         split: PaneSplitReceipt,
     },
+    QuestionNoticeAck {
+        pane_ref: String,
+        owner_ref: String,
+        through_order: u64,
+    },
     AgentList {
         agents: Vec<AgentSummary>,
     },
@@ -710,6 +715,8 @@ pub struct SessionLink {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct PaneSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_notice: Option<crate::question_notice::QuestionNoticeSummary>,
     pub pane_ref: String,
     pub pane_id: String,
     pub pane_pid: u32,
@@ -803,6 +810,8 @@ pub struct CurrentRunSummary {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct AgentSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_notice: Option<crate::question_notice::QuestionNoticeSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_ref: Option<String>,
     pub identity: AgentIdentityStrength,
@@ -1101,6 +1110,11 @@ pub enum OperationWaitUntil {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum ApiRequest {
+    PaneQuestionNoticeAck {
+        target: String,
+        owner_ref: String,
+        through_order: u64,
+    },
     ApiSchema,
     ApiSnapshot,
     PaneList,

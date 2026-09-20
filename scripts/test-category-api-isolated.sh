@@ -89,7 +89,7 @@ run_vt category list --json >"$RUNTIME_DIR/list.json"
 python3 - "$RUNTIME_DIR/list.json" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
-assert value["meta"]["api_version"] == 4, value
+assert value["meta"]["api_version"] == 5, value
 assert value["result"]["type"] == "category_list", value
 assert value["result"]["category_state_revision"] == 0, value
 categories = value["result"]["categories"]

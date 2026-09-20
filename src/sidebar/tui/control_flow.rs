@@ -143,8 +143,11 @@ pub(super) fn sidebar_elapsed_clock_visible(
 
 /// Geometry and row mapping of the most recently drawn frame. Click hit-testing
 /// must use exactly what was drawn, so the run loop records it on every draw.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct ControlMessageContext<'a> {
+    pub(super) question_target: Option<&'a super::question::AckRequest>,
+    pub(super) question_tx: &'a mpsc::Sender<super::question::AckRequest>,
+    pub(super) question_pending: &'a mut bool,
     pub(super) snapshot: Option<&'a ResolvedSnapshot>,
     pub(super) config: &'a Config,
     pub(super) daemon_connected: bool,
@@ -164,6 +167,9 @@ pub(super) fn drain_control_messages(
     context: ControlMessageContext<'_>,
 ) -> Result<bool> {
     let ControlMessageContext {
+        question_target,
+        question_tx,
+        question_pending,
         snapshot,
         config,
         daemon_connected,
@@ -187,6 +193,15 @@ pub(super) fn drain_control_messages(
                     set_sidebar_context(snapshot, state, &source_pane, &session_id);
                     let sidebar = project_view(snapshot, config, state);
                     match crate::sidebar::input::parse_key(&key) {
+                        Some(crate::sidebar::input::SidebarInputAction::AckQuestionNotice) => {
+                            super::question::queue(
+                                question_target,
+                                daemon_connected,
+                                question_pending,
+                                question_tx,
+                                ui,
+                            );
+                        }
                         Some(crate::sidebar::input::SidebarInputAction::AgentNext)
                         | Some(crate::sidebar::input::SidebarInputAction::AgentPrevious)
                         | Some(crate::sidebar::input::SidebarInputAction::ReadCurrent)

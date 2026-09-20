@@ -74,6 +74,7 @@ fn header_filter_positions_are_stable_across_view_axes() {
 fn rich_header_counts() -> BadgeCounts {
     BadgeCounts {
         total: 7,
+        needs_action: 1,
         blocked: 1,
         limited: 0,
         working: 1,
@@ -192,6 +193,7 @@ fn unread_done_does_not_render_the_red_attention_chip() {
     };
     let counts = BadgeCounts {
         total: 1,
+        needs_action: 0,
         blocked: 0,
         done: 1,
         ..BadgeCounts::default()
@@ -220,6 +222,7 @@ fn active_chip_fg_follows_configured_header_fg() {
     };
     let counts = BadgeCounts {
         total: 3,
+        needs_action: 1,
         blocked: 1,
         limited: 0,
         working: 1,
@@ -251,6 +254,7 @@ fn header_chip_fg_overrides_active_chip_fg_but_not_mode_fg() {
     };
     let counts = BadgeCounts {
         total: 3,
+        needs_action: 1,
         blocked: 1,
         limited: 0,
         working: 1,
@@ -328,6 +332,7 @@ fn chip_caps_render_as_pill_and_skip_zero_chips() {
     };
     let counts = BadgeCounts {
         total: 3,
+        needs_action: 1,
         blocked: 1,
         limited: 0,
         working: 0,
@@ -364,6 +369,7 @@ fn header_chip_styles_distinguish_active_nonzero_and_zero_states() {
     let theme = SidebarRenderTheme::default();
     let counts = BadgeCounts {
         total: 7,
+        needs_action: 0,
         blocked: 0,
         limited: 0,
         working: 2,

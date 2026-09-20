@@ -1721,3 +1721,34 @@ fn badge_glyph_is_rendered_in_badge_color_span() {
         "{lines:?}"
     );
 }
+#[test]
+fn question_marks_remain_visible_at_each_width_tier() {
+    let mut chat = row(
+        "chat::%7::700",
+        SidebarRowKind::Chat,
+        0,
+        "Codex",
+        RollupLevel::Idle,
+    );
+    chat.badge_state = Some(BadgeState::Working);
+    chat.meta = Some(crate::sidebar::tree::RowMeta {
+        question_count: 1,
+        question_degraded_count: 1,
+        agent: Some("Codex".into()),
+        ..Default::default()
+    });
+    let theme = SidebarRenderTheme::default();
+    for width in [2, 3, 4, 8, 23, 24, 35, 36, 80] {
+        let lines = render_lines(&[chat.clone()], &SidebarState::default(), width, &theme);
+        let text = lines
+            .into_iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains('?'), "width={width}: {text:?}");
+        assert!(
+            text.contains(theme.badge_glyph(BadgeState::Working)),
+            "width={width}: {text:?}"
+        );
+    }
+}

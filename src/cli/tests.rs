@@ -587,6 +587,7 @@ fn agent_pane_presentation(pane_id: &str) -> crate::daemon::protocol::v2::PanePr
         pane_pid: 101,
     };
     crate::daemon::protocol::v2::PanePresentation {
+        question_notice: None,
         pane_instance: pane_instance.clone(),
         session_links: vec![crate::daemon::protocol::v2::SessionLinkPresentation {
             session_id: "$1".to_string(),

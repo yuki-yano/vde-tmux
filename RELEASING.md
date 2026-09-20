@@ -2,7 +2,37 @@
 
 Publishing is driven by Git tags.
 
-## Local API v4 upgrade
+## Local API v5 upgrade
+
+API 5 / daemon protocol 24 adds persistent, explicitly acknowledged Codex question notices.
+`needs_action` now includes current Blocked panes and unacknowledged question notices; the
+statusline's existing Blocked triage remains separate. PaneState schema 10 and private state
+format 1 are unchanged. Keep existing state and Runs; the question-notice sidecar is added
+independently. A local install does not require a crate version bump or a release tag.
+
+1. Pass formatting, Clippy, tests, extended runtime smoke, UI/UX preflight, and the isolated
+   kill-server test. Reuse successful results for unchanged code. Run
+   `python3 scripts/test-question-notice-isolated.py --extended` for the question hook/API/Q path.
+2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
+   Confirm `vt api schema --json` reports API 5, protocol 24, PaneState 10, and private state 1.
+   Validate the staged binaries on a scratch server before replacing the installed generation.
+3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.
+   Record sidebar windows, widths, active panes, client focus, installed paths, and executable hashes.
+4. Close running sidebars using the installed client, then run its `vt daemon disable` so hooks
+   cannot restart the old daemon during replacement. Back up both executables and the stopped
+   server's state directory outside daemon-managed storage.
+5. Replace both executables from the staged root, verify hashes and schema, then run
+   `vt daemon enable`. Require `Serving / Healthy / Ready`, no transition error, and healthy
+   Agent storage. Restore the recorded sidebar widths and focus using the new client.
+6. Verify each sidebar is alive and uses the installed executable, the private-state generation
+   and retained Runs are preserved, and live Codex panes expose healthy `question_notice` summaries.
+   Existing stock PostToolUse hooks must include `request_user_input_async`; Embedded mode is
+   required. See [question notice behavior](README.md#codex-question-notices).
+
+Never reset state or restart the tmux server as a protocol recovery shortcut. If replacement
+fails, leave the daemon disabled until both executables and their hashes are coherent.
+
+## Historical API v4 upgrade
 
 API v4 replaces public API 3 with provider capabilities, guarded terminal mutations, exact pane
 split, agent start, and Repository Category membership. Daemon protocol 23 carries persisted

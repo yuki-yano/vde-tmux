@@ -100,7 +100,7 @@ SPLIT_JSON="$("$BIN" pane split "$SOURCE_REF" --direction right --size-percent 4
 SPLIT_REF="$(printf '%s' "$SPLIT_JSON" | "$PYTHON" -c '
 import json, sys
 reply = json.load(sys.stdin)
-assert reply["meta"]["api_version"] == 4, reply
+assert reply["meta"]["api_version"] == 5, reply
 result = reply["result"]
 assert result["type"] == "pane_split", result
 split = result["split"]

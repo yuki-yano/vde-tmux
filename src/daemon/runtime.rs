@@ -101,6 +101,7 @@ pub(crate) enum CanonicalSidebarEffect {
 
 pub(crate) struct CanonicalCoordinatorState {
     pub leased: LeasedCanonicalPaneStateRuntime,
+    pub question_notices: crate::question_notice::QuestionNotices,
     pub topology: TopologySnapshot,
     topology_observation_floor: u64,
     pub views: crate::daemon::view_hooks::CurrentClientViews,
@@ -130,6 +131,7 @@ impl CanonicalCoordinatorState {
     ) -> Self {
         Self {
             leased,
+            question_notices: crate::question_notice::QuestionNotices::default(),
             topology,
             topology_observation_floor: 0,
             views,
@@ -664,6 +666,7 @@ mod tests {
             badge,
         });
         PanePresentation {
+            question_notice: None,
             pane_instance,
             session_links: links,
             window_id: window_id.to_string(),

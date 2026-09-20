@@ -525,6 +525,14 @@ pub(super) fn bootstrap_v2_runtime(
         sidebar_preferences,
     );
     canonical.status_metadata = status_metadata;
+    canonical.question_notices = crate::question_notice::QuestionNotices::open(
+        crate::daemon::lifecycle::incarnation_state_path(
+            env,
+            &coordinator.incarnation.hash,
+            "question-notices-v1.json",
+        ),
+        coordinator.incarnation.hash.clone(),
+    );
     canonical.category_state = category_state;
     canonical.projection_config = config.clone();
     *coordinator

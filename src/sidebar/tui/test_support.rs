@@ -23,6 +23,7 @@ pub(super) fn structural_row(id: &str, kind: SidebarRowKind) -> SidebarRow {
 
 pub(super) fn pane(pane_pid: u32) -> PanePresentation {
     PanePresentation {
+        question_notice: None,
         pane_instance: PaneInstance {
             pane_id: "%1".to_string(),
             pane_pid,
@@ -96,6 +97,7 @@ pub(super) fn resolved_pane(pane_id: &str, pane_pid: u32, session_id: &str) -> P
         listening_ports: Vec::new(),
     };
     PanePresentation {
+        question_notice: None,
         pane_instance: pane_instance.clone(),
         session_links: vec![SessionLinkPresentation {
             session_id: session_id.to_string(),

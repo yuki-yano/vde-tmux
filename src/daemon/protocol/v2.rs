@@ -22,7 +22,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 23;
+pub const PROTOCOL_VERSION: u16 = 24;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -685,6 +685,7 @@ pub struct SessionLinkPresentation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PanePresentation {
+    pub question_notice: Option<crate::question_notice::QuestionNoticeSummary>,
     pub pane_instance: PaneInstance,
     pub agent_process: Option<crate::pane_state::AgentProcessIdentity>,
     pub session_links: Vec<SessionLinkPresentation>,
@@ -832,6 +833,11 @@ pub struct StatusSnapshot {
     deny_unknown_fields
 )]
 pub enum SidebarCommand {
+    AckQuestionNotice {
+        pane_instance: PaneInstance,
+        owner_ref: String,
+        through_order: u64,
+    },
     JumpPane {
         pane_instance: PaneInstance,
         source_pane: PaneInstance,
@@ -922,6 +928,7 @@ pub enum ClientMessage {
         proto: u16,
         envelope: PaneEventEnvelope,
         observation: crate::hook::provider::ProviderObservation,
+        question_notice: Option<crate::question_notice::QuestionNoticeInput>,
     },
     StartAgentPrompt {
         proto: u16,
@@ -1139,6 +1146,11 @@ pub struct CategoryRepoMutationEffect {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum ServerMessage {
+    ProviderEventResult {
+        event_id: EventId,
+        question_notice: crate::question_notice::NoticeResult,
+        lifecycle: Box<ServerMessage>,
+    },
     HelloAck {
         proto: u16,
         daemon_instance_id: DaemonInstanceId,
@@ -1649,7 +1661,7 @@ mod tests {
 
     #[test]
     fn every_client_message_roundtrips() {
-        assert_eq!(PROTOCOL_VERSION, 23);
+        assert_eq!(PROTOCOL_VERSION, 24);
         let state_id = StateId::parse("00112233445566778899aabbccddeeff").unwrap();
         let messages = vec![
             ClientMessage::Hello {
@@ -1922,6 +1934,7 @@ mod tests {
     #[test]
     fn every_server_message_roundtrips() {
         let pane_presentation = PanePresentation {
+            question_notice: None,
             pane_instance: pane(),
             session_links: Vec::new(),
             window_id: "@1".to_string(),

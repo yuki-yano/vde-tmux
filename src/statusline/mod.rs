@@ -216,6 +216,7 @@ mod tests {
             badge,
         });
         PanePresentation {
+            question_notice: None,
             pane_instance,
             session_links: Vec::new(),
             window_id: "@2".to_string(),

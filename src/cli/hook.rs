@@ -182,6 +182,27 @@ pub(crate) fn run_hook_command(
                 return Ok(());
             }
             let codex_home = codex_home_from_env(env);
+            let question_notice =
+                crate::question_notice::ingress::from_payload(&arg, input, codex_home.as_deref())
+                    .map(|notice| match notice {
+                        crate::question_notice::QuestionNoticeInput::Issued {
+                            session_id,
+                            turn_id,
+                            tool_use_id,
+                            ..
+                        } => match crate::question_notice::ingress::capture_ancestors() {
+                            Ok(ancestors) => crate::question_notice::QuestionNoticeInput::Issued {
+                                session_id,
+                                turn_id,
+                                tool_use_id,
+                                ancestors,
+                            },
+                            Err(_) => crate::question_notice::QuestionNoticeInput::Rejected {
+                                reason: crate::question_notice::NoticeReason::OriginUnverified,
+                            },
+                        },
+                        other => other,
+                    });
             let event_id = crate::pane_state::EventId::generate()?;
             let retry_before_write = matches!(arg.as_str(), "UserPromptSubmit" | "Stop");
             loop {
@@ -196,7 +217,7 @@ pub(crate) fn run_hook_command(
                     context.event_id.clone(),
                     context.observed_at,
                 )?;
-                match send_typed_hook_event(&mut client, event, observation) {
+                match send_typed_hook_event(&mut client, event, observation, question_notice.clone()) {
                     Ok(()) => return Ok(()),
                     Err(error)
                         if retry_before_write
@@ -271,7 +292,7 @@ fn send_typed_hook_event_observed(
     env: &BTreeMap<String, String>,
     server_hash: &str,
 ) -> Result<()> {
-    match send_typed_hook_event(client, event, observation) {
+    match send_typed_hook_event(client, event, observation, None) {
         Ok(()) => Ok(()),
         Err(error) => {
             let error = anyhow::Error::new(error);
@@ -321,6 +342,7 @@ fn send_typed_hook_event(
     client: &mut crate::daemon::protocol::v2::V2Client,
     event: Option<PaneEventEnvelope>,
     observation: Option<crate::hook::provider::ProviderObservation>,
+    question_notice: Option<crate::question_notice::QuestionNoticeInput>,
 ) -> std::result::Result<(), crate::daemon::protocol::v2::V2RequestError> {
     let Some(envelope) = event else {
         return Ok(());
@@ -331,6 +353,7 @@ fn send_typed_hook_event(
             proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
             envelope,
             observation,
+            question_notice,
         },
         None => crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent {
             proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
@@ -348,6 +371,27 @@ fn validate_typed_hook_response(
     use crate::daemon::protocol::v2::{V2RequestError, V2RequestFailureStage};
 
     match response {
+        crate::daemon::protocol::v2::ServerMessage::ProviderEventResult {
+            event_id: response_id,
+            question_notice,
+            lifecycle,
+        } if response_id == *event_id => {
+            let lifecycle_result = validate_typed_hook_response(*lifecycle, event_id);
+            if let Some(reason) = question_notice.reason {
+                return Err(V2RequestError {
+                    stage: V2RequestFailureStage::AfterFullWrite,
+                    message: format!(
+                        "question_notice: {:?}: {:?}; lifecycle: {}",
+                        question_notice.disposition,
+                        reason,
+                        lifecycle_result
+                            .as_ref()
+                            .map_or_else(|error| error.to_string(), |_| "applied".to_string())
+                    ),
+                });
+            }
+            lifecycle_result
+        }
         crate::daemon::protocol::v2::ServerMessage::PaneEventResult {
             event_id: response_id,
             ..

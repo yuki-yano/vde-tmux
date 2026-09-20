@@ -128,6 +128,26 @@ pub fn send_sidebar_mark_complete_v2(
     Ok(())
 }
 
+pub fn send_question_notice_ack_v2(
+    socket: &Path,
+    server_identity: &str,
+    pane_instance: PaneInstance,
+    owner_ref: String,
+    through_order: u64,
+) -> Result<()> {
+    request_v2_sidebar(
+        socket,
+        server_identity,
+        V2SidebarCommand::AckQuestionNotice {
+            pane_instance,
+            owner_ref,
+            through_order,
+        },
+        V2SidebarResponse::SnapshotAck,
+    )?;
+    Ok(())
+}
+
 pub fn send_sidebar_preference_intent_v2(
     socket: &Path,
     server_identity: &str,

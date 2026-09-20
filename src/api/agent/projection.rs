@@ -65,6 +65,7 @@ pub fn agent_get(
 
 pub(in crate::api) fn pane_summary(pane: &PanePresentation, server_identity: &str) -> PaneSummary {
     PaneSummary {
+        question_notice: pane.question_notice.clone(),
         pane_ref: pane_ref(server_identity, &pane.pane_instance),
         pane_id: pane.pane_instance.pane_id.clone(),
         pane_pid: pane.pane_instance.pane_pid,
@@ -205,6 +206,7 @@ pub(in crate::api) fn agent_summary(
         None => None,
     };
     Some(AgentSummary {
+        question_notice: pane.question_notice.clone(),
         agent_ref: exact_identity.then(|| agent_ref(server_identity, pane)),
         identity: if exact_identity {
             AgentIdentityStrength::Exact

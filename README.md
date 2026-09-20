@@ -142,7 +142,7 @@ Review and trust the hooks with Codex `/hooks` after saving the file.
     ],
     "PostToolUse": [
       {
-        "matcher": "^update_plan$",
+        "matcher": "^(update_plan|request_user_input_async)$",
         "hooks": [{ "type": "command", "command": "vt hook codex PostToolUse" }]
       },
       {
@@ -165,6 +165,38 @@ Review and trust the hooks with Codex `/hooks` after saving the file.
 
 Restart Codex after saving the file.
 Permission requests, plans, subagents, and worktree activity will then appear in the sidebar.
+
+### Codex question notices
+
+With stock Codex CLI 0.155.1, the existing `PostToolUse` hook can observe successful
+`request_user_input_async` calls. Include that tool in the hook matcher above (or use an
+unfiltered PostToolUse hook). No Codex extension, fork, or separate API is required.
+
+The sidebar shows `?` for an **unacknowledged question-issued notice**. Select the agent or
+one of its detail rows and press `Q` to acknowledge the notice you saw. A question arriving
+during that operation stays visible. Acknowledgement is shared across sidebars, and leaves
+focus, agent input, run status, and unread Done untouched. Parent `? N` counts panes, not questions.
+`!` / parent `! N` reports degraded notice tracking; expand the agent for the reason.
+
+Answering or skipping in Codex, focusing the pane, and completing a turn do not clear the
+notice. This feature cannot determine whether a question is still unanswered. Notices survive
+a vde-tmux daemon restart; they close when their exact Codex process or pane is confirmed gone.
+Questions issued before installation, without the hook, or during failed delivery are not recovered.
+A failed sidecar write keeps the notice in memory with a diagnostic and retries every five seconds;
+a daemon crash before recovery can lose unsaved notices. A failed acknowledgement leaves the notice.
+
+Only **Embedded mode** is supported. With a shared LocalDaemon or Remote app-server, the hook
+process is not descended from the pane's CLI, so it is rejected as `ancestor_not_in_pane` rather
+than attached to an arbitrary pane. Codex can automatically reuse a local daemon; in 0.155.1,
+`codex --strict-config` without a remote server option prevents that implicit reuse, provided your
+configuration passes strict validation. vde-tmux does not change your Codex startup settings.
+Subagent questions are excluded. This feature adds no statusline attention entry or OS notification.
+
+Acceptance on 2026-09-20 used the unmodified CLI 0.155.1 in Embedded mode on an isolated tmux
+server. Actual question issuance, continued work/turn completion, answer and skip without automatic
+clearing, and `Q` acknowledgement across two sidebars passed. The fixture regression is separate:
+`python3 scripts/test-question-notice-isolated.py --extended` checks 58 agent panes, two clients,
+and 100 issue/ack cycles against a two-second API/frame delivery bound.
 
 ### 5. Verify
 
@@ -215,7 +247,7 @@ See [Agent JSON API](./AGENT_API.md) for the response envelope, stable occupant 
 durable run completion, filters, and capture bounds. An exact `agent_ref` is emitted only when one
 unique live agent process can be pinned by PID and OS start token. Hooks remain necessary for
 accurate lifecycle details, but hookless agents can use `agent wait` and `agent read` when that live
-process identity is available. API v4 stores durable Run and Operation records separately from the
+process identity is available. API v5 stores durable Run and Operation records separately from the
 bounded pane projection. Guarded prompt dispatch is daemon-owned, requires healthy tmux hooks and
 foreground input ownership, and never places prompt bytes in argv. `agent request` persists the
 same operation ID before daemon mutation and performs an idempotent lookup/resume;
@@ -227,7 +259,7 @@ which is checked twice against Pane, process, foreground ownership, and visible 
 Prompt input treats one terminal LF or CRLF from stdin or a file as a text-record terminator and
 removes it before hashing and dispatch, while preserving all internal line breaks.
 
-API v4 also exposes provider capabilities, `pane split`, `agent start`, guarded terminal
+API v5 also exposes provider capabilities, `pane split`, `agent start`, guarded terminal
 `agent send`, best-effort working-agent `agent steer`, and blocked-agent `agent send-keys`. These mutations require exact references and revalidate
 the tmux server, pane/process identity, and foreground input ownership. Guarded terminal input
 leaves copy-mode before revalidation. A successful `agent send` receipt means tmux applied the
@@ -280,7 +312,7 @@ is observed as the active pane. It does not enter peek mode.
 The sidebar opens in the current tmux window with two independent view axes. `Current` limits the
 rows to the category of that sidebar's source session, while `All` spans every category. `Tree`
 groups Current as Repository→Agent and All as Category→Repository→Agent. `Priority` groups the
-selected scope as Pinned, Needs Input, Unread Done, Running, then Idle. `Flat` removes grouping.
+selected scope as Pinned, Needs Input, Questions, Limited, Unread Done, Running, then Idle. `Flat` removes grouping.
 Press `p` on any agent to toggle its persistent pane pin without changing unread, badge, or
 notification state. `Priority` places pinned agents in the first `PINNED` zone, `Flat` places them
 first, and `Tree` promotes their enclosing Category and Repository while keeping the hierarchy.
@@ -289,7 +321,8 @@ removed when the pane disappears.
 Repository and linked-worktree branch labels show upstream divergence as `↑N` / `↓N`, followed by
 tracked staged and unstaged line changes from `HEAD` as `+N` / `-N`. Zero counts are omitted.
 Untracked and binary files do not contribute line counts.
-The Needs action filter and red triangle match only Blocked agents waiting for user input.
+The Needs action filter includes Blocked agents and panes with unacknowledged question notices.
+The red triangle remains the Blocked badge; question notices use a separate `?`.
 Unread Done agents remain separate under the Done filter. `unread-latest` navigation also includes
 unread Blocked occurrences.
 
@@ -335,9 +368,10 @@ operation produce a non-zero exit status; there is no fallback response.
 | `v` | Cycle Tree / Priority / Flat presentation |
 | `1` / `2` / `3` | Select Tree / Priority / Flat presentation |
 | `Tab` / `Shift+Tab` | Cycle the state filter |
-| `n` / `N` | Move to the next or previous Blocked agent waiting for user input |
+| `n` / `N` | Move to the next or previous visible pane needing action or question-notice acknowledgement |
 | `p` | Pin or unpin the selected agent |
 | `d` | Mark the selected run as complete |
+| `Q` | Acknowledge the displayed question notice; does not answer or skip the question |
 | `a` | Open the add-category dialog |
 | `m` | Open the dialog for moving the selected repository |
 | `r` | Open the dialog for renaming the selected dynamic category |
