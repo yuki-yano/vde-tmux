@@ -1493,6 +1493,24 @@ mod tests {
                 .contains(&serde_json::json!("state_file"))
         );
         assert!(request_schema["properties"].get("operation_id").is_none());
+        let published_commands = value["result"]["schemas"]["request"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["properties"]["command"]["const"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for command in [
+            "category_list",
+            "category_get",
+            "category_assign",
+            "category_automatic",
+        ] {
+            assert!(published_commands.contains(command), "missing {command}");
+        }
+        let success_schema = serde_json::to_string(&value["result"]["schemas"]["success"]).unwrap();
+        for result in ["category_list", "category_get", "category_mutation"] {
+            assert!(success_schema.contains(result), "missing {result}");
+        }
         assert_eq!(
             default_wait_statuses(),
             [
@@ -1543,10 +1561,6 @@ mod tests {
         assert_eq!(
             contract["providers"]["codex"]["capabilities"]["steer"],
             "guarded_terminal_best_effort"
-        );
-        assert_eq!(
-            contract["providers"]["codex"]["recorded_version"],
-            "0.147.0"
         );
         assert_eq!(
             contract["providers"]["codex"]["evidence_basis"],

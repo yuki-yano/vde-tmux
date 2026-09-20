@@ -85,6 +85,10 @@ mod tests {
             BadgeState::Working
         );
         assert_eq!(
+            resolve_badge(&state(LifecycleState::Running, 2, 1, false)),
+            BadgeState::Working
+        );
+        assert_eq!(
             resolve_badge(&state(LifecycleState::Idle, 1, 1, false)),
             BadgeState::Done
         );

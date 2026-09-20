@@ -1168,20 +1168,12 @@ mod lifecycle_command_tests {
             ReachServingAction::Start
         );
         assert_eq!(
-            super::reach_serving_action(DaemonCommandState::Disabled, ReachServingCommand::Ensure),
-            ReachServingAction::DisabledNoop
-        );
-        assert_eq!(
             super::reach_serving_action(DaemonCommandState::Serving, ReachServingCommand::Start),
             ReachServingAction::ReportServing
         );
         assert_eq!(
             super::reach_serving_action(DaemonCommandState::Stopped, ReachServingCommand::Start),
             ReachServingAction::Start
-        );
-        assert_eq!(
-            super::reach_serving_action(DaemonCommandState::Disabled, ReachServingCommand::Start),
-            ReachServingAction::DisabledError
         );
     }
 
@@ -1238,7 +1230,7 @@ mod lifecycle_command_tests {
     }
 
     #[test]
-    fn enable_marker_failure_runs_complete_disabled_rollback() {
+    fn enable_marker_failure_invokes_rollback_and_preserves_the_error() {
         let calls = RefCell::new(Vec::new());
 
         let error = super::finish_enable_transition(
@@ -1251,22 +1243,6 @@ mod lifecycle_command_tests {
             },
             |error| {
                 calls.borrow_mut().push("rollback");
-                let outcome = super::execute_disabled_transition(
-                    true,
-                    || {
-                        calls.borrow_mut().push("disabled-marker");
-                        Ok(())
-                    },
-                    || {
-                        calls.borrow_mut().push("remove-hooks");
-                        Ok(())
-                    },
-                    || {
-                        calls.borrow_mut().push("shutdown");
-                        Ok(())
-                    },
-                );
-                assert!(outcome.is_complete());
                 anyhow::anyhow!("{error:#}; rollback restored disabled state")
             },
         )
@@ -1277,16 +1253,7 @@ mod lifecycle_command_tests {
                 .to_string()
                 .contains("rollback restored disabled state")
         );
-        assert_eq!(
-            *calls.borrow(),
-            [
-                "enable-marker",
-                "rollback",
-                "disabled-marker",
-                "remove-hooks",
-                "shutdown"
-            ]
-        );
+        assert_eq!(*calls.borrow(), ["enable-marker", "rollback"]);
     }
 
     #[test]

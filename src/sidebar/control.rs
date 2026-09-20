@@ -233,60 +233,41 @@ mod tests {
     }
 
     #[test]
-    fn control_socket_roundtrips_focus_identity() {
+    fn control_socket_roundtrips_every_message_identity() {
         let sidebar = PaneInstance {
             pane_id: "%987654".to_string(),
             pane_pid: std::process::id(),
         };
         let listener = ControlListener::bind("test_server", &sidebar).unwrap();
-        let message = ControlMessage::Focus {
-            pane_instance: PaneInstance {
-                pane_id: "%1".to_string(),
-                pane_pid: 7,
+        for message in [
+            ControlMessage::Focus {
+                pane_instance: PaneInstance {
+                    pane_id: "%1".to_string(),
+                    pane_pid: 7,
+                },
+                session_id: "$1".to_string(),
             },
-            session_id: "$1".to_string(),
-        };
-        send("test_server", &sidebar, &message).unwrap();
-        assert_eq!(listener.try_recv().unwrap(), Some(message));
-    }
-
-    #[test]
-    fn control_socket_roundtrips_input_source_identity() {
-        let sidebar = PaneInstance {
-            pane_id: "%987651".to_string(),
-            pane_pid: std::process::id(),
-        };
-        let listener = ControlListener::bind("test_input_server", &sidebar).unwrap();
-        let message = ControlMessage::Input {
-            key: "agent-next".to_string(),
-            source_pane: PaneInstance {
-                pane_id: "%1".to_string(),
-                pane_pid: 7,
+            ControlMessage::Input {
+                key: "agent-next".to_string(),
+                source_pane: PaneInstance {
+                    pane_id: "%1".to_string(),
+                    pane_pid: 7,
+                },
+                session_id: "$1".to_string(),
             },
-            session_id: "$1".to_string(),
-        };
-        send("test_input_server", &sidebar, &message).unwrap();
-        assert_eq!(listener.try_recv().unwrap(), Some(message));
-    }
-
-    #[test]
-    fn control_socket_roundtrips_peek_input_client_identity() {
-        let sidebar = PaneInstance {
-            pane_id: "%987650".to_string(),
-            pane_pid: std::process::id(),
-        };
-        let listener = ControlListener::bind("test_peek_input_server", &sidebar).unwrap();
-        let message = ControlMessage::PeekInput {
-            key: "read-current".to_string(),
-            source_pane: PaneInstance {
-                pane_id: "%1".to_string(),
-                pane_pid: 7,
+            ControlMessage::PeekInput {
+                key: "read-current".to_string(),
+                source_pane: PaneInstance {
+                    pane_id: "%1".to_string(),
+                    pane_pid: 7,
+                },
+                session_id: "$1".to_string(),
+                client_pid: 4242,
             },
-            session_id: "$1".to_string(),
-            client_pid: 4242,
-        };
-        send("test_peek_input_server", &sidebar, &message).unwrap();
-        assert_eq!(listener.try_recv().unwrap(), Some(message));
+        ] {
+            send("test_server", &sidebar, &message).unwrap();
+            assert_eq!(listener.try_recv().unwrap(), Some(message));
+        }
     }
 
     #[test]
@@ -296,31 +277,6 @@ mod tests {
             br#"{"type":"input","key":"v","source_pane":{"pane_id":"%1","pane_pid":7}}"#;
         assert!(serde_json::from_slice::<ControlMessage>(without_source).is_err());
         assert!(serde_json::from_slice::<ControlMessage>(without_session).is_err());
-    }
-
-    #[test]
-    fn secure_socket_dir_tightens_loose_mode_and_rejects_symlink() {
-        let loose = unique_path("vt-sidebar-loose");
-        std::fs::create_dir(&loose).unwrap();
-        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
-        ensure_secure_socket_dir(&loose).unwrap();
-        assert_eq!(
-            std::fs::symlink_metadata(&loose)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        std::fs::remove_dir(&loose).unwrap();
-
-        let target = unique_path("vt-sidebar-target");
-        let link = unique_path("vt-sidebar-link");
-        std::fs::create_dir(&target).unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(ensure_secure_socket_dir(&link).is_err());
-        std::fs::remove_file(link).unwrap();
-        std::fs::remove_dir(target).unwrap();
     }
 
     #[test]

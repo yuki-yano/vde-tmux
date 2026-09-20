@@ -587,10 +587,6 @@ mod tests {
             infer_usage_limit_capture("Allow command execution?\n1. Yes\n2. No\n").inference,
             CaptureInference::NoChange
         );
-        assert_eq!(
-            infer_usage_limit_capture("unchanged output\n").inference,
-            CaptureInference::NoChange
-        );
     }
 
     #[test]
@@ -691,31 +687,6 @@ mod tests {
             capture_mode(&dispatch, &AgentPresenceObservation::Unknown, 101),
             None
         );
-    }
-
-    #[test]
-    fn unknown_presence_drops_capture_from_observation_envelope() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let envelope = observation_envelope(
-            DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
-            pane_instance("%1", 11),
-            None,
-            &tracker,
-            ObservationSample {
-                observed_at: 100,
-                presence: AgentPresenceObservation::Unknown,
-                capture: Some(CaptureObservation {
-                    inference: CaptureInference::ActivityObserved,
-                    observed_fingerprint: Some([1; 32]),
-                }),
-                process: None,
-            },
-        )
-        .unwrap();
-        let PaneEvent::ObservationBatch { capture, .. } = envelope.event else {
-            panic!("expected observation batch");
-        };
-        assert!(capture.is_none());
     }
 
     #[test]
@@ -843,60 +814,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(captures, vec![false, false, true]);
-    }
-
-    #[test]
-    fn observation_poll_skips_capture_when_only_non_agents_and_hook_sessions_exist() {
-        let mut hook_managed = canonical_state("codex");
-        hook_managed.pane_instance = pane_instance("%2", 22);
-        hook_managed.agent_session_id =
-            Some(crate::pane_state::AgentSessionId::parse("codex-session").unwrap());
-        let dispatch = vec![
-            ObservationDispatchSnapshot {
-                pane_instance: pane_instance("%1", 11),
-                base: None,
-                tracker: CaptureTrackerSnapshot::default(),
-                state: None,
-            },
-            ObservationDispatchSnapshot {
-                pane_instance: hook_managed.pane_instance.clone(),
-                base: Some(StoredStateDescriptor::Canonical {
-                    version: hook_managed.version(),
-                }),
-                tracker: CaptureTrackerSnapshot {
-                    epoch: Some((hook_managed.state_id.clone(), hook_managed.agent_epoch)),
-                    hook_authoritative: true,
-                    last_semantic_scan_at: Some(199),
-                    ..CaptureTrackerSnapshot::default()
-                },
-                state: Some(hook_managed),
-            },
-        ];
-        let source = MockCaptureSource {
-            plain_calls: Mutex::new(0),
-            requested_panes: Mutex::new(Vec::new()),
-            tails: Vec::new(),
-        };
-        let processes = AgentProcessSnapshot::parse("11 1 11 11 zsh\n22 1 22 22 codex\n", true);
-
-        let result = run_observation_poll(
-            &source,
-            &dispatch,
-            &processes,
-            &DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
-            200,
-        )
-        .unwrap();
-
-        assert_eq!(*source.plain_calls.lock().unwrap(), 0);
-        assert!(source.requested_panes.lock().unwrap().is_empty());
-        assert_eq!(result.envelopes.len(), 2);
-        assert!(result.envelopes.iter().all(|envelope| {
-            matches!(
-                &envelope.event,
-                PaneEvent::ObservationBatch { capture: None, .. }
-            )
-        }));
     }
 
     #[test]

@@ -2,22 +2,6 @@ use super::super::*;
 use super::*;
 
 #[test]
-fn connection_thread_limiter_enforces_cap_and_releases_slots() {
-    let limiter = Arc::new(V2ConnectionThreadLimiter::new(2, 1));
-    let first = limiter.try_acquire().expect("first connection fits");
-    let second = limiter.try_acquire().expect("second connection fits");
-    assert!(limiter.try_acquire().is_none());
-
-    drop(first);
-    let replacement = limiter.try_acquire();
-    assert!(replacement.is_some());
-
-    drop(second);
-    drop(replacement);
-    assert_eq!(limiter.counts.lock().expect("limiter lock").active, 0);
-}
-
-#[test]
 fn connection_overload_returns_queue_full_without_a_handler_thread() {
     let (mut server, client) = UnixStream::pair().unwrap();
     write_v2_overload_response(&mut server);
@@ -31,20 +15,6 @@ fn connection_overload_returns_queue_full_without_a_handler_thread() {
             ..
         }
     ));
-}
-
-#[test]
-fn connection_thread_permit_releases_during_unwind() {
-    let limiter = Arc::new(V2ConnectionThreadLimiter::new(1, 0));
-    let permit = limiter.try_acquire().expect("connection fits");
-
-    let result = std::panic::catch_unwind(move || {
-        let _permit = permit;
-        panic!("simulated connection handler panic");
-    });
-
-    assert!(result.is_err());
-    assert!(limiter.try_acquire().is_some());
 }
 
 #[test]
@@ -65,6 +35,8 @@ fn streaming_connections_leave_reserved_non_streaming_capacity() {
 
     drop(streaming.pop());
     assert!(reserved.try_mark_streaming());
+    drop(reserved);
+    assert!(limiter.try_acquire().is_some());
 }
 #[test]
 fn v2_frame_body_deadline_is_typed_and_bounded() {

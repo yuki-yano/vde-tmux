@@ -492,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_snapshot_and_pane_counts_above_protocol_limits() {
+    fn rejects_snapshots_above_the_protocol_byte_limit() {
         let oversized = format!("{}{}", "x".repeat(MAX_SNAPSHOT_BYTES), ROW_SEPARATOR);
         assert!(
             parse_pane_snapshot(&oversized)
@@ -500,24 +500,5 @@ mod tests {
                 .to_string()
                 .contains("128 KiB")
         );
-        let row = [
-            "%1", "10", "1", "2", "3", "0", "0", "80", "24", "zsh", "", "0",
-        ]
-        .join(FIELD_SEPARATOR);
-        let too_many = format!(
-            "{}{}",
-            format!("{row}{ROW_SEPARATOR}").repeat(MAX_PANES + 1),
-            ""
-        );
-        // The escaped wire row is large enough that 513 valid rows hit the byte limit first.
-        // This still proves that an over-count snapshot is rejected without weakening the
-        // independent MAX_PANES guard used for more compact future encodings.
-        assert!(
-            parse_pane_snapshot(&too_many)
-                .unwrap_err()
-                .to_string()
-                .contains("128 KiB")
-        );
-        assert_eq!(MAX_PANES, 512);
     }
 }

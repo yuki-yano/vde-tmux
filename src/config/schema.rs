@@ -391,6 +391,20 @@ pub fn config_schema() -> Value {
 mod tests {
     use super::*;
 
+    fn assert_string_enum(value: &Value, expected: &[&str]) {
+        let actual = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = expected
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn checked_in_schema_file_matches_config_schema() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -547,10 +561,15 @@ mod tests {
                 ["type"],
             "boolean"
         );
+        assert_string_enum(
+            &schema["properties"]["statusline"]["properties"]["session_badge"]["properties"]["mode"]
+                ["enum"],
+            &["rollup", "counts"],
+        );
         assert_eq!(
             schema["properties"]["statusline"]["properties"]["session_badge"]["properties"]["mode"]
-                ["enum"][1],
-            "counts"
+                ["type"],
+            "string"
         );
         assert_eq!(
             schema["properties"]["statusline"]["properties"]["session_badge"]["properties"]["chip"]
@@ -576,30 +595,20 @@ mod tests {
                 ["type"],
             "string"
         );
-        assert_eq!(
-            schema["properties"]["statusline"]["properties"]["category"]["properties"]["agent_badge"]
-                ["properties"]["mode"]["enum"][1],
-            "counts"
+        assert_string_enum(
+            &schema["properties"]["statusline"]["properties"]["category"]["properties"]["agent_badge"]
+                ["properties"]["mode"]["enum"],
+            &["rollup", "counts"],
         );
-        assert_eq!(
-            schema["properties"]["statusline"]["properties"]["category"]["properties"]["badge_style"]
-                ["enum"][3],
-            "chip"
+        assert_string_enum(
+            &schema["properties"]["statusline"]["properties"]["category"]["properties"]["badge_style"]
+                ["enum"],
+            &["inline", "plain", "outer", "chip"],
         );
-        assert_eq!(
-            schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["badge_style"]
-                ["enum"][0],
-            "inline"
-        );
-        assert_eq!(
-            schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["badge_style"]
-                ["enum"][2],
-            "outer"
-        );
-        assert_eq!(
-            schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["badge_style"]
-                ["enum"][3],
-            "chip"
+        assert_string_enum(
+            &schema["properties"]["statusline"]["properties"]["sessions"]["properties"]["badge_style"]
+                ["enum"],
+            &["inline", "plain", "outer", "chip"],
         );
         assert_eq!(
             schema["properties"]["statusline"]["properties"]["windows"]["properties"]["current"]["properties"]
@@ -616,10 +625,10 @@ mod tests {
                 ["properties"]["enabled"]["type"],
             "boolean"
         );
-        assert_eq!(
-            schema["properties"]["statusline"]["properties"]["windows"]["properties"]["badge_style"]
-                ["enum"][1],
-            "plain"
+        assert_string_enum(
+            &schema["properties"]["statusline"]["properties"]["windows"]["properties"]["badge_style"]
+                ["enum"],
+            &["inline", "plain", "outer", "chip"],
         );
         assert_eq!(
             schema["properties"]["statusline"]["properties"]["panes"]["properties"]["current"]["properties"]
@@ -635,9 +644,9 @@ mod tests {
 
         assert_eq!(sessions["fixed_width"]["type"], "boolean");
         assert_eq!(sessions["fixed_width"]["default"], false);
-        assert_eq!(
-            sessions["fixed_width_alignment"]["enum"],
-            serde_json::json!(["left", "center"])
+        assert_string_enum(
+            &sessions["fixed_width_alignment"]["enum"],
+            &["left", "center"],
         );
         assert_eq!(sessions["fixed_width_alignment"]["default"], "left");
     }

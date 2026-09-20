@@ -812,7 +812,7 @@ fn window_row(
     command: &str,
 ) -> String {
     [
-        session, index, id, name, panes, active, "0", "0", "0", "0", command, "", "", "",
+        session, index, id, name, panes, active, "0", "0", "0", "0", command,
     ]
     .join("\u{1f}")
 }
@@ -1648,20 +1648,8 @@ fn dispatch_statusline_click_routes_active_and_inactive_category_targets() {
             .insert("TMUX_PANE".to_string(), "%1".to_string());
         let mock = &fixture.mock;
         stub_action_client(mock, "abc", "$1");
-        let format = crate::session::session_list_format();
-        let a = fixture.root.join("repos/a");
-        let b = fixture.root.join("repos/b");
-        mock.stub(
-            &["list-sessions", "-F", &format],
-            &format!(
-                "a\u{1f}1\u{1f}100\u{1f}\u{1f}{}\u{1f}\u{1f}$1\nb\u{1f}1\u{1f}100\u{1f}\u{1f}{}\u{1f}\u{1f}$2\n",
-                a.display(),
-                b.display(),
-            ),
-        );
         mock.stub(&["show-option", "-gqv", "@vde_client_616263_beta"], "");
         mock.stub(&["switch-client", "-c", "abc", "-t", "=b:"], "");
-        mock.stub(&["set-option", "-g", "@vde_client_616263_beta", "b"], "");
 
         let beta = crate::statusline::category_target_key("beta").unwrap();
         let range = format!("{prefix}{beta}");
@@ -1690,46 +1678,6 @@ fn dispatch_statusline_click_ignores_empty_zero_and_unknown_ranges() {
 
         assert!(mock.calls().is_empty(), "{range}");
     }
-}
-
-#[test]
-fn dispatch_category_use_switches_category() {
-    let mut fixture = spawn_category_navigation_fixture();
-    fixture
-        .env
-        .insert("TMUX_PANE".to_string(), "%1".to_string());
-    let mock = &fixture.mock;
-    stub_action_client(mock, "abc", "$1");
-    let format = crate::session::session_list_format();
-    let main = fixture.root.join("repos/main");
-    mock.stub(
-        &["list-sessions", "-F", &format],
-        &format!(
-            "main\u{1f}1\u{1f}100\u{1f}\u{1f}{}\u{1f}\u{1f}$1\n",
-            main.display()
-        ),
-    );
-    mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "");
-    mock.stub(&["switch-client", "-c", "abc", "-t", "=main:"], "");
-    mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
-    run_with(["vt", "category", "use", "work"], mock, &fixture.env).unwrap();
-    assert!(
-        mock.calls()
-            .iter()
-            .any(|call| { call == &vec!["switch-client", "-c", "abc", "-t", "=main:"] })
-    );
-    assert_eq!(
-        mock.calls().last().unwrap(),
-        &["switch-client", "-c", "abc", "-t", "=main:"]
-    );
-    assert!(mock.calls().iter().all(|call| {
-        !matches!(
-            call.as_slice(),
-            [command, option, ..]
-                if command == "show-option" && option == "-gv"
-        ) && call.first().map(String::as_str) != Some("list-windows")
-    }));
-    fixture.finish();
 }
 
 #[test]
@@ -1952,61 +1900,6 @@ fn dispatch_session_new_uses_explicit_scope_when_a_pane_is_shared() {
 }
 
 #[test]
-fn dispatch_project_selector_popup_opens_popup() {
-    let mock = MockTmuxRunner::new();
-    let exe = std::env::current_exe().unwrap().display().to_string();
-    let command = crate::project::project_selector_popup_command(&exe);
-    mock.stub(
-        &[
-            "display-popup",
-            "-E",
-            "-w",
-            "50%",
-            "-h",
-            "50%",
-            "-d",
-            "#{pane_current_path}",
-            &command,
-        ],
-        "",
-    );
-
-    run_with(["vt", "project", "selector", "--popup"], &mock, &env()).unwrap();
-
-    assert_eq!(mock.calls().len(), 1);
-}
-
-#[test]
-fn dispatch_session_manager_opens_popup() {
-    let mock = MockTmuxRunner::new();
-    let exe = std::env::current_exe().unwrap().display().to_string();
-    mock.stub(
-        &["display-message", "-p", "#{pane_current_path}"],
-        "/tmp/project\n",
-    );
-    mock.stub(
-        &[
-            "display-popup",
-            "-E",
-            "-w",
-            "50%",
-            "-h",
-            "50%",
-            "-d",
-            "/tmp/project",
-            &exe,
-            "session-manager",
-            "--popup",
-        ],
-        "",
-    );
-
-    run_with(["vt", "session-manager"], &mock, &tmux_env()).unwrap();
-
-    assert_eq!(mock.calls().len(), 2);
-}
-
-#[test]
 fn session_manager_popup_wrap_is_used_only_inside_tmux() {
     assert!(!should_wrap_session_manager_in_popup(&env()));
     assert!(should_wrap_session_manager_in_popup(&BTreeMap::from([(
@@ -2066,6 +1959,25 @@ fn dispatch_popups_use_configured_size() {
         "",
     );
     run_with(["vt", "session-manager"], &session_mock, &env).unwrap();
+    assert_eq!(
+        session_mock.calls(),
+        vec![
+            vec!["display-message", "-p", "#{pane_current_path}"],
+            vec![
+                "display-popup",
+                "-E",
+                "-w",
+                "72%",
+                "-h",
+                "60%",
+                "-d",
+                "/tmp/project",
+                &exe,
+                "session-manager",
+                "--popup",
+            ],
+        ]
+    );
 
     let project_mock = MockTmuxRunner::new();
     let command = crate::project::project_selector_popup_command(&exe);
@@ -2089,6 +2001,20 @@ fn dispatch_popups_use_configured_size() {
         &env,
     )
     .unwrap();
+    assert_eq!(
+        project_mock.calls(),
+        vec![vec![
+            "display-popup",
+            "-E",
+            "-w",
+            "72%",
+            "-h",
+            "60%",
+            "-d",
+            "#{pane_current_path}",
+            &command,
+        ]]
+    );
 
     std::fs::remove_dir_all(config_home).unwrap();
 }
@@ -2157,6 +2083,7 @@ fn dispatch_session_manager_renders_preview() {
     .unwrap();
 
     assert!(output.contains("Session ni.zsh"));
+    assert!(output.contains("editor"));
     assert!(output.contains("tail"));
     drop(listener);
     std::fs::remove_dir_all(root).unwrap();
@@ -2206,6 +2133,17 @@ fn category_navigation_uses_the_active_snapshot_when_disk_config_is_invalid() {
             .iter()
             .any(|call| { call == &vec!["switch-client", "-c", "abc", "-t", "=main:"] })
     );
+    assert_eq!(
+        fixture.mock.calls().last().unwrap(),
+        &["switch-client", "-c", "abc", "-t", "=main:"]
+    );
+    assert!(fixture.mock.calls().iter().all(|call| {
+        !matches!(
+            call.as_slice(),
+            [command, option, ..]
+                if command == "show-option" && option == "-gv"
+        ) && call.first().map(String::as_str) != Some("list-windows")
+    }));
     fixture.finish();
 }
 
@@ -2375,9 +2313,11 @@ fn agent_hook_stdin_returns_partial_input_when_deadline_hits_before_eof() {
     );
     // Keep write_fd open so the reader never observes EOF; only the deadline ends the read.
     let mut reader = unsafe { File::from_raw_fd(read_fd) };
-    let deadline = Instant::now() + Duration::from_millis(150);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(150);
     let result = super::read_agent_hook_input_from_until(&mut reader, deadline).unwrap();
     assert_eq!(result, "{\"event\":\"Stop\"}");
+    assert!(started.elapsed() < Duration::from_secs(1));
     unsafe { libc::close(write_fd) };
 }
 
@@ -2399,7 +2339,17 @@ fn agent_hook_stdin_errors_when_no_bytes_arrive_before_deadline() {
 
 #[test]
 fn prompt_cli_requires_exactly_one_private_input_source() {
-    assert!(Cli::try_parse_from(["vt", "agent", "prompt", "vta1:test"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "vt",
+            "agent",
+            "prompt",
+            "vta1:test",
+            "--operation-id",
+            "operation_123456",
+        ])
+        .is_err()
+    );
     assert!(
         Cli::try_parse_from([
             "vt",

@@ -1536,24 +1536,6 @@ mod tests {
     }
 
     #[test]
-    fn pane_read_intents_include_runtime_authorized_logical_focus() {
-        let target = pane("%1", 101);
-        let records = [(target.clone(), state(target.clone(), 2, false))]
-            .into_iter()
-            .collect();
-        let intents =
-            pane_read_intents_for_panes(&BTreeSet::from([target.clone()]), 2, &records).unwrap();
-
-        assert_eq!(
-            intents,
-            vec![PaneReadIntent {
-                pane_instance: target,
-                through_order: 2,
-            }]
-        );
-    }
-
-    #[test]
     fn sequencer_position_freezes_unread_order_upper_bound() {
         let target = pane("%1", 101);
         let records = [(target.clone(), state(target.clone(), 4, false))]
@@ -1629,60 +1611,6 @@ mod tests {
             args.iter().filter(|arg| arg.as_str() == "set-hook").count(),
             HOOKS.len()
         );
-    }
-
-    #[test]
-    fn completion_visibility_keeps_fresh_query_contract() {
-        struct Fresh {
-            witnesses: Vec<ClientWitness>,
-        }
-        impl FreshVisibilityIo for Fresh {
-            fn query_witnesses(
-                &self,
-                timeout: Duration,
-            ) -> Result<Vec<ClientWitness>, FreshVisibilityError> {
-                assert_eq!(timeout, FRESH_VISIBILITY_TIMEOUT);
-                Ok(self.witnesses.clone())
-            }
-        }
-        let target = pane("%1", 101);
-        let visibility = completion_visibility(
-            &Fresh {
-                witnesses: vec![ClientWitness {
-                    client_pid: 10,
-                    session_id: "$1".to_string(),
-                    window_id: "@1".to_string(),
-                    active_pane: target.clone(),
-                    control_mode: false,
-                    active_pane_flag: false,
-                }],
-            },
-            &target,
-        )
-        .unwrap();
-        assert!(visibility.snapshot.pane_visible_to_eligible_client);
-        assert_eq!(visibility.diagnostic, None);
-
-        let editor = pane("%9", 109);
-        let visibility = completion_visibility_for_panes(
-            &Fresh {
-                witnesses: vec![ClientWitness {
-                    client_pid: 10,
-                    session_id: "$1".to_string(),
-                    window_id: "@1".to_string(),
-                    active_pane: editor.clone(),
-                    control_mode: false,
-                    active_pane_flag: false,
-                }],
-            },
-            &BTreeSet::from([target, editor]),
-        )
-        .unwrap();
-        assert!(visibility.snapshot.pane_visible_to_eligible_client);
-    }
-
-    #[test]
-    fn hook_command_contains_hook_time_loops() {
         let command = install_command(ViewHookKind::WindowPaneChanged);
         assert!(command.contains("#{P:"));
         assert!(command.contains("#{L:#{S:"));

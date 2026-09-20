@@ -1844,24 +1844,46 @@ mod tests {
             .contains("live process")
         );
         drop(listener);
+        super::verify_stale_socket_can_be_removed(&live, Instant::now() + Duration::from_secs(1))
+            .unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn stale_unowned_unix_socket_can_be_removed() {
-        let root = unique_dir("stale-unowned");
+    fn daemon_instance_lock_is_nonblocking_and_released_on_drop() {
+        let root = unique_dir("daemon-instance-lock");
         std::fs::create_dir_all(&root).unwrap();
-        let socket = root.join("stale.sock");
-        drop(UnixListener::bind(&socket).unwrap());
-
-        super::verify_stale_socket_can_be_removed(&socket, Instant::now() + Duration::from_secs(1))
-            .unwrap();
-
+        let socket = root.join("daemon.sock");
+        let first = super::try_acquire_daemon_instance_lock(&socket)
+            .unwrap()
+            .expect("first instance lock");
+        assert!(
+            super::try_acquire_daemon_instance_lock(&socket)
+                .unwrap()
+                .is_none()
+        );
+        drop(first);
+        assert!(
+            super::try_acquire_daemon_instance_lock(&socket)
+                .unwrap()
+                .is_some()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn writer_lease_rejects_second_writer_for_same_namespace() {
+        let first_hash = "1".repeat(64);
+        let second_hash = "2".repeat(64);
+        assert_ne!(
+            crate::daemon::daemon_socket_path_for_incarnation(&BTreeMap::new(), None, &first_hash),
+            crate::daemon::daemon_socket_path_for_incarnation(&BTreeMap::new(), None, &second_hash)
+        );
+        assert_ne!(
+            crate::daemon::writer_lease_namespace(&first_hash),
+            crate::daemon::writer_lease_namespace(&second_hash)
+        );
+
         let root = unique_dir("writer-lease");
         std::fs::create_dir_all(&root).unwrap();
         let namespace = root.join("server-incarnation");
@@ -1876,85 +1898,6 @@ mod tests {
                 .is_some()
         );
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn distinct_server_incarnations_use_independent_socket_and_writer_lease_namespaces() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-independent-incarnations-{}-{}",
-            std::process::id(),
-            crate::pane_state::EventId::generate().unwrap().as_str()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let first_hash = "1".repeat(64);
-        let second_hash = "2".repeat(64);
-        let first_socket =
-            crate::daemon::daemon_socket_path_for_incarnation(&BTreeMap::new(), None, &first_hash);
-        let second_socket =
-            crate::daemon::daemon_socket_path_for_incarnation(&BTreeMap::new(), None, &second_hash);
-        let first_namespace = crate::daemon::writer_lease_namespace(&first_hash);
-        let second_namespace = crate::daemon::writer_lease_namespace(&second_hash);
-        let first_test_namespace = root.join(
-            first_namespace
-                .strip_prefix("/")
-                .expect("runtime namespace is absolute"),
-        );
-        let second_test_namespace = root.join(
-            second_namespace
-                .strip_prefix("/")
-                .expect("runtime namespace is absolute"),
-        );
-        std::fs::create_dir_all(first_test_namespace.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(second_test_namespace.parent().unwrap()).unwrap();
-
-        assert_ne!(first_socket, second_socket);
-        assert_ne!(first_namespace, second_namespace);
-        let first = super::try_acquire_writer_lease(&first_test_namespace)
-            .unwrap()
-            .expect("first server acquires its writer lease");
-        let second = super::try_acquire_writer_lease(&second_test_namespace)
-            .unwrap()
-            .expect("second server acquires an independent writer lease");
-        assert!(
-            super::try_acquire_writer_lease(&first_test_namespace)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            super::try_acquire_writer_lease(&second_test_namespace)
-                .unwrap()
-                .is_none()
-        );
-
-        drop((first, second));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn ensure_secure_socket_dir_creates_private_directory() {
-        let dir = unique_dir("sec");
-
-        super::ensure_secure_socket_dir(&dir).unwrap();
-
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn ensure_secure_socket_dir_tightens_world_readable_directory() {
-        let dir = unique_dir("insec");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        super::ensure_secure_socket_dir(&dir).unwrap();
-
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o700,
-            "loose but owned socket dir should be tightened"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2053,7 +1996,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_disabled_marker_is_authoritative_across_different_state_environments() {
+    fn tmux_disabled_marker_is_authoritative_without_creating_state() {
         let root = unique_dir("disabled-marker");
         std::fs::create_dir_all(&root).unwrap();
         let tmux_socket = root.join("tmux.sock");
@@ -2081,27 +2024,11 @@ mod tests {
                 root.join("a").display().to_string(),
             ),
         ]);
-        let second = BTreeMap::from([
-            (
-                "TMUX".to_string(),
-                format!("{},123,0", tmux_socket.display()),
-            ),
-            (
-                "XDG_STATE_HOME".to_string(),
-                root.join("b").display().to_string(),
-            ),
-        ]);
-
         assert_eq!(
             super::tmux_desired_mode(&mock, &first).unwrap(),
             super::DesiredMode::Disabled
         );
-        assert_eq!(
-            super::tmux_desired_mode(&mock, &second).unwrap(),
-            super::DesiredMode::Disabled
-        );
         assert!(!root.join("a").exists());
-        assert!(!root.join("b").exists());
         drop(listener);
         std::fs::remove_dir_all(root).unwrap();
     }

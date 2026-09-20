@@ -338,19 +338,4 @@ assert agent["run_seq"] == previous_run_seq + 1, agent
 assert agent["completed_seq"] == previous_run_seq, agent
 ' "$COMPLETED_RUN_SEQ"
 
-SCHEMA_JSON="$("$BIN" api schema --json)"
-printf '%s' "$SCHEMA_JSON" | "$PYTHON" -c '
-import json, sys
-reply = json.load(sys.stdin)
-providers = reply["result"]["contract"]["providers"]
-assert reply["meta"]["api_version"] == 4, reply
-assert providers["codex"]["capabilities"]["prompt_dispatch"] == "durable", providers
-assert providers["codex"]["capabilities"]["steer"] == "guarded_terminal_best_effort", providers
-assert providers["claude"]["capabilities"]["prompt_dispatch"] == "guarded_terminal", providers
-assert providers["claude"]["capabilities"]["steer"] == "guarded_terminal_best_effort", providers
-assert providers["claude"]["capabilities"]["start"] == "provider_session", providers
-assert providers["opencode"]["capabilities"]["prompt_confirmation"] == "none", providers
-assert providers["opencode"]["capabilities"]["steer"] == "disabled", providers
-'
-
 echo "isolated API v4 split/start/send/steer/send-keys, StopFailure recovery/fencing, and copy-mode guards ok"

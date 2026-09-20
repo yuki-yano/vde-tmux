@@ -426,23 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_completion_baseline_can_match_an_existing_newer_completion() {
-        let mut pane = test_agent_pane();
-        let state = &mut pane.resolved.as_mut().unwrap().canonical;
-        state.lifecycle = LifecycleState::Idle;
-        state.completed_seq = 1;
-        state.completed_at = Some(2);
-        let baseline = WaitBaseline::from_pane(&pane, Some(0)).unwrap();
-        let until = [AgentStatus::Done].into_iter().collect();
-        let state = &pane.resolved.as_ref().unwrap().canonical;
-
-        assert_eq!(
-            match_current_wait_status(AgentStateView::from(state), &baseline, &until, true, true,),
-            Some(AgentStatus::Done)
-        );
-    }
-
-    #[test]
     fn wait_recovers_a_completion_coalesced_into_the_next_working_snapshot() {
         let first = test_agent_pane();
         let baseline = WaitBaseline::from_pane(&first, None).unwrap();
@@ -483,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_recovers_a_transient_blocked_transition() {
+    fn wait_recovers_blocked_transitions_with_and_without_prior_completion() {
         let first = test_agent_pane();
         let baseline = WaitBaseline::from_pane(&first, None).unwrap();
         let mut current = first.clone();
@@ -516,43 +499,44 @@ mod tests {
                 at_epoch: 2,
             })
         );
-    }
 
-    #[test]
-    fn a_prior_completion_does_not_hide_a_later_blocked_transition() {
-        let first = test_agent_pane();
-        let baseline = WaitBaseline::from_pane(&first, None).unwrap();
-        let mut current = first.clone();
-        let state = &mut current.resolved.as_mut().unwrap().canonical;
-        state.revision = 3;
-        state.run_seq = 2;
-        state.completed_seq = 1;
-        let mut blocked_version = state.version();
-        blocked_version.revision = 3;
-        let mut snapshot = test_snapshot(current.clone());
-        snapshot.events.push(crate::daemon::TransitionEvent {
-            pane_instance: current.pane_instance.clone(),
-            agent: "codex".to_string(),
-            state_version: Some(blocked_version),
-            run_seq: 2,
-            completed_seq: 1,
-            prompt_digest: None,
-            prompt_submitted: false,
-            from: Some(BadgeState::Working),
-            to: BadgeState::Blocked,
-            at_epoch: 3,
-        });
-        let until = [AgentStatus::Blocked].into_iter().collect();
-
-        assert_eq!(
-            match_wait_event(&snapshot, &baseline, baseline.state_revision, &until),
-            Some(WaitMatch {
-                status: AgentStatus::Blocked,
-                state_revision: 3,
+        {
+            let first = test_agent_pane();
+            let baseline = WaitBaseline::from_pane(&first, None).unwrap();
+            let mut current = first.clone();
+            let state = &mut current.resolved.as_mut().unwrap().canonical;
+            state.revision = 3;
+            state.run_seq = 2;
+            state.completed_seq = 1;
+            let mut blocked_version = state.version();
+            blocked_version.revision = 3;
+            let mut snapshot = test_snapshot(current.clone());
+            snapshot.events.push(crate::daemon::TransitionEvent {
+                pane_instance: current.pane_instance.clone(),
+                agent: "codex".to_string(),
+                state_version: Some(blocked_version),
+                run_seq: 2,
                 completed_seq: 1,
+                prompt_digest: None,
+                prompt_submitted: false,
+                from: Some(BadgeState::Working),
+                to: BadgeState::Blocked,
                 at_epoch: 3,
-            })
-        );
+            });
+            let until = [AgentStatus::Blocked, AgentStatus::Done]
+                .into_iter()
+                .collect();
+
+            assert_eq!(
+                match_wait_event(&snapshot, &baseline, baseline.state_revision, &until),
+                Some(WaitMatch {
+                    status: AgentStatus::Blocked,
+                    state_revision: 3,
+                    completed_seq: 1,
+                    at_epoch: 3,
+                })
+            );
+        }
     }
 
     #[test]
@@ -626,46 +610,28 @@ mod tests {
     }
 
     #[test]
-    fn wait_timeout_is_bounded_before_resolving_tmux() {
-        let runner = crate::tmux::mock::MockTmuxRunner::new();
+    fn invalid_wait_arguments_are_rejected_before_resolving_tmux() {
         let until = [AgentStatus::Done].into_iter().collect();
+        for (timeout, completion_cursor) in [
+            (MAX_WAIT_TIMEOUT + Duration::from_millis(1), None),
+            (Duration::from_secs(1), Some(0)),
+        ] {
+            let runner = crate::tmux::mock::MockTmuxRunner::new();
+            let error = agent_wait(
+                &runner,
+                &BTreeMap::new(),
+                "%1",
+                &until,
+                timeout,
+                completion_cursor,
+            )
+            .unwrap_err();
 
-        let error = agent_wait(
-            &runner,
-            &BTreeMap::new(),
-            "%1",
-            &until,
-            MAX_WAIT_TIMEOUT + Duration::from_millis(1),
-            None,
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error.downcast_ref::<ApiError>().unwrap().code(),
-            "invalid_arguments"
-        );
-        assert!(runner.calls().is_empty());
-    }
-
-    #[test]
-    fn completion_cursor_requires_an_exact_agent_reference_before_resolving_tmux() {
-        let runner = crate::tmux::mock::MockTmuxRunner::new();
-        let until = [AgentStatus::Done].into_iter().collect();
-
-        let error = agent_wait(
-            &runner,
-            &BTreeMap::new(),
-            "%1",
-            &until,
-            Duration::from_secs(1),
-            Some(0),
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error.downcast_ref::<ApiError>().unwrap().code(),
-            "invalid_arguments"
-        );
-        assert!(runner.calls().is_empty());
+            assert_eq!(
+                error.downcast_ref::<ApiError>().unwrap().code(),
+                "invalid_arguments"
+            );
+            assert!(runner.calls().is_empty());
+        }
     }
 }

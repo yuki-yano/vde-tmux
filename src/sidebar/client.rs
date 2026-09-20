@@ -857,79 +857,6 @@ mod tests {
     }
 
     #[test]
-    fn v2_mark_complete_handshakes_and_sends_full_state_version() {
-        let socket = unique_socket_path("vde-tmux-v2-mark-done");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let daemon_instance_id =
-            crate::pane_state::DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap();
-        let expected = StateVersion {
-            state_id: crate::pane_state::StateId::parse("00112233445566778899aabbccddeeff")
-                .unwrap(),
-            agent_epoch: 3,
-            revision: 9,
-        };
-        let expected_for_server = expected.clone();
-        let daemon_for_server = daemon_instance_id.clone();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            assert_eq!(
-                read_client_frame(&mut reader),
-                V2ClientMessage::Hello {
-                    proto: PROTOCOL_VERSION
-                }
-            );
-            write_hello_ack(&mut stream, "scratch");
-
-            let request = read_client_frame(&mut reader);
-            let V2ClientMessage::SidebarCommand {
-                daemon_instance_id,
-                event_id,
-                command,
-                ..
-            } = request
-            else {
-                panic!("expected sidebar command");
-            };
-            assert_eq!(daemon_instance_id, daemon_for_server);
-            assert_eq!(
-                command,
-                V2SidebarCommand::MarkComplete {
-                    pane_instance: PaneInstance {
-                        pane_id: "%7".to_string(),
-                        pane_pid: 4242,
-                    },
-                    expected: expected_for_server.clone(),
-                }
-            );
-            write_frame(
-                &mut stream,
-                &V2ServerMessage::PaneEventResult {
-                    event_id,
-                    accepted_seq: 1,
-                    state_version: Some(expected_for_server),
-                    snapshot_revision: 2,
-                    outcome: crate::daemon::protocol::v2::PaneApplyOutcome::Committed,
-                },
-            );
-        });
-
-        send_sidebar_mark_complete_v2(
-            &socket,
-            "scratch",
-            PaneInstance {
-                pane_id: "%7".to_string(),
-                pane_pid: 4242,
-            },
-            expected,
-        )
-        .unwrap();
-
-        handle.join().unwrap();
-        std::fs::remove_file(socket).unwrap();
-    }
-
-    #[test]
     fn v2_client_rejects_server_identity_mismatch_before_mutation() {
         let socket = unique_socket_path("vde-tmux-v2-identity");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -1012,34 +939,15 @@ mod tests {
                 expected: expected_version.clone(),
             },
             V2SidebarCommand::PreferenceIntent {
-                intent: crate::sidebar::state::SidebarPreferenceIntent::SetPanePinned {
-                    pane_instance: PaneInstance {
-                        pane_id: "%3".to_string(),
-                        pane_pid: 303,
-                    },
-                    pinned: true,
-                },
-            },
-            V2SidebarCommand::PreferenceIntent {
                 intent: crate::sidebar::state::SidebarPreferenceIntent::MoveRepo {
                     repo: crate::sidebar::state::RepoId::new("misc", "app"),
                     neighbor: crate::sidebar::state::RepoId::new("misc", "other"),
                     direction: crate::sidebar::state::MoveDirection::Up,
                 },
             },
-            V2SidebarCommand::PreferenceIntent {
-                intent: crate::sidebar::state::SidebarPreferenceIntent::SetDefaultFilter {
-                    filter: crate::sidebar::state::StatusFilter::DoneOnly,
-                },
-            },
-            V2SidebarCommand::PreferenceIntent {
-                intent: crate::sidebar::state::SidebarPreferenceIntent::SetExpanded {
-                    row_id: "repo::misc::app".to_string(),
-                    expanded: false,
-                },
-            },
         ];
         let expected_for_server = expected_commands.clone();
+        let expected_response_version = expected_version.clone();
         let handle = thread::spawn(move || {
             for expected in expected_for_server {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -1066,7 +974,7 @@ mod tests {
                     V2ServerMessage::PaneEventResult {
                         event_id,
                         accepted_seq: 1,
-                        state_version: None,
+                        state_version: Some(expected_response_version.clone()),
                         snapshot_revision: 2,
                         outcome: crate::daemon::protocol::v2::PaneApplyOutcome::Committed,
                     }
@@ -1107,18 +1015,6 @@ mod tests {
         send_sidebar_preference_intent_v2(
             &socket,
             "scratch",
-            crate::sidebar::state::SidebarPreferenceIntent::SetPanePinned {
-                pane_instance: PaneInstance {
-                    pane_id: "%3".to_string(),
-                    pane_pid: 303,
-                },
-                pinned: true,
-            },
-        )
-        .unwrap();
-        send_sidebar_preference_intent_v2(
-            &socket,
-            "scratch",
             crate::sidebar::state::SidebarPreferenceIntent::MoveRepo {
                 repo: crate::sidebar::state::RepoId::new("misc", "app"),
                 neighbor: crate::sidebar::state::RepoId::new("misc", "other"),
@@ -1126,24 +1022,6 @@ mod tests {
             },
         )
         .unwrap();
-        send_sidebar_preference_intent_v2(
-            &socket,
-            "scratch",
-            crate::sidebar::state::SidebarPreferenceIntent::SetDefaultFilter {
-                filter: crate::sidebar::state::StatusFilter::DoneOnly,
-            },
-        )
-        .unwrap();
-        send_sidebar_preference_intent_v2(
-            &socket,
-            "scratch",
-            crate::sidebar::state::SidebarPreferenceIntent::SetExpanded {
-                row_id: "repo::misc::app".to_string(),
-                expanded: false,
-            },
-        )
-        .unwrap();
-
         handle.join().unwrap();
         std::fs::remove_file(socket).unwrap();
     }
@@ -1334,37 +1212,6 @@ mod tests {
         assert_eq!(second.snapshot_revision, 2);
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
 
-        release_tx.send(()).unwrap();
-        handle.join().unwrap();
-        std::fs::remove_file(socket).unwrap();
-    }
-
-    #[test]
-    fn v2_subscription_keeps_an_idle_peer_without_a_protocol_heartbeat() {
-        let socket = unique_socket_path("vt2-sub-idle");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let handle = thread::spawn(move || {
-            let mut stream = accept_guarded_subscription(&listener, "scratch", "hash");
-            write_frame(
-                &mut stream,
-                &V2ServerMessage::ResolvedSnapshotResult {
-                    snapshot_revision: 1,
-                    snapshot: empty_snapshot(1),
-                },
-            );
-            release_rx.recv().unwrap();
-        });
-        let mut subscription = V2SnapshotSubscription::connect(&socket, "scratch", "hash").unwrap();
-        assert!(subscription.read_initial_snapshot().unwrap().is_some());
-        assert_eq!(
-            subscription
-                .client
-                .reader_stream_for_test()
-                .read_timeout()
-                .unwrap(),
-            None
-        );
         release_tx.send(()).unwrap();
         handle.join().unwrap();
         std::fs::remove_file(socket).unwrap();

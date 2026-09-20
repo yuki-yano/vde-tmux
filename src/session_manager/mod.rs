@@ -1258,29 +1258,6 @@ mod tests {
     }
 
     #[test]
-    fn server_row_is_always_the_last_selector_entry() {
-        let mock = MockTmuxRunner::new();
-        let session_format = crate::session::session_list_format();
-        let window_format = crate::window::window_list_format();
-        mock.stub(&["list-sessions", "-F", &session_format], "");
-        mock.stub(&["list-windows", "-a", "-F", &window_format], "");
-
-        let entries = build_entries(&mock).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries.last().map(|entry| entry.action.as_str()),
-            Some("server")
-        );
-        assert!(entries[0].display.contains("tmux kill-server"));
-    }
-
-    #[test]
-    fn server_row_with_blank_name_and_target_parses() {
-        let rendered = render_entry(&server_entry());
-        assert_eq!(parse_selected_entry(&rendered), Some(server_entry()));
-    }
-
-    #[test]
     fn server_enter_returns_kill_server_outcome() {
         let mock = MockTmuxRunner::new();
         assert_eq!(
@@ -1330,6 +1307,12 @@ mod tests {
             run_interactive_with_io(&mock, &mut popup_io).unwrap(),
             SessionManagerOutcome::KillServer
         );
+        assert_eq!(popup_io.seen_rows.len(), 1);
+        assert_eq!(
+            parse_selected_entry(&popup_io.seen_rows[0]).map(|entry| entry.action),
+            Some("server".to_string())
+        );
+        assert!(popup_io.seen_rows[0].contains("tmux kill-server"));
 
         let mut outside_io = MockSessionManagerIo {
             selection: Some(selection),
@@ -1339,6 +1322,11 @@ mod tests {
         assert_eq!(
             run_interactive_outside_tmux_with_io(&mock, &mut outside_io, &mut attach).unwrap(),
             SessionManagerOutcome::KillServer
+        );
+        assert_eq!(outside_io.seen_rows.len(), 1);
+        assert_eq!(
+            parse_selected_entry(&outside_io.seen_rows[0]).map(|entry| entry.action),
+            Some("server".to_string())
         );
         assert!(attach.targets.is_empty());
     }
@@ -1476,6 +1464,13 @@ mod tests {
         run_interactive_with_io(&mock, &mut io).unwrap();
 
         assert!(io.seen_rows.iter().any(|row| row.contains("ni.zsh")));
+        assert_eq!(
+            io.seen_rows
+                .last()
+                .and_then(|row| parse_selected_entry(row))
+                .map(|entry| entry.action),
+            Some("server".to_string())
+        );
     }
 
     #[test]
@@ -1623,38 +1618,6 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_q_kills_selected_session() {
-        let mock = MockTmuxRunner::new();
-        let selected = render_entry(&ManagerEntry {
-            action: "session".to_string(),
-            name: "ni.zsh".to_string(),
-            session: "ni.zsh".to_string(),
-            target: String::new(),
-            display: "ni.zsh".to_string(),
-        });
-        mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
-        mock.stub(&["kill-session", "-t", "=ni.zsh:"], "");
-
-        run_selection(&mock, &format!("ctrl-q\n{selected}")).unwrap();
-
-        assert_eq!(
-            mock.calls(),
-            vec![
-                vec![
-                    "display-message".to_string(),
-                    "-p".to_string(),
-                    "#{session_name}".to_string()
-                ],
-                vec![
-                    "kill-session".to_string(),
-                    "-t".to_string(),
-                    "=ni.zsh:".to_string()
-                ]
-            ]
-        );
-    }
-
-    #[test]
     fn ctrl_q_kills_selected_window() {
         let mock = MockTmuxRunner::new();
         let selected = render_entry(&ManagerEntry {
@@ -1772,10 +1735,10 @@ mod tests {
         let mock = MockTmuxRunner::new();
         let alpha = render_entry(&ManagerEntry {
             action: "session".to_string(),
-            name: "alpha".to_string(),
-            session: "alpha".to_string(),
+            name: "ni.zsh".to_string(),
+            session: "ni.zsh".to_string(),
             target: String::new(),
-            display: "alpha".to_string(),
+            display: "ni.zsh".to_string(),
         });
         let beta = render_entry(&ManagerEntry {
             action: "session".to_string(),
@@ -1785,22 +1748,19 @@ mod tests {
             display: "beta".to_string(),
         });
         mock.stub(&["display-message", "-p", "#{session_name}"], "gamma\n");
-        mock.stub(&["kill-session", "-t", "=alpha:"], "");
+        mock.stub(&["kill-session", "-t", "=ni.zsh:"], "");
         mock.stub(&["kill-session", "-t", "=beta:"], "");
 
         run_selection(&mock, &format!("ctrl-q\n{alpha}\n{beta}")).unwrap();
 
-        let calls = mock.calls();
-        assert!(calls.contains(&vec![
-            "kill-session".to_string(),
-            "-t".to_string(),
-            "=alpha:".to_string(),
-        ]));
-        assert!(calls.contains(&vec![
-            "kill-session".to_string(),
-            "-t".to_string(),
-            "=beta:".to_string(),
-        ]));
+        assert_eq!(
+            mock.calls(),
+            vec![
+                vec!["display-message", "-p", "#{session_name}"],
+                vec!["kill-session", "-t", "=ni.zsh:"],
+                vec!["kill-session", "-t", "=beta:"],
+            ]
+        );
     }
 
     #[test]
@@ -1843,6 +1803,16 @@ mod tests {
             "-t".to_string(),
             "=other:".to_string(),
         ]));
+        let calls = mock.calls();
+        let switch_index = calls
+            .iter()
+            .position(|call| call == &["switch-client", "-c", "abc", "-t", "=other:"])
+            .unwrap();
+        let kill_index = calls
+            .iter()
+            .position(|call| call == &["kill-session", "-t", "=main:"])
+            .unwrap();
+        assert!(switch_index < kill_index);
     }
 
     #[test]
@@ -1895,106 +1865,6 @@ mod tests {
         run_selection(&mock, &format!("ctrl-r\n{selected}")).unwrap();
 
         assert_eq!(mock.calls().len(), 1);
-    }
-
-    #[test]
-    fn ctrl_q_switches_to_fallback_before_killing_current_session() {
-        let mock = MockTmuxRunner::new();
-        let session_format = crate::session::session_list_format();
-        let selected = render_entry(&ManagerEntry {
-            action: "session".to_string(),
-            name: "main".to_string(),
-            session: "main".to_string(),
-            target: String::new(),
-            display: "main".to_string(),
-        });
-        mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
-        mock.stub(
-            &["list-sessions", "-F", &session_format],
-            "main\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}$1\nother\u{1f}0\u{1f}90\u{1f}public\u{1f}\u{1f}\u{1f}$2\n",
-        );
-        mock.stub(
-            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
-            "abc\t/dev/ttys001\n",
-        );
-        mock.stub(&["switch-client", "-c", "abc", "-t", "=other:"], "");
-        mock.stub(&["kill-session", "-t", "=main:"], "");
-
-        run_selection(&mock, &format!("ctrl-q\n{selected}")).unwrap();
-
-        assert_eq!(
-            mock.calls().last().unwrap(),
-            &vec![
-                "kill-session".to_string(),
-                "-t".to_string(),
-                "=main:".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn render_preview_for_session_includes_windows_and_capture() {
-        let mock = MockTmuxRunner::new();
-        let root = std::path::PathBuf::from("/tmp").join(format!(
-            "vsp-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let socket = root.join("tmux.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "#{pid}\t#{start_time}\t#{socket_path}",
-            ],
-            &format!("123\t456\t{}\n", socket.display()),
-        );
-        let session_format = crate::session::session_list_format();
-        let window_format = crate::window::window_list_format();
-        mock.stub(
-            &["list-sessions", "-F", &session_format],
-            "ni.zsh\u{1f}1\u{1f}100\u{1f}public\u{1f}\u{1f}\u{1f}$2\n",
-        );
-        mock.stub(
-            &["list-windows", "-t", "=ni.zsh:", "-F", &window_format],
-            &format!(
-                "{}\n",
-                window_row("ni.zsh", "2", "@9", "editor", "2", "1", "nvim")
-            ),
-        );
-        mock.stub(
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                "=ni.zsh:",
-                "#{pane_current_path}",
-            ],
-            "/Users/yuki/project\n",
-        );
-        mock.stub(
-            &["capture-pane", "-epJ", "-t", "=ni.zsh:", "-S", "-30"],
-            "hello\nworld\n",
-        );
-
-        let preview = render_preview(
-            &mock,
-            "session",
-            "ni.zsh",
-            &BTreeMap::from([("HOME".to_string(), root.to_string_lossy().into_owned())]),
-        )
-        .unwrap();
-
-        assert!(preview.contains("Session ni.zsh"));
-        assert!(preview.contains("editor"));
-        assert!(preview.contains("hello"));
-        drop(listener);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

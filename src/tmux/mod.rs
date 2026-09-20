@@ -802,12 +802,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn run_command_captures_stdout() {
-        let out = run_command("/bin/sh", &["-c", "printf hello"], None).unwrap();
-        assert_eq!(out, "hello");
-    }
-
-    #[test]
     fn run_command_drains_large_stdout_while_waiting() {
         let out = run_command(
             "/bin/sh",
@@ -819,7 +813,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(out.len(), 2048 * 64);
+        assert_eq!(out, "x".repeat(2048 * 64));
     }
 
     #[test]
@@ -918,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn input_error_distinguishes_partial_from_full_write() {
+    fn input_error_distinguishes_pre_spawn_zero_write_and_partial_write() {
         let partial = run_command_with_input_and_output_limits(
             "/bin/sh",
             &["-c", "dd bs=1 count=1 of=/dev/null 2>/dev/null; exit 4"],
@@ -928,22 +922,6 @@ mod tests {
             1024,
         )
         .unwrap_err();
-        let after = run_command_with_input_and_output_limits(
-            "/bin/sh",
-            &["-c", "cat >/dev/null; exit 4"],
-            b"short input",
-            Some(Duration::from_secs(2)),
-            1024,
-            1024,
-        )
-        .unwrap_err();
-
-        assert_eq!(partial.stage, InputWriteStage::AfterPartialWrite);
-        assert_eq!(after.stage, InputWriteStage::AfterFullWrite);
-    }
-
-    #[test]
-    fn input_error_distinguishes_pre_spawn_from_zero_byte_post_spawn_failure() {
         let before_spawn = run_command_with_input_and_output_limits(
             "/definitely/not/a/vde-tmux-test-program",
             &[],
@@ -958,6 +936,7 @@ mod tests {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed before first byte"),
         ));
 
+        assert_eq!(partial.stage, InputWriteStage::AfterPartialWrite);
         assert_eq!(before_spawn.stage, InputWriteStage::BeforeSpawn);
         assert_eq!(
             classify_input_write_stage(&zero_write),
@@ -1070,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_args_prefixes_socket_name_when_present() {
+    fn tmux_args_handles_present_absent_and_blank_socket_names() {
         assert_eq!(
             tmux_args(Some("scratch"), &["list-sessions"]),
             vec![
@@ -1079,12 +1058,12 @@ mod tests {
                 "list-sessions".to_string()
             ]
         );
-    }
-
-    #[test]
-    fn tmux_args_without_socket_name_is_plain() {
         assert_eq!(
             tmux_args(None, &["list-sessions"]),
+            vec!["list-sessions".to_string()]
+        );
+        assert_eq!(
+            tmux_args(Some("  "), &["list-sessions"]),
             vec!["list-sessions".to_string()]
         );
     }

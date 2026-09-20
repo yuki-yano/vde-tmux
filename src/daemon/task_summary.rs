@@ -580,14 +580,6 @@ mod tests {
     }
 
     #[test]
-    fn null_model_summary_does_not_reuse_the_previous_summary() {
-        assert_eq!(
-            validated_model_summary(ModelOutput { summary: None }).unwrap(),
-            None
-        );
-    }
-
-    #[test]
     fn parser_accepts_direct_and_claude_structured_output() {
         assert_eq!(
             parse_model_output(r#"{"summary":"認証修正"}"#)

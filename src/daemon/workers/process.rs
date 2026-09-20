@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_agent_process_requires_one_unique_identity() {
+    fn native_binary_identity_wins_over_launcher_and_must_be_unique() {
         let codex = AgentKind::parse("codex").unwrap();
         let first = crate::pane_state::AgentProcessIdentity {
             pid: 10,
@@ -530,11 +530,7 @@ mod tests {
             .unwrap()
             .insert(second);
         assert_eq!(detection.exact_agent_process(&codex), None);
-    }
 
-    #[test]
-    fn direct_agent_binary_wins_over_its_interpreted_launcher() {
-        let codex = AgentKind::parse("codex").unwrap();
         let launcher = crate::pane_state::AgentProcessIdentity {
             pid: 10,
             start_token: "launcher".to_string(),
@@ -551,10 +547,7 @@ mod tests {
         );
 
         assert_eq!(processes[&codex], BTreeSet::from([native]));
-    }
 
-    #[test]
-    fn process_agent_detection_distinguishes_native_binary_from_launcher() {
         let launcher =
             detect_process_agent("node /opt/node_modules/@openai/codex/bin/codex.js --yolo")
                 .unwrap();

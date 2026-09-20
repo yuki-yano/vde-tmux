@@ -826,30 +826,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_sessions_reads_project_metadata_without_category_options() {
-        let sep = '\u{1f}'.to_string();
-        let raw = format!(
-            "{}\n{}\n",
-            [
-                "main",
-                "1",
-                "100",
-                "main__vde_session_client_field__0__vde_session_client_row__",
-                "/repo",
-                "",
-                "$1",
-            ]
-            .join(&sep),
-            ["sub", "0", "90", "", "", "", "$2"].join(&sep)
-        );
-        let sessions = parse_sessions(&raw);
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].name, "main");
-        assert!(sessions[0].attached);
-        assert_eq!(sessions[0].project_path, "/repo");
-    }
-
-    #[test]
     fn attached_sessions_include_active_pane_clients_but_exclude_control_clients() {
         let regular = crate::pane_state::ClientWitness {
             client_pid: 10,
@@ -886,29 +862,22 @@ mod tests {
         let format = session_list_format();
         mock.stub(
             &["list-sessions", "-F", &format],
-            "main\u{1f}1\u{1f}100\u{1f}\u{1f}\u{1f}\u{1f}$1\n",
+            "main\u{1f}1\u{1f}100\u{1f}main__vde_session_client_field__0__vde_session_client_row__\u{1f}/repo\u{1f}\u{1f}$1\nsub\u{1f}0\u{1f}90\u{1f}\u{1f}\u{1f}\u{1f}$2\n",
         );
         let sessions = list_sessions(&mock).unwrap();
+        assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].name, "main");
+        assert!(sessions[0].attached);
+        assert_eq!(sessions[0].project_path, "/repo");
         assert_eq!(mock.calls().len(), 1);
     }
 
     #[test]
-    fn current_context_reads_client_and_session() {
-        let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
-            "client-1\t/dev/ttys001\n",
-        );
-        mock.stub(&["display-message", "-p", "#{session_name}"], "main\n");
-        mock.stub(&["display-message", "-p", "#{session_id}"], "$3\n");
-        assert_eq!(current_client_name(&mock).unwrap(), "client-1");
-        assert_eq!(current_session_name(&mock).unwrap(), "main");
-        assert_eq!(current_session_id(&mock).unwrap(), "$3");
-    }
-
-    #[test]
     fn current_session_id_rejects_non_stable_tmux_targets() {
+        let valid = MockTmuxRunner::new();
+        valid.stub(&["display-message", "-p", "#{session_id}"], "$3\n");
+        assert_eq!(current_session_id(&valid).unwrap(), "$3");
+
         let mock = MockTmuxRunner::new();
         mock.stub(&["display-message", "-p", "#{session_id}"], "main\n");
 
@@ -1089,66 +1058,6 @@ mod tests {
     }
 
     #[test]
-    fn create_session_sets_project_category_switches_and_remembers() {
-        let mock = MockTmuxRunner::new();
-        let mut config = crate::config::Config::default();
-        config.categories.default_category = Some("public".to_string());
-        mock.stub(
-            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
-            "client\t/dev/ttys001\n",
-        );
-        mock.stub(
-            &[
-                "new-session",
-                "-d",
-                "-P",
-                "-F",
-                "#{session_name}\u{1f}#{window_id}",
-                "-c",
-                "/Users/me",
-            ],
-            "zsh\u{1f}@9\n",
-        );
-        mock.stub(
-            &[
-                "set-option",
-                "-t",
-                "zsh",
-                crate::options::KEY_PROJECT_PATH,
-                "/Users/me",
-            ],
-            "",
-        );
-        mock.stub(
-            &[
-                "set-option",
-                "-t",
-                "zsh",
-                crate::options::KEY_CATEGORY,
-                "public",
-            ],
-            "",
-        );
-        mock.stub(&["switch-client", "-c", "client", "-t", "=zsh:"], "");
-        mock.stub(
-            &["show-hooks", "-g", "after-new-window[90]"],
-            "after-new-window[90] \n",
-        );
-        mock.stub(
-            &["set-option", "-g", "@vde_client_636c69656e74_public", "zsh"],
-            "",
-        );
-
-        let client = current_client_name(&mock).unwrap();
-        let session =
-            create_session_for_client_resolved(&mock, &config, "/Users/me", &client, "public")
-                .unwrap();
-
-        assert_eq!(session, "zsh");
-        assert_eq!(mock.calls().len(), 7);
-    }
-
-    #[test]
     fn create_session_opens_sidebar_for_created_window_when_all_sidebar_is_enabled() {
         let mock = MockTmuxRunner::new();
         let exe = std::env::current_exe().unwrap();
@@ -1260,8 +1169,30 @@ mod tests {
         );
 
         let client = current_client_name(&mock).unwrap();
-        create_session_for_client_resolved(&mock, &config, "/Users/me", &client, "public").unwrap();
+        let session =
+            create_session_for_client_resolved(&mock, &config, "/Users/me", &client, "public")
+                .unwrap();
 
+        assert_eq!(session, "zsh");
+        for expected in [
+            vec![
+                "set-option",
+                "-t",
+                "zsh",
+                crate::options::KEY_PROJECT_PATH,
+                "/Users/me",
+            ],
+            vec![
+                "set-option",
+                "-t",
+                "zsh",
+                crate::options::KEY_CATEGORY,
+                "public",
+            ],
+            vec!["set-option", "-g", "@vde_client_636c69656e74_public", "zsh"],
+        ] {
+            assert!(mock.calls().iter().any(|call| call == &expected));
+        }
         assert!(mock.calls().iter().any(|call| {
             call.first().map(String::as_str) == Some("split-window")
                 && call
@@ -1391,23 +1322,6 @@ mod tests {
             !(call.first().map(String::as_str) == Some("set-option")
                 && call.get(2).map(String::as_str) == Some("@vde_client_616263_work"))
         }));
-    }
-
-    #[test]
-    fn hook_with_args_remembers_given_client_session() {
-        let mock = MockTmuxRunner::new();
-        let client_format = client_pid_name_format();
-        mock.stub(
-            &["list-clients", "-F", &client_format],
-            "123\u{1f}abc\u{1f}/dev/ttys001\u{1f}0\n",
-        );
-        mock.stub(
-            &["show-option", "-qv", "-t", "=main:", KEY_CATEGORY],
-            "work\n",
-        );
-        mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
-        on_client_session_changed(&mock, Some(123), Some("main")).unwrap();
-        assert_eq!(mock.calls().len(), 3);
     }
 
     #[test]
@@ -1546,30 +1460,6 @@ mod tests {
         let sessions = list_sessions(&mock).unwrap();
         let categories =
             categories_for_sessions(&sessions, &[("main", crate::category::UNCATEGORIZED)]);
-        sync_session_category_mirrors_resolved(&mock, &categories, &sessions).unwrap();
-        assert_eq!(mock.calls().len(), 2);
-    }
-
-    #[test]
-    fn sync_session_category_mirrors_uses_config_default() {
-        let mock = MockTmuxRunner::new();
-        let format = session_list_format();
-        mock.stub(
-            &["list-sessions", "-F", &format],
-            "main\u{1f}1\u{1f}100\u{1f}\u{1f}/Users/me\u{1f}\u{1f}$1\n",
-        );
-        mock.stub(
-            &[
-                "set-option",
-                "-t",
-                "main",
-                crate::options::KEY_CATEGORY,
-                "public",
-            ],
-            "",
-        );
-        let sessions = list_sessions(&mock).unwrap();
-        let categories = categories_for_sessions(&sessions, &[("main", "public")]);
         sync_session_category_mirrors_resolved(&mock, &categories, &sessions).unwrap();
         assert_eq!(mock.calls().len(), 2);
     }

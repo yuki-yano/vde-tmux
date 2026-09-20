@@ -783,32 +783,32 @@ mod tests {
     }
 
     #[test]
-    fn observation_job_rejects_missing_confirmations_and_delimiter_races() {
+    fn observation_job_is_all_or_nothing() {
         let delimiter = "00112233445566778899aabbccddeeff";
-        // Sections without a confirmation marker or with a delimiter collision
-        // discard the whole observation job.
-        assert!(observation_outcome("", 2, delimiter).is_err());
-        assert!(observation_outcome("first only\n", 2, delimiter).is_err());
-        assert!(
+        assert!(matches!(
+            observation_outcome("first only\n", 2, delimiter),
+            Err(CaptureBatchError::DelimiterMismatch {
+                expected: 1,
+                actual: 0
+            })
+        ));
+        assert!(matches!(
             observation_outcome(
                 &format!("first\n{delimiter}\ncollision\n{delimiter}\nsecond\n"),
                 2,
                 delimiter
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn observation_job_discards_all_when_first_middle_or_last_pane_disappears() {
-        let delimiter = "00112233445566778899aabbccddeeff";
+            ),
+            Err(CaptureBatchError::DelimiterMismatch {
+                expected: 1,
+                actual: 2
+            })
+        ));
         let ok = format!("__vde_obs_ok_{delimiter}__");
-        let first_missing = format!("{delimiter}\nsecond\n{ok}\n{delimiter}\nthird\n{ok}\n");
         let middle_missing = format!("first\n{ok}\n{delimiter}\n{delimiter}\nthird\n{ok}\n");
-        let last_missing = format!("first\n{ok}\n{delimiter}\nsecond\n{ok}\n{delimiter}\n");
-        assert!(observation_outcome(&first_missing, 3, delimiter).is_err());
-        assert!(observation_outcome(&middle_missing, 3, delimiter).is_err());
-        assert!(observation_outcome(&last_missing, 3, delimiter).is_err());
+        assert!(matches!(
+            observation_outcome(&middle_missing, 3, delimiter),
+            Err(CaptureBatchError::ProcessFailed(None))
+        ));
 
         let all_present =
             format!("first\n{ok}\n{delimiter}\nsecond\n{ok}\n{delimiter}\nthird\n{ok}\n");

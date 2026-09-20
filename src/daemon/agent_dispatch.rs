@@ -301,14 +301,6 @@ mod tests {
         assert!(rendered.contains("'-q'"));
         assert!(rendered.contains("send-keys"));
         assert!(!rendered.contains("secret prompt"));
-    }
-
-    #[test]
-    fn operation_identity_makes_the_nonce_deterministic() {
-        assert_eq!(
-            dispatch_nonce(&incarnation(), &pane(), "operation-1"),
-            dispatch_nonce(&incarnation(), &pane(), "operation-1")
-        );
         assert_ne!(
             dispatch_nonce(&incarnation(), &pane(), "operation-1"),
             dispatch_nonce(&incarnation(), &pane(), "operation-2")

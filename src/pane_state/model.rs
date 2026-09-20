@@ -1530,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn task_context_keeps_bounded_recent_prompts_and_reference_response() {
+    fn task_context_keeps_bounded_public_and_private_prompt_history() {
         let mut context = TaskContextState::default();
         for prompt in ["origin", "one", "two", "three", "four", "five", "five"] {
             context.observe_prompt(prompt);
@@ -1544,6 +1544,26 @@ mod tests {
         );
         assert_eq!(context.context_fingerprint().unwrap().len(), 64);
         context.validate().unwrap();
+
+        let mut private = TaskContextState::default();
+        private.observe_private_prompt_with_reference("", Some("ignored"));
+        assert_eq!(private, TaskContextState::default());
+        for prompt in ["one", "two", "three", "four", "five"] {
+            private.observe_private_prompt(prompt);
+        }
+        let previous = private.context_fingerprint();
+        private.observe_prompt_with_reference(" ", Some("ignored reference"));
+        assert_eq!(private.context_fingerprint(), previous);
+        private.validate().unwrap();
+        private.observe_prompt_with_reference("five", Some("new reference"));
+        assert_ne!(private.context_fingerprint(), previous);
+        let long = "あ".repeat(TASK_CONTEXT_PROMPT_MAX_BYTES);
+        private.observe_private_prompt(&long);
+        let input = private.summary_input().unwrap();
+        assert_eq!(input.recent_prompts.len(), MAX_TASK_CONTEXT_PROMPTS);
+        assert!(input.recent_prompts.last().unwrap().len() <= TASK_CONTEXT_PROMPT_MAX_BYTES);
+        assert_eq!(input.reference_response.as_deref(), Some("new reference"));
+        private.validate().unwrap();
     }
 
     #[test]
@@ -1631,29 +1651,6 @@ mod tests {
     }
 
     #[test]
-    fn private_task_context_is_bounded_and_tracks_reference_changes() {
-        let mut context = TaskContextState::default();
-        context.observe_private_prompt_with_reference("", Some("ignored"));
-        assert_eq!(context, TaskContextState::default());
-        for prompt in ["one", "two", "three", "four", "five"] {
-            context.observe_private_prompt(prompt);
-        }
-        let previous = context.context_fingerprint();
-        context.observe_prompt_with_reference(" ", Some("ignored reference"));
-        assert_eq!(context.context_fingerprint(), previous);
-        context.validate().unwrap();
-        context.observe_prompt_with_reference("five", Some("new reference"));
-        assert_ne!(context.context_fingerprint(), previous);
-        let long = "あ".repeat(TASK_CONTEXT_PROMPT_MAX_BYTES);
-        context.observe_private_prompt(&long);
-        let input = context.summary_input().unwrap();
-        assert_eq!(input.recent_prompts.len(), MAX_TASK_CONTEXT_PROMPTS);
-        assert!(input.recent_prompts.last().unwrap().len() <= TASK_CONTEXT_PROMPT_MAX_BYTES);
-        assert_eq!(input.reference_response.as_deref(), Some("new reference"));
-        context.validate().unwrap();
-    }
-
-    #[test]
     fn durable_run_projection_advances_sequence_and_rejects_same_sequence_rebinding() {
         let mut state = valid_state();
         state.prompt = Some(PromptState {
@@ -1738,11 +1735,6 @@ mod tests {
 
     #[test]
     fn prompt_digest_is_domain_separated_and_strictly_validated() {
-        assert_eq!(
-            PromptState::digest_decoded_prompt("hello\nworld"),
-            "3cf479a04899c793e4faf30c5b150c0c6e0aca73f52780ec274168e795a9634b"
-        );
-
         let mut prompt = PromptState {
             text: "hello world".to_string(),
             source: "user".to_string(),
@@ -1793,13 +1785,69 @@ mod tests {
     }
 
     #[test]
-    fn invariant_validation_rejects_multiple_open_runs() {
+    fn invariant_validation_rejects_invalid_run_identifiers_and_views() {
         let mut state = valid_state();
         state.run_seq = 2;
         state.completed_seq = 0;
         state.started_at = Some(1);
         state.lifecycle = LifecycleState::Running;
         assert!(state.validate().is_err());
+
+        let mut state = valid_state();
+        state.tasks = TaskState {
+            progress: TaskProgress { done: 0, total: 2 },
+            items: vec![
+                TaskItemState {
+                    id: Some("1".to_string()),
+                    step: "one".to_string(),
+                    status: TaskItemStatus::Pending,
+                },
+                TaskItemState {
+                    id: Some("1".to_string()),
+                    step: "two".to_string(),
+                    status: TaskItemStatus::Pending,
+                },
+            ],
+        };
+        assert!(state.validate().is_err());
+
+        state.tasks = TaskState::default();
+        let subagent = SubagentState {
+            agent_id: "same".to_string(),
+            agent_type: "worker".to_string(),
+            display_name: None,
+        };
+        state.subagents = vec![subagent.clone(), subagent];
+        assert!(state.validate().is_err());
+
+        let pane = PaneInstance {
+            pane_id: "%1".to_string(),
+            pane_pid: 42,
+        };
+        let event = ViewEvent {
+            daemon_instance_id: DaemonInstanceId::parse("00112233445566778899aabbccddeeff")
+                .unwrap(),
+            event_id: EventId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            hook_kind: ViewHookKind::WindowPaneChanged,
+            active_pane: Some(pane.clone()),
+            window_panes: vec![pane.clone(), pane],
+            visibility: ViewVisibilityProof {
+                pane_visible: false,
+                window_visible: false,
+            },
+        };
+        assert!(event.validate().is_err());
+
+        let detached_with_visibility = ViewEvent {
+            hook_kind: ViewHookKind::ClientDetached,
+            active_pane: Some(PaneInstance {
+                pane_id: "%2".to_string(),
+                pane_pid: 43,
+            }),
+            window_panes: Vec::new(),
+            ..event
+        };
+        assert!(detached_with_visibility.validate().is_err());
     }
 
     #[test]
@@ -1831,56 +1879,5 @@ mod tests {
         unread.read_seq = 0;
         unread.latest.as_mut().unwrap().order = 0;
         assert!(unread.validate().is_err());
-    }
-
-    #[test]
-    fn task_and_subagent_identifiers_must_be_unique() {
-        let mut state = valid_state();
-        state.tasks = TaskState {
-            progress: TaskProgress { done: 0, total: 2 },
-            items: vec![
-                TaskItemState {
-                    id: Some("1".to_string()),
-                    step: "one".to_string(),
-                    status: TaskItemStatus::Pending,
-                },
-                TaskItemState {
-                    id: Some("1".to_string()),
-                    step: "two".to_string(),
-                    status: TaskItemStatus::Pending,
-                },
-            ],
-        };
-        assert!(state.validate().is_err());
-
-        state.tasks = TaskState::default();
-        let subagent = SubagentState {
-            agent_id: "same".to_string(),
-            agent_type: "worker".to_string(),
-            display_name: None,
-        };
-        state.subagents = vec![subagent.clone(), subagent];
-        assert!(state.validate().is_err());
-    }
-
-    #[test]
-    fn view_event_rejects_duplicate_window_panes() {
-        let pane = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 42,
-        };
-        let event = ViewEvent {
-            daemon_instance_id: DaemonInstanceId::parse("00112233445566778899aabbccddeeff")
-                .unwrap(),
-            event_id: EventId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
-            hook_kind: ViewHookKind::WindowPaneChanged,
-            active_pane: Some(pane.clone()),
-            window_panes: vec![pane.clone(), pane],
-            visibility: ViewVisibilityProof {
-                pane_visible: false,
-                window_visible: false,
-            },
-        };
-        assert!(event.validate().is_err());
     }
 }

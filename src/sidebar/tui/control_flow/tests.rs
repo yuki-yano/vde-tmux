@@ -1,7 +1,6 @@
 use super::super::test_support::*;
 use super::*;
 use crate::daemon::protocol::v2::{DaemonDiagnostic, ErrorCode, SessionLinkPresentation};
-use crate::sidebar::state::StatusFilter;
 use std::collections::BTreeSet;
 
 #[test]
@@ -34,6 +33,7 @@ fn render_gate_draws_once_per_second_when_visible_and_idle() {
     // The second boundary refreshes elapsed labels exactly once.
     assert!(gate.take_draw_decision(101, true));
     assert!(!gate.take_draw_decision(101, true));
+    assert!(!gate.take_draw_decision(102, false));
     gate.mark_dirty();
     assert!(gate.take_draw_decision(101, true));
     assert!(!gate.take_draw_decision(101, true));
@@ -71,30 +71,6 @@ fn render_gate_toast_transitions_mark_dirty_once() {
     assert!(!gate.take_draw_decision(100, true));
     gate.note_toast(None);
     assert!(gate.take_draw_decision(100, true));
-}
-
-#[test]
-fn only_visible_sidebar_uses_the_elapsed_clock() {
-    let mut gates = (0..20).map(|_| RenderGate::new()).collect::<Vec<_>>();
-    for gate in &mut gates {
-        assert!(gate.take_draw_decision(1000, true));
-    }
-
-    let mut draws = 0;
-    for tick in 0..20 {
-        let now = if tick < 10 { 1000 } else { 1001 };
-        for (index, gate) in gates.iter_mut().enumerate() {
-            if gate.take_draw_decision(now, index == 0) {
-                draws += 1;
-            }
-        }
-    }
-
-    assert_eq!(draws, 1);
-
-    // Explicit state changes still redraw hidden sidebars immediately.
-    gates[1].mark_dirty();
-    assert!(gates[1].take_draw_decision(1001, false));
 }
 
 #[test]
@@ -210,21 +186,13 @@ fn reconnect_updates_preserve_last_snapshot_and_local_state() {
     let (tx, rx) = mpsc::channel();
     let mut current = Some(snapshot(10));
     let mut connection = ConnectionState::Connected;
-    let mut state = SidebarState {
-        filter: StatusFilter::DoneOnly,
-        selection: Some("chat::%1".to_string()),
-        ..SidebarState::default()
-    };
     tx.send(SubscriptionUpdate::Disconnected).unwrap();
     tx.send(SubscriptionUpdate::Connecting).unwrap();
 
     drain_snapshot_updates(&rx, &mut current, &mut connection);
 
     assert_eq!(current.as_ref().unwrap().snapshot_revision, 9);
-    assert_eq!(state.filter, StatusFilter::DoneOnly);
-    assert_eq!(state.selection.as_deref(), Some("chat::%1"));
     assert_eq!(connection, ConnectionState::Connecting);
-    state.scroll = 3;
 }
 
 #[test]

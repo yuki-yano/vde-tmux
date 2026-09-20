@@ -1,4 +1,4 @@
-name: Runtime smoke
+name: Tmux redraw probe
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  runtime-smoke:
+  tmux-redraw-probe:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -21,7 +21,7 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: runtime-smoke
+          shared-key: tmux-redraw-probe
 
       - name: Install tmux 3.7b
         env:
@@ -44,14 +44,8 @@ jobs:
           make install
           echo "$RUNNER_TEMP/tmux/bin" >> "$GITHUB_PATH"
 
-      - name: Verify tmux version and run elapsed-format integration
+      - name: Verify tmux version and run redraw dependency probe
         run: |
           test "$(tmux -V)" = "tmux 3.7b"
           cargo test --locked --test tmux_redraw_probe \
-            tmux_expands_dynamic_pane_elapsed_with_the_former_boundaries -- --ignored --exact
-
-      - name: Run isolated Category Agent API test
-        run: scripts/test-category-api-isolated.sh
-
-      - name: Run isolated runtime smoke
-        run: scripts/smoke-m6-runtime.sh --extended
+            tmux_operations_have_expected_client_redraw_effects -- --ignored --exact

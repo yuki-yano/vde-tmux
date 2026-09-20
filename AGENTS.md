@@ -10,11 +10,12 @@
 
 These live in `scripts/` and all run against an isolated `tmux -L <scratch>` server, never the real one. See `docs/e2e-smoke.md` for the manual walkthrough.
 
-- `scripts/smoke-m6-runtime.sh`: runtime-contract smoke test. Confirms the current UI/UX contract (session ordering, category resolution, multi-client attention, Blocked notifications, statusline content, two-sidebar interaction state, and the daemon lifecycle) in one isolated run. Run it before a release and after changes to statusline, sidebar, or daemon behavior.
-- `scripts/preflight-ui-ux.sh`: multi-client UI/UX preflight against a scratch server. Run it when changing statusline or sidebar rendering.
+- `scripts/smoke-m6-runtime.sh`: normal runtime-contract smoke test. Confirms session ordering, category resolution and switching, multi-client attention, Blocked notifications, statusline content, two-sidebar interaction state, and the daemon lifecycle in one isolated run. Run it after changes to daemon behavior, read/state semantics, category switching, or other runtime contracts.
+- `scripts/smoke-m6-runtime.sh --extended`: adds the 58-pane status-delivery check and category warm-switch distribution/SLA to the normal runtime smoke. Run it after changes to the category performance path or high-volume status delivery.
+- `scripts/preflight-ui-ux.sh`: multi-client UI/UX preflight against a scratch server. Run it for statusline/sidebar rendering or other visual-only changes.
 - `scripts/test-kill-server-isolated.sh`: exercises the session-manager kill-server / tmux-server shutdown path in isolation. Run it when changing the session manager, the kill-server flow, or daemon/tmux shutdown handling.
 
-The runtime smoke script also runs in the manually dispatched `Runtime smoke` GitHub Actions workflow. Run all three scripts locally before a release; the UI/UX preflight and kill-server test remain local-only.
+The manually dispatched `Runtime smoke` GitHub Actions workflow runs the extended runtime smoke. Before a release, run `scripts/smoke-m6-runtime.sh --extended`, the UI/UX preflight, and the kill-server test once each; do not also repeat the normal runtime smoke. The UI/UX preflight and kill-server test remain local-only.
 
 ## Release
 

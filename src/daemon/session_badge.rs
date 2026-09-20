@@ -168,23 +168,20 @@ mod tests {
             false,
         );
         assert_eq!(value.as_deref(), Some("▲"));
-    }
-
-    #[test]
-    fn limited_rollup_outranks_working_without_becoming_blocked() {
-        let glyphs = BadgeGlyphs::default();
-        let counts = BadgeStateCounts::from_states([
-            BadgeState::Working,
-            BadgeState::Limited,
-            BadgeState::Idle,
-        ]);
-
-        assert_eq!(counts.rollup_state(), Some(BadgeState::Limited));
-        assert_eq!(counts.total(), 3);
         assert_eq!(
-            badge_value_from_counts(counts, &glyphs, SessionBadgeMode::Counts, "", false,)
-                .as_deref(),
-            Some("⋄ 1 ● 1 ○ 1")
+            badge_value_from_counts(
+                BadgeStateCounts::from_states([
+                    BadgeState::Working,
+                    BadgeState::Limited,
+                    BadgeState::Idle,
+                ]),
+                &glyphs,
+                SessionBadgeMode::Rollup,
+                "",
+                false,
+            )
+            .as_deref(),
+            Some("⋄")
         );
     }
 
@@ -238,20 +235,6 @@ mod tests {
             )
             .as_deref(),
             Some("○")
-        );
-    }
-
-    #[test]
-    fn typed_count_is_none_for_no_agents() {
-        assert_eq!(
-            badge_value_from_counts(
-                BadgeStateCounts::default(),
-                &BadgeGlyphs::default(),
-                SessionBadgeMode::Rollup,
-                "",
-                false,
-            ),
-            None
         );
     }
 

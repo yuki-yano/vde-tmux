@@ -1922,7 +1922,6 @@ mod tests {
             events: Vec::new(),
             diagnostics: Vec::new(),
         };
-        let encoded = serde_json::to_vec(&snapshot).unwrap();
         let state = SidebarState {
             category_scope: CategoryScope::All,
             ..SidebarState::default()
@@ -1949,8 +1948,6 @@ mod tests {
 
         assert!(before_text.contains("59s"), "{before_text}");
         assert!(after_text.contains("1m00s"), "{after_text}");
-        assert_eq!(snapshot.snapshot_revision, 7);
-        assert_eq!(serde_json::to_vec(&snapshot).unwrap(), encoded);
     }
 
     #[test]

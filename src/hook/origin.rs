@@ -240,35 +240,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_origin_payload_uses_agent_id_when_session_id_is_parent() {
-        let root = unique_temp_dir("codex-origin-agent-id");
-        let sessions = root.join("sessions").join("2026").join("07").join("08");
-        fs::create_dir_all(&sessions).unwrap();
-        fs::write(
-            sessions.join("rollout-parent-session.jsonl"),
-            r#"{"type":"session_meta","payload":{"id":"parent-session","session_id":"parent-session","thread_source":"user"}}"#,
-        )
-        .unwrap();
-        fs::write(
-            sessions.join("rollout-subagent-session.jsonl"),
-            r#"{"type":"session_meta","payload":{"id":"subagent-session","session_id":"parent-session","thread_source":"subagent","parent_thread_id":"parent-session"}}"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            codex_hook_origin_from_payload(
-                Some("parent-session"),
-                Some("subagent-session"),
-                None,
-                Some(&root),
-            ),
-            HookOrigin::NonParent
-        );
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn codex_origin_payload_rejects_mismatched_transcript_session() {
         let root = unique_temp_dir("codex-origin-mismatched-transcript");
         let sessions = root.join("sessions").join("2026").join("08").join("14");

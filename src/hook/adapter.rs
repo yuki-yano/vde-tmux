@@ -703,45 +703,44 @@ mod tests {
     }
 
     #[test]
-    fn generic_wait_reason_accepts_usage_limit_as_a_first_class_value() {
-        let reason = parse_wait_reason(Some("usage_limit")).unwrap();
-        assert!(reason.is_usage_limit());
-    }
-
-    #[test]
-    fn claude_user_prompt_submit_truncates_large_task_notification() {
-        let prompt = format!(
+    fn claude_user_prompt_submit_truncates_at_ascii_and_utf8_boundaries() {
+        let ascii = format!(
             "<task-notification>{}</task-notification>",
             "x".repeat(BODY_MAX_BYTES)
         );
-        let payload = serde_json::json!({
-            "session_id": "session-1",
-            "prompt": prompt,
-        })
-        .to_string();
+        for (body, expected_len, expected_character) in [
+            (ascii, BODY_MAX_BYTES, None),
+            ("界".repeat(BODY_MAX_BYTES), BODY_MAX_BYTES - 1, Some('界')),
+        ] {
+            let payload = serde_json::json!({
+                "session_id": "session-1",
+                "prompt": body,
+            })
+            .to_string();
 
-        let envelope = claude_typed_event_from_json("UserPromptSubmit", &payload, &typed_context())
-            .unwrap()
-            .unwrap();
-        let PaneEvent::BeginRun {
-            prompt: Some(prompt),
-            ..
-        } = envelope.event
-        else {
-            panic!("expected begin-run prompt");
-        };
+            let envelope =
+                claude_typed_event_from_json("UserPromptSubmit", &payload, &typed_context())
+                    .unwrap()
+                    .unwrap();
+            let PaneEvent::BeginRun {
+                prompt: Some(prompt),
+                ..
+            } = envelope.event
+            else {
+                panic!("expected begin-run prompt");
+            };
 
-        assert_eq!(prompt.text.len(), BODY_MAX_BYTES);
-        prompt.validate().unwrap();
-    }
-
-    #[test]
-    fn prompt_preview_truncates_at_utf8_boundary() {
-        let preview = build_prompt_preview(&"界".repeat(BODY_MAX_BYTES)).unwrap();
-
-        assert!(preview.len() <= BODY_MAX_BYTES);
-        assert_eq!(preview.len(), BODY_MAX_BYTES - 1);
-        assert!(preview.chars().all(|character| character == '界'));
+            assert_eq!(prompt.text.len(), expected_len);
+            if let Some(expected_character) = expected_character {
+                assert!(
+                    prompt
+                        .text
+                        .chars()
+                        .all(|character| character == expected_character)
+                );
+            }
+            prompt.validate().unwrap();
+        }
     }
 
     #[test]
@@ -977,21 +976,26 @@ mod tests {
             }))
         );
 
-        let error = generic_typed_event(
+        let usage_limit = generic_typed_event(
             GenericEmitInput {
                 agent: "custom".to_string(),
                 session_id: "session".to_string(),
-                status: Some("running".to_string()),
-                completed_at: Some(123),
+                status: Some("waiting".to_string()),
+                wait_reason: Some("usage_limit".to_string()),
                 ..GenericEmitInput::default()
             },
             &typed_context(),
         )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("--completed-at requires --status idle")
+        .unwrap()
+        .unwrap();
+        let PaneEvent::ExplicitStateReported { report } = usage_limit.event else {
+            panic!("expected explicit state report");
+        };
+        assert_eq!(
+            report.lifecycle,
+            Some(ReportedLifecycle::Waiting {
+                reason: WaitReason::usage_limit()
+            })
         );
     }
 

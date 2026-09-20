@@ -669,28 +669,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_yaml_yields_full_defaults() {
-        let config: Config = serde_yaml_ng::from_str("").unwrap_or_default();
-        assert_eq!(config, Config::default());
-        assert!(config.statusline.summary.enabled);
-        assert!(!config.statusline.summary.hide_idle);
-        assert_eq!(config.statusline.summary.format, "{badge} {count}");
-        assert_eq!(config.daemon.poll_ms, 1000);
-        assert_eq!(config.daemon.git.timeout_ms, 500);
-        assert_eq!(config.sidebar.width, SidebarWidth::Columns(40));
-        assert_eq!(config.sidebar.min_width, 40);
-        assert!(!config.sidebar.task_summary.enabled);
-        assert_eq!(config.sidebar.task_summary.debounce_ms, 750);
-        assert_eq!(config.sidebar.task_summary.timeout_ms, 90_000);
-        assert_eq!(config.popup.width, "50%");
-        assert_eq!(config.popup.height, "50%");
-        assert!(config.session_manager.kill.send_ctrl_c);
-        assert_eq!(config.session_manager.kill.term_wait_ms, 300);
-        assert_eq!(config.session_manager.kill.kill_wait_ms, 300);
-        assert_eq!(config.statusline.category.mode, "list");
-    }
-
-    #[test]
     fn sidebar_task_summary_config_parses_agent_models() {
         let config: Config = serde_yaml_ng::from_str(
             "sidebar:\n  task_summary:\n    enabled: true\n    debounce_ms: 250\n    timeout_ms: 30000\n    codex_model: codex-small\n    claude_model: claude-fast\n",
@@ -750,10 +728,6 @@ mod tests {
 
     #[test]
     fn popup_size_defaults_and_overrides() {
-        let config = Config::default();
-        assert_eq!(config.popup.width, "50%");
-        assert_eq!(config.popup.height, "50%");
-
         let config =
             serde_yaml_ng::from_str::<Config>("popup:\n  width: \"72%\"\n  height: \"60%\"\n")
                 .unwrap();
@@ -767,18 +741,11 @@ mod tests {
         assert_eq!(columns.sidebar.width, SidebarWidth::Columns(64));
         assert_eq!(columns.sidebar.min_width, 40);
 
-        let percent = serde_yaml_ng::from_str::<Config>("sidebar:\n  width: \"10%\"\n").unwrap();
-        assert_eq!(percent.sidebar.width, SidebarWidth::Percent(10));
-        assert_eq!(percent.sidebar.min_width, 40);
-    }
-
-    #[test]
-    fn sidebar_min_width_can_be_overridden() {
-        let config =
+        let percent =
             serde_yaml_ng::from_str::<Config>("sidebar:\n  width: \"10%\"\n  min_width: 48\n")
                 .unwrap();
-        assert_eq!(config.sidebar.width, SidebarWidth::Percent(10));
-        assert_eq!(config.sidebar.min_width, 48);
+        assert_eq!(percent.sidebar.width, SidebarWidth::Percent(10));
+        assert_eq!(percent.sidebar.min_width, 48);
     }
 
     #[test]
@@ -1138,20 +1105,7 @@ categories:
     }
 
     #[test]
-    fn categories_section_parses_path_patterns_only() {
-        let yaml = r#"
-categories:
-  rules:
-    - category: work
-      path_patterns:
-        - github.com/${WORK_OWNER}/*
-"#;
-        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(
-            config.categories.rules[0].path_patterns[0],
-            "github.com/${WORK_OWNER}/*"
-        );
-
+    fn categories_section_rejects_removed_ghq_patterns() {
         let err = serde_yaml_ng::from_str::<Config>(
             "categories:\n  rules:\n    - category: work\n      ghq_patterns:\n        - github.com/acme/*\n",
         )
@@ -1173,18 +1127,6 @@ categories:
         )
         .unwrap_err();
         assert!(err.to_string().contains("glyphs"));
-    }
-
-    #[test]
-    fn session_badge_mode_parses_counts() {
-        let config =
-            serde_yaml_ng::from_str::<Config>("statusline:\n  session_badge:\n    mode: counts\n")
-                .unwrap();
-
-        assert_eq!(
-            config.statusline.session_badge.mode,
-            SessionBadgeMode::Counts
-        );
     }
 
     #[test]

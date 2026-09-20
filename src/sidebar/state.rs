@@ -645,54 +645,16 @@ mod tests {
 
         assert!(state.apply(SidebarAction::CycleFilterBackward, &[]));
         assert_eq!(state.filter, StatusFilter::IdleOnly);
-    }
-
-    #[test]
-    fn filter_cycles_through_all_states() {
-        let mut filter = StatusFilter::All;
-        let mut seen = Vec::new();
-
-        for _ in 0..7 {
-            seen.push(filter);
-            filter = filter.next();
+        for expected in [
+            StatusFilter::DoneOnly,
+            StatusFilter::WorkingOnly,
+            StatusFilter::LimitedOnly,
+            StatusFilter::AttentionOnly,
+            StatusFilter::All,
+        ] {
+            assert!(state.apply(SidebarAction::CycleFilterBackward, &[]));
+            assert_eq!(state.filter, expected);
         }
-
-        assert_eq!(
-            seen,
-            vec![
-                StatusFilter::All,
-                StatusFilter::AttentionOnly,
-                StatusFilter::LimitedOnly,
-                StatusFilter::WorkingOnly,
-                StatusFilter::DoneOnly,
-                StatusFilter::IdleOnly,
-                StatusFilter::All,
-            ]
-        );
-    }
-
-    #[test]
-    fn filter_cycles_backward_through_all_states() {
-        let mut filter = StatusFilter::All;
-        let mut seen = Vec::new();
-
-        for _ in 0..7 {
-            seen.push(filter);
-            filter = filter.previous();
-        }
-
-        assert_eq!(
-            seen,
-            vec![
-                StatusFilter::All,
-                StatusFilter::IdleOnly,
-                StatusFilter::DoneOnly,
-                StatusFilter::WorkingOnly,
-                StatusFilter::LimitedOnly,
-                StatusFilter::AttentionOnly,
-                StatusFilter::All,
-            ]
-        );
     }
 
     #[test]

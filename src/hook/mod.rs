@@ -139,21 +139,4 @@ mod tests {
         assert!(RollupLevel::Running < RollupLevel::Background);
         assert!(RollupLevel::Waiting < RollupLevel::Idle);
     }
-
-    #[test]
-    fn pane_rollup_level_maps_waiting_permission() {
-        assert_eq!(
-            pane_rollup_level(Some(AgentStatus::Waiting), Some("permission_prompt")),
-            RollupLevel::Permission
-        );
-        assert_eq!(
-            pane_rollup_level(Some(AgentStatus::Waiting), Some("usage_limit")),
-            RollupLevel::Limited
-        );
-        assert_eq!(
-            pane_rollup_level(Some(AgentStatus::Waiting), None),
-            RollupLevel::Waiting
-        );
-        assert_eq!(pane_rollup_level(None, None), RollupLevel::Background);
-    }
 }

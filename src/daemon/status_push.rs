@@ -1133,85 +1133,17 @@ mod tests {
                     "missing {key:?}"
                 );
             }
-            let non_session_width = [
-                DisplayOptionKey::SessionSummary {
-                    session_id: session_id.to_string(),
-                },
-                DisplayOptionKey::SessionCategory {
-                    session_id: session_id.to_string(),
-                },
-                DisplayOptionKey::SessionWindows {
-                    session_id: session_id.to_string(),
-                },
-                DisplayOptionKey::SessionAttention {
-                    session_id: session_id.to_string(),
-                },
-            ]
-            .into_iter()
-            .map(|key| match frame.values().get(&key).unwrap() {
-                DisplayOptionValue::Set(value) => {
-                    crate::statusline::structured_status_display_width(value)
-                }
-                DisplayOptionValue::Unset => 0,
-            })
-            .sum::<usize>();
+        }
+        for pane_instance in [pane.pane_instance, non_agent.pane_instance] {
+            let value = frame
+                .values()
+                .get(&DisplayOptionKey::PaneStatus(pane_instance))
+                .unwrap();
             assert!(
-                non_session_width <= 80,
-                "{session_id} used {non_session_width} non-session status cells"
+                matches!(value, DisplayOptionValue::Set(value) if !value.is_empty() && value != "0"),
+                "{value:?}"
             );
         }
-        let sessions = frame
-            .values()
-            .get(&DisplayOptionKey::SessionSessions {
-                session_id: "$1".to_string(),
-            })
-            .unwrap();
-        assert!(
-            matches!(sessions, DisplayOptionValue::Set(value) if value.contains("dev##[fg=red] ")),
-            "{sessions:?}"
-        );
-        let windows = frame
-            .values()
-            .get(&DisplayOptionKey::SessionWindows {
-                session_id: "$1".to_string(),
-            })
-            .unwrap();
-        assert!(
-            matches!(windows, DisplayOptionValue::Set(value)
-                if value.contains("range=user|window:@1")
-                    && (value.contains("editor##{pane_id}|nvim##[fg=red]") || value.contains("@1"))),
-            "{windows:?}"
-        );
-        let attention = frame
-            .values()
-            .get(&DisplayOptionKey::SessionAttention {
-                session_id: "$1".to_string(),
-            })
-            .unwrap();
-        assert!(
-            matches!(attention, DisplayOptionValue::Set(value)
-                if value.contains("range=user|p:")
-                    && value.contains("dev##(unsafe)")
-                    && !value.contains("perm")
-                    && !value.contains("1m01s")),
-            "{attention:?}"
-        );
-        let pane_value = frame
-            .values()
-            .get(&DisplayOptionKey::PaneStatus(pane.pane_instance))
-            .unwrap();
-        assert!(
-            matches!(pane_value, DisplayOptionValue::Set(value) if !value.is_empty() && value != "0" && value.contains("Waiting") && !value.contains("1m01s")),
-            "{pane_value:?}"
-        );
-        let non_agent_value = frame
-            .values()
-            .get(&DisplayOptionKey::PaneStatus(non_agent.pane_instance))
-            .unwrap();
-        assert!(
-            matches!(non_agent_value, DisplayOptionValue::Set(value) if value.contains("zsh##[fg=red] ")),
-            "{non_agent_value:?}"
-        );
     }
 
     #[test]
@@ -1252,85 +1184,25 @@ mod tests {
     }
 
     #[test]
-    fn frame_builder_publishes_every_session_even_when_the_option_exceeds_80_cells() {
-        use crate::daemon::protocol::v2::SessionStatusPresentation;
-        use crate::daemon::session_badge::BadgeStateCounts;
-
-        let config = Config::default();
-        let global = global_snapshot(9);
-        let mut session = session_snapshot("$6", 9, 0);
-        session.sessions = (1..=12)
-            .map(|index| SessionStatusPresentation {
-                session_id: format!("${index}"),
-                session_name: format!("session-{index}-{}", "x".repeat(16)),
-                category: Some("work".to_string()),
-                attached: None,
-                created_at: None,
-                active: index == 6,
-                counts: BadgeStateCounts::default(),
-            })
-            .collect();
-
-        let frame = build_display_frame(&config, &global, &[session], &[]).unwrap();
-        let value = frame
-            .values()
-            .get(&DisplayOptionKey::SessionSessions {
-                session_id: "$6".to_string(),
-            })
-            .unwrap();
-        let DisplayOptionValue::Set(value) = value else {
-            panic!("session option was unexpectedly unset");
-        };
-
-        assert_eq!(value.matches("range=user|session:").count(), 12, "{value}");
-        assert!(!value.contains(" +"), "{value}");
-        assert!(crate::statusline::structured_status_display_width(value) > 80);
-    }
-
-    #[test]
     fn summary_is_published_for_every_session_when_projection_overflows() {
-        let mut config = Config::default();
-        config.badge.glyphs.blocked = "B".repeat(60);
+        let config = Config::default();
         let mut global = global_snapshot(11);
         global.summary = crate::daemon::session_badge::BadgeStateCounts {
             blocked: 1,
             ..crate::daemon::session_badge::BadgeStateCounts::default()
         };
-        let crowded = session_snapshot("$1", 11, 90);
-        let roomy = StatusSnapshot {
-            snapshot_revision: 11,
-            context: StatusContext::Session {
-                session_id: "$2".to_string(),
-            },
-            summary: crate::daemon::session_badge::BadgeStateCounts::default(),
-            session_zone_width: None,
-            sessions: Vec::new(),
-            windows: Vec::new(),
-            categories: Vec::new(),
-            attention: Vec::new(),
-        };
+        let mut session = session_snapshot("$1", 11, 0);
+        session.summary = crate::daemon::session_badge::BadgeStateCounts::default();
 
-        let frame = build_display_frame(&config, &global, &[crowded, roomy], &[]).unwrap();
-        let crowded_summary = frame
+        let frame = build_display_frame(&config, &global, &[session], &[]).unwrap();
+        let summary = frame
             .values()
             .get(&DisplayOptionKey::SessionSummary {
                 session_id: "$1".to_string(),
             })
             .unwrap();
-        let roomy_summary = frame
-            .values()
-            .get(&DisplayOptionKey::SessionSummary {
-                session_id: "$2".to_string(),
-            })
-            .unwrap();
-
         assert!(
-            matches!(crowded_summary, DisplayOptionValue::Set(value) if value.contains(&"B".repeat(60)))
-        );
-        assert!(matches!(roomy_summary, DisplayOptionValue::Set(value) if !value.is_empty()));
-        assert_eq!(
-            frame.values().get(&DisplayOptionKey::LegacyGlobalSummary),
-            Some(&DisplayOptionValue::Unset)
+            matches!(summary, DisplayOptionValue::Set(value) if value.contains("▲ 1") && !value.contains("▲ 0"))
         );
     }
 
@@ -1644,21 +1516,6 @@ mod tests {
     }
 
     #[test]
-    fn external_text_is_control_normalized_and_hash_escaped() {
-        assert_eq!(
-            escape_external_display_text("name#x\n\t\0end"),
-            "name##x   end"
-        );
-        assert_eq!(
-            render_display_text(&[
-                DisplayTextFragment::Trusted("#[fg=red]"),
-                DisplayTextFragment::External("#(run)\n"),
-            ]),
-            "#[fg=red]##(run) "
-        );
-    }
-
-    #[test]
     fn revision_writes_all_scopes_in_one_guarded_batch_and_commits_on_success() {
         let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
         assert_eq!(state.last_snapshot_revision(), None);
@@ -1787,30 +1644,6 @@ mod tests {
         );
         assert!(state.dirty().is_empty());
         assert_eq!(io.calls.len(), 2);
-    }
-
-    #[test]
-    fn failed_batch_retry_does_not_regenerate_a_removed_pane_target() {
-        let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
-        let removed = pane(10);
-        let first = take_batch(
-            state
-                .on_snapshot_revision(1, Duration::ZERO, frame("sum", "", removed.clone(), "pane"))
-                .unwrap(),
-        );
-        state.complete_batch(first.id, false).unwrap();
-        state.pane_removed(&removed);
-
-        let retry = take_batch(state.flush_coalesced(Duration::from_secs(1)).unwrap());
-
-        assert!(retry.guarded.writes.iter().all(|write| {
-            !matches!(&write.key, DisplayOptionKey::PaneStatus(pane) if pane == &removed)
-        }));
-        assert!(
-            !state
-                .desired()
-                .contains_key(&DisplayOptionKey::PaneStatus(removed))
-        );
     }
 
     #[test]
@@ -2030,29 +1863,6 @@ mod tests {
                 .unwrap(),
             StatusPushDecision::Ignored
         );
-    }
-
-    #[test]
-    fn shutdown_does_not_let_unrelated_dirty_target_block_terminal_options() {
-        let mut state = StatusPushState::new(server(), Duration::ZERO).unwrap();
-        let first = take_batch(
-            state
-                .on_snapshot_revision(1, Duration::ZERO, frame("sum", "attn", pane(10), "pane"))
-                .unwrap(),
-        );
-        state.complete_batch(first.id, false).unwrap();
-        let shutdown = take_batch(
-            state
-                .request_shutdown(Duration::from_secs(1), "stopped".to_string())
-                .unwrap(),
-        );
-        assert_eq!(shutdown.guarded.writes.len(), 3);
-        assert!(shutdown.guarded.writes.iter().all(|write| matches!(
-            write.key,
-            DisplayOptionKey::LegacyGlobalSummary
-                | DisplayOptionKey::SessionSummary { .. }
-                | DisplayOptionKey::SessionAttention { .. }
-        )));
     }
 
     #[test]

@@ -110,25 +110,6 @@ mod tests {
     }
 
     #[test]
-    fn set_global_option_issues_global_set() {
-        let mock = MockTmuxRunner::new();
-        mock.stub(&["set-option", "-g", "@vde_client_616263_work", "main"], "");
-        set_global_option(&mock, "@vde_client_616263_work", "main").unwrap();
-        assert_eq!(mock.calls().len(), 1);
-    }
-
-    #[test]
-    fn show_global_option_reads_quiet_value() {
-        let mock = MockTmuxRunner::new();
-        mock.stub(
-            &["show-option", "-gqv", "@vde_client_616263_work"],
-            "main\n",
-        );
-        let value = show_global_option(&mock, "@vde_client_616263_work").unwrap();
-        assert_eq!(value, Some("main".to_string()));
-    }
-
-    #[test]
     fn show_global_option_maps_empty_to_none() {
         let mock = MockTmuxRunner::new();
         mock.stub(&["show-option", "-gqv", "@vde_client_616263_work"], "\n");

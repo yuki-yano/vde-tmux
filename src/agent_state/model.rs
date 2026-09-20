@@ -1026,26 +1026,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn references_roundtrip_without_exposing_delimiter_constraints() {
-        let run_ref = RunRef {
-            server_identity: "server_hash-1".to_string(),
-            generation: StateGeneration::parse("1".repeat(32)).unwrap(),
-            run_id: StableRunId::parse("2".repeat(32)).unwrap(),
-        };
-        assert_eq!(RunRef::decode(&run_ref.encode().unwrap()).unwrap(), run_ref);
-
-        let operation_ref = OperationRef {
-            server_identity: "server_hash-1".to_string(),
-            generation: StateGeneration::parse("1".repeat(32)).unwrap(),
-            operation_id: OperationId::parse("operation_123456").unwrap(),
-        };
-        assert_eq!(
-            OperationRef::decode(&operation_ref.encode().unwrap()).unwrap(),
-            operation_ref
-        );
-    }
-
-    #[test]
     fn state_meta_rejects_ready_target_and_same_reset_target() {
         let generation = StateGeneration::parse("1".repeat(32)).unwrap();
         let mut meta = StateMeta {

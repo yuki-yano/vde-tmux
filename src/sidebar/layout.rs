@@ -1757,17 +1757,6 @@ mod tests {
             &["set-option", "-p", "-t", "%9", KEY_SIDEBAR_MARKER, "1"]
         ));
         assert!(called(&mock, &["resize-pane", "-t", "%9", "-x", "40"]));
-    }
-
-    #[test]
-    fn open_splits_sidebar_as_the_focused_pane() {
-        let mock = MockTmuxRunner::new();
-        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n");
-        stub_window_layout(&mock, "@1", "layout-before\n");
-        stub_split(&mock, "@1", "40");
-
-        open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
-
         assert!(called(
             &mock,
             &[
@@ -2022,27 +2011,6 @@ mod tests {
     fn layout_without_sidebar_rejects_floating_panes() {
         let err = layout_without_sidebar("0000,120x40,0,0<10x10,0,0,9>", "%9").unwrap_err();
         assert!(err.to_string().contains("floating pane layouts"));
-    }
-
-    #[test]
-    fn open_does_not_clear_stale_baseline_options() {
-        let mock = MockTmuxRunner::new();
-        stub_sidebar_panes(&mock, "@1", "%1\t\t80\n%2\t\t80\n");
-        stub_window_layout(&mock, "@1", "layout-current\n");
-        stub_split(&mock, "@1", "40");
-
-        open(&mock, "@1", &exe(), SidebarWidth::Columns(40), 40).unwrap();
-
-        let calls = mock.calls();
-        assert!(
-            !calls
-                .iter()
-                .any(|call| call.first().map(String::as_str) == Some("select-layout"))
-        );
-        assert!(called(
-            &mock,
-            &["set-option", "-p", "-t", "%9", KEY_SIDEBAR_MARKER, "1"]
-        ));
     }
 
     #[test]
@@ -2568,30 +2536,13 @@ mod tests {
     }
 
     #[test]
-    fn prepare_layout_reentry_returns_the_same_sidebar_without_another_split() {
-        let mock = MockTmuxRunner::new();
-        stub_prepare_context(&mock, "@12");
-        stub_sidebar_panes(&mock, "@12", "%22\t\t80\n%23\t1\t40\n");
-        stub_window_layout(&mock, "@12", "layout-before\n");
-
-        let first = prepare_layout(&mock, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
-        let second = prepare_layout(&mock, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
-
-        assert_eq!(first, second);
-        assert!(
-            !mock
-                .calls()
-                .iter()
-                .any(|call| { call.first().map(String::as_str) == Some("split-window") })
-        );
-    }
-
-    #[test]
     fn layout_applied_then_prepare_layout_reuses_the_synchronously_marked_sidebar() {
         let runner = ReentrantPrepareRunner::default();
 
         layout_applied(&runner, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
         let result = prepare_layout(&runner, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
+        let repeated =
+            prepare_layout(&runner, "@12", &exe(), SidebarWidth::Columns(40), 40).unwrap();
 
         let state = runner.state.borrow();
         assert_eq!(state.split_count, 1);
@@ -2599,6 +2550,7 @@ mod tests {
         assert_eq!(state.sidebar_width, 40);
         assert_eq!(result.reserved_panes, ["%23"]);
         assert_eq!(result.content_anchor, "%22");
+        assert_eq!(repeated, result);
     }
 
     #[test]

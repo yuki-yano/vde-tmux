@@ -114,36 +114,6 @@ fn v2_requires_hello_and_rejects_v1_before_side_effects() {
 }
 
 #[test]
-fn v2_read_only_query_does_not_consume_accepted_sequence() {
-    let mut router = V2Router::new(v2_daemon_id(), "server");
-    router.set_phase(DaemonPhase::Serving);
-    let mut connection = V2ConnectionState::default();
-    v2_handshake(&mut router, &mut connection);
-    assert!(matches!(
-        router.route(
-            &mut connection,
-            ClientMessage::QueryResolvedSnapshot {
-                proto: PROTOCOL_VERSION,
-            },
-        ),
-        V2Route::Query(_)
-    ));
-    assert!(matches!(
-        router.route(
-            &mut connection,
-            ClientMessage::QueryRuntimeInfo {
-                proto: PROTOCOL_VERSION,
-            },
-        ),
-        V2Route::Query(_)
-    ));
-    let V2Route::Mutation(mutation) = router.route(&mut connection, v2_begin()) else {
-        panic!("expected mutation");
-    };
-    assert_eq!(mutation.accepted_seq, 1);
-}
-
-#[test]
 fn v2_internal_and_external_mutations_share_one_accepted_sequence() {
     let mut router = V2Router::new(v2_daemon_id(), "server");
     router.set_phase(DaemonPhase::Serving);
@@ -204,6 +174,26 @@ fn v2_serving_with_degraded_hooks_continues_queries_and_canonical_mutations() {
         V2Route::Query(ClientMessage::QueryResolvedSnapshot { .. })
     ));
     assert!(matches!(
+        router.route(
+            &mut connection,
+            ClientMessage::QueryRuntimeInfo {
+                proto: PROTOCOL_VERSION,
+            },
+        ),
+        V2Route::Query(ClientMessage::QueryRuntimeInfo { .. })
+    ));
+    assert!(matches!(
+        router.route(
+            &mut connection,
+            ClientMessage::QueryAgentRun {
+                proto: PROTOCOL_VERSION,
+                run_ref: "vtr3:run".to_string(),
+            },
+        ),
+        V2Route::Query(ClientMessage::QueryAgentRun { run_ref, .. })
+            if run_ref == "vtr3:run"
+    ));
+    assert!(matches!(
         router.route(&mut connection, v2_begin()),
         V2Route::Mutation(V2SequencedMutation {
             accepted_seq: 1,
@@ -215,9 +205,21 @@ fn v2_serving_with_degraded_hooks_continues_queries_and_canonical_mutations() {
 #[test]
 fn v2_bootstrap_fifo_preserves_order_and_rejects_overflow_without_consuming_seq() {
     let mut router = V2Router::new(v2_daemon_id(), "server");
-    router.set_phase(DaemonPhase::Hydrating);
+    router.begin_hydration().unwrap();
     let mut connection = V2ConnectionState::default();
     v2_handshake(&mut router, &mut connection);
+    assert!(matches!(
+        router.route(
+            &mut connection,
+            ClientMessage::QueryResolvedSnapshot {
+                proto: PROTOCOL_VERSION,
+            },
+        ),
+        V2Route::Response(ServerMessage::Error {
+            code: ErrorCode::NotReady,
+            ..
+        })
+    ));
     for expected in 1..=V2_BOOTSTRAP_FIFO_CAPACITY as u64 {
         assert_eq!(
             router.route(&mut connection, v2_begin()),
@@ -311,36 +313,6 @@ fn restart_owned_hook_view_event_keeps_fifo_order_during_bootstrap() {
 }
 
 #[test]
-fn v2_bootstrap_failure_keeps_hydrating_and_never_serves_queries() {
-    let mut router = V2Router::new(v2_daemon_id(), "server");
-    router.begin_hydration().unwrap();
-    let mut connection = V2ConnectionState::default();
-    v2_handshake(&mut router, &mut connection);
-    assert!(matches!(
-        router.route(&mut connection, v2_begin()),
-        V2Route::Queued { accepted_seq: 1 }
-    ));
-    let result = router.finish_bootstrap(|queued| {
-        assert_eq!(queued.len(), 1);
-        Err("initial reconciliation failed")
-    });
-    assert_eq!(result, Err("initial reconciliation failed"));
-    assert_eq!(router.phase(), DaemonPhase::Hydrating);
-    assert!(matches!(
-        router.route(
-            &mut connection,
-            ClientMessage::QueryResolvedSnapshot {
-                proto: PROTOCOL_VERSION,
-            },
-        ),
-        V2Route::Response(ServerMessage::Error {
-            code: ErrorCode::NotReady,
-            ..
-        })
-    ));
-}
-
-#[test]
 fn v2_rejects_stale_instance_and_internal_event_origins() {
     let mut router = V2Router::new(v2_daemon_id(), "server");
     router.set_phase(DaemonPhase::Serving);
@@ -358,6 +330,42 @@ fn v2_rejects_stale_instance_and_internal_event_origins() {
             code: ErrorCode::StaleDaemonInstance,
             ..
         })
+    ));
+    let prompt_event_id = v2_event_id();
+    let prompt = ClientMessage::StartAgentPrompt {
+        proto: PROTOCOL_VERSION,
+        daemon_instance_id: v2_daemon_id(),
+        event_id: prompt_event_id.clone(),
+        target_agent_ref: "vta1:agent".to_string(),
+        operation_id: crate::agent_state::OperationId::parse("operation_router_prompt").unwrap(),
+        prompt_base64: "cHJvbXB0".to_string(),
+        prompt_digest: crate::agent_state::Sha256Digest::of(b"prompt"),
+        dispatch_option: "guarded".to_string(),
+        observed_at: 1,
+    };
+    let V2Route::Mutation(accepted) = router.route(&mut connection, prompt.clone()) else {
+        panic!("valid agent prompt must be routed as a mutation");
+    };
+    assert!(matches!(
+        accepted.mutation,
+        V2AcceptedMutation::External(ClientMessage::StartAgentPrompt { event_id, .. })
+            if event_id == prompt_event_id
+    ));
+    let mut stale_prompt = prompt;
+    let ClientMessage::StartAgentPrompt {
+        daemon_instance_id, ..
+    } = &mut stale_prompt
+    else {
+        unreachable!();
+    };
+    *daemon_instance_id = DaemonInstanceId::parse("00112233445566778899aabbccddeeff").unwrap();
+    assert!(matches!(
+        router.route(&mut connection, stale_prompt),
+        V2Route::Response(ServerMessage::Error {
+            code: ErrorCode::StaleDaemonInstance,
+            event_id: Some(event_id),
+            ..
+        }) if event_id == prompt_event_id
     ));
     let internal_events = [
         PaneEvent::MarkPaneRead { through_order: 1 },
@@ -414,31 +422,6 @@ fn v2_rejects_invalid_view_before_consuming_accepted_sequence() {
     };
     assert!(matches!(
         router.route(&mut connection, invalid),
-        V2Route::Response(ServerMessage::Error {
-            code: ErrorCode::InvalidRequest,
-            ..
-        })
-    ));
-    let detached_pane = PaneInstance {
-        pane_id: "%1".to_string(),
-        pane_pid: 100,
-    };
-    let detached_with_occurrence = ClientMessage::SubmitViewEvent {
-        proto: PROTOCOL_VERSION,
-        event: crate::pane_state::ViewEvent {
-            daemon_instance_id: v2_daemon_id(),
-            event_id: v2_event_id(),
-            hook_kind: crate::pane_state::ViewHookKind::ClientDetached,
-            active_pane: Some(detached_pane.clone()),
-            window_panes: vec![detached_pane],
-            visibility: crate::pane_state::ViewVisibilityProof {
-                pane_visible: false,
-                window_visible: false,
-            },
-        },
-    };
-    assert!(matches!(
-        router.route(&mut connection, detached_with_occurrence),
         V2Route::Response(ServerMessage::Error {
             code: ErrorCode::InvalidRequest,
             ..

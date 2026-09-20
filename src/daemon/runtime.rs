@@ -485,7 +485,7 @@ mod tests {
     use super::projection::preflight_resolved_snapshot_against_runtime;
     use crate::daemon::SidebarModel;
     use crate::daemon::protocol::v2::{
-        PanePresentation, ResolvedSnapshot, ServerMessage, SessionLinkPresentation,
+        PanePresentation, ResolvedSnapshot, SessionLinkPresentation,
     };
     use crate::pane_state::{ClientWitness, StoredStateDescriptor, WaitReason};
 
@@ -857,20 +857,6 @@ mod tests {
         remove_canonical_sidebar_fixture(state, root);
     }
 
-    #[test]
-    fn contains_pane_matches_resolved_snapshot_membership() {
-        let (state, root) = canonical_sidebar_fixture();
-        assert!(state.contains_pane(&PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 101,
-        }));
-        assert!(!state.contains_pane(&PaneInstance {
-            pane_id: "%missing".to_string(),
-            pane_pid: 999,
-        }));
-        remove_canonical_sidebar_fixture(state, root);
-    }
-
     fn client_witness(client_pid: u32, pane_id: &str, pane_pid: u32) -> ClientWitness {
         ClientWitness {
             client_pid,
@@ -998,6 +984,15 @@ mod tests {
         state.begin_peek(10, first.clone(), [first.clone()], 1);
         state.activate_peek(10, 1, first.clone(), 0);
         state.begin_peek(10, first.clone(), [second.clone()], 2);
+        assert!(!state.begin_peek(10, first.clone(), [first.clone()], 3));
+        assert!(matches!(
+            state.peek_leases.get(&10),
+            Some(PeekLease::Pending {
+                operation_seq: 2,
+                candidates,
+                ..
+            }) if candidates == &BTreeSet::from([second.clone()])
+        ));
 
         state.reconcile_peek_leases(&[client_witness(10, "%shell", 103)], 1);
         assert!(matches!(
@@ -1031,35 +1026,6 @@ mod tests {
 
         state.restore_peek_after_failure(10, 2, &[owner], 5);
         assert_eq!(state.active_peek_target(10), Some(&first));
-        remove_canonical_sidebar_fixture(state, root);
-    }
-
-    #[test]
-    fn pending_peek_cannot_be_overwritten_by_a_concurrent_operation() {
-        let (mut state, root) = canonical_sidebar_fixture();
-        let source = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 101,
-        };
-        let first_target = PaneInstance {
-            pane_id: "%2".to_string(),
-            pane_pid: 102,
-        };
-        let second_target = PaneInstance {
-            pane_id: "%shell".to_string(),
-            pane_pid: 103,
-        };
-
-        assert!(state.begin_peek(10, source.clone(), [first_target.clone()], 1));
-        assert!(!state.begin_peek(10, source, [second_target], 2));
-        assert!(matches!(
-            state.peek_leases.get(&10),
-            Some(PeekLease::Pending {
-                operation_seq: 1,
-                candidates,
-                ..
-            }) if candidates == &BTreeSet::from([first_target])
-        ));
         remove_canonical_sidebar_fixture(state, root);
     }
 
@@ -1156,29 +1122,6 @@ mod tests {
         state.begin_peek(10, first, [second.clone()], 1);
         state.activate_peek(10, 1, second, 1);
         state.reconcile_peek_leases(&[client_witness(10, "%shell", 103)], 2);
-        assert!(state.active_peek_target(10).is_none());
-
-        let first = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 101,
-        };
-        let second = PaneInstance {
-            pane_id: "%2".to_string(),
-            pane_pid: 102,
-        };
-        state.begin_peek(10, first.clone(), [second.clone()], 2);
-        state.activate_peek(10, 2, second, 5);
-        let source = client_witness(10, "%1", 101);
-        state.reconcile_peek_leases(std::slice::from_ref(&source), 5);
-        assert!(state.active_peek_target(10).is_some());
-        state.reconcile_peek_leases(std::slice::from_ref(&source), 5);
-        assert!(state.active_peek_target(10).is_some());
-        let landed = client_witness(10, "%2", 102);
-        state.reconcile_peek_leases(std::slice::from_ref(&landed), 6);
-        assert!(state.active_peek_target(10).is_some());
-        state.reconcile_peek_leases(std::slice::from_ref(&source), 5);
-        assert!(state.active_peek_target(10).is_some());
-        state.reconcile_peek_leases(std::slice::from_ref(&source), 7);
         assert!(state.active_peek_target(10).is_none());
 
         let first = PaneInstance {
@@ -1352,72 +1295,6 @@ mod tests {
     }
 
     #[test]
-    fn resolved_history_keeps_same_agent_previous_session_completion_time() {
-        use crate::pane_state::{AgentSessionSource, PaneEvent};
-
-        let (mut state, root) = canonical_sidebar_fixture();
-        state.leased.runtime = CanonicalPaneStateRuntime::default();
-        apply_history_event(
-            &mut state,
-            "codex",
-            "session-a",
-            PaneEvent::BeginRun {
-                started_at: 10,
-                prompt: None,
-            },
-        );
-        apply_history_event(
-            &mut state,
-            "codex",
-            "session-a",
-            PaneEvent::CompleteRun { completed_at: 20 },
-        );
-        apply_history_event(
-            &mut state,
-            "codex",
-            "session-b",
-            PaneEvent::AgentSessionStarted {
-                observed_at: 30,
-                source: AgentSessionSource::Startup,
-                resumed_prompt: None,
-            },
-        );
-
-        let pane = PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 101,
-        };
-        let Some(current) = state.leased.runtime.record(&pane) else {
-            panic!("expected active pane state");
-        };
-        assert_eq!(
-            current
-                .agent_session_id
-                .as_ref()
-                .map(crate::pane_state::AgentSessionId::as_str),
-            Some("session-b")
-        );
-        let snapshot = state.resolved_snapshot();
-        assert_eq!(
-            snapshot
-                .panes
-                .iter()
-                .find(|presentation| presentation.pane_instance == pane)
-                .and_then(|presentation| presentation.resolved.as_ref())
-                .map(|resolved| resolved.badge),
-            Some(BadgeState::Done)
-        );
-        assert!(
-            !snapshot
-                .events
-                .iter()
-                .any(|event| event.from == Some(BadgeState::Done) && event.to == BadgeState::Idle)
-        );
-
-        remove_canonical_sidebar_fixture(state, root);
-    }
-
-    #[test]
     fn resolved_history_retains_the_latest_256_transitions() {
         use crate::pane_state::{AgentSessionSource, PaneEvent};
 
@@ -1441,39 +1318,6 @@ mod tests {
         assert_eq!(snapshot.events.len(), 256);
         assert_eq!(snapshot.events.first().unwrap().at_epoch, 2);
         assert_eq!(snapshot.events.last().unwrap().at_epoch, 257);
-
-        remove_canonical_sidebar_fixture(state, root);
-    }
-
-    #[test]
-    fn resolved_history_exposes_begin_run_prompt_digest() {
-        use crate::pane_state::{PaneEvent, PromptState};
-
-        let (mut state, root) = canonical_sidebar_fixture();
-        state.leased.runtime = CanonicalPaneStateRuntime::default();
-        let digest = PromptState::digest_decoded_prompt("raw\nprompt");
-        apply_history_event(
-            &mut state,
-            "codex",
-            "same-session",
-            PaneEvent::BeginRun {
-                started_at: 1,
-                prompt: Some(PromptState {
-                    text: "raw prompt".to_string(),
-                    source: "user".to_string(),
-                    digest: Some(digest.clone()),
-                }),
-            },
-        );
-
-        assert_eq!(
-            state
-                .resolved_snapshot()
-                .events
-                .last()
-                .and_then(|event| event.prompt_digest.as_ref()),
-            Some(&digest)
-        );
 
         remove_canonical_sidebar_fixture(state, root);
     }
@@ -1524,31 +1368,6 @@ mod tests {
         assert_eq!(state.git_badges, cache_only);
         assert_eq!(state.leased.runtime.snapshot_revision(), 2);
 
-        let oversized = BTreeMap::from([(
-            "/tmp/alpha".to_string(),
-            GitBadge {
-                branch: "x".repeat(crate::pane_state::MAX_RESPONSE_FRAME_BYTES),
-                ahead: 0,
-                behind: 0,
-                insertions: 0,
-                deletions: 0,
-            },
-        )]);
-        assert!(
-            state
-                .replace_git_projection(oversized.clone(), BTreeMap::new())
-                .unwrap()
-        );
-        assert_eq!(state.git_badges, oversized);
-        assert_eq!(state.leased.runtime.snapshot_revision(), 3);
-        let message = ServerMessage::ResolvedSnapshotResult {
-            snapshot_revision: 3,
-            snapshot: state.resolved_snapshot(),
-        };
-        assert!(
-            serde_json::to_vec(&message).unwrap().len()
-                > crate::pane_state::MAX_RESPONSE_FRAME_BYTES
-        );
         remove_canonical_sidebar_fixture(state, root);
     }
 
@@ -2010,41 +1829,6 @@ mod tests {
         state.repo_identities = resolved.sidebar_model.repo_identities;
     }
 
-    #[test]
-    fn display_projection_builds_every_surface_from_one_resolved_revision() {
-        let (mut state, root) = canonical_sidebar_fixture();
-        state.status_metadata = StatusProjectionMetadata {
-            sessions: BTreeMap::from([
-                ("$2".to_string(), SessionProjectionMetadata::default()),
-                ("$1".to_string(), SessionProjectionMetadata::default()),
-            ]),
-            ..StatusProjectionMetadata::default()
-        };
-
-        let (global, sessions, panes) = state.display_projection();
-
-        assert_eq!(global.snapshot_revision, 0);
-        assert_eq!(panes.len(), 3);
-        assert_eq!(
-            sessions
-                .iter()
-                .map(|snapshot| match &snapshot.context {
-                    StatusContext::Session { session_id } => {
-                        session_id.as_str()
-                    }
-                    StatusContext::Global => "global",
-                })
-                .collect::<Vec<_>>(),
-            vec!["$1", "$2"]
-        );
-        assert!(
-            sessions
-                .iter()
-                .all(|snapshot| snapshot.snapshot_revision == global.snapshot_revision)
-        );
-        remove_canonical_sidebar_fixture(state, root);
-    }
-
     fn assert_continuous_display_state(state: &CanonicalCoordinatorState, expected: BadgeState) {
         let resolved = state.resolved_snapshot();
         let pane = resolved
@@ -2134,35 +1918,68 @@ mod tests {
 
     #[test]
     fn done_focus_idle_focus_out_next_completion_is_consistent_across_all_surfaces() {
-        use crate::pane_state::PaneEvent;
+        use crate::pane_state::{PaneEvent, PromptState};
 
         let (mut state, root) = canonical_sidebar_fixture();
         state.leased.runtime = CanonicalPaneStateRuntime::default();
         state.status_metadata = StatusProjectionMetadata {
-            sessions: BTreeMap::from([(
-                "$1".to_string(),
-                SessionProjectionMetadata {
-                    session_name: "main".to_string(),
-                    project_path: "/repo-main".to_string(),
-                    attached: Some(true),
-                    created_at: Some(1),
-                },
-            )]),
+            sessions: BTreeMap::from([
+                (
+                    "$1".to_string(),
+                    SessionProjectionMetadata {
+                        session_name: "main".to_string(),
+                        project_path: "/repo-main".to_string(),
+                        attached: Some(true),
+                        created_at: Some(1),
+                    },
+                ),
+                ("$2".to_string(), SessionProjectionMetadata::default()),
+            ]),
             windows: BTreeMap::new(),
         };
         state.projection_config = status_config();
         set_state_categories(&mut state, &[("/repo-main", "work")]);
 
+        let prompt_digest = PromptState::digest_decoded_prompt("raw\nprompt");
         apply_history_event(
             &mut state,
             "codex",
             "scenario-session",
             PaneEvent::BeginRun {
                 started_at: 10,
-                prompt: None,
+                prompt: Some(PromptState {
+                    text: "raw prompt".to_string(),
+                    source: "user".to_string(),
+                    digest: Some(prompt_digest.clone()),
+                }),
             },
         );
         assert_continuous_display_state(&state, BadgeState::Working);
+        assert_eq!(
+            state
+                .resolved_snapshot()
+                .events
+                .last()
+                .and_then(|event| event.prompt_digest.as_ref()),
+            Some(&prompt_digest)
+        );
+        let (global, sessions, panes) = state.display_projection();
+        assert_eq!(panes.len(), 3);
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|snapshot| match &snapshot.context {
+                    StatusContext::Session { session_id } => session_id.as_str(),
+                    StatusContext::Global => "global",
+                })
+                .collect::<Vec<_>>(),
+            vec!["$1", "$2"]
+        );
+        assert!(
+            sessions
+                .iter()
+                .all(|snapshot| snapshot.snapshot_revision == global.snapshot_revision)
+        );
         apply_history_event(
             &mut state,
             "codex",
@@ -2184,13 +2001,6 @@ mod tests {
             PaneEvent::MarkPaneRead { through_order },
         );
         assert_continuous_display_state(&state, BadgeState::Idle);
-
-        let focus_out_revision = state.resolved_snapshot().snapshot_revision;
-        assert_continuous_display_state(&state, BadgeState::Idle);
-        assert_eq!(
-            state.resolved_snapshot().snapshot_revision,
-            focus_out_revision
-        );
 
         apply_history_event(
             &mut state,

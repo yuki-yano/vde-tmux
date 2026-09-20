@@ -380,19 +380,7 @@ mod tests {
         assert_eq!(second_codex.provider_turn_key, codex.provider_turn_key);
         assert_ne!(second_codex.provider_event_ref, codex.provider_event_ref);
         assert_eq!(second_codex.prompt_digest, codex.prompt_digest);
-    }
 
-    #[test]
-    fn retrying_one_prompt_ingress_reuses_the_same_event_reference() {
-        let first = observation_from_json(
-            "codex",
-            "UserPromptSubmit",
-            r#"{"session_id":"s1","turn_id":"t1","prompt":"hello"}"#,
-            event_id(),
-            1,
-        )
-        .unwrap()
-        .unwrap();
         let retry = observation_from_json(
             "codex",
             "UserPromptSubmit",
@@ -403,8 +391,8 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(first.provider_event_ref, retry.provider_event_ref);
-        assert_eq!(first.payload_digest, retry.payload_digest);
+        assert_eq!(codex.provider_event_ref, retry.provider_event_ref);
+        assert_eq!(codex.payload_digest, retry.payload_digest);
     }
 
     #[test]

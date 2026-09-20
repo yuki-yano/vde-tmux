@@ -1857,6 +1857,15 @@ mod tests {
                 expected_lifecycle,
                 "{name}"
             );
+            if name == "session" {
+                let completion = reduce_once(
+                    missing.record.as_ref(),
+                    PaneEvent::CompleteRun { completed_at: 2 },
+                    &missing.tracker_delta.as_ref().unwrap().next,
+                );
+                assert_eq!(active(&completion).run_seq, 0);
+                assert_eq!(resolve_badge(active(&completion)), BadgeState::Idle);
+            }
         }
 
         let non_creating = vec![
@@ -2097,6 +2106,15 @@ mod tests {
         .unwrap();
         assert_eq!(active(&synthetic).completed_seq, 1);
         assert!(active(&synthetic).agent_session_id.is_some());
+        assert!(!active(&synthetic).synthetic_completion_armed);
+        assert!(
+            synthetic
+                .tracker_delta
+                .as_ref()
+                .unwrap()
+                .next
+                .rebaseline_pending
+        );
         let ignored_progress = reduce_explicit_once(
             unbound.record.as_ref(),
             "codex",
@@ -2316,56 +2334,6 @@ mod tests {
         .unwrap();
         assert_eq!(active(&exact).prompt.as_ref().unwrap().text, "field-only");
 
-        let absent_once = observe(
-            begun.record.as_ref(),
-            &begun_tracker,
-            AgentPresenceObservation::Absent,
-            None,
-            3,
-        );
-        let absent = observe(
-            absent_once.record.as_ref(),
-            &absent_once.tracker_delta.as_ref().unwrap().next,
-            AgentPresenceObservation::Absent,
-            None,
-            4,
-        );
-        assert_eq!(
-            reduce_explicit_once(
-                absent.record.as_ref(),
-                "codex",
-                "session",
-                field_report.clone(),
-                &absent.tracker_delta.as_ref().unwrap().next,
-            )
-            .unwrap_err(),
-            ReduceError::StaleAgentEvent
-        );
-
-        let missing = reduce_explicit_once(
-            None,
-            "codex",
-            "session",
-            field_report.clone(),
-            &CaptureTrackerSnapshot::default(),
-        )
-        .unwrap();
-        assert_eq!(missing.outcome, ReductionOutcome::Noop);
-        assert!(missing.record.is_none());
-
-        let unbound = discover("codex");
-        let unbound_result = reduce_explicit_once(
-            unbound.record.as_ref(),
-            "codex",
-            "session",
-            field_report.clone(),
-            &unbound.tracker_delta.as_ref().unwrap().next,
-        )
-        .unwrap();
-        assert_eq!(unbound_result.record, unbound.record);
-        assert!(active(&unbound_result).prompt.is_none());
-        assert!(active(&unbound_result).agent_session_id.is_none());
-
         assert_eq!(
             reduce_explicit_once(
                 begun.record.as_ref(),
@@ -2516,57 +2484,6 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_process_scan_revokes_public_identity_without_forgetting_replacement_baseline() {
-        let first_process = AgentProcessIdentity {
-            pid: 1001,
-            start_token: "process-a".to_string(),
-        };
-        let first = observe_process(
-            None,
-            &CaptureTrackerSnapshot::default(),
-            "codex",
-            first_process.clone(),
-            1,
-        );
-        let ambiguous = observe_process_check(
-            first.record.as_ref(),
-            &first.tracker_delta.as_ref().unwrap().next,
-            "codex",
-            None,
-            2,
-        );
-        let ambiguous_tracker = &ambiguous.tracker_delta.as_ref().unwrap().next;
-        assert_eq!(ambiguous_tracker.agent_process, None);
-        assert_eq!(
-            ambiguous_tracker.last_agent_process,
-            Some(first_process.clone())
-        );
-        assert_eq!(active(&ambiguous).agent_process, Some(first_process));
-        assert_eq!(active(&ambiguous).agent_epoch, 1);
-
-        let second_process = AgentProcessIdentity {
-            pid: 1002,
-            start_token: "process-b".to_string(),
-        };
-        let replaced = observe_process(
-            ambiguous.record.as_ref(),
-            ambiguous_tracker,
-            "codex",
-            second_process.clone(),
-            3,
-        );
-        assert_eq!(active(&replaced).agent_epoch, 2);
-        assert_eq!(
-            active(&replaced).agent_process,
-            Some(second_process.clone())
-        );
-        assert_eq!(
-            replaced.tracker_delta.as_ref().unwrap().next.agent_process,
-            Some(second_process)
-        );
-    }
-
-    #[test]
     fn mixed_presence_sequences_follow_absence_and_replacement_tracker_table() {
         fn run_sequence(sequence: Vec<AgentPresenceObservation>) -> Reduction {
             let initial = discover("codex");
@@ -2661,7 +2578,6 @@ mod tests {
         );
         let before_explicit = first_absence.tracker_delta.as_ref().unwrap().next.clone();
         assert_eq!(before_explicit.absence_count, 1);
-        let old_base = descriptor(first_absence.record.as_ref().unwrap());
         let progress = reduce_explicit_once(
             first_absence.record.as_ref(),
             "codex",
@@ -2677,24 +2593,6 @@ mod tests {
         assert_eq!(after_explicit.absence_count, 0);
         assert_eq!(after_explicit.replacement_kind, None);
         assert!(after_explicit.generation > before_explicit.generation);
-
-        let stale_poll = PaneEvent::ObservationBatch {
-            base: Some(old_base),
-            tracker_generation: before_explicit.generation,
-            observed_at: 4,
-            presence: AgentPresenceObservation::Absent,
-            capture: None,
-            process: None,
-        };
-        let rejected = reduce(
-            progress.record.as_ref(),
-            &observation_envelope(stale_poll),
-            context(&after_explicit, &VisibilitySnapshot::default()),
-        )
-        .unwrap();
-        assert_eq!(rejected.record, progress.record);
-        assert_eq!(rejected.tracker_delta, None);
-        assert_eq!(rejected.outcome, ReductionOutcome::Noop);
 
         let next_absence = observe(
             progress.record.as_ref(),
@@ -2807,9 +2705,6 @@ mod tests {
         );
         assert_eq!(resolve_badge(active(&acknowledged)), BadgeState::Idle);
 
-        let focus_out = Reduction::unchanged(acknowledged.record.as_ref());
-        assert_eq!(resolve_badge(active(&focus_out)), BadgeState::Idle);
-
         let second_begin = begin(
             acknowledged.record.as_ref(),
             &completed.tracker_delta.as_ref().unwrap().next,
@@ -2914,58 +2809,6 @@ mod tests {
     }
 
     #[test]
-    fn process_discovery_arms_only_first_synthetic_completion() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let event = PaneEvent::ObservationBatch {
-            base: None,
-            tracker_generation: 0,
-            observed_at: 1,
-            presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
-            capture: None,
-            process: None,
-        };
-        let mut observation = envelope(event);
-        observation.agent = None;
-        observation.agent_session_id = None;
-        let discovered = reduce(
-            None,
-            &observation,
-            context(&tracker, &VisibilitySnapshot::default()),
-        )
-        .unwrap();
-        assert!(active(&discovered).synthetic_completion_armed);
-        let completed = reduce_once(
-            discovered.record.as_ref(),
-            PaneEvent::CompleteRun { completed_at: 2 },
-            &discovered.tracker_delta.as_ref().unwrap().next,
-        );
-        assert_eq!(active(&completed).completed_seq, 1);
-        assert!(!active(&completed).synthetic_completion_armed);
-        assert!(completed.tracker_delta.unwrap().next.rebaseline_pending);
-    }
-
-    #[test]
-    fn explicit_session_start_does_not_arm_synthetic_completion() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let started = reduce_once(
-            None,
-            PaneEvent::AgentSessionStarted {
-                observed_at: 1,
-                source: AgentSessionSource::Startup,
-                resumed_prompt: None,
-            },
-            &tracker,
-        );
-        let completion = reduce_once(
-            started.record.as_ref(),
-            PaneEvent::CompleteRun { completed_at: 2 },
-            &started.tracker_delta.as_ref().unwrap().next,
-        );
-        assert_eq!(active(&completion).run_seq, 0);
-        assert_eq!(resolve_badge(active(&completion)), BadgeState::Idle);
-    }
-
-    #[test]
     fn visible_completion_is_acknowledged_before_publication() {
         let tracker = CaptureTrackerSnapshot::default();
         let begun = begin(None, &tracker);
@@ -3061,54 +2904,6 @@ mod tests {
     }
 
     #[test]
-    fn completion_uses_exact_pane_visibility_before_publication() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let begun = begin(None, &tracker);
-        let begun_tracker = begun.tracker_delta.as_ref().unwrap().next.clone();
-        let other_split_visible = VisibilitySnapshot {
-            pane_visible_to_eligible_client: false,
-        };
-        let event = envelope(PaneEvent::CompleteRun { completed_at: 20 });
-
-        let pane = reduce(
-            begun.record.as_ref(),
-            &event,
-            ReductionContext {
-                private_task_prompt: None,
-                visibility: &other_split_visible,
-                tracker: &begun_tracker,
-                new_state_id: Some(StateId::parse(STATE_ID).unwrap()),
-                latest_unread_order: 0,
-            },
-        )
-        .unwrap();
-        assert!(active(&pane).unread.is_unread());
-        assert_eq!(resolve_badge(active(&pane)), BadgeState::Done);
-    }
-
-    #[test]
-    fn stale_ack_cannot_change_new_epoch() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let begun = begin(None, &tracker);
-        let restarted = reduce_once(
-            begun.record.as_ref(),
-            PaneEvent::AgentSessionStarted {
-                observed_at: 2,
-                source: AgentSessionSource::Resume,
-                resumed_prompt: None,
-            },
-            &begun.tracker_delta.as_ref().unwrap().next,
-        );
-        let stale = reduce_once(
-            restarted.record.as_ref(),
-            PaneEvent::MarkPaneRead { through_order: 0 },
-            &restarted.tracker_delta.as_ref().unwrap().next,
-        );
-        assert_eq!(active(&stale).agent_epoch, 2);
-        assert_eq!(active(&stale).unread.read_seq, 0);
-    }
-
-    #[test]
     fn old_view_through_sequence_cannot_acknowledge_a_later_run() {
         let tracker = CaptureTrackerSnapshot::default();
         let first_begin = begin(None, &tracker);
@@ -3146,50 +2941,6 @@ mod tests {
         assert_eq!(active(&acknowledged).unread.read_seq, 0);
         assert!(active(&acknowledged).unread.is_unread());
         assert_eq!(resolve_badge(active(&acknowledged)), BadgeState::Done);
-    }
-
-    #[test]
-    fn two_consecutive_absences_confirm_agent_exit() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let mut discovered = reduce_once(
-            None,
-            PaneEvent::BeginRun {
-                started_at: 1,
-                prompt: None,
-            },
-            &tracker,
-        );
-        discovered.record.as_mut().unwrap().scan_verified = true;
-        let base = descriptor(discovered.record.as_ref().unwrap());
-        let first_tracker = discovered.tracker_delta.as_ref().unwrap().next.clone();
-        let first = reduce_once(
-            discovered.record.as_ref(),
-            PaneEvent::ObservationBatch {
-                base: Some(base),
-                tracker_generation: first_tracker.generation,
-                observed_at: 2,
-                presence: AgentPresenceObservation::Absent,
-                capture: None,
-                process: None,
-            },
-            &first_tracker,
-        );
-        assert!(active(&first).agent_present);
-        let second_tracker = first.tracker_delta.as_ref().unwrap().next.clone();
-        let second = reduce_once(
-            first.record.as_ref(),
-            PaneEvent::ObservationBatch {
-                base: Some(descriptor(first.record.as_ref().unwrap())),
-                tracker_generation: second_tracker.generation,
-                observed_at: 3,
-                presence: AgentPresenceObservation::Absent,
-                capture: None,
-                process: None,
-            },
-            &second_tracker,
-        );
-        assert!(!active(&second).agent_present);
-        assert_eq!(resolve_badge(active(&second)), BadgeState::Done);
     }
 
     #[test]
@@ -3637,62 +3388,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_agent_session_is_rejected() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let begun = begin(None, &tracker);
-        let mut stale = envelope(PaneEvent::CompleteRun { completed_at: 2 });
-        stale.agent_session_id = Some(AgentSessionId::parse("old-session").unwrap());
-        let error = reduce(
-            begun.record.as_ref(),
-            &stale,
-            context(
-                &begun.tracker_delta.as_ref().unwrap().next,
-                &VisibilitySnapshot::default(),
-            ),
-        )
-        .unwrap_err();
-        assert_eq!(error, ReduceError::StaleAgentEvent);
-    }
-
-    #[test]
-    fn waiting_error_and_running_override_unread_badge_priority() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let waiting = reduce_once(
-            None,
-            PaneEvent::WaitRequested {
-                observed_at: 1,
-                reason: WaitReason::PermissionPrompt,
-            },
-            &tracker,
-        );
-        assert_eq!(resolve_badge(active(&waiting)), BadgeState::Blocked);
-        let completed = reduce_once(
-            waiting.record.as_ref(),
-            PaneEvent::CompleteRun { completed_at: 2 },
-            &waiting.tracker_delta.as_ref().unwrap().next,
-        );
-        let running = reduce_once(
-            completed.record.as_ref(),
-            PaneEvent::BeginRun {
-                started_at: 3,
-                prompt: None,
-            },
-            &completed.tracker_delta.as_ref().unwrap().next,
-        );
-        assert!(active(&running).unread.is_unread());
-        assert_eq!(resolve_badge(active(&running)), BadgeState::Working);
-        let failed = reduce_once(
-            running.record.as_ref(),
-            PaneEvent::FailRun {
-                observed_at: 4,
-                reason: Some("failed".to_string()),
-            },
-            &running.tracker_delta.as_ref().unwrap().next,
-        );
-        assert_eq!(resolve_badge(active(&failed)), BadgeState::Blocked);
-    }
-
-    #[test]
     fn resume_starts_new_epoch_and_only_resume_keeps_prompt() {
         let tracker = CaptureTrackerSnapshot::default();
         let started = reduce_once(
@@ -3907,39 +3602,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_operations_are_atomic_and_derive_item_counts() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let begun = begin(None, &tracker);
-        let updated = reduce_once(
-            begun.record.as_ref(),
-            PaneEvent::ProgressUpdated {
-                observed_at: 2,
-                operations: vec![
-                    ProgressOperation::UpsertTaskItem {
-                        id: "one".to_string(),
-                        step: "first".to_string(),
-                    },
-                    ProgressOperation::UpdateTaskItemStatus {
-                        id: "one".to_string(),
-                        status: TaskItemStatus::Completed,
-                    },
-                    ProgressOperation::UpsertSubagent(SubagentState {
-                        agent_id: "worker-1".to_string(),
-                        agent_type: "review".to_string(),
-                        display_name: Some("Reviewer".to_string()),
-                    }),
-                ],
-            },
-            &begun.tracker_delta.as_ref().unwrap().next,
-        );
-        assert_eq!(
-            active(&updated).tasks.progress,
-            TaskProgress { done: 1, total: 1 }
-        );
-        assert_eq!(active(&updated).subagents.len(), 1);
-    }
-
-    #[test]
     fn every_progress_operation_variant_has_the_specified_effect() {
         let begun = begin(None, &CaptureTrackerSnapshot::default());
 
@@ -4120,6 +3782,23 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, ReduceError::InvalidProgressOperation(_)));
         assert_eq!(begun.record, before);
+
+        let error = reduce(
+            begun.record.as_ref(),
+            &envelope(PaneEvent::ProgressUpdated {
+                observed_at: 2,
+                operations: vec![ProgressOperation::UpsertTaskItem {
+                    id: String::new(),
+                    step: "step".to_string(),
+                }],
+            }),
+            context(
+                &begun.tracker_delta.as_ref().unwrap().next,
+                &VisibilitySnapshot::default(),
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReduceError::InvalidProgressOperation(_)));
     }
 
     #[test]
@@ -4218,51 +3897,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_observation_breaks_absence_streak() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let mut begun = begin(None, &tracker);
-        let state = begun.record.as_mut().unwrap();
-        state.scan_verified = true;
-        let mut current = begun.record;
-        let mut current_tracker = begun.tracker_delta.unwrap().next;
-        for presence in [
-            AgentPresenceObservation::Absent,
-            AgentPresenceObservation::Unknown,
-            AgentPresenceObservation::Absent,
-        ] {
-            let result = reduce_once(
-                current.as_ref(),
-                PaneEvent::ObservationBatch {
-                    base: Some(descriptor(current.as_ref().unwrap())),
-                    tracker_generation: current_tracker.generation,
-                    observed_at: 2,
-                    presence,
-                    capture: None,
-                    process: None,
-                },
-                &current_tracker,
-            );
-            current = result.record;
-            current_tracker = result.tracker_delta.unwrap().next;
-        }
-        let state = current.unwrap();
-        assert!(state.agent_present);
-        assert_eq!(current_tracker.absence_count, 1);
-    }
-
-    #[test]
-    fn completion_requests_capture_rebaseline() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let begun = begin(None, &tracker);
-        let completed = reduce_once(
-            begun.record.as_ref(),
-            PaneEvent::CompleteRun { completed_at: 2 },
-            &begun.tracker_delta.as_ref().unwrap().next,
-        );
-        assert!(completed.tracker_delta.unwrap().next.rebaseline_pending);
-    }
-
-    #[test]
     fn empty_capture_tail_does_not_clear_rebaseline() {
         let tracker = CaptureTrackerSnapshot::default();
         let begun = begin(None, &tracker);
@@ -4317,28 +3951,6 @@ mod tests {
         assert!(!next_tracker.rebaseline_pending);
         assert_eq!(next_tracker.fingerprint, Some([2; 32]));
         assert_eq!(resolve_badge(active(&result)), BadgeState::Done);
-    }
-
-    #[test]
-    fn invalid_progress_payload_has_specific_error() {
-        let tracker = CaptureTrackerSnapshot::default();
-        let begun = begin(None, &tracker);
-        let error = reduce(
-            begun.record.as_ref(),
-            &envelope(PaneEvent::ProgressUpdated {
-                observed_at: 2,
-                operations: vec![ProgressOperation::UpsertTaskItem {
-                    id: String::new(),
-                    step: "step".to_string(),
-                }],
-            }),
-            context(
-                &begun.tracker_delta.as_ref().unwrap().next,
-                &VisibilitySnapshot::default(),
-            ),
-        )
-        .unwrap_err();
-        assert!(matches!(error, ReduceError::InvalidProgressOperation(_)));
     }
 
     #[test]

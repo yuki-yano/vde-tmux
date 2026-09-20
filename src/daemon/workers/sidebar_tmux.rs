@@ -407,32 +407,6 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_worker_wraps_atomic_jump_in_server_and_target_pane_guards() {
-        let runner = SidebarGuardRunner::new(server_identity(), "$1\u{1f}@1\u{1f}%1\u{1f}11\n");
-        let pane = pane_instance("%1", 11);
-        let guarded = GuardedSidebarTmuxRunner {
-            runner: &runner,
-            expected_server: &server_identity(),
-            expected_pane: &pane,
-        };
-
-        crate::sidebar::layout::jump_to_pane(&guarded, "%1").unwrap();
-
-        let calls = runner.calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0][0], "display-message");
-        assert_eq!(calls[0][3], ";");
-        assert_eq!(calls[1][0], "if-shell");
-        assert!(calls[1][2].contains("#{pid},4242"), "{:?}", calls[1]);
-        assert!(calls[1][2].contains("#{start_time},99"), "{:?}", calls[1]);
-        assert!(calls[1][3].contains("#{pane_pid},11"), "{:?}", calls[1]);
-        assert!(calls[1][3].contains("switch-client"));
-        assert!(calls[1][3].contains("$1:@1.%1"));
-        assert!(!calls[1][3].contains("select-window"));
-        assert!(!calls[1][3].contains("select-pane"));
-    }
-
-    #[test]
     fn sidebar_worker_checks_target_and_source_instances_in_one_atomic_jump_mutation() {
         let runner = SidebarGuardRunner::new(server_identity(), "$1\u{1f}@1\u{1f}%1\u{1f}11\n")
             .with_client_read_body("20\u{1f}/dev/ttys002\n");
@@ -452,6 +426,8 @@ mod tests {
         assert_eq!(calls[0][0], "display-message");
         assert_eq!(calls[1][0], "display-message");
         assert_eq!(calls[2][0], "if-shell");
+        assert!(calls[2][2].contains("#{pid},4242"), "{calls:?}");
+        assert!(calls[2][2].contains("#{start_time},99"), "{calls:?}");
         let guarded_command = &calls[2][3];
         assert!(guarded_command.contains("#{pane_pid},11"), "{calls:?}");
         assert!(guarded_command.contains("#{pane_id},%9"), "{calls:?}");
@@ -494,12 +470,18 @@ mod tests {
     fn sidebar_worker_reports_server_and_pane_guard_mismatches_without_direct_mutation() {
         let pane = pane_instance("%1", 11);
         let expected_server = server_identity();
-        for (output, expected_server_mismatch) in [
-            (SIDEBAR_SERVER_MISMATCH_SENTINEL, true),
-            (SIDEBAR_PANE_MISMATCH_SENTINEL, false),
+        for (output, mutation_error, expected_server_mismatch) in [
+            (Some(SIDEBAR_SERVER_MISMATCH_SENTINEL), None, true),
+            (Some(SIDEBAR_PANE_MISMATCH_SENTINEL), None, false),
+            (None, Some("tmux failed: can't find pane: %1"), false),
         ] {
-            let runner = SidebarGuardRunner::new(expected_server.clone(), "")
-                .with_mutation_output(format!("{output}\n"));
+            let mut runner = SidebarGuardRunner::new(expected_server.clone(), "");
+            if let Some(output) = output {
+                runner = runner.with_mutation_output(format!("{output}\n"));
+            }
+            if let Some(error) = mutation_error {
+                runner = runner.with_mutation_error(error);
+            }
             let guarded = GuardedSidebarTmuxRunner {
                 runner: &runner,
                 expected_server: &expected_server,
@@ -524,30 +506,6 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_worker_treats_target_disappearance_as_pane_mismatch_without_retrying_raw_command() {
-        let pane = pane_instance("%1", 11);
-        let expected_server = server_identity();
-        let runner = SidebarGuardRunner::new(expected_server.clone(), "")
-            .with_mutation_error("tmux failed: can't find pane: %1");
-        let guarded = GuardedSidebarTmuxRunner {
-            runner: &runner,
-            expected_server: &expected_server,
-            expected_pane: &pane,
-        };
-
-        let error = guarded.run(&["select-pane", "-t", "%1"]).unwrap_err();
-
-        assert!(matches!(
-            error.downcast_ref::<SidebarGuardError>(),
-            Some(SidebarGuardError::PaneInstanceMismatch)
-        ));
-        let calls = runner.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0][0], "if-shell");
-        assert_ne!(calls[0][0], "select-pane");
-    }
-
-    #[test]
     fn unread_jump_skips_a_stale_target_and_uses_the_next_candidate() {
         let runner = SidebarGuardRunner::new(
             server_identity(),
@@ -568,10 +526,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(selected, pane_instance("%2", 22));
-        let calls = runner.calls();
-        assert_eq!(calls.len(), 6);
-        assert!(calls[2][3].contains("#{pane_pid},11"));
-        assert!(calls[5][3].contains("#{pane_pid},22"));
+        let guarded_calls = runner
+            .calls()
+            .into_iter()
+            .filter(|call| call.first().map(String::as_str) == Some("if-shell"))
+            .collect::<Vec<_>>();
+        assert_eq!(guarded_calls.len(), 2);
+        assert!(guarded_calls[0][3].contains("#{pane_pid},11"));
+        assert!(guarded_calls[1][3].contains("#{pane_pid},22"));
     }
 
     #[test]

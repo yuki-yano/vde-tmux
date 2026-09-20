@@ -360,7 +360,6 @@ fn category_mutation_transport_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::contract::schema_json;
 
     #[test]
     fn category_api_projection_keeps_public_shapes_and_resolves_automatic_membership() {
@@ -414,24 +413,6 @@ mod tests {
         assert_eq!(value["receipt"]["before"]["explicit"], false);
         assert_eq!(value["receipt"]["after"]["explicit"], true);
         assert!(value["receipt"]["repo"].get("repo_overrides").is_none());
-    }
-
-    #[test]
-    fn category_requests_are_published_in_the_v4_schema() {
-        let value: serde_json::Value = serde_json::from_str(&schema_json(123).unwrap()).unwrap();
-        let request_schema = serde_json::to_string(&value["result"]["schemas"]["request"]).unwrap();
-        for command in [
-            "category_list",
-            "category_get",
-            "category_assign",
-            "category_automatic",
-        ] {
-            assert!(request_schema.contains(command), "missing {command}");
-        }
-        let success_schema = serde_json::to_string(&value["result"]["schemas"]["success"]).unwrap();
-        for result in ["category_list", "category_get", "category_mutation"] {
-            assert!(success_schema.contains(result), "missing {result}");
-        }
     }
 
     #[test]

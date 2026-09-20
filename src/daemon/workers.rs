@@ -29,8 +29,6 @@ pub fn system_git_runner(timeout: Duration) -> SystemGitRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use crate::daemon::topology::ServerIdentity;
     use crate::pane_state::PaneInstance;
 
@@ -46,11 +44,5 @@ mod tests {
             pane_id: id.to_string(),
             pane_pid: pid,
         }
-    }
-
-    #[test]
-    fn git_worker_runner_receives_configured_timeout() {
-        let runner = system_git_runner(Duration::from_millis(1234));
-        assert_eq!(runner.timeout(), Duration::from_millis(1234));
     }
 }

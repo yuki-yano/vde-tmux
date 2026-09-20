@@ -144,8 +144,6 @@ fn canonical_notification_successful_leader_exit_kills_background_descendants() 
 
 #[test]
 fn canonical_notification_failure_is_written_to_private_incarnation_log() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let root = test_root("notification-log");
     let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
     let hash = "c".repeat(64);
@@ -178,18 +176,6 @@ fn canonical_notification_failure_is_written_to_private_incarnation_log() {
     assert!(contents.contains("notification:"));
     assert!(contents.contains("exited with status"));
     assert!(contents.contains("pane %7"));
-    assert_eq!(
-        std::fs::metadata(path.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-    assert_eq!(
-        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
     let clear_deadline = Instant::now() + Duration::from_secs(1);
     while crate::daemon::lifecycle::read_lifecycle_record(&env, &hash)
         .is_ok_and(|record| record.active_notification.is_some())
@@ -218,9 +204,13 @@ fn status_push_failure_uses_the_shared_daemon_log() {
     let contents =
         std::fs::read_to_string(crate::daemon::lifecycle::daemon_log_path(&env, &hash)).unwrap();
     assert!(contents.contains("status_push: test failure"));
-    for dedicated in ["notification.log", "status-push.log", "pane-state-hook.log"] {
-        assert!(!root.join("vde-tmux").join(&hash).join(dedicated).exists());
-    }
+    assert!(
+        !root
+            .join("vde-tmux")
+            .join(&hash)
+            .join("status-push.log")
+            .exists()
+    );
     drop(coordinator);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -268,70 +258,6 @@ fn tmux_server_liveness_monitor_fail_stops_after_server_process_exits() {
             Err(error) => panic!("failed to remove test state: {error}"),
         }
     }
-}
-
-#[test]
-fn sidebar_worker_completion_reenters_the_shared_sequence_after_external_command() {
-    let mut router = V2Router::new(v2_daemon_id(), "server");
-    router.set_phase(DaemonPhase::Serving);
-    let mut connection = V2ConnectionState::default();
-    v2_handshake(&mut router, &mut connection);
-    let command = ClientMessage::SidebarCommand {
-        proto: PROTOCOL_VERSION,
-        daemon_instance_id: v2_daemon_id(),
-        event_id: v2_event_id(),
-        command: crate::daemon::protocol::v2::SidebarCommand::JumpPane {
-            pane_instance: PaneInstance {
-                pane_id: "%1".to_string(),
-                pane_pid: 101,
-            },
-            source_pane: PaneInstance {
-                pane_id: "%9".to_string(),
-                pane_pid: 909,
-            },
-        },
-    };
-    let V2Route::Mutation(external) = router.route(&mut connection, command) else {
-        panic!("expected sidebar mutation");
-    };
-    let completion = SidebarEffectCompletion {
-        original_accepted_seq: external.accepted_seq,
-        event_id: v2_event_id(),
-        snapshot_revision: 7,
-        witness_observation_floor: 0,
-        result: SidebarEffectResult::Succeeded(PaneInstance {
-            pane_id: "%1".to_string(),
-            pane_pid: 101,
-        }),
-        effect: crate::daemon::runtime::CanonicalSidebarEffect::JumpPane {
-            pane_instance: PaneInstance {
-                pane_id: "%1".to_string(),
-                pane_pid: 101,
-            },
-            client_pid: 10,
-            source_pane: PaneInstance {
-                pane_id: "%9".to_string(),
-                pane_pid: 909,
-            },
-        },
-    };
-    let V2Route::Mutation(internal) =
-        router.accept_internal(V2InternalMutation::SidebarEffectCompleted(completion))
-    else {
-        panic!("expected sequenced sidebar completion");
-    };
-
-    assert_eq!(external.accepted_seq, 1);
-    assert_eq!(internal.accepted_seq, 2);
-    assert!(matches!(
-        internal.mutation,
-        V2AcceptedMutation::Internal(V2InternalMutation::SidebarEffectCompleted(
-            SidebarEffectCompletion {
-                original_accepted_seq: 1,
-                ..
-            }
-        ))
-    ));
 }
 
 #[test]

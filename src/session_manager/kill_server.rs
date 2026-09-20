@@ -688,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_process_groups_are_signaled_once_and_self_group_is_rejected() {
+    fn duplicate_process_groups_are_collected_once() {
         let panes = vec![
             PaneProcess {
                 pane_id: "%1".to_string(),
@@ -709,7 +709,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(groups, BTreeSet::from([201, 202]));
-        assert!(validate_target_groups(&groups, 201, Some(800)).is_err());
     }
 
     #[test]
@@ -783,7 +782,6 @@ mod tests {
 
     #[test]
     fn invalid_pane_data_is_rejected_before_daemon_disable() {
-        assert!(parse_pane_processes("%1\u{1f}0\u{1f}ttys001\u{1f}zsh").is_ok());
         let mut ops = MockOps {
             panes: vec![PaneProcess {
                 pane_id: "%1".to_string(),

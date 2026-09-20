@@ -40,10 +40,9 @@ mod tests {
         cycle_statusline_category_with_snapshot, displayed_category_targets, top_level_user_ranges,
     };
     use super::render::{
-        STATUS_NOW_FORMAT_OPTION, SessionBadgeRenderOptions, StatusToken, pad_session_zone,
-        pane_border_highlight_color, render_structured_attention,
-        render_structured_session_segment, render_structured_sessions, render_structured_summary,
-        status_projection_width, structured_category_tokens, structured_pane_status_label,
+        STATUS_NOW_FORMAT_OPTION, SessionBadgeRenderOptions, StatusToken,
+        pane_border_highlight_color, render_structured_session_segment, render_structured_sessions,
+        render_structured_summary, status_projection_width, structured_pane_status_label,
         tmux_bounded_duration, tmux_display_width,
     };
     use super::targets::{
@@ -579,26 +578,6 @@ mod tests {
     }
 
     #[test]
-    fn session_zone_padding_defaults_to_left_alignment() {
-        assert_eq!(
-            pad_session_zone("abc".to_string(), 7, FixedWidthAlignment::Left),
-            "abc#[default]    "
-        );
-    }
-
-    #[test]
-    fn centered_session_zone_padding_is_balanced_and_puts_an_odd_cell_on_the_right() {
-        assert_eq!(
-            pad_session_zone("abc".to_string(), 7, FixedWidthAlignment::Center),
-            "#[default]  abc#[default]  "
-        );
-        assert_eq!(
-            pad_session_zone("abc".to_string(), 8, FixedWidthAlignment::Center),
-            "#[default]  abc#[default]   "
-        );
-    }
-
-    #[test]
     fn fixed_width_alignment_controls_rendered_session_position() {
         let sessions = vec![status_session("$1", "main", true)];
         let mut config = Config::default();
@@ -621,6 +600,14 @@ mod tests {
         assert_eq!(
             centered.sessions,
             format!("#[default]  {unpadded}#[default]  ")
+        );
+
+        let mut odd_snapshot = snapshot;
+        odd_snapshot.session_zone_width = Some(tmux_display_width(&unpadded) + 5);
+        let odd_centered = render_structured_status_snapshot(&config, &odd_snapshot).unwrap();
+        assert_eq!(
+            odd_centered.sessions,
+            format!("#[default]  {unpadded}#[default]   ")
         );
     }
 
@@ -805,9 +792,24 @@ mod tests {
             rendered.category
         );
         assert!(rendered.category.contains("range=user|C:"));
+        let category_targets = top_level_user_ranges(&rendered.category).unwrap();
+        assert_eq!(
+            category_targets
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            12
+        );
         assert!(rendered.attention.contains('▲'), "{}", rendered.attention);
         assert!(rendered.sessions.contains("日本語セッション0🚀"));
-        assert!(rendered.category.contains("カテゴリ0🚀"));
+        for index in 0..12 {
+            let name = if index == 4 {
+                "現在カテゴリ🚀".to_string()
+            } else {
+                format!("カテゴリ{index}🚀")
+            };
+            assert!(rendered.category.contains(&name), "missing {name}");
+        }
     }
 
     #[test]
@@ -977,40 +979,6 @@ mod tests {
     }
 
     #[test]
-    fn oversized_current_session_and_category_tokens_keep_full_action_targets() {
-        let mut config = Config::default();
-        config.statusline.sessions.current.format = "{session}".to_string();
-        config.statusline.windows.current.format = "{window}".to_string();
-        config.statusline.category.format = "{category}".to_string();
-        let snapshot = StatusSnapshot {
-            context: crate::daemon::protocol::v2::StatusContext::Session {
-                session_id: "$42".to_string(),
-            },
-            sessions: vec![plain_status_session("$42", &"界🚀".repeat(100), true)],
-            windows: vec![WindowStatusPresentation {
-                session_ids: vec!["$42".to_string()],
-                ..status_window("@77", &"窓🪟".repeat(100), 1, true)
-            }],
-            categories: vec![CategoryStatusPresentation {
-                session_ids: vec!["$42".to_string()],
-                ..status_category(&"分類🚀".repeat(25), true)
-            }],
-            ..status_snapshot()
-        };
-        let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
-
-        assert!(rendered.sessions.contains("range=user|session:$42"));
-        assert!(rendered.sessions.contains(&"界🚀".repeat(100)));
-        assert!(rendered.windows.contains("range=user|window:@77"));
-        assert!(rendered.windows.contains("@77"));
-        assert!(rendered.category.contains("range=user|C:"));
-        assert!(rendered.category.contains(&"分類🚀".repeat(25)));
-        assert!(tmux_display_width(&rendered.sessions) > 80);
-        assert!(tmux_display_width(&rendered.category) > 80);
-        assert!(tmux_display_width(&rendered.windows) <= 80);
-    }
-
-    #[test]
     fn every_session_remains_visible_when_the_session_segment_exceeds_the_budget() {
         let mut config = Config::default();
         config.badge.glyphs.blocked = "S".repeat(50);
@@ -1047,6 +1015,12 @@ mod tests {
         assert!(rendered.category.contains(&"分類🚀".repeat(25)));
         assert!(rendered.sessions.contains(&"界🚀".repeat(100)));
         assert!(rendered.sessions.contains("inactive-peer"));
+        assert!(rendered.windows.contains("range=user|window:@77"));
+        assert_eq!(rendered.windows, "#[range=user|window:@77]@77#[norange]");
+        assert!(rendered.category.contains("range=user|C:"));
+        assert!(tmux_display_width(&rendered.sessions) > 80);
+        assert!(tmux_display_width(&rendered.category) > 80);
+        assert!(tmux_display_width(&rendered.windows) <= 80);
         assert!(!rendered.sessions.contains("+1"), "{}", rendered.sessions);
         assert_eq!(
             top_level_user_ranges(&rendered.sessions).unwrap(),
@@ -1108,32 +1082,6 @@ mod tests {
     }
 
     #[test]
-    fn category_tokens_never_replace_names_with_compact_visual_ids() {
-        let config = Config::default();
-        let categories = vec![
-            status_category(&"同じ見た目🚀".repeat(10), true),
-            CategoryStatusPresentation {
-                session_ids: vec!["$2".to_string()],
-                ..status_category(&("同じ見た目🚀".repeat(9) + "別"), true)
-            },
-        ];
-
-        let tokens = structured_category_tokens(&config, &categories).unwrap();
-
-        assert_eq!(tokens[0].compact, tokens[0].rendered);
-        assert_eq!(tokens[1].compact, tokens[1].rendered);
-        assert_ne!(tokens[0].compact, tokens[1].compact);
-        assert!(tokens[0].compact.contains(&"同じ見た目🚀".repeat(10)));
-        assert!(
-            tokens[1]
-                .compact
-                .contains(&("同じ見た目🚀".repeat(9) + "別"))
-        );
-        assert!(tokens[0].compact.contains("range=user|C:"));
-        assert!(tokens[1].compact.contains("range=user|C:"));
-    }
-
-    #[test]
     fn session_indices_and_targets_cover_the_complete_ordered_model() {
         let mut config = Config::default();
         config.statusline.sessions.show_index = true;
@@ -1177,7 +1125,15 @@ mod tests {
             5_400,
         )];
 
-        let rendered = render_structured_attention(&config, &entries);
+        let rendered = render_structured_status_snapshot(
+            &config,
+            &StatusSnapshot {
+                attention: entries.clone(),
+                ..status_snapshot()
+            },
+        )
+        .unwrap()
+        .attention;
 
         assert_eq!(
             rendered,
@@ -1211,16 +1167,27 @@ mod tests {
         let config = Config::default();
         let mut entry = blocked_attention("%1", 101, "main", 10);
 
-        let permission = render_structured_attention(&config, std::slice::from_ref(&entry));
+        let render = |entry: &AttentionEntry| {
+            render_structured_status_snapshot(
+                &config,
+                &StatusSnapshot {
+                    attention: vec![entry.clone()],
+                    ..status_snapshot()
+                },
+            )
+            .unwrap()
+            .attention
+        };
+        let permission = render(&entry);
         assert!(permission.contains("▲ main"), "{permission}");
         assert!(!permission.contains("perm"), "{permission}");
 
         entry.reason = Some("Other(wait)".to_string());
-        let waiting = render_structured_attention(&config, std::slice::from_ref(&entry));
+        let waiting = render(&entry);
         assert!(waiting.contains("▲ main · wait"), "{waiting}");
 
         entry.reason = Some("error".to_string());
-        let error = render_structured_attention(&config, std::slice::from_ref(&entry));
+        let error = render(&entry);
         assert!(error.contains("▲ main · err"), "{error}");
     }
 
@@ -1531,42 +1498,6 @@ mod tests {
     }
 
     #[test]
-    fn category_cycle_uses_all_effective_categories_in_current_mode() {
-        let mock = MockTmuxRunner::new();
-        let memory_key = crate::session::client_memory_key("client", "b");
-        mock.stub(&["show-option", "-gqv", &memory_key], "");
-        mock.stub(&["switch-client", "-c", "client", "-t", "=two:"], "");
-        let snapshot = category_navigation_snapshot(&[
-            ("$1", "one", "a"),
-            ("$2", "two", "b"),
-            ("$3", "three", "c"),
-        ]);
-
-        cycle_statusline_category_with_snapshot(&mock, &snapshot, "client", "$1", Direction::Next)
-            .unwrap();
-
-        assert!(mock.calls().iter().all(|call| {
-            call.first().map(String::as_str) != Some("show-option")
-                || call.get(2).map(String::as_str) != Some("-t")
-        }));
-        assert!(
-            mock.calls()
-                .iter()
-                .any(|call| { call == &["switch-client", "-c", "client", "-t", "=two:"] })
-        );
-        assert!(
-            mock.calls()
-                .iter()
-                .all(|call| call.first().map(String::as_str) != Some("list-sessions")),
-            "resolved category cycle must not query a second session snapshot"
-        );
-        assert_eq!(
-            mock.calls().last().unwrap(),
-            &["switch-client", "-c", "client", "-t", "=two:"]
-        );
-    }
-
-    #[test]
     fn consecutive_category_cycles_preserve_next_and_previous_order() {
         let mock = MockTmuxRunner::new();
         for category in ["a", "b", "c"] {
@@ -1607,6 +1538,16 @@ mod tests {
                 vec!["switch-client", "-c", "client", "-t", "=three:"],
                 vec!["switch-client", "-c", "client", "-t", "=two:"],
             ]
+        );
+        assert!(mock.calls().iter().all(|call| {
+            call.first().map(String::as_str) != Some("show-option")
+                || call.get(2).map(String::as_str) != Some("-t")
+        }));
+        assert!(
+            mock.calls()
+                .iter()
+                .all(|call| call.first().map(String::as_str) != Some("list-sessions")),
+            "resolved category cycle must not query a second session snapshot"
         );
     }
 

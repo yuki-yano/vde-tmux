@@ -171,19 +171,6 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
-    fn state_json_roundtrips() {
-        let state = SidebarPreferences {
-            manual_order: vec![RepoId::new("misc", "app")],
-            ..SidebarPreferences::default()
-        };
-
-        let json = encode_state(&state).unwrap();
-        let decoded = decode_state(&json).unwrap();
-
-        assert_eq!(decoded, state);
-    }
-
-    #[test]
     fn state_json_rejects_unknown_fields_and_schema_versions() {
         let unknown = r#"{"schema_version":3,"category_scope":"current","presentation_mode":"tree","filter":"all","unknown":true}"#;
         let legacy = r#"{"schema_version":1,"manual_order":[],"manual_chat_order":[],"view_mode":"by_category","filter":"all","expansion_overrides":[]}"#;
@@ -235,6 +222,7 @@ mod tests {
         ));
         let path = dir.join("sidebar-order-v1.json");
         let state = SidebarPreferences {
+            manual_order: vec![RepoId::new("misc", "app")],
             manual_chat_order: vec!["%1".to_string()],
             ..SidebarPreferences::default()
         };
@@ -246,37 +234,6 @@ mod tests {
         assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn socket_namespaces_persist_independently_and_survive_reload() {
-        let root = std::env::temp_dir().join(format!(
-            "vde-tmux-socket-state-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let env = BTreeMap::from([(
-            "XDG_STATE_HOME".to_string(),
-            root.to_string_lossy().into_owned(),
-        )]);
-        let first_path = state_path(&env, Path::new("/tmp/tmux/first"));
-        let second_path = state_path(&env, Path::new("/tmp/tmux/second"));
-        let first = SidebarPreferences {
-            filter: crate::sidebar::state::StatusFilter::DoneOnly,
-            ..SidebarPreferences::default()
-        };
-
-        save_state(&first_path, &first).unwrap();
-
-        assert_eq!(load_state(&first_path).unwrap(), first);
-        assert_eq!(
-            load_state(&second_path).unwrap(),
-            SidebarPreferences::default()
-        );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

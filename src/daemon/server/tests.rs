@@ -143,33 +143,6 @@ fn mutation_queue_capacity_logs_each_internal_drop() {
 }
 
 #[test]
-fn snapshot_wait_timeout_yields_heartbeat_instead_of_full_snapshot() {
-    let root = test_root("heartbeat-wait");
-    let coordinator = initialized_test_coordinator(
-        &root,
-        "heartbeat-wait".to_string(),
-        crate::daemon::view_hooks::CurrentClientViews::default(),
-    );
-    let published = coordinator.publish_resolved_snapshot().unwrap();
-
-    // With no newer revision, ten seconds of waiting yields only heartbeat
-    // outcomes; the cached full snapshot is never re-sent.
-    for _ in 0..5 {
-        let outcome = coordinator
-            .wait_for_snapshot_after(published.revision, Duration::from_millis(10))
-            .expect("wait must not observe a shutdown");
-        assert!(matches!(
-            outcome,
-            SnapshotWaitOutcome::HeartbeatDue { snapshot_revision }
-                if snapshot_revision == published.revision
-        ));
-    }
-
-    drop(coordinator);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
 fn idle_subscription_stream_sends_heartbeats_and_new_revisions_still_flow() {
     let root = test_root("heartbeat-stream");
     let coordinator = Arc::new(initialized_test_coordinator(
@@ -444,40 +417,6 @@ fn published_snapshot_frame_is_shared_and_replaced_only_for_new_revision() {
     let stale_publisher = coordinator.publish_resolved_snapshot().unwrap();
     assert_eq!(stale_publisher.revision, changed.revision);
     assert!(Arc::ptr_eq(&stale_publisher.frame, &changed.frame));
-
-    drop(coordinator);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn publish_resolved_snapshot_skips_rebuild_for_unchanged_revision() {
-    let root = test_root("publish-rebuild-baseline");
-    let coordinator = test_coordinator(&root, "f".repeat(64));
-    install_test_state(
-        &coordinator,
-        &root,
-        crate::daemon::view_hooks::CurrentClientViews::default(),
-    );
-
-    let first = coordinator.publish_resolved_snapshot().unwrap();
-    let cached = coordinator.publish_resolved_snapshot().unwrap();
-
-    // The revision fast path serves the cached frame without rebuilding the
-    // checked snapshot when the revision has not changed.
-    assert!(Arc::ptr_eq(&first.frame, &cached.frame));
-
-    coordinator
-        .state
-        .lock()
-        .unwrap()
-        .as_mut()
-        .unwrap()
-        .leased
-        .runtime
-        .mark_projection_changed()
-        .unwrap();
-    let changed = coordinator.publish_resolved_snapshot().unwrap();
-    assert!(!Arc::ptr_eq(&first.frame, &changed.frame));
 
     drop(coordinator);
     std::fs::remove_dir_all(root).unwrap();

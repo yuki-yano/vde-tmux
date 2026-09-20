@@ -62,8 +62,8 @@ mod tests {
     }
 
     #[test]
-    fn render_snapshot_projects_sidebar_model_without_tmux_reparse() {
-        let snapshot = ResolvedSnapshot {
+    fn historical_global_diagnostic_does_not_hide_the_empty_state() {
+        let mut snapshot = ResolvedSnapshot {
             snapshot_revision: 7,
             panes: Vec::new(),
             sidebar_model: crate::daemon::SidebarModel::default(),
@@ -71,27 +71,17 @@ mod tests {
             events: Vec::new(),
             diagnostics: Vec::new(),
         };
+        assert_eq!(
+            render_snapshot(&snapshot, &Config::default()),
+            "No agents detected"
+        );
 
-        let rendered = render_snapshot(&snapshot, &Config::default());
-
-        assert_eq!(rendered, "No agents detected");
-    }
-
-    #[test]
-    fn historical_global_diagnostic_does_not_hide_the_empty_state() {
-        let snapshot = ResolvedSnapshot {
-            snapshot_revision: 7,
-            panes: Vec::new(),
-            sidebar_model: crate::daemon::SidebarModel::default(),
-            attention: Vec::new(),
-            events: Vec::new(),
-            diagnostics: vec![crate::daemon::protocol::v2::DaemonDiagnostic {
-                code: crate::daemon::protocol::v2::ErrorCode::PersistFailed,
-                message: "historical write failure".to_string(),
-                pane_instance: None,
-                event_id: None,
-            }],
-        };
+        snapshot.diagnostics = vec![crate::daemon::protocol::v2::DaemonDiagnostic {
+            code: crate::daemon::protocol::v2::ErrorCode::PersistFailed,
+            message: "historical write failure".to_string(),
+            pane_instance: None,
+            event_id: None,
+        }];
 
         assert_eq!(
             render_snapshot(&snapshot, &Config::default()),

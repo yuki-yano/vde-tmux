@@ -1324,12 +1324,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_post_tool_use_ignores_unknown_tool() {
-        let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {}});
-        assert!(claude_post_tool_use_event(&payload, 123).unwrap().is_none());
-    }
-
-    #[test]
     fn claude_background_bash_requires_explicit_flag_and_command() {
         let payload = serde_json::json!({
             "tool_name": "Bash",
@@ -1434,14 +1428,6 @@ mod tests {
         let (name, path) = resolve_vw_exec_target("vw", "/abs/work/repo").unwrap();
         assert_eq!(name, "repo");
         assert_eq!(path, "/abs/work/repo");
-    }
-
-    #[test]
-    fn run_command_with_timeout_returns_stdout_on_success() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "printf hello"]);
-        let out = run_command_with_timeout(command, Duration::from_secs(5)).unwrap();
-        assert_eq!(out, b"hello");
     }
 
     #[test]

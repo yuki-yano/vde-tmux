@@ -42,24 +42,6 @@ fn payload_hooks_read_stdin_but_legacy_codex_notify_does_not() {
 }
 
 #[test]
-fn agent_hook_stdin_deadline_returns_partial_unclosed_input() {
-    use std::os::unix::net::UnixStream;
-
-    let (mut writer, mut reader) = UnixStream::pair().unwrap();
-    writer.write_all(b"{").unwrap();
-    let started = Instant::now();
-    // A sender that keeps the pipe open past the deadline: the bytes that did
-    // arrive are returned (downstream JSON parsing rejects an incomplete body)
-    // and the read still stays time-bounded rather than discarding them.
-    let payload =
-        read_agent_hook_input_from_until(&mut reader, Instant::now() + Duration::from_millis(30))
-            .unwrap();
-
-    assert_eq!(payload, "{");
-    assert!(started.elapsed() < Duration::from_secs(1));
-}
-
-#[test]
 fn agent_hook_closed_stdin_is_an_empty_payload() {
     struct ClosedStdin;
 

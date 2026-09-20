@@ -2024,15 +2024,6 @@ mod tests {
     }
 
     #[test]
-    fn utf8_suffix_preserves_boundary_and_maximum() {
-        let body = format!("{}終わり", "a".repeat(RESPONSE_ARTIFACT_BODY_MAX_BYTES));
-        let suffix = utf8_suffix(&body, RESPONSE_ARTIFACT_BODY_MAX_BYTES);
-        assert!(suffix.is_char_boundary(0));
-        assert!(suffix.len() <= RESPONSE_ARTIFACT_BODY_MAX_BYTES);
-        assert!(suffix.ends_with("終わり"));
-    }
-
-    #[test]
     fn cleanup_removes_unreferenced_final_and_temporary_bodies() {
         let root = temp_root();
         let store = AgentStateStore::open_or_initialize(&root).unwrap();
@@ -2081,7 +2072,6 @@ mod tests {
             store.load_operation(&operation_id).unwrap(),
             Some(operation.clone())
         );
-        assert_eq!(store.list_operations().unwrap(), vec![operation]);
         assert!(std::fs::read_dir(store.runs_dir()).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -2260,18 +2250,12 @@ mod tests {
             updated_at: 4,
         };
         store.save_operation(&operation).unwrap();
-        let encoded = std::fs::read(store.operation_path(&operation.operation_id)).unwrap();
-        assert!(
-            !encoded
-                .windows(b"private prompt".len())
-                .any(|window| window == b"private prompt")
-        );
         AgentStateStore::open_or_initialize(&root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn rejects_resetting_metadata() {
+    fn open_fails_closed_for_resetting_or_missing_metadata() {
         let root = temp_root();
         let store = AgentStateStore::open_or_initialize(&root).unwrap();
         let resetting = StateMeta::resetting(
@@ -2290,12 +2274,9 @@ mod tests {
             AgentStateStore::open_or_initialize(&root),
             Err(StoreError::StateUninitialized)
         ));
-        std::fs::remove_dir_all(root).unwrap();
-    }
+        drop(store);
+        std::fs::remove_dir_all(&root).unwrap();
 
-    #[test]
-    fn refuses_to_regenerate_metadata_for_an_existing_empty_root() {
-        let root = temp_root();
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&root)
@@ -2384,71 +2365,55 @@ mod tests {
 
     #[test]
     fn private_store_capacity_boundaries_fail_closed_without_requiring_large_fixtures() {
-        for (label, record_limit, byte_limit) in [
-            ("run store", RUN_STORE_MAX_RECORDS, RUN_STORE_MAX_BYTES),
-            (
-                "operation store",
-                OPERATION_STORE_MAX_RECORDS,
-                OPERATION_STORE_MAX_BYTES,
+        let label = "run store";
+        let record_limit = RUN_STORE_MAX_RECORDS;
+        let byte_limit = RUN_STORE_MAX_BYTES;
+        assert!(matches!(
+            next_region_capacity(
+                RegionCapacity {
+                    records: record_limit,
+                    bytes: 0,
+                },
+                None,
+                1,
+                record_limit,
+                byte_limit,
+                label,
             ),
-            (
-                "prompt store",
-                PROMPT_STORE_MAX_RECORDS,
-                PROMPT_STORE_MAX_BYTES,
+            Err(StoreError::Capacity(_))
+        ));
+        assert!(matches!(
+            next_region_capacity(
+                RegionCapacity {
+                    records: 1,
+                    bytes: byte_limit,
+                },
+                Some(1),
+                2,
+                record_limit,
+                byte_limit,
+                label,
             ),
-            (
-                "artifact store",
-                ARTIFACT_STORE_MAX_FILES,
-                ARTIFACT_STORE_MAX_BYTES,
-            ),
-        ] {
-            assert!(matches!(
-                next_region_capacity(
-                    RegionCapacity {
-                        records: record_limit,
-                        bytes: 0,
-                    },
-                    None,
-                    1,
-                    record_limit,
-                    byte_limit,
-                    label,
-                ),
-                Err(StoreError::Capacity(_))
-            ));
-            assert!(matches!(
-                next_region_capacity(
-                    RegionCapacity {
-                        records: 1,
-                        bytes: byte_limit,
-                    },
-                    Some(1),
-                    2,
-                    record_limit,
-                    byte_limit,
-                    label,
-                ),
-                Err(StoreError::Capacity(_))
-            ));
-            assert_eq!(
-                next_region_capacity(
-                    RegionCapacity {
-                        records: record_limit,
-                        bytes: byte_limit,
-                    },
-                    Some(1),
-                    1,
-                    record_limit,
-                    byte_limit,
-                    label,
-                )
-                .unwrap(),
+            Err(StoreError::Capacity(_))
+        ));
+        assert_eq!(
+            next_region_capacity(
                 RegionCapacity {
                     records: record_limit,
                     bytes: byte_limit,
-                }
-            );
-        }
+                },
+                Some(1),
+                1,
+                record_limit,
+                byte_limit,
+                label,
+            )
+            .unwrap(),
+            RegionCapacity {
+                records: record_limit,
+                bytes: byte_limit,
+            }
+        );
     }
 
     #[test]

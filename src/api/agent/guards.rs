@@ -686,19 +686,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_agent_operations_reject_missing_process_identity() {
-        let mut pane = test_agent_pane();
-        pane.agent_process = None;
-
-        let error = AgentIdentity::from_pane(&pane).unwrap_err();
+    fn ongoing_wait_tolerates_unverifiable_identity_but_rejects_replacement() {
+        let mut missing = test_agent_pane();
+        missing.agent_process = None;
+        let error = AgentIdentity::from_pane(&missing).unwrap_err();
         assert_eq!(
             error.downcast_ref::<ApiError>().unwrap().code(),
             "exact_identity_unavailable"
         );
-    }
 
-    #[test]
-    fn ongoing_wait_tolerates_unverifiable_identity_but_rejects_replacement() {
         let mut pane = test_agent_pane();
         let identity = AgentIdentity::from_pane(&pane).unwrap();
         pane.agent_process = None;

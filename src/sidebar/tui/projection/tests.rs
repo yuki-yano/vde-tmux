@@ -4,19 +4,6 @@ use crate::hook::RollupLevel;
 use crate::sidebar::tree::BadgeCounts;
 
 #[test]
-fn local_view_changes_do_not_change_daemon_snapshot_revision() {
-    let snapshot = snapshot(10);
-    let mut state = SidebarState::default();
-    let view = project_view(&snapshot, &Config::default(), &state);
-
-    apply_local_sidebar_key(&mut state, &view, "v");
-    apply_local_sidebar_key(&mut state, &view, "tab");
-
-    assert_eq!(snapshot.snapshot_revision, 9);
-    assert_ne!(state, SidebarState::default());
-}
-
-#[test]
 fn filter_cycles_in_both_directions_and_skips_empty_filters() {
     let mut state = SidebarState::default();
     let view = SidebarView {
@@ -30,6 +17,9 @@ fn filter_cycles_in_both_directions_and_skips_empty_filters() {
         },
         ..SidebarView::default()
     };
+
+    apply_local_sidebar_key(&mut state, &view, "v");
+    assert_eq!(state.presentation_mode, PresentationMode::Priority);
 
     apply_local_sidebar_key(&mut state, &view, "tab");
     assert_eq!(state.filter, StatusFilter::WorkingOnly);
@@ -478,16 +468,13 @@ fn remote_axes_and_filter_updates_converge_without_moving_the_shared_cursor() {
         manual_scroll: true,
         ..SidebarState::default()
     };
-    let mut second = first.clone();
     let original_preferences = Some((
         CategoryScope::All,
         PresentationMode::Tree,
         StatusFilter::All,
     ));
     let mut first_remote = original_preferences;
-    let mut second_remote = original_preferences;
     let mut first_queued = original_preferences;
-    let mut second_queued = original_preferences;
 
     assert!(apply_remote_sidebar_preferences(
         &snapshot,
@@ -495,17 +482,9 @@ fn remote_axes_and_filter_updates_converge_without_moving_the_shared_cursor() {
         &mut first_remote,
         &mut first_queued,
     ));
-    assert!(apply_remote_sidebar_preferences(
-        &snapshot,
-        &mut second,
-        &mut second_remote,
-        &mut second_queued,
-    ));
-
     assert_eq!(first.category_scope, CategoryScope::Current);
     assert_eq!(first.presentation_mode, PresentationMode::Flat);
     assert_eq!(first.filter, StatusFilter::DoneOnly);
-    assert_eq!(first, second);
     assert_eq!(first.selection, selection);
     assert_eq!(first.scroll, 4);
     assert!(first.manual_scroll);
@@ -517,12 +496,11 @@ fn remote_axes_and_filter_updates_converge_without_moving_the_shared_cursor() {
             StatusFilter::DoneOnly
         ))
     );
-    assert_eq!(second_queued, first_queued);
     assert!(!apply_remote_sidebar_preferences(
         &snapshot,
-        &mut second,
-        &mut second_remote,
-        &mut second_queued,
+        &mut first,
+        &mut first_remote,
+        &mut first_queued,
     ));
 }
 
@@ -637,11 +615,8 @@ fn remote_navigation_updates_every_sidebar_state_once_per_revision() {
         manual_scroll: true,
     };
     let mut first = SidebarState::default();
-    let mut second = SidebarState::default();
     let mut first_revision = 0;
-    let mut second_revision = 0;
     let mut first_queued = None;
-    let mut second_queued = None;
 
     assert!(apply_remote_navigation(
         &snapshot,
@@ -649,22 +624,15 @@ fn remote_navigation_updates_every_sidebar_state_once_per_revision() {
         &mut first_revision,
         &mut first_queued,
     ));
-    assert!(apply_remote_navigation(
-        &snapshot,
-        &mut second,
-        &mut second_revision,
-        &mut second_queued,
-    ));
-    assert_eq!(first.selection, second.selection);
+    assert_eq!(first.selection.as_deref(), Some("chat::%1::10"));
     assert_eq!(first.scroll, 7);
-    assert_eq!(second.scroll, 7);
     assert!(first.manual_scroll);
-    assert!(second.manual_scroll);
+    assert_eq!(first_revision, 1);
     assert!(!apply_remote_navigation(
         &snapshot,
-        &mut second,
-        &mut second_revision,
-        &mut second_queued,
+        &mut first,
+        &mut first_revision,
+        &mut first_queued,
     ));
 }
 

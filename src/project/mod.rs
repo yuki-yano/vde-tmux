@@ -321,20 +321,6 @@ mod tests {
     }
 
     #[test]
-    fn selector_displays_home_relative_path_and_restores_selection() {
-        let home = "/Users/me";
-
-        assert_eq!(
-            display_project_path("/Users/me/repos/github.com/acme/app", Some(home)),
-            "~/repos/github.com/acme/app"
-        );
-        assert_eq!(
-            restore_project_selection("~/repos/github.com/acme/app", Some(home)),
-            "/Users/me/repos/github.com/acme/app"
-        );
-    }
-
-    #[test]
     fn selector_popup_uses_current_exe_command() {
         let mock = MockTmuxRunner::new();
         let command = project_selector_popup_command("/tmp/my vt");
@@ -361,140 +347,16 @@ mod tests {
     }
 
     #[test]
-    fn selector_switches_selected_project() {
-        let mock = MockTmuxRunner::new();
-        let format = crate::session::session_list_format();
+    fn selector_displays_and_restores_the_selected_project_path() {
         let mut selector = MockProjectSelectorIo {
             projects: vec!["/Users/me/repos/ni.zsh".to_string()],
             selection: Some("~/repos/ni.zsh".to_string()),
             seen_choices: Vec::new(),
         };
-        let mut config = crate::config::Config::default();
-        config.categories.default_category = Some("public".to_string());
-        mock.stub(
-            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
-            "/dev/ttys001\t/dev/ttys001\n",
-        );
-        mock.stub(&["list-sessions", "-F", &format], "");
-        mock.stub(
-            &[
-                "new-session",
-                "-d",
-                "-P",
-                "-F",
-                "#{window_id}",
-                "-s",
-                "ni.zsh",
-                "-c",
-                "/Users/me/repos/ni.zsh",
-            ],
-            "@1\n",
-        );
-        mock.stub(
-            &[
-                "set-option",
-                "-t",
-                "ni.zsh",
-                crate::options::KEY_PROJECT_PATH,
-                "/Users/me/repos/ni.zsh",
-            ],
-            "",
-        );
-        mock.stub(
-            &[
-                "set-option",
-                "-t",
-                "ni.zsh",
-                crate::options::KEY_CATEGORY,
-                "public",
-            ],
-            "",
-        );
-        mock.stub(
-            &["show-hooks", "-g", "after-new-window[90]"],
-            "after-new-window[90] \n",
-        );
-        mock.stub(
-            &["switch-client", "-c", "/dev/ttys001", "-t", "=ni.zsh:"],
-            "",
-        );
-        mock.stub(
-            &[
-                "set-option",
-                "-g",
-                "@vde_client_2f6465762f74747973303031_public",
-                "ni.zsh",
-            ],
-            "",
-        );
-
         let selected = select_project(Some("/Users/me"), &mut selector).unwrap();
 
         assert_eq!(selector.seen_choices, vec!["~/repos/ni.zsh"]);
         assert_eq!(selected.as_deref(), Some("/Users/me/repos/ni.zsh"));
-    }
-
-    #[test]
-    fn switch_project_creates_missing_session_and_sets_options() {
-        let mock = MockTmuxRunner::new();
-        let format = crate::session::session_list_format();
-        let mut config = crate::config::Config::default();
-        config.categories.default_category = Some("public".to_string());
-        mock.stub(
-            &["display-message", "-p", "#{client_name}\t#{client_tty}"],
-            "\t/dev/ttys001\n",
-        );
-        mock.stub(&["list-sessions", "-F", &format], "");
-        mock.stub(
-            &[
-                "new-session",
-                "-d",
-                "-P",
-                "-F",
-                "#{window_id}",
-                "-s",
-                "repo",
-                "-c",
-                "/tmp/repo",
-            ],
-            "@1\n",
-        );
-        mock.stub(
-            &[
-                "set-option",
-                "-t",
-                "repo",
-                crate::options::KEY_PROJECT_PATH,
-                "/tmp/repo",
-            ],
-            "",
-        );
-        mock.stub(
-            &[
-                "set-option",
-                "-t",
-                "repo",
-                crate::options::KEY_CATEGORY,
-                "public",
-            ],
-            "",
-        );
-        mock.stub(
-            &["show-hooks", "-g", "after-new-window[90]"],
-            "after-new-window[90] \n",
-        );
-        mock.stub(&["switch-client", "-c", "/dev/ttys001", "-t", "=repo:"], "");
-        mock.stub(
-            &[
-                "set-option",
-                "-g",
-                "@vde_client_2f6465762f74747973303031_public",
-                "repo",
-            ],
-            "",
-        );
-        switch_project_resolved(&mock, &config, "/tmp/repo", "public").unwrap();
-        assert_eq!(mock.calls().len(), 8);
     }
 
     #[test]
@@ -832,5 +694,42 @@ mod tests {
         );
 
         switch_project_resolved(&mock, &config, "/tmp/ni.zsh", "public").unwrap();
+        let calls = mock.calls();
+        for expected in [
+            vec![
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-s",
+                "ni.zsh",
+                "-c",
+                "/tmp/ni.zsh",
+            ],
+            vec![
+                "set-option",
+                "-t",
+                "ni.zsh",
+                crate::options::KEY_PROJECT_PATH,
+                "/tmp/ni.zsh",
+            ],
+            vec![
+                "set-option",
+                "-t",
+                "ni.zsh",
+                crate::options::KEY_CATEGORY,
+                "public",
+            ],
+            vec!["switch-client", "-c", "/dev/ttys001", "-t", "=ni.zsh:"],
+            vec![
+                "set-option",
+                "-g",
+                "@vde_client_2f6465762f74747973303031_public",
+                "ni.zsh",
+            ],
+        ] {
+            assert!(calls.iter().any(|call| call == &expected));
+        }
     }
 }

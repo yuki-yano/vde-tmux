@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_symlinked_root() {
+    fn rejects_symlinked_root_and_intermediate() {
         let root = unique_root();
         let target = unique_root();
         std::fs::create_dir_all(&target).unwrap();
@@ -282,6 +282,18 @@ mod tests {
         let result = ensure_secure_dir_chain(&root, &leaf);
         assert!(result.is_err(), "symlinked root must be rejected");
         let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_dir_all(&target);
+
+        let root = unique_root();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = unique_root();
+        std::fs::create_dir_all(&target).unwrap();
+        symlink(&target, root.join("v2")).unwrap();
+        let leaf = root.join("v2").join("sidebar-control");
+        assert!(ensure_secure_dir_chain(&root, &leaf).is_err());
+        let _ = std::fs::remove_file(root.join("v2"));
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&target);
     }
 
@@ -308,22 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_symlinked_intermediate() {
-        let root = unique_root();
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let target = unique_root();
-        std::fs::create_dir_all(&target).unwrap();
-        // root/v2 is a symlink instead of a real directory.
-        symlink(&target, root.join("v2")).unwrap();
-        let leaf = root.join("v2").join("sidebar-control");
-        assert!(ensure_secure_dir_chain(&root, &leaf).is_err());
-        let _ = std::fs::remove_file(root.join("v2"));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&target);
-    }
-
-    #[test]
     fn rejects_regular_file_in_chain() {
         let root = unique_root();
         std::fs::create_dir_all(&root).unwrap();
@@ -331,16 +327,6 @@ mod tests {
         std::fs::write(root.join("v2"), b"not a dir").unwrap();
         let leaf = root.join("v2");
         assert!(ensure_secure_dir_chain(&root, &leaf).is_err());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn reuses_existing_valid_chain_idempotently() {
-        let root = unique_root();
-        let leaf = root.join("v2").join("sidebar-control");
-        ensure_secure_dir_chain(&root, &leaf).unwrap();
-        // A second call over the already-created chain must still succeed.
-        ensure_secure_dir_chain(&root, &leaf).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 

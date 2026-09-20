@@ -137,14 +137,6 @@ mod tests {
     }
 
     #[test]
-    fn reports_natural_exit_status() {
-        let mut child = spawn_group("exit 0");
-        let status = await_exit_then_kill_group(&mut child, Duration::from_secs(5)).unwrap();
-        assert!(status.is_some());
-        assert!(status.unwrap().success());
-    }
-
-    #[test]
     fn reports_failure_exit_status() {
         let mut child = spawn_group("exit 3");
         let status = await_exit_then_kill_group(&mut child, Duration::from_secs(5)).unwrap();

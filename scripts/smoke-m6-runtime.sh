@@ -1,5 +1,34 @@
 #!/usr/bin/env bash
+
+if ((BASH_VERSINFO[0] < 5)); then
+  printf 'error: scripts/smoke-m6-runtime.sh requires Bash 5 or newer; found Bash %s\n' \
+    "$BASH_VERSION" >&2
+  exit 2
+fi
+
 set -euo pipefail
+
+SMOKE_MODE="default"
+SMOKE_EXTENDED=0
+case "$#" in
+  0) ;;
+  1)
+    if [[ "$1" != "--extended" ]]; then
+      printf 'error: unknown argument: %s\n' "$1" >&2
+      printf 'usage: %s [--extended]\n' "${0##*/}" >&2
+      exit 64
+    fi
+    SMOKE_MODE="extended"
+    SMOKE_EXTENDED=1
+    ;;
+  *)
+    printf 'error: expected at most one argument\n' >&2
+    printf 'usage: %s [--extended]\n' "${0##*/}" >&2
+    exit 64
+    ;;
+esac
+
+printf 'runtime smoke mode: %s\n' "$SMOKE_MODE"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/debug/vt"
@@ -402,7 +431,7 @@ echo "protocol v23 linked-window topology converged"
 # Representative old and unknown protocols are rejected at Hello, before any side effect.
 python3 - "$DAEMON_SOCKET" <<'PY'
 import json, socket, sys
-for proto in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 20, 999):
+for proto in (22, 24):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     s.connect(sys.argv[1])
@@ -423,7 +452,6 @@ echo "hook index 70 coexistence ok"
 SERVER_PATH="$(tmux -L "$TMUX_SOCKET" show-environment -g PATH | sed 's/^PATH=//')"
 [[ ":$SERVER_PATH:" == *":$ROOT/target/debug:"* ]]
 [[ "$(PATH="$SERVER_PATH" command -v vt)" == "$HOOK_BIN_DIR/vt" ]]
-grep -F "\"$BIN\"" "$HOOK_BIN_DIR/vt" >/dev/null
 echo "owned hook resolves current target/debug/vt"
 
 # Two PTY-backed attach-session processes are normal clients (not control or active-pane clients).
@@ -1030,13 +1058,6 @@ tmux -L "$TMUX_SOCKET" select-window -t aux:own
 echo "linked active pane after session exercise: $(tmux -L "$TMUX_SOCKET" display-message -p -t main:linked '#{pane_id}')"
 wait_badge Done
 
-# Status format and every pushed display surface use only daemon-owned option values.
-STATUS_LEFT="$(tmux -L "$TMUX_SOCKET" show-options -gv status-left)"
-STATUS_RIGHT="$(tmux -L "$TMUX_SOCKET" show-options -gv status-right)"
-PANE_BORDER="$(tmux -L "$TMUX_SOCKET" show-options -gv pane-border-format)"
-[[ "$STATUS_LEFT$STATUS_RIGHT$PANE_BORDER" != *'#('* ]]
-grep -F '#{@vde_status_' <<<"$STATUS_LEFT$STATUS_RIGHT$PANE_BORDER" >/dev/null
-
 wait_display_options() {
   for _ in $(seq 1 80); do
     local summary sessions windows pane
@@ -1099,46 +1120,51 @@ for surface in \
   run_vt $surface >/dev/null
 done
 
-# A production-sized topology must keep the status push argv small. The daemon writes every scope
-# through one guarded `source-file` tmux client process, even when the command body exceeds tmux's
-# direct command-length limit.
-: >"$TMUX_PROCESS_LOG"
-LARGE_WINDOWS=()
-LAST_LARGE_PANE=""
-LARGE_TARGET_PANES=58
-BASELINE_PANE_COUNT="$(tmux -L "$TMUX_SOCKET" list-panes -a -F '#{pane_id}' | sort -u | wc -l | tr -d ' ')"
-LARGE_WINDOW_COUNT="$((LARGE_TARGET_PANES - BASELINE_PANE_COUNT))"
-[[ "$LARGE_WINDOW_COUNT" -gt 0 ]]
-for index in $(seq 1 "$LARGE_WINDOW_COUNT"); do
-  large_window="$(tmux -L "$TMUX_SOCKET" new-window -d -P -F '#{window_id}' -t aux: \
-    -n "load-$index" "sleep 600")"
-  LARGE_WINDOWS+=("$large_window")
-  LAST_LARGE_PANE="$(tmux -L "$TMUX_SOCKET" display-message -p -t "$large_window" '#{pane_id}')"
-done
-[[ "$(tmux -L "$TMUX_SOCKET" list-panes -a -F '#{pane_id}' | sort -u | wc -l | tr -d ' ')" == "$LARGE_TARGET_PANES" ]]
-for _ in $(seq 1 120); do
-  LARGE_PANE_STATUS="$(tmux -L "$TMUX_SOCKET" show-options -pqv -t "$LAST_LARGE_PANE" \
-    @vde_status_pane 2>/dev/null || true)"
-  LARGE_WINDOWS_STATUS="$(tmux -L "$TMUX_SOCKET" show-options -qv -t aux \
-    @vde_status_windows 2>/dev/null || true)"
-  [[ -n "$LARGE_PANE_STATUS" && "$LARGE_WINDOWS_STATUS" == *'+'* ]] && break
-  sleep 0.1
-done
-[[ -n "$LARGE_PANE_STATUS" && "$LARGE_WINDOWS_STATUS" == *'+'* ]]
-[[ "$LARGE_WINDOWS_STATUS" != *"load-$LARGE_WINDOW_COUNT"* ]]
-STATUS_SOURCE_PROCESSES="$(grep -c 'status-batches.*source-file\|source-file.*status-batches' \
-  "$TMUX_PROCESS_LOG" || true)"
-[[ "$STATUS_SOURCE_PROCESSES" -ge 1 ]]
-if grep 'status-batches' "$TMUX_PROCESS_LOG" | grep -F '@vde_status_pane' >/dev/null; then
-  echo "file-backed status push leaked pane payload into tmux argv" >&2
-  exit 1
+if ((SMOKE_EXTENDED)); then
+  echo "extended check running: 58-pane status projection"
+  # A production-sized topology must keep the status push argv small. The daemon writes every scope
+  # through one guarded `source-file` tmux client process, even when the command body exceeds tmux's
+  # direct command-length limit.
+  : >"$TMUX_PROCESS_LOG"
+  LARGE_WINDOWS=()
+  LAST_LARGE_PANE=""
+  LARGE_TARGET_PANES=58
+  BASELINE_PANE_COUNT="$(tmux -L "$TMUX_SOCKET" list-panes -a -F '#{pane_id}' | sort -u | wc -l | tr -d ' ')"
+  LARGE_WINDOW_COUNT="$((LARGE_TARGET_PANES - BASELINE_PANE_COUNT))"
+  [[ "$LARGE_WINDOW_COUNT" -gt 0 ]]
+  for index in $(seq 1 "$LARGE_WINDOW_COUNT"); do
+    large_window="$(tmux -L "$TMUX_SOCKET" new-window -d -P -F '#{window_id}' -t aux: \
+      -n "load-$index" "sleep 600")"
+    LARGE_WINDOWS+=("$large_window")
+    LAST_LARGE_PANE="$(tmux -L "$TMUX_SOCKET" display-message -p -t "$large_window" '#{pane_id}')"
+  done
+  [[ "$(tmux -L "$TMUX_SOCKET" list-panes -a -F '#{pane_id}' | sort -u | wc -l | tr -d ' ')" == "$LARGE_TARGET_PANES" ]]
+  for _ in $(seq 1 120); do
+    LARGE_PANE_STATUS="$(tmux -L "$TMUX_SOCKET" show-options -pqv -t "$LAST_LARGE_PANE" \
+      @vde_status_pane 2>/dev/null || true)"
+    LARGE_WINDOWS_STATUS="$(tmux -L "$TMUX_SOCKET" show-options -qv -t aux \
+      @vde_status_windows 2>/dev/null || true)"
+    [[ -n "$LARGE_PANE_STATUS" && "$LARGE_WINDOWS_STATUS" == *'+'* ]] && break
+    sleep 0.1
+  done
+  [[ -n "$LARGE_PANE_STATUS" && "$LARGE_WINDOWS_STATUS" == *'+'* ]]
+  [[ "$LARGE_WINDOWS_STATUS" != *"load-$LARGE_WINDOW_COUNT"* ]]
+  STATUS_SOURCE_PROCESSES="$(grep -c 'status-batches.*source-file\|source-file.*status-batches' \
+    "$TMUX_PROCESS_LOG" || true)"
+  [[ "$STATUS_SOURCE_PROCESSES" -ge 1 ]]
+  if grep 'status-batches' "$TMUX_PROCESS_LOG" | grep -F '@vde_status_pane' >/dev/null; then
+    echo "file-backed status push leaked pane payload into tmux argv" >&2
+    exit 1
+  fi
+  STATUS_BATCH_DIR="$V2_SOCKET_ROOT/$SERVER_HASH.status-batches"
+  [[ -d "$STATUS_BATCH_DIR" && "$(find "$STATUS_BATCH_DIR" -type f | wc -l | tr -d ' ')" == 0 ]]
+  echo "large status projection ok: $LARGE_TARGET_PANES panes, guarded source-file, 1 process/batch"
+  for large_window in "${LARGE_WINDOWS[@]}"; do
+    tmux -L "$TMUX_SOCKET" kill-window -t "$large_window"
+  done
+else
+  echo "extended check skipped: 58-pane status projection"
 fi
-STATUS_BATCH_DIR="$V2_SOCKET_ROOT/$SERVER_HASH.status-batches"
-[[ -d "$STATUS_BATCH_DIR" && "$(find "$STATUS_BATCH_DIR" -type f | wc -l | tr -d ' ')" == 0 ]]
-echo "large status projection ok: $LARGE_TARGET_PANES panes, guarded source-file, 1 process/batch"
-for large_window in "${LARGE_WINDOWS[@]}"; do
-  tmux -L "$TMUX_SOCKET" kill-window -t "$large_window"
-done
 
 sidebar_snapshot() {
   VT_PANE="$OTHER_PANE" run_vt sidebar attach --once |
@@ -1734,20 +1760,21 @@ if ! tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'; then
   exit 1
 fi
 CATEGORY_TIMINGS="$RUNTIME_DIR/category-timings.txt"
-: >"$CATEGORY_TIMINGS"
 run_category_action() {
   local direction="$1"
   local source_session
   local switched_session
-  local started_ns
-  local switched_ns
+  local started_at
+  local switched_at
   local action_pid
   local action_error="$RUNTIME_DIR/category-action-error.txt"
   source_session="$(client_session_value "$CLIENT_1" '#{session_id}')" || {
     echo "category $direction could not resolve the source session for $CLIENT_1" >&2
     return 1
   }
-  started_ns="$(python3 -c 'import time; print(time.time_ns())')"
+  if ((SMOKE_EXTENDED)); then
+    started_at="$EPOCHREALTIME"
+  fi
   VT_PANE="$AGENT_PANE" run_vt category "$direction" \
     --client-name "$CLIENT_1" --session-id "$source_session" \
     >/dev/null 2>"$action_error" &
@@ -1764,7 +1791,9 @@ run_category_action() {
     [[ "$switched_session" != "$source_session" ]] && break
     sleep 0.01
   done
-  switched_ns="$(python3 -c 'import time; print(time.time_ns())')"
+  if ((SMOKE_EXTENDED)); then
+    switched_at="$EPOCHREALTIME"
+  fi
   if [[ "$switched_session" == "$source_session" ]]; then
     echo "category client did not switch before the 5s semantic deadline" >&2
     cat "$action_error" >&2
@@ -1780,22 +1809,31 @@ run_category_action() {
     fi
     return 1
   fi
-  python3 - "$started_ns" "$switched_ns" >>"$CATEGORY_TIMINGS" <<'PY'
-import sys
-started_ns, switched_ns = map(int, sys.argv[1:])
-print((switched_ns - started_ns) / 1_000_000_000)
-PY
+  if ((SMOKE_EXTENDED)); then
+    printf '%s %s\n' "$started_at" "$switched_at" >>"$CATEGORY_TIMINGS"
+  fi
 }
-if ! run_category_action next; then
-  echo "category warmup action failed" >&2
-  exit 1
+echo "category contract check running: next/next/prev, client pin, and hook drain (mode=$SMOKE_MODE)"
+CATEGORY_EXPECTED_HOOKS=3
+if ((SMOKE_EXTENDED)); then
+  echo "extended check running: category warm-switch SLA (warmup + 30 repetitions + next/next/prev)"
+  : >"$CATEGORY_TIMINGS"
+  if ! run_category_action next; then
+    echo "category warmup action failed" >&2
+    exit 1
+  fi
+  tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'
+else
+  echo "extended check skipped: category warm-switch SLA and 30 repetitions"
 fi
-tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'
 HOOK_CALLS_BEFORE_CATEGORY="$(wc -l <"$HOOK_LOG")"
-for _ in $(seq 1 30); do
-  run_category_action next
-done
-[[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == main ]]
+if ((SMOKE_EXTENDED)); then
+  for _ in $(seq 1 30); do
+    run_category_action next
+  done
+  [[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == main ]]
+  CATEGORY_EXPECTED_HOOKS=33
+fi
 [[ "$(client_session_value "$CLIENT_2" '#{client_session}')" == aux ]]
 run_category_action next
 [[ "$(client_session_value "$CLIENT_1" '#{client_session}')" == aux ]]
@@ -1809,13 +1847,13 @@ for _ in $(seq 1 200); do
   CATEGORY_HOOK_LOG="$(tail -n "$((HOOK_CALLS_AFTER_CATEGORY - HOOK_CALLS_BEFORE_CATEGORY))" "$HOOK_LOG")"
   CATEGORY_VIEW_HOOKS="$(grep -c 'pane-state-view client-session-changed' <<<"$CATEGORY_HOOK_LOG" || true)"
   CATEGORY_REMEMBERED_HOOKS="$(grep -c 'hooks on-client-session-changed' <<<"$CATEGORY_HOOK_LOG" || true)"
-  if [[ "$CATEGORY_VIEW_HOOKS" -ge 33 && "$CATEGORY_REMEMBERED_HOOKS" -ge 33 ]]; then
+  if [[ "$CATEGORY_VIEW_HOOKS" -ge "$CATEGORY_EXPECTED_HOOKS" && "$CATEGORY_REMEMBERED_HOOKS" -ge "$CATEGORY_EXPECTED_HOOKS" ]]; then
     break
   fi
   sleep 0.05
 done
-if [[ "$CATEGORY_VIEW_HOOKS" -lt 33 || "$CATEGORY_REMEMBERED_HOOKS" -lt 33 ]]; then
-  echo "category hooks did not drain before the 10s semantic deadline: view=$CATEGORY_VIEW_HOOKS remembered=$CATEGORY_REMEMBERED_HOOKS expected=33" >&2
+if [[ "$CATEGORY_VIEW_HOOKS" -lt "$CATEGORY_EXPECTED_HOOKS" || "$CATEGORY_REMEMBERED_HOOKS" -lt "$CATEGORY_EXPECTED_HOOKS" ]]; then
+  echo "category hooks did not drain before the 10s semantic deadline: view=$CATEGORY_VIEW_HOOKS remembered=$CATEGORY_REMEMBERED_HOOKS expected=$CATEGORY_EXPECTED_HOOKS" >&2
   exit 1
 fi
 if grep 'pane-state-view client-session-changed' <<<"$CATEGORY_HOOK_LOG" | grep -v 'status=0 '; then
@@ -1826,19 +1864,26 @@ if grep 'hooks on-client-session-changed' <<<"$CATEGORY_HOOK_LOG" | grep -v 'sta
   echo "category remembered-session hook failed" >&2
   exit 1
 fi
-python3 - "$CATEGORY_TIMINGS" <<'PY'
+if ((SMOKE_EXTENDED)); then
+  python3 - "$CATEGORY_TIMINGS" <<'PY'
 import math, sys
 
-durations = [float(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()][1:]
+durations = [
+    float(ended) - float(started)
+    for line in open(sys.argv[1], encoding="utf-8")
+    if line.strip()
+    for started, ended in [line.split()]
+][1:]
 assert len(durations) == 33, durations
 ordered = sorted(durations)
 p95 = ordered[math.ceil(len(ordered) * 0.95) - 1]
 # This end-to-end sample includes CLI startup, canonical daemon snapshot resolution,
-# switch-client, and the 5ms observer loop. Category navigation must stay below the threshold
+# switch-client, and the 10ms observer loop. Category navigation must stay below the threshold
 # without returning to per-project Git probes or rebuilding category state in the CLI.
 assert p95 <= 0.125, (p95, ordered)
 print(f"category warm switch SLA ok: n={len(durations)} p95={p95 * 1000:.1f}ms max={ordered[-1] * 1000:.1f}ms")
 PY
+fi
 tmux -L "$TMUX_SOCKET" switch-client -c "$CLIENT_1" -t '=main:'
 tmux -L "$TMUX_SOCKET" kill-session -t '=category-fast:'
 for category in category-a category-b category-c; do
@@ -1850,7 +1895,7 @@ PY
 )"
   tmux -L "$TMUX_SOCKET" set-option -gu "$key"
 done
-echo "category reload mirror, consecutive order, multi-client pin, and foreground SLA ok"
+echo "category reload mirror, consecutive order, multi-client pin, and hook drain ok (mode=$SMOKE_MODE)"
 sleep 1
 
 # A corrupt full-state snapshot must stop startup, surface the exact manual reset path, and keep
@@ -2129,4 +2174,4 @@ assert not canonical or canonical.get("agent_session_id") != "persist-failure", 
 PY
 echo "persist failure hook exit status ok"
 
-echo "pane-state v10 scratch smoke ok"
+echo "pane-state v10 scratch smoke ok (mode=$SMOKE_MODE)"

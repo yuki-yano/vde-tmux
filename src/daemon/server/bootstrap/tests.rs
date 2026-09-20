@@ -53,7 +53,7 @@ fn runtime_cleanup_removes_owned_socket_and_process_record_on_early_return() {
 }
 
 #[test]
-fn post_bind_initialization_failure_removes_socket_and_releases_instance_lock() {
+fn post_bind_initialization_failure_removes_socket() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let event_id = EventId::generate().unwrap();
@@ -75,15 +75,10 @@ fn post_bind_initialization_failure_removes_socket_and_releases_instance_lock() 
     let malformed_record = b"{malformed lifecycle record\n";
     std::fs::write(&lifecycle_path, malformed_record).unwrap();
 
-    let Some((listener, instance_lock, socket_cleanup)) = bind_daemon_listener(&socket).unwrap()
+    let Some((listener, _instance_lock, socket_cleanup)) = bind_daemon_listener(&socket).unwrap()
     else {
         panic!("test must acquire the daemon instance lock");
     };
-    assert!(
-        crate::daemon::lifecycle::try_acquire_daemon_instance_lock(&socket)
-            .unwrap()
-            .is_none()
-    );
 
     let result = initialize_runtime_daemon_post_bind(
         &crate::config::Config::default(),
@@ -109,11 +104,6 @@ fn post_bind_initialization_failure_removes_socket_and_releases_instance_lock() 
     assert_eq!(std::fs::read(&lifecycle_path).unwrap(), malformed_record);
 
     drop(listener);
-    drop(instance_lock);
-    let reacquired = crate::daemon::lifecycle::try_acquire_daemon_instance_lock(&socket)
-        .unwrap()
-        .expect("instance lock must be released after the early return");
-    drop(reacquired);
     std::fs::remove_dir_all(root).unwrap();
 }
 

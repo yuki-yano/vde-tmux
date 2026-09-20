@@ -129,9 +129,9 @@ the upgrade only while every agent is Idle and no Done or Blocked state must be 
 state from the former tmux-option storage is not migrated.
 
 1. Bump `version` in `Cargo.toml` and `Cargo.lock`.
-2. Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, `cargo test --locked -- --ignored`, and `cargo publish --dry-run --locked`.
-3. Run the isolated local preflight: `scripts/smoke-m6-runtime.sh`, `scripts/preflight-ui-ux.sh`, and `scripts/test-kill-server-isolated.sh`. These use scratch `tmux -L` servers and isolated state directories; they do not touch the real server or normal state.
-4. Run the `Runtime smoke` workflow with `workflow_dispatch`. Confirm the runtime smoke passes and the ignored redraw probes either pass on tmux 3.7+ or report an explicit version-based skip.
+2. Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, `cargo test --locked --test tmux_redraw_probe tmux_expands_dynamic_pane_elapsed_with_the_former_boundaries -- --ignored --exact`, and `cargo publish --dry-run --locked`.
+3. With Bash 5 or newer selected on `PATH` (`/bin/bash` 3.2 on macOS is unsupported for the runtime SLA clock), run the isolated local preflight once each: `scripts/smoke-m6-runtime.sh --extended`, `scripts/preflight-ui-ux.sh`, and `scripts/test-kill-server-isolated.sh`. The extended run includes the normal runtime smoke, so do not also run it without `--extended`. These use scratch `tmux -L` servers and isolated state directories; they do not touch the real server or normal state.
+4. Run the `Runtime smoke` workflow with `workflow_dispatch`. Confirm the extended runtime smoke and the ignored elapsed-format integration pass on the pinned tmux version.
 5. Commit the version bump and release changes.
 6. Create a tag that matches the crate version:
 
@@ -142,6 +142,10 @@ state from the former tmux-option storage is not migrated.
    ```
 
 The `Publish` workflow validates that `vX.Y.Z` matches `Cargo.toml` before publishing.
+
+When updating the pinned tmux dependency or relying on a new tmux redraw characteristic, dispatch
+the separate `Tmux redraw probe` workflow. Its redraw-only probe is intentionally not part of the
+normal release gate because it measures tmux itself rather than `vt` behavior.
 
 crates.io Trusted Publishing must be configured once for:
 

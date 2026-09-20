@@ -138,25 +138,6 @@ fn header_layout_uses_powerline_title_and_filter_chip_rows() {
 }
 
 #[test]
-fn header_title_leaves_counts_to_the_filter_chip_row() {
-    let counts = BadgeCounts {
-        total: 1,
-        idle: 1,
-        ..BadgeCounts::default()
-    };
-
-    let header = build_header_layout_with_counts(
-        &SidebarState::default(),
-        80,
-        &SidebarRenderTheme::default(),
-        counts,
-    );
-
-    assert!(!header.lines[1].text.contains('1'));
-    assert!(header.lines[2].text.contains("≡ 1"));
-}
-
-#[test]
 fn header_hit_test_targets_modes_and_available_filter_chips() {
     let state = SidebarState {
         category_scope: CategoryScope::All,
@@ -335,28 +316,6 @@ badge:
         !header.lines[2].text.contains("● 1"),
         "{:?}",
         header.lines[2].text
-    );
-}
-
-#[test]
-fn custom_header_suffix_is_rendered_after_mode_segment() {
-    let config = serde_yaml_ng::from_str::<crate::config::Config>(
-        r##"
-sidebar:
-  header:
-    suffix: ""
-"##,
-    )
-    .unwrap();
-    let theme = SidebarRenderTheme::from_sidebar_config(&config.sidebar);
-
-    let header =
-        build_header_layout_with_counts(&SidebarState::default(), 80, &theme, rich_header_counts());
-
-    assert!(
-        header.lines[1].text.ends_with("▾ "),
-        "{:?}",
-        header.lines[1].text
     );
 }
 

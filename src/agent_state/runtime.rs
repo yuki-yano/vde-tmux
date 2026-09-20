@@ -1471,6 +1471,45 @@ mod tests {
                     .is_none()
             );
         }
+
+        let agent_binding = binding();
+        let current = runtime
+            .apply_provider_observation(
+                agent_binding.clone(),
+                1,
+                &observation(
+                    ProviderHookKind::UserPromptSubmit,
+                    "turn-current",
+                    Some(b"manual"),
+                    None,
+                    30,
+                ),
+            )
+            .unwrap()
+            .run
+            .unwrap();
+        assert!(matches!(
+            runtime.apply_provider_observation(
+                agent_binding.clone(),
+                1,
+                &observation(
+                    ProviderHookKind::Stop,
+                    "turn-other",
+                    None,
+                    Some("wrong"),
+                    31,
+                ),
+            ),
+            Err(StoreError::NotFound(_))
+        ));
+        assert_eq!(
+            runtime
+                .current_run_for_binding(&agent_binding)
+                .unwrap()
+                .unwrap()
+                .run_id,
+            current.run_id
+        );
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1528,71 +1567,6 @@ mod tests {
                 .unwrap()
                 .run_id,
             created.run_id
-        );
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn delayed_same_turn_prompt_is_recorded_without_reopening_the_completed_run() {
-        let root = temp_root();
-        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
-        let agent_binding = binding();
-        let first = observation(
-            ProviderHookKind::UserPromptSubmit,
-            "turn-completed",
-            Some(b"first task"),
-            None,
-            10,
-        );
-        let created = runtime
-            .apply_provider_observation(agent_binding.clone(), 1, &first)
-            .unwrap()
-            .run
-            .unwrap();
-        runtime
-            .apply_provider_observation(
-                agent_binding.clone(),
-                1,
-                &observation(
-                    ProviderHookKind::Stop,
-                    "turn-completed",
-                    None,
-                    Some("done"),
-                    11,
-                ),
-            )
-            .unwrap();
-
-        let mut delayed = observation(
-            ProviderHookKind::UserPromptSubmit,
-            "turn-completed",
-            Some(b"late callback"),
-            None,
-            12,
-        );
-        delayed.provider_event_ref = Some(
-            Sha256Digest::of(b"late-same-turn-ingress")
-                .as_str()
-                .to_string(),
-        );
-        delayed.payload_digest = Sha256Digest::of(b"late-same-turn-payload")
-            .as_str()
-            .to_string();
-        let result = runtime
-            .apply_provider_observation(agent_binding, 2, &delayed)
-            .unwrap();
-        let run = result.run.unwrap();
-
-        assert_eq!(result.disposition, ApplyDisposition::EvidenceOnly);
-        assert_eq!(run.run_id, created.run_id);
-        assert_eq!(run.run_seq, 1);
-        assert_eq!(run.execution_phase, ExecutionPhase::Ended);
-        assert_eq!(run.semantic_outcome, SemanticOutcome::Completed);
-        assert_eq!(run.evidence.provider_events.len(), 3);
-        assert_eq!(
-            run.evidence.provider_events.last().unwrap().disposition,
-            "prompt_updated"
         );
 
         std::fs::remove_dir_all(root).unwrap();
@@ -1669,8 +1643,24 @@ mod tests {
             assert_eq!(result.disposition, ApplyDisposition::EvidenceOnly);
             assert_eq!(result.run.as_ref().unwrap().run_id, first_run_id);
             assert_eq!(
+                result.run.as_ref().unwrap().semantic_outcome,
+                SemanticOutcome::Completed
+            );
+            assert_eq!(
                 result.run.as_ref().unwrap().execution_phase,
                 ExecutionPhase::Ended
+            );
+            assert_eq!(
+                result
+                    .run
+                    .as_ref()
+                    .unwrap()
+                    .evidence
+                    .provider_events
+                    .last()
+                    .unwrap()
+                    .disposition,
+                "prompt_updated"
             );
             let current = runtime
                 .current_run_for_binding(&agent_binding)
@@ -1817,77 +1807,6 @@ mod tests {
     }
 
     #[test]
-    fn first_prompt_binds_a_pending_provider_session_to_the_same_process() {
-        let root = temp_root();
-        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
-        let mut confirmed_binding = binding();
-        confirmed_binding.agent_kind = AgentKind::parse("codex").unwrap();
-        confirmed_binding.agent_epoch = 2;
-        let mut pending_binding = OperationBinding::from(confirmed_binding.clone());
-        pending_binding.agent_epoch = 1;
-        pending_binding.provider_session_id = None;
-        let prompt = b"first prompt";
-        let operation_id = OperationId::parse("operation_pending_session_0001").unwrap();
-        runtime
-            .prepare_operation(
-                operation_id.clone(),
-                "vta1:unbound-exact-target".to_string(),
-                prompt,
-                prompt_digest(prompt),
-                "paste_enter".to_string(),
-                pending_binding,
-                StateVersion {
-                    state_id: confirmed_binding.pane_state_id.clone(),
-                    agent_epoch: 1,
-                    revision: 7,
-                },
-                None,
-                1,
-                10,
-            )
-            .unwrap();
-        runtime.mark_dispatch_started(&operation_id, 11).unwrap();
-
-        let mut first_prompt = observation(
-            ProviderHookKind::UserPromptSubmit,
-            "turn-first",
-            Some(prompt),
-            None,
-            12,
-        );
-        first_prompt.provider = confirmed_binding.agent_kind.clone();
-        first_prompt.session_id = confirmed_binding.provider_session_id.clone();
-        let applied = runtime
-            .apply_provider_observation(confirmed_binding.clone(), 1, &first_prompt)
-            .unwrap();
-        let operation = applied.operation.unwrap();
-        assert_eq!(operation.dispatch_state, DispatchState::PromptConfirmed);
-        assert_eq!(
-            operation.binding.provider_session_id.as_ref(),
-            Some(&confirmed_binding.provider_session_id)
-        );
-        assert_eq!(operation.binding.agent_epoch, confirmed_binding.agent_epoch);
-        assert_eq!(
-            operation.expected_pane_version.agent_epoch,
-            confirmed_binding.agent_epoch
-        );
-        assert_eq!(
-            applied.run.unwrap().binding.provider_session_id,
-            confirmed_binding.provider_session_id
-        );
-
-        drop(runtime);
-        let reopened = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
-        let reference = reopened.operation_ref(operation_id);
-        assert_eq!(
-            reopened.get_operation(&reference).unwrap().dispatch_state,
-            DispatchState::PromptConfirmed
-        );
-        drop(reopened);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn prompt_after_same_process_session_rollover_confirms_the_operation() {
         let root = temp_root();
         let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
@@ -1929,6 +1848,8 @@ mod tests {
 
         let prompt = b"task after session rollover";
         let operation_id = OperationId::parse("operation_session_rollover_0001").unwrap();
+        let mut pending_binding = OperationBinding::from(original_binding.clone());
+        pending_binding.provider_session_id = None;
         runtime
             .prepare_operation(
                 operation_id.clone(),
@@ -1936,7 +1857,7 @@ mod tests {
                 prompt,
                 prompt_digest(prompt),
                 "paste_enter".to_string(),
-                original_binding.clone(),
+                pending_binding,
                 pane_version(&original_binding),
                 Some(CurrentDurableRunProjection {
                     run_id: previous_run.run_id.as_str().to_string(),
@@ -2003,6 +1924,13 @@ mod tests {
         assert_eq!(run.operation_id.as_ref(), Some(&operation_id));
 
         drop(runtime);
+        let reopened = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
+        let reference = reopened.operation_ref(operation_id);
+        assert_eq!(
+            reopened.get_operation(&reference).unwrap().dispatch_state,
+            DispatchState::PromptConfirmed
+        );
+        drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2203,9 +2131,7 @@ mod tests {
         assert_eq!(operation.dispatch_state, DispatchState::DispatchStarted);
         assert!(operation.run_id.is_none());
 
-        let settled = runtime.settle_expired_dispatches(20).unwrap();
-        assert_eq!(settled.len(), 1);
-        assert_eq!(settled[0].dispatch_state, DispatchState::DeliveryUnknown);
+        assert!(runtime.has_expired_dispatch(20).unwrap());
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2317,42 +2243,6 @@ mod tests {
             applied.operation.unwrap().dispatch_state,
             DispatchState::PromptConfirmed
         );
-        drop(runtime);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn stable_turn_mismatch_does_not_fall_back_to_current_run() {
-        let root = temp_root();
-        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
-        let agent_binding = binding();
-        runtime
-            .apply_provider_observation(
-                agent_binding.clone(),
-                1,
-                &observation(
-                    ProviderHookKind::UserPromptSubmit,
-                    "turn-current",
-                    Some(b"manual"),
-                    None,
-                    30,
-                ),
-            )
-            .unwrap();
-        let error = runtime
-            .apply_provider_observation(
-                agent_binding,
-                1,
-                &observation(
-                    ProviderHookKind::Stop,
-                    "turn-other",
-                    None,
-                    Some("wrong"),
-                    31,
-                ),
-            )
-            .unwrap_err();
-        assert!(matches!(error, StoreError::NotFound(_)));
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2571,10 +2461,26 @@ mod tests {
             runtime.store.list_runs().unwrap().len(),
             super::super::RUN_RETENTION_PER_PANE + 1
         );
+        let retained_run_ids = runtime
+            .store
+            .list_runs()
+            .unwrap()
+            .into_iter()
+            .map(|run| run.run_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(runtime.turn_index.len(), retained_run_ids.len());
+        assert_eq!(runtime.event_index.len(), retained_run_ids.len());
         assert!(
-            runtime.event_index.len()
-                <= (super::super::RUN_RETENTION_PER_PANE + 1)
-                    * super::super::RUN_EVENT_REFERENCE_MAX_COUNT
+            runtime
+                .turn_index
+                .values()
+                .all(|run_id| retained_run_ids.contains(run_id))
+        );
+        assert!(
+            runtime
+                .event_index
+                .values()
+                .all(|run_id| retained_run_ids.contains(run_id))
         );
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
@@ -2675,7 +2581,7 @@ mod tests {
     }
 
     #[test]
-    fn process_exit_ends_the_run_without_resolving_it() {
+    fn process_exit_and_pane_removal_update_current_run_retention() {
         let root = temp_root();
         let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
         let agent_binding = binding();
@@ -2698,63 +2604,74 @@ mod tests {
             .unwrap();
         assert_eq!(ended.execution_phase, ExecutionPhase::Ended);
         assert_eq!(ended.semantic_outcome, SemanticOutcome::Unresolved);
-        drop(runtime);
-        std::fs::remove_dir_all(root).unwrap();
-    }
 
-    #[test]
-    fn pane_removal_releases_a_completed_run_from_the_current_retention_index() {
-        let root = temp_root();
-        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
-        let agent_binding = binding();
-        runtime
-            .apply_provider_observation(
-                agent_binding.clone(),
-                1,
-                &observation(
-                    ProviderHookKind::UserPromptSubmit,
-                    "turn-completed-removal",
-                    Some(b"manual"),
-                    None,
-                    10,
-                ),
-            )
-            .unwrap();
-        runtime
-            .apply_provider_observation(
-                agent_binding.clone(),
-                1,
-                &observation(
-                    ProviderHookKind::Stop,
-                    "turn-completed-removal",
-                    None,
-                    Some("done"),
-                    11,
-                ),
-            )
-            .unwrap();
-        assert!(
+        {
+            let mut agent_binding = binding();
+            agent_binding.pane_instance = PaneInstance {
+                pane_id: "%8".to_string(),
+                pane_pid: 78,
+            };
+            agent_binding.pane_state_id = StateId::generate().unwrap();
+            agent_binding.process = AgentProcessIdentity {
+                pid: 89,
+                start_token: "completed-process-start-token".to_string(),
+            };
             runtime
+                .apply_provider_observation(
+                    agent_binding.clone(),
+                    1,
+                    &observation(
+                        ProviderHookKind::UserPromptSubmit,
+                        "turn-completed-removal",
+                        Some(b"manual"),
+                        None,
+                        10,
+                    ),
+                )
+                .unwrap();
+            runtime
+                .apply_provider_observation(
+                    agent_binding.clone(),
+                    1,
+                    &observation(
+                        ProviderHookKind::Stop,
+                        "turn-completed-removal",
+                        None,
+                        Some("done"),
+                        11,
+                    ),
+                )
+                .unwrap();
+            let completed_run_id = runtime
                 .current_run_for_binding(&agent_binding)
                 .unwrap()
-                .is_some()
-        );
-
-        let ended = runtime
-            .reconcile_process_for_pane(&agent_binding.pane_instance, true, None, 12)
-            .unwrap();
-        assert!(
-            ended.is_none(),
-            "a completed run does not need an Ended transition"
-        );
-        assert!(
-            runtime
-                .current_run_for_binding(&agent_binding)
                 .unwrap()
-                .is_none(),
-            "a removed pane must not protect a completed historical run forever"
-        );
-        assert_eq!(runtime.store.list_runs().unwrap().len(), 1);
+                .run_id;
+            assert!(
+                runtime
+                    .current_run_for_binding(&agent_binding)
+                    .unwrap()
+                    .is_some()
+            );
+
+            let ended = runtime
+                .reconcile_process_for_pane(&agent_binding.pane_instance, true, None, 12)
+                .unwrap();
+            assert!(
+                ended.is_none(),
+                "a completed run does not need an Ended transition"
+            );
+            assert!(
+                runtime
+                    .current_run_for_binding(&agent_binding)
+                    .unwrap()
+                    .is_none(),
+                "a removed pane must not protect a completed historical run forever"
+            );
+            let runs = runtime.store.list_runs().unwrap();
+            assert_eq!(runs.len(), 2);
+            assert!(runs.iter().any(|run| run.run_id == completed_run_id));
+        }
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -800,6 +800,7 @@ mod tests {
             api_code(&read_state_if_present(&path).unwrap_err()),
             Some("request_state_invalid")
         );
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
             api_code(&read_state_if_present(&path).unwrap_err()),
@@ -820,11 +821,19 @@ mod tests {
             Some("request_state_invalid")
         );
 
-        std::fs::write(&path, vec![b' '; REQUEST_STATE_MAX_BYTES + 1]).unwrap();
-        assert_eq!(
-            api_code(&read_state_if_present(&path).unwrap_err()),
-            Some("request_state_invalid")
-        );
+        let valid = RequestState::active(target(), "review this").unwrap();
+        let encoded = serde_json::to_vec(&valid).unwrap();
+        std::fs::write(&path, &encoded).unwrap();
+        assert_eq!(read_state_if_present(&path).unwrap(), Some(valid.clone()));
+
+        let mut oversized = encoded;
+        oversized.resize(REQUEST_STATE_MAX_BYTES + 1, b' ');
+        let decoded: RequestState = serde_json::from_slice(&oversized).unwrap();
+        decoded.validate().unwrap();
+        std::fs::write(&path, oversized).unwrap();
+        let error = read_state_if_present(&path).unwrap_err();
+        assert_eq!(api_code(&error), Some("request_state_invalid"));
+        assert!(error.to_string().contains("byte limit"), "{error:#}");
 
         let mut state = RequestState::active(target(), "review this").unwrap();
         state.remember_operation(operation_ref(OperationId::generate().unwrap()));
@@ -839,7 +848,8 @@ mod tests {
     fn state_rejects_symlinks_and_non_private_parents() {
         let directory = PrivateDirectory::new();
         let real = directory.0.join("real.json");
-        std::fs::write(&real, b"{}").unwrap();
+        let state = RequestState::active(target(), "review this").unwrap();
+        std::fs::write(&real, serde_json::to_vec(&state).unwrap()).unwrap();
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
         let link = directory.state_path();
         std::os::unix::fs::symlink(&real, &link).unwrap();

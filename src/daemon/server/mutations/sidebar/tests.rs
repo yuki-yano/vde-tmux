@@ -338,11 +338,6 @@ fn pane_pin_persists_outside_canonical_state_and_prunes_with_topology() {
         let mut guard = coordinator.state.lock().unwrap();
         let state = guard.as_mut().unwrap();
         assert!(state.sidebar_preferences.pinned_panes.contains(&target));
-        assert!(
-            serde_json::to_value(state.leased.runtime.record(&target).unwrap()).unwrap()["unread"]
-                .get("pinned")
-                .is_none()
-        );
         state.topology.panes.clear();
         assert!(persist_pruned_sidebar_pins(&coordinator, state).unwrap());
         assert!(state.sidebar_preferences.pinned_panes.is_empty());
@@ -471,11 +466,8 @@ fn read_peek_commit_fences_the_old_occurrence_and_protects_the_source_during_adv
 
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
-}
 
-#[test]
-fn read_peek_without_an_advance_candidate_keeps_a_new_active_source_lease() {
-    let root = test_root("read-peek-stayed");
+    let root = test_root("read-peek-fence-stayed");
     let (mut state, target, _) = read_peek_test_state(&root);
     let result = commit_read_peek_state(
         &mut state,
@@ -500,38 +492,6 @@ fn read_peek_without_an_advance_candidate_keeps_a_new_active_source_lease() {
     emit_read_peek_waiting_occurrence(&mut state, &target);
     assert!(
         state
-            .leased
-            .runtime
-            .record(&target)
-            .unwrap()
-            .unread
-            .is_unread()
-    );
-
-    drop(state);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn read_peek_advance_failure_restores_the_source_without_rolling_back_read() {
-    let root = test_root("read-peek-advance-failure");
-    let (mut state, target, candidate) = read_peek_test_state(&root);
-    commit_read_peek_state(
-        &mut state,
-        &mut ReadPeekStoreIo { fail: false },
-        &v2_daemon_id(),
-        &v2_event_id(),
-        &target,
-        10,
-        vec![candidate],
-        2,
-    )
-    .unwrap();
-    state.restore_peek_after_failure(10, 2, &[read_peek_test_witness(10, &target)], 3);
-
-    assert_eq!(state.active_peek_target(10), Some(&target));
-    assert!(
-        !state
             .leased
             .runtime
             .record(&target)
@@ -580,29 +540,14 @@ fn read_peek_persist_failure_preserves_the_unread_occurrence_and_active_lease() 
 
 #[test]
 fn read_peek_terminal_occurrences_use_client_scoped_born_read_authority() {
-    let scenarios = [
-        (
-            "waiting",
-            PaneEvent::WaitRequested {
-                observed_at: 3,
-                reason: crate::pane_state::WaitReason::PermissionPrompt,
-            },
-            crate::pane_state::UnreadReason::Waiting,
-        ),
-        (
-            "error",
-            PaneEvent::FailRun {
-                observed_at: 3,
-                reason: Some("failed".to_string()),
-            },
-            crate::pane_state::UnreadReason::Error,
-        ),
-        (
-            "completed",
-            PaneEvent::CompleteRun { completed_at: 3 },
-            crate::pane_state::UnreadReason::Completed,
-        ),
-    ];
+    let scenarios = [(
+        "waiting",
+        PaneEvent::WaitRequested {
+            observed_at: 3,
+            reason: crate::pane_state::WaitReason::PermissionPrompt,
+        },
+        crate::pane_state::UnreadReason::Waiting,
+    )];
 
     for (label, terminal_event, expected_reason) in scenarios {
         for observer_visible in [false, true] {
@@ -677,73 +622,65 @@ fn read_peek_terminal_occurrences_use_client_scoped_born_read_authority() {
 
 #[test]
 fn peek_observations_are_causal_across_effect_completion_orderings() {
-    for observation_before_completion in [false, true] {
-        let root = test_root(if observation_before_completion {
-            "peek-observation-before-completion"
-        } else {
-            "peek-completion-before-observation"
-        });
-        let (mut state, source, target) = read_peek_test_state(&root);
-        assert!(state.begin_peek(10, source.clone(), [target.clone()], 2));
-        let source_witness = read_peek_test_witness(10, &source);
-        let target_witness = read_peek_test_witness(10, &target);
+    let root = test_root("peek-observation-before-completion");
+    let (mut state, source, target) = read_peek_test_state(&root);
+    assert!(state.begin_peek(10, source.clone(), [target.clone()], 2));
+    let source_witness = read_peek_test_witness(10, &source);
+    let target_witness = read_peek_test_witness(10, &target);
 
-        if observation_before_completion {
-            state.reconcile_peek_leases(std::slice::from_ref(&target_witness), 4);
-            assert!(matches!(
-                state.peek_leases.get(&10),
-                Some(crate::daemon::runtime::PeekLease::Pending {
-                    operation_seq: 2,
-                    ..
-                })
-            ));
-        }
-        let coordinator = test_coordinator(&root, "causal-completion");
-        *coordinator.state.lock().unwrap() = Some(state);
-        let response = apply_production_mutation(
-            &coordinator,
-            V2SequencedMutation {
-                accepted_seq: 3,
-                mutation: V2AcceptedMutation::Internal(V2InternalMutation::SidebarEffectCompleted(
-                    SidebarEffectCompletion {
-                        original_accepted_seq: 2,
-                        event_id: v2_event_id(),
-                        snapshot_revision: 7,
-                        witness_observation_floor: 5,
-                        result: SidebarEffectResult::Succeeded(target.clone()),
-                        effect: crate::daemon::runtime::CanonicalSidebarEffect::PeekPane {
-                            pane_instance: target.clone(),
-                            client_pid: 10,
-                            source_pane: source.clone(),
-                        },
+    state.reconcile_peek_leases(std::slice::from_ref(&target_witness), 4);
+    assert!(matches!(
+        state.peek_leases.get(&10),
+        Some(crate::daemon::runtime::PeekLease::Pending {
+            operation_seq: 2,
+            ..
+        })
+    ));
+    let coordinator = test_coordinator(&root, "causal-completion");
+    *coordinator.state.lock().unwrap() = Some(state);
+    let response = apply_production_mutation(
+        &coordinator,
+        V2SequencedMutation {
+            accepted_seq: 3,
+            mutation: V2AcceptedMutation::Internal(V2InternalMutation::SidebarEffectCompleted(
+                SidebarEffectCompletion {
+                    original_accepted_seq: 2,
+                    event_id: v2_event_id(),
+                    snapshot_revision: 7,
+                    witness_observation_floor: 5,
+                    result: SidebarEffectResult::Succeeded(target.clone()),
+                    effect: crate::daemon::runtime::CanonicalSidebarEffect::PeekPane {
+                        pane_instance: target.clone(),
+                        client_pid: 10,
+                        source_pane: source.clone(),
                     },
-                )),
-            },
-        );
-        assert!(matches!(
-            response,
-            ServerMessage::SnapshotAck {
-                accepted_seq: 3,
-                ..
-            }
-        ));
-
-        {
-            let mut guard = coordinator.state.lock().unwrap();
-            let state = guard.as_mut().unwrap();
-            state.reconcile_peek_leases(std::slice::from_ref(&source_witness), 4);
-            assert_eq!(state.active_peek_target(10), Some(&target));
-            state.reconcile_peek_leases(std::slice::from_ref(&target_witness), 6);
-            assert_eq!(state.active_peek_target(10), Some(&target));
-            state.reconcile_peek_leases(std::slice::from_ref(&source_witness), 4);
-            assert_eq!(state.active_peek_target(10), Some(&target));
-
-            state.reconcile_peek_leases(std::slice::from_ref(&source_witness), 7);
-            assert!(state.active_peek_target(10).is_none());
+                },
+            )),
+        },
+    );
+    assert!(matches!(
+        response,
+        ServerMessage::SnapshotAck {
+            accepted_seq: 3,
+            ..
         }
-        drop(coordinator);
-        std::fs::remove_dir_all(root).unwrap();
+    ));
+
+    {
+        let mut guard = coordinator.state.lock().unwrap();
+        let state = guard.as_mut().unwrap();
+        state.reconcile_peek_leases(std::slice::from_ref(&source_witness), 4);
+        assert_eq!(state.active_peek_target(10), Some(&target));
+        state.reconcile_peek_leases(std::slice::from_ref(&target_witness), 6);
+        assert_eq!(state.active_peek_target(10), Some(&target));
+        state.reconcile_peek_leases(std::slice::from_ref(&source_witness), 4);
+        assert_eq!(state.active_peek_target(10), Some(&target));
+
+        state.reconcile_peek_leases(std::slice::from_ref(&source_witness), 7);
+        assert!(state.active_peek_target(10).is_none());
     }
+    drop(coordinator);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

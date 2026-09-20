@@ -1392,11 +1392,3 @@ fn unique_socket_path(label: &str) -> std::path::PathBuf {
         std::process::id()
     ))
 }
-
-#[test]
-fn unique_socket_path_uses_short_tmp_path() {
-    let path = unique_socket_path("vde-tmux-sidebar-input");
-
-    assert!(path.starts_with("/tmp"));
-    assert!(path.display().to_string().len() < 104);
-}

@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_handshake_protocol_mismatch_has_a_distinct_public_code() {
+    fn daemon_handshake_failures_keep_distinct_public_recovery_contracts() {
         let error = anyhow::Error::new(crate::daemon::protocol::v2::ProtocolVersionMismatch {
             requested: PROTOCOL_VERSION,
             received: Some(PROTOCOL_VERSION - 1),
@@ -428,10 +428,7 @@ mod tests {
         });
 
         assert_eq!(daemon_connect_error(error).code(), "protocol_mismatch");
-    }
 
-    #[test]
-    fn daemon_handshake_overload_preserves_resource_limit_recovery() {
         let error = anyhow::Error::new(crate::daemon::protocol::v2::DaemonHandshakeError {
             code: crate::daemon::protocol::v2::ErrorCode::QueueFull,
             message: "connection capacity is full".to_string(),

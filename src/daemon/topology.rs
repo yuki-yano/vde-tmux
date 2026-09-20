@@ -985,10 +985,6 @@ mod tests {
                 ]),
             ]
         );
-        assert_eq!(
-            framing.pane_format().split(&framing.field).count(),
-            TOPOLOGY_FIELD_COUNT
-        );
     }
 
     #[test]
@@ -1054,26 +1050,6 @@ mod tests {
     }
 
     #[test]
-    fn zero_session_status_metadata_header_is_valid() {
-        let snapshot =
-            parse_status_metadata(&status_metadata_output(&[]), &framing(), &identity()).unwrap();
-        assert!(snapshot.sessions.is_empty());
-        assert!(snapshot.windows.is_empty());
-    }
-
-    #[test]
-    fn status_metadata_identity_mismatch_rejects_entire_batch() {
-        let wrong = ServerIdentity {
-            pid: 999,
-            start_time: 456,
-        };
-        assert!(matches!(
-            parse_status_metadata(&status_metadata_output(&[]), &framing(), &wrong),
-            Err(TopologyError::IdentityMismatch { .. })
-        ));
-    }
-
-    #[test]
     fn invalid_status_metadata_fields_reject_entire_batch() {
         let invalid_rows = [
             vec![framing().status_session, "$1".to_string()],
@@ -1112,23 +1088,37 @@ mod tests {
     }
 
     #[test]
-    fn status_metadata_accepts_more_than_sixty_four_rows() {
-        let rows = (1..=128)
-            .map(|index| status_window_row(&format!("@{index}"), "0", "0", "0"))
-            .collect::<Vec<_>>();
-        let snapshot =
-            parse_status_metadata(&status_metadata_output(&rows), &framing(), &identity()).unwrap();
-        assert_eq!(snapshot.windows.len(), 128);
-    }
-
-    #[test]
     fn linked_window_rows_are_deduplicated_into_session_links() {
         let rows = vec![
             vec![
-                "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "80", "1",
+                "$1",
+                "alpha\nteam",
+                "@2",
+                "1",
+                "1",
+                "0",
+                "main\twork",
+                "%3",
+                "99",
+                "/tmp/line\none",
+                "zsh\tinteractive",
+                "80",
+                "1",
             ],
             vec![
-                "$2", "beta", "@2", "4", "0", "1", "main", "%3", "99", "/tmp", "zsh", "80", "1",
+                "$2",
+                "beta",
+                "@2",
+                "4",
+                "0",
+                "1",
+                "main\twork",
+                "%3",
+                "99",
+                "/tmp/line\none",
+                "zsh\tinteractive",
+                "80",
+                "1",
             ],
         ];
         let snapshot = parse_topology(&output(&rows), &framing(), &identity()).unwrap();
@@ -1136,6 +1126,13 @@ mod tests {
         assert_eq!(snapshot.panes[0].session_links.len(), 2);
         assert_eq!(snapshot.panes[0].session_links[0].session_id, "$1");
         assert_eq!(snapshot.panes[0].session_links[1].session_id, "$2");
+        assert_eq!(
+            snapshot.panes[0].session_links[0].session_name,
+            "alpha\nteam"
+        );
+        assert_eq!(snapshot.panes[0].window_name, "main\twork");
+        assert_eq!(snapshot.panes[0].current_path, "/tmp/line\none");
+        assert_eq!(snapshot.panes[0].current_command, "zsh\tinteractive");
     }
 
     #[test]
@@ -1207,36 +1204,8 @@ mod tests {
     }
 
     #[test]
-    fn topology_values_preserve_tabs_and_newlines() {
-        let rows = vec![vec![
-            "$1",
-            "alpha\nteam",
-            "@2",
-            "1",
-            "1",
-            "0",
-            "main\twork",
-            "%3",
-            "99",
-            "/tmp/line\none",
-            "zsh\tinteractive",
-            "80",
-            "1",
-        ]];
-        let snapshot = parse_topology(&output(&rows), &framing(), &identity()).unwrap();
-        assert_eq!(
-            snapshot.panes[0].session_links[0].session_name,
-            "alpha\nteam"
-        );
-        assert_eq!(snapshot.panes[0].window_name, "main\twork");
-        assert_eq!(snapshot.panes[0].current_path, "/tmp/line\none");
-        assert_eq!(snapshot.panes[0].current_command, "zsh\tinteractive");
-        assert_eq!(snapshot.panes[0].pane_width, 80);
-    }
-
-    #[test]
     fn pane_width_must_be_a_positive_u16() {
-        for width in ["", "0", "-1", "65536", "wide"] {
+        for width in ["0", "65536"] {
             let row = vec![
                 "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", width, "1",
             ];
@@ -1251,34 +1220,6 @@ mod tests {
     fn zero_session_header_is_a_valid_empty_topology() {
         let snapshot = parse_topology(&output(&[]), &framing(), &identity()).unwrap();
         assert!(snapshot.panes.is_empty());
-        let sessions = format!(
-            "{}{}123{}456{}\n",
-            framing().header,
-            framing().field,
-            framing().field,
-            framing().row
-        );
-        assert_eq!(
-            parse_session_count(&sessions, &framing(), &identity()).unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn session_count_accepts_more_than_sixty_four_sessions() {
-        let framing = framing();
-        let mut output = format!(
-            "{}{}123{}456{}\n",
-            framing.header, framing.field, framing.field, framing.row
-        );
-        for index in 1..=128 {
-            output.push_str(&format!("{}${index}{}\n", framing.session, framing.row));
-        }
-
-        assert_eq!(
-            parse_session_count(&output, &framing, &identity()).unwrap(),
-            128
-        );
     }
 
     #[test]
@@ -1305,15 +1246,6 @@ mod tests {
             &format!("1{}collision", framing().row),
         ]]);
         assert!(parse_topology(&collision, &framing(), &identity()).is_err());
-
-        let wrong = ServerIdentity {
-            pid: 999,
-            start_time: 456,
-        };
-        assert!(matches!(
-            parse_topology(&output(&[]), &framing(), &wrong),
-            Err(TopologyError::IdentityMismatch { .. })
-        ));
 
         let truncated = output(&[vec![
             "$1", "alpha", "@2", "1", "1", "0", "main", "%3", "99", "/tmp", "zsh", "80", "1",

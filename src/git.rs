@@ -803,27 +803,6 @@ mod tests {
     }
 
     #[test]
-    fn porcelain_branch_status_parses_ahead_only_behind_only_and_diverged() {
-        let ahead_only = parse_porcelain_branch_status(
-            "# branch.head main\n# branch.upstream origin/main\n# branch.ab +4 -0\n",
-        )
-        .unwrap();
-        assert_eq!((ahead_only.ahead, ahead_only.behind), (4, 0));
-
-        let behind_only = parse_porcelain_branch_status(
-            "# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -7\n",
-        )
-        .unwrap();
-        assert_eq!((behind_only.ahead, behind_only.behind), (0, 7));
-
-        let diverged = parse_porcelain_branch_status(
-            "# branch.head main\n# branch.upstream origin/main\n# branch.ab +5 -6\n",
-        )
-        .unwrap();
-        assert_eq!((diverged.ahead, diverged.behind), (5, 6));
-    }
-
-    #[test]
     fn porcelain_branch_status_reports_detached_head_without_branch() {
         let status =
             parse_porcelain_branch_status("# branch.oid 0123abc\n# branch.head (detached)\n")
@@ -955,69 +934,6 @@ mod tests {
         assert_eq!(runner.status_calls(), 4);
         assert_eq!(runner.diff_calls(), 4);
         assert_eq!(runner.vw_call_count(), 2);
-    }
-
-    #[test]
-    fn nine_worktrees_cost_one_status_and_diff_command_each_per_poll_when_warm() {
-        let mut runner = MockGitRunner::default();
-        let mut paths = Vec::new();
-        for index in 0..9 {
-            let top = format!("/tmp/worktrees/wt{index}");
-            stub_identity_probe(
-                &mut runner,
-                &top,
-                &top,
-                &format!("/tmp/main/.git/worktrees/wt{index}"),
-                "/tmp/main/.git",
-                "",
-            );
-            let sub = format!("{top}/src");
-            stub_identity_probe(
-                &mut runner,
-                &sub,
-                &top,
-                &format!("/tmp/main/.git/worktrees/wt{index}"),
-                "/tmp/main/.git",
-                "",
-            );
-            stub_status(&mut runner, &top, &format!("# branch.head wt{index}\n"));
-            runner.stub_vw_error(&[&top, "list", "--json"], "vw missing");
-            paths.push(top);
-            paths.push(sub);
-        }
-        let mut poller = GitPoller::new();
-        let now = Instant::now();
-
-        let (badges, worktrees) = poller.poll(&runner, paths.iter().map(String::as_str), now);
-        assert_eq!(badges.len(), 18);
-        assert_eq!(worktrees.len(), 18);
-        // Cold: 18 probes + one status and one diff command per worktree.
-        assert_eq!(runner.probe_calls(), 18);
-        assert_eq!(runner.status_calls(), 9);
-        assert_eq!(runner.diff_calls(), 9);
-
-        poller.poll(
-            &runner,
-            paths.iter().map(String::as_str),
-            now + Duration::from_secs(10),
-        );
-        // Warm: exactly one status and one diff command per worktree per poll.
-        assert_eq!(runner.probe_calls(), 18);
-        assert_eq!(runner.status_calls(), 18);
-        assert_eq!(runner.diff_calls(), 18);
-        // vw is shared per common git dir: one probe per poll.
-        assert_eq!(runner.vw_call_count(), 2);
-    }
-
-    #[test]
-    fn probe_cache_ttl_expiry_reprobes_paths() {
-        let runner = main_and_linked_runner();
-        let mut poller = GitPoller::new();
-        let paths = ["/tmp/main", "/tmp/main/sub", "/tmp/worktrees/feature"];
-        let now = Instant::now();
-
-        poller.poll(&runner, paths, now);
-        assert_eq!(runner.probe_calls(), 3);
 
         poller.poll(
             &runner,

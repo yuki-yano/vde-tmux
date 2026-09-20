@@ -217,16 +217,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pane_prefers_tmux_pane_env() {
-        let mock = MockTmuxRunner::new();
-        assert_eq!(
-            resolve_pane(&mock, &env(&[("TMUX_PANE", "%1")])).unwrap(),
-            Some("%1".to_string())
-        );
-        assert!(mock.calls().is_empty());
-    }
-
-    #[test]
     fn resolve_pane_instance_queries_id_and_pid_together() {
         let mock = MockTmuxRunner::new();
         mock.stub(

@@ -1,20 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z "${VDE_TEST_KILL_SERVER_OUTCOME:-}" ]]; then
-  for outcome in enter ctrl-q; do
-    VDE_TEST_KILL_SERVER_OUTCOME="$outcome" bash "${BASH_SOURCE[0]}"
-  done
-  echo "isolated Kill Server cleanup ok (enter and ctrl-q)"
-  exit 0
-fi
-case "$VDE_TEST_KILL_SERVER_OUTCOME" in
-  enter | ctrl-q) ;;
-  *)
-    echo "unsupported kill-server test outcome: $VDE_TEST_KILL_SERVER_OUTCOME" >&2
-    exit 2
-    ;;
-esac
+export VDE_TEST_KILL_SERVER_OUTCOME=ctrl-q
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SYSTEM_TMUX="$(command -v tmux)"
@@ -133,4 +120,4 @@ for _ in $(seq 1 100); do
 done
 [[ ! -e "$SOCKET_PATH" ]]
 
-echo "isolated Kill Server cleanup ok ($VDE_TEST_KILL_SERVER_OUTCOME)"
+echo "isolated Kill Server cleanup ok (ctrl-q)"

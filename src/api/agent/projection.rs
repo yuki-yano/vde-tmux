@@ -331,10 +331,7 @@ mod tests {
                 .code(),
             "agent_not_found"
         );
-    }
 
-    #[test]
-    fn absent_usage_limited_agent_is_not_exposed_as_a_current_occupant() {
         let mut pane = test_agent_pane();
         pane.agent_process = None;
         let state = &mut pane.resolved.as_mut().unwrap().canonical;

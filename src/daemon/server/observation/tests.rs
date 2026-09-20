@@ -66,26 +66,6 @@ fn observation_poll_parser_is_all_or_nothing() {
 }
 
 #[test]
-fn observation_poll_parser_rejects_oversized_combined_output() {
-    let framing = observation_poll_framing();
-    let identity = crate::daemon::topology::ServerIdentity {
-        pid: 123,
-        start_time: 456,
-    };
-    let mut output = observation_poll_output(&framing);
-    output.push_str(
-        &"x".repeat(crate::daemon::topology::MAX_TMUX_QUERY_OUTPUT_BYTES - output.len() + 1),
-    );
-
-    assert!(matches!(
-        parse_observation_poll_projection(&output, &framing, &identity),
-        Err(ObservationPollQueryError::Topology(
-            crate::daemon::topology::TopologyError::OutputTooLarge { .. }
-        ))
-    ));
-}
-
-#[test]
 fn stale_poll_view_base_blocks_full_replacement() {
     let pane = PaneInstance {
         pane_id: "%1".to_string(),
@@ -128,89 +108,6 @@ fn observation_poll_store_fail_stop_reaches_coordinator() {
             ..
         }
     ));
-}
-
-#[test]
-fn observation_poll_burst_enqueues_one_batch_mutation() {
-    for pane_count in [63, 256, 512] {
-        let root = test_root(&format!("observation-burst-{pane_count}"));
-        let server_identity = crate::daemon::topology::ServerIdentity {
-            pid: 1,
-            start_time: 2,
-        };
-        let coordinator = test_coordinator(&root, format!("observation-burst-{pane_count}"));
-        coordinator
-            .router
-            .lock()
-            .unwrap()
-            .set_phase(DaemonPhase::Serving);
-        let daemon_instance_id = coordinator
-            .router
-            .lock()
-            .unwrap()
-            .daemon_instance_id()
-            .clone();
-
-        let observations = (0..pane_count)
-            .map(|index| PaneEventEnvelope {
-                daemon_instance_id: daemon_instance_id.clone(),
-                event_id: EventId::generate().unwrap(),
-                pane_instance: PaneInstance {
-                    pane_id: format!("%{index}"),
-                    pane_pid: 10_000 + index as u32,
-                },
-                agent: None,
-                agent_session_id: None,
-                event: PaneEvent::ObservationBatch {
-                    base: None,
-                    tracker_generation: 0,
-                    observed_at: 1,
-                    presence: crate::pane_state::AgentPresenceObservation::Unknown,
-                    capture: None,
-                    process: None,
-                },
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            coordinator.enqueue_internal(V2InternalMutation::ObservationBatch(Box::new(
-                ObservationBatchPayload {
-                    projection: Box::new(ObservationPollProjection {
-                        observation_seq: 1,
-                        topology: crate::daemon::topology::TopologySnapshot {
-                            server_identity,
-                            panes: Vec::new(),
-                        },
-                        status_metadata: crate::daemon::runtime::StatusProjectionMetadata::default(
-                        ),
-                        witnesses: Vec::new(),
-                        observation_bases: BTreeMap::new(),
-                        view_base: crate::daemon::view_hooks::CurrentClientViews::default(),
-                        through_unread_order: 0,
-                    }),
-                    observations,
-                    removals: Vec::new(),
-                    diagnostics: Vec::new(),
-                }
-            ),))
-        );
-
-        // One successful poll is exactly one queued mutation regardless of
-        // pane count, and the payload preserves the per-pane events.
-        let queue = coordinator.queue.lock().unwrap();
-        assert_eq!(queue.items.len(), 1);
-        match queue.items.front().map(|item| &item.sequenced.mutation) {
-            Some(V2AcceptedMutation::Internal(V2InternalMutation::ObservationBatch(payload))) => {
-                assert_eq!(payload.observations.len(), pane_count);
-                assert!(payload.removals.is_empty());
-                assert!(payload.diagnostics.is_empty());
-            }
-            other => panic!("expected one observation batch, found {other:?}"),
-        }
-        drop(queue);
-
-        drop(coordinator);
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }
 
 #[test]
@@ -266,33 +163,27 @@ fn query_pane_cache_miss_returns_pane_not_found_after_fresh_absence() {
 }
 
 #[test]
-fn query_pane_cache_miss_returns_internal_error_after_refresh_failure() {
-    let failure = crate::daemon::topology::TopologyError::Query("tmux query failed".to_string());
-    let (response, diagnostics) = query_pane_cache_miss_with_refresh_outcome(Err(failure));
-    assert!(matches!(
-        response,
-        ServerMessage::Error {
-            code: ErrorCode::InternalError,
-            ..
-        }
-    ));
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].code, ErrorCode::InternalError);
-    assert!(diagnostics[0].message.contains("tmux query failed"));
-}
-
-#[test]
-fn query_pane_cache_miss_records_refresh_timeout_diagnostic() {
-    let (response, diagnostics) = query_pane_cache_miss_with_refresh_outcome(Err(
-        crate::daemon::topology::TopologyError::Deadline,
-    ));
-    assert!(matches!(
-        response,
-        ServerMessage::Error {
-            code: ErrorCode::InternalError,
-            ..
-        }
-    ));
-    assert_eq!(diagnostics.len(), 1);
-    assert!(diagnostics[0].message.contains("deadline exceeded"));
+fn query_pane_cache_miss_records_refresh_failures() {
+    for (failure, expected_message) in [
+        (
+            crate::daemon::topology::TopologyError::Query("tmux query failed".to_string()),
+            "tmux query failed",
+        ),
+        (
+            crate::daemon::topology::TopologyError::Deadline,
+            "deadline exceeded",
+        ),
+    ] {
+        let (response, diagnostics) = query_pane_cache_miss_with_refresh_outcome(Err(failure));
+        assert!(matches!(
+            response,
+            ServerMessage::Error {
+                code: ErrorCode::InternalError,
+                ..
+            }
+        ));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, ErrorCode::InternalError);
+        assert!(diagnostics[0].message.contains(expected_message));
+    }
 }

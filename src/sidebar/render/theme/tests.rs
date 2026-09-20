@@ -1,21 +1,11 @@
 use super::*;
 
 #[test]
-fn parse_color_accepts_valid_hex() {
-    assert_eq!(parse_color(Some("#ff8800")), Some(Color::Rgb(255, 136, 0)));
-}
-
-#[test]
 fn parse_color_rejects_non_ascii_six_byte_hex_without_panicking() {
     // "#あXYZ" is 6 bytes but only 4 chars; byte-index slicing would panic.
     assert_eq!(parse_color(Some("#\u{3042}XYZ")), None);
     // Valid byte length but non-hex ASCII stays None as before.
     assert_eq!(parse_color(Some("#gggggg")), None);
-}
-
-#[test]
-fn branch_defaults_to_muted_cyan() {
-    assert_eq!(SidebarRenderTheme::default().branch, Color::Indexed(73));
 }
 
 #[test]

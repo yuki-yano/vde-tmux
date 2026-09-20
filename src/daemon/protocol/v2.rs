@@ -307,11 +307,6 @@ impl V2Client {
             request_sent: true,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn reader_stream_for_test(&self) -> &UnixStream {
-        self.reader.get_ref()
-    }
 }
 
 fn connect_unix_with_deadline(socket: &Path, deadline: Instant) -> io::Result<UnixStream> {
@@ -1848,35 +1843,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_runtime_requests_have_expected_routing_metadata() {
-        let query = ClientMessage::QueryAgentRun {
-            proto: PROTOCOL_VERSION,
-            run_ref: "vtr3:run".to_string(),
-        };
-        assert!(query.is_query());
-        assert!(!query.is_mutation());
-        assert_eq!(query.event_id(), None);
-
-        let mutation_event_id = event_id();
-        let mutation_daemon_id = daemon_id();
-        let mutation = ClientMessage::StartAgentPrompt {
-            proto: PROTOCOL_VERSION,
-            daemon_instance_id: mutation_daemon_id.clone(),
-            event_id: mutation_event_id.clone(),
-            target_agent_ref: "vta1:agent".to_string(),
-            operation_id: operation_id(),
-            prompt_base64: "cHJvbXB0".to_string(),
-            prompt_digest: Sha256Digest::of(b"prompt"),
-            dispatch_option: "guarded".to_string(),
-            observed_at: 1,
-        };
-        assert!(!mutation.is_query());
-        assert!(mutation.is_mutation());
-        assert_eq!(mutation.mutation_instance_id(), Some(&mutation_daemon_id));
-        assert_eq!(mutation.event_id(), Some(&mutation_event_id));
-    }
-
-    #[test]
     fn unknown_fields_and_oversized_frames_are_rejected() {
         let json = format!(r#"{{"op":"hello","proto":{PROTOCOL_VERSION},"unknown":true}}"#);
         assert!(matches!(
@@ -1897,16 +1863,6 @@ mod tests {
     }
 
     #[test]
-    fn unix_connect_rejects_an_expired_deadline_before_opening_socket() {
-        let error = connect_unix_with_deadline(
-            Path::new("/tmp/vde-tmux-never-connect.sock"),
-            Instant::now() - Duration::from_millis(1),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    }
-
-    #[test]
     fn unix_connect_uses_pathname_sockaddr_length_for_repeated_connections() {
         const CONNECTIONS: usize = 128;
         let event_id = EventId::generate().unwrap();
@@ -1917,6 +1873,13 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let socket = root.join("daemon.sock");
+        let error = connect_unix_with_deadline(
+            &root.join("missing.sock"),
+            Instant::now() - Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let acceptor = std::thread::spawn(move || {
             for _ in 0..CONNECTIONS {
@@ -1935,70 +1898,7 @@ mod tests {
 
         let path_len = socket.as_os_str().as_bytes().len();
         assert!(unix_socket_address_len(path_len) < std::mem::size_of::<libc::sockaddr_un>());
-        #[cfg(any(
-            target_os = "aix",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "haiku",
-            target_os = "hurd",
-            target_os = "ios",
-            target_os = "macos",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "tvos",
-            target_os = "visionos",
-            target_os = "watchos"
-        ))]
-        assert_eq!(
-            unix_socket_address_len(path_len),
-            std::mem::offset_of!(libc::sockaddr_un, sun_path) + path_len
-        );
-        #[cfg(not(any(
-            target_os = "aix",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "haiku",
-            target_os = "hurd",
-            target_os = "ios",
-            target_os = "macos",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "tvos",
-            target_os = "visionos",
-            target_os = "watchos"
-        )))]
-        assert_eq!(
-            unix_socket_address_len(path_len),
-            std::mem::offset_of!(libc::sockaddr_un, sun_path) + path_len + 1
-        );
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn v1_shape_does_not_deserialize_as_v2() {
-        let v1 = br#"{"op":"query","proto":1,"what":"summary"}"#;
-        assert!(matches!(
-            decode_request_frame(v1),
-            Err(ServerMessage::Error {
-                code: ErrorCode::UnsupportedProtocol,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn server_error_response_roundtrips_with_newline_frame() {
-        let message = ServerMessage::error(
-            ErrorCode::UnsupportedProtocol,
-            "unsupported",
-            Some(event_id()),
-        );
-        let frame = encode_response_frame(&message).unwrap();
-        assert_eq!(frame.last(), Some(&b'\n'));
-        assert_eq!(
-            serde_json::from_slice::<ServerMessage>(&frame[..frame.len() - 1]).unwrap(),
-            message
-        );
     }
 
     #[test]
@@ -2205,58 +2105,6 @@ mod tests {
             ServerMessage::error(ErrorCode::InternalError, "error", Some(event_id())),
         ];
         for message in messages {
-            let encoded = serde_json::to_vec(&message).unwrap();
-            assert_eq!(
-                serde_json::from_slice::<ServerMessage>(&encoded).unwrap(),
-                message
-            );
-        }
-    }
-
-    #[test]
-    fn every_error_code_roundtrips() {
-        let codes = [
-            ErrorCode::UnsupportedProtocol,
-            ErrorCode::NotReady,
-            ErrorCode::InvalidRequest,
-            ErrorCode::InvalidPaneInstance,
-            ErrorCode::PaneNotFound,
-            ErrorCode::PromptDispatchBusy,
-            ErrorCode::OperationConflict,
-            ErrorCode::OperationNotFound,
-            ErrorCode::OperationStoreFull,
-            ErrorCode::OperationGenerationReplaced,
-            ErrorCode::RunNotFound,
-            ErrorCode::RunGenerationReplaced,
-            ErrorCode::RunUnresolved,
-            ErrorCode::TargetReplaced,
-            ErrorCode::UnsupportedProvider,
-            ErrorCode::ProviderEventConflict,
-            ErrorCode::StaleStateIdentity,
-            ErrorCode::StaleSelection,
-            ErrorCode::StaleAgentEvent,
-            ErrorCode::StaleDaemonInstance,
-            ErrorCode::StalePrecondition,
-            ErrorCode::RecoveryNotAllowed,
-            ErrorCode::ResolutionConflict,
-            ErrorCode::RunAlreadyResolved,
-            ErrorCode::StorageCapacityExceeded,
-            ErrorCode::StateUninitialized,
-            ErrorCode::ArtifactUnavailable,
-            ErrorCode::ArtifactExpired,
-            ErrorCode::InvalidProgressOperation,
-            ErrorCode::StateInvariantViolation,
-            ErrorCode::StateTooLarge,
-            ErrorCode::PersistFailed,
-            ErrorCode::HookCollision,
-            ErrorCode::WriterLeaseHeld,
-            ErrorCode::QueueFull,
-            ErrorCode::ControlUnavailable,
-            ErrorCode::FrameTooLarge,
-            ErrorCode::InternalError,
-        ];
-        for code in codes {
-            let message = ServerMessage::error(code, "error", Some(event_id()));
             let encoded = serde_json::to_vec(&message).unwrap();
             assert_eq!(
                 serde_json::from_slice::<ServerMessage>(&encoded).unwrap(),

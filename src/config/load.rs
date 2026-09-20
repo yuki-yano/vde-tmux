@@ -192,13 +192,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_valid_yaml_no_warnings() {
-        let loaded = parse_config("daemon:\n  poll_ms: 123\n");
-        assert!(loaded.warnings.is_empty());
-        assert_eq!(loaded.config.daemon.poll_ms, 123);
-    }
-
-    #[test]
     fn parse_broken_yaml_returns_default_with_warning() {
         let loaded = parse_config("daemon:\n  poll_ms: [not-a-number\n");
         assert_eq!(loaded.config, Config::default());
@@ -247,9 +240,30 @@ mod tests {
 
     #[test]
     fn parse_empty_is_default_silent() {
-        let loaded = parse_config("   \n");
-        assert_eq!(loaded.config, Config::default());
-        assert!(loaded.warnings.is_empty());
+        for input in ["", "   \n"] {
+            let loaded = parse_config(input);
+            let config = loaded.config;
+            assert!(loaded.warnings.is_empty());
+            assert!(config.statusline.summary.enabled);
+            assert!(!config.statusline.summary.hide_idle);
+            assert_eq!(config.statusline.summary.format, "{badge} {count}");
+            assert_eq!(config.daemon.poll_ms, 1000);
+            assert_eq!(config.daemon.git.timeout_ms, 500);
+            assert_eq!(
+                config.sidebar.width,
+                crate::config::SidebarWidth::Columns(40)
+            );
+            assert_eq!(config.sidebar.min_width, 40);
+            assert!(!config.sidebar.task_summary.enabled);
+            assert_eq!(config.sidebar.task_summary.debounce_ms, 750);
+            assert_eq!(config.sidebar.task_summary.timeout_ms, 90_000);
+            assert_eq!(config.popup.width, "50%");
+            assert_eq!(config.popup.height, "50%");
+            assert!(config.session_manager.kill.send_ctrl_c);
+            assert_eq!(config.session_manager.kill.term_wait_ms, 300);
+            assert_eq!(config.session_manager.kill.kill_wait_ms, 300);
+            assert_eq!(config.statusline.category.mode, "list");
+        }
     }
 
     #[test]
@@ -275,25 +289,6 @@ mod tests {
 
         assert!(error.contains("daemon.poll_ms"));
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn config_pattern_env_expands_configured_path_patterns() {
-        let loaded = parse_config_with_env(
-            r#"
-categories:
-  rules:
-    - category: work
-      path_patterns:
-        - github.com/${WORK_GHQ_OWNER}/*
-"#,
-            &env(&[("WORK_GHQ_OWNER", "acme")]),
-        );
-        assert!(loaded.warnings.is_empty());
-        assert_eq!(
-            loaded.config.categories.rules[0].path_patterns[0],
-            "github.com/acme/*"
-        );
     }
 
     #[test]

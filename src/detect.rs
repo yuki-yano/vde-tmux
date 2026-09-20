@@ -188,21 +188,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_claude_session_limit_from_recent_screen_tail() {
-        let text = "background agent failed\nYou've hit your session limit · resets 5:40pm\n";
-        assert!(detect_usage_limit(text));
-    }
-
-    #[test]
-    fn detects_claude_session_limit_after_tool_result_prefix() {
-        let text = "  ⎿ \u{a0}You've hit your session limit · resets 12am (Asia/Tokyo)\n";
-        assert!(detect_usage_limit(text));
-    }
-
-    #[test]
-    fn detects_codex_usage_limit_with_curly_apostrophe() {
-        let text = "■ You’ve hit your usage limit. Try again at 6:15 PM.\n";
-        assert!(detect_usage_limit(text));
+    fn detects_supported_usage_limit_variants() {
+        for text in [
+            "background agent failed\nYou've hit your session limit · resets 5:40pm\n",
+            "  ⎿ \u{a0}You've hit your session limit · resets 12am (Asia/Tokyo)\n",
+            "■ You’ve hit your usage limit. Try again at 6:15 PM.\n",
+        ] {
+            assert!(detect_usage_limit(text), "{text:?}");
+        }
     }
 
     #[test]
@@ -278,12 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_codex_permission_prompt_from_screen_tail() {
-        let text = "some output\n? Allow command to run?\n  y) yes\n  n) no\n";
-        assert_eq!(detect_codex_wait_reason(text), Some("permission_prompt"));
-    }
-
-    #[test]
     fn does_not_detect_yes_when_permission_question_is_not_adjacent() {
         let text = "Allow command to run?\nnoise\nmore noise\nunrelated summary: yes\n";
         assert_eq!(detect_codex_wait_reason(text), None);
@@ -311,42 +298,25 @@ mod tests {
     }
 
     #[test]
-    fn detects_permission_prompt_within_recent_30_lines() {
-        let mut text = String::from("? Allow command to run?\n  y) yes\n");
+    fn permission_prompt_is_detected_only_within_the_recent_30_lines() {
+        let mut within = String::from("? Allow command to run?\n  y) yes\n");
         for index in 0..28 {
-            text.push_str(&format!("new output {index}\n"));
+            within.push_str(&format!("new output {index}\n"));
         }
+        assert_eq!(detect_codex_wait_reason(&within), Some("permission_prompt"));
 
-        assert_eq!(detect_codex_wait_reason(&text), Some("permission_prompt"));
+        let mut outside = String::from(
+            "Claude needs your permission to use Bash\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n",
+        );
+        for index in 0..30 {
+            outside.push_str(&format!("new output {index}\n"));
+        }
+        assert_eq!(detect_codex_wait_reason(&outside), None);
     }
 
     #[test]
     fn does_not_detect_codex_question_prompt_after_answered_status() {
         let text = "Question 1/1 (1 unanswered)\nRun this commit plan?\nQuestions 1/1 answered\n";
         assert_eq!(detect_codex_wait_reason(text), None);
-    }
-
-    #[test]
-    fn does_not_detect_stale_question_prompt_outside_recent_tail() {
-        let mut text = String::from(
-            "Question 1/1 (1 unanswered)\nRun this commit plan?\n› 1. y (Recommended)\n  2. n\n",
-        );
-        for index in 0..30 {
-            text.push_str(&format!("new output {index}\n"));
-        }
-
-        assert_eq!(detect_codex_wait_reason(&text), None);
-    }
-
-    #[test]
-    fn does_not_detect_stale_claude_permission_prompt_outside_recent_tail() {
-        let mut text = String::from(
-            "Claude needs your permission to use Bash\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n",
-        );
-        for index in 0..30 {
-            text.push_str(&format!("new output {index}\n"));
-        }
-
-        assert_eq!(detect_codex_wait_reason(&text), None);
     }
 }

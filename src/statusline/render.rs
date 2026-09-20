@@ -786,19 +786,6 @@ fn structured_agent_badge(
     Some((value, state))
 }
 
-#[cfg(test)]
-pub(super) fn render_structured_attention(
-    config: &Config,
-    entries: &[crate::daemon::protocol::v2::AttentionEntry],
-) -> String {
-    let (full, compact) = structured_attention_variants(config, entries);
-    if tmux_display_width(&full) <= STATUS_OPTION_CELL_BUDGET {
-        full
-    } else {
-        compact
-    }
-}
-
 fn structured_attention_variants(
     config: &Config,
     entries: &[crate::daemon::protocol::v2::AttentionEntry],

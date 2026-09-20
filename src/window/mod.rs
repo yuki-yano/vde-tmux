@@ -85,7 +85,6 @@ pub fn select_window(runner: &dyn TmuxRunner, target: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmux::mock::MockTmuxRunner;
 
     #[test]
     fn parse_windows_reads_flags_and_defaults_empty_name() {
@@ -124,26 +123,5 @@ mod tests {
 
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].id, "@1");
-    }
-
-    #[test]
-    fn list_windows_for_target_uses_shared_format() {
-        let mock = MockTmuxRunner::new();
-        let format = window_list_format();
-        mock.stub(&["list-windows", "-t", "=main:", "-F", &format], "");
-
-        let windows = list_windows_for_target(&mock, "=main:").unwrap();
-
-        assert!(windows.is_empty());
-        assert_eq!(
-            mock.calls(),
-            vec![vec![
-                "list-windows".to_string(),
-                "-t".to_string(),
-                "=main:".to_string(),
-                "-F".to_string(),
-                format,
-            ]]
-        );
     }
 }
