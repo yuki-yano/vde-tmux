@@ -415,6 +415,8 @@ pub(crate) fn stop_daemon(
     crate::daemon::lifecycle::update_lifecycle_record(env, &incarnation.hash, |record| {
         record.begin_transition(record.desired_mode)
     })?;
+    let expected_process =
+        crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash)?.process;
     match request_shutdown(&incarnation, &socket_path) {
         Ok(false) if force => {
             let record = crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash)?;
@@ -450,7 +452,13 @@ pub(crate) fn stop_daemon(
             )))
         }
         Ok(true) => {
-            if wait_for_daemon_stop(env, &incarnation, &socket_path, Duration::from_secs(2)) {
+            if wait_for_daemon_stop(
+                env,
+                &incarnation,
+                &socket_path,
+                expected_process.as_ref(),
+                Duration::from_secs(2),
+            ) {
                 clear_process_identity(env, &incarnation.hash);
                 return Ok(Some(format!("daemon stopped: {}", socket_path.display())));
             }
@@ -764,6 +772,8 @@ pub(crate) fn reload_daemon(
     crate::daemon::lifecycle::update_lifecycle_record(env, &incarnation.hash, |record| {
         record.begin_transition(crate::daemon::lifecycle::DesiredMode::Enabled)
     })?;
+    let expected_process =
+        crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash)?.process;
     let shutdown = match request_shutdown(&incarnation, &socket_path) {
         Ok(shutdown) => shutdown,
         Err(error) => {
@@ -772,7 +782,14 @@ pub(crate) fn reload_daemon(
         }
     };
     match shutdown {
-        true if !wait_for_daemon_stop(env, &incarnation, &socket_path, Duration::from_secs(2)) => {
+        true if !wait_for_daemon_stop(
+            env,
+            &incarnation,
+            &socket_path,
+            expected_process.as_ref(),
+            Duration::from_secs(2),
+        ) =>
+        {
             let error = anyhow::anyhow!(
                 "daemon did not stop before reload deadline; run `vt daemon stop --force`"
             );
@@ -846,6 +863,7 @@ fn wait_for_daemon_stop(
     env: &BTreeMap<String, String>,
     incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
     socket_path: &Path,
+    expected_process: Option<&crate::daemon::lifecycle::DaemonProcessIdentity>,
     timeout: Duration,
 ) -> bool {
     let deadline = Instant::now() + timeout;
@@ -853,8 +871,9 @@ fn wait_for_daemon_stop(
         let process = crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash)
             .ok()
             .and_then(|record| record.process);
-        let process_alive = recorded_process_is_alive(process.as_ref());
-        if !process_alive && let Some(process) = process.as_ref() {
+        let process_alive = recorded_process_is_alive(process.as_ref())
+            || recorded_process_is_alive(expected_process);
+        if !process_alive && let Some(process) = process.as_ref().or(expected_process) {
             let _ = crate::daemon::lifecycle::remove_force_stopped_socket(socket_path, process);
         }
         let socket_exists = std::fs::symlink_metadata(socket_path).is_ok();
@@ -877,9 +896,17 @@ fn shutdown_daemon_for_disabled_transition(
     incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
     socket_path: &Path,
 ) -> Result<()> {
+    let expected_process =
+        crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash)?.process;
     let shutdown = request_shutdown(incarnation, socket_path);
     if matches!(shutdown, Ok(true))
-        && wait_for_daemon_stop(env, incarnation, socket_path, Duration::from_secs(2))
+        && wait_for_daemon_stop(
+            env,
+            incarnation,
+            socket_path,
+            expected_process.as_ref(),
+            Duration::from_secs(2),
+        )
     {
         return clear_process_identity_checked(env, &incarnation.hash);
     }
@@ -1038,6 +1065,50 @@ mod lifecycle_command_tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::net::UnixListener;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn wait_for_stop_tracks_the_captured_process_after_record_clear() {
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/vt-wait-stop-{}-{}",
+            std::process::id(),
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        let env = BTreeMap::from([(
+            "XDG_STATE_HOME".to_string(),
+            root.join("state").display().to_string(),
+        )]);
+        let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation {
+            socket_path: root.join("tmux.sock"),
+            identity: crate::daemon::topology::ServerIdentity {
+                pid: 10,
+                start_time: 20,
+            },
+            hash: "server".to_string(),
+        };
+        let expected = crate::daemon::lifecycle::DaemonProcessIdentity {
+            pid: std::process::id(),
+            start_token: crate::daemon::lifecycle::process_start_token(std::process::id()).unwrap(),
+            daemon_instance_id: "00112233445566778899aabbccddeeff".to_string(),
+            socket_device: 0,
+            socket_inode: 0,
+        };
+        let socket = root.join("daemon.sock");
+
+        assert!(!super::wait_for_daemon_stop(
+            &env,
+            &incarnation,
+            &socket,
+            Some(&expected),
+            std::time::Duration::from_millis(30),
+        ));
+        assert!(super::wait_for_daemon_stop(
+            &env,
+            &incarnation,
+            &socket,
+            None,
+            std::time::Duration::from_millis(30),
+        ));
+    }
 
     #[test]
     fn reload_shutdown_probe_rejects_an_incompatible_daemon() {
