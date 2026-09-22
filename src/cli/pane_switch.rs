@@ -234,22 +234,24 @@ fn choose_target<'a>(
     let absolute_y = source
         .top
         .saturating_add(source.cursor_y.min(source.height - 1));
-    let mut best: Option<(&Pane, u32)> = None;
-    let mut edge: Option<(&Pane, u32)> = None;
+    let mut best: Option<(&Pane, (u32, u32, u32))> = None;
+    let mut edge: Option<(&Pane, u32, u32, u32)> = None;
 
     for pane in panes {
         if pane.pane_id == source.pane_id || pane.sidebar || pane.floating {
             continue;
         }
-        let aligned = match direction {
+        let (cross_distance, cross_start) = match direction {
             PaneSwitchDirection::Left | PaneSwitchDirection::Right => {
-                (pane.top..pane.top.saturating_add(pane.height)).contains(&absolute_y)
+                (axis_distance(absolute_y, pane.top, pane.height), pane.top)
             }
             PaneSwitchDirection::Up | PaneSwitchDirection::Down => {
-                (pane.left..pane.left.saturating_add(pane.width)).contains(&absolute_x)
+                (axis_distance(absolute_x, pane.left, pane.width), pane.left)
             }
         };
-        if !aligned {
+        // tmux pane geometry excludes the one-cell border between adjacent panes. Treat that
+        // border as adjacent to both panes so a cursor on it cannot see through to a farther pane.
+        if cross_distance > 1 {
             continue;
         }
 
@@ -259,12 +261,20 @@ fn choose_target<'a>(
             PaneSwitchDirection::Up => pane.top.saturating_add(pane.height),
             PaneSwitchDirection::Down => pane.top,
         };
-        let replace_edge = edge.is_none_or(|(_, position)| match direction {
-            PaneSwitchDirection::Left | PaneSwitchDirection::Up => edge_position > position,
-            PaneSwitchDirection::Right | PaneSwitchDirection::Down => edge_position < position,
-        });
+        let replace_edge =
+            edge.is_none_or(|(_, position, best_cross_distance, best_cross_start)| {
+                let nearer_edge = match direction {
+                    PaneSwitchDirection::Left | PaneSwitchDirection::Up => edge_position > position,
+                    PaneSwitchDirection::Right | PaneSwitchDirection::Down => {
+                        edge_position < position
+                    }
+                };
+                nearer_edge
+                    || (edge_position == position
+                        && (cross_distance, cross_start) < (best_cross_distance, best_cross_start))
+            });
         if replace_edge {
-            edge = Some((pane, edge_position));
+            edge = Some((pane, edge_position, cross_distance, cross_start));
         }
 
         let distance = match direction {
@@ -282,15 +292,29 @@ fn choose_target<'a>(
                 .checked_sub(source.top.saturating_add(source.height)),
             _ => None,
         };
-        if let Some(distance) = distance
-            && best.is_none_or(|(_, best_distance)| distance < best_distance)
-        {
-            best = Some((pane, distance));
+        if let Some(distance) = distance {
+            let score = (distance, cross_distance, cross_start);
+            if best.is_none_or(|(_, best_score)| score < best_score) {
+                best = Some((pane, score));
+            }
         }
     }
 
     best.map(|(pane, _)| (pane, false))
-        .or_else(|| edge.map(|(pane, _)| (pane, true)))
+        .or_else(|| edge.map(|(pane, _, _, _)| (pane, true)))
+}
+
+fn axis_distance(position: u32, start: u32, size: u32) -> u32 {
+    if position < start {
+        start - position
+    } else {
+        let end = start.saturating_add(size);
+        if position < end {
+            0
+        } else {
+            position.saturating_sub(end.saturating_sub(1))
+        }
+    }
 }
 
 fn switch_action(
@@ -404,6 +428,47 @@ mod tests {
         assert_eq!(
             choose_target(&panes, &source, PaneSwitchDirection::Left),
             Some((&edge, true))
+        );
+    }
+
+    #[test]
+    fn snaps_border_coordinates_to_the_upper_or_left_adjacent_pane() {
+        let mut horizontal_source = pane("%1", 0, 0, 20, 20);
+        horizontal_source.cursor_y = 10;
+        let upper = pane("%2", 21, 0, 20, 10);
+        let lower = pane("%3", 21, 11, 20, 9);
+        let horizontal_farther = pane("%4", 42, 0, 20, 20);
+        let horizontal_panes = vec![
+            horizontal_source.clone(),
+            lower,
+            horizontal_farther,
+            upper.clone(),
+        ];
+
+        assert_eq!(
+            choose_target(
+                &horizontal_panes,
+                &horizontal_source,
+                PaneSwitchDirection::Right
+            ),
+            Some((&upper, false))
+        );
+
+        let mut vertical_source = pane("%1", 0, 0, 20, 10);
+        vertical_source.cursor_x = 10;
+        let left = pane("%2", 0, 11, 10, 10);
+        let right = pane("%3", 11, 11, 9, 10);
+        let vertical_farther = pane("%4", 0, 22, 20, 10);
+        let vertical_panes = vec![
+            vertical_source.clone(),
+            right,
+            vertical_farther,
+            left.clone(),
+        ];
+
+        assert_eq!(
+            choose_target(&vertical_panes, &vertical_source, PaneSwitchDirection::Down),
+            Some((&left, false))
         );
     }
 
