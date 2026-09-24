@@ -1285,7 +1285,7 @@ fn question_completion_waiting_for_state_leaves_guard_under_deadline_reaper() {
     use crate::question_notice::{
         ingress::TranscriptLocator,
         journal::JournalLocation,
-        profile::{CodexProfile, ProfileRequest},
+        profile::{CodexProfile, ExecutableFingerprint, ProfileRequest},
         resolver::{Binding, Fence, OrderCheck},
     };
     use std::sync::{Arc, mpsc};
@@ -1306,7 +1306,21 @@ fn question_completion_waiting_for_state_leaves_guard_under_deadline_reaper() {
             pane_id: "%1".into(),
             pane_pid: process.pid,
         },
-        executable: ProfileRequest::capture(process.clone()).unwrap(),
+        // This test holds canonical state until the journal guard expires; no
+        // owner/profile validation is reached. Avoid binding to the freshly
+        // linked test binary, whose ctime can exceed Linux's start-time bound.
+        executable: ProfileRequest {
+            process: process.clone(),
+            executable: ExecutableFingerprint {
+                dev: 1,
+                ino: 1,
+                size: 1,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+                ctime_sec: 0,
+                ctime_nsec: 0,
+            },
+        },
         process,
         profile: CodexProfile::V01561,
         locator: TranscriptLocator::capture(&root, &transcript).unwrap(),
@@ -1327,6 +1341,12 @@ fn question_completion_waiting_for_state_leaves_guard_under_deadline_reaper() {
         root.join("journal").display().to_string(),
     )]);
     let location = JournalLocation::new(&env, fence.home.clone()).unwrap();
+    // Initialize the journal before measuring the short transfer deadline.
+    drop(
+        location
+            .lock_hook(Instant::now() + Duration::from_secs(1))
+            .unwrap(),
+    );
     for order in [true, false] {
         let transfer = SharedJournalGuard::new(
             location

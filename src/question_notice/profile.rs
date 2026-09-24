@@ -587,7 +587,24 @@ fn read_version_pipe(mut reader: impl std::io::Read) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::io::Read;
+
+    /// Wait for userspace readiness before inspecting a synthetic process.
+    /// Spawn completion alone is not a procfs argv/executable readiness barrier.
+    pub(crate) fn ready_process() -> std::process::Child {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf R; read -r line"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0];
+        child.stdout.take().unwrap().read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [b'R']);
+        child
+    }
+
     fn embedded_arguments(args: &[String]) -> bool {
         super::argument_mode(args) == super::ArgumentMode::Embedded
     }
@@ -626,10 +643,7 @@ mod tests {
 
     #[test]
     fn request_binds_exact_process_and_never_serializes_path() {
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child = ready_process();
         let pid = child.id();
         let process = AgentProcessIdentity {
             pid,
@@ -673,7 +687,7 @@ int main(int argc, char **argv) {{
         if (mode == 3) {{ for (int i=0; i<5000; i++) putchar('x'); return 0; }}
         puts("codex-cli 0.156.1"); return 0;
     }}
-    sleep(30); return 0;
+    putchar('R'); fflush(stdout); sleep(30); return 0;
 }}
 "#,
                 serde_json::to_string(&mode.to_string_lossy()).unwrap()
@@ -695,7 +709,18 @@ int main(int argc, char **argv) {{
         // the production ctime guard fail-closed.
         #[cfg(target_os = "linux")]
         std::thread::sleep(Duration::from_millis(1100));
-        let mut child = std::process::Command::new(&binary).spawn().unwrap();
+        let spawn = |args: &[&str]| {
+            let mut child = std::process::Command::new(&binary)
+                .args(args)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut ready = [0];
+            child.stdout.take().unwrap().read_exact(&mut ready).unwrap();
+            assert_eq!(ready, [b'R']);
+            child
+        };
+        let mut child = spawn(&[]);
         let process = AgentProcessIdentity {
             pid: child.id(),
             start_token: crate::daemon::lifecycle::agent_process_start_token(child.id()).unwrap(),
@@ -713,10 +738,7 @@ int main(int argc, char **argv) {{
                 expected
             );
         }
-        let mut remote = std::process::Command::new(&binary)
-            .arg("app-server")
-            .spawn()
-            .unwrap();
+        let mut remote = spawn(&["app-server"]);
         let process = AgentProcessIdentity {
             pid: remote.id(),
             start_token: crate::daemon::lifecycle::agent_process_start_token(remote.id()).unwrap(),
@@ -724,10 +746,7 @@ int main(int argc, char **argv) {{
         assert!(positively_non_embedded(&process));
         let _ = remote.kill();
         let _ = remote.wait();
-        let mut unknown = std::process::Command::new(&binary)
-            .arg("--future-mode")
-            .spawn()
-            .unwrap();
+        let mut unknown = spawn(&["--future-mode"]);
         let request_unknown = ProfileRequest::capture(AgentProcessIdentity {
             pid: unknown.id(),
             start_token: crate::daemon::lifecycle::agent_process_start_token(unknown.id()).unwrap(),
@@ -810,10 +829,7 @@ int main(int argc, char **argv) {{
     fn transient_lookup_failure_does_not_poison_new_session_using_same_binary() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child = ready_process();
         let request = ProfileRequest::capture(AgentProcessIdentity {
             pid: child.id(),
             start_token: crate::daemon::lifecycle::agent_process_start_token(child.id()).unwrap(),
@@ -823,7 +839,7 @@ int main(int argc, char **argv) {{
         assert_eq!(
             process_arguments(child.id()).as_deref().map(argument_mode),
             Some(ArgumentMode::Embedded),
-            "sleep fixture argv: {:?}",
+            "synthetic fixture argv: {:?}",
             process_arguments(child.id())
         );
         let cache = Arc::new(ProfileCache::default());
@@ -867,10 +883,7 @@ int main(int argc, char **argv) {{
             atomic::{AtomicUsize, Ordering},
         };
         use std::time::{Duration, Instant};
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child = ready_process();
         let request = ProfileRequest::capture(AgentProcessIdentity {
             pid: child.id(),
             start_token: crate::daemon::lifecycle::agent_process_start_token(child.id()).unwrap(),
@@ -880,7 +893,7 @@ int main(int argc, char **argv) {{
         assert_eq!(
             process_arguments(child.id()).as_deref().map(argument_mode),
             Some(ArgumentMode::Embedded),
-            "sleep fixture argv: {:?}",
+            "synthetic fixture argv: {:?}",
             process_arguments(child.id())
         );
         let cache = Arc::new(ProfileCache::default());

@@ -661,10 +661,7 @@ mod tests {
             std::fs::create_dir_all(root.join("sessions")).unwrap();
             let path = root.join("sessions/transcript.jsonl");
             std::fs::write(&path, b"").unwrap();
-            let child = std::process::Command::new("/bin/sleep")
-                .arg("30")
-                .spawn()
-                .unwrap();
+            let child = crate::question_notice::profile::tests::ready_process();
             let process = AgentProcessIdentity {
                 pid: child.id(),
                 start_token: crate::daemon::lifecycle::agent_process_start_token(child.id())
