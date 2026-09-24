@@ -341,8 +341,8 @@ impl CanonicalCoordinatorState {
 
     pub fn display_projection(
         &self,
+        resolved: ResolvedSnapshot,
     ) -> (StatusSnapshot, Vec<StatusSnapshot>, Vec<PanePresentation>) {
-        let resolved = self.resolved_snapshot();
         let global = build_status_snapshot(
             &resolved,
             StatusContext::Global,

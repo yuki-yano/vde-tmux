@@ -1,6 +1,6 @@
 # Agent JSON API
 
-This document defines the current API v5 contract (daemon protocol 24, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
+This document defines the current API v5 contract (daemon protocol 25, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
 maintained in [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is
 recorded in [AGENT_API_V3.md](AGENT_API_V3.md).
 
@@ -531,8 +531,12 @@ Use one snapshot for all three arguments. The exact owner is the server incarnat
 and Codex PID/start token; agent epoch/session changes do not invalidate it. The daemon rechecks
 process ownership. Future orders, replaced owners, and unverified owners are rejected. Repeating
 the same acknowledgement is harmless. Newer notices stay visible. Acknowledgement does not send
-input, read an unread occurrence, or change lifecycle/Run completion. Answer/skip/focus/turn completion
-never acknowledges a notice automatically. Only Embedded mode is supported; shared LocalDaemon and
+input, read an unread occurrence, or change lifecycle/Run completion. Answer/skip/focus/turn completion alone never acknowledges a notice. A later accepted ordinary
+input in a different turn of the same trusted session can acknowledge a contiguous notice prefix,
+after structural completion/start ordering, exact identity, the home loss journal, Idle/Done, and
+two known normal-composer captures all pass. Direct and accepted queued inputs share this policy;
+queue registration and answer-summary framing never resolve notices. Capture only vetoes.
+Notices present before a daemon restart remain Q-only. Only Embedded mode is supported; shared LocalDaemon and
 Remote app-server hooks cannot be bound to a pane by ancestry.
 
 Notifications and their deduplication keys persist in private `question-notices-v1.json` under the
@@ -541,7 +545,11 @@ are 4096 keys/owner, 65536 total keys, 512 owners, and a 16 MiB sidecar. Confirm
 reclaimed; acknowledged keys are retained until then. Invalid/version-mismatched sidecars are not
 reset or overwritten automatically. Disk failure retains new notices in memory with
 `persistence_pending`, with at most one retry per five seconds; a crash before retry can lose them.
-Acknowledgement is shown only after saving succeeds. API 5 / protocol 24 must be installed together;
+Acknowledgement commits at atomic rename. A pre-rename failure retains the notice; a subsequent
+directory-fsync failure is a logical acknowledgement with `question_ack_directory_fsync_failed`,
+without rollback or automatic rewrite. The private `.expected` marker distinguishes initial absence
+from loss of a previously committed sidecar. Resolver state, transcript cursors, and ingress dedup
+remain memory-only; the shared private home journal stores only digests and writer identities. API 5 / protocol 25 must be installed together;
 there is no old-protocol fallback.
 
 ## Query cost
@@ -597,5 +605,5 @@ includes more work than the daemon-ingress bound; it excludes Codex's pre-hook d
 
 ### 運用反映条件
 
-- [ ] CLI/daemon/sidebar are deployed together with API 5 / protocol 24 while retaining existing Pane State schema 10.
+- [ ] CLI/daemon/sidebar are deployed together with API 5 / protocol 25 while retaining existing Pane State schema 10.
 - [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.

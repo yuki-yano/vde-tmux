@@ -79,6 +79,21 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
         .record(&pane)
         .unwrap()
         .clone();
+    // A memoized Armed evaluation must be invalidated by either a durable Run
+    // revision (including error/evidence updates) or a lifecycle-only transition.
+    let evaluation = crate::question_notice::resolver::evaluation_fence(&before);
+    let mut changed_run = before.clone();
+    changed_run.current_run.as_mut().unwrap().run_revision += 1;
+    assert_ne!(
+        evaluation,
+        crate::question_notice::resolver::evaluation_fence(&changed_run)
+    );
+    let mut changed_lifecycle = before.clone();
+    changed_lifecycle.lifecycle = crate::pane_state::LifecycleState::Running;
+    assert_ne!(
+        evaluation,
+        crate::question_notice::resolver::evaluation_fence(&changed_lifecycle)
+    );
     let input = |tool: &str| QuestionNoticeInput::Issued {
         session_id: "session-one".into(),
         turn_id: "question-turn".into(),
@@ -99,7 +114,7 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
             response,
             ServerMessage::ProviderEventResult {
                 question_notice: crate::question_notice::NoticeResult {
-                    disposition: NoticeDisposition::Persisted,
+                    disposition: NoticeDisposition::Applied,
                     ..
                 },
                 ..
@@ -150,7 +165,7 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
             lifecycle,
             ..
         } => {
-            assert_eq!(question_notice.disposition, NoticeDisposition::Persisted);
+            assert_eq!(question_notice.disposition, NoticeDisposition::Applied);
             assert!(matches!(
                 *lifecycle,
                 ServerMessage::Error {
@@ -213,7 +228,7 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
     );
     assert!(
         matches!(response, ServerMessage::ProviderEventResult {
-        question_notice: crate::question_notice::NoticeResult { disposition: NoticeDisposition::Persisted, .. },
+        question_notice: crate::question_notice::NoticeResult { disposition: NoticeDisposition::Applied, .. },
         ref lifecycle, ..
     } if matches!(**lifecycle, ServerMessage::PaneEventResult { .. })),
         "{response:?}"
@@ -231,7 +246,7 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
     );
     assert!(
         matches!(response, ServerMessage::ProviderEventResult {
-        question_notice: crate::question_notice::NoticeResult { disposition: NoticeDisposition::Persisted, .. },
+        question_notice: crate::question_notice::NoticeResult { disposition: NoticeDisposition::Applied, .. },
         ref lifecycle, ..
     } if matches!(**lifecycle, ServerMessage::Error { code: ErrorCode::NotReady, .. })),
         "{response:?}"
@@ -281,7 +296,7 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
         );
         assert!(
             matches!(response, ServerMessage::ProviderEventResult {
-            question_notice: crate::question_notice::NoticeResult { disposition: NoticeDisposition::Rejected, reason: Some(actual) }, ..
+            question_notice: crate::question_notice::NoticeResult { disposition: NoticeDisposition::Rejected, reason: Some(actual), .. }, ..
         } if actual == reason),
             "{response:?}"
         );
@@ -983,4 +998,386 @@ fn provider_projection_keeps_ui_previews_but_redacts_guarded_prompts() {
         report,
         PaneEvent::ExplicitStateReported { report } if report.prompt.is_none()
     ));
+}
+
+#[test]
+fn question_journal_root_mismatch_recovers_all_same_home_sessions_but_startup_failure_is_local() {
+    use crate::daemon::workers::question::ProbeCompletion;
+    use crate::question_notice::{
+        ingress::{InputClass, ResolverInput, SessionSource, TranscriptLocator},
+        journal::{JournalFailure, JournalLocation},
+        profile::{CodexProfile, ExecutableFingerprint, ProfileRequest},
+        resolver::{Binding, JournalView, Trust, session_key},
+    };
+    let root = test_root("question-journal-routing");
+    let env = BTreeMap::from([("XDG_STATE_HOME".into(), root.display().to_string())]);
+    let coordinator = ProductionV2Coordinator::new(
+        test_incarnation(&root, "question-journal-routing"),
+        env.clone(),
+        None,
+    )
+    .unwrap();
+    install_test_state(&coordinator, &root, Default::default());
+    let pane = PaneInstance {
+        pane_id: "%91".into(),
+        pane_pid: 91,
+    };
+    let process = crate::pane_state::AgentProcessIdentity {
+        pid: 92,
+        start_token: "synthetic".into(),
+    };
+    let locator = TranscriptLocator {
+        home: root.clone(),
+        transcript: root.join("sessions/test.jsonl"),
+        dev: 1,
+        ino: 1,
+    };
+    let home = locator.home_digest();
+    let binding = Binding {
+        owner: "synthetic-owner".into(),
+        pane: pane.clone(),
+        process: process.clone(),
+        executable: ProfileRequest {
+            process,
+            executable: ExecutableFingerprint {
+                dev: 1,
+                ino: 1,
+                size: 1,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+                ctime_sec: 0,
+                ctime_nsec: 0,
+            },
+        },
+        profile: CodexProfile::V01561,
+        locator,
+    };
+    {
+        let mut state = coordinator.state.lock().unwrap();
+        let r = &mut state.as_mut().unwrap().question_notices.resolver;
+        for (home, session) in [
+            (home.clone(), "a"),
+            (home.clone(), "b"),
+            (session_key("other-home"), "c"),
+        ] {
+            r.session_start(
+                home,
+                session_key(session),
+                SessionSource::Startup,
+                Some(binding.clone()),
+                JournalView {
+                    epoch: 0,
+                    veto: false,
+                    session_dirty: false,
+                },
+                true,
+            );
+        }
+    }
+    let location = JournalLocation::new(&env, home.clone()).unwrap();
+    let mut input = ResolverInput {
+        daemon_generation: None,
+        startup_header_verified: false,
+        startup_journal: None,
+        parent_origin_verified: false,
+        ancestors: vec![],
+        profile: CodexProfile::Unknown,
+        process: None,
+        input_class: InputClass::OrdinaryPrompt,
+        source: SessionSource::Startup,
+        home_digest: Some(home.clone()),
+        journal_root_digest: Some(location.root_digest().unwrap()),
+        locator: None,
+        journal_failure: Some(JournalFailure::Contended),
+        journal_failure_reported: false,
+    };
+    let daemon = coordinator
+        .router
+        .lock()
+        .unwrap()
+        .daemon_instance_id()
+        .clone();
+    let observation =
+        |session: &str, input: ResolverInput, kind| super::super::question::ResolverObservation {
+            pane: pane.clone(),
+            daemon: daemon.clone(),
+            session: session_key(session),
+            turn: None,
+            ingress: None,
+            kind,
+            metadata: Some(input),
+        };
+    let runner = crate::tmux::mock::MockTmuxRunner::new();
+    super::super::question::observe(
+        &coordinator,
+        observation(
+            "new",
+            input.clone(),
+            crate::hook::provider::ProviderHookKind::SessionStart,
+        ),
+        None,
+        true,
+        &runner,
+    );
+    {
+        let mut state = coordinator.state.lock().unwrap();
+        let r = &mut state.as_mut().unwrap().question_notices.resolver;
+        assert_eq!(r.trust(&home, &session_key("new")), Trust::HistoryUnknown);
+        assert_eq!(r.diagnostics()["journal_failures"]["contended"], 1);
+        assert_eq!(r.trust(&home, &session_key("a")), Trust::Trusted);
+        assert!(r.recovery_due(std::time::Instant::now()).is_empty());
+    }
+    input.journal_failure = None;
+    input.journal_root_digest = None;
+    super::super::question::observe(
+        &coordinator,
+        observation(
+            "missing-root",
+            input.clone(),
+            crate::hook::provider::ProviderHookKind::SessionStart,
+        ),
+        None,
+        true,
+        &runner,
+    );
+    {
+        let state = coordinator.state.lock().unwrap();
+        let r = &state.as_ref().unwrap().question_notices.resolver;
+        assert_eq!(r.trust(&home, &session_key("a")), Trust::Trusted);
+        assert_eq!(r.session_epoch(&home, &session_key("a")), Some(0));
+        assert_eq!(r.diagnostics()["home_failures"], 0);
+    }
+    input.journal_root_digest = Some(location.root_digest().unwrap());
+    let private_root = root.join("vde-tmux/codex-question-journal-v1");
+    std::fs::rename(&private_root, root.join("journal-backup")).unwrap();
+    std::fs::write(&private_root, b"synthetic IO failure").unwrap();
+    for kind in [
+        crate::hook::provider::ProviderHookKind::SessionStart,
+        crate::hook::provider::ProviderHookKind::UserPromptSubmit,
+        crate::hook::provider::ProviderHookKind::Stop,
+    ] {
+        super::super::question::observe(
+            &coordinator,
+            observation("unavailable-root", input.clone(), kind),
+            None,
+            true,
+            &runner,
+        );
+    }
+    {
+        let state = coordinator.state.lock().unwrap();
+        let r = &state.as_ref().unwrap().question_notices.resolver;
+        assert_eq!(r.trust(&home, &session_key("a")), Trust::Trusted);
+        assert_eq!(r.session_epoch(&home, &session_key("a")), Some(0));
+        assert_eq!(r.diagnostics()["home_failures"], 0);
+    }
+    // A successfully delivered failure RPC already applied the invalidation.
+    // Re-observation must not create a second home-wide recovery ticket.
+    input.journal_failure = Some(JournalFailure::Contended);
+    input.journal_failure_reported = true;
+    super::super::question::observe(
+        &coordinator,
+        observation(
+            "already-reported",
+            input.clone(),
+            crate::hook::provider::ProviderHookKind::Activity,
+        ),
+        None,
+        true,
+        &runner,
+    );
+    assert_eq!(
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .question_notices
+            .resolver
+            .diagnostics()["home_failures"],
+        0
+    );
+    assert_eq!(
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .question_notices
+            .resolver
+            .diagnostics()["journal_failures"]["contended"],
+        1
+    );
+    input.journal_failure = None;
+    input.journal_failure_reported = false;
+    std::fs::remove_file(&private_root).unwrap();
+    std::fs::rename(root.join("journal-backup"), &private_root).unwrap();
+    input.journal_root_digest = Some(session_key("different-state-root"));
+    super::super::question::observe(
+        &coordinator,
+        observation(
+            "a",
+            input.clone(),
+            crate::hook::provider::ProviderHookKind::Activity,
+        ),
+        None,
+        true,
+        &runner,
+    );
+    let ticket = {
+        let mut state = coordinator.state.lock().unwrap();
+        let r = &mut state.as_mut().unwrap().question_notices.resolver;
+        assert_eq!(r.trust(&home, &session_key("a")), Trust::HistoryUnknown);
+        assert_eq!(r.trust(&home, &session_key("b")), Trust::Trusted);
+        assert_eq!(r.diagnostics()["home_failures"], 1);
+        r.recovery_due(std::time::Instant::now())[0].1
+    };
+    let mut guard = location
+        .lock_hook(std::time::Instant::now() + std::time::Duration::from_secs(2))
+        .unwrap();
+    guard.bump().unwrap();
+    let epoch = guard.epoch();
+    drop(guard);
+    // Durable recovery remains effective after arbitrary queue delay, without holding flock.
+    super::super::question::probe_completed(
+        &coordinator,
+        ProbeCompletion::RecoverHome {
+            home: home.clone(),
+            ticket,
+            epoch: Some(epoch),
+        },
+    );
+    {
+        let state = coordinator.state.lock().unwrap();
+        let r = &state.as_ref().unwrap().question_notices.resolver;
+        assert_eq!(r.trust(&home, &session_key("b")), Trust::HistoryUnknown);
+        assert_eq!(
+            r.trust(&session_key("other-home"), &session_key("c")),
+            Trust::Trusted
+        );
+        assert_eq!(r.diagnostics()["home_failures"], 0);
+    }
+    // Missing verified session in the PostToolUse failure RPC must veto the home.
+    super::super::question::journal_failed(&coordinator, &pane, None, &input);
+    assert_eq!(
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .question_notices
+            .resolver
+            .diagnostics()["home_failures"],
+        1
+    );
+    drop(coordinator);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn question_completion_waiting_for_state_leaves_guard_under_deadline_reaper() {
+    use crate::daemon::workers::question::{
+        OrderCompletion, OrderOutcome, ProbeCompletion, SharedJournalGuard,
+    };
+    use crate::question_notice::{
+        ingress::TranscriptLocator,
+        journal::JournalLocation,
+        profile::{CodexProfile, ProfileRequest},
+        resolver::{Binding, Fence, OrderCheck},
+    };
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+    let root = test_root("question-completion-state-wait");
+    std::fs::create_dir_all(root.join("sessions")).unwrap();
+    let transcript = root.join("sessions/turns.jsonl");
+    std::fs::write(&transcript, b"").unwrap();
+    let coordinator = Arc::new(test_coordinator(&root, "question-completion-state-wait"));
+    let process = crate::pane_state::AgentProcessIdentity {
+        pid: std::process::id(),
+        start_token: crate::daemon::lifecycle::agent_process_start_token(std::process::id())
+            .unwrap(),
+    };
+    let binding = Binding {
+        owner: "synthetic".into(),
+        pane: PaneInstance {
+            pane_id: "%1".into(),
+            pane_pid: process.pid,
+        },
+        executable: ProfileRequest::capture(process.clone()).unwrap(),
+        process,
+        profile: CodexProfile::V01561,
+        locator: TranscriptLocator::capture(&root, &transcript).unwrap(),
+    };
+    let fence = Fence {
+        generation: 1,
+        ingress: "synthetic".into(),
+        home: binding.locator.home_digest(),
+        session: crate::question_notice::resolver::session_key("s"),
+        turn: crate::question_notice::resolver::session_key("b"),
+        epoch: 0,
+        acknowledged: 0,
+        latest: 1,
+        binding,
+    };
+    let env = BTreeMap::from([(
+        "XDG_STATE_HOME".into(),
+        root.join("journal").display().to_string(),
+    )]);
+    let location = JournalLocation::new(&env, fence.home.clone()).unwrap();
+    for order in [true, false] {
+        let transfer = SharedJournalGuard::new(
+            location
+                .lock(Instant::now() + Duration::from_millis(80))
+                .unwrap(),
+        );
+        let state = coordinator.state.lock().unwrap();
+        let current = coordinator.clone();
+        let owned_fence = fence.clone();
+        let (started, ready) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            if order {
+                super::super::question::order_completed(
+                    &current,
+                    OrderCompletion {
+                        check: OrderCheck {
+                            fence: owned_fence,
+                            issued_turns: Default::default(),
+                        },
+                        outcome: OrderOutcome::Checked,
+                        reason: None,
+                        proven: Default::default(),
+                        journal: None,
+                        guard: Some(transfer),
+                    },
+                );
+            } else {
+                super::super::question::probe_completed(
+                    &current,
+                    ProbeCompletion::Commit {
+                        fence: owned_fence,
+                        through: 1,
+                        failure: None,
+                        guard: Some(transfer),
+                    },
+                );
+            }
+        });
+        ready.recv().unwrap();
+        // Keep canonical state unavailable beyond the transfer deadline. The hook
+        // must acquire the home lock before that state mutex is made available.
+        let hook = location.lock_hook(Instant::now() + Duration::from_secs(1));
+        drop(state);
+        worker.join().unwrap();
+        assert!(
+            hook.is_ok(),
+            "completion removed guard from reaper while waiting for state"
+        );
+        drop(hook);
+    }
+    drop(coordinator);
+    std::fs::remove_dir_all(root).unwrap();
 }

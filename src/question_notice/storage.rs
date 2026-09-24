@@ -9,6 +9,61 @@ use super::{MAX_KEYS, MAX_KEYS_PER_OWNER, MAX_OWNERS, QuestionNoticeState, Quest
 
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitResult {
+    PreCommitFailed,
+    Committed,
+    CommittedDurabilityUnknown,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FaultPoint {
+    BeforeRename,
+    AfterRename,
+    DirectorySync,
+}
+
+fn marker_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_file_name("question-notices-v1.expected")
+}
+
+fn marker_expected(path: &std::path::Path) -> Result<bool> {
+    let path = marker_path(path);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    crate::pane_state::snapshot::validate_private_file(&path, &file.metadata()?)?;
+    let mut bytes = Vec::new();
+    file.take(3).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes == b"1\n",
+        "invalid question notice expectation marker"
+    );
+    Ok(true)
+}
+
+fn create_marker(path: &std::path::Path) -> Result<()> {
+    if marker_expected(path)? {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(marker_path(path))?;
+    file.write_all(b"1\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshot {
@@ -22,6 +77,7 @@ impl QuestionNotices {
         let Some(path) = &self.path else {
             return Ok(BTreeMap::new());
         };
+        let expected = marker_expected(path)?;
         let file = match std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -29,6 +85,7 @@ impl QuestionNotices {
         {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ensure!(!expected, "expected question notice sidecar is missing");
                 return Ok(BTreeMap::new());
             }
             Err(error) => return Err(error.into()),
@@ -86,7 +143,20 @@ impl QuestionNotices {
         Ok(owners)
     }
 
-    pub(super) fn save(&self) -> Result<()> {
+    pub(super) fn save(&self, deadline: Option<std::time::Instant>) -> CommitResult {
+        let _lock = self
+            .save_lock
+            .lock()
+            .expect("question sidecar save lock poisoned");
+        let mut renamed = false;
+        match self.save_inner(&mut renamed, deadline) {
+            Ok(()) => CommitResult::Committed,
+            Err(_) if renamed => CommitResult::CommittedDurabilityUnknown,
+            Err(_) => CommitResult::PreCommitFailed,
+        }
+    }
+
+    fn save_inner(&self, renamed: &mut bool, deadline: Option<std::time::Instant>) -> Result<()> {
         ensure!(
             !self.invalid_sidecar,
             "question sidecar needs explicit repair"
@@ -123,7 +193,28 @@ impl QuestionNotices {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             file.write_all(&bytes)?;
             file.sync_all()?;
+            #[cfg(test)]
+            ensure!(
+                self.storage_fault != Some(FaultPoint::BeforeRename),
+                "injected precommit failure"
+            );
+            ensure!(
+                deadline.is_none_or(|at| std::time::Instant::now() < at),
+                "question commit guard expired"
+            );
             std::fs::rename(&temp, path)?;
+            *renamed = true;
+            #[cfg(test)]
+            ensure!(
+                self.storage_fault != Some(FaultPoint::AfterRename),
+                "injected postcommit failure"
+            );
+            create_marker(path)?;
+            #[cfg(test)]
+            ensure!(
+                self.storage_fault != Some(FaultPoint::DirectorySync),
+                "injected directory sync failure"
+            );
             std::fs::File::open(parent)?.sync_all()?;
             Ok(())
         })();

@@ -7,7 +7,7 @@ use crate::tmux::TmuxRunner;
 
 #[derive(Debug, Subcommand)]
 pub(super) enum PaneCommand {
-    /// Manage unacknowledged question-issued notifications (does not answer Codex).
+    /// Manage question-issued notices; Q is available when conservative auto-ack retains them.
     QuestionNotice {
         #[command(subcommand)]
         command: QuestionNoticeCommand,

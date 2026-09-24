@@ -4,17 +4,22 @@ Publishing is driven by Git tags.
 
 ## Local API v5 upgrade
 
-API 5 / daemon protocol 24 adds persistent, explicitly acknowledged Codex question notices.
+API 5 / daemon protocol 25 adds conservative automatic acknowledgement of Codex question notices.
 `needs_action` now includes current Blocked panes and unacknowledged question notices; the
 statusline's existing Blocked triage remains separate. PaneState schema 10 and private state
-format 1 are unchanged. Keep existing state and Runs; the question-notice sidecar is added
-independently. A local install does not require a crate version bump or a release tag.
+format 1 are unchanged. Keep existing state, Runs, and the question-notice sidecar (schema 1).
+Resolver trust is runtime-only: notices from before the restart remain Q-only, and existing
+sessions are not made trusted by a later prompt. A local install does not require a crate
+version bump or a release tag.
 
 1. Pass formatting, Clippy, tests, extended runtime smoke, UI/UX preflight, and the isolated
    kill-server test. Reuse successful results for unchanged code. Run
    `python3 scripts/test-question-notice-isolated.py --extended` for the question hook/API/Q path.
+   Its performance gate is the observed condition-wise p95 increase of at most 50ms, zero normal
+   capture failures, at most 20MiB RSS growth, and retained notices on probe drop. Reuse accepted
+   evidence for unchanged product code; distinguish saved-data re-evaluation from a new run.
 2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
-   Confirm `vt api schema --json` reports API 5, protocol 24, PaneState 10, and private state 1.
+   Confirm `vt api schema --json` reports API 5, protocol 25, PaneState 10, and private state 1.
    Validate the staged binaries on a scratch server before replacing the installed generation.
 3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.
    Record sidebar windows, widths, active panes, client focus, installed paths, and executable hashes.
@@ -23,7 +28,8 @@ independently. A local install does not require a crate version bump or a releas
    server's state directory outside daemon-managed storage.
 5. Replace both executables from the staged root, verify hashes and schema, then run
    `vt daemon enable`. Require `Serving / Healthy / Ready`, no transition error, and healthy
-   Agent storage. Restore the recorded sidebar widths and focus using the new client.
+   Agent storage. Restore the recorded sidebar widths and focus using the new client; set
+   `TMUX_PANE` to each window's recorded content pane when reopening its sidebar.
 6. Verify each sidebar is alive and uses the installed executable, the private-state generation
    and retained Runs are preserved, and live Codex panes expose healthy `question_notice` summaries.
    Existing stock PostToolUse hooks must include `request_user_input_async`; Embedded mode is

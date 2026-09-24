@@ -1966,7 +1966,8 @@ mod tests {
                 .and_then(|event| event.prompt_digest.as_ref()),
             Some(&prompt_digest)
         );
-        let (global, sessions, panes) = state.display_projection();
+        let (global, sessions, panes) =
+            state.display_projection(state.checked_resolved_snapshot().unwrap());
         assert_eq!(panes.len(), 3);
         assert_eq!(
             sessions

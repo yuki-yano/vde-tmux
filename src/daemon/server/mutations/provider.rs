@@ -17,6 +17,50 @@ use super::pane::{
 #[cfg(test)]
 mod tests;
 
+/// A single provider mutation already needs the exact process for notice and
+/// lifecycle validation. Share only that fresh scan within the same mutation;
+/// native identity is rechecked on every use and no result crosses requests.
+struct ResolvedProviderProcess {
+    root_pid: u32,
+    kind: String,
+    sampled: std::time::Instant,
+    process: Option<crate::pane_state::AgentProcessIdentity>,
+}
+struct ProviderProcessRunner<'a> {
+    runner: &'a dyn crate::tmux::TmuxRunner,
+    process: std::cell::RefCell<Option<ResolvedProviderProcess>>,
+}
+impl crate::tmux::TmuxRunner for ProviderProcessRunner<'_> {
+    fn run(&self, args: &[&str]) -> Result<String> {
+        self.runner.run(args)
+    }
+    fn resolve_agent_process(
+        &self,
+        root_pid: u32,
+        agent: &crate::pane_state::AgentKind,
+    ) -> Result<Option<crate::pane_state::AgentProcessIdentity>> {
+        if let Some(cached) = self.process.borrow().as_ref()
+            && cached.root_pid == root_pid
+            && cached.kind == agent.as_str()
+            && cached.sampled.elapsed() < Duration::from_millis(100)
+            && cached.process.as_ref().is_some_and(|process| {
+                crate::daemon::lifecycle::agent_process_start_token(process.pid)
+                    .is_ok_and(|token| token == process.start_token)
+            })
+        {
+            return Ok(cached.process.clone());
+        }
+        let process = self.runner.resolve_agent_process(root_pid, agent)?;
+        *self.process.borrow_mut() = Some(ResolvedProviderProcess {
+            root_pid,
+            kind: agent.as_str().to_owned(),
+            sampled: std::time::Instant::now(),
+            process: process.clone(),
+        });
+        Ok(process)
+    }
+}
+
 pub(in crate::daemon::server) fn apply_external_pane_event(
     coordinator: &ProductionV2Coordinator,
     accepted_seq: u64,
@@ -51,6 +95,13 @@ pub(in crate::daemon::server) fn apply_external_provider_notice_with_runner(
     question_notice: Option<crate::question_notice::QuestionNoticeInput>,
     runner: &dyn crate::tmux::TmuxRunner,
 ) -> ServerMessage {
+    let shared_runner = ProviderProcessRunner {
+        runner,
+        process: Default::default(),
+    };
+    let runner = &shared_runner;
+    let resolver_observation =
+        super::question::ResolverObservation::from_provider(&envelope, &observation);
     let notice = question_notice
         .filter(|_| {
             envelope.agent.as_ref() == Some(&observation.provider)
@@ -64,6 +115,17 @@ pub(in crate::daemon::server) fn apply_external_provider_notice_with_runner(
         accepted_seq,
         envelope,
         observation,
+        runner,
+    );
+    let accepted = matches!(
+        &lifecycle,
+        ServerMessage::PaneEventResult { .. } | ServerMessage::SnapshotAck { .. }
+    );
+    super::question::observe(
+        coordinator,
+        resolver_observation,
+        notice.as_ref(),
+        accepted,
         runner,
     );
     match notice {

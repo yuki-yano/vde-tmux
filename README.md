@@ -168,7 +168,7 @@ Permission requests, plans, subagents, and worktree activity will then appear in
 
 ### Codex question notices
 
-With stock Codex CLI 0.155.1, the existing `PostToolUse` hook can observe successful
+With stock Codex CLI 0.155.1 and 0.156.1, the existing `PostToolUse` hook can observe successful
 `request_user_input_async` calls. Include that tool in the hook matcher above (or use an
 unfiltered PostToolUse hook). No Codex extension, fork, or separate API is required.
 
@@ -178,25 +178,49 @@ during that operation stays visible. Acknowledgement is shared across sidebars, 
 focus, agent input, run status, and unread Done untouched. Parent `? N` counts panes, not questions.
 `!` / parent `! N` reports degraded notice tracking; expand the agent for the reason.
 
-Answering or skipping in Codex, focusing the pane, and completing a turn do not clear the
-notice. This feature cannot determine whether a question is still unanswered. Notices survive
-a vde-tmux daemon restart; they close when their exact Codex process or pane is confirmed gone.
-Questions issued before installation, without the hook, or during failed delivery are not recovered.
-A failed sidecar write keeps the notice in memory with a diagnostic and retries every five seconds;
-a daemon crash before recovery can lose unsaved notices. A failed acknowledgement leaves the notice.
+Answering or skipping alone does not guarantee automatic acknowledgement. After the issuing turn
+completes normally, an ordinary input accepted in a different turn of the same trusted session can
+acknowledge the notice when that turn becomes Idle/Done and two viewport checks recognize a normal
+composer. Accepted queued inputs follow the same rule; queue registration alone and answer-summary
+framing do not resolve notices. Markdown block quotes and partial answer tags also retain notices.
+Capture can only veto acknowledgement. This policy does not prove
+that any particular question was answered or read, or that input came from direct TUI interaction.
+Inputs from other routes such as realtime may be indistinguishable in stock hooks.
 
-Only **Embedded mode** is supported. With a shared LocalDaemon or Remote app-server, the hook
-process is not descended from the pane's CLI, so it is rejected as `ancestor_not_in_pane` rather
-than attached to an arbitrary pane. Codex can automatically reuse a local daemon; in 0.155.1,
+Use `Q` for immediate acknowledgement or when any guard is uncertain. Notices present before a daemon
+restart remain Q-only; later prompts cannot clear them. Resume, fork, `/clear`, backtrack/rollback,
+an aborted/error issuing turn, unknown versions/layouts, resized or clipped views, failed captures,
+busy queues, and lost structural history retain notices. A trigger turn may run longer than 30 seconds;
+its candidate expires after 24 hours. More than 32 MiB of unread history can exceed the per-input
+reader budget: use Q or a later distinct ordinary input. Stop does not pre-read that history.
+Notices also close when their exact Codex process or pane is confirmed gone.
+
+Questions issued before installation or without the hook are not recovered. A hook that never starts,
+or whose journal write and daemon request both fail, is unobservable. A failed sidecar write keeps a
+new notice in memory with a diagnostic and retries every five seconds; a crash can lose unsaved notices.
+An acknowledgement failure before atomic rename retains the notice. Directory fsync failure after
+rename is a logical acknowledgement with a diagnostic, without rollback or automatic rewrite.
+
+Only **Embedded mode** is supported. Positively identified LocalDaemon/Remote app-server hooks,
+subagent hooks, hooks outside tmux, and hooks in disabled tmux servers are excluded before journal writes.
+An unverified hook in scope cannot acknowledge notices; an issue without exact ancestry is rejected
+as `ancestor_not_in_pane`. A positively identified unsupported-mode question retains that rejection diagnostic.
+Codex can automatically reuse a local daemon; in 0.155.1,
 `codex --strict-config` without a remote server option prevents that implicit reuse, provided your
-configuration passes strict validation. vde-tmux does not change your Codex startup settings.
+configuration passes strict validation. In 0.156.1, `--no-daemon` is the explicit Embedded-mode option.
+vde-tmux does not change your Codex startup settings.
 Subagent questions are excluded. This feature adds no statusline attention entry or OS notification.
 
 Acceptance on 2026-09-20 used the unmodified CLI 0.155.1 in Embedded mode on an isolated tmux
 server. Actual question issuance, continued work/turn completion, answer and skip without automatic
 clearing, and `Q` acknowledgement across two sidebars passed. The fixture regression is separate:
 `python3 scripts/test-question-notice-isolated.py --extended` checks 58 agent panes, two clients,
-and 100 issue/ack cycles against a two-second API/frame delivery bound.
+and 100 issue/ack cycles against a two-second API/frame delivery bound. It also compares normal
+hook-to-API/status-rail delivery under probe/reader load with an identical baseline and records
+capture failures, probe drops, and daemon RSS. Scratch acceptance on 2026-09-23 with unmodified
+0.155.1 and 0.156.1 verified direct ordinary input, actual Tab-queued ordinary input registered
+before question issuance, queued answer-summary retention, answer-immediate retention, and
+post-restart Q-only acknowledgement. Realtime input was not exercised.
 
 ### 5. Verify
 

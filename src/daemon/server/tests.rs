@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn status_publication_diagnostic_does_not_wait_for_cache_or_record_zero() {
+    let coordinator = Arc::new(detached_test_coordinator("f".repeat(64)));
+    let held = coordinator.snapshot_cache.lock().unwrap();
+    let current = coordinator.clone();
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        current.note_status_publication_age(1, Instant::now());
+        sender.send(()).unwrap();
+    });
+    let completed_while_held = receiver.recv_timeout(Duration::from_secs(1));
+    drop(held);
+    worker.join().unwrap();
+    assert!(completed_while_held.is_ok());
+    let timing = coordinator.status_push_timing.lock().unwrap();
+    assert_eq!(timing.publication_age_unavailable, 1);
+    assert!(!timing.timings.contains_key("publication_to_snapshot"));
+}
+
+#[test]
 fn production_fail_stop_marks_router_and_releases_waiters() {
     let coordinator = detached_test_coordinator("a".repeat(64));
     let (sender, receiver) = mpsc::channel();
@@ -522,6 +541,7 @@ fn terminal_subscription_frame_is_written_once_then_stream_closes() {
     let message = ServerMessage::error(ErrorCode::FrameTooLarge, "too large", None);
     let frame = crate::daemon::protocol::v2::encode_response_frame(&message).unwrap();
     *coordinator.snapshot_cache.lock().unwrap() = Some(PublishedResolvedSnapshot {
+        published_at: Instant::now(),
         revision: 2,
         frame: Arc::new(frame),
         message: Arc::new(message),

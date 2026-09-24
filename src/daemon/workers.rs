@@ -5,6 +5,7 @@ use crate::git::SystemGitRunner;
 mod capture;
 mod observation;
 mod process;
+pub mod question;
 mod sidebar_tmux;
 
 pub use capture::{

@@ -81,6 +81,8 @@ pub struct ProviderObservation {
     pub prompt_digest: Option<String>,
     pub response: Option<ResponseCandidate>,
     pub observed_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_resolver: Option<crate::question_notice::ingress::ResolverInput>,
 }
 
 impl ProviderObservation {
@@ -95,6 +97,13 @@ impl ProviderObservation {
     }
 
     pub fn validate(&self) -> Result<(), ModelError> {
+        if self
+            .question_resolver
+            .as_ref()
+            .is_some_and(|input| self.provider.as_str() != "codex" || !input.validate())
+        {
+            return Err(ModelError("invalid question resolver metadata".to_string()));
+        }
         if self.observed_at < 0 {
             return Err(ModelError(
                 "provider observation timestamp must not be negative".to_string(),
@@ -254,6 +263,7 @@ pub fn observation_from_json(
         prompt_digest,
         response,
         observed_at,
+        question_resolver: None,
     };
     observation.validate()?;
     Ok(Some(observation))

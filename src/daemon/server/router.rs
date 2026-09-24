@@ -29,6 +29,9 @@ pub(super) enum V2AcceptedMutation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum V2InternalMutation {
+    QuestionOrderCompleted(crate::daemon::workers::question::OrderCompletion),
+    QuestionTick,
+    QuestionProbeCompleted(crate::daemon::workers::question::ProbeCompletion),
     PaneEvent(Box<PaneEventEnvelope>),
     ObservationBatch(Box<ObservationBatchPayload>),
     RefreshTopology,
@@ -388,6 +391,58 @@ pub(super) fn validate_v2_origin(
 ) -> std::result::Result<(), ServerMessage> {
     use crate::daemon::protocol::v2::{ClientMessage, ErrorCode, ServerMessage};
     match message {
+        ClientMessage::ReportQuestionJournalFailure {
+            event_id,
+            pane_instance,
+            session_digest,
+            metadata,
+            ..
+        } => {
+            if !metadata.validate()
+                || metadata.journal_failure.is_none()
+                || pane_instance.validate().is_err()
+                || session_digest.as_ref().is_some_and(|value| {
+                    value.len() != 64
+                        || !value
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+            {
+                return Err(ServerMessage::error(
+                    ErrorCode::InvalidRequest,
+                    "invalid journal failure report",
+                    Some(event_id.clone()),
+                ));
+            }
+            Ok(())
+        }
+        ClientMessage::SubmitQuestionSession {
+            event_id,
+            pane_instance,
+            session_digest,
+            metadata,
+            ..
+        } => {
+            use crate::question_notice::ingress::SessionSource;
+            if !metadata.validate()
+                || pane_instance.validate().is_err()
+                || session_digest.len() != 64
+                || !session_digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || matches!(
+                    metadata.source,
+                    SessionSource::Startup | SessionSource::Resume | SessionSource::Clear
+                )
+            {
+                return Err(ServerMessage::error(
+                    ErrorCode::InvalidRequest,
+                    "invalid resolver-only session observation",
+                    Some(event_id.clone()),
+                ));
+            }
+            Ok(())
+        }
         ClientMessage::SubmitPaneEvent { envelope, .. } if !envelope.event.is_external() => {
             Err(ServerMessage::error(
                 ErrorCode::InvalidRequest,

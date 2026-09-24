@@ -45,7 +45,7 @@ fn fenced_ack_preserves_new_arrivals_and_deduplicates_after_ack() {
     let mut store = QuestionNotices::default();
     assert_eq!(
         issue(&mut store, "one").disposition,
-        NoticeDisposition::Persisted
+        NoticeDisposition::Applied
     );
     let displayed = summary(&store);
     issue(&mut store, "two");
@@ -114,8 +114,8 @@ fn write_failure_displays_notice_retries_dirty_state_and_never_retries_failed_ac
     std::fs::remove_file(temp.path()).unwrap();
     std::fs::create_dir(temp.path()).unwrap();
     assert_eq!(
-        issue(&mut store, "two").disposition,
-        NoticeDisposition::MemoryOnly
+        issue(&mut store, "two").durability,
+        Some(NoticeDurability::MemoryOnly)
     );
     assert_eq!(
         summary(&store).reason,
@@ -137,6 +137,99 @@ fn write_failure_displays_notice_retries_dirty_state_and_never_retries_failed_ac
     assert!(summary(&reopened).unacknowledged);
     assert_eq!(summary(&reopened).latest_order, 3);
     assert_eq!(summary(&reopened).acknowledged_order, 0);
+}
+
+#[test]
+fn duplicate_reports_memory_only_until_a_successful_save_promotes_it() {
+    let temp = Temp::new();
+    let mut store = QuestionNotices::open(temp.path(), "server".into());
+    std::fs::create_dir(temp.path()).unwrap();
+    let first = issue(&mut store, "one");
+    assert_eq!(first.disposition, NoticeDisposition::Applied);
+    assert_eq!(first.durability, Some(NoticeDurability::MemoryOnly));
+    let retry = issue(&mut store, "one");
+    assert_eq!(retry.disposition, NoticeDisposition::Duplicate);
+    assert_eq!(retry.durability, Some(NoticeDurability::MemoryOnly));
+    std::fs::remove_dir(temp.path()).unwrap();
+    let retry = issue(&mut store, "one");
+    assert_eq!(retry.disposition, NoticeDisposition::Duplicate);
+    assert_eq!(retry.durability, Some(NoticeDurability::Persisted));
+    assert_eq!(summary(&store).latest_order, 1);
+    assert_eq!(
+        issue(
+            &mut QuestionNotices::open(temp.path(), "server".into()),
+            "one"
+        )
+        .durability,
+        Some(NoticeDurability::Persisted)
+    );
+}
+
+#[test]
+fn ack_commit_faults_distinguish_rollback_from_logical_commit_and_restart() {
+    for fault in [
+        storage::FaultPoint::BeforeRename,
+        storage::FaultPoint::AfterRename,
+        storage::FaultPoint::DirectorySync,
+    ] {
+        let temp = Temp::new();
+        let mut store = QuestionNotices::open(temp.path(), "server".into());
+        issue(&mut store, "one");
+        let owner = summary(&store).owner_ref.unwrap();
+        let old = std::fs::read(temp.path()).unwrap();
+        store.storage_fault = Some(fault);
+        let result = store.acknowledge(&pane(), &owner, 1);
+        if fault == storage::FaultPoint::BeforeRename {
+            assert_eq!(result, Err("persistence_pending"));
+            assert_eq!(summary(&store).acknowledged_order, 0);
+            assert_eq!(std::fs::read(temp.path()).unwrap(), old);
+        } else {
+            assert_eq!(result, Ok(true));
+            assert_eq!(summary(&store).acknowledged_order, 1);
+            assert_eq!(
+                summary(&store).reason,
+                Some(NoticeReason::QuestionAckDirectoryFsyncFailed)
+            );
+            assert!(!store.dirty);
+            let committed = std::fs::read(temp.path()).unwrap();
+            store.storage_fault = None;
+            assert!(!store.reconcile(|_, _| true));
+            assert_eq!(std::fs::read(temp.path()).unwrap(), committed);
+        }
+        let reopened = QuestionNotices::open(temp.path(), "server".into());
+        assert_eq!(
+            summary(&reopened).acknowledged_order,
+            if fault == storage::FaultPoint::BeforeRename {
+                0
+            } else {
+                1
+            }
+        );
+        // A filesystem recovering the older valid sidecar produces a retained notification.
+        std::fs::write(temp.path(), old).unwrap();
+        let reopened = QuestionNotices::open(temp.path(), "server".into());
+        assert!(summary(&reopened).unacknowledged);
+        assert_eq!(summary(&reopened).acknowledged_order, 0);
+    }
+}
+
+#[test]
+fn sidecar_expectation_distinguishes_initial_absence_from_loss_without_schema_changes() {
+    let temp = Temp::new();
+    let mut store = QuestionNotices::open(temp.path(), "server".into());
+    assert!(!store.invalid_sidecar);
+    issue(&mut store, "one");
+    assert_eq!(
+        std::fs::read(temp.0.join("question-notices-v1.expected")).unwrap(),
+        b"1\n"
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(temp.path()).unwrap()).unwrap();
+    assert_eq!(snapshot["schema_version"], 1);
+    assert!(snapshot["owners"][0]["seen"].is_array());
+    assert!(!snapshot.to_string().contains("resolver"));
+    std::fs::remove_file(temp.path()).unwrap();
+    assert!(QuestionNotices::open(temp.path(), "server".into()).invalid_sidecar);
 }
 
 #[test]
@@ -184,7 +277,7 @@ fn capacity_keeps_seen_keys_after_ack_and_recovers_only_when_owners_are_removed(
     store.reconcile(|_, _| false);
     assert_eq!(
         issue(&mut store, "overflow").disposition,
-        NoticeDisposition::Persisted
+        NoticeDisposition::Applied
     );
     assert!(!summary(&store).degraded());
     assert!(serde_json::to_vec(&summary(&store)).unwrap().len() < 1024);
@@ -205,7 +298,7 @@ fn total_key_and_owner_limits_reject_without_eviction_and_survive_reload() {
             ("session", "turn", &index.to_string()),
             42,
         );
-        assert_eq!(result.disposition, NoticeDisposition::Persisted);
+        assert_eq!(result.disposition, NoticeDisposition::Applied);
     }
     let next = owner_pane(MAX_KEYS / MAX_KEYS_PER_OWNER);
     assert_eq!(
@@ -237,7 +330,7 @@ fn total_key_and_owner_limits_reject_without_eviction_and_survive_reload() {
         reopened
             .issue(next, process(), ("session", "turn", "next"), 43)
             .disposition,
-        NoticeDisposition::Persisted
+        NoticeDisposition::Applied
     );
 
     let mut store = QuestionNotices::default();
@@ -246,7 +339,7 @@ fn total_key_and_owner_limits_reject_without_eviction_and_survive_reload() {
             store
                 .issue(owner_pane(index), process(), ("session", "turn", "one"), 42)
                 .disposition,
-            NoticeDisposition::Persisted
+            NoticeDisposition::Applied
         );
     }
     assert_eq!(

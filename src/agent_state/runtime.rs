@@ -1328,6 +1328,7 @@ mod tests {
             response: response
                 .map(|body| ResponseCandidate::from_body(body, ProviderCompleteness::Complete)),
             observed_at,
+            question_resolver: None,
         }
     }
 

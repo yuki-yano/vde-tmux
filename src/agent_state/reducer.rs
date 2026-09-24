@@ -355,6 +355,7 @@ mod tests {
                 .then(|| Sha256Digest::of(payload.as_bytes()).as_str().to_string()),
             response: None,
             observed_at,
+            question_resolver: None,
         }
     }
 

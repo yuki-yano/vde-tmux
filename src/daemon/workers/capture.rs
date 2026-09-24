@@ -26,6 +26,13 @@ pub trait ObservationWorkerIo: Send + Sync + 'static {
         &self,
         args: &[String],
     ) -> std::result::Result<CaptureBatchOutput, CaptureBatchError>;
+
+    fn capture_question_batch(
+        &self,
+        args: &[String],
+    ) -> std::result::Result<CaptureBatchOutput, CaptureBatchError> {
+        self.capture_batch(args)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +62,32 @@ impl ObservationWorkerIo for SystemObservationWorkerIo {
         &self,
         args: &[String],
     ) -> std::result::Result<CaptureBatchOutput, CaptureBatchError> {
+        self.capture_with_limits(
+            args,
+            OBSERVATION_CAPTURE_STDOUT_MAX_BYTES,
+            OBSERVATION_CAPTURE_STDERR_MAX_BYTES,
+        )
+    }
+
+    fn capture_question_batch(
+        &self,
+        args: &[String],
+    ) -> std::result::Result<CaptureBatchOutput, CaptureBatchError> {
+        self.capture_with_limits(
+            args,
+            crate::question_notice::capture::STDOUT_LIMIT,
+            crate::question_notice::capture::STDERR_LIMIT,
+        )
+    }
+}
+
+impl SystemObservationWorkerIo {
+    fn capture_with_limits(
+        &self,
+        args: &[String],
+        stdout_limit: usize,
+        stderr_limit: usize,
+    ) -> std::result::Result<CaptureBatchOutput, CaptureBatchError> {
         let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
         let tmux_args = tmux_args(self.socket_name.as_deref(), &refs);
         let mut child = std::process::Command::new("tmux")
@@ -67,24 +100,22 @@ impl ObservationWorkerIo for SystemObservationWorkerIo {
             .process_group(0)
             .spawn()
             .map_err(|error| CaptureBatchError::Io(error.to_string()))?;
-        let stdout = child.stdout.take().map(|stdout| {
-            thread::spawn(move || {
-                read_capture_pipe_bounded(stdout, OBSERVATION_CAPTURE_STDOUT_MAX_BYTES)
-            })
-        });
-        let stderr = child.stderr.take().map(|stderr| {
-            thread::spawn(move || {
-                read_capture_pipe_bounded(stderr, OBSERVATION_CAPTURE_STDERR_MAX_BYTES)
-            })
-        });
+        let stdout = child
+            .stdout
+            .take()
+            .map(|stdout| thread::spawn(move || read_capture_pipe_bounded(stdout, stdout_limit)));
+        let stderr = child
+            .stderr
+            .take()
+            .map(|stderr| thread::spawn(move || read_capture_pipe_bounded(stderr, stderr_limit)));
         // On every path, kill the whole process group before reaping the child
         // so a descendant holding the capture pipes dies and the readers reach
         // EOF; the reads are then always joined, never detached.
         let status = crate::proc::await_exit_then_kill_group(&mut child, self.timeout);
         // Join both readers before propagating any error so no thread is left
         // detached on the error path.
-        let stdout = collect_capture_reader("stdout", stdout);
-        let stderr = collect_capture_reader("stderr", stderr);
+        let stdout = collect_capture_reader("stdout", stdout, stdout_limit);
+        let stderr = collect_capture_reader("stderr", stderr, stderr_limit);
         let status = status
             .map_err(|error| CaptureBatchError::Io(error.to_string()))?
             .ok_or_else(|| {
@@ -138,6 +169,7 @@ fn read_capture_pipe_bounded(
 fn collect_capture_reader(
     label: &str,
     reader: Option<thread::JoinHandle<std::io::Result<CaptureReaderOutput>>>,
+    limit: usize,
 ) -> std::result::Result<CaptureReaderOutput, CaptureBatchError> {
     let output = reader
         .ok_or_else(|| CaptureBatchError::Io(format!("capture {label} was not piped")))?
@@ -148,11 +180,7 @@ fn collect_capture_reader(
         return Err(CaptureBatchError::OutputLimit {
             scope: format!("capture {label}"),
             actual: output.total_bytes,
-            limit: if label == "stdout" {
-                OBSERVATION_CAPTURE_STDOUT_MAX_BYTES
-            } else {
-                OBSERVATION_CAPTURE_STDERR_MAX_BYTES
-            },
+            limit,
         });
     }
     Ok(output)
@@ -441,17 +469,132 @@ enum CaptureRequest {
     },
 }
 
+struct ProbeRegistration {
+    panes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<PaneInstance>>>,
+    pane: PaneInstance,
+}
+impl Drop for ProbeRegistration {
+    fn drop(&mut self) {
+        self.panes
+            .lock()
+            .expect("probe pane lock poisoned")
+            .remove(&self.pane);
+    }
+}
+
+struct AsyncQuestionProbe {
+    registration: ProbeRegistration,
+    profile: crate::question_notice::profile::CodexProfile,
+    deadline: Instant,
+    reply: mpsc::SyncSender<crate::question_notice::capture::CaptureClass>,
+}
+
 #[derive(Clone)]
 pub struct CaptureCoordinatorHandle {
+    metrics: std::sync::Arc<std::sync::Mutex<CaptureMetrics>>,
     tx: mpsc::SyncSender<CaptureRequest>,
+    normal_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    probe_tx: Option<mpsc::SyncSender<AsyncQuestionProbe>>,
+    probe_panes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<PaneInstance>>>,
+}
+
+#[derive(Default, serde::Serialize)]
+struct CaptureMetrics {
+    normal_sequence: u64,
+    normal_failures: u64,
+    // Bounded numeric evidence only: sequence and request-to-reply microseconds.
+    normal_samples: std::collections::VecDeque<(u64, u64)>,
+    probe_classes: [u64; 3],
+    probe_dropped: u64,
 }
 
 impl CaptureCoordinatorHandle {
+    pub fn diagnostics(&self) -> serde_json::Value {
+        serde_json::to_value(&*self.metrics.lock().expect("capture metrics lock poisoned"))
+            .expect("finite counters")
+    }
+    pub fn normal_busy(&self) -> bool {
+        self.normal_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    }
+
+    pub fn capture_question(
+        &self,
+        pane: PaneInstance,
+        profile: crate::question_notice::profile::CodexProfile,
+        deadline: Instant,
+    ) -> crate::question_notice::capture::CaptureClass {
+        let result = self.capture_question_inner(pane, profile, deadline);
+        let index = match result {
+            crate::question_notice::capture::CaptureClass::ActiveQuestion => 0,
+            crate::question_notice::capture::CaptureClass::NormalComposer => 1,
+            crate::question_notice::capture::CaptureClass::Ambiguous => 2,
+        };
+        let mut metrics = self.metrics.lock().expect("capture metrics lock poisoned");
+        metrics.probe_classes[index] = metrics.probe_classes[index].saturating_add(1);
+        result
+    }
+
+    fn record_probe_drop(&self) {
+        let mut metrics = self.metrics.lock().expect("capture metrics lock poisoned");
+        metrics.probe_dropped = metrics.probe_dropped.saturating_add(1);
+    }
+
+    fn capture_question_inner(
+        &self,
+        pane: PaneInstance,
+        profile: crate::question_notice::profile::CodexProfile,
+        deadline: Instant,
+    ) -> crate::question_notice::capture::CaptureClass {
+        use crate::question_notice::capture::CaptureClass;
+        if self.normal_busy() || Instant::now() >= deadline {
+            self.record_probe_drop();
+            return CaptureClass::Ambiguous;
+        }
+        let Some(sender) = &self.probe_tx else {
+            return CaptureClass::Ambiguous;
+        };
+        {
+            let mut panes = self.probe_panes.lock().expect("probe pane lock poisoned");
+            if panes.len() >= 4 || !panes.insert(pane.clone()) {
+                self.record_probe_drop();
+                return CaptureClass::Ambiguous;
+            }
+        }
+        let registration = ProbeRegistration {
+            panes: self.probe_panes.clone(),
+            pane,
+        };
+        let (reply, receive) = mpsc::sync_channel(1);
+        if sender
+            .try_send(AsyncQuestionProbe {
+                registration,
+                profile,
+                deadline,
+                reply,
+            })
+            .is_err()
+        {
+            self.record_probe_drop();
+            return CaptureClass::Ambiguous;
+        }
+        receive
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(CaptureClass::Ambiguous)
+    }
+
     fn try_enqueue(&self, request: CaptureRequest) -> Result<(), CaptureBatchError> {
-        self.tx.try_send(request).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => CaptureBatchError::ObservationQueueFull,
-            mpsc::TrySendError::Disconnected(_) => {
-                CaptureBatchError::Io("capture coordinator is stopped".to_string())
+        self.normal_pending
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.tx.try_send(request).map_err(|error| {
+            self.normal_pending
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            match error {
+                mpsc::TrySendError::Full(_) => CaptureBatchError::ObservationQueueFull,
+                mpsc::TrySendError::Disconnected(_) => {
+                    CaptureBatchError::Io("capture coordinator is stopped".to_string())
+                }
             }
         })
     }
@@ -465,14 +608,32 @@ impl CaptureSource for CaptureCoordinatorHandle {
         if panes.is_empty() {
             return Ok(Vec::new());
         }
+        let started = Instant::now();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.try_enqueue(CaptureRequest::ObservationPlain {
-            panes: panes.to_vec(),
-            reply: reply_tx,
-        })?;
-        reply_rx.recv().map_err(|_| {
-            CaptureBatchError::Io("capture coordinator dropped the reply".to_string())
-        })?
+        let result = self
+            .try_enqueue(CaptureRequest::ObservationPlain {
+                panes: panes.to_vec(),
+                reply: reply_tx,
+            })
+            .and_then(|()| {
+                reply_rx.recv().map_err(|_| {
+                    CaptureBatchError::Io("capture coordinator dropped the reply".to_string())
+                })?
+            });
+        let mut metrics = self.metrics.lock().expect("capture metrics lock poisoned");
+        metrics.normal_sequence = metrics.normal_sequence.saturating_add(1);
+        let sequence = metrics.normal_sequence;
+        if result.is_err() {
+            metrics.normal_failures = metrics.normal_failures.saturating_add(1);
+        }
+        if metrics.normal_samples.len() >= 1024 {
+            metrics.normal_samples.pop_front();
+        }
+        metrics.normal_samples.push_back((
+            sequence,
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        ));
+        result
     }
 }
 
@@ -481,6 +642,38 @@ pub fn start_capture_coordinator(
     expected_identity: ServerIdentity,
 ) -> CaptureCoordinatorHandle {
     let (tx, rx) = mpsc::sync_channel::<CaptureRequest>(DAEMON_OBSERVATION_CAPTURE_QUEUE_CAPACITY);
+    let normal_pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe_panes = Default::default();
+    let (probe_tx, probe_rx) = mpsc::sync_channel::<AsyncQuestionProbe>(2);
+    let probe_rx = std::sync::Arc::new(std::sync::Mutex::new(probe_rx));
+    for _ in 0..2 {
+        let receiver = probe_rx.clone();
+        let probe_io = io.clone();
+        let identity = expected_identity.clone();
+        let pending = normal_pending.clone();
+        thread::spawn(move || {
+            loop {
+                let Ok(request) = receiver.lock().expect("probe receive lock poisoned").recv()
+                else {
+                    break;
+                };
+                let result = if pending.load(std::sync::atomic::Ordering::Acquire) != 0
+                    || Instant::now() >= request.deadline
+                {
+                    crate::question_notice::capture::CaptureClass::Ambiguous
+                } else {
+                    capture_question_viewport(
+                        probe_io.as_ref(),
+                        &identity,
+                        &request.registration.pane,
+                        request.profile,
+                    )
+                };
+                let _ = request.reply.try_send(result);
+            }
+        });
+    }
+    let pending = normal_pending.clone();
     thread::spawn(move || {
         while let Ok(first) = rx.recv() {
             let mut requests = vec![first];
@@ -495,10 +688,106 @@ pub fn start_capture_coordinator(
                     Err(_) => break,
                 }
             }
+            let count = requests.len();
             execute_capture_group(io.as_ref(), &expected_identity, requests);
+            pending.fetch_sub(count, std::sync::atomic::Ordering::AcqRel);
         }
     });
-    CaptureCoordinatorHandle { tx }
+    CaptureCoordinatorHandle {
+        metrics: Default::default(),
+        tx,
+        normal_pending,
+        probe_tx: Some(probe_tx),
+        probe_panes,
+    }
+}
+
+fn capture_question_viewport(
+    io: &dyn ObservationWorkerIo,
+    identity: &ServerIdentity,
+    pane: &PaneInstance,
+    profile: crate::question_notice::profile::CodexProfile,
+) -> crate::question_notice::capture::CaptureClass {
+    use crate::question_notice::capture::{CaptureClass, GROUP_LIMIT, STDERR_LIMIT, STDOUT_LIMIT};
+    let Ok(id) = generate_capture_delimiter() else {
+        return CaptureClass::Ambiguous;
+    };
+    let start = format!("__vt_question_start_{id}__");
+    let end = format!("__vt_question_end_{id}__");
+    let fields = "#{pid}:#{start_time}:#{pane_pid}:#{pane_width}:#{pane_height}";
+    let args = vec![
+        "display-message".into(),
+        "-p".into(),
+        "-t".into(),
+        pane.pane_id.clone(),
+        format!("{start}{fields}"),
+        ";".into(),
+        "capture-pane".into(),
+        "-pJ".into(),
+        "-t".into(),
+        pane.pane_id.clone(),
+        ";".into(),
+        "display-message".into(),
+        "-p".into(),
+        "-t".into(),
+        pane.pane_id.clone(),
+        format!("{end}{fields}"),
+    ];
+    let Ok(output) = io.capture_question_batch(&args) else {
+        return CaptureClass::Ambiguous;
+    };
+    if output.exit_code != Some(0)
+        || !output.stderr.is_empty()
+        || output.stdout.len() > STDOUT_LIMIT
+        || output.stderr.len() > STDERR_LIMIT
+        || output.stdout.len() + output.stderr.len() > GROUP_LIMIT
+    {
+        return CaptureClass::Ambiguous;
+    }
+    classify_question_output(&output.stdout, &start, &end, identity, pane, profile)
+}
+
+fn classify_question_output(
+    stdout: &str,
+    start: &str,
+    end: &str,
+    identity: &ServerIdentity,
+    pane: &PaneInstance,
+    profile: crate::question_notice::profile::CodexProfile,
+) -> crate::question_notice::capture::CaptureClass {
+    use crate::question_notice::capture::CaptureClass;
+    let Some((header, body)) = stdout.split_once('\n') else {
+        return CaptureClass::Ambiguous;
+    };
+    let body = body.strip_suffix('\n').unwrap_or(body);
+    let Some(split) = body.rfind('\n') else {
+        return CaptureClass::Ambiguous;
+    };
+    let Some(before) = header.strip_prefix(start) else {
+        return CaptureClass::Ambiguous;
+    };
+    let Some(after) = body[split + 1..].strip_prefix(end) else {
+        return CaptureClass::Ambiguous;
+    };
+    if before != after {
+        return CaptureClass::Ambiguous;
+    }
+    let fields: Vec<_> = before.split(':').collect();
+    if fields.len() != 5
+        || fields[0].parse::<u32>().ok() != Some(identity.pid)
+        || fields[1].parse::<i64>().ok() != Some(identity.start_time)
+        || fields[2].parse::<u32>().ok() != Some(pane.pane_pid)
+    {
+        return CaptureClass::Ambiguous;
+    }
+    let Some((width, height)) = fields[3]
+        .parse::<u16>()
+        .ok()
+        .zip(fields[4].parse::<u16>().ok())
+    else {
+        return CaptureClass::Ambiguous;
+    };
+    crate::question_notice::capture::classify(profile, &body[..=split], width, height)
 }
 
 /// tmux clients reject command sequences beyond roughly 1000 arguments
@@ -676,7 +965,9 @@ mod tests {
             })
         });
 
-        let error = collect_capture_reader("stdout", Some(reader)).unwrap_err();
+        let error =
+            collect_capture_reader("stdout", Some(reader), OBSERVATION_CAPTURE_STDOUT_MAX_BYTES)
+                .unwrap_err();
         assert_eq!(
             error,
             CaptureBatchError::OutputLimit {
@@ -706,7 +997,13 @@ mod tests {
     #[test]
     fn observation_capture_queue_rejects_full_without_blocking() {
         let (tx, _rx) = mpsc::sync_channel(1);
-        let handle = CaptureCoordinatorHandle { tx };
+        let handle = CaptureCoordinatorHandle {
+            metrics: Default::default(),
+            tx,
+            normal_pending: Default::default(),
+            probe_tx: None,
+            probe_panes: Default::default(),
+        };
         let (first_reply, _first_rx) = mpsc::sync_channel(1);
         handle
             .try_enqueue(CaptureRequest::ObservationPlain {

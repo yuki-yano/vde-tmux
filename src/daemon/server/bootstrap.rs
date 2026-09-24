@@ -128,6 +128,7 @@ pub fn run_runtime_daemon_server(
         )),
         coordinator.incarnation.identity.clone(),
     );
+    super::mutations::question::start_workers(coordinator.clone(), capture.clone());
     start_canonical_observation_worker(
         coordinator.clone(),
         Duration::from_millis(config.daemon.poll_ms),

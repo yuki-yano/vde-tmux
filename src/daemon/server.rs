@@ -90,17 +90,57 @@ use observation::reconcile_views_with_witnesses;
 struct ProductionMutation {
     sequenced: V2SequencedMutation,
     raw_frame_bytes: usize,
+    enqueued_at: Instant,
 }
 
 #[derive(Debug, Default)]
 struct ProductionQueue {
     items: VecDeque<ProductionMutation>,
     in_flight: bool,
+    in_flight_kind: Option<&'static str>,
+    timings: BTreeMap<&'static str, MutationTiming>,
+    queue_timings: BTreeMap<&'static str, MutationTiming>,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+struct MutationTiming {
+    // Upper bounds in milliseconds: 1, 5, 10, 25, 50, 100, 250, 1000, infinity.
+    buckets: [u64; 9],
+    total_micros: u64,
+    max_micros: u64,
+}
+impl MutationTiming {
+    fn observe(&mut self, duration: Duration) {
+        let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+        let bucket = [1000, 5000, 10000, 25000, 50000, 100000, 250000, 1000000]
+            .iter()
+            .position(|upper| micros <= *upper)
+            .unwrap_or(8);
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+        self.total_micros = self.total_micros.saturating_add(micros);
+        self.max_micros = self.max_micros.max(micros);
+    }
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+struct StatusPushTiming {
+    timings: BTreeMap<&'static str, MutationTiming>,
+    coalesced_decisions: u64,
+    batches: u64,
+    committed_batches: u64,
+    publication_age_unavailable: u64,
+    // Upper bounds: 1, 2, 4, 8, 16, 32, 64, 128, infinity. No key contents.
+    batch_key_counts: [u64; 9],
+    #[serde(skip)]
+    coalesced_since: Option<Instant>,
+    #[serde(skip)]
+    coalesced_ready_at: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
 struct PublishedResolvedSnapshot {
     revision: u64,
+    published_at: Instant,
     frame: Arc<Vec<u8>>,
     message: Arc<ServerMessage>,
     terminal: bool,
@@ -125,6 +165,12 @@ enum StatusPushTrigger {
 }
 
 struct ProductionV2Coordinator {
+    question_profiles: Arc<crate::question_notice::profile::ProfileCache>,
+    question_wake: std::sync::atomic::AtomicBool,
+    question_tick_pending: std::sync::atomic::AtomicBool,
+    question_orders: Mutex<Option<crate::daemon::workers::question::OrderWorkerHandle>>,
+    question_probes: Mutex<Option<crate::daemon::workers::question::ProbeWorkerHandle>>,
+    question_capture: Mutex<Option<crate::daemon::workers::CaptureCoordinatorHandle>>,
     router: Mutex<V2Router>,
     state: Mutex<Option<super::runtime::CanonicalCoordinatorState>>,
     agent_runtime: Mutex<Option<crate::agent_state::runtime::AgentRuntime>>,
@@ -151,6 +197,7 @@ struct ProductionV2Coordinator {
     status_push: Mutex<crate::daemon::status_push::StatusPushState>,
     status_push_driver: Mutex<()>,
     status_push_started: Instant,
+    status_push_timing: Mutex<StatusPushTiming>,
     config_hash: Mutex<String>,
     witness_observation_seq: Arc<AtomicU64>,
     current_view_refresh_generation: AtomicU64,
@@ -236,12 +283,19 @@ impl ProductionV2Coordinator {
             status_push: Mutex::new(status_push),
             status_push_driver: Mutex::new(()),
             status_push_started: Instant::now(),
+            status_push_timing: Mutex::default(),
             config_hash: Mutex::new(crate::daemon::lifecycle::config_hash(
                 &crate::config::Config::default(),
             )),
             witness_observation_seq,
             current_view_refresh_generation: AtomicU64::new(0),
             current_view_refresh_running: AtomicBool::new(false),
+            question_profiles: Arc::default(),
+            question_wake: std::sync::atomic::AtomicBool::new(true),
+            question_tick_pending: std::sync::atomic::AtomicBool::new(false),
+            question_orders: Mutex::new(None),
+            question_probes: Mutex::new(None),
+            question_capture: Mutex::new(None),
         })
     }
 
@@ -690,6 +744,7 @@ impl ProductionV2Coordinator {
             .push_back(ProductionMutation {
                 sequenced,
                 raw_frame_bytes,
+                enqueued_at: Instant::now(),
             });
         self.queue_ready.notify_one();
         receiver
@@ -707,6 +762,7 @@ impl ProductionV2Coordinator {
             .push_back(ProductionMutation {
                 sequenced,
                 raw_frame_bytes,
+                enqueued_at: Instant::now(),
             });
         self.queue_ready.notify_one();
     }
@@ -715,6 +771,47 @@ impl ProductionV2Coordinator {
         use crate::daemon::protocol::v2::{ClientMessage, ErrorCode, ServerMessage};
 
         match message {
+            ClientMessage::QueryQuestionDiagnostics { .. } => {
+                let mut counters = self
+                    .state
+                    .lock()
+                    .expect("canonical state lock poisoned")
+                    .as_ref()
+                    .map(|state| state.question_notices.resolver.diagnostics())
+                    .unwrap_or_default();
+                counters["capture"] = self
+                    .question_capture
+                    .lock()
+                    .expect("question capture lock poisoned")
+                    .as_ref()
+                    .map(|capture| capture.diagnostics())
+                    .unwrap_or_default();
+                counters["unknown_mode_lookups"] = self.question_profiles.unknown_modes().into();
+                {
+                    let queue = self.queue.lock().expect("v2 queue lock poisoned");
+                    counters["mutation_queue"] = serde_json::json!({
+                        "queued": queue.items.len(), "in_flight": queue.in_flight,
+                        "kind": queue.in_flight_kind,
+                        "question_tick_pending": self.question_tick_pending.load(Ordering::Acquire),
+                        "timings": queue.timings,
+                        "queue_timings": queue.queue_timings,
+                    });
+                }
+                counters["status_push"] = serde_json::to_value(
+                    &*self
+                        .status_push_timing
+                        .lock()
+                        .expect("status timing lock poisoned"),
+                )
+                .expect("finite status timing serialization");
+                ServerMessage::QuestionDiagnostics { counters }
+            }
+            ClientMessage::QueryQuestionProfile { request, .. } => {
+                let profile = self
+                    .question_profiles
+                    .lookup(&request, Instant::now() + Duration::from_secs(2));
+                ServerMessage::QuestionProfileResult { request, profile }
+            }
             ClientMessage::QueryResolvedSnapshot { .. } | ClientMessage::Subscribe { .. } => {
                 if self
                     .state
@@ -1221,6 +1318,7 @@ impl ProductionV2Coordinator {
                     .push_back(ProductionMutation {
                         sequenced,
                         raw_frame_bytes: 0,
+                        enqueued_at: Instant::now(),
                     });
                 self.queue_ready.notify_one();
                 true
@@ -1324,6 +1422,7 @@ impl ProductionV2Coordinator {
             };
         let published = PublishedResolvedSnapshot {
             revision,
+            published_at: Instant::now(),
             frame: Arc::new(frame),
             message: Arc::new(message),
             terminal,
@@ -1374,13 +1473,88 @@ impl ProductionV2Coordinator {
         }
     }
 
+    fn note_status_timing(&self, phase: &'static str, duration: Duration) {
+        self.status_push_timing
+            .lock()
+            .expect("status timing lock poisoned")
+            .timings
+            .entry(phase)
+            .or_default()
+            .observe(duration);
+    }
+
+    fn note_status_publication_age(&self, revision: u64, observed_at: Instant) {
+        // Diagnostics must not wait behind frame serialization while the status
+        // driver is held. Contention is unavailable, never a zero-age sample.
+        let age = self.snapshot_cache.try_lock().ok().and_then(|cache| {
+            cache
+                .as_ref()
+                .filter(|published| published.revision == revision)
+                .and_then(|published| observed_at.checked_duration_since(published.published_at))
+        });
+        if let Some(age) = age {
+            self.note_status_timing("publication_to_snapshot", age);
+        } else {
+            let mut timing = self
+                .status_push_timing
+                .lock()
+                .expect("status timing lock poisoned");
+            timing.publication_age_unavailable =
+                timing.publication_age_unavailable.saturating_add(1);
+        }
+    }
+
+    fn note_status_decision(&self, decision: &crate::daemon::status_push::StatusPushDecision) {
+        use crate::daemon::status_push::StatusPushDecision;
+        let mut timing = self
+            .status_push_timing
+            .lock()
+            .expect("status timing lock poisoned");
+        match decision {
+            StatusPushDecision::Coalesced { ready_at } => {
+                timing.coalesced_decisions = timing.coalesced_decisions.saturating_add(1);
+                timing.coalesced_since.get_or_insert_with(Instant::now);
+                timing.coalesced_ready_at.get_or_insert(*ready_at);
+            }
+            StatusPushDecision::Batch(batch) => {
+                timing.batches = timing.batches.saturating_add(1);
+                let bucket = [1, 2, 4, 8, 16, 32, 64, 128]
+                    .iter()
+                    .position(|upper| batch.guarded.writes.len() <= *upper)
+                    .unwrap_or(8);
+                timing.batch_key_counts[bucket] = timing.batch_key_counts[bucket].saturating_add(1);
+                if let Some(since) = timing.coalesced_since.take() {
+                    timing
+                        .timings
+                        .entry("coalesced_wait")
+                        .or_default()
+                        .observe(since.elapsed());
+                }
+                if let Some(ready_at) = timing.coalesced_ready_at.take() {
+                    timing
+                        .timings
+                        .entry("coalescing_overdue")
+                        .or_default()
+                        .observe(self.status_push_started.elapsed().saturating_sub(ready_at));
+                }
+            }
+            StatusPushDecision::NoChanges => {
+                timing.coalesced_since = None;
+                timing.coalesced_ready_at = None;
+            }
+            StatusPushDecision::Ignored | StatusPushDecision::WaitingForInFlight => {}
+        }
+    }
+
     fn drive_status_push(&self, trigger: StatusPushTrigger) -> Result<()> {
         use crate::daemon::status_push::build_display_frame;
 
+        let began = Instant::now();
         let _driver = self
             .status_push_driver
             .lock()
             .expect("status push driver lock poisoned");
+        self.note_status_timing("driver_wait", began.elapsed());
         let now = self.status_push_started.elapsed();
         let decision = match trigger {
             StatusPushTrigger::Flush => self
@@ -1390,8 +1564,10 @@ impl ProductionV2Coordinator {
                 .flush_coalesced(now)
                 .map_err(anyhow::Error::new)?,
             StatusPushTrigger::Snapshot => {
-                let (global, sessions, panes, config) = {
+                let (global, sessions, panes, config, revision_observed_at) = {
+                    let began = Instant::now();
                     let state = self.state.lock().expect("canonical state lock poisoned");
+                    self.note_status_timing("state_wait", began.elapsed());
                     let state = state
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("canonical state is not initialized"))?;
@@ -1405,12 +1581,30 @@ impl ProductionV2Coordinator {
                     {
                         return Ok(());
                     }
-                    let _ = state.checked_resolved_snapshot()?;
-                    let (global, sessions, panes) = state.display_projection();
-                    (global, sessions, panes, state.projection_config.clone())
+                    let revision_observed_at = Instant::now();
+                    let began = Instant::now();
+                    let resolved = state.checked_resolved_snapshot();
+                    self.note_status_timing("preflight", began.elapsed());
+                    let resolved = resolved?;
+                    let began = Instant::now();
+                    let (global, sessions, panes) = state.display_projection(resolved);
+                    self.note_status_timing("projection", began.elapsed());
+                    (
+                        global,
+                        sessions,
+                        panes,
+                        state.projection_config.clone(),
+                        revision_observed_at,
+                    )
                 };
-                let frame = build_display_frame(&config, &global, &sessions, &panes)
-                    .map_err(anyhow::Error::new)?;
+                // Read the publication cache only after releasing canonical state.
+                // This age includes polling and lock wait after publication, not
+                // pre-publication mutation work; it overlaps the wait histograms.
+                self.note_status_publication_age(global.snapshot_revision, revision_observed_at);
+                let began = Instant::now();
+                let frame = build_display_frame(&config, &global, &sessions, &panes);
+                self.note_status_timing("render", began.elapsed());
+                let frame = frame.map_err(anyhow::Error::new)?;
                 let mut push = self.status_push.lock().expect("status push lock poisoned");
                 match trigger {
                     StatusPushTrigger::Snapshot => {
@@ -1432,6 +1626,7 @@ impl ProductionV2Coordinator {
             BatchExecution, StatusPushDecision, SystemDisplayBatchIo,
         };
 
+        self.note_status_decision(&decision);
         let StatusPushDecision::Batch(prepared) = decision else {
             return Ok(());
         };
@@ -1443,14 +1638,23 @@ impl ProductionV2Coordinator {
         )
         .with_extension("status-batches");
         let mut io = SystemDisplayBatchIo::new(&runner, &batch_dir);
+        let began = Instant::now();
         let result = self
             .status_push
             .lock()
             .expect("status push lock poisoned")
-            .execute_prepared(&prepared, &mut io)
-            .map_err(anyhow::Error::new)?;
+            .execute_prepared(&prepared, &mut io);
+        self.note_status_timing("batch_io", began.elapsed());
+        let result = result.map_err(anyhow::Error::new)?;
         match result {
-            BatchExecution::Committed => Ok(()),
+            BatchExecution::Committed => {
+                let mut timing = self
+                    .status_push_timing
+                    .lock()
+                    .expect("status timing lock poisoned");
+                timing.committed_batches = timing.committed_batches.saturating_add(1);
+                Ok(())
+            }
             BatchExecution::Failed(error) => {
                 self.log_status_push_error(&format!("status display batch failed: {error}"));
                 Ok(())
@@ -1956,13 +2160,49 @@ fn start_v2_mutation_worker(coordinator: Arc<ProductionV2Coordinator>) {
                 if coordinator.shutdown.load(Ordering::SeqCst) {
                     break;
                 }
-                queue.in_flight = true;
-                queue.items.pop_front()
+                let mutation = queue.items.pop_front();
+                queue.in_flight = mutation.is_some();
+                queue.in_flight_kind =
+                    mutation
+                        .as_ref()
+                        .map(|mutation| match &mutation.sequenced.mutation {
+                            V2AcceptedMutation::Internal(V2InternalMutation::QuestionTick) => {
+                                "question_tick"
+                            }
+                            V2AcceptedMutation::Internal(
+                                V2InternalMutation::QuestionOrderCompleted(_),
+                            ) => "question_order",
+                            V2AcceptedMutation::Internal(
+                                V2InternalMutation::QuestionProbeCompleted(_),
+                            ) => "question_probe",
+                            V2AcceptedMutation::External(ClientMessage::SubmitProviderEvent {
+                                ..
+                            }) => "provider",
+                            V2AcceptedMutation::Internal(V2InternalMutation::ObservationBatch(
+                                _,
+                            )) => "observation",
+                            V2AcceptedMutation::External(
+                                ClientMessage::ReportQuestionJournalFailure { .. },
+                            ) => "journal_failure",
+                            V2AcceptedMutation::External(ClientMessage::Shutdown { .. }) => {
+                                "shutdown"
+                            }
+                            _ => "other",
+                        });
+                if let (Some(kind), Some(mutation)) = (queue.in_flight_kind, mutation.as_ref()) {
+                    queue
+                        .queue_timings
+                        .entry(kind)
+                        .or_default()
+                        .observe(mutation.enqueued_at.elapsed());
+                }
+                mutation
             };
             let Some(mutation) = mutation else {
                 continue;
             };
             debug_assert!(mutation.raw_frame_bytes <= crate::pane_state::MAX_REQUEST_FRAME_BYTES);
+            let mutation_started = Instant::now();
             let accepted_seq = mutation.sequenced.accepted_seq;
             let graceful_shutdown = matches!(
                 &mutation.sequenced.mutation,
@@ -1990,7 +2230,15 @@ fn start_v2_mutation_worker(coordinator: Arc<ProductionV2Coordinator>) {
                 coordinator.mark_shutdown_ready();
             }
             let mut queue = coordinator.queue.lock().expect("v2 queue lock poisoned");
+            if let Some(kind) = queue.in_flight_kind {
+                queue
+                    .timings
+                    .entry(kind)
+                    .or_default()
+                    .observe(mutation_started.elapsed());
+            }
             queue.in_flight = false;
+            queue.in_flight_kind = None;
             coordinator.queue_ready.notify_all();
         }
     });
@@ -2022,6 +2270,75 @@ fn apply_production_mutation(
 
     let accepted_seq = sequenced.accepted_seq;
     let response = match sequenced.mutation {
+        V2AcceptedMutation::External(ClientMessage::ReportQuestionJournalFailure {
+            pane_instance,
+            session_digest,
+            metadata,
+            event_id,
+            ..
+        }) => {
+            mutations::question::journal_failed(
+                coordinator,
+                &pane_instance,
+                session_digest.as_deref(),
+                &metadata,
+            );
+            let mut response = mutations::question::internal_ack(coordinator, accepted_seq);
+            if let ServerMessage::SnapshotAck { event_id: id, .. } = &mut response {
+                *id = event_id;
+            }
+            response
+        }
+        V2AcceptedMutation::External(ClientMessage::SubmitQuestionSession {
+            daemon_instance_id,
+            pane_instance,
+            session_digest,
+            metadata,
+            event_id,
+            ..
+        }) => {
+            let runner = coordinator.status_push_runner(Duration::from_secs(1));
+            mutations::question::observe(
+                coordinator,
+                mutations::question::ResolverObservation {
+                    pane: pane_instance,
+                    daemon: daemon_instance_id,
+                    session: session_digest,
+                    turn: None,
+                    ingress: None,
+                    kind: crate::hook::provider::ProviderHookKind::SessionStart,
+                    metadata: Some(metadata),
+                },
+                None,
+                true,
+                &runner,
+            );
+            let mut response = mutations::question::internal_ack(coordinator, accepted_seq);
+            if let ServerMessage::SnapshotAck { event_id: id, .. } = &mut response {
+                *id = event_id;
+            }
+            response
+        }
+        // Resolver-only transitions cannot change topology or lifecycle. Their
+        // workers already validate the exact owner. Keep the existing periodic
+        // observation/provider maintenance, without rescanning every pane for
+        // each sample and scheduler tick. Notice projection changes are published
+        // by the common mutation worker after this handler returns.
+        V2AcceptedMutation::Internal(V2InternalMutation::QuestionOrderCompleted(completion)) => {
+            mutations::question::order_completed(coordinator, completion);
+            return mutations::question::internal_ack(coordinator, accepted_seq);
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::QuestionTick) => {
+            coordinator
+                .question_tick_pending
+                .store(false, Ordering::Release);
+            mutations::question::tick(coordinator);
+            return mutations::question::internal_ack(coordinator, accepted_seq);
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::QuestionProbeCompleted(completion)) => {
+            mutations::question::probe_completed(coordinator, completion);
+            return mutations::question::internal_ack(coordinator, accepted_seq);
+        }
         V2AcceptedMutation::External(ClientMessage::SubmitPaneEvent { envelope, .. }) => {
             apply_external_pane_event(coordinator, accepted_seq, envelope)
         }
@@ -2513,6 +2830,8 @@ fn apply_production_mutation(
             | ClientMessage::QueryAgentOperation { .. }
             | ClientMessage::QueryAgentResponse { .. }
             | ClientMessage::QueryAgentStorage { .. }
+            | ClientMessage::QueryQuestionProfile { .. }
+            | ClientMessage::QueryQuestionDiagnostics { .. }
             | ClientMessage::PaneSwitch { .. }
             | ClientMessage::Subscribe { .. },
         ) => unreachable!("v2 router cannot sequence a read-only request"),

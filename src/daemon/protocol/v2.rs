@@ -22,7 +22,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 24;
+pub const PROTOCOL_VERSION: u16 = 25;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +111,65 @@ impl std::fmt::Display for V2RequestError {
 impl std::error::Error for V2RequestError {}
 
 impl V2Client {
+    pub(crate) fn report_question_journal_failure(
+        &self,
+        pane_instance: &PaneInstance,
+        session_digest: Option<String>,
+        metadata: &crate::question_notice::ingress::ResolverInput,
+    ) -> Result<()> {
+        let peer = self.writer.peer_addr()?;
+        let socket = peer
+            .as_pathname()
+            .ok_or_else(|| anyhow::anyhow!("journal peer unavailable"))?;
+        let mut client = Self::connect_with_deadline(socket, &self.server_identity, self.deadline)?;
+        let event_id = EventId::generate()?;
+        let response = client.request_with_stage(&ClientMessage::ReportQuestionJournalFailure {
+            proto: PROTOCOL_VERSION,
+            daemon_instance_id: self.daemon_instance_id.clone(),
+            event_id: event_id.clone(),
+            pane_instance: pane_instance.clone(),
+            session_digest,
+            metadata: metadata.clone(),
+        })?;
+        anyhow::ensure!(
+            matches!(response, ServerMessage::SnapshotAck { event_id: id, .. } if id == event_id),
+            "journal report rejected"
+        );
+        Ok(())
+    }
+
+    /// Profile lookup has its own bounded connection; the event connection stays unused.
+    pub(crate) fn question_profile(
+        &self,
+        request: &crate::question_notice::profile::ProfileRequest,
+    ) -> crate::question_notice::profile::CodexProfile {
+        use crate::question_notice::profile::CodexProfile;
+        let lookup = || -> Result<CodexProfile> {
+            let peer = self.writer.peer_addr()?;
+            let socket = peer
+                .as_pathname()
+                .ok_or_else(|| anyhow::anyhow!("profile peer unavailable"))?;
+            let mut client = Self::connect_with_deadline(
+                socket,
+                &self.server_identity,
+                self.deadline.min(Instant::now() + Duration::from_secs(2)),
+            )?;
+            Ok(
+                match client.request_with_stage(&ClientMessage::QueryQuestionProfile {
+                    proto: PROTOCOL_VERSION,
+                    request: request.clone(),
+                })? {
+                    ServerMessage::QuestionProfileResult {
+                        request: bound,
+                        profile,
+                    } if &bound == request => profile,
+                    _ => CodexProfile::Unknown,
+                },
+            )
+        };
+        lookup().unwrap_or(CodexProfile::Unknown)
+    }
+
     pub fn connect(socket: &Path, expected_server_identity: &str) -> Result<Self> {
         Self::connect_with_timeout(socket, expected_server_identity, CLIENT_REQUEST_TIMEOUT)
     }
@@ -876,6 +935,29 @@ pub enum SidebarCommand {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum ClientMessage {
+    QueryQuestionDiagnostics {
+        proto: u16,
+    },
+    ReportQuestionJournalFailure {
+        proto: u16,
+        daemon_instance_id: DaemonInstanceId,
+        event_id: EventId,
+        pane_instance: PaneInstance,
+        session_digest: Option<String>,
+        metadata: crate::question_notice::ingress::ResolverInput,
+    },
+    SubmitQuestionSession {
+        proto: u16,
+        daemon_instance_id: DaemonInstanceId,
+        event_id: EventId,
+        pane_instance: PaneInstance,
+        session_digest: String,
+        metadata: crate::question_notice::ingress::ResolverInput,
+    },
+    QueryQuestionProfile {
+        proto: u16,
+        request: crate::question_notice::profile::ProfileRequest,
+    },
     Hello {
         proto: u16,
     },
@@ -978,6 +1060,10 @@ impl ClientMessage {
     pub fn proto(&self) -> u16 {
         match self {
             Self::Hello { proto }
+            | Self::QueryQuestionDiagnostics { proto }
+            | Self::ReportQuestionJournalFailure { proto, .. }
+            | Self::SubmitQuestionSession { proto, .. }
+            | Self::QueryQuestionProfile { proto, .. }
             | Self::QueryResolvedSnapshot { proto }
             | Self::QueryStatusSnapshot { proto, .. }
             | Self::QueryPane { proto, .. }
@@ -1009,6 +1095,12 @@ impl ClientMessage {
             Self::StartAgentPrompt {
                 daemon_instance_id, ..
             }
+            | Self::SubmitQuestionSession {
+                daemon_instance_id, ..
+            }
+            | Self::ReportQuestionJournalFailure {
+                daemon_instance_id, ..
+            }
             | Self::ResolveAgentRun {
                 daemon_instance_id, ..
             }
@@ -1032,6 +1124,8 @@ impl ClientMessage {
             }
             Self::SubmitViewEvent { event, .. } => Some(&event.event_id),
             Self::StartAgentPrompt { event_id, .. }
+            | Self::SubmitQuestionSession { event_id, .. }
+            | Self::ReportQuestionJournalFailure { event_id, .. }
             | Self::ResolveAgentRun { event_id, .. }
             | Self::SidebarCommand { event_id, .. }
             | Self::RefreshTopology { event_id, .. }
@@ -1048,6 +1142,8 @@ impl ClientMessage {
         matches!(
             self,
             Self::QueryResolvedSnapshot { .. }
+                | Self::QueryQuestionDiagnostics { .. }
+                | Self::QueryQuestionProfile { .. }
                 | Self::QueryStatusSnapshot { .. }
                 | Self::QueryPane { .. }
                 | Self::QueryRuntimeInfo { .. }
@@ -1146,6 +1242,13 @@ pub struct CategoryRepoMutationEffect {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum ServerMessage {
+    QuestionDiagnostics {
+        counters: serde_json::Value,
+    },
+    QuestionProfileResult {
+        request: crate::question_notice::profile::ProfileRequest,
+        profile: crate::question_notice::profile::CodexProfile,
+    },
     ProviderEventResult {
         event_id: EventId,
         question_notice: crate::question_notice::NoticeResult,
@@ -1661,7 +1764,7 @@ mod tests {
 
     #[test]
     fn every_client_message_roundtrips() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+        assert_eq!(PROTOCOL_VERSION, 25);
         let state_id = StateId::parse("00112233445566778899aabbccddeeff").unwrap();
         let messages = vec![
             ClientMessage::Hello {

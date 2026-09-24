@@ -182,7 +182,18 @@ pub(crate) fn run_hook_command(
                 return Ok(());
             }
             let codex_home = codex_home_from_env(env);
-            let question_notice =
+            let mut prepared = crate::question_notice::ingress::PreparedHook::prepare(
+                &arg,
+                input,
+                codex_home.as_deref(),
+                env,
+                runner,
+                now_epoch,
+                deadline,
+            );
+            let question_notice = if prepared.excluded {
+                prepared.excluded_notice(&arg, input, codex_home.as_deref())
+            } else {
                 crate::question_notice::ingress::from_payload(&arg, input, codex_home.as_deref())
                     .map(|notice| match notice {
                         crate::question_notice::QuestionNoticeInput::Issued {
@@ -190,34 +201,96 @@ pub(crate) fn run_hook_command(
                             turn_id,
                             tool_use_id,
                             ..
-                        } => match crate::question_notice::ingress::capture_ancestors() {
-                            Ok(ancestors) => crate::question_notice::QuestionNoticeInput::Issued {
-                                session_id,
-                                turn_id,
-                                tool_use_id,
-                                ancestors,
-                            },
-                            Err(_) => crate::question_notice::QuestionNoticeInput::Rejected {
+                        } => match prepared.metadata.ancestors.clone() {
+                            ancestors if !ancestors.is_empty() => {
+                                crate::question_notice::QuestionNoticeInput::Issued {
+                                    session_id,
+                                    turn_id,
+                                    tool_use_id,
+                                    ancestors,
+                                }
+                            }
+                            _ => crate::question_notice::QuestionNoticeInput::Rejected {
                                 reason: crate::question_notice::NoticeReason::OriginUnverified,
                             },
                         },
                         other => other,
-                    });
+                    })
+            };
             let event_id = crate::pane_state::EventId::generate()?;
             let retry_before_write = matches!(arg.as_str(), "UserPromptSubmit" | "Stop");
             loop {
                 let (mut client, context, server_hash) =
                     typed_hook_context(runner, env, deadline, now_epoch, event_id.clone())?;
-                let event =
-                    codex_typed_event_from_input(&arg, input, &context, codex_home.as_deref())?;
-                let observation = crate::hook::provider::observation_from_json(
+                prepared
+                    .metadata
+                    .daemon_generation
+                    .get_or_insert_with(|| context.daemon_instance_id.clone());
+                if arg == "PostToolUse" && prepared.metadata.journal_failure.is_some() {
+                    let session = serde_json::from_str::<Value>(input).ok().and_then(|value| {
+                        value
+                            .get("session_id")
+                            .and_then(Value::as_str)
+                            .filter(|id| crate::question_notice::ingress::valid_identifier(id))
+                            .map(crate::question_notice::resolver::session_key)
+                    });
+                    // Best effort even when the payload cannot produce a lifecycle event.
+                    // Failure here must not suppress the ordinary notice delivery attempt.
+                    prepared.metadata.journal_failure_reported = client
+                        .report_question_journal_failure(
+                            &context.pane_instance,
+                            session,
+                            &prepared.metadata,
+                        )
+                        .is_ok();
+                }
+                if let Some(request) = prepared.metadata.process.clone() {
+                    let profile = client.question_profile(&request);
+                    prepared.classify(input, profile);
+                }
+                let mut observation = crate::hook::provider::observation_from_json(
                     "codex",
                     &arg,
                     input,
                     context.event_id.clone(),
                     context.observed_at,
                 )?;
-                match send_typed_hook_event(&mut client, event, observation, question_notice.clone()) {
+                if !prepared.excluded
+                    && arg == "SessionStart"
+                    && !matches!(
+                        prepared.metadata.source,
+                        crate::question_notice::ingress::SessionSource::Startup
+                            | crate::question_notice::ingress::SessionSource::Resume
+                            | crate::question_notice::ingress::SessionSource::Clear
+                    )
+                {
+                    let Some(observation) = observation else {
+                        return Ok(());
+                    };
+                    let response = client.request_with_stage(
+                        &crate::daemon::protocol::v2::ClientMessage::SubmitQuestionSession {
+                            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                            daemon_instance_id: context.daemon_instance_id,
+                            event_id: context.event_id.clone(),
+                            pane_instance: context.pane_instance,
+                            session_digest: crate::question_notice::resolver::session_key(
+                                observation.session_id.as_str(),
+                            ),
+                            metadata: prepared.metadata.clone(),
+                        },
+                    )?;
+                    return validate_typed_hook_response(response, &context.event_id)
+                        .map_err(anyhow::Error::new);
+                }
+                let event =
+                    codex_typed_event_from_input(&arg, input, &context, codex_home.as_deref())?;
+                if let Some(observation) = observation.as_mut()
+                    && prepared.relevant
+                    && !prepared.excluded
+                {
+                    observation.question_resolver = Some(prepared.metadata.clone());
+                }
+                match send_typed_hook_event(&mut client, event, observation, question_notice.clone(), Some(&prepared)) {
                     Ok(()) => return Ok(()),
                     Err(error)
                         if retry_before_write
@@ -292,7 +365,7 @@ fn send_typed_hook_event_observed(
     env: &BTreeMap<String, String>,
     server_hash: &str,
 ) -> Result<()> {
-    match send_typed_hook_event(client, event, observation, None) {
+    match send_typed_hook_event(client, event, observation, None, None) {
         Ok(()) => Ok(()),
         Err(error) => {
             let error = anyhow::Error::new(error);
@@ -343,6 +416,7 @@ fn send_typed_hook_event(
     event: Option<PaneEventEnvelope>,
     observation: Option<crate::hook::provider::ProviderObservation>,
     question_notice: Option<crate::question_notice::QuestionNoticeInput>,
+    prepared: Option<&crate::question_notice::ingress::PreparedHook>,
 ) -> std::result::Result<(), crate::daemon::protocol::v2::V2RequestError> {
     let Some(envelope) = event else {
         return Ok(());
@@ -361,6 +435,17 @@ fn send_typed_hook_event(
         },
     };
     let response = client.request_with_stage(&message)?;
+    if let crate::daemon::protocol::v2::ServerMessage::ProviderEventResult {
+        event_id: response_id,
+        question_notice,
+        ..
+    } = &response
+        && response_id == &event_id
+        && let Some(prepared) = prepared
+    {
+        // Notice durability is independent of the subsequent lifecycle result.
+        prepared.persisted(question_notice);
+    }
     validate_typed_hook_response(response, &event_id)
 }
 
