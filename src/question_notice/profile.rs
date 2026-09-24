@@ -689,6 +689,12 @@ int main(int argc, char **argv) {{
                 .unwrap()
                 .success()
         );
+        // Linux btime is whole seconds and starttime is whole clock ticks. A
+        // freshly linked fixture can be newer than that conservative start
+        // bound even though it predates exec. Age only the test fixture; keep
+        // the production ctime guard fail-closed.
+        #[cfg(target_os = "linux")]
+        std::thread::sleep(Duration::from_millis(1100));
         let mut child = std::process::Command::new(&binary).spawn().unwrap();
         let process = AgentProcessIdentity {
             pid: child.id(),
@@ -813,6 +819,13 @@ int main(int argc, char **argv) {{
             start_token: crate::daemon::lifecycle::agent_process_start_token(child.id()).unwrap(),
         })
         .unwrap();
+        assert!(request.matches_current_process());
+        assert_eq!(
+            process_arguments(child.id()).as_deref().map(argument_mode),
+            Some(ArgumentMode::Embedded),
+            "sleep fixture argv: {:?}",
+            process_arguments(child.id())
+        );
         let cache = Arc::new(ProfileCache::default());
         assert_eq!(
             cache.lookup_with(&request, Instant::now() + Duration::from_secs(1), |_, _| {
@@ -863,6 +876,13 @@ int main(int argc, char **argv) {{
             start_token: crate::daemon::lifecycle::agent_process_start_token(child.id()).unwrap(),
         })
         .unwrap();
+        assert!(request.matches_current_process());
+        assert_eq!(
+            process_arguments(child.id()).as_deref().map(argument_mode),
+            Some(ArgumentMode::Embedded),
+            "sleep fixture argv: {:?}",
+            process_arguments(child.id())
+        );
         let cache = Arc::new(ProfileCache::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let workers = (0..8)
