@@ -367,10 +367,10 @@ fn detect_process_agent(command: &str) -> Option<DetectedProcessAgent> {
     let mut fields = command.split_whitespace();
     let executable = fields.next()?.rsplit('/').next()?;
     if matches!(executable, "claude" | "codex" | "opencode") {
-        // Codex may spawn ChatGPT's non-interactive app server as a descendant.
-        // It is not a pane occupant and must not make the interactive Codex
-        // process identity ambiguous.
-        if executable == "codex" && fields.next() == Some("app-server") {
+        // Codex/ChatGPT may spawn app-server and sandbox helpers as descendants.
+        // Neither is a pane occupant; counting them makes the interactive
+        // Codex process identity ambiguous.
+        if executable == "codex" && matches!(fields.next(), Some("app-server" | "sandbox")) {
             return None;
         }
         return Some(DetectedProcessAgent {
@@ -393,7 +393,7 @@ fn detect_process_agent(command: &str) -> Option<DetectedProcessAgent> {
                 "opencode" => Some("opencode"),
                 _ => None,
             })?;
-        if agent == "codex" && fields.next() == Some("app-server") {
+        if agent == "codex" && matches!(fields.next(), Some("app-server" | "sandbox")) {
             return None;
         }
         Some(agent)
@@ -576,6 +576,39 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn codex_sandbox_helpers_do_not_replace_the_interactive_process() {
+        let codex = AgentKind::parse("codex").unwrap();
+        let interactive_pid = std::process::id();
+        let helper_pid = unsafe { libc::getppid() };
+        let snapshot = AgentProcessSnapshot::parse(
+            &format!(
+                "{root} 0 100 100 zsh\n\
+                 {interactive_pid} {root} 100 100 /opt/bin/codex --yolo\n\
+                 {helper_pid} {interactive_pid} 200 0 /opt/bin/codex sandbox -c synthetic=true macos -- sleep 30\n",
+                root = u32::MAX,
+            ),
+            true,
+        );
+        let detection = snapshot.detect_from_pid_tree(u32::MAX);
+
+        assert_eq!(detection.agents, BTreeSet::from([codex.clone()]));
+        assert_eq!(
+            detection
+                .exact_agent_process(&codex)
+                .map(|process| process.pid),
+            Some(interactive_pid),
+        );
+        for command in [
+            "/opt/bin/codex sandbox macos -- sleep 30",
+            "node /opt/node_modules/@openai/codex/bin/codex.js sandbox linux -- sleep 30",
+        ] {
+            assert!(detect_process_agent(command).is_none(), "{command}");
+        }
+        // A prompt containing the same word is still an interactive invocation.
+        assert!(detect_process_agent("codex --yolo explain sandbox behavior").is_some());
     }
 
     #[test]
