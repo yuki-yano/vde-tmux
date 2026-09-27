@@ -14,6 +14,32 @@ pub const OBSERVATION_CAPTURE_STDOUT_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const OBSERVATION_CAPTURE_STDERR_MAX_BYTES: usize = 64 * 1024;
 pub const OBSERVATION_CAPTURE_GROUP_MAX_BYTES: usize = 16 * 1024 * 1024;
 
+/// A single ephemeral capture with a verified viewport boundary. History stays
+/// available for existing lifecycle signals; presentation reads only viewport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedScreen {
+    tail: String,
+    viewport_start: usize,
+}
+
+impl CapturedScreen {
+    pub fn tail(&self) -> &str {
+        &self.tail
+    }
+
+    pub fn viewport(&self) -> &str {
+        &self.tail[self.viewport_start..]
+    }
+
+    #[cfg(test)]
+    pub fn visible_fixture(tail: String) -> Self {
+        Self {
+            tail,
+            viewport_start: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureBatchOutput {
     pub exit_code: Option<i32>,
@@ -203,6 +229,7 @@ pub enum CaptureBatchError {
         actual: usize,
     },
     InvalidIdentityHeader,
+    InvalidViewport,
     IdentityMismatch {
         expected: ServerIdentity,
         actual: ServerIdentity,
@@ -231,6 +258,7 @@ impl std::fmt::Display for CaptureBatchError {
                 "capture delimiter count mismatch: expected {expected}, received {actual}"
             ),
             Self::InvalidIdentityHeader => formatter.write_str("invalid capture identity header"),
+            Self::InvalidViewport => formatter.write_str("capture viewport missing or changed"),
             Self::IdentityMismatch { expected, actual } => write!(
                 formatter,
                 "tmux server identity mismatch: expected {}:{}, received {}:{}",
@@ -256,6 +284,10 @@ fn obs_ok_marker(delimiter: &str) -> String {
     format!("__vde_obs_ok_{delimiter}__")
 }
 
+fn obs_view_marker(delimiter: &str) -> String {
+    format!("__vde_obs_view_{delimiter}__")
+}
+
 fn job_boundary_marker(delimiter: &str) -> String {
     format!("__vde_job_{delimiter}__")
 }
@@ -268,7 +300,7 @@ pub enum CaptureJobSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureJobOutcome {
-    Observation(std::result::Result<Vec<String>, CaptureBatchError>),
+    Observation(std::result::Result<Vec<CapturedScreen>, CaptureBatchError>),
 }
 
 /// Builds one framed tmux command group for every job. The server identity
@@ -300,6 +332,8 @@ pub fn combined_capture_args(jobs: &[CaptureJobSpec], delimiter: &str) -> Vec<St
                             ";".to_string(),
                         ]);
                     }
+                    // Keep wrapped rows separate: viewport_start below relies
+                    // on one captured line per screen row, so never add -J.
                     let capture = vec![
                         "capture-pane".to_string(),
                         "-p".to_string(),
@@ -308,10 +342,25 @@ pub fn combined_capture_args(jobs: &[CaptureJobSpec], delimiter: &str) -> Vec<St
                         "-t".to_string(),
                         pane.pane_id.clone(),
                     ];
+                    let view_marker = vec![
+                        "display-message".to_string(),
+                        "-p".to_string(),
+                        "-t".to_string(),
+                        pane.pane_id.clone(),
+                        format!(
+                            "{}#{{pane_width}}:#{{pane_height}}",
+                            obs_view_marker(delimiter)
+                        ),
+                    ];
                     let ok_marker = vec![
                         "display-message".to_string(),
                         "-p".to_string(),
-                        obs_ok_marker(delimiter),
+                        "-t".to_string(),
+                        pane.pane_id.clone(),
+                        format!(
+                            "{}#{{pane_width}}:#{{pane_height}}",
+                            obs_ok_marker(delimiter)
+                        ),
                     ];
                     // The guard makes a vanished pane observable: when `-t`
                     // fails to resolve, the whole if-shell errors out and the
@@ -325,7 +374,8 @@ pub fn combined_capture_args(jobs: &[CaptureJobSpec], delimiter: &str) -> Vec<St
                         pane.pane_id.clone(),
                         "1".to_string(),
                         format!(
-                            "{} ; {}",
+                            "{} ; {} ; {}",
+                            crate::pane_state::store::tmux_command_string(&view_marker),
                             crate::pane_state::store::tmux_command_string(&capture),
                             crate::pane_state::store::tmux_command_string(&ok_marker),
                         ),
@@ -337,15 +387,19 @@ pub fn combined_capture_args(jobs: &[CaptureJobSpec], delimiter: &str) -> Vec<St
     args
 }
 
-/// Parses one combined capture invocation. The exit code and stderr are not
-/// used for validation; correctness is judged from the self-describing stdout
-/// structure instead.
+/// Parses one combined capture invocation. An unsuccessful client with no
+/// stdout produced no server evidence, so discard the batch as a transport
+/// failure. Otherwise validate the self-describing stdout: a malformed or
+/// mismatching identity remains fatal, including on nonzero exit.
 pub fn parse_combined_capture(
     output: CaptureBatchOutput,
     jobs: &[CaptureJobSpec],
     delimiter: &str,
     expected_identity: &ServerIdentity,
 ) -> std::result::Result<Vec<CaptureJobOutcome>, CaptureBatchError> {
+    if output.exit_code != Some(0) && output.stdout.is_empty() {
+        return Err(CaptureBatchError::ProcessFailed(output.exit_code));
+    }
     let (identity_line, stdout) = output
         .stdout
         .split_once('\n')
@@ -420,7 +474,7 @@ fn parse_observation_job(
     body: &str,
     pane_count: usize,
     delimiter: &str,
-) -> std::result::Result<Vec<String>, CaptureBatchError> {
+) -> std::result::Result<Vec<CapturedScreen>, CaptureBatchError> {
     if pane_count == 0 {
         return Ok(Vec::new());
     }
@@ -432,18 +486,43 @@ fn parse_observation_job(
         });
     }
     let ok_marker = obs_ok_marker(delimiter);
+    let view_marker = obs_view_marker(delimiter);
     let mut tails = Vec::with_capacity(pane_count);
     for section in sections {
         let mut lines = section.split_inclusive('\n').collect::<Vec<_>>();
-        let confirmed = lines.last().is_some_and(|last| {
-            let value = last.strip_suffix('\n').unwrap_or(last);
-            value.strip_suffix('\r').unwrap_or(value) == ok_marker
-        });
-        if !confirmed {
+        let shape = |line: &str, marker: &str| {
+            let (width, height) = line
+                .trim_end_matches(['\r', '\n'])
+                .strip_prefix(marker)?
+                .split_once(':')?;
+            let width = width.parse::<usize>().ok()?;
+            let height = height.parse::<usize>().ok()?;
+            (width > 0 && height > 0).then_some((width, height))
+        };
+        if !lines
+            .last()
+            .is_some_and(|line| line.starts_with(&ok_marker))
+        {
             return Err(CaptureBatchError::ProcessFailed(None));
         }
+        let before = lines.first().and_then(|line| shape(line, &view_marker));
+        let after = lines.last().and_then(|line| shape(line, &ok_marker));
+        let Some((_, height)) = before.filter(|_| before == after) else {
+            return Err(CaptureBatchError::InvalidViewport);
+        };
         lines.pop();
-        tails.push(lines.concat());
+        lines.remove(0);
+        if lines.len() < height {
+            return Err(CaptureBatchError::InvalidViewport);
+        }
+        let viewport_start = lines[..lines.len() - height]
+            .iter()
+            .map(|line| line.len())
+            .sum();
+        tails.push(CapturedScreen {
+            tail: lines.concat(),
+            viewport_start,
+        });
     }
     Ok(tails)
 }
@@ -454,7 +533,7 @@ pub trait CaptureSource: Send + Sync {
     fn capture_plain_tails(
         &self,
         panes: &[PaneInstance],
-    ) -> std::result::Result<Vec<String>, CaptureBatchError>;
+    ) -> std::result::Result<Vec<CapturedScreen>, CaptureBatchError>;
 }
 
 pub const CAPTURE_COALESCE_WINDOW: Duration = Duration::from_millis(25);
@@ -465,7 +544,7 @@ const DAEMON_OBSERVATION_CAPTURE_QUEUE_CAPACITY: usize = 8;
 enum CaptureRequest {
     ObservationPlain {
         panes: Vec<PaneInstance>,
-        reply: mpsc::SyncSender<std::result::Result<Vec<String>, CaptureBatchError>>,
+        reply: mpsc::SyncSender<std::result::Result<Vec<CapturedScreen>, CaptureBatchError>>,
     },
 }
 
@@ -604,7 +683,7 @@ impl CaptureSource for CaptureCoordinatorHandle {
     fn capture_plain_tails(
         &self,
         panes: &[PaneInstance],
-    ) -> std::result::Result<Vec<String>, CaptureBatchError> {
+    ) -> std::result::Result<Vec<CapturedScreen>, CaptureBatchError> {
         if panes.is_empty() {
             return Ok(Vec::new());
         }
@@ -794,8 +873,12 @@ fn classify_question_output(
 /// (measured on tmux 3.7: 993 accepted, 1008 rejected), so capture
 /// invocations are planned against an argument budget with a safety margin
 /// and large jobs are split across several invocations. The default
-/// nine-sidebar / ~62-pane configuration fits in a single invocation.
+/// nine-sidebar / ~62-pane configuration may span multiple byte-bounded calls.
 const MAX_ARGS_PER_CAPTURE_INVOCATION: usize = 850;
+/// tmux also bounds the packed command message to about 16 KiB. Count the
+/// actual UTF-8 argv plus NUL separators with headroom for the message header.
+const MAX_BYTES_PER_CAPTURE_INVOCATION: usize = 14 * 1024;
+const BUDGET_DELIMITER: &str = "00000000000000000000000000000000";
 /// Worst-case arguments one guarded observation capture adds: the command
 /// separator, a section separator, and six if-shell arguments.
 const ARGS_PER_OBSERVATION_ITEM: usize = 11;
@@ -805,7 +888,9 @@ const ARGS_PER_INVOCATION_HEADER: usize = 3;
 /// Splits the coalesced requests into invocations that fit the tmux argument
 /// budget. Each planned entry keeps the index of the request it came from so
 /// partial results can be re-assembled per request.
-fn plan_capture_invocations(requests: &[CaptureRequest]) -> Vec<Vec<(usize, CaptureJobSpec)>> {
+fn plan_capture_invocations(
+    requests: &[CaptureRequest],
+) -> Result<Vec<Vec<(usize, CaptureJobSpec)>>, CaptureBatchError> {
     let mut invocations: Vec<Vec<(usize, CaptureJobSpec)>> = Vec::new();
     let mut current: Vec<(usize, CaptureJobSpec)> = Vec::new();
     let mut current_args = ARGS_PER_INVOCATION_HEADER;
@@ -822,7 +907,52 @@ fn plan_capture_invocations(requests: &[CaptureRequest]) -> Vec<Vec<(usize, Capt
                 current_args = ARGS_PER_INVOCATION_HEADER;
                 continue;
             }
-            let take = fits.min(items.len() - offset);
+            // Binary-search the largest slice whose actual framed command fits.
+            // Nested if-shell strings count as one argv but can be hundreds of
+            // bytes; the argument count alone cannot bound the tmux message.
+            let mut lower = 0;
+            let mut upper = fits.min(items.len() - offset);
+            while lower < upper {
+                let candidate = lower + (upper - lower).div_ceil(2);
+                let mut jobs = current
+                    .iter()
+                    .map(|(_, job)| job.clone())
+                    .collect::<Vec<_>>();
+                jobs.push(CaptureJobSpec::ObservationPlain {
+                    panes: items[offset..offset + candidate].to_vec(),
+                });
+                let bytes = combined_capture_args(&jobs, BUDGET_DELIMITER)
+                    .iter()
+                    .map(|arg| arg.len() + 1)
+                    .sum::<usize>();
+                if bytes <= MAX_BYTES_PER_CAPTURE_INVOCATION {
+                    lower = candidate;
+                } else {
+                    upper = candidate - 1;
+                }
+            }
+            let take = lower;
+            if take == 0 {
+                if current.is_empty() {
+                    let bytes = combined_capture_args(
+                        &[CaptureJobSpec::ObservationPlain {
+                            panes: vec![items[offset].clone()],
+                        }],
+                        BUDGET_DELIMITER,
+                    )
+                    .iter()
+                    .map(|arg| arg.len() + 1)
+                    .sum();
+                    return Err(CaptureBatchError::OutputLimit {
+                        scope: "capture command argv".to_string(),
+                        actual: bytes,
+                        limit: MAX_BYTES_PER_CAPTURE_INVOCATION,
+                    });
+                }
+                invocations.push(std::mem::take(&mut current));
+                current_args = ARGS_PER_INVOCATION_HEADER;
+                continue;
+            }
             let slice = items[offset..offset + take].to_vec();
             current.push((
                 request_index,
@@ -835,7 +965,7 @@ fn plan_capture_invocations(requests: &[CaptureRequest]) -> Vec<Vec<(usize, Capt
     if !current.is_empty() {
         invocations.push(current);
     }
-    invocations
+    Ok(invocations)
 }
 
 fn execute_capture_group(
@@ -843,8 +973,10 @@ fn execute_capture_group(
     expected_identity: &ServerIdentity,
     requests: Vec<CaptureRequest>,
 ) {
-    let mut observation_acc: BTreeMap<usize, std::result::Result<Vec<String>, CaptureBatchError>> =
-        BTreeMap::new();
+    let mut observation_acc: BTreeMap<
+        usize,
+        std::result::Result<Vec<CapturedScreen>, CaptureBatchError>,
+    > = BTreeMap::new();
     for (request_index, request) in requests.iter().enumerate() {
         match request {
             CaptureRequest::ObservationPlain { .. } => {
@@ -855,7 +987,14 @@ fn execute_capture_group(
 
     let mut fatal: Option<CaptureBatchError> = None;
     let mut retained_group_bytes = 0usize;
-    'invocations: for invocation in plan_capture_invocations(&requests) {
+    let invocations = match plan_capture_invocations(&requests) {
+        Ok(invocations) => invocations,
+        Err(error) => {
+            fatal = Some(error);
+            Vec::new()
+        }
+    };
+    'invocations: for invocation in invocations {
         let jobs = invocation
             .iter()
             .map(|(_, job)| job.clone())
@@ -874,7 +1013,8 @@ fn execute_capture_group(
                                 .expect("observation slice maps to an observation request");
                             match (accumulator, result) {
                                 (Ok(tails), Ok(more)) => {
-                                    let added = more.iter().map(String::len).sum::<usize>();
+                                    let added =
+                                        more.iter().map(|screen| screen.tail.len()).sum::<usize>();
                                     if let Err(error) =
                                         add_retained_capture_bytes(&mut retained_group_bytes, added)
                                     {
@@ -1052,6 +1192,7 @@ mod tests {
             .filter(|arg| arg.contains("capture-pane") && arg.contains("__vde_obs_ok_"))
             .collect::<Vec<_>>();
         assert_eq!(guarded.len(), 2);
+        assert!(guarded.iter().all(|command| !command.contains("-J")));
         assert!(guarded[0].contains("%1"));
         assert!(guarded[1].contains("%2"));
     }
@@ -1060,7 +1201,7 @@ mod tests {
         stdout_body: &str,
         pane_count: usize,
         delimiter: &str,
-    ) -> std::result::Result<Vec<String>, CaptureBatchError> {
+    ) -> std::result::Result<Vec<CapturedScreen>, CaptureBatchError> {
         let panes = (0..pane_count)
             .map(|index| pane_instance(&format!("%{index}"), 10 + index as u32))
             .collect::<Vec<_>>();
@@ -1077,6 +1218,135 @@ mod tests {
         .unwrap();
         let CaptureJobOutcome::Observation(result) = outcomes.into_iter().next().unwrap();
         result
+    }
+
+    #[test]
+    fn unsuccessful_empty_client_is_discarded_without_weakening_identity_checks() {
+        for exit_code in [Some(1), None] {
+            assert_eq!(
+                parse_combined_capture(
+                    CaptureBatchOutput {
+                        exit_code,
+                        stdout: String::new(),
+                        stderr: "command too long".to_string(),
+                    },
+                    &[],
+                    "d",
+                    &server_identity()
+                ),
+                Err(CaptureBatchError::ProcessFailed(exit_code))
+            );
+        }
+        for (exit_code, stdout) in [
+            (Some(0), ""),
+            (Some(0), "malformed\n"),
+            (Some(1), "malformed\n"),
+        ] {
+            assert_eq!(
+                parse_combined_capture(
+                    CaptureBatchOutput {
+                        exit_code,
+                        stdout: stdout.to_string(),
+                        stderr: String::new(),
+                    },
+                    &[],
+                    "d",
+                    &server_identity()
+                ),
+                Err(CaptureBatchError::InvalidIdentityHeader)
+            );
+        }
+        let expected = server_identity();
+        let other = ServerIdentity {
+            pid: expected.pid + 1,
+            ..expected.clone()
+        };
+        for exit_code in [Some(0), Some(1)] {
+            assert!(matches!(
+                parse_combined_capture(
+                    CaptureBatchOutput {
+                        exit_code,
+                        stdout: combined_stdout("d", &other, &[]),
+                        stderr: String::new(),
+                    },
+                    &[],
+                    "d",
+                    &expected
+                ),
+                Err(CaptureBatchError::IdentityMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn capture_plan_bounds_packed_bytes_and_preserves_every_request_in_order() {
+        let mut requests = Vec::new();
+        for count in [58, 256, 1] {
+            let (reply, _) = mpsc::sync_channel(1);
+            requests.push(CaptureRequest::ObservationPlain {
+                panes: (0..count)
+                    .map(|index| pane_instance(&format!("%{}", u64::MAX - index), 10))
+                    .collect(),
+                reply,
+            });
+        }
+        let invocations = plan_capture_invocations(&requests).unwrap();
+        assert!(invocations.len() > 3);
+        let mut recovered = vec![Vec::new(); requests.len()];
+        for invocation in invocations {
+            let jobs = invocation
+                .iter()
+                .map(|(_, job)| job.clone())
+                .collect::<Vec<_>>();
+            let args = combined_capture_args(&jobs, BUDGET_DELIMITER);
+            assert!(args.len() <= MAX_ARGS_PER_CAPTURE_INVOCATION);
+            assert!(
+                args.iter().map(|arg| arg.len() + 1).sum::<usize>()
+                    <= MAX_BYTES_PER_CAPTURE_INVOCATION
+            );
+            for (index, CaptureJobSpec::ObservationPlain { panes }) in invocation {
+                recovered[index].extend(panes);
+            }
+        }
+        for (index, request) in requests.iter().enumerate() {
+            let CaptureRequest::ObservationPlain { panes, .. } = request;
+            assert_eq!(&recovered[index], panes);
+        }
+        let (reply, _) = mpsc::sync_channel(1);
+        assert!(matches!(
+            plan_capture_invocations(&[CaptureRequest::ObservationPlain {
+                panes: vec![pane_instance(
+                    &format!("%{}", "1".repeat(MAX_BYTES_PER_CAPTURE_INVOCATION)),
+                    10
+                )],
+                reply,
+            }]),
+            Err(CaptureBatchError::OutputLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn viewport_excludes_history_and_rejects_resize_or_incomplete_capture() {
+        let section = "__vde_obs_view_d__80:2\nWould you like to run the following command?\n› 1. Yes, proceed (y)\nQuestion 1/1 (1 unanswered)\n\n__vde_obs_ok_d__80:2\n";
+        let screens = observation_outcome(section, 1, "d").unwrap();
+        assert!(screens[0].tail().contains("Would you like"));
+        assert_eq!(screens[0].viewport(), "Question 1/1 (1 unanswered)\n\n");
+        assert_eq!(
+            crate::detect::codex::classify(screens[0].viewport()).modal,
+            Some(crate::detect::codex::Modal::SynchronousQuestion)
+        );
+        for invalid in [
+            section.replace("ok_d__80:2", "ok_d__81:2"),
+            section.replace("view_d__80:2", "view_d__80:5"),
+            section.replace("80:2", "80:5"),
+            section.replace("80:2", "80:0"),
+            section.replace("view_d__80:2", "view_d__broken"),
+        ] {
+            assert_eq!(
+                observation_outcome(&invalid, 1, "d"),
+                Err(CaptureBatchError::InvalidViewport)
+            );
+        }
     }
 
     #[test]
@@ -1100,21 +1370,24 @@ mod tests {
                 actual: 2
             })
         ));
-        let ok = format!("__vde_obs_ok_{delimiter}__");
-        let middle_missing = format!("first\n{ok}\n{delimiter}\n{delimiter}\nthird\n{ok}\n");
+        let ok = format!("__vde_obs_ok_{delimiter}__80:1");
+        let view = format!("__vde_obs_view_{delimiter}__80:1");
+        let middle_missing =
+            format!("{view}\nfirst\n{ok}\n{delimiter}\n{delimiter}\n{view}\nthird\n{ok}\n");
         assert!(matches!(
             observation_outcome(&middle_missing, 3, delimiter),
             Err(CaptureBatchError::ProcessFailed(None))
         ));
 
-        let all_present =
-            format!("first\n{ok}\n{delimiter}\nsecond\n{ok}\n{delimiter}\nthird\n{ok}\n");
+        let all_present = format!(
+            "{view}\nfirst\n{ok}\n{delimiter}\n{view}\nsecond\n{ok}\n{delimiter}\n{view}\nthird\n{ok}\n"
+        );
         assert_eq!(
             observation_outcome(&all_present, 3, delimiter).unwrap(),
             vec![
-                "first\n".to_string(),
-                "second\n".to_string(),
-                "third\n".to_string()
+                CapturedScreen::visible_fixture("first\n".to_string()),
+                CapturedScreen::visible_fixture("second\n".to_string()),
+                CapturedScreen::visible_fixture("third\n".to_string())
             ]
         );
     }

@@ -148,6 +148,9 @@ pub struct CanonicalStateRuntime {
     diagnostics: VecDeque<PaneStateDiagnostic>,
     transitions: VecDeque<CanonicalTransition>,
     notification_jobs: VecDeque<CanonicalNotification>,
+    /// Start version of each continuous canonical Blocked occurrence. This is
+    /// runtime-only; metadata/read revisions must not invalidate its notification.
+    notification_generations: BTreeMap<PaneInstance, StateVersion>,
     triage: BTreeMap<PaneInstance, crate::daemon::session_badge::BadgeState>,
     triage_calm_polls: BTreeMap<PaneInstance, u8>,
     flash: BTreeMap<PaneInstance, u8>,
@@ -180,6 +183,9 @@ impl CanonicalStateRuntime {
                 },
             );
             if super::resolve_badge(state) == crate::daemon::session_badge::BadgeState::Blocked {
+                runtime
+                    .notification_generations
+                    .insert(pane.clone(), state.version());
                 runtime.triage.insert(
                     pane.clone(),
                     crate::daemon::session_badge::BadgeState::Blocked,
@@ -260,6 +266,24 @@ impl CanonicalStateRuntime {
         self.notification_jobs.drain(..).collect()
     }
 
+    pub fn notification_is_current(&self, notification: &CanonicalNotification) -> bool {
+        !self.fail_stopped
+            && self
+                .notification_generations
+                .get(&notification.pane_instance)
+                == Some(&notification.state_version)
+            && self
+                .records
+                .get(&notification.pane_instance)
+                .is_some_and(|state| {
+                    state.agent_present
+                        && state.state_id == notification.state_version.state_id
+                        && state.agent_epoch == notification.state_version.agent_epoch
+                        && super::resolve_badge(state)
+                            == crate::daemon::session_badge::BadgeState::Blocked
+                })
+    }
+
     pub fn advance_poll_projection(&mut self) -> Result<bool, StoreError> {
         let mut draft = self.clone();
         let mut visible_changed = false;
@@ -303,6 +327,7 @@ impl CanonicalStateRuntime {
                 !(0..=super::resolver::SCREEN_EVIDENCE_TTL_SECONDS)
                     .contains(&now.saturating_sub(at))
             }) {
+                tracker.codex_screen_expired_at = tracker.codex_screen.map(|(_, at)| at);
                 tracker.codex_screen = None;
                 changed = true;
             }
@@ -384,6 +409,7 @@ impl CanonicalStateRuntime {
             return Ok(false);
         }
         draft.triage.remove(pane);
+        draft.notification_generations.remove(pane);
         draft.triage_calm_polls.remove(pane);
         draft.flash.remove(pane);
         draft.bump_snapshot_revision()?;
@@ -581,8 +607,8 @@ impl CanonicalStateRuntime {
         if reduction.outcome != ReductionOutcome::CanonicalChanged {
             if let Some(delta) = reduction.tracker_delta {
                 let public_identity_changed = tracker.agent_process != delta.next.agent_process
-                    || tracker.codex_screen.map(|(evidence, _)| evidence)
-                        != delta.next.codex_screen.map(|(evidence, _)| evidence)
+                    || tracker.codex_screen != delta.next.codex_screen
+                    || tracker.codex_screen_expired_at != delta.next.codex_screen_expired_at
                     || tracker.hook_authoritative != delta.next.hook_authoritative;
                 self.trackers
                     .insert(envelope.pane_instance.clone(), delta.next);
@@ -678,6 +704,13 @@ impl CanonicalStateRuntime {
         };
         let transition_state = current.or(previous);
         let state_version = current.map(PaneState::version);
+        if current_badge != Some(crate::daemon::session_badge::BadgeState::Blocked)
+            || previous.zip(current).is_some_and(|(before, after)| {
+                before.state_id != after.state_id || before.agent_epoch != after.agent_epoch
+            })
+        {
+            self.notification_generations.remove(pane);
+        }
         self.transitions.push_back(CanonicalTransition {
             pane_instance: pane.clone(),
             agent,
@@ -709,6 +742,8 @@ impl CanonicalStateRuntime {
             if current_badge == Some(crate::daemon::session_badge::BadgeState::Blocked)
                 && let Some(state_version) = state_version
             {
+                self.notification_generations
+                    .insert(pane.clone(), state_version.clone());
                 self.notification_jobs.push_back(CanonicalNotification {
                     pane_instance: pane.clone(),
                     state_version,
@@ -819,6 +854,7 @@ impl CanonicalStateRuntime {
         if self.transitions.len() > MAX_DIAGNOSTICS
             || self.diagnostics.len() > MAX_DIAGNOSTICS
             || self.notification_jobs.len() > 64
+            || self.notification_generations.len() > MAX_DIAGNOSTICS
             || self.triage.len() > MAX_DIAGNOSTICS
             || self.triage_calm_polls.len() > MAX_DIAGNOSTICS
             || self.flash.len() > MAX_DIAGNOSTICS
@@ -997,12 +1033,111 @@ mod tests {
         assert_eq!(runtime.record(&target), Some(&before));
         assert_eq!(runtime.transitions.clone(), history);
         assert!(runtime.notification_jobs().is_empty());
+        // An unchanged screen refreshes its public observation time as well.
         let revision = runtime.snapshot_revision();
-        runtime.expire_screen_evidence(14).unwrap();
+        let refreshed = runtime.tracker(&target);
+        let base = runtime.descriptor(&target);
+        apply(
+            &mut runtime,
+            &mut io,
+            target.clone(),
+            PaneEvent::ObservationBatch {
+                base,
+                tracker_generation: refreshed.generation,
+                observed_at: 11,
+                presence: AgentPresenceObservation::Present(before.agent.clone()),
+                capture: Some(CaptureObservation {
+                    inference: CaptureInference::NoChange,
+                    observed_fingerprint: Some([1; 32]),
+                    codex_screen: refreshed.codex_screen.map(|(evidence, _)| evidence),
+                }),
+                process: None,
+            },
+        )
+        .unwrap();
+        assert!(runtime.snapshot_revision() > revision);
+        assert_eq!(runtime.tracker(&target).codex_screen.unwrap().1, 11);
+        assert_eq!(runtime.record(&target), Some(&before));
+        assert_eq!(runtime.transitions, history);
+        assert!(runtime.notification_jobs().is_empty());
+        let revision = runtime.snapshot_revision();
+        runtime.expire_screen_evidence(15).unwrap();
         assert!(runtime.snapshot_revision() > revision);
         assert!(runtime.tracker(&target).codex_screen.is_none());
+        let explanation = crate::pane_state::resolve_presentation_with_explanation(
+            &before,
+            &runtime.tracker(&target),
+            15,
+        )
+        .1;
+        assert_eq!(explanation.reason, PresentationReason::EvidenceExpired);
+        assert_eq!(explanation.observed_at, Some(11));
         let hydrated = CanonicalStateRuntime::hydrate(runtime.records.clone()).unwrap();
         assert!(hydrated.tracker(&target).codex_screen.is_none());
+        assert!(hydrated.tracker(&target).codex_screen_expired_at.is_none());
+    }
+
+    #[test]
+    fn queued_notification_tracks_blocked_occurrence_not_metadata_revision() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = RecordingStore::default();
+        let target = pane(1);
+        let wait = PaneEvent::WaitRequested {
+            observed_at: 10,
+            reason: WaitReason::PermissionPrompt,
+        };
+        apply(&mut runtime, &mut io, target.clone(), wait.clone()).unwrap();
+        let first = runtime.drain_notification_jobs().pop().unwrap();
+        assert!(runtime.notification_is_current(&first));
+        // Real metadata/read events change revision without leaving Blocked.
+        apply(
+            &mut runtime,
+            &mut io,
+            target.clone(),
+            PaneEvent::ProgressUpdated {
+                observed_at: 11,
+                operations: vec![ProgressOperation::TaskCreated],
+            },
+        )
+        .unwrap();
+        let order = runtime.latest_unread_order();
+        apply(
+            &mut runtime,
+            &mut io,
+            target.clone(),
+            PaneEvent::MarkPaneRead {
+                through_order: order,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            runtime.record(&target).unwrap().revision,
+            first.state_version.revision
+        );
+        assert!(runtime.notification_is_current(&first));
+        apply(
+            &mut runtime,
+            &mut io,
+            target.clone(),
+            PaneEvent::ActivityObserved { observed_at: 11 },
+        )
+        .unwrap();
+        assert!(!runtime.notification_is_current(&first));
+        apply(&mut runtime, &mut io, target.clone(), wait).unwrap();
+        let second = runtime.drain_notification_jobs().pop().unwrap();
+        assert!(!runtime.notification_is_current(&first));
+        assert!(runtime.notification_is_current(&second));
+        let mut wrong_pane = second.clone();
+        wrong_pane.pane_instance.pane_pid += 1;
+        assert!(!runtime.notification_is_current(&wrong_pane));
+        runtime.records.get_mut(&target).unwrap().agent_epoch += 1;
+        assert!(!runtime.notification_is_current(&second));
+        let descriptor = runtime.descriptor(&target);
+        runtime
+            .remove_absent_pane(&mut io, &target, descriptor.as_ref())
+            .unwrap();
+        assert!(!runtime.notification_is_current(&second));
+        assert!(runtime.notification_generations.is_empty());
     }
 
     #[test]

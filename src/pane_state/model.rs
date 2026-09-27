@@ -1150,6 +1150,65 @@ pub struct ResolvedPaneState {
     pub pane_id: String,
     pub current_path: String,
     pub badge: BadgeState,
+    pub presentation: PresentationExplanation,
+}
+
+/// Body-free, runtime-only explanation of the displayed badge.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct PresentationExplanation {
+    pub reason: PresentationReason,
+    pub observed_at: Option<i64>,
+    pub ttl_seconds: Option<i64>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentationReason {
+    #[default]
+    Canonical,
+    HookAuthoritative,
+    AgentAbsent,
+    CanonicalActive,
+    ScreenWorking,
+    ScreenApproval,
+    ScreenQuestion,
+    ScreenTrust,
+    ScreenUpdate,
+    UnreadCompletion,
+    UnknownScreen,
+    TranscriptViewer,
+    EvidenceUnavailable,
+    EvidenceExpired,
+    ObservationTimeInvalid,
+    EpochMismatch,
+}
+
+impl PresentationReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Canonical => "記録された状態",
+            Self::HookAuthoritative => "エージェントからの状態通知",
+            Self::AgentAbsent => "エージェント終了後の記録",
+            Self::CanonicalActive => "記録された実行・入力待ち状態",
+            Self::ScreenWorking => "画面に実行中の表示",
+            Self::ScreenApproval => "画面に承認待ちの表示",
+            Self::ScreenQuestion => "画面に回答待ちの表示",
+            Self::ScreenTrust => "ディレクトリの信頼確認待ち",
+            Self::ScreenUpdate => "更新方法の選択待ち",
+            Self::UnreadCompletion => "未確認の完了通知",
+            Self::UnknownScreen => "画面から状態を判定できません",
+            Self::TranscriptViewer => "履歴閲覧中のため画面判定できません",
+            Self::EvidenceUnavailable => "現在の画面情報がありません",
+            Self::EvidenceExpired => "画面情報の有効期限切れ",
+            Self::ObservationTimeInvalid => "画面の観測時刻が現在時刻より先になっています",
+            Self::EpochMismatch => "現在のエージェントの画面情報がありません",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1465,6 +1524,8 @@ pub struct CaptureTrackerSnapshot {
     pub hook_authoritative: bool,
     /// Ephemeral finite evidence; never serialized into canonical Pane State.
     pub codex_screen: Option<(crate::detect::codex::Evidence, i64)>,
+    /// Preserve only the observation timestamp when expiring positive evidence.
+    pub codex_screen_expired_at: Option<i64>,
     /// A same-session interruption received after completion awaits one terminal check.
     pub interruption_verification_pending: bool,
     /// Currently verified exact identity exposed through the daemon projection.

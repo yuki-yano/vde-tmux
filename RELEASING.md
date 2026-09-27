@@ -4,12 +4,17 @@ Publishing is driven by Git tags.
 
 ## Local API v6 upgrade
 
-API 6 / daemon protocol 26 adds ephemeral Codex Working/Blocked/Unknown presentation and
+API 6 / daemon protocol 27 adds ephemeral Codex Working/Blocked/Unknown presentation and
 rejects lifecycle hooks whose process ancestry does not belong to the claimed embedded pane.
 The conservative automatic acknowledgement of Codex question notices remains unchanged.
 `needs_action` now includes current Blocked panes and unacknowledged question notices; the
 statusline's existing Blocked triage remains separate. PaneState schema 10 and private state
 format 1 are unchanged. Keep existing state, Runs, and the question-notice sidecar (schema 1).
+Protocol 27 additionally carries finite presentation explanations, including evidence expiry.
+Agent API 6 adds `presentation` to summaries without changing existing fields. Startup trust/update
+screen detection is presentation-only. Canonical notification jobs are checked against their
+Blocked occurrence when accepted for execution; their generation is runtime-only. State changes
+after validation cannot retract the accepted notification.
 Resolver trust is runtime-only: notices from before the restart remain Q-only, and existing
 sessions are not made trusted by a later prompt. A local install does not require a crate
 version bump or a release tag.
@@ -21,7 +26,7 @@ version bump or a release tag.
    capture failures, at most 20MiB RSS growth, and retained notices on probe drop. Reuse accepted
    evidence for unchanged product code; distinguish saved-data re-evaluation from a new run.
 2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
-   Confirm `vt api schema --json` reports API 6, protocol 26, PaneState 10, and private state 1.
+   Confirm `vt api schema --json` reports API 6, protocol 27, PaneState 10, and private state 1.
    Validate the staged binaries on a scratch server before replacing the installed generation:
    `VDE_VT_BIN=<temporary-root>/bin/vt python3 scripts/test-codex-observation-isolated.py`.
 3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.

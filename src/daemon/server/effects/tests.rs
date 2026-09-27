@@ -1,6 +1,51 @@
 use super::super::*;
 use super::*;
 
+fn notification_test_generation() -> crate::pane_state::CanonicalNotification {
+    crate::pane_state::CanonicalNotification {
+        pane_instance: PaneInstance {
+            pane_id: "%7".into(),
+            pane_pid: 7,
+        },
+        state_version: crate::pane_state::StateVersion {
+            state_id: crate::pane_state::StateId::parse("1".repeat(32)).unwrap(),
+            agent_epoch: 1,
+            revision: 1,
+        },
+    }
+}
+
+pub(super) fn notification_test_state()
+-> Arc<Mutex<Option<crate::daemon::runtime::CanonicalCoordinatorState>>> {
+    let root = test_root("notification-state");
+    let target = notification_test_generation().pane_instance;
+    let mut record = read_peek_test_pane_state(target.clone(), &"1".repeat(32), 1);
+    record.lifecycle = crate::pane_state::LifecycleState::Waiting {
+        reason: crate::pane_state::WaitReason::PermissionPrompt,
+    };
+    record.run_seq = 2;
+    let mut leased =
+        crate::daemon::runtime::LeasedCanonicalPaneStateRuntime::acquire(&root.join("writer"))
+            .unwrap();
+    leased
+        .hydrate(BTreeMap::from([(target.clone(), record)]))
+        .unwrap();
+    Arc::new(Mutex::new(Some(
+        crate::daemon::runtime::CanonicalCoordinatorState::new(
+            leased,
+            crate::daemon::topology::TopologySnapshot {
+                server_identity: crate::daemon::topology::ServerIdentity {
+                    pid: 1,
+                    start_time: 1,
+                },
+                panes: vec![read_peek_test_topology_pane(target, false)],
+            },
+            Default::default(),
+            Default::default(),
+        ),
+    )))
+}
+
 #[test]
 fn nvim_marker_parser_ignores_empty_and_malformed_values() {
     let output = "%6\u{1f}94451\u{1f}68736\n%8\u{1f}95025\u{1f}\ninvalid\n";
@@ -43,8 +88,8 @@ fn canonical_notification_worker_exports_blocked_environment() {
     let sender = start_notification_worker(command);
     sender
         .try_send(NotificationWorkerJob {
-            pane_id: "%7".to_string(),
             agent: "codex".to_string(),
+            notification: notification_test_generation(),
         })
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -62,6 +107,68 @@ fn canonical_notification_worker_exports_blocked_environment() {
 }
 
 #[test]
+fn queued_notification_is_revalidated_after_a_slow_prior_command() {
+    let root = test_root("notification-stale-queue");
+    let started = root.join("started");
+    let release = root.join("release");
+    let output = root.join("sent");
+    let env = BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]);
+    let hash = "a".repeat(64);
+    let state = notification_test_state();
+    let command = format!(
+        "printf 'sent\\n' >> '{}'; touch '{}'; while [ ! -f '{}' ]; do sleep 0.01; done",
+        output.display(),
+        started.display(),
+        release.display()
+    );
+    let sender = start_notification_worker_with_control(
+        command,
+        Duration::from_secs(5),
+        Some((env.clone(), hash.clone())),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(())),
+        state.clone(),
+    );
+    let job = || NotificationWorkerJob {
+        agent: "codex".into(),
+        notification: notification_test_generation(),
+    };
+    sender.send(job()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !started.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "first notification did not start"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    sender.send(job()).unwrap();
+    // It was valid when enqueued, but the pane has gone before execution.
+    state
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .topology
+        .panes
+        .clear();
+    std::fs::write(&release, b"release").unwrap();
+    let log = crate::daemon::lifecycle::daemon_log_path(&env, &hash);
+    while !std::fs::read_to_string(&log)
+        .is_ok_and(|text| text.contains("stale_notification_skipped"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "queued notification was not revalidated"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read_to_string(output).unwrap(), "sent\n");
+    drop(sender);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn canonical_notification_timeout_kills_descendant_processes() {
     let root = test_root("notification-timeout");
     let pid_file = root.join("child.pid");
@@ -70,8 +177,8 @@ fn canonical_notification_timeout_kills_descendant_processes() {
         start_notification_worker_with_timeout_and_log(command, Duration::from_millis(100), None);
     sender
         .try_send(NotificationWorkerJob {
-            pane_id: "%7".to_string(),
             agent: "codex".to_string(),
+            notification: notification_test_generation(),
         })
         .unwrap();
     let file_deadline = Instant::now() + Duration::from_secs(1);
@@ -113,8 +220,8 @@ fn canonical_notification_successful_leader_exit_kills_background_descendants() 
         start_notification_worker_with_timeout_and_log(command, Duration::from_secs(2), None);
     sender
         .try_send(NotificationWorkerJob {
-            pane_id: "%7".to_string(),
             agent: "codex".to_string(),
+            notification: notification_test_generation(),
         })
         .unwrap();
     let file_deadline = Instant::now() + Duration::from_secs(1);
@@ -154,8 +261,8 @@ fn canonical_notification_failure_is_written_to_private_incarnation_log() {
     );
     sender
         .try_send(NotificationWorkerJob {
-            pane_id: "%7".to_string(),
             agent: "codex".to_string(),
+            notification: notification_test_generation(),
         })
         .unwrap();
     let path = crate::daemon::lifecycle::daemon_log_path(&env, &hash);

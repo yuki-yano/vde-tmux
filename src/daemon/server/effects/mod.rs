@@ -23,8 +23,8 @@ mod tests;
 
 #[derive(Debug)]
 pub(super) struct NotificationWorkerJob {
-    pub(super) pane_id: String,
     pub(super) agent: String,
+    pub(super) notification: crate::pane_state::CanonicalNotification,
 }
 
 pub(super) struct SidebarTmuxJob {
@@ -221,6 +221,7 @@ pub(super) fn start_notification_worker_with_timeout_and_log(
         log_context,
         Arc::new(AtomicBool::new(false)),
         Arc::new(Mutex::new(())),
+        tests::notification_test_state(),
     )
 }
 
@@ -230,10 +231,45 @@ pub(super) fn start_notification_worker_with_control(
     log_context: Option<(std::collections::BTreeMap<String, String>, String)>,
     shutdown: Arc<AtomicBool>,
     process_lock: Arc<Mutex<()>>,
+    state: Arc<Mutex<Option<crate::daemon::runtime::CanonicalCoordinatorState>>>,
 ) -> SyncSender<NotificationWorkerJob> {
     let (sender, receiver) = mpsc::sync_channel::<NotificationWorkerJob>(64);
     thread::spawn(move || {
         while let Ok(job) = receiver.recv() {
+            // Revalidate the queued occurrence at execution time, without holding
+            // the mutation lock across process locking or fork/exec. A state change
+            // after this check cannot retract an already accepted notification.
+            let state_guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    log_notification_failure(
+                        log_context.as_ref(),
+                        "notification_state_lock_poisoned",
+                    );
+                    break;
+                }
+            };
+            let current = state_guard.as_ref().is_some_and(|state| {
+                state
+                    .leased
+                    .runtime
+                    .notification_is_current(&job.notification)
+                    && state
+                        .topology
+                        .panes
+                        .iter()
+                        .any(|pane| pane.pane_instance == job.notification.pane_instance)
+                    && state
+                        .leased
+                        .runtime
+                        .record(&job.notification.pane_instance)
+                        .is_some_and(|record| record.agent.as_str() == job.agent)
+            });
+            drop(state_guard);
+            if !current {
+                log_notification_failure(log_context.as_ref(), "stale_notification_skipped");
+                continue;
+            }
             let process_guard = process_lock
                 .lock()
                 .expect("notification process lock poisoned");
@@ -244,7 +280,7 @@ pub(super) fn start_notification_worker_with_control(
             process
                 .arg("-c")
                 .arg(&command)
-                .env("VDE_PANE_ID", &job.pane_id)
+                .env("VDE_PANE_ID", &job.notification.pane_instance.pane_id)
                 .env("VDE_AGENT", &job.agent)
                 .env("VDE_BADGE_STATE", "Blocked")
                 .stdin(Stdio::null())
@@ -266,7 +302,7 @@ pub(super) fn start_notification_worker_with_control(
                         log_context.as_ref(),
                         &format!(
                             "notification command spawn failed for pane {}: {error}",
-                            job.pane_id
+                            job.notification.pane_instance.pane_id
                         ),
                     );
                     continue;
@@ -284,7 +320,7 @@ pub(super) fn start_notification_worker_with_control(
                             log_context.as_ref(),
                             &format!(
                                 "notification process identity failed for pane {}: {error}",
-                                job.pane_id
+                                job.notification.pane_instance.pane_id
                             ),
                         );
                         continue;
@@ -299,7 +335,7 @@ pub(super) fn start_notification_worker_with_control(
                     log_context.as_ref(),
                     &format!(
                         "notification process identity persistence failed for pane {}: {error}",
-                        job.pane_id
+                        job.notification.pane_instance.pane_id
                     ),
                 );
                 continue;
@@ -318,7 +354,7 @@ pub(super) fn start_notification_worker_with_control(
                                 log_context.as_ref(),
                                 &format!(
                                     "notification command exited with status {status} for pane {}",
-                                    job.pane_id
+                                    job.notification.pane_instance.pane_id
                                 ),
                             );
                         }
@@ -333,7 +369,7 @@ pub(super) fn start_notification_worker_with_control(
                             log_context.as_ref(),
                             &format!(
                                 "notification command timed out after {timeout:?} for pane {}",
-                                job.pane_id
+                                job.notification.pane_instance.pane_id
                             ),
                         );
                         break;
@@ -344,7 +380,7 @@ pub(super) fn start_notification_worker_with_control(
                             log_context.as_ref(),
                             &format!(
                                 "notification command wait failed for pane {}: {error}",
-                                job.pane_id
+                                job.notification.pane_instance.pane_id
                             ),
                         );
                         break;

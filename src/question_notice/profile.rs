@@ -285,21 +285,6 @@ pub(crate) fn non_embedded_arguments(args: &[String]) -> bool {
     argument_mode(args) == ArgumentMode::NonEmbedded
 }
 
-/// Positive mode evidence only; unavailable argv/identity is not an exclusion.
-pub fn positively_non_embedded(process: &AgentProcessIdentity) -> bool {
-    executable_path(process.pid)
-        .is_some_and(|path| path.file_name().is_some_and(|name| name == "codex"))
-        && crate::daemon::lifecycle::agent_process_start_token(process.pid)
-            .ok()
-            .as_deref()
-            == Some(&process.start_token)
-        && process_arguments(process.pid).is_some_and(|args| non_embedded_arguments(&args))
-        && crate::daemon::lifecycle::agent_process_start_token(process.pid)
-            .ok()
-            .as_deref()
-            == Some(&process.start_token)
-}
-
 /// Only a transient local inspection. Neither argv nor environment is returned to the daemon
 /// protocol or recorded in the profile cache.
 pub(crate) fn process_arguments(pid: u32) -> Option<Vec<String>> {
@@ -747,7 +732,9 @@ int main(int argc, char **argv) {{
             start_token: crate::daemon::lifecycle::agent_process_start_token(child.id()).unwrap(),
         };
         let request = ProfileRequest::capture(process.clone()).unwrap();
-        assert!(!positively_non_embedded(&process));
+        assert!(!non_embedded_arguments(
+            &process_arguments(process.pid).unwrap()
+        ));
         assert_eq!(
             version_from_process(&request, Instant::now() + Duration::from_secs(1)),
             Some(CodexProfile::V01561)
@@ -764,7 +751,9 @@ int main(int argc, char **argv) {{
             pid: remote.id(),
             start_token: crate::daemon::lifecycle::agent_process_start_token(remote.id()).unwrap(),
         };
-        assert!(positively_non_embedded(&process));
+        assert!(non_embedded_arguments(
+            &process_arguments(process.pid).unwrap()
+        ));
         let _ = remote.kill();
         let _ = remote.wait();
         let mut unknown = spawn(&["--future-mode"]);

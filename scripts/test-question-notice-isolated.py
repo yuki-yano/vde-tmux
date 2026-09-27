@@ -75,9 +75,9 @@ def diagnostics():
         stream.settimeout(3)
         stream.connect(daemon_socket)
         reader = stream.makefile("r")
-        stream.sendall(b'{"op":"hello","proto":26}\n')
+        stream.sendall(b'{"op":"hello","proto":27}\n')
         json.loads(reader.readline())
-        stream.sendall(b'{"op":"query_question_diagnostics","proto":26}\n')
+        stream.sendall(b'{"op":"query_question_diagnostics","proto":27}\n')
         return json.loads(reader.readline())
 
 
@@ -261,7 +261,24 @@ def attach_client():
     clients.append((process, master, thread))
 
 
-def fixed_drop_retention(fixture):
+def fixed_drop_retention():
+    def ownership_drops():
+        return sum(path.read_text().count("hook_ownership: dropped: owner_unverified")
+                   for path in (root / "state").rglob("daemon.log"))
+
+    phase_drops = ownership_drops()
+    hook_evidence = []
+
+    def send(event, **fields):
+        before = ownership_drops()
+        result = emit_at(fixture, event, **fields)
+        after = ownership_drops()
+        hook_evidence.append({"event": event, "exit_code": result["code"],
+                              "ownership_drops": after - before})
+        (root / "fixed-drop-hooks.json").write_text(json.dumps(hook_evidence, indent=2) + "\n")
+        assert after == before, (event, "hook ownership silently rejected")
+        return result
+
     # All other producers are stopped. This is the sole candidate, so a drop
     # counter delta identifies this exact owner/order, not another pane's notice.
     wait(lambda: all(diagnostics()["counters"][key] == 0 for key in ["checking", "armed", "probing"]),
@@ -277,6 +294,10 @@ def fixed_drop_retention(fixture):
                   "-c", str(root), fixture_command(fixture))
     wait((fixture / "ready").exists, "fixed drop clean startup")
     assert json.loads((fixture / "startup.json").read_text())["code"] == 0
+    # Startup completion is not the daemon's topology/process scan barrier.
+    # Require the same exact identity precondition as the other issue tests.
+    wait(lambda: query("agent", "get", target)["agent"]["summary"]["identity"] == "exact",
+         "fixed drop exact Codex identity")
     # Fault-inject only the external normal-capture subprocess in this scratch
     # daemon. Its existing 1-second timeout and queue limits remain unchanged.
     hold, entered = root / "hold-normal-capture", root / "normal-capture-entered"
@@ -291,19 +312,29 @@ def fixed_drop_retention(fixture):
                        + shlex.join([sys.executable, str(blocker)]) + "; fi;; esac\nexec "
                        + shlex.quote(real_tmux) + " \"$@\"\n")
     wrapper.chmod(0o700)
+    # Publish and verify this newly created test executable before sending a
+    # hook with its production 300ms tmux deadline. A cold script launch can
+    # exceed that deadline on macOS; it is fixture setup, not the probe fault.
+    wrapper_started = time.monotonic()
+    assert run([str(wrapper), "-L", socket, "display-message", "-p", "-t", target,
+                "#{pane_id}"]).stdout.strip() == target
+    (root / "fixed-drop-wrapper-ready.json").write_text(json.dumps({
+        "elapsed_ms": (time.monotonic() - wrapper_started) * 1000,
+        "hold_enabled": hold.exists(), "pane_verified": True}) + "\n")
+    assert not hold.exists()
     evidence = {"matched_drop": False}
     try:
         for attempt in range(4):
             issued, accepted = f"drop-{attempt}-a", f"drop-{attempt}-b"
-            emit_at(fixture, "UserPromptSubmit", turn_id=issued, prompt="synthetic fixed drop issuer")
-            emit_at(fixture, "PostToolUse", turn_id=issued, tool_name="request_user_input_async",
+            send("UserPromptSubmit", turn_id=issued, prompt="synthetic fixed drop issuer")
+            send("PostToolUse", turn_id=issued, tool_name="request_user_input_async",
                     tool_use_id=issued, tool_response='{"accepted":true}', _ui="normal")
-            emit_at(fixture, "Stop", turn_id=issued)
+            send("Stop", turn_id=issued)
             before = query("agent", "get", target)["agent"]["summary"]["question_notice"]
             prepared = False
             for preparation in range(8):
                 accepted = f"drop-{attempt}-b-{preparation}"
-                emit_at(fixture, "UserPromptSubmit", turn_id=accepted, prompt="synthetic fixed drop ordinary input")
+                send("UserPromptSubmit", turn_id=accepted, prompt="synthetic fixed drop ordinary input")
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline:
                     if diagnostics()["counters"]["armed"] == 1:
@@ -315,7 +346,7 @@ def fixed_drop_retention(fixture):
                 # A distinct accepted prompt may prepare a new candidate when a
                 # prior order check conservatively retained on its 100ms budget.
                 # This is only setup; no new prompt is sent after the tested drop.
-                emit_at(fixture, "Stop", turn_id=accepted)
+                send("Stop", turn_id=accepted)
             if not prepared:
                 (root / "fixed-drop-failure.json").write_text(json.dumps(diagnostics()["counters"]))
                 raise AssertionError("fixed drop setup never armed a candidate")
@@ -323,7 +354,7 @@ def fixed_drop_retention(fixture):
             entered.unlink(missing_ok=True)
             hold.touch()
             wait(entered.exists, "normal capture in flight")
-            emit_at(fixture, "Stop", turn_id=accepted)
+            send("Stop", turn_id=accepted)
             deadline = time.monotonic() + 1.7
             delta = 0
             while time.monotonic() < deadline:
@@ -346,6 +377,7 @@ def fixed_drop_retention(fixture):
                             "latest_unchanged": after["latest_order"] == before["latest_order"],
                             "unacknowledged": after["unacknowledged"]}
                 break
+        assert ownership_drops() == phase_drops, "ownership rejection during fixed-drop phase"
         return evidence
     finally:
         hold.unlink(missing_ok=True)
@@ -358,7 +390,12 @@ def assert_auto_ack_under_load(phase_result):
         phase_result["while_producers_active"])
 
 
-def benchmark():
+def assert_fixed_drop_retention(fixed):
+    assert fixed["matched_drop"] and fixed["owner_unchanged"] and fixed["latest_unchanged"], fixed
+    assert fixed["unacknowledged"] and fixed["ack_before"] == fixed["ack_after"], fixed
+
+
+def benchmark(fixed_drop_only=False):
     fixtures = []
     for index in range(57):
         fixture = root / f"load-{index}"
@@ -380,6 +417,12 @@ def benchmark():
         entries = tmux("list-panes", "-t", window, "-F", "#{pane_id} #{@vde_sidebar}").splitlines()
         sidebars.extend(line.split()[0] for line in entries if line.endswith(" 1"))
     assert len(sidebars) == 2, sidebars
+    if fixed_drop_only:
+        fixed = fixed_drop_retention()
+        (root / "fixed-drop-retention.json").write_text(json.dumps(fixed, indent=2) + "\n")
+        assert_fixed_drop_retention(fixed)
+        print("58 panes / two clients / fixed dropped probe retained its notice")
+        return
 
     # Baseline: identical panes, clients, daemon and ordinary observation work,
     # with no resolver candidates. Keep it separate from the probe/reader phase.
@@ -665,20 +708,19 @@ def benchmark():
                                    "journal_before": journal_begin, "journal_after": journal_evidence()}}
     resource["performance_verdict"] = verdict(status_statistics, comparable_load)
     (root / "resource-budget.json").write_text(json.dumps(resource, indent=2) + "\n")
-    resource["fixed_drop_retention"] = fixed_drop_retention(fixtures[-1])
-    (root / "resource-budget.json").write_text(json.dumps(resource, indent=2) + "\n")
     report = {"agent_panes": 58, "clients": 2, "poll_ms": 1000, "iterations": 100,
               "clock": "monotonic; issue before hook process launch, Q before control request (conservative upper bounds)",
               "max_ms": {key: max(sample[key] for sample in samples) for key in samples[0]}, "samples": samples}
     (root / "latency.json").write_text(json.dumps(report, indent=2) + "\n")
+    resource["fixed_drop_retention"] = fixed_drop_retention()
+    (root / "resource-budget.json").write_text(json.dumps(resource, indent=2) + "\n")
     # Full bounded numeric evidence stays in JSON; failure output is a small summary.
     gate_summary = {key: resource[key] for key in ["baseline_p95_ms", "load_p95_ms",
         "normal_capture_failures", "rss_increase_mib", "performance_verdict", "status_statistics"]}
     assert not load_errors, gate_summary
     assert resource["load_probe_count"] >= 4, gate_summary
     fixed = resource["fixed_drop_retention"]
-    assert fixed["matched_drop"] and fixed["owner_unchanged"] and fixed["latest_unchanged"], gate_summary
-    assert fixed["unacknowledged"] and fixed["ack_before"] == fixed["ack_after"], gate_summary
+    assert_fixed_drop_retention(fixed)
     assert resource["load_p95_ms"] - resource["baseline_p95_ms"] <= 50, gate_summary
     assert resource["performance_verdict"] == "pass", gate_summary
     assert resource["normal_capture_failures"] == 0, gate_summary
@@ -909,8 +951,8 @@ try:
     assert "hook_ownership: dropped: owner_unverified" in logs
     assert not notice()["unacknowledged"]
     shutdown_under_question_load()
-    if "--extended" in sys.argv:
-        benchmark()
+    if "--extended" in sys.argv or "--fixed-drop-only" in sys.argv:
+        benchmark(fixed_drop_only="--fixed-drop-only" in sys.argv)
     post("last")
     tmux("kill-pane", "-t", pane)
     wait(lambda: all(owner["pane"]["pane_id"] != pane for owner in json.loads(sidecars[0].read_text())["owners"]),

@@ -14,6 +14,8 @@ const MAX_SCREEN_BYTES: usize = 512 * 1024;
 pub enum Modal {
     Approval,
     SynchronousQuestion,
+    TrustDirectory,
+    StartupUpdate,
 }
 
 /// A question may coexist with work. Absence of all evidence means unknown,
@@ -57,7 +59,7 @@ pub fn classify(screen: &str) -> Evidence {
     {
         Some(Modal::SynchronousQuestion)
     } else {
-        detect_modal(after_prompt)
+        startup_modal(&lines).or_else(|| detect_modal(after_prompt))
     };
     let before_composer = &lines[..current_prompt.unwrap_or(lines.len())];
     let working = live_timer(before_composer);
@@ -71,6 +73,44 @@ pub fn classify(screen: &str) -> Evidence {
             && recent.iter().any(|line| asynchronous_question_marker(line)),
         transcript_viewer: false,
     }
+}
+
+fn startup_modal(lines: &[&str]) -> Option<Modal> {
+    // A later composer or response makes startup text historical. Numbered
+    // choices are deliberately excluded by is_prompt.
+    if lines
+        .iter()
+        .any(|line| is_prompt(line) || is_response(line))
+    {
+        return None;
+    }
+    let non_empty: Vec<_> = lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let top = &non_empty[..non_empty.len().min(20)];
+    if top
+        .first()
+        .is_some_and(|line| line.starts_with("> You are in "))
+        && top
+            .join(" ")
+            .contains("Do you trust the contents of this directory?")
+        && top
+            .iter()
+            .any(|line| yes_choice(&line.to_ascii_lowercase()))
+    {
+        return Some(Modal::TrustDirectory);
+    }
+    let bottom = &non_empty[non_empty.len().saturating_sub(20)..];
+    if bottom.iter().any(|line| line.contains("Update available!"))
+        && bottom.iter().any(|line| line.contains("Update now"))
+        && bottom.join(" ").contains("Skip until next version")
+        && bottom.last() == Some(&"Press enter to continue")
+    {
+        return Some(Modal::StartupUpdate);
+    }
+    None
 }
 
 fn is_prompt(line: &str) -> bool {
@@ -212,6 +252,42 @@ pub fn asynchronous_question_marker(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_modals_require_current_structured_controls() {
+        let trust = "> You are in /synthetic/project\n\nDo you trust the contents of this directory?\n› 1. Yes, continue\n  2. No, exit\n";
+        let update = "Update available! 0.1 -> 0.2\n› 1. Update now\n  2. Skip\n  3. Skip until next version\n\nPress enter to continue\n";
+        for (screen, modal) in [
+            (trust, Modal::TrustDirectory),
+            (update, Modal::StartupUpdate),
+        ] {
+            assert_eq!(classify(screen).modal, Some(modal));
+            for historical in [
+                format!("{screen}\n› Ask Codex\n"),
+                format!("• Earlier output\n{screen}"),
+                format!("{screen}\n↑/↓ to scroll · q to quit\n"),
+            ] {
+                assert_eq!(classify(&historical).modal, None, "{historical:?}");
+            }
+        }
+        for unknown in [
+            "Do you trust the contents of this directory?\n",
+            "Update available!\n",
+            "[y/n]\n",
+            "would you like to\nyes\n",
+            "Update now\nSkip until next version\nPress enter to continue\n",
+        ] {
+            assert_eq!(classify(unknown).modal, None);
+        }
+        assert_eq!(
+            classify(&trust.replace("Yes, continue", "unrecognized option")).modal,
+            None
+        );
+        assert_eq!(
+            classify(&format!("{update}{}", "later output\n".repeat(25))).modal,
+            None
+        );
+    }
 
     #[test]
     fn dynamic_activity_keymaps_reduced_motion_and_queued_inputs() {

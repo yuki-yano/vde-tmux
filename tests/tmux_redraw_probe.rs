@@ -291,6 +291,7 @@ fn running_pane_presentation(epoch: i64) -> PanePresentation {
         agent_process: None,
         stored: None,
         resolved: Some(ResolvedPaneState {
+            presentation: Default::default(),
             canonical,
             window_id: "@1".to_string(),
             pane_id: pane_instance.pane_id.clone(),

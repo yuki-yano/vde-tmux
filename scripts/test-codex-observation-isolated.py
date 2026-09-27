@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -104,7 +105,17 @@ def main():
         "VDE_TMUX_SOCKET_NAME": socket,
         "VDE_FIXTURE_ROOT": str(work),
         "VDE_FIXTURE_VT": str(BIN),
+        "PATH": str(work) + ":" + os.environ["PATH"],
     }
+    real_tmux = shutil.which("tmux")
+    assert real_tmux is not None, "tmux is required"
+    capture_failure = work / "fail-observation-capture"
+    (work / "tmux").write_text(
+        "#!/bin/sh\nif [ -f " + shlex.quote(str(capture_failure)) + " ]; then\n"
+        "  case \"$*\" in *__vde_capture_identity_*) "
+        "printf 'synthetic capture client failure\\n' >&2; exit 1;; esac\nfi\n"
+        "exec " + shlex.quote(real_tmux) + " \"$@\"\n")
+    (work / "tmux").chmod(0o700)
     for name in ["home", "state", "config", "codex-home/sessions"]:
         (work / name).mkdir(parents=True)
     for role in ["first", "second", "embedded", "shared", "renamed"]:
@@ -125,8 +136,11 @@ def main():
         "SCREEN_APPROVAL": ("Would you like to run the following command?\n  › 1. Yes, proceed (y)\n  2. No (esc)\n", "blocked", True),
         "SCREEN_SYNC": ("Question 1/1 (1 unanswered)\n", "blocked", True),
         "SCREEN_ASYNC": ("• Reviewing (3s)\n  ? 1 question · 3s\n› Ask Codex\n", "working", False),
+        "SCREEN_TRUST": ("> You are in /synthetic/project\nDo you trust the contents of this directory?\n› 1. Yes, continue\n  2. No, exit\n", "blocked", True),
+        "SCREEN_UPDATE": ("Update available!\n› 1. Update now\n  2. Skip until next version\nPress enter to continue\n", "blocked", True),
         "SCREEN_UNKNOWN": ("Unrecognized UI\n› Ask Codex\n", "unknown", False),
     }
+    reasons = {"SCREEN_WORK": "screen_working", "SCREEN_APPROVAL": "screen_approval", "SCREEN_SYNC": "screen_question", "SCREEN_ASYNC": "screen_working", "SCREEN_TRUST": "screen_trust", "SCREEN_UPDATE": "screen_update", "SCREEN_UNKNOWN": "unknown_screen"}
     for name, (text, _, _) in screens.items():
         (work / f"{name}.txt").write_text(text)
     (work / "codex.c").write_text(NATIVE)
@@ -213,12 +227,30 @@ def main():
                 print(f"Checking screen {role}/{name} -> {badge}", flush=True)
                 with (work / f"{role}.fifo").open("w") as stream:
                     stream.write(f"{name} {pane}\n")
-                agents = await_agents(lambda a: a[pane]["badge"] == badge)
+                agents = await_agents(lambda a: a[pane]["badge"] == badge and a[pane]["presentation"]["reason"] == reasons[name])
+                assert agents[pane]["presentation"]["ttl_seconds"] == 3
                 assert agents[pane]["status"] == "idle"
                 assert agents[pane]["needs_action"] == needs_action
                 detail = json.loads(vt("agent", "get", pane, "--json"))["result"]["agent"]
                 assert detail["run_seq"] == detail["completed_seq"] == 0
                 screen_cases += 1
+
+        # A failed capture client cannot provide screen evidence, but must not
+        # stop the daemon or allocate a Run. A later successful poll recovers.
+        daemon_instance = json.loads(vt("api", "snapshot", "--json"))["meta"]["daemon_instance_id"]
+        capture_failure.touch()
+        await_agents(lambda a: all(a[panes[role]]["badge"] == "unknown"
+                                   and a[panes[role]]["presentation"]["reason"] == "evidence_unavailable"
+                                   for role in ["first", "second"]))
+        assert json.loads(vt("api", "snapshot", "--json"))["meta"]["daemon_instance_id"] == daemon_instance
+        capture_failure.unlink()
+        await_agents(lambda a: all(a[panes[role]]["presentation"]["reason"] == "unknown_screen"
+                                   for role in ["first", "second"]))
+        for role in ["first", "second"]:
+            detail = json.loads(vt("agent", "get", panes[role], "--json"))["result"]["agent"]
+            assert detail["run_seq"] == detail["completed_seq"] == 0
+        assert json.loads(vt("api", "snapshot", "--json"))["meta"]["daemon_instance_id"] == daemon_instance
+        print("PASS: failed capture client retained daemon identity and recovered screen evidence", flush=True)
 
         target = panes["embedded"]
         hook("embedded", "SessionStart", target)
@@ -254,6 +286,7 @@ def main():
         time.sleep(2.2)
         agents = {a["pane_id"]: a for a in snapshot()["agents"]}
         assert agents[target]["badge"] in ["idle", "done"], agents[target]["badge"]
+        assert agents[target]["presentation"]["reason"] == "hook_authoritative"
         report = {"screen_cases": screen_cases, "screen_created_runs": 0, "shared_hook_cases": 24, "wrong_pane_bindings": 0,
                   "embedded_hook_cases": 8, "embedded_completed_seq": 2,
                   "embedded_hooks_restore_authority_after_restart": True,

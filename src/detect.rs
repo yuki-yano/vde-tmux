@@ -50,14 +50,6 @@ pub fn is_provider_overloaded_error(text: &str) -> bool {
     normalized.contains("529") && normalized.contains("overloaded")
 }
 
-pub fn detect_codex_wait_reason(screen_tail: &str) -> Option<&'static str> {
-    match codex::classify(screen_tail).modal {
-        Some(codex::Modal::Approval) => Some("permission_prompt"),
-        Some(codex::Modal::SynchronousQuestion) => Some("codex_question_prompt"),
-        None => None,
-    }
-}
-
 fn recent_wait_reason_lines(screen_tail: &str) -> Vec<String> {
     let raw_lines = screen_tail.lines().collect::<Vec<_>>();
     let scan_start = raw_lines.len().saturating_sub(WAIT_REASON_SCAN_TAIL_LINES);
@@ -176,27 +168,27 @@ mod tests {
     #[test]
     fn does_not_detect_yes_when_permission_question_is_not_adjacent() {
         let text = "Allow command to run?\nnoise\nmore noise\nunrelated summary: yes\n";
-        assert_eq!(detect_codex_wait_reason(text), None);
+        assert_eq!(codex::classify(text).modal, None);
     }
 
     #[test]
     fn detects_codex_permission_prompt_with_adjacent_choice() {
         let text = "? Allow command to run?\n  y) yes\n  n) no\n";
-        assert_eq!(detect_codex_wait_reason(text), Some("permission_prompt"));
+        assert_eq!(codex::classify(text).modal, Some(codex::Modal::Approval));
     }
 
     #[test]
     fn detects_claude_permission_prompt_with_numbered_yes_choice() {
         let text = "Claude needs your permission to use Bash\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n";
-        assert_eq!(detect_codex_wait_reason(text), Some("permission_prompt"));
+        assert_eq!(codex::classify(text).modal, Some(codex::Modal::Approval));
     }
 
     #[test]
     fn detects_codex_question_prompt_from_unanswered_status() {
         let text = "Question 1/1 (1 unanswered)\nRun this commit plan?\n› 1. y (Recommended)\n  2. e\n  3. n\n  4. None of the above\n";
         assert_eq!(
-            detect_codex_wait_reason(text),
-            Some("codex_question_prompt")
+            codex::classify(text).modal,
+            Some(codex::Modal::SynchronousQuestion)
         );
     }
 
@@ -206,7 +198,7 @@ mod tests {
         for index in 0..28 {
             within.push_str(&format!("new output {index}\n"));
         }
-        assert_eq!(detect_codex_wait_reason(&within), Some("permission_prompt"));
+        assert_eq!(codex::classify(&within).modal, Some(codex::Modal::Approval));
 
         let mut outside = String::from(
             "Claude needs your permission to use Bash\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n",
@@ -214,12 +206,12 @@ mod tests {
         for index in 0..30 {
             outside.push_str(&format!("new output {index}\n"));
         }
-        assert_eq!(detect_codex_wait_reason(&outside), None);
+        assert_eq!(codex::classify(&outside).modal, None);
     }
 
     #[test]
     fn does_not_detect_codex_question_prompt_after_answered_status() {
         let text = "Question 1/1 (1 unanswered)\nRun this commit plan?\nQuestions 1/1 answered\n";
-        assert_eq!(detect_codex_wait_reason(text), None);
+        assert_eq!(codex::classify(text).modal, None);
     }
 }

@@ -172,7 +172,7 @@ struct ProductionV2Coordinator {
     question_probes: Mutex<Option<crate::daemon::workers::question::ProbeWorkerHandle>>,
     question_capture: Mutex<Option<crate::daemon::workers::CaptureCoordinatorHandle>>,
     router: Mutex<V2Router>,
-    state: Mutex<Option<super::runtime::CanonicalCoordinatorState>>,
+    state: Arc<Mutex<Option<super::runtime::CanonicalCoordinatorState>>>,
     agent_runtime: Mutex<Option<crate::agent_state::runtime::AgentRuntime>>,
     queue: Mutex<ProductionQueue>,
     queue_ready: Condvar,
@@ -227,6 +227,7 @@ impl ProductionV2Coordinator {
     ) -> Result<Self> {
         let notification_shutdown = Arc::new(AtomicBool::new(false));
         let notification_process_lock = Arc::new(Mutex::new(()));
+        let state = Arc::new(Mutex::new(None));
         let notification_tx = notification_command.map(|command| {
             start_notification_worker_with_control(
                 command,
@@ -234,6 +235,7 @@ impl ProductionV2Coordinator {
                 Some((env.clone(), incarnation.hash.clone())),
                 notification_shutdown.clone(),
                 notification_process_lock.clone(),
+                state.clone(),
             )
         });
         let task_summary_worker = task_summary_config
@@ -259,7 +261,7 @@ impl ProductionV2Coordinator {
                 DaemonInstanceId::generate()?,
                 incarnation.hash.clone(),
             )),
-            state: Mutex::new(None),
+            state,
             agent_runtime: Mutex::new(None),
             queue: Mutex::new(ProductionQueue::default()),
             queue_ready: Condvar::new(),

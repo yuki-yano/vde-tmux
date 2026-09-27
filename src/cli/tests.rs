@@ -609,6 +609,7 @@ fn agent_pane_presentation(pane_id: &str) -> crate::daemon::protocol::v2::PanePr
         }),
         stored: None,
         resolved: Some(ResolvedPaneState {
+            presentation: Default::default(),
             canonical: PaneState {
                 schema_version: PANE_STATE_SCHEMA_VERSION,
                 state_id: StateId::parse("00112233445566778899aabbccddeeff").unwrap(),

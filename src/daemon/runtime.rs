@@ -632,6 +632,7 @@ mod tests {
             pane_pid,
         };
         let resolved = badge.map(|badge| crate::pane_state::ResolvedPaneState {
+            presentation: Default::default(),
             canonical: PaneState {
                 schema_version: crate::pane_state::PANE_STATE_SCHEMA_VERSION,
                 state_id: crate::pane_state::StateId::parse(format!("{pane_pid:032x}")).unwrap(),

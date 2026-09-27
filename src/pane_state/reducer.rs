@@ -368,6 +368,7 @@ fn reduce_explicit(
     {
         tracker.hook_authoritative = true;
         tracker.codex_screen = None;
+        tracker.codex_screen_expired_at = None;
     }
     tracker.interruption_verification_pending = false;
     tracker.absence_count = 0;
@@ -448,6 +449,7 @@ fn reduce_observation(
     match presence {
         AgentPresenceObservation::Unknown => {
             tracker.codex_screen = None;
+            tracker.codex_screen_expired_at = None;
             tracker.agent_process = None;
             tracker.absence_count = 0;
             tracker.replacement_kind = None;
@@ -1423,6 +1425,7 @@ fn apply_capture(
     observed_at: i64,
     visibility: &VisibilitySnapshot,
 ) -> Result<(), ReduceError> {
+    tracker.codex_screen_expired_at = None;
     tracker.codex_screen = capture
         .and_then(|capture| capture.codex_screen)
         .map(|evidence| (evidence, observed_at));
@@ -1500,6 +1503,7 @@ fn reset_tracker_for_state(
         epoch: Some((state.state_id.clone(), state.agent_epoch)),
         hook_authoritative: false,
         codex_screen: None,
+        codex_screen_expired_at: None,
         interruption_verification_pending: false,
         agent_process: None,
         last_agent_process: state.agent_process.clone(),

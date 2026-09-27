@@ -125,16 +125,19 @@ impl CanonicalCoordinatorState {
             let record = runtime.record(&topology.pane_instance);
             let resolved = match record {
                 Some(state) if state.agent_present || state.unread.is_unread() => {
+                    let (badge, presentation) =
+                        crate::pane_state::resolve_presentation_with_explanation(
+                            state,
+                            &runtime.tracker(&topology.pane_instance),
+                            now,
+                        );
                     Some(ResolvedPaneState {
                         canonical: state.clone(),
                         window_id: topology.window_id.clone(),
                         pane_id: topology.pane_instance.pane_id.clone(),
                         current_path: topology.current_path.clone(),
-                        badge: crate::pane_state::resolve_presentation(
-                            state,
-                            &runtime.tracker(&topology.pane_instance),
-                            now,
-                        ),
+                        badge,
+                        presentation,
                     })
                 }
                 _ => None,

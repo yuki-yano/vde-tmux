@@ -1,6 +1,6 @@
 # Agent JSON API
 
-This document defines the current API v6 contract (daemon protocol 26, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
+This document defines the current API v6 contract (daemon protocol 27, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
 maintained in [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is
 recorded in [AGENT_API_V3.md](AGENT_API_V3.md).
 
@@ -549,7 +549,7 @@ Acknowledgement commits at atomic rename. A pre-rename failure retains the notic
 directory-fsync failure is a logical acknowledgement with `question_ack_directory_fsync_failed`,
 without rollback or automatic rewrite. The private `.expected` marker distinguishes initial absence
 from loss of a previously committed sidecar. Resolver state, transcript cursors, and ingress dedup
-remain memory-only; the shared private home journal stores only digests and writer identities. API 6 / protocol 26 must be installed together;
+remain memory-only; the shared private home journal stores only digests and writer identities. API 6 / protocol 27 must be installed together;
 there is no old-protocol fallback.
 
 ## Query cost
@@ -605,7 +605,7 @@ includes more work than the daemon-ingress bound; it excludes Codex's pre-hook d
 
 ### 運用反映条件
 
-- [ ] CLI/daemon/sidebar are deployed together with API 6 / protocol 26 while retaining existing Pane State schema 10.
+- [ ] CLI/daemon/sidebar are deployed together with API 6 / protocol 27 while retaining existing Pane State schema 10.
 - [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.
 
 
@@ -632,6 +632,22 @@ acknowledge a Question notice, or generate an OS notification/triage event. The 
 300-second stale-completion rule for open non-authoritative runs is unchanged. A screen
 modal no longer creates a new Codex run merely by appearing.
 
+Agent summaries now include the additive `presentation` object (API 6): `reason` is a finite
+code, `observed_at` is the optional Unix timestamp of the screen observation, and `ttl_seconds`
+is its optional lifetime (three seconds for Codex screen evidence). The timestamp remains
+available after expiry for diagnosis, but positive evidence cannot be used after its deadline.
+Clients can compute age from `meta.emitted_at`; no screen text or activity title is included.
+Reasons distinguish canonical/hook authority, current screen Working/approval/question,
+directory trust/startup update, unread completion, unknown UI, transcript viewer, unavailable
+or expired evidence, and an epoch mismatch. `badge` and its reason come from the same decision.
+The new startup screens affect presentation only and cannot change a Run or Question notice.
+
+OS notifications remain tied to canonical Blocked transitions. Before starting the external
+notification command, the daemon rechecks the original pane and Blocked occurrence. Resolved,
+replaced, removed or superseded occurrences are skipped; unrelated metadata/read revisions
+do not cancel an otherwise current notification. State changes after this check cannot retract
+an accepted notification.
+
 Codex hooks require a process ancestor chain rooted in their claimed pane. Shared app-server
 hooks, including renamed executables, cannot use inherited `TMUX_PANE` to update that pane
 or another pane. Rejection logs contain only finite reason codes. Embedded hooks remain
@@ -646,5 +662,5 @@ to use the embedded hook lifecycle.
 Pane State schema 10 and Question sidecar schema 1 are unchanged. Question remains a durable
 unacknowledged issuance notice. Capture is veto-only; answers alone, unknown evidence, and
 notifications predating daemon restart do not acquire new automatic acknowledgement rules.
-CLI, daemon, and sidebars must be replaced together for protocol 26; there is no mixed-version
+CLI, daemon, and sidebars must be replaced together for protocol 27; there is no mixed-version
 fallback. Hook authority is not inferred to have expired merely because events stop arriving.

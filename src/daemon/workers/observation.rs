@@ -10,7 +10,7 @@ use crate::pane_state::{
     PaneEvent, PaneEventEnvelope, PaneInstance, PaneState, StoredStateDescriptor, WaitReason,
 };
 
-use super::capture::{CaptureBatchError, CaptureSource};
+use super::capture::{CaptureBatchError, CaptureSource, CapturedScreen};
 use super::process::AgentProcessSnapshot;
 
 pub const STALE_CAPTURE_SECONDS: i64 = 300;
@@ -50,13 +50,14 @@ pub fn classify_presence(
 pub fn infer_capture(
     state: Option<&PaneState>,
     tracker: &CaptureTrackerSnapshot,
-    tail: &str,
+    screen: &CapturedScreen,
     observed_at: i64,
 ) -> CaptureObservation {
+    let tail = screen.tail();
     let evidence = crate::detect::codex::classify(tail);
     let codex_screen = state
         .filter(|state| state.agent.as_str() == "codex")
-        .map(|_| evidence);
+        .map(|_| crate::detect::codex::classify(screen.viewport()));
     let observed_fingerprint = capture_sha256(tail);
     let inference = if state.is_some_and(|state| {
         matches!(state.agent.as_str(), "claude" | "codex") && detect_usage_limit(tail)
@@ -75,12 +76,16 @@ pub fn infer_capture(
     {
         CaptureInference::NoChange
     } else if let Some(modal) = evidence.modal {
-        CaptureInference::PermissionWait {
-            reason: if modal == crate::detect::codex::Modal::Approval {
-                WaitReason::PermissionPrompt
-            } else {
-                WaitReason::Other("codex_question_prompt".to_string())
+        match modal {
+            crate::detect::codex::Modal::Approval => CaptureInference::PermissionWait {
+                reason: WaitReason::PermissionPrompt,
             },
+            crate::detect::codex::Modal::SynchronousQuestion => CaptureInference::PermissionWait {
+                reason: WaitReason::Other("codex_question_prompt".to_string()),
+            },
+            // Startup UI changes presentation only, never a previously open Run.
+            crate::detect::codex::Modal::TrustDirectory
+            | crate::detect::codex::Modal::StartupUpdate => CaptureInference::NoChange,
         }
     } else if observed_fingerprint != tracker.fingerprint {
         CaptureInference::ActivityObserved
@@ -288,12 +293,12 @@ pub fn run_observation_poll(
         let Some(presence) = presence else {
             continue;
         };
-        let capture = tails_by_index[index].as_deref().map(|tail| {
+        let capture = tails_by_index[index].as_ref().map(|screen| {
             match capture_modes[index].expect("a captured tail has an inference mode") {
                 CaptureMode::FullInference => infer_capture(
                     snapshot.state.as_ref(),
                     &snapshot.tracker,
-                    tail,
+                    screen,
                     observed_at,
                 ),
                 CaptureMode::ActiveTerminalSignals => infer_active_terminal_capture(
@@ -302,9 +307,9 @@ pub fn run_observation_poll(
                         .as_ref()
                         .expect("active terminal capture has canonical state")
                         .agent,
-                    tail,
+                    screen.tail(),
                 ),
-                CaptureMode::UsageLimitOnly => infer_usage_limit_capture(tail),
+                CaptureMode::UsageLimitOnly => infer_usage_limit_capture(screen.tail()),
             }
         });
         let process = processes.process_observation(
@@ -458,11 +463,30 @@ mod tests {
         fn capture_plain_tails(
             &self,
             panes: &[PaneInstance],
-        ) -> std::result::Result<Vec<String>, CaptureBatchError> {
+        ) -> std::result::Result<Vec<CapturedScreen>, CaptureBatchError> {
             *self.plain_calls.lock().unwrap() += 1;
             self.requested_panes.lock().unwrap().push(panes.to_vec());
-            Ok(self.tails.clone())
+            Ok(self
+                .tails
+                .iter()
+                .cloned()
+                .map(CapturedScreen::visible_fixture)
+                .collect())
         }
+    }
+
+    fn infer_capture(
+        state: Option<&PaneState>,
+        tracker: &CaptureTrackerSnapshot,
+        tail: &str,
+        observed_at: i64,
+    ) -> CaptureObservation {
+        super::infer_capture(
+            state,
+            tracker,
+            &CapturedScreen::visible_fixture(tail.to_string()),
+            observed_at,
+        )
     }
 
     fn canonical_state(agent: &str) -> PaneState {

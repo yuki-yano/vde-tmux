@@ -118,6 +118,7 @@ pub(super) fn resolved_pane(pane_id: &str, pane_pid: u32, session_id: &str) -> P
             version: canonical.version(),
         }),
         resolved: Some(crate::pane_state::ResolvedPaneState {
+            presentation: Default::default(),
             canonical,
             window_id: "@1".to_string(),
             pane_id: pane_id.to_string(),

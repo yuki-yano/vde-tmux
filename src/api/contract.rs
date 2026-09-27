@@ -823,6 +823,7 @@ pub struct AgentSummary {
     pub agent: String,
     pub status: AgentStatus,
     pub badge: AgentBadge,
+    pub presentation: crate::pane_state::PresentationExplanation,
     pub lifecycle: LifecycleSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_run: Option<CurrentRunSummary>,

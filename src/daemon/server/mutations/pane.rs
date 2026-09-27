@@ -339,8 +339,8 @@ pub(in crate::daemon::server) fn finish_pane_event_projection(
             continue;
         };
         let job = NotificationWorkerJob {
-            pane_id: notification.pane_instance.pane_id.clone(),
             agent,
+            notification: notification.clone(),
         };
         if let Err(error) = sender.try_send(job) {
             let reason = match error {

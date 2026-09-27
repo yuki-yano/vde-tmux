@@ -1030,6 +1030,7 @@ mod tests {
             agent_process: None,
             stored: None,
             resolved: Some(ResolvedPaneState {
+                presentation: Default::default(),
                 canonical: PaneState {
                     schema_version: PANE_STATE_SCHEMA_VERSION,
                     state_id: StateId::parse("00000000000000000000000000000700").unwrap(),

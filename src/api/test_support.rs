@@ -24,6 +24,7 @@ pub(super) fn test_agent_pane() -> PanePresentation {
         }),
         stored: None,
         resolved: Some(crate::pane_state::ResolvedPaneState {
+            presentation: Default::default(),
             canonical: crate::pane_state::PaneState {
                 schema_version: crate::pane_state::PANE_STATE_SCHEMA_VERSION,
                 state_id: crate::pane_state::StateId::parse("00112233445566778899aabbccddeeff")

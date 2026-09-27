@@ -1,6 +1,8 @@
 use crate::daemon::session_badge::BadgeState;
 
-use super::model::{LifecycleState, PaneState, UnreadReason};
+use super::model::{
+    LifecycleState, PaneState, PresentationExplanation, PresentationReason, UnreadReason,
+};
 
 pub const SCREEN_EVIDENCE_TTL_SECONDS: i64 = 3;
 
@@ -11,30 +13,91 @@ pub fn resolve_presentation(
     tracker: &super::CaptureTrackerSnapshot,
     now: i64,
 ) -> BadgeState {
+    resolve_presentation_with_explanation(state, tracker, now).0
+}
+
+pub fn resolve_presentation_with_explanation(
+    state: &PaneState,
+    tracker: &super::CaptureTrackerSnapshot,
+    now: i64,
+) -> (BadgeState, PresentationExplanation) {
+    use PresentationReason as Reason;
     let canonical = resolve_badge(state);
-    if state.agent.as_str() != "codex"
-        || tracker.hook_authoritative
-        || !state.agent_present
-        || !matches!(state.lifecycle, LifecycleState::Idle)
-    {
-        return canonical;
-    }
-    if let Some((evidence, observed_at)) = tracker.codex_screen
-        && tracker.epoch.as_ref() == Some(&(state.state_id.clone(), state.agent_epoch))
-        && (0..=SCREEN_EVIDENCE_TTL_SECONDS).contains(&now.saturating_sub(observed_at))
-        && !evidence.transcript_viewer
-    {
-        if evidence.modal.is_some() {
-            return BadgeState::Blocked;
-        }
-        if evidence.working {
-            return BadgeState::Working;
-        }
-    }
-    if canonical == BadgeState::Done {
-        BadgeState::Done
+    let canonical_reason = if state.agent.as_str() != "codex" {
+        Some(Reason::Canonical)
+    } else if tracker.hook_authoritative {
+        Some(Reason::HookAuthoritative)
+    } else if !state.agent_present {
+        Some(Reason::AgentAbsent)
+    } else if !matches!(state.lifecycle, LifecycleState::Idle) {
+        Some(Reason::CanonicalActive)
     } else {
-        BadgeState::Unknown
+        None
+    };
+    if let Some(reason) = canonical_reason {
+        return (
+            canonical,
+            PresentationExplanation {
+                reason,
+                ..Default::default()
+            },
+        );
+    }
+    let same_epoch = tracker.epoch.as_ref() == Some(&(state.state_id.clone(), state.agent_epoch));
+    let observed_at = same_epoch
+        .then(|| {
+            tracker
+                .codex_screen
+                .map(|(_, at)| at)
+                .or(tracker.codex_screen_expired_at)
+        })
+        .flatten();
+    let explanation = |reason| PresentationExplanation {
+        reason,
+        observed_at,
+        ttl_seconds: Some(SCREEN_EVIDENCE_TTL_SECONDS),
+    };
+    let unavailable_reason = if !same_epoch {
+        Reason::EpochMismatch
+    } else if let Some((evidence, at)) = tracker.codex_screen {
+        if now < at {
+            Reason::ObservationTimeInvalid
+        } else if now.saturating_sub(at) > SCREEN_EVIDENCE_TTL_SECONDS {
+            Reason::EvidenceExpired
+        } else if evidence.transcript_viewer {
+            Reason::TranscriptViewer
+        } else if let Some(modal) = evidence.modal {
+            let reason = match modal {
+                crate::detect::codex::Modal::Approval => Reason::ScreenApproval,
+                crate::detect::codex::Modal::SynchronousQuestion => Reason::ScreenQuestion,
+                crate::detect::codex::Modal::TrustDirectory => Reason::ScreenTrust,
+                crate::detect::codex::Modal::StartupUpdate => Reason::ScreenUpdate,
+            };
+            return (BadgeState::Blocked, explanation(reason));
+        } else if evidence.working {
+            return (BadgeState::Working, explanation(Reason::ScreenWorking));
+        } else {
+            Reason::UnknownScreen
+        }
+    } else if let Some(at) = tracker.codex_screen_expired_at {
+        if now < at {
+            Reason::ObservationTimeInvalid
+        } else {
+            Reason::EvidenceExpired
+        }
+    } else {
+        Reason::EvidenceUnavailable
+    };
+    if canonical == BadgeState::Done {
+        (
+            BadgeState::Done,
+            PresentationExplanation {
+                reason: Reason::UnreadCompletion,
+                ..Default::default()
+            },
+        )
+    } else {
+        (BadgeState::Unknown, explanation(unavailable_reason))
     }
 }
 
@@ -62,6 +125,128 @@ mod tests {
         AgentKind, PANE_STATE_SCHEMA_VERSION, PaneInstance, StateId, TaskState, UnreadOccurrence,
         UnreadState,
     };
+
+    #[test]
+    fn explanation_matches_authority_freshness_and_modal_precedence_without_bodies() {
+        use PresentationReason as Reason;
+        let idle = state(LifecycleState::Idle, 0, 0, false);
+        let mut tracker = super::super::CaptureTrackerSnapshot {
+            epoch: Some((idle.state_id.clone(), idle.agent_epoch)),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_presentation_with_explanation(&idle, &tracker, 100)
+                .1
+                .reason,
+            Reason::EvidenceUnavailable
+        );
+        for (screen, badge, reason) in [
+            (
+                "• Private activity title (3s)\n› Private input\n",
+                BadgeState::Working,
+                Reason::ScreenWorking,
+            ),
+            (
+                "Allow command to run?\n  y) yes\n",
+                BadgeState::Blocked,
+                Reason::ScreenApproval,
+            ),
+            (
+                "Question 1/1 (1 unanswered)\nPrivate question body\n",
+                BadgeState::Blocked,
+                Reason::ScreenQuestion,
+            ),
+            (
+                "> You are in /private\nDo you trust the contents of this directory?\n› 1. Yes, continue\n",
+                BadgeState::Blocked,
+                Reason::ScreenTrust,
+            ),
+            (
+                "Update available!\nUpdate now\nSkip until next version\nPress enter to continue\n",
+                BadgeState::Blocked,
+                Reason::ScreenUpdate,
+            ),
+            (
+                "private unknown UI",
+                BadgeState::Unknown,
+                Reason::UnknownScreen,
+            ),
+            (
+                "↑/↓ to scroll",
+                BadgeState::Unknown,
+                Reason::TranscriptViewer,
+            ),
+        ] {
+            tracker.codex_screen = Some((crate::detect::codex::classify(screen), 100));
+            let (actual, explanation) = resolve_presentation_with_explanation(&idle, &tracker, 103);
+            assert_eq!((actual, explanation.reason), (badge, reason));
+            assert_eq!(explanation.observed_at, Some(100));
+            assert_eq!(explanation.ttl_seconds, Some(3));
+            let json = serde_json::to_string(&explanation).unwrap();
+            assert!(!json.to_ascii_lowercase().contains("private"));
+            assert_eq!(
+                resolve_presentation_with_explanation(&idle, &tracker, 104)
+                    .1
+                    .reason,
+                Reason::EvidenceExpired
+            );
+            assert_eq!(
+                resolve_presentation_with_explanation(&idle, &tracker, 99)
+                    .1
+                    .reason,
+                Reason::ObservationTimeInvalid
+            );
+        }
+        tracker.codex_screen = None;
+        tracker.codex_screen_expired_at = Some(100);
+        assert_eq!(
+            resolve_presentation_with_explanation(&idle, &tracker, 104)
+                .1
+                .reason,
+            Reason::EvidenceExpired
+        );
+        tracker.epoch = None;
+        let explanation = resolve_presentation_with_explanation(&idle, &tracker, 104).1;
+        assert_eq!(explanation.reason, Reason::EpochMismatch);
+        assert_eq!(explanation.observed_at, None);
+        let done = state(LifecycleState::Idle, 1, 1, false);
+        assert_eq!(
+            resolve_presentation_with_explanation(&done, &tracker, 104)
+                .1
+                .reason,
+            Reason::UnreadCompletion
+        );
+        let running = state(LifecycleState::Running, 1, 0, false);
+        assert_eq!(
+            resolve_presentation_with_explanation(&running, &tracker, 104)
+                .1
+                .reason,
+            Reason::CanonicalActive
+        );
+        let mut absent = idle.clone();
+        absent.agent_present = false;
+        assert_eq!(
+            resolve_presentation_with_explanation(&absent, &tracker, 104)
+                .1
+                .reason,
+            Reason::AgentAbsent
+        );
+        tracker.hook_authoritative = true;
+        assert_eq!(
+            resolve_presentation_with_explanation(&idle, &tracker, 104)
+                .1
+                .reason,
+            Reason::HookAuthoritative
+        );
+        let mut other = idle;
+        other.agent = AgentKind::parse("claude").unwrap();
+        assert_eq!(
+            resolve_presentation_with_explanation(&other, &tracker, 104)
+                .1
+                .reason,
+            Reason::Canonical
+        );
+    }
 
     fn state(lifecycle: LifecycleState, run: u64, completed: u64, read: bool) -> PaneState {
         PaneState {

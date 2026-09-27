@@ -183,6 +183,7 @@ mod tests {
             pane_pid: 700,
         };
         let resolved = resolved.map(|(lifecycle, badge)| crate::pane_state::ResolvedPaneState {
+            presentation: Default::default(),
             canonical: crate::pane_state::PaneState {
                 schema_version: crate::pane_state::PANE_STATE_SCHEMA_VERSION,
                 state_id: crate::pane_state::StateId::parse("00000000000000000000000000000007")

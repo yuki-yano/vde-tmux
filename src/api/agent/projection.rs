@@ -219,6 +219,7 @@ pub(in crate::api) fn agent_summary(
         agent: state.agent.as_str().to_string(),
         status: agent_status(state),
         badge: AgentBadge::from(resolved.badge),
+        presentation: resolved.presentation,
         lifecycle: lifecycle_summary(&state.lifecycle),
         current_run: None,
         sessions: session_links(pane),
@@ -353,6 +354,28 @@ mod tests {
                 .unwrap()
                 .code(),
             "agent_not_found"
+        );
+    }
+
+    #[test]
+    fn public_summary_explains_the_display_without_changing_canonical_status() {
+        let mut pane = test_agent_pane();
+        let resolved = pane.resolved.as_mut().unwrap();
+        resolved.canonical.lifecycle = LifecycleState::Idle;
+        resolved.badge = BadgeState::Unknown;
+        resolved.presentation = crate::pane_state::PresentationExplanation {
+            reason: crate::pane_state::PresentationReason::EvidenceExpired,
+            observed_at: Some(100),
+            ttl_seconds: Some(3),
+        };
+        let snapshot = test_snapshot(pane.clone());
+        let summary = agent_summary(&pane, &snapshot, "server").unwrap();
+        let json = serde_json::to_value(summary).unwrap();
+        assert_eq!(json["badge"], "unknown");
+        assert_eq!(json["lifecycle"]["state"], "idle");
+        assert_eq!(
+            json["presentation"],
+            serde_json::json!({"reason":"evidence_expired", "observed_at":100, "ttl_seconds":3})
         );
     }
 
