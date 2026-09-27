@@ -18,25 +18,16 @@ pub fn classify(profile: CodexProfile, viewport: &str, width: u16, height: u16) 
     if profile == CodexProfile::Unknown || viewport.len() > STDOUT_LIMIT || viewport.is_empty() {
         return CaptureClass::Ambiguous;
     }
-    static SUMMARY: OnceLock<Regex> = OnceLock::new();
-    static PROGRESS: OnceLock<Regex> = OnceLock::new();
-    static CHOICE: OnceLock<Regex> = OnceLock::new();
-    let summary = pattern(&SUMMARY, r"^\s*\?\s+\d+ questions?(?:\s*·.*)?\s*$");
-    let progress = pattern(&PROGRESS, r"^\s*\d+ of \d+\s*$");
-    let choice = pattern(&CHOICE, r"^\s*›\s+\d+\.\s");
     let lines: Vec<_> = viewport.lines().collect();
-    for line in &lines {
-        if summary.is_match(line)
-            || progress.is_match(line)
-            || choice.is_match(line)
-            || (line.contains(" submit") && line.contains(" skip"))
-            || line.contains(" to answer")
-            || line.contains("next question")
-            || line.contains("prev question")
-            || line.trim() == "Type your answer"
-        {
-            return CaptureClass::ActiveQuestion;
-        }
+    if lines
+        .iter()
+        .any(|line| crate::detect::codex::asynchronous_question_marker(line))
+    {
+        return CaptureClass::ActiveQuestion;
+    }
+    let evidence = crate::detect::codex::classify(viewport);
+    if evidence.modal.is_some() || evidence.working || evidence.transcript_viewer {
+        return CaptureClass::Ambiguous;
     }
     if width < 80
         || height < 24

@@ -1173,6 +1173,7 @@ pub enum AgentPresenceObservation {
 pub struct CaptureObservation {
     pub inference: CaptureInference,
     pub observed_fingerprint: Option<[u8; 32]>,
+    pub codex_screen: Option<crate::detect::codex::Evidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1462,6 +1463,8 @@ pub struct CaptureTrackerSnapshot {
     pub generation: u64,
     pub epoch: Option<(StateId, u64)>,
     pub hook_authoritative: bool,
+    /// Ephemeral finite evidence; never serialized into canonical Pane State.
+    pub codex_screen: Option<(crate::detect::codex::Evidence, i64)>,
     /// A same-session interruption received after completion awaits one terminal check.
     pub interruption_verification_pending: bool,
     /// Currently verified exact identity exposed through the daemon projection.

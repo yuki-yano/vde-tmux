@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use crate::detect::{detect_claude_terminal_error, detect_codex_wait_reason, detect_usage_limit};
+use crate::detect::{detect_claude_terminal_error, detect_usage_limit};
 use crate::pane_state::{
     AgentKind, AgentPresenceObservation, CaptureInference, CaptureObservation,
     CaptureTrackerSnapshot, DaemonInstanceId, EventId, LifecycleState, ObservationDispatchSnapshot,
@@ -53,6 +53,10 @@ pub fn infer_capture(
     tail: &str,
     observed_at: i64,
 ) -> CaptureObservation {
+    let evidence = crate::detect::codex::classify(tail);
+    let codex_screen = state
+        .filter(|state| state.agent.as_str() == "codex")
+        .map(|_| evidence);
     let observed_fingerprint = capture_sha256(tail);
     let inference = if state.is_some_and(|state| {
         matches!(state.agent.as_str(), "claude" | "codex") && detect_usage_limit(tail)
@@ -70,12 +74,12 @@ pub fn infer_capture(
         || tracker.fingerprint.is_none()
     {
         CaptureInference::NoChange
-    } else if let Some(reason) = detect_codex_wait_reason(tail) {
+    } else if let Some(modal) = evidence.modal {
         CaptureInference::PermissionWait {
-            reason: if reason == "permission_prompt" {
+            reason: if modal == crate::detect::codex::Modal::Approval {
                 WaitReason::PermissionPrompt
             } else {
-                WaitReason::Other(reason.to_string())
+                WaitReason::Other("codex_question_prompt".to_string())
             },
         }
     } else if observed_fingerprint != tracker.fingerprint {
@@ -98,6 +102,7 @@ pub fn infer_capture(
     CaptureObservation {
         inference,
         observed_fingerprint,
+        codex_screen,
     }
 }
 
@@ -114,6 +119,7 @@ fn infer_active_terminal_capture(agent: &AgentKind, tail: &str) -> CaptureObserv
         CaptureInference::NoChange
     };
     CaptureObservation {
+        codex_screen: None,
         inference,
         observed_fingerprint: capture_sha256(tail),
     }
@@ -121,6 +127,7 @@ fn infer_active_terminal_capture(agent: &AgentKind, tail: &str) -> CaptureObserv
 
 fn infer_usage_limit_capture(tail: &str) -> CaptureObservation {
     CaptureObservation {
+        codex_screen: None,
         inference: if detect_usage_limit(tail) {
             CaptureInference::UsageLimit
         } else {

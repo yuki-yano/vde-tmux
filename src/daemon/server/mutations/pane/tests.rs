@@ -325,6 +325,7 @@ fn observation_unread_preflight_matches_state_creating_inferences() {
         listening_ports: Vec::new(),
     };
     let permission_wait = CaptureObservation {
+        codex_screen: Some(crate::detect::codex::Evidence::default()),
         inference: CaptureInference::PermissionWait {
             reason: WaitReason::PermissionPrompt,
         },
@@ -333,12 +334,14 @@ fn observation_unread_preflight_matches_state_creating_inferences() {
     let tracker = CaptureTrackerSnapshot::default();
     let present = AgentPresenceObservation::Present(agent);
     let provider_error = CaptureObservation {
+        codex_screen: Some(crate::detect::codex::Evidence::default()),
         inference: CaptureInference::ProviderError {
             reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
         },
         observed_fingerprint: Some([2; 32]),
     };
     let usage_limit = CaptureObservation {
+        codex_screen: Some(crate::detect::codex::Evidence::default()),
         inference: CaptureInference::UsageLimit,
         observed_fingerprint: Some([3; 32]),
     };
@@ -359,6 +362,17 @@ fn observation_unread_preflight_matches_state_creating_inferences() {
     ));
 
     state.lifecycle = LifecycleState::Running;
+    let stale_capture = CaptureObservation {
+        codex_screen: Some(crate::detect::codex::Evidence::default()),
+        inference: CaptureInference::StaleRunCompleted,
+        observed_fingerprint: Some([4; 32]),
+    };
+    assert!(observation_may_create_unread(
+        &state,
+        &tracker,
+        &present,
+        Some(&stale_capture)
+    ));
     assert!(observation_may_create_unread(
         &state,
         &tracker,

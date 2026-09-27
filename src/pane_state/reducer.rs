@@ -211,8 +211,8 @@ fn reduce_explicit(
             )?;
             let completed_outside_capture = state.completed_seq > 0;
             let mut tracker = reset_tracker_for_state(context.tracker, &state)?;
-            tracker.hook_authoritative =
-                matches!(envelope.event, PaneEvent::AgentSessionStarted { .. });
+            tracker.hook_authoritative = agent.as_str() == "codex"
+                || matches!(envelope.event, PaneEvent::AgentSessionStarted { .. });
             tracker.rebaseline_pending = completed_outside_capture;
             bump_tracker(&mut tracker)?;
             return finish_state_reduction(current, state, tracker, Some(context.tracker));
@@ -360,6 +360,15 @@ fn reduce_explicit(
     } else {
         context.tracker.clone()
     };
+    // Accepted Codex lifecycle input re-establishes authority after hydration.
+    // CLI hook ingress proves embedded ownership before delivering these events;
+    // this does not restore the separate Question resolver's pre-restart trust.
+    if agent.as_str() == "codex"
+        && (matches!(identity, ExistingIdentity::ExactPresent) || epoch_evidence)
+    {
+        tracker.hook_authoritative = true;
+        tracker.codex_screen = None;
+    }
     tracker.interruption_verification_pending = false;
     tracker.absence_count = 0;
     tracker.replacement_kind = None;
@@ -438,6 +447,7 @@ fn reduce_observation(
 
     match presence {
         AgentPresenceObservation::Unknown => {
+            tracker.codex_screen = None;
             tracker.agent_process = None;
             tracker.absence_count = 0;
             tracker.replacement_kind = None;
@@ -1413,6 +1423,9 @@ fn apply_capture(
     observed_at: i64,
     visibility: &VisibilitySnapshot,
 ) -> Result<(), ReduceError> {
+    tracker.codex_screen = capture
+        .and_then(|capture| capture.codex_screen)
+        .map(|evidence| (evidence, observed_at));
     let Some(capture) = capture else {
         return Ok(());
     };
@@ -1437,7 +1450,11 @@ fn apply_capture(
     }
     match &capture.inference {
         CaptureInference::PermissionWait { reason } => {
-            wait_requested(state, observed_at, reason.clone())?;
+            // A screen modal alone cannot issue a canonical Run. Existing open
+            // runs retain their lifecycle/stale-completion contract.
+            if state.agent.as_str() != "codex" || state.run_seq > state.completed_seq {
+                wait_requested(state, observed_at, reason.clone())?;
+            }
         }
         CaptureInference::UsageLimit => {
             wait_requested(state, observed_at, WaitReason::usage_limit())?;
@@ -1482,6 +1499,7 @@ fn reset_tracker_for_state(
         generation: tracker.generation,
         epoch: Some((state.state_id.clone(), state.agent_epoch)),
         hook_authoritative: false,
+        codex_screen: None,
         interruption_verification_pending: false,
         agent_process: None,
         last_agent_process: state.agent_process.clone(),
@@ -1640,6 +1658,86 @@ mod tests {
             },
             tracker,
         )
+    }
+
+    #[test]
+    fn accepted_codex_lifecycle_restores_authority_after_daemon_restart() {
+        let started = begin(None, &CaptureTrackerSnapshot::default());
+        let state = active(&started);
+        let hydrated_tracker =
+            reset_tracker_for_state(&CaptureTrackerSnapshot::default(), state).unwrap();
+        assert!(!hydrated_tracker.hook_authoritative);
+        let completed = reduce_once(
+            Some(state),
+            PaneEvent::CompleteRun { completed_at: 20 },
+            &hydrated_tracker,
+        );
+        assert!(
+            completed
+                .tracker_delta
+                .as_ref()
+                .unwrap()
+                .next
+                .hook_authoritative
+        );
+        assert_eq!(active(&completed).completed_seq, 1);
+        let stale = reduce_explicit_once(
+            Some(state),
+            "codex",
+            "different-session",
+            PaneEvent::CompleteRun { completed_at: 20 },
+            &hydrated_tracker,
+        );
+        assert!(matches!(stale, Err(ReduceError::StaleAgentEvent)));
+        assert!(!hydrated_tracker.hook_authoritative);
+    }
+
+    #[test]
+    fn screen_modal_does_not_create_run_and_failed_capture_clears_evidence() {
+        let reduction = reduce_once(
+            None,
+            PaneEvent::AgentSessionStarted {
+                observed_at: 10,
+                source: crate::pane_state::AgentSessionSource::Startup,
+                resumed_prompt: None,
+            },
+            &CaptureTrackerSnapshot::default(),
+        );
+        let mut state = active(&reduction).clone();
+        let before = state.clone();
+        let mut tracker =
+            reset_tracker_for_state(&CaptureTrackerSnapshot::default(), &state).unwrap();
+        tracker.fingerprint = Some([1; 32]);
+        let capture = CaptureObservation {
+            inference: CaptureInference::PermissionWait {
+                reason: WaitReason::PermissionPrompt,
+            },
+            observed_fingerprint: Some([2; 32]),
+            codex_screen: Some(crate::detect::codex::Evidence {
+                modal: Some(crate::detect::codex::Modal::Approval),
+                ..Default::default()
+            }),
+        };
+        apply_capture(
+            &mut state,
+            Some(&capture),
+            &mut tracker,
+            20,
+            &VisibilitySnapshot::default(),
+        )
+        .unwrap();
+        assert_eq!(state, before);
+        assert!(tracker.codex_screen.is_some());
+        apply_capture(
+            &mut state,
+            None,
+            &mut tracker,
+            21,
+            &VisibilitySnapshot::default(),
+        )
+        .unwrap();
+        assert!(tracker.codex_screen.is_none());
+        assert_eq!(state, before);
     }
 
     fn progress(current: &Reduction, operations: Vec<ProgressOperation>) -> Reduction {
@@ -1837,14 +1935,13 @@ mod tests {
             assert!(!state.scan_verified, "{name}");
             assert!(!state.synthetic_completion_armed, "{name}");
             assert_eq!(state.completed_seq, expected_completed, "{name}");
-            assert_eq!(
+            assert!(
                 missing
                     .tracker_delta
                     .as_ref()
                     .unwrap()
                     .next
                     .hook_authoritative,
-                name == "session",
                 "{name}"
             );
             assert_eq!(
@@ -2374,6 +2471,7 @@ mod tests {
             &verified.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
             Some(CaptureObservation {
+                codex_screen: None,
                 inference: CaptureInference::ActivityObserved,
                 observed_fingerprint: Some([1; 32]),
             }),
@@ -2411,6 +2509,7 @@ mod tests {
             &confirmed.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
             Some(CaptureObservation {
+                codex_screen: None,
                 inference: CaptureInference::ActivityObserved,
                 observed_fingerprint: Some([2; 32]),
             }),
@@ -2961,6 +3060,7 @@ mod tests {
             &first_tracker,
             AgentPresenceObservation::Absent,
             Some(CaptureObservation {
+                codex_screen: None,
                 inference: CaptureInference::UsageLimit,
                 observed_fingerprint: Some([7; 32]),
             }),
@@ -2996,6 +3096,7 @@ mod tests {
             &begun.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
             Some(CaptureObservation {
+                codex_screen: None,
                 inference: CaptureInference::ProviderError {
                     reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
                 },
@@ -3168,6 +3269,7 @@ mod tests {
             pending_tracker,
             AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
             Some(CaptureObservation {
+                codex_screen: None,
                 inference: CaptureInference::ProviderError {
                     reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
                 },
@@ -3208,6 +3310,7 @@ mod tests {
             &pending_limit.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
             Some(CaptureObservation {
+                codex_screen: None,
                 inference: CaptureInference::UsageLimit,
                 observed_fingerprint: Some([6; 32]),
             }),
@@ -3232,6 +3335,7 @@ mod tests {
             &pending.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
             Some(CaptureObservation {
+                codex_screen: None,
                 inference: CaptureInference::NoChange,
                 observed_fingerprint: Some([8; 32]),
             }),
@@ -3325,6 +3429,7 @@ mod tests {
             completed_tracker,
             AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
             Some(CaptureObservation {
+                codex_screen: None,
                 inference: CaptureInference::ProviderError {
                     reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
                 },
@@ -3835,6 +3940,7 @@ mod tests {
             &CaptureTrackerSnapshot::default(),
             AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
             Some(CaptureObservation {
+                codex_screen: None,
                 inference: CaptureInference::NoChange,
                 observed_fingerprint: Some([1; 32]),
             }),
@@ -3853,6 +3959,7 @@ mod tests {
             &baseline.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
             Some(CaptureObservation {
+                codex_screen: None,
                 inference: CaptureInference::ActivityObserved,
                 observed_fingerprint: Some([2; 32]),
             }),
@@ -3914,6 +4021,7 @@ mod tests {
                 observed_at: 3,
                 presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
                 capture: Some(CaptureObservation {
+                    codex_screen: None,
                     inference: CaptureInference::NoChange,
                     observed_fingerprint: None,
                 }),
@@ -3940,6 +4048,7 @@ mod tests {
                 observed_at: 301,
                 presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
                 capture: Some(CaptureObservation {
+                    codex_screen: None,
                     inference: CaptureInference::StaleRunCompleted,
                     observed_fingerprint: Some([2; 32]),
                 }),

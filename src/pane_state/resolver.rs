@@ -2,6 +2,42 @@ use crate::daemon::session_badge::BadgeState;
 
 use super::model::{LifecycleState, PaneState, UnreadReason};
 
+pub const SCREEN_EVIDENCE_TTL_SECONDS: i64 = 3;
+
+/// Current presentation only. Canonical transitions, wait events, notices and
+/// OS notifications must continue using resolve_badge / the canonical state.
+pub fn resolve_presentation(
+    state: &PaneState,
+    tracker: &super::CaptureTrackerSnapshot,
+    now: i64,
+) -> BadgeState {
+    let canonical = resolve_badge(state);
+    if state.agent.as_str() != "codex"
+        || tracker.hook_authoritative
+        || !state.agent_present
+        || !matches!(state.lifecycle, LifecycleState::Idle)
+    {
+        return canonical;
+    }
+    if let Some((evidence, observed_at)) = tracker.codex_screen
+        && tracker.epoch.as_ref() == Some(&(state.state_id.clone(), state.agent_epoch))
+        && (0..=SCREEN_EVIDENCE_TTL_SECONDS).contains(&now.saturating_sub(observed_at))
+        && !evidence.transcript_viewer
+    {
+        if evidence.modal.is_some() {
+            return BadgeState::Blocked;
+        }
+        if evidence.working {
+            return BadgeState::Working;
+        }
+    }
+    if canonical == BadgeState::Done {
+        BadgeState::Done
+    } else {
+        BadgeState::Unknown
+    }
+}
+
 pub fn resolve_badge(state: &PaneState) -> BadgeState {
     match state.lifecycle {
         LifecycleState::Waiting { ref reason } if reason.is_usage_limit() => BadgeState::Limited,
@@ -118,5 +154,49 @@ mod tests {
             )),
             BadgeState::Limited
         );
+    }
+
+    #[test]
+    fn screen_evidence_changes_presentation_without_changing_canonical_state() {
+        let state = state(LifecycleState::Idle, 0, 0, false);
+        let original = state.clone();
+        let mut tracker = super::super::CaptureTrackerSnapshot {
+            epoch: Some((state.state_id.clone(), state.agent_epoch)),
+            ..Default::default()
+        };
+        for (screen, badge) in [
+            (
+                "• Reviewing (3s)\n  ? 1 question · 3s\n› Ask Codex\n",
+                BadgeState::Working,
+            ),
+            (
+                "Would you like to run the following command?\n  › 1. Yes, proceed (y)\n",
+                BadgeState::Blocked,
+            ),
+            ("Question 1/1 (1 unanswered)\n", BadgeState::Blocked),
+            ("  ? 1 question · 3s\n› Ask Codex\n", BadgeState::Unknown),
+            ("unrecognized screen", BadgeState::Unknown),
+        ] {
+            tracker.codex_screen = Some((crate::detect::codex::classify(screen), 100));
+            assert_eq!(resolve_presentation(&state, &tracker, 100), badge);
+            assert_eq!(
+                resolve_presentation(&state, &tracker, 104),
+                BadgeState::Unknown
+            );
+            tracker.hook_authoritative = true;
+            assert_eq!(
+                resolve_presentation(&state, &tracker, 100),
+                BadgeState::Idle
+            );
+            tracker.hook_authoritative = false;
+        }
+        tracker.codex_screen = Some((crate::detect::codex::classify("• Working (1s)\n› "), 100));
+        tracker.epoch = None;
+        assert_eq!(
+            resolve_presentation(&state, &tracker, 100),
+            BadgeState::Unknown
+        );
+        assert_eq!(state, original);
+        assert_eq!(resolve_badge(&state), BadgeState::Idle);
     }
 }

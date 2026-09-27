@@ -216,6 +216,7 @@ impl SidebarRenderTheme {
             }
             RollupLevel::Limited => self.badge_color(BadgeState::Limited),
             RollupLevel::Running => self.badge_color(BadgeState::Working),
+            RollupLevel::Unknown => self.badge_color(BadgeState::Unknown),
             RollupLevel::Background | RollupLevel::Idle => self.badge_color(BadgeState::Idle),
         }
     }
@@ -230,7 +231,7 @@ impl SidebarRenderTheme {
             BadgeState::Limited => self.badge_limited,
             BadgeState::Working => self.badge_working,
             BadgeState::Done => self.badge_done,
-            BadgeState::Idle => self.badge_idle,
+            BadgeState::Unknown | BadgeState::Idle => self.badge_idle,
         }
     }
 }

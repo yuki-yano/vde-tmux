@@ -130,7 +130,11 @@ impl CanonicalCoordinatorState {
                         window_id: topology.window_id.clone(),
                         pane_id: topology.pane_instance.pane_id.clone(),
                         current_path: topology.current_path.clone(),
-                        badge: crate::pane_state::resolve_badge(state),
+                        badge: crate::pane_state::resolve_presentation(
+                            state,
+                            &runtime.tracker(&topology.pane_instance),
+                            now,
+                        ),
                     })
                 }
                 _ => None,

@@ -4,6 +4,8 @@ use std::time::Duration;
 use crate::pane_state::AgentKind;
 use crate::tmux::run_command;
 
+pub(crate) const INTERPRETER_PROGRAMS: &[&str] = &["node", "bun", "deno", "python", "python3"];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessDetection {
     pub agents: BTreeSet<AgentKind>,
@@ -367,10 +369,12 @@ fn detect_process_agent(command: &str) -> Option<DetectedProcessAgent> {
     let mut fields = command.split_whitespace();
     let executable = fields.next()?.rsplit('/').next()?;
     if matches!(executable, "claude" | "codex" | "opencode") {
-        // Codex/ChatGPT may spawn app-server and sandbox helpers as descendants.
+        // Codex/ChatGPT may spawn app-server, sandbox and MCP helpers as descendants.
         // Neither is a pane occupant; counting them makes the interactive
         // Codex process identity ambiguous.
-        if executable == "codex" && matches!(fields.next(), Some("app-server" | "sandbox")) {
+        if executable == "codex"
+            && matches!(fields.next(), Some("app-server" | "sandbox" | "mcp-server"))
+        {
             return None;
         }
         return Some(DetectedProcessAgent {
@@ -379,10 +383,7 @@ fn detect_process_agent(command: &str) -> Option<DetectedProcessAgent> {
         });
     }
     let executable = executable.to_ascii_lowercase();
-    let interpreted = if matches!(
-        executable.as_str(),
-        "node" | "bun" | "deno" | "python" | "python3"
-    ) {
+    let interpreted = if INTERPRETER_PROGRAMS.contains(&executable.as_str()) {
         let script = fields.next()?;
         let agent = script
             .split(['/', '\\'])
@@ -393,7 +394,9 @@ fn detect_process_agent(command: &str) -> Option<DetectedProcessAgent> {
                 "opencode" => Some("opencode"),
                 _ => None,
             })?;
-        if agent == "codex" && matches!(fields.next(), Some("app-server" | "sandbox")) {
+        if agent == "codex"
+            && matches!(fields.next(), Some("app-server" | "sandbox" | "mcp-server"))
+        {
             return None;
         }
         Some(agent)
@@ -404,6 +407,13 @@ fn detect_process_agent(command: &str) -> Option<DetectedProcessAgent> {
         agent: AgentKind::parse(interpreted?).ok()?,
         source: AgentProcessSource::Interpreted,
     })
+}
+
+/// Uses the existing provider executable rules without requiring uniqueness among
+/// unrelated siblings. Hook ownership additionally proves the OS ancestor chain.
+pub(crate) fn is_codex_command(arguments: &[String]) -> bool {
+    detect_process_agent(&arguments.join(" "))
+        .is_some_and(|detected| detected.agent.as_str() == "codex")
 }
 
 pub fn read_agent_process_snapshot(timeout: Duration, scan_ports: bool) -> AgentProcessSnapshot {

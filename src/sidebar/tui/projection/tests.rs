@@ -14,6 +14,7 @@ fn filter_cycles_in_both_directions_and_skips_empty_filters() {
             limited: 0,
             working: 2,
             done: 0,
+            unknown: 0,
             idle: 4,
         },
         ..SidebarView::default()

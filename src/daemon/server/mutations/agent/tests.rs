@@ -468,6 +468,27 @@ fn guarded_prompt_process_owner_rejections_cover_every_fail_closed_branch() {
 }
 
 #[test]
+fn screen_evidence_cannot_authorize_durable_prompt_dispatch() {
+    let binding = guarded_prompt_test_binding();
+    let pane = guarded_prompt_test_pane_state(&binding);
+    let mut tracker = crate::pane_state::CaptureTrackerSnapshot {
+        epoch: Some((pane.state_id.clone(), pane.agent_epoch)),
+        ..Default::default()
+    };
+    assert!(require_observed_prompt_readiness(&pane, &tracker).is_err());
+    tracker.codex_screen = Some((
+        crate::detect::codex::Evidence {
+            working: true,
+            ..Default::default()
+        },
+        super::super::super::epoch_seconds(),
+    ));
+    assert!(require_observed_prompt_readiness(&pane, &tracker).is_err());
+    tracker.hook_authoritative = true;
+    assert!(require_observed_prompt_readiness(&pane, &tracker).is_ok());
+}
+
+#[test]
 fn guarded_prompt_lock_binding_and_pane_preconditions_are_fail_closed() {
     let binding = guarded_prompt_test_binding();
     let pane = binding.pane_instance.clone();

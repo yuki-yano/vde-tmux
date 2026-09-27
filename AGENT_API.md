@@ -1,6 +1,6 @@
 # Agent JSON API
 
-This document defines the current API v5 contract (daemon protocol 25, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
+This document defines the current API v6 contract (daemon protocol 26, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
 maintained in [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is
 recorded in [AGENT_API_V3.md](AGENT_API_V3.md).
 
@@ -85,7 +85,7 @@ the conceptual request command, success envelope, and error envelope.
 ```json
 {
   "meta": {
-    "api_version": 5,
+    "api_version": 6,
     "server_identity": "...",
     "daemon_instance_id": "...",
     "snapshot_revision": 42,
@@ -549,7 +549,7 @@ Acknowledgement commits at atomic rename. A pre-rename failure retains the notic
 directory-fsync failure is a logical acknowledgement with `question_ack_directory_fsync_failed`,
 without rollback or automatic rewrite. The private `.expected` marker distinguishes initial absence
 from loss of a previously committed sidecar. Resolver state, transcript cursors, and ingress dedup
-remain memory-only; the shared private home journal stores only digests and writer identities. API 5 / protocol 25 must be installed together;
+remain memory-only; the shared private home journal stores only digests and writer identities. API 6 / protocol 26 must be installed together;
 there is no old-protocol fallback.
 
 ## Query cost
@@ -605,5 +605,46 @@ includes more work than the daemon-ingress bound; it excludes Codex's pre-hook d
 
 ### 運用反映条件
 
-- [ ] CLI/daemon/sidebar are deployed together with API 5 / protocol 25 while retaining existing Pane State schema 10.
+- [ ] CLI/daemon/sidebar are deployed together with API 6 / protocol 26 while retaining existing Pane State schema 10.
 - [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.
+
+
+## Codex screen evidence (API 6)
+
+`badge` includes `unknown` in API 6. It represents current presentation; `status`,
+`lifecycle`, and `agent wait` continue to describe canonical lifecycle. A Codex pane
+without authoritative lifecycle hooks can therefore have `status: idle` and
+`badge: working`, `blocked`, or `unknown`. `--status working` and
+`agent wait --until working` do not match screen activity alone.
+
+The existing capture batch supplies finite Codex evidence. A fresh live activity timer
+(including dynamic labels, remapped interrupt keys, and queued inputs) gives Working;
+a current approval or synchronous question gives Blocked and `needs_action: true`.
+An asynchronous question can coexist with Working and does not alone imply Blocked.
+Unknown UI, transcript viewers, capture failure, and evidence older than three seconds
+produce Unknown when no canonical state takes priority. Existing unread completion
+remains Done. Authoritative hooks and canonical active/waiting/error states take priority.
+Unknown uses `?` and the neutral Idle color, and is visible even when Idle is hidden.
+
+Evidence lives only in the runtime tracker and is invalidated on epoch/process replacement,
+failed observation, or expiry. It does not issue a new Run, complete a Run, confirm a prompt,
+acknowledge a Question notice, or generate an OS notification/triage event. The pre-existing
+300-second stale-completion rule for open non-authoritative runs is unchanged. A screen
+modal no longer creates a new Codex run merely by appearing.
+
+Codex hooks require a process ancestor chain rooted in their claimed pane. Shared app-server
+hooks, including renamed executables, cannot use inherited `TMUX_PANE` to update that pane
+or another pane. Rejection logs contain only finite reason codes. Embedded hooks remain
+usable with an unrelated MCP server child. This prevents misattribution; it does not restore
+lifecycle events from a shared server. Ordinary prompt dispatch is rejected while readiness
+is Unknown or Working/Blocked, and durable Codex dispatch requires authoritative hooks in
+the current daemon epoch. In embedded mode, a subsequent accepted lifecycle hook restores authority after daemon restart;
+this does not restore Question resolver trust for notices predating restart. Shared-server mode
+continues to reject hooks. Start Codex with `--no-daemon` (or set `features.daemon_auto_start=false`)
+to use the embedded hook lifecycle.
+
+Pane State schema 10 and Question sidecar schema 1 are unchanged. Question remains a durable
+unacknowledged issuance notice. Capture is veto-only; answers alone, unknown evidence, and
+notifications predating daemon restart do not acquire new automatic acknowledgement rules.
+CLI, daemon, and sidebars must be replaced together for protocol 26; there is no mixed-version
+fallback. Hook authority is not inferred to have expired merely because events stop arriving.

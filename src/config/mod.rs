@@ -400,6 +400,7 @@ pub struct BadgeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BadgeGlyphs {
+    pub unknown: String,
     pub blocked: String,
     pub limited: String,
     pub working: String,
@@ -410,6 +411,7 @@ pub struct BadgeGlyphs {
 impl Default for BadgeGlyphs {
     fn default() -> Self {
         Self {
+            unknown: "?".to_string(),
             blocked: "▲".to_string(),
             limited: "⋄".to_string(),
             working: "●".to_string(),
@@ -448,7 +450,7 @@ impl BadgeColors {
             "limited" => Some(self.limited.as_str()),
             "working" => Some(self.working.as_str()),
             "done" => Some(self.done.as_str()),
-            "idle" => Some(self.idle.as_str()),
+            "unknown" | "idle" => Some(self.idle.as_str()),
             _ => None,
         }
     }

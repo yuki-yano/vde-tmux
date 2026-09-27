@@ -79,6 +79,7 @@ fn rich_header_counts() -> BadgeCounts {
         limited: 0,
         working: 1,
         done: 0,
+        unknown: 0,
         idle: 5,
     }
 }
@@ -227,6 +228,7 @@ fn active_chip_fg_follows_configured_header_fg() {
         limited: 0,
         working: 1,
         done: 0,
+        unknown: 0,
         idle: 1,
     };
     let state = SidebarState {
@@ -259,6 +261,7 @@ fn header_chip_fg_overrides_active_chip_fg_but_not_mode_fg() {
         limited: 0,
         working: 1,
         done: 0,
+        unknown: 0,
         idle: 1,
     };
     let state = SidebarState {
@@ -337,6 +340,7 @@ fn chip_caps_render_as_pill_and_skip_zero_chips() {
         limited: 0,
         working: 0,
         done: 0,
+        unknown: 0,
         idle: 2,
     };
     let state = SidebarState::default();
@@ -374,6 +378,7 @@ fn header_chip_styles_distinguish_active_nonzero_and_zero_states() {
         limited: 0,
         working: 2,
         done: 0,
+        unknown: 0,
         idle: 5,
     };
     let state = SidebarState {

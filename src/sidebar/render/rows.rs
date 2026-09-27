@@ -1036,6 +1036,7 @@ fn render_rail_lines(
         BadgeState::Limited,
         BadgeState::Working,
         BadgeState::Done,
+        BadgeState::Unknown,
         BadgeState::Idle,
     ] {
         let count = chat_rows
@@ -1266,6 +1267,7 @@ fn closed_chat_right_parts(row: &SidebarRow) -> Vec<ClosedChatRightPart> {
 
 fn closed_chat_state_or_time_label(row: &SidebarRow) -> Option<String> {
     match row.badge_state? {
+        BadgeState::Unknown => None,
         BadgeState::Blocked | BadgeState::Limited | BadgeState::Working => row
             .meta
             .as_ref()
@@ -1402,6 +1404,7 @@ fn elapsed_full_label(secs: i64) -> String {
 
 fn expanded_chat_right_label(row: &SidebarRow) -> Option<String> {
     match row.badge_state? {
+        BadgeState::Unknown => None,
         BadgeState::Blocked | BadgeState::Limited | BadgeState::Working => row
             .meta
             .as_ref()

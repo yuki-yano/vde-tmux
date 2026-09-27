@@ -1,3 +1,5 @@
+pub mod codex;
+
 // capture-pane may include deeper scrollback; only recent screen lines should drive waiting state.
 const WAIT_REASON_SCAN_TAIL_LINES: usize = 30;
 
@@ -49,25 +51,11 @@ pub fn is_provider_overloaded_error(text: &str) -> bool {
 }
 
 pub fn detect_codex_wait_reason(screen_tail: &str) -> Option<&'static str> {
-    let lines = recent_wait_reason_lines(screen_tail);
-
-    for (index, line) in lines.iter().enumerate() {
-        if !looks_like_permission_question(line) {
-            continue;
-        }
-        if lines
-            .iter()
-            .skip(index + 1)
-            .take(3)
-            .any(|candidate| looks_like_yes_choice(candidate))
-        {
-            return Some("permission_prompt");
-        }
+    match codex::classify(screen_tail).modal {
+        Some(codex::Modal::Approval) => Some("permission_prompt"),
+        Some(codex::Modal::SynchronousQuestion) => Some("codex_question_prompt"),
+        None => None,
     }
-    if codex_question_prompt_active(&lines) {
-        return Some("codex_question_prompt");
-    }
-    None
 }
 
 fn recent_wait_reason_lines(screen_tail: &str) -> Vec<String> {
@@ -96,91 +84,6 @@ fn is_claude_prompt_separator(line: &str) -> bool {
 
 fn looks_like_claude_turn_done(line: &str) -> bool {
     line.starts_with(['✻', '✽', '✶', '✢', '✳']) && line.contains(" · done ")
-}
-
-fn looks_like_permission_question(line: &str) -> bool {
-    let asks_for_permission =
-        line.contains("allow") || line.contains("approve") || line.contains("permission");
-    let mentions_action = line.contains("command")
-        || line.contains("edit")
-        || line.contains("write")
-        || line.contains("tool")
-        || line.contains("bash")
-        || line.contains("use")
-        || line.contains("run")
-        || line.contains("execute");
-    (asks_for_permission && mentions_action && line.contains('?'))
-        || line.contains("do you want to proceed?")
-}
-
-fn looks_like_yes_choice(line: &str) -> bool {
-    let normalized = line
-        .trim_start_matches(|ch: char| {
-            ch.is_whitespace() || ch == '-' || ch == '*' || ch == '>' || ch == '❯'
-        })
-        .trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.' || ch == ')' || ch == '-')
-        .trim();
-    normalized == "yes"
-        || normalized.starts_with("yes ")
-        || normalized.starts_with("y) yes")
-        || normalized.starts_with("y - yes")
-        || normalized.starts_with("[y] yes")
-}
-
-fn codex_question_prompt_active(lines: &[String]) -> bool {
-    let mut latest_status = None;
-    for line in lines {
-        if looks_like_codex_question_unanswered(line) {
-            latest_status = Some(true);
-        } else if looks_like_codex_questions_answered(line) {
-            latest_status = Some(false);
-        }
-    }
-    latest_status == Some(true)
-}
-
-fn looks_like_codex_question_unanswered(line: &str) -> bool {
-    let line = normalize_question_status_line(line);
-    let Some(rest) = line.strip_prefix("question") else {
-        return false;
-    };
-    let Some(rest) = parse_question_index(rest) else {
-        return false;
-    };
-    let rest = rest.trim();
-    if !rest.starts_with('(') || !rest.ends_with(')') {
-        return false;
-    }
-    let inner = rest.trim_start_matches('(').trim_end_matches(')').trim();
-    let Some(rest) = consume_ascii_digits(inner) else {
-        return false;
-    };
-    rest.trim() == "unanswered"
-}
-
-fn looks_like_codex_questions_answered(line: &str) -> bool {
-    let line = normalize_question_status_line(line);
-    let Some(rest) = line.strip_prefix("questions") else {
-        return false;
-    };
-    parse_question_index(rest)
-        .map(str::trim)
-        .is_some_and(|rest| rest == "answered")
-}
-
-fn normalize_question_status_line(line: &str) -> &str {
-    line.trim_start_matches(['•', '*', '-']).trim()
-}
-
-fn parse_question_index(input: &str) -> Option<&str> {
-    let rest = consume_ascii_digits(input.trim_start())?;
-    let rest = rest.trim_start().strip_prefix('/')?;
-    consume_ascii_digits(rest.trim_start())
-}
-
-fn consume_ascii_digits(input: &str) -> Option<&str> {
-    let digit_count = input.bytes().take_while(u8::is_ascii_digit).count();
-    (digit_count > 0).then_some(&input[digit_count..])
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod origin;
+pub mod ownership;
 pub mod provider;
 pub mod writer;
 
@@ -34,6 +35,7 @@ pub enum RollupLevel {
     Limited,
     Running,
     Background,
+    Unknown,
     Idle,
 }
 

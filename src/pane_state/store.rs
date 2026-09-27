@@ -296,6 +296,23 @@ impl CanonicalStateRuntime {
         Ok(visible_changed)
     }
 
+    pub fn expire_screen_evidence(&mut self, now: i64) -> Result<(), StoreError> {
+        let mut changed = false;
+        for tracker in self.trackers.values_mut() {
+            if tracker.codex_screen.is_some_and(|(_, at)| {
+                !(0..=super::resolver::SCREEN_EVIDENCE_TTL_SECONDS)
+                    .contains(&now.saturating_sub(at))
+            }) {
+                tracker.codex_screen = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump_snapshot_revision()?;
+        }
+        Ok(())
+    }
+
     pub fn add_diagnostic(
         &mut self,
         pane_instance: PaneInstance,
@@ -563,7 +580,10 @@ impl CanonicalStateRuntime {
         )?;
         if reduction.outcome != ReductionOutcome::CanonicalChanged {
             if let Some(delta) = reduction.tracker_delta {
-                let public_identity_changed = tracker.agent_process != delta.next.agent_process;
+                let public_identity_changed = tracker.agent_process != delta.next.agent_process
+                    || tracker.codex_screen.map(|(evidence, _)| evidence)
+                        != delta.next.codex_screen.map(|(evidence, _)| evidence)
+                    || tracker.hook_authoritative != delta.next.hook_authoritative;
                 self.trackers
                     .insert(envelope.pane_instance.clone(), delta.next);
                 if public_identity_changed {
@@ -925,6 +945,64 @@ mod tests {
             &envelope(pane_instance, event),
             &VisibilitySnapshot::default(),
         )
+    }
+
+    #[test]
+    fn screen_updates_publish_without_persistence_events_or_notifications() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = RecordingStore::default();
+        let target = pane(1);
+        apply(
+            &mut runtime,
+            &mut io,
+            target.clone(),
+            PaneEvent::AgentSessionStarted {
+                observed_at: 1,
+                source: AgentSessionSource::Startup,
+                resumed_prompt: None,
+            },
+        )
+        .unwrap();
+        runtime.records.get_mut(&target).unwrap().scan_verified = true;
+        let before = runtime.record(&target).unwrap().clone();
+        let history = runtime.transitions.clone();
+        let mut tracker = runtime.tracker(&target);
+        tracker.hook_authoritative = false;
+        tracker.fingerprint = Some([1; 32]);
+        runtime.trackers.insert(target.clone(), tracker.clone());
+        let revision = runtime.snapshot_revision();
+        let base = runtime.descriptor(&target);
+        apply(
+            &mut runtime,
+            &mut io,
+            target.clone(),
+            PaneEvent::ObservationBatch {
+                base,
+                tracker_generation: tracker.generation,
+                observed_at: 10,
+                presence: AgentPresenceObservation::Present(before.agent.clone()),
+                capture: Some(CaptureObservation {
+                    inference: CaptureInference::NoChange,
+                    observed_fingerprint: Some([1; 32]),
+                    codex_screen: Some(crate::detect::codex::Evidence {
+                        working: true,
+                        ..Default::default()
+                    }),
+                }),
+                process: None,
+            },
+        )
+        .unwrap();
+        assert!(runtime.snapshot_revision() > revision);
+        assert_eq!(runtime.record(&target), Some(&before));
+        assert_eq!(runtime.transitions.clone(), history);
+        assert!(runtime.notification_jobs().is_empty());
+        let revision = runtime.snapshot_revision();
+        runtime.expire_screen_evidence(14).unwrap();
+        assert!(runtime.snapshot_revision() > revision);
+        assert!(runtime.tracker(&target).codex_screen.is_none());
+        let hydrated = CanonicalStateRuntime::hydrate(runtime.records.clone()).unwrap();
+        assert!(hydrated.tracker(&target).codex_screen.is_none());
     }
 
     #[test]

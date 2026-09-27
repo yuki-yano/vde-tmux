@@ -72,7 +72,7 @@ pub fn render_summary(
                 BadgeState::Limited => &badge.colors.limited,
                 BadgeState::Working => &badge.colors.working,
                 BadgeState::Done => &badge.colors.done,
-                BadgeState::Idle => &badge.colors.idle,
+                BadgeState::Unknown | BadgeState::Idle => &badge.colors.idle,
             };
             let dim = if *count == 0 { ",dim" } else { "" };
             let count = count.to_string();

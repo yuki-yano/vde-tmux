@@ -14,7 +14,7 @@ use crate::daemon::session_badge::BadgeState;
 
 use super::common::epoch_now;
 
-pub const API_VERSION: u16 = 5;
+pub const API_VERSION: u16 = 6;
 pub const DEFAULT_READ_LINES: usize = 120;
 pub const MAX_READ_LINES: usize = 2_000;
 pub const MAX_READ_BYTES: usize = 1024 * 1024;
@@ -763,6 +763,7 @@ impl AgentStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentBadge {
+    Unknown,
     Blocked,
     Limited,
     Working,
@@ -777,6 +778,7 @@ impl From<BadgeState> for AgentBadge {
             BadgeState::Limited => Self::Limited,
             BadgeState::Working => Self::Working,
             BadgeState::Done => Self::Done,
+            BadgeState::Unknown => Self::Unknown,
             BadgeState::Idle => Self::Idle,
         }
     }

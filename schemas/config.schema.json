@@ -29,6 +29,10 @@
         "glyphs": {
           "additionalProperties": true,
           "properties": {
+            "unknown": {
+              "type": "string",
+              "default": "?"
+            },
             "blocked": {
               "type": "string"
             },

@@ -59,7 +59,7 @@ def tmux(*args):
 
 def query(*args):
     reply = json.loads(run([vt, *args, "--json"]).stdout)
-    assert reply["meta"]["api_version"] == 5, reply
+    assert reply["meta"]["api_version"] == 6, reply
     return reply["result"]
 
 
@@ -75,9 +75,9 @@ def diagnostics():
         stream.settimeout(3)
         stream.connect(daemon_socket)
         reader = stream.makefile("r")
-        stream.sendall(b'{"op":"hello","proto":25}\n')
+        stream.sendall(b'{"op":"hello","proto":26}\n')
         json.loads(reader.readline())
-        stream.sendall(b'{"op":"query_question_diagnostics","proto":25}\n')
+        stream.sendall(b'{"op":"query_question_diagnostics","proto":26}\n')
         return json.loads(reader.readline())
 
 
@@ -762,26 +762,20 @@ def excluded_mode_lifecycle():
     target = tmux("new-window", "-d", "-P", "-F", "#{pane_id}", "-n", "excluded-mode", command)
     wait((directory / "ready").exists, "excluded mode startup")
     assert json.loads((directory / "startup.json").read_text())["code"] == 0
-    def summary():
-        return query("agent", "get", target)["agent"]["summary"]
+    wait(lambda: any(a["pane_id"] == target for a in query("agent", "list")["agents"]), "excluded mode process observation")
+    before = query("agent", "get", target)["agent"]
     emit_at(directory, "UserPromptSubmit", turn_id="excluded", prompt="synthetic mode lifecycle")
-    wait(lambda: summary()["status"] == "working", "excluded mode UPS lifecycle")
-    # This existing rejection is returned to the hook while lifecycle still applies.
-    result = directory / "result.json"
-    result.unlink()
-    temporary = directory / "request.tmp"
-    temporary.write_text(json.dumps({"event": "PostToolUse", "fields": {
-        "turn_id": "excluded", "tool_name": "request_user_input_async", "tool_use_id": "excluded",
-        "tool_response": '{"accepted":true}'}}))
-    temporary.replace(directory / "request.json")
-    wait(result.exists, "excluded mode question")
-    reply = json.loads(result.read_text())
-    assert reply["code"] != 0 and "AncestorNotInPane" in reply["error"], reply
-    assert not summary()["question_notice"]["unacknowledged"]
+    emit_at(directory, "PostToolUse", turn_id="excluded", tool_name="request_user_input_async",
+            tool_use_id="excluded", tool_response='{"accepted":true}')
     emit_at(directory, "Stop", turn_id="excluded")
-    wait(lambda: summary()["status"] == "done", "excluded mode Stop lifecycle")
+    after = query("agent", "get", target)["agent"]
+    for field in ["agent_epoch", "agent_session_id", "run_seq", "completed_seq", "prompt"]:
+        assert after.get(field) == before.get(field), (field, after.get(field))
+    assert not after["summary"]["question_notice"]["unacknowledged"]
+    logs = "\n".join(p.read_text() for p in (root / "state").rglob("daemon.log"))
+    assert logs.count("hook_ownership: dropped: shared_server") >= 4
     tmux("kill-pane", "-t", target)
-    print("excluded mode: rejected notice and preserved UPS/Stop lifecycle passed")
+    print("excluded mode: lifecycle and question hooks rejected without pane mutation")
 
 
 def shutdown_under_question_load():
@@ -910,7 +904,9 @@ try:
                "tool_use_id": "outside", "tool_response": '{"accepted":true}'}
     external_env = {**env, "TMUX_PANE": pane}
     external = subprocess.run([vt, "hook", "codex", "PostToolUse"], env=external_env, input=json.dumps(outside), text=True, capture_output=True, timeout=10)
-    assert external.returncode != 0 and "AncestorNotInPane" in external.stderr, external.stderr
+    assert external.returncode == 0, external.stderr
+    logs = "\n".join(p.read_text() for p in (root / "state").rglob("daemon.log"))
+    assert "hook_ownership: dropped: owner_unverified" in logs
     assert not notice()["unacknowledged"]
     shutdown_under_question_load()
     if "--extended" in sys.argv:

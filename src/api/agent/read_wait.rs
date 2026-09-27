@@ -298,6 +298,7 @@ pub(in crate::api) fn match_wait_event(
             continue;
         }
         let badge_status = match event.to {
+            BadgeState::Unknown => continue,
             BadgeState::Blocked => AgentStatus::Blocked,
             BadgeState::Limited => AgentStatus::Limited,
             BadgeState::Working => AgentStatus::Working,

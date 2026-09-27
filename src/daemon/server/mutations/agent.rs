@@ -530,12 +530,14 @@ pub(in crate::daemon::server) fn resolve_agent_prompt_target(
         let state = state
             .as_ref()
             .ok_or_else(|| "daemon is hydrating".to_string())?;
-        state
+        let record = state
             .leased
             .runtime
             .record(&pane)
             .cloned()
-            .ok_or_else(|| "agent pane is not retained".to_string())?
+            .ok_or_else(|| "agent pane is not retained".to_string())?;
+        require_observed_prompt_readiness(&record, &state.leased.runtime.tracker(&pane))?;
+        record
     };
     let process = record
         .agent_process
@@ -600,6 +602,13 @@ pub(in crate::daemon::server) fn verify_agent_prompt_precondition(
         .record(&operation.binding.pane_instance)
         .ok_or_else(|| "agent pane is no longer retained".to_string())?;
     let exact_binding_matches = agent_prompt_precondition_matches(record, operation);
+    require_observed_prompt_readiness(
+        record,
+        &state
+            .leased
+            .runtime
+            .tracker(&operation.binding.pane_instance),
+    )?;
     if exact_binding_matches {
         Ok(())
     } else {
@@ -607,6 +616,27 @@ pub(in crate::daemon::server) fn verify_agent_prompt_precondition(
             "pane revision, lifecycle, current run, session, or process changed before dispatch"
                 .to_string(),
         )
+    }
+}
+
+fn require_observed_prompt_readiness(
+    record: &crate::pane_state::PaneState,
+    tracker: &crate::pane_state::CaptureTrackerSnapshot,
+) -> Result<(), String> {
+    use crate::daemon::session_badge::BadgeState;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system time is unavailable".to_string())?
+        .as_secs() as i64;
+    match crate::pane_state::resolve_presentation(record, tracker, now) {
+        BadgeState::Working | BadgeState::Blocked | BadgeState::Limited => {
+            Err("agent is busy or blocked".to_string())
+        }
+        BadgeState::Unknown => Err("agent readiness is unknown".to_string()),
+        _ if record.agent.as_str() == "codex" && !tracker.hook_authoritative => {
+            Err("Codex lifecycle hooks are not verified for this daemon epoch".to_string())
+        }
+        _ => Ok(()),
     }
 }
 

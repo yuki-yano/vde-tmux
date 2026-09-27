@@ -222,6 +222,7 @@ pub struct PreparedHook {
 
 impl PreparedHook {
     /// Performs no daemon IO. The provisional entry must precede daemon startup/delivery.
+    #[allow(clippy::too_many_arguments)] // The captured owner is shared with lifecycle delivery.
     pub fn prepare(
         event: &str,
         raw: &str,
@@ -230,6 +231,7 @@ impl PreparedHook {
         runner: &dyn crate::tmux::TmuxRunner,
         now: i64,
         deadline: std::time::Instant,
+        owner: &crate::hook::ownership::CodexHookOwner,
     ) -> Self {
         use super::journal::{DirtyEntry, DirtyReason, JournalFailure, JournalLocation};
         let relevant = matches!(event, "SessionStart" | "UserPromptSubmit" | "Stop")
@@ -282,28 +284,16 @@ impl PreparedHook {
         let ancestors = if excluded {
             Vec::new()
         } else {
-            capture_ancestors().unwrap_or_default()
+            owner.ancestors.clone()
         };
-        let mode_excluded = !excluded
-            && ancestors
-                .iter()
-                .any(super::profile::positively_non_embedded);
+        let mode_excluded = !excluded && owner.non_embedded;
         let excluded = excluded || mode_excluded;
         let process = if excluded {
             None
         } else {
-            crate::hook::writer::resolve_pane_instance(runner, env)
-                .ok()
-                .flatten()
-                .and_then(|pane| {
-                    runner
-                        .resolve_agent_process(
-                            pane.pane_pid,
-                            &crate::pane_state::AgentKind::parse("codex").expect("constant kind"),
-                        )
-                        .ok()
-                        .flatten()
-                })
+            owner
+                .process
+                .clone()
                 .filter(|process| ancestors.contains(process))
                 .and_then(super::profile::ProfileRequest::capture)
         };
@@ -625,6 +615,7 @@ mod classification_tests {
             &runner,
             0,
             std::time::Instant::now() + std::time::Duration::from_secs(1),
+            &crate::hook::ownership::CodexHookOwner::default(),
         );
         prepared.excluded = true;
         prepared.mode_excluded = true;

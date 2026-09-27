@@ -935,6 +935,7 @@ mod tests {
                 limited: 0,
                 working: 1,
                 done: 0,
+                unknown: 0,
                 idle: 1,
             },
             session_zone_width: None,

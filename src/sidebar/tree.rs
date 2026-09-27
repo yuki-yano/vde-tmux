@@ -76,6 +76,7 @@ pub struct BadgeCounts {
     pub limited: usize,
     pub working: usize,
     pub done: usize,
+    pub unknown: usize,
     pub idle: usize,
 }
 
@@ -213,24 +214,28 @@ pub fn build_rows_from_presentations(
             .get(&repo_key)
             .map(|placement| placement.category.to_string())
             .unwrap_or_else(|| crate::category::UNCATEGORIZED.to_string());
-        let (rollup, wait_reason) = match &canonical.lifecycle {
-            crate::pane_state::LifecycleState::Idle => (RollupLevel::Idle, String::new()),
-            crate::pane_state::LifecycleState::Running => (RollupLevel::Running, String::new()),
-            crate::pane_state::LifecycleState::Waiting { reason } => match reason {
-                crate::pane_state::WaitReason::PermissionPrompt => {
-                    (RollupLevel::Permission, "permission_prompt".to_string())
+        let (rollup, wait_reason) = match resolved.badge {
+            BadgeState::Working => (RollupLevel::Running, String::new()),
+            BadgeState::Limited => (
+                RollupLevel::Limited,
+                crate::pane_state::USAGE_LIMIT_WAIT_REASON.to_string(),
+            ),
+            BadgeState::Unknown => (RollupLevel::Unknown, String::new()),
+            BadgeState::Idle | BadgeState::Done => (RollupLevel::Idle, String::new()),
+            BadgeState::Blocked => match &canonical.lifecycle {
+                crate::pane_state::LifecycleState::Waiting { reason } => match reason {
+                    crate::pane_state::WaitReason::PermissionPrompt => {
+                        (RollupLevel::Permission, "permission_prompt".to_string())
+                    }
+                    crate::pane_state::WaitReason::Other(reason) => {
+                        (RollupLevel::Waiting, reason.clone())
+                    }
+                },
+                crate::pane_state::LifecycleState::Error { reason } => {
+                    (RollupLevel::Error, reason.clone().unwrap_or_default())
                 }
-                reason if reason.is_usage_limit() => (
-                    RollupLevel::Limited,
-                    crate::pane_state::USAGE_LIMIT_WAIT_REASON.to_string(),
-                ),
-                crate::pane_state::WaitReason::Other(reason) => {
-                    (RollupLevel::Waiting, reason.clone())
-                }
+                _ => (RollupLevel::Waiting, "screen_modal".to_string()),
             },
-            crate::pane_state::LifecycleState::Error { reason } => {
-                (RollupLevel::Error, reason.clone().unwrap_or_default())
-            }
         };
         let task_items = canonical
             .tasks
@@ -419,6 +424,7 @@ fn badge_counts_from_agent_panes<'a>(
             BadgeState::Limited => counts.limited += 1,
             BadgeState::Working => counts.working += 1,
             BadgeState::Done => counts.done += 1,
+            BadgeState::Unknown => counts.unknown += 1,
             BadgeState::Idle => counts.idle += 1,
         }
     }
@@ -776,6 +782,7 @@ fn priority_rows(
         ("limited", "LIMITED", Some(BadgeState::Limited)),
         ("unread-done", "UNREAD DONE", Some(BadgeState::Done)),
         ("running", "RUNNING", Some(BadgeState::Working)),
+        ("unknown", "UNKNOWN", Some(BadgeState::Unknown)),
         ("idle", "IDLE", Some(BadgeState::Idle)),
     ] {
         let section = if key == "pinned" {
@@ -1410,6 +1417,7 @@ enum ChatSortBucket {
     Limited,
     Running,
     Done,
+    Unknown,
     Idle,
 }
 
@@ -1419,6 +1427,7 @@ fn chat_sort_bucket(pane: &AgentPane) -> ChatSortBucket {
         BadgeState::Limited => ChatSortBucket::Limited,
         BadgeState::Working => ChatSortBucket::Running,
         BadgeState::Done => ChatSortBucket::Done,
+        BadgeState::Unknown => ChatSortBucket::Unknown,
         BadgeState::Idle => ChatSortBucket::Idle,
     }
 }

@@ -182,6 +182,7 @@ pub(crate) fn run_hook_command(
                 return Ok(());
             }
             let codex_home = codex_home_from_env(env);
+            let owner = crate::hook::ownership::CodexHookOwner::capture(runner, env);
             let mut prepared = crate::question_notice::ingress::PreparedHook::prepare(
                 &arg,
                 input,
@@ -190,7 +191,22 @@ pub(crate) fn run_hook_command(
                 runner,
                 now_epoch,
                 deadline,
+                &owner,
             );
+            // Preserve an already-created dirty journal on ambiguity. It must veto
+            // auto-ack even when this hook cannot safely be routed to any pane.
+            if !owner.verified() {
+                crate::hook::ownership::record_rejection(
+                    runner,
+                    env,
+                    if owner.non_embedded {
+                        "hook_ownership: dropped: shared_server"
+                    } else {
+                        "hook_ownership: dropped: owner_unverified"
+                    },
+                );
+                return Ok(());
+            }
             let question_notice = if prepared.excluded {
                 prepared.excluded_notice(&arg, input, codex_home.as_deref())
             } else {
@@ -222,6 +238,14 @@ pub(crate) fn run_hook_command(
             loop {
                 let (mut client, context, server_hash) =
                     typed_hook_context(runner, env, deadline, now_epoch, event_id.clone())?;
+                if !owner.still_owned(&context.pane_instance) {
+                    crate::hook::ownership::record_rejection(
+                        runner,
+                        env,
+                        "hook_ownership: dropped: owner_changed",
+                    );
+                    return Ok(());
+                }
                 prepared
                     .metadata
                     .daemon_generation

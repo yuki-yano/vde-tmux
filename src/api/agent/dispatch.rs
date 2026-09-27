@@ -64,6 +64,18 @@ pub fn agent_send(
         .as_ref()
         .expect("resolve_agent requires resolved state")
         .canonical;
+    match pane.resolved.as_ref().expect("resolved agent").badge {
+        crate::daemon::session_badge::BadgeState::Working => {
+            return Err(api_error!("agent_busy", "agent is currently working").into());
+        }
+        crate::daemon::session_badge::BadgeState::Blocked => {
+            return Err(api_error!("agent_blocked", "agent is currently blocked").into());
+        }
+        crate::daemon::session_badge::BadgeState::Unknown => {
+            return Err(api_error!("invalid_target", "agent readiness is unknown").into());
+        }
+        _ => {}
+    }
     match agent_status(state) {
         AgentStatus::Working => {
             return Err(api_error!(

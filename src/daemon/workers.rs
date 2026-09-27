@@ -22,6 +22,7 @@ pub use observation::{
     observation_envelope, pane_removal_envelopes, run_observation_poll,
 };
 pub use process::{AgentProcessSnapshot, ProcessDetection, read_agent_process_snapshot};
+pub(crate) use process::{INTERPRETER_PROGRAMS, is_codex_command};
 pub use sidebar_tmux::{SidebarTmuxError, SystemWorkerIo, WorkerIo};
 
 pub fn system_git_runner(timeout: Duration) -> SystemGitRunner {

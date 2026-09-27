@@ -142,7 +142,7 @@ pub(super) fn pane_border_highlight_color(
         BadgeState::Limited => &config.badge.colors.limited,
         BadgeState::Working => &config.badge.colors.working,
         BadgeState::Done => &config.badge.colors.done,
-        BadgeState::Idle => return None,
+        BadgeState::Unknown | BadgeState::Idle => return None,
     };
     Some(normalize_tmux_color(color))
 }
@@ -156,15 +156,21 @@ pub(super) fn render_structured_summary(config: &Config, counts: BadgeStateCount
         (BadgeState::Limited, counts.limited),
         (BadgeState::Working, counts.working),
         (BadgeState::Done, counts.done),
+        (BadgeState::Unknown, counts.unknown),
         (BadgeState::Idle, counts.idle),
     ];
     let visible_counts = if config.statusline.summary.hide_idle {
-        &state_counts[..4]
+        &state_counts[..5]
     } else {
         &state_counts[..]
     };
+    let visible_counts = visible_counts
+        .iter()
+        .copied()
+        .filter(|(badge, count)| *badge != BadgeState::Unknown || *count > 0)
+        .collect::<Vec<_>>();
     crate::daemon::render_summary(
-        visible_counts,
+        &visible_counts,
         &config.badge,
         &config.statusline.summary.format,
     )
@@ -867,6 +873,7 @@ fn structured_pane_time_label(
     badge: BadgeState,
 ) -> Option<String> {
     let (epoch, suffix) = match badge {
+        BadgeState::Unknown => return None,
         BadgeState::Done | BadgeState::Idle => (state.completed_at?, " ago"),
         BadgeState::Blocked | BadgeState::Limited | BadgeState::Working => (state.started_at?, ""),
     };
@@ -1188,7 +1195,7 @@ fn counts_badge_fragment(badge: &str, restore_fg: &str, badge_config: &BadgeConf
                 BadgeState::Limited => &badge_config.colors.limited,
                 BadgeState::Working => &badge_config.colors.working,
                 BadgeState::Done => &badge_config.colors.done,
-                BadgeState::Idle => &badge_config.colors.idle,
+                BadgeState::Unknown | BadgeState::Idle => &badge_config.colors.idle,
             };
             parts.push(format!(
                 "#[fg={color}]{} {}#[fg={restore_fg}]",
@@ -1252,6 +1259,7 @@ fn count_glyph_state(token: &str, glyphs: &BadgeGlyphs) -> Option<BadgeState> {
         BadgeState::Limited,
         BadgeState::Working,
         BadgeState::Done,
+        BadgeState::Unknown,
         BadgeState::Idle,
     ]
     .into_iter()

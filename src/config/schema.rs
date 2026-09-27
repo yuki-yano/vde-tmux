@@ -38,6 +38,7 @@ pub fn config_schema() -> Value {
                         "type": "object",
                         "additionalProperties": true,
                         "properties": {
+                            "unknown": { "type": "string", "default": "?" },
                             "blocked": { "type": "string" },
                             "limited": { "type": "string" },
                             "working": { "type": "string" },

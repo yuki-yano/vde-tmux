@@ -8,6 +8,7 @@ pub enum BadgeState {
     Limited,
     Working,
     Done,
+    Unknown,
     Idle,
 }
 
@@ -18,6 +19,7 @@ impl BadgeState {
             BadgeState::Limited => "limited",
             BadgeState::Working => "working",
             BadgeState::Done => "done",
+            BadgeState::Unknown => "unknown",
             BadgeState::Idle => "idle",
         }
     }
@@ -30,6 +32,7 @@ pub struct BadgeStateCounts {
     pub limited: usize,
     pub working: usize,
     pub done: usize,
+    pub unknown: usize,
     pub idle: usize,
 }
 
@@ -48,6 +51,7 @@ impl BadgeStateCounts {
             BadgeState::Limited => self.limited += 1,
             BadgeState::Working => self.working += 1,
             BadgeState::Done => self.done += 1,
+            BadgeState::Unknown => self.unknown += 1,
             BadgeState::Idle => self.idle += 1,
         }
     }
@@ -57,11 +61,12 @@ impl BadgeStateCounts {
         self.limited += other.limited;
         self.working += other.working;
         self.done += other.done;
+        self.unknown += other.unknown;
         self.idle += other.idle;
     }
 
     pub fn total(self) -> usize {
-        self.blocked + self.limited + self.working + self.done + self.idle
+        self.blocked + self.limited + self.working + self.done + self.unknown + self.idle
     }
 
     pub fn rollup_state(self) -> Option<BadgeState> {
@@ -70,6 +75,7 @@ impl BadgeStateCounts {
             (BadgeState::Limited, self.limited),
             (BadgeState::Working, self.working),
             (BadgeState::Done, self.done),
+            (BadgeState::Unknown, self.unknown),
             (BadgeState::Idle, self.idle),
         ]
         .into_iter()
@@ -126,6 +132,7 @@ fn badge_counts_value(
         (BadgeState::Limited, counts.limited),
         (BadgeState::Working, counts.working),
         (BadgeState::Done, counts.done),
+        (BadgeState::Unknown, counts.unknown),
         (BadgeState::Idle, counts.idle),
     ]
     .into_iter()
@@ -144,6 +151,7 @@ pub fn glyph_for_state(state: BadgeState, glyphs: &BadgeGlyphs) -> &str {
         BadgeState::Limited => &glyphs.limited,
         BadgeState::Working => &glyphs.working,
         BadgeState::Done => &glyphs.done,
+        BadgeState::Unknown => &glyphs.unknown,
         BadgeState::Idle => &glyphs.idle,
     }
 }

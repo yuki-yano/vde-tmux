@@ -63,6 +63,7 @@ mod tests {
                 limited: 0,
                 working: 1,
                 done: 1,
+                unknown: 0,
                 idle: 1,
             },
         }
@@ -146,6 +147,7 @@ mod tests {
             session_ids: vec!["$1".to_string()],
             active,
             counts: BadgeStateCounts {
+                unknown: 0,
                 idle: 1,
                 ..BadgeStateCounts::default()
             },
@@ -256,6 +258,7 @@ mod tests {
                 limited: 0,
                 working: 2,
                 done: 0,
+                unknown: 0,
                 idle: 1,
             },
             session_zone_width: None,
@@ -821,6 +824,7 @@ mod tests {
             limited: 1,
             working: 1,
             done: 1,
+            unknown: 0,
             idle: 1,
         };
 
@@ -856,6 +860,7 @@ mod tests {
                 limited: 0,
                 working: 1,
                 done: 0,
+                unknown: 0,
                 idle: 9,
             },
         );
@@ -885,6 +890,7 @@ mod tests {
                 limited: 0,
                 working: 1,
                 done: 1,
+                unknown: 0,
                 idle: 1,
             },
         );

@@ -2,9 +2,11 @@
 
 Publishing is driven by Git tags.
 
-## Local API v5 upgrade
+## Local API v6 upgrade
 
-API 5 / daemon protocol 25 adds conservative automatic acknowledgement of Codex question notices.
+API 6 / daemon protocol 26 adds ephemeral Codex Working/Blocked/Unknown presentation and
+rejects lifecycle hooks whose process ancestry does not belong to the claimed embedded pane.
+The conservative automatic acknowledgement of Codex question notices remains unchanged.
 `needs_action` now includes current Blocked panes and unacknowledged question notices; the
 statusline's existing Blocked triage remains separate. PaneState schema 10 and private state
 format 1 are unchanged. Keep existing state, Runs, and the question-notice sidecar (schema 1).
@@ -19,8 +21,9 @@ version bump or a release tag.
    capture failures, at most 20MiB RSS growth, and retained notices on probe drop. Reuse accepted
    evidence for unchanged product code; distinguish saved-data re-evaluation from a new run.
 2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
-   Confirm `vt api schema --json` reports API 5, protocol 25, PaneState 10, and private state 1.
-   Validate the staged binaries on a scratch server before replacing the installed generation.
+   Confirm `vt api schema --json` reports API 6, protocol 26, PaneState 10, and private state 1.
+   Validate the staged binaries on a scratch server before replacing the installed generation:
+   `VDE_VT_BIN=<temporary-root>/bin/vt python3 scripts/test-codex-observation-isolated.py`.
 3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.
    Record sidebar windows, widths, active panes, client focus, installed paths, and executable hashes.
 4. Close running sidebars using the installed client, then run its `vt daemon disable` so hooks

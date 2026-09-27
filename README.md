@@ -731,3 +731,28 @@ persisted.
 ## License
 
 [MIT](./LICENSE)
+
+
+### Codex observation and hook ownership
+
+Codex panes without authoritative hooks now show observed Working or a current approval /
+synchronous question (Blocked). Unrecognized or unavailable observations show `?` (Unknown)
+in the sidebar and statusline. An asynchronous question may remain visible while work continues.
+These badges do not complete Runs or acknowledge durable Question notices. After answering,
+`Q` remains available to acknowledge a retained notice; automatic acknowledgement still requires
+the existing trusted different-turn ordinary-prompt proof. Notices retained across daemon restart
+remain Q-only.
+
+Shared app-server hooks are rejected because their inherited pane environment does not identify
+the originating TUI. Embedded hooks are verified through their own process ancestry. Screen-only
+panes cannot provide lifecycle prompt confirmation; automatic prompt dispatch is rejected until
+hooks are authoritative. Embedded hooks restore this authority after daemon restart; shared-server
+mode requires starting Codex with `--no-daemon` (or `features.daemon_auto_start=false`). API 6 / daemon protocol 26 must be installed together; Pane State schema
+10 and Question sidecar schema 1 remain unchanged. See [the API contract](AGENT_API.md#codex-screen-evidence-api-6).
+
+Run `python3 scripts/test-codex-observation-isolated.py` after building the binaries to verify
+shared-server ownership, embedded hooks with MCP children, and screen badges using native
+synthetic fixtures on an isolated tmux server. It never sends model requests or changes the real server.
+
+Process discovery currently cannot reliably identify Codex executable/script paths containing spaces;
+use a path without spaces when hook ownership is reported as unverified.

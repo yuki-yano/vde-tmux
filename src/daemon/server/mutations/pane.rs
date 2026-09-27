@@ -52,6 +52,10 @@ pub(in crate::daemon::server) fn apply_triage_projection(
         .as_mut()
         .expect("state initialized before triage projection");
     state.leased.runtime.advance_poll_projection()?;
+    state
+        .leased
+        .runtime
+        .expire_screen_evidence(epoch_seconds())?;
     Ok(state.leased.runtime.snapshot_revision())
 }
 

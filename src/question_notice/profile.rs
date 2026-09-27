@@ -105,6 +105,16 @@ enum ArgumentMode {
 }
 
 fn argument_mode(args: &[String]) -> ArgumentMode {
+    argument_mode_for(args, false)
+}
+
+/// A renamed server can be identified by its subcommand, but generic launchers
+/// must not inherit the rest of Codex's command vocabulary.
+pub(crate) fn app_server_arguments(args: &[String]) -> bool {
+    argument_mode_for(args, true) == ArgumentMode::NonEmbedded
+}
+
+fn argument_mode_for(args: &[String], server_only: bool) -> ArgumentMode {
     let mut values = args.iter().skip(1).peekable();
     let mut positional_known = true;
     while let Some(arg) = values.next() {
@@ -113,7 +123,11 @@ fn argument_mode(args: &[String]) -> ArgumentMode {
             || arg == "--connect"
             || arg.starts_with("--connect=")
         {
-            return ArgumentMode::NonEmbedded;
+            return if server_only {
+                ArgumentMode::Unknown
+            } else {
+                ArgumentMode::NonEmbedded
+            };
         }
         // Clap ends value collection for attached values; the following token
         // can still be a subcommand. Bare image options consume multiple values.
@@ -216,41 +230,44 @@ fn argument_mode(args: &[String]) -> ArgumentMode {
         if !positional_known {
             return ArgumentMode::Unknown;
         }
-        return if matches!(
-            arg.as_str(),
-            "exec"
-                | "e"
-                | "review"
-                | "app-server"
-                | "mcp-server"
-                | "remote-control"
-                | "exec-server"
-                | "agents"
-                | "tcp-tunnel"
-                | "login"
-                | "logout"
-                | "mcp"
-                | "plugin"
-                | "app"
-                | "completion"
-                | "update"
-                | "doctor"
-                | "sandbox"
-                | "debug"
-                | "execpolicy"
-                | "apply"
-                | "a"
-                | "queue"
-                | "archive"
-                | "delete"
-                | "migrate-rollouts"
-                | "unarchive"
-                | "cloud"
-                | "cloud-tasks"
-                | "responses-api-proxy"
-                | "stdio-to-uds"
-                | "features"
-        ) {
+        return if arg == "app-server"
+            || (!server_only
+                && matches!(
+                    arg.as_str(),
+                    "exec"
+                        | "e"
+                        | "review"
+                        | "app-server"
+                        | "mcp-server"
+                        | "remote-control"
+                        | "exec-server"
+                        | "agents"
+                        | "tcp-tunnel"
+                        | "login"
+                        | "logout"
+                        | "mcp"
+                        | "plugin"
+                        | "app"
+                        | "completion"
+                        | "update"
+                        | "doctor"
+                        | "sandbox"
+                        | "debug"
+                        | "execpolicy"
+                        | "apply"
+                        | "a"
+                        | "queue"
+                        | "archive"
+                        | "delete"
+                        | "migrate-rollouts"
+                        | "unarchive"
+                        | "cloud"
+                        | "cloud-tasks"
+                        | "responses-api-proxy"
+                        | "stdio-to-uds"
+                        | "features"
+                ))
+        {
             ArgumentMode::NonEmbedded
         } else {
             ArgumentMode::Embedded
@@ -264,6 +281,11 @@ fn argument_mode(args: &[String]) -> ArgumentMode {
 }
 
 /// Positive mode evidence only; unavailable argv/identity is not an exclusion.
+pub(crate) fn non_embedded_arguments(args: &[String]) -> bool {
+    argument_mode(args) == ArgumentMode::NonEmbedded
+}
+
+/// Positive mode evidence only; unavailable argv/identity is not an exclusion.
 pub fn positively_non_embedded(process: &AgentProcessIdentity) -> bool {
     executable_path(process.pid)
         .is_some_and(|path| path.file_name().is_some_and(|name| name == "codex"))
@@ -271,8 +293,7 @@ pub fn positively_non_embedded(process: &AgentProcessIdentity) -> bool {
             .ok()
             .as_deref()
             == Some(&process.start_token)
-        && process_arguments(process.pid)
-            .is_some_and(|args| argument_mode(&args) == ArgumentMode::NonEmbedded)
+        && process_arguments(process.pid).is_some_and(|args| non_embedded_arguments(&args))
         && crate::daemon::lifecycle::agent_process_start_token(process.pid)
             .ok()
             .as_deref()
@@ -281,7 +302,7 @@ pub fn positively_non_embedded(process: &AgentProcessIdentity) -> bool {
 
 /// Only a transient local inspection. Neither argv nor environment is returned to the daemon
 /// protocol or recorded in the profile cache.
-fn process_arguments(pid: u32) -> Option<Vec<String>> {
+pub(crate) fn process_arguments(pid: u32) -> Option<Vec<String>> {
     #[cfg(target_os = "macos")]
     {
         let mut mib = [

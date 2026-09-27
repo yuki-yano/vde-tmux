@@ -1943,6 +1943,16 @@ mod tests {
         state.projection_config = status_config();
         set_state_categories(&mut state, &[("/repo-main", "work")]);
 
+        apply_history_event(
+            &mut state,
+            "codex",
+            "scenario-session",
+            PaneEvent::AgentSessionStarted {
+                observed_at: 9,
+                source: crate::pane_state::AgentSessionSource::Startup,
+                resumed_prompt: None,
+            },
+        );
         let prompt_digest = PromptState::digest_decoded_prompt("raw\nprompt");
         apply_history_event(
             &mut state,
