@@ -344,7 +344,8 @@ Pinned agents remain pinned when they become read or their lifecycle changes, an
 removed when the pane disappears.
 Repository and linked-worktree branch labels show upstream divergence as `↑N` / `↓N`, followed by
 tracked staged and unstaged line changes from `HEAD` as `+N` / `-N`. Zero counts are omitted.
-Untracked and binary files do not contribute line counts.
+Untracked text files not excluded by Git ignore rules also contribute all their lines to `+N`.
+Binary files do not contribute line counts.
 The Needs action filter includes Blocked agents and panes with unacknowledged question notices.
 The red triangle remains the Blocked badge; question notices use a separate `?`.
 Unread Done agents remain separate under the Done filter. `unread-latest` navigation also includes

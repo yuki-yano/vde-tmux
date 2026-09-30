@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -71,6 +74,7 @@ impl VwLockedState {
 pub trait GitRunner: Send + Sync {
     fn run(&self, cwd: &str, args: &[&str]) -> Result<String>;
     fn run_vw(&self, cwd: &str, args: &[&str]) -> Result<String>;
+    fn untracked_insertions(&self, cwd: &str) -> Result<u64>;
 
     fn probe_worktree(&self, cwd: &str, args: &[&str]) -> Result<Option<String>> {
         match self.run(cwd, args) {
@@ -118,6 +122,10 @@ impl GitRunner for SystemGitRunner {
 
     fn run_vw(&self, cwd: &str, args: &[&str]) -> Result<String> {
         run_process_command("vw", cwd, args, self.timeout)
+    }
+
+    fn untracked_insertions(&self, cwd: &str) -> Result<u64> {
+        untracked_insertions(cwd, self.timeout)
     }
 
     fn probe_worktree(&self, cwd: &str, args: &[&str]) -> Result<Option<String>> {
@@ -304,7 +312,7 @@ struct ProbeCacheEntry {
 /// Stateful steady-state poller owned by the daemon git worker. Pane paths are
 /// resolved to worktree identities through a bounded TTL cache, deduplicated by
 /// worktree top-level, and each worktree is refreshed with a single
-/// `git status --porcelain=v2 --branch --untracked-files=no` invocation.
+/// branch status, tracked diff, and untracked-file scan.
 #[derive(Debug, Default)]
 pub struct GitPoller {
     cache: BTreeMap<String, ProbeCacheEntry>,
@@ -393,7 +401,9 @@ impl GitPoller {
                         branch,
                         ahead: status.ahead,
                         behind: status.behind,
-                        insertions: diff.insertions,
+                        insertions: diff.insertions.saturating_add(
+                            runner.untracked_insertions(top_level).unwrap_or_default(),
+                        ),
                         deletions: diff.deletions,
                     },
                 );
@@ -541,6 +551,216 @@ fn relative_suffix(root: &str, path: &str) -> Option<String> {
     (!label.is_empty()).then_some(label)
 }
 
+/// Enumerate once per worktree, preserving arbitrary Unix filenames. The index
+/// is only read: a newly staged file moves to the HEAD diff instead of being
+/// counted twice. Git's standard excludes include repository and global ignores.
+fn untracked_insertions(cwd: &str, timeout: Duration) -> Result<u64> {
+    let deadline = Instant::now() + timeout;
+    let paths = run_untracked_git(
+        cwd,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        None,
+        deadline,
+    )?;
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let attributes = run_untracked_git(
+        cwd,
+        &["check-attr", "-z", "--stdin", "diff"],
+        Some(&paths),
+        deadline,
+    )?;
+    let fields = attributes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    if fields.last() != Some(&b"".as_slice()) || (fields.len() - 1) % 3 != 0 {
+        bail!("invalid untracked diff attributes");
+    }
+    let (attributes, _) = fields[..fields.len() - 1].as_chunks::<3>();
+    let mut drivers = BTreeMap::new();
+    if attributes
+        .iter()
+        .any(|fields| !matches!(fields[2], b"set" | b"unset" | b"unspecified"))
+    {
+        // A named driver can override binary detection. Query driver settings
+        // in one batch, never launch one subprocess per untracked file.
+        if let Ok(config) = run_untracked_git(
+            cwd,
+            &[
+                "config",
+                "--type=bool",
+                "--null",
+                "--get-regexp",
+                r"^diff\..*\.binary$",
+            ],
+            None,
+            deadline,
+        ) {
+            for record in config.split(|byte| *byte == 0) {
+                let Some(separator) = record.iter().position(|byte| *byte == b'\n') else {
+                    continue;
+                };
+                let (key, rest) = record.split_at(separator);
+                let value = &rest[1..];
+                let Some(name) = key
+                    .strip_prefix(b"diff.")
+                    .and_then(|key| key.strip_suffix(b".binary"))
+                else {
+                    continue;
+                };
+                let binary = match value {
+                    b"true" | b"yes" | b"on" | b"1" | b"" => true,
+                    b"false" | b"no" | b"off" | b"0" => false,
+                    _ => continue,
+                };
+                drivers.insert(name.to_vec(), binary);
+            }
+        }
+    }
+    let mut total = 0u64;
+    for [path, attribute, value] in attributes {
+        let driver_binary = drivers.get(*value).copied();
+        if *attribute != b"diff" || *value == b"unset" || driver_binary == Some(true) {
+            continue;
+        }
+        let path = Path::new(cwd).join(std::ffi::OsStr::from_bytes(path));
+        let lines = untracked_file_lines(
+            &path,
+            *value == b"set" || driver_binary == Some(false),
+            deadline,
+        )?;
+        total = total
+            .checked_add(lines)
+            .ok_or_else(|| anyhow::anyhow!("untracked insertion total overflowed"))?;
+    }
+    Ok(total)
+}
+
+fn untracked_file_lines(path: &Path, force_text: bool, deadline: Instant) -> Result<u64> {
+    if Instant::now() >= deadline {
+        bail!("untracked file scan timed out");
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_symlink() {
+        // Git stores the link target, not the contents of the destination.
+        let target = std::fs::read_link(path)?;
+        let bytes = target.as_os_str().as_bytes();
+        return Ok(bytes.iter().filter(|byte| **byte == b'\n').count() as u64
+            + u64::from(!bytes.is_empty() && !bytes.ends_with(b"\n")));
+    }
+    if !metadata.is_file() {
+        return Ok(0);
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    // A replacement FIFO must neither block the worker nor become file data.
+    if !file.metadata()?.is_file() {
+        return Ok(0);
+    }
+    let mut prefix = Vec::with_capacity(8000);
+    Read::by_ref(&mut file)
+        .take(8000)
+        .read_to_end(&mut prefix)?;
+    if !force_text && prefix.contains(&0) {
+        return Ok(0);
+    }
+    let mut lines = prefix.iter().filter(|byte| **byte == b'\n').count() as u64;
+    let mut last = prefix.last().copied();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if Instant::now() >= deadline {
+            bail!("untracked file scan timed out");
+        }
+        let len = file.read(&mut buffer)?;
+        if len == 0 {
+            return Ok(lines + u64::from(last.is_some_and(|byte| byte != b'\n')));
+        }
+        lines += buffer[..len].iter().filter(|byte| **byte == b'\n').count() as u64;
+        last = Some(buffer[len - 1]);
+    }
+}
+
+/// ls-files/check-attr may exceed a pipe buffer. Drain both streams while
+/// waiting, and bound the complete enumeration rather than returning a prefix.
+fn run_untracked_git(
+    cwd: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
+    if Instant::now() >= deadline {
+        bail!("untracked file scan timed out");
+    }
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    fn read_pipe(
+        pipe: impl Read + Send + 'static,
+    ) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.take(OUTPUT_LIMIT + 1).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
+    }
+    let stdout = read_pipe(child.stdout.take().expect("piped stdout"));
+    let stderr = read_pipe(child.stderr.take().expect("piped stderr"));
+    let writer = input.map(|input| {
+        let input = input.to_vec();
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        std::thread::spawn(move || stdin.write_all(&input))
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Err(error) => break Err(anyhow::Error::from(error)),
+            Ok(None) if Instant::now() >= deadline => {
+                break Err(anyhow::anyhow!("untracked file scan timed out"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    };
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stdout = stdout.join().expect("stdout reader panicked");
+    let stderr = stderr.join().expect("stderr reader panicked");
+    let written = writer.map(|writer| writer.join().expect("stdin writer panicked"));
+    let status = status?;
+    let stdout = stdout?;
+    let stderr = stderr?;
+    if !status.success() {
+        bail!("git {args:?} failed: {}", String::from_utf8_lossy(&stderr));
+    }
+    if stdout.len() as u64 > OUTPUT_LIMIT || stderr.len() as u64 > OUTPUT_LIMIT {
+        bail!("untracked file enumeration exceeded byte limit");
+    }
+    if let Some(written) = written {
+        written?;
+    }
+    Ok(stdout)
+}
+
 fn run_git_command(cwd: &str, args: &[&str], timeout: Duration) -> Result<String> {
     run_process_command("git", cwd, args, timeout)
 }
@@ -622,6 +842,8 @@ mod tests {
         vw_responses: std::collections::BTreeMap<Vec<String>, anyhow::Result<String, String>>,
         calls: std::sync::Mutex<Vec<Vec<String>>>,
         vw_calls: std::sync::Mutex<Vec<Vec<String>>>,
+        untracked: BTreeMap<String, u64>,
+        untracked_calls: std::sync::Mutex<Vec<String>>,
     }
 
     impl MockGitRunner {
@@ -690,6 +912,11 @@ mod tests {
     }
 
     impl GitRunner for MockGitRunner {
+        fn untracked_insertions(&self, cwd: &str) -> Result<u64> {
+            self.untracked_calls.lock().unwrap().push(cwd.to_string());
+            Ok(self.untracked.get(cwd).copied().unwrap_or_default())
+        }
+
         fn run(&self, cwd: &str, args: &[&str]) -> anyhow::Result<String> {
             let mut key = vec![cwd.to_string()];
             key.extend(args.iter().map(|value| value.to_string()));
@@ -844,6 +1071,123 @@ mod tests {
         assert!(parse_numstat(&format!("{}\t0\ta\n1\t0\tb\n", u64::MAX)).is_err());
     }
 
+    struct GitFixture(std::path::PathBuf);
+
+    impl GitFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "vde-git-stat-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let fixture = Self(root);
+            fixture.git(&["init", "-b", "main"]);
+            fixture.git(&["config", "user.name", "Fixture"]);
+            fixture.git(&["config", "user.email", "fixture@example.invalid"]);
+            fixture.git(&["config", "core.excludesFile", "/dev/null"]);
+            fixture
+        }
+
+        fn git(&self, args: &[&str]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&self.0)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn write(&self, path: impl AsRef<Path>, body: impl AsRef<[u8]>) {
+            std::fs::write(self.0.join(path), body).unwrap();
+        }
+
+        fn count(&self) -> u64 {
+            untracked_insertions(self.0.to_str().unwrap(), Duration::from_secs(5)).unwrap()
+        }
+    }
+
+    impl Drop for GitFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn untracked_scan_preserves_names_excludes_ignored_binary_and_counts_link_targets() {
+        let fixture = GitFixture::new();
+        fixture.write(".gitignore", "ignored\n");
+        fixture.write(
+            ".gitattributes",
+            "opaque -diff\nforced diff\ndriver diff=opaque\n",
+        );
+        fixture.git(&["add", ".gitignore", ".gitattributes"]);
+        fixture.git(&["config", "diff.opaque.binary", "true"]);
+        fixture.write("new\n\tfile", "one\ntwo");
+        fixture.write("-leading-option", b"non-UTF-8 text: \xff\n");
+        // APFS rejects non-UTF-8 names; Linux accepts them. Non-UTF-8 file
+        // contents are covered on both platforms above.
+        let invalid_name_lines = if cfg!(target_os = "macos") {
+            0
+        } else {
+            fixture.write(std::ffi::OsStr::from_bytes(b"invalid-\xff"), "one\n");
+            1
+        };
+        fixture.write("empty", "");
+        fixture.write("binary", b"line\n\0binary\n");
+        fixture.write("ignored", "not counted\n");
+        fixture.write("opaque", "not counted\n");
+        fixture.write("driver", "not counted\n");
+        fixture.write("forced", b"one\0\ntwo\n");
+        std::os::unix::fs::symlink("ignored", fixture.0.join("link")).unwrap();
+        let fifo = std::ffi::CString::new(fixture.0.join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(fixture.count(), 6 + invalid_name_lines);
+        fixture.git(&["add", "--", "new\n\tfile"]);
+        assert_eq!(fixture.count(), 4 + invalid_name_lines);
+    }
+
+    #[test]
+    fn poll_combines_head_diff_and_untracked_without_double_counting_partial_staging() {
+        let fixture = GitFixture::new();
+        fixture.write("tracked", "base\n");
+        fixture.git(&["add", "tracked"]);
+        fixture.git(&["commit", "-m", "Baseline"]);
+        fixture.write("tracked", "base\nstaged\n");
+        fixture.git(&["add", "tracked"]);
+        fixture.write("tracked", "base\nreplacement\nthird\n");
+        fixture.write("new", "one\ntwo");
+        std::fs::create_dir(fixture.0.join("sub")).unwrap();
+        let cwd = fixture.0.to_str().unwrap();
+        let sub = fixture.0.join("sub");
+        let runner = SystemGitRunner::new(Duration::from_secs(5));
+        let mut poller = GitPoller::new();
+        let (badges, _) = poller.poll(&runner, [cwd, sub.to_str().unwrap()], Instant::now());
+        assert_eq!(badges[cwd].insertions, 4);
+        assert_eq!(badges[cwd].deletions, 0);
+        assert_eq!(badges[cwd], badges[sub.to_str().unwrap()]);
+        fixture.git(&["add", "new"]);
+        let (badges, _) = poller.poll(&runner, [cwd], Instant::now());
+        assert_eq!(badges[cwd].insertions, 4);
+    }
+
+    #[test]
+    fn untracked_scan_drains_large_enumerations_and_streams_large_files() {
+        let fixture = GitFixture::new();
+        for index in 0..900 {
+            fixture.write(format!("{index:04}-{}", "x".repeat(96)), "one\n");
+        }
+        fixture.write("large", "one\n".repeat(40_000));
+        assert_eq!(fixture.count(), 40_900);
+    }
+
     fn main_and_linked_runner() -> MockGitRunner {
         let mut runner = MockGitRunner::default();
         stub_identity_probe(
@@ -895,7 +1239,11 @@ mod tests {
 
     #[test]
     fn steady_state_poll_dedupes_status_by_worktree_top_level() {
-        let runner = main_and_linked_runner();
+        let mut runner = main_and_linked_runner();
+        runner.untracked.insert("/tmp/main".to_string(), 5);
+        runner
+            .untracked
+            .insert("/tmp/worktrees/feature".to_string(), 8);
         let mut poller = GitPoller::new();
         let paths = ["/tmp/main", "/tmp/main/sub", "/tmp/worktrees/feature"];
         let now = Instant::now();
@@ -907,10 +1255,10 @@ mod tests {
         assert_eq!(badges["/tmp/main"].branch, "main");
         assert_eq!(badges["/tmp/main"].ahead, 1);
         assert_eq!(badges["/tmp/main"].behind, 2);
-        assert_eq!(badges["/tmp/main"].insertions, 12);
+        assert_eq!(badges["/tmp/main"].insertions, 17);
         assert_eq!(badges["/tmp/main"].deletions, 3);
         assert_eq!(badges["/tmp/worktrees/feature"].branch, "feature");
-        assert_eq!(badges["/tmp/worktrees/feature"].insertions, 4);
+        assert_eq!(badges["/tmp/worktrees/feature"].insertions, 12);
         assert_eq!(badges["/tmp/worktrees/feature"].deletions, 9);
         assert_eq!(worktrees.len(), 1);
         assert_eq!(
@@ -922,6 +1270,7 @@ mod tests {
         assert_eq!(runner.probe_calls(), 3);
         assert_eq!(runner.status_calls(), 2);
         assert_eq!(runner.diff_calls(), 2);
+        assert_eq!(runner.untracked_calls.lock().unwrap().len(), 2);
         assert_eq!(runner.vw_call_count(), 1);
 
         let (warm_badges, warm_worktrees) =
@@ -933,6 +1282,7 @@ mod tests {
         assert_eq!(runner.probe_calls(), 3);
         assert_eq!(runner.status_calls(), 4);
         assert_eq!(runner.diff_calls(), 4);
+        assert_eq!(runner.untracked_calls.lock().unwrap().len(), 4);
         assert_eq!(runner.vw_call_count(), 2);
 
         poller.poll(

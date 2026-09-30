@@ -207,6 +207,10 @@ mod tests {
             bail!("not a git repository")
         }
 
+        fn untracked_insertions(&self, _cwd: &str) -> Result<u64> {
+            bail!("unexpected untracked scan")
+        }
+
         fn run_vw(&self, _cwd: &str, _args: &[&str]) -> Result<String> {
             bail!("unexpected vw call")
         }

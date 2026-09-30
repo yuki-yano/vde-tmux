@@ -120,6 +120,10 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("not a git repository"))
         }
 
+        fn untracked_insertions(&self, _cwd: &str) -> Result<u64> {
+            bail!("unexpected untracked scan")
+        }
+
         fn run_vw(&self, _cwd: &str, _args: &[&str]) -> Result<String> {
             bail!("unexpected vw call")
         }
@@ -188,6 +192,10 @@ mod tests {
         impl GitRunner for TimedOutGitRunner {
             fn run(&self, _cwd: &str, _args: &[&str]) -> Result<String> {
                 bail!("git probe timed out")
+            }
+
+            fn untracked_insertions(&self, _cwd: &str) -> Result<u64> {
+                bail!("unexpected untracked scan")
             }
 
             fn run_vw(&self, _cwd: &str, _args: &[&str]) -> Result<String> {

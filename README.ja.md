@@ -275,7 +275,8 @@ Treeでは階層を維持したまま所属するCategoryとRepositoryが優先�
 pinは既読化やlifecycle変更では解除されず、paneが消えたときに削除されます。
 Repositoryとlinked worktreeのbranch labelには、upstreamとの差を`↑N` / `↓N`、
 `HEAD`からのtrackedなstagedおよびunstaged差分行数を`+N` / `-N`で続けて表示します。
-0件は省略し、untracked fileとbinary fileは差分行数へ含めません。
+Gitのignore対象を除くuntrackedなテキストファイルも、全行を`+N`へ加算します。
+0件は省略し、binary fileは差分行数へ含めません。
 
 ```bash
 vt sidebar open --width 40
