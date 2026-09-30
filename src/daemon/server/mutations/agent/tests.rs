@@ -468,6 +468,87 @@ fn guarded_prompt_process_owner_rejections_cover_every_fail_closed_branch() {
 }
 
 #[test]
+fn first_prompt_readiness_does_not_establish_hook_authority_or_bypass_history() {
+    let binding = guarded_prompt_test_binding();
+    let mut pane = guarded_prompt_test_pane_state(&binding);
+    pane.agent_session_id = None;
+    pane.run_seq = 0;
+    let tracker = crate::pane_state::CaptureTrackerSnapshot::default();
+    let runner = crate::tmux::mock::MockTmuxRunner::new();
+    runner.stub_agent_process(
+        pane.pane_instance.pane_pid,
+        "codex",
+        Some(binding.process.clone()),
+    );
+    runner.stub_agent_input_owner(pane.pane_instance.pane_pid, binding.process.pid, true);
+    runner.stub_agent_arguments(binding.process.pid, &["codex", "--no-daemon", "--yolo"]);
+    let frame =
+        "__vde_initial_prompt__#{pane_pid}:#{cursor_x}:#{cursor_y}:#{pane_width}:#{pane_height}";
+    let header = format!(
+        "__vde_initial_prompt__{}:2:1:80:4",
+        pane.pane_instance.pane_pid
+    );
+    runner.stub(
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &pane.pane_instance.pane_id,
+            frame,
+            ";",
+            "capture-pane",
+            "-p",
+            "-e",
+            "-t",
+            &pane.pane_instance.pane_id,
+            ";",
+            "display-message",
+            "-p",
+            "-t",
+            &pane.pane_instance.pane_id,
+            frame,
+        ],
+        &format!("{header}\nCodex\n› \x1b[2mAsk Codex to do anything\x1b[0m\n\n? for shortcuts\n{header}\n"),
+    );
+    assert!(require_prompt_readiness(&runner, &pane, &tracker).is_ok());
+    assert!(!tracker.hook_authoritative);
+    assert_eq!(
+        crate::pane_state::resolve_presentation(&pane, &tracker, epoch_seconds()),
+        crate::daemon::session_badge::BadgeState::Unknown
+    );
+    runner.stub_agent_arguments(binding.process.pid, &["codex", "--yolo"]);
+    assert!(require_prompt_readiness(&runner, &pane, &tracker).is_err());
+    runner.stub_agent_arguments(binding.process.pid, &["codex", "--no-daemon"]);
+    runner.stub_agent_input_owner(pane.pane_instance.pane_pid, binding.process.pid, false);
+    assert!(require_prompt_readiness(&runner, &pane, &tracker).is_err());
+    runner.stub_agent_input_owner(pane.pane_instance.pane_pid, binding.process.pid, true);
+    for previous in [
+        {
+            let mut value = pane.clone();
+            value.run_seq = 1;
+            value
+        },
+        {
+            let mut value = pane.clone();
+            value.agent_session_id = Some(binding.provider_session_id.clone());
+            value
+        },
+        {
+            let mut value = pane.clone();
+            value.scan_verified = false;
+            value
+        },
+        {
+            let mut value = pane.clone();
+            value.lifecycle = crate::pane_state::LifecycleState::Running;
+            value
+        },
+    ] {
+        assert!(require_prompt_readiness(&runner, &previous, &tracker).is_err());
+    }
+}
+
+#[test]
 fn screen_evidence_cannot_authorize_durable_prompt_dispatch() {
     let binding = guarded_prompt_test_binding();
     let pane = guarded_prompt_test_pane_state(&binding);

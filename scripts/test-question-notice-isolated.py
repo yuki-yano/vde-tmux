@@ -944,9 +944,22 @@ try:
     outside = {"hook_event_name": "PostToolUse", "session_id": "question-fixture-root", "turn_id": "question-fixture-turn",
                "transcript_path": str(root / "home/.codex/sessions/question-fixture-root.jsonl"), "tool_name": "request_user_input_async",
                "tool_use_id": "outside", "tool_response": '{"accepted":true}'}
-    external_env = {**env, "TMUX_PANE": pane}
-    external = subprocess.run([vt, "hook", "codex", "PostToolUse"], env=external_env, input=json.dumps(outside), text=True, capture_output=True, timeout=10)
-    assert external.returncode == 0, external.stderr
+    # Launch from a scratch shell so the test runner's own Codex ancestry cannot
+    # make this a shared-server rejection instead of the unverified-owner case.
+    outside_body = root / "outside-hook.json"
+    outside_body.write_text(json.dumps(outside))
+    outside_status = root / "outside-hook.status"
+    outside_stderr = root / "outside-hook.stderr"
+    outside_script = root / "outside-hook.sh"
+    outside_script.write_text(
+        f"#!/bin/sh\n"
+        f"env TMUX_PANE={shlex.quote(pane)} {shlex.quote(vt)} hook codex PostToolUse "
+        f"< {shlex.quote(str(outside_body))} > /dev/null 2> {shlex.quote(str(outside_stderr))}\n"
+        f"printf '%s\\n' \"$?\" > {shlex.quote(str(outside_status))}\n"
+    )
+    tmux("new-window", "-d", "-n", "outside-hook", f"sh {shlex.quote(str(outside_script))}")
+    wait(outside_status.exists, "outside hook completion")
+    assert outside_status.read_text().strip() == "0", outside_stderr.read_text()
     logs = "\n".join(p.read_text() for p in (root / "state").rglob("daemon.log"))
     assert "hook_ownership: dropped: owner_unverified" in logs
     assert not notice()["unacknowledged"]

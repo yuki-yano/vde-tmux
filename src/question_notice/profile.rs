@@ -115,8 +115,25 @@ pub(crate) fn app_server_arguments(args: &[String]) -> bool {
 }
 
 fn argument_mode_for(args: &[String], server_only: bool) -> ArgumentMode {
+    argument_mode_checked(args, server_only, false)
+}
+
+/// An explicit flag, rather than a config value or inherited pane environment,
+/// proves that the interactive invocation does not use the shared server.
+pub(crate) fn independent_arguments(args: &[String]) -> bool {
+    argument_mode_checked(args, false, true) == ArgumentMode::Embedded
+}
+
+fn argument_mode_checked(
+    args: &[String],
+    server_only: bool,
+    require_independent: bool,
+) -> ArgumentMode {
     let mut values = args.iter().skip(1).peekable();
     let mut positional_known = true;
+    let mut no_daemon = false;
+    let mut conversation_command = false;
+    let mut conversation_id = false;
     while let Some(arg) = values.next() {
         if arg == "--remote"
             || arg.starts_with("--remote=")
@@ -174,13 +191,20 @@ fn argument_mode_for(args: &[String], server_only: bool) -> ArgumentMode {
             continue;
         }
         if arg == "--" {
-            return if positional_known {
+            return if positional_known && !require_independent {
                 ArgumentMode::Embedded
             } else {
                 ArgumentMode::Unknown
             };
         }
         if arg.starts_with('-') {
+            no_daemon |= arg == "--no-daemon";
+            if require_independent
+                && conversation_command
+                && matches!(arg.as_str(), "--last" | "--all")
+            {
+                continue;
+            }
             // An unknown option might consume its next token. Never interpret that
             // value as positive evidence of an out-of-scope subcommand.
             if ![
@@ -230,6 +254,22 @@ fn argument_mode_for(args: &[String], server_only: bool) -> ArgumentMode {
         if !positional_known {
             return ArgumentMode::Unknown;
         }
+        // An initial positional prompt may already be queued by the CLI. Resume
+        // and fork select a conversation, but do not submit an initial prompt.
+        if require_independent {
+            if !no_daemon {
+                return ArgumentMode::Unknown;
+            }
+            if !conversation_command && matches!(arg.as_str(), "resume" | "fork") {
+                conversation_command = true;
+                continue;
+            }
+            if conversation_command && !conversation_id && is_conversation_id(arg) {
+                conversation_id = true;
+                continue;
+            }
+            return ArgumentMode::Unknown;
+        }
         return if arg == "app-server"
             || (!server_only
                 && matches!(
@@ -273,11 +313,22 @@ fn argument_mode_for(args: &[String], server_only: bool) -> ArgumentMode {
             ArgumentMode::Embedded
         };
     }
-    if !args.is_empty() && positional_known {
+    if !args.is_empty() && positional_known && (!require_independent || no_daemon) {
         ArgumentMode::Embedded
     } else {
         ArgumentMode::Unknown
     }
+}
+
+fn is_conversation_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 /// Positive mode evidence only; unavailable argv/identity is not an exclusion.
@@ -780,6 +831,43 @@ int main(int argc, char **argv) {{
         let _ = child.kill();
         let _ = child.wait();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn independent_mode_requires_a_real_option_and_no_queued_prompt() {
+        for args in [
+            vec!["codex", "--no-daemon"],
+            vec!["codex", "--yolo", "--no-daemon"],
+            vec!["codex", "-m", "synthetic", "--no-daemon"],
+            vec!["codex", "--no-daemon", "resume", "--last"],
+            vec![
+                "codex",
+                "--no-daemon",
+                "fork",
+                "01234567-89ab-cdef-0123-456789abcdef",
+            ],
+        ] {
+            assert!(independent_arguments(
+                &args.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            ));
+        }
+        for args in [
+            vec!["codex"],
+            vec!["codex", "--yolo"],
+            vec!["codex", "-c", "daemon_auto_start=false"],
+            vec!["codex", "--model", "--no-daemon"],
+            vec!["codex", "--", "--no-daemon"],
+            vec!["codex", "--unknown", "--no-daemon"],
+            vec!["codex", "--no-daemon", "initial prompt"],
+            vec!["codex", "--no-daemon", "resume", "--last", "queued prompt"],
+            vec!["codex", "--no-daemon", "app-server"],
+            vec!["codex", "--no-daemon", "--remote", "synthetic"],
+            vec!["codex", "--no-daemon", "resume", "--connect=synthetic"],
+        ] {
+            assert!(!independent_arguments(
+                &args.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            ));
+        }
     }
 
     #[test]

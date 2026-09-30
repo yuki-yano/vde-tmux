@@ -652,12 +652,24 @@ Codex hooks require a process ancestor chain rooted in their claimed pane. Share
 hooks, including renamed executables, cannot use inherited `TMUX_PANE` to update that pane
 or another pane. Rejection logs contain only finite reason codes. Embedded hooks remain
 usable with an unrelated MCP server child. This prevents misattribution; it does not restore
-lifecycle events from a shared server. Ordinary prompt dispatch is rejected while readiness
-is Unknown or Working/Blocked, and durable Codex dispatch requires authoritative hooks in
-the current daemon epoch. In embedded mode, a subsequent accepted lifecycle hook restores authority after daemon restart;
+lifecycle events from a shared server. Working/Blocked dispatch is rejected. Durable Codex
+dispatch normally requires authoritative hooks in the current daemon epoch. The first prompt
+is also accepted before any session/hook is registered when all of the following hold:
+the exact process is scan-verified and owns foreground input, canonical state is Idle with
+zero Runs/completions and no prompt/session, argv proves an explicit `--no-daemon` interactive
+invocation without a queued initial prompt, and a fresh stable viewport/cursor identifies the
+empty input field. These checks run during preparation and again before dispatch; the pane
+revision fence is rechecked after inspection. Presentation remains Unknown until a hook is
+accepted. Only the matching provider prompt digest confirms the Operation and binds its
+session/Run. Bare invocations, `daemon_auto_start=false` alone, dialogs, drafts, and changed
+processes do not qualify. Current empty-input detection supports Codex's
+`Ask Codex to do anything` composer; an unrecognized layout is rejected without sending.
+The first `SessionStart` may advance the agent epoch. Follow the confirmed Operation's
+returned `run_ref` for wait/response, rather than continuing to use the pre-start agent reference.
+In embedded mode, a subsequent accepted lifecycle hook restores authority after daemon restart;
 this does not restore Question resolver trust for notices predating restart. Shared-server mode
-continues to reject hooks. Start Codex with `--no-daemon` (or set `features.daemon_auto_start=false`)
-to use the embedded hook lifecycle.
+continues to reject hooks. Start Codex with `--no-daemon` to select the embedded hook lifecycle;
+`features.daemon_auto_start=false` does not prevent attaching to an already running server.
 
 Pane State schema 10 and Question sidecar schema 1 are unchanged. Question remains a durable
 unacknowledged issuance notice. Capture is veto-only; answers alone, unknown evidence, and

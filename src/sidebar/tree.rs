@@ -99,8 +99,6 @@ impl BadgeCounts {
 
 #[derive(Debug, Clone)]
 struct AgentPane {
-    presentation: Option<crate::pane_state::PresentationExplanation>,
-    presentation_age: Option<i64>,
     question_notice: Option<crate::question_notice::QuestionNoticeSummary>,
     pane_instance: PaneInstance,
     pane_id: String,
@@ -276,12 +274,6 @@ pub fn build_rows_from_presentations(
             .entry((category.clone(), repo_key.to_string()))
             .or_default()
             .push(AgentPane {
-                presentation: (canonical.agent.as_str() == "codex")
-                    .then_some(resolved.presentation),
-                presentation_age: resolved
-                    .presentation
-                    .observed_at
-                    .map(|at| ctx.now.saturating_sub(at).max(0)),
                 question_notice: pane.question_notice.clone(),
                 pane_instance: pane.pane_instance.clone(),
                 pane_id: pane.pane_instance.pane_id.clone(),
@@ -951,23 +943,6 @@ fn push_chat_detail_rows(
     include_repo_git: bool,
     rows: &mut Vec<SidebarRow>,
 ) {
-    if let Some(explanation) = pane.presentation {
-        let detail = pane
-            .presentation_age
-            .map(|age| {
-                format!(
-                    "（{age}秒前に観測、有効期限: {}秒）",
-                    explanation.ttl_seconds.unwrap_or_default()
-                )
-            })
-            .unwrap_or_default();
-        rows.push(detail_row(
-            pane,
-            depth,
-            "presentation-reason",
-            format!("状態判定: {}{detail}", explanation.reason.label()),
-        ));
-    }
     if let Some(notice) = &pane.question_notice {
         if notice.unacknowledged {
             rows.push(detail_row(pane, depth, "question-notice", "? Codexから質問が発行されました。回答済みでも通知は残ります。Qで確認済みにできます。".to_string()));
@@ -1633,8 +1608,6 @@ mod tests {
 
     fn agent_pane(badge_state: BadgeState, completed_at: &str) -> AgentPane {
         AgentPane {
-            presentation: None,
-            presentation_age: None,
             question_notice: None,
             pane_instance: PaneInstance {
                 pane_id: "%1".to_string(),
@@ -2197,19 +2170,18 @@ mod tests {
     }
 
     #[test]
-    fn codex_detail_explains_an_expired_badge_without_claiming_completion() {
+    fn unknown_detail_keeps_summary_and_response_without_claiming_completion() {
         let mut pane = agent_pane(BadgeState::Unknown, "");
-        pane.presentation = Some(crate::pane_state::PresentationExplanation {
-            reason: crate::pane_state::PresentationReason::EvidenceExpired,
-            observed_at: Some(100),
-            ttl_seconds: Some(3),
-        });
-        pane.presentation_age = Some(4);
+        pane.task_summary = "状態通知と要約の復旧".to_string();
+        pane.latest_response = "状態通知の経路を確認しています。".to_string();
         let mut rows = Vec::new();
         push_chat_detail_rows(&pane, 1, true, &mut rows);
-        assert!(rows.iter().any(
-            |row| row.label == "状態判定: 画面情報の有効期限切れ（4秒前に観測、有効期限: 3秒）"
-        ));
+        assert_eq!(rows[0].label, "状態通知と要約の復旧");
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "▷ 状態通知の経路を確認しています。")
+        );
+        assert!(!rows.iter().any(|row| row.label.starts_with("状態判定:")));
         assert!(!rows.iter().any(|row| row.label.contains("回答済み")));
     }
 

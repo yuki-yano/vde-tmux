@@ -164,6 +164,26 @@ pane移動はdaemonが所有する1つの常駐tmux control-mode clientを通し
 
 Codex を再起動すると、permission request、plan、subagent、worktree activity がサイドバーへ反映されます。
 
+tmux 内の新規 Codex で状態通知と task 要約を使う場合は、`codex --no-daemon` で独立起動します。
+共有 app-server の hook は、通知元の pane を特定できないため受け付けません。
+この指定は今回の起動だけに適用され、Desktop など他のクライアントの設定は変わりません。
+起動直後が Unknown でも、最初の依頼を
+`vt agent request <exact-agent-ref> --state-file <未使用のprivate path> --stdin --json`
+から送信できます。送信前に、明示的な `--no-daemon`、同一プロセスによる入力の所有権、
+空の Codex 入力欄を確認します。trust/update ダイアログ、入力途中の本文、起動時に指定した
+prompt、共有 server への送信は拒否します。
+受理された `UserPromptSubmit` hook で prompt と session を確定します。
+画面の準備確認だけでは hook の権威や完了状態を確定しません。
+送信後に `prompt_confirmed`、状態通知・完了表示と、有効にしている場合は task 要約を確認します。
+vde-tmux daemon の再起動後は、次の embedded hook が受理されると状態通知が復旧します。
+それまでは Unknown と表示される場合があります。
+`codex queue` など共有 server を必要とする操作は、`--no-daemon` と併用できません。
+実行中の共有 thread を、独立起動側でも同時に開かないでください。
+
+サイドバーの詳細は要約や応答を中心に表示します。判定理由は
+`vt agent get <pane ID> --json` の `summary.presentation` で確認できます。
+画面から判定できない Unknown を、完了や Idle として扱うことはありません。
+
 ### 5. 動作確認
 
 tmux 内で次のコマンドを実行します。

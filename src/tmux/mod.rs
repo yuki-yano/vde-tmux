@@ -55,6 +55,20 @@ pub mod mock;
 pub trait TmuxRunner {
     fn run(&self, args: &[&str]) -> Result<String>;
 
+    fn agent_process_arguments(
+        &self,
+        process: &crate::pane_state::AgentProcessIdentity,
+    ) -> Result<Vec<String>> {
+        let before = crate::daemon::lifecycle::agent_process_start_token(process.pid)?;
+        let args = crate::question_notice::profile::process_arguments(process.pid)
+            .ok_or_else(|| anyhow::anyhow!("agent process arguments are unavailable"))?;
+        let after = crate::daemon::lifecycle::agent_process_start_token(process.pid)?;
+        if before != process.start_token || after != process.start_token {
+            bail!("agent process identity changed while reading arguments");
+        }
+        Ok(args)
+    }
+
     fn run_with_input(
         &self,
         _args: &[&str],

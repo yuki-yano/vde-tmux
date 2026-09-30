@@ -6,6 +6,7 @@ import sys
 import termios
 import time
 import tty
+import threading
 
 
 VT_BIN = os.environ["VT_BIN"]
@@ -43,10 +44,26 @@ def emit_hook(event, **fields):
 
 if not SKIP_SESSION_START:
     emit_hook("SessionStart", source="startup")
+
+def control_hooks():
+    fifo = os.environ.get("CODEX_HOOK_CONTROL")
+    if not fifo:
+        return
+    with os.fdopen(os.open(fifo, os.O_RDWR), "r", encoding="utf-8") as commands:
+        for line in commands:
+            request = json.loads(line)
+            emit_hook(request["event"], **request["fields"])
+            with open(os.environ["CODEX_HOOK_RECEIPTS"], "a", encoding="utf-8") as receipt:
+                receipt.write(request["id"] + "\n")
+
+threading.Thread(target=control_hooks, daemon=True).start()
 descriptor = sys.stdin.fileno()
 original = termios.tcgetattr(descriptor)
 tty.setraw(descriptor)
-sys.stdout.write("\x1b[?2004hREADY\r\n")
+if os.environ.get("CODEX_INITIAL_COMPOSER") == "1":
+    sys.stdout.write("\x1b[?2004hREADY\r\n› \x1b[2mAsk Codex to do anything\x1b[0m\x1b[3G")
+else:
+    sys.stdout.write("\x1b[?2004hREADY\r\n")
 sys.stdout.flush()
 
 buffer = bytearray()

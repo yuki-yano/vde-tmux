@@ -13,6 +13,7 @@ use super::super::state_helpers::{pane_snapshot_store, production_store_error_re
 use super::super::{ProductionV2Coordinator, epoch_seconds};
 use super::pane::pane_belongs_to_run_epoch;
 
+mod initial_prompt;
 #[cfg(test)]
 mod tests;
 
@@ -180,7 +181,7 @@ pub(in crate::daemon::server) fn apply_start_agent_prompt_with_runner(
     }
 
     let (binding, expected_run_seq, pane, expected_pane_version, expected_current_run) =
-        match resolve_agent_prompt_target(coordinator, &target_agent_ref) {
+        match resolve_agent_prompt_target(coordinator, runner, &target_agent_ref) {
             Ok(value) => value,
             Err(message) => {
                 if let Some(rejection_code) =
@@ -291,7 +292,7 @@ pub(in crate::daemon::server) fn apply_start_agent_prompt_with_runner(
     if let Err(rejection) = verify_agent_prompt_process_and_owner(runner, &pane, &binding) {
         return reject_pre_dispatch(rejection.code, rejection.message);
     }
-    if let Err(message) = verify_agent_prompt_precondition(coordinator, &operation) {
+    if let Err(message) = verify_agent_prompt_precondition(coordinator, runner, &operation) {
         return reject_pre_dispatch("pane_precondition_changed", message);
     }
     let staged = {
@@ -481,6 +482,7 @@ pub(in crate::daemon::server) fn maybe_crash_agent_operation(
 
 pub(in crate::daemon::server) fn resolve_agent_prompt_target(
     coordinator: &ProductionV2Coordinator,
+    runner: &dyn crate::tmux::TmuxRunner,
     target_agent_ref: &str,
 ) -> std::result::Result<
     (
@@ -522,7 +524,7 @@ pub(in crate::daemon::server) fn resolve_agent_prompt_target(
     {
         return Err("invalid agent_ref process start token digest".to_string());
     }
-    let record = {
+    let (record, tracker) = {
         let state = coordinator
             .state
             .lock()
@@ -536,8 +538,8 @@ pub(in crate::daemon::server) fn resolve_agent_prompt_target(
             .record(&pane)
             .cloned()
             .ok_or_else(|| "agent pane is not retained".to_string())?;
-        require_observed_prompt_readiness(&record, &state.leased.runtime.tracker(&pane))?;
-        record
+        let tracker = state.leased.runtime.tracker(&pane);
+        (record, tracker)
     };
     let process = record
         .agent_process
@@ -561,6 +563,7 @@ pub(in crate::daemon::server) fn resolve_agent_prompt_target(
     if !matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle) {
         return Err("agent is busy or blocked".to_string());
     }
+    require_prompt_readiness(runner, &record, &tracker)?;
     let provider_session_id = record.agent_session_id.clone();
     let expected_run_seq = record
         .run_seq
@@ -587,35 +590,53 @@ pub(in crate::daemon::server) fn resolve_agent_prompt_target(
 
 pub(in crate::daemon::server) fn verify_agent_prompt_precondition(
     coordinator: &ProductionV2Coordinator,
+    runner: &dyn crate::tmux::TmuxRunner,
     operation: &crate::agent_state::OperationRecord,
 ) -> std::result::Result<(), String> {
-    let state = coordinator
-        .state
-        .lock()
-        .expect("canonical state lock poisoned");
-    let state = state
-        .as_ref()
-        .ok_or_else(|| "daemon is hydrating".to_string())?;
-    let record = state
-        .leased
-        .runtime
-        .record(&operation.binding.pane_instance)
-        .ok_or_else(|| "agent pane is no longer retained".to_string())?;
-    let exact_binding_matches = agent_prompt_precondition_matches(record, operation);
-    require_observed_prompt_readiness(
-        record,
-        &state
+    let read_current = || {
+        let state = coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned");
+        let state = state
+            .as_ref()
+            .ok_or_else(|| "daemon is hydrating".to_string())?;
+        let record = state
             .leased
             .runtime
-            .tracker(&operation.binding.pane_instance),
-    )?;
-    if exact_binding_matches {
-        Ok(())
+            .record(&operation.binding.pane_instance)
+            .ok_or_else(|| "agent pane is no longer retained".to_string())?;
+        if !agent_prompt_precondition_matches(record, operation) {
+            return Err("pane revision, lifecycle, current run, session, or process changed before dispatch".to_string());
+        }
+        Ok((
+            record.clone(),
+            state
+                .leased
+                .runtime
+                .tracker(&operation.binding.pane_instance),
+        ))
+    };
+    let (record, tracker) = read_current()?;
+    require_prompt_readiness(runner, &record, &tracker)?;
+    // Process/cursor inspection must not hold the canonical lock. Recheck the
+    // CAS fence after it, so a concurrent hook cannot make this snapshot stale.
+    read_current()?;
+    Ok(())
+}
+
+fn require_prompt_readiness(
+    runner: &dyn crate::tmux::TmuxRunner,
+    record: &crate::pane_state::PaneState,
+    tracker: &crate::pane_state::CaptureTrackerSnapshot,
+) -> Result<(), String> {
+    if initial_prompt::candidate(record, tracker)
+        && crate::pane_state::resolve_presentation(record, tracker, epoch_seconds())
+            == crate::daemon::session_badge::BadgeState::Unknown
+    {
+        initial_prompt::require_ready(runner, record)
     } else {
-        Err(
-            "pane revision, lifecycle, current run, session, or process changed before dispatch"
-                .to_string(),
-        )
+        require_observed_prompt_readiness(record, tracker)
     }
 }
 

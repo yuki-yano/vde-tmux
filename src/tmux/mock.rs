@@ -18,6 +18,7 @@ pub struct MockTmuxRunner {
     calls: RefCell<Vec<Vec<String>>>,
     input_calls: RefCell<Vec<(Vec<String>, Vec<u8>)>>,
     agent_input_owners: RefCell<HashMap<(u32, u32), std::result::Result<bool, String>>>,
+    agent_arguments: RefCell<HashMap<u32, Vec<String>>>,
 }
 
 impl MockTmuxRunner {
@@ -46,6 +47,16 @@ impl MockTmuxRunner {
             .insert((root_pid, agent_pid), Ok(is_owner));
     }
 
+    pub fn stub_agent_arguments(&self, pid: u32, arguments: &[&str]) {
+        self.agent_arguments.borrow_mut().insert(
+            pid,
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_string())
+                .collect(),
+        );
+    }
+
     pub fn stub_agent_process(
         &self,
         root_pid: u32,
@@ -71,6 +82,17 @@ impl MockTmuxRunner {
 }
 
 impl TmuxRunner for MockTmuxRunner {
+    fn agent_process_arguments(
+        &self,
+        process: &crate::pane_state::AgentProcessIdentity,
+    ) -> Result<Vec<String>> {
+        self.agent_arguments
+            .borrow()
+            .get(&process.pid)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no process argument stub for {}", process.pid))
+    }
+
     fn run(&self, args: &[&str]) -> Result<String> {
         let key: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         self.calls.borrow_mut().push(key.clone());

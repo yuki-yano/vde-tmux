@@ -33,6 +33,11 @@ export VDE_TMUX_SOCKET_NAME="$TMUX_SOCKET"
 export VT_BIN="$BIN"
 export PROMPT_LOG
 export CODEX_SKIP_SESSION_START=1
+export CODEX_INITIAL_COMPOSER=1
+export CODEX_FIXTURE_SCRIPT="$FIXTURE"
+export CODEX_HOOK_CONTROL="$ROOT/hooks.fifo"
+export CODEX_HOOK_RECEIPTS="$ROOT/hook-receipts.txt"
+mkfifo "$CODEX_HOOK_CONTROL"
 mkdir -p "$XDG_CONFIG_HOME/vde-tmux" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$(dirname "$CODEX_FIXTURE")" "$(dirname "$CODEX_TRANSCRIPT_PATH")"
 printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"id\":\"$CODEX_SESSION_ID\",\"thread_source\":\"user\"}}" >"$CODEX_TRANSCRIPT_PATH"
 
@@ -49,12 +54,14 @@ export TMUX="$TMUX_SOCKET_PATH,$TMUX_SERVER_PID,0"
 
 "$BIN" daemon start >/dev/null
 PANE_ID="$(tmux -L "$TMUX_SOCKET" display-message -p -t guarded: '#{pane_id}')"
-tmux -L "$TMUX_SOCKET" respawn-pane -k -t "$PANE_ID" "exec '$CODEX_FIXTURE' '$FIXTURE'"
+# The embedded fixture keeps its argv as a native Codex process while executing
+# Python. The script path is supplied separately, like the stock CLI runtime.
+tmux -L "$TMUX_SOCKET" respawn-pane -k -t "$PANE_ID" "exec '$CODEX_FIXTURE' --no-daemon"
 
 AGENT_JSON=""
 for _ in $(seq 1 100); do
   if AGENT_JSON="$("$BIN" agent get "$PANE_ID" --json 2>/dev/null)" \
-    && printf '%s' "$AGENT_JSON" | "$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); assert value["result"]["agent"]["summary"]["identity"] == "exact"; assert value["result"]["agent"]["summary"]["status"] == "idle"' 2>/dev/null
+    && printf '%s' "$AGENT_JSON" | "$PYTHON" -c 'import json,sys; summary=json.load(sys.stdin)["result"]["agent"]["summary"]; assert summary["identity"] == "exact"; assert summary["status"] == "idle"; assert summary["badge"] == "unknown"' 2>/dev/null
   then
     break
   fi
@@ -62,7 +69,7 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 if [[ -z "$AGENT_JSON" ]]; then
-  echo "guarded prompt fixture was not discovered as an exact idle agent" >&2
+  echo "guarded prompt fixture was not discovered as an exact uninitialized agent" >&2
   tmux -L "$TMUX_SOCKET" list-panes -a -F '#{pane_id} pid=#{pane_pid} dead=#{pane_dead} command=#{pane_current_command}' >&2 || true
   tmux -L "$TMUX_SOCKET" capture-pane -p -t "$PANE_ID" -S -100 >&2 || true
   "$BIN" agent get "$PANE_ID" --json >&2 || true
@@ -82,6 +89,8 @@ printf 'first line\nsecond line' >"$PROMPT_FILE"
 OPERATION_ID="isolated_prompt_$(printf '%08d' $$)"
 if ! RESULT="$("$BIN" agent prompt "$AGENT_REF" --operation-id "$OPERATION_ID" --prompt-file "$PROMPT_FILE" --confirm-timeout-ms 5000 --json 2>"$ROOT/prompt-error.json")"; then
   cat "$ROOT/prompt-error.json" >&2
+  tmux -L "$TMUX_SOCKET" display-message -p -t "$PANE_ID" '#{pane_pid}:#{cursor_x}:#{cursor_y}:#{pane_width}:#{pane_height}' >"$ROOT/failed-cursor.txt" || true
+  tmux -L "$TMUX_SOCKET" capture-pane -ep -t "$PANE_ID" >"$ROOT/failed-screen.ansi" || true
   tmux -L "$TMUX_SOCKET" list-panes -a -F '#{pane_id} pid=#{pane_pid} dead=#{pane_dead} command=#{pane_current_command}' >&2 || true
   tmux -L "$TMUX_SOCKET" capture-pane -p -t "$PANE_ID" -S -100 >&2 || true
   "$BIN" agent get "$PANE_ID" --json >&2 || true
@@ -112,7 +121,7 @@ if tmux -L "$TMUX_SOCKET" list-buffers -F '#{buffer_name}' 2>/dev/null | grep -F
 fi
 
 "$PYTHON" - "$BIN" "$PANE_ID" "$CODEX_SESSION_ID" "$CODEX_TRANSCRIPT_PATH" <<'PY'
-import json, os, subprocess, sys
+import json, os, subprocess, sys, time, uuid
 
 binary, pane, session, transcript = sys.argv[1:]
 env = dict(os.environ, TMUX_PANE=pane)
@@ -121,9 +130,19 @@ def query(*args):
     return json.loads(subprocess.check_output([binary, *args, "--json"], env=env))["result"]
 
 def hook(event, turn, **fields):
-    payload = dict(session_id=session, transcript_path=transcript, turn_id=turn, **fields)
-    subprocess.run([binary, "hook", "codex", event], input=json.dumps(payload),
-                   text=True, env=env, check=True)
+    request_id = uuid.uuid4().hex
+    with open(os.environ["CODEX_HOOK_CONTROL"], "w", encoding="utf-8") as fifo:
+        fifo.write(json.dumps(dict(id=request_id, event=event, fields=dict(turn_id=turn, **fields))) + "\n")
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            with open(os.environ["CODEX_HOOK_RECEIPTS"], encoding="utf-8") as receipts:
+                if request_id in receipts.read().splitlines():
+                    return
+        except FileNotFoundError:
+            pass
+        assert time.monotonic() < deadline, "owned fixture hook timed out"
+        time.sleep(.02)
 
 agent_ref = query("agent", "get", pane)["agent"]["summary"]["agent_ref"]
 baseline = query("agent", "get", agent_ref)["agent"]["run_seq"]
