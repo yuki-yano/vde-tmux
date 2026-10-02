@@ -85,6 +85,7 @@ pub struct Candidate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sample {
+    MatchedQuestion,
     ActiveQuestion,
     NormalComposer,
     Ambiguous,
@@ -127,6 +128,7 @@ pub enum RetainReason {
     Fence,
     SampleJournalVeto,
     Active,
+    MatchedQuestion,
     Ambiguous,
     Deadline,
     Interrupted,
@@ -1198,7 +1200,11 @@ mod tests {
             // The integration invokes this also on Armed entry if Stop already arrived.
             r.eligible(&binding.owner, &session_key("b"), true, false, done_at);
             let job = r.due(done_at + Duration::from_millis(150)).pop().unwrap();
-            for veto in [Sample::ActiveQuestion, Sample::Ambiguous] {
+            for veto in [
+                Sample::MatchedQuestion,
+                Sample::ActiveQuestion,
+                Sample::Ambiguous,
+            ] {
                 assert_eq!(
                     r.sample(&job.0, job.1, veto, done_at + Duration::from_millis(150)),
                     None

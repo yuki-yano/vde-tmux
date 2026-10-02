@@ -479,6 +479,7 @@ pub fn from_payload(
         turn_id: turn.to_string(),
         tool_use_id: tool.to_string(),
         ancestors: Vec::new(),
+        questions: super::text::QuestionEvidence::from_tool_input(payload.get("tool_input")),
     })
 }
 
@@ -570,8 +571,13 @@ mod classification_tests {
     use crate::question_notice::profile::CodexProfile;
 
     #[test]
-    fn answer_framing_and_partial_envelopes_are_vetoes_for_both_versions_and_routes() {
-        for profile in [CodexProfile::V01551, CodexProfile::V01561] {
+    fn answer_framing_and_partial_envelopes_are_vetoes_for_known_versions_and_routes() {
+        for profile in [
+            CodexProfile::V01551,
+            CodexProfile::V01561,
+            CodexProfile::V01593,
+            CodexProfile::V01600,
+        ] {
             for _route in ["direct", "queue"] {
                 for input in [
                     "",

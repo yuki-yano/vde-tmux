@@ -5,9 +5,13 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
+#ifndef VDE_QUESTION_FIXTURE_VERSION
+#define VDE_QUESTION_FIXTURE_VERSION "0.159.3"
+#endif
+
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        puts("codex-cli 0.156.1");
+        puts("codex-cli " VDE_QUESTION_FIXTURE_VERSION);
         return 0;
     }
     int offset = argc == 5 && strcmp(argv[1], "--remote=synthetic") == 0 ? 1 : 0;

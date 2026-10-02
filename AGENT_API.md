@@ -1,6 +1,6 @@
 # Agent JSON API
 
-This document defines the current API v6 contract (daemon protocol 27, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
+This document defines the current API v6 contract (daemon protocol 28, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
 maintained in [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is
 recorded in [AGENT_API_V3.md](AGENT_API_V3.md).
 
@@ -549,8 +549,17 @@ Acknowledgement commits at atomic rename. A pre-rename failure retains the notic
 directory-fsync failure is a logical acknowledgement with `question_ack_directory_fsync_failed`,
 without rollback or automatic rewrite. The private `.expected` marker distinguishes initial absence
 from loss of a previously committed sidecar. Resolver state, transcript cursors, and ingress dedup
-remain memory-only; the shared private home journal stores only digests and writer identities. API 6 / protocol 27 must be installed together;
+remain memory-only; the shared private home journal stores only digests and writer identities. API 6 / protocol 28 must be installed together;
 there is no old-protocol fallback.
+Question text matching is restricted to the exact 0.159.3/0.160.0 profiles. The older 0.155.1/0.156.1
+profiles retain their generic marker and normal-composer guards; their stock hook schema uses the
+same `questions[].title` and optional string-array `options`. Runtime text evidence is bounded to
+2048 issuance entries globally and 512 per owner, with at most 512 distinct fingerprints per
+capture. Fingerprint extraction accepts at most eight questions, sixteen choices each, and 16 KiB
+of raw text. Larger or malformed text evidence becomes unavailable; an owned question notice is
+still accepted and retained for manual acknowledgement.
+Repeated fingerprints are deduplicated only after every unacknowledged order and session has been
+checked. Missing entries, capacity exhaustion, clipped cards and restart never justify clearing.
 
 ## Query cost
 
@@ -605,7 +614,7 @@ includes more work than the daemon-ingress bound; it excludes Codex's pre-hook d
 
 ### 運用反映条件
 
-- [ ] CLI/daemon/sidebar are deployed together with API 6 / protocol 27 while retaining existing Pane State schema 10.
+- [ ] CLI/daemon/sidebar are deployed together with API 6 / protocol 28 while retaining existing Pane State schema 10.
 - [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.
 
 
@@ -674,5 +683,5 @@ continues to reject hooks. Start Codex with `--no-daemon` to select the embedded
 Pane State schema 10 and Question sidecar schema 1 are unchanged. Question remains a durable
 unacknowledged issuance notice. Capture is veto-only; answers alone, unknown evidence, and
 notifications predating daemon restart do not acquire new automatic acknowledgement rules.
-CLI, daemon, and sidebars must be replaced together for protocol 27; there is no mixed-version
+CLI, daemon, and sidebars must be replaced together for protocol 28; there is no mixed-version
 fallback. Hook authority is not inferred to have expired merely because events stop arriving.

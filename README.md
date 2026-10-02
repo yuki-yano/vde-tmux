@@ -168,7 +168,7 @@ Permission requests, plans, subagents, and worktree activity will then appear in
 
 ### Codex question notices
 
-With stock Codex CLI 0.155.1 and 0.156.1, the existing `PostToolUse` hook can observe successful
+With stock Codex CLI 0.155.1, 0.156.1, 0.159.3, and 0.160.0, the existing `PostToolUse` hook can observe successful
 `request_user_input_async` calls. Include that tool in the hook matcher above (or use an
 unfiltered PostToolUse hook). No Codex extension, fork, or separate API is required.
 
@@ -186,6 +186,15 @@ framing do not resolve notices. Markdown block quotes and partial answer tags al
 Capture can only veto acknowledgement. This policy does not prove
 that any particular question was answered or read, or that input came from direct TUI interaction.
 Inputs from other routes such as realtime may be indistinguishable in stock hooks.
+
+The viewport veto also matches the issued question's title and complete, ordered choices in the
+current question editor. Whitespace and soft wrapping are normalized, and Codex's generated
+Other choice is excluded. Matching retains the notice; different text, history, or clipped choices
+never prove resolution. Only bounded SHA-256 fingerprints leave hook parsing, and those fingerprints
+stay in daemon memory, bound to the exact owner, session, and notice order. Missing question input
+retains notices for manual `Q` acknowledgement; no raw question text is added to state or diagnostics.
+Text matching targets complete Codex 0.159.3/0.160.0 question cards, including freeform drafts. Clipped titles
+or choices can remain unmatched; generic question markers and ambiguity still retain the notice.
 
 Use `Q` for immediate acknowledgement or when any guard is uncertain. Notices present before a daemon
 restart remain Q-only; later prompts cannot clear them. Resume, fork, `/clear`, backtrack/rollback,
@@ -769,7 +778,7 @@ After a vde-tmux daemon restart, authority returns with the next
 accepted embedded hook; until then the pane may show Unknown. Shared-server commands such as
 `codex queue` are not available with `--no-daemon`; keep those workflows on the shared server.
 Do not open an active shared thread in both modes.
-API 6 / daemon protocol 27 must be installed together; Pane State schema 10 and Question sidecar
+API 6 / daemon protocol 28 must be installed together; Pane State schema 10 and Question sidecar
 schema 1 remain unchanged. See [the API contract](AGENT_API.md#codex-screen-evidence-api-6).
 
 Run `python3 scripts/test-codex-observation-isolated.py` after building the binaries to verify

@@ -564,6 +564,7 @@ impl Drop for ProbeRegistration {
 struct AsyncQuestionProbe {
     registration: ProbeRegistration,
     profile: crate::question_notice::profile::CodexProfile,
+    questions: crate::question_notice::text::QuestionEvidence,
     deadline: Instant,
     reply: mpsc::SyncSender<crate::question_notice::capture::CaptureClass>,
 }
@@ -583,7 +584,7 @@ struct CaptureMetrics {
     normal_failures: u64,
     // Bounded numeric evidence only: sequence and request-to-reply microseconds.
     normal_samples: std::collections::VecDeque<(u64, u64)>,
-    probe_classes: [u64; 3],
+    probe_classes: [u64; 4],
     probe_dropped: u64,
 }
 
@@ -602,13 +603,15 @@ impl CaptureCoordinatorHandle {
         &self,
         pane: PaneInstance,
         profile: crate::question_notice::profile::CodexProfile,
+        questions: crate::question_notice::text::QuestionEvidence,
         deadline: Instant,
     ) -> crate::question_notice::capture::CaptureClass {
-        let result = self.capture_question_inner(pane, profile, deadline);
+        let result = self.capture_question_inner(pane, profile, questions, deadline);
         let index = match result {
             crate::question_notice::capture::CaptureClass::ActiveQuestion => 0,
             crate::question_notice::capture::CaptureClass::NormalComposer => 1,
             crate::question_notice::capture::CaptureClass::Ambiguous => 2,
+            crate::question_notice::capture::CaptureClass::MatchedQuestion => 3,
         };
         let mut metrics = self.metrics.lock().expect("capture metrics lock poisoned");
         metrics.probe_classes[index] = metrics.probe_classes[index].saturating_add(1);
@@ -624,6 +627,7 @@ impl CaptureCoordinatorHandle {
         &self,
         pane: PaneInstance,
         profile: crate::question_notice::profile::CodexProfile,
+        questions: crate::question_notice::text::QuestionEvidence,
         deadline: Instant,
     ) -> crate::question_notice::capture::CaptureClass {
         use crate::question_notice::capture::CaptureClass;
@@ -650,6 +654,7 @@ impl CaptureCoordinatorHandle {
             .try_send(AsyncQuestionProbe {
                 registration,
                 profile,
+                questions,
                 deadline,
                 reply,
             })
@@ -746,6 +751,7 @@ pub fn start_capture_coordinator(
                         &identity,
                         &request.registration.pane,
                         request.profile,
+                        &request.questions,
                     )
                 };
                 let _ = request.reply.try_send(result);
@@ -786,6 +792,7 @@ fn capture_question_viewport(
     identity: &ServerIdentity,
     pane: &PaneInstance,
     profile: crate::question_notice::profile::CodexProfile,
+    questions: &crate::question_notice::text::QuestionEvidence,
 ) -> crate::question_notice::capture::CaptureClass {
     use crate::question_notice::capture::{CaptureClass, GROUP_LIMIT, STDERR_LIMIT, STDOUT_LIMIT};
     let Ok(id) = generate_capture_delimiter() else {
@@ -823,7 +830,15 @@ fn capture_question_viewport(
     {
         return CaptureClass::Ambiguous;
     }
-    classify_question_output(&output.stdout, &start, &end, identity, pane, profile)
+    classify_question_output(
+        &output.stdout,
+        &start,
+        &end,
+        identity,
+        pane,
+        profile,
+        questions,
+    )
 }
 
 fn classify_question_output(
@@ -833,6 +848,7 @@ fn classify_question_output(
     identity: &ServerIdentity,
     pane: &PaneInstance,
     profile: crate::question_notice::profile::CodexProfile,
+    questions: &crate::question_notice::text::QuestionEvidence,
 ) -> crate::question_notice::capture::CaptureClass {
     use crate::question_notice::capture::CaptureClass;
     let Some((header, body)) = stdout.split_once('\n') else {
@@ -866,7 +882,7 @@ fn classify_question_output(
     else {
         return CaptureClass::Ambiguous;
     };
-    crate::question_notice::capture::classify(profile, &body[..=split], width, height)
+    crate::question_notice::capture::classify(profile, &body[..=split], width, height, questions)
 }
 
 /// tmux clients reject command sequences beyond roughly 1000 arguments

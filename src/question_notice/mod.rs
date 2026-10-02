@@ -15,6 +15,7 @@ pub mod journal;
 pub mod profile;
 pub mod resolver;
 mod storage;
+pub mod text;
 pub use storage::CommitResult;
 #[cfg(test)]
 mod tests;
@@ -25,6 +26,9 @@ pub const MAX_KEYS_PER_OWNER: usize = 4096;
 pub const MAX_KEYS: usize = 65536;
 pub const MAX_ANCESTORS: usize = 64;
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_TEXT_NOTICES: usize = 2048;
+const MAX_TEXT_NOTICES_PER_OWNER: usize = 512;
+const MAX_CAPTURE_FINGERPRINTS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +77,7 @@ pub enum QuestionNoticeInput {
         turn_id: String,
         tool_use_id: String,
         ancestors: Vec<AgentProcessIdentity>,
+        questions: text::QuestionEvidence,
     },
     Rejected {
         reason: NoticeReason,
@@ -137,6 +142,8 @@ pub struct QuestionNotices {
     dirty: bool,
     last_write_attempt: Option<Instant>,
     memory_only: BTreeSet<(String, String)>,
+    // Runtime only; absence after restart must never be treated as resolution.
+    question_text: BTreeMap<(String, u64), (String, text::QuestionEvidence)>,
     #[cfg(test)]
     storage_fault: Option<storage::FaultPoint>,
 }
@@ -149,6 +156,66 @@ fn digest(value: &impl Serialize) -> String {
 }
 
 impl QuestionNotices {
+    pub fn remember_questions(
+        &mut self,
+        owner: String,
+        order: u64,
+        session: &str,
+        questions: text::QuestionEvidence,
+    ) {
+        if !self
+            .owners
+            .get(&owner)
+            .is_some_and(|state| order > state.acknowledged_order && order == state.latest_order)
+            || !questions.valid()
+            || self.question_text.len() >= MAX_TEXT_NOTICES
+            || self
+                .question_text
+                .range((owner.clone(), 0)..=(owner.clone(), u64::MAX))
+                .count()
+                >= MAX_TEXT_NOTICES_PER_OWNER
+        {
+            return;
+        }
+        self.question_text.insert(
+            (owner, order),
+            (turn_order::identifier_digest(session), questions),
+        );
+    }
+
+    pub fn capture_questions(
+        &self,
+        owner: &str,
+        session: &str,
+        acknowledged: u64,
+        latest: u64,
+    ) -> text::QuestionEvidence {
+        use text::QuestionEvidence;
+        if latest.saturating_sub(acknowledged) > MAX_TEXT_NOTICES_PER_OWNER as u64 {
+            return QuestionEvidence::Unavailable;
+        }
+        let mut questions = BTreeSet::new();
+        for order in acknowledged.saturating_add(1)..=latest {
+            let Some((bound_session, QuestionEvidence::Fingerprints(contents))) =
+                self.question_text.get(&(owner.to_string(), order))
+            else {
+                return QuestionEvidence::Unavailable;
+            };
+            if bound_session != session {
+                return QuestionEvidence::Unavailable;
+            }
+            questions.extend(contents.iter().cloned());
+            if questions.len() > MAX_CAPTURE_FINGERPRINTS {
+                return QuestionEvidence::Unavailable;
+            }
+        }
+        if questions.is_empty() {
+            QuestionEvidence::Unavailable
+        } else {
+            QuestionEvidence::Fingerprints(questions.into_iter().collect())
+        }
+    }
+
     pub fn open(path: PathBuf, server_hash: String) -> Self {
         let mut store = Self {
             path: Some(path),
@@ -353,6 +420,8 @@ impl QuestionNotices {
             }
         }
         self.resolver.acknowledged(owner_ref, through_order);
+        self.question_text
+            .retain(|(owner, order), _| owner != owner_ref || *order > through_order);
         Ok(true)
     }
 
@@ -373,6 +442,8 @@ impl QuestionNotices {
         }
         self.memory_only
             .retain(|(owner, _)| self.owners.contains_key(owner));
+        self.question_text
+            .retain(|(owner, _), _| self.owners.contains_key(owner));
         self.bound
             .retain(|pane, process| owner_alive(pane, process));
         let removed = old_len != self.owners.len();

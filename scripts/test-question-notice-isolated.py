@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real vt hook/socket/API/sidebar path on an isolated tmux server.
 
-The fixture supplies the stock Codex 0.155.1 PostToolUse schema and a verifiable
+The fixture supplies the stock Codex PostToolUse schema and a verifiable
 ancestor process. This does not replace acceptance with the actual Codex CLI.
 """
 import json
@@ -28,11 +28,13 @@ repo = Path(__file__).resolve().parent.parent
 root = Path(tempfile.mkdtemp(prefix="vde-question-notice-"))
 socket = "vde-question-" + str(os.getpid())
 build = Path(os.environ.get("VDE_TMUX_TEST_BUILD_BIN", repo / "target/debug/vt"))
+fixture_version = os.environ.get("VDE_QUESTION_FIXTURE_VERSION", "0.159.3")
+assert fixture_version in {"0.155.1", "0.156.1", "0.159.3", "0.160.0"}, fixture_version
 for directory in ["bin", "config/vde/tmux", "state", "runtime", "home", "fixture"]:
     (root / directory).mkdir(parents=True, exist_ok=True, mode=0o700)
 shutil.copy2(build, root / "bin/vt")
 shutil.copy2(repo / "scripts/fixtures/codex-question-hooks.py", root / "bin/hooks.py")
-subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", str(repo / "scripts/fixtures/codex-question-owner.c"),
+subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", '-DVDE_QUESTION_FIXTURE_VERSION="' + fixture_version + '"', str(repo / "scripts/fixtures/codex-question-owner.c"),
                 "-o", str(root / "bin/codex")], check=True)
 vt = str(root / "bin/vt")
 daemon_socket = None
@@ -43,6 +45,10 @@ env = {**os.environ, "HOME": str(root / "home"), "ZDOTDIR": str(root / "home"),
        "VT_BIN": vt, "TERM": "xterm-256color", "PATH": str(root / "bin") + ":" + os.environ["PATH"]}
 env.pop("TMUX", None)
 env.pop("TMUX_PANE", None)
+reported = subprocess.run([str(root / "bin/codex"), "--version"], env={"PATH": env["PATH"]},
+                          text=True, capture_output=True, check=True)
+assert reported.stdout == "codex-cli " + fixture_version + "\n" and not reported.stderr, reported
+print("synthetic owner profile verified with cleared environment: " + fixture_version, flush=True)
 (root / "config/vde/tmux/config.yml").write_text("daemon:\n  poll_ms: 1000\nsidebar:\n  width: 60\n  task_summary:\n    enabled: false\nnotify:\n  enabled: false\n")
 
 
@@ -75,9 +81,9 @@ def diagnostics():
         stream.settimeout(3)
         stream.connect(daemon_socket)
         reader = stream.makefile("r")
-        stream.sendall(b'{"op":"hello","proto":27}\n')
+        stream.sendall(b'{"op":"hello","proto":28}\n')
         json.loads(reader.readline())
-        stream.sendall(b'{"op":"query_question_diagnostics","proto":27}\n')
+        stream.sendall(b'{"op":"query_question_diagnostics","proto":28}\n')
         return json.loads(reader.readline())
 
 
@@ -786,14 +792,49 @@ def auto_ack_cases():
             time.sleep(0.7)  # Queue registration produces no hook and cannot resolve anything.
             assert notice()["unacknowledged"]
     issue("veto-a", "veto-question")
+    reason = "matched_question" if fixture_version in {"0.159.3", "0.160.0"} else "active"
+    matched_before = diagnostics()["counters"]["retained_by"].get(reason, 0)
+    send("UserPromptSubmit", turn_id="matched-b", prompt="synthetic next ordinary request")
+    send("Stop", turn_id="matched-b")
+    wait(lambda: diagnostics()["counters"]["retained_by"].get(reason, 0) > matched_before,
+         "current question title and choices retaining veto")
+    assert notice()["unacknowledged"]
     send("UserPromptSubmit", turn_id="veto-b", prompt="synthetic next ordinary request", _ui="overlay")
     send("Stop", turn_id="veto-b")
     time.sleep(0.8)
     assert notice()["unacknowledged"], "unknown overlay acknowledged notice"
     ack(notice())
+    if fixture_version in {"0.159.3", "0.160.0"}:
+        for index, draft in enumerate(["", "A freeform draft"]):
+            turn = f"freeform-{index}"
+            send("UserPromptSubmit", turn_id=turn, prompt="synthetic freeform issuer")
+            send("PostToolUse", turn_id=turn, tool_name="request_user_input_async", tool_use_id=turn,
+                 tool_input={"questions": [{"title": "fixture-private-freeform"}]},
+                 tool_response='{"accepted":true}', _ui="question", _draft=draft,
+                 _footer="  Custom binding" if draft else "  enter submit   ctrl+] skip")
+            send("Stop", turn_id=turn)
+            before = diagnostics()["counters"]["retained_by"].get("matched_question", 0)
+            send("UserPromptSubmit", turn_id=turn + "-next", prompt="synthetic next ordinary request")
+            send("Stop", turn_id=turn + "-next")
+            wait(lambda: diagnostics()["counters"]["retained_by"].get("matched_question", 0) > before,
+                 "freeform placeholder/draft retaining veto")
+            assert notice()["unacknowledged"]
+            ack(notice())
+    send("UserPromptSubmit", turn_id="missing-a", prompt="synthetic missing question input")
+    send("PostToolUse", turn_id="missing-a", tool_name="request_user_input_async", tool_use_id="missing-question",
+         tool_response='{"accepted":true}', tool_input=None, _ui="normal")
+    send("Stop", turn_id="missing-a")
+    ambiguous_before = diagnostics()["counters"]["retained_by"].get("ambiguous", 0)
+    send("UserPromptSubmit", turn_id="missing-b", prompt="synthetic next ordinary request")
+    send("Stop", turn_id="missing-b")
+    wait(lambda: diagnostics()["counters"]["retained_by"].get("ambiguous", 0) > ambiguous_before,
+         "missing question text retaining veto")
+    assert notice()["unacknowledged"]
+    ack(notice())
     tmux("kill-pane", "-t", pane)
     pane, pane_ref = old_pane, old_ref
-    print("auto-ack: direct/accepted queue, answer framing, no-hook queue, and overlay veto passed")
+    detail = "current question text and freeform drafts" if fixture_version in {"0.159.3", "0.160.0"} else "generic active question markers"
+    print("auto-ack: direct/accepted queue, answer framing, no-hook queue, " + detail + ", missing text, and overlay veto passed")
 
 
 def excluded_mode_lifecycle():

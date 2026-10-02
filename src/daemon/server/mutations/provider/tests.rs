@@ -94,11 +94,25 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
         evaluation,
         crate::question_notice::resolver::evaluation_fence(&changed_lifecycle)
     );
+    let fingerprints = crate::question_notice::text::QuestionEvidence::from_tool_input(Some(
+        &serde_json::json!({"questions":[{"title":"Question from actual provider apply", "options":["Continue"]}]}),
+    ));
     let input = |tool: &str| QuestionNoticeInput::Issued {
         session_id: "session-one".into(),
         turn_id: "question-turn".into(),
         tool_use_id: tool.into(),
         ancestors: vec![process.clone()],
+        questions: if tool == "call-2" {
+            // Malformed optional evidence must not reject an owned notification.
+            crate::question_notice::text::QuestionEvidence::Fingerprints(vec![
+                crate::question_notice::text::QuestionFingerprint {
+                    title: "invalid-digest".into(),
+                    options: vec![],
+                },
+            ])
+        } else {
+            fingerprints.clone()
+        },
     };
     let (envelope, observation) = event("PostToolUse", "session-one");
     let response = apply_external_provider_notice_with_runner(
@@ -136,6 +150,100 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
         assert!(snapshot.attention.is_empty());
         snapshot.panes[0].question_notice.clone().unwrap()
     };
+    // Exercise the production apply -> cache -> tick -> queued Sample boundary.
+    {
+        use crate::question_notice::ingress::{InputClass, SessionSource, TranscriptLocator};
+        use crate::question_notice::profile::{
+            CodexProfile, ExecutableFingerprint, ProfileRequest,
+        };
+        use crate::question_notice::resolver::{Binding, JournalView, NoticeFence, session_key};
+        let owner = displayed.owner_ref.clone().unwrap();
+        let binding = Binding {
+            owner: owner.clone(),
+            pane: pane.clone(),
+            process: process.clone(),
+            executable: ProfileRequest {
+                process: process.clone(),
+                executable: ExecutableFingerprint {
+                    dev: 1,
+                    ino: 1,
+                    size: 1,
+                    mtime_sec: 0,
+                    mtime_nsec: 0,
+                    ctime_sec: 0,
+                    ctime_nsec: 0,
+                },
+            },
+            profile: CodexProfile::V01593,
+            locator: TranscriptLocator {
+                home: root.clone(),
+                transcript: root.join("sessions/test.jsonl"),
+                dev: 1,
+                ino: 1,
+            },
+        };
+        let journal = JournalView {
+            epoch: 0,
+            veto: false,
+            session_dirty: false,
+        };
+        let now = std::time::Instant::now() - std::time::Duration::from_millis(200);
+        {
+            let mut state = coordinator.state.lock().unwrap();
+            let state = state.as_mut().unwrap();
+            let current_fence = crate::question_notice::resolver::lifecycle_fence(
+                state.leased.runtime.record(&pane).unwrap(),
+            );
+            let resolver = &mut state.question_notices.resolver;
+            *resolver = Default::default();
+            resolver.session_start(
+                binding.locator.home_digest(),
+                session_key("session-one"),
+                SessionSource::Startup,
+                Some(binding.clone()),
+                journal,
+                true,
+            );
+            resolver.issue(
+                &binding,
+                &binding.locator.home_digest(),
+                &session_key("session-one"),
+                &session_key("issued-turn"),
+                1,
+                0,
+            );
+            let check = resolver
+                .ordinary(
+                    InputClass::OrdinaryPrompt,
+                    &binding,
+                    &session_key("session-one"),
+                    "accepted-input",
+                    &session_key("next-turn"),
+                    NoticeFence {
+                        acknowledged: 0,
+                        latest: 1,
+                    },
+                    journal,
+                    now,
+                )
+                .unwrap();
+            assert!(resolver.checked(&check, &check.issued_turns, now));
+            resolver.eligible(&owner, &session_key("next-turn"), true, false, now);
+            resolver.record_eligibility(&owner, current_fence);
+        }
+        let (handle, queued) = crate::daemon::workers::question::ProbeWorkerHandle::test_queue();
+        *coordinator.question_probes.lock().unwrap() = Some(handle);
+        super::super::question::tick(&coordinator);
+        let crate::daemon::workers::question::ProbeJob::Sample {
+            questions, fence, ..
+        } = queued.try_recv().unwrap()
+        else {
+            panic!("expected Sample job")
+        };
+        assert_eq!(questions, fingerprints);
+        assert_eq!(fence.binding.owner, owner);
+        assert_eq!(fence.session, session_key("session-one"));
+    }
     // /new changes agent epoch and removes the cached process; notification ownership survives.
     let (envelope, observation) = event("SessionStart", "session-two");
     apply_external_provider_event_with_runner(&coordinator, 3, envelope, observation, &runner);
@@ -217,6 +325,7 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
         turn_id: "question-turn".into(),
         tool_use_id: tool.into(),
         ancestors: vec![process.clone()],
+        questions: crate::question_notice::text::QuestionEvidence::Unavailable,
     };
     let response = apply_external_provider_notice_with_runner(
         &coordinator,

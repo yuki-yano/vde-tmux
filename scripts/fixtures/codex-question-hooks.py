@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stock 0.155.1 hook payload/ancestor fixture, not a Codex implementation."""
+"""Stock async-question hook payload/ancestor fixture, not a Codex implementation."""
 import json
 import os
 from pathlib import Path
@@ -15,12 +15,28 @@ transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": sess
 started_turns = set()
 completed_turns = set()
 ui = "normal"
+question = {"title": "fixture-private-question", "options": ["fixture-private-answer"]}
+draft = ""
+footer = "  enter submit   ctrl+] skip\r\n  shift+→ main prompt"
 
 
 def render():
     height = os.get_terminal_size().lines
-    body = "  ? 1 question" if ui == "question" else ("Action Required" if ui == "overlay" else "Synthetic fixture")
-    sys.stdout.write(f"\033[2J\033[H{body}\033[{height-3};1H› Ask Codex\033[{height-1};1H  ? for shortcuts")
+    if ui == "question":
+        # Source-defined 0.159.3 editor, including its generated Other choice.
+        choices = question.get("options") or []
+        other = draft or ("Other (write an answer)" if any(choice.lower() == "other" for choice in choices) else "Other")
+        body = "  " + question["title"] + "\r\n\r\n"
+        if choices:
+            body += "\r\n".join(f"  {'›' if index == 1 else ' '} {index}. {text}"
+                                  for index, text in enumerate([*choices, other], 1))
+        else:
+            body += "  " + (draft or "Type your answer")
+        body += "\r\n\r\n" + footer
+        sys.stdout.write(f"\033[2J\033[{height-10};1H{body}")
+    else:
+        body = "Action Required" if ui == "overlay" else "Synthetic fixture"
+        sys.stdout.write(f"\033[2J\033[H{body}\033[{height-3};1H› Ask Codex\033[{height-1};1H  ? for shortcuts")
     sys.stdout.flush()
 
 
@@ -30,9 +46,16 @@ def append(kind, turn):
 
 
 def hook(event, fields):
-    global ui
+    global ui, question, draft, footer
     fields = dict(fields)
     ui = fields.pop("_ui", ui)
+    draft = fields.pop("_draft", draft)
+    footer = fields.pop("_footer", footer)
+    if event == "PostToolUse" and fields.get("tool_name") == "request_user_input_async":
+        fields.setdefault("tool_input", {"questions": [question]})
+        supplied = (fields.get("tool_input") or {}).get("questions")
+        if supplied:
+            question = supplied[0]
     padding = fields.pop("_padding", 0)
     if padding:
         with transcript.open("a") as stream:

@@ -106,6 +106,87 @@ fn restart_retains_notice_and_dedup_but_does_not_transfer_process_ownership() {
 }
 
 #[test]
+fn question_fingerprints_are_owner_session_order_bound_and_never_persisted() {
+    use super::text::QuestionEvidence;
+    let temp = Temp::new();
+    let mut store = QuestionNotices::open(temp.path(), "server".into());
+    let questions = QuestionEvidence::from_tool_input(Some(
+        &serde_json::json!({"questions":[{"title":"private-title-canary", "options":["private-option-canary"]}]}),
+    ));
+    issue(&mut store, "one");
+    let owner = summary(&store).owner_ref.unwrap();
+    let session = turn_order::identifier_digest("session");
+    store.remember_questions(owner.clone(), 1, "session", questions.clone());
+    assert_eq!(store.capture_questions(&owner, &session, 0, 1), questions);
+    assert_eq!(
+        store.capture_questions(&owner, "wrong-session", 0, 1),
+        QuestionEvidence::Unavailable
+    );
+    assert_eq!(
+        store.capture_questions("wrong-owner", &session, 0, 1),
+        QuestionEvidence::Unavailable
+    );
+    issue(&mut store, "two");
+    assert_eq!(
+        store.capture_questions(&owner, &session, 0, 2),
+        QuestionEvidence::Unavailable
+    );
+    store.remember_questions(owner.clone(), 2, "session", questions.clone());
+    store.acknowledge(&pane(), &owner, 1).unwrap();
+    assert!(!store.question_text.contains_key(&(owner.clone(), 1)));
+    assert_eq!(store.capture_questions(&owner, &session, 1, 2), questions);
+    store.persist().unwrap();
+    let disk = std::fs::read_to_string(temp.path()).unwrap();
+    assert!(!disk.contains("private-title-canary"));
+    assert!(!disk.contains("private-option-canary"));
+    let text::QuestionEvidence::Fingerprints(hashes) = questions else {
+        unreachable!()
+    };
+    assert!(!disk.contains(&hashes[0].title));
+    let restarted = QuestionNotices::open(temp.path(), "server".into());
+    assert!(summary(&restarted).unacknowledged);
+    assert_eq!(
+        restarted.capture_questions(&owner, &session, 1, 2),
+        QuestionEvidence::Unavailable
+    );
+    store.reconcile(|_, _| false);
+    assert!(store.question_text.is_empty());
+}
+
+#[test]
+fn long_pending_prefix_deduplicates_fingerprints_without_losing_order_coverage() {
+    use super::text::QuestionEvidence;
+    let mut store = QuestionNotices::default();
+    let evidence = QuestionEvidence::from_tool_input(Some(&serde_json::json!({
+        "questions":[{"title":"Repeated pending question", "options":["Yes"]}]
+    })));
+    let session = turn_order::identifier_digest("session");
+    for order in 1..=512 {
+        issue(&mut store, &format!("pending-{order}"));
+        let owner = summary(&store).owner_ref.unwrap();
+        store.remember_questions(owner, order, "session", evidence.clone());
+    }
+    let owner = summary(&store).owner_ref.unwrap();
+    assert_eq!(store.capture_questions(&owner, &session, 0, 512), evidence);
+    store.question_text.remove(&(owner.clone(), 200));
+    assert_eq!(
+        store.capture_questions(&owner, &session, 0, 512),
+        QuestionEvidence::Unavailable
+    );
+    store.acknowledge(&pane(), &owner, 256).unwrap();
+    assert_eq!(
+        store.capture_questions(&owner, &session, 256, 512),
+        evidence
+    );
+    issue(&mut store, "pending-513");
+    store.remember_questions(owner.clone(), 513, "session", evidence.clone());
+    assert_eq!(
+        store.capture_questions(&owner, &session, 256, 513),
+        evidence
+    );
+}
+
+#[test]
 fn write_failure_displays_notice_retries_dirty_state_and_never_retries_failed_ack() {
     let temp = Temp::new();
     let mut store = QuestionNotices::open(temp.path(), "server".into());

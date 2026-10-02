@@ -4,9 +4,13 @@ Publishing is driven by Git tags.
 
 ## Local API v6 upgrade
 
-API 6 / daemon protocol 27 adds ephemeral Codex Working/Blocked/Unknown presentation and
+API 6 / daemon protocol 28 adds ephemeral Codex Working/Blocked/Unknown presentation and
 rejects lifecycle hooks whose process ancestry does not belong to the claimed embedded pane.
-The conservative automatic acknowledgement of Codex question notices remains unchanged.
+Protocol 28 carries bounded question fingerprints from hook parsing. They are kept only in daemon
+memory, bound to owner/session/notice order, and match title plus ordered choices in the current
+question editor as a retaining veto. Missing fingerprints retain notices. The issuing-turn,
+ordinary-input, two-capture and final-guard requirements for automatic acknowledgement remain.
+Codex 0.159.3 and 0.160.0 are additional exact rendering profiles; unknown versions remain conservative.
 `needs_action` now includes current Blocked panes and unacknowledged question notices; the
 statusline's existing Blocked triage remains separate. PaneState schema 10 and private state
 format 1 are unchanged. Keep existing state, Runs, and the question-notice sidecar (schema 1).
@@ -26,7 +30,7 @@ version bump or a release tag.
    capture failures, at most 20MiB RSS growth, and retained notices on probe drop. Reuse accepted
    evidence for unchanged product code; distinguish saved-data re-evaluation from a new run.
 2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
-   Confirm `vt api schema --json` reports API 6, protocol 27, PaneState 10, and private state 1.
+   Confirm `vt api schema --json` reports API 6, protocol 28, PaneState 10, and private state 1.
    Validate the staged binaries on a scratch server before replacing the installed generation:
    `VDE_VT_BIN=<temporary-root>/bin/vt python3 scripts/test-codex-observation-isolated.py`.
 3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.

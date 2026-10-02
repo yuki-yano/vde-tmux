@@ -12,6 +12,8 @@ use crate::pane_state::AgentProcessIdentity;
 pub enum CodexProfile {
     V01551,
     V01561,
+    V01593,
+    V01600,
     #[default]
     Unknown,
 }
@@ -24,6 +26,8 @@ impl CodexProfile {
         match stdout {
             b"codex-cli 0.155.1\n" => Self::V01551,
             b"codex-cli 0.156.1\n" => Self::V01561,
+            b"codex-cli 0.159.3\n" => Self::V01593,
+            b"codex-cli 0.160.0\n" => Self::V01600,
             _ => Self::Unknown,
         }
     }
@@ -678,8 +682,18 @@ pub(crate) mod tests {
             CodexProfile::from_version_output(b"codex-cli 0.156.1\n", b"", true),
             CodexProfile::V01561
         );
+        assert_eq!(
+            CodexProfile::from_version_output(b"codex-cli 0.159.3\n", b"", true),
+            CodexProfile::V01593
+        );
+        assert_eq!(
+            CodexProfile::from_version_output(b"codex-cli 0.160.0\n", b"", true),
+            CodexProfile::V01600
+        );
         for output in [
             b"codex-cli 0.157.0\n".as_slice(),
+            b"codex-cli 0.159.4\n",
+            b"codex-cli 0.160.1\n",
             b"shim codex-cli 0.156.1\n",
             b"codex-cli 0.156.1\nsecret",
         ] {

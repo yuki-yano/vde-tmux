@@ -342,6 +342,7 @@ pub enum ProbeJob {
         fence: Fence,
         probe_id: u64,
         deadline: Instant,
+        questions: crate::question_notice::text::QuestionEvidence,
     },
     Commit {
         fence: Fence,
@@ -379,6 +380,12 @@ pub struct ProbeWorkerHandle {
 impl ProbeWorkerHandle {
     pub fn submit(&self, job: ProbeJob) -> bool {
         self.sender.try_send(job).is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_queue() -> (Self, mpsc::Receiver<ProbeJob>) {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        (Self { sender }, receiver)
     }
 }
 
@@ -425,6 +432,7 @@ pub fn start_probe_workers(
                         fence,
                         probe_id,
                         deadline,
+                        questions,
                     } => {
                         let (sample, guard) = sample_with_guard(
                             &env,
@@ -436,6 +444,7 @@ pub fn start_probe_workers(
                                 capture.capture_question(
                                     fence.binding.pane.clone(),
                                     fence.binding.profile,
+                                    questions,
                                     deadline,
                                 )
                             },

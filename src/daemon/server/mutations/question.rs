@@ -867,6 +867,12 @@ pub(in crate::daemon::server) fn tick(coordinator: &ProductionV2Coordinator) {
                             fence: fence.clone(),
                             probe_id,
                             deadline,
+                            questions: state.question_notices.capture_questions(
+                                &fence.binding.owner,
+                                &fence.session,
+                                fence.acknowledged,
+                                fence.latest,
+                            ),
                         })
                     });
             if !submitted {
@@ -1070,7 +1076,9 @@ pub(in crate::daemon::server) fn probe_completed(
                 }
             } else if sample != Sample::NormalComposer {
                 state.question_notices.resolver.note_retained(
-                    if sample == Sample::ActiveQuestion {
+                    if sample == Sample::MatchedQuestion {
+                        RetainReason::MatchedQuestion
+                    } else if sample == Sample::ActiveQuestion {
                         RetainReason::Active
                     } else {
                         RetainReason::Ambiguous
@@ -1154,6 +1162,7 @@ pub(in crate::daemon::server) fn apply(
             turn_id,
             tool_use_id,
             ancestors,
+            questions,
         } = input
         else {
             let QuestionNoticeInput::Rejected { reason } = input else {
@@ -1207,7 +1216,12 @@ pub(in crate::daemon::server) fn apply(
         if !ancestors.contains(&process) {
             return Err(NoticeReason::AncestorNotInPane);
         }
-        Ok((process, session_id, turn_id, tool_use_id))
+        let questions = if questions.valid() {
+            questions
+        } else {
+            crate::question_notice::text::QuestionEvidence::Unavailable
+        };
+        Ok((process, session_id, turn_id, tool_use_id, questions))
     })();
     let mut guard = coordinator
         .state
@@ -1220,12 +1234,26 @@ pub(in crate::daemon::server) fn apply(
         .question_notices
         .summary(&envelope.pane_instance, None);
     let result = match verified {
-        Ok((process, session, turn, tool)) => state.question_notices.issue(
-            envelope.pane_instance.clone(),
-            process,
-            (&session, &turn, &tool),
-            super::super::epoch_seconds(),
-        ),
+        Ok((process, session, turn, tool, questions)) => {
+            let result = state.question_notices.issue(
+                envelope.pane_instance.clone(),
+                process.clone(),
+                (&session, &turn, &tool),
+                super::super::epoch_seconds(),
+            );
+            if result.disposition == crate::question_notice::NoticeDisposition::Applied {
+                let summary = state
+                    .question_notices
+                    .summary(&envelope.pane_instance, Some(&process));
+                state.question_notices.remember_questions(
+                    summary.owner_ref.expect("applied notice owner"),
+                    summary.latest_order,
+                    &session,
+                    questions,
+                );
+            }
+            result
+        }
         Err(reason) => state
             .question_notices
             .reject(&envelope.pane_instance, reason),
