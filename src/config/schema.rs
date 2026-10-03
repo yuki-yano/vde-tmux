@@ -7,6 +7,16 @@ pub fn config_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
+            "codex": {
+                "type": "object", "additionalProperties": false,
+                "properties": { "capacity_auto_resume": {
+                    "type": "object", "additionalProperties": false,
+                    "properties": {
+                        "enabled": { "type": "boolean", "default": false },
+                        "prompt": { "type": "string", "default": crate::codex_capacity::DEFAULT_PROMPT, "description": "Up to 65536 UTF-8 bytes; trailing LF removed; no surrounding whitespace, control characters, leading / or !, or trailing @/$ token." }
+                    }
+                }}
+            },
             "categories": {
                 "type": "object",
                 "additionalProperties": false,

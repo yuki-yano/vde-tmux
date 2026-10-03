@@ -491,6 +491,111 @@ impl AgentRuntime {
         })
     }
 
+    /// Record terminal provider failure without claiming semantic completion.
+    pub(crate) fn capacity_failure(
+        &mut self,
+        id: &StableRunId,
+        observed_at: i64,
+    ) -> Result<RunRecord, StoreError> {
+        let mut run = self.required_run(id)?;
+        if self
+            .current_run_for_binding(&run.binding)?
+            .as_ref()
+            .map(|r| &r.run_id)
+            != Some(id)
+            || run.semantic_outcome != SemanticOutcome::Unresolved
+            || run.execution_phase == ExecutionPhase::Ended
+        {
+            return Err(StoreError::Invalid(
+                "capacity failure is not the current unresolved run".into(),
+            ));
+        }
+        let turn = run
+            .provider_turn_key
+            .as_deref()
+            .ok_or_else(|| StoreError::Invalid("capacity turn is absent".into()))?;
+        let digest = Sha256Digest::of(
+            format!(
+                "{}:{turn}:task_complete_error",
+                run.binding.provider_session_id.as_str()
+            )
+            .as_bytes(),
+        );
+        let event_ref = format!("capacity:{}", digest.as_str());
+        let new_evidence = !run
+            .evidence
+            .provider_events
+            .iter()
+            .any(|e| e.event_ref == event_ref);
+        let changed = new_evidence || run.execution_phase != ExecutionPhase::Error;
+        if new_evidence {
+            run.evidence
+                .provider_events
+                .push(super::model::ProviderEventReference {
+                    event_ref,
+                    ingress_request_id: "terminal_failure".into(),
+                    payload_digest: digest,
+                    disposition: "provider_overloaded".into(),
+                    receipt: "terminal_failure".into(),
+                    count: 1,
+                    first_observed_at: observed_at,
+                    last_observed_at: observed_at,
+                });
+        }
+        if changed {
+            run.revision = run
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Invalid("run revision overflow".into()))?;
+            run.updated_at = run.updated_at.max(observed_at);
+        }
+        run.evidence.first_observed_at.get_or_insert(observed_at);
+        run.evidence.last_observed_at = Some(
+            run.evidence
+                .last_observed_at
+                .unwrap_or(observed_at)
+                .max(observed_at),
+        );
+        run.execution_phase = ExecutionPhase::Error;
+        self.store.save_run(&run)?;
+        self.index_run(&run)?;
+        Ok(run)
+    }
+
+    /// Late or ambiguous automatic input must never acknowledge a human Question.
+    pub(crate) fn capacity_input(
+        &self,
+        binding: &AgentBinding,
+        observation: &ProviderObservation,
+    ) -> Result<bool, StoreError> {
+        if observation.hook_kind != ProviderHookKind::UserPromptSubmit {
+            return Ok(false);
+        }
+        let matches = |o: &OperationRecord| {
+            o.dispatch_option == crate::codex_capacity::ORIGIN
+                && operation_binding_matches_agent(&o.binding, binding)
+                && observation.prompt_digest.as_deref() == Some(o.prompt_digest.as_str())
+        };
+        if let Some(run) = self.provider_event_run(observation)?
+            && let Some(id) = run.operation_id.as_ref()
+            && matches(&self.required_operation(id)?)
+        {
+            return Ok(true);
+        }
+        let Some(id) = self
+            .in_flight_by_binding
+            .get(&operation_target_key_for_agent(binding)?)
+        else {
+            return Ok(false);
+        };
+        let operation = self.required_operation(id)?;
+        Ok(matches(&operation)
+            && matches!(
+                operation.dispatch_state,
+                DispatchState::DispatchStarted | DispatchState::DeliveryUnknown
+            ))
+    }
+
     pub fn current_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
         self.current_by_binding
             .values()
@@ -1268,6 +1373,130 @@ mod tests {
         AgentKind, AgentProcessIdentity, AgentSessionId, CurrentDurableRunProjection, EventId,
         LifecycleState, PaneInstance, StateId, StateVersion,
     };
+
+    #[test]
+    fn capacity_failure_is_unresolved_idempotent_and_ended_by_next_prompt() {
+        let root = temp_root();
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+        let b = binding();
+        let run = runtime
+            .apply_provider_observation(
+                b.clone(),
+                1,
+                &observation(
+                    ProviderHookKind::UserPromptSubmit,
+                    "failed",
+                    Some(b"human"),
+                    None,
+                    10,
+                ),
+            )
+            .unwrap()
+            .run
+            .unwrap();
+        let failed = runtime.capacity_failure(&run.run_id, 11).unwrap();
+        assert_eq!(failed.execution_phase, ExecutionPhase::Error);
+        assert_eq!(failed.semantic_outcome, SemanticOutcome::Unresolved);
+        assert!(failed.resolution.is_none());
+        assert!(failed.artifact.is_none());
+        let repeated = runtime.capacity_failure(&run.run_id, 11).unwrap();
+        assert_eq!(failed, repeated);
+        let reference = runtime.run_ref(run.run_id.clone());
+        drop(runtime);
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+        assert_eq!(runtime.get_run(&reference).unwrap(), failed);
+        runtime
+            .apply_provider_observation(
+                b,
+                2,
+                &observation(
+                    ProviderHookKind::UserPromptSubmit,
+                    "next",
+                    Some(b"next human"),
+                    None,
+                    12,
+                ),
+            )
+            .unwrap();
+        let old = runtime.get_run(&reference).unwrap();
+        assert_eq!(old.execution_phase, ExecutionPhase::Ended);
+        assert_eq!(old.semantic_outcome, SemanticOutcome::Unresolved);
+        assert!(runtime.capacity_failure(&old.run_id, 13).is_err());
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn late_automatic_input_is_non_authoritative_and_unknown_fence_survives_restart() {
+        let root = temp_root();
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+        let b = binding();
+        let id = OperationId::generate().unwrap();
+        runtime
+            .prepare_operation(
+                id.clone(),
+                "vta1:automatic".into(),
+                b"auto",
+                prompt_digest(b"auto"),
+                crate::codex_capacity::ORIGIN.into(),
+                b.clone(),
+                pane_version(&b),
+                None,
+                1,
+                10,
+            )
+            .unwrap();
+        runtime.mark_dispatch_started(&id, 11).unwrap();
+        runtime
+            .settle_dispatch(&id, DispatchState::DeliveryUnknown, "unknown", 12)
+            .unwrap();
+        let automatic = observation(
+            ProviderHookKind::UserPromptSubmit,
+            "late",
+            Some(b"auto"),
+            None,
+            100,
+        );
+        assert!(runtime.capacity_input(&b, &automatic).unwrap());
+        assert!(
+            !runtime
+                .capacity_input(
+                    &b,
+                    &observation(
+                        ProviderHookKind::UserPromptSubmit,
+                        "human",
+                        Some(b"human"),
+                        None,
+                        100
+                    )
+                )
+                .unwrap()
+        );
+        drop(runtime);
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+        assert!(runtime.capacity_input(&b, &automatic).unwrap());
+        let mut changed = b.clone();
+        changed.agent_epoch += 1;
+        changed.provider_session_id = AgentSessionId::parse("other-session").unwrap();
+        assert!(
+            runtime
+                .prepare_operation(
+                    OperationId::generate().unwrap(),
+                    "vta1:new".into(),
+                    b"new",
+                    prompt_digest(b"new"),
+                    "paste_enter".into(),
+                    changed,
+                    pane_version(&b),
+                    None,
+                    1,
+                    101
+                )
+                .is_err()
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn binding() -> AgentBinding {
         AgentBinding {

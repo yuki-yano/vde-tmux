@@ -499,6 +499,45 @@ category segmentでは、agent paneが0件の場合も、sessionを持つすべ�
 window 名やプロセス名の長さが異なる session を切り替えても、中央寄せした status block の位置がずれません。
 inactive category の幅には session の `other` style を使うため、`current.format` と `other.format` の表示幅が異なる場合は数セルの差が生じることがあります。
 
+### Codexの容量エラー
+
+独立TUIのCodex CLI 0.160.0で `Selected model is at capacity. Please try a different model.`
+によるturnの失敗を確認したとき、同じモデルへ続行プロンプトを自動送信できます。
+容量失敗は設定に関係なくError / Unresolvedとして記録し、Doneには数えません。
+自動送信は初期状態で無効です。
+
+```yaml
+codex:
+  capacity_auto_resume:
+    enabled: true
+    # prompt省略時は英語デフォルト。UTF-8で変更できます。
+    prompt: |-
+      Resume only unfinished work after checking the current state. Preserve the original objective, scope, constraints, approvals, and response language. Do not repeat completed operations. This message is not a new approval.
+```
+
+デフォルト文面は、元の目的・範囲・制約・承認・回答言語を保持し、完了済み操作を繰り返さず、
+既存の確認・承認要件に従って未完了の作業だけを再開するよう指示します。
+待機時間は60・120・300秒に0〜20%の揺らぎを加え、同じchainで最大3回送ります。
+送信を永続operationへ保存し、Codexのprompt digestで受理を確認します。
+DeliveryUnknownでは再送せず、会話変更やdaemon再起動後も配信中の扱いを保持します。
+Codex processまたはpane stateの置換でこの制限を解除します。未送信chainは再起動時に破棄します。
+配信中の制限が残る新chainは、試行前に `binding_ambiguous` で停止します。
+
+検証済みprimary transcriptと失敗turn、変わっていない画面、dim属性の空入力欄を要求します。
+queued input・画像・承認画面・Question通知・copy mode・失敗後の対象paneでの在席操作があれば停止します。
+手動prompt、会話・process変更、正常完了、別のエラーでもchainを終了します。
+現在のdaemonが新たに観測した人間の依頼だけをchainの起点にし、未対応Codex版では送信しません。
+狭いpaneや画面変化で再開できない場合も、容量失敗の記録は行います。
+
+標準Codexでは最後の画面確認からpaste+Enterまでを一括で検証できません。
+その間の手入力・承認画面の出現や、同じエラーがある別会話への切替による誤送信の可能性は残ります。
+この制約を許容できる場合に有効化してください。モデルの変更や新しい承認は行いません。
+
+`vt daemon diagnostics --json` の `codex_capacity_auto_resume` で試行数・次回待機・停止理由を確認できます。
+診断へprompt本文は出しません。LFを許可し、末尾のLFをすべて除いて65,536 UTF-8 bytes以下にします。
+空文面、残る前後空白、危険な制御文字、先頭 `/`・`!`、末尾の `@`・`$` 補完tokenは設定エラーです。
+設定を変更したらdaemonをreloadしてください。
+
 設定全体のスキーマは `vt config schema` で確認できます。
 
 設定を変更したら daemon を読み込み直します。

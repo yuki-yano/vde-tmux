@@ -574,6 +574,23 @@ fn version_from_process(
     request: &ProfileRequest,
     deadline: std::time::Instant,
 ) -> Option<CodexProfile> {
+    let (stdout, stderr) = version_output_from_process(request, deadline)?;
+    Some(CodexProfile::from_version_output(&stdout, &stderr, true))
+}
+
+/// Capacity recovery has its own finite rendering contract, independent of Question profiles.
+pub(crate) fn capacity_version(request: &ProfileRequest) -> bool {
+    version_output_from_process(
+        request,
+        std::time::Instant::now() + std::time::Duration::from_millis(250),
+    )
+    .is_some_and(|(out, err)| out == b"codex-cli 0.160.0\n" && err.is_empty())
+}
+
+fn version_output_from_process(
+    request: &ProfileRequest,
+    deadline: std::time::Instant,
+) -> Option<(Vec<u8>, Vec<u8>)> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -626,7 +643,7 @@ fn version_from_process(
     if !stderr.is_empty() {
         return None;
     }
-    Some(CodexProfile::from_version_output(&stdout, &stderr, true))
+    Some((stdout, stderr))
 }
 
 fn read_version_pipe(mut reader: impl std::io::Read) -> Option<Vec<u8>> {

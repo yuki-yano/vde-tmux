@@ -116,6 +116,7 @@ pub fn run_runtime_daemon_server(
     start_tmux_server_liveness_monitor(coordinator.clone())?;
     start_v2_mutation_worker(coordinator.clone());
     start_agent_prompt_timeout_worker(coordinator.clone());
+    super::capacity::start(coordinator.clone());
     start_sidebar_completion_forwarder(coordinator.clone());
     start_task_summary_completion_forwarder(coordinator.clone());
     let capture = crate::daemon::workers::start_capture_coordinator(

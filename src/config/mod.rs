@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer, de};
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub codex: crate::codex_capacity::CodexConfig,
     pub categories: CategoriesConfig,
     pub statusline: StatuslineConfig,
     pub sidebar: SidebarConfig,

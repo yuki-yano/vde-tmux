@@ -96,6 +96,27 @@
       },
       "type": "object"
     },
+    "codex": {
+      "additionalProperties": false,
+      "properties": {
+        "capacity_auto_resume": {
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "default": false,
+              "type": "boolean"
+            },
+            "prompt": {
+              "default": "The previous request was interrupted by a model capacity error. Resume only the unfinished work after checking the current state and completed actions. Preserve the original objective, scope, constraints, approvals, and response language. Do not repeat completed operations. Follow the existing requirements for clarification and approval. This message is not a new approval.",
+              "description": "Up to 65536 UTF-8 bytes; trailing LF removed; no surrounding whitespace, control characters, leading / or !, or trailing @/$ token.",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
     "daemon": {
       "additionalProperties": true,
       "properties": {

@@ -310,6 +310,7 @@ fn observation_batch_keeps_sequence_order_with_following_mutations() {
     assert!(
         coordinator.enqueue_internal(V2InternalMutation::ObservationBatch(Box::new(
             ObservationBatchPayload {
+                capacity_failures: Vec::new(),
                 projection: Box::new(ObservationPollProjection {
                     observation_seq: 1,
                     topology: crate::daemon::topology::TopologySnapshot {

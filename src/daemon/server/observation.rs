@@ -127,6 +127,7 @@ pub(super) fn start_canonical_observation_worker(
                 &dispatch,
                 &processes,
                 &daemon_instance_id,
+                &super::capacity::waiting_panes(&coordinator),
                 epoch_seconds(),
             );
             match poll_result {
@@ -166,6 +167,7 @@ pub(super) fn start_canonical_observation_worker(
                         Box::new(ObservationBatchPayload {
                             projection: Box::new(projection),
                             observations: result.envelopes,
+                            capacity_failures: result.capacity_failures,
                             removals,
                             diagnostics,
                         }),

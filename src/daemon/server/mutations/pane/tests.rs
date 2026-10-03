@@ -247,6 +247,7 @@ fn observation_batch_applies_all_stages_and_publishes_one_snapshot_build() {
             accepted_seq: 1,
             mutation: V2AcceptedMutation::Internal(V2InternalMutation::ObservationBatch(Box::new(
                 ObservationBatchPayload {
+                    capacity_failures: Vec::new(),
                     projection: Box::new(ObservationPollProjection {
                         observation_seq: 1,
                         topology: crate::daemon::topology::TopologySnapshot {

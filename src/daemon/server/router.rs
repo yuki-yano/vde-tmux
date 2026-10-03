@@ -31,6 +31,7 @@ pub(super) enum V2AcceptedMutation {
 pub(super) enum V2InternalMutation {
     QuestionOrderCompleted(crate::daemon::workers::question::OrderCompletion),
     QuestionTick,
+    CapacityTick,
     QuestionProbeCompleted(crate::daemon::workers::question::ProbeCompletion),
     PaneEvent(Box<PaneEventEnvelope>),
     ObservationBatch(Box<ObservationBatchPayload>),
@@ -85,6 +86,7 @@ pub(super) struct ObservationPollProjection {
 /// after the whole batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ObservationBatchPayload {
+    pub(super) capacity_failures: Vec<crate::codex_capacity::CapacitySample>,
     pub(super) projection: Box<ObservationPollProjection>,
     pub(super) observations: Vec<PaneEventEnvelope>,
     pub(super) removals: Vec<PaneEventEnvelope>,

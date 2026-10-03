@@ -5,6 +5,7 @@ pub mod agent_state;
 pub mod api;
 pub mod category;
 pub mod cli;
+pub mod codex_capacity;
 pub mod config;
 pub mod daemon;
 pub mod detect;

@@ -1058,6 +1058,28 @@ pub(crate) fn config_schema() -> Result<Option<String>> {
     )?))
 }
 
+pub(super) fn diagnostics(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    compact: bool,
+) -> Result<Option<String>> {
+    use crate::daemon::protocol::v2::{ClientMessage, PROTOCOL_VERSION, ServerMessage, V2Client};
+    let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
+    let socket = crate::daemon::daemon_socket_path_for_incarnation(env, None, &incarnation.hash);
+    let mut client =
+        V2Client::connect_with_timeout(&socket, &incarnation.hash, Duration::from_secs(3))?;
+    match client.request(&ClientMessage::QueryQuestionDiagnostics {
+        proto: PROTOCOL_VERSION,
+    })? {
+        message @ ServerMessage::QuestionDiagnostics { .. } => Ok(Some(if compact {
+            serde_json::to_string(&message)?
+        } else {
+            serde_json::to_string_pretty(&message)?
+        })),
+        other => bail!("unexpected diagnostics response: {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod lifecycle_command_tests {
     use std::cell::RefCell;

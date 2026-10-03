@@ -31,6 +31,12 @@ pub fn parse_config_with_env(yaml: &str, env: &BTreeMap<String, String>) -> Load
     let deserializer = serde_yaml_ng::Deserializer::from_str(yaml);
     match serde_path_to_error::deserialize::<_, Config>(deserializer) {
         Ok(mut config) => {
+            config.codex.capacity_auto_resume.prompt = config
+                .codex
+                .capacity_auto_resume
+                .prompt
+                .trim_end_matches('\n')
+                .to_owned();
             match expand_config_patterns(&mut config, env).and_then(|()| validate_config(&config)) {
                 Ok(()) => LoadedConfig {
                     config,
@@ -50,6 +56,7 @@ pub fn parse_config_with_env(yaml: &str, env: &BTreeMap<String, String>) -> Load
 }
 
 fn validate_config(config: &Config) -> Result<(), String> {
+    crate::codex_capacity::validate_prompt(&config.codex.capacity_auto_resume.prompt)?;
     crate::category::configured_category_names(config)
         .map(|_| ())
         .map_err(|error| format!("categories: {error}"))?;
@@ -172,6 +179,77 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn capacity_config_is_opt_in_and_normalizes_only_trailing_lf() {
+        assert!(!parse_config("").config.codex.capacity_auto_resume.enabled);
+        let loaded = parse_config(
+            "codex:\n  capacity_auto_resume:\n    enabled: true\n    prompt: |\n      続行してください。\n\n",
+        );
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(
+            loaded.config.codex.capacity_auto_resume.prompt,
+            "続行してください。"
+        );
+        for prompt in [
+            "",
+            " x",
+            "x ",
+            "/model",
+            "!cmd",
+            "continue @file",
+            "continue $skill",
+        ] {
+            let yaml = format!(
+                "codex:\n  capacity_auto_resume:\n    enabled: true\n    prompt: {}\n",
+                serde_json::to_string(prompt).unwrap()
+            );
+            assert!(!parse_config(&yaml).warnings.is_empty(), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn strict_capacity_load_rejects_invalid_prompt_without_using_default() {
+        let root = std::env::temp_dir().join(format!(
+            "vde-capacity-config-{}",
+            crate::pane_state::EventId::generate().unwrap().as_str()
+        ));
+        let path = root.join("vde/tmux/config.yml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let env = env(&[("XDG_CONFIG_HOME", root.to_str().unwrap())]);
+        for prompt in [
+            "",
+            "/model",
+            "Continue @file",
+            " leading",
+            "trailing ",
+            "x\r",
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    "codex:\n  capacity_auto_resume:\n    enabled: true\n    prompt: {}\n",
+                    serde_json::to_string(prompt).unwrap()
+                ),
+            )
+            .unwrap();
+            assert!(
+                load_config_strict(&env)
+                    .unwrap_err()
+                    .contains("codex.capacity_auto_resume.prompt")
+            );
+        }
+        std::fs::write(&path,"codex:\n  capacity_auto_resume:\n    enabled: true\n    prompt: |+\n      続行してください。\n      条件を保持してください。\n\n\n").unwrap();
+        assert_eq!(
+            load_config_strict(&env)
+                .unwrap()
+                .codex
+                .capacity_auto_resume
+                .prompt,
+            "続行してください。\n条件を保持してください。"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

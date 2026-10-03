@@ -598,6 +598,48 @@ The category segment publishes every category that contains a session, including
 
 `statusline.sessions.fixed_width: true` pads the active category's session segment to the widest category and keeps the combined category/session/window area at the same width across sessions. Session content is left-aligned within that fixed area by default; set `fixed_width_alignment: center` to center it. This keeps a centered status block stable when switching between sessions whose window names or process names have different lengths. Widths for inactive categories use the `other` session style; if `current.format` and `other.format` have different visual widths, the fixed width may differ by a few cells.
 
+### Codex capacity errors
+
+Codex CLI 0.160.0 independent TUI sessions can resume automatically after the exact
+`Selected model is at capacity. Please try a different model.` terminal failure.
+Capacity failures are always recorded as Error / Unresolved; they never count as Done.
+Automatic sending is disabled by default. Enable it with:
+
+```yaml
+codex:
+  capacity_auto_resume:
+    enabled: true
+    # Omit prompt to use the English default, or set your own UTF-8 text.
+    prompt: |-
+      Resume only unfinished work after checking the current state. Preserve the original objective, scope, constraints, approvals, and response language. Do not repeat completed operations. This message is not a new approval.
+```
+
+The default also explicitly preserves existing clarification and approval requirements.
+It keeps the original response language. The same model is retried after 60, 120 and 300
+seconds, with 0–20% jitter, at most three times per uninterrupted chain. Each send uses
+a durable operation and requires matching provider prompt confirmation. DeliveryUnknown
+stops sending and remains in flight across session changes and daemon restart; a replaced
+Codex process or pane state releases that fence. Pending chains are discarded on restart.
+If a new chain meets that in-flight fence, it stops with `binding_ambiguous` before an attempt.
+
+Sending requires a verified primary transcript, exact failed turn, unchanged viewport,
+empty dim placeholder, no queued input, images, modal or Question notice, no copy mode,
+and no interactive client activity on the target pane since failure. Manual prompts,
+session/process changes, successful completion and other errors end the chain. Only new
+human prompts observed by the current daemon can start a chain. Unsupported versions stop
+sending. Narrow or changed screens can still record failure while stopping recovery.
+
+Stock Codex exposes no atomic input/thread identity contract: input or an approval can
+appear between the final capture and paste+Enter; switching to another conversation with
+the same error can also evade the screen guard. Enable this only when that residual risk
+is acceptable. The feature does not change models or grant new approval.
+
+Inspect `vt daemon diagnostics --json` under `codex_capacity_auto_resume` for attempts,
+next retry and stop reason. Prompt text is not included in diagnostics. Prompts accept LF
+and up to 65,536 UTF-8 bytes; all trailing LF are stripped. Empty text, remaining surrounding
+whitespace, unsafe controls, leading `/` or `!`, and a trailing `@`/`$` completion token
+reject daemon startup/reload. Reload the daemon after changing configuration.
+
 The full schema is available with `vt config schema`.
 
 Reload the daemon after changing the file:

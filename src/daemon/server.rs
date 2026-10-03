@@ -38,6 +38,7 @@ const CURRENT_VIEW_REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
 const PANE_SWITCH_REQUEST_SEPARATOR: &str = "__vde_pane_switch_request__";
 
 mod bootstrap;
+mod capacity;
 mod contracts;
 mod effects;
 mod framing;
@@ -165,6 +166,10 @@ enum StatusPushTrigger {
 }
 
 struct ProductionV2Coordinator {
+    event_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    dispatch_clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    capacity: Mutex<capacity::CapacityState>,
+    capacity_tick_pending: AtomicBool,
     question_profiles: Arc<crate::question_notice::profile::ProfileCache>,
     question_wake: std::sync::atomic::AtomicBool,
     question_tick_pending: std::sync::atomic::AtomicBool,
@@ -292,6 +297,10 @@ impl ProductionV2Coordinator {
             witness_observation_seq,
             current_view_refresh_generation: AtomicU64::new(0),
             current_view_refresh_running: AtomicBool::new(false),
+            event_clock: Arc::new(epoch_seconds),
+            dispatch_clock: Arc::new(Instant::now),
+            capacity: Mutex::default(),
+            capacity_tick_pending: AtomicBool::new(false),
             question_profiles: Arc::default(),
             question_wake: std::sync::atomic::AtomicBool::new(true),
             question_tick_pending: std::sync::atomic::AtomicBool::new(false),
@@ -501,6 +510,8 @@ impl ProductionV2Coordinator {
     }
 
     fn configure_health(&self, config: &crate::config::Config) {
+        self.capacity.lock().expect("capacity lock poisoned").config =
+            config.codex.capacity_auto_resume.clone();
         *self.config_hash.lock().expect("config hash lock poisoned") =
             crate::daemon::lifecycle::config_hash(config);
     }
@@ -788,6 +799,11 @@ impl ProductionV2Coordinator {
                     .as_ref()
                     .map(|capture| capture.diagnostics())
                     .unwrap_or_default();
+                counters["codex_capacity_auto_resume"] = self
+                    .capacity
+                    .lock()
+                    .expect("capacity lock poisoned")
+                    .diagnostics();
                 counters["unknown_mode_lookups"] = self.question_profiles.unknown_modes().into();
                 {
                     let queue = self.queue.lock().expect("v2 queue lock poisoned");
@@ -2168,6 +2184,9 @@ fn start_v2_mutation_worker(coordinator: Arc<ProductionV2Coordinator>) {
                     mutation
                         .as_ref()
                         .map(|mutation| match &mutation.sequenced.mutation {
+                            V2AcceptedMutation::Internal(V2InternalMutation::CapacityTick) => {
+                                "capacity_tick"
+                            }
                             V2AcceptedMutation::Internal(V2InternalMutation::QuestionTick) => {
                                 "question_tick"
                             }
@@ -2328,6 +2347,13 @@ fn apply_production_mutation(
         // by the common mutation worker after this handler returns.
         V2AcceptedMutation::Internal(V2InternalMutation::QuestionOrderCompleted(completion)) => {
             mutations::question::order_completed(coordinator, completion);
+            return mutations::question::internal_ack(coordinator, accepted_seq);
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::CapacityTick) => {
+            coordinator
+                .capacity_tick_pending
+                .store(false, Ordering::Release);
+            capacity::tick(coordinator);
             return mutations::question::internal_ack(coordinator, accepted_seq);
         }
         V2AcceptedMutation::Internal(V2InternalMutation::QuestionTick) => {

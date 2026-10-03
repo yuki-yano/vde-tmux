@@ -30,6 +30,25 @@ pub(crate) fn dispatch_prompt_guarded(
     prompt: &[u8],
     operation_id: &str,
 ) -> DispatchOutcome {
+    dispatch_prompt_inner(runner, incarnation, pane, prompt, operation_id, true)
+}
+pub(crate) fn dispatch_recovery_guarded(
+    runner: &dyn TmuxRunner,
+    incarnation: &TmuxServerIncarnation,
+    pane: &PaneInstance,
+    prompt: &[u8],
+    operation_id: &str,
+) -> DispatchOutcome {
+    dispatch_prompt_inner(runner, incarnation, pane, prompt, operation_id, false)
+}
+pub(crate) fn dispatch_prompt_inner(
+    runner: &dyn TmuxRunner,
+    incarnation: &TmuxServerIncarnation,
+    pane: &PaneInstance,
+    prompt: &[u8],
+    operation_id: &str,
+    cancel_mode: bool,
+) -> DispatchOutcome {
     let nonce = dispatch_nonce(incarnation, pane, operation_id);
     let expected_pane_command = match runner.run(&[
         "display-message",
@@ -50,8 +69,13 @@ pub(crate) fn dispatch_prompt_guarded(
             ));
         }
     };
-    let command =
-        build_guarded_prompt_command(incarnation, pane, expected_pane_command.trim(), &nonce);
+    let command = build_prompt_command(
+        incarnation,
+        pane,
+        expected_pane_command.trim(),
+        &nonce,
+        cancel_mode,
+    );
     let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
     let result = runner.run_with_input(&args, prompt);
     let _ = runner.run(&["delete-buffer", "-b", &command.buffer]);
@@ -137,11 +161,21 @@ fn dispatch_nonce(
     format!("{:x}", hasher.finalize())
 }
 
+#[cfg(test)]
 fn build_guarded_prompt_command(
     incarnation: &TmuxServerIncarnation,
     pane: &PaneInstance,
     expected_pane_command: &str,
     nonce: &str,
+) -> GuardedPromptCommand {
+    build_prompt_command(incarnation, pane, expected_pane_command, nonce, true)
+}
+fn build_prompt_command(
+    incarnation: &TmuxServerIncarnation,
+    pane: &PaneInstance,
+    expected_pane_command: &str,
+    nonce: &str,
+    cancel_mode: bool,
 ) -> GuardedPromptCommand {
     const SUCCESS_PREFIX: &str = "__vde_agent_prompt_submitted__";
     const SERVER_MISMATCH_PREFIX: &str = "__vde_agent_prompt_server_mismatch__";
@@ -199,7 +233,7 @@ fn build_guarded_prompt_command(
         "-F".to_string(),
         "-t".to_string(),
         pane.pane_id.clone(),
-        ready_after_mode_cancel_guard,
+        ready_after_mode_cancel_guard.clone(),
         submitted.clone(),
         crate::pane_state::store::tmux_command_string(&pane_mismatch_args),
     ]);
@@ -210,15 +244,23 @@ fn build_guarded_prompt_command(
         pane.pane_id.clone(),
         "#{>:#{pane_in_mode},0}".to_string(),
         submit_after_mode_cancel,
-        submitted,
+        submitted.clone(),
     ]);
     let pane_guard = crate::pane_state::store::tmux_command_string(&[
         "if-shell".to_string(),
         "-F".to_string(),
         "-t".to_string(),
         pane.pane_id.clone(),
-        exact_pane_guard,
-        submit_with_mode_cancel,
+        if cancel_mode {
+            exact_pane_guard
+        } else {
+            ready_after_mode_cancel_guard
+        },
+        if cancel_mode {
+            submit_with_mode_cancel
+        } else {
+            submitted
+        },
         crate::pane_state::store::tmux_command_string(&pane_mismatch_args),
     ]);
     let mut server_mismatch_args = delete_buffer();
@@ -276,6 +318,16 @@ mod tests {
             pane_id: "%4".to_string(),
             pane_pid: 789,
         }
+    }
+
+    #[test]
+    fn recovery_guard_never_cancels_copy_mode() {
+        let command =
+            build_prompt_command(&incarnation(), &pane(), "codex", &"a".repeat(64), false);
+        let text = command.args.join(" ");
+        assert!(!text.contains("copy-mode"));
+        assert!(text.contains("#{==:#{pane_in_mode},0}"));
+        assert!(text.contains("paste-buffer"));
     }
 
     #[test]

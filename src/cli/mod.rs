@@ -210,6 +210,11 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
+    /// Emit bounded runtime diagnostics as JSON (including capacity recovery).
+    Diagnostics {
+        #[arg(long)]
+        json: bool,
+    },
     /// Start if enabled; when disabled, succeed without changing state.
     Ensure,
     /// Explicitly start the daemon; disabled mode is an error.
@@ -908,6 +913,7 @@ where
                     Ok(result)
                 }
                 Some(DaemonCommand::Status) => daemon::status_daemon(runner, env, None),
+                Some(DaemonCommand::Diagnostics { json }) => daemon::diagnostics(runner, env, json),
                 None => daemon::run_daemon(
                     runner,
                     env,

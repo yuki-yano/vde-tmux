@@ -71,6 +71,7 @@ pub(in crate::daemon::server) fn apply_observation_batch(
     use crate::daemon::protocol::v2::{ErrorCode, ServerMessage};
 
     let ObservationBatchPayload {
+        capacity_failures,
         projection,
         observations,
         removals,
@@ -92,6 +93,7 @@ pub(in crate::daemon::server) fn apply_observation_batch(
             );
         }
     }
+    super::super::capacity::detect(coordinator, accepted_seq, &capacity_failures);
     for (pane_instance, message) in diagnostics {
         if let Err(error) = apply_diagnostic_projection(coordinator, pane_instance, message) {
             return production_store_error_response(coordinator, error, None);

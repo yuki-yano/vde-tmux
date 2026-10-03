@@ -54,6 +54,59 @@ pub(in crate::daemon::server) fn apply_start_agent_prompt_with_runner(
     dispatch_option: String,
     observed_at: i64,
 ) -> ServerMessage {
+    apply_prompt_inner(
+        coordinator,
+        runner,
+        event_id,
+        target_agent_ref,
+        operation_id,
+        prompt_base64,
+        prompt_digest,
+        dispatch_option,
+        observed_at,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::daemon::server) fn apply_capacity_prompt_at(
+    coordinator: &ProductionV2Coordinator,
+    runner: &dyn crate::tmux::TmuxRunner,
+    event_id: EventId,
+    target_agent_ref: String,
+    operation_id: crate::agent_state::OperationId,
+    prompt_base64: String,
+    prompt_digest: crate::agent_state::Sha256Digest,
+    recovery: &super::super::capacity::RecoveryCandidate,
+    epoch: i64,
+) -> ServerMessage {
+    apply_prompt_inner(
+        coordinator,
+        runner,
+        event_id,
+        target_agent_ref,
+        operation_id,
+        prompt_base64,
+        prompt_digest,
+        crate::codex_capacity::ORIGIN.into(),
+        epoch,
+        Some(recovery),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::daemon::server) fn apply_prompt_inner(
+    coordinator: &ProductionV2Coordinator,
+    runner: &dyn crate::tmux::TmuxRunner,
+    event_id: EventId,
+    target_agent_ref: String,
+    operation_id: crate::agent_state::OperationId,
+    prompt_base64: String,
+    prompt_digest: crate::agent_state::Sha256Digest,
+    dispatch_option: String,
+    observed_at: i64,
+    recovery: Option<&super::super::capacity::RecoveryCandidate>,
+) -> ServerMessage {
     use crate::agent_state::runtime::PrepareOperationResult;
     use crate::daemon::agent_dispatch::DispatchOutcome;
     use crate::daemon::protocol::v2::{ErrorCode, PROTOCOL_VERSION, ServerMessage};
@@ -76,14 +129,25 @@ pub(in crate::daemon::server) fn apply_start_agent_prompt_with_runner(
         }
     };
 
-    if observed_at < 0 || dispatch_option != "paste_enter" {
+    if observed_at < 0
+        || dispatch_option
+            != if recovery.is_some() {
+                crate::codex_capacity::ORIGIN
+            } else {
+                "paste_enter"
+            }
+    {
         return ServerMessage::error(
             ErrorCode::InvalidRequest,
-            "agent prompt requires a non-negative timestamp and dispatch_option=paste_enter",
+            "agent prompt requires a non-negative timestamp and the authorized dispatch option",
             Some(event_id),
         );
     }
-    let observed_at = epoch_seconds();
+    let observed_at = if recovery.is_some() {
+        observed_at
+    } else {
+        epoch_seconds()
+    };
     let prompt = match base64::engine::general_purpose::STANDARD.decode(&prompt_base64) {
         Ok(prompt)
             if !prompt.is_empty()
@@ -181,7 +245,11 @@ pub(in crate::daemon::server) fn apply_start_agent_prompt_with_runner(
     }
 
     let (binding, expected_run_seq, pane, expected_pane_version, expected_current_run) =
-        match resolve_agent_prompt_target(coordinator, runner, &target_agent_ref) {
+        match if recovery.is_some() {
+            resolve_prompt_target_inner(coordinator, runner, &target_agent_ref, recovery)
+        } else {
+            resolve_agent_prompt_target(coordinator, runner, &target_agent_ref)
+        } {
             Ok(value) => value,
             Err(message) => {
                 if let Some(rejection_code) =
@@ -292,7 +360,11 @@ pub(in crate::daemon::server) fn apply_start_agent_prompt_with_runner(
     if let Err(rejection) = verify_agent_prompt_process_and_owner(runner, &pane, &binding) {
         return reject_pre_dispatch(rejection.code, rejection.message);
     }
-    if let Err(message) = verify_agent_prompt_precondition(coordinator, runner, &operation) {
+    if let Err(message) = if recovery.is_some() {
+        verify_prompt_precondition_inner(coordinator, runner, &operation, recovery)
+    } else {
+        verify_agent_prompt_precondition(coordinator, runner, &operation)
+    } {
         return reject_pre_dispatch("pane_precondition_changed", message);
     }
     let staged = {
@@ -309,7 +381,12 @@ pub(in crate::daemon::server) fn apply_start_agent_prompt_with_runner(
             Err(error) => return agent_state_query_error_with_event(error, Some(event_id)),
         }
     };
-    let dispatch = crate::daemon::agent_dispatch::dispatch_prompt_guarded(
+    let dispatcher = if recovery.is_some() {
+        crate::daemon::agent_dispatch::dispatch_recovery_guarded
+    } else {
+        crate::daemon::agent_dispatch::dispatch_prompt_guarded
+    };
+    let dispatch = dispatcher(
         runner,
         &coordinator.incarnation,
         &pane,
@@ -494,6 +571,24 @@ pub(in crate::daemon::server) fn resolve_agent_prompt_target(
     ),
     String,
 > {
+    resolve_prompt_target_inner(coordinator, runner, target_agent_ref, None)
+}
+
+pub(in crate::daemon::server) fn resolve_prompt_target_inner(
+    coordinator: &ProductionV2Coordinator,
+    runner: &dyn crate::tmux::TmuxRunner,
+    target_agent_ref: &str,
+    recovery: Option<&super::super::capacity::RecoveryCandidate>,
+) -> std::result::Result<
+    (
+        crate::agent_state::OperationBinding,
+        u64,
+        crate::pane_state::PaneInstance,
+        crate::pane_state::StateVersion,
+        Option<crate::pane_state::CurrentDurableRunProjection>,
+    ),
+    String,
+> {
     use sha2::{Digest as _, Sha256};
 
     let parts = target_agent_ref.split(':').collect::<Vec<_>>();
@@ -560,10 +655,18 @@ pub(in crate::daemon::server) fn resolve_agent_prompt_target(
             record.agent.as_str()
         ));
     }
-    if !matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle) {
+    if !matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle)
+        && !recovery.is_some_and(|r| r.matches(&record))
+    {
         return Err("agent is busy or blocked".to_string());
     }
-    require_prompt_readiness(runner, &record, &tracker)?;
+    if let Some(recovery) = recovery {
+        if !recovery.matches(&record) || !tracker.hook_authoritative {
+            return Err("capacity recovery precondition changed".into());
+        }
+    } else {
+        require_prompt_readiness(runner, &record, &tracker)?;
+    }
     let provider_session_id = record.agent_session_id.clone();
     let expected_run_seq = record
         .run_seq
@@ -593,6 +696,15 @@ pub(in crate::daemon::server) fn verify_agent_prompt_precondition(
     runner: &dyn crate::tmux::TmuxRunner,
     operation: &crate::agent_state::OperationRecord,
 ) -> std::result::Result<(), String> {
+    verify_prompt_precondition_inner(coordinator, runner, operation, None)
+}
+
+pub(in crate::daemon::server) fn verify_prompt_precondition_inner(
+    coordinator: &ProductionV2Coordinator,
+    runner: &dyn crate::tmux::TmuxRunner,
+    operation: &crate::agent_state::OperationRecord,
+    recovery: Option<&super::super::capacity::RecoveryCandidate>,
+) -> std::result::Result<(), String> {
     let read_current = || {
         let state = coordinator
             .state
@@ -606,7 +718,11 @@ pub(in crate::daemon::server) fn verify_agent_prompt_precondition(
             .runtime
             .record(&operation.binding.pane_instance)
             .ok_or_else(|| "agent pane is no longer retained".to_string())?;
-        if !agent_prompt_precondition_matches(record, operation) {
+        if !if let Some(recovery) = recovery {
+            agent_prompt_identity_matches(record, operation) && recovery.matches(record)
+        } else {
+            agent_prompt_precondition_matches(record, operation)
+        } {
             return Err("pane revision, lifecycle, current run, session, or process changed before dispatch".to_string());
         }
         Ok((
@@ -618,7 +734,11 @@ pub(in crate::daemon::server) fn verify_agent_prompt_precondition(
         ))
     };
     let (record, tracker) = read_current()?;
-    require_prompt_readiness(runner, &record, &tracker)?;
+    if let Some(recovery) = recovery {
+        recovery.verify(coordinator, runner, &record)?;
+    } else {
+        require_prompt_readiness(runner, &record, &tracker)?;
+    }
     // Process/cursor inspection must not hold the canonical lock. Recheck the
     // CAS fence after it, so a concurrent hook cannot make this snapshot stale.
     read_current()?;
@@ -665,6 +785,13 @@ pub(in crate::daemon::server) fn agent_prompt_precondition_matches(
     record: &crate::pane_state::PaneState,
     operation: &crate::agent_state::OperationRecord,
 ) -> bool {
+    agent_prompt_identity_matches(record, operation)
+        && matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle)
+}
+fn agent_prompt_identity_matches(
+    record: &crate::pane_state::PaneState,
+    operation: &crate::agent_state::OperationRecord,
+) -> bool {
     record.agent_present
         && record.version() == operation.expected_pane_version
         && record.current_run == operation.expected_current_run
@@ -672,7 +799,6 @@ pub(in crate::daemon::server) fn agent_prompt_precondition_matches(
         && record.agent_session_id == operation.binding.provider_session_id
         && record.agent_process.as_ref() == Some(&operation.binding.process)
         && record.run_seq.checked_add(1) == Some(operation.expected_run_seq)
-        && matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle)
 }
 
 #[allow(clippy::too_many_arguments)]

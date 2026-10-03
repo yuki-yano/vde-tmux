@@ -186,6 +186,7 @@ pub fn observation_envelope(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationPollResult {
+    pub capacity_failures: Vec<crate::codex_capacity::CapacitySample>,
     pub envelopes: Vec<PaneEventEnvelope>,
     pub diagnostics: Vec<String>,
 }
@@ -218,6 +219,7 @@ pub fn run_observation_poll(
     dispatch: &[ObservationDispatchSnapshot],
     processes: &AgentProcessSnapshot,
     daemon_instance_id: &DaemonInstanceId,
+    capacity_waiting: &BTreeSet<PaneInstance>,
     observed_at: i64,
 ) -> std::result::Result<ObservationPollResult, ObservationPollError> {
     let mut diagnostics = Vec::new();
@@ -249,9 +251,14 @@ pub fn run_observation_poll(
         .iter()
         .enumerate()
         .map(|(index, presence)| {
-            presence
-                .as_ref()
-                .and_then(|presence| capture_mode(&dispatch[index], presence, observed_at))
+            presence.as_ref().and_then(|presence| {
+                capture_mode(
+                    &dispatch[index],
+                    presence,
+                    observed_at,
+                    capacity_waiting.contains(&dispatch[index].pane_instance),
+                )
+            })
         })
         .collect::<Vec<_>>();
     let capture_indices = capture_modes
@@ -289,10 +296,25 @@ pub fn run_observation_poll(
         }
     }
     let mut envelopes = Vec::new();
+    let mut capacity_failures = Vec::new();
     for (index, (snapshot, presence)) in dispatch.iter().zip(observations).enumerate() {
         let Some(presence) = presence else {
             continue;
         };
+        if snapshot
+            .state
+            .as_ref()
+            .is_some_and(|s| s.agent.as_str() == "codex")
+            && let Some(screen) = tails_by_index[index].as_ref()
+        {
+            let plain = screen.viewport();
+            capacity_failures.push(crate::codex_capacity::CapacitySample {
+                pane: snapshot.pane_instance.clone(),
+                failure_hint: crate::codex_capacity::failure_hint(plain),
+                working: crate::detect::codex::classify(plain).working,
+                frame: crate::codex_capacity::frame(plain).map(|(_, digest)| digest),
+            });
+        }
         let capture = tails_by_index[index].as_ref().map(|screen| {
             match capture_modes[index].expect("a captured tail has an inference mode") {
                 CaptureMode::FullInference => infer_capture(
@@ -344,6 +366,7 @@ pub fn run_observation_poll(
         );
     }
     Ok(ObservationPollResult {
+        capacity_failures,
         envelopes,
         diagnostics,
     })
@@ -360,6 +383,7 @@ fn capture_mode(
     snapshot: &ObservationDispatchSnapshot,
     presence: &AgentPresenceObservation,
     observed_at: i64,
+    capacity_waiting: bool,
 ) -> Option<CaptureMode> {
     if snapshot.tracker.interruption_verification_pending
         && !matches!(presence, AgentPresenceObservation::Unknown)
@@ -404,7 +428,9 @@ fn capture_mode(
         return Some(CaptureMode::UsageLimitOnly);
     }
     (matches!(presence, AgentPresenceObservation::Present(agent) if agent == &state.agent)
-        && matches!(state.lifecycle, LifecycleState::Running)
+        && (matches!(state.lifecycle, LifecycleState::Running)
+            || (capacity_waiting && state.agent.as_str() == "codex" && matches!(&state.lifecycle,
+                LifecycleState::Error { reason } if reason.as_deref() == Some(crate::codex_capacity::REASON))))
         && snapshot
             .tracker
             .last_semantic_scan_at
@@ -673,15 +699,43 @@ mod tests {
             state: Some(state),
         };
 
-        assert_eq!(capture_mode(&dispatch, &present, 104), None);
+        assert_eq!(capture_mode(&dispatch, &present, 104, false), None);
         assert_eq!(
-            capture_mode(&dispatch, &present, 105),
+            capture_mode(&dispatch, &present, 105, false),
             Some(CaptureMode::ActiveTerminalSignals)
         );
         assert_eq!(
-            capture_mode(&dispatch, &AgentPresenceObservation::Absent, 101),
+            capture_mode(&dispatch, &AgentPresenceObservation::Absent, 101, false),
             Some(CaptureMode::UsageLimitOnly)
         );
+    }
+
+    #[test]
+    fn capacity_error_capture_requires_a_waiting_chain() {
+        let mut state = canonical_state("codex");
+        state.lifecycle = LifecycleState::Error {
+            reason: Some(crate::codex_capacity::REASON.into()),
+        };
+        let present = AgentPresenceObservation::Present(state.agent.clone());
+        let dispatch = ObservationDispatchSnapshot {
+            pane_instance: state.pane_instance.clone(),
+            base: Some(StoredStateDescriptor::Canonical {
+                version: state.version(),
+            }),
+            tracker: CaptureTrackerSnapshot {
+                epoch: Some((state.state_id.clone(), state.agent_epoch)),
+                hook_authoritative: true,
+                last_semantic_scan_at: Some(100),
+                ..Default::default()
+            },
+            state: Some(state),
+        };
+        assert_eq!(capture_mode(&dispatch, &present, 105, false), None);
+        assert_eq!(
+            capture_mode(&dispatch, &present, 105, true),
+            Some(CaptureMode::ActiveTerminalSignals)
+        );
+        assert_eq!(capture_mode(&dispatch, &present, 104, true), None);
     }
 
     #[test]
@@ -707,15 +761,15 @@ mod tests {
         };
 
         assert_eq!(
-            capture_mode(&dispatch, &present, 101),
+            capture_mode(&dispatch, &present, 101, false),
             Some(CaptureMode::ActiveTerminalSignals)
         );
         assert_eq!(
-            capture_mode(&dispatch, &AgentPresenceObservation::Absent, 101),
+            capture_mode(&dispatch, &AgentPresenceObservation::Absent, 101, false),
             Some(CaptureMode::ActiveTerminalSignals)
         );
         assert_eq!(
-            capture_mode(&dispatch, &AgentPresenceObservation::Unknown, 101),
+            capture_mode(&dispatch, &AgentPresenceObservation::Unknown, 101, false),
             None
         );
     }
@@ -748,6 +802,7 @@ mod tests {
             &dispatch,
             &processes,
             &DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            &BTreeSet::new(),
             200,
         )
         .unwrap();
@@ -826,6 +881,7 @@ mod tests {
             &dispatch,
             &processes,
             &DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            &BTreeSet::new(),
             200,
         )
         .unwrap();
@@ -877,6 +933,7 @@ mod tests {
             &dispatch,
             &processes,
             &DaemonInstanceId::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+            &BTreeSet::new(),
             200,
         )
         .unwrap();

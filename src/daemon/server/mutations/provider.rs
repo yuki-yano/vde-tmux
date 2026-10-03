@@ -100,7 +100,10 @@ pub(in crate::daemon::server) fn apply_external_provider_notice_with_runner(
         process: Default::default(),
     };
     let runner = &shared_runner;
-    let resolver_observation =
+    let automatic = super::super::capacity::auto_input(coordinator, &envelope, &observation);
+    let capacity_envelope = envelope.clone();
+    let capacity_observation = observation.clone();
+    let mut resolver_observation =
         super::question::ResolverObservation::from_provider(&envelope, &observation);
     let notice = question_notice
         .filter(|_| {
@@ -121,6 +124,25 @@ pub(in crate::daemon::server) fn apply_external_provider_notice_with_runner(
         &lifecycle,
         ServerMessage::PaneEventResult { .. } | ServerMessage::SnapshotAck { .. }
     );
+    // SessionStart clears process identity until the submit's fresh process scan.
+    // Recheck after apply so adjacent-epoch confirmation also excludes automatic input.
+    let automatic = automatic
+        || super::super::capacity::auto_input(
+            coordinator,
+            &capacity_envelope,
+            &capacity_observation,
+        );
+    if automatic && let Some(input) = resolver_observation.metadata.as_mut() {
+        input.input_class = crate::question_notice::ingress::InputClass::NonAuthoritativeInput;
+    }
+    if accepted {
+        super::super::capacity::observe(
+            coordinator,
+            &capacity_envelope,
+            &capacity_observation,
+            automatic,
+        );
+    }
     super::question::observe(
         coordinator,
         resolver_observation,
@@ -172,7 +194,7 @@ pub(in crate::daemon::server) fn apply_external_provider_event_with_runner(
         );
     }
 
-    let received_at = epoch_seconds();
+    let received_at = (coordinator.event_clock)();
     observation.observed_at = received_at;
     normalize_provider_pane_event(&mut envelope.event, received_at);
 
@@ -307,20 +329,27 @@ pub(in crate::daemon::server) fn apply_external_provider_event_with_runner(
     // Provider adapters already reduce human-entered prompts and responses to
     // bounded, single-line UI previews. Keep those previews for the sidebar,
     // but never serialize dispatched prompts with the public PaneState previews.
-    let private_prompt = apply_result.run.as_ref().is_some_and(|run| {
-        run.operation_id.is_some()
-            && (observation.hook_kind != ProviderHookKind::UserPromptSubmit
-                || apply_result.operation.as_ref().is_none_or(|operation| {
-                    observation.prompt_digest.as_deref() == Some(operation.prompt_digest.as_str())
-                }))
-    });
+    let automatic = apply_result
+        .operation
+        .as_ref()
+        .is_some_and(|o| o.dispatch_option == crate::codex_capacity::ORIGIN)
+        || super::super::capacity::auto_input(coordinator, &envelope, &observation);
+    let private_prompt = automatic
+        || apply_result.run.as_ref().is_some_and(|run| {
+            run.operation_id.is_some()
+                && (observation.hook_kind != ProviderHookKind::UserPromptSubmit
+                    || apply_result.operation.as_ref().is_none_or(|operation| {
+                        observation.prompt_digest.as_deref()
+                            == Some(operation.prompt_digest.as_str())
+                    }))
+        });
     // Pass private summary evidence separately so neither the persisted record
     // nor the public event projection can contain the dispatch body.
     let private_task_prompt = match &envelope.event {
         PaneEvent::BeginRun {
             prompt: Some(prompt),
             ..
-        } if private_prompt => Some(prompt.text.clone()),
+        } if private_prompt && !automatic => Some(prompt.text.clone()),
         _ => None,
     };
     redact_private_provider_prompt(&mut envelope.event, private_prompt);
