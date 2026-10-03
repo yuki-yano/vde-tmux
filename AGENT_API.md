@@ -1,6 +1,6 @@
 # Agent JSON API
 
-This document defines the current API v6 contract (daemon protocol 28, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
+This document defines the current API v6 contract (daemon protocol 29, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
 maintained in [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is
 recorded in [AGENT_API_V3.md](AGENT_API_V3.md).
 
@@ -76,6 +76,72 @@ inputs owned by the caller, not transport or delivery state. `--state-file` is d
 is the caller-chosen intent handle, while vt exclusively owns its opaque contents and update order.
 After dispatch, use the returned Operation, Run, or terminal-send receipt instead of prompt-file
 metadata as the acceptance signal.
+
+### Delayed prompt confirmation and manual fence release
+
+A durable Operation becomes `delivery_unknown` after its 10-second confirmation deadline. That
+deadline reports uncertainty; matching evidence remains valid afterward. The first
+`UserPromptSubmit` with the expected Binding, run sequence, and prompt digest links the Run and
+confirms the Operation even after a long queue or compaction delay. Its Response Artifact carries
+the same `operation_id`. Late confirmation uses `confirmation_basis=binding_sequence_digest`;
+`source_attribution=non_exclusive` still applies because hooks do not identify the sending Operation.
+
+```bash
+vt agent operation wait "$OPERATION_REF" --follow-unknown --timeout-ms 300000 --json
+```
+
+The caller's wait deadline does not cancel delivery or prevent later confirmation. Inspect the same
+Operation again after a timeout. Do not resend while delivery is ambiguous. Idle, an unrelated Run,
+or its completion alone cannot prove that a queued prompt will never run, so they do not release
+the fence automatically.
+
+If inspection cannot establish a matching Run, an operator can explicitly release the dispatch
+fence. Inspect the provider's pending input and confirm its queue is empty before sending new work.
+Read the current Operation revision and document the inspection reason:
+
+```bash
+vt agent operation get "$OPERATION_REF" --json > operation.json
+REVISION="$(jq -r '.result.operation.revision' operation.json)"
+vt agent operation abandon "$OPERATION_REF" --expected-revision "$REVISION" \
+  --reason 'Inspected the completed Run and queued input' --json
+```
+
+`abandon` accepts only an unlinked `delivery_unknown` Operation. It checks the exact reference,
+generation, and revision, persists `result_receipt.code=operator_abandoned` with
+`source_attribution=operator:REASON`, and releases only that Operation's fence. Reasons must contain
+1–247 UTF-8 bytes, must not be blank, and must contain no control characters. Repeating the original
+revision and reason returns the same record; changed revisions or reasons are rejected.
+If a Run was already saved with that `operation_id` but confirmation failed before updating the
+Operation, abandonment is rejected. Retry the provider observation or restart the daemon to finish
+that confirmation; the persisted Run link is authoritative.
+
+Delivery remains `delivery_unknown`: abandonment neither confirms acceptance nor cancels queued
+input. It permits a new dispatch but can lead to duplicate work if the old prompt is still queued.
+If the old queued prompt A and new Operation B have identical digests, A's Run can confirm B:
+the hook cannot distinguish the sender, and B's own execution may remain unlinked. If their digests
+differ, A can consume B's expected run sequence; B's later Run then remains unlinked and B may also
+require manual abandonment. An idle display alone does not establish that the provider queue is empty.
+The abandoned Operation is never redispatched or automatically linked to a later Run, and its fence
+stays released after daemon restart. `operation wait --follow-unknown` ends on abandonment with a
+`delivery_unknown` error, `side_effect=possible`, and the `operator_abandoned` receipt.
+
+Retained dispatched Operations provide digest/Binding evidence for prompt redaction and automatic
+input classification even after abandonment or an interleaved Run. This evidence never links an
+abandoned Operation or releases a newer fence. It contains no prompt body and is rebuilt on restart.
+Because hooks do not identify input provenance, a later identical prompt from the same owner is
+conservatively kept private; matching automatic-resume text remains non-authoritative for Question
+acknowledgement and does not replace the task context. This classification lasts while the Operation
+is retained and its Binding matches; process/pane replacement is excluded.
+Operations have no automatic garbage collection; they persist until an explicit storage reset
+and are bounded by the 65,536-record limit. Classification is therefore effective for the matching
+owner's lifetime. If automatic-resume text is configured to a short phrase such as `continue`, a
+human later typing the same phrase also receives this conservative classification: it cannot
+acknowledge a Question, replace the task context, or appear in the public prompt preview.
+
+Already stored unlinked Runs from the old implementation do not retain prompt digests, so they
+cannot be matched retrospectively. Inspect them and abandon the stale Operation if appropriate.
+This addition retains API 6 and the private record format; CLI, daemon, and sidebars must use
+daemon protocol 29 together.
 
 API commands always emit JSON. `--json` is accepted so callers can state the expected format. A
 successful command writes one envelope to stdout. A failed command writes one error envelope to
@@ -342,8 +408,9 @@ the real session and confirm the Operation; an unbound session is never stored i
 Codex may also emit `SessionStart` for a fresh provider session in the same TUI process as the
 dispatched prompt arrives. That event advances the canonical Agent epoch and resets its run sequence.
 The immediately following epoch's first `UserPromptSubmit` may still confirm the Operation only when
-the server, pane instance, pane state, agent kind, process identity, prompt digest, and confirmation
-window all match. Confirmation records the new provider session and epoch. A process replacement,
+the server, pane instance, pane state, agent kind, process identity, prompt digest, and observation
+time lower bound all match. The 10-second uncertainty deadline does not limit this adjacent-epoch
+confirmation either. Confirmation records the new provider session and epoch. A process replacement,
 skipped epoch, later run in the new epoch, or prompt mismatch never crosses this fence.
 
 The same `operation_id`, target, and prompt bytes are idempotent. A retry of an unexpired
@@ -365,7 +432,8 @@ vt agent run wait "$RUN_REF" --until completed --json
 vt agent run response "$RUN_REF" --json
 ```
 
-`delivery_unknown` is a typed ambiguous result. Do not call `agent prompt` with a new operation ID.
+`delivery_unknown` is a typed ambiguous result. Do not call `agent prompt` with a new operation ID
+until delivery is confirmed or an operator follows the [manual fence release](#delayed-prompt-confirmation-and-manual-fence-release) procedure.
 Use `agent operation get`; pass `--follow-unknown` only when waiting for a possible late matching
 provider hook. `agent prompt` and `agent operation wait` return non-zero typed error envelopes with
 the durable Operation receipt for `delivery_unknown` and `rejected`; `agent operation get` remains
@@ -549,7 +617,7 @@ Acknowledgement commits at atomic rename. A pre-rename failure retains the notic
 directory-fsync failure is a logical acknowledgement with `question_ack_directory_fsync_failed`,
 without rollback or automatic rewrite. The private `.expected` marker distinguishes initial absence
 from loss of a previously committed sidecar. Resolver state, transcript cursors, and ingress dedup
-remain memory-only; the shared private home journal stores only digests and writer identities. API 6 / protocol 28 must be installed together;
+remain memory-only; the shared private home journal stores only digests and writer identities. API 6 / protocol 29 must be installed together;
 there is no old-protocol fallback.
 Question text matching is restricted to the exact 0.159.3/0.160.0 profiles. The older 0.155.1/0.156.1
 profiles retain their generic marker and normal-composer guards; their stock hook schema uses the
@@ -614,7 +682,7 @@ includes more work than the daemon-ingress bound; it excludes Codex's pre-hook d
 
 ### 運用反映条件
 
-- [ ] CLI/daemon/sidebar are deployed together with API 6 / protocol 28 while retaining existing Pane State schema 10.
+- [ ] CLI/daemon/sidebar are deployed together with API 6 / protocol 29 while retaining existing Pane State schema 10.
 - [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.
 
 
@@ -683,5 +751,5 @@ continues to reject hooks. Start Codex with `--no-daemon` to select the embedded
 Pane State schema 10 and Question sidecar schema 1 are unchanged. Question remains a durable
 unacknowledged issuance notice. Capture is veto-only; answers alone, unknown evidence, and
 notifications predating daemon restart do not acquire new automatic acknowledgement rules.
-CLI, daemon, and sidebars must be replaced together for protocol 28; there is no mixed-version
+CLI, daemon, and sidebars must be replaced together for protocol 29; there is no mixed-version
 fallback. Hook authority is not inferred to have expired merely because events stop arriving.

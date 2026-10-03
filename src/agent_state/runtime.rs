@@ -23,6 +23,31 @@ pub struct ProviderApplyResult {
     pub run: Option<RunRecord>,
     pub operation: Option<OperationRecord>,
     pub disposition: ApplyDisposition,
+    pub dispatched_prompt: bool,
+}
+
+struct DispatchInputEvidence {
+    binding: OperationBinding,
+    digest: Sha256Digest,
+    automatic: bool,
+    created_at: i64,
+}
+
+impl DispatchInputEvidence {
+    fn from_operation(operation: &OperationRecord) -> Option<Self> {
+        matches!(
+            operation.dispatch_state,
+            DispatchState::DispatchStarted
+                | DispatchState::DeliveryUnknown
+                | DispatchState::PromptConfirmed
+        )
+        .then(|| Self {
+            binding: operation.binding.clone(),
+            digest: operation.prompt_digest.clone(),
+            automatic: operation.dispatch_option == crate::codex_capacity::ORIGIN,
+            created_at: operation.created_at,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +64,9 @@ pub struct AgentRuntime {
     turn_index: BTreeMap<String, StableRunId>,
     event_index: BTreeMap<String, StableRunId>,
     in_flight_by_binding: BTreeMap<String, OperationId>,
+    // Classification/redaction evidence is independent of attribution and the
+    // dispatch fence. An abandoned or interleaved queued input is still private.
+    dispatch_inputs_by_binding: BTreeMap<String, BTreeMap<OperationId, DispatchInputEvidence>>,
 }
 
 impl AgentRuntime {
@@ -52,6 +80,7 @@ impl AgentRuntime {
             turn_index: BTreeMap::new(),
             event_index: BTreeMap::new(),
             in_flight_by_binding: BTreeMap::new(),
+            dispatch_inputs_by_binding: BTreeMap::new(),
         };
         runtime.rebuild_indexes()?;
         runtime.reconcile_in_flight_after_restart()?;
@@ -203,6 +232,7 @@ impl AgentRuntime {
         record.dispatch_state = DispatchState::DispatchStarted;
         advance_operation_revision(&mut record, observed_at)?;
         self.store.save_operation(&record)?;
+        self.index_dispatch_input(&record)?;
         Ok(record)
     }
 
@@ -244,8 +274,7 @@ impl AgentRuntime {
         let mut record = self.required_operation(operation_id)?;
         if record.dispatch_state == state {
             if state == DispatchState::Rejected {
-                self.in_flight_by_binding
-                    .remove(&operation_target_key(&record.binding)?);
+                self.release_dispatch_fence(&record)?;
             }
             self.store.delete_prompt(operation_id)?;
             return Ok(record);
@@ -272,15 +301,83 @@ impl AgentRuntime {
         });
         advance_operation_revision(&mut record, observed_at)?;
         self.store.save_operation(&record)?;
+        self.index_dispatch_input(&record)?;
         if state == DispatchState::Rejected {
-            self.in_flight_by_binding
-                .remove(&operation_target_key(&record.binding)?);
+            self.release_dispatch_fence(&record)?;
         } else {
             self.in_flight_by_binding
                 .insert(operation_target_key(&record.binding)?, operation_id.clone());
         }
         self.store.delete_prompt(operation_id)?;
         Ok(record)
+    }
+
+    pub fn abandon_operation(
+        &mut self,
+        reference: &OperationRef,
+        expected_revision: u64,
+        reason: &str,
+        observed_at: i64,
+    ) -> Result<OperationRecord, StoreError> {
+        self.validate_operation_ref(reference)?;
+        let receipt = OperationResultReceipt::operator_abandon(reason, observed_at)
+            .map_err(|error| StoreError::Invalid(error.to_string()))?;
+        let mut operation = self.required_operation(&reference.operation_id)?;
+        if operation.operator_abandoned() {
+            if expected_revision.checked_add(1) == Some(operation.revision)
+                && operation
+                    .result_receipt
+                    .as_ref()
+                    .unwrap()
+                    .source_attribution
+                    == receipt.source_attribution
+            {
+                self.release_dispatch_fence(&operation)?;
+                self.store.delete_prompt(&operation.operation_id)?;
+                return Ok(operation);
+            }
+            return Err(StoreError::OperationConflict(
+                "abandon retry does not match the original revision and reason".to_string(),
+            ));
+        }
+        if expected_revision == 0 || operation.revision != expected_revision {
+            return Err(StoreError::StalePrecondition(
+                "operation revision changed before abandon".to_string(),
+            ));
+        }
+        if operation.dispatch_state != DispatchState::DeliveryUnknown || operation.run_id.is_some()
+        {
+            return Err(StoreError::OperationConflict(
+                "only an unlinked delivery_unknown operation can be abandoned".to_string(),
+            ));
+        }
+        // save_run precedes save_operation during confirmation. The Operation's
+        // run_id alone cannot detect a partial confirmation after an I/O error.
+        if self
+            .store
+            .list_runs()?
+            .iter()
+            .any(|run| run.operation_id.as_ref() == Some(&operation.operation_id))
+        {
+            return Err(StoreError::OperationConflict(
+                "operation already has a persisted linked run; retry confirmation before abandon"
+                    .to_string(),
+            ));
+        }
+        operation.result_receipt = Some(receipt);
+        advance_operation_revision(&mut operation, observed_at)?;
+        self.store.save_operation(&operation)?;
+        self.release_dispatch_fence(&operation)?;
+        self.store.delete_prompt(&operation.operation_id)?;
+        Ok(operation)
+    }
+
+    fn release_dispatch_fence(&mut self, operation: &OperationRecord) -> Result<(), StoreError> {
+        let key = operation_target_key(&operation.binding)?;
+        if self.in_flight_by_binding.get(&key) == Some(&operation.operation_id) {
+            self.in_flight_by_binding.remove(&key);
+        }
+        Ok(())
     }
 
     pub fn settle_expired_dispatches(
@@ -342,6 +439,7 @@ impl AgentRuntime {
                 run: None,
                 operation: None,
                 disposition: ApplyDisposition::Applied,
+                dispatched_prompt: false,
             });
         }
         if let Some(event_ref) = &observation.provider_event_ref
@@ -485,6 +583,7 @@ impl AgentRuntime {
                 .transpose()?;
         }
         Ok(ProviderApplyResult {
+            dispatched_prompt: self.matches_dispatch_input(&run.binding, observation, false)?,
             run: Some(run),
             operation,
             disposition,
@@ -568,32 +667,45 @@ impl AgentRuntime {
         binding: &AgentBinding,
         observation: &ProviderObservation,
     ) -> Result<bool, StoreError> {
+        self.matches_dispatch_input(binding, observation, true)
+    }
+
+    fn matches_dispatch_input(
+        &self,
+        binding: &AgentBinding,
+        observation: &ProviderObservation,
+        automatic_only: bool,
+    ) -> Result<bool, StoreError> {
         if observation.hook_kind != ProviderHookKind::UserPromptSubmit {
             return Ok(false);
         }
-        let matches = |o: &OperationRecord| {
-            o.dispatch_option == crate::codex_capacity::ORIGIN
-                && operation_binding_matches_agent(&o.binding, binding)
-                && observation.prompt_digest.as_deref() == Some(o.prompt_digest.as_str())
-        };
-        if let Some(run) = self.provider_event_run(observation)?
-            && let Some(id) = run.operation_id.as_ref()
-            && matches(&self.required_operation(id)?)
-        {
-            return Ok(true);
-        }
-        let Some(id) = self
-            .in_flight_by_binding
+        Ok(self
+            .dispatch_inputs_by_binding
             .get(&operation_target_key_for_agent(binding)?)
-        else {
-            return Ok(false);
-        };
-        let operation = self.required_operation(id)?;
-        Ok(matches(&operation)
-            && matches!(
-                operation.dispatch_state,
-                DispatchState::DispatchStarted | DispatchState::DeliveryUnknown
-            ))
+            .is_some_and(|inputs| {
+                inputs.values().any(|input| {
+                    (!automatic_only || input.automatic)
+                        && operation_binding_matches_agent(&input.binding, binding)
+                        && observation.prompt_digest.as_deref() == Some(input.digest.as_str())
+                        && observation.observed_at >= input.created_at
+                })
+            }))
+    }
+
+    fn index_dispatch_input(&mut self, operation: &OperationRecord) -> Result<(), StoreError> {
+        let key = operation_target_key(&operation.binding)?;
+        if let Some(input) = DispatchInputEvidence::from_operation(operation) {
+            self.dispatch_inputs_by_binding
+                .entry(key)
+                .or_default()
+                .insert(operation.operation_id.clone(), input);
+        } else if let Some(inputs) = self.dispatch_inputs_by_binding.get_mut(&key) {
+            inputs.remove(&operation.operation_id);
+            if inputs.is_empty() {
+                self.dispatch_inputs_by_binding.remove(&key);
+            }
+        }
+        Ok(())
     }
 
     pub fn current_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
@@ -922,16 +1034,17 @@ impl AgentRuntime {
             self.index_run(&run)?;
         }
         self.store.for_each_operation(|operation| {
-            if matches!(
-                operation.dispatch_state,
-                DispatchState::Prepared
-                    | DispatchState::DispatchStarted
-                    | DispatchState::DeliveryUnknown
-            ) {
+            if operation.dispatch_fenced() {
                 self.in_flight_by_binding.insert(
                     operation_target_key(&operation.binding)?,
                     operation.operation_id.clone(),
                 );
+            }
+            if let Some(input) = DispatchInputEvidence::from_operation(&operation) {
+                self.dispatch_inputs_by_binding
+                    .entry(operation_target_key(&operation.binding)?)
+                    .or_default()
+                    .insert(operation.operation_id.clone(), input);
             }
             Ok(())
         })
@@ -1132,7 +1245,8 @@ impl AgentRuntime {
             && operation_run_sequence_matches_agent(&operation, binding, run_seq)
             && operation.prompt_digest.as_str() == prompt_digest
             && observation.observed_at >= operation.updated_at
-            && observation.observed_at <= operation.confirmation_deadline_at
+            // The deadline settles uncertainty; it does not invalidate later
+            // evidence for the still-fenced, exact expected turn.
             && matches!(
                 operation.dispatch_state,
                 DispatchState::DispatchStarted | DispatchState::DeliveryUnknown
@@ -1158,15 +1272,16 @@ impl AgentRuntime {
                     "confirmed operation points to another run".to_string(),
                 ));
             }
-            self.in_flight_by_binding
-                .remove(&operation_target_key(&operation.binding)?);
+            self.release_dispatch_fence(&operation)?;
             self.store.delete_prompt(operation_id)?;
             return Ok(Some(operation));
         }
-        if !matches!(
-            operation.dispatch_state,
-            DispatchState::DispatchStarted | DispatchState::DeliveryUnknown
-        ) {
+        if operation.operator_abandoned()
+            || !matches!(
+                operation.dispatch_state,
+                DispatchState::DispatchStarted | DispatchState::DeliveryUnknown
+            )
+        {
             return Err(StoreError::OperationConflict(format!(
                 "linked operation cannot be confirmed from {:?}",
                 operation.dispatch_state
@@ -1194,13 +1309,20 @@ impl AgentRuntime {
         operation.result_receipt = Some(OperationResultReceipt {
             code: "prompt_confirmed".to_string(),
             observed_at,
-            confirmation_basis: Some("guarded_window_digest".to_string()),
+            confirmation_basis: Some(
+                if run.created_at > operation.confirmation_deadline_at {
+                    "binding_sequence_digest"
+                } else {
+                    "guarded_window_digest"
+                }
+                .to_string(),
+            ),
             source_attribution: Some("non_exclusive".to_string()),
         });
         advance_operation_revision(&mut operation, observed_at)?;
         self.store.save_operation(&operation)?;
-        self.in_flight_by_binding
-            .remove(&operation_target_key(&operation.binding)?);
+        self.index_dispatch_input(&operation)?;
+        self.release_dispatch_fence(&operation)?;
         self.store.delete_prompt(operation_id)?;
         Ok(Some(operation))
     }
@@ -2428,51 +2550,549 @@ mod tests {
 
     #[test]
     fn delivery_unknown_can_be_confirmed_late_without_redispatch() {
+        // Cover timeout, restart while ambiguous, and a hook arriving before
+        // the timeout sweep has persisted delivery_unknown.
+        for (expire, restart) in [(true, false), (true, true), (false, false)] {
+            let root = temp_root();
+            let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+            let agent_binding = binding();
+            let prompt = b"late evidence";
+            let operation_id = OperationId::parse("operation_runtime_late").unwrap();
+            runtime
+                .prepare_operation(
+                    operation_id.clone(),
+                    "vta1:exact-target".into(),
+                    prompt,
+                    prompt_digest(prompt),
+                    "paste_enter".into(),
+                    agent_binding.clone(),
+                    pane_version(&agent_binding),
+                    None,
+                    1,
+                    20,
+                )
+                .unwrap();
+            runtime.mark_dispatch_started(&operation_id, 21).unwrap();
+            if expire {
+                let expired = runtime.settle_expired_dispatches(30).unwrap();
+                assert_eq!(expired[0].dispatch_state, DispatchState::DeliveryUnknown);
+                assert_eq!(
+                    expired[0].result_receipt.as_ref().unwrap().code,
+                    "prompt_confirmation_timeout"
+                );
+            }
+            if restart {
+                drop(runtime);
+                runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+            }
+            let applied = runtime
+                .apply_provider_observation(
+                    agent_binding.clone(),
+                    1,
+                    &observation(
+                        ProviderHookKind::UserPromptSubmit,
+                        "turn-late",
+                        Some(prompt),
+                        None,
+                        160,
+                    ),
+                )
+                .unwrap();
+            let operation = applied.operation.unwrap();
+            let run = applied.run.unwrap();
+            assert_eq!(operation.dispatch_state, DispatchState::PromptConfirmed);
+            assert_eq!(operation.run_id, Some(run.run_id.clone()));
+            assert_eq!(run.operation_id, Some(operation_id.clone()));
+            assert_eq!(
+                operation
+                    .result_receipt
+                    .as_ref()
+                    .unwrap()
+                    .confirmation_basis
+                    .as_deref(),
+                Some("binding_sequence_digest")
+            );
+            assert_eq!(
+                operation
+                    .result_receipt
+                    .as_ref()
+                    .unwrap()
+                    .source_attribution
+                    .as_deref(),
+                Some("non_exclusive")
+            );
+            let stop = observation(
+                ProviderHookKind::Stop,
+                "turn-late",
+                None,
+                Some("complete response"),
+                170,
+            );
+            let completed = runtime
+                .apply_provider_observation(agent_binding.clone(), 1, &stop)
+                .unwrap()
+                .run
+                .unwrap();
+            assert_eq!(completed.semantic_outcome, SemanticOutcome::Completed);
+            assert_eq!(
+                completed.artifact.as_ref().unwrap().operation_id,
+                Some(operation_id.clone())
+            );
+            assert_eq!(
+                runtime.read_response(&runtime.run_ref(run.run_id)).unwrap(),
+                "complete response"
+            );
+            let next_id = OperationId::generate().unwrap();
+            runtime
+                .prepare_operation(
+                    next_id.clone(),
+                    "vta1:exact-target".into(),
+                    b"next",
+                    prompt_digest(b"next"),
+                    "paste_enter".into(),
+                    agent_binding.clone(),
+                    pane_version(&agent_binding),
+                    None,
+                    2,
+                    171,
+                )
+                .unwrap();
+            // A duplicate hook for the old confirmed Operation must not
+            // release the next Operation's fence.
+            runtime
+                .apply_provider_observation(agent_binding.clone(), 1, &stop)
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .in_flight_by_binding
+                    .get(&operation_target_key_for_agent(&agent_binding).unwrap()),
+                Some(&next_id)
+            );
+            let reference = runtime.operation_ref(operation_id);
+            assert!(matches!(
+                runtime.abandon_operation(&reference, operation.revision, "done", 172),
+                Err(StoreError::OperationConflict(_))
+            ));
+            drop(runtime);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn late_prompt_confirmation_keeps_binding_sequence_digest_and_time_fences() {
+        for mismatch in [
+            "digest", "sequence", "session", "epoch", "process", "pane", "state", "time",
+        ] {
+            let root = temp_root();
+            let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+            let original = binding();
+            let id = OperationId::generate().unwrap();
+            runtime
+                .prepare_operation(
+                    id.clone(),
+                    "vta1:target".into(),
+                    b"prompt",
+                    prompt_digest(b"prompt"),
+                    "paste_enter".into(),
+                    original.clone(),
+                    pane_version(&original),
+                    None,
+                    1,
+                    20,
+                )
+                .unwrap();
+            runtime.mark_dispatch_started(&id, 21).unwrap();
+            runtime.settle_expired_dispatches(30).unwrap();
+            let mut observed = original.clone();
+            let mut run_seq = 1;
+            let mut event = observation(
+                ProviderHookKind::UserPromptSubmit,
+                "late-mismatch",
+                Some(b"prompt"),
+                None,
+                160,
+            );
+            match mismatch {
+                "digest" => event.prompt_digest = Some(prompt_digest(b"different").as_str().into()),
+                "sequence" => run_seq = 2,
+                "session" => {
+                    observed.provider_session_id = AgentSessionId::parse("different").unwrap()
+                }
+                "epoch" => observed.agent_epoch += 2,
+                "process" => observed.process.start_token = "replacement".into(),
+                "pane" => observed.pane_instance.pane_pid += 1,
+                "state" => observed.pane_state_id = StateId::generate().unwrap(),
+                "time" => event.observed_at = 19,
+                _ => unreachable!(),
+            }
+            event.session_id = observed.provider_session_id.clone();
+            let result = runtime
+                .apply_provider_observation(observed, run_seq, &event)
+                .unwrap();
+            assert!(result.operation.is_none(), "{mismatch}");
+            assert!(result.run.unwrap().operation_id.is_none(), "{mismatch}");
+            assert_eq!(
+                runtime
+                    .get_operation(&runtime.operation_ref(id.clone()))
+                    .unwrap()
+                    .dispatch_state,
+                DispatchState::DeliveryUnknown
+            );
+            assert_eq!(
+                runtime
+                    .in_flight_by_binding
+                    .get(&operation_target_key_for_agent(&original).unwrap()),
+                Some(&id),
+                "{mismatch}"
+            );
+            drop(runtime);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn abandon_rejects_a_persisted_run_link_before_operation_confirmation() {
+        for indexed in [false, true] {
+            let root = temp_root();
+            let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+            let b = binding();
+            let id = OperationId::generate().unwrap();
+            runtime
+                .prepare_operation(
+                    id.clone(),
+                    "vta1:target".into(),
+                    b"prompt",
+                    prompt_digest(b"prompt"),
+                    "paste_enter".into(),
+                    b.clone(),
+                    pane_version(&b),
+                    None,
+                    1,
+                    10,
+                )
+                .unwrap();
+            runtime.mark_dispatch_started(&id, 11).unwrap();
+            runtime.settle_expired_dispatches(20).unwrap();
+            let reference = runtime.operation_ref(id.clone());
+            let before = runtime.get_operation(&reference).unwrap();
+            let submit = observation(
+                ProviderHookKind::UserPromptSubmit,
+                "partial-link",
+                Some(b"prompt"),
+                None,
+                160,
+            );
+            let run = new_run_from_observation(
+                runtime.store.generation().clone(),
+                b.clone(),
+                1,
+                Some(id),
+                &submit,
+            )
+            .unwrap();
+            // Model a failure after save_run, either before index_run or before
+            // the Operation write. The persisted Run is authoritative in both.
+            runtime.store.save_run(&run).unwrap();
+            if indexed {
+                runtime.index_run(&run).unwrap();
+            }
+            assert!(matches!(
+                runtime.abandon_operation(&reference, before.revision, "inspected", 161),
+                Err(StoreError::OperationConflict(_))
+            ));
+            assert_eq!(runtime.get_operation(&reference).unwrap(), before);
+            drop(runtime);
+            let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+            assert_eq!(
+                runtime.get_operation(&reference).unwrap().run_id,
+                Some(run.run_id)
+            );
+            let completed = runtime
+                .apply_provider_observation(
+                    b,
+                    1,
+                    &observation(
+                        ProviderHookKind::Stop,
+                        "partial-link",
+                        None,
+                        Some("done"),
+                        170,
+                    ),
+                )
+                .unwrap()
+                .run
+                .unwrap();
+            assert_eq!(completed.semantic_outcome, SemanticOutcome::Completed);
+            assert_eq!(
+                completed.artifact.unwrap().operation_id,
+                Some(reference.operation_id)
+            );
+            drop(runtime);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn abandoned_and_interleaved_dispatches_keep_input_classification_after_restart() {
+        for automatic in [false, true] {
+            let root = temp_root();
+            let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+            let b = binding();
+            let id = OperationId::generate().unwrap();
+            runtime
+                .prepare_operation(
+                    id.clone(),
+                    "vta1:target".into(),
+                    b"old",
+                    prompt_digest(b"old"),
+                    if automatic {
+                        crate::codex_capacity::ORIGIN
+                    } else {
+                        "paste_enter"
+                    }
+                    .into(),
+                    b.clone(),
+                    pane_version(&b),
+                    None,
+                    1,
+                    10,
+                )
+                .unwrap();
+            let submit = observation(
+                ProviderHookKind::UserPromptSubmit,
+                "old-input",
+                Some(b"old"),
+                None,
+                160,
+            );
+            assert!(
+                !runtime.matches_dispatch_input(&b, &submit, false).unwrap(),
+                "prepared input was never dispatched"
+            );
+            runtime.mark_dispatch_started(&id, 11).unwrap();
+            runtime.settle_expired_dispatches(20).unwrap();
+            let reference = runtime.operation_ref(id);
+            let revision = runtime.get_operation(&reference).unwrap().revision;
+            runtime
+                .abandon_operation(&reference, revision, "queue inspected", 21)
+                .unwrap();
+            drop(runtime);
+            let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+            let next_id = OperationId::generate().unwrap();
+            runtime
+                .prepare_operation(
+                    next_id.clone(),
+                    "vta1:target".into(),
+                    b"next",
+                    prompt_digest(b"next"),
+                    "paste_enter".into(),
+                    b.clone(),
+                    pane_version(&b),
+                    None,
+                    1,
+                    22,
+                )
+                .unwrap();
+            runtime.mark_dispatch_started(&next_id, 23).unwrap();
+            assert_eq!(runtime.capacity_input(&b, &submit).unwrap(), automatic);
+            let result = runtime
+                .apply_provider_observation(b.clone(), 1, &submit)
+                .unwrap();
+            assert!(result.dispatched_prompt);
+            assert!(result.run.unwrap().operation_id.is_none());
+            // The old queue item consumes the expected sequence, so the next
+            // input is private but cannot be linked to the new Operation.
+            let next = observation(
+                ProviderHookKind::UserPromptSubmit,
+                "next-input",
+                Some(b"next"),
+                None,
+                161,
+            );
+            let result = runtime
+                .apply_provider_observation(b.clone(), 2, &next)
+                .unwrap();
+            assert!(result.dispatched_prompt);
+            assert!(result.run.unwrap().operation_id.is_none());
+            assert_eq!(
+                runtime
+                    .in_flight_by_binding
+                    .get(&operation_target_key_for_agent(&b).unwrap()),
+                Some(&next_id)
+            );
+            for mismatch in ["process", "pane", "session", "time", "digest"] {
+                let mut changed = b.clone();
+                let mut changed_submit = submit.clone();
+                match mismatch {
+                    "process" => changed.process.start_token = "replacement".into(),
+                    "pane" => changed.pane_instance.pane_pid += 1,
+                    "session" => {
+                        changed.provider_session_id = AgentSessionId::parse("other").unwrap()
+                    }
+                    "time" => changed_submit.observed_at = 9,
+                    "digest" => {
+                        changed_submit.prompt_digest = Some(prompt_digest(b"human").as_str().into())
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    !runtime
+                        .matches_dispatch_input(&changed, &changed_submit, false)
+                        .unwrap(),
+                    "{mismatch}"
+                );
+            }
+            drop(runtime);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn operator_abandon_is_cas_guarded_durable_and_never_confirms_or_redispatches() {
         let root = temp_root();
-        let mut runtime = AgentRuntime::open(root.clone(), "server-a".to_string()).unwrap();
-        let agent_binding = binding();
-        let prompt = b"late evidence";
-        let operation_id = OperationId::parse("operation_runtime_0002").unwrap();
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+        let b = binding();
+        let id = OperationId::generate().unwrap();
         runtime
             .prepare_operation(
-                operation_id.clone(),
-                "vta1:exact-target".to_string(),
-                prompt,
-                prompt_digest(prompt),
-                "paste_enter".to_string(),
-                agent_binding.clone(),
-                pane_version(&agent_binding),
+                id.clone(),
+                "vta1:target".into(),
+                b"prompt",
+                prompt_digest(b"prompt"),
+                "paste_enter".into(),
+                b.clone(),
+                pane_version(&b),
                 None,
                 1,
-                20,
+                10,
             )
             .unwrap();
-        runtime.mark_dispatch_started(&operation_id, 21).unwrap();
-        runtime
-            .settle_dispatch(
-                &operation_id,
-                DispatchState::DeliveryUnknown,
-                "ambiguous",
-                22,
-            )
+        let reference = runtime.operation_ref(id.clone());
+        assert!(matches!(
+            runtime.abandon_operation(&reference, 1, "inspected", 11),
+            Err(StoreError::OperationConflict(_))
+        ));
+        runtime.mark_dispatch_started(&id, 11).unwrap();
+        assert!(matches!(
+            runtime.abandon_operation(&reference, 2, "inspected", 12),
+            Err(StoreError::OperationConflict(_))
+        ));
+        runtime.settle_expired_dispatches(20).unwrap();
+        assert!(matches!(
+            runtime.abandon_operation(&reference, 2, "inspected", 21),
+            Err(StoreError::StalePrecondition(_))
+        ));
+        for reason in [
+            "".to_string(),
+            " ".to_string(),
+            "bad\nreason".to_string(),
+            "a".repeat(248),
+        ] {
+            assert!(
+                runtime
+                    .abandon_operation(&reference, 3, &reason, 21)
+                    .is_err()
+            );
+        }
+        let mut foreign = reference.clone();
+        foreign.server_identity = "another-server".into();
+        assert!(matches!(
+            runtime.abandon_operation(&foreign, 3, "inspected", 21),
+            Err(StoreError::OperationGenerationReplaced(_))
+        ));
+        let abandoned = runtime
+            .abandon_operation(&reference, 3, "inspected completed run", 21)
             .unwrap();
-        let applied = runtime
+        assert!(abandoned.operator_abandoned());
+        assert!(!abandoned.dispatch_fenced());
+        assert_eq!(abandoned.revision, 4);
+        assert_eq!(
+            abandoned
+                .result_receipt
+                .as_ref()
+                .unwrap()
+                .source_attribution
+                .as_deref(),
+            Some("operator:inspected completed run")
+        );
+        assert_eq!(
+            runtime
+                .abandon_operation(&reference, 3, "inspected completed run", 22)
+                .unwrap(),
+            abandoned
+        );
+        assert!(matches!(
+            runtime.abandon_operation(&reference, 3, "changed reason", 22),
+            Err(StoreError::OperationConflict(_))
+        ));
+        let delayed = runtime
             .apply_provider_observation(
-                agent_binding,
+                b.clone(),
                 1,
                 &observation(
                     ProviderHookKind::UserPromptSubmit,
-                    "turn-late",
-                    Some(prompt),
+                    "late-abandoned",
+                    Some(b"prompt"),
                     None,
-                    23,
+                    160,
                 ),
             )
             .unwrap();
+        assert!(delayed.operation.is_none());
+        assert!(delayed.run.unwrap().operation_id.is_none());
+        drop(runtime);
+        let mut runtime = AgentRuntime::open(root.clone(), "server-a".into()).unwrap();
+        assert_eq!(runtime.get_operation(&reference).unwrap(), abandoned);
+        let next_id = OperationId::generate().unwrap();
+        runtime
+            .prepare_operation(
+                next_id.clone(),
+                "vta1:target".into(),
+                b"next",
+                prompt_digest(b"next"),
+                "paste_enter".into(),
+                b.clone(),
+                pane_version(&b),
+                None,
+                2,
+                170,
+            )
+            .unwrap();
         assert_eq!(
-            applied.operation.unwrap().dispatch_state,
-            DispatchState::PromptConfirmed
+            runtime
+                .abandon_operation(&reference, 3, "inspected completed run", 171)
+                .unwrap(),
+            abandoned
         );
+        assert_eq!(
+            runtime
+                .in_flight_by_binding
+                .get(&operation_target_key_for_agent(&b).unwrap()),
+            Some(&next_id)
+        );
+        assert!(matches!(
+            runtime.prepare_operation(
+                OperationId::generate().unwrap(),
+                "vta1:target".into(),
+                b"third",
+                prompt_digest(b"third"),
+                "paste_enter".into(),
+                b.clone(),
+                pane_version(&b),
+                None,
+                2,
+                171
+            ),
+            Err(StoreError::PromptDispatchBusy(_))
+        ));
+        let mut forbidden = abandoned.clone();
+        forbidden.revision += 1;
+        forbidden.updated_at += 1;
+        forbidden.result_receipt.as_mut().unwrap().code = "different".into();
+        assert!(matches!(
+            runtime.store.save_operation(&forbidden),
+            Err(StoreError::Conflict(_))
+        ));
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }

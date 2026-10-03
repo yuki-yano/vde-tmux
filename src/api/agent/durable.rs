@@ -323,7 +323,7 @@ pub(in crate::api) fn operation_wait_matches(
 ) -> bool {
     match operation.dispatch_state {
         DispatchState::PromptConfirmed | DispatchState::Rejected => true,
-        DispatchState::DeliveryUnknown => !follow_unknown,
+        DispatchState::DeliveryUnknown => !follow_unknown || operation.operator_abandoned(),
         DispatchState::Prepared | DispatchState::DispatchStarted => false,
     }
 }
@@ -669,6 +669,18 @@ mod tests {
                 .map(|receipt| receipt.operation_ref.as_str()),
             Some("vto3:test")
         );
+        operation.result_receipt = Some(
+            crate::agent_state::OperationResultReceipt::operator_abandon(
+                "inspected completed run",
+                3,
+            )
+            .unwrap(),
+        );
+        assert!(operation_wait_matches(&operation, true));
+        let abandoned = operation_terminal_error("vto3:test", operation.clone());
+        assert_eq!(abandoned.code, ApiErrorCode::DeliveryUnknown);
+        assert_eq!(abandoned.side_effect, ApiSideEffect::Possible);
+        assert!(abandoned.message.contains("operator_abandoned"));
         operation.dispatch_state = DispatchState::PromptConfirmed;
         assert!(operation_wait_matches(&operation, true));
         operation.dispatch_state = DispatchState::Rejected;

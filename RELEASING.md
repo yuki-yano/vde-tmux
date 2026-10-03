@@ -4,7 +4,11 @@ Publishing is driven by Git tags.
 
 ## Local API v6 upgrade
 
-API 6 / daemon protocol 28 adds ephemeral Codex Working/Blocked/Unknown presentation and
+API 6 / daemon protocol 29 adds late durable prompt confirmation and revision-guarded
+`agent operation abandon`. The 10-second deadline reports delivery uncertainty; matching later
+Run evidence can still confirm the Operation. Abandonment preserves ambiguity while releasing its
+dispatch fence. Dispatched-input classification and prompt redaction survive fence release.
+Protocol 28 added ephemeral Codex Working/Blocked/Unknown presentation and
 rejects lifecycle hooks whose process ancestry does not belong to the claimed embedded pane.
 Protocol 28 carries bounded question fingerprints from hook parsing. They are kept only in daemon
 memory, bound to owner/session/notice order, and match title plus ordered choices in the current
@@ -30,7 +34,7 @@ version bump or a release tag.
    capture failures, at most 20MiB RSS growth, and retained notices on probe drop. Reuse accepted
    evidence for unchanged product code; distinguish saved-data re-evaluation from a new run.
 2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
-   Confirm `vt api schema --json` reports API 6, protocol 28, PaneState 10, and private state 1.
+   Confirm `vt api schema --json` reports API 6, protocol 29, PaneState 10, and private state 1.
    Validate the staged binaries on a scratch server before replacing the installed generation:
    `VDE_VT_BIN=<temporary-root>/bin/vt python3 scripts/test-codex-observation-isolated.py`.
 3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.
@@ -46,6 +50,12 @@ version bump or a release tag.
    and retained Runs are preserved, and live Codex panes expose healthy `question_notice` summaries.
    Existing stock PostToolUse hooks must include `request_user_input_async`; Embedded mode is
    required. See [question notice behavior](README.md#codex-question-notices).
+7. After upgrading, inspect any old `delivery_unknown` Operations and their provider queues before
+   using [manual abandonment](AGENT_API.md#delayed-prompt-confirmation-and-manual-fence-release).
+   Previously stored unlinked Runs cannot be matched retrospectively. `in_flight_operations` counts
+   only Prepared/DispatchStarted Operations, so old ambiguity does not itself block the cutover.
+   Do not abandon or resend automatically during installation. Rolling back to the old binary
+   restores the dispatch fence of operator-abandoned Operations; it lacks the abandonment semantics.
 
 Never reset state or restart the tmux server as a protocol recovery shortcut. If replacement
 fails, leave the daemon disabled until both executables and their hashes are coherent.

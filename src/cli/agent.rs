@@ -235,6 +235,15 @@ impl AgentRunOutcomeArg {
 pub(super) enum AgentOperationCommand {
     /// Get one operation by exact operation_ref.
     Get { operation_ref: String },
+    /// Release an ambiguous dispatch fence after manual inspection; does not cancel queued input.
+    Abandon {
+        operation_ref: String,
+        #[arg(long)]
+        expected_revision: u64,
+        /// Inspection reason (1..247 UTF-8 bytes, no control characters).
+        #[arg(long)]
+        reason: String,
+    },
     /// Wait until one exact operation reaches the requested dispatch state.
     Wait {
         operation_ref: String,
@@ -608,6 +617,18 @@ pub(super) fn dispatch(
             AgentOperationCommand::Get { operation_ref } => {
                 crate::api::agent_operation_get(runner, env, observed_at, &operation_ref)
             }
+            AgentOperationCommand::Abandon {
+                operation_ref,
+                expected_revision,
+                reason,
+            } => crate::api::agent_operation_abandon(
+                runner,
+                env,
+                observed_at,
+                &operation_ref,
+                expected_revision,
+                &reason,
+            ),
             AgentOperationCommand::Wait {
                 operation_ref,
                 until,

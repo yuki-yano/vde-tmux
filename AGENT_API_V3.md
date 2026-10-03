@@ -346,12 +346,12 @@ Dispatch Operation自体の成功は`prompt_confirmed`とする。linked Agent R
 
 callerとdaemonは`delivery_unknown`からdispatchを再実行しない。
 
-`delivery_unknown`は同じ完全なAgent Bindingへのambiguous fenceとして残す。late provider
-confirmation、occupant replacement、またはquiesced offline resetまで、別operation IDによる
-追加dispatchも拒否する。
+`delivery_unknown`は同じdispatch targetへのambiguous fenceとして残す。late provider
+confirmation、process/pane replacement、operator abandon、またはquiesced offline resetまで、別operation IDによる追加dispatchも拒否する。
 
-provider evidenceからOperationへの新規帰属を作れるのは、Operation作成から10秒のconfirmation deadline内だけとする。
-deadline内にOperationへlink済みのRunがある場合、そのRunへ一意に帰属する後続evidenceとrestart reconcileはdeadline後も`delivery_unknown`を`prompt_confirmed`へ単調補強できる。新規帰属を作れないdeadline後のevidenceはRunだけを更新し、ambiguous fenceを解除しない。
+現在の継承契約では、Operation作成から10秒のconfirmation deadlineは`delivery_unknown`を通知する期限であり、provider evidenceの有効期限ではない。期限後も同じOperationがfenceを保持し、Binding、expected run sequence、prompt digest、観測時刻の下限が一致する最初のUserPromptSubmitで新規帰属を作れる。link済みRunの後続evidenceとrestart reconcileもOperationを前進させる。旧実装の「10秒後は新規帰属しない」という制限は廃止した。
+
+idle、別prompt、別Runの開始・完了だけではfenceを解除しない。照合できない場合は`vt agent operation abandon REF --expected-revision N --reason TEXT`で手動解除する。dispatch_stateはdelivery_unknownのまま、result_receipt.codeを`operator_abandoned`、source_attributionを`operator:TEXT`として保存する。abandon後は元Operationへの自動帰属と再送を行わず、再起動後もfenceを復活させない。公開操作の詳細は[AGENT_API.md](AGENT_API.md)を参照する。
 
 ### Write ordering
 
@@ -379,9 +379,9 @@ Agent Binding、expected run sequence、live process fenceは新規Operation受�
 
 ### Confirmation limits
 
-provider UserPromptSubmitはsource operation IDを持たないため、同じAgent Binding、expected run sequence、time window、prompt digestに一致する人間の同一promptとvde-tmux dispatchを区別できない。
+provider UserPromptSubmitはsource operation IDを持たないため、同じAgent Binding、expected run sequence、prompt digestに一致する人間の同一promptとvde-tmux dispatchを区別できない。
 
-`prompt_confirmed` receiptは`confirmation_basis=guarded_window_digest`と`source_attribution=non_exclusive`を返す。
+`prompt_confirmed` receiptは期限内のRun作成で`confirmation_basis=guarded_window_digest`、期限後で`confirmation_basis=binding_sequence_digest`を返す。いずれも`source_attribution=non_exclusive`であり、送信元の独占的な証明ではない。
 
 異なるpromptまたはrun sequenceのinterleaveは`delivery_unknown`とする。
 
@@ -525,6 +525,7 @@ waitはRun Record retentionを延長せず、待機中にGCされた場合は`ru
 `vt agent operation wait OPERATION_REF --until prompt-confirmed`は`prompt_confirmed`または`rejected`まで待つ。`delivery_unknown`では再送禁止のtyped ambiguous resultを即時返す。
 
 late confirmationだけを観測する場合は`--follow-unknown --timeout-ms N`を明示する。
+operator abandonはfollow-unknownの待機を終了させ、possible side effectを持つdelivery_unknown errorと解除済みreceiptを返す。
 
 `--until run-completed`は`run_ref`確定後にlinked runのcompletionを待ち、operation resultとrun resultを別fieldで返す。
 

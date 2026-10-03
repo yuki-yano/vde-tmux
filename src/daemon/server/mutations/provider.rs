@@ -335,6 +335,7 @@ pub(in crate::daemon::server) fn apply_external_provider_event_with_runner(
         .is_some_and(|o| o.dispatch_option == crate::codex_capacity::ORIGIN)
         || super::super::capacity::auto_input(coordinator, &envelope, &observation);
     let private_prompt = automatic
+        || apply_result.dispatched_prompt
         || apply_result.run.as_ref().is_some_and(|run| {
             run.operation_id.is_some()
                 && (observation.hook_kind != ProviderHookKind::UserPromptSubmit

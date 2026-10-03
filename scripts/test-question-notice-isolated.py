@@ -81,9 +81,9 @@ def diagnostics():
         stream.settimeout(3)
         stream.connect(daemon_socket)
         reader = stream.makefile("r")
-        stream.sendall(b'{"op":"hello","proto":28}\n')
+        stream.sendall(b'{"op":"hello","proto":29}\n')
         json.loads(reader.readline())
-        stream.sendall(b'{"op":"query_question_diagnostics","proto":28}\n')
+        stream.sendall(b'{"op":"query_question_diagnostics","proto":29}\n')
         return json.loads(reader.readline())
 
 

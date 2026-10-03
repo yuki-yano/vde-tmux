@@ -1375,21 +1375,26 @@ fn validate_operation_replacement(
             "operation replacement must advance revision and time exactly once".to_string(),
         ));
     }
-    let valid_transition = matches!(
-        (existing.dispatch_state, next.dispatch_state),
-        (
-            DispatchState::Prepared,
-            DispatchState::DispatchStarted | DispatchState::Rejected
-        ) | (
-            DispatchState::DispatchStarted,
-            DispatchState::PromptConfirmed
-                | DispatchState::DeliveryUnknown
-                | DispatchState::Rejected
-        ) | (
-            DispatchState::DeliveryUnknown,
-            DispatchState::PromptConfirmed
-        )
-    );
+    let abandonment = existing.dispatch_state == DispatchState::DeliveryUnknown
+        && !existing.operator_abandoned()
+        && next.operator_abandoned();
+    let valid_transition = !existing.operator_abandoned()
+        && (abandonment
+            || matches!(
+                (existing.dispatch_state, next.dispatch_state),
+                (
+                    DispatchState::Prepared,
+                    DispatchState::DispatchStarted | DispatchState::Rejected
+                ) | (
+                    DispatchState::DispatchStarted,
+                    DispatchState::PromptConfirmed
+                        | DispatchState::DeliveryUnknown
+                        | DispatchState::Rejected
+                ) | (
+                    DispatchState::DeliveryUnknown,
+                    DispatchState::PromptConfirmed
+                )
+            ));
     if !valid_transition {
         return Err(StoreError::Conflict(
             "invalid dispatch operation state transition".to_string(),
@@ -1402,6 +1407,7 @@ fn validate_operation_replacement(
     }
     if existing.result_receipt.is_some()
         && existing.result_receipt != next.result_receipt
+        && !abandonment
         && !matches!(
             (existing.dispatch_state, next.dispatch_state),
             (

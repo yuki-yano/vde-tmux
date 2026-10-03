@@ -208,7 +208,7 @@ pub(crate) use agent::run::{
 };
 pub use agent::{
     dispatch::{agent_prompt, agent_send, agent_send_keys, agent_start, agent_steer},
-    operation::{agent_operation_get, agent_operation_wait},
+    operation::{agent_operation_abandon, agent_operation_get, agent_operation_wait},
     projection::{agent_get, agent_list},
     read_wait::{agent_read, agent_wait},
     run::{agent_run_check, agent_run_get, agent_run_resolve, agent_run_response, agent_run_wait},

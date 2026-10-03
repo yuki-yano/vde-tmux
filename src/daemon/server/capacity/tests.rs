@@ -687,7 +687,7 @@ fn public_origin_and_id_forgery_are_rejected_without_staging_or_sending() {
 
 #[test]
 fn known_question_profile_late_auto_input_neither_acks_nor_changes_original_context() {
-    for late in [false, true] {
+    for (late, abandoned) in [(false, false), (true, false), (true, true)] {
         let f = Fixture::new();
         let t = f.target(if late { 7 } else { 8 });
         f.submit(&t, "human", "original objective", 0, CodexProfile::V01561);
@@ -716,6 +716,15 @@ fn known_question_profile_late_auto_input_neither_acks_nor_changes_original_cont
                 .settle_dispatch(&id, DispatchState::DeliveryUnknown, "unknown", 1003)
                 .unwrap();
         }
+        if abandoned {
+            let mut runtime = f.coordinator.agent_runtime.lock().unwrap();
+            let runtime = runtime.as_mut().unwrap();
+            let reference = runtime.operation_ref(id.clone());
+            let revision = runtime.get_operation(&reference).unwrap().revision;
+            runtime
+                .abandon_operation(&reference, revision, "queue inspected", 1004)
+                .unwrap();
+        }
         f.submit(
             &t,
             "auto",
@@ -733,7 +742,43 @@ fn known_question_profile_late_auto_input_neither_acks_nor_changes_original_cont
         assert!(summary.unacknowledged);
         assert_eq!(summary.acknowledged_order, 0);
         assert!(state.question_notices.resolver.non_authoritative >= 1);
-        assert_eq!(linked, !late);
+        assert_eq!(linked, !abandoned);
+        let operation = f
+            .coordinator
+            .agent_runtime
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .store()
+            .load_operation(&id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            operation.dispatch_state,
+            if abandoned {
+                DispatchState::DeliveryUnknown
+            } else {
+                DispatchState::PromptConfirmed
+            }
+        );
+        if abandoned {
+            assert!(operation.operator_abandoned());
+            continue;
+        }
+        assert_eq!(
+            operation
+                .result_receipt
+                .as_ref()
+                .unwrap()
+                .confirmation_basis
+                .as_deref(),
+            Some(if late {
+                "binding_sequence_digest"
+            } else {
+                "guarded_window_digest"
+            })
+        );
     }
 }
 

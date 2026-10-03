@@ -12,6 +12,72 @@ use super::durable::{
 use crate::agent_state::{DispatchState, OperationId, OperationRecord, Sha256Digest};
 use crate::tmux::TmuxRunner;
 
+pub fn agent_operation_abandon(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    observed_at: i64,
+    operation_ref: &str,
+    expected_revision: u64,
+    reason: &str,
+) -> Result<String> {
+    use crate::api::connection::{ApiConnection, daemon_api_error};
+    use crate::daemon::protocol::v2::{
+        CLIENT_REQUEST_TIMEOUT, ClientMessage, PROTOCOL_VERSION, ServerMessage,
+    };
+
+    crate::agent_state::OperationRef::decode(operation_ref)
+        .map_err(|error| api_error!("invalid_reference", error.to_string()))?;
+    if expected_revision == 0 {
+        return Err(api_error!("invalid_arguments", "--expected-revision must be positive").into());
+    }
+    crate::agent_state::OperationResultReceipt::operator_abandon(reason, observed_at)
+        .map_err(|error| api_error!("invalid_arguments", error.to_string()))?;
+    let mut connection = ApiConnection::connect(runner, env, None)?;
+    connection
+        .client
+        .set_deadline(Instant::now() + CLIENT_REQUEST_TIMEOUT);
+    let event_id = crate::pane_state::EventId::generate()
+        .map_err(|error| api_error!("internal_error", error.to_string()))?;
+    let response = connection
+        .client
+        .request(&ClientMessage::AbandonAgentOperation {
+            proto: PROTOCOL_VERSION,
+            daemon_instance_id: connection.client.daemon_instance_id().clone(),
+            event_id,
+            operation_ref: operation_ref.to_string(),
+            expected_revision,
+            reason: reason.to_string(),
+        })
+        .map_err(|error| api_error!("daemon_query_failed", format!("{error:#}")))?;
+    match response {
+        ServerMessage::AgentOperationResult {
+            proto,
+            operation_ref: returned_ref,
+            operation,
+        } if proto == PROTOCOL_VERSION
+            && returned_ref == operation_ref
+            && operation.operator_abandoned() =>
+        {
+            success_agent_json(
+                &connection,
+                observed_at,
+                ApiResult::AgentOperation {
+                    operation_ref: returned_ref,
+                    run_ref: None,
+                    operation,
+                    waited_ms: 0,
+                },
+            )
+        }
+        ServerMessage::Error { code, message, .. } => Err(daemon_api_error(code, message).into()),
+        other => Err(api_error!(
+            "invalid_daemon_response",
+            format!("unexpected operation abandon result: {other:?}")
+        )
+        .into()),
+    }
+}
+
 pub(crate) struct PromptRequestIdentity<'a> {
     pub operation_id: &'a OperationId,
     pub target: &'a str,

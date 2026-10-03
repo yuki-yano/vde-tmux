@@ -148,6 +148,10 @@ restart_after_fault() {
     echo "daemon restart did not clean the stale guarded prompt buffer" >&2
     return 1
   fi
+  # Hydration deliberately drops lifecycle authority. Supply fresh idle
+  # fixture observations without changing the prepared binding or pane CAS.
+  TMUX_PANE="$PREPARED_PANE_ID" "$BIN" hook emit --agent codex --session-id "$PREPARED_SESSION_ID" --status idle
+  TMUX_PANE="$UNKNOWN_PANE_ID" "$BIN" hook emit --agent codex --session-id "$UNKNOWN_SESSION_ID" --status idle
 }
 
 printf 'resume prepared operation after restart' >"$PREPARED_PROMPT_FILE"
@@ -231,6 +235,9 @@ lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
 assert [json.loads(line) for line in lines] == ["confirm dispatch after delayed hook"], lines
 PY
 
+# Force provider evidence beyond the durable 10-second deadline, rather than
+# merely beyond a short CLI wait. This reproduces compaction-length queuing.
+"$PYTHON" -c 'import json,sys,time; deadline=json.load(sys.stdin)["result"]["operation"]["confirmation_deadline_at"]; time.sleep(max(0, deadline + 2 - time.time()))' <<<"$UNKNOWN_GET"
 "$BIN" agent operation wait "$UNKNOWN_OPERATION_REF" \
   --until prompt-confirmed \
   --follow-unknown \
@@ -241,17 +248,81 @@ sleep 0.1
 touch "$UNKNOWN_HOOK_GATE"
 wait "$WAIT_PID"
 LATE_RESULT="$(<"$ROOT/late-confirmation.json")"
-"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); result=value["result"]; operation=result["operation"]; assert operation["dispatch_state"] == "prompt_confirmed"; assert operation["result_receipt"]["confirmation_basis"] == "guarded_window_digest"; assert operation["result_receipt"]["source_attribution"] == "non_exclusive"; assert result["run_ref"].startswith("vtr3:")' <<<"$LATE_RESULT"
+"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); result=value["result"]; operation=result["operation"]; assert operation["dispatch_state"] == "prompt_confirmed"; assert operation["result_receipt"]["confirmation_basis"] == "binding_sequence_digest"; assert operation["result_receipt"]["source_attribution"] == "non_exclusive"; assert operation["updated_at"] > operation["confirmation_deadline_at"]; assert result["run_ref"].startswith("vtr3:")' <<<"$LATE_RESULT"
 
 UNKNOWN_RUN_REF="$("$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["result"]["run_ref"])' <<<"$LATE_RESULT")"
 RUN_RESULT="$("$BIN" agent run wait "$UNKNOWN_RUN_REF" --until completed --timeout-ms 5000 --json)"
 "$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); run=value["result"]["run"]; assert run["execution_phase"] == "ended"; assert run["semantic_outcome"] == "completed"' <<<"$RUN_RESULT"
 RESPONSE_RESULT="$("$BIN" agent run response "$UNKNOWN_RUN_REF" --json)"
-"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); assert value["result"]["body"] == "isolated guarded prompt accepted"; assert value["result"]["metadata"]["store_completeness"] == "complete"' <<<"$RESPONSE_RESULT"
+"$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); assert value["result"]["body"] == "isolated guarded prompt accepted"; assert value["result"]["metadata"]["store_completeness"] == "complete"; assert value["result"]["metadata"]["operation_id"] == sys.argv[1]' "$UNKNOWN_OPERATION_ID" <<<"$RESPONSE_RESULT"
+
+# The same binding accepts another durable request after late confirmation.
+printf '%s' 'next request after late confirmation' >"$ROOT/next-prompt.txt"
+"$BIN" agent request "$UNKNOWN_AGENT_REF" --state-file "$ROOT/next-request.json" \
+  --prompt-file "$ROOT/next-prompt.txt" --confirm-timeout-ms 5000 --json >"$ROOT/next-request-result.json"
+NEXT_RUN_REF="$("$PYTHON" -c 'import json,sys; v=json.load(open(sys.argv[1]))["result"]; assert v["operation"]["dispatch_state"] == "prompt_confirmed"; print(v["run_ref"])' "$ROOT/next-request-result.json")"
+"$BIN" agent run wait "$NEXT_RUN_REF" --until completed --timeout-ms 5000 --json >"$ROOT/next-run.json"
+
+# Gate a fresh dispatch until it actually reaches prompt_confirmation_timeout.
+rm "$UNKNOWN_HOOK_GATE"
+printf '%s' 'operator abandonment inspection' >"$ROOT/abandon-prompt.txt"
+if "$BIN" agent request "$UNKNOWN_AGENT_REF" --state-file "$ROOT/abandon-request.json" \
+  --prompt-file "$ROOT/abandon-prompt.txt" --confirm-timeout-ms 250 --json \
+  >"$ROOT/unexpected-abandon-request.json" 2>"$ROOT/abandon-request-error.json"; then
+  echo "gated abandon request unexpectedly succeeded" >&2
+  exit 1
+fi
+ABANDON_OPERATION_REF="$("$PYTHON" -c 'import json,sys; e=json.load(open(sys.argv[1]))["error"]; assert e["code"] == "delivery_unknown"; print(e["receipt"]["operation_ref"])' "$ROOT/abandon-request-error.json")"
+ABANDON_GET="$("$BIN" agent operation get "$ABANDON_OPERATION_REF" --json)"
+"$PYTHON" -c 'import json,sys,time; deadline=json.load(sys.stdin)["result"]["operation"]["confirmation_deadline_at"]; time.sleep(max(0, deadline + 1 - time.time()))' <<<"$ABANDON_GET"
+ABANDON_GET="$("$BIN" agent operation get "$ABANDON_OPERATION_REF" --json)"
+ABANDON_REVISION="$("$PYTHON" -c 'import json,sys; o=json.load(sys.stdin)["result"]["operation"]; assert o["dispatch_state"] == "delivery_unknown"; assert o["result_receipt"]["code"] == "prompt_confirmation_timeout"; print(o["revision"])' <<<"$ABANDON_GET")"
+if "$BIN" agent operation abandon "$ABANDON_OPERATION_REF" --expected-revision 1 \
+  --reason 'inspected gated prompt' --json >"$ROOT/unexpected-stale-abandon.json" 2>"$ROOT/stale-abandon.json"; then
+  echo "stale abandon revision unexpectedly succeeded" >&2
+  exit 1
+fi
+"$PYTHON" -c 'import json,sys; assert json.load(open(sys.argv[1]))["error"]["code"] == "stale_precondition"' "$ROOT/stale-abandon.json"
+"$BIN" agent operation wait "$ABANDON_OPERATION_REF" --follow-unknown --timeout-ms 5000 \
+  --json >"$ROOT/unexpected-abandoned-wait.json" 2>"$ROOT/abandoned-wait-error.json" &
+WAIT_PID=$!
+sleep 0.1
+"$BIN" agent operation abandon "$ABANDON_OPERATION_REF" --expected-revision "$ABANDON_REVISION" \
+  --reason 'inspected gated prompt' --json >"$ROOT/abandoned.json"
+if wait "$WAIT_PID"; then
+  echo "abandoned operation wait unexpectedly reported prompt confirmation" >&2
+  exit 1
+fi
+"$PYTHON" -c 'import json,sys; e=json.load(open(sys.argv[1]))["error"]; assert e["code"] == "delivery_unknown"; assert e["side_effect"] == "possible"; assert e["receipt"]["operation"]["result_receipt"]["code"] == "operator_abandoned"' "$ROOT/abandoned-wait-error.json"
+"$BIN" agent operation abandon "$ABANDON_OPERATION_REF" --expected-revision "$ABANDON_REVISION" \
+  --reason 'inspected gated prompt' --json >"$ROOT/abandoned-retry.json"
+"$PYTHON" -c 'import json,sys; a,b=[json.load(open(p))["result"]["operation"] for p in sys.argv[1:]]; assert a == b; assert a["dispatch_state"] == "delivery_unknown"; assert a["result_receipt"]["source_attribution"] == "operator:inspected gated prompt"' "$ROOT/abandoned.json" "$ROOT/abandoned-retry.json"
+
+# Abandon releases only the fence: queued input still runs, with no invented link.
+touch "$UNKNOWN_HOOK_GATE"
+"$BIN" agent wait "$UNKNOWN_AGENT_REF" --until done --after-completed-seq 2 --timeout-ms 5000 --json >"$ROOT/abandoned-agent-done.json"
+"$BIN" agent get "$UNKNOWN_AGENT_REF" --json >"$ROOT/abandoned-agent.json"
+ABANDONED_RUN_REF="$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["agent"]["summary"]["current_run"]["run_ref"])' "$ROOT/abandoned-agent.json")"
+"$BIN" agent run response "$ABANDONED_RUN_REF" --json >"$ROOT/abandoned-response.json"
+"$PYTHON" -c 'import json,sys; m=json.load(open(sys.argv[1]))["result"]["metadata"]; assert m["operation_id"] is None; assert m["provider_completeness"] == "complete"; assert m["store_completeness"] == "complete"' "$ROOT/abandoned-response.json"
+"$BIN" daemon stop >/dev/null
+"$BIN" daemon start >/dev/null
+"$BIN" agent operation get "$ABANDON_OPERATION_REF" --json >"$ROOT/abandoned-after-restart.json"
+"$PYTHON" -c 'import json,sys; a,b=[json.load(open(p))["result"]["operation"] for p in sys.argv[1:]]; assert a == b' "$ROOT/abandoned.json" "$ROOT/abandoned-after-restart.json"
+TMUX_PANE="$UNKNOWN_PANE_ID" "$BIN" hook emit --agent codex --session-id "$UNKNOWN_SESSION_ID" --status idle
+printf '%s' 'next request after abandonment' >"$ROOT/after-abandon.txt"
+"$BIN" agent request "$UNKNOWN_AGENT_REF" --state-file "$ROOT/after-abandon-request.json" \
+  --prompt-file "$ROOT/after-abandon.txt" --confirm-timeout-ms 5000 --json >"$ROOT/after-abandon-result.json"
+"$PYTHON" - "$UNKNOWN_PROMPT_LOG" <<'PY'
+import json, sys
+prompts = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+assert prompts == ["confirm dispatch after delayed hook", "next request after late confirmation",
+                   "operator abandonment inspection", "next request after abandonment"], prompts
+PY
 
 if tmux -L "$TMUX_SOCKET" list-buffers -F '#{buffer_name}' 2>/dev/null | grep -F 'vde-agent-prompt-' >/dev/null; then
   echo "guarded prompt buffer leaked" >&2
   exit 1
 fi
 
-echo "isolated prepared restart, stale buffer cleanup, dispatch ambiguity, no-redispatch retry, and late hook recovery ok"
+echo "isolated restart, deadline-late hook/Artifact, follow-unknown, next request, and CAS/idempotent/durable abandon ok"

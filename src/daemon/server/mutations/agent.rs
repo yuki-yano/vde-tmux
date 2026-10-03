@@ -801,6 +801,44 @@ fn agent_prompt_identity_matches(
         && record.run_seq.checked_add(1) == Some(operation.expected_run_seq)
 }
 
+pub(in crate::daemon::server) fn apply_abandon_agent_operation(
+    coordinator: &ProductionV2Coordinator,
+    event_id: EventId,
+    operation_ref: String,
+    expected_revision: u64,
+    reason: String,
+) -> ServerMessage {
+    let reference = match crate::agent_state::OperationRef::decode(&operation_ref) {
+        Ok(reference) => reference,
+        Err(error) => {
+            return ServerMessage::error(
+                ErrorCode::InvalidRequest,
+                error.to_string(),
+                Some(event_id),
+            );
+        }
+    };
+    let mut runtime = coordinator
+        .agent_runtime
+        .lock()
+        .expect("agent runtime lock poisoned");
+    let Some(runtime) = runtime.as_mut() else {
+        return ServerMessage::error(
+            ErrorCode::NotReady,
+            "agent runtime is hydrating",
+            Some(event_id),
+        );
+    };
+    match runtime.abandon_operation(&reference, expected_revision, &reason, epoch_seconds()) {
+        Ok(operation) => ServerMessage::AgentOperationResult {
+            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            operation_ref,
+            operation,
+        },
+        Err(error) => agent_state_query_error_with_event(error, Some(event_id)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::daemon::server) fn apply_resolve_agent_run(
     coordinator: &ProductionV2Coordinator,

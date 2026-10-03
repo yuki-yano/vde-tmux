@@ -74,7 +74,8 @@ use router::{
 
 use bootstrap::initial_view_reconciliation;
 use mutations::agent::{
-    agent_state_query_error, apply_resolve_agent_run, apply_start_agent_prompt,
+    agent_state_query_error, apply_abandon_agent_operation, apply_resolve_agent_run,
+    apply_start_agent_prompt,
 };
 use mutations::pane::{
     apply_diagnostic_projection, apply_external_view_event, apply_observation_batch,
@@ -2419,6 +2420,19 @@ fn apply_production_mutation(
             resolution_id,
             reason,
             actor_pid,
+        ),
+        V2AcceptedMutation::External(ClientMessage::AbandonAgentOperation {
+            event_id,
+            operation_ref,
+            expected_revision,
+            reason,
+            ..
+        }) => apply_abandon_agent_operation(
+            coordinator,
+            event_id,
+            operation_ref,
+            expected_revision,
+            reason,
         ),
         V2AcceptedMutation::External(ClientMessage::SubmitViewEvent { event, .. }) => {
             apply_external_view_event(coordinator, accepted_seq, event)

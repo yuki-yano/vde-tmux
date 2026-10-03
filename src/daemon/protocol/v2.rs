@@ -22,7 +22,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 28;
+pub const PROTOCOL_VERSION: u16 = 29;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1034,6 +1034,14 @@ pub enum ClientMessage {
         reason: String,
         actor_pid: u32,
     },
+    AbandonAgentOperation {
+        proto: u16,
+        daemon_instance_id: DaemonInstanceId,
+        event_id: EventId,
+        operation_ref: String,
+        expected_revision: u64,
+        reason: String,
+    },
     SubmitViewEvent {
         proto: u16,
         event: ViewEvent,
@@ -1079,6 +1087,7 @@ impl ClientMessage {
             | Self::SubmitProviderEvent { proto, .. }
             | Self::StartAgentPrompt { proto, .. }
             | Self::ResolveAgentRun { proto, .. }
+            | Self::AbandonAgentOperation { proto, .. }
             | Self::SubmitViewEvent { proto, .. }
             | Self::SidebarCommand { proto, .. }
             | Self::RefreshTopology { proto, .. }
@@ -1104,6 +1113,9 @@ impl ClientMessage {
             | Self::ResolveAgentRun {
                 daemon_instance_id, ..
             }
+            | Self::AbandonAgentOperation {
+                daemon_instance_id, ..
+            }
             | Self::SidebarCommand {
                 daemon_instance_id, ..
             }
@@ -1127,6 +1139,7 @@ impl ClientMessage {
             | Self::SubmitQuestionSession { event_id, .. }
             | Self::ReportQuestionJournalFailure { event_id, .. }
             | Self::ResolveAgentRun { event_id, .. }
+            | Self::AbandonAgentOperation { event_id, .. }
             | Self::SidebarCommand { event_id, .. }
             | Self::RefreshTopology { event_id, .. }
             | Self::Shutdown { event_id, .. } => Some(event_id),
@@ -1764,7 +1777,7 @@ mod tests {
 
     #[test]
     fn every_client_message_roundtrips() {
-        assert_eq!(PROTOCOL_VERSION, 28);
+        assert_eq!(PROTOCOL_VERSION, 29);
         let state_id = StateId::parse("00112233445566778899aabbccddeeff").unwrap();
         let messages = vec![
             ClientMessage::Hello {
@@ -1795,6 +1808,14 @@ mod tests {
             ClientMessage::QueryAgentOperation {
                 proto: PROTOCOL_VERSION,
                 operation_ref: "vto3:operation".to_string(),
+            },
+            ClientMessage::AbandonAgentOperation {
+                proto: PROTOCOL_VERSION,
+                daemon_instance_id: daemon_id(),
+                event_id: event_id(),
+                operation_ref: "vto3:operation".to_string(),
+                expected_revision: 3,
+                reason: "verified completed run".to_string(),
             },
             ClientMessage::QueryAgentResponse {
                 proto: PROTOCOL_VERSION,

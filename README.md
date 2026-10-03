@@ -820,7 +820,7 @@ After a vde-tmux daemon restart, authority returns with the next
 accepted embedded hook; until then the pane may show Unknown. Shared-server commands such as
 `codex queue` are not available with `--no-daemon`; keep those workflows on the shared server.
 Do not open an active shared thread in both modes.
-API 6 / daemon protocol 28 must be installed together; Pane State schema 10 and Question sidecar
+API 6 / daemon protocol 29 must be installed together; Pane State schema 10 and Question sidecar
 schema 1 remain unchanged. See [the API contract](AGENT_API.md#codex-screen-evidence-api-6).
 
 Run `python3 scripts/test-codex-observation-isolated.py` after building the binaries to verify

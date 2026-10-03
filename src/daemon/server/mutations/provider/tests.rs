@@ -444,6 +444,15 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
 
 #[test]
 fn dispatched_prompt_generates_summary_without_publishing_or_persisting_its_input() {
+    assert_private_dispatch_summary(false);
+}
+
+#[test]
+fn abandoned_prompt_generates_private_summary_without_public_preview() {
+    assert_private_dispatch_summary(true);
+}
+
+fn assert_private_dispatch_summary(abandon: bool) {
     use crate::agent_state::{AgentBinding, OperationId, Sha256Digest};
     use crate::daemon::task_summary::{TaskSummaryCompletion, TaskSummaryJob};
     use crate::pane_state::{AgentProcessIdentity, TaskSummaryOutcome, TaskSummaryState};
@@ -546,7 +555,7 @@ fn dispatched_prompt_generates_summary_without_publishing_or_persisting_its_inpu
                 ))
                 .unwrap(),
                 "paste_enter".to_string(),
-                binding,
+                binding.clone(),
                 record.version(),
                 record.current_run.clone(),
                 record.run_seq + 1,
@@ -556,8 +565,40 @@ fn dispatched_prompt_generates_summary_without_publishing_or_persisting_its_inpu
         runtime
             .mark_dispatch_started(&operation_id, epoch_seconds())
             .unwrap();
+        if abandon {
+            let operation = runtime
+                .settle_dispatch(
+                    &operation_id,
+                    crate::agent_state::DispatchState::DeliveryUnknown,
+                    "prompt_confirmation_timeout",
+                    epoch_seconds(),
+                )
+                .unwrap();
+            let reference = runtime.operation_ref(operation_id.clone());
+            runtime
+                .abandon_operation(
+                    &reference,
+                    operation.revision,
+                    "queue inspected",
+                    epoch_seconds(),
+                )
+                .unwrap();
+        }
     }
     apply(begin.clone(), observation.clone(), 3);
+    {
+        let guard = coordinator.agent_runtime.lock().unwrap();
+        let runtime = guard.as_ref().unwrap();
+        let run = runtime.current_run_for_binding(&binding).unwrap().unwrap();
+        assert_eq!(run.operation_id.is_none(), abandon);
+        assert_eq!(
+            runtime
+                .get_operation(&runtime.operation_ref(operation_id.clone()))
+                .unwrap()
+                .operator_abandoned(),
+            abandon
+        );
+    }
     let first = receiver.try_recv().unwrap();
     assert_eq!(first.task_context.recent_prompts, [private_prompt]);
     apply(begin, observation, 4);

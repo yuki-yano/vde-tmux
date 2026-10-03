@@ -1209,6 +1209,14 @@ pub enum ApiRequest {
     AgentOperationGet {
         operation_ref: String,
     },
+    AgentOperationAbandon {
+        operation_ref: String,
+        #[schemars(range(min = 1))]
+        expected_revision: u64,
+        /// Nonblank reason, 1-247 UTF-8 bytes, with no control characters.
+        #[schemars(length(min = 1, max = 247))]
+        reason: String,
+    },
     AgentOperationWait {
         operation_ref: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -814,6 +814,21 @@ pub struct OperationResultReceipt {
 }
 
 impl OperationResultReceipt {
+    pub fn operator_abandon(reason: &str, observed_at: i64) -> Result<Self, ModelError> {
+        if reason.trim().is_empty() {
+            return Err(ModelError("abandon reason must not be blank".to_string()));
+        }
+        validate_required_text(reason, "abandon reason", IDENTIFIER_MAX_BYTES - 9)?;
+        let receipt = Self {
+            code: "operator_abandoned".to_string(),
+            observed_at,
+            confirmation_basis: None,
+            source_attribution: Some(format!("operator:{reason}")),
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         validate_required_text(&self.code, "operation receipt code", IDENTIFIER_MAX_BYTES)?;
         if self.observed_at < 0 {
@@ -857,6 +872,24 @@ pub struct OperationRecord {
 }
 
 impl OperationRecord {
+    /// Delivery remains ambiguous after an operator explicitly releases its fence.
+    pub fn operator_abandoned(&self) -> bool {
+        self.dispatch_state == DispatchState::DeliveryUnknown
+            && self
+                .result_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.code == "operator_abandoned")
+    }
+
+    pub fn dispatch_fenced(&self) -> bool {
+        matches!(
+            self.dispatch_state,
+            DispatchState::Prepared
+                | DispatchState::DispatchStarted
+                | DispatchState::DeliveryUnknown
+        ) && !self.operator_abandoned()
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.state_format_version != PRIVATE_STATE_FORMAT_VERSION {
             return Err(ModelError(
@@ -906,6 +939,21 @@ impl OperationRecord {
                     "invalid operation state/receipt combination".to_string(),
                 ));
             }
+        }
+        if let Some(receipt) = &self.result_receipt
+            && receipt.code == "operator_abandoned"
+            && (!self.operator_abandoned()
+                || self.run_id.is_some()
+                || receipt.confirmation_basis.is_some()
+                || !receipt.source_attribution.as_ref().is_some_and(|source| {
+                    source
+                        .strip_prefix("operator:")
+                        .is_some_and(|reason| !reason.trim().is_empty())
+                }))
+        {
+            return Err(ModelError(
+                "invalid abandoned operation receipt".to_string(),
+            ));
         }
         if self.binding.provider_session_id.is_none()
             && (self.binding.agent_kind.as_str() != "codex"
