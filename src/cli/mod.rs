@@ -390,7 +390,7 @@ pub fn run() -> ExitCode {
     let timeout = if is_view_hook {
         Duration::from_millis(100)
     } else if is_agent_hook {
-        Duration::from_millis(300)
+        Duration::from_millis(1000)
     } else {
         Duration::from_secs(3)
     };
