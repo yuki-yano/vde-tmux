@@ -820,7 +820,16 @@ After a vde-tmux daemon restart, authority returns with the next
 accepted embedded hook; until then the pane may show Unknown. Shared-server commands such as
 `codex queue` are not available with `--no-daemon`; keep those workflows on the shared server.
 Do not open an active shared thread in both modes.
-API 6 / daemon protocol 29 must be installed together; Pane State schema 10 and Question sidecar
+Accepted async-question replies in Codex 0.159.3/0.160.0 now acknowledge matching question IDs,
+including replies accepted while the same turn is running. Partial or out-of-order replies keep
+unanswered notices visible; the persisted acknowledgement advances only over an entirely
+answered prefix. Complete reply envelopes are required, with verified owner/session and a clean
+loss journal. A verified startup in this daemon generation and unchanged home epoch are required;
+resume/clear sessions, sessions continuing across daemon restart, and sessions invalidated by
+home-wide hook loss keep new notices Q-only as well. Unknown IDs, malformed/quoted frames, automatic capacity inputs and missing or
+restart-era issuance evidence retain notices. See [Question notices](AGENT_API.md#question-notices-api-v5).
+
+API 6 / daemon protocol 30 must be installed together; Pane State schema 10 and Question sidecar
 schema 1 remain unchanged. See [the API contract](AGENT_API.md#codex-screen-evidence-api-6).
 
 Run `python3 scripts/test-codex-observation-isolated.py` after building the binaries to verify

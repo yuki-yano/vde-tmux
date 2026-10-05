@@ -4,7 +4,12 @@ Publishing is driven by Git tags.
 
 ## Local API v6 upgrade
 
-API 6 / daemon protocol 29 adds late durable prompt confirmation and revision-guarded
+API 6 / daemon protocol 30 adds ID-matched acknowledgement for accepted async-question replies.
+Hook metadata contains only bounded reply-ID hashes; per-issuance partial answers remain in
+memory. Same-turn replies may acknowledge an entirely answered prefix without capture/Idle,
+while newer unanswered notices and restart-era notices remain. Preserve the exact process/session,
+profile, generation and loss-journal guards. Question sidecar schema 1 is unchanged.
+Protocol 29 added late durable prompt confirmation and revision-guarded
 `agent operation abandon`. The 10-second deadline reports delivery uncertainty; matching later
 Run evidence can still confirm the Operation. Abandonment preserves ambiguity while releasing its
 dispatch fence. Dispatched-input classification and prompt redaction survive fence release.
@@ -27,14 +32,30 @@ Resolver trust is runtime-only: notices from before the restart remain Q-only, a
 sessions are not made trusted by a later prompt. A local install does not require a crate
 version bump or a release tag.
 
-1. Pass formatting, Clippy, tests, extended runtime smoke, UI/UX preflight, and the isolated
-   kill-server test. Reuse successful results for unchanged code. Run
-   `python3 scripts/test-question-notice-isolated.py --extended` for the question hook/API/Q path.
+1. Pass formatting, Clippy, tests, and the checks applicable to the change under `AGENTS.md`.
+   Reuse successful results for unchanged code. A local binary replacement does not by itself
+   require the extended runtime smoke, UI/UX preflight, kill-server test, or long question load test;
+   the full release preflight below remains required before publishing.
+   Run `python3 scripts/test-question-notice-isolated.py` after changes to the question hook/API/Q path.
+   Add `--extended` when changing ordinary-prompt auto-ack scheduling, capture admission, status
+   delivery performance, or their resource limits, or when investigating an unresolved concern in
+   those paths. Do not add it solely for reply-ID parsing, reply-worker changes, documentation, or installation.
    Its performance gate is the observed condition-wise p95 increase of at most 50ms, zero normal
    capture failures, at most 20MiB RSS growth, and retained notices on probe drop. Reuse accepted
    evidence for unchanged product code; distinguish saved-data re-evaluation from a new run.
+   Run `python3 scripts/test-question-notice-isolated.py --reply-load-only` when changing reply-worker
+   admission, queueing, execution budgets, retries, journal waits, or shared mutation/IO scheduling.
+   It exercises
+   valid ID-matched reply workers with 58 panes, two clients and three concurrent producers
+   (two ABBA cycles, 200 status samples per condition). This targeted pressure check does not
+   replace an applicable extended question gate. Select each load test by the affected path rather
+   than running both for every question change. It checks acknowledgement during active load, bounded
+   RSS growth, zero normal capture failures and status p95 within a 2s/1.5x budget.
+   Every submitted reply must settle before manual Q (accepted frames and acknowledged notice
+   orders equal submitted cycles, including combined prefix advancement), with no terminal reply/journal failure;
+   per-phase counters and retention reasons are saved as evidence.
 2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
-   Confirm `vt api schema --json` reports API 6, protocol 29, PaneState 10, and private state 1.
+   Confirm `vt api schema --json` reports API 6, protocol 30, PaneState 10, and private state 1.
    Validate the staged binaries on a scratch server before replacing the installed generation:
    `VDE_VT_BIN=<temporary-root>/bin/vt python3 scripts/test-codex-observation-isolated.py`.
 3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.

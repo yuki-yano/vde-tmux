@@ -40,6 +40,212 @@ fn summary(store: &QuestionNotices) -> QuestionNoticeSummary {
     store.summary(&pane(), Some(&process()))
 }
 
+fn tracked_issue(store: &mut QuestionNotices, call: &str, count: usize) -> String {
+    issue(store, call);
+    let summary = summary(store);
+    let owner = summary.owner_ref.unwrap();
+    store.remember_reply_items(&owner, summary.latest_order, "session", call, count);
+    owner
+}
+
+fn answer(
+    store: &mut QuestionNotices,
+    owner: &str,
+    items: &[(&str, usize)],
+) -> Result<bool, &'static str> {
+    store.acknowledge_reply(
+        &pane(),
+        owner,
+        &turn_order::identifier_digest("session"),
+        &reply::ReplyEvidence {
+            items: items
+                .iter()
+                .map(|(call, index)| reply::item_digest(call, *index))
+                .collect(),
+        },
+        Instant::now() + Duration::from_secs(2),
+    )
+}
+
+#[test]
+fn partial_and_out_of_order_replies_only_advance_a_fully_answered_prefix() {
+    let mut store = QuestionNotices::default();
+    let owner = tracked_issue(&mut store, "first", 2);
+    tracked_issue(&mut store, "second", 1);
+    tracked_issue(&mut store, "third", 1);
+    assert_eq!(answer(&mut store, &owner, &[("second", 0)]), Ok(false));
+    assert_eq!(answer(&mut store, &owner, &[("second", 0)]), Ok(false));
+    assert_eq!(answer(&mut store, &owner, &[("first", 0)]), Ok(false));
+    assert_eq!(summary(&store).acknowledged_order, 0);
+    assert_eq!(answer(&mut store, &owner, &[("first", 1)]), Ok(true));
+    assert_eq!(summary(&store).acknowledged_order, 2);
+    assert!(summary(&store).unacknowledged);
+    assert_eq!(
+        answer(&mut store, &owner, &[("second", 0)]),
+        Err("unknown_reply_item")
+    );
+    assert_eq!(summary(&store).acknowledged_order, 2);
+    assert_eq!(answer(&mut store, &owner, &[("third", 0)]), Ok(true));
+    assert!(!summary(&store).unacknowledged);
+    assert!(store.reply_items.is_empty());
+    assert_eq!(answer(&mut store, &owner, &[("third", 0)]), Ok(false));
+}
+
+#[test]
+fn wrong_owner_session_unknown_or_mixed_reply_cannot_consume_known_pending_items() {
+    let mut store = QuestionNotices::default();
+    let owner = tracked_issue(&mut store, "first", 1);
+    assert_eq!(
+        answer(&mut store, "other-owner", &[("first", 0)]),
+        Err("stale_notice_owner")
+    );
+    assert_eq!(
+        store.acknowledge_reply(
+            &pane(),
+            &owner,
+            &turn_order::identifier_digest("other"),
+            &reply::ReplyEvidence {
+                items: vec![reply::item_digest("first", 0)]
+            },
+            Instant::now() + Duration::from_secs(2)
+        ),
+        Err("unknown_reply_item")
+    );
+    assert_eq!(
+        answer(&mut store, &owner, &[("first", 0), ("unknown", 0)]),
+        Err("unknown_reply_item")
+    );
+    assert_eq!(summary(&store).acknowledged_order, 0);
+    assert_eq!(answer(&mut store, &owner, &[("first", 0)]), Ok(true));
+}
+
+#[test]
+fn reply_ack_rollback_preserves_notice_and_restart_does_not_rebuild_reply_evidence() {
+    let temp = Temp::new();
+    let mut store = QuestionNotices::open(temp.path(), "server".into());
+    let owner = tracked_issue(&mut store, "private-call-canary", 1);
+    let id = reply::item_digest("private-call-canary", 0);
+    let body = std::fs::read_to_string(temp.path()).unwrap();
+    assert!(!body.contains("private-call-canary") && !body.contains(&id));
+    store.storage_fault = Some(storage::FaultPoint::BeforeRename);
+    assert_eq!(
+        answer(&mut store, &owner, &[("private-call-canary", 0)]),
+        Err("persistence_pending")
+    );
+    assert!(summary(&store).unacknowledged);
+    assert!(store.reply_items[&(owner.clone(), 1)].pending.contains(&id));
+    drop(store);
+    let mut reopened = QuestionNotices::open(temp.path(), "server".into());
+    assert!(summary(&reopened).unacknowledged);
+    assert_eq!(
+        answer(&mut reopened, &owner, &[("private-call-canary", 0)]),
+        Err("unknown_reply_item")
+    );
+    reopened.acknowledge(&pane(), &owner, 1).unwrap();
+    assert!(!summary(&reopened).unacknowledged);
+}
+
+#[test]
+fn absent_issuance_evidence_blocks_later_answered_prefix_and_dead_owner_cleanup_removes_it() {
+    let mut store = QuestionNotices::default();
+    issue(&mut store, "untracked");
+    let owner = tracked_issue(&mut store, "second", 1);
+    assert_eq!(answer(&mut store, &owner, &[("second", 0)]), Ok(false));
+    assert_eq!(summary(&store).acknowledged_order, 0);
+    assert!(summary(&store).unacknowledged);
+    store.reconcile(|_, _| false);
+    assert!(store.reply_items.is_empty());
+    assert!(store.reply_calls.is_empty());
+}
+
+#[test]
+fn reused_call_ids_do_not_allow_delayed_replies_to_clear_a_new_notice() {
+    let mut store = QuestionNotices::default();
+    let owner = tracked_issue(&mut store, "reused", 1);
+    answer(&mut store, &owner, &[("reused", 0)]).unwrap();
+    store.issue(pane(), process(), ("session", "new-turn", "reused"), 43);
+    store.remember_reply_items(&owner, 2, "session", "reused", 1);
+    assert_eq!(
+        answer(&mut store, &owner, &[("reused", 0)]),
+        Err("unknown_reply_item")
+    );
+    assert_eq!(summary(&store).acknowledged_order, 1);
+    assert!(summary(&store).unacknowledged);
+}
+
+#[test]
+fn untracked_or_over_capacity_calls_remain_tombstoned_after_q() {
+    for count in [0, reply::MAX_ISSUED_ITEMS + 1] {
+        let mut store = QuestionNotices::default();
+        let owner = tracked_issue(&mut store, "reused", count);
+        store.acknowledge(&pane(), &owner, 1).unwrap();
+        store.issue(pane(), process(), ("session", "later", "reused"), 43);
+        store.remember_reply_items(&owner, 2, "session", "reused", 1);
+        assert_eq!(
+            answer(&mut store, &owner, &[("reused", 0)]),
+            Err("unknown_reply_item")
+        );
+        assert!(summary(&store).unacknowledged);
+    }
+    let mut store = QuestionNotices::default();
+    for index in 0..MAX_TEXT_NOTICES_PER_OWNER {
+        tracked_issue(&mut store, &format!("filled-{index}"), 1);
+    }
+    let owner = tracked_issue(&mut store, "reused", 1);
+    assert_eq!(store.reply_items.len(), MAX_TEXT_NOTICES_PER_OWNER);
+    store
+        .acknowledge(&pane(), &owner, summary(&store).latest_order)
+        .unwrap();
+    store.issue(pane(), process(), ("session", "later", "reused"), 43);
+    let latest = summary(&store).latest_order;
+    store.remember_reply_items(&owner, latest, "session", "reused", 1);
+    assert_eq!(
+        answer(&mut store, &owner, &[("reused", 0)]),
+        Err("unknown_reply_item")
+    );
+}
+
+#[test]
+fn exhausted_call_history_disables_reply_ack_until_owner_cleanup() {
+    let mut store = QuestionNotices::default();
+    let owner = tracked_issue(&mut store, "first", 1);
+    store.reply_calls.insert(
+        owner.clone(),
+        (0..MAX_KEYS_PER_OWNER)
+            .map(|index| format!("{index:064x}"))
+            .collect(),
+    );
+    tracked_issue(&mut store, "untracked", 1);
+    assert!(store.reply_blocked_owners.contains(&owner));
+    assert!(store.reply_items.is_empty());
+    store.acknowledge(&pane(), &owner, 2).unwrap();
+    tracked_issue(&mut store, "new", 1);
+    assert_eq!(
+        answer(&mut store, &owner, &[("new", 0)]),
+        Err("unknown_reply_item")
+    );
+    store.reconcile(|_, _| false);
+    assert!(store.reply_blocked_owners.is_empty());
+}
+
+#[test]
+fn expired_partial_reply_does_not_consume_pending_items() {
+    let mut store = QuestionNotices::default();
+    let owner = tracked_issue(&mut store, "first", 2);
+    let result = store.acknowledge_reply(
+        &pane(),
+        &owner,
+        &turn_order::identifier_digest("session"),
+        &reply::ReplyEvidence {
+            items: vec![reply::item_digest("first", 0)],
+        },
+        Instant::now(),
+    );
+    assert_eq!(result, Err("reply_deadline"));
+    assert_eq!(answer(&mut store, &owner, &[("first", 1)]), Ok(false));
+    assert!(summary(&store).unacknowledged);
+}
+
 #[test]
 fn fenced_ack_preserves_new_arrivals_and_deduplicates_after_ack() {
     let mut store = QuestionNotices::default();
@@ -516,4 +722,211 @@ fn captured_ancestry_contains_current_exact_process() {
         ancestors[0].start_token,
         crate::daemon::lifecycle::agent_process_start_token(std::process::id()).unwrap()
     );
+}
+
+#[test]
+fn partial_reply_preserves_an_existing_ordinary_candidate() {
+    use ingress::{InputClass, SessionSource, TranscriptLocator};
+    use profile::{CodexProfile, ExecutableFingerprint, ProfileRequest};
+    use resolver::{Binding, JournalView, NoticeFence, session_key};
+    let mut store = QuestionNotices::default();
+    let owner = tracked_issue(&mut store, "call", 2);
+    let binding = Binding {
+        owner: owner.clone(),
+        pane: pane(),
+        process: process(),
+        executable: ProfileRequest {
+            process: process(),
+            executable: ExecutableFingerprint {
+                dev: 1,
+                ino: 1,
+                size: 1,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+                ctime_sec: 0,
+                ctime_nsec: 0,
+            },
+        },
+        profile: CodexProfile::V01593,
+        locator: TranscriptLocator {
+            home: PathBuf::from("/synthetic"),
+            transcript: PathBuf::from("/synthetic/transcript"),
+            dev: 1,
+            ino: 1,
+        },
+    };
+    let journal = JournalView {
+        epoch: 0,
+        veto: false,
+        session_dirty: false,
+    };
+    store.resolver.session_start(
+        binding.locator.home_digest(),
+        session_key("session"),
+        SessionSource::Startup,
+        Some(binding.clone()),
+        journal,
+        true,
+    );
+    store.resolver.issue(
+        &binding,
+        &binding.locator.home_digest(),
+        &session_key("session"),
+        &session_key("a"),
+        1,
+        0,
+    );
+    store
+        .resolver
+        .ordinary(
+            InputClass::OrdinaryPrompt,
+            &binding,
+            &session_key("session"),
+            "input",
+            &session_key("b"),
+            NoticeFence {
+                acknowledged: 0,
+                latest: 1,
+            },
+            journal,
+            Instant::now(),
+        )
+        .unwrap();
+    assert_eq!(answer(&mut store, &owner, &[("call", 0)]), Ok(false));
+    assert!(store.resolver.candidate(&owner).is_some());
+    assert_eq!(answer(&mut store, &owner, &[("call", 1)]), Ok(true));
+    assert!(store.resolver.candidate(&owner).is_none());
+}
+
+#[test]
+fn reply_acceptance_freezes_id_orders_and_cannot_adopt_future_issuance() {
+    let mut store = QuestionNotices::default();
+    let owner = tracked_issue(&mut store, "a", 1);
+    let session = turn_order::identifier_digest("session");
+    let mixed = reply::ReplyEvidence {
+        items: vec![reply::item_digest("a", 0), reply::item_digest("b", 0)],
+    };
+    assert_eq!(
+        store.match_reply_orders(&pane(), &owner, &session, &mixed),
+        Err("unknown_reply_item")
+    );
+    let known = reply::ReplyEvidence {
+        items: vec![reply::item_digest("a", 0)],
+    };
+    let orders = store
+        .match_reply_orders(&pane(), &owner, &session, &known)
+        .unwrap();
+    tracked_issue(&mut store, "b", 1);
+    assert_eq!(
+        store.acknowledge_reply_orders(
+            &pane(),
+            &owner,
+            &session,
+            &known,
+            &orders,
+            Instant::now() + Duration::from_secs(1)
+        ),
+        Ok(true)
+    );
+    assert_eq!(summary(&store).acknowledged_order, 1);
+    assert!(summary(&store).unacknowledged);
+    // An old job cannot rebind a reused call after Q.
+    store.acknowledge(&pane(), &owner, 2).unwrap();
+    store.issue(pane(), process(), ("session", "later", "a"), 43);
+    store.remember_reply_items(&owner, 3, "session", "a", 1);
+    assert_eq!(
+        store.acknowledge_reply_orders(
+            &pane(),
+            &owner,
+            &session,
+            &known,
+            &orders,
+            Instant::now() + Duration::from_secs(1)
+        ),
+        Ok(false)
+    );
+    assert_eq!(summary(&store).acknowledged_order, 2);
+    assert!(summary(&store).unacknowledged);
+}
+
+#[test]
+fn manual_ack_of_an_earlier_pair_does_not_discard_the_remaining_accepted_reply() {
+    let mut store = QuestionNotices::default();
+    let owner = tracked_issue(&mut store, "a", 1);
+    tracked_issue(&mut store, "b", 1);
+    let session = turn_order::identifier_digest("session");
+    let reply = reply::ReplyEvidence {
+        items: vec![reply::item_digest("a", 0), reply::item_digest("b", 0)],
+    };
+    let orders = store
+        .match_reply_orders(&pane(), &owner, &session, &reply)
+        .unwrap();
+    store.acknowledge(&pane(), &owner, 1).unwrap();
+    tracked_issue(&mut store, "new-unanswered", 1);
+    assert_eq!(
+        store.acknowledge_reply_orders(
+            &pane(),
+            &owner,
+            &session,
+            &reply,
+            &orders,
+            Instant::now() + Duration::from_secs(1)
+        ),
+        Ok(true)
+    );
+    assert_eq!(summary(&store).acknowledged_order, 2);
+    assert_eq!(summary(&store).latest_order, 3);
+    assert!(summary(&store).unacknowledged);
+}
+
+#[test]
+fn nearly_expired_reply_and_failed_ack_do_not_create_a_global_persistence_backlog() {
+    let temp = Temp::new();
+    let mut store = QuestionNotices::open(temp.path(), "server".into());
+    let owner = tracked_issue(&mut store, "first", 1);
+    let reply = reply::ReplyEvidence {
+        items: vec![reply::item_digest("first", 0)],
+    };
+    let session = turn_order::identifier_digest("session");
+    let orders = store
+        .match_reply_orders(&pane(), &owner, &session, &reply)
+        .unwrap();
+    let before = std::fs::read(temp.path()).unwrap();
+    let last = store.last_write_attempt;
+    assert_eq!(
+        store.acknowledge_reply_orders(
+            &pane(),
+            &owner,
+            &session,
+            &reply,
+            &orders,
+            Instant::now() + Duration::from_millis(10)
+        ),
+        Err("reply_deadline")
+    );
+    assert!(!store.dirty);
+    assert_eq!(store.last_write_attempt, last);
+    assert_eq!(std::fs::read(temp.path()).unwrap(), before);
+    store.storage_fault = Some(storage::FaultPoint::BeforeRename);
+    assert_eq!(
+        answer(&mut store, &owner, &[("first", 0)]),
+        Err("persistence_pending")
+    );
+    assert!(!store.dirty);
+    assert_eq!(store.last_write_attempt, last);
+    assert!(summary(&store).unacknowledged && summary(&store).degraded());
+    let other = PaneInstance {
+        pane_id: "%8".into(),
+        pane_pid: 800,
+    };
+    assert!(!store.summary(&other, None).degraded());
+    store.storage_fault = None;
+    assert_eq!(
+        store
+            .issue(other.clone(), process(), ("session", "turn", "new"), 43)
+            .durability,
+        Some(NoticeDurability::Persisted)
+    );
+    assert!(!store.dirty && !summary(&store).degraded());
+    assert_eq!(summary(&store).acknowledged_order, 0);
 }

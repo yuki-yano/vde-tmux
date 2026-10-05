@@ -1234,6 +1234,7 @@ fn question_journal_root_mismatch_recovers_all_same_home_sessions_but_startup_fa
         profile: CodexProfile::Unknown,
         process: None,
         input_class: InputClass::OrdinaryPrompt,
+        reply: None,
         source: SessionSource::Startup,
         home_digest: Some(home.clone()),
         journal_root_digest: Some(location.root_digest().unwrap()),
@@ -1550,4 +1551,440 @@ fn question_completion_waiting_for_state_leaves_guard_under_deadline_reaper() {
     }
     drop(coordinator);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
+    use crate::daemon::workers::question::{ReplyCompletion, ReplyJob, SharedJournalGuard};
+    use crate::question_notice::{
+        QuestionNotices,
+        ingress::{SessionSource, TranscriptLocator},
+        journal::{DirtyEntry, DirtyReason, JournalLocation, WriterState},
+        profile::{CodexProfile, ExecutableFingerprint, ProfileRequest},
+        reply::{ReplyEvidence, item_digest},
+        resolver::{Binding, Fence, JournalView, session_key},
+    };
+    for case in [
+        "ok",
+        "persist",
+        "owner",
+        "resume",
+        "epoch",
+        "dirty",
+        "expired",
+        "unknown",
+        "arrival",
+        "retry",
+        "retry-arrival",
+        "retry-owner-proof",
+        "retry-queue-full",
+        "retry-owner",
+        "retry-resume",
+    ] {
+        let root = test_root(&format!("reply-{case}"));
+        let env = BTreeMap::from([("XDG_STATE_HOME".into(), root.display().to_string())]);
+        let coordinator = ProductionV2Coordinator::new(
+            test_incarnation(&root, format!("reply-{case}")),
+            env.clone(),
+            None,
+        )
+        .unwrap();
+        install_test_state(&coordinator, &root, Default::default());
+        *coordinator.agent_runtime.lock().unwrap() = Some(
+            crate::agent_state::runtime::AgentRuntime::open(
+                root.join("agent-state"),
+                "reply-provider".into(),
+            )
+            .unwrap(),
+        );
+        let pane = PaneInstance {
+            pane_id: "%541".into(),
+            pane_pid: 54100,
+        };
+        let process = crate::pane_state::AgentProcessIdentity {
+            pid: 54101,
+            start_token: "reply-process".into(),
+        };
+        let runner = crate::tmux::mock::MockTmuxRunner::new();
+        runner.stub_agent_process(pane.pane_pid, "codex", Some(process.clone()));
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .topology
+            .panes = vec![read_peek_test_topology_pane(pane.clone(), false)];
+        let daemon = coordinator
+            .router
+            .lock()
+            .unwrap()
+            .daemon_instance_id()
+            .clone();
+        for kind in ["SessionStart", "UserPromptSubmit"] {
+            let (envelope, observation) = codex_provider_test_event(daemon.clone(), pane.clone(), kind,
+                &serde_json::json!({"session_id":"session", "turn_id":"turn", "source":"startup", "prompt":"issuer"}).to_string(), 42);
+            apply_external_provider_event_with_runner(
+                &coordinator,
+                1,
+                envelope,
+                observation,
+                &runner,
+            );
+        }
+        let binding;
+        {
+            let mut guard = coordinator.state.lock().unwrap();
+            let state = guard.as_mut().unwrap();
+            state.question_notices = QuestionNotices::open(
+                root.join("reply-notices/question-notices-v1.json"),
+                "reply-server".into(),
+            );
+            state.question_notices.issue(
+                pane.clone(),
+                process.clone(),
+                ("session", "turn", "call"),
+                42,
+            );
+            let owner = state
+                .question_notices
+                .summary(&pane, Some(&process))
+                .owner_ref
+                .unwrap();
+            state
+                .question_notices
+                .remember_reply_items(&owner, 1, "session", "call", 1);
+            binding = Binding {
+                owner,
+                pane: pane.clone(),
+                process: process.clone(),
+                executable: ProfileRequest {
+                    process: process.clone(),
+                    executable: ExecutableFingerprint {
+                        dev: 1,
+                        ino: 1,
+                        size: 1,
+                        mtime_sec: 0,
+                        mtime_nsec: 0,
+                        ctime_sec: 0,
+                        ctime_nsec: 0,
+                    },
+                },
+                profile: CodexProfile::V01593,
+                locator: TranscriptLocator {
+                    home: root.clone(),
+                    transcript: root.join("transcript"),
+                    dev: 1,
+                    ino: 1,
+                },
+            };
+            state.question_notices.resolver.session_start(
+                binding.locator.home_digest(),
+                session_key("session"),
+                if matches!(case, "resume" | "retry-resume") {
+                    SessionSource::Resume
+                } else {
+                    SessionSource::Startup
+                },
+                Some(binding.clone()),
+                JournalView {
+                    epoch: 0,
+                    veto: false,
+                    session_dirty: false,
+                },
+                true,
+            );
+            if case == "persist" {
+                state
+                    .question_notices
+                    .inject_reply_commit_failure_for_test();
+            }
+            if matches!(case, "owner" | "retry-owner") {
+                state.topology.panes.clear();
+            }
+            state.leased.runtime.mark_projection_changed().unwrap();
+        }
+        // Submit-side validation cannot accept a mixed unknown/future item.
+        let observed = super::super::question::ResolverObservation {
+            pane: pane.clone(),
+            daemon: daemon.clone(),
+            session: session_key("session"),
+            turn: Some(session_key("turn")),
+            ingress: Some("reply".into()),
+            kind: crate::hook::provider::ProviderHookKind::UserPromptSubmit,
+            metadata: None,
+        };
+        {
+            let state = coordinator.state.lock().unwrap();
+            let state = state.as_ref().unwrap();
+            let mixed = ReplyEvidence {
+                items: vec![item_digest("call", 0), item_digest("future", 0)],
+            };
+            assert!(
+                super::super::question::prepare_reply_job(
+                    state,
+                    &observed,
+                    binding.clone(),
+                    &binding.locator.home_digest(),
+                    0,
+                    &mixed
+                )
+                .is_err()
+            );
+            let known = ReplyEvidence {
+                items: vec![item_digest("call", 0)],
+            };
+            let prepared = super::super::question::prepare_reply_job(
+                state,
+                &observed,
+                binding.clone(),
+                &binding.locator.home_digest(),
+                0,
+                &known,
+            );
+            if matches!(case, "resume" | "retry-resume") {
+                assert!(prepared.is_err());
+            } else {
+                let job = prepared.unwrap();
+                assert_eq!(job.orders, vec![1]);
+                assert_eq!(job.fence.latest, 1);
+                let (worker, queued) =
+                    crate::daemon::workers::question::ReplyWorkerHandle::test_queue();
+                for _ in 0..16 {
+                    assert!(worker.submit(job.clone()));
+                }
+                assert!(!worker.submit(job));
+                assert_eq!(queued.try_recv().unwrap().orders, vec![1]);
+            }
+        }
+        if matches!(case, "arrival" | "retry-arrival" | "retry-owner-proof") {
+            let mut state = coordinator.state.lock().unwrap();
+            let state = state.as_mut().unwrap();
+            state.question_notices.issue(
+                pane.clone(),
+                process.clone(),
+                ("session", "turn", "future"),
+                43,
+            );
+            state
+                .question_notices
+                .remember_reply_items(&binding.owner, 2, "session", "future", 1);
+            state.leased.runtime.mark_projection_changed().unwrap();
+        }
+        // Publish the lifecycle/issue revision before the deferred reply completion,
+        // reproducing the cache race that previously kept sidebar Q visible.
+        let before = coordinator.publish_resolved_snapshot().unwrap();
+        let location = JournalLocation::new(&env, binding.locator.home_digest()).unwrap();
+        drop(
+            location
+                .lock_hook(Instant::now() + Duration::from_secs(2))
+                .unwrap(),
+        );
+        let mut locked = location
+            .lock(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        if case == "dirty" {
+            let entry = DirtyEntry::new(
+                binding.locator.home_digest(),
+                (Some("session"), Some("turn"), Some("lost")),
+                DirtyReason::QuestionHook,
+                42,
+            )
+            .unwrap();
+            locked.insert(entry).unwrap();
+        }
+        locked
+            .evaluate(Some(&session_key("session")), |_| WriterState::Unknown)
+            .unwrap();
+        let transfer = SharedJournalGuard::new(locked);
+        if case == "expired" {
+            transfer.take();
+        }
+        let mut job = ReplyJob {
+            fence: Fence {
+                generation: 0,
+                ingress: "reply".into(),
+                home: binding.locator.home_digest(),
+                session: session_key("session"),
+                turn: session_key("turn"),
+                epoch: u64::from(case == "epoch"),
+                acknowledged: 0,
+                latest: 1,
+                binding,
+            },
+            orders: vec![1],
+            attempt: 0,
+            reply: ReplyEvidence {
+                items: vec![item_digest(
+                    if case == "unknown" { "unknown" } else { "call" },
+                    0,
+                )],
+            },
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        if matches!(case, "retry-owner" | "retry-resume" | "retry-queue-full") {
+            let (worker, queued) =
+                crate::daemon::workers::question::ReplyWorkerHandle::test_queue();
+            if case == "retry-queue-full" {
+                for _ in 0..16 {
+                    assert!(worker.submit(job.clone()));
+                }
+            }
+            *coordinator.question_replies.lock().unwrap() = Some(worker);
+            super::super::question::reply_completed(
+                &coordinator,
+                ReplyCompletion {
+                    job,
+                    reason: Some(crate::question_notice::resolver::RetainReason::MutationBusy),
+                    guard: None,
+                },
+            );
+            if case == "retry-queue-full" {
+                assert_eq!(queued.try_iter().count(), 16);
+            } else {
+                assert!(queued.try_recv().is_err());
+            }
+            let state = coordinator.state.lock().unwrap();
+            let notices = &state.as_ref().unwrap().question_notices;
+            let reason = match case {
+                "retry-owner" => "reply_owner",
+                "retry-queue-full" => "reply_queue_unavailable",
+                _ => "reply_history_unknown",
+            };
+            assert_eq!(notices.resolver.diagnostics()["retained_by"][reason], 1);
+            assert_eq!(notices.resolver.replies_retried, 0);
+            assert!(notices.summary(&pane, Some(&process)).unacknowledged);
+            continue;
+        }
+        if case == "retry" {
+            let (worker, queued) =
+                crate::daemon::workers::question::ReplyWorkerHandle::test_queue();
+            *coordinator.question_replies.lock().unwrap() = Some(worker);
+            let mut next = job.clone();
+            for attempt in 0..3 {
+                assert_eq!(next.attempt, attempt);
+                super::super::question::reply_completed(
+                    &coordinator,
+                    ReplyCompletion {
+                        job: next.clone(),
+                        reason: Some(crate::question_notice::resolver::RetainReason::MutationBusy),
+                        guard: None,
+                    },
+                );
+                if attempt < 2 {
+                    let retry = queued.try_recv().unwrap();
+                    assert_eq!(retry.orders, next.orders);
+                    assert_eq!(retry.reply, next.reply);
+                    assert_eq!(retry.fence, next.fence);
+                    next = retry;
+                } else {
+                    assert!(queued.try_recv().is_err());
+                }
+            }
+            let guard = coordinator.state.lock().unwrap();
+            let state = guard.as_ref().unwrap();
+            assert!(
+                state
+                    .question_notices
+                    .summary(&pane, Some(&process))
+                    .unacknowledged
+            );
+            assert_eq!(state.question_notices.resolver.replies_retried, 2);
+            continue;
+        }
+        if matches!(case, "retry-arrival" | "retry-owner-proof") {
+            let (worker, queued) =
+                crate::daemon::workers::question::ReplyWorkerHandle::test_queue();
+            *coordinator.question_replies.lock().unwrap() = Some(worker);
+            super::super::question::reply_completed(
+                &coordinator,
+                ReplyCompletion {
+                    job: job.clone(),
+                    reason: Some(if case == "retry-owner-proof" {
+                        crate::question_notice::resolver::RetainReason::Owner
+                    } else {
+                        crate::question_notice::resolver::RetainReason::MutationBusy
+                    }),
+                    guard: None,
+                },
+            );
+            let retry = queued.try_recv().unwrap();
+            assert_eq!(retry.attempt, 1);
+            assert_eq!(retry.fence, job.fence);
+            assert_eq!(retry.orders, job.orders);
+            assert_eq!(retry.reply, job.reply);
+            job = retry;
+        }
+        super::super::question::reply_completed(
+            &coordinator,
+            ReplyCompletion {
+                job,
+                reason: None,
+                guard: Some(transfer),
+            },
+        );
+        let after = coordinator.publish_resolved_snapshot().unwrap();
+        let state = coordinator.state.lock().unwrap();
+        let state = state.as_ref().unwrap();
+        let notice = state.question_notices.summary(&pane, Some(&process));
+        assert_eq!(
+            notice.unacknowledged,
+            case != "ok",
+            "{case}: {:?} {:?}",
+            state.question_notices.resolver.diagnostics(),
+            state.leased.runtime.record(&pane)
+        );
+        assert_eq!(
+            after.revision > before.revision,
+            matches!(
+                case,
+                "ok" | "persist" | "arrival" | "retry-arrival" | "retry-owner-proof"
+            ),
+            "{case}"
+        );
+        if let ServerMessage::ResolvedSnapshotResult { snapshot, .. } = after.message.as_ref() {
+            if case != "owner" {
+                assert_eq!(
+                    snapshot.panes[0]
+                        .question_notice
+                        .as_ref()
+                        .unwrap()
+                        .unacknowledged,
+                    case != "ok",
+                    "{case}"
+                );
+                if case == "persist" {
+                    assert!(
+                        snapshot.panes[0]
+                            .question_notice
+                            .as_ref()
+                            .unwrap()
+                            .tracking_health
+                            == crate::question_notice::TrackingHealth::Degraded
+                    );
+                }
+            }
+        } else {
+            panic!("unexpected published message");
+        }
+        if matches!(case, "retry-arrival" | "retry-owner-proof") {
+            assert_eq!(notice.acknowledged_order, 1);
+            assert_eq!(notice.latest_order, 2);
+            assert_eq!(state.question_notices.resolver.replies_retried, 1);
+            assert_eq!(state.question_notices.resolver.replies_accepted, 1);
+            assert_eq!(state.question_notices.resolver.replies_acked, 1);
+        }
+        if !matches!(
+            case,
+            "ok" | "arrival" | "retry-arrival" | "retry-owner-proof"
+        ) {
+            assert!(
+                !state.question_notices.resolver.diagnostics()["retained_by"]
+                    .as_object()
+                    .unwrap()
+                    .is_empty(),
+                "{case}"
+            );
+        }
+    }
 }

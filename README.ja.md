@@ -184,6 +184,12 @@ vde-tmux daemon の再起動後は、次の embedded hook が受理されると�
 `vt agent get <pane ID> --json` の `summary.presentation` で確認できます。
 画面から判定できない Unknown を、完了や Idle として扱うことはありません。
 
+Codex 0.159.3 / 0.160.0 の回答frameが受理されると、発行した質問IDと照合して対応するQuestion通知を確認済みにします。
+同じturnで実行中の回答にも対応します。複数質問の一部だけに答えた場合や逆順に答えた場合は、未回答通知を越えて確認済み順序を進めません。
+引用・不完全なframe・未知のID・別session・自動capacity入力では通知を残します。
+照合情報はdaemonメモリだけに保持します。現在のdaemon世代で検証済みstartupを観測し、homeのhook欠落がないsessionが対象です。
+再起動前の通知、再起動をまたいで続くsession、resume/clearしたsession、hook欠落で信頼を失ったsessionは、新しい通知も `Q` で手動確認してください。
+
 Question 通知の自動確認では、現在の質問欄の本文と選択肢も照合します。
 折り返しや空白の違いを吸収し、Codex が追加する Other の選択肢は除外します。
 一致は通知を残す根拠に使い、不一致・履歴上の表示・選択肢の省略だけで通知を消しません。

@@ -154,6 +154,20 @@ pub enum RetainReason {
     CommitQueueUnavailable,
     ProbeBindingChanged,
     MutationBusy,
+    ReplyQueueUnavailable,
+    ReplyHistoryUnknown,
+    ReplyUnknownItem,
+    ReplyPersistencePending,
+    ReplyGuardUnavailable,
+    ReplyJournalDirty,
+    ReplyOwner,
+    ReplyDeadline,
+    ReplyEpoch,
+    ReplyJournalAcquire,
+    ReplyJournalEvaluation,
+    ReplyMutationBusy,
+    ReplyInvalidEvidence,
+    ReplyOwnerBudget,
 }
 
 #[derive(Debug)]
@@ -176,6 +190,10 @@ pub struct Resolver {
     pub candidates_started: u64,
     pub candidates_armed: u64,
     pub candidates_acked: u64,
+    pub replies_received: u64,
+    pub replies_accepted: u64,
+    pub replies_acked: u64,
+    pub replies_retried: u64,
 }
 
 impl Default for Resolver {
@@ -200,6 +218,10 @@ impl Default for Resolver {
             candidates_started: 0,
             candidates_armed: 0,
             candidates_acked: 0,
+            replies_received: 0,
+            replies_accepted: 0,
+            replies_acked: 0,
+            replies_retried: 0,
         }
     }
 }
@@ -237,6 +259,10 @@ impl Resolver {
             "candidates_started": self.candidates_started,
             "candidates_armed": self.candidates_armed,
             "candidates_acked": self.candidates_acked,
+            "replies_received": self.replies_received,
+            "replies_accepted": self.replies_accepted,
+            "replies_acked": self.replies_acked,
+            "replies_retried": self.replies_retried,
         })
     }
     /// A failed journal write without a verified session blocks this entire home
@@ -360,6 +386,19 @@ impl Resolver {
         self.sessions
             .get(&(home.to_owned(), session.to_owned()))
             .and_then(|state| state.binding.as_ref())
+    }
+
+    pub fn reply_allowed(&self, home: &str, session: &str, binding: &Binding, epoch: u64) -> bool {
+        !self.disabled
+            && !self.home_failures.contains_key(home)
+            && self
+                .sessions
+                .get(&(home.to_owned(), session.to_owned()))
+                .is_some_and(|state| {
+                    state.trust == Trust::Trusted
+                        && state.binding.as_ref() == Some(binding)
+                        && state.epoch == epoch
+                })
     }
 
     fn disable(&mut self) {

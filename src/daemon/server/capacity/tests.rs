@@ -291,6 +291,14 @@ impl Fixture {
         let (envelope,mut observation)=codex_provider_test_event(daemon.clone(),t.pane.clone(),kind,&serde_json::json!({"session_id":t.session,"turn_id":turn,"source":"startup","prompt":prompt,"last_assistant_message":"done"}).to_string(),epoch);
         let locator = TranscriptLocator::capture(&self.root.join("codex"), &t.path).unwrap();
         observation.question_resolver = Some(ResolverInput {
+            reply: (prompt == policy::DEFAULT_PROMPT).then(|| {
+                crate::question_notice::reply::ReplyEvidence {
+                    items: vec![crate::question_notice::reply::item_digest(
+                        "question-tool",
+                        0,
+                    )],
+                }
+            }),
             daemon_generation: Some(daemon),
             startup_header_verified: false,
             startup_journal: None,
@@ -742,6 +750,7 @@ fn known_question_profile_late_auto_input_neither_acks_nor_changes_original_cont
         assert!(summary.unacknowledged);
         assert_eq!(summary.acknowledged_order, 0);
         assert!(state.question_notices.resolver.non_authoritative >= 1);
+        assert_eq!(state.question_notices.resolver.replies_received, 0);
         assert_eq!(linked, !abandoned);
         let operation = f
             .coordinator

@@ -168,6 +168,7 @@ pub(in crate::daemon::server) fn observe(
     };
     if observation.kind == ProviderHookKind::UserPromptSubmit
         && input.input_class == InputClass::NonAuthoritativeInput
+        && input.reply.is_none()
     {
         if let Some(state) = coordinator
             .state
@@ -402,6 +403,37 @@ pub(in crate::daemon::server) fn observe(
             );
         }
     }
+    if observation.kind == ProviderHookKind::UserPromptSubmit
+        && accepted
+        && let Some(reply) = input.reply.as_ref()
+    {
+        use crate::question_notice::resolver::RetainReason;
+        state.question_notices.resolver.replies_received = state
+            .question_notices
+            .resolver
+            .replies_received
+            .saturating_add(1);
+        let job = match prepare_reply_job(state, &observation, binding, home, epoch, reply) {
+            Ok(job) => job,
+            Err(reason) => {
+                state.question_notices.resolver.note_retained(reason);
+                return;
+            }
+        };
+        if !coordinator
+            .question_replies
+            .lock()
+            .expect("question reply lock poisoned")
+            .as_ref()
+            .is_some_and(|worker| worker.submit(job))
+        {
+            state
+                .question_notices
+                .resolver
+                .note_retained(RetainReason::ReplyQueueUnavailable);
+        }
+        return;
+    }
     if observation.kind == ProviderHookKind::UserPromptSubmit && accepted {
         let summary = state
             .question_notices
@@ -451,6 +483,265 @@ pub(in crate::daemon::server) fn observe(
     }
     drop(guard);
     // The enclosing mutation's maintain pass evaluates the final provider state once.
+}
+
+pub(in crate::daemon::server) fn prepare_reply_job(
+    state: &crate::daemon::runtime::CanonicalCoordinatorState,
+    observation: &ResolverObservation,
+    binding: crate::question_notice::resolver::Binding,
+    home: &str,
+    epoch: u64,
+    reply: &crate::question_notice::reply::ReplyEvidence,
+) -> Result<
+    crate::daemon::workers::question::ReplyJob,
+    crate::question_notice::resolver::RetainReason,
+> {
+    use crate::question_notice::resolver::{Fence, RetainReason};
+    if !state
+        .question_notices
+        .resolver
+        .reply_allowed(home, &observation.session, &binding, epoch)
+    {
+        return Err(RetainReason::ReplyHistoryUnknown);
+    }
+    let orders = state
+        .question_notices
+        .match_reply_orders(&binding.pane, &binding.owner, &observation.session, reply)
+        .map_err(|error| match error {
+            "stale_notice_owner" => RetainReason::ReplyOwner,
+            "invalid_reply_evidence" => RetainReason::ReplyInvalidEvidence,
+            _ => RetainReason::ReplyUnknownItem,
+        })?;
+    let summary = state
+        .question_notices
+        .summary(&binding.pane, Some(&binding.process));
+    Ok(crate::daemon::workers::question::ReplyJob {
+        fence: Fence {
+            generation: 0,
+            ingress: observation.ingress.clone().unwrap_or_default(),
+            home: home.to_owned(),
+            session: observation.session.clone(),
+            turn: observation.turn.clone().unwrap_or_default(),
+            epoch,
+            acknowledged: summary.acknowledged_order,
+            latest: summary.latest_order,
+            binding,
+        },
+        reply: reply.clone(),
+        orders,
+        attempt: 0,
+        deadline: std::time::Instant::now() + std::time::Duration::from_millis(1500),
+    })
+}
+
+fn reply_reason(
+    reason: crate::question_notice::resolver::RetainReason,
+) -> crate::question_notice::resolver::RetainReason {
+    use crate::question_notice::resolver::RetainReason::*;
+    match reason {
+        Owner => ReplyOwner,
+        Deadline => ReplyDeadline,
+        JournalAcquire => ReplyJournalAcquire,
+        JournalEvaluation => ReplyJournalEvaluation,
+        JournalVeto => ReplyJournalDirty,
+        Epoch => ReplyEpoch,
+        MutationBusy => ReplyMutationBusy,
+        other => other,
+    }
+}
+
+fn retry_reply(
+    coordinator: &ProductionV2Coordinator,
+    state: &mut crate::daemon::runtime::CanonicalCoordinatorState,
+    job: &crate::daemon::workers::question::ReplyJob,
+    reason: crate::question_notice::resolver::RetainReason,
+) -> Result<(), crate::question_notice::resolver::RetainReason> {
+    use crate::question_notice::resolver::RetainReason::*;
+    if job.attempt >= 2
+        || !matches!(
+            reason,
+            ReplyMutationBusy
+                | ReplyOwnerBudget
+                | ReplyGuardUnavailable
+                | ReplyDeadline
+                | ReplyJournalAcquire
+                | ReplyOwner
+        )
+    {
+        return Err(reason);
+    }
+    if !owner_binding_current(state, &job.fence) {
+        return Err(ReplyOwner);
+    }
+    if !state.question_notices.resolver.reply_allowed(
+        &job.fence.home,
+        &job.fence.session,
+        &job.fence.binding,
+        job.fence.epoch,
+    ) {
+        return Err(ReplyHistoryUnknown);
+    }
+    let mut retry = job.clone();
+    retry.attempt += 1;
+    retry.deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    let submitted = coordinator
+        .question_replies
+        .lock()
+        .expect("question reply lock poisoned")
+        .as_ref()
+        .is_some_and(|worker| worker.submit(retry));
+    if submitted {
+        state.question_notices.resolver.replies_retried = state
+            .question_notices
+            .resolver
+            .replies_retried
+            .saturating_add(1);
+    }
+    if submitted {
+        Ok(())
+    } else {
+        Err(ReplyQueueUnavailable)
+    }
+}
+
+pub(in crate::daemon::server) fn reply_completed(
+    coordinator: &ProductionV2Coordinator,
+    completion: crate::daemon::workers::question::ReplyCompletion,
+) {
+    let _wake = ResolverWake(&coordinator.question_wake);
+    use crate::question_notice::resolver::RetainReason;
+    let fence = &completion.job.fence;
+    let mut state_guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    // The worker acquired and evaluated the journal before transferring it. No
+    // flock wait or journal repair IO occurs on the serial mutation path.
+    let mut journal = completion.guard.as_ref().and_then(|guard| guard.take());
+    let Some(state) = state_guard.as_mut() else {
+        return;
+    };
+    if let Some(reason) = completion.reason {
+        let reason = reply_reason(reason);
+        if let Err(reason) = retry_reply(coordinator, state, &completion.job, reason) {
+            state.question_notices.resolver.note_retained(reason);
+        }
+        return;
+    }
+    let Some(locked) = journal.as_mut().filter(|guard| guard.is_current()) else {
+        if let Err(reason) = retry_reply(
+            coordinator,
+            state,
+            &completion.job,
+            RetainReason::ReplyGuardUnavailable,
+        ) {
+            state.question_notices.resolver.note_retained(reason);
+        }
+        return;
+    };
+    // The held lock protects the worker's validated evaluation; reading it again
+    // without dead-writer repair checks session dirty state and the same epoch.
+    let clean = locked
+        .evaluate(Some(&fence.session), |_| {
+            crate::question_notice::journal::WriterState::Unknown
+        })
+        .is_ok_and(|view| !view.veto && !view.session_dirty && view.epoch == fence.epoch);
+    if !clean {
+        state
+            .question_notices
+            .resolver
+            .note_retained(RetainReason::ReplyJournalDirty);
+        return;
+    }
+    if !owner_binding_current(state, fence) {
+        state
+            .question_notices
+            .resolver
+            .note_retained(RetainReason::ReplyOwner);
+        return;
+    }
+    if !state.question_notices.resolver.reply_allowed(
+        &fence.home,
+        &fence.session,
+        &fence.binding,
+        fence.epoch,
+    ) {
+        state
+            .question_notices
+            .resolver
+            .note_retained(RetainReason::ReplyHistoryUnknown);
+        return;
+    }
+    if locked
+        .deadline()
+        .saturating_duration_since(std::time::Instant::now())
+        < crate::question_notice::REPLY_COMMIT_RESERVE
+    {
+        drop(journal);
+        if let Err(reason) = retry_reply(
+            coordinator,
+            state,
+            &completion.job,
+            RetainReason::ReplyDeadline,
+        ) {
+            state.question_notices.resolver.note_retained(reason);
+        }
+        return;
+    }
+    let before = state
+        .question_notices
+        .summary(&fence.binding.pane, Some(&fence.binding.process));
+    let result = state.question_notices.acknowledge_reply_orders(
+        &fence.binding.pane,
+        &fence.binding.owner,
+        &fence.session,
+        &completion.job.reply,
+        &completion.job.orders,
+        locked.deadline(),
+    );
+    drop(journal);
+    if result == Err("reply_deadline") {
+        if let Err(reason) = retry_reply(
+            coordinator,
+            state,
+            &completion.job,
+            RetainReason::ReplyDeadline,
+        ) {
+            state.question_notices.resolver.note_retained(reason);
+        }
+        return;
+    }
+    match result {
+        Ok(changed) => {
+            state.question_notices.resolver.replies_accepted = state
+                .question_notices
+                .resolver
+                .replies_accepted
+                .saturating_add(1);
+            if changed {
+                state.question_notices.resolver.replies_acked = state
+                    .question_notices
+                    .resolver
+                    .replies_acked
+                    .saturating_add(1);
+            }
+        }
+        Err(error) => state.question_notices.resolver.note_retained(match error {
+            "unknown_reply_item" => RetainReason::ReplyUnknownItem,
+            "reply_deadline" => RetainReason::ReplyDeadline,
+            "stale_notice_owner" => RetainReason::ReplyOwner,
+            "invalid_reply_evidence" | "invalid_sidecar" => RetainReason::ReplyInvalidEvidence,
+            _ => RetainReason::ReplyPersistencePending,
+        }),
+    }
+    if before
+        != state
+            .question_notices
+            .summary(&fence.binding.pane, Some(&fence.binding.process))
+        && let Err(error) = state.leased.runtime.mark_projection_changed()
+    {
+        coordinator.fail_stop(error.to_string());
+    }
 }
 
 pub(in crate::daemon::server) fn start_workers(
@@ -515,6 +806,16 @@ pub(in crate::daemon::server) fn start_workers(
             let queue = current.queue.lock().expect("v2 queue lock poisoned");
             queue.in_flight || !queue.items.is_empty()
         });
+    let (replies, reply_completed) = crate::daemon::workers::question::start_reply_worker(
+        coordinator.env.clone(),
+        verify_owner.clone(),
+        completion_ready.clone(),
+        mutation_busy.clone(),
+    );
+    *coordinator
+        .question_replies
+        .lock()
+        .expect("question reply lock poisoned") = Some(replies);
     let (probes, probe_completed) = crate::daemon::workers::question::start_probe_workers(
         coordinator.env.clone(),
         capture.clone(),
@@ -555,6 +856,18 @@ pub(in crate::daemon::server) fn start_workers(
             .load(std::sync::atomic::Ordering::Acquire)
         {
             let _ = ready.recv_timeout(Duration::from_millis(25));
+            for completion in reply_completed.try_iter() {
+                if !coordinator.enqueue_internal(
+                    super::super::V2InternalMutation::QuestionReplyCompleted(completion),
+                ) && let Some(worker) = coordinator
+                    .question_replies
+                    .lock()
+                    .expect("question reply lock poisoned")
+                    .as_ref()
+                {
+                    worker.note_dropped_completion();
+                }
+            }
             for completion in completed.try_iter() {
                 coordinator.enqueue_internal(
                     super::super::V2InternalMutation::QuestionOrderCompleted(completion),
@@ -1245,8 +1558,22 @@ pub(in crate::daemon::server) fn apply(
                 let summary = state
                     .question_notices
                     .summary(&envelope.pane_instance, Some(&process));
+                let owner = summary.owner_ref.expect("applied notice owner");
+                let count = match &questions {
+                    crate::question_notice::text::QuestionEvidence::Fingerprints(items) => {
+                        items.len()
+                    }
+                    crate::question_notice::text::QuestionEvidence::Unavailable => 0,
+                };
+                state.question_notices.remember_reply_items(
+                    &owner,
+                    summary.latest_order,
+                    &session,
+                    &tool,
+                    count,
+                );
                 state.question_notices.remember_questions(
-                    summary.owner_ref.expect("applied notice owner"),
+                    owner,
                     summary.latest_order,
                     &session,
                     questions,

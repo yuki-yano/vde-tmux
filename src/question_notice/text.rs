@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const MAX_QUESTIONS: usize = 8;
+pub(super) const MAX_QUESTIONS: usize = 8;
 const MAX_OPTIONS: usize = 16;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 

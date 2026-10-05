@@ -13,6 +13,7 @@ pub mod capture;
 pub mod ingress;
 pub mod journal;
 pub mod profile;
+pub mod reply;
 pub mod resolver;
 mod storage;
 pub mod text;
@@ -25,6 +26,7 @@ pub const MAX_OWNERS: usize = 512;
 pub const MAX_KEYS_PER_OWNER: usize = 4096;
 pub const MAX_KEYS: usize = 65536;
 pub const MAX_ANCESTORS: usize = 64;
+pub const REPLY_COMMIT_RESERVE: Duration = Duration::from_millis(40);
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_TEXT_NOTICES: usize = 2048;
 const MAX_TEXT_NOTICES_PER_OWNER: usize = 512;
@@ -129,6 +131,13 @@ struct QuestionNoticeState {
     seen: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ReplyItems {
+    session: String,
+    items: BTreeSet<String>,
+    pending: BTreeSet<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct QuestionNotices {
     pub resolver: resolver::Resolver,
@@ -144,6 +153,13 @@ pub struct QuestionNotices {
     memory_only: BTreeSet<(String, String)>,
     // Runtime only; absence after restart must never be treated as resolution.
     question_text: BTreeMap<(String, u64), (String, text::QuestionEvidence)>,
+    // Sparse replies are runtime-only. A missing entry always blocks prefix advancement.
+    reply_items: BTreeMap<(String, u64), ReplyItems>,
+    // Retain used call identities until owner death, so a delayed reply cannot
+    // acknowledge a newly reused call ID even after the old notice was acked.
+    reply_calls: BTreeMap<String, BTreeSet<String>>,
+    // If identity history cannot be retained, disable reply ack for this owner.
+    reply_blocked_owners: BTreeSet<String>,
     #[cfg(test)]
     storage_fault: Option<storage::FaultPoint>,
 }
@@ -156,6 +172,229 @@ fn digest(value: &impl Serialize) -> String {
 }
 
 impl QuestionNotices {
+    #[cfg(test)]
+    pub(crate) fn inject_reply_commit_failure_for_test(&mut self) {
+        self.storage_fault = Some(storage::FaultPoint::BeforeRename);
+    }
+    pub fn remember_reply_items(
+        &mut self,
+        owner: &str,
+        order: u64,
+        session: &str,
+        call: &str,
+        count: usize,
+    ) {
+        if self.reply_blocked_owners.contains(owner)
+            || !self.owners.get(owner).is_some_and(|state| {
+                order > state.acknowledged_order && order == state.latest_order
+            })
+        {
+            return;
+        }
+        let session_digest = turn_order::identifier_digest(session);
+        let call_digest = digest(&(&session_digest, call));
+        if self
+            .reply_calls
+            .get(owner)
+            .is_some_and(|calls| calls.contains(&call_digest))
+        {
+            let ambiguous: BTreeSet<_> = (0..reply::MAX_ISSUED_ITEMS)
+                .map(|index| reply::item_digest(call, index))
+                .collect();
+            self.reply_items.retain(|(bound_owner, _), items| {
+                bound_owner != owner
+                    || items.session != session_digest
+                    || items.items.is_disjoint(&ambiguous)
+            });
+            return;
+        }
+        // Record every accepted call, even when text/count or active capacity is
+        // unavailable. Q freeing an untracked notice must not permit ID reuse.
+        if self.reply_calls.values().map(BTreeSet::len).sum::<usize>() >= MAX_KEYS
+            || self
+                .reply_calls
+                .get(owner)
+                .is_some_and(|calls| calls.len() >= MAX_KEYS_PER_OWNER)
+        {
+            self.reply_blocked_owners.insert(owner.to_owned());
+            self.reply_items
+                .retain(|(bound_owner, _), _| bound_owner != owner);
+            return;
+        }
+        self.reply_calls
+            .entry(owner.to_string())
+            .or_default()
+            .insert(call_digest);
+        if count == 0
+            || count > reply::MAX_ISSUED_ITEMS
+            || self.reply_items.len() >= MAX_TEXT_NOTICES
+            || self
+                .reply_items
+                .range((owner.to_string(), 0)..=(owner.to_string(), u64::MAX))
+                .count()
+                >= MAX_TEXT_NOTICES_PER_OWNER
+        {
+            return;
+        }
+        let items: BTreeSet<_> = (0..count)
+            .map(|index| reply::item_digest(call, index))
+            .collect();
+        self.reply_items.insert(
+            (owner.to_string(), order),
+            ReplyItems {
+                session: session_digest,
+                pending: items.clone(),
+                items,
+            },
+        );
+    }
+
+    /// Freeze exact ID -> order bindings at acceptance, before any IO wait.
+    pub fn match_reply_orders(
+        &self,
+        pane: &PaneInstance,
+        owner: &str,
+        session: &str,
+        reply: &reply::ReplyEvidence,
+    ) -> Result<Vec<u64>, &'static str> {
+        if !reply.valid() || !self.tracking_healthy() {
+            return Err("invalid_reply_evidence");
+        }
+        let notice = self
+            .owners
+            .get(owner)
+            .filter(|state| &state.pane == pane)
+            .ok_or("stale_notice_owner")?;
+        if notice.acknowledged_order >= notice.latest_order {
+            return Err("unknown_reply_item");
+        }
+        reply
+            .items
+            .iter()
+            .map(|id| {
+                self.reply_items
+                    .range(
+                        (
+                            owner.to_owned(),
+                            notice.acknowledged_order.saturating_add(1),
+                        )..=(owner.to_owned(), notice.latest_order),
+                    )
+                    .find(|(_, items)| items.session == session && items.items.contains(id))
+                    .map(|((_, order), _)| *order)
+                    .ok_or("unknown_reply_item")
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn acknowledge_reply(
+        &mut self,
+        pane: &PaneInstance,
+        owner: &str,
+        session: &str,
+        reply: &reply::ReplyEvidence,
+        deadline: Instant,
+    ) -> Result<bool, &'static str> {
+        if self.owners.get(owner).is_some_and(|notice| {
+            &notice.pane == pane && notice.acknowledged_order >= notice.latest_order
+        }) {
+            return Ok(false);
+        }
+        let orders = self.match_reply_orders(pane, owner, session, reply)?;
+        self.acknowledge_reply_orders(pane, owner, session, reply, &orders, deadline)
+    }
+
+    /// Apply only the ID/order pairs frozen at acceptance; then advance the answered prefix.
+    pub fn acknowledge_reply_orders(
+        &mut self,
+        pane: &PaneInstance,
+        owner: &str,
+        session: &str,
+        reply: &reply::ReplyEvidence,
+        orders: &[u64],
+        deadline: Instant,
+    ) -> Result<bool, &'static str> {
+        if deadline.saturating_duration_since(Instant::now()) < REPLY_COMMIT_RESERVE {
+            return Err("reply_deadline");
+        }
+        if !reply.valid()
+            || orders.len() != reply.items.len()
+            || orders.contains(&0)
+            || !self.tracking_healthy()
+        {
+            return Err("invalid_reply_evidence");
+        }
+        let notice = self
+            .owners
+            .get(owner)
+            .filter(|state| &state.pane == pane)
+            .ok_or("stale_notice_owner")?;
+        let acknowledged = notice.acknowledged_order;
+        let latest = notice.latest_order;
+        if acknowledged >= latest {
+            return Ok(false);
+        }
+        // Already acknowledged pairs were verified when the job was accepted.
+        // Q/ordinary completion may consume them while it waits; never rebind
+        // those IDs to newly issued questions, and still apply its remaining pairs.
+        if orders.iter().all(|order| *order <= acknowledged) {
+            return Ok(false);
+        }
+        let range =
+            (owner.to_string(), acknowledged.saturating_add(1))..=(owner.to_string(), latest);
+        let before: BTreeMap<_, _> = self
+            .reply_items
+            .range(range.clone())
+            .map(|(key, items)| (key.clone(), items.clone()))
+            .collect();
+        // Reject the whole reply if any ID is unknown or belongs to another session.
+        // Already consumed pairs from this accepted job are harmless; fresh
+        // ingress still rejects IDs from fully acknowledged notices.
+        if reply.items.iter().zip(orders).any(|(id, order)| {
+            *order > acknowledged
+                && !before
+                    .get(&(owner.to_owned(), *order))
+                    .is_some_and(|items| items.session == session && items.items.contains(id))
+        }) {
+            return Err("unknown_reply_item");
+        }
+        for (id, order) in reply.items.iter().zip(orders) {
+            if *order <= acknowledged {
+                continue;
+            }
+            self.reply_items
+                .get_mut(&(owner.to_owned(), *order))
+                .expect("validated reply entry")
+                .pending
+                .remove(id);
+        }
+        let mut through = acknowledged;
+        for order in acknowledged.saturating_add(1)..=latest {
+            if !self
+                .reply_items
+                .get(&(owner.to_string(), order))
+                .is_some_and(|items| items.pending.is_empty())
+            {
+                break;
+            }
+            through = order;
+        }
+        if through == acknowledged {
+            if Instant::now() >= deadline {
+                self.reply_items.extend(before);
+                return Err("reply_deadline");
+            }
+            return Ok(false);
+        }
+        match self.acknowledge_until(pane, owner, through, Some(deadline)) {
+            Ok(changed) => Ok(changed),
+            Err(error) => {
+                self.reply_items.extend(before);
+                Err(error)
+            }
+        }
+    }
+
     pub fn remember_questions(
         &mut self,
         owner: String,
@@ -400,6 +639,8 @@ impl QuestionNotices {
         if through_order <= owner.acknowledged_order {
             return Ok(false);
         }
+        let was_dirty = self.dirty;
+        let last_attempt = self.last_write_attempt;
         let before = owner.acknowledged_order;
         owner.acknowledged_order = through_order;
         match self.persist_commit_until(deadline) {
@@ -408,7 +649,12 @@ impl QuestionNotices {
                     .get_mut(owner_ref)
                     .expect("owner retained")
                     .acknowledged_order = before;
-                self.dirty = true; // Rewrite the retained notification, never retry the failed ack.
+                // The old sidecar still represents the restored state. Do not
+                // turn an uncommitted ack into a global write backlog/rate limit.
+                self.dirty = was_dirty;
+                self.last_write_attempt = last_attempt;
+                self.diagnostics
+                    .insert(pane.clone(), NoticeReason::PersistencePending);
                 return Err("persistence_pending");
             }
             CommitResult::CommittedDurabilityUnknown => {
@@ -421,6 +667,8 @@ impl QuestionNotices {
         }
         self.resolver.acknowledged(owner_ref, through_order);
         self.question_text
+            .retain(|(owner, order), _| owner != owner_ref || *order > through_order);
+        self.reply_items
             .retain(|(owner, order), _| owner != owner_ref || *order > through_order);
         Ok(true)
     }
@@ -444,6 +692,12 @@ impl QuestionNotices {
             .retain(|(owner, _)| self.owners.contains_key(owner));
         self.question_text
             .retain(|(owner, _), _| self.owners.contains_key(owner));
+        self.reply_items
+            .retain(|(owner, _), _| self.owners.contains_key(owner));
+        self.reply_calls
+            .retain(|owner, _| self.owners.contains_key(owner));
+        self.reply_blocked_owners
+            .retain(|owner| self.owners.contains_key(owner));
         self.bound
             .retain(|pane, process| owner_alive(pane, process));
         let removed = old_len != self.owners.len();
@@ -483,6 +737,8 @@ impl QuestionNotices {
         self.dirty = false;
         if result == CommitResult::Committed {
             self.memory_only.clear();
+            self.diagnostics
+                .retain(|_, reason| *reason != NoticeReason::PersistencePending);
         }
         self.last_write_attempt = None;
         result

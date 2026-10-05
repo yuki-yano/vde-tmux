@@ -174,6 +174,7 @@ struct ProductionV2Coordinator {
     question_profiles: Arc<crate::question_notice::profile::ProfileCache>,
     question_wake: std::sync::atomic::AtomicBool,
     question_tick_pending: std::sync::atomic::AtomicBool,
+    question_replies: Mutex<Option<crate::daemon::workers::question::ReplyWorkerHandle>>,
     question_orders: Mutex<Option<crate::daemon::workers::question::OrderWorkerHandle>>,
     question_probes: Mutex<Option<crate::daemon::workers::question::ProbeWorkerHandle>>,
     question_capture: Mutex<Option<crate::daemon::workers::CaptureCoordinatorHandle>>,
@@ -305,6 +306,7 @@ impl ProductionV2Coordinator {
             question_profiles: Arc::default(),
             question_wake: std::sync::atomic::AtomicBool::new(true),
             question_tick_pending: std::sync::atomic::AtomicBool::new(false),
+            question_replies: Mutex::new(None),
             question_orders: Mutex::new(None),
             question_probes: Mutex::new(None),
             question_capture: Mutex::new(None),
@@ -799,6 +801,13 @@ impl ProductionV2Coordinator {
                     .expect("question capture lock poisoned")
                     .as_ref()
                     .map(|capture| capture.diagnostics())
+                    .unwrap_or_default();
+                counters["reply_worker"] = self
+                    .question_replies
+                    .lock()
+                    .expect("question reply lock poisoned")
+                    .as_ref()
+                    .map(|worker| worker.diagnostics())
                     .unwrap_or_default();
                 counters["codex_capacity_auto_resume"] = self
                     .capacity
@@ -2192,6 +2201,9 @@ fn start_v2_mutation_worker(coordinator: Arc<ProductionV2Coordinator>) {
                                 "question_tick"
                             }
                             V2AcceptedMutation::Internal(
+                                V2InternalMutation::QuestionReplyCompleted(_),
+                            ) => "question_reply",
+                            V2AcceptedMutation::Internal(
                                 V2InternalMutation::QuestionOrderCompleted(_),
                             ) => "question_order",
                             V2AcceptedMutation::Internal(
@@ -2362,6 +2374,10 @@ fn apply_production_mutation(
                 .question_tick_pending
                 .store(false, Ordering::Release);
             mutations::question::tick(coordinator);
+            return mutations::question::internal_ack(coordinator, accepted_seq);
+        }
+        V2AcceptedMutation::Internal(V2InternalMutation::QuestionReplyCompleted(completion)) => {
+            mutations::question::reply_completed(coordinator, completion);
             return mutations::question::internal_ack(coordinator, accepted_seq);
         }
         V2AcceptedMutation::Internal(V2InternalMutation::QuestionProbeCompleted(completion)) => {

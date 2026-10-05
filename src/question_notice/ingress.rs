@@ -36,6 +36,7 @@ pub struct ResolverInput {
     pub profile: super::profile::CodexProfile,
     pub process: Option<super::profile::ProfileRequest>,
     pub input_class: InputClass,
+    pub reply: Option<super::reply::ReplyEvidence>,
     pub source: SessionSource,
     pub home_digest: Option<String>,
     pub journal_root_digest: Option<String>,
@@ -54,6 +55,15 @@ pub struct StartupJournal {
 impl ResolverInput {
     pub fn validate(&self) -> bool {
         self.ancestors.len() <= MAX_ANCESTORS
+            && self
+                .reply
+                .as_ref()
+                .is_none_or(super::reply::ReplyEvidence::valid)
+            && (self.reply.is_none()
+                || matches!(
+                    self.profile,
+                    super::profile::CodexProfile::V01593 | super::profile::CodexProfile::V01600
+                ))
             && self
                 .ancestors
                 .iter()
@@ -247,6 +257,7 @@ impl PreparedHook {
                     profile: super::profile::CodexProfile::Unknown,
                     process: None,
                     input_class: InputClass::NonAuthoritativeInput,
+                    reply: None,
                     source: SessionSource::Unknown,
                     home_digest: None,
                     journal_root_digest: None,
@@ -325,6 +336,7 @@ impl PreparedHook {
                 profile: super::profile::CodexProfile::Unknown,
                 process,
                 input_class: InputClass::NonAuthoritativeInput,
+                reply: None,
                 source,
                 home_digest: home_digest.clone(),
                 journal_root_digest: if excluded {
@@ -416,9 +428,15 @@ impl PreparedHook {
 
     pub fn classify(&mut self, raw: &str, profile: super::profile::CodexProfile) {
         self.metadata.profile = profile;
-        self.metadata.input_class = serde_json::from_str::<Value>(raw)
-            .ok()
-            .map(|value| classify_prompt(value.get("prompt").and_then(Value::as_str), profile))
+        let payload = serde_json::from_str::<Value>(raw).ok();
+        let prompt = payload
+            .as_ref()
+            .and_then(|value| value.get("prompt"))
+            .and_then(Value::as_str);
+        self.metadata.reply = super::reply::ReplyEvidence::parse(prompt, profile);
+        self.metadata.input_class = payload
+            .as_ref()
+            .map(|_| classify_prompt(prompt, profile))
             .unwrap_or(InputClass::NonAuthoritativeInput);
     }
 

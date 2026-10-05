@@ -29,6 +29,7 @@ pub(super) enum V2AcceptedMutation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum V2InternalMutation {
+    QuestionReplyCompleted(crate::daemon::workers::question::ReplyCompletion),
     QuestionOrderCompleted(crate::daemon::workers::question::OrderCompletion),
     QuestionTick,
     CapacityTick,

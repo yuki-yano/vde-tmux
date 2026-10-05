@@ -81,9 +81,9 @@ def diagnostics():
         stream.settimeout(3)
         stream.connect(daemon_socket)
         reader = stream.makefile("r")
-        stream.sendall(b'{"op":"hello","proto":29}\n')
+        stream.sendall(b'{"op":"hello","proto":30}\n')
         json.loads(reader.readline())
-        stream.sendall(b'{"op":"query_question_diagnostics","proto":29}\n')
+        stream.sendall(b'{"op":"query_question_diagnostics","proto":30}\n')
         return json.loads(reader.readline())
 
 
@@ -250,7 +250,7 @@ def attach_client():
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 80, 200, 0, 0))
     process = subprocess.Popen(["tmux", "-L", socket, "attach-session", "-t", "questions"],
-                               env=env, stdin=slave, stdout=slave, stderr=slave)
+                               env={k:v for k,v in env.items() if k not in {"TMUX", "TMUX_PANE"}}, stdin=slave, stdout=slave, stderr=slave)
     os.close(slave)
 
     def drain():
@@ -401,7 +401,7 @@ def assert_fixed_drop_retention(fixed):
     assert fixed["unacknowledged"] and fixed["ack_before"] == fixed["ack_after"], fixed
 
 
-def benchmark(fixed_drop_only=False):
+def benchmark(fixed_drop_only=False, reply_load_only=False):
     fixtures = []
     for index in range(57):
         fixture = root / f"load-{index}"
@@ -412,9 +412,15 @@ def benchmark(fixed_drop_only=False):
         wait((fixture / "ready").exists, "load fixture startup", timeout=15)
         assert json.loads((fixture / "startup.json").read_text())["code"] == 0
     wait(lambda: len(query("agent", "list")["agents"]) == 58, "58 agent panes", timeout=60)
-    for _ in range(2):
+    def interactive_clients():
+        rows = tmux("list-clients", "-F", "#{client_control_mode}|#{client_pid}|#{client_tty}").splitlines()
+        return [row.split("|", 2) for row in rows
+                if row.startswith("0|") and row.split("|", 2)[2]]
+
+    for _ in range(2 - len(interactive_clients())):
         attach_client()
-    wait(lambda: len(tmux("list-clients", "-F", "#{client_tty}").splitlines()) == 2, "two attached clients")
+    wait(lambda: len(interactive_clients()) == 2, "two attached clients")
+    (root / "clients-ready.json").write_text(json.dumps(interactive_clients(), indent=2) + "\n")
     sidebars = []
     for window in ["@0", "@1"]:
         run([vt, "sidebar", "open", "--window", window])
@@ -545,6 +551,115 @@ def benchmark(fixed_drop_only=False):
             activity["stopped_by_phase"] = load_stop.is_set()
 
     rss_peak = rss_baseline
+
+    stress_capture_start = diagnostics()["counters"]["capture"]["normal_failures"]
+    if reply_load_only:
+        # Targeted reply-worker pressure, separate from the long ordinary-resolver
+        # release gate. Both phases keep the same three hook/issue producers.
+        results = []
+        def reply_producer(index, fixture, resolve, phase, ready, activity):
+            activity["cycles"] = 0
+            ready.set()
+            try:
+                while not load_stop.is_set():
+                    call = f"reply-load-{phase}-{index}-{activity['cycles']}"
+                    emit_at(fixture, "UserPromptSubmit", turn_id=call, prompt="issuer")
+                    emit_at(fixture, "PostToolUse", turn_id=call, tool_name="request_user_input_async", tool_use_id=call,
+                            tool_input={"questions":[{"title":"load question"}]}, tool_response='{"accepted":true}')
+                    reply = {"questionItemId":json.dumps(["request_user_input_async",call,0],separators=(",", ":")),
+                             "question":"load question", "answer":"load answer"}
+                    prompt = "<send_user_message_question_reply>" + json.dumps(reply if resolve else {"questionItemId":"synthetic"}) + "</send_user_message_question_reply>"
+                    emit_at(fixture, "UserPromptSubmit", turn_id=call, prompt=prompt, _ui="normal")
+                    emit_at(fixture, "Stop", turn_id=call)
+                    activity["cycles"] += 1
+                    load_stop.wait(1.7)
+            except Exception as error:
+                load_errors.append(str(error))
+        def monitor_reply_rss():
+            nonlocal rss_peak
+            while not load_stop.wait(.2):
+                rss_peak = max(rss_peak, rss_kib())
+        for phase, resolve in PHASE_ORDER:
+            load_stop.clear()
+            ack_before = []
+            for index in range(3):
+                target_pane = tmux("display-message", "-p", "-t", f"questions:load-{index}", "#{pane_id}")
+                ack_before.append(query("agent", "get", target_pane)["agent"]["summary"]["question_notice"]["acknowledged_order"])
+            before = diagnostics()["counters"]
+            journal_before = journal_evidence()
+            ready = [threading.Event() for _ in range(3)]
+            activities = [{} for _ in range(3)]
+            threads = [threading.Thread(target=reply_producer, args=(index, fixture, resolve, phase, ready[index], activities[index]))
+                       for index, fixture in enumerate(fixtures[:3])]
+            monitor = threading.Thread(target=monitor_reply_rss)
+            monitor.start()
+            for thread in threads: thread.start()
+            try:
+                assert all(signal.wait(5) for signal in ready)
+                wait(lambda: all(activity["cycles"] >= 1 for activity in activities), "reply load producers active")
+                measured = status_delivery("reply-"+phase, time.monotonic(), iterations=25)
+                after_active = diagnostics()["counters"]
+                rss_peak = max(rss_peak, rss_kib())
+            finally:
+                load_stop.set()
+                for thread in threads: thread.join(timeout=20)
+                monitor.join(timeout=3)
+            assert not load_errors, load_errors
+            assert all(not thread.is_alive() for thread in threads)
+            assert all(activity["cycles"] > 0 for activity in activities), activities
+            accepted = after_active["replies_accepted"] - before["replies_accepted"]
+            acked = after_active["replies_acked"] - before["replies_acked"]
+            if resolve: assert accepted > 0 and acked > 0, after_active
+            settled = []
+            settle_errors = []
+            for index, fixture in enumerate(fixtures[:3]):
+                target_pane = tmux("display-message", "-p", "-t", f"questions:load-{index}", "#{pane_id}")
+                def current_notice():
+                    return query("agent", "get", target_pane)["agent"]["summary"]["question_notice"]
+                if resolve:
+                    try:
+                        # Up to 17 admitted jobs, 1.5s per execution and three
+                        # attempts: include bounded queue draining in this wait.
+                        wait(lambda: not current_notice()["unacknowledged"], "all loaded replies settled before Q", timeout=90)
+                    except AssertionError as error:
+                        settle_errors.append(str(error))
+                target = query("agent", "get", target_pane)["agent"]["summary"]
+                n = target["question_notice"]
+                settled.append({"producer":index, "cycles":activities[index]["cycles"], "latest":n["latest_order"], "acknowledged":n["acknowledged_order"]})
+                if not resolve and n["unacknowledged"]:
+                    query("pane", "question-notice", "ack", target["pane_ref"], "--owner-ref", n["owner_ref"], "--through-order", str(n["latest_order"]))
+            final = diagnostics()["counters"]
+            retained_delta = {key:final["retained_by"].get(key, 0)-before["retained_by"].get(key, 0)
+                              for key in final["retained_by"] if key.startswith("reply_")}
+            phase_evidence = {"settled_before_q":settled, "reply_retained_delta":retained_delta,
+                              "journal_before":journal_before, "journal_after":journal_evidence(), "settle_errors":settle_errors,
+                              "journal_failure_delta": {key:final["journal_failures"].get(key,0)-before["journal_failures"].get(key,0) for key in final["journal_failures"]},
+                              "final_accepted":final["replies_accepted"]-before["replies_accepted"],
+                              "final_acked":final["replies_acked"]-before["replies_acked"],
+                              "confirmed_orders":sum(n["acknowledged"]-ack_before[n["producer"]] for n in settled),
+                              "retries":final["replies_retried"]-before["replies_retried"],
+                              "worker_delta": {key:final["reply_worker"][key]-before["reply_worker"][key] for key in final["reply_worker"]}}
+            (root / f"reply-load-{phase}.json").write_text(json.dumps(phase_evidence, indent=2)+"\n")
+            if resolve:
+                assert phase_evidence["final_accepted"] == sum(a["cycles"] for a in activities), phase_evidence
+                assert phase_evidence["confirmed_orders"] == sum(a["cycles"] for a in activities), phase_evidence
+                assert not any(retained_delta.values()), phase_evidence
+                assert phase_evidence["worker_delta"]["completion_dropped"] == 0, phase_evidence
+                assert all(n["latest"] == n["acknowledged"] for n in settled), phase_evidence
+                assert not settle_errors and not any(phase_evidence["journal_failure_delta"].values()) and final["home_failures"] == 0, phase_evidence
+                assert phase_evidence["journal_after"]["epoch"] == journal_before["epoch"] and phase_evidence["journal_after"]["dirty_count"] == 0, phase_evidence
+            results.append({"phase":phase, "reply_load":resolve, **measured, "producers":activities, "accepted_while_active":accepted, "acked_while_active":acked, **phase_evidence})
+        assert diagnostics()["counters"]["capture"]["normal_failures"] == stress_capture_start
+        baseline_ms = [v for r in results if not r["reply_load"] for v in r["rail_ms"]]
+        load_ms = [v for r in results if r["reply_load"] for v in r["rail_ms"]]
+        evidence = {"kind":"targeted_reply_worker_load", "panes":58, "clients":2, "status_samples_per_condition":len(load_ms),
+                    "baseline_p95_ms":percentile95(baseline_ms), "reply_load_p95_ms":percentile95(load_ms),
+                    "rss_growth_kib":rss_peak-rss_baseline, "phases":results}
+        (root / "reply-load-evidence.json").write_text(json.dumps(evidence, indent=2)+"\n")
+        assert evidence["rss_growth_kib"] <= 20*1024, evidence["rss_growth_kib"]
+        assert evidence["reply_load_p95_ms"] <= max(evidence["baseline_p95_ms"]*1.5, 2000), {k:v for k,v in evidence.items() if k != "phases"}
+        print("targeted reply load: " + json.dumps({k:v for k,v in evidence.items() if k != "phases"}), flush=True)
+        return
 
     def frames_visible(expected):
         return all(("QUESTIONS" in tmux("capture-pane", "-p", "-t", target)) == expected for target in sidebars)
@@ -778,8 +893,22 @@ def auto_ack_cases():
     send("Stop", turn_id="answer")
     time.sleep(0.7)
     assert notice()["unacknowledged"], "answer framing acknowledged notice"
+    def ordinary_after_observation():
+        # The positive ordinary case assumes a quiet capture window. A probe
+        # deliberately retains on concurrent mutations; do not align this case
+        # with the daemon's periodic topology mutation by accident.
+        def observation_count(counters):
+            return sum(counters["mutation_queue"]["timings"].get("observation", {}).get("buckets", []))
+        before = observation_count(diagnostics()["counters"])
+        def fresh_idle():
+            current = diagnostics()["counters"]
+            queue = current["mutation_queue"]
+            return observation_count(current) > before and not queue["in_flight"] and queue["queued"] == 0
+        wait(fresh_idle, "fresh idle observation before positive ordinary probe")
+
     # Direct and accepted queued payloads are identical; only acceptance triggers this.
     for turn in ["direct", "accepted-queue"]:
+        ordinary_after_observation()
         send("UserPromptSubmit", turn_id=turn, prompt="synthetic next ordinary request", _ui="normal")
         send("Stop", turn_id=turn)
         try:
@@ -835,6 +964,83 @@ def auto_ack_cases():
     pane, pane_ref = old_pane, old_ref
     detail = "current question text and freeform drafts" if fixture_version in {"0.159.3", "0.160.0"} else "generic active question markers"
     print("auto-ack: direct/accepted queue, answer framing, no-hook queue, " + detail + ", missing text, and overlay veto passed")
+
+
+def reply_ack_cases():
+    if fixture_version not in {"0.159.3", "0.160.0"}:
+        return
+    global pane, pane_ref
+    old_pane, old_ref = pane, pane_ref
+    directory = root / "reply-ack"
+    directory.mkdir()
+    pane = tmux("new-window", "-d", "-P", "-F", "#{pane_id}", "-n", "reply-ack", fixture_command(directory))
+    wait((directory / "ready").exists, "reply-ack startup")
+    assert json.loads((directory / "startup.json").read_text())["code"] == 0
+    wait(lambda: agent()["summary"]["identity"] == "exact", "reply-ack identity")
+    pane_ref = agent()["summary"]["pane_ref"]
+
+    window = tmux("display-message", "-p", "-t", pane, "#{window_id}")
+    attach_client()
+    run([vt, "sidebar", "open", "--window", window])
+    wait(lambda: run([vt, "sidebar", "input", "2", "--window", window], check=False).returncode == 0,
+         "reply sidebar connected")
+    sidebar = next(line.split()[0] for line in tmux("list-panes", "-t", window, "-F", "#{pane_id} #{@vde_sidebar}").splitlines()
+                   if line.endswith(" 1"))
+    def visible(expected):
+        return ("QUESTIONS" in tmux("capture-pane", "-p", "-t", sidebar)) == expected
+
+    def send(event, **fields):
+        before = diagnostics()["counters"]
+        result = emit_at(directory, event, turn_id="same-turn", **fields)
+        if event == "UserPromptSubmit" and fields.get("prompt", "").startswith("<send_user_message_question_reply>"):
+            def processed():
+                after = diagnostics()["counters"]
+                return (after["replies_accepted"] > before["replies_accepted"] or
+                        sum(after["retained_by"].values()) > sum(before["retained_by"].values()))
+            wait(processed, "reply worker completion")
+        return result
+
+    def frame(*items):
+        return "<send_user_message_question_reply>" + json.dumps([
+            {"questionItemId": json.dumps(["request_user_input_async", call, index], separators=(",", ":")),
+             "question": "reply-private-question", "answer": "reply-private-answer"}
+            for call, index in items]) + "</send_user_message_question_reply>"
+
+    def issue(call, count=1):
+        send("PostToolUse", tool_name="request_user_input_async", tool_use_id=call,
+             tool_input={"questions": [{"title": f"reply-private-question-{index}"} for index in range(count)]},
+             tool_response='{"accepted":true}', _ui="question")
+
+    send("UserPromptSubmit", prompt="synthetic reply issuer")
+    issue("first", 2)
+    issue("second")
+    wait(lambda: visible(True), "reply sidebar issue")
+    send("UserPromptSubmit", prompt=frame(("second", 0)), _ui="normal")
+    assert notice()["acknowledged_order"] == 0 and notice()["unacknowledged"]
+    send("UserPromptSubmit", prompt=frame(("first", 0)))
+    assert notice()["acknowledged_order"] == 0
+    send("UserPromptSubmit", prompt=frame(("first", 1), ("unknown", 0)))
+    assert notice()["acknowledged_order"] == 0
+    send("UserPromptSubmit", prompt="Quoted: " + frame(("first", 1)))
+    assert notice()["acknowledged_order"] == 0
+    send("UserPromptSubmit", prompt=frame(("first", 1)))
+    assert notice()["acknowledged_order"] == 2 and not notice()["unacknowledged"]
+    wait(lambda: visible(False), "reply sidebar immediate clear while running")
+    assert agent()["summary"]["lifecycle"]["state"] == "running", "reply required completion/idle"
+    issue("third")
+    wait(lambda: visible(True), "new unanswered reply sidebar notice")
+    send("UserPromptSubmit", prompt=frame(("second", 0)), _ui="normal")
+    assert notice()["acknowledged_order"] == 2 and notice()["unacknowledged"]
+    send("UserPromptSubmit", prompt=frame(("third", 0)))
+    assert notice()["acknowledged_order"] == 3 and not notice()["unacknowledged"]
+    wait(lambda: visible(False), "reply sidebar latest clear")
+    send("Stop")
+    for saved in (root / "state").rglob("question-notices-v1.json"):
+        assert "reply-private-" not in saved.read_text()
+    tmux("kill-pane", "-t", sidebar)
+    tmux("kill-pane", "-t", pane)
+    pane, pane_ref = old_pane, old_ref
+    print("reply-ack: same-turn running, partial/reverse replies, unknown/quoted IDs, new notice retention, connected sidebar updates, and privacy passed")
 
 
 def excluded_mode_lifecycle():
@@ -924,97 +1130,101 @@ try:
     wait((root / "fixture/ready").exists, "fixture startup")
     wait(lambda: agent()["summary"]["identity"] == "exact", "exact Codex identity")
     pane_ref = agent()["summary"]["pane_ref"]
-    auto_ack_cases()
-    excluded_mode_lifecycle()
-    assert emit("UserPromptSubmit", prompt="question notice acceptance fixture")["code"] == 0
-    result = post("call-1")
-    assert result["code"] == 0, result
-    first = wait(lambda: notice() if notice()["unacknowledged"] else None, "issued notice")
-    assert agent()["summary"]["status"] == "working"
-    assert agent()["summary"]["needs_action"] is True
-    assert "?" in run([vt, "sidebar", "attach", "--once"]).stdout
-    tmux("set-option", "-p", "-t", env["TMUX_PANE"], "-u", "@vde_sidebar")
-    post("call-2")
-    ack(first)
-    assert notice()["unacknowledged"] and notice()["acknowledged_order"] == 1
-    current = notice()
-    future = {**current, "latest_order": current["latest_order"] + 1}
-    assert ack(future, ok=False).returncode != 0
-    before = agent()
-    ack(current)
-    after = agent()
-    assert not notice()["unacknowledged"]
-    for field in ["state_revision", "run_seq", "completed_seq"]:
-        assert before[field] == after[field], field
-    post("call-1")
-    assert not notice()["unacknowledged"], "acknowledged replay revived notification"
-    post("call-3")
-    assert emit("Stop", last_assistant_message="fixture completed")["code"] == 0
-    assert notice()["unacknowledged"] and agent()["summary"]["status"] == "done"
-    saved = notice()
-    stop_daemon("rehydration")
-    start_daemon()
-    wait(lambda: notice().get("owner_ref") == saved["owner_ref"], "rehydration and owner rebind")
-    assert notice()["unacknowledged"]
-    ack(saved)
-    post("call-3")
-    assert not notice()["unacknowledged"], "restart lost acknowledged dedup key"
-    sidecars = list((root / "state").rglob("question-notices-v1.json"))
-    assert len(sidecars) == 1
-    assert "fixture-private" not in sidecars[0].read_text()
-    assert sidecars[0].stat().st_mode & 0o777 == 0o600
-    # Exercise the real scratch state directory boundary, including restart.
-    sidecar = sidecars[0]
-    saved_sidecar = sidecar.read_bytes()
-    marker = sidecar.with_name("question-notices-v1.expected")
-    assert marker.exists() and marker.stat().st_mode & 0o777 == 0o600
-    for fault in ["missing", "corrupt"]:
-        stop_daemon(f"before-{fault}-sidecar")
-        if fault == "missing":
-            sidecar.unlink()
-        else:
-            sidecar.write_text("invalid synthetic sidecar")
+    if "--reply-load-only" in sys.argv:
+        benchmark(reply_load_only=True)
+    else:
+        auto_ack_cases()
+        reply_ack_cases()
+        excluded_mode_lifecycle()
+        assert emit("UserPromptSubmit", prompt="question notice acceptance fixture")["code"] == 0
+        result = post("call-1")
+        assert result["code"] == 0, result
+        first = wait(lambda: notice() if notice()["unacknowledged"] else None, "issued notice")
+        assert agent()["summary"]["status"] == "working"
+        assert agent()["summary"]["needs_action"] is True
+        assert "?" in run([vt, "sidebar", "attach", "--once"]).stdout
+        tmux("set-option", "-p", "-t", env["TMUX_PANE"], "-u", "@vde_sidebar")
+        post("call-2")
+        ack(first)
+        assert notice()["unacknowledged"] and notice()["acknowledged_order"] == 1
+        current = notice()
+        future = {**current, "latest_order": current["latest_order"] + 1}
+        assert ack(future, ok=False).returncode != 0
+        before = agent()
+        ack(current)
+        after = agent()
+        assert not notice()["unacknowledged"]
+        for field in ["state_revision", "run_seq", "completed_seq"]:
+            assert before[field] == after[field], field
+        post("call-1")
+        assert not notice()["unacknowledged"], "acknowledged replay revived notification"
+        post("call-3")
+        assert emit("Stop", last_assistant_message="fixture completed")["code"] == 0
+        assert notice()["unacknowledged"] and agent()["summary"]["status"] == "done"
+        saved = notice()
+        stop_daemon("rehydration")
         start_daemon()
-        wait(lambda: notice()["tracking_health"] != "healthy", fault + " expected sidecar unhealthy")
-        stop_daemon(f"restore-{fault}-sidecar")
-        sidecar.write_bytes(saved_sidecar)
-        sidecar.chmod(0o600)
-        start_daemon()
-        wait(lambda: notice()["tracking_health"] == "healthy", "restored sidecar healthy")
-    # A hook invoked outside the exact pane ancestry cannot create a notice there.
-    outside = {"hook_event_name": "PostToolUse", "session_id": "question-fixture-root", "turn_id": "question-fixture-turn",
-               "transcript_path": str(root / "home/.codex/sessions/question-fixture-root.jsonl"), "tool_name": "request_user_input_async",
-               "tool_use_id": "outside", "tool_response": '{"accepted":true}'}
-    # Launch from a scratch shell so the test runner's own Codex ancestry cannot
-    # make this a shared-server rejection instead of the unverified-owner case.
-    outside_body = root / "outside-hook.json"
-    outside_body.write_text(json.dumps(outside))
-    outside_status = root / "outside-hook.status"
-    outside_stderr = root / "outside-hook.stderr"
-    outside_script = root / "outside-hook.sh"
-    outside_script.write_text(
-        f"#!/bin/sh\n"
-        f"env TMUX_PANE={shlex.quote(pane)} {shlex.quote(vt)} hook codex PostToolUse "
-        f"< {shlex.quote(str(outside_body))} > /dev/null 2> {shlex.quote(str(outside_stderr))}\n"
-        f"printf '%s\\n' \"$?\" > {shlex.quote(str(outside_status))}\n"
-    )
-    tmux("new-window", "-d", "-n", "outside-hook", f"sh {shlex.quote(str(outside_script))}")
-    wait(outside_status.exists, "outside hook completion")
-    assert outside_status.read_text().strip() == "0", outside_stderr.read_text()
-    logs = "\n".join(p.read_text() for p in (root / "state").rglob("daemon.log"))
-    assert "hook_ownership: dropped: owner_unverified" in logs
-    assert not notice()["unacknowledged"]
-    shutdown_under_question_load()
-    if "--extended" in sys.argv or "--fixed-drop-only" in sys.argv:
-        benchmark(fixed_drop_only="--fixed-drop-only" in sys.argv)
-    post("last")
-    tmux("kill-pane", "-t", pane)
-    wait(lambda: all(owner["pane"]["pane_id"] != pane for owner in json.loads(sidecars[0].read_text())["owners"]),
-         "confirmed owner cleanup")
-    print("question notices: hook ancestry, API, sidebar rendering, fenced ack, dedup, restart, Stop, privacy, and owner cleanup passed")
-    print("shutdown evidence: " + json.dumps({"count": len(shutdown_evidence),
-          "max_ms": max(item["elapsed_ms"] for item in shutdown_evidence),
-          "near_deadline_count": sum(item["near_deadline"] for item in shutdown_evidence)}))
+        wait(lambda: notice().get("owner_ref") == saved["owner_ref"], "rehydration and owner rebind")
+        assert notice()["unacknowledged"]
+        ack(saved)
+        post("call-3")
+        assert not notice()["unacknowledged"], "restart lost acknowledged dedup key"
+        sidecars = list((root / "state").rglob("question-notices-v1.json"))
+        assert len(sidecars) == 1
+        assert "fixture-private" not in sidecars[0].read_text()
+        assert sidecars[0].stat().st_mode & 0o777 == 0o600
+        # Exercise the real scratch state directory boundary, including restart.
+        sidecar = sidecars[0]
+        saved_sidecar = sidecar.read_bytes()
+        marker = sidecar.with_name("question-notices-v1.expected")
+        assert marker.exists() and marker.stat().st_mode & 0o777 == 0o600
+        for fault in ["missing", "corrupt"]:
+            stop_daemon(f"before-{fault}-sidecar")
+            if fault == "missing":
+                sidecar.unlink()
+            else:
+                sidecar.write_text("invalid synthetic sidecar")
+            start_daemon()
+            wait(lambda: notice()["tracking_health"] != "healthy", fault + " expected sidecar unhealthy")
+            stop_daemon(f"restore-{fault}-sidecar")
+            sidecar.write_bytes(saved_sidecar)
+            sidecar.chmod(0o600)
+            start_daemon()
+            wait(lambda: notice()["tracking_health"] == "healthy", "restored sidecar healthy")
+        # A hook invoked outside the exact pane ancestry cannot create a notice there.
+        outside = {"hook_event_name": "PostToolUse", "session_id": "question-fixture-root", "turn_id": "question-fixture-turn",
+                   "transcript_path": str(root / "home/.codex/sessions/question-fixture-root.jsonl"), "tool_name": "request_user_input_async",
+                   "tool_use_id": "outside", "tool_response": '{"accepted":true}'}
+        # Launch from a scratch shell so the test runner's own Codex ancestry cannot
+        # make this a shared-server rejection instead of the unverified-owner case.
+        outside_body = root / "outside-hook.json"
+        outside_body.write_text(json.dumps(outside))
+        outside_status = root / "outside-hook.status"
+        outside_stderr = root / "outside-hook.stderr"
+        outside_script = root / "outside-hook.sh"
+        outside_script.write_text(
+            f"#!/bin/sh\n"
+            f"env TMUX_PANE={shlex.quote(pane)} {shlex.quote(vt)} hook codex PostToolUse "
+            f"< {shlex.quote(str(outside_body))} > /dev/null 2> {shlex.quote(str(outside_stderr))}\n"
+            f"printf '%s\\n' \"$?\" > {shlex.quote(str(outside_status))}\n"
+        )
+        tmux("new-window", "-d", "-n", "outside-hook", f"sh {shlex.quote(str(outside_script))}")
+        wait(outside_status.exists, "outside hook completion")
+        assert outside_status.read_text().strip() == "0", outside_stderr.read_text()
+        logs = "\n".join(p.read_text() for p in (root / "state").rglob("daemon.log"))
+        assert "hook_ownership: dropped: owner_unverified" in logs
+        assert not notice()["unacknowledged"]
+        shutdown_under_question_load()
+        if any(flag in sys.argv for flag in ["--extended", "--fixed-drop-only"]):
+            benchmark(fixed_drop_only="--fixed-drop-only" in sys.argv)
+        post("last")
+        tmux("kill-pane", "-t", pane)
+        wait(lambda: all(owner["pane"]["pane_id"] != pane for owner in json.loads(sidecars[0].read_text())["owners"]),
+             "confirmed owner cleanup")
+        print("question notices: hook ancestry, API, sidebar rendering, fenced ack, dedup, restart, Stop, privacy, and owner cleanup passed")
+        print("shutdown evidence: " + json.dumps({"count": len(shutdown_evidence),
+              "max_ms": max(item["elapsed_ms"] for item in shutdown_evidence),
+              "near_deadline_count": sum(item["near_deadline"] for item in shutdown_evidence)}))
 finally:
     if started_daemon:
         run([vt, "daemon", "disable"], check=False)

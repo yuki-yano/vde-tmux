@@ -1,6 +1,6 @@
 # Agent JSON API
 
-This document defines the current API v6 contract (daemon protocol 29, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
+This document defines the current API v6 contract (daemon protocol 30, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
 maintained in [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is
 recorded in [AGENT_API_V3.md](AGENT_API_V3.md).
 
@@ -141,7 +141,7 @@ acknowledge a Question, replace the task context, or appear in the public prompt
 Already stored unlinked Runs from the old implementation do not retain prompt digests, so they
 cannot be matched retrospectively. Inspect them and abandon the stale Operation if appropriate.
 This addition retains API 6 and the private record format; CLI, daemon, and sidebars must use
-daemon protocol 29 together.
+daemon protocol 30 together.
 
 API commands always emit JSON. `--json` is accepted so callers can state the expected format. A
 successful command writes one envelope to stdout. A failed command writes one error envelope to
@@ -599,11 +599,61 @@ Use one snapshot for all three arguments. The exact owner is the server incarnat
 and Codex PID/start token; agent epoch/session changes do not invalidate it. The daemon rechecks
 process ownership. Future orders, replaced owners, and unverified owners are rejected. Repeating
 the same acknowledgement is harmless. Newer notices stay visible. Acknowledgement does not send
-input, read an unread occurrence, or change lifecycle/Run completion. Answer/skip/focus/turn completion alone never acknowledges a notice. A later accepted ordinary
+input, read an unread occurrence, or change lifecycle/Run completion. Skip/focus/turn completion alone never acknowledges a notice. A later accepted ordinary
 input in a different turn of the same trusted session can acknowledge a contiguous notice prefix,
 after structural completion/start ordering, exact identity, the home loss journal, Idle/Done, and
 two known normal-composer captures all pass. Direct and accepted queued inputs share this policy;
-queue registration and answer-summary framing never resolve notices. Capture only vetoes.
+queue registration and unrecognized answer framing never resolve notices. Capture only vetoes.
+A complete accepted `<send_user_message_question_reply>` envelope from Codex 0.159.3/0.160.0
+acknowledges its matching question IDs without waiting for Idle/Done or another turn. The parser
+accepts one reply object or a nonempty array, optionally after the standard IDE context prefix.
+Each canonical `questionItemId` is `["request_user_input_async", call_id, question_index]` serialized
+as compact JSON; question and answer must be strings. Only hash evidence enters daemon metadata.
+The reply must pass the current embedded parent process, exact pane/owner/session, generation,
+known profile, trusted-session/transcript and clean home-journal guards. Trusted requires a verified startup
+SessionStart in the current daemon generation and unchanged home epoch; resume/clear sessions,
+sessions continuing across daemon restart, and sessions invalidated by a home-wide hook loss
+retain notices even for new replies. Use manual Q when this trust cannot be established. Capacity-generated input
+cannot acknowledge notices. Quoted, malformed, duplicate-ID, unknown-ID, wrong-session, oversized,
+and older whole-message reply IDs retain notices.
+
+ID-to-notification-order bindings are fixed at hook acceptance, before worker waiting.
+A subsequently issued question cannot turn an unknown reply ID into a known one. If Q or ordinary
+completion acknowledges an accepted pair while it waits, that pair is an idempotent no-op and
+the remaining accepted pairs may still resolve; consumed IDs are never rebound to new questions.
+The worker can recheck a temporary live-writer veto or lock contention with lightweight journal
+polls and backoff within its 1.5s execution deadline. The bounded worker queue permits 16 waiting
+jobs and one executing job; each attempt's budget starts when dequeued. Queue waiting never
+adopts new IDs and every attempt revalidates the current guards. Final owner scans are limited to three per attempt. Admission/guard/deadline failures can
+resubmit the same accepted ID/order evidence at most twice (three attempts, up to nine owner
+scans total); every attempt rechecks owner/session/trust/journal and never resends the prompt.
+Replies may wait up to 300ms without a lock for mutations entering during owner verification;
+retries add a bounded 50ms/100ms delay within their deadline. Capture-based admission is unchanged.
+An unverifiable owner may be rechecked only while the same canonical binding/trust remain current.
+Canonical owner/trust changes, epoch changes, unknown items, history loss, writer veto and failed persistence are terminal.
+The worker reserves a final acquisition window, and commit requires at least 40ms remaining.
+No journal lock is retained while waiting and no prompt is resent; epoch changes, invalid
+owners and persistence failures retain notices. All items of one issuance must be answered. Sparse or out-of-order answers are remembered in
+memory, but only a fully answered contiguous notification prefix advances the persisted
+`acknowledged_order`: answering a newer question cannot clear an older unanswered one. Newly
+issued unanswered notifications remain visible. Evidence is bounded to 2048 issuances globally,
+512 per owner, up to 8 items per issuance, 64 replies per envelope and 64KiB prompt bytes. Missing
+or over-capacity issuance evidence blocks prefix advancement. Issuance IDs, partial answer sets,
+question text and answer content are never added to the sidecar or public API. A failed commit
+retains the notice and rolls back the newly applied reply. An uncommitted acknowledgement
+restores the previous write-backlog/rate-limit state, and marks only its pane degraded; use a new accepted reply or manual Q,
+not an automatic resend. Per-order reply evidence is removed by acknowledgement and dead-owner cleanup. Used call-ID
+hashes remain until owner death (4096 per owner / 65536 globally); reuse of an ID makes its
+issuance evidence ambiguous and retains the affected notices. Every accepted call is tombstoned
+even when item evidence is unavailable; exhausting the identity-history bound disables reply
+acknowledgement for that owner until cleanup. Reply journal acquisition runs in a bounded IO
+worker, outside serial mutations. `question_resolver` diagnostics include reply received/accepted/
+acknowledged/retried counts and retention reasons (history, queue/guard, journal, unknown ID,
+persistence). `replies_acked` counts replies that advanced the notification prefix; one reply may
+advance several previously answered notifications, while a partial reply may advance none.
+`reply_worker` also counts jobs dequeued past their original enqueue budget and completions
+dropped by a full completion/mutation queue. Queue pressure retains notices for manual Q.
+
 Notices present before a daemon restart remain Q-only. Only Embedded mode is supported; shared LocalDaemon and
 Remote app-server hooks cannot be bound to a pane by ancestry.
 
@@ -617,7 +667,7 @@ Acknowledgement commits at atomic rename. A pre-rename failure retains the notic
 directory-fsync failure is a logical acknowledgement with `question_ack_directory_fsync_failed`,
 without rollback or automatic rewrite. The private `.expected` marker distinguishes initial absence
 from loss of a previously committed sidecar. Resolver state, transcript cursors, and ingress dedup
-remain memory-only; the shared private home journal stores only digests and writer identities. API 6 / protocol 29 must be installed together;
+remain memory-only; the shared private home journal stores only digests and writer identities. API 6 / protocol 30 must be installed together;
 there is no old-protocol fallback.
 Question text matching is restricted to the exact 0.159.3/0.160.0 profiles. The older 0.155.1/0.156.1
 profiles retain their generic marker and normal-composer guards; their stock hook schema uses the
@@ -682,7 +732,7 @@ includes more work than the daemon-ingress bound; it excludes Codex's pre-hook d
 
 ### 運用反映条件
 
-- [ ] CLI/daemon/sidebar are deployed together with API 6 / protocol 29 while retaining existing Pane State schema 10.
+- [ ] CLI/daemon/sidebar are deployed together with API 6 / protocol 30 while retaining existing Pane State schema 10.
 - [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.
 
 
@@ -749,7 +799,7 @@ continues to reject hooks. Start Codex with `--no-daemon` to select the embedded
 `features.daemon_auto_start=false` does not prevent attaching to an already running server.
 
 Pane State schema 10 and Question sidecar schema 1 are unchanged. Question remains a durable
-unacknowledged issuance notice. Capture is veto-only; answers alone, unknown evidence, and
+unacknowledged issuance notice. Capture is veto-only; unrecognized answers, unknown evidence, and
 notifications predating daemon restart do not acquire new automatic acknowledgement rules.
-CLI, daemon, and sidebars must be replaced together for protocol 29; there is no mixed-version
+CLI, daemon, and sidebars must be replaced together for protocol 30; there is no mixed-version
 fallback. Hook authority is not inferred to have expired merely because events stop arriving.

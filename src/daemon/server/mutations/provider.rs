@@ -134,6 +134,7 @@ pub(in crate::daemon::server) fn apply_external_provider_notice_with_runner(
         );
     if automatic && let Some(input) = resolver_observation.metadata.as_mut() {
         input.input_class = crate::question_notice::ingress::InputClass::NonAuthoritativeInput;
+        input.reply = None;
     }
     if accepted {
         super::super::capacity::observe(
