@@ -248,6 +248,7 @@ pub(super) fn daemon_api_error(
         | ErrorCode::InvalidPaneInstance
         | ErrorCode::InvalidProgressOperation => ApiErrorCode::DaemonInvalidRequest,
         ErrorCode::PaneNotFound => ApiErrorCode::PaneNotFound,
+        ErrorCode::AgentNotReady => ApiErrorCode::AgentNotReady,
         ErrorCode::PromptDispatchBusy => ApiErrorCode::PromptDispatchBusy,
         ErrorCode::OperationConflict => ApiErrorCode::OperationConflict,
         ErrorCode::OperationNotFound => ApiErrorCode::OperationNotFound,

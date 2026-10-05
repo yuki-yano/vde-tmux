@@ -194,7 +194,8 @@ stream_max_retries = 0
     # Trust only this newly generated fixture's three absolute-path hooks.
     tmux("send-keys", "-t", pane, "Down", "Enter")
     wait(lambda: "Ask Codex to do anything" in tmux("capture-pane", "-p", "-t", pane))
-    time.sleep(2)
+    wait(lambda: any(a["pane_id"] == pane and a["identity"] == "exact"
+                     for a in vt("agent", "list")["result"]["agents"]))
     if not INTERNAL_RETRY:
         tmux("send-keys", "-l", "-t", pane, "CAPACITY_TEST_LINK")
         time.sleep(.5)
@@ -204,6 +205,19 @@ stream_max_retries = 0
         assert "\x1b]8;" in linked, repr(linked)
         (ROOT / "linked-ansi.txt").write_text(linked)
         print("stock TUI history includes OSC 8 link", flush=True)
+        run(VT, "daemon", "restart")
+        recovered = wait(lambda: (v := vt("agent", "get", pane))
+                         and v["result"]["agent"]["summary"]["presentation"]["reason"] == "provider_resynchronized" and v)
+        reference = recovered["result"]["agent"]["summary"]["agent_ref"]
+        resumed = subprocess.run([VT, "agent", "prompt", reference, "--operation-id",
+                                  "stock-restart-readiness-0001", "--stdin"],
+                                 input="CAPACITY_TEST_LINK\n", env=ENV, cwd=ROOT,
+                                 capture_output=True, text=True, timeout=20)
+        assert resumed.returncode == 0, resumed.stderr
+        (ROOT / "restart-prompt.json").write_text(resumed.stdout)
+        wait(lambda: (v := vt("agent", "get", pane))
+             and v["result"]["agent"]["summary"]["status"] == "done" and v)
+        print("stock daemon restart -> external prompt -> Done passed", flush=True)
     completed_before = vt("agent", "get", pane)["result"]["agent"]["completed_seq"]
     tmux("send-keys", "-l", "-t", pane, "CAPACITY_TEST_INTERNAL" if INTERNAL_RETRY else "CAPACITY_TEST_INITIAL")
     time.sleep(.5)
@@ -230,7 +244,8 @@ stream_max_retries = 0
     wait(lambda: "CAPACITY_RECOVERY_DONE" in tmux("capture-pane", "-p", "-t", pane), 100)
     final = wait(lambda: (v := vt("agent", "get", pane)) and v["result"]["agent"]["summary"]["status"] == "done" and v)
     wait(lambda: (c := chain()) and c["stop_reason"] == "completed" and c)
-    operations = [json.loads(p.read_text()) for p in (ROOT / "state").glob("**/operations/*.json")]
+    operations = [value for p in (ROOT / "state").glob("**/operations/*.json")
+                  if (value := json.loads(p.read_text()))["dispatch_option"] == "capacity_auto_resume"]
     assert len(operations) == 1 and operations[0]["dispatch_state"] == "prompt_confirmed"
     assert operations[0]["dispatch_option"] == "capacity_auto_resume"
     (ROOT / "confirmed-operation.json").write_text(json.dumps(operations[0], indent=2))

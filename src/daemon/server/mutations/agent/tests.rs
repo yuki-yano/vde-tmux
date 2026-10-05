@@ -469,6 +469,13 @@ fn guarded_prompt_process_owner_rejections_cover_every_fail_closed_branch() {
 
 #[test]
 fn first_prompt_readiness_does_not_establish_hook_authority_or_bypass_history() {
+    let root = test_root("first-prompt-readiness");
+    let coordinator = ProductionV2Coordinator::new(
+        test_incarnation(&root, "first-prompt-readiness"),
+        BTreeMap::from([("XDG_STATE_HOME".to_string(), root.display().to_string())]),
+        None,
+    )
+    .unwrap();
     let binding = guarded_prompt_test_binding();
     let mut pane = guarded_prompt_test_pane_state(&binding);
     pane.agent_session_id = None;
@@ -510,17 +517,17 @@ fn first_prompt_readiness_does_not_establish_hook_authority_or_bypass_history() 
         ],
         &format!("{header}\nCodex\n› \x1b[2mAsk Codex to do anything\x1b[0m\n\n? for shortcuts\n{header}\n"),
     );
-    assert!(require_prompt_readiness(&runner, &pane, &tracker).is_ok());
+    assert!(require_prompt_readiness(&coordinator, &runner, &pane, &tracker).is_ok());
     assert!(!tracker.hook_authoritative);
     assert_eq!(
         crate::pane_state::resolve_presentation(&pane, &tracker, epoch_seconds()),
         crate::daemon::session_badge::BadgeState::Unknown
     );
     runner.stub_agent_arguments(binding.process.pid, &["codex", "--yolo"]);
-    assert!(require_prompt_readiness(&runner, &pane, &tracker).is_err());
+    assert!(require_prompt_readiness(&coordinator, &runner, &pane, &tracker).is_err());
     runner.stub_agent_arguments(binding.process.pid, &["codex", "--no-daemon"]);
     runner.stub_agent_input_owner(pane.pane_instance.pane_pid, binding.process.pid, false);
-    assert!(require_prompt_readiness(&runner, &pane, &tracker).is_err());
+    assert!(require_prompt_readiness(&coordinator, &runner, &pane, &tracker).is_err());
     runner.stub_agent_input_owner(pane.pane_instance.pane_pid, binding.process.pid, true);
     for previous in [
         {
@@ -544,7 +551,7 @@ fn first_prompt_readiness_does_not_establish_hook_authority_or_bypass_history() 
             value
         },
     ] {
-        assert!(require_prompt_readiness(&runner, &previous, &tracker).is_err());
+        assert!(require_prompt_readiness(&coordinator, &runner, &previous, &tracker).is_err());
     }
 }
 

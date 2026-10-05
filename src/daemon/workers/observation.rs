@@ -105,6 +105,7 @@ pub fn infer_capture(
         CaptureInference::NoChange
     };
     CaptureObservation {
+        codex_idle_verified: false,
         inference,
         observed_fingerprint,
         codex_screen,
@@ -124,6 +125,7 @@ fn infer_active_terminal_capture(agent: &AgentKind, tail: &str) -> CaptureObserv
         CaptureInference::NoChange
     };
     CaptureObservation {
+        codex_idle_verified: false,
         codex_screen: None,
         inference,
         observed_fingerprint: capture_sha256(tail),
@@ -132,6 +134,7 @@ fn infer_active_terminal_capture(agent: &AgentKind, tail: &str) -> CaptureObserv
 
 fn infer_usage_limit_capture(tail: &str) -> CaptureObservation {
     CaptureObservation {
+        codex_idle_verified: false,
         codex_screen: None,
         inference: if detect_usage_limit(tail) {
             CaptureInference::UsageLimit

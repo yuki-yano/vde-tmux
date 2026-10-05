@@ -64,6 +64,26 @@ pub fn agent_send(
         .as_ref()
         .expect("resolve_agent requires resolved state")
         .canonical;
+    let capability = provider_capabilities(state.agent.as_str()).ok_or_else(|| {
+        api_error!(
+            "unsupported_provider",
+            format!(
+                "agent {} has no public transport contract",
+                state.agent.as_str()
+            ),
+        )
+    })?;
+    if capability.prompt_dispatch != ApiPromptDispatchCapability::GuardedTerminal {
+        return Err(api_error!(
+            "unsupported_provider",
+            format!(
+                "agent {} requires {:?} prompt dispatch instead of guarded terminal send",
+                state.agent.as_str(),
+                capability.prompt_dispatch
+            ),
+        )
+        .into());
+    }
     match pane.resolved.as_ref().expect("resolved agent").badge {
         crate::daemon::session_badge::BadgeState::Working => {
             return Err(api_error!("agent_busy", "agent is currently working").into());
@@ -105,26 +125,6 @@ pub fn agent_send(
             .into());
         }
         AgentStatus::Done | AgentStatus::Idle => {}
-    }
-    let capability = provider_capabilities(state.agent.as_str()).ok_or_else(|| {
-        api_error!(
-            "unsupported_provider",
-            format!(
-                "agent {} has no public transport contract",
-                state.agent.as_str()
-            ),
-        )
-    })?;
-    if capability.prompt_dispatch != ApiPromptDispatchCapability::GuardedTerminal {
-        return Err(api_error!(
-            "unsupported_provider",
-            format!(
-                "agent {} requires {:?} prompt dispatch instead of guarded terminal send",
-                state.agent.as_str(),
-                capability.prompt_dispatch
-            ),
-        )
-        .into());
     }
     verify_agent_input_target(runner, env, &connection, pane, &identity)?;
     let prompt_digest = Sha256Digest::parse(crate::pane_state::PromptState::digest_decoded_prompt(

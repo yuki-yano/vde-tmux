@@ -76,6 +76,11 @@ pub fn resolve_presentation_with_explanation(
             return (BadgeState::Blocked, explanation(reason));
         } else if evidence.working {
             return (BadgeState::Working, explanation(Reason::ScreenWorking));
+        } else if tracker
+            .codex_idle_verified_at
+            .is_some_and(|at| (0..=SCREEN_EVIDENCE_TTL_SECONDS).contains(&now.saturating_sub(at)))
+        {
+            return (canonical, explanation(Reason::ProviderResynchronized));
         } else {
             Reason::UnknownScreen
         }

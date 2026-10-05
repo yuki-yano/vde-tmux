@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::git::SystemGitRunner;
 
 mod capture;
+pub(crate) mod codex_resync;
 mod observation;
 mod process;
 pub mod question;

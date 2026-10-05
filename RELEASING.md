@@ -4,11 +4,14 @@ Publishing is driven by Git tags.
 
 ## Local API v6 upgrade
 
-API 6 / daemon protocol 30 adds ID-matched acknowledgement for accepted async-question replies.
-Hook metadata contains only bounded reply-ID hashes; per-issuance partial answers remain in
-memory. Same-turn replies may acknowledge an entirely answered prefix without capture/Idle,
-while newer unanswered notices and restart-era notices remain. Preserve the exact process/session,
-profile, generation and loss-journal guards. Question sidecar schema 1 is unchanged.
+API 6 / daemon protocol 31 persists ID-matched acknowledgement for accepted async-question replies.
+Hook metadata contains only bounded reply-ID hashes. Per-issuance partial answers and call-ID
+tombstones survive restart. Answered notices clear independently of older unanswered notices;
+the acknowledged-order watermark still advances only over a contiguous answered prefix.
+The reply worker checks the exact process/session owner once and rechecks the canonical binding
+before saving. It does not require startup trust, capture/Idle or a home-wide loss journal.
+Pre-upgrade notices without issued-ID metadata remain available for manual Q.
+Question sidecar schema 1 is unchanged.
 Protocol 29 added late durable prompt confirmation and revision-guarded
 `agent operation abandon`. The 10-second deadline reports delivery uncertainty; matching later
 Run evidence can still confirm the Operation. Abandonment preserves ambiguity while releasing its
@@ -28,8 +31,10 @@ Agent API 6 adds `presentation` to summaries without changing existing fields. S
 screen detection is presentation-only. Canonical notification jobs are checked against their
 Blocked occurrence when accepted for execution; their generation is runtime-only. State changes
 after validation cannot retract the accepted notification.
-Resolver trust is runtime-only: notices from before the restart remain Q-only, and existing
-sessions are not made trusted by a later prompt. A local install does not require a crate
+Ordinary-resolver trust is runtime-only. Exact issued-ID bindings, partial answers and call-ID
+tombstones persist across restart; pre-upgrade notices without IDs remain available for Q.
+Existing Idle readiness is recovered from the exact live rollout writer and bounded structural
+history, without synthesizing startup trust or Run completion. A local install does not require a crate
 version bump or a release tag.
 
 1. Pass formatting, Clippy, tests, and the checks applicable to the change under `AGENTS.md`.
@@ -55,7 +60,7 @@ version bump or a release tag.
    orders equal submitted cycles, including combined prefix advancement), with no terminal reply/journal failure;
    per-phase counters and retention reasons are saved as evidence.
 2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
-   Confirm `vt api schema --json` reports API 6, protocol 30, PaneState 10, and private state 1.
+   Confirm `vt api schema --json` reports API 6, protocol 31, PaneState 10, and private state 1.
    Validate the staged binaries on a scratch server before replacing the installed generation:
    `VDE_VT_BIN=<temporary-root>/bin/vt python3 scripts/test-codex-observation-isolated.py`.
 3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.

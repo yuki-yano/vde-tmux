@@ -217,6 +217,7 @@ pub(crate) fn run_hook_command(
                             turn_id,
                             tool_use_id,
                             questions,
+                            item_count,
                             ..
                         } => match prepared.metadata.ancestors.clone() {
                             ancestors if !ancestors.is_empty() => {
@@ -226,6 +227,7 @@ pub(crate) fn run_hook_command(
                                     tool_use_id,
                                     ancestors,
                                     questions,
+                                    item_count,
                                 }
                             }
                             _ => crate::question_notice::QuestionNoticeInput::Rejected {

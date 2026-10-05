@@ -80,6 +80,7 @@ pub enum QuestionNoticeInput {
         tool_use_id: String,
         ancestors: Vec<AgentProcessIdentity>,
         questions: text::QuestionEvidence,
+        item_count: usize,
     },
     Rejected {
         reason: NoticeReason,
@@ -131,7 +132,8 @@ struct QuestionNoticeState {
     seen: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplyItems {
     session: String,
     items: BTreeSet<String>,
@@ -153,7 +155,7 @@ pub struct QuestionNotices {
     memory_only: BTreeSet<(String, String)>,
     // Runtime only; absence after restart must never be treated as resolution.
     question_text: BTreeMap<(String, u64), (String, text::QuestionEvidence)>,
-    // Sparse replies are runtime-only. A missing entry always blocks prefix advancement.
+    // Persisted exact ID bindings and partial answers; missing entries remain unresolved.
     reply_items: BTreeMap<(String, u64), ReplyItems>,
     // Retain used call identities until owner death, so a delayed reply cannot
     // acknowledge a newly reused call ID even after the old notice was acked.
@@ -176,7 +178,19 @@ impl QuestionNotices {
     pub(crate) fn inject_reply_commit_failure_for_test(&mut self) {
         self.storage_fault = Some(storage::FaultPoint::BeforeRename);
     }
+    #[cfg(test)]
     pub fn remember_reply_items(
+        &mut self,
+        owner: &str,
+        order: u64,
+        session: &str,
+        call: &str,
+        count: usize,
+    ) {
+        self.register_reply_items(owner, order, session, call, count);
+        let _ = self.persist();
+    }
+    fn register_reply_items(
         &mut self,
         owner: &str,
         order: u64,
@@ -206,6 +220,7 @@ impl QuestionNotices {
                     || items.session != session_digest
                     || items.items.is_disjoint(&ambiguous)
             });
+            self.dirty = true;
             return;
         }
         // Record every accepted call, even when text/count or active capacity is
@@ -219,12 +234,14 @@ impl QuestionNotices {
             self.reply_blocked_owners.insert(owner.to_owned());
             self.reply_items
                 .retain(|(bound_owner, _), _| bound_owner != owner);
+            self.dirty = true;
             return;
         }
         self.reply_calls
             .entry(owner.to_string())
             .or_default()
             .insert(call_digest);
+        self.dirty = true;
         if count == 0
             || count > reply::MAX_ISSUED_ITEMS
             || self.reply_items.len() >= MAX_TEXT_NOTICES
@@ -380,9 +397,32 @@ impl QuestionNotices {
             through = order;
         }
         if through == acknowledged {
-            if Instant::now() >= deadline {
-                self.reply_items.extend(before);
-                return Err("reply_deadline");
+            let changed = self.reply_items.range(range).any(|(key, items)| {
+                before
+                    .get(key)
+                    .is_some_and(|old| old.pending != items.pending)
+            });
+            if !changed {
+                return Ok(false);
+            }
+            let was_dirty = self.dirty;
+            let last_attempt = self.last_write_attempt;
+            match self.persist_commit_until(Some(deadline)) {
+                CommitResult::PreCommitFailed => {
+                    self.reply_items.extend(before);
+                    self.dirty = was_dirty;
+                    self.last_write_attempt = last_attempt;
+                    self.diagnostics
+                        .insert(pane.clone(), NoticeReason::PersistencePending);
+                    return Err("persistence_pending");
+                }
+                CommitResult::CommittedDurabilityUnknown => {
+                    self.diagnostics
+                        .insert(pane.clone(), NoticeReason::QuestionAckDirectoryFsyncFailed);
+                }
+                CommitResult::Committed => {
+                    self.diagnostics.remove(pane);
+                }
             }
             return Ok(false);
         }
@@ -486,6 +526,17 @@ impl QuestionNotices {
         identifiers: (&str, &str, &str),
         now: i64,
     ) -> NoticeResult {
+        self.issue_with_items(pane, process, identifiers, now, None)
+    }
+
+    pub fn issue_with_items(
+        &mut self,
+        pane: PaneInstance,
+        process: AgentProcessIdentity,
+        identifiers: (&str, &str, &str),
+        now: i64,
+        item_count: Option<usize>,
+    ) -> NoticeResult {
         self.bind(pane.clone(), process.clone());
         if self.invalid_sidecar {
             return self.reject(&pane, NoticeReason::InvalidSidecar);
@@ -528,7 +579,7 @@ impl QuestionNotices {
             .or_insert_with(|| QuestionNoticeState {
                 pane: pane.clone(),
                 process,
-                owner_ref,
+                owner_ref: owner_ref.clone(),
                 latest_order: 0,
                 acknowledged_order: 0,
                 last_issued_at: now,
@@ -537,6 +588,10 @@ impl QuestionNotices {
         owner.latest_order += 1;
         owner.last_issued_at = now;
         owner.seen.insert(key);
+        let order = owner.latest_order;
+        if let Some(count) = item_count {
+            self.register_reply_items(&owner_ref, order, identifiers.0, identifiers.2, count);
+        }
         self.diagnostics.remove(&pane);
         self.dirty = true;
         // A failed disk must not be hammered by subsequent hook deliveries.
@@ -572,8 +627,14 @@ impl QuestionNotices {
             self.diagnostics.get(pane).copied()
         };
         QuestionNoticeSummary {
-            unacknowledged: owner
-                .is_some_and(|owner| owner.latest_order > owner.acknowledged_order),
+            unacknowledged: owner.is_some_and(|owner| {
+                (owner.acknowledged_order.saturating_add(1)..=owner.latest_order).any(|order| {
+                    !self
+                        .reply_items
+                        .get(&(owner.owner_ref.clone(), order))
+                        .is_some_and(|items| items.pending.is_empty())
+                })
+            }),
             owner_ref: owner.map(|owner| owner.owner_ref.clone()),
             latest_order: owner.map_or(0, |owner| owner.latest_order),
             acknowledged_order: owner.map_or(0, |owner| owner.acknowledged_order),

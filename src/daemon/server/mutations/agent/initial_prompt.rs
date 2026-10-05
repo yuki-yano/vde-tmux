@@ -1,4 +1,4 @@
-//! Input readiness for the first embedded prompt is separate from hook authority.
+//! Fresh empty-composer verification shared by every embedded prompt.
 //! Nothing here changes presentation, lifecycle, or provider confirmation.
 
 use crate::pane_state::{CaptureTrackerSnapshot, LifecycleState, PaneState};
@@ -29,7 +29,7 @@ pub(super) fn require_ready(runner: &dyn TmuxRunner, record: &PaneState) -> Resu
         .agent_process_arguments(process)
         .map_err(|error| error.to_string())?;
     if !crate::question_notice::profile::independent_arguments(&args) {
-        return Err("first prompt requires an explicit --no-daemon interactive invocation without a queued initial prompt".into());
+        return Err("prompt requires an explicit --no-daemon interactive invocation without a queued initial prompt".into());
     }
     let pane = &record.pane_instance;
     let verify = || {
@@ -39,13 +39,18 @@ pub(super) fn require_ready(runner: &dyn TmuxRunner, record: &PaneState) -> Resu
             .as_ref()
             != Some(process)
         {
-            return Err("agent process changed while verifying first prompt readiness".into());
+            return Err("agent process changed while verifying prompt readiness".into());
         }
         runner
             .verify_agent_input_owner(pane.pane_pid, process.pid)
             .map_err(|error| error.to_string())
     };
     verify()?;
+    if let Some(session) = &record.agent_session_id {
+        runner
+            .codex_active_transcript(process, session.as_str())
+            .map_err(|error| format!("current Codex session is not verified: {error}"))?;
+    }
     // Read the live viewport and cursor in one tmux command queue. Matching
     // before/after frames exclude pane replacement, resize and cursor movement.
     let frame =
@@ -75,7 +80,7 @@ pub(super) fn require_ready(runner: &dyn TmuxRunner, record: &PaneState) -> Resu
         )
         .map_err(|error| error.to_string())?;
     if output.truncated || !empty_composer(&output.text, pane.pane_pid) {
-        return Err("Codex initial input field is not ready or is not empty".into());
+        return Err("Codex input field is not ready or is not empty".into());
     }
     verify()
 }
@@ -119,6 +124,13 @@ fn empty_composer(output: &str, pane_pid: u32) -> bool {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
+    if screen.lines().any(|line| {
+        let line = line.trim();
+        crate::detect::codex::queued_input_header(line)
+            || line.starts_with("Reconnect failed — check the endpoint, then relaunch")
+    }) {
+        return false;
+    }
     if crate::detect::codex::classify(&screen) != crate::detect::codex::Evidence::default() {
         return false;
     }
@@ -154,6 +166,10 @@ mod tests {
         assert!(empty_composer(&screen, 42));
         let blank_bottom = screen.replace("? for shortcuts", "");
         assert!(empty_composer(&blank_bottom, 42));
+        assert!(empty_composer(
+            &screen.replace("Codex\n", "Fixed queued jobs and pending input naming\n"),
+            42
+        ));
         for rejected in [
             screen.replace("42:2:", "42:3:"),
             screen.replace("\x1b[2m", ""),
@@ -163,6 +179,15 @@ mod tests {
             screen.replace("Ask Codex to do anything", "1. Yes, continue"),
             screen.replacen("Codex\n", "• Working (3s)\n", 1),
             screen.replace("? for shortcuts", "Question 1/1 (1 unanswered)"),
+            screen.replace("? for shortcuts", "• Queued follow-up inputs"),
+            screen.replace(
+                "? for shortcuts",
+                "• Messages to be submitted at end of turn",
+            ),
+            screen.replace(
+                "? for shortcuts",
+                "Reconnect failed — check the endpoint, then relaunch",
+            ),
             screen.replace("? for shortcuts", "↑/↓ to scroll"),
             screen.replace("? for shortcuts", "  ? 1 question · 3s"),
         ] {

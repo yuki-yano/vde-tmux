@@ -198,8 +198,10 @@ pub(in crate::daemon::server) fn observe(
         }
         return;
     }
+    let exact_reply =
+        accepted && observation.kind == ProviderHookKind::UserPromptSubmit && input.reply.is_some();
     let root = journal_root(coordinator, input);
-    if root == JournalRoot::Unavailable {
+    if !exact_reply && root == JournalRoot::Unavailable {
         if observation.kind == ProviderHookKind::Activity
             && input.journal_failure.is_some()
             && !input.journal_failure_reported
@@ -224,7 +226,7 @@ pub(in crate::daemon::server) fn observe(
         }
         return;
     }
-    if root == JournalRoot::Mismatch {
+    if !exact_reply && root == JournalRoot::Mismatch {
         if let Some(state) = coordinator
             .state
             .lock()
@@ -310,7 +312,7 @@ pub(in crate::daemon::server) fn observe(
             .locator
             .as_ref()
             .is_some_and(|locator| locator.home_digest() == home && locator.matches_current_file())
-        && input.journal_failure.is_none()
+        && (exact_reply || input.journal_failure.is_none())
         && state.question_notices.tracking_healthy()
         && pane_verified
         && state
@@ -497,13 +499,6 @@ pub(in crate::daemon::server) fn prepare_reply_job(
     crate::question_notice::resolver::RetainReason,
 > {
     use crate::question_notice::resolver::{Fence, RetainReason};
-    if !state
-        .question_notices
-        .resolver
-        .reply_allowed(home, &observation.session, &binding, epoch)
-    {
-        return Err(RetainReason::ReplyHistoryUnknown);
-    }
     let orders = state
         .question_notices
         .match_reply_orders(&binding.pane, &binding.owner, &observation.session, reply)
@@ -573,14 +568,6 @@ fn retry_reply(
     if !owner_binding_current(state, &job.fence) {
         return Err(ReplyOwner);
     }
-    if !state.question_notices.resolver.reply_allowed(
-        &job.fence.home,
-        &job.fence.session,
-        &job.fence.binding,
-        job.fence.epoch,
-    ) {
-        return Err(ReplyHistoryUnknown);
-    }
     let mut retry = job.clone();
     retry.attempt += 1;
     retry.deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
@@ -615,9 +602,6 @@ pub(in crate::daemon::server) fn reply_completed(
         .state
         .lock()
         .expect("canonical state lock poisoned");
-    // The worker acquired and evaluated the journal before transferring it. No
-    // flock wait or journal repair IO occurs on the serial mutation path.
-    let mut journal = completion.guard.as_ref().and_then(|guard| guard.take());
     let Some(state) = state_guard.as_mut() else {
         return;
     };
@@ -628,31 +612,6 @@ pub(in crate::daemon::server) fn reply_completed(
         }
         return;
     }
-    let Some(locked) = journal.as_mut().filter(|guard| guard.is_current()) else {
-        if let Err(reason) = retry_reply(
-            coordinator,
-            state,
-            &completion.job,
-            RetainReason::ReplyGuardUnavailable,
-        ) {
-            state.question_notices.resolver.note_retained(reason);
-        }
-        return;
-    };
-    // The held lock protects the worker's validated evaluation; reading it again
-    // without dead-writer repair checks session dirty state and the same epoch.
-    let clean = locked
-        .evaluate(Some(&fence.session), |_| {
-            crate::question_notice::journal::WriterState::Unknown
-        })
-        .is_ok_and(|view| !view.veto && !view.session_dirty && view.epoch == fence.epoch);
-    if !clean {
-        state
-            .question_notices
-            .resolver
-            .note_retained(RetainReason::ReplyJournalDirty);
-        return;
-    }
     if !owner_binding_current(state, fence) {
         state
             .question_notices
@@ -660,24 +619,12 @@ pub(in crate::daemon::server) fn reply_completed(
             .note_retained(RetainReason::ReplyOwner);
         return;
     }
-    if !state.question_notices.resolver.reply_allowed(
-        &fence.home,
-        &fence.session,
-        &fence.binding,
-        fence.epoch,
-    ) {
-        state
-            .question_notices
-            .resolver
-            .note_retained(RetainReason::ReplyHistoryUnknown);
-        return;
-    }
-    if locked
-        .deadline()
+    if completion
+        .job
+        .deadline
         .saturating_duration_since(std::time::Instant::now())
         < crate::question_notice::REPLY_COMMIT_RESERVE
     {
-        drop(journal);
         if let Err(reason) = retry_reply(
             coordinator,
             state,
@@ -697,9 +644,8 @@ pub(in crate::daemon::server) fn reply_completed(
         &fence.session,
         &completion.job.reply,
         &completion.job.orders,
-        locked.deadline(),
+        completion.job.deadline,
     );
-    drop(journal);
     if result == Err("reply_deadline") {
         if let Err(reason) = retry_reply(
             coordinator,
@@ -807,10 +753,8 @@ pub(in crate::daemon::server) fn start_workers(
             queue.in_flight || !queue.items.is_empty()
         });
     let (replies, reply_completed) = crate::daemon::workers::question::start_reply_worker(
-        coordinator.env.clone(),
         verify_owner.clone(),
         completion_ready.clone(),
-        mutation_busy.clone(),
     );
     *coordinator
         .question_replies
@@ -1476,6 +1420,7 @@ pub(in crate::daemon::server) fn apply(
             tool_use_id,
             ancestors,
             questions,
+            item_count,
         } = input
         else {
             let QuestionNoticeInput::Rejected { reason } = input else {
@@ -1534,7 +1479,14 @@ pub(in crate::daemon::server) fn apply(
         } else {
             crate::question_notice::text::QuestionEvidence::Unavailable
         };
-        Ok((process, session_id, turn_id, tool_use_id, questions))
+        Ok((
+            process,
+            session_id,
+            turn_id,
+            tool_use_id,
+            questions,
+            item_count,
+        ))
     })();
     let mut guard = coordinator
         .state
@@ -1547,31 +1499,19 @@ pub(in crate::daemon::server) fn apply(
         .question_notices
         .summary(&envelope.pane_instance, None);
     let result = match verified {
-        Ok((process, session, turn, tool, questions)) => {
-            let result = state.question_notices.issue(
+        Ok((process, session, turn, tool, questions, item_count)) => {
+            let result = state.question_notices.issue_with_items(
                 envelope.pane_instance.clone(),
                 process.clone(),
                 (&session, &turn, &tool),
                 super::super::epoch_seconds(),
+                Some(item_count),
             );
             if result.disposition == crate::question_notice::NoticeDisposition::Applied {
                 let summary = state
                     .question_notices
                     .summary(&envelope.pane_instance, Some(&process));
                 let owner = summary.owner_ref.expect("applied notice owner");
-                let count = match &questions {
-                    crate::question_notice::text::QuestionEvidence::Fingerprints(items) => {
-                        items.len()
-                    }
-                    crate::question_notice::text::QuestionEvidence::Unavailable => 0,
-                };
-                state.question_notices.remember_reply_items(
-                    &owner,
-                    summary.latest_order,
-                    &session,
-                    &tool,
-                    count,
-                );
                 state.question_notices.remember_questions(
                     owner,
                     summary.latest_order,

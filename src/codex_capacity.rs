@@ -160,7 +160,12 @@ fn parse_tail(data: &[u8], turn: &str) -> anyhow::Result<bool> {
 
 /// Plain viewport predicate; ANSI styling is checked separately for the live composer row.
 pub fn frame(screen: &str) -> Option<(usize, [u8; 32])> {
-    if screen.len() > 512 * 1024 || screen.chars().any(|c| c.is_control() && c != '\n') {
+    if screen.len() > 512 * 1024
+        || screen.chars().any(|c| c.is_control() && c != '\n')
+        || screen
+            .lines()
+            .any(crate::detect::codex::queued_input_header)
+    {
         return None;
     }
     let evidence = crate::detect::codex::classify(screen);
@@ -439,6 +444,14 @@ mod tests {
         assert!(frame(&good.replace('›', "»")).is_some());
         for extra in ["[Image #1]", "• Queued follow-up inputs", "? 1 question"] {
             assert!(frame(&good.replace("\n\n›", &format!("\n{extra}\n›"))).is_none());
+        }
+        for header in [
+            "• Queued follow-up inputs",
+            "• Messages to be submitted after next tool call",
+            "• Messages to be submitted at end of turn",
+        ] {
+            assert!(frame(&format!("{header}\n{good}")).is_none());
+            assert!(frame(&format!("{good}\n{header}")).is_none());
         }
         for glyph in [
             "!",

@@ -55,6 +55,14 @@ pub mod mock;
 pub trait TmuxRunner {
     fn run(&self, args: &[&str]) -> Result<String>;
 
+    fn codex_active_transcript(
+        &self,
+        process: &crate::pane_state::AgentProcessIdentity,
+        session: &str,
+    ) -> Result<crate::question_notice::ingress::TranscriptLocator> {
+        crate::daemon::workers::codex_resync::active_locator(process, session)
+    }
+
     fn agent_process_arguments(
         &self,
         process: &crate::pane_state::AgentProcessIdentity,
@@ -136,7 +144,26 @@ pub fn run_command_with_output_limit(
     timeout: Option<Duration>,
     max_stdout_bytes: Option<usize>,
 ) -> Result<String> {
-    run_command_with_optional_input(program, args, None, timeout, max_stdout_bytes)
+    run_command_with_optional_input(program, args, None, timeout, max_stdout_bytes, &[0], false)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn run_command_with_accepted_exit_codes(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    accepted: &[i32],
+) -> Result<String> {
+    run_command_with_optional_input(
+        program,
+        args,
+        None,
+        Some(timeout),
+        Some(max_stdout_bytes),
+        accepted,
+        true,
+    )
 }
 
 pub fn run_command_with_input_and_output_limits(
@@ -163,6 +190,8 @@ fn run_command_with_optional_input(
     input: Option<&[u8]>,
     timeout: Option<Duration>,
     max_stdout_bytes: Option<usize>,
+    accepted_exit_codes: &[i32],
+    strict_output: bool,
 ) -> Result<String> {
     let mut command = command_with_timeout_group(program, timeout);
     let mut child = command
@@ -181,10 +210,13 @@ fn run_command_with_optional_input(
         .stdout
         .take()
         .map(|stdout| read_pipe_in_background(stdout, max_stdout_bytes, Retention::Prefix));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|stderr| read_pipe_in_background(stderr, None, Retention::Prefix));
+    let stderr = child.stderr.take().map(|stderr| {
+        read_pipe_in_background(
+            stderr,
+            strict_output.then_some(16 * 1024),
+            Retention::Prefix,
+        )
+    });
     let input_cancelled = Arc::new(AtomicBool::new(false));
     let stdin = input.and_then(|input| {
         child
@@ -204,6 +236,17 @@ fn run_command_with_optional_input(
     let stdout = collect_pipe_output(stdout);
     let stderr = collect_pipe_output(stderr);
     let status = status?;
+    if strict_output {
+        if let Some(error) = stdout.error {
+            return Err(error).with_context(|| format!("failed to read {program} stdout"));
+        }
+        if let Some(error) = stderr.error {
+            return Err(error).with_context(|| format!("failed to read {program} stderr"));
+        }
+        if stderr.exceeded || !stderr.bytes.is_empty() {
+            bail!("{program} descriptor enumeration reported diagnostics");
+        }
+    }
     if stdout.exceeded {
         bail!(
             "{program} stdout exceeded byte limit: {actual} bytes > {limit} bytes",
@@ -212,7 +255,10 @@ fn run_command_with_optional_input(
         );
     }
     let stdout = String::from_utf8_lossy(&stdout.bytes).into_owned();
-    if status.success() {
+    if status
+        .code()
+        .is_some_and(|code| accepted_exit_codes.contains(&code))
+    {
         stdin.with_context(|| format!("failed to pipe input to {program}"))?;
         return Ok(stdout);
     }

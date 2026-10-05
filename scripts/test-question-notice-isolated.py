@@ -81,9 +81,9 @@ def diagnostics():
         stream.settimeout(3)
         stream.connect(daemon_socket)
         reader = stream.makefile("r")
-        stream.sendall(b'{"op":"hello","proto":30}\n')
+        stream.sendall(b'{"op":"hello","proto":31}\n')
         json.loads(reader.readline())
-        stream.sendall(b'{"op":"query_question_diagnostics","proto":30}\n')
+        stream.sendall(b'{"op":"query_question_diagnostics","proto":31}\n')
         return json.loads(reader.readline())
 
 
@@ -1019,11 +1019,15 @@ def reply_ack_cases():
     assert notice()["acknowledged_order"] == 0 and notice()["unacknowledged"]
     send("UserPromptSubmit", prompt=frame(("first", 0)))
     assert notice()["acknowledged_order"] == 0
+    stop_daemon("partial-reply-restart")
+    start_daemon()
     send("UserPromptSubmit", prompt=frame(("first", 1), ("unknown", 0)))
     assert notice()["acknowledged_order"] == 0
     send("UserPromptSubmit", prompt="Quoted: " + frame(("first", 1)))
     assert notice()["acknowledged_order"] == 0
     send("UserPromptSubmit", prompt=frame(("first", 1)))
+    wait(lambda: notice()["acknowledged_order"] == 2 and not notice()["unacknowledged"],
+         "restored partial and reverse reply commit published")
     assert notice()["acknowledged_order"] == 2 and not notice()["unacknowledged"]
     wait(lambda: visible(False), "reply sidebar immediate clear while running")
     assert agent()["summary"]["lifecycle"]["state"] == "running", "reply required completion/idle"
@@ -1032,8 +1036,15 @@ def reply_ack_cases():
     send("UserPromptSubmit", prompt=frame(("second", 0)), _ui="normal")
     assert notice()["acknowledged_order"] == 2 and notice()["unacknowledged"]
     send("UserPromptSubmit", prompt=frame(("third", 0)))
+    wait(lambda: notice()["acknowledged_order"] == 3 and not notice()["unacknowledged"],
+         "latest reply commit published")
     assert notice()["acknowledged_order"] == 3 and not notice()["unacknowledged"]
     wait(lambda: visible(False), "reply sidebar latest clear")
+    send("PostToolUse", tool_name="request_user_input_async", tool_use_id="long-body",
+         tool_input={"questions":[{"title":"private"*4000}]}, tool_response='{"accepted":true}', _ui="normal")
+    send("UserPromptSubmit", prompt=frame(("long-body", 0)))
+    wait(lambda: not notice()["unacknowledged"], "long body ID reply published")
+    assert not notice()["unacknowledged"], "fingerprint limit disabled ID matching"
     send("Stop")
     for saved in (root / "state").rglob("question-notices-v1.json"):
         assert "reply-private-" not in saved.read_text()

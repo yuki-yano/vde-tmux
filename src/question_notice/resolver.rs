@@ -388,19 +388,6 @@ impl Resolver {
             .and_then(|state| state.binding.as_ref())
     }
 
-    pub fn reply_allowed(&self, home: &str, session: &str, binding: &Binding, epoch: u64) -> bool {
-        !self.disabled
-            && !self.home_failures.contains_key(home)
-            && self
-                .sessions
-                .get(&(home.to_owned(), session.to_owned()))
-                .is_some_and(|state| {
-                    state.trust == Trust::Trusted
-                        && state.binding.as_ref() == Some(binding)
-                        && state.epoch == epoch
-                })
-    }
-
     fn disable(&mut self) {
         self.disabled = true;
         self.candidates.clear();

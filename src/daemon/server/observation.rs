@@ -131,7 +131,64 @@ pub(super) fn start_canonical_observation_worker(
                 epoch_seconds(),
             );
             match poll_result {
-                Ok(result) => {
+                Ok(mut result) => {
+                    let mut resync = coordinator
+                        .codex_resync
+                        .lock()
+                        .expect("Codex resync lock poisoned");
+                    resync.retain(
+                        &dispatch
+                            .iter()
+                            .filter_map(|snapshot| {
+                                snapshot
+                                    .state
+                                    .as_ref()?
+                                    .agent_process
+                                    .as_ref()
+                                    .map(|p| p.pid)
+                            })
+                            .collect(),
+                    );
+                    let candidates: Vec<_> = dispatch
+                        .iter()
+                        .filter(|snapshot| !snapshot.tracker.hook_authoritative)
+                        .filter_map(|snapshot| snapshot.state.as_ref())
+                        .filter(|record| {
+                            record.agent.as_str() == "codex"
+                                && record.agent_present
+                                && record.scan_verified
+                                && record.agent_session_id.is_some()
+                                && matches!(
+                                    record.lifecycle,
+                                    crate::pane_state::LifecycleState::Idle
+                                )
+                                && record.run_seq == record.completed_seq
+                        })
+                        .collect();
+                    let idle = resync.poll(&candidates);
+                    drop(resync);
+                    for (snapshot, envelope) in dispatch.iter().zip(&mut result.envelopes) {
+                        let Some(record) = snapshot.state.as_ref() else {
+                            continue;
+                        };
+                        if snapshot.tracker.hook_authoritative {
+                            continue;
+                        }
+                        if let crate::pane_state::PaneEvent::ObservationBatch {
+                            capture: Some(capture),
+                            process: Some(process),
+                            ..
+                        } = &mut envelope.event
+                            && process.agent_process_checked
+                            && process.agent_process.as_ref() == record.agent_process.as_ref()
+                        {
+                            capture.codex_idle_verified = record
+                                .agent_process
+                                .as_ref()
+                                .is_some_and(|process| idle.get(&process.pid) == Some(&true));
+                        }
+                    }
+
                     let current = projection
                         .topology
                         .panes

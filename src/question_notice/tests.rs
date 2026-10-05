@@ -41,11 +41,15 @@ fn summary(store: &QuestionNotices) -> QuestionNoticeSummary {
 }
 
 fn tracked_issue(store: &mut QuestionNotices, call: &str, count: usize) -> String {
-    issue(store, call);
+    store.issue_with_items(
+        pane(),
+        process(),
+        ("session", "turn", call),
+        42,
+        Some(count),
+    );
     let summary = summary(store);
-    let owner = summary.owner_ref.unwrap();
-    store.remember_reply_items(&owner, summary.latest_order, "session", call, count);
-    owner
+    summary.owner_ref.unwrap()
 }
 
 fn answer(
@@ -120,13 +124,13 @@ fn wrong_owner_session_unknown_or_mixed_reply_cannot_consume_known_pending_items
 }
 
 #[test]
-fn reply_ack_rollback_preserves_notice_and_restart_does_not_rebuild_reply_evidence() {
+fn reply_ack_rollback_preserves_notice_and_restart_restores_exact_reply_evidence() {
     let temp = Temp::new();
     let mut store = QuestionNotices::open(temp.path(), "server".into());
     let owner = tracked_issue(&mut store, "private-call-canary", 1);
     let id = reply::item_digest("private-call-canary", 0);
     let body = std::fs::read_to_string(temp.path()).unwrap();
-    assert!(!body.contains("private-call-canary") && !body.contains(&id));
+    assert!(!body.contains("private-call-canary") && body.contains(&id));
     store.storage_fault = Some(storage::FaultPoint::BeforeRename);
     assert_eq!(
         answer(&mut store, &owner, &[("private-call-canary", 0)]),
@@ -139,7 +143,7 @@ fn reply_ack_rollback_preserves_notice_and_restart_does_not_rebuild_reply_eviden
     assert!(summary(&reopened).unacknowledged);
     assert_eq!(
         answer(&mut reopened, &owner, &[("private-call-canary", 0)]),
-        Err("unknown_reply_item")
+        Ok(true)
     );
     reopened.acknowledge(&pane(), &owner, 1).unwrap();
     assert!(!summary(&reopened).unacknowledged);
@@ -929,4 +933,54 @@ fn nearly_expired_reply_and_failed_ack_do_not_create_a_global_persistence_backlo
     );
     assert!(!store.dirty && !summary(&store).degraded());
     assert_eq!(summary(&store).acknowledged_order, 0);
+}
+
+#[test]
+fn partial_and_sparse_answers_survive_restart_and_call_reuse_stays_blocked() {
+    let temp = Temp::new();
+    let mut store = QuestionNotices::open(temp.path(), "server".into());
+    let owner = tracked_issue(&mut store, "first", 2);
+    tracked_issue(&mut store, "second", 1);
+    answer(&mut store, &owner, &[("first", 0), ("second", 0)]).unwrap();
+    drop(store);
+    let mut store = QuestionNotices::open(temp.path(), "server".into());
+    assert_eq!(store.reply_items[&(owner.clone(), 1)].pending.len(), 1);
+    assert!(store.reply_items[&(owner.clone(), 2)].pending.is_empty());
+    assert_eq!(answer(&mut store, &owner, &[("first", 1)]), Ok(true));
+    assert!(!summary(&store).unacknowledged);
+    drop(store);
+    let mut store = QuestionNotices::open(temp.path(), "server".into());
+    store.issue(pane(), process(), ("session", "next", "second"), 43);
+    store.remember_reply_items(&owner, 3, "session", "second", 1);
+    assert_eq!(
+        answer(&mut store, &owner, &[("second", 0)]),
+        Err("unknown_reply_item")
+    );
+}
+
+#[test]
+fn partial_reply_precommit_failure_is_local_and_does_not_throttle_other_panes() {
+    let temp = Temp::new();
+    let mut store = QuestionNotices::open(temp.path(), "server".into());
+    let owner = tracked_issue(&mut store, "partial", 2);
+    let last = store.last_write_attempt;
+    store.storage_fault = Some(storage::FaultPoint::BeforeRename);
+    assert_eq!(
+        answer(&mut store, &owner, &[("partial", 0)]),
+        Err("persistence_pending")
+    );
+    assert_eq!(store.reply_items[&(owner, 1)].pending.len(), 2);
+    assert!(!store.dirty && summary(&store).degraded());
+    assert_eq!(store.last_write_attempt, last);
+    store.storage_fault = None;
+    let other = PaneInstance {
+        pane_id: "%8".into(),
+        pane_pid: 800,
+    };
+    assert_eq!(
+        store
+            .issue(other, process(), ("session", "turn", "other"), 43)
+            .durability,
+        Some(NoticeDurability::Persisted)
+    );
 }

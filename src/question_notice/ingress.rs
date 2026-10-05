@@ -497,6 +497,11 @@ pub fn from_payload(
         turn_id: turn.to_string(),
         tool_use_id: tool.to_string(),
         ancestors: Vec::new(),
+        item_count: payload
+            .get("tool_input")
+            .and_then(|input| input.get("questions"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
         questions: super::text::QuestionEvidence::from_tool_input(payload.get("tool_input")),
     })
 }

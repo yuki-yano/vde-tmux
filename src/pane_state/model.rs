@@ -1172,6 +1172,7 @@ pub enum PresentationReason {
     #[default]
     Canonical,
     HookAuthoritative,
+    ProviderResynchronized,
     AgentAbsent,
     CanonicalActive,
     ScreenWorking,
@@ -1193,6 +1194,7 @@ impl PresentationReason {
         match self {
             Self::Canonical => "記録された状態",
             Self::HookAuthoritative => "エージェントからの状態通知",
+            Self::ProviderResynchronized => "現在sessionの実行記録を再同期",
             Self::AgentAbsent => "エージェント終了後の記録",
             Self::CanonicalActive => "記録された実行・入力待ち状態",
             Self::ScreenWorking => "画面に実行中の表示",
@@ -1233,6 +1235,7 @@ pub struct CaptureObservation {
     pub inference: CaptureInference,
     pub observed_fingerprint: Option<[u8; 32]>,
     pub codex_screen: Option<crate::detect::codex::Evidence>,
+    pub codex_idle_verified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1522,6 +1525,7 @@ pub struct CaptureTrackerSnapshot {
     pub generation: u64,
     pub epoch: Option<(StateId, u64)>,
     pub hook_authoritative: bool,
+    pub codex_idle_verified_at: Option<i64>,
     /// Ephemeral finite evidence; never serialized into canonical Pane State.
     pub codex_screen: Option<(crate::detect::codex::Evidence, i64)>,
     /// Preserve only the observation timestamp when expiring positive evidence.

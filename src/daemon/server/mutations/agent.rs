@@ -272,6 +272,8 @@ pub(in crate::daemon::server) fn apply_prompt_inner(
                 }
                 let code = if message.starts_with("unsupported provider:") {
                     ErrorCode::UnsupportedProvider
+                } else if message.starts_with("readiness:") {
+                    ErrorCode::AgentNotReady
                 } else {
                     ErrorCode::StaleAgentEvent
                 };
@@ -658,14 +660,15 @@ pub(in crate::daemon::server) fn resolve_prompt_target_inner(
     if !matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle)
         && !recovery.is_some_and(|r| r.matches(&record))
     {
-        return Err("agent is busy or blocked".to_string());
+        return Err("readiness: agent is busy or blocked".to_string());
     }
     if let Some(recovery) = recovery {
         if !recovery.matches(&record) || !tracker.hook_authoritative {
             return Err("capacity recovery precondition changed".into());
         }
     } else {
-        require_prompt_readiness(runner, &record, &tracker)?;
+        require_prompt_readiness(coordinator, runner, &record, &tracker)
+            .map_err(|reason| format!("readiness: {reason}"))?;
     }
     let provider_session_id = record.agent_session_id.clone();
     let expected_run_seq = record
@@ -737,7 +740,7 @@ pub(in crate::daemon::server) fn verify_prompt_precondition_inner(
     if let Some(recovery) = recovery {
         recovery.verify(coordinator, runner, &record)?;
     } else {
-        require_prompt_readiness(runner, &record, &tracker)?;
+        require_prompt_readiness(coordinator, runner, &record, &tracker)?;
     }
     // Process/cursor inspection must not hold the canonical lock. Recheck the
     // CAS fence after it, so a concurrent hook cannot make this snapshot stale.
@@ -746,6 +749,7 @@ pub(in crate::daemon::server) fn verify_prompt_precondition_inner(
 }
 
 fn require_prompt_readiness(
+    coordinator: &ProductionV2Coordinator,
     runner: &dyn crate::tmux::TmuxRunner,
     record: &crate::pane_state::PaneState,
     tracker: &crate::pane_state::CaptureTrackerSnapshot,
@@ -756,7 +760,18 @@ fn require_prompt_readiness(
     {
         initial_prompt::require_ready(runner, record)
     } else {
-        require_observed_prompt_readiness(record, tracker)
+        require_observed_prompt_readiness(record, tracker)?;
+        initial_prompt::require_ready(runner, record)?;
+        if !tracker.hook_authoritative
+            && !coordinator
+                .codex_resync
+                .lock()
+                .map_err(|_| "Codex resynchronization is unavailable")?
+                .sample(record)
+        {
+            return Err("current Codex session is not structurally idle".into());
+        }
+        Ok(())
     }
 }
 
@@ -774,7 +789,13 @@ fn require_observed_prompt_readiness(
             Err("agent is busy or blocked".to_string())
         }
         BadgeState::Unknown => Err("agent readiness is unknown".to_string()),
-        _ if record.agent.as_str() == "codex" && !tracker.hook_authoritative => {
+        _ if record.agent.as_str() == "codex"
+            && !tracker.hook_authoritative
+            && !tracker.codex_idle_verified_at.is_some_and(|at| {
+                (0..=crate::pane_state::resolver::SCREEN_EVIDENCE_TTL_SECONDS)
+                    .contains(&now.saturating_sub(at))
+            }) =>
+        {
             Err("Codex lifecycle hooks are not verified for this daemon epoch".to_string())
         }
         _ => Ok(()),

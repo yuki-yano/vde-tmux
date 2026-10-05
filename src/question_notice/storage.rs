@@ -70,10 +70,18 @@ struct Snapshot {
     schema_version: u16,
     server_hash: String,
     owners: Vec<QuestionNoticeState>,
+    // An additive on-disk upgrade preserves existing notification watermarks.
+    // Missing old metadata never establishes that a question was answered.
+    #[serde(default)]
+    reply_items: Vec<(String, u64, super::ReplyItems)>,
+    #[serde(default)]
+    reply_calls: BTreeMap<String, std::collections::BTreeSet<String>>,
+    #[serde(default)]
+    reply_blocked_owners: std::collections::BTreeSet<String>,
 }
 
 impl QuestionNotices {
-    pub(super) fn load(&self) -> Result<BTreeMap<String, QuestionNoticeState>> {
+    pub(super) fn load(&mut self) -> Result<BTreeMap<String, QuestionNoticeState>> {
         let Some(path) = &self.path else {
             return Ok(BTreeMap::new());
         };
@@ -140,6 +148,68 @@ impl QuestionNotices {
                 "duplicate question owner"
             );
         }
+        let valid_digest = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        ensure!(
+            snapshot.reply_items.len() <= super::MAX_TEXT_NOTICES,
+            "too many reply entries"
+        );
+        let mut replies = BTreeMap::new();
+        let mut per_owner = BTreeMap::<String, usize>::new();
+        for (owner, order, items) in snapshot.reply_items {
+            let state = owners
+                .get(&owner)
+                .ok_or_else(|| anyhow::anyhow!("unknown reply owner"))?;
+            ensure!(
+                order > 0
+                    && order <= state.latest_order
+                    && valid_digest(&items.session)
+                    && !items.items.is_empty()
+                    && items.items.len() <= super::reply::MAX_ISSUED_ITEMS
+                    && items.items.iter().all(|id| valid_digest(id))
+                    && items.pending.is_subset(&items.items),
+                "invalid reply metadata"
+            );
+            // A committed prefix can include consumed entries until memory cleanup.
+            if order <= state.acknowledged_order {
+                continue;
+            }
+            let count = per_owner.entry(owner.clone()).or_default();
+            *count += 1;
+            ensure!(
+                *count <= super::MAX_TEXT_NOTICES_PER_OWNER,
+                "too many owner replies"
+            );
+            ensure!(
+                replies.insert((owner, order), items).is_none(),
+                "duplicate reply order"
+            );
+        }
+        let mut calls = 0;
+        for (owner, ids) in &snapshot.reply_calls {
+            ensure!(
+                owners.contains_key(owner)
+                    && ids.len() <= MAX_KEYS_PER_OWNER
+                    && ids.iter().all(|id| valid_digest(id)),
+                "invalid reply call history"
+            );
+            calls += ids.len();
+            ensure!(calls <= MAX_KEYS, "too many reply calls");
+        }
+        ensure!(
+            snapshot
+                .reply_blocked_owners
+                .iter()
+                .all(|owner| owners.contains_key(owner)),
+            "invalid blocked reply owner"
+        );
+        self.reply_items = replies;
+        self.reply_calls = snapshot.reply_calls;
+        self.reply_blocked_owners = snapshot.reply_blocked_owners;
         Ok(owners)
     }
 
@@ -168,6 +238,13 @@ impl QuestionNotices {
             schema_version: 1,
             server_hash: self.server_hash.clone(),
             owners: self.owners.values().cloned().collect(),
+            reply_items: self
+                .reply_items
+                .iter()
+                .map(|((owner, order), items)| (owner.clone(), *order, items.clone()))
+                .collect(),
+            reply_calls: self.reply_calls.clone(),
+            reply_blocked_owners: self.reply_blocked_owners.clone(),
         })?;
         ensure!(
             bytes.len() <= MAX_BYTES,

@@ -102,6 +102,7 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
         turn_id: "question-turn".into(),
         tool_use_id: tool.into(),
         ancestors: vec![process.clone()],
+        item_count: 1,
         questions: if tool == "call-2" {
             // Malformed optional evidence must not reject an owned notification.
             crate::question_notice::text::QuestionEvidence::Fingerprints(vec![
@@ -325,6 +326,7 @@ fn question_notice_survives_stop_first_and_session_binding_rejection_without_cha
         turn_id: "question-turn".into(),
         tool_use_id: tool.into(),
         ancestors: vec![process.clone()],
+        item_count: 1,
         questions: crate::question_notice::text::QuestionEvidence::Unavailable,
     };
     let response = apply_external_provider_notice_with_runner(
@@ -1555,7 +1557,7 @@ fn question_completion_waiting_for_state_leaves_guard_under_deadline_reaper() {
 
 #[test]
 fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
-    use crate::daemon::workers::question::{ReplyCompletion, ReplyJob, SharedJournalGuard};
+    use crate::daemon::workers::question::{ReplyCompletion, ReplyJob};
     use crate::question_notice::{
         QuestionNotices,
         ingress::{SessionSource, TranscriptLocator},
@@ -1742,9 +1744,7 @@ fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
                 0,
                 &known,
             );
-            if matches!(case, "resume" | "retry-resume") {
-                assert!(prepared.is_err());
-            } else {
+            {
                 let job = prepared.unwrap();
                 assert_eq!(job.orders, vec![1]);
                 assert_eq!(job.fence.latest, 1);
@@ -1796,10 +1796,7 @@ fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
         locked
             .evaluate(Some(&session_key("session")), |_| WriterState::Unknown)
             .unwrap();
-        let transfer = SharedJournalGuard::new(locked);
-        if case == "expired" {
-            transfer.take();
-        }
+        drop(locked);
         let mut job = ReplyJob {
             fence: Fence {
                 generation: 0,
@@ -1822,7 +1819,7 @@ fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
             },
             deadline: Instant::now() + Duration::from_secs(1),
         };
-        if matches!(case, "retry-owner" | "retry-resume" | "retry-queue-full") {
+        if matches!(case, "retry-owner" | "retry-queue-full") {
             let (worker, queued) =
                 crate::daemon::workers::question::ReplyWorkerHandle::test_queue();
             if case == "retry-queue-full" {
@@ -1836,7 +1833,6 @@ fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
                 ReplyCompletion {
                     job,
                     reason: Some(crate::question_notice::resolver::RetainReason::MutationBusy),
-                    guard: None,
                 },
             );
             if case == "retry-queue-full" {
@@ -1868,7 +1864,6 @@ fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
                     ReplyCompletion {
                         job: next.clone(),
                         reason: Some(crate::question_notice::resolver::RetainReason::MutationBusy),
-                        guard: None,
                     },
                 );
                 if attempt < 2 {
@@ -1905,7 +1900,6 @@ fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
                     } else {
                         crate::question_notice::resolver::RetainReason::MutationBusy
                     }),
-                    guard: None,
                 },
             );
             let retry = queued.try_recv().unwrap();
@@ -1917,11 +1911,7 @@ fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
         }
         super::super::question::reply_completed(
             &coordinator,
-            ReplyCompletion {
-                job,
-                reason: None,
-                guard: Some(transfer),
-            },
+            ReplyCompletion { job, reason: None },
         );
         let after = coordinator.publish_resolved_snapshot().unwrap();
         let state = coordinator.state.lock().unwrap();
@@ -1929,7 +1919,10 @@ fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
         let notice = state.question_notices.summary(&pane, Some(&process));
         assert_eq!(
             notice.unacknowledged,
-            case != "ok",
+            !matches!(
+                case,
+                "ok" | "resume" | "dirty" | "epoch" | "expired" | "retry-resume"
+            ),
             "{case}: {:?} {:?}",
             state.question_notices.resolver.diagnostics(),
             state.leased.runtime.record(&pane)
@@ -1938,7 +1931,15 @@ fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
             after.revision > before.revision,
             matches!(
                 case,
-                "ok" | "persist" | "arrival" | "retry-arrival" | "retry-owner-proof"
+                "ok" | "persist"
+                    | "arrival"
+                    | "retry-arrival"
+                    | "retry-owner-proof"
+                    | "resume"
+                    | "dirty"
+                    | "epoch"
+                    | "expired"
+                    | "retry-resume"
             ),
             "{case}"
         );
@@ -1950,7 +1951,10 @@ fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
                         .as_ref()
                         .unwrap()
                         .unacknowledged,
-                    case != "ok",
+                    !matches!(
+                        case,
+                        "ok" | "resume" | "dirty" | "epoch" | "expired" | "retry-resume"
+                    ),
                     "{case}"
                 );
                 if case == "persist" {
@@ -1976,7 +1980,14 @@ fn reply_completion_revalidates_guards_and_publishes_ack_or_failure_health() {
         }
         if !matches!(
             case,
-            "ok" | "arrival" | "retry-arrival" | "retry-owner-proof"
+            "ok" | "arrival"
+                | "retry-arrival"
+                | "retry-owner-proof"
+                | "resume"
+                | "dirty"
+                | "epoch"
+                | "expired"
+                | "retry-resume"
         ) {
             assert!(
                 !state.question_notices.resolver.diagnostics()["retained_by"]

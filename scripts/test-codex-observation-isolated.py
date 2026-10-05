@@ -52,10 +52,25 @@ int main(int argc, char **argv) {
     }
     char path[4096], line[512], event[64], pane[64];
     snprintf(path, sizeof(path), "%s/%s.fifo", root, role);
+    FILE *rollout = NULL;
+    if (!strcmp(role, "embedded")) {
+        snprintf(path, sizeof(path), "%s/sessions/rollout-embedded.jsonl", getenv("CODEX_HOME"));
+        rollout = fopen(path, "a+");
+        if (!rollout) return 8;
+    }
+    snprintf(path, sizeof(path), "%s/%s.fifo", root, role);
     FILE *commands = fopen(path, "r+");
     if (!commands) return 2;
     while (fgets(line, sizeof(line), commands)) {
         if (sscanf(line, "%63s %63s", event, pane) != 2) return 3;
+        if (!strncmp(event, "SESSION_", 8) && rollout) {
+            fclose(rollout);
+            snprintf(path, sizeof(path), "%s/sessions/rollout-%s.jsonl", getenv("CODEX_HOME"),
+                !strcmp(event, "SESSION_SWAP") ? "replacement" : "embedded");
+            rollout = fopen(path, "a+");
+            if (!rollout) return 8;
+            continue;
+        }
         if (!strncmp(event, "SCREEN_", 7)) {
             snprintf(path, sizeof(path), "%s/%s.txt", root, event);
             FILE *screen = fopen(path, "r");
@@ -99,14 +114,16 @@ def main():
     env = {
         **os.environ,
         "HOME": str(work / "home"),
+        "ZDOTDIR": str(work / "home"),
         "XDG_STATE_HOME": str(work / "state"),
         "XDG_CONFIG_HOME": str(work / "config"),
         "CODEX_HOME": str(work / "codex-home"),
         "VDE_TMUX_SOCKET_NAME": socket,
         "VDE_FIXTURE_ROOT": str(work),
         "VDE_FIXTURE_VT": str(BIN),
-        "PATH": str(work) + ":" + os.environ["PATH"],
+        "PATH": str(work) + ":" + str(BIN.parent) + ":" + os.environ["PATH"],
     }
+    assert Path(shutil.which("vt", path=env["PATH"])).resolve() == BIN
     real_tmux = shutil.which("tmux")
     assert real_tmux is not None, "tmux is required"
     capture_failure = work / "fail-observation-capture"
@@ -138,6 +155,9 @@ def main():
         "SCREEN_ASYNC": ("• Reviewing (3s)\n  ? 1 question · 3s\n› Ask Codex\n", "working", False),
         "SCREEN_TRUST": ("> You are in /synthetic/project\nDo you trust the contents of this directory?\n› 1. Yes, continue\n  2. No, exit\n", "blocked", True),
         "SCREEN_UPDATE": ("Update available!\n› 1. Update now\n  2. Skip until next version\nPress enter to continue\n", "blocked", True),
+        "SCREEN_READY": ("Codex\n› \033[2mAsk Codex to do anything\033[0m\n\n? for shortcuts\033[2;3H", "idle", False),
+        "SCREEN_DRAFT": ("Codex\n› typed draft\n\n? for shortcuts\033[2;3H", "unknown", False),
+        "SCREEN_QUEUE": ("Codex\n› \033[2mAsk Codex to do anything\033[0m\n\n• Queued follow-up inputs\033[2;3H", "unknown", False),
         "SCREEN_UNKNOWN": ("Unrecognized UI\n› Ask Codex\n", "unknown", False),
     }
     reasons = {"SCREEN_WORK": "screen_working", "SCREEN_APPROVAL": "screen_approval", "SCREEN_SYNC": "screen_question", "SCREEN_ASYNC": "screen_working", "SCREEN_TRUST": "screen_trust", "SCREEN_UPDATE": "screen_update", "SCREEN_UNKNOWN": "unknown_screen"}
@@ -153,7 +173,7 @@ def main():
         return result.stdout.strip()
 
     def tmux(*args, **kwargs):
-        return run(["tmux", "-u", "-L", socket, *args], **kwargs)
+        return run(["tmux", "-u", "-f", "/dev/null", "-L", socket, *args], **kwargs)
 
     def vt(*args):
         return run([BIN, *args])
@@ -168,6 +188,11 @@ def main():
             if predicate(agents):
                 return agents
             if time.monotonic() >= deadline:
+                (work / "failure-topology.txt").write_text(tmux("list-panes", "-a", "-F", "#{pane_id}:#{pane_pid}:#{pane_dead}:#{pane_current_command}"))
+                (work / "failure-state.json").write_text(json.dumps(snapshot()))
+                selected = [line for line in tmux("show-environment", "-g").splitlines()
+                            if line.startswith(("PATH=", "HOME=", "ZDOTDIR=", "VDE_FIXTURE_", "VDE_TMUX_"))]
+                (work / "failure-environment.txt").write_text("\n".join(selected))
                 raise AssertionError("scratch state condition was not observed: " + json.dumps({p: {k: a.get(k) for k in ["status", "badge", "needs_action"]} for p, a in agents.items()}))
             time.sleep(0.1)
 
@@ -198,7 +223,7 @@ def main():
         panes = {}
         for role in ["first", "second", "embedded"]:
             command = shlex.join(["env", f"VDE_FIXTURE_ROLE={role}", str(work / "codex")]
-                                 + (["--", "app-server"] if role == "embedded" else []))
+                                 + (["--no-daemon"] if role == "embedded" else []))
             args = (["new-session", "-d", "-s", "fixture", "-x", "140", "-y", "32"]
                     if not panes else ["new-window", "-d", "-t", "fixture"])
             panes[role] = tmux(*args, "-P", "-F", "#{pane_id}", command)
@@ -224,6 +249,7 @@ def main():
         for role in ["first", "second"]:
             pane = panes[role]
             for name, (_, badge, needs_action) in screens.items():
+                if name not in reasons: continue;
                 print(f"Checking screen {role}/{name} -> {badge}", flush=True)
                 with (work / f"{role}.fifo").open("w") as stream:
                     stream.write(f"{name} {pane}\n")
@@ -266,6 +292,89 @@ def main():
         after = json.loads(vt("agent", "get", target, "--json"))["result"]["agent"]
         assert after["agent_session_id"] == "embedded"
         assert after["run_seq"] == after["completed_seq"] == 1
+        transcript = work / "codex-home/sessions/rollout-embedded.jsonl"
+        def structural(kind, turn):
+            with transcript.open("a") as stream:
+                stream.write(json.dumps({"type":"event_msg", "payload":{"type":kind,"turn_id":turn}})+"\n")
+        def screen(name):
+            with (work / "embedded.fifo").open("w") as stream:
+                stream.write(f"{name} {target}\n")
+            time.sleep(0.1)
+        structural("task_started", "synthetic-turn")
+        structural("task_complete", "synthetic-turn")
+        screen("SCREEN_READY")
+        recovered = []
+        for cycle in range(int(os.environ.get("VDE_RESYNC_CYCLES", "20"))):
+            started = time.monotonic()
+            vt("daemon", "restart")
+            await_agents(lambda a: a[target]["presentation"]["reason"] == "provider_resynchronized")
+            elapsed = time.monotonic() - started
+            assert elapsed <= 5, elapsed
+            recovered.append(round(elapsed, 3))
+        # Known completion is retained; no UserPromptSubmit hook was needed to recover.
+        after = json.loads(vt("agent", "get", target, "--json"))["result"]["agent"]
+        assert after["run_seq"] == after["completed_seq"] == 1
+        def reject_prompt(label):
+            before = tmux("capture-pane", "-p", "-t", target)
+            reference = json.loads(vt("agent", "get", target, "--json"))["result"]["agent"]["summary"]["agent_ref"]
+            result = subprocess.run([str(BIN), "agent", "prompt", reference, "--operation-id", "resync-reject-"+label,
+                                     "--stdin"], input="must-not-send", env=env, text=True, capture_output=True, timeout=15)
+            assert result.returncode != 0, result.stdout
+            failure = json.loads(result.stdout or result.stderr)
+            assert failure["error"]["code"] == "agent_not_ready", failure
+            assert tmux("capture-pane", "-p", "-t", target) == before
+        screen("SCREEN_DRAFT")
+        reject_prompt("draft")
+        screen("SCREEN_QUEUE")
+        reject_prompt("queue")
+        screen("SCREEN_READY")
+        await_agents(lambda a: a[target]["presentation"]["reason"] == "provider_resynchronized")
+        structural("task_started", "lost-hook-turn")
+        reject_prompt("new-turn")
+        structural("task_complete", "lost-hook-turn")
+        replacement = transcript.with_name("rollout-replacement.jsonl")
+        replacement.write_text(json.dumps({"type":"session_meta","payload":{"id":"replacement","thread_source":"user"}})+"\n")
+        screen("SESSION_SWAP")
+        reject_prompt("same-pid-new-session")
+        screen("SESSION_RESTORE")
+        screen("SCREEN_READY")
+        await_agents(lambda a: a[target]["presentation"]["reason"] == "provider_resynchronized")
+        # A history larger than one request must recover incrementally, and the
+        # final dispatch must reuse that checkpoint instead of starting over.
+        with transcript.open("a") as stream:
+            stream.write('{"type":"response_item","payload":{"body":"')
+            stream.write("x" * (34 * 1024 * 1024))
+            stream.write('"}}\n')
+        large_history_written = int(time.time())
+        await_agents(lambda a: a[target]["presentation"]["reason"] == "provider_resynchronized"
+                     and (a[target]["presentation"].get("observed_at") or 0) > large_history_written + 3)
+        prompt = "synthetic external resync prompt"
+        reference = json.loads(vt("agent", "get", target, "--json"))["result"]["agent"]["summary"]["agent_ref"]
+        proc = subprocess.Popen([str(BIN), "agent", "prompt", reference, "--operation-id", "resync-external-prompt-0001", "--stdin"],
+                                env=env, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc.stdin.write(prompt+"\n")
+        proc.stdin.close()
+        deadline = time.monotonic()+5
+        while prompt not in tmux("capture-pane", "-p", "-t", target):
+            assert time.monotonic() < deadline, "external prompt was not delivered"
+            time.sleep(0.05)
+        for event in ["UserPromptSubmit", "Stop"]:
+            path = work / f"embedded-{event}.json"
+            payload = json.loads(path.read_text())
+            payload.update(turn_id="external-resync-turn", prompt=prompt)
+            path.write_text(json.dumps(payload))
+        structural("task_started", "external-resync-turn")
+        hook("embedded", "UserPromptSubmit", target)
+        proc.wait(timeout=10)
+        result = json.loads(proc.stdout.read())
+        assert proc.returncode == 0, (result, proc.stderr.read())
+        hook("embedded", "Stop", target)
+        structural("task_complete", "external-resync-turn")
+        await_agents(lambda a: a[target]["status"] == "done")
+        (work / "resync-evidence.json").write_text(json.dumps({"restart_cycles":len(recovered), "restart_seconds":recovered,
+            "external_prompt":"confirmed", "large_history_mib":34,
+            "negative_cases":["draft","queue","lost-hook-turn","same-pid-new-session"]}, indent=2)+"\n")
+        print(f"PASS: {len(recovered)} restarts recovered without manual input; external prompt confirmed; draft/queue/new turn/session replacement rejected", flush=True)
         vt("daemon", "restart")
         await_agents(lambda a: a[target]["identity"] == "exact")
         for event in ["UserPromptSubmit", "Stop"]:
@@ -278,7 +387,7 @@ def main():
         hook("embedded", "Stop", target)
         await_agents(lambda a: a[target]["status"] == "done")
         after = json.loads(vt("agent", "get", target, "--json"))["result"]["agent"]
-        assert after["run_seq"] == after["completed_seq"] == 2
+        assert after["run_seq"] == after["completed_seq"] == 3
         # A working-looking screen after accepted Stop must not replace the
         # authoritative lifecycle, even without a repeated SessionStart.
         with (work / "embedded.fifo").open("w") as stream:
@@ -288,7 +397,7 @@ def main():
         assert agents[target]["badge"] in ["idle", "done"], agents[target]["badge"]
         assert agents[target]["presentation"]["reason"] == "hook_authoritative"
         report = {"screen_cases": screen_cases, "screen_created_runs": 0, "shared_hook_cases": 24, "wrong_pane_bindings": 0,
-                  "embedded_hook_cases": 8, "embedded_completed_seq": 2,
+                  "embedded_hook_cases": 10, "embedded_completed_seq": 3,
                   "embedded_hooks_restore_authority_after_restart": True,
                   "embedded_with_mcp_sibling": True, "renamed_app_server_rejected": True,
                   "hook_timings": timings, "fixture_kind": "native synthetic process tree"}

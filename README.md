@@ -196,8 +196,9 @@ retains notices for manual `Q` acknowledgement; no raw question text is added to
 Text matching targets complete Codex 0.159.3/0.160.0 question cards, including freeform drafts. Clipped titles
 or choices can remain unmatched; generic question markers and ambiguity still retain the notice.
 
-Use `Q` for immediate acknowledgement or when any guard is uncertain. Notices present before a daemon
-restart remain Q-only; later prompts cannot clear them. Resume, fork, `/clear`, backtrack/rollback,
+Use `Q` for explicit acknowledgement or when IDs cannot be verified. Saved ID bindings and partial
+answers survive daemon restart; pre-upgrade notices without ID evidence remain available for Q.
+For the ordinary-prompt path, resume, fork, `/clear`, backtrack/rollback,
 an aborted/error issuing turn, unknown versions/layouts, resized or clipped views, failed captures,
 busy queues, and lost structural history retain notices. A trigger turn may run longer than 30 seconds;
 its candidate expires after 24 hours. More than 32 MiB of unread history can exceed the per-input
@@ -622,17 +623,17 @@ stops sending and remains in flight across session changes and daemon restart; a
 Codex process or pane state releases that fence. Pending chains are discarded on restart.
 If a new chain meets that in-flight fence, it stops with `binding_ambiguous` before an attempt.
 
-Sending requires a verified primary transcript, exact failed turn, unchanged viewport,
+Sending requires the exact process's current writable transcript and failed session, exact failed turn, unchanged viewport,
 empty dim placeholder, no queued input, images, modal or Question notice, no copy mode,
 and no interactive client activity on the target pane since failure. Manual prompts,
 session/process changes, successful completion and other errors end the chain. Only new
 human prompts observed by the current daemon can start a chain. Unsupported versions stop
 sending. Narrow or changed screens can still record failure while stopping recovery.
 
-Stock Codex exposes no atomic input/thread identity contract: input or an approval can
-appear between the final capture and paste+Enter; switching to another conversation with
-the same error can also evade the screen guard. Enable this only when that residual risk
-is acceptable. The feature does not change models or grant new approval.
+The live writer check rejects a session switch even when its hook was missed and the error
+screen looks identical. Stock Codex exposes no atomic input/thread identity contract: input
+or an approval can still appear between final verification and paste+Enter. The feature does
+not change models or grant new approval.
 
 Inspect `vt daemon diagnostics --json` under `codex_capacity_auto_resume` for attempts,
 next retry and stop reason. Prompt text is not included in diagnostics. Prompts accept LF
@@ -791,9 +792,9 @@ Codex panes without authoritative hooks now show observed Working or a current a
 synchronous question (Blocked). Unrecognized or unavailable observations show `?` (Unknown)
 in the sidebar and statusline. An asynchronous question may remain visible while work continues.
 These badges do not complete Runs or acknowledge durable Question notices. After answering,
-`Q` remains available to acknowledge a retained notice; automatic acknowledgement still requires
-the existing trusted different-turn ordinary-prompt proof. Notices retained across daemon restart
-remain Q-only.
+`Q` remains available to acknowledge retained notices. Known answer IDs acknowledge their own
+issued questions, including after daemon restart; ordinary-prompt acknowledgement has a separate
+conservative different-turn proof.
 
 Expanded Codex rows prioritize task summaries and response previews. Badge reasons are available
 for diagnosis as `summary.presentation` in `vt agent get --json` (and the corresponding agent
@@ -816,20 +817,21 @@ draft input, queued initial prompts, and shared-server invocations are rejected.
 `UserPromptSubmit` hook confirms the prompt and establishes the provider session; screen
 readiness alone never establishes hook authority or completion. Verify `prompt_confirmed`,
 `hook_authoritative`, completion, and (when enabled) a task summary after the prompt.
-After a vde-tmux daemon restart, authority returns with the next
-accepted embedded hook; until then the pane may show Unknown. Shared-server commands such as
+After a vde-tmux daemon restart, an existing Idle session is resynchronized from its exact live
+rollout writer and complete structural history. It can become input-ready without manual input;
+this does not fabricate hook authority or a Run completion. Every prompt checks the fresh empty
+composer, foreground owner and current session. Drafts and queued inputs prevent sending. Shared-server commands such as
 `codex queue` are not available with `--no-daemon`; keep those workflows on the shared server.
 Do not open an active shared thread in both modes.
 Accepted async-question replies in Codex 0.159.3/0.160.0 now acknowledge matching question IDs,
 including replies accepted while the same turn is running. Partial or out-of-order replies keep
-unanswered notices visible; the persisted acknowledgement advances only over an entirely
-answered prefix. Complete reply envelopes are required, with verified owner/session and a clean
-loss journal. A verified startup in this daemon generation and unchanged home epoch are required;
-resume/clear sessions, sessions continuing across daemon restart, and sessions invalidated by
-home-wide hook loss keep new notices Q-only as well. Unknown IDs, malformed/quoted frames, automatic capacity inputs and missing or
-restart-era issuance evidence retain notices. See [Question notices](AGENT_API.md#question-notices-api-v5).
+unanswered notices visible and persist across restart. Matching known IDs does not depend on a
+startup hook in the current daemon or home-wide history. Item counts are independent of body
+fingerprints. Exact owner/session checks and ID-reuse protection remain required; unknown IDs,
+malformed/quoted frames, automatic capacity inputs and missing issuance evidence retain notices.
+See [Question notices](AGENT_API.md#question-notices-api-v5).
 
-API 6 / daemon protocol 30 must be installed together; Pane State schema 10 and Question sidecar
+API 6 / daemon protocol 31 must be installed together; Pane State schema 10 and Question sidecar
 schema 1 remain unchanged. See [the API contract](AGENT_API.md#codex-screen-evidence-api-6).
 
 Run `python3 scripts/test-codex-observation-isolated.py` after building the binaries to verify

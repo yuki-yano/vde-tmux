@@ -164,7 +164,7 @@ fn live_timer(lines: &[&str]) -> bool {
     false
 }
 
-fn queued_input_header(line: &str) -> bool {
+pub(crate) fn queued_input_header(line: &str) -> bool {
     [
         "• Queued follow-up inputs",
         "• Messages to be submitted after next tool call",

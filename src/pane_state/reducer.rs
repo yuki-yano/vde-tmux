@@ -449,6 +449,7 @@ fn reduce_observation(
     match presence {
         AgentPresenceObservation::Unknown => {
             tracker.codex_screen = None;
+            tracker.codex_idle_verified_at = None;
             tracker.codex_screen_expired_at = None;
             tracker.agent_process = None;
             tracker.absence_count = 0;
@@ -1425,6 +1426,9 @@ fn apply_capture(
     observed_at: i64,
     visibility: &VisibilitySnapshot,
 ) -> Result<(), ReduceError> {
+    tracker.codex_idle_verified_at = capture
+        .filter(|capture| capture.codex_idle_verified)
+        .map(|_| observed_at);
     tracker.codex_screen_expired_at = None;
     tracker.codex_screen = capture
         .and_then(|capture| capture.codex_screen)
@@ -1502,6 +1506,7 @@ fn reset_tracker_for_state(
         generation: tracker.generation,
         epoch: Some((state.state_id.clone(), state.agent_epoch)),
         hook_authoritative: false,
+        codex_idle_verified_at: None,
         codex_screen: None,
         codex_screen_expired_at: None,
         interruption_verification_pending: false,
@@ -1713,6 +1718,7 @@ mod tests {
             reset_tracker_for_state(&CaptureTrackerSnapshot::default(), &state).unwrap();
         tracker.fingerprint = Some([1; 32]);
         let capture = CaptureObservation {
+            codex_idle_verified: false,
             inference: CaptureInference::PermissionWait {
                 reason: WaitReason::PermissionPrompt,
             },
@@ -2475,6 +2481,7 @@ mod tests {
             &verified.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
             Some(CaptureObservation {
+                codex_idle_verified: false,
                 codex_screen: None,
                 inference: CaptureInference::ActivityObserved,
                 observed_fingerprint: Some([1; 32]),
@@ -2513,6 +2520,7 @@ mod tests {
             &confirmed.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
             Some(CaptureObservation {
+                codex_idle_verified: false,
                 codex_screen: None,
                 inference: CaptureInference::ActivityObserved,
                 observed_fingerprint: Some([2; 32]),
@@ -3064,6 +3072,7 @@ mod tests {
             &first_tracker,
             AgentPresenceObservation::Absent,
             Some(CaptureObservation {
+                codex_idle_verified: false,
                 codex_screen: None,
                 inference: CaptureInference::UsageLimit,
                 observed_fingerprint: Some([7; 32]),
@@ -3100,6 +3109,7 @@ mod tests {
             &begun.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
             Some(CaptureObservation {
+                codex_idle_verified: false,
                 codex_screen: None,
                 inference: CaptureInference::ProviderError {
                     reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
@@ -3273,6 +3283,7 @@ mod tests {
             pending_tracker,
             AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
             Some(CaptureObservation {
+                codex_idle_verified: false,
                 codex_screen: None,
                 inference: CaptureInference::ProviderError {
                     reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
@@ -3314,6 +3325,7 @@ mod tests {
             &pending_limit.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
             Some(CaptureObservation {
+                codex_idle_verified: false,
                 codex_screen: None,
                 inference: CaptureInference::UsageLimit,
                 observed_fingerprint: Some([6; 32]),
@@ -3339,6 +3351,7 @@ mod tests {
             &pending.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
             Some(CaptureObservation {
+                codex_idle_verified: false,
                 codex_screen: None,
                 inference: CaptureInference::NoChange,
                 observed_fingerprint: Some([8; 32]),
@@ -3433,6 +3446,7 @@ mod tests {
             completed_tracker,
             AgentPresenceObservation::Present(AgentKind::parse("claude").unwrap()),
             Some(CaptureObservation {
+                codex_idle_verified: false,
                 codex_screen: None,
                 inference: CaptureInference::ProviderError {
                     reason: crate::detect::PROVIDER_OVERLOADED_REASON.to_string(),
@@ -3944,6 +3958,7 @@ mod tests {
             &CaptureTrackerSnapshot::default(),
             AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
             Some(CaptureObservation {
+                codex_idle_verified: false,
                 codex_screen: None,
                 inference: CaptureInference::NoChange,
                 observed_fingerprint: Some([1; 32]),
@@ -3963,6 +3978,7 @@ mod tests {
             &baseline.tracker_delta.as_ref().unwrap().next,
             AgentPresenceObservation::Present(AgentKind::parse("opencode").unwrap()),
             Some(CaptureObservation {
+                codex_idle_verified: false,
                 codex_screen: None,
                 inference: CaptureInference::ActivityObserved,
                 observed_fingerprint: Some([2; 32]),
@@ -4025,6 +4041,7 @@ mod tests {
                 observed_at: 3,
                 presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
                 capture: Some(CaptureObservation {
+                    codex_idle_verified: false,
                     codex_screen: None,
                     inference: CaptureInference::NoChange,
                     observed_fingerprint: None,
@@ -4052,6 +4069,7 @@ mod tests {
                 observed_at: 301,
                 presence: AgentPresenceObservation::Present(AgentKind::parse("codex").unwrap()),
                 capture: Some(CaptureObservation {
+                    codex_idle_verified: false,
                     codex_screen: None,
                     inference: CaptureInference::StaleRunCompleted,
                     observed_fingerprint: Some([2; 32]),

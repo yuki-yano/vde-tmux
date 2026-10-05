@@ -945,7 +945,7 @@ fn push_chat_detail_rows(
 ) {
     if let Some(notice) = &pane.question_notice {
         if notice.unacknowledged {
-            rows.push(detail_row(pane, depth, "question-notice", "? Codexから質問が発行されました。回答済みでも通知は残ります。Qで確認済みにできます。".to_string()));
+            rows.push(detail_row(pane, depth, "question-notice", "? Codexからの質問通知があります。確認できた回答は自動反映されます。Qで通知を確認済みにできます。".to_string()));
         }
         if let Some(reason) = notice.reason {
             rows.push(detail_row(

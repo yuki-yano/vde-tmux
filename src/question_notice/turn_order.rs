@@ -69,6 +69,21 @@ impl Cursor {
     pub fn locator(&self) -> &TranscriptLocator {
         &self.locator
     }
+    /// Call only after a complete, non-partial read of the live writer's file.
+    pub fn idle(&self) -> bool {
+        self.header_verified()
+            && self
+                .turns
+                .values()
+                .all(|turn| turn.complete.is_some() || turn.aborted.is_some())
+            && self
+                .turns
+                .values()
+                .max_by_key(|turn| turn.start)
+                .is_some_and(|turn| {
+                    turn.complete.is_some() && turn.aborted.is_none() && !turn.error
+                })
+    }
     pub fn proves(&self, issued: &str, submitted: &str) -> bool {
         if !self.header_verified() || issued == submitted {
             return false;
@@ -830,6 +845,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn idle_requires_latest_normal_completion_and_rejects_new_open_turn() {
+        let mut f = Fixture::new();
+        f.event("task_started", "old", "");
+        f.event("turn_aborted", "old", "");
+        f.event("task_started", "current", "");
+        f.event("task_complete", "current", "");
+        let slice = f.read().unwrap();
+        assert!(!slice.more && !slice.partial && f.cursor.idle());
+        f.event("task_started", "next", "");
+        assert!(!f.read().unwrap().more);
+        assert!(!f.cursor.idle());
+        f.event(
+            "task_complete",
+            "next",
+            ",\"error\":{\"message\":\"error\"}",
+        );
+        f.read().unwrap();
+        assert!(!f.cursor.idle());
     }
 
     #[test]

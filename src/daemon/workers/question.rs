@@ -16,7 +16,6 @@ pub enum OwnerCheck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Admission {
     WaitBeforeLock,
-    Reply,
     NoWaitAfterCapture,
 }
 pub type VerifyOwner = Arc<dyn Fn(&Binding, OwnerCheck) -> bool + Send + Sync>;
@@ -114,7 +113,6 @@ pub struct ReplyJob {
 pub struct ReplyCompletion {
     pub job: ReplyJob,
     pub reason: Option<RetainReason>,
-    pub guard: Option<SharedJournalGuard>,
 }
 #[derive(Clone)]
 pub struct ReplyWorkerHandle {
@@ -155,10 +153,8 @@ impl ReplyWorkerHandle {
     }
 }
 pub fn start_reply_worker(
-    env: BTreeMap<String, String>,
     verify_owner: VerifyOwner,
     completion_ready: mpsc::SyncSender<()>,
-    mutation_busy: MutationBusy,
 ) -> (ReplyWorkerHandle, mpsc::Receiver<ReplyCompletion>) {
     let (sender, receiver) = mpsc::sync_channel::<ReplyJob>(16);
     let worker = ReplyWorkerHandle {
@@ -166,7 +162,7 @@ pub fn start_reply_worker(
         counters: Arc::default(),
     };
     let counters = worker.counters.clone();
-    // One completion per admitted job; a dropped result releases its guard.
+    // One completion per admitted job.
     let (completed, completions) = mpsc::sync_channel(17);
     std::thread::spawn(move || {
         while let Ok(mut job) = receiver.recv() {
@@ -179,16 +175,8 @@ pub fn start_reply_worker(
             // only once this attempt starts, rather than expiring accepted IDs
             // in the queue and multiplying that backlog through retries.
             job.deadline = Instant::now() + REPLY_ATTEMPT_BUDGET;
-            let result =
-                execute_reply_job(&env, &job, verify_owner.as_ref(), mutation_busy.as_ref());
-            let (guard, reason) = match result {
-                Ok(guard) => (Some(guard), None),
-                Err(reason) => (None, Some(reason)),
-            };
-            if completed
-                .try_send(ReplyCompletion { job, guard, reason })
-                .is_ok()
-            {
+            let reason = execute_reply_job(&job, verify_owner.as_ref()).err();
+            if completed.try_send(ReplyCompletion { job, reason }).is_ok() {
                 let _ = completion_ready.try_send(());
             } else {
                 counters
@@ -201,89 +189,12 @@ pub fn start_reply_worker(
 }
 
 fn execute_reply_job(
-    env: &BTreeMap<String, String>,
     job: &ReplyJob,
     verify_owner: &(dyn Fn(&Binding, OwnerCheck) -> bool + Send + Sync),
-    mutation_busy: &(dyn Fn() -> bool + Send + Sync),
-) -> Result<SharedJournalGuard, RetainReason> {
-    if job.attempt > 0 {
-        // Dephase bounded retries from the mutation burst that rejected them.
-        // This runs without a journal lock and stays inside the attempt deadline.
-        let delay = Duration::from_millis(50 * u64::from(job.attempt));
-        if Instant::now() + delay >= job.deadline {
-            return Err(RetainReason::Deadline);
-        }
-        std::thread::sleep(delay);
-    }
-    let scans = std::sync::atomic::AtomicUsize::new(0);
-    let bounded_verify = |binding: &Binding, check: OwnerCheck| {
-        scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 && verify_owner(binding, check)
-    };
-    let mut backoff = Duration::from_millis(5);
-    let final_start = job.deadline - Duration::from_millis(200);
-    loop {
-        if Instant::now() >= final_start {
-            return Err(RetainReason::Deadline);
-        }
-        // This poll never scans an owner or spawns tmux. A clean poll is only
-        // admission, never proof of delivery: the final acquisition verifies it.
-        wait_for_mutation_idle(final_start, mutation_busy)?;
-        let location = JournalLocation::new(env, job.fence.home.clone())
-            .map_err(|_| RetainReason::JournalAcquire)?;
-        let mut guard = match location.lock(job.deadline) {
-            Ok(guard) => guard,
-            Err(crate::question_notice::journal::JournalFailure::Contended)
-                if Instant::now() + backoff < final_start =>
-            {
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_millis(80));
-                continue;
-            }
-            Err(_) if Instant::now() >= final_start => return Err(RetainReason::Deadline),
-            Err(_) => return Err(RetainReason::JournalAcquire),
-        };
-        let evaluation = guard
-            .evaluate(Some(&job.fence.session), writer_state)
-            .map_err(|_| RetainReason::JournalEvaluation)?;
-        if evaluation.epoch != job.fence.epoch {
-            return Err(RetainReason::Epoch);
-        }
-        drop(guard);
-        if evaluation.veto {
-            if Instant::now() + backoff >= final_start {
-                return Err(RetainReason::JournalVeto);
-            }
-            std::thread::sleep(backoff);
-            backoff = (backoff * 2).min(Duration::from_millis(80));
-            continue;
-        }
-        if Instant::now() >= final_start {
-            return Err(RetainReason::Deadline);
-        }
-        if scans.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
-            return Err(RetainReason::ReplyOwnerBudget);
-        }
-        let result = acquire_clean_guard(
-            env,
-            &job.fence,
-            job.deadline,
-            &bounded_verify,
-            OwnerCheck::Full,
-            Admission::Reply,
-            mutation_busy,
-        );
-        if matches!(result, Err(RetainReason::JournalVeto)) {
-            // A writer entered between the lightweight poll and final acquisition.
-            // Return to the poll, preserving the job-wide three-scan budget.
-            continue;
-        }
-        if matches!(result, Err(RetainReason::Owner))
-            && scans.load(std::sync::atomic::Ordering::Relaxed) > 3
-        {
-            return Err(RetainReason::ReplyOwnerBudget);
-        }
-        return result;
-    }
+) -> Result<(), RetainReason> {
+    // Accepted, known item IDs do not need turn ordering or a home-wide journal.
+    // One fresh owner scan plus the final canonical binding check fences the reply.
+    validate_probe_owner(&job.fence, job.deadline, verify_owner, OwnerCheck::Full)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -779,19 +690,7 @@ fn acquire_for_mutation(
             return Err(RetainReason::MutationBusy);
         }
         validate_probe_owner(fence, deadline, verify_owner, check)?;
-        if admission == Admission::Reply {
-            // A mutation entering during the full owner scan is a scheduling
-            // race, not contradictory owner evidence. Allow a short lock-free
-            // admission wait; never age a capture or repeat PS for each busy poll.
-            wait_for_mutation_idle(
-                deadline.min(Instant::now() + Duration::from_millis(300)),
-                mutation_busy,
-            )?;
-        }
         if mutation_busy() {
-            if admission == Admission::Reply {
-                std::thread::sleep(Duration::from_millis(20));
-            }
             continue;
         }
         let location = JournalLocation::new(env, fence.home.clone())
@@ -801,9 +700,6 @@ fn acquire_for_mutation(
             .map_err(|_| RetainReason::JournalAcquire)?;
         if mutation_busy() {
             drop(guard);
-            if admission == Admission::Reply {
-                std::thread::sleep(Duration::from_millis(20));
-            }
             continue;
         }
         return Ok(guard);
@@ -926,124 +822,41 @@ mod tests {
     }
 
     #[test]
-    fn sustained_reply_veto_does_not_scan_owners_and_changed_epoch_stops_immediately() {
-        for changed_epoch in [false, true] {
-            let f = Fixture::new();
-            let location = JournalLocation::new(&f.env, f.fence.home.clone()).unwrap();
-            let mut held = location
-                .lock_hook(Instant::now() + Duration::from_secs(2))
-                .unwrap();
-            let entry = crate::question_notice::journal::DirtyEntry::new(
-                f.fence.home.clone(),
-                (Some("session"), Some("turn"), Some("call")),
-                crate::question_notice::journal::DirtyReason::QuestionHook,
-                42,
-            )
+    fn exact_reply_checks_owner_once_without_waiting_for_home_journal() {
+        let f = Fixture::new();
+        let location = JournalLocation::new(&f.env, f.fence.home.clone()).unwrap();
+        let _held = location
+            .lock_hook(Instant::now() + Duration::from_secs(2))
             .unwrap();
-            held.insert(entry).unwrap();
-            if changed_epoch {
-                held.bump().unwrap();
-            }
-            drop(held);
-            let scans = std::sync::atomic::AtomicUsize::new(0);
-            let job = ReplyJob {
-                fence: f.fence.clone(),
-                orders: vec![1],
-                attempt: 0,
-                reply: crate::question_notice::reply::ReplyEvidence {
-                    items: vec![crate::question_notice::reply::item_digest("call", 0)],
-                },
-                deadline: Instant::now() + Duration::from_millis(600),
-            };
-            let result = execute_reply_job(
-                &f.env,
-                &job,
-                &|_, _| {
-                    scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    true
-                },
-                &|| false,
-            );
-            assert_eq!(
-                result.unwrap_err(),
-                if changed_epoch {
-                    RetainReason::Epoch
-                } else {
-                    RetainReason::JournalVeto
-                }
-            );
-            assert_eq!(scans.load(std::sync::atomic::Ordering::Relaxed), 0);
-        }
+        let job = ReplyJob {
+            fence: f.fence.clone(),
+            orders: vec![1],
+            attempt: 0,
+            reply: crate::question_notice::reply::ReplyEvidence {
+                items: vec![crate::question_notice::reply::item_digest("call", 0)],
+            },
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let scans = std::sync::atomic::AtomicUsize::new(0);
+        assert_eq!(
+            execute_reply_job(&job, &|_, _| {
+                scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            }),
+            Ok(())
+        );
+        assert_eq!(scans.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            execute_reply_job(&job, &|_, _| false),
+            Err(RetainReason::Owner)
+        );
     }
 
     #[test]
-    fn reply_worker_rechecks_live_writer_veto_but_never_accepts_a_changed_epoch() {
-        for changed_epoch in [false, true] {
-            let f = Fixture::new();
-            let location = JournalLocation::new(&f.env, f.fence.home.clone()).unwrap();
-            let mut held = location
-                .lock_hook(Instant::now() + Duration::from_secs(2))
-                .unwrap();
-            let entry = crate::question_notice::journal::DirtyEntry::new(
-                f.fence.home.clone(),
-                (Some("session"), Some("turn"), Some("call")),
-                crate::question_notice::journal::DirtyReason::QuestionHook,
-                42,
-            )
-            .unwrap();
-            let key = held.insert(entry).unwrap();
-            drop(held);
-            let (ready, _) = mpsc::sync_channel(1);
-            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let observed_count = count.clone();
-            let (worker, completed) = start_reply_worker(
-                f.env.clone(),
-                Arc::new(move |_, _| {
-                    observed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    true
-                }),
-                ready,
-                Arc::new(|| false),
-            );
-            worker.submit(ReplyJob {
-                fence: f.fence.clone(),
-                orders: vec![1],
-                attempt: 0,
-                reply: crate::question_notice::reply::ReplyEvidence {
-                    items: vec![crate::question_notice::reply::item_digest("call", 0)],
-                },
-                deadline: Instant::now() + Duration::from_secs(2),
-            });
-            std::thread::sleep(Duration::from_millis(20));
-            assert!(completed.try_recv().is_err());
-            let mut held = location
-                .lock_hook(Instant::now() + Duration::from_secs(2))
-                .unwrap();
-            if changed_epoch {
-                held.bump().unwrap();
-            }
-            held.clear_persisted(&key).unwrap();
-            drop(held);
-            let completion = completed.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert_eq!(
-                completion.reason,
-                changed_epoch.then_some(RetainReason::Epoch)
-            );
-            assert_eq!(completion.guard.is_some(), !changed_epoch);
-            assert!(count.load(std::sync::atomic::Ordering::Relaxed) <= 3);
-        }
-    }
-
-    #[test]
-    fn dropped_reply_completion_is_visible_and_releases_the_journal() {
+    fn dropped_reply_completion_is_visible() {
         let f = Fixture::new();
         let (ready, _) = mpsc::sync_channel(1);
-        let (worker, completed) = start_reply_worker(
-            f.env.clone(),
-            Arc::new(|_, _| true),
-            ready,
-            Arc::new(|| false),
-        );
+        let (worker, completed) = start_reply_worker(Arc::new(|_, _| true), ready);
         drop(completed);
         assert!(worker.submit(ReplyJob {
             fence: f.fence.clone(),
@@ -1059,12 +872,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(worker.diagnostics()["completion_dropped"], 1);
-        let location = JournalLocation::new(&f.env, f.fence.home.clone()).unwrap();
-        assert!(
-            location
-                .lock_hook(Instant::now() + Duration::from_secs(1))
-                .is_ok()
-        );
     }
 
     #[test]
@@ -1077,7 +884,6 @@ mod tests {
         let scans = AtomicUsize::new(0);
         let (ready, _) = mpsc::sync_channel(1);
         let (worker, completed) = start_reply_worker(
-            f.env.clone(),
             Arc::new(move |_, _| {
                 if scans.fetch_add(1, Ordering::SeqCst) == 0 {
                     started.send(()).unwrap();
@@ -1086,7 +892,6 @@ mod tests {
                 true
             }),
             ready,
-            Arc::new(|| false),
         );
         let mut job = ReplyJob {
             fence: f.fence.clone(),
@@ -1106,48 +911,11 @@ mod tests {
         release.send(()).unwrap();
         let first = completed.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(first.reason, None);
-        drop(first.guard.unwrap().take());
         let second = completed.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(second.reason, None);
         assert!(second.job.deadline > queued_deadline);
-        assert!(second.guard.unwrap().take().unwrap().is_current());
         assert_eq!(worker.diagnostics()["queued_past_budget"], 1);
         assert_eq!(worker.diagnostics()["completion_dropped"], 0);
-    }
-
-    #[test]
-    fn reply_worker_waits_for_mutation_admission_without_holding_a_journal_lock() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let f = Fixture::new();
-        let busy = Arc::new(AtomicBool::new(true));
-        let observed = busy.clone();
-        let (ready, _) = mpsc::sync_channel(1);
-        let (worker, completed) = start_reply_worker(
-            f.env.clone(),
-            Arc::new(|_, _| true),
-            ready,
-            Arc::new(move || observed.load(Ordering::Acquire)),
-        );
-        assert!(worker.submit(ReplyJob {
-            fence: f.fence.clone(),
-            orders: vec![1],
-            attempt: 0,
-            reply: crate::question_notice::reply::ReplyEvidence {
-                items: vec![crate::question_notice::reply::item_digest("call", 0)]
-            },
-            deadline: Instant::now() + Duration::from_secs(2)
-        }));
-        let location = JournalLocation::new(&f.env, f.fence.home.clone()).unwrap();
-        let held = location
-            .lock_hook(Instant::now() + Duration::from_secs(1))
-            .unwrap();
-        assert!(completed.try_recv().is_err());
-        drop(held);
-        busy.store(false, Ordering::Release);
-        let completion = completed.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(completion.reason, None);
-        let guard = completion.guard.unwrap().take().unwrap();
-        assert!(guard.is_current());
     }
 
     #[test]
@@ -1299,34 +1067,6 @@ mod tests {
         );
         assert_eq!(sample, Sample::Ambiguous);
         assert_eq!(result.unwrap_err(), RetainReason::MutationBusy);
-    }
-
-    #[test]
-    fn reply_admission_waits_for_a_mid_scan_burst_without_repeating_owner_scan() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let f = Fixture::new();
-        let scans = AtomicUsize::new(0);
-        let busy_reads = AtomicUsize::new(0);
-        let result = acquire_clean_guard(
-            &f.env,
-            &f.fence,
-            Instant::now() + Duration::from_secs(2),
-            &|_, _| {
-                scans.fetch_add(1, Ordering::SeqCst);
-                busy_reads.store(8, Ordering::SeqCst);
-                true
-            },
-            OwnerCheck::Full,
-            Admission::Reply,
-            &|| {
-                busy_reads
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-            },
-        );
-        assert!(result.is_ok());
-        assert_eq!(scans.load(Ordering::SeqCst), 1);
-        assert_eq!(busy_reads.load(Ordering::SeqCst), 0);
     }
 
     #[test]

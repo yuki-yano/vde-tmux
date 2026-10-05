@@ -63,12 +63,35 @@ use std::io::Write;
 #[derive(Default)]
 struct DispatchRunner {
     mock: MockTmuxRunner,
+    transcripts: RefCell<BTreeMap<u32, TranscriptLocator>>,
     sent: RefCell<Vec<Vec<u8>>>,
     unknown: std::cell::Cell<bool>,
 }
 impl TmuxRunner for DispatchRunner {
     fn run(&self, args: &[&str]) -> anyhow::Result<String> {
         self.mock.run(args)
+    }
+    fn codex_active_transcript(
+        &self,
+        process: &crate::pane_state::AgentProcessIdentity,
+        session: &str,
+    ) -> anyhow::Result<TranscriptLocator> {
+        let locator = self
+            .transcripts
+            .borrow()
+            .get(&process.pid)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("active transcript unavailable"))?;
+        anyhow::ensure!(
+            locator
+                .transcript
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(&format!("-{session}.jsonl")),
+            "active session changed"
+        );
+        Ok(locator)
     }
     fn run_with_input(
         &self,
@@ -225,6 +248,10 @@ impl Fixture {
             session,
             path,
         };
+        self.runner.transcripts.borrow_mut().insert(
+            target.process.pid,
+            TranscriptLocator::capture(&self.root.join("codex"), &target.path).unwrap(),
+        );
         self.event(
             &target,
             "SessionStart",
@@ -422,6 +449,23 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn session_switch_without_a_hook_cancels_recovery_before_send() {
+    let f = Fixture::new();
+    let t = f.target(1);
+    f.submit(&t, "first", "human objective", 0, CodexProfile::Unknown);
+    f.fail(&t, "first", 1);
+    let replacement = t.path.with_file_name("rollout-replacement.jsonl");
+    std::fs::write(&replacement, "{}\n").unwrap();
+    f.runner.transcripts.borrow_mut().insert(
+        t.process.pid,
+        TranscriptLocator::capture(&f.root.join("codex"), &replacement).unwrap(),
+    );
+    f.tick(61);
+    assert!(f.runner.sent.borrow().is_empty());
+    assert_eq!(f.chain(&t).reason.as_deref(), Some("dispatch_rejected"));
 }
 
 #[test]

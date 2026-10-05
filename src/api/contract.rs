@@ -125,6 +125,7 @@ pub enum ApiErrorCode {
     InvalidDaemonResponse,
     CaptureFailed,
     AgentBusy,
+    AgentNotReady,
     AgentBlocked,
     AgentLimited,
     PromptConfirmationUnavailable,
@@ -184,6 +185,7 @@ impl ApiErrorCode {
             Self::InvalidDaemonResponse => "invalid_daemon_response",
             Self::CaptureFailed => "capture_failed",
             Self::AgentBusy => "agent_busy",
+            Self::AgentNotReady => "agent_not_ready",
             Self::AgentBlocked => "agent_blocked",
             Self::AgentLimited => "agent_limited",
             Self::PromptConfirmationUnavailable => "prompt_confirmation_unavailable",
@@ -236,6 +238,7 @@ impl ApiErrorCode {
                 ApiErrorStage::RequestValidation
             }
             Self::AgentBusy
+            | Self::AgentNotReady
             | Self::AgentBlocked
             | Self::AgentLimited
             | Self::PromptConfirmationUnavailable
@@ -262,6 +265,7 @@ impl ApiErrorCode {
             | Self::ControlUnavailable
             | Self::ResourceLimit
             | Self::AgentBusy
+            | Self::AgentNotReady
             | Self::AgentBlocked
             | Self::AgentLimited
             | Self::PromptConfirmationUnavailable
@@ -1463,7 +1467,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            54
+            55
         );
         let error_codes = value["result"]["schemas"]["error"]["$defs"]["ApiErrorCode"]["enum"]
             .as_array()

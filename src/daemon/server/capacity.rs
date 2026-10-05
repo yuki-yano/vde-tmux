@@ -97,6 +97,15 @@ impl RecoveryCandidate {
         if !tracker.hook_authoritative {
             return Err("hooks are not authoritative".into());
         }
+        let active = runner
+            .codex_active_transcript(
+                &self.failed.binding.process,
+                self.failed.binding.provider_session_id.as_str(),
+            )
+            .map_err(|_| "current Codex session is unavailable or changed")?;
+        if active != self.locator {
+            return Err("active Codex transcript changed".into());
+        }
         let mut size = self.size;
         if !policy::read_failure(
             &self.locator,

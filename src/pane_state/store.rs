@@ -1018,6 +1018,7 @@ mod tests {
                 observed_at: 10,
                 presence: AgentPresenceObservation::Present(before.agent.clone()),
                 capture: Some(CaptureObservation {
+                    codex_idle_verified: false,
                     inference: CaptureInference::NoChange,
                     observed_fingerprint: Some([1; 32]),
                     codex_screen: Some(crate::detect::codex::Evidence {
@@ -1047,6 +1048,7 @@ mod tests {
                 observed_at: 11,
                 presence: AgentPresenceObservation::Present(before.agent.clone()),
                 capture: Some(CaptureObservation {
+                    codex_idle_verified: false,
                     inference: CaptureInference::NoChange,
                     observed_fingerprint: Some([1; 32]),
                     codex_screen: refreshed.codex_screen.map(|(evidence, _)| evidence),
