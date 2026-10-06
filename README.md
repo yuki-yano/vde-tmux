@@ -66,12 +66,11 @@ bind-key -n M-e run-shell "vt sidebar focus-toggle --window #{q:window_id}"
 Notes:
 
 - `vt daemon ensure` starts the daemon on demand.
-- The daemon stores the absolute path of the running `vt` executable in `@vde_executable`. Neovim pane navigation uses that exact binary instead of searching `PATH`.
 - vde-tmux pushes rendered text into the `@vde_status_*` options, so tmux does not start a process on every status redraw.
 - `@vde_status_now_format` is required for the elapsed time shown on pane borders.
-- `Blocked`, `Limited`, `Working`, and `Done` agent panes fill the unused pane-statusline width with a plain single-line rail in the badge color. With `pane-border-status bottom`, only the bottom edge is highlighted and no content cells on the left or right are covered. `Idle` and non-agent panes get no additional rail.
+- `Blocked`, `Limited`, `Working`, and `Done` agent panes fill the rest of their bottom pane border with a line in the badge color.
 - The `window-status-*` settings replace tmux's native window list with the vde-tmux session and window segments.
-- `--client-name` and `--session-id` keep session and category bindings scoped to the client that triggered them, which matters when multiple tmux clients are attached.
+- `--client-name` and `--session-id` keep actions scoped to the client that triggered them when multiple tmux clients are attached.
 
 Reload the configuration:
 
@@ -93,11 +92,11 @@ This repository also provides a Neovim plugin. Load it with lazy.nvim:
 }
 ```
 
-The default `<C-h/j/k/l>` mappings move between Neovim windows and signal the daemon through a lightweight tmux channel at an edge to enter another tmux pane. The tmux root binding spawns no per-key `vt` or `tmux` process; a Neovim edge uses one tmux client only to send the signal. When the destination runs Neovim, the plugin selects the window aligned with the source cursor. Selection metadata is stored on the destination pane together with its PID, preventing another client or a reused pane from consuming it.
-
-Pane switching is executed through one persistent tmux control-mode client owned by the daemon. The client is attached to an existing session with `ignore-size`, `no-output`, and `no-detach-on-destroy`; vde-tmux excludes it when deciding whether a session has a regular attached client. It is still visible to native `tmux list-clients`, and while no regular client is attached, tmux's native alert and `destroy-unattached` bookkeeping for the one session hosting the control client follows tmux's attached-client semantics.
+The default `<C-h/j/k/l>` mappings move between Neovim windows and, at an edge, ask the daemon to move to the adjacent tmux pane. When the destination pane runs Neovim, the plugin selects the window aligned with the source cursor.
 
 Existing mappings can call the API directly, such as `require('vde-tmux').navigate('h')`. `setup()` accepts `keybindings = false`, `modes`, `debug`, `disable_when_floating`, and `navigate_from_floating`.
+
+The daemon switches panes through one persistent tmux control-mode client. vde-tmux ignores it when deciding whether a session has an attached client, but it is visible in `tmux list-clients`. While no regular client is attached, tmux treats the session hosting this client as attached for its own alerts and `destroy-unattached`.
 
 ### 3. Claude Code hooks
 
@@ -163,78 +162,17 @@ Review and trust the hooks with Codex `/hooks` after saving the file.
 }
 ```
 
-Restart Codex after saving the file.
-Permission requests, plans, subagents, and worktree activity will then appear in the sidebar.
+Start Codex in tmux with `codex --no-daemon`.
+vde-tmux accepts hooks only from this Embedded mode: hooks from a shared app-server cannot identify the pane they came from, so they are rejected.
+The option applies only to that invocation and leaves other clients' shared daemon settings unchanged; `features.daemon_auto_start=false` alone does not prevent attaching to an already running server.
+Shared-server commands such as `codex queue` are unavailable with `--no-daemon`, and an active shared thread should not be opened in both modes.
 
-### Codex question notices
+Permission requests, plans, subagents, worktree activity, and [question notices](#codex-question-notices) then appear in the sidebar.
 
-With stock Codex CLI 0.155.1, 0.156.1, 0.159.3, and 0.160.0, the existing `PostToolUse` hook can observe successful
-`request_user_input_async` calls. Include that tool in the hook matcher above (or use an
-unfiltered PostToolUse hook). No Codex extension, fork, or separate API is required.
-
-The sidebar shows `?` for an **unacknowledged question-issued notice**. Select the agent or
-one of its detail rows and press `Q` to acknowledge the notice you saw. A question arriving
-during that operation stays visible. Acknowledgement is shared across sidebars, and leaves
-focus, agent input, run status, and unread Done untouched. Parent `? N` counts panes, not questions.
-`!` / parent `! N` reports degraded notice tracking; expand the agent for the reason.
-
-Accepted replies with known question IDs automatically acknowledge their matching notices in every
-Codex client version. Partial answers retain the unanswered items; no rendering profile, Idle/Done,
-or later turn is required. Malformed replies and unknown IDs retain notices.
-
-Skipping alone does not guarantee automatic acknowledgement. After the issuing turn
-completes normally, an ordinary input accepted in a different turn of the same trusted session can
-acknowledge the notice when that turn becomes Idle/Done and two viewport checks recognize a normal
-composer. Accepted queued inputs follow the same rule; queue registration alone and answer-summary
-framing do not resolve notices. Markdown block quotes and partial answer tags also retain notices.
-Capture can only veto acknowledgement. This policy does not prove
-that any particular question was answered or read, or that input came from direct TUI interaction.
-Inputs from other routes such as realtime may be indistinguishable in stock hooks.
-
-The viewport veto also matches the issued question's title and complete, ordered choices in the
-current question editor. Whitespace and soft wrapping are normalized, and Codex's generated
-Other choice is excluded. Matching retains the notice; different text, history, or clipped choices
-never prove resolution. Only bounded SHA-256 fingerprints leave hook parsing, and those fingerprints
-stay in daemon memory, bound to the exact owner, session, and notice order. Missing question input
-retains notices for manual `Q` acknowledgement; no raw question text is added to state or diagnostics.
-Text matching targets complete Codex 0.159.3/0.160.0 question cards, including freeform drafts. Clipped titles
-or choices can remain unmatched; generic question markers and ambiguity still retain the notice.
-
-Use `Q` for explicit acknowledgement or when IDs cannot be verified. Saved ID bindings and partial
-answers survive daemon restart; pre-upgrade notices without ID evidence remain available for Q.
-For the ordinary-prompt path, resume, fork, `/clear`, backtrack/rollback,
-an aborted/error issuing turn, unknown versions/layouts, resized or clipped views, failed captures,
-busy queues, and lost structural history retain notices. A trigger turn may run longer than 30 seconds;
-its candidate expires after 24 hours. More than 32 MiB of unread history can exceed the per-input
-reader budget: use Q or a later distinct ordinary input. Stop does not pre-read that history.
-Notices also close when their exact Codex process or pane is confirmed gone.
-
-Questions issued before installation or without the hook are not recovered. A hook that never starts,
-or whose journal write and daemon request both fail, is unobservable. A failed sidecar write keeps a
-new notice in memory with a diagnostic and retries every five seconds; a crash can lose unsaved notices.
-An acknowledgement failure before atomic rename retains the notice. Directory fsync failure after
-rename is a logical acknowledgement with a diagnostic, without rollback or automatic rewrite.
-
-Only **Embedded mode** is supported. Positively identified LocalDaemon/Remote app-server hooks,
-subagent hooks, hooks outside tmux, and hooks in disabled tmux servers are excluded before journal writes.
-An unverified hook in scope cannot acknowledge notices; an issue without exact ancestry is rejected
-as `ancestor_not_in_pane`. A positively identified unsupported-mode question retains that rejection diagnostic.
-Codex can automatically reuse a local daemon; in 0.155.1,
-`codex --strict-config` without a remote server option prevents that implicit reuse, provided your
-configuration passes strict validation. In 0.156.1, `--no-daemon` is the explicit Embedded-mode option.
-vde-tmux does not change your Codex startup settings.
-Subagent questions are excluded. This feature adds no statusline attention entry or OS notification.
-
-Acceptance on 2026-09-20 used the unmodified CLI 0.155.1 in Embedded mode on an isolated tmux
-server. Actual question issuance, continued work/turn completion, answer and skip without automatic
-clearing, and `Q` acknowledgement across two sidebars passed. The fixture regression is separate:
-`python3 scripts/test-question-notice-isolated.py --extended` checks 58 agent panes, two clients,
-and 100 issue/ack cycles against a two-second API/frame delivery bound. It also compares normal
-hook-to-API/status-rail delivery under probe/reader load with an identical baseline and records
-capture failures, probe drops, and daemon RSS. Scratch acceptance on 2026-09-23 with unmodified
-0.155.1 and 0.156.1 verified direct ordinary input, actual Tab-queued ordinary input registered
-before question issuance, queued answer-summary retention, answer-immediate retention, and
-post-restart Q-only acknowledgement. Realtime input was not exercised.
+Without accepted hooks, a Codex pane shows the state observed on its screen: Working, or Blocked for an approval or synchronous question.
+A screen that cannot be recognized shows `?` (Unknown).
+Screen observation never completes a run or acknowledges a question notice.
+`summary.presentation` in `vt agent get --json` explains why a badge was chosen.
 
 ### 5. Verify
 
@@ -248,154 +186,74 @@ vt sidebar open
 vde-tmux can detect Claude Code, Codex, and opencode from the command running in a pane even without hooks.
 Hooks are still required for accurate prompts, completion times, and waiting states.
 
-## Agent JSON API
-
-Agents can inspect the daemon's cached canonical topology and wait for live process-identified exact
-agent occupants without polling tmux topology:
-
-```bash
-vt api schema --json
-vt api snapshot --json
-vt agent list --status working --json
-vt agent wait %456 --until done,blocked,limited --json
-vt pane read %456 --source latest --lines 120 --json
-
-AGENT_REF="$(vt agent get %456 --json | jq -r '.result.agent.summary.agent_ref')"
-REQUEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vt-request.XXXXXX")"
-printf '%s' 'Review the current diff.' >"$REQUEST_DIR/prompt.txt"
-PROMPT_JSON="$(vt agent request "$AGENT_REF" \
-  --state-file "$REQUEST_DIR/request.json" \
-  --prompt-file "$REQUEST_DIR/prompt.txt" --json)"
-OPERATION_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.operation_ref')"
-RUN_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.run_ref')"
-vt agent run wait "$RUN_REF" --json
-vt agent run response "$RUN_REF" --json
-```
-
-Use `vt api snapshot --json` for one-shot inventory and diagnostics instead of composing
-`tmux list-panes` with separate `vt pane list` and `vt agent list` calls. It returns the live
-canonical panes, resolved agents, and grouped daemon diagnostics under one `snapshot_revision`.
-Prompt files passed through `--prompt-file` are request inputs rather than delivery state. For
-durable Codex dispatch, `agent request` stores the generated operation ID, byte-identical retry
-body, and recovered operation reference in the vt-owned state file. Reinvoke it with the same
-exact target and `--state-file`, without a body source, after response loss. Use a new private
-state-file path for every new prompt intent.
-
-See [Agent JSON API](./AGENT_API.md) for the response envelope, stable occupant references,
-durable run completion, filters, and capture bounds. An exact `agent_ref` is emitted only when one
-unique live agent process can be pinned by PID and OS start token. Hooks remain necessary for
-accurate lifecycle details, but hookless agents can use `agent wait` and `agent read` when that live
-process identity is available. API v5 stores durable Run and Operation records separately from the
-bounded pane projection. Guarded prompt dispatch is daemon-owned, requires healthy tmux hooks and
-foreground input ownership, and never places prompt bytes in argv. `agent request` persists the
-same operation ID before daemon mutation and performs an idempotent lookup/resume;
-`delivery_unknown` is never converted into a new dispatch. The lower-level `agent prompt` remains
-available to callers that deliberately manage a stable operation ID and byte-identical retry body.
-Historical unresolved
-runs remain readable while retained. CAS recovery is restricted to the Pane's current durable Run,
-which is checked twice against Pane, process, foreground ownership, and visible viewport state.
-Prompt input treats one terminal LF or CRLF from stdin or a file as a text-record terminator and
-removes it before hashing and dispatch, while preserving all internal line breaks.
-
-API v5 also exposes provider capabilities, `pane split`, `agent start`, guarded terminal
-`agent send`, best-effort working-agent `agent steer`, and blocked-agent `agent send-keys`. These mutations require exact references and revalidate
-the tmux server, pane/process identity, and foreground input ownership. Guarded terminal input
-leaves copy-mode before revalidation. For Claude prompts that name image files, vt presses Enter
-only after Claude has finished reading the pasted images. A successful `agent send` receipt means
-tmux applied the input; callers must use its lifecycle cursor with `agent wait` before claiming
-provider acceptance.
-`agent steer` is available for exact working Codex/Claude occupants. It applies the same guards but
-does not prove active-turn attribution; a concurrent completion may start a new turn instead.
-
-When Claude Code or Codex exhausts its allowance, the active agent is queryable as
-`status=limited`, `lifecycle.state=waiting`, and `lifecycle.reason=usage_limit`. Claude Code's
-`StopFailure` event is authoritative for an open run: `error=rate_limit` becomes Limited, while
-other API failures become `status=blocked` with `lifecycle.state=error`. `error=overloaded` and a
-529 overload use the stable reason `provider_overloaded`. If the same session reports a failure
-after its run already completed, vde-tmux performs one terminal check before opening another run;
-this keeps delayed or ancillary failures from replacing a successful completion. A bounded,
-five-second supplementary pane-tail scan recognizes only the
-provider's usage-limit messages and a Claude `⏺ API Error:` whose `· done` turn summary is the
-latest semantic line before the input area. Generic rate-limit text, status-line warnings, stale
-errors, and API-error text followed by a new prompt, retry spinner, tool output, or assistant output
-do not change state. Use `vt pane read` to inspect the provider text.
-vde-tmux does not retry automatically because the failed turn may already have performed side
-effects; a later `SessionStart` or `UserPromptSubmit` is recovery evidence.
-When process scanning confirms that the agent exited, the open run is completed and the pane is no
-longer exposed as a current Limited agent.
-
 ## Agent states
 
 | Badge | State | Meaning |
 | --- | --- | --- |
 | `▲` | Blocked | The agent needs input or hit an error |
-| `⋄` | Limited | The provider usage or session allowance is exhausted; shown in orange and excluded from Needs action |
+| `⋄` | Limited | The provider usage or session allowance is exhausted; excluded from Needs action |
 | `●` | Working | The agent is running |
 | `✓` | Done | The run completed and has not been acknowledged |
 | `○` | Idle | No work is active, or the completed run was acknowledged |
+| `?` | Unknown | The screen of a Codex pane without accepted hooks could not be recognized |
 
-A `Done` agent becomes `Idle` when its exact pane is active for an eligible tmux client.
-Viewing another split in the same window does not acknowledge it. Read state survives daemon
-restarts and is shared by every tmux client and sidebar. The daemon periodically reconciles current
-client views, so a missed view hook is repaired by the next observation poll. Priority peek
-navigation is the exception: it keeps unread while its owning client moves between agents. Peek
-leases are in-memory only, so restarting the daemon ends peek mode and the initial view reconcile
-applies the normal active-pane read rule.
+A `Done` agent becomes `Idle` when its exact pane is active for a tmux client.
+Viewing another split in the same window does not acknowledge it.
+Read state survives daemon restarts and is shared by every tmux client and sidebar.
 
-`unread-latest` jumps to the newest unread Waiting, Error, or Completed occurrence across all panes.
-The daemon owns the global ordering and retries the next unread pane if the newest target disappears
-during the jump. The jump itself does not mark anything read; the destination becomes read after it
-is observed as the active pane. It does not enter peek mode.
+`unread-latest` jumps to the pane with the newest unread event (waiting for input, error, or completion) across all panes.
+The jump itself does not mark anything read; the destination becomes read once it is observed as the active pane.
+
+Limited comes from Claude Code's `StopFailure` hook with `error=rate_limit`, or from the provider's usage-limit message on the screen.
+Other Claude Code API failures become Blocked.
+vde-tmux does not retry a failed turn automatically because the turn may already have had side effects.
+The agent leaves Limited on its next `SessionStart` or `UserPromptSubmit`, or when its process exits.
+Use `vt pane read` to inspect the provider's message.
 
 ## Sidebar
 
-The sidebar opens in the current tmux window with two independent view axes. `Current` limits the
-rows to the category of that sidebar's source session, while `All` spans every category. `Tree`
-groups Current as Repository→Agent and All as Category→Repository→Agent. `Priority` groups the
-selected scope as Pinned, Needs Input, Questions, Limited, Unread Done, Running, then Idle. `Flat` removes grouping.
-Press `p` on any agent to toggle its persistent pane pin without changing unread, badge, or
-notification state. `Priority` places pinned agents in the first `PINNED` zone, `Flat` places them
-first, and `Tree` promotes their enclosing Category and Repository while keeping the hierarchy.
-Pinned agents remain pinned when they become read or their lifecycle changes, and stale pins are
-removed when the pane disappears.
-Repository and linked-worktree branch labels show upstream divergence as `↑N` / `↓N`, followed by
-tracked staged and unstaged line changes from `HEAD` as `+N` / `-N`. Zero counts are omitted.
-Untracked text files not excluded by Git ignore rules also contribute all their lines to `+N`.
-Binary files do not contribute line counts.
-The Needs action filter includes Blocked agents and panes with unacknowledged question notices.
-The red triangle remains the Blocked badge; question notices use a separate `?`.
-Unread Done agents remain separate under the Done filter. `unread-latest` navigation also includes
-unread Blocked occurrences.
+The sidebar opens in the current tmux window.
 
 ```bash
 vt sidebar open --width 40
 vt sidebar open --width 20%
 vt sidebar toggle
 vt sidebar toggle --all
-vt sidebar rail
+vt sidebar rail    # toggle between a narrow rail and the normal width
 vt sidebar close
 ```
 
 `vt sidebar focus-toggle` opens a missing sidebar, focuses a visible one, and closes it when it already has focus.
 
-Layout managers can synchronously reserve the vde-tmux sidebar before applying a pane layout:
+### Views
 
-```bash
-vt sidebar prepare-layout --window @12 --json
-```
+The sidebar has two independent view settings:
 
-The command prints exactly one JSON object such as
-`{"window_id":"@12","status":"ready","reserved_panes":[{"pane_id":"%23","role":"sidebar"}],"content_anchor":"%22"}`.
-`ready` means that every returned sidebar pane exists, has `@vde_sidebar=1`, and has completed its
-width reconciliation. It does not wait for the first TUI render or a daemon snapshot. The command
-does not start or wait for the vde-tmux daemon, so an active daemon configuration is required. If
-the daemon is not running or its configuration has not been applied, the command fails closed with
-a non-zero exit status. Run `vt daemon reload` first when the active configuration needs to be
-applied. When the auto-all hook is disabled and no marked sidebar exists, the command returns `absent`, an empty
-`reserved_panes`, and an existing non-sidebar pane as `content_anchor` without creating a sidebar.
-The operation is serialized per tmux window and is idempotent with the auto-all new-window hook.
-Invalid or missing windows, a window without a non-sidebar content pane, and any failed tmux or JSON
-operation produce a non-zero exit status; there is no fallback response.
+- Scope: `Current` shows the category of the sidebar's session, and `All` shows every category.
+- Presentation: `Tree` groups Current as Repository → Agent and All as Category → Repository → Agent. `Priority` groups agents as Pinned, Needs Input, Questions, Limited, Unread Done, Running, then Idle. `Flat` removes grouping.
+
+The Needs action filter includes Blocked agents and agents with unacknowledged [question notices](#codex-question-notices).
+Unread Done agents appear under the Done filter.
+
+Agents pinned with `p` come first in Priority and Flat, and their Category and Repository come first in Tree.
+A pin is independent of unread, badge, and notification state, and is removed when the pane disappears.
+
+A cyan `▎` marks agents that belong to an active session.
+The agent pane focused by a tmux client uses the yellow `selection_bar` color instead.
+Keyboard selection is shown by the row background.
+An editprompt editor pane counts as focusing its target agent when the `@editprompt_is_editor`, `@editprompt_target_panes`, and `@editprompt_editor_pane` options link the two panes in both directions.
+
+Repository and linked-worktree branch labels show upstream divergence as `↑N` / `↓N` and staged and unstaged line changes from `HEAD` as `+N` / `-N`.
+Untracked text files that Git does not ignore count toward `+N`.
+Zero counts are omitted, and binary files are not counted.
+
+Expanded agents show the branch or worktree, task status, ahead/behind counts, listening TCP ports, background commands that Claude Code reports with `run_in_background`, and a `▷` preview of the last response.
+
+Scope, presentation, filter, manual order, expansion, selection, and scrolling are shared by all sidebars on the same tmux server.
+Each sidebar keeps its own Current category and return target, which follow its source session.
+Scope, presentation, filter, manual order, and expansion are saved per tmux socket under `$XDG_STATE_HOME/vde/tmux/sidebar-state/`.
+
+### Keys
 
 | Key | Action |
 | --- | --- |
@@ -420,36 +278,15 @@ operation produce a non-zero exit status; there is no fallback response.
 | `J` / `K` | Change manual ordering |
 | `q` / `Esc` | Close the sidebar |
 
-Agents belonging to an active session have a cyan `▎` marker on the left. The exact agent pane
-focused by an eligible tmux client uses the yellow `selection_bar` color instead; this marker follows
-pane, session, and category changes and disappears when the focused pane is not a live agent.
-An editprompt editor pane is treated as logically focusing its single live agent target when the
-`@editprompt_is_editor`, `@editprompt_target_panes`, and reverse `@editprompt_editor_pane` options
-form a valid bidirectional link. The target pane remains physically inactive; logical focus only
-drives current-agent, attention, and read/Done handling.
-Keyboard selection remains visible through the row background and does not create a current-agent
-marker by itself.
-Click the first rendered line of an agent to expand or collapse it. Click its
-second or later line to jump to the agent pane without selecting it first.
-Use `Space` to expand or collapse the selected agent from the keyboard.
-The mouse wheel scrolls overflow without moving the selected cursor.
-An agent with no activity yet uses a single line while collapsed.
-Category edit dialogs keep the header visible and replace the rows area. In the move and delete
-dialogs, use `j`/`k`, the arrow keys, or `gg`/`G` to choose the destination, `Enter` to save, and
-`Esc` to cancel. The dialog remains visible while saving. A successful save closes it; a failed
-save keeps the input and selection in place and shows the error inside the dialog.
-Expanded agents show a compact signal row with the pane branch or worktree, task status glyphs,
-ahead/behind counts, and listening TCP ports. Claude Bash calls are shown as background processes
-only when the hook explicitly reports `run_in_background`; command text is never guessed, and the
-process row clears after the command leaves the pane process tree. Codex does not currently report a
-background flag, but its listening ports are still discovered from the pane process tree. A Stop
-payload's `last_assistant_message` appears as a muted `▷` response preview in the expanded details.
-Category scope, presentation, filter, manual order, expansion state, selection, and scrolling are
-synchronized across all open sidebars on the same tmux server. The concrete Current category and
-return target remain local to each sidebar and follow its source session.
+Click the first line of an agent to expand or collapse it, or a later line to jump to its pane.
+The mouse wheel scrolls without moving the selection.
 
-An open sidebar can also be controlled without focusing it. The input source updates that sidebar's
-Current category context; axis, filter, selection, and scrolling changes use shared state.
+In the category dialogs, choose an entry with `j`/`k`, the arrow keys, or `gg`/`G`, save with `Enter`, and cancel with `Esc`.
+A failed save keeps the dialog open and shows the error.
+
+### Controlling the sidebar from tmux
+
+An open sidebar can also be controlled without focusing it:
 
 ```tmux
 bind-key -n M-v run-shell "vt sidebar input v --window #{q:window_id}"
@@ -461,19 +298,58 @@ bind-key -n M-u run-shell "vt sidebar input unread-latest --window #{q:window_id
 bind-key -n M-p run-shell "vt sidebar input pin-toggle --window #{q:window_id}"
 ```
 
-`C-M-j` and `C-M-k` work only in Priority view. They move the invoking tmux client to the next or
-previous visible agent without wrapping and preserve unread. `C-M-e` explicitly marks the current
-peek target read through the occurrence accepted by the daemon, then advances to the next visible
-unread agent below it when one is still available. Occurrences created on the source pane after
-acceptance remain unread. `C-M-e` can acknowledge the active peek target from Tree or Flat as well,
-but does not auto-advance outside Priority. Normal sidebar activation, pane focus, and
-`unread-latest` retain the ordinary auto-read behavior. Peek state belongs to the exact tmux client;
-another client viewing the same pane may acknowledge it globally.
+`C-M-j` and `C-M-k` work only in Priority view.
+They move the invoking client to the next or previous visible agent without wrapping, and keep the agent unread (peek).
+`C-M-e` marks the current peek target read; in Priority, it then moves to the next unread agent below.
+Peek state belongs to the invoking client: another client viewing the same pane still marks it read.
+Restarting the daemon ends peek mode.
+
+### Layout managers
+
+Layout managers can reserve the sidebar synchronously before applying a pane layout:
+
+```bash
+vt sidebar prepare-layout --window @12 --json
+```
+
+The command prints one JSON object such as
+`{"window_id":"@12","status":"ready","reserved_panes":[{"pane_id":"%23","role":"sidebar"}],"content_anchor":"%22"}`.
+`ready` means every returned sidebar pane exists and has finished width reconciliation; it does not wait for the sidebar to render.
+When the auto-all hook is disabled and no sidebar exists, the command returns `absent`, an empty `reserved_panes`, and an existing content pane as `content_anchor`.
+The command is idempotent with the auto-all new-window hook.
+
+The command does not start the daemon.
+It exits non-zero when the daemon is not running with its configuration applied (run `vt daemon reload` first), when the window is invalid or has no content pane, or when a tmux operation fails.
+
+## Codex question notices
+
+Codex's `request_user_input_async` asks questions while the turn keeps running.
+With stock Codex CLI 0.155.1, 0.156.1, 0.159.3, and 0.160.0, the `PostToolUse` hook above observes these questions; keep `request_user_input_async` in its matcher, or use an unfiltered `PostToolUse` hook.
+Only Embedded mode (`codex --no-daemon`) is supported, and subagent questions are excluded.
+
+- The sidebar shows `?` on an agent with an unacknowledged question notice. A parent `? N` counts panes, not questions.
+- Select the agent or one of its detail rows and press `Q` to acknowledge the notices you saw. `Q` does not answer or skip the question. A question that arrives during the operation stays visible.
+- Acknowledgement is shared across sidebars and does not change focus, agent input, run status, or unread Done.
+- `!` (or a parent `! N`) means notice tracking is degraded; expand the agent to see the reason.
+
+When Codex accepts an answer, vde-tmux matches its question IDs and acknowledges those notices automatically, in every Codex version.
+After a partial answer, the unanswered questions stay visible; answered items are remembered across daemon restarts.
+
+Skipping a question does not acknowledge it.
+An ordinary prompt accepted in a later turn of the same session can acknowledge earlier notices once that turn becomes Idle or Done and the screen shows a normal input field.
+Whenever vde-tmux cannot verify this, for example after resume, fork, `/clear`, rollback, an unknown Codex version or layout, or a clipped view, the notice stays until you press `Q`.
+This check does not prove that a question was read or answered.
+
+Question and answer text is never saved; vde-tmux keeps only bounded hashes.
+Questions issued before the hook was installed are not recovered.
+Notices close when their Codex process or pane is gone.
+Question notices add no status-line entry or OS notification.
+See [Question notices](./AGENT_API.md#question-notices) for the full contract.
 
 ## Sessions and categories
 
-Categories group repositories by canonical project identity. Git worktrees that
-share a common directory are treated as one repository:
+Categories group repositories by canonical project identity.
+Git worktrees that share a common directory are treated as one repository:
 
 ```yaml
 categories:
@@ -500,30 +376,14 @@ vt session-cycle prev
 vt session new -c ~/src/my-project
 ```
 
-Configured categories remain the read-only baseline. Dynamic categories, explicit
-repository assignments, and category/repository order are stored per tmux socket.
-An explicit assignment wins over config rules until `vt category automatic` is
-used. Recreating a session for the same repository restores its assignment.
-In the sidebar, use `a` to add a category, `m` to move a repository, `r` to
-rename a dynamic category, `D` to delete one, and `J`/`K` to reorder categories
-or repositories. All × Tree keeps repositories from managed sessions visible
-even when they currently have no agent panes. `@vde_category` remains a derived,
-write-only mirror for external tmux formats.
+Categories from the configuration file cannot be changed from vde-tmux.
+Dynamic categories, explicit repository assignments, and category and repository order are stored per tmux socket.
+An explicit assignment overrides the config rules until `vt category automatic` is run, and is restored when a session for the same repository is recreated.
+All × Tree keeps repositories of managed sessions visible even when they have no agent panes.
+vde-tmux writes the effective category to `@vde_category` for external tmux formats; changing the option does not change the membership.
 
-Terminal agents can use the versioned JSON membership boundary without gaining Category catalog
-mutation privileges:
-
-```bash
-vt category list --json
-vt category get --repo ~/src/temporary-project --json
-vt category assign scratch --repo ~/src/temporary-project --json
-vt category automatic --repo ~/src/temporary-project --json
-```
-
-The mutation receipt reports the canonical Repository identity, effective before/after placement,
-whether the request changed state, and the persisted Category revision. JSON reads never start a
-stopped daemon. JSON mutations ensure it, reject disk/active config drift, and operate on the shared
-Repository identity, so linked worktrees move together.
+`category list`, `get`, `assign`, and `automatic` accept `--json`, which lets agents change repository membership through a versioned interface.
+See [Repository category membership](./AGENT_API.md#repository-category-membership).
 
 With fzf installed, open a popup for switching or removing sessions, windows, and panes:
 
@@ -577,40 +437,37 @@ badge:
     working: "●"
     done: "✓"
     idle: "○"
+    unknown: "?"
+```
+
+The full schema is available with `vt config schema`.
+Reload the daemon after changing the file:
+
+```bash
+vt daemon reload
 ```
 
 `statusline.summary.format` supports the `{badge}` and `{count}` placeholders, such as `{badge}{count}` or `{badge}: {count}`.
-Zero-count states, including `Limited`, remain visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
-When enabled, the summary remains visible even when category or window content is long.
+Zero-count states stay visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
+When enabled, the summary stays visible even when category or window content is long.
+The category segment lists every category that has a session with its full label, even when it exceeds the status width.
 
-`sidebar.task_summary.enabled` adds a short persistent-task summary to collapsed and expanded agent
-rows. The daemon generates it asynchronously with an isolated CLI matching the pane agent (`codex
-exec` for Codex and `claude -p` for Claude). The raw latest prompt remains available in pane state
-and the JSON API but is intentionally not rendered in the sidebar. No cross-provider fallback is
-used. Prompt evidence is bounded and best-effort redacted before the additional model request; keep
-the feature disabled if that extra request is not acceptable. Model names are optional and
-otherwise follow the installed CLI's default.
+`statusline.sessions.fixed_width: true` pads the session area to the widest category, so the combined category, session, and window area keeps the same width when you switch sessions.
+Content is left-aligned by default; set `fixed_width_alignment: center` to center it.
+If the `current` and `other` session formats have different widths, the area can differ by a few cells.
 
-The summary context follows the latest four prompt occurrences for the current agent epoch. A
-second `UserPromptSubmit` with the same provider turn updates the active run instead of conflicting
-or allocating another run. While the current context is awaiting generation, or if generation
-fails, an older summary is not rendered. `agent list/get` reports `task_summary_status` as
-`current` or `failed` once the current-context attempt finishes; failed entries also include a
-bounded `task_summary_error` code. An absent status can mean generation is pending or the feature is
-disabled. A failed fingerprint is not retried until another prompt changes the context.
-`UserPromptSubmit` and `Stop` hook delivery use an eight-second deadline so a daemon reload can
-finish without dropping the lifecycle event.
-
-The category segment publishes every category that contains a session, including categories with no agent panes. Each category keeps its full label and action target; category entries are never collapsed into `+N` or `cat:N`, even when the segment exceeds the shared status width budget.
-
-`statusline.sessions.fixed_width: true` pads the active category's session segment to the widest category and keeps the combined category/session/window area at the same width across sessions. Session content is left-aligned within that fixed area by default; set `fixed_width_alignment: center` to center it. This keeps a centered status block stable when switching between sessions whose window names or process names have different lengths. Widths for inactive categories use the `other` session style; if `current.format` and `other.format` have different visual widths, the fixed width may differ by a few cells.
+`sidebar.task_summary.enabled` adds a short summary of the current task to agent rows.
+The daemon generates it asynchronously with the CLI that matches the agent (`codex exec` for Codex, `claude -p` for Claude), without falling back to another provider.
+This sends bounded, best-effort redacted prompt text in an additional model request; keep the feature disabled if that is not acceptable.
+Model names are optional and default to the installed CLI's default.
+The summary follows the latest four prompts of the current agent, and an older summary is hidden while a new one is pending or after it fails.
+`vt agent get --json` reports `task_summary_status` (`current` or `failed`) and, on failure, `task_summary_error`.
 
 ### Codex capacity errors
 
-Codex CLI 0.160.0 independent TUI sessions can resume automatically after the exact
-`Selected model is at capacity. Please try a different model.` terminal failure.
-Capacity failures are always recorded as Error / Unresolved; they never count as Done.
-Automatic sending is disabled by default. Enable it with:
+vde-tmux can resume a Codex CLI 0.160.0 session started with `--no-daemon` after its turn fails with `Selected model is at capacity. Please try a different model.`
+Capacity failures are always recorded as Error / Unresolved and never count as Done.
+Automatic resume is disabled by default. Enable it with:
 
 ```yaml
 codex:
@@ -621,39 +478,22 @@ codex:
       Resume only unfinished work after checking the current state. Preserve the original objective, scope, constraints, approvals, and response language. Do not repeat completed operations. This message is not a new approval.
 ```
 
-The default also explicitly preserves existing clarification and approval requirements.
-It keeps the original response language. The same model is retried after 60, 120 and 300
-seconds, with 0–20% jitter, at most three times per uninterrupted chain. Each send uses
-a durable operation and requires matching provider prompt confirmation. DeliveryUnknown
-stops sending and remains in flight across session changes and daemon restart; a replaced
-Codex process or pane state releases that fence. Pending chains are discarded on restart.
-If a new chain meets that in-flight fence, it stops with `binding_ambiguous` before an attempt.
+vde-tmux retries the same model after 60, 120, and 300 seconds with 0–20% jitter, at most three times per failure chain.
+It does not change models or grant approvals.
 
-Sending requires the exact process's current writable transcript and failed session, exact failed turn, unchanged viewport,
-empty dim placeholder, no queued input, images, modal or Question notice, no copy mode,
-and no interactive client activity on the target pane since failure. Manual prompts,
-session/process changes, successful completion and other errors end the chain. Only new
-human prompts observed by the current daemon can start a chain. Unsupported versions stop
-sending. Narrow or changed screens can still record failure while stopping recovery.
+A resume prompt is sent only when the pane still shows the same failed turn with an empty input field, and nothing has changed since the failure: no queued input, images, dialogs, question notices, copy mode, or interaction with the pane.
+A manual prompt, a session or process change, a successful completion, or another error ends the chain.
+Only prompts that a person sent while the current daemon was running can start a chain.
+Other Codex versions, narrow panes, and changed screens are still recorded as failures but are not resumed.
+Pending retries are discarded when the daemon restarts.
+If delivery of a resume prompt cannot be confirmed, vde-tmux stops sending to that Codex process, even across daemon restarts, until the process or pane is replaced.
 
-The live writer check rejects a session switch even when its hook was missed and the error
-screen looks identical. Stock Codex exposes no atomic input/thread identity contract: input
-or an approval can still appear between final verification and paste+Enter. The feature does
-not change models or grant new approval.
+Stock Codex cannot check its input field and submit in one atomic step: typed input or an approval prompt can still appear between the final check and the paste.
+Enable the feature only if that risk is acceptable.
 
-Inspect `vt daemon diagnostics --json` under `codex_capacity_auto_resume` for attempts,
-next retry and stop reason. Prompt text is not included in diagnostics. Prompts accept LF
-and up to 65,536 UTF-8 bytes; all trailing LF are stripped. Empty text, remaining surrounding
-whitespace, unsafe controls, leading `/` or `!`, and a trailing `@`/`$` completion token
-reject daemon startup/reload. Reload the daemon after changing configuration.
-
-The full schema is available with `vt config schema`.
-
-Reload the daemon after changing the file:
-
-```bash
-vt daemon reload
-```
+`vt daemon diagnostics --json` reports attempts, the next retry, and the stop reason under `codex_capacity_auto_resume`, without prompt text.
+A custom prompt may contain LF and is limited to 65,536 UTF-8 bytes after trailing LFs are removed.
+The daemon refuses to start or reload with an empty prompt, surrounding whitespace, unsafe control characters, a leading `/` or `!`, or a trailing `@`/`$` completion token.
 
 ## Notifications
 
@@ -666,6 +506,37 @@ notify:
 ```
 
 The command receives `VDE_PANE_ID`, `VDE_AGENT`, and `VDE_BADGE_STATE`.
+A queued notification is skipped if its Blocked state has already been resolved when the command is about to run.
+
+## Agent JSON API
+
+Agents can inspect panes and other agents, and wait for them, without polling tmux:
+
+```bash
+vt api schema --json
+vt api snapshot --json
+vt agent list --status working --json
+vt agent wait %456 --until done,blocked,limited --json
+vt pane read %456 --source latest --lines 120 --json
+
+AGENT_REF="$(vt agent get %456 --json | jq -r '.result.agent.summary.agent_ref')"
+REQUEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vt-request.XXXXXX")"
+printf '%s' 'Review the current diff.' >"$REQUEST_DIR/prompt.txt"
+PROMPT_JSON="$(vt agent request "$AGENT_REF" \
+  --state-file "$REQUEST_DIR/request.json" \
+  --prompt-file "$REQUEST_DIR/prompt.txt" --json)"
+RUN_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.run_ref')"
+vt agent run wait "$RUN_REF" --json
+vt agent run response "$RUN_REF" --json
+```
+
+- `vt api snapshot --json` returns panes, agents, and daemon diagnostics from one consistent revision. Prefer it over combining `tmux list-panes` with separate `vt pane list` and `vt agent list` calls.
+- `vt agent request` sends a prompt to a Codex agent durably. It saves its progress in the `--state-file` you choose; if the response is lost, rerun it with the same target and state file and without a prompt body to resume instead of resending. Use a new state-file path for every new prompt. Prompt text never appears in argv.
+- A Codex session freshly started with `--no-daemon` can take its first `agent request` while it still shows Unknown.
+- `agent send` (idle or done agents), `agent steer` (working agents), and `agent send-keys` (blocked agents) provide guarded terminal input. `pane split` and `agent start` create panes and start agents.
+- Mutations require an exact reference. An `agent_ref` is available only while vde-tmux can identify one live agent process by its PID and start time.
+
+See [Agent JSON API](./AGENT_API.md) for the full contract.
 
 ## Integrating another agent
 
@@ -682,10 +553,7 @@ vt hook emit \
 ```
 
 `--status` accepts `running`, `waiting`, `idle`, and `error`.
-`hook emit --prompt` is public display metadata and is passed in the process argv. Do not use it for
-secrets. Provider adapters should accept private bodies on stdin. Durable Codex callers should use
-`vt agent request` with a private state path and `--stdin` or `--prompt-file`; low-level adapters
-may use `vt agent prompt`. Neither command places the prompt body in argv.
+`--prompt` is display metadata passed in the process argv, so do not use it for secrets.
 A waiting event also needs a reason:
 
 ```bash
@@ -696,7 +564,7 @@ vt hook emit \
   --wait-reason permission_prompt
 ```
 
-Provider integrations can report exhausted usage explicitly with `--wait-reason usage_limit`.
+Report exhausted usage with `--wait-reason usage_limit`.
 
 ## Daemon operations
 
@@ -716,20 +584,12 @@ Use `disable` when the daemon must remain stopped.
 
 ### Pane-state persistence
 
-The daemon stores one private full-state snapshot per tmux server incarnation under
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v10.json`. A daemon restart restores the
-prompt, task progress and items, subagents, worktree activity, lifecycle, timestamps, agent
-identity, task context and generated summaries, the latest response preview, explicitly reported
-background processes, listening ports, and Done/acknowledgement state for panes
-whose pane ID and PID still match.
+The daemon saves pane details such as prompts, tasks, subagents, lifecycle, summaries, and read state to `$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v10.json`, one file per tmux server.
+After a daemon restart, it restores them for panes whose pane ID and PID still match.
+Files for tmux servers that no longer run are not removed automatically.
 
-If this snapshot is corrupt or insecure, daemon startup stops instead of repairing it or falling
-back. `vt daemon status` reports the snapshot path in `last_transition_error`; remove that file only when you
-intend to reset all saved pane state for that tmux server, then run `vt daemon ensure`.
-
-Production startup does not migrate snapshots from older pane-state schemas. Without a separate
-one-shot migration, pane details reset after a schema upgrade. Snapshots for other tmux server
-incarnations are not removed automatically.
+If the file is corrupt or has unsafe permissions, the daemon does not start, and `vt daemon status` shows the file path in `last_transition_error`.
+Remove the file only if you intend to reset all saved pane state for that tmux server, then run `vt daemon ensure`.
 
 ## Upgrading
 
@@ -743,17 +603,20 @@ vt daemon ensure
 ```
 
 If the binary was replaced while the old daemon was still running, `vt daemon stop --force` stops it.
+Saved pane details are not migrated when the pane-state schema changes, so they reset after such an upgrade.
 
 ## Troubleshooting
 
 ### The status line or sidebar does not update
 
-Inspect daemon health, and reload after configuration changes:
+Check daemon health. After changing the configuration, reload it; `reload` validates the configuration and reports errors.
 
 ```bash
 vt daemon status
 vt daemon reload
 ```
+
+Notification, status update, and hook delivery errors are logged to `$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/daemon.log`.
 
 ### Reloading tmux configuration breaks hooks
 
@@ -766,83 +629,12 @@ set-hook -g client-session-changed[0] 'your-command'
 
 An unindexed `set-hook` replaces the existing hook array.
 
-### Inspect configuration errors
-
-```bash
-vt daemon reload
-vt daemon status
-```
-
-Each tmux server incarnation has one operational log at
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/daemon.log`. Notification, status-push, and hook
-delivery errors use distinct prefixes in that file.
-Sidebar order, category scope, presentation, filter, and row expansion are stored atomically below
-`$XDG_STATE_HOME/vde/tmux/sidebar-state/`, isolated by tmux socket. These values are shared live by
-sidebars on the same tmux server. Selection and scrolling are shared while the daemon is running but
-are not persisted. The concrete Current category and return target remain instance-local and are not
-persisted.
-
 ## Known limitations
 
 - Without hooks, waiting detection is limited to states that can be inferred from visible pane output
 - When the daemon stops, the last rendered status options remain until the next hook event or `vt daemon ensure`
+- Codex executables or scripts whose paths contain spaces may not be identified, and their hook ownership is then reported as unverified
 
 ## License
 
 [MIT](./LICENSE)
-
-
-### Codex observation and hook ownership
-
-Codex panes without authoritative hooks now show observed Working or a current approval /
-synchronous question (Blocked). Unrecognized or unavailable observations show `?` (Unknown)
-in the sidebar and statusline. An asynchronous question may remain visible while work continues.
-These badges do not complete Runs or acknowledge durable Question notices. After answering,
-`Q` remains available to acknowledge retained notices. Known answer IDs acknowledge their own
-issued questions, including after daemon restart; ordinary-prompt acknowledgement has a separate
-conservative different-turn proof.
-
-Expanded Codex rows prioritize task summaries and response previews. Badge reasons are available
-for diagnosis as `summary.presentation` in `vt agent get --json` (and the corresponding agent
-summary in `vt pane get` / `vt api snapshot`), without adding a diagnostic row to the sidebar.
-These body-free explanations do not turn an unknown screen into proof of completion or an
-answered question.
-Structured directory-trust and startup-update prompts are displayed as Blocked for screen-only
-panes. Queued OS notifications are rechecked immediately before execution, so an obsolete
-Blocked occurrence does not produce a late notification. State changes after this check cannot retract an accepted notification.
-
-Shared app-server hooks are rejected because their inherited pane environment does not identify
-the originating TUI. Embedded hooks are verified through their own process ancestry. Screen-only
-panes cannot provide lifecycle prompt confirmation. For new tmux sessions that need lifecycle status and task summaries,
-start `codex --no-daemon`. This selects an independent runtime for that invocation and leaves
-other clients' shared daemon settings unchanged. The first prompt can be sent with
-`vt agent request <exact-agent-ref> --state-file <new-private-path> --stdin --json`, even while
-startup shows Unknown. Before dispatch, vt verifies the explicit `--no-daemon` invocation,
-the exact foreground process, and a stable empty Codex input field. Trust/update dialogs,
-draft input, queued initial prompts, and shared-server invocations are rejected. The accepted
-`UserPromptSubmit` hook confirms the prompt and establishes the provider session; screen
-readiness alone never establishes hook authority or completion. Verify `prompt_confirmed`,
-`hook_authoritative`, completion, and (when enabled) a task summary after the prompt.
-After a vde-tmux daemon restart, an existing Idle session is resynchronized from its exact live
-rollout writer and complete structural history. It can become input-ready without manual input;
-this does not fabricate hook authority or a Run completion. Every prompt checks the fresh empty
-composer, foreground owner and current session. Drafts and queued inputs prevent sending. Shared-server commands such as
-`codex queue` are not available with `--no-daemon`; keep those workflows on the shared server.
-Do not open an active shared thread in both modes.
-Accepted async-question replies in every Codex client version acknowledge matching question IDs,
-including replies accepted while the same turn is running. Partial or out-of-order replies keep
-unanswered notices visible and persist across restart. Matching known IDs does not depend on a
-startup hook in the current daemon or home-wide history. Item counts are independent of body
-fingerprints. Exact owner/session checks and ID-reuse protection remain required; unknown IDs,
-malformed/quoted frames, automatic capacity inputs and missing issuance evidence retain notices.
-See [Question notices](AGENT_API.md#question-notices-api-v5).
-
-API 6 / daemon protocol 31 must be installed together; Pane State schema 10 and Question sidecar
-schema 1 remain unchanged. See [the API contract](AGENT_API.md#codex-screen-evidence-api-6).
-
-Run `python3 scripts/test-codex-observation-isolated.py` after building the binaries to verify
-shared-server ownership, embedded hooks with MCP children, and screen badges using native
-synthetic fixtures on an isolated tmux server. It never sends model requests or changes the real server.
-
-Process discovery currently cannot reliably identify Codex executable/script paths containing spaces;
-use a path without spaces when hook ownership is reported as unverified.

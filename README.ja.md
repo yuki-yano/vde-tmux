@@ -9,9 +9,9 @@ Claude Code、Codex、opencode の pane を追跡し、tmux の status line と�
 
 ## できること
 
-- すべての tmux session にいるエージェントを `Blocked`、`Working`、`Done`、`Idle` に分類する
+- すべての tmux session にいるエージェントを `Blocked`、`Limited`、`Working`、`Done`、`Idle` に分類する
 - 対応が必要なエージェントを status line に表示する
-- task要約、経過時間、task、subagent、worktree activity をサイドバーに表示する
+- task 要約、経過時間、task、subagent、worktree activity をサイドバーに表示する
 - サイドバーからエージェントの pane へ直接移動する
 - session をカテゴリで整理し、キーボードや status line のクリックで切り替える
 - エージェントが入力待ちになったとき、任意の通知コマンドを実行する
@@ -66,10 +66,9 @@ bind-key -n M-e run-shell "vt sidebar focus-toggle --window #{q:window_id}"
 設定の要点は次のとおりです。
 
 - `vt daemon ensure` が daemon を必要に応じて起動します。
-- daemon は実際に起動している `vt` の絶対パスを `@vde_executable` へ保存します。Neovim pane navigation は PATH を検索せず、この実体を使います。
 - vde-tmux は描画済みのテキストを `@vde_status_*` option へ書き込むため、status line の再描画ごとに外部プロセスは起動しません。
 - `@vde_status_now_format` は pane border の経過時間表示に必要です。
-- `Blocked`、`Working`、`Done` の agent pane は、pane statusline の残り幅をバッジと同じ色の一重罫線で埋めます。`pane-border-status bottom` のため下辺だけが強調され、左右の本文セルには重なりません。`Idle` と non-agent pane には追加の罫線を描きません。
+- `Blocked`、`Limited`、`Working`、`Done` の agent pane は、下辺の pane border の残り幅をバッジと同じ色の線で埋めます。
 - `window-status-*` の設定は、tmux 標準の window list を vde-tmux の session と window の表示へ置き換えます。
 - `--client-name` と `--session-id` により、複数の tmux client を使っていても操作対象が別の client へずれません。
 
@@ -93,11 +92,14 @@ tmux source-file ~/.tmux.conf
 }
 ```
 
-デフォルトの `<C-h/j/k/l>` は Neovim 内では window 間を移動し、端ではtmux内の軽量なsignalをdaemonへ送り、tmux paneへ移動します。tmux root bindingはキーごとの`vt`/`tmux` processを起動せず、Neovimの端からは1つのtmux clientだけでsignalを送ります。移動先が Neovim の場合は、移動元のカーソル座標に合う window を選択します。選択情報は移動先 pane の option に PID とともに保存されるため、別 client や再利用された pane が誤って消費しません。
-
-pane移動はdaemonが所有する1つの常駐tmux control-mode clientを通して実行します。このclientは`ignore-size`、`no-output`、`no-detach-on-destroy`付きで既存sessionへattachし、vde-tmuxがregular clientのattach有無を判定するときは除外されます。nativeな`tmux list-clients`には表示されます。またregular clientが1つもいない間、control clientのattach先となる1 sessionでは、tmux nativeのalertと`destroy-unattached`判定がtmuxのattached-client意味論に従います。
+デフォルトの `<C-h/j/k/l>` は Neovim 内では window 間を移動し、端では daemon に隣の tmux pane への移動を依頼します。
+移動先の pane が Neovim の場合は、移動元のカーソル位置に合う window を選択します。
 
 `require('vde-tmux').navigate('h')` のように API だけを既存の mapping から呼ぶこともできます。`setup()` には `keybindings = false`、`modes`、`debug`、`disable_when_floating`、`navigate_from_floating` を指定できます。
+
+daemon は常駐する一つの tmux control-mode client を通して pane を切り替えます。
+vde-tmux は session に client が attach しているかを判定するときにこの client を除外しますが、`tmux list-clients` には表示されます。
+通常の client が一つも attach していない間は、この client の attach 先 session について、tmux 自身の alert と `destroy-unattached` は attach 中として扱います。
 
 ### 3. Claude Code の hook
 
@@ -141,7 +143,7 @@ pane移動はdaemonが所有する1つの常駐tmux control-mode clientを通し
     ],
     "PostToolUse": [
       {
-        "matcher": "^update_plan$",
+        "matcher": "^(update_plan|request_user_input_async)$",
         "hooks": [{ "type": "command", "command": "vt hook codex PostToolUse" }]
       },
       {
@@ -162,41 +164,17 @@ pane移動はdaemonが所有する1つの常駐tmux control-mode clientを通し
 }
 ```
 
-Codex を再起動すると、permission request、plan、subagent、worktree activity がサイドバーへ反映されます。
+tmux 内の Codex は `codex --no-daemon` で起動します。
+vde-tmux はこの Embedded mode の hook だけを受け付けます。共有 app-server の hook は通知元の pane を特定できないため拒否します。
+この指定はその起動だけに適用され、他のクライアントの共有 daemon 設定は変わりません。`features.daemon_auto_start=false` だけでは、起動済みの server への接続は防げません。
+`codex queue` など共有 server を必要とするコマンドは `--no-daemon` では使えません。実行中の共有 thread を両方のモードで同時に開かないでください。
 
-tmux 内の新規 Codex で状態通知と task 要約を使う場合は、`codex --no-daemon` で独立起動します。
-共有 app-server の hook は、通知元の pane を特定できないため受け付けません。
-この指定は今回の起動だけに適用され、Desktop など他のクライアントの設定は変わりません。
-起動直後が Unknown でも、最初の依頼を
-`vt agent request <exact-agent-ref> --state-file <未使用のprivate path> --stdin --json`
-から送信できます。送信前に、明示的な `--no-daemon`、同一プロセスによる入力の所有権、
-空の Codex 入力欄を確認します。trust/update ダイアログ、入力途中の本文、起動時に指定した
-prompt、共有 server への送信は拒否します。
-受理された `UserPromptSubmit` hook で prompt と session を確定します。
-画面の準備確認だけでは hook の権威や完了状態を確定しません。
-送信後に `prompt_confirmed`、状態通知・完了表示と、有効にしている場合は task 要約を確認します。
-vde-tmux daemon の再起動後は、次の embedded hook が受理されると状態通知が復旧します。
-それまでは Unknown と表示される場合があります。
-`codex queue` など共有 server を必要とする操作は、`--no-daemon` と併用できません。
-実行中の共有 thread を、独立起動側でも同時に開かないでください。
+設定後は、permission request、plan、subagent、worktree activity、[Question 通知](#codex-の-question-通知)がサイドバーに表示されます。
 
-サイドバーの詳細は要約や応答を中心に表示します。判定理由は
-`vt agent get <pane ID> --json` の `summary.presentation` で確認できます。
-画面から判定できない Unknown を、完了や Idle として扱うことはありません。
-
-Codex 0.159.3 / 0.160.0 の回答frameが受理されると、発行した質問IDと照合して対応するQuestion通知を確認済みにします。
-同じturnで実行中の回答にも対応します。複数質問の一部だけに答えた場合や逆順に答えた場合は、未回答通知を越えて確認済み順序を進めません。
-引用・不完全なframe・未知のID・別session・自動capacity入力では通知を残します。
-照合情報はdaemonメモリだけに保持します。現在のdaemon世代で検証済みstartupを観測し、homeのhook欠落がないsessionが対象です。
-再起動前の通知、再起動をまたいで続くsession、resume/clearしたsession、hook欠落で信頼を失ったsessionは、新しい通知も `Q` で手動確認してください。
-
-Question 通知の自動確認では、現在の質問欄の本文と選択肢も照合します。
-折り返しや空白の違いを吸収し、Codex が追加する Other の選択肢は除外します。
-一致は通知を残す根拠に使い、不一致・履歴上の表示・選択肢の省略だけで通知を消しません。
-本文自体は保存せず、発行元・session・通知順序に紐付く指紋を daemon のメモリだけに保持します。
-本文照合は Codex 0.159.3 / 0.160.0 の完全な質問欄が対象です。長い本文や選択肢が切れた表示は
-照合できない場合があり、通常の質問マーカーや曖昧判定で通知を残します。
-照合情報が取れない場合は通知を残し、`Q` で手動確認できます。Codex 0.159.3 / 0.160.0 の質問表示にも対応しています。
+hook が受理されていない Codex pane は、画面から読み取った状態を表示します。作業中なら Working、承認や同期的な質問なら Blocked です。
+画面を判別できない場合は `?`（Unknown）を表示します。
+画面からの判定で run を完了させたり、Question 通知を確認済みにしたりすることはありません。
+バッジの判定理由は `vt agent get --json` の `summary.presentation` で確認できます。
 
 ### 5. 動作確認
 
@@ -210,116 +188,74 @@ vt sidebar open
 hook を設定していなくても、Claude Code、Codex、opencode は pane の実行コマンドから検出できます。
 ただし、prompt、完了時刻、入力待ちを正確に表示するには hook が必要です。
 
-## エージェント向け JSON API
-
-エージェントは tmux topology をポーリングせず、daemon の canonical topology cache を参照し、
-実プロセスで識別された同一の agent occupant を固定して完了を待てます。
-
-```bash
-vt api schema --json
-vt agent list --status working --json
-vt agent wait %456 --until done,blocked --json
-vt pane read %456 --source latest --lines 120 --json
-
-AGENT_REF="$(vt agent get %456 --json | jq -r '.result.agent.summary.agent_ref')"
-REQUEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vt-request.XXXXXX")"
-printf '%s' '現在の差分をレビューしてください。' >"$REQUEST_DIR/prompt.txt"
-PROMPT_JSON="$(vt agent request "$AGENT_REF" \
-  --state-file "$REQUEST_DIR/request.json" \
-  --prompt-file "$REQUEST_DIR/prompt.txt" --json)"
-RUN_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.run_ref')"
-vt agent run wait "$RUN_REF" --json
-vt agent run response "$RUN_REF" --json
-```
-
-response envelope、occupant を固定する参照、filter、capture 上限については
-[Agent JSON API](./AGENT_API.md) を参照してください。PID と OS の process start token で一意な
-実プロセスを固定できる場合だけ exact `agent_ref` が発行されます。正確な lifecycle 表示には
-引き続き hook が必要ですが、実プロセスを一意に識別できれば hookless agent でも
-`agent wait` / `agent read` を利用できます。guarded prompt dispatch はさらに、daemon 管理下の
-tmux hook が healthy であること、Claude Code / Codex 向けの prompt adapter があること、対象が
-idle/done かつ foreground input owner であることを要求します。外部 provider hook は事前の
-health 値ではなく、送信後の digest event によって確認します。`agent request`はdaemon mutation
-より前にOperation IDと同一byteのretry bodyをvt管理stateへ保存します。応答を失った場合は、同じ
-exact targetと`--state-file`だけで再実行します。新しいprompt intentには新しいprivate state-file
-pathを使います。成功時はdigest確認済みreceiptを返し、配送が曖昧な場合も新しいOperationへ
-自動変換しません。Operation IDとretry bodyをcallerが明示管理する低レベルprimitiveとして
-`agent prompt`も残ります。
-
 ## 状態の読み方
 
 | 表示 | 状態 | 意味 |
 | --- | --- | --- |
-| `▲` | Blocked | 許可や回答など、利用者の入力を待っている |
-| `⋄` | Limited | providerの利用量またはsession上限に達している |
+| `▲` | Blocked | 許可や回答など利用者の入力を待っている、またはエラーで止まっている |
+| `⋄` | Limited | provider の利用量または session 上限に達している。要対応には含めない |
 | `●` | Working | エージェントが作業している |
 | `✓` | Done | 作業が完了し、まだ確認されていない |
 | `○` | Idle | 作業がない、または完了を確認済み |
+| `?` | Unknown | hook が受理されていない Codex pane の画面を判別できない |
 
-`Done` は、対象の exact pane が eligible な tmux client で active になると `Idle` になります。
+`Done` は、対象の pane がいずれかの tmux client で active になると `Idle` になります。
 同じ window の別 split を見ても既読にはなりません。
 既読状態は daemon の再起動後も保持され、すべての tmux client とサイドバーで共有されます。
-daemon は現在の client view を定期的に再照合するため、view hook を一度取りこぼしても次の
-observation pollで修復されます。Priorityのpeek navigationだけは例外で、操作元clientが
-agent間を移動している間も未読を維持します。Peek Leaseはmemory内だけに保持されるため、
-daemonを再起動するとpeekは終了し、初回のview reconcileで通常のactive-pane既読規則が適用されます。
 
-`unread-latest` は全paneを横断し、未読のWaiting、Error、Completedのうち最新の発生へ移動します。
-globalな発生順はdaemonが管理し、移動中に最新paneが消えた場合は次の未読paneを試します。
-移動操作そのものは既読化せず、移動先がactive paneとして観測された後に既読になります。
-この操作はpeekには入りません。
+`unread-latest` は、全 pane のうち未読のイベント（入力待ち、エラー、完了）が最も新しい pane へ移動します。
+移動操作そのものは既読化せず、移動先が active pane として観測された後に既読になります。
 
-Claude Codeのopen runがAPIエラーで終了した場合、`StopFailure` を一次情報として扱います。
-`error=rate_limit` は `Limited`、それ以外は `Blocked` / `lifecycle.state=error` になり、`error=overloaded` と529 overloadのreasonは `provider_overloaded` です。
-同じsessionからrun完了後にfailureが届いた場合は、遅延イベントや補助処理の失敗で正常完了を上書きしないよう、terminalを1回確認して現在のエラー表示と一致した場合だけ次のrunを開きます。
-hookを取りこぼした場合に限り、daemonは5秒間隔の補助scanで、`⏺ API Error:` の後にある `· done` turn summaryが入力欄より前の最新semantic行になった状態を検出します。
-古いエラー、通常のログ本文、新しいprompt、retry spinner、tool出力、assistant出力がエラー後に続いている画面は検出しません。
-途中で副作用が発生済みの可能性があるため自動再送は行わず、後続の `SessionStart` または `UserPromptSubmit` を回復証拠とします。
+Limited は、Claude Code の `StopFailure` hook の `error=rate_limit`、または画面に表示された provider の利用上限メッセージから判定します。
+Claude Code のそれ以外の API エラーは Blocked になります。
+失敗した turn は途中で副作用が発生している可能性があるため、自動では再実行しません。
+次の `SessionStart` または `UserPromptSubmit` を受け取るか、プロセスが終了すると Limited は解除されます。
+provider のメッセージは `vt pane read` で確認できます。
 
 ## サイドバー
 
-サイドバーは現在のtmux windowに開き、対象範囲と表示方法を独立した2軸で切り替えます。
-`Current`はそのサイドバーの起点sessionが属するcategoryだけ、`All`は全categoryを対象にします。
-`Tree`はCurrentではRepository→Agent、AllではCategory→Repository→Agentの階層表示です。
-`Priority`は選択中のscopeをPinned、Needs Input、Unread Done、Running、Idleの順にまとめ、
-`Flat`はgroupingを外します。
-任意のagentで`p`を押すと、未読、badge、notificationとは独立した永続pane pinを切り替えます。
-Priorityではpinされたagentが先頭の`PINNED` zoneへ移動し、Flatでは先頭へ移動します。
-Treeでは階層を維持したまま所属するCategoryとRepositoryが優先されます。
-pinは既読化やlifecycle変更では解除されず、paneが消えたときに削除されます。
-Repositoryとlinked worktreeのbranch labelには、upstreamとの差を`↑N` / `↓N`、
-`HEAD`からのtrackedなstagedおよびunstaged差分行数を`+N` / `-N`で続けて表示します。
-Gitのignore対象を除くuntrackedなテキストファイルも、全行を`+N`へ加算します。
-0件は省略し、binary fileは差分行数へ含めません。
+サイドバーは現在の tmux window に開きます。
 
 ```bash
 vt sidebar open --width 40
 vt sidebar open --width 20%
 vt sidebar toggle
 vt sidebar toggle --all
-vt sidebar rail
+vt sidebar rail    # 細い rail 表示と通常幅を切り替える
 vt sidebar close
 ```
 
 `vt sidebar focus-toggle` は、サイドバーがなければ開き、表示中ならフォーカスし、フォーカス中なら閉じます。
 
-layout managerは、pane layoutを適用する前にvde-tmuxのsidebar予約を同期的に確定できます。
+### 表示
 
-```bash
-vt sidebar prepare-layout --window @12 --json
-```
+サイドバーには独立した二つの表示設定があります。
 
-このcommandは、
-`{"window_id":"@12","status":"ready","reserved_panes":[{"pane_id":"%23","role":"sidebar"}],"content_anchor":"%22"}`
-のようなJSON objectを1つだけ出力します。
-`ready`は、返却したsidebar paneが存在し、`@vde_sidebar=1`が設定され、幅のreconcileが完了したことを意味します。
-TUIの初回描画やdaemon snapshotの到着は待ちません。
-このcommand自身はvde-tmux daemonを起動せず、起動完了も待たないため、daemonのactive configが必要です。
-daemonが未起動、またはconfigが未反映の場合はfail closedとなり、non-zeroで終了します。
-active configを反映する必要がある場合は、先に`vt daemon reload`を実行してください。
-auto-all hookが無効でmarked sidebarが存在しない場合は、sidebarを作成せず、`absent`、空の`reserved_panes`、既存のnon-sidebar paneを`content_anchor`として返します。
-処理はtmux window単位で直列化され、auto-allのnew-window hookと同時に実行しても冪等です。
-window IDの不正、window不存在、non-sidebar content pane不在、tmux操作またはJSON生成の失敗はnon-zeroとなり、fallback responseは返しません。
+- 対象範囲：`Current` はサイドバーの session が属するカテゴリだけ、`All` はすべてのカテゴリを表示します。
+- 表示方法：`Tree` は Current では Repository → Agent、All では Category → Repository → Agent の階層で表示します。`Priority` は Pinned、Needs Input、Questions、Limited、Unread Done、Running、Idle の順にまとめます。`Flat` はまとめずに並べます。
+
+要対応（Needs action）フィルタには、Blocked のエージェントと、未確認の [Question 通知](#codex-の-question-通知)があるエージェントが含まれます。
+未読の Done は Done フィルタに表示されます。
+
+`p` で pin したエージェントは、Priority と Flat では先頭に、Tree では所属するカテゴリと Repository ごと上位に表示されます。
+pin は未読、バッジ、通知とは独立しており、pane が消えると解除されます。
+
+アクティブな session に属するエージェントには、左端に水色の `▎` を表示します。
+tmux client がフォーカスしているエージェントの pane には、代わりに黄色の `selection_bar` の色を使います。
+キーボードでの選択は行の背景色で示します。
+editprompt の editor pane は、`@editprompt_is_editor`、`@editprompt_target_panes`、`@editprompt_editor_pane` の option で双方向に結び付いている場合、対象エージェントをフォーカスしているものとして扱います。
+
+Repository と linked worktree の branch label には、upstream との差を `↑N` / `↓N`、`HEAD` からの staged と unstaged の差分行数を `+N` / `-N` で表示します。
+Git の ignore 対象ではない untracked なテキストファイルも `+N` に含めます。
+0 件は省略し、binary file は数えません。
+
+展開したエージェントには、branch または worktree、task の状態、ahead/behind、listen 中の TCP port、Claude Code が `run_in_background` として報告した background コマンド、最後の応答のプレビュー（`▷`）を表示します。
+
+対象範囲、表示方法、フィルタ、手動の並び順、開閉状態、選択位置、スクロールは、同じ tmux server のすべてのサイドバーで共有します。
+具体的な Current のカテゴリと戻り先は、サイドバーごとに起点 session に追従します。
+対象範囲、表示方法、フィルタ、手動の並び順、開閉状態は、tmux socket ごとに `$XDG_STATE_HOME/vde/tmux/sidebar-state/` へ保存します。
+
+### キー操作
 
 | キー | 動作 |
 | --- | --- |
@@ -329,34 +265,34 @@ window IDの不正、window不存在、non-sidebar content pane不在、tmux操�
 | `Ctrl-F` / `Ctrl-B` | 1ページ下または上へ移動する |
 | `Enter` | 選択したエージェントの pane へ移動する |
 | `Space` | 選択行を開閉する |
-| `c` | category scopeをCurrent / Allで切り替える |
-| `v` | presentationをTree / Priority / Flatの順に切り替える |
-| `1` / `2` / `3` | Tree / Priority / Flatへ直接切り替える |
+| `c` | 対象範囲を Current / All で切り替える |
+| `v` | 表示方法を Tree / Priority / Flat の順に切り替える |
+| `1` / `2` / `3` | Tree / Priority / Flat へ直接切り替える |
 | `Tab` / `Shift+Tab` | 状態フィルタを切り替える |
-| `n` / `N` | 次または前の要対応エージェントへ移動する |
-| `p` | Priorityで選択中の未読agentをpinまたはunpinする |
+| `n` / `N` | 対応または Question 通知の確認が必要な、次または前の pane へ移動する |
+| `p` | 選択中のエージェントを pin または unpin する |
 | `d` | 選択中の run を完了としてマークする |
-| `a` | category追加dialogを開く |
-| `m` | 選択中のRepositoryを移動するdialogを開く |
-| `r` | 選択中の動的categoryをrenameするdialogを開く |
-| `D` | 選択中の動的categoryを削除するdialogを開く |
-| `J` / `K` | 手動順序を変更する |
+| `Q` | 表示中の Question 通知を確認済みにする。質問への回答やスキップは行わない |
+| `a` | カテゴリ追加の dialog を開く |
+| `m` | 選択中の Repository を移動する dialog を開く |
+| `r` | 選択中の動的カテゴリの名前を変更する dialog を開く |
+| `D` | 選択中の動的カテゴリを削除する dialog を開く |
+| `J` / `K` | 手動の並び順を変更する |
 | `q` / `Esc` | サイドバーを閉じる |
 
-現在の session に属するエージェントには左端へ `▎` を表示します。
-エージェントの1行目をクリックすると開閉を切り替えます。2行目以降をクリックすると、
-事前に選択していなくてもそのエージェントのpaneへ移動します。
-キーボードでは選択中のエージェントを`Space`で開閉します。
-マウスホイールは選択カーソルを動かさず、はみ出した表示範囲をスクロールします。
-起動後にまだ操作されていないエージェントは、閉じている間は1行だけ表示します。
-category編集dialogはheaderを残してrows領域に表示されます。`m`と`D`では`j`/`k`、矢印、`gg`/`G`で移動先を選び、`Enter`で保存、`Esc`でキャンセルします。
-保存中もdialogを表示し続け、成功時に閉じます。失敗時は入力内容と選択位置を保持し、dialog内にエラーを表示します。
-category scope、presentation、filter、手動順序、開閉状態、選択位置、スクロールは、
-同じtmux serverの全サイドバーで同期します。具体的なCurrent categoryとreturn targetだけは
-sidebar instanceごとに保持し、そのサイドバーへ入力した起点sessionへ追従します。
-開いているサイドバーはfocusを移さずに操作できます。
+エージェントの1行目をクリックすると開閉し、2行目以降をクリックするとその pane へ移動します。
+マウスホイールは選択位置を動かさずにスクロールします。
+
+カテゴリの dialog では、`j`/`k`、矢印キー、`gg`/`G` で項目を選び、`Enter` で保存、`Esc` でキャンセルします。
+保存に失敗した場合は dialog を開いたままエラーを表示します。
+
+### tmux からサイドバーを操作する
+
+開いているサイドバーは、フォーカスを移さずに操作できます。
 
 ```tmux
+bind-key -n M-v run-shell "vt sidebar input v --window #{q:window_id}"
+bind-key -n M-f run-shell "vt sidebar input tab --window #{q:window_id}"
 bind-key -n C-M-j run-shell "vt sidebar input agent-next --window #{q:window_id} --client-pid #{client_pid}"
 bind-key -n C-M-k run-shell "vt sidebar input agent-prev --window #{q:window_id} --client-pid #{client_pid}"
 bind-key -n C-M-e run-shell "vt sidebar input read-current --window #{q:window_id} --client-pid #{client_pid}"
@@ -364,18 +300,59 @@ bind-key -n M-u run-shell "vt sidebar input unread-latest --window #{q:window_id
 bind-key -n M-p run-shell "vt sidebar input pin-toggle --window #{q:window_id}"
 ```
 
-`C-M-j`と`C-M-k`はPriority表示でだけ動作します。表示中のagentをwrapせずに前後移動し、
-操作元tmux clientのpane focusも移しますが、未読は維持します。`C-M-e`は現在のpeek対象を、
-daemonが受理した時点の発生まで明示的に既読にし、その下に表示中の未読agentが残っていれば
-次へ進みます。受理後に元paneで発生した新しい通知は未読のまま残ります。`C-M-e`はTreeやFlatでも
-現在のpeek対象を既読にできますが、その場合は自動移動しません。通常のsidebar activation、pane focus、
-`unread-latest`は従来どおりauto-readです。
-Peek状態はexact tmux clientごとに保持され、別clientが同じpaneを通常表示するとglobalに既読になります。
+`C-M-j` と `C-M-k` は Priority 表示でだけ動作します。
+操作元の client を、表示中の次または前のエージェントへ端で折り返さずに移動し、未読のまま残します（peek）。
+`C-M-e` は現在の peek 対象を既読にし、Priority 表示ではその下にある次の未読エージェントへ進みます。
+peek の状態は操作元の client ごとに保持され、別の client が同じ pane を表示すると既読になります。
+daemon を再起動すると peek は終了します。
+
+### layout manager との連携
+
+layout manager は、pane layout を適用する前にサイドバーの予約を同期的に確定できます。
+
+```bash
+vt sidebar prepare-layout --window @12 --json
+```
+
+このコマンドは
+`{"window_id":"@12","status":"ready","reserved_panes":[{"pane_id":"%23","role":"sidebar"}],"content_anchor":"%22"}`
+のような JSON object を一つ出力します。
+`ready` は、返したサイドバー pane がすべて存在し、幅の調整が完了したことを表します。サイドバーの描画は待ちません。
+auto-all hook が無効でサイドバーがない場合は、`absent`、空の `reserved_panes`、既存の content pane を `content_anchor` として返します。
+auto-all の new-window hook と同時に実行しても結果は変わりません。
+
+このコマンドは daemon を起動しません。
+設定を反映した daemon が動いていない場合（先に `vt daemon reload` を実行してください）、window が不正または content pane がない場合、tmux の操作に失敗した場合は non-zero で終了します。
+
+## Codex の Question 通知
+
+Codex の `request_user_input_async` は、turn を止めずに質問を出します。
+標準の Codex CLI 0.155.1、0.156.1、0.159.3、0.160.0 では、前述の `PostToolUse` hook でこの質問を検出できます。matcher に `request_user_input_async` を含めるか、matcher なしの `PostToolUse` hook を使ってください。
+対応するのは Embedded mode（`codex --no-daemon`）だけで、subagent の質問は対象外です。
+
+- 未確認の Question 通知があるエージェントには、サイドバーで `?` を表示します。親行の `? N` は質問数ではなく pane 数です。
+- エージェントまたはその詳細行を選んで `Q` を押すと、表示中の通知を確認済みにします。`Q` は質問への回答やスキップを行いません。操作中に届いた質問は表示されたまま残ります。
+- 確認済みの状態はサイドバー間で共有され、フォーカス、エージェントへの入力、run の状態、未読の Done は変わりません。
+- `!`（親行では `! N`）は通知の追跡が劣化していることを示します。エージェントを展開すると理由を確認できます。
+
+Codex が回答を受理すると、vde-tmux は質問 ID を照合し、対応する通知を自動で確認済みにします。Codex のバージョンは問いません。
+一部だけ回答した場合は未回答の質問が表示されたまま残り、回答済みの項目は daemon を再起動しても保持されます。
+
+質問をスキップしただけでは確認済みになりません。
+同じ session の後続の turn で通常の prompt が受理された場合、その turn が Idle または Done になり、画面に通常の入力欄が表示されていれば、それ以前の通知を確認済みにできます。
+resume、fork、`/clear`、rollback、未知の Codex バージョンや画面構成、表示の切れなどで確認できない場合は、`Q` を押すまで通知を残します。
+この判定は、質問が読まれたことや回答されたことを証明するものではありません。
+
+質問と回答の本文は保存せず、上限付きのハッシュだけを保持します。
+hook を設定する前に出た質問は復元しません。
+Codex のプロセスまたは pane がなくなると、その通知は閉じます。
+Question 通知は status line への表示や OS 通知を追加しません。
+詳細な仕様は [Question notices](./AGENT_API.md#question-notices) を参照してください。
 
 ## session とカテゴリ
 
-カテゴリを使うと、canonicalなRepository identity単位でtmux sessionをまとめられます。
-同じgit common directoryを共有するworktreeは一つのRepositoryとして扱われます。
+カテゴリは、Repository を正規化した project の識別子ごとにまとめます。
+同じ git common directory を共有する worktree は一つの Repository として扱います。
 
 ```yaml
 categories:
@@ -402,26 +379,14 @@ vt session-cycle prev
 vt session new -c ~/src/my-project
 ```
 
-configのカテゴリはread-onlyな最低限の定義として残ります。
-動的カテゴリ、Repositoryの明示的な所属、カテゴリとRepositoryの順序はtmux socketごとに保存されます。
-明示的な所属は`vt category automatic`を実行するまでconfig ruleより優先され、同じRepositoryのsessionを作り直した場合も復元されます。
-サイドバーでは`a`でカテゴリ追加、`m`でRepository移動、`r`で動的カテゴリ名変更、`D`で削除、`J`/`K`でカテゴリまたはRepositoryを並べ替えられます。
-All × Treeでは、管理対象sessionのRepositoryはagent paneがない場合も表示されます。
-`@vde_category`は外部tmux format向けの導出済みwrite-only mirrorです。
+設定ファイルのカテゴリは vde-tmux からは変更できません。
+動的カテゴリ、Repository の明示的な所属、カテゴリと Repository の並び順は、tmux socket ごとに保存します。
+明示的な所属は `vt category automatic` を実行するまで設定ファイルのルールより優先され、同じ Repository の session を作り直したときにも復元されます。
+All × Tree では、管理対象 session の Repository を、agent pane がない場合も表示します。
+vde-tmux は外部の tmux format 向けに、有効なカテゴリを `@vde_category` へ書き出します。この option を書き換えても所属は変わりません。
 
-Agentは、Category catalogを変更する権限を広げずに、versioned JSON APIでRepository所属を操作できます。
-
-```bash
-vt category list --json
-vt category get --repo ~/src/temporary-project --json
-vt category assign scratch --repo ~/src/temporary-project --json
-vt category automatic --repo ~/src/temporary-project --json
-```
-
-mutation receiptにはcanonical Repository identity、変更前後のeffective placement、実際に状態が変わったか、persist済みCategory revisionが含まれます。
-JSON readは停止中のdaemonを起動しません。
-JSON mutationはdaemonをensureし、disk configとactive configの不一致を拒否します。
-操作単位は共有Repository identityなので、linked worktreeも同時に移動します。
+`category list`、`get`、`assign`、`automatic` は `--json` を受け付けます。エージェントはこの versioned なインターフェースで Repository の所属を変更できます。
+詳細は [Repository category membership](./AGENT_API.md#repository-category-membership) を参照してください。
 
 fzf をインストールすると、session、window、pane を切り替えたり削除したりする popup を利用できます。
 
@@ -471,86 +436,67 @@ statusline:
 badge:
   glyphs:
     blocked: "▲"
+    limited: "⋄"
     working: "●"
     done: "✓"
     idle: "○"
+    unknown: "?"
 ```
-
-`statusline.summary.format` では `{badge}` と `{count}` の placeholder を使えます（`{badge}{count}`、`{badge}: {count}` など）。
-件数が 0 の状態も表示するため、summary の表示幅は安定します。
-Idle を表示したくない場合は `hide_idle: true` を指定します。
-summary が有効な場合は、category や window の表示が長いときも常に表示します。
-
-`sidebar.task_summary.enabled`を有効にすると、閉じたagent行と展開した詳細へ短いtask要約を表示します。
-daemonはpaneのagentに対応する独立CLI（Codexは`codex exec`、Claudeは`claude -p`）で要約を非同期生成します。
-手入力された最新のraw promptはpane stateとJSON APIには保持しますが、サイドバーには表示しません。
-API経由で送信されたpromptは、要約用のboundedな入力をdaemonのメモリ内だけで保持し、pane stateの保存ファイルやJSON APIには本文を含めません。
-この場合も生成待ち・生成中はspinnerを表示し、完了後に短いtask要約を表示します。
-生成済みの要約とcontextのハッシュは保存するため、daemon再起動後も要約を表示できます。
-再起動時に生成が未完了だった場合は入力が残らないため、次のpromptを受け取ったときに生成します。
-providerをまたぐfallbackは行いません。追加のmodel requestを許容できない場合は無効のままにしてください。
-
-要約contextは、現在のagent epochに届いた直近4件のprompt occurrenceへ追従します。
-同じprovider turnで2件目以降の`UserPromptSubmit`が届いた場合は、conflictや別runの作成ではなくactive runを更新します。
-現在のcontextに対する生成待ちまたは生成失敗中は、古い要約を表示しません。
-`agent list/get`は現在contextの生成完了後に`task_summary_status`を`current`または`failed`で返し、失敗時はboundedな`task_summary_error` codeも返します。
-statusがない場合は生成待ちまたは機能無効のいずれかです。同じfingerprintの失敗は、次のpromptでcontextが変わるまで再試行しません。
-`UserPromptSubmit`と`Stop`のhook配送には8秒のdeadlineを使い、daemon reloadの完了待ちによるlifecycle eventの欠落を防ぎます。
-
-category segmentでは、agent paneが0件の場合も、sessionを持つすべてのカテゴリを表示します。
-各カテゴリは、共有status幅のbudgetを超える場合も完全なラベルと操作targetをpublishし、`+N`や`cat:N`へ省略しません。
-
-`statusline.sessions.fixed_width: true` を指定すると、active category の session 領域を最も広い category に合わせ、category、session、window を合わせた領域も全 session で同じ幅に揃えます。
-固定領域内のsession表示はデフォルトで左寄せです。中央寄せにする場合は `fixed_width_alignment: center` を指定します。
-window 名やプロセス名の長さが異なる session を切り替えても、中央寄せした status block の位置がずれません。
-inactive category の幅には session の `other` style を使うため、`current.format` と `other.format` の表示幅が異なる場合は数セルの差が生じることがあります。
-
-### Codexの容量エラー
-
-独立TUIのCodex CLI 0.160.0で `Selected model is at capacity. Please try a different model.`
-によるturnの失敗を確認したとき、同じモデルへ続行プロンプトを自動送信できます。
-容量失敗は設定に関係なくError / Unresolvedとして記録し、Doneには数えません。
-自動送信は初期状態で無効です。
-
-```yaml
-codex:
-  capacity_auto_resume:
-    enabled: true
-    # prompt省略時は英語デフォルト。UTF-8で変更できます。
-    prompt: |-
-      Resume only unfinished work after checking the current state. Preserve the original objective, scope, constraints, approvals, and response language. Do not repeat completed operations. This message is not a new approval.
-```
-
-デフォルト文面は、元の目的・範囲・制約・承認・回答言語を保持し、完了済み操作を繰り返さず、
-既存の確認・承認要件に従って未完了の作業だけを再開するよう指示します。
-待機時間は60・120・300秒に0〜20%の揺らぎを加え、同じchainで最大3回送ります。
-送信を永続operationへ保存し、Codexのprompt digestで受理を確認します。
-DeliveryUnknownでは再送せず、会話変更やdaemon再起動後も配信中の扱いを保持します。
-Codex processまたはpane stateの置換でこの制限を解除します。未送信chainは再起動時に破棄します。
-配信中の制限が残る新chainは、試行前に `binding_ambiguous` で停止します。
-
-検証済みprimary transcriptと失敗turn、変わっていない画面、dim属性の空入力欄を要求します。
-queued input・画像・承認画面・Question通知・copy mode・失敗後の対象paneでの在席操作があれば停止します。
-手動prompt、会話・process変更、正常完了、別のエラーでもchainを終了します。
-現在のdaemonが新たに観測した人間の依頼だけをchainの起点にし、未対応Codex版では送信しません。
-狭いpaneや画面変化で再開できない場合も、容量失敗の記録は行います。
-
-標準Codexでは最後の画面確認からpaste+Enterまでを一括で検証できません。
-その間の手入力・承認画面の出現や、同じエラーがある別会話への切替による誤送信の可能性は残ります。
-この制約を許容できる場合に有効化してください。モデルの変更や新しい承認は行いません。
-
-`vt daemon diagnostics --json` の `codex_capacity_auto_resume` で試行数・次回待機・停止理由を確認できます。
-診断へprompt本文は出しません。LFを許可し、末尾のLFをすべて除いて65,536 UTF-8 bytes以下にします。
-空文面、残る前後空白、危険な制御文字、先頭 `/`・`!`、末尾の `@`・`$` 補完tokenは設定エラーです。
-設定を変更したらdaemonをreloadしてください。
 
 設定全体のスキーマは `vt config schema` で確認できます。
-
 設定を変更したら daemon を読み込み直します。
 
 ```bash
 vt daemon reload
 ```
+
+`statusline.summary.format` では `{badge}` と `{count}` の placeholder を使えます（`{badge}{count}`、`{badge}: {count}` など）。
+件数が 0 の状態も表示するため、summary の表示幅は安定します。Idle を表示したくない場合は `hide_idle: true` を指定します。
+summary を有効にしている場合は、カテゴリや window の表示が長いときも常に表示します。
+カテゴリの表示には、session があるすべてのカテゴリを、status の幅を超える場合も省略せずに表示します。
+
+`statusline.sessions.fixed_width: true` を指定すると、session の表示領域を最も広いカテゴリに合わせ、session を切り替えてもカテゴリ、session、window を合わせた領域の幅を一定に保ちます。
+デフォルトは左寄せで、中央寄せにする場合は `fixed_width_alignment: center` を指定します。
+session の `current` と `other` の format で表示幅が異なる場合は、数セルの差が生じることがあります。
+
+`sidebar.task_summary.enabled` を有効にすると、エージェントの行に現在の task の短い要約を表示します。
+daemon はエージェントに対応する CLI（Codex は `codex exec`、Claude は `claude -p`）で要約を非同期に生成し、別の provider へ切り替えることはありません。
+要約のために、上限付きで可能な範囲の秘匿処理をした prompt を追加の model request として送信します。これを許容できない場合は無効のままにしてください。
+model 名は任意で、指定しない場合はインストール済み CLI のデフォルトを使います。
+要約は現在のエージェントの直近4件の prompt に追従し、新しい要約の生成待ちや生成失敗の間は古い要約を表示しません。
+`vt agent get --json` は `task_summary_status`（`current` または `failed`）と、失敗時の `task_summary_error` を返します。
+
+### Codex の容量エラー
+
+vde-tmux は、`--no-daemon` で起動した Codex CLI 0.160.0 の turn が `Selected model is at capacity. Please try a different model.` で失敗したとき、作業の再開を依頼できます。
+容量エラーは設定に関係なく Error / Unresolved として記録し、Done には数えません。
+自動再開は初期状態で無効です。次のように有効にします。
+
+```yaml
+codex:
+  capacity_auto_resume:
+    enabled: true
+    # prompt を省略すると英語のデフォルト文面を使います。UTF-8 で変更できます。
+    prompt: |-
+      Resume only unfinished work after checking the current state. Preserve the original objective, scope, constraints, approvals, and response language. Do not repeat completed operations. This message is not a new approval.
+```
+
+同じ model に対して、60、120、300秒後（0〜20% の揺らぎを加える）に、一連の失敗につき最大3回まで再開を依頼します。
+model の変更や新たな承認は行いません。
+
+再開の依頼を送るのは、pane が同じ失敗した turn を表示したまま入力欄が空で、失敗後に何も変化していない場合だけです。queued input、画像、dialog、Question 通知、copy mode、その pane での操作のいずれかがあれば送りません。
+手動の prompt、session やプロセスの変更、正常な完了、別のエラーで一連の再開は終了します。
+再開の対象になるのは、現在の daemon が動いている間に人が送った prompt だけです。
+他の Codex バージョン、狭い pane、変化した画面でも失敗は記録しますが、再開はしません。
+待機中の再開は daemon の再起動で破棄します。
+再開の依頼が届いたか確認できない場合は、Codex のプロセスまたは pane が置き換わるまで、daemon を再起動しても送信を止めたままにします。
+
+標準の Codex では、入力欄の確認と送信を一度に行えません。最後の確認から貼り付けまでの間に、手入力や承認画面が割り込む可能性は残ります。
+この制約を許容できる場合に有効にしてください。
+
+`vt daemon diagnostics --json` の `codex_capacity_auto_resume` で、試行回数、次回の再開予定、停止理由を確認できます。prompt の本文は含みません。
+独自の prompt には LF を含められ、末尾の LF を除いて 65,536 UTF-8 bytes 以下にします。
+空の文面、前後の空白、危険な制御文字、先頭の `/`・`!`、末尾の `@`・`$` の補完 token があると、daemon は起動や reload を拒否します。
 
 ## 通知
 
@@ -563,6 +509,37 @@ notify:
 ```
 
 通知コマンドには `VDE_PANE_ID`、`VDE_AGENT`、`VDE_BADGE_STATE` が渡されます。
+実行待ちの通知は、実行直前に Blocked が解消済みであれば実行しません。
+
+## エージェント向け JSON API
+
+エージェントは tmux をポーリングせずに、pane や他のエージェントの状態を確認し、完了を待てます。
+
+```bash
+vt api schema --json
+vt api snapshot --json
+vt agent list --status working --json
+vt agent wait %456 --until done,blocked,limited --json
+vt pane read %456 --source latest --lines 120 --json
+
+AGENT_REF="$(vt agent get %456 --json | jq -r '.result.agent.summary.agent_ref')"
+REQUEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vt-request.XXXXXX")"
+printf '%s' '現在の差分をレビューしてください。' >"$REQUEST_DIR/prompt.txt"
+PROMPT_JSON="$(vt agent request "$AGENT_REF" \
+  --state-file "$REQUEST_DIR/request.json" \
+  --prompt-file "$REQUEST_DIR/prompt.txt" --json)"
+RUN_REF="$(printf '%s' "$PROMPT_JSON" | jq -r '.result.run_ref')"
+vt agent run wait "$RUN_REF" --json
+vt agent run response "$RUN_REF" --json
+```
+
+- `vt api snapshot --json` は、pane、エージェント、daemon の診断情報を一貫した一つの revision で返します。`tmux list-panes`、`vt pane list`、`vt agent list` を組み合わせるより、こちらを使ってください。
+- `vt agent request` は、Codex のエージェントへ prompt を確実に送ります。進行状況は `--state-file` に指定したファイルへ保存します。応答を受け取れなかった場合は、同じ対象と state file で prompt の本文を付けずに再実行すると、再送せずに続きから確認できます。新しい prompt ごとに新しい state file の path を使ってください。prompt の本文が argv に現れることはありません。
+- `--no-daemon` で起動した直後の Codex session は、Unknown と表示されている間でも最初の `agent request` を受け付けます。
+- `agent send`（idle または done のエージェント）、`agent steer`（作業中のエージェント）、`agent send-keys`（Blocked のエージェント）で、保護された端末入力を送れます。`pane split` と `agent start` で pane の作成とエージェントの起動ができます。
+- 変更操作には exact な参照が必要です。`agent_ref` は、PID と起動時刻で生きているエージェントのプロセスを一つに特定できる間だけ発行されます。
+
+完全な仕様は [Agent JSON API](./AGENT_API.md) を参照してください。
 
 ## その他のエージェントを接続する
 
@@ -579,6 +556,7 @@ vt hook emit \
 ```
 
 `--status` は `running`、`waiting`、`idle`、`error` を受け取ります。
+`--prompt` は表示用の情報としてプロセスの argv に渡るため、秘密情報には使わないでください。
 入力待ちを送る場合は理由も指定します。
 
 ```bash
@@ -588,6 +566,8 @@ vt hook emit \
   --status waiting \
   --wait-reason permission_prompt
 ```
+
+利用上限に達したことは `--wait-reason usage_limit` で送れます。
 
 ## daemon の操作
 
@@ -607,17 +587,12 @@ vt hook emit \
 
 ### pane state の永続化
 
-daemon は tmux server incarnation ごとに一つの private な full-state snapshot を
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v10.json` へ保存します。
-daemon 再起動後も、pane ID と PID が一致する pane の prompt、task の進捗と項目、subagent、worktree activity、lifecycle、時刻、agent identity、Unread Spanのpin、Done と確認済み状態を復元します。
+daemon は、prompt、task、subagent、状態遷移、要約、既読状態などの pane の詳細を、tmux server ごとに `$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v10.json` へ保存します。
+daemon の再起動後は、pane ID と PID が一致する pane についてこれらを復元します。
+すでに動いていない tmux server のファイルは自動では削除しません。
 
-snapshot が破損している、または権限が安全でない場合、daemon は修復や fallback を行わず起動を停止します。
-`vt daemon status` の `last_transition_error` に snapshot path が表示されます。
-その tmux server の保存済み pane state をすべてリセットする場合に限り、表示された file を削除してから `vt daemon ensure` を実行してください。
-
-productionの起動処理は、古いpane-state schemaのsnapshotを移行しません。
-別途ワンショット移行を行わない場合、schema更新後にpane詳細はリセットされます。
-別のtmux server incarnationのsnapshotは自動削除しません。
+ファイルが破損している、または権限が安全でない場合、daemon は起動せず、`vt daemon status` の `last_transition_error` にファイルの path を表示します。
+その tmux server の保存済み pane state をすべてリセットする場合に限り、そのファイルを削除してから `vt daemon ensure` を実行してください。
 
 ## アップグレード
 
@@ -631,17 +606,20 @@ vt daemon ensure
 ```
 
 古い daemon が動いたままバイナリを差し替えた場合は、`vt daemon stop --force` で停止できます。
+pane state の schema が変わるアップグレードでは、保存済みの pane の詳細は移行されずにリセットされます。
 
 ## トラブルシュート
 
 ### status line またはサイドバーが更新されない
 
-daemon の状態を確認し、設定を変更した直後であれば読み込み直します。
+daemon の状態を確認します。設定を変更した場合は読み込み直します。`reload` は設定を検証し、エラーがあれば表示します。
 
 ```bash
 vt daemon status
 vt daemon reload
 ```
+
+通知、status の更新、hook の配送のエラーは `$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/daemon.log` に記録されます。
 
 ### tmux の設定を読み込むと hook が壊れる
 
@@ -654,26 +632,11 @@ set-hook -g client-session-changed[0] 'your-command'
 
 index を付けない `set-hook` は既存の hook 配列を置き換えます。
 
-### 設定エラーを確認する
-
-```bash
-vt daemon reload
-vt daemon status
-```
-
-tmux server incarnation ごとの運用 log は
-`$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/daemon.log` 一つです。
-notification、status push、hook delivery の error は、この file 内でそれぞれ異なる prefix を使います。
-サイドバーの並び順、category scope、presentation、filter、行の展開状態は、tmux socketごとに分離された
-`$XDG_STATE_HOME/vde/tmux/sidebar-state/` 配下の一つのファイルへatomicに保存されます。
-同じtmux serverのサイドバー間では保存対象の値と選択、スクロールが即時共有されます。
-選択とスクロールは daemon の稼働中だけ共有され、保存はされません。
-具体的なCurrent categoryとreturn targetはinstance localのまま保存されません。
-
 ## 既知の制約
 
 - hook がない場合、入力待ちの判定は pane に表示された内容から推測できる範囲に限られる
 - daemon が停止すると最後に描画した status option が残り、次の hook event または `vt daemon ensure` まで更新されない
+- path に空白を含む Codex の実行ファイルやスクリプトは識別できない場合があり、そのときは hook の所有者が未検証として報告される
 
 ## License
 

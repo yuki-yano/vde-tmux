@@ -1,216 +1,9 @@
 # Releasing
 
-Publishing is driven by Git tags.
+Publishing to crates.io is driven by Git tags.
+A local binary upgrade without publishing is described in [Local binary upgrade](#local-binary-upgrade).
 
-## Local API v6 upgrade
-
-API 6 / daemon protocol 31 persists ID-matched acknowledgement for accepted async-question replies.
-Hook metadata contains only bounded reply-ID hashes. Per-issuance partial answers and call-ID
-tombstones survive restart. Answered notices clear independently of older unanswered notices;
-the acknowledged-order watermark still advances only over a contiguous answered prefix.
-The reply worker checks the exact process/session owner once and rechecks the canonical binding
-before saving. It does not require startup trust, capture/Idle or a home-wide loss journal.
-Pre-upgrade notices without issued-ID metadata remain available for manual Q.
-Question sidecar schema 1 is unchanged.
-Protocol 29 added late durable prompt confirmation and revision-guarded
-`agent operation abandon`. The 10-second deadline reports delivery uncertainty; matching later
-Run evidence can still confirm the Operation. Abandonment preserves ambiguity while releasing its
-dispatch fence. Dispatched-input classification and prompt redaction survive fence release.
-Protocol 28 added ephemeral Codex Working/Blocked/Unknown presentation and
-rejects lifecycle hooks whose process ancestry does not belong to the claimed embedded pane.
-Protocol 28 carries bounded question fingerprints from hook parsing. They are kept only in daemon
-memory, bound to owner/session/notice order, and match title plus ordered choices in the current
-question editor as a retaining veto. Missing fingerprints retain notices. The issuing-turn,
-ordinary-input, two-capture and final-guard requirements for automatic acknowledgement remain.
-Codex 0.159.3 and 0.160.0 are additional exact rendering profiles; unknown versions remain conservative.
-`needs_action` now includes current Blocked panes and unacknowledged question notices; the
-statusline's existing Blocked triage remains separate. PaneState schema 10 and private state
-format 1 are unchanged. Keep existing state, Runs, and the question-notice sidecar (schema 1).
-Protocol 27 additionally carries finite presentation explanations, including evidence expiry.
-Agent API 6 adds `presentation` to summaries without changing existing fields. Startup trust/update
-screen detection is presentation-only. Canonical notification jobs are checked against their
-Blocked occurrence when accepted for execution; their generation is runtime-only. State changes
-after validation cannot retract the accepted notification.
-Ordinary-resolver trust is runtime-only. Exact issued-ID bindings, partial answers and call-ID
-tombstones persist across restart; pre-upgrade notices without IDs remain available for Q.
-Existing Idle readiness is recovered from the exact live rollout writer and bounded structural
-history, without synthesizing startup trust or Run completion. A local install does not require a crate
-version bump or a release tag.
-
-1. Pass formatting, Clippy, tests, and the checks applicable to the change under `AGENTS.md`.
-   Reuse successful results for unchanged code. A local binary replacement does not by itself
-   require the extended runtime smoke, UI/UX preflight, kill-server test, or long question load test;
-   the full release preflight below remains required before publishing.
-   Run `python3 scripts/test-question-notice-isolated.py` after changes to the question hook/API/Q path.
-   Add `--extended` when changing ordinary-prompt auto-ack scheduling, capture admission, status
-   delivery performance, or their resource limits, or when investigating an unresolved concern in
-   those paths. Do not add it solely for reply-ID parsing, reply-worker changes, documentation, or installation.
-   Its performance gate is the observed condition-wise p95 increase of at most 50ms, zero normal
-   capture failures, at most 20MiB RSS growth, and retained notices on probe drop. Reuse accepted
-   evidence for unchanged product code; distinguish saved-data re-evaluation from a new run.
-   Run `python3 scripts/test-question-notice-isolated.py --reply-load-only` when changing reply-worker
-   admission, queueing, execution budgets, retries, journal waits, or shared mutation/IO scheduling.
-   It exercises
-   valid ID-matched reply workers with 58 panes, two clients and three concurrent producers
-   (two ABBA cycles, 200 status samples per condition). This targeted pressure check does not
-   replace an applicable extended question gate. Select each load test by the affected path rather
-   than running both for every question change. It checks acknowledgement during active load, bounded
-   RSS growth, zero normal capture failures and status p95 within a 2s/1.5x budget.
-   Every submitted reply must settle before manual Q (accepted frames and acknowledged notice
-   orders equal submitted cycles, including combined prefix advancement), with no terminal reply/journal failure;
-   per-phase counters and retention reasons are saved as evidence.
-2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
-   Confirm `vt api schema --json` reports API 6, protocol 31, PaneState 10, and private state 1.
-   Validate the staged binaries on a scratch server before replacing the installed generation:
-   `VDE_VT_BIN=<temporary-root>/bin/vt python3 scripts/test-codex-observation-isolated.py`.
-3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.
-   Record sidebar windows, widths, active panes, client focus, installed paths, and executable hashes.
-4. Close running sidebars using the installed client, then run its `vt daemon disable` so hooks
-   cannot restart the old daemon during replacement. Back up both executables and the stopped
-   server's state directory outside daemon-managed storage.
-5. Replace both executables from the staged root, verify hashes and schema, then run
-   `vt daemon enable`. Require `Serving / Healthy / Ready`, no transition error, and healthy
-   Agent storage. Restore the recorded sidebar widths and focus using the new client; set
-   `TMUX_PANE` to each window's recorded content pane when reopening its sidebar.
-6. Verify each sidebar is alive and uses the installed executable, the private-state generation
-   and retained Runs are preserved, and live Codex panes expose healthy `question_notice` summaries.
-   Existing stock PostToolUse hooks must include `request_user_input_async`; Embedded mode is
-   required. See [question notice behavior](README.md#codex-question-notices).
-7. After upgrading, inspect any old `delivery_unknown` Operations and their provider queues before
-   using [manual abandonment](AGENT_API.md#delayed-prompt-confirmation-and-manual-fence-release).
-   Previously stored unlinked Runs cannot be matched retrospectively. `in_flight_operations` counts
-   only Prepared/DispatchStarted Operations, so old ambiguity does not itself block the cutover.
-   Do not abandon or resend automatically during installation. Rolling back to the old binary
-   restores the dispatch fence of operator-abandoned Operations; it lacks the abandonment semantics.
-
-Never reset state or restart the tmux server as a protocol recovery shortcut. If replacement
-fails, leave the daemon disabled until both executables and their hashes are coherent.
-
-## Historical API v4 upgrade
-
-API v4 replaces public API 3 with provider capabilities, guarded terminal mutations, exact pane
-split, agent start, and Repository Category membership. Daemon protocol 23 carries persisted
-Category mutation receipts in addition to editprompt logical focus, the Limited display state,
-client-scoped sidebar peek navigation, current-context task-summary outcomes, and transient
-task-summary loading state and private task-context fingerprints. Private summary inputs remain
-in daemon memory; only the fingerprint and generated summary are persisted. PaneState
-10 replaces PaneState 9 so task-summary context can follow same-turn prompt updates; the v9 file is
-left untouched and v10 starts empty. Private state format 1 does not change. Public API 3 is not
-retained in parallel.
-
-Before replacement, pass the release gates listed below plus
-`scripts/test-category-api-isolated.sh`,
-`scripts/test-agent-api-v4-isolated.sh`, `scripts/test-agent-prompt-isolated.sh`, and
-`scripts/test-agent-operation-crash-isolated.sh`. Confirm `vt agent storage status --json` reports
-zero `in_flight_operations`. Stage both binaries with
-`cargo install --path . --locked --root <temporary-root>` and verify the staged schema reports API
-4, protocol 23, PaneState 10, and private state 1.
-
-Close running sidebars and run `vt daemon disable` before copying either executable so hooks cannot
-restart a mixed binary generation during replacement. Back up both installed executables, replace
-them from the staged root, verify their SHA-256 hashes, then run `vt daemon enable`. Reopen sidebars
-and verify the installed schema, daemon health, hook ownership, one guarded copy-mode send on a
-scratch server, Category list/get/assign/automatic, a same-turn Codex steer, and a SessionStart-free
-first Codex prompt. Do not reset
-private Agent state or delete the untouched PaneState v9 snapshot for this upgrade. On a failed copy
-or version check, keep the daemon disabled and restore both
-executables from the same backup before re-enabling it.
-
-## Historical initial API v3 cutover
-
-The first API v3 cutover is a coordinated restart, not an in-place binary replacement. It changes
-the public Agent API from 2 to 3, daemon protocol from 14 to 15, PaneState schema from 8 to 9, and
-introduces private state format 1. No runtime compatibility path or PaneState v8 migration exists.
-The v8 file is left untouched, while the v9 PaneState and private state start empty.
-
-Before touching the installed binary:
-
-1. Pass `cargo fmt --check`, Clippy with warnings denied, all normal and ignored tests, the three
-   release smoke scripts, `scripts/test-agent-prompt-isolated.sh`, and
-   `scripts/test-agent-operation-crash-isolated.sh`.
-2. Stage `cargo install --path . --locked --root <temporary-root>` and verify the staged `vt`
-   reports API 3, protocol 15, PaneState 9, and private state 1 from `vt api schema --json`. Record
-   both staged executable hashes; these are the exact cutover candidates.
-3. Stop new dispatches and waits. End supported-provider sessions from the old generation after
-   confirming that no active execution, unresolved result, or delivery outcome still matters.
-4. Close every running sidebar. An old sidebar client cannot reconnect across the protocol change.
-5. Record the installed binary paths and hashes. Back up both installed executables outside the
-   daemon-managed directories. Back up the state root only after the daemon is disabled below.
-
-Run the cutover in this order, using the currently installed v14 client for the first command:
-
-```sh
-INSTALLED_VT="$(command -v vt)"
-INSTALLED_VDE_TMUX="$(command -v vde-tmux)"
-CUTOVER_BACKUP="$(mktemp -d "${TMPDIR:-/tmp}/vde-tmux-v14-backup.XXXXXX")"
-STAGED_ROOT="<temporary-root-used-by-the-passed-staged-install>"
-CANDIDATE_VT="$STAGED_ROOT/bin/vt"
-CANDIDATE_VDE_TMUX="$STAGED_ROOT/bin/vde-tmux"
-STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/vde-tmux"
-CANDIDATE_VT_SHA="$(shasum -a 256 "$CANDIDATE_VT" | awk '{print $1}')"
-CANDIDATE_VDE_TMUX_SHA="$(shasum -a 256 "$CANDIDATE_VDE_TMUX" | awk '{print $1}')"
-
-install -m 0755 "$INSTALLED_VT" "$CUTOVER_BACKUP/vt"
-install -m 0755 "$INSTALLED_VDE_TMUX" "$CUTOVER_BACKUP/vde-tmux"
-shasum -a 256 "$INSTALLED_VT" "$INSTALLED_VDE_TMUX"
-shasum -a 256 "$CANDIDATE_VT" "$CANDIDATE_VDE_TMUX"
-printf 'rollback backup: %s\n' "$CUTOVER_BACKUP"
-
-tmux list-panes -a -F '#{window_id} #{@vde_sidebar}' \
-  | awk '$2 == "1" { print $1 }' \
-  | sort -u \
-  | while IFS= read -r window_id; do
-      vt sidebar close --window "$window_id"
-    done
-
-vt daemon disable
-if [ -d "$STATE_ROOT" ]; then
-  cp -R "$STATE_ROOT" "$CUTOVER_BACKUP/state"
-fi
-
-install -m 0755 "$CANDIDATE_VT" "$INSTALLED_VT"
-install -m 0755 "$CANDIDATE_VDE_TMUX" "$INSTALLED_VDE_TMUX"
-test "$(shasum -a 256 "$INSTALLED_VT" | awk '{print $1}')" = "$CANDIDATE_VT_SHA"
-test "$(shasum -a 256 "$INSTALLED_VDE_TMUX" | awk '{print $1}')" = "$CANDIDATE_VDE_TMUX_SHA"
-
-vt daemon enable
-vt daemon status
-vt api schema --json | jq -e '
-  .meta.api_version == 3 and
-  .result.contract.versions == {
-    public_agent_api: 3,
-    daemon_protocol: 15,
-    pane_state_schema: 9,
-    private_state_format: 1
-  }'
-vt agent storage status --json
-```
-
-`vt daemon disable` removes the owned hooks, records disabled mode, and stops the old daemon before
-either executable is replaced. This closes the window where a focus or provider hook could restart
-the v14 daemon during installation. If an executable copy or hash comparison fails, leave the
-server disabled, restore both executables from `CUTOVER_BACKUP`, verify their hashes, and run the
-restored `vt daemon enable`. If the binary was replaced before disabled mode was recorded, the new
-`vt daemon disable` revalidates and force-stops the incompatible recorded daemon. Do not restart the
-tmux server as a protocol recovery shortcut.
-
-After the version checks pass, reopen sidebars and restart Claude Code and Codex sessions so their
-SessionStart hooks are observed by the new generation. Verify one guarded Codex prompt, operation
-resume across daemon restart, run completion, response artifact read, and current-run recovery on
-the real server. Keep the dotfiles bridge on its raw transport until every API v3 rollout DoD item
-is complete; Claude Code durable mutation remains disabled.
-
-For rollback, first stop new dispatches and waits, run `vt daemon disable` with the v15 binary,
-restore both recorded v14 executables from the external backup, verify their hashes, and run the
-restored `vt daemon enable`. Restore the offline state backup only when rollback requires the exact
-pre-cutover state; the untouched PaneState v8 file is otherwise authoritative again. Trigger
-rollback on protocol/version mismatch, daemon health failure, duplicate dispatch, failed restart
-resume, failed response read, or an unrecoverable private-state startup error. Do not copy
-v9/private-state records into the v8 state root.
-
-For the first release that switches pane persistence to the private full-state snapshot, perform
-the upgrade only while every agent is Idle and no Done or Blocked state must be retained. Pane
-state from the former tmux-option storage is not migrated.
+## Release
 
 1. Bump `version` in `Cargo.toml` and `Cargo.lock`.
 2. Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, `cargo test --locked --test tmux_redraw_probe tmux_expands_dynamic_pane_elapsed_with_the_former_boundaries -- --ignored --exact`, and `cargo publish --dry-run --locked`.
@@ -237,3 +30,62 @@ crates.io Trusted Publishing must be configured once for:
 - repository: `vde-tmux`
 - workflow: `publish.yml`
 - environment: `crates-io`
+
+## Local binary upgrade
+
+A local install replaces the installed `vt` and `vde-tmux` executables without a crate version
+bump or a release tag. The current generation is Agent API 6, daemon protocol 31, PaneState schema
+10, private state format 1, and Question sidecar schema 1. CLI, daemon, and sidebars must run the
+same generation. Keep the existing pane state, Runs, and question-notice sidecar.
+
+1. Pass formatting, Clippy, tests, and the checks applicable to the change under `AGENTS.md`.
+   Reuse successful results for unchanged code. A local binary replacement does not by itself
+   require the extended runtime smoke, UI/UX preflight, kill-server test, or a long question load
+   test; the full release preflight above remains required before publishing.
+   For question-notice changes, select the checks by the affected path:
+   - Run `python3 scripts/test-question-notice-isolated.py` after changes to the question
+     hook/API/Q path.
+   - Add `--extended` when changing ordinary-prompt auto-ack scheduling, capture admission, status
+     delivery performance, or their resource limits, or when investigating an unresolved concern
+     in those paths. Do not add it solely for reply-ID parsing, reply-worker changes,
+     documentation, or installation. Its gate is a condition-wise p95 increase of at most 50ms,
+     zero normal capture failures, at most 20MiB RSS growth, and retained notices on probe drop.
+   - Run `python3 scripts/test-question-notice-isolated.py --reply-load-only` when changing
+     reply-worker admission, queueing, execution budgets, retries, journal waits, or shared
+     mutation/IO scheduling. It runs valid ID-matched reply workers with 58 panes, two clients,
+     and three concurrent producers (two ABBA cycles, 200 status samples per condition). Its gate
+     is acknowledgement during active load, bounded RSS growth, zero normal capture failures,
+     status p95 within a 2s/1.5x budget, and no terminal reply/journal failure. Every submitted
+     reply must settle before manual Q: accepted frames and acknowledged notice orders equal the
+     submitted cycles, including combined prefix advancement. Per-phase counters and retention
+     reasons are saved as evidence. This check does not replace an applicable `--extended` run.
+   - Do not run both load tests for every question change. Reuse accepted evidence for unchanged
+     product code, and distinguish a re-evaluation of saved data from a new run.
+2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
+   Confirm `vt api schema --json` reports API 6, protocol 31, PaneState 10, and private state 1.
+   Validate the staged binaries on a scratch server before replacing the installed generation:
+   `VDE_VT_BIN=<temporary-root>/bin/vt python3 scripts/test-codex-observation-isolated.py`.
+3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.
+   Record sidebar windows, widths, active panes, client focus, installed paths, and executable hashes.
+4. Close running sidebars using the installed client, then run its `vt daemon disable` so hooks
+   cannot restart the old daemon during replacement. Back up both executables and the stopped
+   server's state directory outside daemon-managed storage.
+5. Replace both executables from the staged root, verify hashes and schema, then run
+   `vt daemon enable`. Require `Serving / Healthy / Ready`, no transition error, and healthy
+   Agent storage. Restore the recorded sidebar widths and focus using the new client; set
+   `TMUX_PANE` to each window's recorded content pane when reopening its sidebar.
+6. Verify each sidebar is alive and uses the installed executable, the private-state generation
+   and retained Runs are preserved, and live Codex panes expose healthy `question_notice` summaries.
+   Existing stock PostToolUse hooks must include `request_user_input_async`; Embedded mode is
+   required. See [Codex question notices](README.md#codex-question-notices).
+7. `in_flight_operations` counts only Prepared/DispatchStarted Operations, so an existing
+   `delivery_unknown` Operation does not block the replacement. Inspect such Operations and their
+   provider queues before using
+   [manual abandonment](AGENT_API.md#delayed-prompt-confirmation-and-manual-fence-release);
+   do not abandon or resend automatically during installation. Unlinked Runs stored by daemon
+   protocols before 29 have no prompt digest and cannot be matched retrospectively. Rolling back
+   to a binary before protocol 29 restores the dispatch fence of operator-abandoned Operations.
+
+Never reset state or restart the tmux server as a protocol recovery shortcut. If replacement
+fails, leave the daemon disabled until both executables and their hashes are coherent, for
+example by restoring both from the same backup.

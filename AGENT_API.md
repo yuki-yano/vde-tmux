@@ -1,8 +1,10 @@
 # Agent JSON API
 
-This document defines the current API v6 contract (daemon protocol 31, Pane State schema 10). The inherited v4 mutation boundary and rollout gates are
-maintained in [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is
-recorded in [AGENT_API_V3.md](AGENT_API_V3.md).
+This document defines the current API v6 contract (daemon protocol 31, Pane State schema 10,
+Question sidecar schema 1). CLI, daemon, and sidebars must be installed together; there is no
+mixed-version fallback. The inherited v4 mutation boundary and rollout gates are maintained in
+[AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is recorded in
+[AGENT_API_V3.md](AGENT_API_V3.md).
 
 `vt` exposes a versioned JSON interface for terminal agents. The command tree is the public API.
 Read-only topology and state commands coexist with exact-reference mutations for durable prompt
@@ -77,71 +79,7 @@ is the caller-chosen intent handle, while vt exclusively owns its opaque content
 After dispatch, use the returned Operation, Run, or terminal-send receipt instead of prompt-file
 metadata as the acceptance signal.
 
-### Delayed prompt confirmation and manual fence release
-
-A durable Operation becomes `delivery_unknown` after its 10-second confirmation deadline. That
-deadline reports uncertainty; matching evidence remains valid afterward. The first
-`UserPromptSubmit` with the expected Binding, run sequence, and prompt digest links the Run and
-confirms the Operation even after a long queue or compaction delay. Its Response Artifact carries
-the same `operation_id`. Late confirmation uses `confirmation_basis=binding_sequence_digest`;
-`source_attribution=non_exclusive` still applies because hooks do not identify the sending Operation.
-
-```bash
-vt agent operation wait "$OPERATION_REF" --follow-unknown --timeout-ms 300000 --json
-```
-
-The caller's wait deadline does not cancel delivery or prevent later confirmation. Inspect the same
-Operation again after a timeout. Do not resend while delivery is ambiguous. Idle, an unrelated Run,
-or its completion alone cannot prove that a queued prompt will never run, so they do not release
-the fence automatically.
-
-If inspection cannot establish a matching Run, an operator can explicitly release the dispatch
-fence. Inspect the provider's pending input and confirm its queue is empty before sending new work.
-Read the current Operation revision and document the inspection reason:
-
-```bash
-vt agent operation get "$OPERATION_REF" --json > operation.json
-REVISION="$(jq -r '.result.operation.revision' operation.json)"
-vt agent operation abandon "$OPERATION_REF" --expected-revision "$REVISION" \
-  --reason 'Inspected the completed Run and queued input' --json
-```
-
-`abandon` accepts only an unlinked `delivery_unknown` Operation. It checks the exact reference,
-generation, and revision, persists `result_receipt.code=operator_abandoned` with
-`source_attribution=operator:REASON`, and releases only that Operation's fence. Reasons must contain
-1–247 UTF-8 bytes, must not be blank, and must contain no control characters. Repeating the original
-revision and reason returns the same record; changed revisions or reasons are rejected.
-If a Run was already saved with that `operation_id` but confirmation failed before updating the
-Operation, abandonment is rejected. Retry the provider observation or restart the daemon to finish
-that confirmation; the persisted Run link is authoritative.
-
-Delivery remains `delivery_unknown`: abandonment neither confirms acceptance nor cancels queued
-input. It permits a new dispatch but can lead to duplicate work if the old prompt is still queued.
-If the old queued prompt A and new Operation B have identical digests, A's Run can confirm B:
-the hook cannot distinguish the sender, and B's own execution may remain unlinked. If their digests
-differ, A can consume B's expected run sequence; B's later Run then remains unlinked and B may also
-require manual abandonment. An idle display alone does not establish that the provider queue is empty.
-The abandoned Operation is never redispatched or automatically linked to a later Run, and its fence
-stays released after daemon restart. `operation wait --follow-unknown` ends on abandonment with a
-`delivery_unknown` error, `side_effect=possible`, and the `operator_abandoned` receipt.
-
-Retained dispatched Operations provide digest/Binding evidence for prompt redaction and automatic
-input classification even after abandonment or an interleaved Run. This evidence never links an
-abandoned Operation or releases a newer fence. It contains no prompt body and is rebuilt on restart.
-Because hooks do not identify input provenance, a later identical prompt from the same owner is
-conservatively kept private; matching automatic-resume text remains non-authoritative for Question
-acknowledgement and does not replace the task context. This classification lasts while the Operation
-is retained and its Binding matches; process/pane replacement is excluded.
-Operations have no automatic garbage collection; they persist until an explicit storage reset
-and are bounded by the 65,536-record limit. Classification is therefore effective for the matching
-owner's lifetime. If automatic-resume text is configured to a short phrase such as `continue`, a
-human later typing the same phrase also receives this conservative classification: it cannot
-acknowledge a Question, replace the task context, or appear in the public prompt preview.
-
-Already stored unlinked Runs from the old implementation do not retain prompt digests, so they
-cannot be matched retrospectively. Inspect them and abandon the stale Operation if appropriate.
-This addition retains API 6 and the private record format; CLI, daemon, and sidebars must use
-daemon protocol 31 together.
+## Response envelope
 
 API commands always emit JSON. `--json` is accepted so callers can state the expected format. A
 successful command writes one envelope to stdout. A failed command writes one error envelope to
@@ -184,62 +122,6 @@ one logical intent; it does not expose the input source or state contents. Repea
 The prompt deadline covers the whole operation from daemon connection and preflight through digest
 confirmation; it does not start only after submission.
 
-## Repository category membership
-
-The Category Agent API exposes the ordered catalog and repository membership without exposing
-catalog mutation or manual ordering:
-
-```bash
-vt category list --json
-vt category get --repo /absolute/project/path --json
-vt category assign work --repo /absolute/project/path --json
-vt category automatic --repo /absolute/project/path --json
-```
-
-`list` returns one-based `index`, `name`, `display_name`, the closed `source` enum
-(`configured`, `dynamic`, or `system`), and `category_state_revision`. `get` returns the canonical
-repository `key`, rule path, display name, effective category, and `explicit`. A Git main worktree
-and linked worktrees that share the same common directory return the same repository key.
-
-JSON `list` and `get` require an already-Serving daemon and never start it. All four commands
-require the strictly loaded disk config to match the daemon's active config hash; a mismatch is
-`stale_precondition` with reload guidance. A missing or non-directory path is `invalid_target`, and
-failure to establish its canonical Git or path identity is `identity_verification_failed`.
-
-`assign` sets an explicit membership in an existing category. `automatic` removes that override so
-config rules, the configured default, and finally `Uncategorized` determine the effective
-category. Both mutations ensure the daemon and return a `category_mutation` receipt containing
-`accepted_seq`, canonical `repo`, typed `requested`, effective `before` and `after`, `changed`, and
-the persisted `category_state_revision`. Reapplying the current explicit category or automatic
-state succeeds with `changed: false` and does not advance the Category state revision.
-`meta.snapshot_revision` is the daemon revision carried by the same mutation result.
-
-An unknown category is `daemon_invalid_request` with `side_effect: none`. If the complete mutation
-request was sent but its receipt could not be read, the result is `delivery_unknown` at
-`after_dispatch`, with `side_effect: possible` and `retry_action: inspect_manually`. Do not resend
-automatically. Run `category get` once to inspect current membership, while retaining that the
-original receipt was not recovered.
-
-Category creation, rename, deletion, catalog/repository ordering, category navigation, session
-switching, and pane Agent operations are outside this API boundary. They do not gain JSON behavior
-through the Category commands above.
-
-`agent steer` accepts only an exact Codex or Claude occupant whose initial canonical status is
-`working`. It uses the same guarded copy-mode exit, pane/process identity, and foreground input-owner
-fences as `agent send`. It does not wait for provider hooks or prove active-turn attribution. Its
-receipt therefore reports `dispatch=guarded_terminal_best_effort` and
-`race_policy=may_start_next_turn`: a completion racing with input may make the text the next turn.
-Success means tmux applied the input, not that the provider accepted it or interrupted the current
-turn. `opencode` advertises `steer=disabled` until its behavior is verified.
-
-Claude reads pasted image paths asynchronously and discards an Enter that arrives meanwhile. For a
-Claude `agent send` or `agent steer` whose prompt has a line, or text after a space before an
-absolute path, ending in `.png`, `.jpg`, `.jpeg`, `.gif`, or `.webp`, vt pastes first, waits up to
-10 seconds for Claude's input field to change and leave its `Pasting…` state, and then sends Enter
-under the same guards. If the input does not settle or the Enter guard fails, the prompt remains
-pasted without Enter and the command fails with `delivery_unknown`; inspect the pane instead of
-resending.
-
 ## Agent state
 
 The public `status` describes durable agent activity and is independent of the sidebar's unread UI
@@ -255,8 +137,7 @@ projection:
 
 `badge` contains the current sidebar badge. A read completion therefore has `status: done`,
 `badge: idle`, and `unread: false`. A limited agent has `status: limited`, `badge: limited`, and
-`needs_action: false` unless it also has an unacknowledged question notice. In API v5,
-`needs_action` is the union of current Blocked panes and unacknowledged question-notice panes.
+`needs_action: false` unless it also has an unacknowledged question notice. `needs_action` is the union of current Blocked panes and unacknowledged question-notice panes.
 It excludes the two-poll visual TRIAGE retention after Blocked clears and does not disappear
 merely because a pane is visible. Badge totals remain mutually exclusive; notices are not an
 additional execution status.
@@ -487,6 +368,85 @@ response preview. The full response body remains available solely through the ex
 `agent run response` read. A prompt linked to guarded dispatch is omitted from PaneState and every
 public snapshot; its private body contract is unchanged.
 
+### Delayed prompt confirmation and manual fence release
+
+A durable Operation becomes `delivery_unknown` after its 10-second confirmation deadline. That
+deadline reports uncertainty; matching evidence remains valid afterward. The first
+`UserPromptSubmit` with the expected Binding, run sequence, and prompt digest links the Run and
+confirms the Operation even after a long queue or compaction delay. Its Response Artifact carries
+the same `operation_id`. Late confirmation uses `confirmation_basis=binding_sequence_digest`;
+`source_attribution=non_exclusive` still applies because hooks do not identify the sending Operation.
+
+```bash
+vt agent operation wait "$OPERATION_REF" --follow-unknown --timeout-ms 300000 --json
+```
+
+The caller's wait deadline does not cancel delivery or prevent later confirmation. Inspect the same
+Operation again after a timeout. Do not resend while delivery is ambiguous. Idle, an unrelated Run,
+or its completion alone cannot prove that a queued prompt will never run, so they do not release
+the fence automatically.
+
+If inspection cannot establish a matching Run, an operator can explicitly release the dispatch
+fence. Inspect the provider's pending input and confirm its queue is empty before sending new work.
+Read the current Operation revision and document the inspection reason:
+
+```bash
+vt agent operation get "$OPERATION_REF" --json > operation.json
+REVISION="$(jq -r '.result.operation.revision' operation.json)"
+vt agent operation abandon "$OPERATION_REF" --expected-revision "$REVISION" \
+  --reason 'Inspected the completed Run and queued input' --json
+```
+
+`abandon` accepts only an unlinked `delivery_unknown` Operation. It checks the exact reference,
+generation, and revision, persists `result_receipt.code=operator_abandoned` with
+`source_attribution=operator:REASON`, and releases only that Operation's fence. Reasons must contain
+1–247 UTF-8 bytes, must not be blank, and must contain no control characters. Repeating the original
+revision and reason returns the same record; changed revisions or reasons are rejected.
+If a Run was already saved with that `operation_id` but confirmation failed before updating the
+Operation, abandonment is rejected. Retry the provider observation or restart the daemon to finish
+that confirmation; the persisted Run link is authoritative.
+
+Delivery remains `delivery_unknown`: abandonment neither confirms acceptance nor cancels queued
+input. It permits a new dispatch but can lead to duplicate work if the old prompt is still queued.
+If the old queued prompt A and new Operation B have identical digests, A's Run can confirm B:
+the hook cannot distinguish the sender, and B's own execution may remain unlinked. If their digests
+differ, A can consume B's expected run sequence; B's later Run then remains unlinked and B may also
+require manual abandonment. An idle display alone does not establish that the provider queue is empty.
+The abandoned Operation is never redispatched or automatically linked to a later Run, and its fence
+stays released after daemon restart. `operation wait --follow-unknown` ends on abandonment with a
+`delivery_unknown` error, `side_effect=possible`, and the `operator_abandoned` receipt.
+
+Retained dispatched Operations provide digest/Binding evidence for prompt redaction and automatic
+input classification even after abandonment or an interleaved Run. This evidence never links an
+abandoned Operation or releases a newer fence. It contains no prompt body and is rebuilt on restart.
+Because hooks do not identify input provenance, a later identical prompt from the same owner is
+conservatively kept private; matching automatic-resume text remains non-authoritative for Question
+acknowledgement and does not replace the task context. This classification lasts while the Operation
+is retained and its Binding matches; process/pane replacement is excluded.
+Operations have no automatic garbage collection; they persist until an explicit storage reset
+and are bounded by the 65,536-record limit. Classification is therefore effective for the matching
+owner's lifetime. If automatic-resume text is configured to a short phrase such as `continue`, a
+human later typing the same phrase also receives this conservative classification: it cannot
+acknowledge a Question, replace the task context, or appear in the public prompt preview.
+
+## Guarded terminal input
+
+`agent steer` accepts only an exact Codex or Claude occupant whose initial canonical status is
+`working`. It uses the same guarded copy-mode exit, pane/process identity, and foreground input-owner
+fences as `agent send`. It does not wait for provider hooks or prove active-turn attribution. Its
+receipt therefore reports `dispatch=guarded_terminal_best_effort` and
+`race_policy=may_start_next_turn`: a completion racing with input may make the text the next turn.
+Success means tmux applied the input, not that the provider accepted it or interrupted the current
+turn. `opencode` advertises `steer=disabled` until its behavior is verified.
+
+Claude reads pasted image paths asynchronously and discards an Enter that arrives meanwhile. For a
+Claude `agent send` or `agent steer` whose prompt has a line, or text after a space before an
+absolute path, ending in `.png`, `.jpg`, `.jpeg`, `.gif`, or `.webp`, vt pastes first, waits up to
+10 seconds for Claude's input field to change and leave its `Pasting…` state, and then sends Enter
+under the same guards. If the input does not settle or the Enter guard fails, the prompt remains
+pasted without Enter and the command fails with `delivery_unknown`; inspect the pane instead of
+resending.
+
 ## Storage status and offline reset
 
 `agent storage status` reports the private state generation, format version, bounded usage, and
@@ -550,6 +510,46 @@ daemon instance and canonical pane/agent identity are then checked again. A veri
 fails closed with `stale_reference`; a daemon restart or connection loss is reported as
 `stale_daemon`, `daemon_unavailable`, or `daemon_stream_error`, depending on when it occurs.
 
+## Repository category membership
+
+The Category Agent API exposes the ordered catalog and repository membership without exposing
+catalog mutation or manual ordering:
+
+```bash
+vt category list --json
+vt category get --repo /absolute/project/path --json
+vt category assign work --repo /absolute/project/path --json
+vt category automatic --repo /absolute/project/path --json
+```
+
+`list` returns one-based `index`, `name`, `display_name`, the closed `source` enum
+(`configured`, `dynamic`, or `system`), and `category_state_revision`. `get` returns the canonical
+repository `key`, rule path, display name, effective category, and `explicit`. A Git main worktree
+and linked worktrees that share the same common directory return the same repository key.
+
+JSON `list` and `get` require an already-Serving daemon and never start it. All four commands
+require the strictly loaded disk config to match the daemon's active config hash; a mismatch is
+`stale_precondition` with reload guidance. A missing or non-directory path is `invalid_target`, and
+failure to establish its canonical Git or path identity is `identity_verification_failed`.
+
+`assign` sets an explicit membership in an existing category. `automatic` removes that override so
+config rules, the configured default, and finally `Uncategorized` determine the effective
+category. Both mutations ensure the daemon and return a `category_mutation` receipt containing
+`accepted_seq`, canonical `repo`, typed `requested`, effective `before` and `after`, `changed`, and
+the persisted `category_state_revision`. Reapplying the current explicit category or automatic
+state succeeds with `changed: false` and does not advance the Category state revision.
+`meta.snapshot_revision` is the daemon revision carried by the same mutation result.
+
+An unknown category is `daemon_invalid_request` with `side_effect: none`. If the complete mutation
+request was sent but its receipt could not be read, the result is `delivery_unknown` at
+`after_dispatch`, with `side_effect: possible` and `retry_action: inspect_manually`. Do not resend
+automatically. Run `category get` once to inspect current membership, while retaining that the
+original receipt was not recovered.
+
+Category creation, rename, deletion, catalog/repository ordering, category navigation, session
+switching, and pane Agent operations are outside this API boundary. They do not gain JSON behavior
+through the Category commands above.
+
 ## Errors
 
 Every error contains a closed-enum `code`, human-readable `message`, `stage`, `side_effect`, and
@@ -568,8 +568,9 @@ Every error contains a closed-enum `code`, human-readable `message`, `stage`, `s
   `run_already_resolved`, `target_replaced`, `unsupported_provider`, `provider_event_conflict`,
   `recovery_not_allowed`, `stale_precondition`, `resolution_conflict`,
   `storage_capacity_exceeded`, `state_uninitialized`, `artifact_unavailable`, `artifact_expired`.
-- Prompt mutation: `agent_busy`, `agent_blocked`, `agent_limited`, `prompt_confirmation_unavailable`,
-  `agent_not_input_owner`, `prompt_dispatch_busy`, `dispatch_rejected`, `delivery_unknown`.
+- Prompt mutation: `agent_busy`, `agent_blocked`, `agent_limited`, `agent_not_ready`,
+  `prompt_confirmation_unavailable`, `agent_not_input_owner`, `prompt_dispatch_busy`,
+  `dispatch_rejected`, `delivery_unknown`.
 
 `stage` is one of `request_validation`, `target_resolution`, `observation`, `before_dispatch`,
 `dispatch`, or `after_dispatch`. `side_effect` is `none`, `possible`, or `confirmed`.
@@ -587,13 +588,14 @@ Every error contains a closed-enum `code`, human-readable `message`, `stage`, `s
 `event_history_lost` requires a new observation. `delivery_unknown` always requires manual
 inspection; it is never permission to resend the prompt.
 
-## Question notices (API v5)
+## Question notices
 
 Stock Codex's successful `request_user_input_async` PostToolUse issues a notification.
 `PaneSummary` and `AgentSummary` expose `question_notice` for live Codex panes, with
 `unacknowledged`, `owner_ref`, `latest_order`, `acknowledged_order`, `last_issued_at`,
 `tracking_health` (`healthy` / `degraded`), and `reason`. No question text, answers, tool identifiers,
 or pending count is exposed. Absence of a notice is not proof that there are no unanswered questions.
+Only Embedded mode is supported; shared/remote app-server ancestry cannot identify a pane owner.
 
 ```bash
 PANE_JSON="$(vt pane get %456 --json)"
@@ -607,11 +609,11 @@ Use one snapshot for all three arguments. The exact owner is the server incarnat
 and Codex PID/start token; agent epoch/session changes do not invalidate it. The daemon rechecks
 process ownership. Future orders, replaced owners, and unverified owners are rejected. Repeating
 the same acknowledgement is harmless. Newer notices stay visible. Acknowledgement does not send
-input, read an unread occurrence, or change lifecycle/Run completion. Skip/focus/turn completion alone never acknowledges a notice. A later accepted ordinary
-input in a different turn of the same trusted session can acknowledge a contiguous notice prefix,
-after structural completion/start ordering, exact identity, the home loss journal, Idle/Done, and
-two known normal-composer captures all pass. Direct and accepted queued inputs share this policy;
-queue registration and unrecognized answer framing never resolve notices. Capture only vetoes.
+input, read an unread occurrence, or change lifecycle/Run completion. Skip, focus, and turn
+completion alone never acknowledge a notice.
+
+### Reply acknowledgement
+
 A complete accepted `<send_user_message_question_reply>` envelope from any Codex client version
 acknowledges its matching question IDs without waiting for Idle/Done or another turn. The parser
 accepts one reply object or a nonempty array, optionally after the standard IDE context prefix.
@@ -622,7 +624,7 @@ checks. Reply parsing and acknowledgement do not require a known rendering profi
 or a client-version lookup. Known issued IDs do not require a startup hook in the current daemon
 or a complete home-wide history. Resume and daemon restart retain their ID bindings and partial
 answers. Unknown IDs, wrong sessions, malformed or quoted envelopes, and automatic capacity
-inputs never acknowledge a notice. Skip, focus and completion alone do not prove an answer.
+inputs never acknowledge a notice.
 
 ID/order bindings are frozen at acceptance. A newly issued question cannot make an unknown ID
 valid, and consumed IDs cannot be rebound. The bounded queue holds 16 waiting jobs and one
@@ -636,19 +638,38 @@ Issued item counts come from structured `questions[]`, independently of body fin
 The private sidecar retains only hashed session/item/call identities, orders and pending bits.
 Partial and reverse-order answers are saved immediately and survive daemon restart. All items in
 an issuance must be answered. A fully answered later issuance is resolved independently of an
-older pending issuance; the older notice remains visible. `acknowledged_order` is still the
+older pending issuance; the older notice remains visible. `acknowledged_order` is the
 contiguous confirmed prefix, and Q explicitly acknowledges through its fixed snapshot order.
-Missing old ID metadata stays unresolved and is never reconstructed from a screen or ordinary
-prompt. The additive sidecar upgrade preserves existing owners, deduplication keys and watermarks.
-Question and answer bodies are never persisted or exposed by this metadata.
+Notices without issued-ID metadata stay unresolved and are never reconstructed from a screen or
+ordinary prompt; they remain available for Q. Question and answer bodies are never persisted or
+exposed by this metadata.
+
+### Ordinary-prompt acknowledgement
+
+A later accepted ordinary input in a different turn of the same trusted session can acknowledge a
+contiguous notice prefix, after structural completion/start ordering, exact identity, the home loss
+journal, Idle/Done, and two known normal-composer captures all pass. Direct and accepted queued
+inputs share this policy; queue registration and unrecognized answer framing never resolve
+notices. Capture only vetoes acknowledgement.
+
+Question text matching is restricted to the exact 0.159.3/0.160.0 profiles. The older 0.155.1/0.156.1
+profiles retain their generic marker and normal-composer guards; their stock hook schema uses the
+same `questions[].title` and optional string-array `options`. Runtime text evidence is bounded to
+2048 issuance entries globally and 512 per owner, with at most 512 distinct fingerprints per
+capture. Fingerprint extraction accepts at most eight questions, sixteen choices each, and 16 KiB
+of raw text. Larger or malformed text evidence becomes unavailable; an owned question notice is
+still accepted and retained for manual acknowledgement.
+Repeated fingerprints are deduplicated only after every unacknowledged order and session has been
+checked. Missing entries, capacity exhaustion, clipped cards and restart never justify clearing.
+
+### Persistence and limits
 
 Bounds are 2048 tracked issuances globally, 512 per owner, 8 items per issuance, 64 reply items
 per envelope and 64KiB prompt bytes. Used call-ID hashes remain until owner death (4096 per owner,
 65536 globally). Reusing a known call ID invalidates its ambiguous bindings. Capacity exhaustion
 retains notices for Q. A pre-rename failure rolls back pending bits and write-backlog state and
 marks only the affected pane degraded. A post-rename directory-fsync failure is a logical commit
-with a durability diagnostic. Existing pre-upgrade notices without IDs remain available for Q.
-Only Embedded mode is supported; shared/remote app-server ancestry cannot identify a pane owner.
+with a durability diagnostic.
 
 Notifications and their deduplication keys persist in private `question-notices-v1.json` under the
 server incarnation state directory, independently of Pane State schema 10 and durable Runs. Limits
@@ -660,17 +681,92 @@ Acknowledgement commits at atomic rename. A pre-rename failure retains the notic
 directory-fsync failure is a logical acknowledgement with `question_ack_directory_fsync_failed`,
 without rollback or automatic rewrite. The private `.expected` marker distinguishes initial absence
 from loss of a previously committed sidecar. Resolver state, transcript cursors, and ingress dedup
-remain memory-only; the shared private home journal stores only digests and writer identities. API 6 / protocol 31 must be installed together;
-there is no old-protocol fallback.
-Question text matching is restricted to the exact 0.159.3/0.160.0 profiles. The older 0.155.1/0.156.1
-profiles retain their generic marker and normal-composer guards; their stock hook schema uses the
-same `questions[].title` and optional string-array `options`. Runtime text evidence is bounded to
-2048 issuance entries globally and 512 per owner, with at most 512 distinct fingerprints per
-capture. Fingerprint extraction accepts at most eight questions, sixteen choices each, and 16 KiB
-of raw text. Larger or malformed text evidence becomes unavailable; an owned question notice is
-still accepted and retained for manual acknowledgement.
-Repeated fingerprints are deduplicated only after every unacknowledged order and session has been
-checked. Missing entries, capacity exhaustion, clipped cards and restart never justify clearing.
+remain memory-only; the shared private home journal stores only digests and writer identities.
+
+## Codex screen evidence
+
+`badge` can be `unknown`. It represents current presentation; `status`,
+`lifecycle`, and `agent wait` continue to describe canonical lifecycle. A Codex pane
+without authoritative lifecycle hooks can therefore have `status: idle` and
+`badge: working`, `blocked`, or `unknown`. `--status working` and
+`agent wait --until working` do not match screen activity alone.
+
+The existing capture batch supplies finite Codex evidence. A fresh live activity timer
+(including dynamic labels, remapped interrupt keys, and queued inputs) gives Working;
+a current approval or synchronous question gives Blocked and `needs_action: true`.
+An asynchronous question can coexist with Working and does not alone imply Blocked.
+Unknown UI, transcript viewers, capture failure, and evidence older than three seconds
+produce Unknown when no canonical state takes priority. Existing unread completion
+remains Done. Authoritative hooks and canonical active/waiting/error states take priority.
+Unknown uses `?` and the neutral Idle color, and is visible even when Idle is hidden.
+
+Evidence lives only in the runtime tracker and is invalidated on epoch/process replacement,
+failed observation, or expiry. It does not issue a new Run, complete a Run, confirm a prompt,
+acknowledge a Question notice, or generate an OS notification/triage event. The 300-second
+stale-completion rule for open non-authoritative runs still applies. A screen modal alone never
+creates a Codex run.
+
+Agent summaries include a `presentation` object: `reason` is a finite
+code, `observed_at` is the optional Unix timestamp of the screen observation, and `ttl_seconds`
+is its optional lifetime (three seconds for Codex screen evidence). The timestamp remains
+available after expiry for diagnosis, but positive evidence cannot be used after its deadline.
+Clients can compute age from `meta.emitted_at`; no screen text or activity title is included.
+Reasons distinguish canonical/hook authority, current screen Working/approval/question,
+directory trust/startup update, unread completion, unknown UI, transcript viewer, unavailable
+or expired evidence, and an epoch mismatch. `badge` and its reason come from the same decision.
+Directory-trust and startup-update screens affect presentation only and cannot change a Run or
+Question notice.
+
+Screen evidence does not change Question notices: capture only vetoes acknowledgement, and
+unrecognized answers or unknown evidence never acknowledge a notice.
+
+OS notifications remain tied to canonical Blocked transitions. Before starting the external
+notification command, the daemon rechecks the original pane and Blocked occurrence. Resolved,
+replaced, removed or superseded occurrences are skipped; unrelated metadata/read revisions
+do not cancel an otherwise current notification. State changes after this check cannot retract
+an accepted notification.
+
+### Hook ownership and first prompt
+
+Codex hooks require a process ancestor chain rooted in their claimed pane. Shared app-server
+hooks, including renamed executables, cannot use inherited `TMUX_PANE` to update that pane
+or another pane. Rejection logs contain only finite reason codes. Embedded hooks remain
+usable with an unrelated MCP server child. This prevents misattribution; it does not restore
+lifecycle events from a shared server. Start Codex with `--no-daemon` to select the embedded hook
+lifecycle; `features.daemon_auto_start=false` does not prevent attaching to an already running
+server. Hook authority is not inferred to have expired merely because events stop arriving.
+
+Working/Blocked dispatch is rejected. Durable Codex dispatch normally requires authoritative hooks
+in the current daemon epoch. The first prompt is also accepted before any session/hook is
+registered when all of the following hold: the exact process is scan-verified and owns foreground
+input, canonical state is Idle with zero Runs/completions and no prompt/session, argv proves an
+explicit `--no-daemon` interactive invocation without a queued initial prompt, and a fresh stable
+viewport/cursor identifies the empty input field. These checks run during preparation and again
+before dispatch; the pane revision fence is rechecked after inspection. Presentation remains
+Unknown until a hook is accepted. Only the matching provider prompt digest confirms the Operation
+and binds its session/Run. Bare invocations, `daemon_auto_start=false` alone, dialogs, drafts, and
+changed processes do not qualify. Current empty-input detection supports Codex's
+`Ask Codex to do anything` composer; an unrecognized layout is rejected without sending.
+The first `SessionStart` may advance the agent epoch. Follow the confirmed Operation's
+returned `run_ref` for wait/response, rather than continuing to use the pre-start agent reference.
+
+In embedded mode, a subsequent accepted lifecycle hook restores authority after daemon restart.
+Saved exact Question IDs can be acknowledged without restoring ordinary-resolver trust.
+
+### Restart readiness
+
+For an existing canonical Idle Codex session, the observation worker identifies the exact process's
+single writable rollout descriptor (macOS lsof or Linux procfs). It verifies PID/start token,
+explicit independent argv, current session, file identity and complete bounded structural history.
+Only a latest normal completion with no open turn supplies transient `provider_resynchronized`
+presentation evidence. Old completed files, ambiguous descriptors, partial history and a different
+session do not. This changes neither hook authority nor canonical Run completion.
+Every durable prompt checks a fresh empty composer, cursor, foreground owner and current session;
+resynchronized sessions also reread structural state immediately before dispatch. Drafts, current
+queue headers, blocked/working screens and unresolved dispatches prevent sending.
+A readiness rejection is `agent_not_ready` (before dispatch, wait then retry), not `stale_reference`.
+Shared invocations require moving to an independently owned Codex session. No process is restarted
+and no saved Run or operation is abandoned to recover readiness.
 
 ## Query cost
 
@@ -698,20 +794,24 @@ tmux process drains all output but retains at most 8 MiB stdout and 64 KiB stder
 observation group retains at most 16 MiB of parsed pane tails. Exceeding any of those bounds produces
 a typed capture output-limit failure.
 
-## Definition of Done for API v4 rollout
+## Rollout checklists
 
-The measurable functional, test, and operational completion checklist is maintained in
+These checklists record rollout completion and are not part of the API contract.
+
+### API v4
+
+The functional, test, and operational checklist is maintained in
 [AGENT_API_V4.md](AGENT_API_V4.md#definition-of-done). The API is not rollout-complete while any
 item in that checklist remains unchecked.
 
-## API v5 question-notice completion checklist
+### Question notices (introduced in API v5)
 
-### 機能完了条件
+#### Functional completion
 
 - [x] Existing stock Codex PostToolUse detects issuance and a fenced acknowledgement clears only displayed notices.
 - [x] Sidebar/API agree on current needs-action membership; lifecycle, unread, Runs, statusline, and OS notifications retain their contracts.
 
-### テスト完了条件
+#### Test completion
 
 - [x] Parser/owner guards, restart/dedup, persistence failure, capacity, stale/future fences, and multi-client rendering pass.
 - [x] Isolated runtime smoke, UI preflight, and real stock Codex Embedded hook acceptance pass; fixture and real-CLI evidence are recorded separately.
@@ -723,91 +823,7 @@ frames with 58 agent panes, two attached clients, and 100 issue/ack cycles at `p
 Timing begins before launching the hook process or sending the Q control request, so it
 includes more work than the daemon-ingress bound; it excludes Codex's pre-hook delay.
 
-### 運用反映条件
+#### Operational rollout
 
 - [ ] CLI/daemon/sidebar are deployed together with API 6 / protocol 31 while retaining existing Pane State schema 10.
 - [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.
-
-
-## Codex screen evidence (API 6)
-
-`badge` includes `unknown` in API 6. It represents current presentation; `status`,
-`lifecycle`, and `agent wait` continue to describe canonical lifecycle. A Codex pane
-without authoritative lifecycle hooks can therefore have `status: idle` and
-`badge: working`, `blocked`, or `unknown`. `--status working` and
-`agent wait --until working` do not match screen activity alone.
-
-The existing capture batch supplies finite Codex evidence. A fresh live activity timer
-(including dynamic labels, remapped interrupt keys, and queued inputs) gives Working;
-a current approval or synchronous question gives Blocked and `needs_action: true`.
-An asynchronous question can coexist with Working and does not alone imply Blocked.
-Unknown UI, transcript viewers, capture failure, and evidence older than three seconds
-produce Unknown when no canonical state takes priority. Existing unread completion
-remains Done. Authoritative hooks and canonical active/waiting/error states take priority.
-Unknown uses `?` and the neutral Idle color, and is visible even when Idle is hidden.
-
-Evidence lives only in the runtime tracker and is invalidated on epoch/process replacement,
-failed observation, or expiry. It does not issue a new Run, complete a Run, confirm a prompt,
-acknowledge a Question notice, or generate an OS notification/triage event. The pre-existing
-300-second stale-completion rule for open non-authoritative runs is unchanged. A screen
-modal no longer creates a new Codex run merely by appearing.
-
-Agent summaries now include the additive `presentation` object (API 6): `reason` is a finite
-code, `observed_at` is the optional Unix timestamp of the screen observation, and `ttl_seconds`
-is its optional lifetime (three seconds for Codex screen evidence). The timestamp remains
-available after expiry for diagnosis, but positive evidence cannot be used after its deadline.
-Clients can compute age from `meta.emitted_at`; no screen text or activity title is included.
-Reasons distinguish canonical/hook authority, current screen Working/approval/question,
-directory trust/startup update, unread completion, unknown UI, transcript viewer, unavailable
-or expired evidence, and an epoch mismatch. `badge` and its reason come from the same decision.
-The new startup screens affect presentation only and cannot change a Run or Question notice.
-
-OS notifications remain tied to canonical Blocked transitions. Before starting the external
-notification command, the daemon rechecks the original pane and Blocked occurrence. Resolved,
-replaced, removed or superseded occurrences are skipped; unrelated metadata/read revisions
-do not cancel an otherwise current notification. State changes after this check cannot retract
-an accepted notification.
-
-Codex hooks require a process ancestor chain rooted in their claimed pane. Shared app-server
-hooks, including renamed executables, cannot use inherited `TMUX_PANE` to update that pane
-or another pane. Rejection logs contain only finite reason codes. Embedded hooks remain
-usable with an unrelated MCP server child. This prevents misattribution; it does not restore
-lifecycle events from a shared server. Working/Blocked dispatch is rejected. Durable Codex
-dispatch normally requires authoritative hooks in the current daemon epoch. The first prompt
-is also accepted before any session/hook is registered when all of the following hold:
-the exact process is scan-verified and owns foreground input, canonical state is Idle with
-zero Runs/completions and no prompt/session, argv proves an explicit `--no-daemon` interactive
-invocation without a queued initial prompt, and a fresh stable viewport/cursor identifies the
-empty input field. These checks run during preparation and again before dispatch; the pane
-revision fence is rechecked after inspection. Presentation remains Unknown until a hook is
-accepted. Only the matching provider prompt digest confirms the Operation and binds its
-session/Run. Bare invocations, `daemon_auto_start=false` alone, dialogs, drafts, and changed
-processes do not qualify. Current empty-input detection supports Codex's
-`Ask Codex to do anything` composer; an unrecognized layout is rejected without sending.
-The first `SessionStart` may advance the agent epoch. Follow the confirmed Operation's
-returned `run_ref` for wait/response, rather than continuing to use the pre-start agent reference.
-In embedded mode, a subsequent accepted lifecycle hook restores authority after daemon restart.
-Saved exact Question IDs can be acknowledged without restoring ordinary-resolver trust. Shared-server mode
-continues to reject hooks. Start Codex with `--no-daemon` to select the embedded hook lifecycle;
-`features.daemon_auto_start=false` does not prevent attaching to an already running server.
-
-Pane State schema 10 and Question sidecar schema 1 are unchanged. Question remains a durable
-unacknowledged issuance notice. Capture is veto-only; unrecognized answers and unknown evidence
-do not acquire new automatic acknowledgement rules.
-CLI, daemon, and sidebars must be replaced together for protocol 31; there is no mixed-version
-fallback. Hook authority is not inferred to have expired merely because events stop arriving.
-
-### Restart readiness (protocol 31)
-
-For an existing canonical Idle Codex session, the observation worker identifies the exact process's
-single writable rollout descriptor (macOS lsof or Linux procfs). It verifies PID/start token,
-explicit independent argv, current session, file identity and complete bounded structural history.
-Only a latest normal completion with no open turn supplies transient `provider_resynchronized`
-presentation evidence. Old completed files, ambiguous descriptors, partial history and a different
-session do not. This changes neither hook authority nor canonical Run completion.
-Every durable prompt checks a fresh empty composer, cursor, foreground owner and current session;
-resynchronized sessions also reread structural state immediately before dispatch. Drafts, current
-queue headers, blocked/working screens and unresolved dispatches prevent sending.
-A readiness rejection is `agent_not_ready` (before dispatch, wait then retry), not `stale_reference`.
-Shared invocations require moving to an independently owned Codex session. No process is restarted
-and no saved Run or operation is abandoned to recover readiness.
