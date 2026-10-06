@@ -602,7 +602,9 @@ pub(super) fn start_tmux_server_liveness_monitor(
     coordinator: Arc<ProductionV2Coordinator>,
 ) -> Result<()> {
     let server_pid = coordinator.incarnation.identity.pid;
-    let expected_start_token = crate::daemon::lifecycle::process_start_token(server_pid)
+    // This token is local to the monitor. On macOS use proc_pidinfo so startup
+    // cannot block on a ps output pipe while other workers spawn tmux clients.
+    let expected_start_token = crate::daemon::lifecycle::agent_process_start_token(server_pid)
         .with_context(|| {
             format!("failed to identify tmux server process before starting liveness monitor: {server_pid}")
         })?;
@@ -620,7 +622,7 @@ pub(super) fn start_tmux_server_liveness_monitor(
             if coordinator.shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            if !crate::daemon::lifecycle::process_start_token(server_pid)
+            if !crate::daemon::lifecycle::agent_process_start_token(server_pid)
                 .is_ok_and(|actual| actual == expected_start_token)
             {
                 coordinator.fail_stop(format!("tmux server process exited: pid={server_pid}"));

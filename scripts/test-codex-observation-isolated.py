@@ -193,6 +193,16 @@ def main():
                 selected = [line for line in tmux("show-environment", "-g").splitlines()
                             if line.startswith(("PATH=", "HOME=", "ZDOTDIR=", "VDE_FIXTURE_", "VDE_TMUX_"))]
                 (work / "failure-environment.txt").write_text("\n".join(selected))
+                process_scan = run(["ps", "-ax", "-o", "pid=,ppid=,pgid=,tpgid=,comm="], checked=False)
+                (work / "failure-process-scan.txt").write_text(process_scan)
+                (work / "failure-daemon-diagnostics.json").write_text(vt("daemon", "diagnostics", "--json"))
+                (work / "failure-daemon-status.txt").write_text(vt("daemon", "status"))
+                if shutil.which("sample"):
+                    for state_path in (work / "state/vde-tmux").glob("*/lifecycle.json"):
+                        process = json.loads(state_path.read_text()).get("process")
+                        if process:
+                            run(["sample", str(process["pid"]), "1", "1", "-file",
+                                 work / "failure-daemon-stack.txt"], checked=False, timeout=8)
                 raise AssertionError("scratch state condition was not observed: " + json.dumps({p: {k: a.get(k) for k in ["status", "badge", "needs_action"]} for p, a in agents.items()}))
             time.sleep(0.1)
 
