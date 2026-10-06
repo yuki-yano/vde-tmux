@@ -454,7 +454,7 @@ SERVER_PATH="$(tmux -L "$TMUX_SOCKET" show-environment -g PATH | sed 's/^PATH=//
 [[ "$(PATH="$SERVER_PATH" command -v vt)" == "$HOOK_BIN_DIR/vt" ]]
 echo "owned hook resolves current target/debug/vt"
 
-# Two PTY-backed attach-session processes are normal clients (not control or active-pane clients).
+# Two PTY-backed attach-session processes are normal clients, not control clients.
 cat >"$PTY_CLIENT" <<'PY'
 import os, pty, select, subprocess, sys
 fifo, log, socket_name, session, *mode = sys.argv[1:]
@@ -945,12 +945,12 @@ tmux -L "$TMUX_SOCKET" select-pane -t "$AGENT_PANE"
 CONTROL_FIFO="$RUNTIME_DIR/control.in"
 mkfifo "$CONTROL_FIFO"
 exec 9<>"$CONTROL_FIFO"
-tmux -L "$TMUX_SOCKET" -C attach-session -f active-pane -t main <"$CONTROL_FIFO" >"$RUNTIME_DIR/control.log" 2>&1 &
+tmux -L "$TMUX_SOCKET" -C attach-session -t main <"$CONTROL_FIFO" >"$RUNTIME_DIR/control.log" 2>&1 &
 CONTROL_PID=$!
 CONTROL_CLIENT=""
 for _ in $(seq 1 30); do
   CONTROL_CLIENT="$(tmux -L "$TMUX_SOCKET" list-clients -F '#{client_name} #{client_control_mode} #{client_flags}' \
-    | awk '$2 != "0" && $0 ~ /active-pane/ { print $1; exit }')"
+    | awk '$2 != "0" && $0 ~ /control-mode/ { print $1; exit }')"
   [[ -n "$CONTROL_CLIENT" ]] && break
   sleep 0.05
 done
@@ -959,16 +959,15 @@ tmux -L "$TMUX_SOCKET" refresh-client -t "$CONTROL_CLIENT" -A "$AGENT_PANE:on"
 CONTROL_FLAGS=""
 for _ in $(seq 1 50); do
   CONTROL_FLAGS="$(tmux -L "$TMUX_SOCKET" list-clients -F '#{client_name} #{client_flags}' | awk -v client="$CONTROL_CLIENT" '$1 == client { $1=""; sub(/^ /, ""); print; exit }')"
-  [[ "$CONTROL_FLAGS" == *active-pane* ]] && break
+  [[ "$CONTROL_FLAGS" == *control-mode* ]] && break
   sleep 0.01
 done
 echo "control client flags: $CONTROL_FLAGS"
 [[ -n "$CONTROL_FLAGS" ]]
 grep -F 'control-mode' <<<"$CONTROL_FLAGS" >/dev/null
-grep -F 'active-pane' <<<"$CONTROL_FLAGS" >/dev/null
 sleep 1
 wait_badge Done
-echo "control/active-pane client did not acknowledge"
+echo "control client did not acknowledge"
 kill "$CONTROL_PID" 2>/dev/null || true
 CONTROL_PID=""
 mkfifo "$CLIENT_FIFO_3"

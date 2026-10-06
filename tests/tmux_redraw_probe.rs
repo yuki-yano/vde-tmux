@@ -229,6 +229,7 @@ fn assert_tmux_3_7_or_newer() {
         .trim()
         .strip_prefix("tmux ")
         .expect("tmux version must start with 'tmux '");
+    let number = number.strip_prefix("next-").unwrap_or(number);
     let mut parts = number.split(['.', 'a', 'b', 'c']);
     let major = parts
         .next()

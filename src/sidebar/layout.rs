@@ -736,6 +736,10 @@ fn resolve_width(layout: &str, width: SidebarWidth, min_width: u16) -> Result<u1
 }
 
 fn parse_layout_root_size(layout: &str) -> Option<(u32, u32)> {
+    if layout.trim_start().starts_with('{') {
+        let layout = parse_json_tmux_layout(layout).ok()?;
+        return Some((layout.root.sx, layout.root.sy));
+    }
     let (_, rest) = layout.split_once(',')?;
     parse_size(rest)
 }
@@ -961,8 +965,102 @@ enum TmuxLayoutKind {
     TopBottom(Vec<TmuxLayoutCell>),
 }
 
+#[derive(serde::Deserialize)]
+struct JsonTmuxLayout {
+    #[serde(rename = "V")]
+    version: u32,
+    #[serde(rename = "L")]
+    root: JsonTmuxLayoutCell,
+}
+
+#[derive(serde::Deserialize)]
+struct JsonTmuxLayoutCell {
+    #[serde(rename = "w")]
+    sx: u32,
+    #[serde(rename = "h")]
+    sy: u32,
+    #[serde(rename = "x")]
+    xoff: i32,
+    #[serde(rename = "y")]
+    yoff: i32,
+    #[serde(rename = "I")]
+    pane_id: Option<String>,
+    #[serde(rename = "t")]
+    kind: String,
+    #[serde(rename = "c")]
+    children: Option<Vec<JsonTmuxLayoutCell>>,
+    #[serde(rename = "z")]
+    floating_zindex: Option<u32>,
+}
+
+fn parse_json_tmux_layout(layout: &str) -> Result<JsonTmuxLayout> {
+    let layout: JsonTmuxLayout =
+        serde_json::from_str(layout).context("invalid tmux JSON layout")?;
+    if layout.version != 2 {
+        bail!("unsupported tmux JSON layout version {}", layout.version);
+    }
+    Ok(layout)
+}
+
+impl JsonTmuxLayoutCell {
+    fn into_layout_cell(self) -> Result<TmuxLayoutCell> {
+        if self.floating_zindex.is_some() {
+            bail!("floating pane layouts are not supported");
+        }
+        if self.sx == 0 || self.sy == 0 {
+            bail!("invalid tmux JSON layout size");
+        }
+        let kind = match self.kind.as_str() {
+            "p" => {
+                let pane_id = self
+                    .pane_id
+                    .as_deref()
+                    .context("tmux JSON pane ID is missing")?;
+                validate_pane_id(pane_id)?;
+                if self.children.is_some() {
+                    bail!("tmux JSON pane cannot have children");
+                }
+                TmuxLayoutKind::Leaf
+            }
+            "h" | "v" => {
+                if self.pane_id.is_some() {
+                    bail!("tmux JSON container cannot have a pane ID");
+                }
+                let children = self
+                    .children
+                    .context("tmux JSON layout children are missing")?;
+                if children.len() < 2 {
+                    bail!("tmux JSON layout container must have at least two children");
+                }
+                let children = children
+                    .into_iter()
+                    .map(Self::into_layout_cell)
+                    .collect::<Result<Vec<_>>>()?;
+                if self.kind == "h" {
+                    TmuxLayoutKind::LeftRight(children)
+                } else {
+                    TmuxLayoutKind::TopBottom(children)
+                }
+            }
+            _ => bail!("invalid tmux JSON layout type {}", self.kind),
+        };
+        Ok(TmuxLayoutCell {
+            sx: self.sx,
+            sy: self.sy,
+            xoff: self.xoff,
+            yoff: self.yoff,
+            pane_id: self.pane_id,
+            kind,
+        })
+    }
+}
+
 fn parse_tmux_layout(layout: &str) -> Result<TmuxLayoutCell> {
     let layout = layout.trim();
+    // HEAD emits JSON for ordinary clients and the checksummed format for control clients.
+    if layout.starts_with('{') {
+        return parse_json_tmux_layout(layout)?.root.into_layout_cell();
+    }
     if layout.contains('<') || layout.contains('>') {
         bail!("floating pane layouts are not supported");
     }
@@ -987,6 +1085,7 @@ fn parse_tmux_layout(layout: &str) -> Result<TmuxLayoutCell> {
 }
 
 fn format_tmux_layout(root: &TmuxLayoutCell) -> String {
+    // select-layout accepts this format on HEAD as well as on released tmux versions.
     let body = format_layout_cell(root);
     format!("{:04x},{}", tmux_layout_checksum(&body), body)
 }
@@ -1945,6 +2044,58 @@ mod tests {
             layout_without_sidebar(layout, "%9").unwrap(),
             Some(expected.to_string())
         );
+    }
+
+    #[test]
+    fn json_layout_without_sidebar_preserves_remaining_pane_ratios() {
+        let layout = r#"{"V":2,"L":{"t":"h","w":120,"h":40,"x":0,"y":0,"c":[
+            {"t":"p","w":20,"h":40,"x":0,"y":0,"a":true,"i":0,"I":"%9"},
+            {"t":"v","w":65,"h":40,"x":21,"y":0,"c":[
+                {"t":"p","w":65,"h":29,"x":21,"y":0,"l":0,"i":1,"I":"%1"},
+                {"t":"p","w":65,"h":10,"x":21,"y":30,"i":2,"I":"%2"}]},
+            {"t":"p","w":33,"h":40,"x":87,"y":0,"i":3,"I":"%3"}]}}"#;
+        assert_eq!(
+            layout_without_sidebar(layout, "%9").unwrap(),
+            Some("c0cd,120x40,0,0{79x40,0,0[79x29,0,0,1,79x10,0,30,2],40x40,80,0,3}".to_string())
+        );
+    }
+
+    #[test]
+    fn json_layout_resolves_percent_width_and_minimum() {
+        let layout = r#"{"V":2,"L":{"t":"p","w":220,"h":60,"x":0,"y":0,"a":true,"i":0,"I":"%0"}}"#;
+        assert_eq!(
+            resolve_width(layout, crate::config::SidebarWidth::Percent(20), 30).unwrap(),
+            44
+        );
+        assert_eq!(
+            resolve_width(layout, crate::config::SidebarWidth::Percent(10), 30).unwrap(),
+            30
+        );
+        assert_eq!(layout_without_sidebar(layout, "%0").unwrap(), None);
+    }
+
+    #[test]
+    fn json_layout_rejects_unknown_versions_and_malformed_nodes() {
+        for layout in [
+            r#"{"V":3,"L":{"t":"p","w":120,"h":40,"x":0,"y":0,"I":"%9"}}"#,
+            r#"{"V":2,"L":{"t":"p","w":120,"h":40,"x":0,"y":0}}"#,
+            r#"{"V":2,"L":{"t":"p","w":120,"h":40,"x":0,"y":0,"I":"invalid"}}"#,
+            r#"{"V":2,"L":{"t":"p","w":120,"h":40,"x":0,"y":0,"I":"%9","c":[]}}"#,
+            r#"{"V":2,"L":{"t":"h","w":120,"h":40,"x":0,"y":0,"c":[]}}"#,
+            r#"{"V":2,"L":{"t":"unknown","w":120,"h":40,"x":0,"y":0}}"#,
+            r#"{"V":2,"L":{"t":"p","w":0,"h":40,"x":0,"y":0,"I":"%9"}}"#,
+        ] {
+            assert!(parse_tmux_layout(layout).is_err(), "accepted {layout}");
+        }
+    }
+
+    #[test]
+    fn json_layout_rejects_floating_panes() {
+        let layout = r#"{"V":2,"L":{"t":"h","w":120,"h":40,"x":0,"y":0,"c":[
+            {"t":"p","w":120,"h":40,"x":0,"y":0,"i":0,"I":"%0"},
+            {"t":"p","w":20,"h":10,"x":10,"y":10,"i":1,"z":0,"I":"%9"}]}}"#;
+        let error = layout_without_sidebar(layout, "%9").unwrap_err();
+        assert!(error.to_string().contains("floating pane layouts"));
     }
 
     #[test]

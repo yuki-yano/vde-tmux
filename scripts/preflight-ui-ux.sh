@@ -532,12 +532,12 @@ tmux_cmd select-pane -t "$OTHER_PANE"
 CONTROL_FIFO="$SANDBOX/control.in"
 mkfifo "$CONTROL_FIFO"
 exec 9<>"$CONTROL_FIFO"
-tmux_cmd -C attach-session -f active-pane -t A <"$CONTROL_FIFO" >"$ARTIFACT_DIR/control-client.log" 2>&1 &
+tmux_cmd -C attach-session -t A <"$CONTROL_FIFO" >"$ARTIFACT_DIR/control-client.log" 2>&1 &
 CONTROL_PID=$!
 CONTROL_CLIENT=""
 for _ in $(seq 1 60); do
   CONTROL_CLIENT="$(tmux_cmd list-clients -F '#{client_name} #{client_control_mode} #{client_flags}' \
-    | awk '$2 != "0" && $0 ~ /active-pane/ { print $1; exit }')"
+    | awk '$2 != "0" && $0 ~ /control-mode/ { print $1; exit }')"
   [[ -n "$CONTROL_CLIENT" ]] && break
   sleep 0.05
 done
