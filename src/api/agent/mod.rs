@@ -1,3 +1,4 @@
+mod claude_paste;
 pub(super) mod dispatch;
 pub(super) mod durable;
 pub(super) mod guards;

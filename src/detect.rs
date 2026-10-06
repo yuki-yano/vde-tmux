@@ -70,7 +70,7 @@ fn recent_claude_screen_lines(screen_tail: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_claude_prompt_separator(line: &str) -> bool {
+pub(crate) fn is_claude_prompt_separator(line: &str) -> bool {
     !line.is_empty() && line.chars().all(|ch| ch == '─')
 }
 

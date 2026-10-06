@@ -300,8 +300,10 @@ removes it before hashing and dispatch, while preserving all internal line break
 API v5 also exposes provider capabilities, `pane split`, `agent start`, guarded terminal
 `agent send`, best-effort working-agent `agent steer`, and blocked-agent `agent send-keys`. These mutations require exact references and revalidate
 the tmux server, pane/process identity, and foreground input ownership. Guarded terminal input
-leaves copy-mode before revalidation. A successful `agent send` receipt means tmux applied the
-input; callers must use its lifecycle cursor with `agent wait` before claiming provider acceptance.
+leaves copy-mode before revalidation. For Claude prompts that name image files, vt presses Enter
+only after Claude has finished reading the pasted images. A successful `agent send` receipt means
+tmux applied the input; callers must use its lifecycle cursor with `agent wait` before claiming
+provider acceptance.
 `agent steer` is available for exact working Codex/Claude occupants. It applies the same guards but
 does not prove active-turn attribution; a concurrent completion may start a new turn instead.
 

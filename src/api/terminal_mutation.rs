@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -7,6 +8,7 @@ use crate::pane_state::PaneInstance;
 use crate::tmux::{InputWriteStage, TmuxRunner};
 
 const INPUT_BUFFER_PREFIX: &str = "vde-agent-input-";
+const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TerminalMutationOutcome {
@@ -30,6 +32,13 @@ struct GuardedCommand {
     pane_mismatch: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDelivery {
+    PasteAndSubmit,
+    /// Print the pane screen immediately before pasting, and leave Enter to the caller.
+    CaptureAndPaste,
+}
+
 pub(super) fn submit_text_guarded(
     runner: &dyn TmuxRunner,
     incarnation: &TmuxServerIncarnation,
@@ -44,8 +53,99 @@ pub(super) fn submit_text_guarded(
         );
     }
     let nonce = mutation_nonce(incarnation, pane, nonce_seed, b"text");
-    let command = build_guarded_text_command(incarnation, pane, expected_pane_command, &nonce);
+    let command = build_guarded_text_command(
+        incarnation,
+        pane,
+        expected_pane_command,
+        &nonce,
+        TextDelivery::PasteAndSubmit,
+    );
     run_guarded_command(runner, command, body)
+}
+
+/// Pastes without Enter, waits until `settled(screen_before_paste, screen_now)`, then presses
+/// Enter. Used when the provider consumes a paste asynchronously and drops an Enter meanwhile.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn submit_text_when_settled(
+    runner: &dyn TmuxRunner,
+    incarnation: &TmuxServerIncarnation,
+    pane: &PaneInstance,
+    expected_pane_command: &str,
+    body: &[u8],
+    nonce_seed: &str,
+    settled: fn(&str, &str) -> bool,
+    timeout: Duration,
+) -> TerminalMutationOutcome {
+    if !safe_pane_command(expected_pane_command) {
+        return TerminalMutationOutcome::Rejected(
+            "pane foreground command is unavailable before guarded input".to_string(),
+        );
+    }
+    let nonce = mutation_nonce(incarnation, pane, nonce_seed, b"paste");
+    let command = build_guarded_text_command(
+        incarnation,
+        pane,
+        expected_pane_command,
+        &nonce,
+        TextDelivery::CaptureAndPaste,
+    );
+    let output = match run_guarded_command_output(runner, &command, body) {
+        Ok(output) => output,
+        Err(outcome) => return outcome,
+    };
+    let before = output
+        .lines()
+        .take_while(|line| line.trim() != command.success)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Err(message) = wait_until_settled(runner, pane, &before, settled, timeout) {
+        return TerminalMutationOutcome::DeliveryUnknown(format!(
+            "guarded input was pasted but Enter was not sent: {message}"
+        ));
+    }
+    match send_keys_guarded(
+        runner,
+        incarnation,
+        pane,
+        expected_pane_command,
+        &["Enter".to_string()],
+        nonce_seed,
+    ) {
+        TerminalMutationOutcome::Applied => TerminalMutationOutcome::Applied,
+        TerminalMutationOutcome::Rejected(message)
+        | TerminalMutationOutcome::DeliveryUnknown(message) => {
+            TerminalMutationOutcome::DeliveryUnknown(format!(
+                "guarded input was pasted but Enter was not delivered: {message}"
+            ))
+        }
+    }
+}
+
+fn wait_until_settled(
+    runner: &dyn TmuxRunner,
+    pane: &PaneInstance,
+    before: &str,
+    settled: fn(&str, &str) -> bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let screen = runner
+            .run(&["capture-pane", "-p", "-t", &pane.pane_id])
+            .map_err(|error| {
+                format!("pane capture failed while waiting for the paste: {error:#}")
+            })?;
+        if settled(before, &screen) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the pane did not finish consuming the paste within {}ms",
+                timeout.as_millis()
+            ));
+        }
+        std::thread::sleep(SETTLE_POLL_INTERVAL);
+    }
 }
 
 pub(super) fn send_keys_guarded(
@@ -186,6 +286,17 @@ fn run_guarded_command(
     command: GuardedCommand,
     input: &[u8],
 ) -> TerminalMutationOutcome {
+    match run_guarded_command_output(runner, &command, input) {
+        Ok(_) => TerminalMutationOutcome::Applied,
+        Err(outcome) => outcome,
+    }
+}
+
+fn run_guarded_command_output(
+    runner: &dyn TmuxRunner,
+    command: &GuardedCommand,
+    input: &[u8],
+) -> Result<String, TerminalMutationOutcome> {
     let refs = command.args.iter().map(String::as_str).collect::<Vec<_>>();
     let result = runner.run_with_input(&refs, input);
     if let Some(buffer) = &command.buffer {
@@ -194,7 +305,7 @@ fn run_guarded_command(
     let output = match result {
         Ok(output) => output,
         Err(error) => {
-            return match error.stage {
+            return Err(match error.stage {
                 InputWriteStage::BeforeSpawn => TerminalMutationOutcome::Rejected(format!(
                     "guarded terminal mutation failed before spawn: {error}"
                 )),
@@ -206,23 +317,23 @@ fn run_guarded_command(
                         error.stage
                     ))
                 }
-            };
+            });
         }
     };
     let markers = output.lines().map(str::trim).collect::<BTreeSet<_>>();
     if markers.contains(command.success.as_str()) {
-        return TerminalMutationOutcome::Applied;
+        return Ok(output);
     }
     if markers.contains(command.server_mismatch.as_str())
         || markers.contains(command.pane_mismatch.as_str())
     {
-        return TerminalMutationOutcome::Rejected(
+        return Err(TerminalMutationOutcome::Rejected(
             "tmux server, pane, or foreground command changed before guarded input".to_string(),
-        );
+        ));
     }
-    TerminalMutationOutcome::DeliveryUnknown(
+    Err(TerminalMutationOutcome::DeliveryUnknown(
         "guarded terminal mutation returned without an unambiguous side-effect marker".to_string(),
-    )
+    ))
 }
 
 fn build_guarded_text_command(
@@ -230,10 +341,24 @@ fn build_guarded_text_command(
     pane: &PaneInstance,
     expected_pane_command: &str,
     nonce: &str,
+    delivery: TextDelivery,
 ) -> GuardedCommand {
     let buffer = format!("{INPUT_BUFFER_PREFIX}{}", &nonce[..24]);
-    let (success, server_mismatch, pane_mismatch) = markers(nonce, "text");
-    let submitted = crate::pane_state::store::tmux_command_string(&[
+    let (success, server_mismatch, pane_mismatch) = match delivery {
+        TextDelivery::PasteAndSubmit => markers(nonce, "text"),
+        TextDelivery::CaptureAndPaste => markers(nonce, "paste"),
+    };
+    let mut applied = Vec::new();
+    if delivery == TextDelivery::CaptureAndPaste {
+        applied.extend([
+            "capture-pane".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            pane.pane_id.clone(),
+            ";".to_string(),
+        ]);
+    }
+    applied.extend([
         "paste-buffer".to_string(),
         "-p".to_string(),
         "-r".to_string(),
@@ -243,11 +368,17 @@ fn build_guarded_text_command(
         "-t".to_string(),
         pane.pane_id.clone(),
         ";".to_string(),
-        "send-keys".to_string(),
-        "-t".to_string(),
-        pane.pane_id.clone(),
-        "Enter".to_string(),
-        ";".to_string(),
+    ]);
+    if delivery == TextDelivery::PasteAndSubmit {
+        applied.extend([
+            "send-keys".to_string(),
+            "-t".to_string(),
+            pane.pane_id.clone(),
+            "Enter".to_string(),
+            ";".to_string(),
+        ]);
+    }
+    applied.extend([
         "display-message".to_string(),
         "-p".to_string(),
         success.clone(),
@@ -255,7 +386,7 @@ fn build_guarded_text_command(
     let guarded = guard_after_copy_mode_cancel(
         pane,
         expected_pane_command,
-        submitted,
+        crate::pane_state::store::tmux_command_string(&applied),
         &pane_mismatch,
         Some(&buffer),
     );
@@ -475,7 +606,13 @@ mod tests {
     fn text_guard_cancels_copy_mode_without_exposing_body_in_argv() {
         let runner = MockTmuxRunner::new();
         let nonce = mutation_nonce(&incarnation(), &pane(), "request", b"text");
-        let command = build_guarded_text_command(&incarnation(), &pane(), "claude", &nonce);
+        let command = build_guarded_text_command(
+            &incarnation(),
+            &pane(),
+            "claude",
+            &nonce,
+            TextDelivery::PasteAndSubmit,
+        );
         runner.stub(
             &command.args.iter().map(String::as_str).collect::<Vec<_>>(),
             &format!("{}\n", command.success),
@@ -503,6 +640,97 @@ mod tests {
         assert!(rendered.contains("pane_in_mode"));
         assert!(rendered.contains("copy-mode"));
         assert!(rendered.contains("paste-buffer"));
+    }
+
+    fn stub_settled_paste(runner: &MockTmuxRunner, screen_before: &str) -> Vec<String> {
+        let nonce = mutation_nonce(&incarnation(), &pane(), "request", b"paste");
+        let command = build_guarded_text_command(
+            &incarnation(),
+            &pane(),
+            "claude",
+            &nonce,
+            TextDelivery::CaptureAndPaste,
+        );
+        runner.stub(
+            &command.args.iter().map(String::as_str).collect::<Vec<_>>(),
+            &format!("{screen_before}\n{}\n", command.success),
+        );
+        runner.stub(
+            &["delete-buffer", "-b", command.buffer.as_deref().unwrap()],
+            "",
+        );
+        command.args
+    }
+
+    fn stub_enter(runner: &MockTmuxRunner) -> Vec<String> {
+        let nonce = mutation_nonce(&incarnation(), &pane(), "request", b"keys");
+        let command = build_guarded_keys_command(
+            &incarnation(),
+            &pane(),
+            "claude",
+            &["Enter".to_string()],
+            &nonce,
+        );
+        runner.stub(
+            &command.args.iter().map(String::as_str).collect::<Vec<_>>(),
+            &format!("{}\n", command.success),
+        );
+        command.args
+    }
+
+    #[test]
+    fn settled_text_captures_before_paste_and_presses_enter_after_settle() {
+        let runner = MockTmuxRunner::new();
+        let paste_args = stub_settled_paste(&runner, "screen before");
+        runner.stub(&["capture-pane", "-p", "-t", "%4"], "screen after\n");
+        let enter_args = stub_enter(&runner);
+
+        assert_eq!(
+            submit_text_when_settled(
+                &runner,
+                &incarnation(),
+                &pane(),
+                "claude",
+                b"prompt /tmp/shot.png",
+                "request",
+                |before, now| before == "screen before" && now == "screen after\n",
+                Duration::ZERO,
+            ),
+            TerminalMutationOutcome::Applied
+        );
+        let rendered = paste_args.join(" ");
+        assert!(rendered.find("capture-pane").unwrap() < rendered.find("paste-buffer").unwrap());
+        assert!(!rendered.contains("send-keys"));
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0], paste_args);
+        assert_eq!(calls[2], vec!["capture-pane", "-p", "-t", "%4"]);
+        assert_eq!(calls[3], enter_args);
+    }
+
+    #[test]
+    fn unsettled_paste_reports_unknown_delivery_without_enter() {
+        let runner = MockTmuxRunner::new();
+        stub_settled_paste(&runner, "screen before");
+        runner.stub(&["capture-pane", "-p", "-t", "%4"], "screen before\n");
+
+        let outcome = submit_text_when_settled(
+            &runner,
+            &incarnation(),
+            &pane(),
+            "claude",
+            b"prompt /tmp/shot.png",
+            "request",
+            |before, now| before != now.trim_end(),
+            Duration::ZERO,
+        );
+
+        assert!(matches!(
+            outcome,
+            TerminalMutationOutcome::DeliveryUnknown(message)
+                if message.contains("pasted but Enter was not sent")
+        ));
+        assert_eq!(runner.calls().len(), 3);
     }
 
     #[test]

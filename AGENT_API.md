@@ -232,6 +232,14 @@ receipt therefore reports `dispatch=guarded_terminal_best_effort` and
 Success means tmux applied the input, not that the provider accepted it or interrupted the current
 turn. `opencode` advertises `steer=disabled` until its behavior is verified.
 
+Claude reads pasted image paths asynchronously and discards an Enter that arrives meanwhile. For a
+Claude `agent send` or `agent steer` whose prompt has a line, or text after a space before an
+absolute path, ending in `.png`, `.jpg`, `.jpeg`, `.gif`, or `.webp`, vt pastes first, waits up to
+10 seconds for Claude's input field to change and leave its `Pasting…` state, and then sends Enter
+under the same guards. If the input does not settle or the Enter guard fails, the prompt remains
+pasted without Enter and the command fails with `delivery_unknown`; inspect the pane instead of
+resending.
+
 ## Agent state
 
 The public `status` describes durable agent activity and is independent of the sidebar's unread UI

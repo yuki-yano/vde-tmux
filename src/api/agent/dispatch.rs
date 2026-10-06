@@ -22,6 +22,7 @@ use super::super::pane::{
     pane_ref, require_live_pane_instance, require_same_pane, resolve_pane, verify_live_pane,
 };
 use super::super::terminal_mutation;
+use super::claude_paste;
 use super::durable::{
     elapsed_millis, linked_run_ref, operation_is_terminal, operation_terminal_error,
     prompt_before_dispatch_timeout, prompt_wait_timeout, sleep_until_next_poll, wait_for_operation,
@@ -34,8 +35,10 @@ use super::guards::{
 };
 use super::projection::{agent_detail, agent_status};
 use crate::agent_state::{DispatchState, OperationId, Sha256Digest};
+use crate::daemon::lifecycle::TmuxServerIncarnation;
 use crate::daemon::protocol::v2::{
-    CLIENT_REQUEST_TIMEOUT, ClientMessage, PROTOCOL_VERSION, ServerMessage, V2RequestFailureStage,
+    CLIENT_REQUEST_TIMEOUT, ClientMessage, PROTOCOL_VERSION, PanePresentation, ServerMessage,
+    V2RequestFailureStage,
 };
 use crate::pane_state::{EventId, PaneInstance};
 use crate::tmux::TmuxRunner;
@@ -133,12 +136,12 @@ pub fn agent_send(
     .expect("PromptState emits a valid SHA-256 digest");
     let nonce = EventId::generate()
         .map_err(|error| api_error!("internal_error", format!("send request ID: {error}")))?;
-    apply_terminal_mutation(terminal_mutation::submit_text_guarded(
+    apply_terminal_mutation(submit_prompt_text(
         runner,
         &connection.incarnation,
-        &pane.pane_instance,
-        &pane.current_command,
-        prompt.as_bytes(),
+        pane,
+        state.agent.as_str(),
+        prompt,
         nonce.as_str(),
     ))?;
     let mut after_connection = connection.reconnect()?;
@@ -160,6 +163,36 @@ pub fn agent_send(
                 dispatch: ApiPromptDispatchCapability::GuardedTerminal,
             },
         },
+    )
+}
+
+fn submit_prompt_text(
+    runner: &dyn TmuxRunner,
+    incarnation: &TmuxServerIncarnation,
+    pane: &PanePresentation,
+    agent: &str,
+    prompt: &str,
+    nonce_seed: &str,
+) -> terminal_mutation::TerminalMutationOutcome {
+    if agent == "claude" && claude_paste::reads_image_paths(prompt) {
+        return terminal_mutation::submit_text_when_settled(
+            runner,
+            incarnation,
+            &pane.pane_instance,
+            &pane.current_command,
+            prompt.as_bytes(),
+            nonce_seed,
+            claude_paste::paste_settled,
+            claude_paste::IMAGE_PASTE_SETTLE_TIMEOUT,
+        );
+    }
+    terminal_mutation::submit_text_guarded(
+        runner,
+        incarnation,
+        &pane.pane_instance,
+        &pane.current_command,
+        prompt.as_bytes(),
+        nonce_seed,
     )
 }
 
@@ -244,12 +277,12 @@ pub fn agent_steer(
     .expect("PromptState emits a valid SHA-256 digest");
     let nonce = EventId::generate()
         .map_err(|error| api_error!("internal_error", format!("steer request ID: {error}")))?;
-    apply_terminal_mutation(terminal_mutation::submit_text_guarded(
+    apply_terminal_mutation(submit_prompt_text(
         runner,
         &connection.incarnation,
-        &pane.pane_instance,
-        &pane.current_command,
-        prompt.as_bytes(),
+        pane,
+        state.agent.as_str(),
+        prompt,
         nonce.as_str(),
     ))?;
     let mut after_connection = connection.reconnect()?;

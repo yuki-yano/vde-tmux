@@ -47,3 +47,22 @@ the remaining work is an authenticated, disposable profile path.
 The API v4 durable adapter therefore remains disabled for Claude Code. API v4 separately exposes
 guarded terminal dispatch with lifecycle-cursor confirmation and bounded terminal read; this does
 not claim durable provider attribution or Response Artifact support.
+
+### Pasted image paths
+
+- Observed at: 2026-10-06 (Asia/Tokyo)
+- Provider: Claude Code 2.1.287
+- Probe: manual, on an isolated tmux server with only `vt hook claude` hooks and the API base URL
+  pointed at a closed port
+
+Observations:
+
+- Claude splits a bracketed paste at newlines and at a space before an absolute path. A segment
+  ending in `.png`, `.jpg`, `.jpeg`, `.gif`, or `.webp` is read asynchronously, even when the file
+  does not exist. Until the read finishes, the input field is unchanged and the footer shows
+  `Pasting…`.
+- An Enter received during that read is discarded; a plain-text paste replays it instead. Pasting
+  and pressing Enter in one tmux command left the prompt unsent in 7 of 7 trials.
+- Claude inserts the paste and clears its pending-Enter state in the same update. Pressing Enter
+  once the input field changed submitted 7 of 7 trials. The read took 30-40 ms for a 200x120 PNG
+  and 710-960 ms when a 23 MB 3456x2234 PNG was included.
