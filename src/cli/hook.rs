@@ -272,7 +272,15 @@ pub(crate) fn run_hook_command(
                         )
                         .is_ok();
                 }
-                if let Some(request) = prepared.metadata.process.clone() {
+                // ID-matched replies use their structural contract at every client
+                // version. Rendering profiles are only needed by the other paths.
+                prepared.classify(
+                    input,
+                    crate::question_notice::profile::CodexProfile::Unknown,
+                );
+                if (arg != "UserPromptSubmit" || prepared.metadata.reply.is_none())
+                    && let Some(request) = prepared.metadata.process.clone()
+                {
                     let profile = client.question_profile(&request);
                     prepared.classify(input, profile);
                 }

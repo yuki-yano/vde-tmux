@@ -59,11 +59,6 @@ impl ResolverInput {
                 .reply
                 .as_ref()
                 .is_none_or(super::reply::ReplyEvidence::valid)
-            && (self.reply.is_none()
-                || matches!(
-                    self.profile,
-                    super::profile::CodexProfile::V01593 | super::profile::CodexProfile::V01600
-                ))
             && self
                 .ancestors
                 .iter()
@@ -433,7 +428,7 @@ impl PreparedHook {
             .as_ref()
             .and_then(|value| value.get("prompt"))
             .and_then(Value::as_str);
-        self.metadata.reply = super::reply::ReplyEvidence::parse(prompt, profile);
+        self.metadata.reply = super::reply::ReplyEvidence::parse(prompt);
         self.metadata.input_class = payload
             .as_ref()
             .map(|_| classify_prompt(prompt, profile))

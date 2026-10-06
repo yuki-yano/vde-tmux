@@ -29,7 +29,12 @@ root = Path(tempfile.mkdtemp(prefix="vde-question-notice-"))
 socket = "vde-question-" + str(os.getpid())
 build = Path(os.environ.get("VDE_TMUX_TEST_BUILD_BIN", repo / "target/debug/vt"))
 fixture_version = os.environ.get("VDE_QUESTION_FIXTURE_VERSION", "0.159.3")
-assert fixture_version in {"0.155.1", "0.156.1", "0.159.3", "0.160.0"}, fixture_version
+assert len(fixture_version.split(".")) == 3 and all(
+    part.isascii() and part.isdigit() for part in fixture_version.split(".")
+), fixture_version
+assert "--reply-only" in sys.argv or fixture_version in {
+    "0.155.1", "0.156.1", "0.159.3", "0.160.0"
+}, "unknown rendering profiles require --reply-only"
 for directory in ["bin", "config/vde/tmux", "state", "runtime", "home", "fixture"]:
     (root / directory).mkdir(parents=True, exist_ok=True, mode=0o700)
 shutil.copy2(build, root / "bin/vt")
@@ -967,8 +972,6 @@ def auto_ack_cases():
 
 
 def reply_ack_cases():
-    if fixture_version not in {"0.159.3", "0.160.0"}:
-        return
     global pane, pane_ref
     old_pane, old_ref = pane, pane_ref
     directory = root / "reply-ack"
@@ -982,10 +985,12 @@ def reply_ack_cases():
     window = tmux("display-message", "-p", "-t", pane, "#{window_id}")
     attach_client()
     run([vt, "sidebar", "open", "--window", window])
-    wait(lambda: run([vt, "sidebar", "input", "2", "--window", window], check=False).returncode == 0,
-         "reply sidebar connected")
     sidebar = next(line.split()[0] for line in tmux("list-panes", "-t", window, "-F", "#{pane_id} #{@vde_sidebar}").splitlines()
                    if line.endswith(" 1"))
+    # The control socket can accept input before the initial snapshot seeds preferences.
+    # Wait for the requested mode to be drawn, rather than just socket acceptance.
+    wait(lambda: run([vt, "sidebar", "input", "2", "--window", window], check=False).returncode == 0
+         and "Priority" in tmux("capture-pane", "-p", "-t", sidebar), "reply sidebar priority view ready")
     def visible(expected):
         return ("QUESTIONS" in tmux("capture-pane", "-p", "-t", sidebar)) == expected
 
@@ -1014,7 +1019,12 @@ def reply_ack_cases():
     send("UserPromptSubmit", prompt="synthetic reply issuer")
     issue("first", 2)
     issue("second")
-    wait(lambda: visible(True), "reply sidebar issue")
+    try:
+        wait(lambda: visible(True), "reply sidebar issue")
+    except AssertionError:
+        (directory / "sidebar-issue.txt").write_text(tmux("capture-pane", "-p", "-t", sidebar))
+        (directory / "sidebar-issue-snapshot.json").write_text(run([vt, "api", "snapshot", "--json"]).stdout)
+        raise
     send("UserPromptSubmit", prompt=frame(("second", 0)), _ui="normal")
     assert notice()["acknowledged_order"] == 0 and notice()["unacknowledged"]
     send("UserPromptSubmit", prompt=frame(("first", 0)))
@@ -1143,6 +1153,9 @@ try:
     pane_ref = agent()["summary"]["pane_ref"]
     if "--reply-load-only" in sys.argv:
         benchmark(reply_load_only=True)
+    elif "--reply-only" in sys.argv:
+        reply_ack_cases()
+        excluded_mode_lifecycle()
     else:
         auto_ack_cases()
         reply_ack_cases()

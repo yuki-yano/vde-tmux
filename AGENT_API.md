@@ -604,13 +604,14 @@ input in a different turn of the same trusted session can acknowledge a contiguo
 after structural completion/start ordering, exact identity, the home loss journal, Idle/Done, and
 two known normal-composer captures all pass. Direct and accepted queued inputs share this policy;
 queue registration and unrecognized answer framing never resolve notices. Capture only vetoes.
-A complete accepted `<send_user_message_question_reply>` envelope from Codex 0.159.3/0.160.0
+A complete accepted `<send_user_message_question_reply>` envelope from any Codex client version
 acknowledges its matching question IDs without waiting for Idle/Done or another turn. The parser
 accepts one reply object or a nonempty array, optionally after the standard IDE context prefix.
 Each canonical `questionItemId` is `["request_user_input_async", call_id, question_index]` serialized
 as compact JSON; question and answer must be strings. Only hash evidence enters daemon metadata.
-The reply must pass the current embedded parent process, exact pane/owner/session, generation,
-and known profile checks. Known issued IDs do not require a startup hook in the current daemon
+The reply must pass the current embedded parent process, exact pane/owner/session, and generation
+checks. Reply parsing and acknowledgement do not require a known rendering profile
+or a client-version lookup. Known issued IDs do not require a startup hook in the current daemon
 or a complete home-wide history. Resume and daemon restart retain their ID bindings and partial
 answers. Unknown IDs, wrong sessions, malformed or quoted envelopes, and automatic capacity
 inputs never acknowledge a notice. Skip, focus and completion alone do not prove an answer.

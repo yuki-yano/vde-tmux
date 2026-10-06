@@ -178,7 +178,11 @@ during that operation stays visible. Acknowledgement is shared across sidebars, 
 focus, agent input, run status, and unread Done untouched. Parent `? N` counts panes, not questions.
 `!` / parent `! N` reports degraded notice tracking; expand the agent for the reason.
 
-Answering or skipping alone does not guarantee automatic acknowledgement. After the issuing turn
+Accepted replies with known question IDs automatically acknowledge their matching notices in every
+Codex client version. Partial answers retain the unanswered items; no rendering profile, Idle/Done,
+or later turn is required. Malformed replies and unknown IDs retain notices.
+
+Skipping alone does not guarantee automatic acknowledgement. After the issuing turn
 completes normally, an ordinary input accepted in a different turn of the same trusted session can
 acknowledge the notice when that turn becomes Idle/Done and two viewport checks recognize a normal
 composer. Accepted queued inputs follow the same rule; queue registration alone and answer-summary
@@ -823,7 +827,7 @@ this does not fabricate hook authority or a Run completion. Every prompt checks 
 composer, foreground owner and current session. Drafts and queued inputs prevent sending. Shared-server commands such as
 `codex queue` are not available with `--no-daemon`; keep those workflows on the shared server.
 Do not open an active shared thread in both modes.
-Accepted async-question replies in Codex 0.159.3/0.160.0 now acknowledge matching question IDs,
+Accepted async-question replies in every Codex client version acknowledge matching question IDs,
 including replies accepted while the same turn is running. Partial or out-of-order replies keep
 unanswered notices visible and persist across restart. Matching known IDs does not depend on a
 startup hook in the current daemon or home-wide history. Item counts are independent of body

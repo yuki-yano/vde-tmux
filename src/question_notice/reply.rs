@@ -4,8 +4,6 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::profile::CodexProfile;
-
 pub const MAX_ITEMS: usize = 64;
 pub const MAX_ISSUED_ITEMS: usize = super::text::MAX_QUESTIONS;
 
@@ -48,10 +46,7 @@ impl ReplyEvidence {
             })
     }
 
-    pub fn parse(prompt: Option<&str>, profile: CodexProfile) -> Option<Self> {
-        if !matches!(profile, CodexProfile::V01593 | CodexProfile::V01600) {
-            return None;
-        }
+    pub fn parse(prompt: Option<&str>) -> Option<Self> {
         let text = prompt.filter(|text| text.len() <= 64 * 1024)?.trim();
         let text = if text.starts_with("# Context from my IDE setup:\n") {
             text.rsplit_once("\n## My request for Codex:\n")?.1.trim()
@@ -113,27 +108,18 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_complete_profile_defined_reply_and_ide_context_without_retaining_bodies() {
-        for profile in [CodexProfile::V01593, CodexProfile::V01600] {
-            let prompt = frame("call-one", 0);
-            let expected = ReplyEvidence {
-                items: vec![item_digest("call-one", 0)],
-            };
-            assert_eq!(
-                ReplyEvidence::parse(Some(&prompt), profile),
-                Some(expected.clone())
-            );
-            let ide = format!(
-                "# Context from my IDE setup:\nopen files\n## My request for Codex:\n{prompt}"
-            );
-            assert_eq!(
-                ReplyEvidence::parse(Some(&ide), profile),
-                Some(expected.clone())
-            );
-            let serialized = serde_json::to_string(&expected).unwrap();
-            for private in ["private question", "private answer", "call-one"] {
-                assert!(!serialized.contains(private));
-            }
+    fn recognizes_complete_reply_and_ide_context_without_retaining_bodies() {
+        let prompt = frame("call-one", 0);
+        let expected = ReplyEvidence {
+            items: vec![item_digest("call-one", 0)],
+        };
+        assert_eq!(ReplyEvidence::parse(Some(&prompt)), Some(expected.clone()));
+        let ide =
+            format!("# Context from my IDE setup:\nopen files\n## My request for Codex:\n{prompt}");
+        assert_eq!(ReplyEvidence::parse(Some(&ide)), Some(expected.clone()));
+        let serialized = serde_json::to_string(&expected).unwrap();
+        for private in ["private question", "private answer", "call-one"] {
+            assert!(!serialized.contains(private));
         }
     }
 
@@ -149,18 +135,7 @@ mod tests {
                 serde_json::json!({"questionItemId":"[\"request_user_input_async\", \"call-one\", 0]", "question":"q","answer":"a"})),
         ];
         for text in malformed {
-            assert_eq!(
-                ReplyEvidence::parse(Some(&text), CodexProfile::V01593),
-                None,
-                "{text}"
-            );
-        }
-        for profile in [
-            CodexProfile::Unknown,
-            CodexProfile::V01551,
-            CodexProfile::V01561,
-        ] {
-            assert_eq!(ReplyEvidence::parse(Some(&valid), profile), None);
+            assert_eq!(ReplyEvidence::parse(Some(&text)), None, "{text}");
         }
     }
 
@@ -175,16 +150,10 @@ mod tests {
             let text = format!(
                 "<send_user_message_question_reply>{value}</send_user_message_question_reply>"
             );
-            assert_eq!(
-                ReplyEvidence::parse(Some(&text), CodexProfile::V01600),
-                None
-            );
+            assert_eq!(ReplyEvidence::parse(Some(&text)), None);
         }
         let large = format!("{}{}", " ".repeat(64 * 1024), frame("call", 0));
-        assert_eq!(
-            ReplyEvidence::parse(Some(&large), CodexProfile::V01600),
-            None
-        );
+        assert_eq!(ReplyEvidence::parse(Some(&large)), None);
     }
     #[test]
     fn rejects_duplicate_known_fields_in_objects_and_mixed_arrays() {
@@ -206,11 +175,7 @@ mod tests {
                 let prompt = format!(
                     "<send_user_message_question_reply>{raw}</send_user_message_question_reply>"
                 );
-                assert_eq!(
-                    ReplyEvidence::parse(Some(&prompt), CodexProfile::V01600),
-                    None,
-                    "{prompt}"
-                );
+                assert_eq!(ReplyEvidence::parse(Some(&prompt)), None, "{prompt}");
             }
         }
     }

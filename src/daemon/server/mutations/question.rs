@@ -306,8 +306,7 @@ pub(in crate::daemon::server) fn observe(
     let valid = input.parent_origin_verified
         && input.daemon_generation.as_ref() == Some(&observation.daemon)
         && process_verified
-        && profile_verified
-        && input.profile != CodexProfile::Unknown
+        && (exact_reply || (profile_verified && input.profile != CodexProfile::Unknown))
         && input
             .locator
             .as_ref()
@@ -327,8 +326,8 @@ pub(in crate::daemon::server) fn observe(
             input.parent_origin_verified,
             input.daemon_generation.as_ref() == Some(&observation.daemon),
             process_verified,
-            profile_verified,
-            input.profile != CodexProfile::Unknown,
+            exact_reply || profile_verified,
+            exact_reply || input.profile != CodexProfile::Unknown,
             input.locator.as_ref().is_some_and(|locator| {
                 locator.home_digest() == home && locator.matches_current_file()
             }),
