@@ -40,10 +40,9 @@ mod tests {
         cycle_statusline_category_with_snapshot, displayed_category_targets, top_level_user_ranges,
     };
     use super::render::{
-        STATUS_NOW_FORMAT_OPTION, SessionBadgeRenderOptions, StatusToken,
-        pane_border_highlight_color, render_structured_session_segment, render_structured_sessions,
-        render_structured_summary, status_projection_width, structured_pane_status_label,
-        tmux_bounded_duration, tmux_display_width,
+        STATUS_NOW_FORMAT_OPTION, SessionBadgeRenderOptions, pane_border_highlight_color,
+        render_structured_session_segment, render_structured_sessions, render_structured_summary,
+        structured_pane_status_label, tmux_bounded_duration, tmux_display_width,
     };
     use super::targets::{
         CATEGORY_RANGE_PREFIX, CURRENT_CATEGORY_RANGE_PREFIX, TMUX_USER_RANGE_NAME_MAX_BYTES,
@@ -151,6 +150,284 @@ mod tests {
                 idle: 1,
                 ..BadgeStateCounts::default()
             },
+        }
+    }
+
+    #[test]
+    fn window_map_distinguishes_total_from_sparse_zero_based_indices() {
+        let config = Config::default();
+        let snapshot = StatusSnapshot {
+            windows: vec![
+                status_window("@9", "zsh", 9, false),
+                status_window("@2", "node", 2, true),
+                status_window("@5", "logs", 5, false),
+                status_window("@0", "node", 0, false),
+            ],
+            ..status_snapshot()
+        };
+        let rendered = render_structured_status_snapshot(&config, &snapshot).unwrap();
+        assert!(rendered.windows.starts_with("W 4 "));
+        assert_eq!(
+            top_level_user_ranges(&rendered.windows).unwrap(),
+            vec!["window:@0", "window:@2", "window:@5", "window:@9"]
+        );
+        assert!(rendered.windows.contains("#[reverse]2#[noreverse]"));
+        assert!(rendered.windows.ends_with(" │ node"));
+        assert_eq!(rendered.windows.matches("node").count(), 1);
+        assert!(!rendered.windows.contains("logs"));
+        assert!(!rendered.windows.contains("zsh"));
+        let empty = render_structured_status_snapshot(&config, &status_snapshot()).unwrap();
+        assert!(empty.windows.is_empty());
+        let single = render_structured_status_snapshot(
+            &config,
+            &StatusSnapshot {
+                windows: vec![status_window("@9", "zsh", 9, true)],
+                ..status_snapshot()
+            },
+        )
+        .unwrap();
+        assert!(single.windows.starts_with("W 1 "));
+        assert!(single.windows.contains("#[reverse]9#[noreverse]"));
+    }
+
+    #[test]
+    fn window_map_aggregates_each_windows_agent_states_with_session_colors() {
+        let config = Config::default();
+        let snapshot = StatusSnapshot {
+            windows: vec![
+                WindowStatusPresentation {
+                    counts: BadgeStateCounts {
+                        blocked: 1,
+                        limited: 2,
+                        working: 3,
+                        done: 4,
+                        unknown: 5,
+                        idle: 6,
+                    },
+                    ..status_window("@1", "node", 1, true)
+                },
+                WindowStatusPresentation {
+                    counts: BadgeStateCounts {
+                        working: 7,
+                        idle: 8,
+                        ..BadgeStateCounts::default()
+                    },
+                    ..status_window("@2", "zsh", 2, false)
+                },
+            ],
+            ..status_snapshot()
+        };
+        let windows = render_structured_status_snapshot(&config, &snapshot)
+            .unwrap()
+            .windows;
+        let current = windows.split("#[norange]").next().unwrap();
+        let mut previous = 0;
+        for text in ["▲ 1", "⋄ 2", "● 3", "✓ 4", "? 5", "○ 6"] {
+            let position = current.find(text).expect(text);
+            assert!(position > previous, "{current}");
+            previous = position;
+        }
+        assert!(windows.contains(&format!("#[fg={}]▲ 1", config.badge.colors.blocked)));
+        assert!(windows.contains(&format!("#[fg={}]● 7", config.badge.colors.working)));
+        assert!(windows.contains(&format!("#[fg={}]✓ 4", config.badge.colors.done)));
+        assert!(windows.contains("○ 8"));
+        assert_eq!(
+            top_level_user_ranges(&windows).unwrap(),
+            vec!["window:@1", "window:@2"]
+        );
+    }
+
+    #[test]
+    fn window_map_keeps_index_positions_when_the_active_window_changes() {
+        let config = Config::default();
+        let windows = (1..=4)
+            .map(|index| WindowStatusPresentation {
+                counts: BadgeStateCounts {
+                    working: index as usize,
+                    ..BadgeStateCounts::default()
+                },
+                ..status_window(&format!("@{index}"), "node", index, index == 1)
+            })
+            .collect::<Vec<_>>();
+        let first = render_structured_status_snapshot(
+            &config,
+            &StatusSnapshot {
+                windows: windows.clone(),
+                ..status_snapshot()
+            },
+        )
+        .unwrap()
+        .windows;
+        let mut windows = windows;
+        windows[0].active = false;
+        windows[2].active = true;
+        let third = render_structured_status_snapshot(
+            &config,
+            &StatusSnapshot {
+                windows,
+                ..status_snapshot()
+            },
+        )
+        .unwrap()
+        .windows;
+        for index in 1..=4 {
+            let range = format!("#[range=user|window:@{index}]");
+            let position = |text: &str| tmux_display_width(text.split(&range).next().unwrap());
+            assert_eq!(position(&first), position(&third), "Window {index}");
+        }
+    }
+
+    #[test]
+    fn window_map_preserves_contiguous_neighbors_and_hidden_attention_on_each_side() {
+        let windows = (0..58)
+            .map(|index| WindowStatusPresentation {
+                counts: match index {
+                    0 => BadgeStateCounts {
+                        blocked: 2,
+                        ..BadgeStateCounts::default()
+                    },
+                    57 => BadgeStateCounts {
+                        done: 3,
+                        ..BadgeStateCounts::default()
+                    },
+                    _ => BadgeStateCounts {
+                        working: 1,
+                        ..BadgeStateCounts::default()
+                    },
+                },
+                ..status_window(&format!("@{index}"), "node", index, index == 29)
+            })
+            .collect();
+        let windows = render_structured_status_snapshot(
+            &Config::default(),
+            &StatusSnapshot {
+                windows,
+                ..status_snapshot()
+            },
+        )
+        .unwrap()
+        .windows;
+        assert!(windows.starts_with("W 58 "));
+        assert!(
+            tmux_display_width(&windows) <= STATUS_OPTION_CELL_BUDGET,
+            "{windows}"
+        );
+        assert!(windows.contains("#[reverse]29#[noreverse]"));
+        let targets = top_level_user_ranges(&windows)
+            .unwrap()
+            .iter()
+            .map(|target| {
+                target
+                    .strip_prefix("window:@")
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(targets.contains(&29));
+        assert!(targets.len() > 1);
+        assert!(targets.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        let left = windows.split("#[range=user|window:").next().unwrap();
+        let right = windows.rsplit("#[norange]").next().unwrap();
+        assert!(left.contains("▲") && left.contains(" 2"), "{left}");
+        assert!(right.contains("✓") && right.contains(" 3"), "{right}");
+        assert!(!targets.contains(&0) && !targets.contains(&57));
+    }
+
+    #[test]
+    fn window_map_bounds_and_escapes_current_name_without_spoofing_click_targets() {
+        let name = "日本語#[norange]#{pane_id}\n🪟".repeat(10);
+        let windows = render_structured_status_snapshot(
+            &Config::default(),
+            &StatusSnapshot {
+                windows: vec![status_window("@1", &name, 0, true)],
+                ..status_snapshot()
+            },
+        )
+        .unwrap()
+        .windows;
+        assert!(windows.contains(" │ 日本語##[norange…"), "{windows}");
+        assert!(!windows.contains('\n'));
+        assert_eq!(top_level_user_ranges(&windows).unwrap(), vec!["window:@1"]);
+        assert!(tmux_display_width(windows.split(" │ ").last().unwrap()) <= 16);
+    }
+
+    #[test]
+    fn window_bell_is_distinct_from_agent_input_waiting() {
+        let mut config = Config::default();
+        config.statusline.windows.bell.fg = Some("#f9e2af".to_string());
+        let windows = render_structured_status_snapshot(
+            &config,
+            &StatusSnapshot {
+                windows: vec![WindowStatusPresentation {
+                    bell: Some(true),
+                    counts: BadgeStateCounts {
+                        blocked: 1,
+                        working: 2,
+                        ..BadgeStateCounts::default()
+                    },
+                    ..status_window("@1", "node", 1, true)
+                }],
+                ..status_snapshot()
+            },
+        )
+        .unwrap()
+        .windows;
+        assert!(windows.contains("#[fg=#f9e2af]♪"));
+        assert!(windows.contains(&format!("#[fg={}]▲ 1", config.badge.colors.blocked)));
+        assert!(windows.contains("#[bold,fg=#e8ecfb,bg=#434662]"));
+    }
+
+    #[test]
+    fn crowded_window_map_shortens_name_before_losing_current_or_hidden_agent_counts() {
+        let windows = (0..20)
+            .map(|index| WindowStatusPresentation {
+                counts: if index == 10 {
+                    BadgeStateCounts {
+                        blocked: 1,
+                        limited: 1,
+                        working: 1,
+                        done: 1,
+                        unknown: 1,
+                        idle: 1,
+                    }
+                } else {
+                    BadgeStateCounts {
+                        blocked: 1,
+                        limited: 1,
+                        done: 1,
+                        ..BadgeStateCounts::default()
+                    }
+                },
+                ..status_window(
+                    &format!("@{index}"),
+                    "long-window-name-abcdefg",
+                    index,
+                    index == 10,
+                )
+            })
+            .collect();
+        let windows = render_structured_status_snapshot(
+            &Config::default(),
+            &StatusSnapshot {
+                windows,
+                ..status_snapshot()
+            },
+        )
+        .unwrap()
+        .windows;
+        assert!(
+            tmux_display_width(&windows) <= STATUS_OPTION_CELL_BUDGET,
+            "{windows}"
+        );
+        assert!(windows.contains("#[reverse]10#[noreverse]"));
+        for text in ["▲ 1", "⋄ 1", "● 1", "✓ 1", "? 1", "○ 1"] {
+            assert!(windows.contains(text), "{text}: {windows}");
+        }
+        let left = windows.split("#[range=user|window:").next().unwrap();
+        let right = windows.rsplit("#[norange]").next().unwrap();
+        for glyph in ["▲", "⋄", "✓"] {
+            assert!(left.contains(glyph) && right.contains(glyph), "{windows}");
         }
     }
 
@@ -318,7 +595,9 @@ mod tests {
             rendered.sessions
         );
         assert!(
-            rendered.windows.contains("2|editor|3|nvim|working|"),
+            rendered
+                .windows
+                .contains("2#[noreverse]|editor|3|nvim|working|"),
             "{}",
             rendered.windows
         );
@@ -424,7 +703,7 @@ mod tests {
         assert!(
             rendered
                 .windows
-                .contains("win##{command}|sh##[bg=red] {window}|4"),
+                .contains("win##{command}|sh##[bg=red] {window}|#[reverse]4#[noreverse]"),
             "{}",
             rendered.windows
         );
@@ -764,7 +1043,11 @@ mod tests {
         assert!(!rendered.category.contains("+"), "{}", rendered.category);
         assert!(!rendered.summary.is_empty(), "{rendered:?}");
         assert!(tmux_display_width(&rendered.windows) <= 80);
-        assert!(rendered.windows.contains("+"), "{}", rendered.windows);
+        assert!(
+            rendered.windows.starts_with("W 12 "),
+            "{}",
+            rendered.windows
+        );
         let total = [
             &rendered.attention,
             &rendered.category,
@@ -882,59 +1165,6 @@ mod tests {
     }
 
     #[test]
-    fn default_summary_width_is_counted_at_the_eighty_cell_budget_boundary() {
-        let config = Config::default();
-        let summary = render_structured_summary(
-            &config,
-            BadgeStateCounts {
-                blocked: 1,
-                limited: 0,
-                working: 1,
-                done: 1,
-                unknown: 0,
-                idle: 1,
-            },
-        );
-        let mut category_tokens = [StatusToken {
-            rendered: "c".repeat(61),
-            compact: String::new(),
-            current: true,
-        }];
-        let category_included = [true];
-
-        assert_eq!(
-            status_projection_width(
-                &summary,
-                &category_tokens,
-                &category_included,
-                &[],
-                &[],
-                &[],
-                &[],
-                "",
-                &config,
-            ),
-            STATUS_OPTION_CELL_BUDGET
-        );
-
-        category_tokens[0].rendered.push('c');
-        assert_eq!(
-            status_projection_width(
-                &summary,
-                &category_tokens,
-                &category_included,
-                &[],
-                &[],
-                &[],
-                &[],
-                "",
-                &config,
-            ),
-            STATUS_OPTION_CELL_BUDGET + 1
-        );
-    }
-
-    #[test]
     fn oversized_summary_remains_visible_with_current_action_targets() {
         let mut config = Config::default();
         config.badge.glyphs.blocked = "B".repeat(70);
@@ -1024,7 +1254,10 @@ mod tests {
         assert!(rendered.sessions.contains(&"界🚀".repeat(100)));
         assert!(rendered.sessions.contains("inactive-peer"));
         assert!(rendered.windows.contains("range=user|window:@77"));
-        assert_eq!(rendered.windows, "#[range=user|window:@77]@77#[norange]");
+        assert!(rendered.windows.starts_with("W 1 "));
+        assert!(rendered.windows.contains("#[reverse]1#[noreverse]"));
+        assert!(rendered.windows.contains("窓🪟窓🪟窓🪟窓…"));
+        assert!(!rendered.windows.contains("]@77"));
         assert!(rendered.category.contains("range=user|C:"));
         assert!(tmux_display_width(&rendered.sessions) > 80);
         assert!(tmux_display_width(&rendered.category) > 80);

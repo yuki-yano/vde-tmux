@@ -1499,8 +1499,12 @@ fn dispatch_statusline_windows_prints_output() {
     .unwrap();
 
     assert!(output.contains("#[range=user|window:@1]"), "{output}");
-    assert!(output.contains("1:zsh"), "{output}");
-    assert!(output.contains("2:editor"), "{output}");
+    assert!(output.starts_with("W 2 "), "{output}");
+    assert!(output.contains("#[range=user|window:@2]"), "{output}");
+    assert!(output.contains("#[reverse]2#[noreverse]"), "{output}");
+    assert!(output.contains("● 1"), "{output}");
+    assert!(output.ends_with(" │ editor"), "{output}");
+    assert!(!output.contains("zsh"), "{output}");
     fixture.finish();
 }
 

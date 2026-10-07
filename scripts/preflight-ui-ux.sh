@@ -321,8 +321,13 @@ cp "$CONFIG_HOME/vde/tmux/config.yml" "$ARTIFACT_DIR/config.valid.yml"
 cat >"$TMUX_CONF" <<'EOF'
 set -g exit-empty off
 set -g status on
-set -g status-left '#{@vde_status_category}#{@vde_status_sessions}#{@vde_status_windows}'
-set -g status-right '#{@vde_status_attention}#{@vde_status_summary}'
+set -g status-left-length 10000
+set -g status-right-length 80
+set -g status-left '#{@vde_status_summary} #{@vde_status_category}#{@vde_status_sessions}#{@vde_status_attention}'
+set -g status-right '#{@vde_status_windows}'
+setw -g window-status-format ''
+setw -g window-status-current-format ''
+set -g window-status-separator ''
 set -g pane-border-status top
 set -g pane-border-format '#{@vde_status_pane}'
 EOF
@@ -1048,10 +1053,14 @@ assert len(lines) == 5, len(lines)
 sessions = lines[1]
 assert len(re.findall(r"#\[range=user\|session:\$\d+\]", sessions)) == 5, sessions
 assert not re.search(r"(?:^|\s)\+\d+(?:\s|$)", sessions), sessions
-non_session_total = widths[0] + widths[2] + widths[3] + widths[4]
-assert non_session_total <= 80, non_session_total
+assert widths[2] <= 80, widths[2]
+assert widths[3] <= 80, widths[3]
+windows = lines[2].rstrip("\n")
+assert windows.startswith("W "), windows
+assert re.search(r"#\[range=user\|window:@\d+\]", windows), windows
+assert "#[reverse]" in windows, windows
 PY
-record width-captures PASS-16-24-35-36-sidebar-all-sessions-and-80-other-status
+record width-captures PASS-16-24-35-36-sidebar-all-sessions-and-80-window-map
 
 query_snapshot
 run_vt daemon status >"$ARTIFACT_DIR/final-daemon-status.txt"

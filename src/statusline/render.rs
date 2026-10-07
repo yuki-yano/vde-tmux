@@ -441,17 +441,10 @@ pub(super) fn structured_category_tokens(
 
 fn structured_window_tokens(
     config: &Config,
-    windows: &[WindowStatusPresentation],
+    windows: &[&WindowStatusPresentation],
 ) -> Vec<StatusToken> {
-    let mut windows = windows.iter().collect::<Vec<_>>();
-    windows.sort_by(|left, right| {
-        left.window_index
-            .unwrap_or(i64::MAX)
-            .cmp(&right.window_index.unwrap_or(i64::MAX))
-            .then_with(|| left.window_id.cmp(&right.window_id))
-    });
     windows
-        .into_iter()
+        .iter()
         .map(|window| {
             let style = structured_window_segment_style(config, window);
             let badge = structured_agent_badge(
@@ -466,10 +459,15 @@ fn structured_window_tokens(
                 badge.as_ref(),
                 &style.colors,
             );
-            let index = window
+            let raw_index = window
                 .window_index
                 .map(|value| value.to_string())
-                .unwrap_or_default();
+                .unwrap_or_else(|| "?".to_string());
+            let index = if window.active {
+                format!("#[reverse]{raw_index}#[noreverse]")
+            } else {
+                raw_index
+            };
             let name = structured_external_text(if window.window_name.is_empty() {
                 "(unnamed)"
             } else {
@@ -488,7 +486,7 @@ fn structured_window_tokens(
                 .rollup_state()
                 .unwrap_or(BadgeState::Idle)
                 .as_str();
-            let body = render_structured_template(
+            let mut body = render_structured_template(
                 &style.format,
                 &[
                     ("{badge}", badge_fragment.as_str()),
@@ -501,6 +499,11 @@ fn structured_window_tokens(
                     ("{state}", state),
                 ],
             );
+            if badge_fragment.is_empty() && style.format == " {index} {badge} " {
+                body = format!(" {index} ");
+            }
+            let notification = window_notification(config, window, &style);
+            body.push_str(&notification);
             let segment = if config.statusline.windows.badge_style == BadgeStyle::Chip {
                 match badge.as_ref() {
                     Some((value, state)) => render_chip_agent_segment(
@@ -521,16 +524,216 @@ fn structured_window_tokens(
                 "#[range=user|window:{}]{segment}#[norange]",
                 window.window_id
             );
+            // Width compaction preserves the public index and agent counts. Internal @IDs
+            // identify click targets only; they are never the visible current-window label.
+            let mut compact_style = style.clone();
+            compact_style.prefix.clear();
+            compact_style.suffix.clear();
+            let compact_badge = badge
+                .as_ref()
+                .map(|(value, state)| {
+                    agent_badge_fragment(
+                        config,
+                        &config.statusline.windows.agent_badge,
+                        BadgeStyle::Inline,
+                        value,
+                        state,
+                        style.colors.fg.as_deref(),
+                        style.colors.bg.as_deref(),
+                    )
+                })
+                .unwrap_or_default();
+            let compact_body = if compact_badge.is_empty() {
+                format!(" {index}{notification} ")
+            } else {
+                format!(" {index} {compact_badge}{notification} ")
+            };
+            let compact = tmux_style_segment(&compact_style, &compact_body);
             StatusToken {
                 compact: format!(
-                    "#[range=user|window:{}]{}#[norange]",
-                    window.window_id, window.window_id
+                    "#[range=user|window:{}]{compact}#[norange]",
+                    window.window_id
                 ),
                 rendered,
                 current: window.active,
             }
         })
         .collect::<Vec<_>>()
+}
+
+fn window_notification(
+    config: &Config,
+    window: &WindowStatusPresentation,
+    style: &SegmentStyle,
+) -> String {
+    let (glyph, colors) = if window.bell.unwrap_or(false) {
+        ("♪", &config.statusline.windows.bell)
+    } else if window.activity.unwrap_or(false) || window.silence.unwrap_or(false) {
+        ("·", &config.statusline.windows.activity)
+    } else {
+        return String::new();
+    };
+    let color = colors.fg.as_deref().unwrap_or("#f9e2af");
+    let restore = style.colors.fg.as_deref().unwrap_or("default");
+    format!(" #[fg={color}]{glyph}#[fg={restore}]")
+}
+
+fn render_window_map(config: &Config, windows: &[WindowStatusPresentation]) -> String {
+    if windows.is_empty() {
+        return String::new();
+    }
+    let mut ordered = windows.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.window_index
+            .unwrap_or(i64::MAX)
+            .cmp(&right.window_index.unwrap_or(i64::MAX))
+            .then_with(|| left.window_id.cmp(&right.window_id))
+    });
+    let tokens = structured_window_tokens(config, &ordered);
+    let active = tokens.iter().position(|token| token.current);
+    let current_name = active.map(|index| {
+        let name = &ordered[index].window_name;
+        let name = if name.is_empty() { "(unnamed)" } else { name };
+        name.chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>()
+    });
+    let cell_widths = [false, true].map(|compact| {
+        tokens
+            .iter()
+            .map(|token| {
+                tmux_display_width(if compact {
+                    &token.compact
+                } else {
+                    &token.rendered
+                })
+            })
+            .max()
+            .unwrap_or(0)
+    });
+    let render = |start: usize, end: usize, compact: bool, name_width: usize| {
+        let selected = &tokens[start..end];
+        let cells = selected
+            .iter()
+            .map(|token| {
+                if compact {
+                    &token.compact
+                } else {
+                    &token.rendered
+                }
+            })
+            .collect::<Vec<_>>();
+        // Equal-width cells keep every index in place when only the active Window changes.
+        let cell_width = cell_widths[usize::from(compact)];
+        let cells = cells
+            .iter()
+            .map(|cell| {
+                let padding = " ".repeat(cell_width.saturating_sub(tmux_display_width(cell)));
+                format!("{cell}{padding}")
+            })
+            .collect::<Vec<_>>()
+            .join(&config.statusline.windows.separator);
+        let left = window_map_omission(config, &ordered[..start], true);
+        let right = window_map_omission(config, &ordered[end..], false);
+        let name = current_name
+            .as_ref()
+            .filter(|_| name_width > 0)
+            .map(|name| {
+                format!(
+                    " │ {}",
+                    structured_external_text(&crate::sidebar::render::truncate_display(
+                        name, name_width
+                    ))
+                )
+            })
+            .unwrap_or_default();
+        format!("W {} {left}{cells}{right}{name}", ordered.len())
+    };
+    let full = render(0, tokens.len(), false, 16);
+    if tmux_display_width(&full) <= STATUS_OPTION_CELL_BUDGET {
+        return full;
+    }
+    let center = active.unwrap_or(0);
+    let mut start = center;
+    let mut end = center + 1;
+    let name_width =
+        if tmux_display_width(&render(start, end, true, 16)) <= STATUS_OPTION_CELL_BUDGET {
+            16
+        } else {
+            STATUS_OPTION_CELL_BUDGET
+                .saturating_sub(tmux_display_width(&render(start, end, true, 0)))
+                .saturating_sub(3)
+                .min(16)
+        };
+    // Grow a contiguous neighborhood, alternating left and right; hidden windows retain
+    // their actual side and aggregate state rather than becoming a misleading trailing +N.
+    loop {
+        let mut grew = false;
+        if start > 0
+            && tmux_display_width(&render(start - 1, end, true, name_width))
+                <= STATUS_OPTION_CELL_BUDGET
+        {
+            start -= 1;
+            grew = true;
+        }
+        if end < tokens.len()
+            && tmux_display_width(&render(start, end + 1, true, name_width))
+                <= STATUS_OPTION_CELL_BUDGET
+        {
+            end += 1;
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    render(start, end, true, name_width)
+}
+
+fn window_map_omission(
+    config: &Config,
+    windows: &[&WindowStatusPresentation],
+    left: bool,
+) -> String {
+    if windows.is_empty() {
+        return String::new();
+    }
+    let mut counts = BadgeStateCounts::default();
+    for window in windows {
+        counts.merge(window.counts);
+    }
+    let states = [
+        (BadgeState::Blocked, counts.blocked),
+        (BadgeState::Limited, counts.limited),
+        (BadgeState::Done, counts.done),
+    ];
+    let badges = states
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(state, count)| {
+            format!(
+                "{} {count}",
+                structured_pane_badge(config, state, "default")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let badges = if badges.is_empty() {
+        String::new()
+    } else {
+        format!(" {badges}")
+    };
+    if left {
+        format!("{}…{badges} ", windows.len())
+    } else {
+        format!(" …{}{badges}", windows.len())
+    }
 }
 
 fn render_bounded_status_snapshot(
@@ -544,73 +747,27 @@ fn render_bounded_status_snapshot(
         .enumerate()
         .map(|(index, session)| render_session_token(config, session, index))
         .collect::<Vec<_>>();
-    let mut window_tokens = structured_window_tokens(config, &snapshot.windows);
     let category_included = vec![true; category_tokens.len()];
-    // Session navigation uses the stable targets embedded in this exact rendered model. Keep
-    // every ordered session visible so the status line and next/previous actions never collapse
-    // to the current session plus a non-actionable `+N` summary.
+    // Keep Session navigation and global Summary independent from Window compaction.
     let session_included = vec![true; session_tokens.len()];
-    let mut window_included = window_tokens
-        .iter()
-        .map(|token| token.current)
-        .collect::<Vec<_>>();
+    let windows = render_window_map(config, &snapshot.windows);
+    let summary = render_structured_summary(config, snapshot.summary);
     let (attention_full, attention_compact) =
         structured_attention_variants(config, &snapshot.attention);
-    let mut attention = attention_full;
-    let summary = render_structured_summary(config, snapshot.summary);
-
-    // Keep the complete session action model independent from the bounded status content.
-    // Summary is the persistent aggregate state indicator. Keep it visible even when category
-    // styling or content makes the bounded projection exceed the shared budget.
-    if status_projection_width(
-        &summary,
-        &category_tokens,
-        &category_included,
-        &session_tokens,
-        &session_included,
-        &window_tokens,
-        &window_included,
-        &attention,
-        config,
-    ) > STATUS_OPTION_CELL_BUDGET
+    let category_width = category_tokens
+        .iter()
+        .map(|token| tmux_display_width(&token.rendered))
+        .sum::<usize>();
+    let attention = if tmux_display_width(&summary)
+        + category_width
+        + tmux_display_width(&windows)
+        + tmux_display_width(&attention_full)
+        > STATUS_OPTION_CELL_BUDGET
     {
-        compact_current_tokens(&mut window_tokens);
-    }
-    if status_projection_width(
-        &summary,
-        &category_tokens,
-        &category_included,
-        &session_tokens,
-        &session_included,
-        &window_tokens,
-        &window_included,
-        &attention,
-        config,
-    ) > STATUS_OPTION_CELL_BUDGET
-    {
-        attention = attention_compact;
-    }
-
-    for index in 0..window_tokens.len() {
-        if window_included[index] {
-            continue;
-        }
-        window_included[index] = true;
-        if status_projection_width(
-            &summary,
-            &category_tokens,
-            &category_included,
-            &session_tokens,
-            &session_included,
-            &window_tokens,
-            &window_included,
-            &attention,
-            config,
-        ) > STATUS_OPTION_CELL_BUDGET
-        {
-            window_included[index] = false;
-        }
-    }
+        attention_compact
+    } else {
+        attention_full
+    };
 
     let category = render_selected_status_tokens(&category_tokens, &category_included, "");
     let mut sessions = render_selected_sessions(
@@ -629,11 +786,6 @@ fn render_bounded_status_snapshot(
             config.statusline.sessions.fixed_width_alignment,
         );
     }
-    let windows = render_selected_status_tokens(
-        &window_tokens,
-        &window_included,
-        &config.statusline.windows.separator,
-    );
     Ok(StructuredStatusSegments {
         snapshot_revision: snapshot.snapshot_revision,
         summary,
@@ -642,36 +794,6 @@ fn render_bounded_status_snapshot(
         windows,
         attention,
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn status_projection_width(
-    summary: &str,
-    category_tokens: &[StatusToken],
-    category_included: &[bool],
-    _session_tokens: &[StatusToken],
-    _session_included: &[bool],
-    window_tokens: &[StatusToken],
-    window_included: &[bool],
-    attention: &str,
-    config: &Config,
-) -> usize {
-    tmux_display_width(summary)
-        + selected_status_tokens_width(category_tokens, category_included, "")
-        + selected_status_tokens_width(
-            window_tokens,
-            window_included,
-            &config.statusline.windows.separator,
-        )
-        + tmux_display_width(attention)
-}
-
-fn selected_status_tokens_width(
-    tokens: &[StatusToken],
-    included: &[bool],
-    separator: &str,
-) -> usize {
-    tmux_display_width(&render_selected_status_tokens(tokens, included, separator))
 }
 
 fn render_selected_status_tokens(
@@ -749,12 +871,6 @@ pub(super) fn pad_session_zone(
     }
 }
 
-fn compact_current_tokens(tokens: &mut [StatusToken]) {
-    for token in tokens.iter_mut().filter(|token| token.current) {
-        token.rendered = token.compact.clone();
-    }
-}
-
 fn structured_window_segment_style(
     config: &Config,
     window: &WindowStatusPresentation,
@@ -766,11 +882,6 @@ fn structured_window_segment_style(
     };
     if window.last {
         apply_color_overlay(&mut style.colors, &config.statusline.windows.last);
-    }
-    if window.bell.unwrap_or(false) {
-        apply_color_overlay(&mut style.colors, &config.statusline.windows.bell);
-    } else if window.activity.unwrap_or(false) || window.silence.unwrap_or(false) {
-        apply_color_overlay(&mut style.colors, &config.statusline.windows.activity);
     }
     style
 }

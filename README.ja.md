@@ -46,8 +46,9 @@ vt --version
 run-shell -b 'vt daemon ensure'
 
 set -g status-left-length 10000
-set -g status-left '#{@vde_status_category}#[fg=#8f8ba8] │ #[default]#{@vde_status_sessions}#[fg=#8f8ba8] │ #[default]#{@vde_status_windows}'
-set -g status-right '#{@vde_status_attention} #{@vde_status_summary}'
+set -g status-right-length 80
+set -g status-left '#{@vde_status_summary}#[fg=#8f8ba8] │ #[default]#{@vde_status_category}#[fg=#8f8ba8] │ #[default]#{@vde_status_sessions} #{@vde_status_attention}'
+set -g status-right '#{@vde_status_windows}'
 
 setw -g window-status-format ''
 setw -g window-status-current-format ''
@@ -70,6 +71,7 @@ bind-key -n M-e run-shell "vt sidebar focus-toggle --window #{q:window_id}"
 - `@vde_status_now_format` は pane border の経過時間表示に必要です。
 - `Blocked`、`Limited`、`Working`、`Done` の agent pane は、下辺の pane border の残り幅をバッジと同じ色の線で埋めます。
 - `window-status-*` の設定は、tmux 標準の window list を vde-tmux の session と window の表示へ置き換えます。
+- Window マップは `status-right` に置き、Session 一覧が長い場合も現在の Window を表示します。`status-format` を上書きしている場合は、右寄せの `#{T:status-right}` 領域も含めてください。
 - `--client-name` と `--session-id` により、複数の tmux client を使っていても操作対象が別の client へずれません。
 
 設定を読み込み直します。
@@ -423,6 +425,27 @@ sidebar:
     # claude_model: optional-model-name
 
 statusline:
+  windows:
+    badge_style: inline
+    agent_badge:
+      enabled: true
+      mode: counts
+      hide_idle: false
+    current:
+      format: " {index} {badge} "
+      bold: true
+      colors:
+        fg: "#e8ecfb"
+        bg: "#434662"
+    other:
+      format: " {index} {badge} "
+      colors:
+        fg: "#a6adc8"
+        bg: "#2a2b3c"
+    bell:
+      fg: "#f9e2af"
+    activity:
+      fg: "#f9e2af"
   sessions:
     fixed_width: true
     fixed_width_alignment: center # left（デフォルト）| center
@@ -453,6 +476,16 @@ vt daemon reload
 `statusline.summary.format` では `{badge}` と `{count}` の placeholder を使えます（`{badge}{count}`、`{badge}: {count}` など）。
 件数が 0 の状態も表示するため、summary の表示幅は安定します。Idle を表示したくない場合は `hide_idle: true` を指定します。
 summary を有効にしている場合は、カテゴリや window の表示が長いときも常に表示します。
+Window マップの先頭にある `W N` は、現在の Session に属する Window の総数です。
+各セルは tmux の実際の index を使い、0 始まりや欠番もそのまま表示します。現在の index は反転表示します。
+現在の Window 名だけをマップの後ろに表示し、最大16セルに制限します。
+Agent の件数は Window ごとに集計し、Session バッジと同じ順序・色で、Blocked、Limited、Working、未読 Done、Unknown、Idle を表示します。件数表示はデフォルトで有効で、0 件の状態は省略します。
+マップには独立した80セルの表示幅を割り当てます。収まらない場合は現在の Window と連続する近傍を残し、省略した Window 数を左右それぞれに表示します。
+省略した側にある Blocked、Limited、未読 Done の Agent 件数も残します。
+縮小表示でも現在の index と Agent 件数を維持します。内部の `@` ID はクリック対象の識別にだけ使います。
+各セルは最も広いセルに合わせて余白を補い、現在の Window を切り替えたときの位置のずれを抑えます。
+bell（`♪`）と activity（`·`）は Agent バッジと別の印で表示し、Window 全体の色は変更しません。
+既存の設定で `{index}:{window}` を使っている場合や `windows.agent_badge` が無効の場合は、上記のマップ用設定へ更新してください。
 カテゴリの表示には、session があるすべてのカテゴリを、status の幅を超える場合も省略せずに表示します。
 
 `statusline.sessions.fixed_width: true` を指定すると、session の表示領域を最も広いカテゴリに合わせ、session を切り替えてもカテゴリ、session、window を合わせた領域の幅を一定に保ちます。

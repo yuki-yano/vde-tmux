@@ -46,8 +46,9 @@ Add the following to `~/.tmux.conf`:
 run-shell -b 'vt daemon ensure'
 
 set -g status-left-length 10000
-set -g status-left '#{@vde_status_category}#[fg=#8f8ba8] │ #[default]#{@vde_status_sessions}#[fg=#8f8ba8] │ #[default]#{@vde_status_windows}'
-set -g status-right '#{@vde_status_attention} #{@vde_status_summary}'
+set -g status-right-length 80
+set -g status-left '#{@vde_status_summary}#[fg=#8f8ba8] │ #[default]#{@vde_status_category}#[fg=#8f8ba8] │ #[default]#{@vde_status_sessions} #{@vde_status_attention}'
+set -g status-right '#{@vde_status_windows}'
 
 setw -g window-status-format ''
 setw -g window-status-current-format ''
@@ -70,6 +71,7 @@ Notes:
 - `@vde_status_now_format` is required for the elapsed time shown on pane borders.
 - `Blocked`, `Limited`, `Working`, and `Done` agent panes fill the rest of their bottom pane border with a line in the badge color.
 - The `window-status-*` settings replace tmux's native window list with the vde-tmux session and window segments.
+- The Window map belongs in `status-right`, so a long Session list does not hide the current Window. If you override `status-format`, include its right-aligned `#{T:status-right}` area as well.
 - `--client-name` and `--session-id` keep actions scoped to the client that triggered them when multiple tmux clients are attached.
 
 Reload the configuration:
@@ -420,6 +422,27 @@ sidebar:
     # claude_model: optional-model-name
 
 statusline:
+  windows:
+    badge_style: inline
+    agent_badge:
+      enabled: true
+      mode: counts
+      hide_idle: false
+    current:
+      format: " {index} {badge} "
+      bold: true
+      colors:
+        fg: "#e8ecfb"
+        bg: "#434662"
+    other:
+      format: " {index} {badge} "
+      colors:
+        fg: "#a6adc8"
+        bg: "#2a2b3c"
+    bell:
+      fg: "#f9e2af"
+    activity:
+      fg: "#f9e2af"
   sessions:
     fixed_width: true
     fixed_width_alignment: center # left (default) | center
@@ -450,6 +473,17 @@ vt daemon reload
 `statusline.summary.format` supports the `{badge}` and `{count}` placeholders, such as `{badge}{count}` or `{badge}: {count}`.
 Zero-count states stay visible so the summary width stays stable; set `hide_idle: true` to omit the idle token.
 When enabled, the summary stays visible even when category or window content is long.
+The Window map starts with `W N`, where `N` is the number of Windows in the current Session.
+Each cell uses the real tmux index, including zero-based indices and gaps; the active index is reversed.
+Only the current Window name follows the map, limited to 16 display cells.
+Each Window's agents are counted separately in the same state order and colors as Session badges:
+Blocked, Limited, Working, unread Done, Unknown, and Idle. Counts are enabled by default; zero-count states are omitted.
+The map uses an independent 80-cell budget. When it does not fit, it keeps contiguous neighbors of the active Window and shows omitted Window counts on their respective sides.
+Hidden Blocked, Limited, and unread Done agent counts remain visible next to each omitted side.
+The current index and agent counts survive compaction; internal `@` IDs are only click targets.
+Cells are padded to the widest cell so their positions stay stable when the active Window changes.
+Bell (`♪`) and activity (`·`) indicators are separate from agent badges and do not recolor the whole Window.
+If an existing configuration uses `{index}:{window}` or disables `windows.agent_badge`, update that section to the map configuration above.
 The category segment lists every category that has a session with its full label, even when it exceeds the status width.
 
 `statusline.sessions.fixed_width: true` pads the session area to the widest category, so the combined category, session, and window area keeps the same width when you switch sessions.

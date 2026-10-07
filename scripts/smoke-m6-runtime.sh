@@ -210,8 +210,13 @@ YAML
 # no #() command. The daemon is started while the scratch server still has zero sessions.
 cat >"$TMUX_CONF" <<EOF
 set -g exit-empty off
-set -g status-left '#{@vde_status_category}#{@vde_status_sessions}#{@vde_status_windows}'
-set -g status-right '#{@vde_status_attention}#{@vde_status_summary}'
+set -g status-left-length 10000
+set -g status-right-length 80
+set -g status-left '#{@vde_status_summary} #{@vde_status_category}#{@vde_status_sessions}#{@vde_status_attention}'
+set -g status-right '#{@vde_status_windows}'
+setw -g window-status-format ''
+setw -g window-status-current-format ''
+set -g window-status-separator ''
 set -g pane-border-status top
 set -g pane-border-format '#{@vde_status_pane}'
 set-hook -g 'client-session-changed[0]' 'run-shell "vt hooks on-client-session-changed '\''#{client_pid}'\'' '\''#{session_name}'\''"'
@@ -1085,6 +1090,9 @@ MAIN_WINDOWS="$(tmux -L "$TMUX_SOCKET" show-options -v -t main @vde_status_windo
 AUX_WINDOWS="$(tmux -L "$TMUX_SOCKET" show-options -v -t aux @vde_status_windows)"
 echo "display main windows: $MAIN_WINDOWS"
 echo "display aux windows: $AUX_WINDOWS"
+[[ "$MAIN_WINDOWS" == 'W 2 '* ]]
+[[ "$AUX_WINDOWS" == 'W 2 '* ]]
+grep -F '✓ 1' <<<"$MAIN_WINDOWS" >/dev/null
 grep -F linked <<<"$MAIN_WINDOWS" >/dev/null
 grep -F own <<<"$AUX_WINDOWS" >/dev/null
 [[ "$MAIN_WINDOWS" != "$AUX_WINDOWS" ]]

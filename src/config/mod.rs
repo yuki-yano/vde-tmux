@@ -149,20 +149,34 @@ impl Default for StatuslineWindowsConfig {
     fn default() -> Self {
         Self {
             current: SegmentStyle {
-                format: " {index}:{window} ".to_string(),
+                format: " {index} {badge} ".to_string(),
                 bold: true,
+                colors: SegmentColors {
+                    fg: Some("#e8ecfb".to_string()),
+                    bg: Some("#434662".to_string()),
+                    ..SegmentColors::default()
+                },
                 ..SegmentStyle::default()
             },
             other: SegmentStyle {
-                format: " {index}:{window} ".to_string(),
+                format: " {index} {badge} ".to_string(),
+                colors: SegmentColors {
+                    fg: Some("#a6adc8".to_string()),
+                    bg: Some("#2a2b3c".to_string()),
+                    ..SegmentColors::default()
+                },
                 ..SegmentStyle::default()
             },
             last: SegmentColors::default(),
             bell: SegmentColors::default(),
             activity: SegmentColors::default(),
-            agent_badge: AgentBadgeConfig::default(),
+            agent_badge: AgentBadgeConfig {
+                enabled: true,
+                mode: SessionBadgeMode::Counts,
+                ..AgentBadgeConfig::default()
+            },
             badge_style: BadgeStyle::Inline,
-            separator: String::new(),
+            separator: " ".to_string(),
         }
     }
 }
@@ -925,7 +939,7 @@ daemon:
         assert_eq!(config.statusline.sessions.current.format, " {session} ");
         assert_eq!(
             config.statusline.windows.current.format,
-            " {index}:{window} "
+            " {index} {badge} "
         );
         assert!(config.statusline.windows.current.bold);
         assert_eq!(
