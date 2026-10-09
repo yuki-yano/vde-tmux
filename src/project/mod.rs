@@ -36,7 +36,16 @@ impl ProjectSelectorIo for SystemProjectSelectorIo {
         if choices.is_empty() {
             return Ok(None);
         }
-        let preview = r#"path="$(eval echo {})"; if command -v bat >/dev/null 2>&1; then bat --color=always --paging=never --style=plain --theme="Catppuccin Mocha" "$path/README.md"; else cat "$path/README.md"; fi"#;
+        let preview = r#"repo_path={}
+case "$repo_path" in
+    '~') repo_path="$HOME" ;;
+    '~/'*) repo_path="$HOME/${repo_path#'~/'}" ;;
+esac
+if command -v bat >/dev/null 2>&1; then
+    bat --color=always --paging=never --style=plain --theme="Catppuccin Mocha" "$repo_path/README.md"
+else
+    cat "$repo_path/README.md"
+fi"#;
         let mut child = Command::new("fzf")
             .args([
                 "--prompt=Project> ",
