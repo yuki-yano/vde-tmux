@@ -113,13 +113,43 @@ Add these hooks to `~/.claude/settings.json`:
     "PostToolUse": [{ "hooks": [{ "type": "command", "command": "vt hook claude PostToolUse" }] }],
     "Notification": [{ "hooks": [{ "type": "command", "command": "vt hook claude Notification" }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "vt hook claude Stop" }] }],
-    "StopFailure": [{ "hooks": [{ "type": "command", "command": "vt hook claude StopFailure" }] }]
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "vt hook claude StopFailure" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "vt hook claude SessionEnd" }] }]
   }
 }
 ```
 
 Restart Claude Code after saving the file.
 Its lifecycle and task progress will then appear in vde-tmux.
+
+Claude's background result waits remain **Working** until the task notification (or a
+successful `TaskStop`) is followed by the parent response's `Stop`. The sidebar uses
+the Working color with `◌` and `結果待ち`; change the symbol with
+`badge.glyphs.awaiting_result`. Working filters and statusline counts include these waits.
+
+This tracks only a single literal invocation of `vt agent wait`, `vt agent run wait`,
+or `vt agent operation wait` in the parent Bash tool, including automatic backgrounding.
+The executable must be `vt` or the absolute path of the running vt binary. Variables,
+shell operators, redirection, and calls through shell/Python wrappers are outside this
+contract. Other background commands, including resident servers, do not hold the run open.
+Keep the hooks synchronous (do not set `async: true`) and probe the installed Claude
+version before enabling this workflow. The observed contract is Claude Code 2.1.287;
+vt does not infer a missing background task ID from output text.
+
+An empty or unavailable task registry does not prove result delivery. The API's
+`background_wait` and expanded pane details show presence in the **last Stop snapshot**,
+not current process liveness. A missing notification keeps the wait open without a
+time-based completion. If it cannot be recovered, select the pane in the sidebar and
+press `d` to mark it complete manually. This clears tracking without stopping the command. Stopping a task from Claude's UI may produce neither a `TaskStop` receipt nor a notification; use manual completion if it leaves the pane waiting.
+Malformed receipts are Blocked with an `await_*` lifecycle reason; the same cause is
+not notified repeatedly. Manual completion also clears these tracking errors.
+
+The expanded pane shows `◷` reservations in the task-label color, with the time of the
+last parent Stop. `scheduled_crons` exposes the same snapshot. Reservations do not
+change the main badge or keep a run open; the snapshot is hidden during active computation.
+Cron wakeups keep the existing prompt and Done-notification behavior. A late task
+notification after manual or automatic completion starts a normal new response; it
+does not restore the old wait.
 
 ### 4. Codex hooks
 
@@ -618,7 +648,7 @@ Use `disable` when the daemon must remain stopped.
 
 ### Pane-state persistence
 
-The daemon saves pane details such as prompts, tasks, subagents, lifecycle, summaries, and read state to `$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v10.json`, one file per tmux server.
+The daemon saves pane details such as prompts, tasks, subagents, lifecycle, summaries, and read state to `$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v11.json`, one file per tmux server.
 After a daemon restart, it restores them for panes whose pane ID and PID still match.
 Files for tmux servers that no longer run are not removed automatically.
 

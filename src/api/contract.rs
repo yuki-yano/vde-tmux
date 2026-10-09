@@ -14,7 +14,7 @@ use crate::daemon::session_badge::BadgeState;
 
 use super::common::epoch_now;
 
-pub const API_VERSION: u16 = 6;
+pub const API_VERSION: u16 = 7;
 pub const DEFAULT_READ_LINES: usize = 120;
 pub const MAX_READ_LINES: usize = 2_000;
 pub const MAX_READ_BYTES: usize = 1024 * 1024;
@@ -815,7 +815,28 @@ pub struct CurrentRunSummary {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BackgroundWaitSummary {
+    pub paused: bool,
+    pub pending_count: usize,
+    pub paused_at: Option<i64>,
+    /// Presence in the last normal Stop snapshot, not current process liveness.
+    pub tasks: Vec<BackgroundWaitTaskSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BackgroundWaitTaskSummary {
+    pub task_id: String,
+    pub last_registry_presence: crate::pane_state::RegistryPresence,
+    pub last_checked_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct AgentSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_wait: Option<BackgroundWaitSummary>,
+    /// Reservations from the last parent Stop; hidden during active computation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_crons: Option<crate::pane_state::ClaudeCronSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub question_notice: Option<crate::question_notice::QuestionNoticeSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]

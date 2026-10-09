@@ -488,6 +488,8 @@ mod tests {
                 subagents: Vec::new(),
                 worktree_activity: None,
                 background_process: None,
+                claude_background: Default::default(),
+                claude_crons: Default::default(),
                 listening_ports: Vec::new(),
             },
             window_id: "@2".to_string(),
@@ -737,6 +739,56 @@ mod tests {
             rendered.contains(&config.badge.colors.blocked),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn awaiting_result_pane_status_uses_custom_glyph_and_preserves_blocked_precedence() {
+        use crate::pane_state::{BackgroundReceipt, BackgroundWaitTask, RegistryPresence};
+        let mut config = Config::default();
+        config.badge.glyphs.awaiting_result = "W".into();
+        config.statusline.panes.current.format = "{badge}|{status}|{detail}|{time}".into();
+        let mut pane = structured_pane(
+            "claude",
+            "/tmp",
+            true,
+            Some((
+                crate::pane_state::LifecycleState::Running,
+                BadgeState::Working,
+            )),
+        );
+        let resolved = pane.resolved.as_mut().unwrap();
+        resolved.canonical.agent = crate::pane_state::AgentKind::parse("claude").unwrap();
+        resolved.canonical.claude_background.paused = true;
+        resolved.canonical.claude_background.paused_at = Some(100);
+        resolved
+            .canonical
+            .claude_background
+            .tasks
+            .push(BackgroundWaitTask {
+                task_id: "b1".into(),
+                tool_use_id: "t1".into(),
+                owner_run_seq: 1,
+                command: "vt agent wait %2".into(),
+                registered_at: 60,
+                receipt: BackgroundReceipt::Pending,
+                notification_status: None,
+                last_registry_presence: RegistryPresence::Unknown,
+                last_checked_at: None,
+            });
+        let rendered = render_structured_pane_status(&config, &pane);
+        assert_eq!(rendered.matches("W").count(), 2, "{rendered}");
+        assert_eq!(rendered.matches("結果待ち").count(), 2, "{rendered}");
+        assert!(rendered.contains(&config.badge.colors.working));
+        assert!(rendered.contains(STATUS_NOW_FORMAT_OPTION));
+        let resolved = pane.resolved.as_mut().unwrap();
+        resolved.badge = BadgeState::Blocked;
+        resolved.canonical.lifecycle = crate::pane_state::LifecycleState::Waiting {
+            reason: crate::pane_state::WaitReason::PermissionPrompt,
+        };
+        let rendered = render_structured_pane_status(&config, &pane);
+        assert!(!rendered.contains("結果待ち"));
+        assert!(rendered.contains("Waiting"));
+        assert!(rendered.contains(&config.badge.colors.blocked));
     }
 
     #[test]

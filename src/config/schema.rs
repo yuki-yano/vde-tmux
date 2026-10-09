@@ -52,6 +52,7 @@ pub fn config_schema() -> Value {
                             "blocked": { "type": "string" },
                             "limited": { "type": "string" },
                             "working": { "type": "string" },
+                            "awaiting_result": { "type": "string" },
                             "done": { "type": "string" },
                             "idle": { "type": "string" }
                         }

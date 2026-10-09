@@ -45,6 +45,8 @@ pub struct SidebarRow {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RowMeta {
+    pub awaiting_result: bool,
+    pub snapshot_at: Option<i64>,
     pub question_notice: Option<crate::question_notice::QuestionNoticeSummary>,
     pub question_count: usize,
     pub question_degraded_count: usize,
@@ -119,6 +121,8 @@ struct AgentPane {
     subagents: Vec<SubagentDetail>,
     worktree_activity: Option<WorktreeActivity>,
     background_process: Option<crate::pane_state::BackgroundProcessState>,
+    claude_background: crate::pane_state::ClaudeBackgroundState,
+    claude_crons: crate::pane_state::ClaudeCronSnapshot,
     listening_ports: Vec<u16>,
     worktree: Option<WorktreeInfo>,
     git: Option<crate::git::GitBadge>,
@@ -317,6 +321,8 @@ pub fn build_rows_from_presentations(
                 subagents,
                 worktree_activity,
                 background_process: canonical.background_process.clone(),
+                claude_background: canonical.claude_background.clone(),
+                claude_crons: canonical.claude_crons.clone(),
                 listening_ports: canonical.listening_ports.clone(),
                 worktree: ctx.worktrees.get(&pane.current_path).cloned(),
                 git: ctx.git.get(&pane.current_path).cloned(),
@@ -978,7 +984,65 @@ fn push_chat_detail_rows(
         }
         rows.push(row);
     }
-    if let Some(process) = &pane.background_process {
+    if pane.claude_background.is_awaiting_result() && pane.badge_state == BadgeState::Working {
+        rows.push(detail_row(
+            pane,
+            depth,
+            "awaiting-result",
+            format!("結果待ち {}", pane.claude_background.pending_count()),
+        ));
+        let pending: Vec<_> = pane
+            .claude_background
+            .tasks
+            .iter()
+            .filter(|t| t.receipt == crate::pane_state::BackgroundReceipt::Pending)
+            .collect();
+        let count = |presence| {
+            pending
+                .iter()
+                .filter(|t| t.last_registry_presence == presence)
+                .count()
+        };
+        let at = pending.iter().filter_map(|t| t.last_checked_at).max();
+        let mut row = detail_row(
+            pane,
+            depth,
+            "awaiting-registry",
+            format!(
+                "なし{} あり{} 不明{}",
+                count(crate::pane_state::RegistryPresence::Absent),
+                count(crate::pane_state::RegistryPresence::Present),
+                count(crate::pane_state::RegistryPresence::Unknown)
+            ),
+        );
+        row.meta = Some(RowMeta {
+            snapshot_at: at,
+            ..Default::default()
+        });
+        rows.push(row);
+    }
+    if !pane.claude_crons.entries.is_empty()
+        && !(pane.badge_state == BadgeState::Working && !pane.claude_background.paused)
+    {
+        let mut row = detail_row(
+            pane,
+            depth,
+            "cron",
+            format!("◷ {} 予約確認", pane.claude_crons.entries.len()),
+        );
+        row.meta = Some(RowMeta {
+            snapshot_at: pane.claude_crons.observed_at,
+            ..Default::default()
+        });
+        rows.push(row);
+    }
+    if let Some(process) = &pane.background_process
+        && !pane
+            .claude_background
+            .tasks
+            .iter()
+            .any(|t| t.command == process.command)
+    {
         rows.push(detail_row(
             pane,
             depth,
@@ -1180,6 +1244,9 @@ fn expanded_chat_label(pane: &AgentPane) -> String {
 fn chat_meta(pane: &AgentPane, now: i64) -> RowMeta {
     let tasks = parse_tasks(&pane.tasks);
     RowMeta {
+        snapshot_at: None,
+        awaiting_result: pane.badge_state == BadgeState::Working
+            && pane.claude_background.is_awaiting_result(),
         question_notice: pane.question_notice.clone(),
         question_count: usize::from(
             pane.question_notice
@@ -1631,6 +1698,8 @@ mod tests {
             subagents: Vec::new(),
             worktree_activity: None,
             background_process: None,
+            claude_background: Default::default(),
+            claude_crons: Default::default(),
             listening_ports: Vec::new(),
             worktree: None,
             git: None,
@@ -2024,6 +2093,8 @@ mod tests {
             subagents: Vec::new(),
             worktree_activity: None,
             background_process: None,
+            claude_background: Default::default(),
+            claude_crons: Default::default(),
             listening_ports: Vec::new(),
         };
         let pane = crate::daemon::protocol::v2::PanePresentation {

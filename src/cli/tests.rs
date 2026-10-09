@@ -641,6 +641,8 @@ fn agent_pane_presentation(pane_id: &str) -> crate::daemon::protocol::v2::PanePr
                 subagents: Vec::new(),
                 worktree_activity: None,
                 background_process: None,
+                claude_background: Default::default(),
+                claude_crons: Default::default(),
                 listening_ports: Vec::new(),
             },
             window_id: "@1".to_string(),

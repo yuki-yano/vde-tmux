@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{PaneInstance, PaneState, StoreError};
 
-pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 10;
-pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v10.json";
+pub const PANE_SNAPSHOT_SCHEMA_VERSION: u16 = 11;
+pub const PANE_SNAPSHOT_FILE: &str = "pane-state-v11.json";
+// Review this predecessor when bumping the snapshot schema. It is rejected, never loaded.
+const PREVIOUS_PANE_SNAPSHOT_FILE: &str = "pane-state-v10.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,7 +107,22 @@ pub fn load_snapshot(
 ) -> Result<BTreeMap<PaneInstance, PaneState>, StoreError> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let previous = path.with_file_name(PREVIOUS_PANE_SNAPSHOT_FILE);
+            match std::fs::symlink_metadata(&previous) {
+                Ok(_) => {
+                    return Err(StoreError::PersistFailed(format!(
+                        "{PREVIOUS_PANE_SNAPSHOT_FILE} requires an offline schema {PANE_SNAPSHOT_SCHEMA_VERSION} conversion; \
+                         if schema {PANE_SNAPSHOT_SCHEMA_VERSION} was intentionally removed to reset state, archive the old file \
+                         outside daemon storage instead of reconverting it; see RELEASING.md"
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(BTreeMap::new());
+                }
+                Err(error) => return Err(StoreError::PersistFailed(error.to_string())),
+            }
+        }
         Err(error) => return Err(StoreError::PersistFailed(error.to_string())),
     };
     validate_private_file(path, &metadata)?;
@@ -253,6 +270,20 @@ pub(crate) fn validate_private_file(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_filename_matches_schema_version() {
+        assert_eq!(
+            super::PANE_SNAPSHOT_FILE,
+            format!("pane-state-v{}.json", super::PANE_SNAPSHOT_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            super::PREVIOUS_PANE_SNAPSHOT_FILE,
+            format!(
+                "pane-state-v{}.json",
+                super::PANE_SNAPSHOT_SCHEMA_VERSION - 1
+            )
+        );
+    }
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -334,6 +365,8 @@ mod tests {
                 observed_at: 11,
             }),
             background_process: None,
+            claude_background: Default::default(),
+            claude_crons: Default::default(),
             listening_ports: Vec::new(),
         }
     }
@@ -386,6 +419,29 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn previous_snapshot_requires_explicit_offline_conversion() {
+        let root = private_root("previous");
+        let path = root.join(PANE_SNAPSHOT_FILE);
+        let previous = root.join("pane-state-v10.json");
+        let original = b"{old snapshot preserved}";
+        std::fs::write(&previous, original).unwrap();
+
+        let error = load_snapshot(&path, &identity()).unwrap_err();
+        assert!(error.to_string().contains("offline schema 11 conversion"));
+        assert_eq!(std::fs::read(&previous).unwrap(), original);
+        assert!(!path.exists());
+
+        let expected = BTreeMap::from([(state(1).pane_instance.clone(), state(1))]);
+        save_snapshot(&path, &identity(), &expected).unwrap();
+        assert_eq!(load_snapshot(&path, &identity()).unwrap(), expected);
+        assert_eq!(std::fs::read(&previous).unwrap(), original);
+        std::fs::rename(&previous, root.join("archived-v10.json")).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(load_snapshot(&path, &identity()).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 

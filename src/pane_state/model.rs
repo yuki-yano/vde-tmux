@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::daemon::session_badge::BadgeState;
 
-pub const PANE_STATE_SCHEMA_VERSION: u16 = 10;
+pub const PANE_STATE_SCHEMA_VERSION: u16 = 11;
 pub const IDENTIFIER_MAX_BYTES: usize = 256;
 pub const BODY_MAX_BYTES: usize = 4096;
 pub const PATH_MAX_BYTES: usize = 8192;
@@ -859,6 +859,8 @@ pub struct PaneState {
     pub subagents: Vec<SubagentState>,
     pub worktree_activity: Option<WorktreeActivity>,
     pub background_process: Option<BackgroundProcessState>,
+    pub claude_background: super::claude_background::ClaudeBackgroundState,
+    pub claude_crons: super::claude_background::ClaudeCronSnapshot,
     pub listening_ports: Vec<u16>,
 }
 
@@ -878,6 +880,8 @@ impl PaneState {
                 self.schema_version
             )));
         }
+        self.claude_background.validate(self.run_seq)?;
+        self.claude_crons.validate()?;
         self.pane_instance.validate()?;
         if let Some(identity) = &self.agent_process {
             identity.validate()?;
@@ -910,13 +914,30 @@ impl PaneState {
             ));
         }
         let idle = matches!(self.lifecycle, LifecycleState::Idle);
+        if self.claude_background.blocks_completion() && idle {
+            return Err(ModelError(
+                "background wait cannot belong to an idle run".into(),
+            ));
+        }
+        if self.agent.as_str() != "claude"
+            && (!self.claude_background.tasks.is_empty()
+                || !self.claude_background.faults.is_empty()
+                || !self.claude_crons.entries.is_empty())
+        {
+            return Err(ModelError(
+                "Claude background state requires a Claude agent".into(),
+            ));
+        }
         if idle != (self.run_seq == self.completed_seq) {
             return Err(ModelError(
                 "lifecycle and run sequence disagree".to_string(),
             ));
         }
         if !self.agent_present
-            && (!self.scan_verified || (!idle && !self.lifecycle.is_usage_limited()))
+            && (!self.scan_verified
+                || (!idle
+                    && !self.lifecycle.is_usage_limited()
+                    && !matches!(&self.lifecycle, LifecycleState::Error { reason: Some(reason) } if reason == "await_agent_ended")))
         {
             return Err(ModelError(
                 "absent agent must be scan-verified and idle or usage-limited".to_string(),
@@ -1330,6 +1351,24 @@ impl ExplicitStateReport {
     deny_unknown_fields
 )]
 pub enum PaneEvent {
+    ClaudeToolResultObserved {
+        observed_at: i64,
+        result: super::claude_background::ClaudeToolResult,
+        operations: Vec<ProgressOperation>,
+    },
+    ClaudeTaskNotificationsObserved {
+        observed_at: i64,
+        notifications: Vec<super::claude_background::ClaudeTaskNotification>,
+    },
+    ClaudeStopped {
+        observed_at: i64,
+        response: Option<ResponseState>,
+        registry: Option<Vec<super::claude_background::ClaudeRegistryEntry>>,
+        crons: Option<Vec<super::claude_background::ClaudeCron>>,
+    },
+    ClaudeSessionEnded {
+        observed_at: i64,
+    },
     AgentSessionStarted {
         observed_at: i64,
         source: AgentSessionSource,
@@ -1397,7 +1436,11 @@ impl PaneEvent {
     pub fn is_external(&self) -> bool {
         matches!(
             self,
-            Self::AgentSessionStarted { .. }
+            Self::ClaudeToolResultObserved { .. }
+                | Self::ClaudeTaskNotificationsObserved { .. }
+                | Self::ClaudeStopped { .. }
+                | Self::ClaudeSessionEnded { .. }
+                | Self::AgentSessionStarted { .. }
                 | Self::BeginRun { .. }
                 | Self::ActivityObserved { .. }
                 | Self::ActivityAndProgressObserved { .. }
@@ -1593,6 +1636,8 @@ mod tests {
             subagents: Vec::new(),
             worktree_activity: None,
             background_process: None,
+            claude_background: Default::default(),
+            claude_crons: Default::default(),
             listening_ports: Vec::new(),
         }
     }

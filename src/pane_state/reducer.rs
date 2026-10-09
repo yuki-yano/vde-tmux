@@ -1,6 +1,11 @@
 use std::fmt;
 
+use super::claude_background::*;
 use super::model::*;
+
+#[cfg(test)]
+#[path = "claude_background_tests.rs"]
+mod claude_background_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReductionOutcome {
@@ -192,6 +197,18 @@ fn reduce_explicit(
     let agent = envelope.agent.as_ref().ok_or_else(|| {
         ReduceError::InvalidRequest("explicit event requires an agent".to_string())
     })?;
+    if matches!(
+        envelope.event,
+        PaneEvent::ClaudeToolResultObserved { .. }
+            | PaneEvent::ClaudeTaskNotificationsObserved { .. }
+            | PaneEvent::ClaudeStopped { .. }
+            | PaneEvent::ClaudeSessionEnded { .. }
+    ) && agent.as_str() != "claude"
+    {
+        return Err(ReduceError::InvalidRequest(
+            "Claude observation requires a Claude agent".into(),
+        ));
+    }
     let session = envelope.agent_session_id.as_ref().ok_or_else(|| {
         ReduceError::InvalidRequest("explicit event requires an agent session ID".to_string())
     })?;
@@ -643,6 +660,8 @@ fn new_state(
         subagents: Vec::new(),
         worktree_activity: None,
         background_process: None,
+        claude_background: Default::default(),
+        claude_crons: Default::default(),
         listening_ports: Vec::new(),
     })
 }
@@ -658,6 +677,7 @@ fn apply_initial_explicit_event(
     private_task_prompt: Option<&str>,
 ) -> Result<(), ReduceError> {
     match event {
+        PaneEvent::ClaudeStopped { .. } => apply_claude_stop(state, event, visibility, true),
         PaneEvent::AgentSessionStarted { .. } => apply_agent_session_started(state, event),
         PaneEvent::CompleteRun { completed_at } => {
             complete_run(state, *completed_at, visibility, true)
@@ -688,6 +708,68 @@ fn apply_regular_explicit_event(
     private_task_prompt: Option<&str>,
 ) -> Result<(), ReduceError> {
     match event {
+        PaneEvent::ClaudeToolResultObserved {
+            observed_at,
+            result,
+            operations,
+        } => {
+            activity_observed(state, *observed_at)?;
+            apply_progress(state, operations)?;
+            apply_claude_tool_result(state, result, *observed_at)
+        }
+        PaneEvent::ClaudeTaskNotificationsObserved {
+            observed_at,
+            notifications,
+        } => {
+            // Even untracked task notifications must preserve an unfinished human prompt.
+            if matches!(
+                state.lifecycle,
+                LifecycleState::Running | LifecycleState::Idle
+            ) || matches!(&state.lifecycle, LifecycleState::Error { reason: Some(reason) }
+                    if state.claude_background.faults.iter().any(|f| &f.reason == reason))
+            {
+                activity_observed(state, *observed_at)?;
+            } else {
+                state.claude_background.activity();
+            }
+            if notifications.is_empty() || notifications.len() > MAX_BACKGROUND_TASKS {
+                return Err(ReduceError::InvalidRequest(
+                    "invalid notification count".into(),
+                ));
+            }
+            for notification in notifications {
+                if let Some(index) = state.claude_background.tasks.iter().position(|t| {
+                    t.task_id == notification.task_id && t.tool_use_id == notification.tool_use_id
+                }) {
+                    let valid = notification
+                        .status
+                        .as_deref()
+                        .is_some_and(valid_background_id);
+                    if valid {
+                        let task = &mut state.claude_background.tasks[index];
+                        if task.receipt != BackgroundReceipt::Cancelled {
+                            task.receipt = BackgroundReceipt::Delivered;
+                        }
+                        task.notification_status = notification.status.clone();
+                        state
+                            .claude_background
+                            .clear_task_faults(&notification.task_id);
+                    } else if state.claude_background.tasks[index].receipt
+                        == BackgroundReceipt::Pending
+                    {
+                        state
+                            .claude_background
+                            .fault("await_notification_invalid", &notification.task_id);
+                    }
+                }
+            }
+            Ok(())
+        }
+        PaneEvent::ClaudeStopped { .. } => apply_claude_stop(state, event, visibility, false),
+        PaneEvent::ClaudeSessionEnded { .. } => {
+            end_claude_tracking(state);
+            Ok(())
+        }
         PaneEvent::AgentSessionStarted { .. } => apply_agent_session_started(state, event),
         PaneEvent::BeginRun { started_at, prompt } => {
             begin_run(state, *started_at, prompt.clone(), private_task_prompt)
@@ -722,6 +804,190 @@ fn apply_regular_explicit_event(
         _ => Err(ReduceError::InvalidRequest(
             "event is not an explicit agent event".to_string(),
         )),
+    }
+}
+
+fn apply_claude_tool_result(
+    state: &mut PaneState,
+    result: &ClaudeToolResult,
+    at: i64,
+) -> Result<(), ReduceError> {
+    match result {
+        ClaudeToolResult::Registered {
+            task_id,
+            tool_use_id,
+            command,
+        } => {
+            if !valid_background_id(task_id)
+                || !valid_background_id(tool_use_id)
+                || command.is_empty()
+                || command.len() > BODY_MAX_BYTES
+            {
+                return Err(ReduceError::InvalidRequest(
+                    "invalid background registration".into(),
+                ));
+            }
+            if let Some(task) = state
+                .claude_background
+                .tasks
+                .iter()
+                .find(|t| &t.task_id == task_id)
+            {
+                if &task.tool_use_id != tool_use_id || &task.command != command {
+                    state
+                        .claude_background
+                        .fault("await_identity_conflict", task_id);
+                }
+            } else if state
+                .claude_background
+                .tasks
+                .iter()
+                .any(|t| &t.tool_use_id == tool_use_id)
+            {
+                state
+                    .claude_background
+                    .fault("await_identity_conflict", task_id);
+            } else if state.claude_background.tasks.len() >= MAX_BACKGROUND_TASKS {
+                state
+                    .claude_background
+                    .fault("await_tracking_overflow", "overflow");
+            } else {
+                state.claude_background.tasks.push(BackgroundWaitTask {
+                    task_id: task_id.clone(),
+                    tool_use_id: tool_use_id.clone(),
+                    command: command.clone(),
+                    owner_run_seq: state.run_seq,
+                    registered_at: at,
+                    receipt: BackgroundReceipt::Pending,
+                    notification_status: None,
+                    last_registry_presence: RegistryPresence::Unknown,
+                    last_checked_at: None,
+                });
+            }
+            state
+                .claude_background
+                .faults
+                .retain(|f| f.reason != "await_launch_unconfirmed" || &f.key != tool_use_id);
+        }
+        ClaudeToolResult::LaunchUnconfirmed { tool_use_id } => {
+            if !valid_background_id(tool_use_id) {
+                return Err(ReduceError::InvalidRequest("invalid tool-use ID".into()));
+            }
+            state
+                .claude_background
+                .fault("await_launch_unconfirmed", tool_use_id);
+        }
+        ClaudeToolResult::TaskStopped { task_id, command } => {
+            if let Some(task) = state
+                .claude_background
+                .tasks
+                .iter_mut()
+                .find(|t| &t.task_id == task_id && &t.command == command)
+            {
+                task.receipt = BackgroundReceipt::Cancelled;
+                state.claude_background.clear_task_faults(task_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_claude_stop(
+    state: &mut PaneState,
+    event: &PaneEvent,
+    visibility: &VisibilitySnapshot,
+    initial: bool,
+) -> Result<(), ReduceError> {
+    let PaneEvent::ClaudeStopped {
+        observed_at,
+        response,
+        registry,
+        crons,
+    } = event
+    else {
+        unreachable!()
+    };
+    for task in &mut state.claude_background.tasks {
+        if task.receipt != BackgroundReceipt::Pending {
+            continue;
+        }
+        task.last_registry_presence = match registry {
+            None => RegistryPresence::Unknown,
+            Some(entries)
+                if entries
+                    .iter()
+                    .any(|e| e.id == task.task_id && e.task_type == "shell") =>
+            {
+                RegistryPresence::Present
+            }
+            Some(_) => RegistryPresence::Absent,
+        };
+        task.last_checked_at = Some(*observed_at);
+    }
+    let snapshot = ClaudeCronSnapshot {
+        entries: crons.clone().unwrap_or_default(),
+        observed_at: crons.as_ref().map(|_| *observed_at),
+    };
+    state.claude_crons = if snapshot.validate().is_ok() {
+        snapshot
+    } else {
+        Default::default()
+    };
+    if state.claude_background.blocks_completion() {
+        // A normal parent Stop confirms recovery from a prior provider failure.
+        // Receipt arrival alone, above, cannot clear Waiting or provider Error.
+        state.lifecycle = match state
+            .claude_background
+            .faults
+            .iter()
+            .find(|f| !f.reported)
+            .or_else(|| state.claude_background.faults.first())
+        {
+            Some(fault) => LifecycleState::Error {
+                reason: Some(fault.reason.clone()),
+            },
+            None => LifecycleState::Running,
+        };
+        state.claude_background.paused = true;
+        state
+            .claude_background
+            .paused_at
+            .get_or_insert(*observed_at);
+        return Ok(());
+    }
+    // A receipt only releases this gate when the parent subsequently stops.
+    // Keep it intact while subagents still defer that stop.
+    if !state.subagents.is_empty() {
+        return Ok(());
+    }
+    state.claude_background = Default::default();
+    let completed_before = state.completed_seq;
+    match response {
+        Some(response) => {
+            complete_run_with_response(state, *observed_at, response, visibility, initial)?
+        }
+        None => complete_run(state, *observed_at, visibility, initial)?,
+    }
+    if state.completed_seq > completed_before && response.is_none() {
+        state.latest_response = None;
+    }
+    Ok(())
+}
+
+fn end_claude_tracking(state: &mut PaneState) {
+    let open =
+        !state.claude_background.tasks.is_empty() || state.claude_background.blocks_completion();
+    state.claude_background = Default::default();
+    state.claude_crons = Default::default();
+    if open {
+        state
+            .claude_background
+            .fault("await_agent_ended", "session");
+        if !state.lifecycle.is_usage_limited() {
+            state.lifecycle = LifecycleState::Error {
+                reason: Some("await_agent_ended".into()),
+            };
+        }
     }
 }
 
@@ -835,7 +1101,9 @@ fn classify_identity(
 fn is_epoch_start_evidence(event: &PaneEvent) -> bool {
     matches!(
         event,
-        PaneEvent::AgentSessionStarted { .. }
+        PaneEvent::ClaudeToolResultObserved { .. }
+            | PaneEvent::ClaudeTaskNotificationsObserved { .. }
+            | PaneEvent::AgentSessionStarted { .. }
             | PaneEvent::BeginRun { .. }
             | PaneEvent::ActivityObserved { .. }
             | PaneEvent::ActivityAndProgressObserved { .. }
@@ -859,7 +1127,9 @@ fn is_epoch_start_evidence(event: &PaneEvent) -> bool {
 fn is_completion(event: &PaneEvent) -> bool {
     matches!(
         event,
-        PaneEvent::CompleteRun { .. } | PaneEvent::ResponseAndCompleteRun { .. }
+        PaneEvent::CompleteRun { .. }
+            | PaneEvent::ResponseAndCompleteRun { .. }
+            | PaneEvent::ClaudeStopped { .. }
     ) || matches!(
         event,
         PaneEvent::ExplicitStateReported {
@@ -884,7 +1154,9 @@ fn is_completion(event: &PaneEvent) -> bool {
 fn is_completion_for_state(state: &PaneState, event: &PaneEvent) -> bool {
     matches!(
         event,
-        PaneEvent::CompleteRun { .. } | PaneEvent::ResponseAndCompleteRun { .. }
+        PaneEvent::CompleteRun { .. }
+            | PaneEvent::ResponseAndCompleteRun { .. }
+            | PaneEvent::ClaudeStopped { .. }
     ) || matches!(
         event,
         PaneEvent::ExplicitStateReported {
@@ -955,6 +1227,8 @@ fn begin_agent_epoch(
     state.subagents.clear();
     state.worktree_activity = None;
     state.background_process = None;
+    state.claude_background = Default::default();
+    state.claude_crons = Default::default();
     state.listening_ports.clear();
     Ok(())
 }
@@ -972,6 +1246,7 @@ fn start_new_run(state: &mut PaneState, started_at: i64) -> Result<(), ReduceErr
         state.tasks = TaskState::default();
         state.subagents.clear();
         state.worktree_activity = None;
+        state.claude_background = Default::default();
     }
     state.synthetic_completion_armed = false;
     Ok(())
@@ -994,6 +1269,7 @@ fn begin_run(
         .flatten();
     start_new_run(state, started_at)?;
     state.lifecycle = LifecycleState::Running;
+    state.claude_background.activity();
     state.prompt = prompt;
     if let Some(prompt) = private_task_prompt {
         state.prompt = None;
@@ -1020,6 +1296,7 @@ fn begin_run(
 fn activity_observed(state: &mut PaneState, observed_at: i64) -> Result<(), ReduceError> {
     start_new_run(state, observed_at)?;
     state.lifecycle = LifecycleState::Running;
+    state.claude_background.activity();
     Ok(())
 }
 
@@ -1051,7 +1328,10 @@ fn complete_run(
 ) -> Result<(), ReduceError> {
     // Parent agents can stop their turn while background subagents are still active.
     // Keep the aggregate pane run open until a later stop follows the last subagent exit.
-    if !state.subagents.is_empty() {
+    if !state.subagents.is_empty()
+        || !state.claude_background.tasks.is_empty()
+        || state.claude_background.blocks_completion()
+    {
         return Ok(());
     }
     if state.run_seq == 0 {
@@ -1068,6 +1348,7 @@ fn complete_run(
     state.completed_at = Some(completed_at);
     state.synthetic_completion_armed = false;
     state.subagents.clear();
+    state.claude_background = Default::default();
     state.worktree_activity = None;
     Ok(())
 }
@@ -1103,6 +1384,10 @@ fn mark_done(state: &mut PaneState, completed_at: i64) -> Result<(), ReduceError
     state.completed_at = Some(completed_at);
     state.synthetic_completion_armed = false;
     state.tasks = TaskState::default();
+    if !state.claude_background.tasks.is_empty() || state.claude_background.blocks_completion() {
+        state.latest_response = None;
+    }
+    state.claude_background = Default::default();
     state.subagents.clear();
     state.worktree_activity = None;
     Ok(())
@@ -1117,6 +1402,34 @@ fn apply_unread_transition(
     if matches!(event, PaneEvent::MarkPaneRead { .. }) {
         return Ok(());
     }
+    let mut fresh_background_fault = false;
+    if let LifecycleState::Error {
+        reason: Some(reason),
+    } = &state.lifecycle
+        && state
+            .claude_background
+            .faults
+            .iter()
+            .any(|f| &f.reason == reason)
+    {
+        let pending = state
+            .claude_background
+            .faults
+            .iter()
+            .find(|f| &f.reason == reason && !f.reported);
+        if pending.is_none() {
+            return Ok(());
+        }
+        if let Some(fault) = state
+            .claude_background
+            .faults
+            .iter_mut()
+            .find(|f| &f.reason == reason && !f.reported)
+        {
+            fault.reported = true;
+            fresh_background_fault = true;
+        }
+    }
     let same_epoch = current.is_some_and(|previous| previous.agent_epoch == state.agent_epoch);
     let previous_lifecycle = same_epoch
         .then(|| current.map(|previous| &previous.lifecycle))
@@ -1128,7 +1441,8 @@ fn apply_unread_transition(
             Some(UnreadReason::Waiting)
         }
         LifecycleState::Error { .. }
-            if !matches!(previous_lifecycle, Some(LifecycleState::Error { .. })) =>
+            if fresh_background_fault
+                || !matches!(previous_lifecycle, Some(LifecycleState::Error { .. })) =>
         {
             Some(UnreadReason::Error)
         }
@@ -1182,7 +1496,11 @@ fn apply_unread_transition(
 
 fn event_epoch(event: &PaneEvent, state: &PaneState) -> i64 {
     match event {
-        PaneEvent::AgentSessionStarted { observed_at, .. }
+        PaneEvent::ClaudeToolResultObserved { observed_at, .. }
+        | PaneEvent::ClaudeTaskNotificationsObserved { observed_at, .. }
+        | PaneEvent::ClaudeStopped { observed_at, .. }
+        | PaneEvent::ClaudeSessionEnded { observed_at, .. }
+        | PaneEvent::AgentSessionStarted { observed_at, .. }
         | PaneEvent::ActivityObserved { observed_at }
         | PaneEvent::ActivityAndProgressObserved { observed_at, .. }
         | PaneEvent::WaitRequested { observed_at, .. }
@@ -1207,12 +1525,18 @@ fn confirm_absent(
     observed_at: i64,
     visibility: &VisibilitySnapshot,
 ) -> Result<(), ReduceError> {
-    if state.run_seq > state.completed_seq {
+    let background_open =
+        !state.claude_background.tasks.is_empty() || state.claude_background.blocks_completion();
+    if background_open {
+        end_claude_tracking(state);
+    }
+    if state.run_seq > state.completed_seq && !background_open {
         complete_run(state, observed_at, visibility, false)?;
     }
     state.agent_present = false;
     state.scan_verified = true;
     state.background_process = None;
+    state.claude_crons = Default::default();
     state.listening_ports.clear();
     Ok(())
 }
@@ -1470,7 +1794,10 @@ fn apply_capture(
             fail_run(state, observed_at, Some(reason.clone()))?;
         }
         CaptureInference::ActivityObserved => {
-            if tracker.fingerprint.is_some() && state.run_seq > state.completed_seq {
+            if !state.claude_background.blocks_completion()
+                && tracker.fingerprint.is_some()
+                && state.run_seq > state.completed_seq
+            {
                 activity_observed(state, observed_at)?;
             }
         }

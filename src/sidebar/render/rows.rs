@@ -93,6 +93,18 @@ fn question_marks(row: &SidebarRow) -> String {
     marks
 }
 
+fn row_badge_glyph<'a>(
+    row: &SidebarRow,
+    state: BadgeState,
+    theme: &'a SidebarRenderTheme,
+) -> &'a str {
+    if state == BadgeState::Working && row.meta.as_ref().is_some_and(|meta| meta.awaiting_result) {
+        &theme.badge_glyphs.awaiting_result
+    } else {
+        theme.badge_glyph(state)
+    }
+}
+
 fn render_standard_lines(
     rows: &[SidebarRow],
     state: &SidebarState,
@@ -150,7 +162,11 @@ fn render_closed_chat_summary_line(
     let current_agent = row_is_current_agent(row, state);
     let indent = "  ".repeat(row.depth);
     let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
-    let glyph = format!("{}{}", theme.badge_glyph(badge_state), question_marks(row));
+    let glyph = format!(
+        "{}{}",
+        row_badge_glyph(row, badge_state, theme),
+        question_marks(row)
+    );
     let agent_source = chat_agent_label(row);
 
     let mut prefix = Vec::new();
@@ -331,7 +347,11 @@ fn render_row_line(
     let badge = if row.kind == SidebarRowKind::Chat {
         row.badge_state.map(|state| {
             (
-                format!("{}{} ", theme.badge_glyph(state), question_marks(row)),
+                format!(
+                    "{}{} ",
+                    row_badge_glyph(row, state, theme),
+                    question_marks(row)
+                ),
                 theme.badge_color(state),
             )
         })
@@ -368,6 +388,7 @@ fn render_row_line(
         SidebarRowKind::Detail if row.id.ends_with("::summary-loading") => {
             task_summary_spinner(state).to_string()
         }
+        SidebarRowKind::Detail => detail_display_label(row, theme),
         _ => row.label.clone(),
     };
     let label = truncate_display(&label_source, label_budget);
@@ -560,11 +581,54 @@ fn label_spans(
     vec![Span::styled(label, base)]
 }
 
+fn detail_display_label(row: &SidebarRow, theme: &SidebarRenderTheme) -> String {
+    let label = &row.label;
+    if row.id.ends_with("::awaiting-result") {
+        return format!("{} {label}", theme.badge_glyphs.awaiting_result);
+    }
+    if row.id.ends_with("::cron") || row.id.ends_with("::awaiting-registry") {
+        let at = row
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.snapshot_at)
+            .map(|at| {
+                let age = crate::sidebar::tree::now_epoch_secs()
+                    .saturating_sub(at)
+                    .max(0);
+                let duration = if (60..600).contains(&age) {
+                    format!("{}m", age / 60)
+                } else {
+                    elapsed_label(age)
+                };
+                format!("{duration} ago")
+            })
+            .unwrap_or_else(|| "未確認".to_string());
+        return if row.id.ends_with("::awaiting-registry") {
+            format!("Stop {at} {label}")
+        } else {
+            format!("{label} {at}")
+        };
+    }
+    label.clone()
+}
+
 fn detail_label_spans(
     label: &str,
     row: &SidebarRow,
     theme: &SidebarRenderTheme,
 ) -> Option<Vec<Span<'static>>> {
+    if row.id.ends_with("::awaiting-result") {
+        return Some(vec![Span::styled(
+            label.to_string(),
+            Style::default().fg(theme.badge_working),
+        )]);
+    }
+    if row.id.ends_with("::cron") || row.id.ends_with("::awaiting-registry") {
+        return Some(vec![Span::styled(
+            label.to_string(),
+            Style::default().fg(theme.task_label),
+        )]);
+    }
     if row.id.ends_with("::signal") {
         return Some(signal_label_spans(label, row, theme));
     }
@@ -865,7 +929,11 @@ fn render_chat_dense_line(
     let selected = state.selection.as_deref() == Some(row.id.as_str());
     let current_agent = row_is_current_agent(row, state);
     let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
-    let glyph = format!("{}{}", theme.badge_glyph(badge_state), question_marks(row));
+    let glyph = format!(
+        "{}{}",
+        row_badge_glyph(row, badge_state, theme),
+        question_marks(row)
+    );
     let agent_source = row
         .meta
         .as_ref()
@@ -978,7 +1046,11 @@ fn render_micro_lines(
             continue;
         }
         let badge_state = row.badge_state.unwrap_or(BadgeState::Idle);
-        let glyph = format!("{}{}", theme.badge_glyph(badge_state), question_marks(row));
+        let glyph = format!(
+            "{}{}",
+            row_badge_glyph(row, badge_state, theme),
+            question_marks(row)
+        );
         let right = right_label(row).unwrap_or_default();
         let selected = state.selection.as_deref() == Some(row.id.as_str());
         let marker = row_leading_marker_span(row, row_is_current_agent(row, state), theme);
@@ -1073,7 +1145,7 @@ fn render_rail_lines(
         if !marks.is_empty() {
             lines.push(Line::from(Span::styled(
                 super::text::slice_display(
-                    &format!("{}{marks}", theme.badge_glyph(glyph)),
+                    &format!("{}{marks}", row_badge_glyph(row, glyph, theme)),
                     0,
                     width as u16,
                 ),
@@ -1086,7 +1158,7 @@ fn render_rail_lines(
         let visible_glyph = if pinned {
             "✦"
         } else {
-            theme.badge_glyph(glyph)
+            row_badge_glyph(row, glyph, theme)
         };
         let glyph_style = if pinned {
             style.fg(theme.toggle)
@@ -1308,6 +1380,11 @@ fn subagent_count_token(row: &SidebarRow) -> Option<ClosedChatRightPart> {
 }
 
 fn closed_chat_reason_token(row: &SidebarRow) -> Option<String> {
+    if row.badge_state == Some(BadgeState::Working)
+        && row.meta.as_ref().is_some_and(|meta| meta.awaiting_result)
+    {
+        return Some("結果待ち".to_string());
+    }
     if !matches!(
         row.rollup,
         RollupLevel::Permission | RollupLevel::Waiting | RollupLevel::Limited | RollupLevel::Error

@@ -873,7 +873,11 @@ fn record_badge(state: Option<&PaneState>) -> Option<crate::daemon::session_badg
 
 fn transition_at_epoch(event: &PaneEvent, current: Option<&PaneState>) -> i64 {
     match event {
-        PaneEvent::AgentSessionStarted { observed_at, .. }
+        PaneEvent::ClaudeToolResultObserved { observed_at, .. }
+        | PaneEvent::ClaudeTaskNotificationsObserved { observed_at, .. }
+        | PaneEvent::ClaudeStopped { observed_at, .. }
+        | PaneEvent::ClaudeSessionEnded { observed_at, .. }
+        | PaneEvent::AgentSessionStarted { observed_at, .. }
         | PaneEvent::ActivityObserved { observed_at }
         | PaneEvent::ActivityAndProgressObserved { observed_at, .. }
         | PaneEvent::WaitRequested { observed_at, .. }
@@ -898,6 +902,9 @@ fn event_can_create_record(current: Option<&PaneState>, event: &PaneEvent) -> bo
         return false;
     }
     match event {
+        PaneEvent::ClaudeToolResultObserved { .. }
+        | PaneEvent::ClaudeTaskNotificationsObserved { .. }
+        | PaneEvent::ClaudeStopped { .. } => true,
         PaneEvent::AgentSessionStarted { .. }
         | PaneEvent::BeginRun { .. }
         | PaneEvent::ActivityObserved { .. }

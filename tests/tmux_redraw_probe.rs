@@ -276,6 +276,8 @@ fn running_pane_presentation(epoch: i64) -> PanePresentation {
         subagents: Vec::new(),
         worktree_activity: None,
         background_process: None,
+        claude_background: Default::default(),
+        claude_crons: Default::default(),
         listening_ports: Vec::new(),
     };
     PanePresentation {

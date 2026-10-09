@@ -34,8 +34,8 @@ crates.io Trusted Publishing must be configured once for:
 ## Local binary upgrade
 
 A local install replaces the installed `vt` and `vde-tmux` executables without a crate version
-bump or a release tag. The current generation is Agent API 6, daemon protocol 31, PaneState schema
-10, private state format 1, and Question sidecar schema 1. CLI, daemon, and sidebars must run the
+bump or a release tag. The current generation is Agent API 7, daemon protocol 32, PaneState schema
+11, private state format 1, and Question sidecar schema 1. CLI, daemon, and sidebars must run the
 same generation. Keep the existing pane state, Runs, and question-notice sidecar.
 
 1. Pass formatting, Clippy, tests, and the checks applicable to the change under `AGENTS.md`.
@@ -62,14 +62,20 @@ same generation. Keep the existing pane state, Runs, and question-notice sidecar
    - Do not run both load tests for every question change. Reuse accepted evidence for unchanged
      product code, and distinguish a re-evaluation of saved data from a new run.
 2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
-   Confirm `vt api schema --json` reports API 6, protocol 31, PaneState 10, and private state 1.
+   Confirm `vt api schema --json` reports API 7, protocol 32, PaneState 11, and private state 1.
    Validate the staged binaries on a scratch server before replacing the installed generation:
    `VDE_VT_BIN=<temporary-root>/bin/vt python3 scripts/test-codex-observation-isolated.py`.
 3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.
    Record sidebar windows, widths, active panes, client focus, installed paths, and executable hashes.
+   Enumerate all live tmux incarnations and daemons using the executables being replaced. Include
+   each affected server in the disabled-daemon cutover and state conversion; do not leave another
+   live server on the old binary generation. Inactive historical incarnations are left untouched.
 4. Close running sidebars using the installed client, then run its `vt daemon disable` so hooks
    cannot restart the old daemon during replacement. Back up both executables and the stopped
    server's state directory outside daemon-managed storage.
+   For a schema 10 installation, perform the one-time offline conversion below before enabling
+   the new daemon. The new binary rejects an unconverted schema 10 snapshot; it never treats
+   that existing state as an empty installation.
 5. Replace both executables from the staged root, verify hashes and schema, then run
    `vt daemon enable`. Require `Serving / Healthy / Ready`, no transition error, and healthy
    Agent storage. Restore the recorded sidebar widths and focus using the new client; set
@@ -89,3 +95,38 @@ same generation. Keep the existing pane state, Runs, and question-notice sidecar
 Never reset state or restart the tmux server as a protocol recovery shortcut. If replacement
 fails, leave the daemon disabled until both executables and their hashes are coherent, for
 example by restoring both from the same backup.
+
+## One-time PaneState schema 10 → 11 conversion
+
+This is an installation operation while the daemon is disabled, not a runtime compatibility
+path. First back up the stopped incarnation state directory outside daemon-managed storage.
+Keep its server identity, every existing record field, Runs/Operations, and Question sidecar.
+Change only the outer and record `schema_version` from 10 to 11, adding these fields per record:
+
+```json
+{
+  "claude_background": { "tasks": [], "faults": [], "paused": false, "paused_at": null },
+  "claude_crons": { "entries": [], "observed_at": null }
+}
+```
+
+Write the result as a new `pane-state-v11.json` in the same private incarnation directory
+(mode 0700), using a private temporary file (0600), fsync, atomic rename, and directory fsync.
+Reject unexpected source versions, pre-existing destination files, symlinks, or insecure owners
+and permissions. Keep `pane-state-v10.json` unchanged until the new daemon has successfully loaded v11. Then
+move v10 into the existing backup outside daemon-managed storage and fsync both directories.
+Leaving v10 beside v11 would block a later intentional reset and invite stale-state reconversion.
+If v11 is intentionally removed to reset state, archive the old v10 instead of converting it again.
+Validate the converted records with the staged binary on an isolated server before performing
+the real conversion: change only `server_identity` in the validation copy to the scratch server
+identity so its strict identity check passes. All record fields still undergo validation. The real
+conversion must retain the original server identity unchanged. No notifications or
+reservations that predate this feature are inferred. Enable the new daemon only after both
+installed executables match the staged hashes; verify retained pane identities, epochs, run and
+completion sequences, unread state, storage generation, Runs, and Question notice orders. For each live affected incarnation, either preserve and convert its
+state or obtain explicit approval to discard it; never silently reset a second server.
+
+The Claude hooks must include synchronous `PostToolUse`, `UserPromptSubmit`, `Stop`, and
+`SessionEnd`; preserve unrelated hooks and settings. Confirm `badge.glyphs.awaiting_result`
+resolves to the intended glyph. Verify one ordinary Claude wait with a resident command,
+result-wait → response → Done, and one cron addition/deletion after installing.

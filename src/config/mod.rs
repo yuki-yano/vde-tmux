@@ -419,6 +419,7 @@ pub struct BadgeGlyphs {
     pub blocked: String,
     pub limited: String,
     pub working: String,
+    pub awaiting_result: String,
     pub done: String,
     pub idle: String,
 }
@@ -430,6 +431,7 @@ impl Default for BadgeGlyphs {
             blocked: "▲".to_string(),
             limited: "⋄".to_string(),
             working: "●".to_string(),
+            awaiting_result: "◌".to_string(),
             done: "✓".to_string(),
             idle: "○".to_string(),
         }

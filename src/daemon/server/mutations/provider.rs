@@ -696,6 +696,22 @@ pub(in crate::daemon::server) fn normalize_provider_pane_event(
     observed_at: i64,
 ) {
     match event {
+        PaneEvent::ClaudeToolResultObserved {
+            observed_at: event_at,
+            ..
+        }
+        | PaneEvent::ClaudeTaskNotificationsObserved {
+            observed_at: event_at,
+            ..
+        }
+        | PaneEvent::ClaudeStopped {
+            observed_at: event_at,
+            ..
+        }
+        | PaneEvent::ClaudeSessionEnded {
+            observed_at: event_at,
+            ..
+        } => *event_at = observed_at,
         PaneEvent::AgentSessionStarted {
             observed_at: event_at,
             ..

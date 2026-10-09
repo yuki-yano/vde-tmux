@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod claude_background;
 pub mod origin;
 pub mod ownership;
 pub mod provider;

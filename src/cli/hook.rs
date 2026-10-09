@@ -711,6 +711,16 @@ pub(crate) fn claude_typed_event_from_input(
     input: &str,
     context: &TypedAdapterContext,
 ) -> Result<Option<PaneEventEnvelope>> {
+    let typed = claude_typed_event_from_json(event, input, context)?;
+    if let Some(mut envelope) = typed.clone()
+        && let PaneEvent::ClaudeToolResultObserved { operations, .. } = &mut envelope.event
+    {
+        if let Some(progress) = claude_progress_event_from_input(event, input, context.observed_at)?
+        {
+            *operations = typed_progress_operations(progress)?;
+        }
+        return Ok(Some(envelope));
+    }
     if let Some(progress_event) =
         claude_progress_event_from_input(event, input, context.observed_at)?
     {
@@ -722,7 +732,7 @@ pub(crate) fn claude_typed_event_from_input(
             context,
         )?));
     }
-    claude_typed_event_from_json(event, input, context)
+    Ok(typed)
 }
 
 pub(crate) fn codex_typed_event_from_input(

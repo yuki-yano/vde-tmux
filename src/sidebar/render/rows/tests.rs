@@ -6,6 +6,84 @@ use crate::sidebar::tree::{SidebarRow, SidebarRowKind};
 use ratatui::style::{Color, Modifier};
 use ratatui::text::Span;
 
+#[test]
+fn result_wait_glyph_keeps_working_color_and_blocked_priority() {
+    let mut chat = chat_row(
+        "chat::await",
+        "Claude",
+        RollupLevel::Running,
+        BadgeState::Working,
+    );
+    chat.meta = Some(crate::sidebar::tree::RowMeta {
+        awaiting_result: true,
+        ..Default::default()
+    });
+    let mut theme = SidebarRenderTheme::default();
+    theme.badge_glyphs.awaiting_result = "W".into();
+    for width in [3, 18, 30, 60] {
+        let lines = render_lines(&[chat.clone()], &SidebarState::default(), width, &theme);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.content.contains('W')),
+            "width={width}"
+        );
+    }
+    assert_eq!(row_badge_glyph(&chat, BadgeState::Working, &theme), "W");
+    assert_eq!(theme.badge_color(BadgeState::Working), theme.badge_working);
+    chat.badge_state = Some(BadgeState::Blocked);
+    assert_eq!(
+        row_badge_glyph(&chat, BadgeState::Blocked, &theme),
+        theme.badge_glyph(BadgeState::Blocked)
+    );
+    let cron = detail_row(
+        "meta::pane::cron",
+        "◷ 1 最後に確認した予約 123",
+        RollupLevel::Idle,
+    );
+    assert!(
+        detail_label_spans(&cron.label, &cron, &theme)
+            .unwrap()
+            .iter()
+            .all(|s| s.style.fg == Some(theme.task_label))
+    );
+}
+
+#[test]
+fn background_details_include_dynamic_text_in_width_budget() {
+    let theme = SidebarRenderTheme::default();
+    for (suffix, label) in [
+        ("awaiting-result", "結果待ち 2件"),
+        ("awaiting-registry", "なし1 あり0 不明1"),
+        ("cron", "◷ 2 予約確認"),
+    ] {
+        let mut detail = detail_row(
+            &format!("meta::pane::{suffix}"),
+            label,
+            RollupLevel::Running,
+        );
+        detail.meta = Some(crate::sidebar::tree::RowMeta {
+            snapshot_at: Some(crate::sidebar::tree::now_epoch_secs() - 180),
+            ..Default::default()
+        });
+        for width in [18, 24, 30, 60] {
+            let line = render_row_line(&detail, &SidebarState::default(), width, &theme);
+            let text = line_to_string(line);
+            assert!(
+                display_width(&text) <= width,
+                "{suffix} width={width}: {text}"
+            );
+            if suffix == "awaiting-registry" && width >= 30 {
+                assert!(text.contains("Stop 3m ago なし1"), "{text}");
+            }
+            if suffix == "cron" && width >= 30 {
+                assert!(text.contains("3m ago"), "{text}");
+            }
+        }
+    }
+}
+
 fn row(
     id: &str,
     kind: SidebarRowKind,

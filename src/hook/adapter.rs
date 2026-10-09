@@ -73,6 +73,10 @@ pub fn claude_typed_event_from_json(
     if origin == HookOrigin::NonParent && is_guarded_claude_lifecycle_event(event) {
         return Ok(None);
     }
+    let notifications = payload
+        .prompt
+        .as_deref()
+        .and_then(super::claude_background::task_notifications);
     let event = match event {
         "SessionStart" => PaneEvent::AgentSessionStarted {
             observed_at: context.observed_at,
@@ -89,6 +93,15 @@ pub fn claude_typed_event_from_json(
                 None
             },
         },
+        "UserPromptSubmit" if notifications.is_some() => {
+            if !origin.is_parent() {
+                return Ok(None);
+            }
+            PaneEvent::ClaudeTaskNotificationsObserved {
+                observed_at: context.observed_at,
+                notifications: notifications.unwrap(),
+            }
+        }
         "UserPromptSubmit" => PaneEvent::BeginRun {
             started_at: context.observed_at,
             prompt: payload
@@ -98,6 +111,19 @@ pub fn claude_typed_event_from_json(
                 .transpose()?
                 .flatten(),
         },
+        "PostToolUse" if origin.is_parent() => {
+            let value = serde_json::from_str(raw_json)?;
+            match super::claude_background::tool_result(&value) {
+                Some(result) => PaneEvent::ClaudeToolResultObserved {
+                    observed_at: context.observed_at,
+                    result,
+                    operations: Vec::new(),
+                },
+                None => PaneEvent::ActivityObserved {
+                    observed_at: context.observed_at,
+                },
+            }
+        }
         "PreToolUse" | "PostToolUse" => PaneEvent::ActivityObserved {
             observed_at: context.observed_at,
         },
@@ -108,10 +134,41 @@ pub fn claude_typed_event_from_json(
             }
         }
         "Notification" => return Ok(None),
-        "Stop" => stop_event(
-            payload.last_assistant_message.as_deref(),
-            context.observed_at,
-        ),
+        "Stop" => {
+            if !origin.is_parent() {
+                return Ok(None);
+            }
+            let value: serde_json::Value = serde_json::from_str(raw_json)?;
+            let response = match stop_event(
+                payload.last_assistant_message.as_deref(),
+                context.observed_at,
+            ) {
+                PaneEvent::ResponseAndCompleteRun { response, .. } => Some(response),
+                _ => None,
+            };
+            let registry = value
+                .get("background_tasks")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let crons = value
+                .get("session_crons")
+                .and_then(|v| v.as_array())
+                .filter(|entries| entries.len() <= crate::pane_state::MAX_BACKGROUND_TASKS)
+                .and_then(|v| serde_json::from_value(serde_json::Value::Array(v.clone())).ok());
+            PaneEvent::ClaudeStopped {
+                observed_at: context.observed_at,
+                response,
+                registry,
+                crons,
+            }
+        }
+        "SessionEnd" => {
+            if !origin.is_parent() {
+                return Ok(None);
+            }
+            PaneEvent::ClaudeSessionEnded {
+                observed_at: context.observed_at,
+            }
+        }
         "StopFailure" => claude_stop_failure_event(&payload, context.observed_at)?,
         _ => return Ok(None),
     };
@@ -396,6 +453,7 @@ fn is_guarded_claude_lifecycle_event(event: &str) -> bool {
             | "Notification"
             | "PreToolUse"
             | "PostToolUse"
+            | "SessionEnd"
     )
 }
 
@@ -605,7 +663,12 @@ mod tests {
             (
                 "Stop",
                 r#"{"session_id":"session-1"}"#,
-                PaneEvent::CompleteRun { completed_at: 123 },
+                PaneEvent::ClaudeStopped {
+                    observed_at: 123,
+                    response: None,
+                    registry: None,
+                    crons: None,
+                },
             ),
         ];
         for (hook, payload, expected) in fixtures {
@@ -1147,12 +1210,17 @@ mod tests {
     }
 
     fn assert_response_completion(envelope: PaneEventEnvelope, agent: &str) {
-        let PaneEvent::ResponseAndCompleteRun {
-            completed_at,
-            response,
-        } = envelope.event
-        else {
-            panic!("expected response completion for {agent}");
+        let (completed_at, response) = match envelope.event {
+            PaneEvent::ResponseAndCompleteRun {
+                completed_at,
+                response,
+            } => (completed_at, response),
+            PaneEvent::ClaudeStopped {
+                observed_at,
+                response: Some(response),
+                ..
+            } => (observed_at, response),
+            _ => panic!("expected response completion for {agent}"),
         };
         assert_eq!(completed_at, 123);
         assert_eq!(response.text, format!("done for {agent}"));

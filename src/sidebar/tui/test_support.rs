@@ -94,6 +94,8 @@ pub(super) fn resolved_pane(pane_id: &str, pane_pid: u32, session_id: &str) -> P
         subagents: Vec::new(),
         worktree_activity: None,
         background_process: None,
+        claude_background: Default::default(),
+        claude_crons: Default::default(),
         listening_ports: Vec::new(),
     };
     PanePresentation {

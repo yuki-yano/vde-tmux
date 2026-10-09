@@ -71,7 +71,9 @@ pub fn render_structured_pane_status(config: &Config, pane: &PanePresentation) -
                 resolved.canonical.agent.as_str(),
             ));
             let badge_state = resolved.badge;
-            let badge = structured_pane_badge(config, badge_state, &text_fg);
+            let awaiting_result = badge_state == BadgeState::Working
+                && resolved.canonical.claude_background.is_awaiting_result();
+            let badge = structured_pane_badge(config, badge_state, &text_fg, awaiting_result);
             let status_label = structured_pane_status_label(&resolved.canonical, badge_state);
             let status =
                 structured_pane_status_fragment(config, status_label, badge_state, &text_fg);
@@ -85,6 +87,7 @@ pub fn render_structured_pane_status(config: &Config, pane: &PanePresentation) -
                 time_label.as_deref(),
                 badge_state,
                 &text_fg,
+                awaiting_result,
             );
             (agent, badge, status, time, detail)
         }
@@ -719,7 +722,7 @@ fn window_map_omission(
         .map(|(state, count)| {
             format!(
                 "{} {count}",
-                structured_pane_badge(config, state, "default")
+                structured_pane_badge(config, state, "default", false)
             )
         })
         .collect::<Vec<_>>()
@@ -937,8 +940,17 @@ fn structured_attention_variants(
     )
 }
 
-fn structured_pane_badge(config: &Config, state: BadgeState, text_fg: &str) -> String {
-    let glyph = glyph_for_state(state, &config.badge.glyphs);
+fn structured_pane_badge(
+    config: &Config,
+    state: BadgeState,
+    text_fg: &str,
+    awaiting_result: bool,
+) -> String {
+    let glyph = if awaiting_result {
+        &config.badge.glyphs.awaiting_result
+    } else {
+        glyph_for_state(state, &config.badge.glyphs)
+    };
     let color = config
         .badge
         .colors
@@ -953,6 +965,9 @@ pub(super) fn structured_pane_status_label(
 ) -> &'static str {
     if badge == BadgeState::Done {
         return "Done";
+    }
+    if badge == BadgeState::Working && state.claude_background.is_awaiting_result() {
+        return "結果待ち";
     }
     match state.lifecycle {
         crate::pane_state::LifecycleState::Idle => "Idle",
@@ -1079,8 +1094,13 @@ fn structured_pane_detail(
     time: Option<&str>,
     state: BadgeState,
     text_fg: &str,
+    awaiting_result: bool,
 ) -> String {
-    let glyph = glyph_for_state(state, &config.badge.glyphs);
+    let glyph = if awaiting_result {
+        &config.badge.glyphs.awaiting_result
+    } else {
+        glyph_for_state(state, &config.badge.glyphs)
+    };
     let color = config
         .badge
         .colors

@@ -1,6 +1,6 @@
 # Agent JSON API
 
-This document defines the current API v6 contract (daemon protocol 31, Pane State schema 10,
+This document defines the current API v7 contract (daemon protocol 32, Pane State schema 11,
 Question sidecar schema 1). CLI, daemon, and sidebars must be installed together; there is no
 mixed-version fallback. The inherited v4 mutation boundary and rollout gates are maintained in
 [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is recorded in
@@ -171,6 +171,33 @@ Filters are exact except for `--cwd-prefix`, which compares normalized path comp
 - `--cwd-prefix` matches a path and its descendants.
 - `--unread` returns unread agents.
 - `--needs-action` returns agents waiting for user action.
+
+## Claude background result waits and reservations
+
+`AgentSummary.background_wait` is present while Claude has tracked result receipts or tracking
+faults. It contains `paused`, `paused_at` (Unix seconds or null), `pending_count`, and `tasks`.
+Each pending task exposes `task_id`, `last_registry_presence` (`present`, `absent`, or `unknown`),
+and `last_checked_at` (Unix seconds or null). Presence describes the last normal parent `Stop`
+snapshot, not current process liveness or result delivery. Missing registry data is `unknown`.
+
+The parent Bash tool's single literal `vt agent wait`, `vt agent run wait`, or
+`vt agent operation wait` is registered only after a normal `PostToolUse` supplies a valid
+background task ID and tool-use ID. Wrappers, variables, and shell operators are outside this
+contract. Unrelated resident commands do not hold completion. A matching task notification or
+successful `TaskStop`, followed by the parent `Stop`, releases the wait. Registry absence and
+elapsed time do not release it. Public status, badge counts, and filters stay `working`; the
+individual pane's glyph is `badge.glyphs.awaiting_result` (`◌` by default). Provider input/limit
+states keep precedence. Tracking faults are `blocked` with an `await_*` lifecycle reason.
+
+`AgentSummary.scheduled_crons`, when present, contains `entries` and `observed_at` (Unix seconds).
+Entries contain `id`, `schedule`, and `recurring`. This is a reservation snapshot from the last
+normal parent `Stop`; active computation hides it. Empty or missing snapshots and agent/session
+end clear it. Reservations do not hold a run open or predict the next firing time.
+
+Manual completion clears result tracking and faults without stopping the command. Claude's UI
+stop may emit neither a receipt nor a notification, so it may require manual completion. Late
+notifications after completion start a normal new response instead of restoring the old wait.
+These contracts require synchronous hooks; missing events are not inferred from terminal text.
 
 ## Identity and waiting
 
@@ -672,7 +699,7 @@ marks only the affected pane degraded. A post-rename directory-fsync failure is 
 with a durability diagnostic.
 
 Notifications and their deduplication keys persist in private `question-notices-v1.json` under the
-server incarnation state directory, independently of Pane State schema 10 and durable Runs. Limits
+server incarnation state directory, independently of Pane State schema 11 and durable Runs. Limits
 are 4096 keys/owner, 65536 total keys, 512 owners, and a 16 MiB sidecar. Confirmed dead owners are
 reclaimed; acknowledged keys are retained until then. Invalid/version-mismatched sidecars are not
 reset or overwritten automatically. Disk failure retains new notices in memory with
@@ -834,5 +861,5 @@ includes more work than the daemon-ingress bound; it excludes Codex's pre-hook d
 
 #### Operational rollout
 
-- [ ] CLI/daemon/sidebar are deployed together with API 6 / protocol 31 while retaining existing Pane State schema 10.
+- [ ] CLI/daemon/sidebar are deployed together with API 7 / protocol 32 while retaining pane state via the offline schema 10 → 11 conversion in RELEASING.md.
 - [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.

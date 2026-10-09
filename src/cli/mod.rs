@@ -28,6 +28,76 @@ use pane::PaneCommand;
 
 const MAX_AGENT_HOOK_STDIN_BYTES: usize = 16 * 1024 * 1024;
 
+/// A deliberately small shell grammar: one command with literal words/quotes only.
+pub(crate) fn is_literal_agent_wait(command: &str) -> bool {
+    if command.len() > crate::pane_state::BODY_MAX_BYTES
+        || command.contains([
+            '\n', '\r', '\\', '$', '`', ';', '|', '&', '<', '>', '(', ')', '*', '?', '[', ']', '{',
+            '}', '~', '#',
+        ])
+    {
+        return false;
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut started = false;
+    for c in command.chars() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else {
+                word.push(c);
+            }
+            started = true;
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+            started = true;
+        } else if c.is_whitespace() {
+            if started {
+                words.push(std::mem::take(&mut word));
+                started = false;
+            }
+        } else {
+            word.push(c);
+            started = true;
+        }
+    }
+    if quote.is_some() {
+        return false;
+    }
+    if started {
+        words.push(word);
+    }
+    let Some(binary) = words.first() else {
+        return false;
+    };
+    let own = std::env::current_exe().ok();
+    if binary != "vt" && own.as_ref().and_then(|p| p.to_str()) != Some(binary.as_str()) {
+        return false;
+    }
+    let Ok(cli) = Cli::try_parse_from(words) else {
+        return false;
+    };
+    matches!(
+        cli.command,
+        Command::Agent {
+            command: AgentCommand::Wait { .. },
+            ..
+        } | Command::Agent {
+            command: AgentCommand::Run {
+                command: agent::AgentRunCommand::Wait { .. }
+            },
+            ..
+        } | Command::Agent {
+            command: AgentCommand::Operation {
+                command: agent::AgentOperationCommand::Wait { .. }
+            },
+            ..
+        }
+    )
+}
+
 /// vde-tmux CLI。
 #[derive(Debug, Parser)]
 #[command(version, about = "tmux state & UI manager", subcommand_required = true)]

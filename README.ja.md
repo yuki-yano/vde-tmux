@@ -116,12 +116,21 @@ vde-tmux は session に client が attach しているかを判定するとき�
     "PostToolUse": [{ "hooks": [{ "type": "command", "command": "vt hook claude PostToolUse" }] }],
     "Notification": [{ "hooks": [{ "type": "command", "command": "vt hook claude Notification" }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "vt hook claude Stop" }] }],
-    "StopFailure": [{ "hooks": [{ "type": "command", "command": "vt hook claude StopFailure" }] }]
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "vt hook claude StopFailure" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "vt hook claude SessionEnd" }] }]
   }
 }
 ```
 
 保存後に Claude Code を再起動すると、状態遷移と task の進捗が表示されます。
+
+Claude の親 Bash tool が背景実行した `vt agent wait`、`vt agent run wait`、`vt agent operation wait` は、通知の配達または成功した `TaskStop` と、その後の親応答の `Stop` まで Working を維持します。個別 pane には Working の色で `◌` と「結果待ち」を表示します。記号は `badge.glyphs.awaiting_result` で変更でき、Working の件数とフィルタにも含まれます。
+
+対象は単独のリテラル command です。実行ファイルは `vt` または実行中の vt と同じ絶対パスに限ります。変数、shell 演算子、redirect、shell/Python 経由の間接呼び出しは対象外です。自動の背景移行も追跡しますが、常駐 server など他の背景 command は run を保持しません。hook は同期で実行し、`async: true` を設定しないでください。観測した形式は Claude Code 2.1.287 で、利用する版で事前に確認します。出力本文から欠けた背景 task ID を推定しません。
+
+API の `background_wait` と pane 詳細の一覧への有無・確認時刻は、最後の正常な `Stop` 時点の snapshot です。現在の実行状況や結果の配達を示すものではありません。通知が欠けた場合、時間だけでは完了させません。復旧できない場合は sidebar で対象 pane を選んで `d` を押し、手動完了にします。台帳を解除する操作で、command 自体は停止しません。Claude の UI から停止すると `TaskStop` と通知が出ないこともあり、その場合も手動完了が必要です。不正な receipt は `await_*` の理由付き Blocked とし、同じ原因で繰り返し通知しません。
+
+展開した pane の `◷` は予約件数と最後の親 `Stop` の確認時刻を、task label の色で示します。API の `scheduled_crons` も同じ snapshot です。予約は主バッジや run の完了条件を変えず、計算中は表示しません。cron 発火時の prompt と Done 通知は通常の応答と同じ扱いです。手動・自動完了後に届いた task 通知も新しい応答として処理し、古い待機を復元しません。
 
 ### 4. Codex の hook
 
@@ -620,7 +629,7 @@ vt hook emit \
 
 ### pane state の永続化
 
-daemon は、prompt、task、subagent、状態遷移、要約、既読状態などの pane の詳細を、tmux server ごとに `$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v10.json` へ保存します。
+daemon は、prompt、task、subagent、状態遷移、要約、既読状態などの pane の詳細を、tmux server ごとに `$XDG_STATE_HOME/vde-tmux/<incarnation-hash>/pane-state-v11.json` へ保存します。
 daemon の再起動後は、pane ID と PID が一致する pane についてこれらを復元します。
 すでに動いていない tmux server のファイルは自動では削除しません。
 

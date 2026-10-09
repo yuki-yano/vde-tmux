@@ -1,0 +1,565 @@
+{
+  "claude_version": "2.1.287",
+  "observations": [
+    {
+      "case": "finite",
+      "duration": 23.61,
+      "events": [
+        {
+          "at": 1791529338.730454,
+          "hook_event_name": "SessionStart",
+          "session_id": "666ddb5b-6a41-4907-91fd-7d95444cec9b",
+          "source": "startup",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/finite/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-finite/666ddb5b-6a41-4907-91fd-7d95444cec9b.jsonl"
+        },
+        {
+          "at": 1791529338.7928278,
+          "hook_event_name": "UserPromptSubmit",
+          "session_id": "666ddb5b-6a41-4907-91fd-7d95444cec9b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/finite/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-finite/666ddb5b-6a41-4907-91fd-7d95444cec9b.jsonl",
+          "prompt": "Run exactly python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py finite with Bash run_in_background true. Reply QUEUED immediately. Do not poll, read files, stop the command, or run other commands. On its notification reply RECEIVED only."
+        },
+        {
+          "at": 1791529341.1533911,
+          "hook_event_name": "PreToolUse",
+          "session_id": "666ddb5b-6a41-4907-91fd-7d95444cec9b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/finite/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-finite/666ddb5b-6a41-4907-91fd-7d95444cec9b.jsonl",
+          "tool_name": "Bash",
+          "tool_use_id": "toolu_01GmfSeVxg1xiYXFeRn518NM",
+          "tool_input": {
+            "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py finite",
+            "description": "Run job script in background",
+            "run_in_background": true
+          }
+        },
+        {
+          "at": 1791529341.287513,
+          "hook_event_name": "PostToolUse",
+          "session_id": "666ddb5b-6a41-4907-91fd-7d95444cec9b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/finite/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-finite/666ddb5b-6a41-4907-91fd-7d95444cec9b.jsonl",
+          "tool_name": "Bash",
+          "tool_use_id": "toolu_01GmfSeVxg1xiYXFeRn518NM",
+          "tool_input": {
+            "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py finite",
+            "description": "Run job script in background",
+            "run_in_background": true
+          },
+          "tool_response": {
+            "stdout": "",
+            "stderr": "",
+            "interrupted": false,
+            "isImage": false,
+            "noOutputExpected": false,
+            "backgroundTaskId": "bzkx23hfn"
+          }
+        },
+        {
+          "at": 1791529342.780072,
+          "hook_event_name": "Stop",
+          "session_id": "666ddb5b-6a41-4907-91fd-7d95444cec9b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/finite/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-finite/666ddb5b-6a41-4907-91fd-7d95444cec9b.jsonl",
+          "background_tasks": [
+            {
+              "id": "bzkx23hfn",
+              "type": "shell",
+              "status": "running",
+              "description": "Run job script in background",
+              "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py finite"
+            }
+          ],
+          "session_crons": [],
+          "last_assistant_message": "QUEUED",
+          "stop_hook_active": false
+        },
+        {
+          "at": 1791529356.3261251,
+          "hook_event_name": "UserPromptSubmit",
+          "session_id": "666ddb5b-6a41-4907-91fd-7d95444cec9b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/finite/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-finite/666ddb5b-6a41-4907-91fd-7d95444cec9b.jsonl",
+          "prompt": "<task-notification>\n<task-id>bzkx23hfn</task-id>\n<tool-use-id>toolu_01GmfSeVxg1xiYXFeRn518NM</tool-use-id>\n<output-file>/private/tmp/claude-501/-private-tmp-vde-claude-wait-v2-RiYib3-finite/666ddb5b-6a41-4907-91fd-7d95444cec9b/tasks/bzkx23hfn.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run job script in background\" completed (exit code 0)</summary>\n</task-notification>"
+        },
+        {
+          "at": 1791529358.087764,
+          "hook_event_name": "Stop",
+          "session_id": "666ddb5b-6a41-4907-91fd-7d95444cec9b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/finite/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-finite/666ddb5b-6a41-4907-91fd-7d95444cec9b.jsonl",
+          "background_tasks": [],
+          "session_crons": [],
+          "last_assistant_message": "RECEIVED",
+          "stop_hook_active": false
+        },
+        {
+          "at": 1791529358.119328,
+          "hook_event_name": "SessionEnd",
+          "session_id": "666ddb5b-6a41-4907-91fd-7d95444cec9b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/finite/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-finite/666ddb5b-6a41-4907-91fd-7d95444cec9b.jsonl"
+        }
+      ]
+    },
+    {
+      "case": "quick",
+      "duration": 10.1,
+      "events": [
+        {
+          "at": 1791529338.8547971,
+          "hook_event_name": "SessionStart",
+          "session_id": "aac663e3-e841-4706-9929-c9462b235845",
+          "source": "startup",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/quick/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-quick/aac663e3-e841-4706-9929-c9462b235845.jsonl"
+        },
+        {
+          "at": 1791529338.9254148,
+          "hook_event_name": "UserPromptSubmit",
+          "session_id": "aac663e3-e841-4706-9929-c9462b235845",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/quick/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-quick/aac663e3-e841-4706-9929-c9462b235845.jsonl",
+          "prompt": "Run exactly python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py quick with Bash run_in_background true. Reply QUEUED immediately. Do not poll, read files, stop the command, or run other commands. On its notification reply RECEIVED only."
+        },
+        {
+          "at": 1791529341.289299,
+          "hook_event_name": "PreToolUse",
+          "session_id": "aac663e3-e841-4706-9929-c9462b235845",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/quick/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-quick/aac663e3-e841-4706-9929-c9462b235845.jsonl",
+          "tool_name": "Bash",
+          "tool_use_id": "toolu_01TCz9gPyCQpx4mTQVXL6CiQ",
+          "tool_input": {
+            "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py quick",
+            "description": "Run job script in background",
+            "run_in_background": true
+          }
+        },
+        {
+          "at": 1791529341.395314,
+          "hook_event_name": "PostToolUse",
+          "session_id": "aac663e3-e841-4706-9929-c9462b235845",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/quick/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-quick/aac663e3-e841-4706-9929-c9462b235845.jsonl",
+          "tool_name": "Bash",
+          "tool_use_id": "toolu_01TCz9gPyCQpx4mTQVXL6CiQ",
+          "tool_input": {
+            "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py quick",
+            "description": "Run job script in background",
+            "run_in_background": true
+          },
+          "tool_response": {
+            "stdout": "",
+            "stderr": "",
+            "interrupted": false,
+            "isImage": false,
+            "noOutputExpected": false,
+            "backgroundTaskId": "bsbkunp6k"
+          }
+        },
+        {
+          "at": 1791529342.7314181,
+          "hook_event_name": "Stop",
+          "session_id": "aac663e3-e841-4706-9929-c9462b235845",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/quick/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-quick/aac663e3-e841-4706-9929-c9462b235845.jsonl",
+          "background_tasks": [],
+          "session_crons": [],
+          "last_assistant_message": "QUEUED",
+          "stop_hook_active": false
+        },
+        {
+          "at": 1791529342.78611,
+          "hook_event_name": "UserPromptSubmit",
+          "session_id": "aac663e3-e841-4706-9929-c9462b235845",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/quick/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-quick/aac663e3-e841-4706-9929-c9462b235845.jsonl",
+          "prompt": "<task-notification>\n<task-id>bsbkunp6k</task-id>\n<tool-use-id>toolu_01TCz9gPyCQpx4mTQVXL6CiQ</tool-use-id>\n<output-file>/private/tmp/claude-501/-private-tmp-vde-claude-wait-v2-RiYib3-quick/aac663e3-e841-4706-9929-c9462b235845/tasks/bsbkunp6k.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run job script in background\" completed (exit code 0)</summary>\n</task-notification>"
+        },
+        {
+          "at": 1791529344.425935,
+          "hook_event_name": "Stop",
+          "session_id": "aac663e3-e841-4706-9929-c9462b235845",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/quick/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-quick/aac663e3-e841-4706-9929-c9462b235845.jsonl",
+          "background_tasks": [],
+          "session_crons": [],
+          "last_assistant_message": "RECEIVED",
+          "stop_hook_active": false
+        },
+        {
+          "at": 1791529344.462195,
+          "hook_event_name": "SessionEnd",
+          "session_id": "aac663e3-e841-4706-9929-c9462b235845",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/quick/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-quick/aac663e3-e841-4706-9929-c9462b235845.jsonl"
+        }
+      ]
+    },
+    {
+      "case": "service",
+      "duration": 18.17,
+      "events": [
+        {
+          "at": 1791529338.7200582,
+          "hook_event_name": "SessionStart",
+          "session_id": "24ba3747-e375-4215-96b1-71a1c065916b",
+          "source": "startup",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/service/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-service/24ba3747-e375-4215-96b1-71a1c065916b.jsonl"
+        },
+        {
+          "at": 1791529338.807811,
+          "hook_event_name": "UserPromptSubmit",
+          "session_id": "24ba3747-e375-4215-96b1-71a1c065916b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/service/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-service/24ba3747-e375-4215-96b1-71a1c065916b.jsonl",
+          "prompt": "Run exactly python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py service with Bash run_in_background true. Reply QUEUED immediately. Do not poll, read files, stop the command, or run other commands. On its notification reply RECEIVED only."
+        },
+        {
+          "at": 1791529341.153174,
+          "hook_event_name": "PreToolUse",
+          "session_id": "24ba3747-e375-4215-96b1-71a1c065916b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/service/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-service/24ba3747-e375-4215-96b1-71a1c065916b.jsonl",
+          "tool_name": "Bash",
+          "tool_use_id": "toolu_01Lbh4hBfXmHDVpwutLaWLkn",
+          "tool_input": {
+            "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py service",
+            "description": "Run job script in background",
+            "run_in_background": true
+          }
+        },
+        {
+          "at": 1791529341.287565,
+          "hook_event_name": "PostToolUse",
+          "session_id": "24ba3747-e375-4215-96b1-71a1c065916b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/service/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-service/24ba3747-e375-4215-96b1-71a1c065916b.jsonl",
+          "tool_name": "Bash",
+          "tool_use_id": "toolu_01Lbh4hBfXmHDVpwutLaWLkn",
+          "tool_input": {
+            "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py service",
+            "description": "Run job script in background",
+            "run_in_background": true
+          },
+          "tool_response": {
+            "stdout": "",
+            "stderr": "",
+            "interrupted": false,
+            "isImage": false,
+            "noOutputExpected": false,
+            "backgroundTaskId": "bl4sp3bxu"
+          }
+        },
+        {
+          "at": 1791529342.7324889,
+          "hook_event_name": "Stop",
+          "session_id": "24ba3747-e375-4215-96b1-71a1c065916b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/service/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-service/24ba3747-e375-4215-96b1-71a1c065916b.jsonl",
+          "background_tasks": [
+            {
+              "id": "bl4sp3bxu",
+              "type": "shell",
+              "status": "running",
+              "description": "Run job script in background",
+              "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py service"
+            }
+          ],
+          "session_crons": [],
+          "last_assistant_message": "QUEUED",
+          "stop_hook_active": false
+        },
+        {
+          "at": 1791529350.945386,
+          "hook_event_name": "UserPromptSubmit",
+          "session_id": "24ba3747-e375-4215-96b1-71a1c065916b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/service/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-service/24ba3747-e375-4215-96b1-71a1c065916b.jsonl",
+          "prompt": "<task-notification>\n<task-id>bl4sp3bxu</task-id>\n<tool-use-id>toolu_01Lbh4hBfXmHDVpwutLaWLkn</tool-use-id>\n<output-file>/private/tmp/claude-501/-private-tmp-vde-claude-wait-v2-RiYib3-service/24ba3747-e375-4215-96b1-71a1c065916b/tasks/bl4sp3bxu.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run job script in background\" completed (exit code 0)</summary>\n</task-notification>"
+        },
+        {
+          "at": 1791529352.584865,
+          "hook_event_name": "Stop",
+          "session_id": "24ba3747-e375-4215-96b1-71a1c065916b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/service/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-service/24ba3747-e375-4215-96b1-71a1c065916b.jsonl",
+          "background_tasks": [],
+          "session_crons": [],
+          "last_assistant_message": "RECEIVED",
+          "stop_hook_active": false
+        },
+        {
+          "at": 1791529352.6149492,
+          "hook_event_name": "SessionEnd",
+          "session_id": "24ba3747-e375-4215-96b1-71a1c065916b",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/service/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-service/24ba3747-e375-4215-96b1-71a1c065916b.jsonl"
+        }
+      ]
+    },
+    {
+      "case": "fail",
+      "duration": 23.59,
+      "events": [
+        {
+          "at": 1791529338.7263749,
+          "hook_event_name": "SessionStart",
+          "session_id": "d88beda3-c26c-40a4-bcf8-a4b47350438c",
+          "source": "startup",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/fail/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-fail/d88beda3-c26c-40a4-bcf8-a4b47350438c.jsonl"
+        },
+        {
+          "at": 1791529338.781579,
+          "hook_event_name": "UserPromptSubmit",
+          "session_id": "d88beda3-c26c-40a4-bcf8-a4b47350438c",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/fail/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-fail/d88beda3-c26c-40a4-bcf8-a4b47350438c.jsonl",
+          "prompt": "Run exactly python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py fail with Bash run_in_background true. Reply QUEUED immediately. Do not poll, read files, stop the command, or run other commands. On its notification reply RECEIVED only."
+        },
+        {
+          "at": 1791529341.153174,
+          "hook_event_name": "PreToolUse",
+          "session_id": "d88beda3-c26c-40a4-bcf8-a4b47350438c",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/fail/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-fail/d88beda3-c26c-40a4-bcf8-a4b47350438c.jsonl",
+          "tool_name": "Bash",
+          "tool_use_id": "toolu_01JAWse2GcvSK2ybYuD8dwpy",
+          "tool_input": {
+            "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py fail",
+            "description": "Run job script in background",
+            "run_in_background": true
+          }
+        },
+        {
+          "at": 1791529341.2875562,
+          "hook_event_name": "PostToolUse",
+          "session_id": "d88beda3-c26c-40a4-bcf8-a4b47350438c",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/fail/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-fail/d88beda3-c26c-40a4-bcf8-a4b47350438c.jsonl",
+          "tool_name": "Bash",
+          "tool_use_id": "toolu_01JAWse2GcvSK2ybYuD8dwpy",
+          "tool_input": {
+            "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py fail",
+            "description": "Run job script in background",
+            "run_in_background": true
+          },
+          "tool_response": {
+            "stdout": "",
+            "stderr": "",
+            "interrupted": false,
+            "isImage": false,
+            "noOutputExpected": false,
+            "backgroundTaskId": "blghrqyce"
+          }
+        },
+        {
+          "at": 1791529342.619013,
+          "hook_event_name": "Stop",
+          "session_id": "d88beda3-c26c-40a4-bcf8-a4b47350438c",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/fail/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-fail/d88beda3-c26c-40a4-bcf8-a4b47350438c.jsonl",
+          "background_tasks": [
+            {
+              "id": "blghrqyce",
+              "type": "shell",
+              "status": "running",
+              "description": "Run job script in background",
+              "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py fail"
+            }
+          ],
+          "session_crons": [],
+          "last_assistant_message": "QUEUED",
+          "stop_hook_active": false
+        },
+        {
+          "at": 1791529356.3261352,
+          "hook_event_name": "UserPromptSubmit",
+          "session_id": "d88beda3-c26c-40a4-bcf8-a4b47350438c",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/fail/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-fail/d88beda3-c26c-40a4-bcf8-a4b47350438c.jsonl",
+          "prompt": "<task-notification>\n<task-id>blghrqyce</task-id>\n<tool-use-id>toolu_01JAWse2GcvSK2ybYuD8dwpy</tool-use-id>\n<output-file>/private/tmp/claude-501/-private-tmp-vde-claude-wait-v2-RiYib3-fail/d88beda3-c26c-40a4-bcf8-a4b47350438c/tasks/blghrqyce.output</output-file>\n<status>failed</status>\n<summary>Background command \"Run job script in background\" failed with exit code 9</summary>\n</task-notification>"
+        },
+        {
+          "at": 1791529358.017718,
+          "hook_event_name": "Stop",
+          "session_id": "d88beda3-c26c-40a4-bcf8-a4b47350438c",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/fail/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-fail/d88beda3-c26c-40a4-bcf8-a4b47350438c.jsonl",
+          "background_tasks": [],
+          "session_crons": [],
+          "last_assistant_message": "RECEIVED",
+          "stop_hook_active": false
+        },
+        {
+          "at": 1791529358.047963,
+          "hook_event_name": "SessionEnd",
+          "session_id": "d88beda3-c26c-40a4-bcf8-a4b47350438c",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/fail/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-fail/d88beda3-c26c-40a4-bcf8-a4b47350438c.jsonl"
+        }
+      ]
+    },
+    {
+      "case": "cron",
+      "duration": 107.84,
+      "events": [
+        {
+          "at": 1791529338.718109,
+          "hook_event_name": "SessionStart",
+          "session_id": "912afa4b-da61-4639-934c-bf8c882d3415",
+          "source": "startup",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/cron/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-cron/912afa4b-da61-4639-934c-bf8c882d3415.jsonl"
+        },
+        {
+          "at": 1791529338.787551,
+          "hook_event_name": "UserPromptSubmit",
+          "session_id": "912afa4b-da61-4639-934c-bf8c882d3415",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/cron/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-cron/912afa4b-da61-4639-934c-bf8c882d3415.jsonl",
+          "prompt": "Create one non-recurring session CronCreate with cron 4 16 9 10 * and prompt \"Reply CHRONOWAKE only\". Reply SCHEDULED when created. Do not use other tools."
+        },
+        {
+          "at": 1791529341.0086122,
+          "hook_event_name": "PreToolUse",
+          "session_id": "912afa4b-da61-4639-934c-bf8c882d3415",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/cron/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-cron/912afa4b-da61-4639-934c-bf8c882d3415.jsonl",
+          "tool_name": "CronCreate",
+          "tool_use_id": "toolu_018BrbWBajdE5BqfHDAXqEwL",
+          "tool_input": {
+            "cron": "4 16 9 10 *",
+            "prompt": "Reply CHRONOWAKE only",
+            "recurring": false
+          }
+        },
+        {
+          "at": 1791529341.4824371,
+          "hook_event_name": "PostToolUse",
+          "session_id": "912afa4b-da61-4639-934c-bf8c882d3415",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/cron/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-cron/912afa4b-da61-4639-934c-bf8c882d3415.jsonl",
+          "tool_name": "CronCreate",
+          "tool_use_id": "toolu_018BrbWBajdE5BqfHDAXqEwL",
+          "tool_input": {
+            "cron": "4 16 9 10 *",
+            "prompt": "Reply CHRONOWAKE only",
+            "recurring": false
+          },
+          "tool_response": {
+            "id": "fc919191",
+            "humanSchedule": "4 16 9 10 *",
+            "recurring": false,
+            "durable": false
+          }
+        },
+        {
+          "at": 1791529342.733144,
+          "hook_event_name": "Stop",
+          "session_id": "912afa4b-da61-4639-934c-bf8c882d3415",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/cron/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-cron/912afa4b-da61-4639-934c-bf8c882d3415.jsonl",
+          "background_tasks": [],
+          "session_crons": [
+            {
+              "id": "fc919191",
+              "schedule": "4 16 9 10 *",
+              "recurring": false,
+              "prompt": "Reply CHRONOWAKE only"
+            }
+          ],
+          "last_assistant_message": "SCHEDULED",
+          "stop_hook_active": false
+        },
+        {
+          "at": 1791529440.727015,
+          "hook_event_name": "UserPromptSubmit",
+          "session_id": "912afa4b-da61-4639-934c-bf8c882d3415",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/cron/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-cron/912afa4b-da61-4639-934c-bf8c882d3415.jsonl",
+          "prompt": "Reply CHRONOWAKE only"
+        },
+        {
+          "at": 1791529442.393622,
+          "hook_event_name": "Stop",
+          "session_id": "912afa4b-da61-4639-934c-bf8c882d3415",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/cron/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-cron/912afa4b-da61-4639-934c-bf8c882d3415.jsonl",
+          "background_tasks": [],
+          "session_crons": [],
+          "last_assistant_message": "CHRONOWAKE",
+          "stop_hook_active": false
+        },
+        {
+          "at": 1791529442.420128,
+          "hook_event_name": "SessionEnd",
+          "session_id": "912afa4b-da61-4639-934c-bf8c882d3415",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/cron/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-cron/912afa4b-da61-4639-934c-bf8c882d3415.jsonl"
+        }
+      ]
+    },
+    {
+      "case": "stop",
+      "duration": 9.98,
+      "events": [
+        {
+          "at": 1791530014.3722398,
+          "hook_event_name": "SessionStart",
+          "session_id": "8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782",
+          "source": "startup",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/stop/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-stop/8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782.jsonl"
+        },
+        {
+          "at": 1791530014.404215,
+          "hook_event_name": "UserPromptSubmit",
+          "session_id": "8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/stop/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-stop/8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782.jsonl",
+          "prompt": "Run exactly python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py service with Bash run_in_background true. Then use TaskStop once with the returned task ID to stop that fixture. Reply CANCELED only. Do not run other commands or read files. On any task notification reply RECEIVED only."
+        },
+        {
+          "at": 1791530016.7678368,
+          "hook_event_name": "PreToolUse",
+          "session_id": "8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/stop/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-stop/8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782.jsonl",
+          "tool_name": "Bash",
+          "tool_use_id": "toolu_016G5SAqYVGtYqtBH3XSKTYn",
+          "tool_input": {
+            "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py service",
+            "run_in_background": true
+          }
+        },
+        {
+          "at": 1791530016.8532171,
+          "hook_event_name": "PostToolUse",
+          "session_id": "8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/stop/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-stop/8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782.jsonl",
+          "tool_name": "Bash",
+          "tool_use_id": "toolu_016G5SAqYVGtYqtBH3XSKTYn",
+          "tool_input": {
+            "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py service",
+            "run_in_background": true
+          },
+          "tool_response": {
+            "stdout": "",
+            "stderr": "",
+            "interrupted": false,
+            "isImage": false,
+            "noOutputExpected": false,
+            "backgroundTaskId": "bs4mrans1"
+          }
+        },
+        {
+          "at": 1791530019.058293,
+          "hook_event_name": "PreToolUse",
+          "session_id": "8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/stop/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-stop/8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782.jsonl",
+          "tool_name": "TaskStop",
+          "tool_use_id": "toolu_01PLokUapFp2v49crfJ4jJxr",
+          "tool_input": {
+            "task_id": "bs4mrans1"
+          }
+        },
+        {
+          "at": 1791530019.0839381,
+          "hook_event_name": "PostToolUse",
+          "session_id": "8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/stop/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-stop/8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782.jsonl",
+          "tool_name": "TaskStop",
+          "tool_use_id": "toolu_01PLokUapFp2v49crfJ4jJxr",
+          "tool_input": {
+            "task_id": "bs4mrans1"
+          },
+          "tool_response": {
+            "message": "Successfully stopped task: bs4mrans1 (python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py service)",
+            "task_id": "bs4mrans1",
+            "task_type": "local_bash",
+            "command": "python3 /private/tmp/vde-claude-wait-v2.RiYib3/job.py service"
+          }
+        },
+        {
+          "at": 1791530020.184157,
+          "hook_event_name": "Stop",
+          "session_id": "8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/stop/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-stop/8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782.jsonl",
+          "background_tasks": [],
+          "session_crons": [],
+          "last_assistant_message": "CANCELED",
+          "stop_hook_active": false
+        },
+        {
+          "at": 1791530020.2144718,
+          "hook_event_name": "SessionEnd",
+          "session_id": "8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782",
+          "transcript_path": "/private/tmp/vde-claude-wait-v2.RiYib3/stop/claude-home/projects/-private-tmp-vde-claude-wait-v2-RiYib3-stop/8f6ff4ec-40f5-4a13-bfc1-a3a4699e5782.jsonl"
+        }
+      ]
+    }
+  ]
+}

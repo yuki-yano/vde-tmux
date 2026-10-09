@@ -206,6 +206,28 @@ pub(in crate::api) fn agent_summary(
         None => None,
     };
     Some(AgentSummary {
+        background_wait: (!state.claude_background.tasks.is_empty()
+            || !state.claude_background.faults.is_empty())
+        .then(|| super::super::contract::BackgroundWaitSummary {
+            paused: state.claude_background.paused,
+            pending_count: state.claude_background.pending_count(),
+            paused_at: state.claude_background.paused_at,
+            tasks: state
+                .claude_background
+                .tasks
+                .iter()
+                .filter(|t| t.receipt == crate::pane_state::BackgroundReceipt::Pending)
+                .map(|t| super::super::contract::BackgroundWaitTaskSummary {
+                    task_id: t.task_id.clone(),
+                    last_registry_presence: t.last_registry_presence,
+                    last_checked_at: t.last_checked_at,
+                })
+                .collect(),
+        }),
+        scheduled_crons: (!state.claude_crons.entries.is_empty()
+            && !(matches!(state.lifecycle, LifecycleState::Running)
+                && !state.claude_background.paused))
+            .then(|| state.claude_crons.clone()),
         question_notice: pane.question_notice.clone(),
         agent_ref: exact_identity.then(|| agent_ref(server_identity, pane)),
         identity: if exact_identity {
@@ -309,6 +331,58 @@ pub(in crate::api) fn matches_agent_filter(agent: &AgentSummary, filter: &AgentL
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_wait_projection_preserves_working_and_snapshot_freshness() {
+        let mut pane = test_agent_pane();
+        let resolved = pane.resolved.as_mut().unwrap();
+        let state = &mut resolved.canonical;
+        state.agent = crate::pane_state::AgentKind::parse("claude").unwrap();
+        state.claude_background.paused = true;
+        state.claude_background.paused_at = Some(10);
+        state
+            .claude_background
+            .tasks
+            .push(crate::pane_state::BackgroundWaitTask {
+                task_id: "b1".into(),
+                tool_use_id: "t1".into(),
+                owner_run_seq: 1,
+                command: "vt agent wait %2".into(),
+                registered_at: 2,
+                receipt: crate::pane_state::BackgroundReceipt::Pending,
+                notification_status: None,
+                last_registry_presence: crate::pane_state::RegistryPresence::Absent,
+                last_checked_at: Some(10),
+            });
+        state.claude_crons = crate::pane_state::ClaudeCronSnapshot {
+            entries: vec![crate::pane_state::ClaudeCron {
+                id: "c1".into(),
+                schedule: "* * * * *".into(),
+                recurring: true,
+            }],
+            observed_at: Some(10),
+        };
+        let snapshot = test_snapshot(pane.clone());
+        let summary = agent_summary(&pane, &snapshot, "server").unwrap();
+        assert_eq!(summary.status, AgentStatus::Working);
+        assert_eq!(summary.badge, AgentBadge::Working);
+        assert_eq!(
+            summary.background_wait.unwrap().tasks[0].last_checked_at,
+            Some(10)
+        );
+        assert!(summary.scheduled_crons.is_some());
+        pane.resolved
+            .as_mut()
+            .unwrap()
+            .canonical
+            .claude_background
+            .activity();
+        assert!(
+            agent_summary(&pane, &snapshot, "server")
+                .unwrap()
+                .scheduled_crons
+                .is_none()
+        );
+    }
     use super::*;
     use crate::api::contract::ApiError;
     use crate::api::test_support::*;

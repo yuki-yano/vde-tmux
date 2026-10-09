@@ -323,6 +323,8 @@ fn observation_unread_preflight_matches_state_creating_inferences() {
         subagents: Vec::new(),
         worktree_activity: None,
         background_process: None,
+        claude_background: Default::default(),
+        claude_crons: Default::default(),
         listening_ports: Vec::new(),
     };
     let permission_wait = CaptureObservation {

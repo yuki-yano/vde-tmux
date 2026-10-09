@@ -489,7 +489,10 @@ pub(in crate::daemon::server) fn unread_visibility_for_event(
         (current, tracker, focus_equivalent_panes)
     };
     let may_create_unread = match &envelope.event {
-        PaneEvent::WaitRequested { .. } | PaneEvent::FailRun { .. } => true,
+        PaneEvent::WaitRequested { .. }
+        | PaneEvent::FailRun { .. }
+        | PaneEvent::ClaudeStopped { .. }
+        | PaneEvent::ClaudeSessionEnded { .. } => true,
         PaneEvent::CompleteRun { .. } | PaneEvent::ResponseAndCompleteRun { .. } => {
             current.as_ref().is_none_or(|state| {
                 state.run_seq > state.completed_seq || state.synthetic_completion_armed

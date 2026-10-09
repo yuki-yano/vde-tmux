@@ -11,13 +11,13 @@
             "blocked": {
               "type": "string"
             },
-            "limited": {
-              "type": "string"
-            },
             "done": {
               "type": "string"
             },
             "idle": {
+              "type": "string"
+            },
+            "limited": {
               "type": "string"
             },
             "working": {
@@ -29,20 +29,23 @@
         "glyphs": {
           "additionalProperties": true,
           "properties": {
-            "unknown": {
-              "type": "string",
-              "default": "?"
-            },
-            "blocked": {
+            "awaiting_result": {
               "type": "string"
             },
-            "limited": {
+            "blocked": {
               "type": "string"
             },
             "done": {
               "type": "string"
             },
             "idle": {
+              "type": "string"
+            },
+            "limited": {
+              "type": "string"
+            },
+            "unknown": {
+              "default": "?",
               "type": "string"
             },
             "working": {
@@ -190,25 +193,16 @@
             "badge_blocked": {
               "type": "string"
             },
-            "badge_limited": {
-              "type": "string"
-            },
             "badge_done": {
               "type": "string"
             },
             "badge_idle": {
               "type": "string"
             },
+            "badge_limited": {
+              "type": "string"
+            },
             "badge_working": {
-              "type": "string"
-            },
-            "header_active_bg": {
-              "type": "string"
-            },
-            "header_active_fg": {
-              "type": "string"
-            },
-            "header_filter_bg": {
               "type": "string"
             },
             "git_ahead": {
@@ -221,6 +215,15 @@
               "type": "string"
             },
             "git_insertions": {
+              "type": "string"
+            },
+            "header_active_bg": {
+              "type": "string"
+            },
+            "header_active_fg": {
+              "type": "string"
+            },
+            "header_filter_bg": {
               "type": "string"
             },
             "selection_bar": {
@@ -507,6 +510,15 @@
         "sessions": {
           "additionalProperties": true,
           "properties": {
+            "badge_style": {
+              "enum": [
+                "inline",
+                "plain",
+                "outer",
+                "chip"
+              ],
+              "type": "string"
+            },
             "fixed_width": {
               "default": false,
               "type": "boolean"
@@ -516,15 +528,6 @@
               "enum": [
                 "left",
                 "center"
-              ],
-              "type": "string"
-            },
-            "badge_style": {
-              "enum": [
-                "inline",
-                "plain",
-                "outer",
-                "chip"
               ],
               "type": "string"
             },
