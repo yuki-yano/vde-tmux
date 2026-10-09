@@ -53,6 +53,8 @@ int main(int argc, char **argv) {
     char path[4096], line[512], event[64], pane[64];
     snprintf(path, sizeof(path), "%s/%s.fifo", root, role);
     FILE *rollout = NULL;
+    FILE *subagent_rollouts[2] = {NULL, NULL};
+    FILE *duplicate_rollout = NULL;
     if (!strcmp(role, "embedded")) {
         snprintf(path, sizeof(path), "%s/sessions/rollout-embedded.jsonl", getenv("CODEX_HOME"));
         rollout = fopen(path, "a+");
@@ -63,6 +65,35 @@ int main(int argc, char **argv) {
     if (!commands) return 2;
     while (fgets(line, sizeof(line), commands)) {
         if (sscanf(line, "%63s %63s", event, pane) != 2) return 3;
+        if (!strcmp(event, "SUBAGENTS_OPEN")) {
+            const char *names[] = {"active", "completed"};
+            for (int i = 0; i < 2; i++) {
+                snprintf(path, sizeof(path), "%s/sessions/rollout-subagent-%s.jsonl",
+                    getenv("CODEX_HOME"), names[i]);
+                subagent_rollouts[i] = fopen(path, "a+");
+                if (!subagent_rollouts[i]) return 8;
+            }
+            continue;
+        }
+        if (!strcmp(event, "DUPLICATE_OPEN")) {
+            snprintf(path, sizeof(path), "%s/sessions/duplicate/rollout-embedded.jsonl",
+                getenv("CODEX_HOME"));
+            duplicate_rollout = fopen(path, "a+");
+            if (!duplicate_rollout) return 8;
+            continue;
+        }
+        if (!strcmp(event, "OTHER_ROOT_OPEN")) {
+            snprintf(path, sizeof(path), "%s/sessions/rollout-other-root.jsonl",
+                getenv("CODEX_HOME"));
+            duplicate_rollout = fopen(path, "a+");
+            if (!duplicate_rollout) return 8;
+            continue;
+        }
+        if (!strcmp(event, "DUPLICATE_CLOSE")) {
+            if (duplicate_rollout) fclose(duplicate_rollout);
+            duplicate_rollout = NULL;
+            continue;
+        }
         if (!strncmp(event, "SESSION_", 8) && rollout) {
             fclose(rollout);
             snprintf(path, sizeof(path), "%s/sessions/rollout-%s.jsonl", getenv("CODEX_HOME"),
@@ -313,6 +344,22 @@ def main():
         structural("task_started", "synthetic-turn")
         structural("task_complete", "synthetic-turn")
         screen("SCREEN_READY")
+        subagent_paths = []
+        for state in ["active", "completed"]:
+            child = transcript.with_name(f"rollout-subagent-{state}.jsonl")
+            child.write_text(json.dumps({"type":"session_meta", "payload":{
+                "id":f"subagent-{state}", "thread_source":"subagent",
+                "session_id":"embedded", "forked_from_id":"embedded",
+                "source":{"subagent":{"thread_spawn":{"parent_thread_id":"embedded"}}},
+                "base_instructions":{"text":"x" * (23 * 1024)}}})+"\n"
+                +json.dumps({"type":"event_msg", "payload":{
+                    "type":"task_started", "turn_id":f"child-{state}"}})+"\n")
+            if state == "completed":
+                with child.open("a") as stream:
+                    stream.write(json.dumps({"type":"event_msg", "payload":{
+                        "type":"task_complete", "turn_id":f"child-{state}"}})+"\n")
+            subagent_paths.append(child)
+        screen("SUBAGENTS_OPEN")
         recovered = []
         for cycle in range(int(os.environ.get("VDE_RESYNC_CYCLES", "20"))):
             started = time.monotonic()
@@ -342,13 +389,36 @@ def main():
         structural("task_started", "lost-hook-turn")
         reject_prompt("new-turn")
         structural("task_complete", "lost-hook-turn")
+        await_agents(lambda a: a[target]["presentation"]["reason"] == "provider_resynchronized")
+        duplicate = transcript.parent / "duplicate/rollout-embedded.jsonl"
+        duplicate.parent.mkdir()
+        duplicate.write_text(json.dumps({"type":"session_meta", "payload":{
+            "id":"embedded", "thread_source":"user"}})+"\n")
+        screen("DUPLICATE_OPEN")
+        await_agents(lambda a: a[target]["presentation"]["reason"] != "provider_resynchronized")
+        reject_prompt("duplicate-session-writer")
+        screen("DUPLICATE_CLOSE")
+        await_agents(lambda a: a[target]["presentation"]["reason"] == "provider_resynchronized")
+        other_root = transcript.with_name("rollout-other-root.jsonl")
+        other_root.write_text(json.dumps({"type":"session_meta", "payload":{
+            "id":"other-root", "thread_source":"user"}})+"\n")
+        screen("OTHER_ROOT_OPEN")
+        await_agents(lambda a: a[target]["presentation"]["reason"] != "provider_resynchronized")
+        reject_prompt("old-root-retained-with-stale-canonical-session")
+        screen("DUPLICATE_CLOSE")
+        await_agents(lambda a: a[target]["presentation"]["reason"] == "provider_resynchronized")
         replacement = transcript.with_name("rollout-replacement.jsonl")
         replacement.write_text(json.dumps({"type":"session_meta","payload":{"id":"replacement","thread_source":"user"}})+"\n")
         screen("SESSION_SWAP")
+        await_agents(lambda a: a[target]["presentation"]["reason"] != "provider_resynchronized")
         reject_prompt("same-pid-new-session")
         screen("SESSION_RESTORE")
         screen("SCREEN_READY")
         await_agents(lambda a: a[target]["presentation"]["reason"] == "provider_resynchronized")
+        # Finished subagents keep their writers open in the same process.
+        with subagent_paths[0].open("a") as stream:
+            stream.write(json.dumps({"type":"event_msg", "payload":{
+                "type":"task_complete", "turn_id":"child-active"}})+"\n")
         # A history larger than one request must recover incrementally, and the
         # final dispatch must reuse that checkpoint instead of starting over.
         with transcript.open("a") as stream:
@@ -383,8 +453,10 @@ def main():
         await_agents(lambda a: a[target]["status"] == "done")
         (work / "resync-evidence.json").write_text(json.dumps({"restart_cycles":len(recovered), "restart_seconds":recovered,
             "external_prompt":"confirmed", "large_history_mib":34,
-            "negative_cases":["draft","queue","lost-hook-turn","same-pid-new-session"]}, indent=2)+"\n")
-        print(f"PASS: {len(recovered)} restarts recovered without manual input; external prompt confirmed; draft/queue/new turn/session replacement rejected", flush=True)
+            "retained_subagent_writers":2,
+            "negative_cases":["draft","queue","lost-hook-turn","duplicate-session-writer",
+                              "old-root-retained-with-stale-canonical-session","same-pid-new-session"]}, indent=2)+"\n")
+        print(f"PASS: {len(recovered)} restarts recovered with subagent writers retained; external prompt confirmed; draft/queue/new turn/duplicate writer/session replacement rejected", flush=True)
         vt("daemon", "restart")
         await_agents(lambda a: a[target]["identity"] == "exact")
         for event in ["UserPromptSubmit", "Stop"]:

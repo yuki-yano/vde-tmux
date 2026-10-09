@@ -51,8 +51,13 @@ impl Resynchronizer {
             let verified = paths
                 .get(&process.pid)
                 .and_then(|paths| {
-                    locator_from_paths(process, state.agent_session_id.as_ref()?.as_str(), paths)
-                        .ok()
+                    locator_from_paths(
+                        process,
+                        state.agent_session_id.as_ref()?.as_str(),
+                        paths,
+                        deadline,
+                    )
+                    .ok()
                 })
                 .is_some_and(|locator| self.read_idle(state, locator, deadline).unwrap_or(false));
             results.insert(process.pid, verified);
@@ -122,6 +127,7 @@ pub(crate) fn active_locator(
     process: &AgentProcessIdentity,
     session: &str,
 ) -> Result<TranscriptLocator> {
+    let deadline = Instant::now() + Duration::from_millis(500);
     let before = crate::daemon::lifecycle::agent_process_start_token(process.pid)?;
     ensure!(before == process.start_token, "process replaced");
     let args = crate::question_notice::profile::process_arguments(process.pid)
@@ -131,12 +137,13 @@ pub(crate) fn active_locator(
         "shared or queued Codex invocation"
     );
     let paths = writable_rollouts(process.pid)?;
-    locator_from_paths(process, session, &paths)
+    locator_from_paths(process, session, &paths, deadline)
 }
 fn locator_from_paths(
     process: &AgentProcessIdentity,
     session: &str,
     paths: &[PathBuf],
+    deadline: Instant,
 ) -> Result<TranscriptLocator> {
     ensure!(
         crate::daemon::lifecycle::agent_process_start_token(process.pid)? == process.start_token,
@@ -148,30 +155,66 @@ fn locator_from_paths(
         crate::question_notice::profile::independent_arguments(&args),
         "shared or queued invocation"
     );
-    ensure!(
-        paths.len() == 1,
-        "active session is unavailable or ambiguous"
-    );
-    let path = &paths[0];
-    // The exact writer, not a search through old sessions, supplies both home and session.
-    let home = path
-        .ancestors()
-        .find(|path| path.file_name().is_some_and(|name| name == "sessions"))
-        .and_then(Path::parent)
-        .ok_or_else(|| anyhow::anyhow!("invalid rollout path"))?;
-    let expected_suffix = format!("-{session}.jsonl");
-    ensure!(
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(&expected_suffix)),
-        "current session changed"
-    );
-    let locator = TranscriptLocator::capture(home, path)
-        .ok_or_else(|| anyhow::anyhow!("rollout identity unavailable"))?;
+    let locator = session_locator(session, paths, deadline)?;
     ensure!(
         crate::daemon::lifecycle::agent_process_start_token(process.pid)? == process.start_token,
         "process replaced"
     );
+    Ok(locator)
+}
+
+fn session_locator(
+    session: &str,
+    paths: &[PathBuf],
+    deadline: Instant,
+) -> Result<TranscriptLocator> {
+    use crate::question_notice::turn_order::{SessionHeader, session_header};
+
+    ensure!(
+        paths.len() <= 128,
+        "session writer candidate limit exceeded"
+    );
+    ensure!(!paths.is_empty(), "current session writer is unavailable");
+    // Subagent writers do not own the parent input. A second root writer still
+    // makes the current session ambiguous, even if canonical hooks are stale.
+    let expected_suffix = format!("-{session}.jsonl");
+    let expected_digest = identifier_digest(session);
+    let mut root = None;
+    for path in paths {
+        ensure!(
+            Instant::now() < deadline,
+            "session verification deadline exceeded"
+        );
+        // The exact writer, not a filesystem search, supplies home and session.
+        let home = path
+            .ancestors()
+            .find(|path| path.file_name().is_some_and(|name| name == "sessions"))
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("invalid rollout path"))?;
+        let locator = TranscriptLocator::capture(home, path)
+            .ok_or_else(|| anyhow::anyhow!("rollout identity unavailable"))?;
+        let header = session_header(&locator, deadline);
+        ensure!(
+            Instant::now() < deadline,
+            "session verification deadline exceeded"
+        );
+        match header
+            .ok_or_else(|| anyhow::anyhow!("session header is invalid or exceeds its byte limit"))?
+        {
+            SessionHeader::NonRoot => {}
+            SessionHeader::Root { session_digest } => {
+                ensure!(root.is_none(), "multiple root session writers are open");
+                let name_matches = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&expected_suffix));
+                root = Some((locator, name_matches && session_digest == expected_digest));
+            }
+        }
+    }
+    let (locator, matches) =
+        root.ok_or_else(|| anyhow::anyhow!("current root session writer is unavailable"))?;
+    ensure!(matches, "current session root metadata does not match");
     Ok(locator)
 }
 
@@ -300,6 +343,111 @@ fn rollout_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(1)
+    }
+
+    struct Rollouts(PathBuf);
+
+    impl Rollouts {
+        fn new() -> Self {
+            let home = std::env::temp_dir().join(format!(
+                "vt-codex-rollouts-{}",
+                crate::pane_state::EventId::generate().unwrap().as_str()
+            ));
+            std::fs::create_dir_all(home.join("sessions")).unwrap();
+            Self(home)
+        }
+
+        fn write(&self, relative: &str, body: &str) -> PathBuf {
+            let path = self.0.join("sessions").join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Rollouts {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn exact_root_session_is_selected_among_active_and_completed_subagent_writers() {
+        let fixture = Rollouts::new();
+        let root = fixture.write(
+            "rollout-root.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"thread_source\":\"user\"}}\n",
+        );
+        let mut paths = vec![fixture.write(
+            "rollout-subagent-active.jsonl",
+            &format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"subagent-active\",\"session_id\":\"root\",\"forked_from_id\":\"root\",\"thread_source\":\"subagent\",\"source\":{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"root\"}}}}}},\"base_instructions\":{{\"text\":\"{}\"}}}}}}\n", "x".repeat(23 * 1024)),
+        )];
+        paths.push(root.clone());
+        paths.push(fixture.write(
+            "rollout-subagent-completed.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"subagent-completed\",\"thread_source\":\"subagent\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"child-turn\"}}\n",
+        ));
+        paths.push(fixture.write(
+            "rollout-voice.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"voice\",\"thread_source\":\"realtime_voice\"}}\n",
+        ));
+        let selected = session_locator("root", &paths, deadline()).unwrap();
+        assert_eq!(selected.transcript, root.canonicalize().unwrap());
+        assert_eq!(
+            selected,
+            TranscriptLocator::capture(&fixture.0, &root).unwrap()
+        );
+        let mut body = std::fs::read_to_string(&root).unwrap();
+        body.push_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"capacity-turn\",\"error\":{\"codex_error_info\":\"server_overloaded\"}}}\n");
+        std::fs::write(&root, body).unwrap();
+        assert!(crate::codex_capacity::read_failure(&selected, "capacity-turn", &mut 0).unwrap());
+        assert!(session_locator("subagent-active", &paths, deadline()).is_err());
+        assert!(session_locator("subagent-completed", &paths, deadline()).is_err());
+    }
+
+    #[test]
+    fn root_session_selection_rejects_missing_ambiguous_and_untrusted_writers() {
+        let fixture = Rollouts::new();
+        let valid = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"thread_source\":\"user\"}}\n";
+        let root = fixture.write("rollout-root.jsonl", valid);
+        assert!(session_locator("root", &[], deadline()).is_err());
+        assert!(session_locator("missing", std::slice::from_ref(&root), deadline()).is_err());
+        let duplicate = fixture.write("duplicate/rollout-root.jsonl", valid);
+        assert!(session_locator("root", &[root.clone(), duplicate], deadline()).is_err());
+        let other_root = fixture.write("rollout-other.jsonl", &valid.replace("root", "other"));
+        let two_roots = [root.clone(), other_root];
+        assert!(session_locator("root", &two_roots, deadline()).is_err());
+        assert!(session_locator("other", &two_roots, deadline()).is_err());
+        let unverified_child = fixture.write(
+            "rollout-child.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"child\"}}\n",
+        );
+        assert!(session_locator("root", &[root.clone(), unverified_child], deadline()).is_err());
+        assert!(session_locator("root", std::slice::from_ref(&root), Instant::now()).is_err());
+        assert!(session_locator("root", &vec![root.clone(); 129], deadline()).is_err());
+        for body in [
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\",\"thread_source\":\"user\"}}\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"thread_source\":\"subagent\"}}\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"thread_source\":\"user\",\"parent_thread_id\":\"parent\"}}\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"root\"}}\n",
+            "{\"type\":\"session_meta\",\"payload\":",
+        ] {
+            std::fs::write(&root, body).unwrap();
+            assert!(session_locator("root", std::slice::from_ref(&root), deadline()).is_err());
+        }
+        std::fs::write(&root, format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"root\",\"thread_source\":\"user\",\"base_instructions\":{{\"text\":\"{}\"}}}}}}\n", "x".repeat(256 * 1024))).unwrap();
+        assert!(session_locator("root", std::slice::from_ref(&root), deadline()).is_err());
+        std::fs::write(&root, valid).unwrap();
+        let symlink = fixture.0.join("sessions/symlink/rollout-root.jsonl");
+        std::fs::create_dir_all(symlink.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&root, &symlink).unwrap();
+        assert!(session_locator("root", &[symlink], deadline()).is_err());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn partial_descriptor_output_with_diagnostics_is_not_trusted() {

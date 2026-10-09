@@ -239,47 +239,83 @@ pub fn verify_startup_header(
     session: &str,
     deadline: Instant,
 ) -> bool {
-    let verify = || -> Result<bool> {
-        if !locator.matches_current_file() {
-            return Ok(false);
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&locator.transcript)
+    read_header(locator, REQUEST_BYTES, deadline)
+        .ok()
+        .flatten()
+        .is_some_and(|record| {
+            record.kind == Kind::SessionMeta
+                && record.id.as_deref() == Some(session)
+                && record.user_source
+                && !record.parent
+        })
+}
+
+pub(crate) enum SessionHeader {
+    Root { session_digest: String },
+    NonRoot,
+}
+
+/// Classify one writer without retaining the instructions or conversation body.
+pub(crate) fn session_header(
+    locator: &TranscriptLocator,
+    deadline: Instant,
+) -> Option<SessionHeader> {
+    let record = read_header(locator, 256 * 1024, deadline).ok()??;
+    if record.kind != Kind::SessionMeta {
+        return None;
+    }
+    let session_digest = record.id?;
+    // Interactive parent input belongs to thread_source=user. Other sources
+    // use the hook-origin NonParent classification, including realtime_voice.
+    if record.user_source && !record.parent {
+        Some(SessionHeader::Root { session_digest })
+    } else if record.source_known || record.parent {
+        Some(SessionHeader::NonRoot)
+    } else {
+        None
+    }
+}
+
+fn read_header(
+    locator: &TranscriptLocator,
+    max_bytes: usize,
+    deadline: Instant,
+) -> Result<Option<Record>> {
+    if !locator.matches_current_file() {
+        return Ok(None);
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&locator.transcript)
+        .map_err(|_| ReadFailure::Unavailable)?;
+    let before = file.metadata().map_err(|_| ReadFailure::Unavailable)?;
+    if before.dev() != locator.dev || before.ino() != locator.ino {
+        return Ok(None);
+    }
+    let mut parser = Parser::default();
+    let mut bytes = 0;
+    let mut buffer = [0; 64 * 1024];
+    while bytes < max_bytes && Instant::now() < deadline {
+        let count = file
+            .read(&mut buffer[..(max_bytes - bytes).min(64 * 1024)])
             .map_err(|_| ReadFailure::Unavailable)?;
-        let before = file.metadata().map_err(|_| ReadFailure::Unavailable)?;
-        if before.dev() != locator.dev || before.ino() != locator.ino {
-            return Ok(false);
+        if count == 0 {
+            return Ok(None);
         }
-        let mut parser = Parser::default();
-        let mut bytes = 0;
-        let mut buffer = [0; 64 * 1024];
-        while bytes < REQUEST_BYTES && Instant::now() < deadline {
-            let count = file
-                .read(&mut buffer)
-                .map_err(|_| ReadFailure::Unavailable)?;
-            if count == 0 {
-                return Ok(false);
-            }
-            bytes += count;
-            for byte in &buffer[..count] {
-                if let Some(record) = parser.feed(*byte)? {
-                    let after = file.metadata().map_err(|_| ReadFailure::Unavailable)?;
-                    return Ok(record.kind == Kind::SessionMeta
-                        && record.id.as_deref() == Some(session)
-                        && record.user_source
-                        && !record.parent
-                        && after.len() >= before.len()
-                        && after.dev() == before.dev()
-                        && after.ino() == before.ino()
-                        && locator.matches_current_file());
-                }
+        bytes += count;
+        for byte in &buffer[..count] {
+            if let Some(record) = parser.feed(*byte)? {
+                let after = file.metadata().map_err(|_| ReadFailure::Unavailable)?;
+                return Ok((after.len() >= before.len()
+                    && after.dev() == before.dev()
+                    && after.ino() == before.ino()
+                    && locator.matches_current_file())
+                .then_some(record));
             }
         }
-        Ok(false)
-    };
-    verify().unwrap_or(false)
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -314,6 +350,7 @@ struct Record {
     id: Option<String>,
     turn: Option<String>,
     user_source: bool,
+    source_known: bool,
     parent: bool,
     error: bool,
 }
@@ -747,7 +784,10 @@ impl Parser {
             (Role::Payload, Field::Type) => self.record.event = Kind::parse(value),
             (Role::Payload, Field::Id) => self.record.id = Some(identifier_digest(value)),
             (Role::Payload, Field::Turn) => self.record.turn = Some(identifier_digest(value)),
-            (Role::Payload, Field::Source) => self.record.user_source = value == "user",
+            (Role::Payload, Field::Source) => {
+                self.record.user_source = value == "user";
+                self.record.source_known = true;
+            }
             (Role::Payload, Field::Parent) => self.record.parent = !value.is_empty(),
             _ => {}
         }

@@ -755,9 +755,18 @@ Saved exact Question IDs can be acknowledged without restoring ordinary-resolver
 
 ### Restart readiness
 
-For an existing canonical Idle Codex session, the observation worker identifies the exact process's
-single writable rollout descriptor (macOS lsof or Linux procfs). It verifies PID/start token,
-explicit independent argv, current session, file identity and complete bounded structural history.
+For an existing canonical Idle Codex session, the observation worker inspects the exact process's
+writable rollout descriptors (macOS lsof or Linux procfs). Exactly one must have a root-session
+header (`payload.thread_source=user` without `payload.parent_thread_id`); its filename and
+`payload.id` must both match the canonical session. Other descriptors are allowed only when their
+headers identify non-root sessions. Active and completed subagent writers do not determine the
+parent's readiness. Header selection permits at most 128 candidates, reads at most 256KiB per
+header, and shares a 500ms verification deadline. Invalid, unknown or over-budget headers reject
+readiness. It also verifies PID/start token, explicit independent argv, file identity and complete
+bounded structural history.
+Multiple root writers remain ambiguous and prevent sending, including when Codex retains the old
+root after `/new` or `/resume`; the canonical session alone does not prove which root is current.
+Readiness cannot recover while those roots stay open; restart Codex before retrying in that case.
 Only a latest normal completion with no open turn supplies transient `provider_resynchronized`
 presentation evidence. Old completed files, ambiguous descriptors, partial history and a different
 session do not. This changes neither hook authority nor canonical Run completion.
@@ -765,8 +774,8 @@ Every durable prompt checks a fresh empty composer, cursor, foreground owner and
 resynchronized sessions also reread structural state immediately before dispatch. Drafts, current
 queue headers, blocked/working screens and unresolved dispatches prevent sending.
 A readiness rejection is `agent_not_ready` (before dispatch, wait then retry), not `stale_reference`.
-Shared invocations require moving to an independently owned Codex session. No process is restarted
-and no saved Run or operation is abandoned to recover readiness.
+Shared invocations require moving to an independently owned Codex session. The readiness check
+itself never restarts a process or abandons a saved Run or operation.
 
 ## Query cost
 
