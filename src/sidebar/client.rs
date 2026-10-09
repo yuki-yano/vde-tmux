@@ -890,6 +890,9 @@ mod tests {
                 serde_json::from_str::<V2ClientMessage>(line.trim()).unwrap(),
                 V2ClientMessage::Hello { .. }
             ));
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
             write_frame(
                 &mut stream,
                 &V2ServerMessage::HelloAck {
@@ -903,9 +906,6 @@ mod tests {
                     hook_health: crate::daemon::protocol::v2::HookHealth::Healthy,
                 },
             );
-            stream
-                .set_read_timeout(Some(Duration::from_millis(100)))
-                .unwrap();
             line.clear();
             let read = BufReader::new(stream).read_line(&mut line).unwrap();
             assert_eq!(read, 0, "mutation must not follow a mismatched HelloAck");
