@@ -607,6 +607,7 @@ fn verify_active_config_hash(
         V2Client::connect_with_timeout(socket, server_identity, V2_SUBSCRIBE_INITIAL_TIMEOUT)?;
     let response = client.request(&V2ClientMessage::QueryRuntimeInfo {
         proto: PROTOCOL_VERSION,
+        config_context_vars: Vec::new(),
     })?;
     let V2ServerMessage::RuntimeInfoResult { info } = response else {
         return v2_server_error("RuntimeInfoResult", response);
@@ -835,6 +836,7 @@ mod tests {
             &mut stream,
             &V2ServerMessage::RuntimeInfoResult {
                 info: crate::daemon::protocol::v2::RuntimeInfo {
+                    reload_identity: Default::default(),
                     config_hash: config_hash.to_string(),
                     control_health: crate::daemon::protocol::v2::ControlHealth::Ready,
                 },
@@ -1315,6 +1317,7 @@ mod tests {
                 &mut stream,
                 &V2ServerMessage::RuntimeInfoResult {
                     info: crate::daemon::protocol::v2::RuntimeInfo {
+                        reload_identity: Default::default(),
                         config_hash: "hash".to_string(),
                         control_health: crate::daemon::protocol::v2::ControlHealth::Ready,
                     },
@@ -1366,6 +1369,7 @@ mod tests {
                 &mut stream,
                 &V2ServerMessage::RuntimeInfoResult {
                     info: crate::daemon::protocol::v2::RuntimeInfo {
+                        reload_identity: Default::default(),
                         config_hash: "active".to_string(),
                         control_health: crate::daemon::protocol::v2::ControlHealth::Ready,
                     },

@@ -1,6 +1,6 @@
 # Agent JSON API
 
-This document defines the current API v7 contract (daemon protocol 32, Pane State schema 11,
+This document defines the current API v7 contract (daemon protocol 33, Pane State schema 11,
 Question sidecar schema 1). CLI, daemon, and sidebars must be installed together; there is no
 mixed-version fallback. The inherited v4 mutation boundary and rollout gates are maintained in
 [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is recorded in
@@ -861,5 +861,5 @@ includes more work than the daemon-ingress bound; it excludes Codex's pre-hook d
 
 #### Operational rollout
 
-- [ ] CLI/daemon/sidebar are deployed together with API 7 / protocol 32 while retaining pane state via the offline schema 10 → 11 conversion in RELEASING.md.
+- [ ] CLI/daemon/sidebar are deployed together with API 7 / protocol 33 while retaining pane state via the offline schema 10 → 11 conversion in RELEASING.md.
 - [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.

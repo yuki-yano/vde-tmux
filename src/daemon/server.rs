@@ -207,6 +207,7 @@ struct ProductionV2Coordinator {
     status_push_started: Instant,
     status_push_timing: Mutex<StatusPushTiming>,
     config_hash: Mutex<String>,
+    config_reload_identity: Mutex<crate::config::load::ConfigReloadIdentity>,
     witness_observation_seq: Arc<AtomicU64>,
     current_view_refresh_generation: AtomicU64,
     current_view_refresh_running: AtomicBool,
@@ -294,6 +295,7 @@ impl ProductionV2Coordinator {
             status_push_driver: Mutex::new(()),
             status_push_started: Instant::now(),
             status_push_timing: Mutex::default(),
+            config_reload_identity: Mutex::new(Default::default()),
             config_hash: Mutex::new(crate::daemon::lifecycle::config_hash(
                 &crate::config::Config::default(),
             )),
@@ -514,7 +516,15 @@ impl ProductionV2Coordinator {
         );
     }
 
-    fn configure_health(&self, config: &crate::config::Config) {
+    fn configure_health(
+        &self,
+        config: &crate::config::Config,
+        identity: crate::config::load::ConfigReloadIdentity,
+    ) {
+        *self
+            .config_reload_identity
+            .lock()
+            .expect("config identity lock poisoned") = identity;
         self.capacity.lock().expect("capacity lock poisoned").config =
             config.codex.capacity_auto_resume.clone();
         *self.config_hash.lock().expect("config hash lock poisoned") =
@@ -895,16 +905,32 @@ impl ProductionV2Coordinator {
                     snapshot,
                 }
             }
-            ClientMessage::QueryRuntimeInfo { .. } => ServerMessage::RuntimeInfoResult {
-                info: crate::daemon::protocol::v2::RuntimeInfo {
-                    config_hash: self
-                        .config_hash
-                        .lock()
-                        .expect("config hash lock poisoned")
-                        .clone(),
-                    control_health: self.control_health(),
-                },
-            },
+            ClientMessage::QueryRuntimeInfo {
+                config_context_vars,
+                ..
+            } => {
+                let mut reload_identity = self
+                    .config_reload_identity
+                    .lock()
+                    .expect("config identity lock poisoned")
+                    .clone();
+                match crate::config::load::config_context_hash(&self.env, &config_context_vars) {
+                    Ok(hash) => reload_identity.context_hash = hash,
+                    Err(error) => return ServerMessage::error(ErrorCode::NotReady, error, None),
+                }
+                reload_identity.context_vars = config_context_vars;
+                ServerMessage::RuntimeInfoResult {
+                    info: crate::daemon::protocol::v2::RuntimeInfo {
+                        config_hash: self
+                            .config_hash
+                            .lock()
+                            .expect("config hash lock poisoned")
+                            .clone(),
+                        reload_identity,
+                        control_health: self.control_health(),
+                    },
+                }
+            }
             ClientMessage::QueryAgentRun { run_ref, .. } => {
                 let reference = match crate::agent_state::RunRef::decode(&run_ref) {
                     Ok(reference) => reference,
@@ -2252,6 +2278,7 @@ fn start_v2_mutation_worker(coordinator: Arc<ProductionV2Coordinator>) {
                     .expect("status push driver lock poisoned")
             });
             let response = apply_production_mutation(&coordinator, mutation.sequenced);
+            let shutdown_accepted = matches!(&response, ServerMessage::ShutdownAccepted { .. });
             if changes_topology_targets {
                 coordinator.sync_status_push_topology_targets_locked();
             }
@@ -2262,7 +2289,7 @@ fn start_v2_mutation_worker(coordinator: Arc<ProductionV2Coordinator>) {
             if !coordinator.is_deferred_response(accepted_seq) {
                 coordinator.complete(accepted_seq, response);
             }
-            if graceful_shutdown {
+            if graceful_shutdown && shutdown_accepted {
                 coordinator.mark_shutdown_ready();
             }
             let mut queue = coordinator.queue.lock().expect("v2 queue lock poisoned");
@@ -2872,7 +2899,35 @@ fn apply_production_mutation(
                 manual_scroll,
             ),
         },
-        V2AcceptedMutation::External(ClientMessage::Shutdown { event_id, .. }) => {
+        V2AcceptedMutation::External(ClientMessage::Shutdown {
+            event_id,
+            require_quiescent,
+            ..
+        }) => {
+            if require_quiescent {
+                let runtime = coordinator
+                    .agent_runtime
+                    .lock()
+                    .expect("agent runtime lock poisoned");
+                let Some(runtime) = runtime.as_ref() else {
+                    return ServerMessage::error(
+                        ErrorCode::NotReady,
+                        "agent runtime is hydrating",
+                        Some(event_id),
+                    );
+                };
+                match runtime.has_in_flight_operations() {
+                    Ok(true) => {
+                        return ServerMessage::error(
+                            ErrorCode::NotReady,
+                            "config reload deferred: agent prompt delivery is in flight; retry after delivery finishes",
+                            Some(event_id),
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => return agent_state_query_error(error),
+                }
+            }
             coordinator.begin_graceful_shutdown(accepted_seq);
             ServerMessage::ShutdownAccepted {
                 event_id,

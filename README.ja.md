@@ -332,8 +332,8 @@ vt sidebar prepare-layout --window @12 --json
 auto-all hook が無効でサイドバーがない場合は、`absent`、空の `reserved_panes`、既存の content pane を `content_anchor` として返します。
 auto-all の new-window hook と同時に実行しても結果は変わりません。
 
-このコマンドは daemon を起動しません。
-設定を反映した daemon が動いていない場合（先に `vt daemon reload` を実行してください）、window が不正または content pane がない場合、tmux の操作に失敗した場合は non-zero で終了します。
+このコマンドには、現在の設定を反映した稼働中の daemon が必要です。設定が未反映なら自動 reload せずにエラーを返すため、`vt daemon reload` を実行してから再試行してください。
+daemon が停止中または無効、設定が不正または未反映、window が不正または content pane がない、tmux の操作に失敗した場合は non-zero で終了します。
 
 ## Codex の Question 通知
 
@@ -413,6 +413,9 @@ ghq を使っている場合は、project selector から session を作成ま�
 ```bash
 vt project selector --popup
 ```
+
+一覧を開く前に、設定の変更を自動で反映します。
+対話的な tmux terminal で起動に失敗した場合は、`Enter` を押すまでエラー表示を残します。
 
 ## 設定ファイル
 
@@ -626,6 +629,14 @@ vt hook emit \
 
 `stop` は自動起動を無効にしません。
 停止状態を維持したい場合は `disable` を使います。
+
+現在の設定を必要とする対話コマンドは、有効な設定ファイルと稼働中の daemon の設定が異なると、自動で reload します。
+同時に複数のコマンドが実行されても、reload は1回にまとめます。
+自動 reload は、実行ファイル、設定ファイルの参照元、設定で使う環境変数の値が同じ場合に行い、Agent の prompt 配送中は保留します。
+hook や JSON の layout コマンドは、daemon を再起動せずに設定の未反映をエラーで返します。
+設定が不正なら稼働中の daemon を維持し、停止中や無効な daemon は自動 reload では起動しません。
+reload は daemon の再起動を伴うため、peek mode は終了し、sidebar の購読は再接続されます。
+変更をすぐ反映したい場合は `vt daemon reload` を実行してください。
 
 ### pane state の永続化
 

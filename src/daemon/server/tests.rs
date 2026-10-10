@@ -1,6 +1,170 @@
 use super::*;
 
 #[test]
+fn configured_health_keeps_identity_from_validated_source() {
+    let root = test_root("config-reload-source");
+    let config_dir = root.join(".config/vde/tmux");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.yml");
+    std::fs::write(
+        &config_path,
+        "statusline:\n  sessions:\n    show_index: true\n",
+    )
+    .unwrap();
+    let env = BTreeMap::from([("HOME".to_string(), root.display().to_string())]);
+    let (config, identity) = crate::config::load::load_config_for_reload(&env).unwrap();
+    std::fs::write(&config_path, "daemon:\n  poll_ms: [broken\n").unwrap();
+    let coordinator = test_coordinator(&root, "reload-source");
+    coordinator.configure_health(&config, identity.clone());
+    assert_eq!(
+        *coordinator.config_reload_identity.lock().unwrap(),
+        identity
+    );
+    assert_eq!(
+        *coordinator.config_hash.lock().unwrap(),
+        crate::daemon::lifecycle::config_hash(&config)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn automatic_reload_shutdown_respects_dispatch_quiescence() {
+    use crate::agent_state::{AgentBinding, DispatchState, OperationId, Sha256Digest};
+    use crate::pane_state::{
+        AgentKind, AgentProcessIdentity, AgentSessionId, StateId, StateVersion,
+    };
+    for state in [
+        DispatchState::Prepared,
+        DispatchState::DispatchStarted,
+        DispatchState::DeliveryUnknown,
+    ] {
+        let root = test_root("config-reload-busy");
+        let coordinator = test_coordinator(&root, "reload-busy");
+        let mut runtime = crate::agent_state::runtime::AgentRuntime::open(
+            root.join("agent-state"),
+            "reload-busy".to_string(),
+        )
+        .unwrap();
+        let state_id = StateId::generate().unwrap();
+        let binding = AgentBinding {
+            server_identity: coordinator.incarnation.identity.clone(),
+            pane_instance: PaneInstance {
+                pane_id: "%1".into(),
+                pane_pid: 100,
+            },
+            pane_state_id: state_id.clone(),
+            agent_epoch: 1,
+            agent_kind: AgentKind::parse("codex").unwrap(),
+            provider_session_id: AgentSessionId::parse("config-reload-session").unwrap(),
+            process: AgentProcessIdentity {
+                pid: 101,
+                start_token: "process-start".into(),
+            },
+        };
+        let operation = OperationId::parse("config_reload_operation_0001").unwrap();
+        runtime
+            .prepare_operation(
+                operation.clone(),
+                "vta1:reload-target".into(),
+                b"fixture prompt",
+                Sha256Digest::parse(crate::pane_state::PromptState::digest_decoded_prompt(
+                    "fixture prompt",
+                ))
+                .unwrap(),
+                "paste_enter".into(),
+                binding,
+                StateVersion {
+                    state_id,
+                    agent_epoch: 1,
+                    revision: 1,
+                },
+                None,
+                1,
+                epoch_seconds(),
+            )
+            .unwrap();
+        if state != DispatchState::Prepared {
+            runtime
+                .mark_dispatch_started(&operation, epoch_seconds())
+                .unwrap();
+        }
+        if state == DispatchState::DeliveryUnknown {
+            runtime
+                .settle_dispatch(&operation, state, "fixture_unknown", epoch_seconds())
+                .unwrap();
+        }
+        *coordinator.agent_runtime.lock().unwrap() = Some(runtime);
+        let daemon_id = coordinator
+            .router
+            .lock()
+            .unwrap()
+            .daemon_instance_id()
+            .clone();
+        let response = apply_production_mutation(
+            &coordinator,
+            V2SequencedMutation {
+                accepted_seq: 1,
+                mutation: V2AcceptedMutation::External(ClientMessage::Shutdown {
+                    proto: PROTOCOL_VERSION,
+                    daemon_instance_id: daemon_id.clone(),
+                    event_id: v2_event_id(),
+                    require_quiescent: true,
+                }),
+            },
+        );
+        if state == DispatchState::DeliveryUnknown {
+            assert!(matches!(response, ServerMessage::ShutdownAccepted { .. }));
+        } else {
+            assert!(
+                matches!(
+                    response,
+                    ServerMessage::Error {
+                        code: ErrorCode::NotReady,
+                        ..
+                    }
+                ),
+                "{response:?}"
+            );
+        }
+        assert_eq!(
+            coordinator.shutdown.load(Ordering::SeqCst),
+            state == DispatchState::DeliveryUnknown
+        );
+        assert!(!coordinator.shutdown_ready.load(Ordering::SeqCst));
+        let guard = coordinator.agent_runtime.lock().unwrap();
+        let record = guard
+            .as_ref()
+            .unwrap()
+            .store()
+            .load_operation(&operation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.dispatch_state, state);
+        drop(guard);
+        if state == DispatchState::DeliveryUnknown {
+            std::fs::remove_dir_all(root).unwrap();
+            continue;
+        }
+        // An explicit manual reload keeps its existing operator-authorized semantics.
+        let response = apply_production_mutation(
+            &coordinator,
+            V2SequencedMutation {
+                accepted_seq: 2,
+                mutation: V2AcceptedMutation::External(ClientMessage::Shutdown {
+                    proto: PROTOCOL_VERSION,
+                    daemon_instance_id: daemon_id,
+                    event_id: EventId::generate().unwrap(),
+                    require_quiescent: false,
+                }),
+            },
+        );
+        assert!(matches!(response, ServerMessage::ShutdownAccepted { .. }));
+        assert!(coordinator.shutdown.load(Ordering::SeqCst));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn status_publication_diagnostic_does_not_wait_for_cache_or_record_zero() {
     let coordinator = Arc::new(detached_test_coordinator("f".repeat(64)));
     let held = coordinator.snapshot_cache.lock().unwrap();

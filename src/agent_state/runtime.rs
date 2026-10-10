@@ -414,6 +414,15 @@ impl AgentRuntime {
             .collect()
     }
 
+    pub fn has_in_flight_operations(&self) -> Result<bool, StoreError> {
+        for operation_id in self.in_flight_by_binding.values() {
+            if self.required_operation(operation_id)?.in_flight() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn has_expired_dispatch(&self, observed_at: i64) -> Result<bool, StoreError> {
         for operation_id in self.in_flight_by_binding.values() {
             let operation = self.required_operation(operation_id)?;

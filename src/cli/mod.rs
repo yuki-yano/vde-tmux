@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -453,6 +453,12 @@ fn current_env() -> BTreeMap<String, String> {
 pub fn run() -> ExitCode {
     let args = std::env::args_os().collect::<Vec<_>>();
     let is_json_api = is_json_api_args(&args);
+    let pause_selector_error = args.get(1).and_then(|arg| arg.to_str()) == Some("project")
+        && args.get(2).and_then(|arg| arg.to_str()) == Some("selector")
+        && !args.iter().any(|arg| arg == "--popup")
+        && std::env::var("TMUX").is_ok_and(|value| !value.is_empty())
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal();
     let observed_at = now_epoch();
     let is_agent_hook = args.get(1).and_then(|arg| arg.to_str()) == Some("hook");
     let is_view_hook = args.get(1).and_then(|arg| arg.to_str()) == Some("hooks")
@@ -516,6 +522,10 @@ pub fn run() -> ExitCode {
                 eprintln!("{}", crate::api::render_error(&error, observed_at));
             } else {
                 eprintln!("{error:#}");
+                if pause_selector_error {
+                    eprintln!("Press Enter to close.");
+                    let _ = std::io::stdin().read_line(&mut String::new());
+                }
             }
             ExitCode::FAILURE
         }
@@ -968,20 +978,8 @@ where
                 }
                 Some(DaemonCommand::Disable) => daemon::disable_daemon(runner, env, None),
                 Some(DaemonCommand::Enable) => daemon::enable_daemon(runner, env, None),
-                Some(DaemonCommand::Restart) => {
-                    let result = daemon::restart_daemon(runner, env, None)?;
-                    let config =
-                        crate::config::load::load_config_strict(env).map_err(anyhow::Error::msg)?;
-                    crate::session::sync_session_category_mirrors(runner, &config, env)?;
-                    Ok(result)
-                }
-                Some(DaemonCommand::Reload) => {
-                    let result = daemon::reload_daemon(runner, env, None)?;
-                    let config =
-                        crate::config::load::load_config_strict(env).map_err(anyhow::Error::msg)?;
-                    crate::session::sync_session_category_mirrors(runner, &config, env)?;
-                    Ok(result)
-                }
+                Some(DaemonCommand::Restart) => daemon::restart_daemon(runner, env, None),
+                Some(DaemonCommand::Reload) => daemon::reload_daemon(runner, env, None),
                 Some(DaemonCommand::Status) => daemon::status_daemon(runner, env, None),
                 Some(DaemonCommand::Diagnostics { json }) => daemon::diagnostics(runner, env, json),
                 None => daemon::run_daemon(
@@ -1001,7 +999,17 @@ where
         Command::Sidebar { command } => {
             let guarded_config = command
                 .requires_active_config()
-                .then(|| require_active_config(runner, env))
+                .then(|| {
+                    require_active_config(
+                        runner,
+                        env,
+                        if command.allows_config_reload() {
+                            ConfigSync::AutoReload
+                        } else {
+                            ConfigSync::CheckOnly
+                        },
+                    )
+                })
                 .transpose()?;
             sidebar::run_sidebar_command(
                 command,
@@ -1075,14 +1083,14 @@ where
                     if json {
                         return crate::api::category_list(runner, env, now_epoch).map(Some);
                     }
-                    let config = require_active_config(runner, env)?;
+                    let config = require_active_config(runner, env, ConfigSync::AutoReload)?;
                     return category::list(runner, env, &config).map(Some);
                 }
                 CategoryCommand::Get { repo, json } => {
                     if json {
                         return crate::api::category_get(runner, env, now_epoch, &repo).map(Some);
                     }
-                    let config = require_active_config(runner, env)?;
+                    let config = require_active_config(runner, env, ConfigSync::AutoReload)?;
                     return category::get(runner, env, &config, &repo).map(Some);
                 }
                 CategoryCommand::Create { name } => {
@@ -1216,7 +1224,7 @@ where
                         scope.client_name.as_deref(),
                         scope.session_id.as_deref(),
                     )?;
-                    let config = require_active_config(runner, env)?;
+                    let config = require_active_config(runner, env, ConfigSync::AutoReload)?;
                     crate::session::create_session_for_client(
                         runner,
                         &config,
@@ -1277,7 +1285,7 @@ where
         Command::Project { command } => {
             match command {
                 ProjectCommand::Switch { path } => {
-                    let config = require_active_config(runner, env)?;
+                    let config = require_active_config(runner, env, ConfigSync::AutoReload)?;
                     crate::project::switch_project(runner, &config, env, &path)?;
                 }
                 ProjectCommand::Selector { popup } => {
@@ -1288,7 +1296,7 @@ where
                             &std::env::current_exe()?.display().to_string(),
                         )?;
                     } else {
-                        let config = require_active_config(runner, env)?;
+                        let config = require_active_config(runner, env, ConfigSync::AutoReload)?;
                         crate::project::run_project_selector(runner, &config, env)?;
                     }
                 }
@@ -1377,23 +1385,118 @@ fn agent_hook_delivery_timeout_from_args(args: &[OsString]) -> Duration {
     }
 }
 
-fn require_active_config(
-    runner: &dyn TmuxRunner,
-    env: &BTreeMap<String, String>,
-) -> Result<crate::config::Config> {
-    let config = crate::config::load::load_config_strict(env).map_err(|error| {
+fn load_operation_config(env: &BTreeMap<String, String>) -> Result<crate::config::Config> {
+    crate::config::load::load_config_strict(env).map_err(|error| {
         anyhow::anyhow!(
             "config-dependent operation refused: {error}; fix the config and run `vt daemon reload`"
         )
-    })?;
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ConfigSync {
+    AutoReload,
+    CheckOnly,
+}
+
+fn require_active_config(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    sync: ConfigSync,
+) -> Result<crate::config::Config> {
+    let (config, identity) = crate::config::load::load_config_for_reload(env)
+        .map_err(|error| anyhow::anyhow!("config-dependent operation refused: {error}"))?;
     let disk_hash = crate::daemon::lifecycle::config_hash(&config);
-    let active_hash = query_active_config_hash(runner, env).map_err(|error| {
-        anyhow::anyhow!(
-            "config-dependent operation refused: daemon active config is unavailable ({error:#}); run `vt daemon reload`"
-        )
-    })?;
-    verify_active_config_hash(&disk_hash, &active_hash)?;
+    let active = query_active_config(runner, env);
+    if active
+        .as_ref()
+        .is_ok_and(|active| active.info.config_hash == disk_hash)
+    {
+        return Ok(config);
+    }
+    if matches!(sync, ConfigSync::CheckOnly) {
+        verify_active_config_hash(&disk_hash, &active?.info.config_hash)?;
+        return Ok(config);
+    }
+    let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
+    let socket = crate::daemon::daemon_socket_path_for_incarnation(env, None, &incarnation.hash);
+    if crate::daemon::lifecycle::tmux_desired_mode(runner, env)?
+        == crate::daemon::lifecycle::DesiredMode::Disabled
+        || crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash)?.desired_mode
+            == crate::daemon::lifecycle::DesiredMode::Disabled
+    {
+        bail!("daemon is disabled; run `vt daemon enable` before this operation");
+    }
+    // Wait out another reload, including its temporary socket removal. Never
+    // spawn an unavailable daemon merely because a config-dependent command ran.
+    let start_lock = crate::daemon::lifecycle::acquire_daemon_reload_lock(&socket)?;
+    if crate::daemon::lifecycle::tmux_desired_mode(runner, env)?
+        == crate::daemon::lifecycle::DesiredMode::Disabled
+        || crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash)?.desired_mode
+            == crate::daemon::lifecycle::DesiredMode::Disabled
+    {
+        bail!("daemon is disabled; run `vt daemon enable` before this operation");
+    }
+    let (config, identity_after_lock) =
+        crate::config::load::load_config_for_reload(env).map_err(anyhow::Error::msg)?;
+    let disk_hash = crate::daemon::lifecycle::config_hash(&config);
+    let active = query_active_config_waiting(runner, env, true, &identity_after_lock.context_vars)
+        .map_err(|error| {
+            if crate::daemon::protocol::v2::is_protocol_version_mismatch(&error) {
+                anyhow::anyhow!("daemon active config is unavailable ({error:#}); complete the local binary upgrade first")
+            } else {
+                anyhow::anyhow!("daemon active config is unavailable ({error:#}); run `vt daemon ensure`")
+            }
+        })?;
+    if active.info.config_hash == disk_hash {
+        return Ok(config);
+    }
+    verify_automatic_config_reload(&identity_after_lock, &active.info.reload_identity)?;
+    // A source/environment change while waiting needs a fresh explicit attempt.
+    if identity.context_hash != identity_after_lock.context_hash {
+        bail!("configuration environment changed while waiting for reload; retry the operation");
+    }
+    if std::io::stderr().is_terminal() {
+        eprintln!("Reloading daemon configuration...");
+    }
+    daemon::reload_daemon_with_start_lock(
+        runner,
+        env,
+        &incarnation,
+        &socket,
+        &start_lock,
+        Some(&active.daemon_instance_id),
+    )?;
+    let config = load_operation_config(env)?;
+    verify_active_config_hash(
+        &crate::daemon::lifecycle::config_hash(&config),
+        &query_active_config_hash(runner, env)?,
+    )?;
+    drop(start_lock);
+    daemon::sync_reloaded_category_mirrors(runner, &config, env)?;
     Ok(config)
+}
+
+fn verify_automatic_config_reload(
+    disk: &crate::config::load::ConfigReloadIdentity,
+    active: &crate::config::load::ConfigReloadIdentity,
+) -> Result<()> {
+    if disk.executable != active.executable {
+        bail!(
+            "automatic config reload refused: executable differs from the running daemon; complete the local binary upgrade first"
+        );
+    }
+    if disk.context_hash != active.context_hash {
+        bail!(
+            "automatic config reload refused: configuration path or environment differs from the running daemon; run `vt daemon reload` explicitly"
+        );
+    }
+    if disk.source_hash == active.source_hash {
+        bail!(
+            "automatic config reload refused: source is unchanged but effective settings differ; run `vt daemon reload` explicitly"
+        );
+    }
+    Ok(())
 }
 
 fn verify_active_config_hash(disk_hash: &str, active_hash: &str) -> Result<()> {
@@ -1410,27 +1513,59 @@ fn verify_active_config_hash(disk_hash: &str, active_hash: &str) -> Result<()> {
     Ok(())
 }
 
+struct ActiveConfig {
+    info: crate::daemon::protocol::v2::RuntimeInfo,
+    daemon_instance_id: crate::pane_state::DaemonInstanceId,
+}
+
 fn query_active_config_hash(
     runner: &dyn TmuxRunner,
     env: &BTreeMap<String, String>,
 ) -> Result<String> {
+    Ok(query_active_config(runner, env)?.info.config_hash)
+}
+
+fn query_active_config(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+) -> Result<ActiveConfig> {
+    query_active_config_waiting(runner, env, false, &[])
+}
+
+fn query_active_config_waiting(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    wait_serving: bool,
+    config_context_vars: &[String],
+) -> Result<ActiveConfig> {
     let incarnation = crate::daemon::lifecycle::TmuxServerIncarnation::resolve(runner, env)?;
     let socket = crate::daemon::daemon_socket_path_for_incarnation(env, None, &incarnation.hash);
-    let mut client = crate::daemon::protocol::v2::V2Client::connect_with_timeout(
-        &socket,
-        &incarnation.hash,
-        Duration::from_millis(500),
-    )?;
-    if client.phase() != crate::daemon::protocol::v2::DaemonPhase::Serving {
-        bail!("daemon is not serving active configuration queries");
-    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut client = loop {
+        let client = crate::daemon::protocol::v2::V2Client::connect_with_timeout(
+            &socket,
+            &incarnation.hash,
+            Duration::from_millis(500),
+        )?;
+        if client.phase() == crate::daemon::protocol::v2::DaemonPhase::Serving {
+            break client;
+        }
+        if !wait_serving || Instant::now() >= deadline {
+            bail!("daemon is still starting; retry once it reaches Serving");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     match client.request(
         &crate::daemon::protocol::v2::ClientMessage::QueryRuntimeInfo {
             proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            config_context_vars: config_context_vars.to_vec(),
         },
     )? {
         crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult { info } => {
-            Ok(info.config_hash)
+            Ok(ActiveConfig {
+                info,
+                daemon_instance_id: client.daemon_instance_id().clone(),
+            })
         }
         crate::daemon::protocol::v2::ServerMessage::Error { code, message, .. } => {
             bail!("daemon query failed ({code:?}): {message}")

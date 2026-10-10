@@ -290,6 +290,7 @@ fn spawn_active_config_guard_fixture_with_yaml(yaml: &str) -> V2QueryFixture {
     let config_hash = crate::daemon::lifecycle::config_hash(&loaded.config);
     let response = crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult {
         info: crate::daemon::protocol::v2::RuntimeInfo {
+            reload_identity: Default::default(),
             config_hash,
             control_health: crate::daemon::protocol::v2::ControlHealth::Ready,
         },
@@ -297,6 +298,7 @@ fn spawn_active_config_guard_fixture_with_yaml(yaml: &str) -> V2QueryFixture {
     let mut fixture = spawn_v2_query_fixture(
         crate::daemon::protocol::v2::ClientMessage::QueryRuntimeInfo {
             proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            config_context_vars: Vec::new(),
         },
         response,
     );
@@ -386,12 +388,14 @@ fn spawn_v2_handshake_fixture() -> V2QueryFixture {
                 .unwrap(),
             crate::daemon::protocol::v2::ClientMessage::QueryRuntimeInfo {
                 proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                config_context_vars: Vec::new(),
             }
         );
         serde_json::to_writer(
             &mut stream,
             &crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult {
                 info: crate::daemon::protocol::v2::RuntimeInfo {
+                    reload_identity: Default::default(),
                     config_hash: "test-config".to_string(),
                     control_health: crate::daemon::protocol::v2::ControlHealth::Ready,
                 },
@@ -2095,6 +2099,29 @@ fn dispatch_session_manager_renders_preview() {
     assert!(output.contains("tail"));
     drop(listener);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reload_query_uses_validated_context_vars_without_rereading_config() {
+    let context_vars = vec!["RELOAD_OWNER".to_string(), "RELOAD_TEAM".to_string()];
+    let fixture = spawn_v2_query_fixture(
+        crate::daemon::protocol::v2::ClientMessage::QueryRuntimeInfo {
+            proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+            config_context_vars: context_vars.clone(),
+        },
+        crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult {
+            info: crate::daemon::protocol::v2::RuntimeInfo {
+                reload_identity: Default::default(),
+                config_hash: "validated-config".to_string(),
+                control_health: crate::daemon::protocol::v2::ControlHealth::Ready,
+            },
+        },
+    );
+    // No HOME/config path is available: the query must use the caller's identity.
+    let active =
+        query_active_config_waiting(&fixture.mock, &fixture.env, true, &context_vars).unwrap();
+    assert_eq!(active.info.config_hash, "validated-config");
+    fixture.finish();
 }
 
 #[test]

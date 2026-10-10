@@ -39,6 +39,7 @@ mod tests;
 
 pub fn run_runtime_daemon_server(
     config: crate::config::Config,
+    reload_identity: crate::config::load::ConfigReloadIdentity,
     socket_path: &Path,
     env: &std::collections::BTreeMap<String, String>,
     incarnation: crate::daemon::lifecycle::TmuxServerIncarnation,
@@ -64,6 +65,7 @@ pub fn run_runtime_daemon_server(
 
     let (coordinator, mut runtime_cleanup) = initialize_runtime_daemon_post_bind(
         &config,
+        reload_identity,
         socket_path,
         env,
         incarnation,
@@ -189,6 +191,7 @@ pub(super) fn start_pane_switch_trigger_worker(coordinator: Arc<ProductionV2Coor
 
 pub(super) fn initialize_runtime_daemon_post_bind(
     config: &crate::config::Config,
+    reload_identity: crate::config::load::ConfigReloadIdentity,
     socket_path: &Path,
     env: &std::collections::BTreeMap<String, String>,
     incarnation: crate::daemon::lifecycle::TmuxServerIncarnation,
@@ -202,7 +205,7 @@ pub(super) fn initialize_runtime_daemon_post_bind(
         notification_command,
         config.sidebar.task_summary.clone(),
     )?);
-    coordinator.configure_health(config);
+    coordinator.configure_health(config, reload_identity);
     let daemon_instance_id = coordinator
         .router
         .lock()

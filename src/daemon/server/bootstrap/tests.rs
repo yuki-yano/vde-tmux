@@ -65,10 +65,13 @@ fn post_bind_initialization_failure_removes_socket() {
     std::fs::create_dir(&root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = root.join("daemon.sock");
-    let env = BTreeMap::from([(
-        "XDG_STATE_HOME".to_string(),
-        root.to_string_lossy().into_owned(),
-    )]);
+    let env = BTreeMap::from([
+        (
+            "XDG_STATE_HOME".to_string(),
+            root.to_string_lossy().into_owned(),
+        ),
+        ("HOME".to_string(), root.to_string_lossy().into_owned()),
+    ]);
     let incarnation_hash = "c".repeat(64);
     crate::daemon::lifecycle::update_lifecycle_record(&env, &incarnation_hash, |_| Ok(())).unwrap();
     let lifecycle_path = crate::daemon::lifecycle::lifecycle_record_path(&env, &incarnation_hash);
@@ -82,6 +85,7 @@ fn post_bind_initialization_failure_removes_socket() {
 
     let result = initialize_runtime_daemon_post_bind(
         &crate::config::Config::default(),
+        crate::config::load::load_config_for_reload(&env).unwrap().1,
         &socket,
         &env,
         crate::daemon::lifecycle::TmuxServerIncarnation {

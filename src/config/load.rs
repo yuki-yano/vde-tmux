@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
 use super::Config;
 
 pub fn config_file_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
@@ -165,6 +168,97 @@ pub fn load_config_strict(env: &BTreeMap<String, String>) -> Result<Config, Stri
     } else {
         Err(loaded.warnings.join("; "))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigReloadIdentity {
+    pub source_hash: String,
+    pub context_hash: String,
+    pub context_vars: Vec<String>,
+    pub executable: String,
+}
+
+pub(crate) fn load_config_for_reload(
+    env: &BTreeMap<String, String>,
+) -> Result<(Config, ConfigReloadIdentity), String> {
+    use std::os::unix::fs::MetadataExt;
+    let path = config_file_path(env).ok_or("HOME is not set")?;
+    let path = std::path::absolute(path).map_err(|error| error.to_string())?;
+    let (contents, present) = match std::fs::read_to_string(&path) {
+        Ok(contents) => (contents, true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    let loaded = parse_config_with_env(&contents, env);
+    if !loaded.warnings.is_empty() {
+        return Err(loaded.warnings.join("; "));
+    }
+    let mut source = Sha256::new();
+    source.update([u8::from(present)]);
+    source.update(contents.as_bytes());
+    // Only category path patterns expand environment variables. Comments and
+    // literal prompt text do not affect the environment identity.
+    let raw = if contents.trim().is_empty() {
+        Config::default()
+    } else {
+        serde_yaml_ng::from_str::<Config>(&contents).map_err(|error| error.to_string())?
+    };
+    let mut names = std::collections::BTreeSet::new();
+    for pattern in raw
+        .categories
+        .rules
+        .iter()
+        .flat_map(|rule| &rule.path_patterns)
+    {
+        for rest in pattern.split("${").skip(1) {
+            if let Some((name, _)) = rest.split_once('}')
+                && is_env_name(name)
+            {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    let context_vars = names.into_iter().collect::<Vec<_>>();
+    let context_hash = config_context_hash(env, &context_vars)?;
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let exe = std::fs::canonicalize(exe).map_err(|error| error.to_string())?;
+    let metadata = std::fs::metadata(&exe).map_err(|error| error.to_string())?;
+    let executable = format!(
+        "{}:{}:{}:{}:{}:{}",
+        exe.display(),
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+    );
+    Ok((
+        loaded.config,
+        ConfigReloadIdentity {
+            source_hash: format!("{:x}", source.finalize()),
+            context_hash,
+            context_vars,
+            executable,
+        },
+    ))
+}
+
+pub(crate) fn config_context_hash(
+    env: &BTreeMap<String, String>,
+    names: &[String],
+) -> Result<String, String> {
+    let path = config_file_path(env).ok_or("HOME is not set")?;
+    let path = std::path::absolute(path).map_err(|error| error.to_string())?;
+    let variables = names
+        .iter()
+        .map(|name| (name, env.get(name)))
+        .collect::<BTreeMap<_, _>>();
+    let context = (path, env.get("HOME"), variables);
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&context).map_err(|error| error.to_string())?)
+    ))
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 32;
+pub const PROTOCOL_VERSION: u16 = 33;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -721,6 +721,7 @@ pub enum ControlHealth {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeInfo {
     pub config_hash: String,
+    pub reload_identity: crate::config::load::ConfigReloadIdentity,
     pub control_health: ControlHealth,
 }
 
@@ -974,6 +975,7 @@ pub enum ClientMessage {
     },
     QueryRuntimeInfo {
         proto: u16,
+        config_context_vars: Vec<String>,
     },
     QueryAgentRun {
         proto: u16,
@@ -1061,6 +1063,7 @@ pub enum ClientMessage {
         proto: u16,
         daemon_instance_id: DaemonInstanceId,
         event_id: EventId,
+        require_quiescent: bool,
     },
 }
 
@@ -1075,7 +1078,7 @@ impl ClientMessage {
             | Self::QueryResolvedSnapshot { proto }
             | Self::QueryStatusSnapshot { proto, .. }
             | Self::QueryPane { proto, .. }
-            | Self::QueryRuntimeInfo { proto }
+            | Self::QueryRuntimeInfo { proto, .. }
             | Self::QueryAgentRun { proto, .. }
             | Self::QueryCurrentAgentRuns { proto, .. }
             | Self::QueryAgentOperation { proto, .. }
@@ -1610,6 +1613,7 @@ mod tests {
                 &mut stream,
                 &ServerMessage::RuntimeInfoResult {
                     info: RuntimeInfo {
+                        reload_identity: Default::default(),
                         config_hash: "hash".to_string(),
                         control_health: ControlHealth::Ready,
                     },
@@ -1629,6 +1633,7 @@ mod tests {
             client
                 .request(&ClientMessage::QueryRuntimeInfo {
                     proto: PROTOCOL_VERSION,
+                    config_context_vars: Vec::new(),
                 })
                 .unwrap(),
             ServerMessage::RuntimeInfoResult { .. }
@@ -1636,6 +1641,7 @@ mod tests {
         let error = client
             .request_with_stage(&ClientMessage::QueryRuntimeInfo {
                 proto: PROTOCOL_VERSION,
+                config_context_vars: Vec::new(),
             })
             .unwrap_err();
         assert_eq!(error.stage, V2RequestFailureStage::BeforeFullWrite);
@@ -1778,7 +1784,7 @@ mod tests {
 
     #[test]
     fn every_client_message_roundtrips() {
-        assert_eq!(PROTOCOL_VERSION, 32);
+        assert_eq!(PROTOCOL_VERSION, 33);
         let state_id = StateId::parse("00112233445566778899aabbccddeeff").unwrap();
         let messages = vec![
             ClientMessage::Hello {
@@ -1797,6 +1803,7 @@ mod tests {
             },
             ClientMessage::QueryRuntimeInfo {
                 proto: PROTOCOL_VERSION,
+                config_context_vars: Vec::new(),
             },
             ClientMessage::QueryAgentRun {
                 proto: PROTOCOL_VERSION,
@@ -1971,6 +1978,7 @@ mod tests {
                 proto: PROTOCOL_VERSION,
                 daemon_instance_id: daemon_id(),
                 event_id: event_id(),
+                require_quiescent: false,
             },
         ];
         for message in messages {
@@ -2148,6 +2156,7 @@ mod tests {
             },
             ServerMessage::RuntimeInfoResult {
                 info: RuntimeInfo {
+                    reload_identity: Default::default(),
                     config_hash: "hash".to_string(),
                     control_health: ControlHealth::Ready,
                 },

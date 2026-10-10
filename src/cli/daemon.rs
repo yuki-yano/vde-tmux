@@ -194,8 +194,8 @@ pub(crate) fn run_daemon(
     } else {
         crate::daemon::daemon_socket_path_for_incarnation(env, socket, &incarnation.hash)
     };
-    let config = match crate::config::load::load_config_strict(env) {
-        Ok(config) => config,
+    let (config, reload_identity) = match crate::config::load::load_config_for_reload(env) {
+        Ok(loaded) => loaded,
         Err(error) => {
             let message = format!("strict config validation failed before daemon startup: {error}");
             let _ = crate::daemon::lifecycle::append_daemon_log(env, &incarnation.hash, &message);
@@ -213,6 +213,7 @@ pub(crate) fn run_daemon(
     };
     if let Err(error) = crate::daemon::server::run_runtime_daemon_server(
         config,
+        reload_identity,
         &socket_path,
         env,
         incarnation.clone(),
@@ -382,6 +383,7 @@ pub(crate) fn status_daemon(
             let (config_hash, control_health) = match client.request(
                 &crate::daemon::protocol::v2::ClientMessage::QueryRuntimeInfo {
                     proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
+                    config_context_vars: Vec::new(),
                 },
             ) {
                 Ok(crate::daemon::protocol::v2::ServerMessage::RuntimeInfoResult { info }) => {
@@ -559,6 +561,7 @@ fn disable_daemon_for_incarnation(
 ) -> Result<Option<String>> {
     let socket_path =
         crate::daemon::daemon_socket_path_for_incarnation(env, socket, &incarnation.hash);
+    let _start_lock = crate::daemon::lifecycle::acquire_daemon_reload_lock(&socket_path)?;
     let outcome = execute_disabled_transition(
         false,
         || {
@@ -768,24 +771,69 @@ pub(crate) fn reload_daemon(
         crate::daemon::daemon_socket_path_for_incarnation(env, socket, &incarnation.hash);
     // Detaching the old control client emits hooks that can start a replacement.
     // Hold the startup lock until shutdown has been observed and recorded.
-    let start_lock = crate::daemon::lifecycle::acquire_daemon_start_lock(&socket_path)?;
-    crate::daemon::lifecycle::update_lifecycle_record(env, &incarnation.hash, |record| {
-        record.begin_transition(crate::daemon::lifecycle::DesiredMode::Enabled)
-    })?;
+    let start_lock = crate::daemon::lifecycle::acquire_daemon_reload_lock(&socket_path)?;
+    reload_daemon_with_start_lock(runner, env, &incarnation, &socket_path, &start_lock, None)?;
+    let config = super::load_operation_config(env)?;
+    super::verify_active_config_hash(
+        &crate::daemon::lifecycle::config_hash(&config),
+        &super::query_active_config_hash(runner, env)?,
+    )?;
+    drop(start_lock);
+    sync_reloaded_category_mirrors(runner, &config, env)?;
+    Ok(Some(format!("daemon reloaded: {}", socket_path.display())))
+}
+
+pub(crate) fn reload_daemon_with_start_lock(
+    runner: &dyn TmuxRunner,
+    env: &BTreeMap<String, String>,
+    incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
+    socket_path: &Path,
+    start_lock: &crate::daemon::lifecycle::DaemonFileLock,
+    expected_instance: Option<&crate::pane_state::DaemonInstanceId>,
+) -> Result<()> {
+    // Validate again after waiting for the lock, before stopping a healthy daemon.
+    super::load_operation_config(env)?;
+    incarnation.verify(runner, env)?;
+    if crate::daemon::lifecycle::tmux_desired_mode(runner, env)?
+        == crate::daemon::lifecycle::DesiredMode::Disabled
+        || crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash)?.desired_mode
+            == crate::daemon::lifecycle::DesiredMode::Disabled
+    {
+        bail!("daemon is disabled; reload did not change runtime state");
+    }
     let expected_process =
         crate::daemon::lifecycle::read_lifecycle_record(env, &incarnation.hash)?.process;
-    let shutdown = match request_shutdown(&incarnation, &socket_path) {
-        Ok(shutdown) => shutdown,
-        Err(error) => {
-            record_transition_failure(env, &incarnation.hash, &error);
-            return Err(error);
+    let shutdown = if let Some(expected_instance) = expected_instance {
+        // The daemon checks quiescence atomically in the mutation queue. A Busy
+        // refusal leaves both the daemon and lifecycle generation unchanged.
+        if !request_config_reload_shutdown(incarnation, socket_path, Some(expected_instance))? {
+            bail!(
+                "daemon became unavailable before automatic config reload; no replacement started"
+            );
+        }
+        crate::daemon::lifecycle::update_lifecycle_record(env, &incarnation.hash, |record| {
+            record.begin_transition(crate::daemon::lifecycle::DesiredMode::Enabled)
+        }).map_err(|error| anyhow::anyhow!(
+            "daemon shutdown was accepted but the lifecycle transition failed; no replacement started: {error:#}"
+        ))?;
+        true
+    } else {
+        crate::daemon::lifecycle::update_lifecycle_record(env, &incarnation.hash, |record| {
+            record.begin_transition(crate::daemon::lifecycle::DesiredMode::Enabled)
+        })?;
+        match request_shutdown(incarnation, socket_path) {
+            Ok(shutdown) => shutdown,
+            Err(error) => {
+                record_transition_failure(env, &incarnation.hash, &error);
+                return Err(error);
+            }
         }
     };
     match shutdown {
         true if !wait_for_daemon_stop(
             env,
-            &incarnation,
-            &socket_path,
+            incarnation,
+            socket_path,
             expected_process.as_ref(),
             Duration::from_secs(2),
         ) =>
@@ -810,9 +858,14 @@ pub(crate) fn reload_daemon(
         _ => {}
     }
     clear_process_identity(env, &incarnation.hash);
-    drop(start_lock);
-    match crate::daemon::lifecycle::ensure_daemon_serving_v2(runner, env, socket) {
-        Ok((_, socket_path)) => Ok(Some(format!("daemon reloaded: {}", socket_path.display()))),
+    match crate::daemon::lifecycle::ensure_daemon_serving_v2_with_start_lock(
+        runner,
+        incarnation.clone(),
+        env,
+        socket_path.to_path_buf(),
+        start_lock,
+    ) {
+        Ok(_) => Ok(()),
         Err(error) => {
             let log = crate::daemon::lifecycle::daemon_log_path(env, &incarnation.hash);
             let failure = anyhow::anyhow!(
@@ -825,9 +878,27 @@ pub(crate) fn reload_daemon(
     }
 }
 
+pub(crate) fn sync_reloaded_category_mirrors(
+    runner: &dyn TmuxRunner,
+    config: &crate::config::Config,
+    env: &BTreeMap<String, String>,
+) -> Result<()> {
+    crate::session::sync_session_category_mirrors(runner, config, env).context(
+        "daemon reloaded, but category mirror sync failed; run `vt daemon reload` to retry synchronization",
+    )
+}
+
 fn request_shutdown(
     incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
     socket_path: &Path,
+) -> Result<bool> {
+    request_config_reload_shutdown(incarnation, socket_path, None)
+}
+
+fn request_config_reload_shutdown(
+    incarnation: &crate::daemon::lifecycle::TmuxServerIncarnation,
+    socket_path: &Path,
+    expected_instance: Option<&crate::pane_state::DaemonInstanceId>,
 ) -> Result<bool> {
     let mut client = match crate::daemon::protocol::v2::V2Client::connect_with_timeout(
         socket_path,
@@ -842,11 +913,15 @@ fn request_shutdown(
         }
         Err(_) => return Ok(false),
     };
+    if expected_instance.is_some_and(|expected| expected != client.daemon_instance_id()) {
+        bail!("daemon instance changed before automatic config reload; retry the operation");
+    }
     let event_id = crate::pane_state::EventId::generate()?;
     match client.request(&crate::daemon::protocol::v2::ClientMessage::Shutdown {
         proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
         daemon_instance_id: client.daemon_instance_id().clone(),
         event_id: event_id.clone(),
+        require_quiescent: expected_instance.is_some(),
     })? {
         crate::daemon::protocol::v2::ServerMessage::ShutdownAccepted {
             event_id: response_id,

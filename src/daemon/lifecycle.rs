@@ -1010,6 +1010,16 @@ fn ensure_daemon_live_v2_for_incarnation_until_mode(
     }
     ensure_deadline_remaining(deadline, "acquiring daemon start lock")?;
     let _start_lock = acquire_daemon_start_lock_until(&socket, deadline)?;
+    ensure_daemon_live_v2_with_start_lock(incarnation, env, socket, deadline, &_start_lock)
+}
+
+fn ensure_daemon_live_v2_with_start_lock(
+    incarnation: TmuxServerIncarnation,
+    env: &BTreeMap<String, String>,
+    socket: PathBuf,
+    deadline: Instant,
+    _start_lock: &DaemonFileLock,
+) -> Result<(TmuxServerIncarnation, PathBuf)> {
     if probe_v2_daemon_until(&socket, &incarnation.hash, deadline)?.is_some() {
         return Ok((incarnation, socket));
     }
@@ -1244,6 +1254,33 @@ pub fn ensure_daemon_serving_v2_until(
 ) -> Result<(TmuxServerIncarnation, PathBuf)> {
     let (incarnation, socket) =
         ensure_daemon_live_v2_until(runner, env, explicit_socket, deadline)?;
+    wait_for_daemon_serving(incarnation, env, socket, deadline)
+}
+
+pub(crate) fn ensure_daemon_serving_v2_with_start_lock(
+    runner: &dyn TmuxRunner,
+    incarnation: TmuxServerIncarnation,
+    env: &BTreeMap<String, String>,
+    socket: PathBuf,
+    start_lock: &DaemonFileLock,
+) -> Result<(TmuxServerIncarnation, PathBuf)> {
+    let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+    if tmux_desired_mode(runner, env)? == DesiredMode::Disabled
+        || read_lifecycle_record(env, &incarnation.hash)?.desired_mode == DesiredMode::Disabled
+    {
+        bail!("daemon was disabled during reload; daemon remains stopped");
+    }
+    let (incarnation, socket) =
+        ensure_daemon_live_v2_with_start_lock(incarnation, env, socket, deadline, start_lock)?;
+    wait_for_daemon_serving(incarnation, env, socket, deadline)
+}
+
+fn wait_for_daemon_serving(
+    incarnation: TmuxServerIncarnation,
+    env: &BTreeMap<String, String>,
+    socket: PathBuf,
+    deadline: Instant,
+) -> Result<(TmuxServerIncarnation, PathBuf)> {
     let startup_generation = read_lifecycle_record(env, &incarnation.hash)?.generation;
     loop {
         if probe_v2_daemon_until(&socket, &incarnation.hash, deadline)?
@@ -1287,11 +1324,12 @@ impl Drop for DaemonFileLock {
     }
 }
 
-pub(crate) fn acquire_daemon_start_lock(socket: &Path) -> Result<DaemonFileLock> {
+pub(crate) fn acquire_daemon_reload_lock(socket: &Path) -> Result<DaemonFileLock> {
     if let Some(parent) = socket.parent().filter(|path| !path.as_os_str().is_empty()) {
         ensure_secure_socket_dir(parent)?;
     }
-    acquire_daemon_start_lock_until(socket, Instant::now() + DAEMON_START_TIMEOUT)
+    // A reload includes the old daemon's shutdown and the new daemon's startup.
+    acquire_daemon_start_lock_until(socket, Instant::now() + Duration::from_secs(15))
 }
 
 fn acquire_daemon_start_lock_until(socket: &Path, deadline: Instant) -> Result<DaemonFileLock> {

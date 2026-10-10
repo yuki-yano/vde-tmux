@@ -95,6 +95,7 @@ impl ApiConnection {
             .client
             .request(&ClientMessage::QueryRuntimeInfo {
                 proto: PROTOCOL_VERSION,
+                config_context_vars: Vec::new(),
             })
             .map_err(|error| api_error!("daemon_query_failed", format!("{error:#}")))?
         {

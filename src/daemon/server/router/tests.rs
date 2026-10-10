@@ -178,6 +178,7 @@ fn v2_serving_with_degraded_hooks_continues_queries_and_canonical_mutations() {
             &mut connection,
             ClientMessage::QueryRuntimeInfo {
                 proto: PROTOCOL_VERSION,
+                config_context_vars: Vec::new(),
             },
         ),
         V2Route::Query(ClientMessage::QueryRuntimeInfo { .. })

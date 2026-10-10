@@ -350,8 +350,8 @@ The command prints one JSON object such as
 When the auto-all hook is disabled and no sidebar exists, the command returns `absent`, an empty `reserved_panes`, and an existing content pane as `content_anchor`.
 The command is idempotent with the auto-all new-window hook.
 
-The command does not start the daemon.
-It exits non-zero when the daemon is not running with its configuration applied (run `vt daemon reload` first), when the window is invalid or has no content pane, or when a tmux operation fails.
+The command requires a running daemon with the current configuration applied. It reports pending changes without reloading; run `vt daemon reload` before retrying.
+It exits non-zero when the daemon is unavailable or disabled, the configuration is invalid or pending, the window is invalid or has no content pane, or a tmux operation fails.
 
 ## Codex question notices
 
@@ -431,6 +431,9 @@ With ghq installed, create or select a session from the project selector:
 ```bash
 vt project selector --popup
 ```
+
+Configuration changes are applied automatically before opening the selector.
+If the selector fails in an interactive tmux terminal, the error stays visible until you press `Enter`.
 
 ## Configuration
 
@@ -645,6 +648,15 @@ For normal use, the `vt daemon ensure` line in the tmux configuration manages st
 
 `stop` does not disable automatic startup.
 Use `disable` when the daemon must remain stopped.
+
+Interactive configuration-dependent commands automatically reload a running daemon when
+valid disk settings differ from its active settings. Concurrent requests share one reload.
+Automatic reload requires the same executable, configuration path, and values for referenced
+environment variables. It is deferred while an Agent prompt delivery is in flight.
+Hook and JSON layout commands report pending configuration changes without restarting the daemon.
+Invalid settings leave the running daemon unchanged, and automatic reload does not start an
+unavailable or disabled daemon. Reload restarts the daemon, which ends peek mode and reconnects
+sidebar subscriptions. Use `vt daemon reload` to apply changes immediately.
 
 ### Pane-state persistence
 

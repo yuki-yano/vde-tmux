@@ -87,6 +87,13 @@ pub(crate) enum SidebarCommand {
 }
 
 impl SidebarCommand {
+    pub(crate) fn allows_config_reload(&self) -> bool {
+        matches!(
+            self,
+            Self::Open { .. } | Self::Toggle { .. } | Self::Rail { .. }
+        )
+    }
+
     pub(crate) fn requires_active_config(&self) -> bool {
         matches!(
             self,
@@ -284,7 +291,7 @@ where
         }
         SidebarCommand::FocusToggle { window, width } => {
             run_focus_toggle_command(runner, env, window, width, || {
-                super::require_active_config(runner, env)
+                super::require_active_config(runner, env, super::ConfigSync::AutoReload)
             })?;
             Ok(None)
         }
