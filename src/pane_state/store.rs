@@ -219,6 +219,38 @@ impl CanonicalStateRuntime {
         self.trackers.get(pane).cloned().unwrap_or_default()
     }
 
+    pub fn note_codex_binding_rejected(
+        &mut self,
+        pane: &PaneInstance,
+        expected: &StateVersion,
+        process: &AgentProcessIdentity,
+    ) -> Result<bool, StoreError> {
+        let Some(record) = self.records.get(pane).filter(|record| {
+            record.version() == *expected
+                && record.agent.as_str() == "codex"
+                && record.agent_present
+                && record.agent_process.as_ref() == Some(process)
+        }) else {
+            return Ok(false);
+        };
+        let rejection = CodexBindingRejection {
+            state_id: record.state_id.clone(),
+            agent_epoch: record.agent_epoch,
+            process: process.clone(),
+        };
+        let tracker = self.trackers.entry(pane.clone()).or_default();
+        if tracker.codex_binding_rejected.as_ref() == Some(&rejection) {
+            return Ok(false);
+        }
+        tracker.generation = tracker
+            .generation
+            .checked_add(1)
+            .ok_or(StoreError::CounterOverflow("capture tracker generation"))?;
+        tracker.epoch = Some((record.state_id.clone(), record.agent_epoch));
+        tracker.codex_binding_rejected = Some(rejection);
+        Ok(true)
+    }
+
     pub fn freeze_observation_dispatch(
         &self,
         panes: impl IntoIterator<Item = PaneInstance>,
@@ -988,6 +1020,91 @@ mod tests {
             &envelope(pane_instance, event),
             &VisibilitySnapshot::default(),
         )
+    }
+
+    #[test]
+    fn rejected_codex_binding_survives_capture_and_clears_only_at_a_new_epoch() {
+        let mut runtime = CanonicalStateRuntime::default();
+        let mut io = RecordingStore::default();
+        let target = pane(91);
+        let session_start = || PaneEvent::AgentSessionStarted {
+            observed_at: 1,
+            source: AgentSessionSource::Startup,
+            resumed_prompt: None,
+        };
+        apply(&mut runtime, &mut io, target.clone(), session_start()).unwrap();
+        let process = AgentProcessIdentity {
+            pid: 9182,
+            start_token: "original".into(),
+        };
+        runtime.records.get_mut(&target).unwrap().agent_process = Some(process.clone());
+        let before = runtime.record(&target).unwrap().clone();
+        let old_generation = runtime.tracker(&target).generation;
+        let mut other_process = process.clone();
+        other_process.start_token = "replacement".into();
+        assert!(
+            !runtime
+                .note_codex_binding_rejected(&target, &before.version(), &other_process)
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .note_codex_binding_rejected(&target, &before.version(), &process)
+                .unwrap()
+        );
+        let rejection = runtime.tracker(&target).codex_binding_rejected.unwrap();
+        assert_eq!(runtime.record(&target), Some(&before));
+        let generation = runtime.tracker(&target).generation;
+        assert_eq!(generation, old_generation + 1);
+        assert!(
+            !runtime
+                .note_codex_binding_rejected(&target, &before.version(), &process)
+                .unwrap()
+        );
+        assert_eq!(runtime.tracker(&target).generation, generation);
+        for stale in [true, false] {
+            let event = PaneEvent::ObservationBatch {
+                base: runtime.descriptor(&target),
+                tracker_generation: if stale {
+                    old_generation
+                } else {
+                    runtime.tracker(&target).generation
+                },
+                observed_at: 3,
+                presence: AgentPresenceObservation::Unknown,
+                capture: Some(CaptureObservation {
+                    inference: CaptureInference::NoChange,
+                    observed_fingerprint: Some([3; 32]),
+                    codex_idle_verified: true,
+                    codex_screen: None,
+                }),
+                process: None,
+            };
+            apply(&mut runtime, &mut io, target.clone(), event).unwrap();
+            assert_eq!(
+                runtime.tracker(&target).codex_binding_rejected,
+                Some(rejection.clone())
+            );
+        }
+        apply(
+            &mut runtime,
+            &mut io,
+            target.clone(),
+            PaneEvent::CompleteRun { completed_at: 4 },
+        )
+        .unwrap();
+        assert!(runtime.tracker(&target).hook_authoritative);
+        assert_eq!(
+            runtime.tracker(&target).codex_binding_rejected,
+            Some(rejection)
+        );
+        apply(&mut runtime, &mut io, target.clone(), session_start()).unwrap();
+        assert!(runtime.tracker(&target).codex_binding_rejected.is_none());
+        assert!(
+            !runtime
+                .note_codex_binding_rejected(&target, &before.version(), &process)
+                .unwrap()
+        );
     }
 
     #[test]

@@ -1,56 +1,41 @@
 //! Fresh empty-composer verification shared by every embedded prompt.
 //! Nothing here changes presentation, lifecycle, or provider confirmation.
 
-use crate::pane_state::{CaptureTrackerSnapshot, LifecycleState, PaneState};
+use crate::pane_state::PaneState;
 use crate::tmux::TmuxRunner;
 use ansi_to_tui::IntoText as _;
 use ratatui::style::Modifier;
-
-pub(super) fn candidate(record: &PaneState, tracker: &CaptureTrackerSnapshot) -> bool {
-    record.agent.as_str() == "codex"
-        && record.agent_present
-        && record.scan_verified
-        && record.agent_process.is_some()
-        && !tracker.hook_authoritative
-        && record.agent_session_id.is_none()
-        && record.run_seq == 0
-        && record.completed_seq == 0
-        && record.current_run.is_none()
-        && record.prompt.is_none()
-        && matches!(record.lifecycle, LifecycleState::Idle)
-}
 
 pub(super) fn require_ready(runner: &dyn TmuxRunner, record: &PaneState) -> Result<(), String> {
     let process = record
         .agent_process
         .as_ref()
-        .ok_or("agent process is unavailable")?;
+        .ok_or("process_unavailable: agent process is unavailable")?;
     let args = runner
         .agent_process_arguments(process)
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "process_arguments_unavailable: process arguments are unavailable")?;
     if !crate::question_notice::profile::independent_arguments(&args) {
-        return Err("prompt requires an explicit --no-daemon interactive invocation without a queued initial prompt".into());
+        return Err("independent_invocation_required: prompt requires an explicit --no-daemon interactive invocation without a queued initial prompt".into());
     }
     let pane = &record.pane_instance;
     let verify = || {
         if runner
             .resolve_agent_process(pane.pane_pid, &record.agent)
-            .map_err(|error| error.to_string())?
+            .map_err(|_| "process_unavailable: exact process could not be verified")?
             .as_ref()
             != Some(process)
         {
-            return Err("agent process changed while verifying prompt readiness".into());
+            return Err(
+                "process_changed: agent process changed while verifying prompt readiness".into(),
+            );
         }
         runner
             .verify_agent_input_owner(pane.pane_pid, process.pid)
-            .map_err(|error| error.to_string())
+            .map_err(|_| {
+                "input_owner_unverified: foreground input owner could not be verified".into()
+            })
     };
     verify()?;
-    if let Some(session) = &record.agent_session_id {
-        runner
-            .codex_active_transcript(process, session.as_str())
-            .map_err(|error| format!("current Codex session is not verified: {error}"))?;
-    }
     // Read the live viewport and cursor in one tmux command queue. Matching
     // before/after frames exclude pane replacement, resize and cursor movement.
     let frame =
@@ -78,9 +63,9 @@ pub(super) fn require_ready(runner: &dyn TmuxRunner, record: &PaneState) -> Resu
             ],
             512 * 1024,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "input_observation_failed: live input field could not be inspected")?;
     if output.truncated || !empty_composer(&output.text, pane.pane_pid) {
-        return Err("Codex input field is not ready or is not empty".into());
+        return Err("input_not_ready: Codex input field is not ready or is not empty".into());
     }
     verify()
 }

@@ -63,6 +63,14 @@ pub trait TmuxRunner {
         crate::daemon::workers::codex_resync::active_locator(process, session)
     }
 
+    fn codex_root_transcripts(
+        &self,
+        process: &crate::pane_state::AgentProcessIdentity,
+        canonical_session: Option<&str>,
+    ) -> Result<Vec<(crate::question_notice::ingress::TranscriptLocator, String)>> {
+        crate::daemon::workers::codex_resync::root_locators(process, canonical_session)
+    }
+
     fn agent_process_arguments(
         &self,
         process: &crate::pane_state::AgentProcessIdentity,

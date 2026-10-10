@@ -1,6 +1,6 @@
 # Agent JSON API
 
-This document defines the current API v7 contract (daemon protocol 33, Pane State schema 11,
+This document defines the current API v8 contract (daemon protocol 34, Pane State schema 11,
 Question sidecar schema 1). CLI, daemon, and sidebars must be installed together; there is no
 mixed-version fallback. The inherited v4 mutation boundary and rollout gates are maintained in
 [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is recorded in
@@ -316,10 +316,13 @@ hooks, acquires the per-pane dispatch lock, and verifies that the agent process 
 input. It then persists `dispatch_started` before spawning tmux. A matching `UserPromptSubmit` hook
 creates the Run Record first and advances the Operation to `prompt_confirmed`.
 
-If the exact Codex process is present but its startup `SessionStart` was not observed, the Operation
-is staged with a pending provider session. The daemon still fences the exact pane, process, input
-owner, and prompt digest. Only the first matching `UserPromptSubmit` from that same process may bind
-the real session and confirm the Operation; an unbound session is never stored in a Run Record.
+An ordinary prompt targets the conversation open in the exact pane/process at dispatch time
+(`providers.codex.attribution.prompt_target = open_conversation_at_dispatch` in `api schema`).
+Its Operation is always staged with a pending provider session, even when a canonical session is
+known. `/new` need not emit a hook or create a rollout before the first input. The daemon fences
+the exact pane, process, input owner, prompt digest and next-run order. Only the matching
+`UserPromptSubmit` binds the actual session and confirms the Operation; an unbound session is
+never stored in a Run Record. Automatic capacity recovery remains pinned to its original session.
 
 Codex may also emit `SessionStart` for a fresh provider session in the same TUI process as the
 dispatched prompt arrives. That event advances the canonical Agent epoch and resets its run sequence.
@@ -763,16 +766,16 @@ lifecycle events from a shared server. Start Codex with `--no-daemon` to select 
 lifecycle; `features.daemon_auto_start=false` does not prevent attaching to an already running
 server. Hook authority is not inferred to have expired merely because events stop arriving.
 
-Working/Blocked dispatch is rejected. Durable Codex dispatch normally requires authoritative hooks
-in the current daemon epoch. The first prompt is also accepted before any session/hook is
-registered when all of the following hold: the exact process is scan-verified and owns foreground
-input, canonical state is Idle with zero Runs/completions and no prompt/session, argv proves an
-explicit `--no-daemon` interactive invocation without a queued initial prompt, and a fresh stable
-viewport/cursor identifies the empty input field. These checks run during preparation and again
-before dispatch; the pane revision fence is rechecked after inspection. Presentation remains
-Unknown until a hook is accepted. Only the matching provider prompt digest confirms the Operation
-and binds its session/Run. Bare invocations, `daemon_auto_start=false` alone, dialogs, drafts, and
-changed processes do not qualify. Current empty-input detection supports Codex's
+Working/Blocked dispatch is rejected. Every ordinary durable Codex prompt requires the exact
+scan-verified process to own foreground input, canonical Idle with balanced Runs/completions,
+an explicit `--no-daemon` interactive invocation without a queued initial prompt, and a fresh
+stable viewport/cursor identifying the empty input field. Readiness also checks all open root
+rollouts as described below. These checks run during preparation and again before dispatch;
+the pane revision fence is rechecked after inspection. Hook authority in the current daemon
+epoch is not a prerequisite for this fresh verification. It is not synthesized by this check,
+and presentation may remain Unknown. Only the matching provider prompt digest confirms the
+Operation and binds its session/Run. Bare invocations, `daemon_auto_start=false` alone, dialogs,
+drafts, and changed processes do not qualify. Current empty-input detection supports Codex's
 `Ask Codex to do anything` composer; an unrecognized layout is rejected without sending.
 The first `SessionStart` may advance the agent epoch. Follow the confirmed Operation's
 returned `run_ref` for wait/response, rather than continuing to use the pre-start agent reference.
@@ -780,27 +783,57 @@ returned `run_ref` for wait/response, rather than continuing to use the pre-star
 In embedded mode, a subsequent accepted lifecycle hook restores authority after daemon restart.
 Saved exact Question IDs can be acknowledged without restoring ordinary-resolver trust.
 
-### Restart readiness
+### Prompt readiness and restart observation
 
-For an existing canonical Idle Codex session, the observation worker inspects the exact process's
-writable rollout descriptors (macOS lsof or Linux procfs). Exactly one must have a root-session
-header (`payload.thread_source=user` without `payload.parent_thread_id`); its filename and
-`payload.id` must both match the canonical session. Other descriptors are allowed only when their
-headers identify non-root sessions. Active and completed subagent writers do not determine the
-parent's readiness. Header selection permits at most 128 candidates, reads at most 256KiB per
-header, and shares a 500ms verification deadline. Invalid, unknown or over-budget headers reject
-readiness. It also verifies PID/start token, explicit independent argv, file identity and complete
-bounded structural history.
-Multiple root writers remain ambiguous and prevent sending, including when Codex retains the old
-root after `/new` or `/resume`; the canonical session alone does not prove which root is current.
-Readiness cannot recover while those roots stay open; restart Codex before retrying in that case.
-Only a latest normal completion with no open turn supplies transient `provider_resynchronized`
-presentation evidence. Old completed files, ambiguous descriptors, partial history and a different
-session do not. This changes neither hook authority nor canonical Run completion.
-Every durable prompt checks a fresh empty composer, cursor, foreground owner and current session;
-resynchronized sessions also reread structural state immediately before dispatch. Drafts, current
-queue headers, blocked/working screens and unresolved dispatches prevent sending.
+Before an ordinary prompt, the exact process's writable rollout descriptors are enumerated
+(macOS lsof or Linux procfs). Every root (`payload.thread_source=user` without
+`payload.parent_thread_id`) must have verified, complete structural history with no open turn.
+Header-only and aborted histories qualify. Distinct quiescent roots may remain open after
+`/new` or `/resume`; they do not select the target session. Duplicate writers claiming the same
+root session, unknown headers, partial history and open turns reject readiness. A successfully
+enumerated process with zero roots can qualify because the new conversation's rollout is created
+only at its first input; enumeration failure never counts as zero roots. Active and completed
+subagent writers are excluded by their verified headers.
+A root with non-null `forked_from_id` must match an already recorded canonical session;
+a mismatch is `forked_conversation_unbound` before input, including the first prompt after
+runtime `/fork`. When the canonical session is absent, a newly discovered independent process
+can bootstrap through UserPromptSubmit, including `codex fork` and forked `codex resume` startup.
+SessionStart source `fork` itself is unsupported. A mismatched retained fork may also block a
+normal conversation; wait for that writer to close.
+
+A non-duplicate foreign-session `UserPromptSubmit` rejected by the canonical binding records
+`provider_binding_rejected` evidence only after freshly verifying that the canonical process
+still occupies the pane. Stop/tool events and replacement processes do not record it. The hook
+envelope does not identify its emitting process: a nested user-thread Codex in the same pane can
+therefore cause a conservative refusal. The evidence is bound to pane state, epoch and process;
+preparation and both sides of the final readiness/CAS check reject further ordinary prompts,
+even after an operator abandons the earlier unknown operation. Tracker generation prevents stale
+observations from erasing the evidence. Same-epoch captures and authority restoration preserve it;
+an accepted SessionStart or process/epoch replacement clears it. To recover, open a normal `/new`
+and manually submit its first prompt so the supported SessionStart is accepted, or restart Codex.
+
+The rejection evidence is ephemeral and is cleared on daemon restart. After restart, a missing
+SessionStart can therefore permit one execution that cannot be confirmed before the new rejection
+is observed. Unresolved Operations retain their durable process fence across that restart; daemon
+restart never authorizes resending them. A fork header mismatching a recorded canonical session
+is still rejected after restart.
+Header selection permits at most 128 candidates, reads at most 256KiB per header and shares a
+500ms deadline. Structural verification uses a shared 250ms deadline and up to 32MiB per root
+with incremental cursor checkpoints; background observation warms those checkpoints. PID/start
+token, independent argv, file identity, composer and foreground owner are checked freshly.
+Drafts, current queue headers, blocked/working screens and unresolved dispatches prevent sending.
+The live checks cannot lock out simultaneous human input or conversation switching. Identical
+human input cannot be distinguished by digest; the contract targets the conversation at actual
+dispatch and requires hook confirmation rather than promising a preselected session.
+
+Passive `provider_resynchronized` presentation remains stricter: exactly one root must match the
+canonical session in both filename and header, with a latest normal completion and no open turn.
+Multiple roots, zero roots and partial history do not supply that evidence. This changes neither
+hook authority nor canonical Run completion; explicit prompt readiness is checked independently.
 A readiness rejection is `agent_not_ready` (before dispatch, wait then retry), not `stale_reference`.
+Its message carries a reason prefix; `daemon.log` records only finite reason codes, without prompt
+text, session IDs or transcript paths. Post-dispatch uncertainty is `delivery_unknown` and must
+never trigger an automatic resend, including after daemon restart.
 Shared invocations require moving to an independently owned Codex session. The readiness check
 itself never restarts a process or abandons a saved Run or operation.
 
@@ -861,5 +894,5 @@ includes more work than the daemon-ingress bound; it excludes Codex's pre-hook d
 
 #### Operational rollout
 
-- [ ] CLI/daemon/sidebar are deployed together with API 7 / protocol 33 while retaining pane state via the offline schema 10 → 11 conversion in RELEASING.md.
+- [ ] CLI/daemon/sidebar are deployed together with API 8 / protocol 34 while retaining pane state via the offline schema 10 → 11 conversion in RELEASING.md.
 - [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.

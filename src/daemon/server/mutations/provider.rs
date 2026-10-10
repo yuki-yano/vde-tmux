@@ -235,7 +235,21 @@ pub(in crate::daemon::server) fn apply_external_provider_event_with_runner(
     } else {
         let record = match provider_binding_record(coordinator, &envelope, &observation) {
             Ok(record) => record,
-            Err(response) => return response,
+            Err(response) => {
+                if let Err(error) = note_rejected_prompt_binding(
+                    coordinator,
+                    &envelope,
+                    &observation,
+                    process_runner,
+                ) {
+                    return production_store_error_response(
+                        coordinator,
+                        error,
+                        Some(envelope.event_id),
+                    );
+                }
+                return response;
+            }
         };
         let record = if record.agent_process.is_none() {
             match refresh_provider_process_identity(
@@ -425,6 +439,60 @@ pub(in crate::daemon::server) fn apply_external_provider_event_with_runner(
         apply_result.run,
         private_task_prompt.as_deref(),
     )
+}
+
+fn note_rejected_prompt_binding(
+    coordinator: &ProductionV2Coordinator,
+    envelope: &PaneEventEnvelope,
+    observation: &crate::hook::provider::ProviderObservation,
+    runner: &dyn crate::tmux::TmuxRunner,
+) -> Result<(), crate::pane_state::store::StoreError> {
+    if observation.hook_kind != crate::hook::provider::ProviderHookKind::UserPromptSubmit {
+        return Ok(());
+    }
+    let record = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned")
+        .as_ref()
+        .and_then(|state| state.leased.runtime.record(&envelope.pane_instance))
+        .cloned();
+    let Some(record) = record.filter(|record| {
+        record.agent.as_str() == "codex"
+            && record.agent_present
+            && record
+                .agent_session_id
+                .as_ref()
+                .is_some_and(|session| session != &observation.session_id)
+    }) else {
+        return Ok(());
+    };
+    let Some(process) = record.agent_process.as_ref() else {
+        return Ok(());
+    };
+    // Ingress checked pane ownership. Recheck the current canonical occupant;
+    // the envelope does not carry the process identity of the hook emitter.
+    if runner
+        .resolve_agent_process(record.pane_instance.pane_pid, &record.agent)
+        .ok()
+        .flatten()
+        .as_ref()
+        != Some(process)
+    {
+        return Ok(());
+    }
+    let mut guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    if let Some(state) = guard.as_mut() {
+        state.leased.runtime.note_codex_binding_rejected(
+            &record.pane_instance,
+            &record.version(),
+            process,
+        )?;
+    }
+    Ok(())
 }
 
 pub(in crate::daemon::server) fn project_provider_run_evidence_only(

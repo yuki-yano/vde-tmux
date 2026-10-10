@@ -8,6 +8,8 @@ use super::{InputCommandError, InputWriteStage, TmuxRunner};
 type AgentProcessKey = (u32, String);
 type StubAgentProcessResult =
     std::result::Result<Option<crate::pane_state::AgentProcessIdentity>, String>;
+type CodexRoots = Vec<(crate::question_notice::ingress::TranscriptLocator, String)>;
+type StubCodexRootsResult = std::result::Result<CodexRoots, String>;
 
 #[derive(Debug, Default)]
 pub struct MockTmuxRunner {
@@ -19,6 +21,7 @@ pub struct MockTmuxRunner {
     input_calls: RefCell<Vec<(Vec<String>, Vec<u8>)>>,
     agent_input_owners: RefCell<HashMap<(u32, u32), std::result::Result<bool, String>>>,
     agent_arguments: RefCell<HashMap<u32, Vec<String>>>,
+    codex_roots: RefCell<HashMap<u32, StubCodexRootsResult>>,
 }
 
 impl MockTmuxRunner {
@@ -57,6 +60,20 @@ impl MockTmuxRunner {
         );
     }
 
+    pub fn stub_codex_root_transcripts(
+        &self,
+        pid: u32,
+        roots: Vec<(crate::question_notice::ingress::TranscriptLocator, String)>,
+    ) {
+        self.codex_roots.borrow_mut().insert(pid, Ok(roots));
+    }
+
+    pub fn stub_codex_root_error(&self, pid: u32, message: &str) {
+        self.codex_roots
+            .borrow_mut()
+            .insert(pid, Err(message.into()));
+    }
+
     pub fn stub_agent_process(
         &self,
         root_pid: u32,
@@ -82,6 +99,19 @@ impl MockTmuxRunner {
 }
 
 impl TmuxRunner for MockTmuxRunner {
+    fn codex_root_transcripts(
+        &self,
+        process: &crate::pane_state::AgentProcessIdentity,
+        _canonical_session: Option<&str>,
+    ) -> Result<Vec<(crate::question_notice::ingress::TranscriptLocator, String)>> {
+        self.codex_roots
+            .borrow()
+            .get(&process.pid)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no Codex root transcript stub for {}", process.pid))?
+            .map_err(anyhow::Error::msg)
+    }
+
     fn agent_process_arguments(
         &self,
         process: &crate::pane_state::AgentProcessIdentity,

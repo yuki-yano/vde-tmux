@@ -468,7 +468,7 @@ fn guarded_prompt_process_owner_rejections_cover_every_fail_closed_branch() {
 }
 
 #[test]
-fn first_prompt_readiness_does_not_establish_hook_authority_or_bypass_history() {
+fn prompt_bootstrap_requires_live_empty_composer_and_preserves_hook_authority() {
     let root = test_root("first-prompt-readiness");
     let coordinator = ProductionV2Coordinator::new(
         test_incarnation(&root, "first-prompt-readiness"),
@@ -489,6 +489,7 @@ fn first_prompt_readiness_does_not_establish_hook_authority_or_bypass_history() 
     );
     runner.stub_agent_input_owner(pane.pane_instance.pane_pid, binding.process.pid, true);
     runner.stub_agent_arguments(binding.process.pid, &["codex", "--no-daemon", "--yolo"]);
+    runner.stub_codex_root_transcripts(binding.process.pid, Vec::new());
     let frame =
         "__vde_initial_prompt__#{pane_pid}:#{cursor_x}:#{cursor_y}:#{pane_width}:#{pane_height}";
     let header = format!(
@@ -523,6 +524,53 @@ fn first_prompt_readiness_does_not_establish_hook_authority_or_bypass_history() 
         crate::pane_state::resolve_presentation(&pane, &tracker, epoch_seconds()),
         crate::daemon::session_badge::BadgeState::Unknown
     );
+    // /new may leave an old canonical session while no root writer is open.
+    let mut switched = pane.clone();
+    switched.agent_session_id = Some(binding.provider_session_id.clone());
+    switched.run_seq = 1;
+    switched.completed_seq = 1;
+    assert!(require_prompt_readiness(&coordinator, &runner, &switched, &tracker).is_ok());
+    runner.stub_codex_root_error(binding.process.pid, "enumeration failed");
+    assert!(
+        require_prompt_readiness(&coordinator, &runner, &switched, &tracker)
+            .unwrap_err()
+            .starts_with("root_observation_failed:")
+    );
+    let home = root.join("codex");
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    let path = home.join("sessions/rollout-open.jsonl");
+    std::fs::write(&path, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"open\",\"thread_source\":\"user\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"open-turn\"}}\n").unwrap();
+    runner.stub_codex_root_transcripts(
+        binding.process.pid,
+        vec![(
+            crate::question_notice::ingress::TranscriptLocator::capture(&home, &path).unwrap(),
+            crate::question_notice::turn_order::identifier_digest("open"),
+        )],
+    );
+    assert!(
+        require_prompt_readiness(&coordinator, &runner, &switched, &tracker)
+            .unwrap_err()
+            .starts_with("root_not_quiescent:")
+    );
+    runner.stub_codex_root_transcripts(binding.process.pid, Vec::new());
+    let mut rejected = tracker.clone();
+    rejected.codex_binding_rejected = Some(crate::pane_state::CodexBindingRejection {
+        state_id: switched.state_id.clone(),
+        agent_epoch: switched.agent_epoch,
+        process: binding.process.clone(),
+    });
+    assert!(
+        require_prompt_readiness(&coordinator, &runner, &switched, &rejected)
+            .unwrap_err()
+            .starts_with("provider_binding_rejected:")
+    );
+    rejected
+        .codex_binding_rejected
+        .as_mut()
+        .unwrap()
+        .process
+        .start_token = "replaced".into();
+    assert!(require_prompt_readiness(&coordinator, &runner, &switched, &rejected).is_ok());
     runner.stub_agent_arguments(binding.process.pid, &["codex", "--yolo"]);
     assert!(require_prompt_readiness(&coordinator, &runner, &pane, &tracker).is_err());
     runner.stub_agent_arguments(binding.process.pid, &["codex", "--no-daemon"]);
@@ -533,11 +581,6 @@ fn first_prompt_readiness_does_not_establish_hook_authority_or_bypass_history() 
         {
             let mut value = pane.clone();
             value.run_seq = 1;
-            value
-        },
-        {
-            let mut value = pane.clone();
-            value.agent_session_id = Some(binding.provider_session_id.clone());
             value
         },
         {
@@ -553,27 +596,6 @@ fn first_prompt_readiness_does_not_establish_hook_authority_or_bypass_history() 
     ] {
         assert!(require_prompt_readiness(&coordinator, &runner, &previous, &tracker).is_err());
     }
-}
-
-#[test]
-fn screen_evidence_cannot_authorize_durable_prompt_dispatch() {
-    let binding = guarded_prompt_test_binding();
-    let pane = guarded_prompt_test_pane_state(&binding);
-    let mut tracker = crate::pane_state::CaptureTrackerSnapshot {
-        epoch: Some((pane.state_id.clone(), pane.agent_epoch)),
-        ..Default::default()
-    };
-    assert!(require_observed_prompt_readiness(&pane, &tracker).is_err());
-    tracker.codex_screen = Some((
-        crate::detect::codex::Evidence {
-            working: true,
-            ..Default::default()
-        },
-        super::super::super::epoch_seconds(),
-    ));
-    assert!(require_observed_prompt_readiness(&pane, &tracker).is_err());
-    tracker.hook_authoritative = true;
-    assert!(require_observed_prompt_readiness(&pane, &tracker).is_ok());
 }
 
 #[test]
@@ -618,8 +640,14 @@ fn guarded_prompt_lock_binding_and_pane_preconditions_are_fail_closed() {
 
     let mut pane_state = guarded_prompt_test_pane_state(&binding);
     assert!(agent_prompt_precondition_matches(&pane_state, &operation));
-    pane_state.revision += 1;
+    let mut pending = operation.clone();
+    pending.binding.provider_session_id = None;
+    pane_state.agent_session_id =
+        Some(crate::pane_state::AgentSessionId::parse("new-session").unwrap());
+    assert!(agent_prompt_precondition_matches(&pane_state, &pending));
     assert!(!agent_prompt_precondition_matches(&pane_state, &operation));
+    pane_state.revision += 1;
+    assert!(!agent_prompt_precondition_matches(&pane_state, &pending));
 }
 
 #[test]

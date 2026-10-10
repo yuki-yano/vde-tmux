@@ -70,12 +70,16 @@ impl Cursor {
         &self.locator
     }
     /// Call only after a complete, non-partial read of the live writer's file.
-    pub fn idle(&self) -> bool {
+    pub fn quiescent(&self) -> bool {
         self.header_verified()
             && self
                 .turns
                 .values()
                 .all(|turn| turn.complete.is_some() || turn.aborted.is_some())
+    }
+    /// A normal completion is required for passive lifecycle resynchronization.
+    pub fn idle(&self) -> bool {
+        self.quiescent()
             && self
                 .turns
                 .values()
@@ -251,7 +255,10 @@ pub fn verify_startup_header(
 }
 
 pub(crate) enum SessionHeader {
-    Root { session_digest: String },
+    Root {
+        session_digest: String,
+        forked: bool,
+    },
     NonRoot,
 }
 
@@ -268,7 +275,10 @@ pub(crate) fn session_header(
     // Interactive parent input belongs to thread_source=user. Other sources
     // use the hook-origin NonParent classification, including realtime_voice.
     if record.user_source && !record.parent {
-        Some(SessionHeader::Root { session_digest })
+        Some(SessionHeader::Root {
+            session_digest,
+            forked: record.forked,
+        })
     } else if record.source_known || record.parent {
         Some(SessionHeader::NonRoot)
     } else {
@@ -352,6 +362,7 @@ struct Record {
     user_source: bool,
     source_known: bool,
     parent: bool,
+    forked: bool,
     error: bool,
 }
 
@@ -365,6 +376,7 @@ enum Field {
     Turn,
     Source,
     Parent,
+    Fork,
     Error,
 }
 impl Field {
@@ -376,6 +388,7 @@ impl Field {
             "turn_id" => Self::Turn,
             "thread_source" => Self::Source,
             "parent_thread_id" => Self::Parent,
+            "forked_from_id" => Self::Fork,
             "error" => Self::Error,
             _ => Self::Other,
         }
@@ -727,6 +740,9 @@ impl Parser {
             if field == Field::Parent {
                 self.record.parent = byte != b'n';
             }
+            if field == Field::Fork {
+                self.record.forked = byte != b'n';
+            }
         }
         match byte {
             b'{' | b'[' => {
@@ -905,6 +921,21 @@ mod tests {
             ",\"error\":{\"message\":\"error\"}",
         );
         f.read().unwrap();
+        assert!(!f.cursor.idle());
+    }
+
+    #[test]
+    fn quiescence_allows_a_new_header_and_aborted_turn_but_never_an_open_turn() {
+        let mut f = Fixture::new();
+        f.read().unwrap();
+        assert!(f.cursor.quiescent());
+        assert!(!f.cursor.idle());
+        f.event("task_started", "turn", "");
+        f.read().unwrap();
+        assert!(!f.cursor.quiescent());
+        f.event("turn_aborted", "turn", "");
+        f.read().unwrap();
+        assert!(f.cursor.quiescent());
         assert!(!f.cursor.idle());
     }
 

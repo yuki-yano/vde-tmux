@@ -151,7 +151,6 @@ pub(super) fn start_canonical_observation_worker(
                     );
                     let candidates: Vec<_> = dispatch
                         .iter()
-                        .filter(|snapshot| !snapshot.tracker.hook_authoritative)
                         .filter_map(|snapshot| snapshot.state.as_ref())
                         .filter(|record| {
                             record.agent.as_str() == "codex"

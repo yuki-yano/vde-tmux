@@ -1568,6 +1568,8 @@ pub struct CaptureTrackerSnapshot {
     pub generation: u64,
     pub epoch: Option<(StateId, u64)>,
     pub hook_authoritative: bool,
+    /// Ephemeral evidence of an exact process's rejected foreign-session submit.
+    pub codex_binding_rejected: Option<CodexBindingRejection>,
     pub codex_idle_verified_at: Option<i64>,
     /// Ephemeral finite evidence; never serialized into canonical Pane State.
     pub codex_screen: Option<(crate::detect::codex::Evidence, i64)>,
@@ -1586,6 +1588,13 @@ pub struct CaptureTrackerSnapshot {
     pub last_change_at: Option<i64>,
     pub last_semantic_scan_at: Option<i64>,
     pub rebaseline_pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexBindingRejection {
+    pub state_id: StateId,
+    pub agent_epoch: u64,
+    pub process: AgentProcessIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

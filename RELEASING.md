@@ -34,7 +34,7 @@ crates.io Trusted Publishing must be configured once for:
 ## Local binary upgrade
 
 A local install replaces the installed `vt` and `vde-tmux` executables without a crate version
-bump or a release tag. The current generation is Agent API 7, daemon protocol 33, PaneState schema
+bump or a release tag. The current generation is Agent API 8, daemon protocol 34, PaneState schema
 11, private state format 1, and Question sidecar schema 1. CLI, daemon, and sidebars must run the
 same generation. Keep the existing pane state, Runs, and question-notice sidecar.
 
@@ -62,7 +62,7 @@ same generation. Keep the existing pane state, Runs, and question-notice sidecar
    - Do not run both load tests for every question change. Reuse accepted evidence for unchanged
      product code, and distinguish a re-evaluation of saved data from a new run.
 2. Stage both binaries with `cargo install --path . --locked --root <temporary-root>`.
-   Confirm `vt api schema --json` reports API 7, protocol 33, PaneState 11, and private state 1.
+   Confirm `vt api schema --json` reports API 8, protocol 34, PaneState 11, and private state 1.
    Validate the staged binaries on a scratch server before replacing the installed generation:
    `VDE_VT_BIN=<temporary-root>/bin/vt python3 scripts/test-codex-observation-isolated.py`.
 3. Confirm the installed `vt agent storage status --json` reports zero `in_flight_operations`.

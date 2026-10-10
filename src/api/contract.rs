@@ -14,7 +14,7 @@ use crate::daemon::session_badge::BadgeState;
 
 use super::common::epoch_now;
 
-pub const API_VERSION: u16 = 7;
+pub const API_VERSION: u16 = 8;
 pub const DEFAULT_READ_LINES: usize = 120;
 pub const MAX_READ_LINES: usize = 2_000;
 pub const MAX_READ_BYTES: usize = 1024 * 1024;
@@ -488,10 +488,17 @@ pub enum ApiAgentStartCapability {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ApiProviderAttributionContract {
+    pub prompt_target: ApiPromptTargetPolicy,
     pub stable_event_reference: Vec<ApiProviderAttributionField>,
     pub prompt_event: ApiProviderHookEvent,
     pub completion_event: ApiProviderHookEvent,
     pub response_artifact_source: ApiResponseArtifactSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiPromptTargetPolicy {
+    OpenConversationAtDispatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -1408,6 +1415,7 @@ fn api_schema_contract() -> ApiSchemaContract {
                     source_revision: Some("a4fb816a52fc4178ef3a01d285f0c6cc0191d7c0".to_string()),
                     probe_observation_count: Some(20),
                     attribution: Some(ApiProviderAttributionContract {
+                        prompt_target: ApiPromptTargetPolicy::OpenConversationAtDispatch,
                         stable_event_reference: vec![
                             ApiProviderAttributionField::Provider,
                             ApiProviderAttributionField::SessionId,
@@ -1615,6 +1623,10 @@ mod tests {
         assert_eq!(
             contract["providers"]["codex"]["evidence_basis"],
             "authenticated_isolated_runtime_probe"
+        );
+        assert_eq!(
+            contract["providers"]["codex"]["attribution"]["prompt_target"],
+            "open_conversation_at_dispatch"
         );
         assert_eq!(
             contract["providers"]["codex"]["attribution"]["stable_event_reference"],

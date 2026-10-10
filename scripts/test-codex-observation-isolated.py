@@ -380,6 +380,35 @@ def main():
             failure = json.loads(result.stdout or result.stderr)
             assert failure["error"]["code"] == "agent_not_ready", failure
             assert tmux("capture-pane", "-p", "-t", target) == before
+        def confirm_prompt(label):
+            prompt = "synthetic prompt " + label
+            before = json.loads(vt("agent", "get", target, "--json"))["result"]["agent"]
+            proc = subprocess.Popen([str(BIN), "agent", "prompt", before["summary"]["agent_ref"],
+                                     "--operation-id", "resync-accept-"+label, "--stdin"],
+                                    env=env, text=True, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc.stdin.write(prompt+"\n")
+            proc.stdin.close()
+            deadline = time.monotonic()+5
+            while prompt not in tmux("capture-pane", "-p", "-t", target):
+                assert time.monotonic() < deadline, "prompt was not delivered: "+label
+                time.sleep(0.05)
+            for event in ["UserPromptSubmit", "Stop"]:
+                path = work / f"embedded-{event}.json"
+                payload = json.loads(path.read_text())
+                payload.update(turn_id=label, prompt=prompt)
+                path.write_text(json.dumps(payload))
+            structural("task_started", label)
+            hook("embedded", "UserPromptSubmit", target)
+            proc.wait(timeout=10)
+            result = json.loads(proc.stdout.read())
+            assert proc.returncode == 0, (result, proc.stderr.read())
+            hook("embedded", "Stop", target)
+            structural("task_complete", label)
+            await_agents(lambda a: a[target]["status"] == "done")
+            after = json.loads(vt("agent", "get", target, "--json"))["result"]["agent"]
+            assert after["run_seq"] == after["completed_seq"] == before["run_seq"]+1
+            screen("SCREEN_READY")
         screen("SCREEN_DRAFT")
         reject_prompt("draft")
         screen("SCREEN_QUEUE")
@@ -401,17 +430,32 @@ def main():
         await_agents(lambda a: a[target]["presentation"]["reason"] == "provider_resynchronized")
         other_root = transcript.with_name("rollout-other-root.jsonl")
         other_root.write_text(json.dumps({"type":"session_meta", "payload":{
+            "id":"other-root", "thread_source":"user", "forked_from_id":"embedded"}})+"\n")
+        screen("OTHER_ROOT_OPEN")
+        reject_prompt("unbound-fork")
+        screen("DUPLICATE_CLOSE")
+        other_root.write_text(json.dumps({"type":"session_meta", "payload":{
             "id":"other-root", "thread_source":"user"}})+"\n")
         screen("OTHER_ROOT_OPEN")
         await_agents(lambda a: a[target]["presentation"]["reason"] != "provider_resynchronized")
-        reject_prompt("old-root-retained-with-stale-canonical-session")
+        with other_root.open("a") as stream:
+            stream.write(json.dumps({"type":"event_msg", "payload":{
+                "type":"task_started", "turn_id":"retained-root-turn"}})+"\n")
+        reject_prompt("retained-root-open-turn")
+        with other_root.open("a") as stream:
+            stream.write(json.dumps({"type":"event_msg", "payload":{
+                "type":"task_complete", "turn_id":"retained-root-turn"}})+"\n")
+        confirm_prompt("multiple-quiescent-roots")
         screen("DUPLICATE_CLOSE")
+        # The accepted hooks restore authority. Restart once to exercise the
+        # separate passive resynchronization checks below again.
+        vt("daemon", "restart")
         await_agents(lambda a: a[target]["presentation"]["reason"] == "provider_resynchronized")
         replacement = transcript.with_name("rollout-replacement.jsonl")
-        replacement.write_text(json.dumps({"type":"session_meta","payload":{"id":"replacement","thread_source":"user"}})+"\n")
+        replacement.write_text(json.dumps({"type":"session_meta","payload":{"id":"replacement"}})+"\n")
         screen("SESSION_SWAP")
         await_agents(lambda a: a[target]["presentation"]["reason"] != "provider_resynchronized")
-        reject_prompt("same-pid-new-session")
+        reject_prompt("unverified-replacement-header")
         screen("SESSION_RESTORE")
         screen("SCREEN_READY")
         await_agents(lambda a: a[target]["presentation"]["reason"] == "provider_resynchronized")
@@ -454,9 +498,10 @@ def main():
         (work / "resync-evidence.json").write_text(json.dumps({"restart_cycles":len(recovered), "restart_seconds":recovered,
             "external_prompt":"confirmed", "large_history_mib":34,
             "retained_subagent_writers":2,
+            "multiple_quiescent_roots":"confirmed",
             "negative_cases":["draft","queue","lost-hook-turn","duplicate-session-writer",
-                              "old-root-retained-with-stale-canonical-session","same-pid-new-session"]}, indent=2)+"\n")
-        print(f"PASS: {len(recovered)} restarts recovered with subagent writers retained; external prompt confirmed; draft/queue/new turn/duplicate writer/session replacement rejected", flush=True)
+                              "retained-root-open-turn","unverified-replacement-header","unbound-fork"]}, indent=2)+"\n")
+        print(f"PASS: {len(recovered)} restarts recovered; multiple quiescent roots and large-history prompt confirmed; draft/queue/open turn/duplicate/unknown header rejected", flush=True)
         vt("daemon", "restart")
         await_agents(lambda a: a[target]["identity"] == "exact")
         for event in ["UserPromptSubmit", "Stop"]:
@@ -469,7 +514,7 @@ def main():
         hook("embedded", "Stop", target)
         await_agents(lambda a: a[target]["status"] == "done")
         after = json.loads(vt("agent", "get", target, "--json"))["result"]["agent"]
-        assert after["run_seq"] == after["completed_seq"] == 3
+        assert after["run_seq"] == after["completed_seq"] == 4
         # A working-looking screen after accepted Stop must not replace the
         # authoritative lifecycle, even without a repeated SessionStart.
         with (work / "embedded.fifo").open("w") as stream:
@@ -479,7 +524,7 @@ def main():
         assert agents[target]["badge"] in ["idle", "done"], agents[target]["badge"]
         assert agents[target]["presentation"]["reason"] == "hook_authoritative"
         report = {"screen_cases": screen_cases, "screen_created_runs": 0, "shared_hook_cases": 24, "wrong_pane_bindings": 0,
-                  "embedded_hook_cases": 10, "embedded_completed_seq": 3,
+                  "embedded_hook_cases": 12, "embedded_completed_seq": 4,
                   "embedded_hooks_restore_authority_after_restart": True,
                   "embedded_with_mcp_sibling": True, "renamed_app_server_rejected": True,
                   "hook_timings": timings, "fixture_kind": "native synthetic process tree"}

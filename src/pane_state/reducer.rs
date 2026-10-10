@@ -1833,6 +1833,7 @@ fn reset_tracker_for_state(
         generation: tracker.generation,
         epoch: Some((state.state_id.clone(), state.agent_epoch)),
         hook_authoritative: false,
+        codex_binding_rejected: None,
         codex_idle_verified_at: None,
         codex_screen: None,
         codex_screen_expired_at: None,

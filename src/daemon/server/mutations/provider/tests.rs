@@ -2,6 +2,142 @@ use super::super::super::*;
 use super::*;
 
 #[test]
+fn foreign_submit_rejection_requires_the_current_process_and_session_start_clears_it() {
+    let root = test_root("foreign-submit-rejection");
+    let coordinator = ProductionV2Coordinator::new(
+        test_incarnation(&root, "foreign-submit-rejection"),
+        BTreeMap::from([
+            ("XDG_STATE_HOME".into(), root.display().to_string()),
+            (
+                "VDE_TMUX_SOCKET_NAME".into(),
+                format!("vde-foreign-binding-test-{}", std::process::id()),
+            ),
+        ]),
+        None,
+    )
+    .unwrap();
+    install_test_state(&coordinator, &root, Default::default());
+    *coordinator.agent_runtime.lock().unwrap() = Some(
+        crate::agent_state::runtime::AgentRuntime::open(
+            root.join("agent-state"),
+            "foreign-submit-rejection".into(),
+        )
+        .unwrap(),
+    );
+    let pane = PaneInstance {
+        pane_id: "%542".into(),
+        pane_pid: 54200,
+    };
+    coordinator
+        .state
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .topology
+        .panes = vec![read_peek_test_topology_pane(pane.clone(), false)];
+    let process = crate::pane_state::AgentProcessIdentity {
+        pid: 54201,
+        start_token: "foreign-process".into(),
+    };
+    let runner = crate::tmux::mock::MockTmuxRunner::new();
+    runner.stub_agent_process(pane.pane_pid, "codex", Some(process.clone()));
+    let daemon_id = coordinator
+        .router
+        .lock()
+        .unwrap()
+        .daemon_instance_id()
+        .clone();
+    let event = |kind, session: &str| {
+        codex_provider_test_event(daemon_id.clone(), pane.clone(), kind,
+        &serde_json::json!({"session_id":session,"turn_id":"test-turn","source":"startup","prompt":"test","last_assistant_message":"done"}).to_string(), 42)
+    };
+    for kind in ["SessionStart", "UserPromptSubmit", "Stop"] {
+        let (envelope, observation) = event(kind, "known");
+        let response = apply_external_provider_event_with_runner(
+            &coordinator,
+            1,
+            envelope,
+            observation,
+            &runner,
+        );
+        assert!(
+            matches!(response, ServerMessage::PaneEventResult { .. }),
+            "{kind}: {response:?}"
+        );
+    }
+    let before = coordinator
+        .state
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .leased
+        .runtime
+        .record(&pane)
+        .unwrap()
+        .clone();
+    let rejected = || {
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .leased
+            .runtime
+            .tracker(&pane)
+            .codex_binding_rejected
+    };
+    let submit = |kind| {
+        let (envelope, observation) = event(kind, "foreign");
+        assert!(matches!(
+            apply_external_provider_event_with_runner(
+                &coordinator,
+                2,
+                envelope,
+                observation,
+                &runner
+            ),
+            ServerMessage::Error {
+                code: ErrorCode::StaleAgentEvent,
+                ..
+            }
+        ));
+    };
+    submit("Stop");
+    assert!(rejected().is_none());
+    let mut replacement = process.clone();
+    replacement.start_token = "different".into();
+    runner.stub_agent_process(pane.pane_pid, "codex", Some(replacement));
+    submit("UserPromptSubmit");
+    assert!(rejected().is_none());
+    runner.stub_agent_process(pane.pane_pid, "codex", Some(process.clone()));
+    submit("UserPromptSubmit");
+    let proof = rejected().unwrap();
+    assert_eq!(proof.process, process);
+    assert_eq!(proof.state_id, before.state_id);
+    assert_eq!(
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .leased
+            .runtime
+            .record(&pane),
+        Some(&before)
+    );
+    let (envelope, observation) = event("SessionStart", "foreign");
+    assert!(matches!(
+        apply_external_provider_event_with_runner(&coordinator, 3, envelope, observation, &runner),
+        ServerMessage::PaneEventResult { .. }
+    ));
+    assert!(rejected().is_none());
+}
+
+#[test]
 fn question_notice_survives_stop_first_and_session_binding_rejection_without_changing_run_state() {
     use crate::question_notice::{NoticeDisposition, QuestionNoticeInput};
     let root = test_root("question-provider");

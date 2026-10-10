@@ -252,6 +252,9 @@ pub(in crate::daemon::server) fn apply_prompt_inner(
         } {
             Ok(value) => value,
             Err(message) => {
+                if message.starts_with("readiness:") {
+                    log_prompt_readiness_rejection(coordinator, &message);
+                }
                 if let Some(rejection_code) =
                     prepared_target_rejection_code(existing_prepared.is_some(), None)
                 {
@@ -367,6 +370,9 @@ pub(in crate::daemon::server) fn apply_prompt_inner(
     } else {
         verify_agent_prompt_precondition(coordinator, runner, &operation)
     } {
+        if recovery.is_none() {
+            log_prompt_readiness_rejection(coordinator, &message);
+        }
         return reject_pre_dispatch("pane_precondition_changed", message);
     }
     let staged = {
@@ -660,7 +666,7 @@ pub(in crate::daemon::server) fn resolve_prompt_target_inner(
     if !matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle)
         && !recovery.is_some_and(|r| r.matches(&record))
     {
-        return Err("readiness: agent is busy or blocked".to_string());
+        return Err("readiness: agent_not_idle: agent is busy or blocked".to_string());
     }
     if let Some(recovery) = recovery {
         if !recovery.matches(&record) || !tracker.hook_authoritative {
@@ -669,8 +675,23 @@ pub(in crate::daemon::server) fn resolve_prompt_target_inner(
     } else {
         require_prompt_readiness(coordinator, runner, &record, &tracker)
             .map_err(|reason| format!("readiness: {reason}"))?;
+        let guard = coordinator
+            .state
+            .lock()
+            .expect("canonical state lock poisoned");
+        let state = guard.as_ref().ok_or("daemon is hydrating")?;
+        let current = state
+            .leased
+            .runtime
+            .record(&pane)
+            .ok_or("agent pane is no longer retained")?;
+        require_provider_binding_ready(current, &state.leased.runtime.tracker(&pane))
+            .map_err(|reason| format!("readiness: {reason}"))?;
     }
-    let provider_session_id = record.agent_session_id.clone();
+    // Ordinary prompts target the conversation open in this exact TUI at
+    // dispatch. /new need not emit a hook or materialize its rollout beforehand.
+    // Capacity recovery, in contrast, remains bound to its original session.
+    let provider_session_id = recovery.and(record.agent_session_id.clone());
     let expected_run_seq = record
         .run_seq
         .checked_add(1)
@@ -728,13 +749,14 @@ pub(in crate::daemon::server) fn verify_prompt_precondition_inner(
         } {
             return Err("pane revision, lifecycle, current run, session, or process changed before dispatch".to_string());
         }
-        Ok((
-            record.clone(),
-            state
-                .leased
-                .runtime
-                .tracker(&operation.binding.pane_instance),
-        ))
+        let tracker = state
+            .leased
+            .runtime
+            .tracker(&operation.binding.pane_instance);
+        if recovery.is_none() {
+            require_provider_binding_ready(record, &tracker)?;
+        }
+        Ok((record.clone(), tracker))
     };
     let (record, tracker) = read_current()?;
     if let Some(recovery) = recovery {
@@ -754,52 +776,87 @@ fn require_prompt_readiness(
     record: &crate::pane_state::PaneState,
     tracker: &crate::pane_state::CaptureTrackerSnapshot,
 ) -> Result<(), String> {
-    if initial_prompt::candidate(record, tracker)
-        && crate::pane_state::resolve_presentation(record, tracker, epoch_seconds())
-            == crate::daemon::session_badge::BadgeState::Unknown
+    require_provider_binding_ready(record, tracker)?;
+    if record.agent.as_str() != "codex"
+        || !record.agent_present
+        || !record.scan_verified
+        || !matches!(record.lifecycle, crate::pane_state::LifecycleState::Idle)
+        || record.run_seq != record.completed_seq
     {
-        initial_prompt::require_ready(runner, record)
-    } else {
-        require_observed_prompt_readiness(record, tracker)?;
-        initial_prompt::require_ready(runner, record)?;
-        if !tracker.hook_authoritative
-            && !coordinator
-                .codex_resync
-                .lock()
-                .map_err(|_| "Codex resynchronization is unavailable")?
-                .sample(record)
-        {
-            return Err("current Codex session is not structurally idle".into());
-        }
-        Ok(())
+        return Err("agent_not_idle: exact Codex must have no unfinished turn".into());
     }
+    initial_prompt::require_ready(runner, record)?;
+    let process = record
+        .agent_process
+        .as_ref()
+        .ok_or("process_unavailable: exact Codex process is unavailable")?;
+    let roots = runner
+        .codex_root_transcripts(
+            process,
+            record.agent_session_id.as_ref().map(|s| s.as_str()),
+        )
+        .map_err(|error| {
+            let reason = error.to_string();
+            if reason.starts_with("forked_conversation_unbound:") {
+                reason
+            } else {
+                format!("root_observation_failed: {reason}")
+            }
+        })?;
+    coordinator
+        .codex_resync
+        .lock()
+        .map_err(|_| "root_observation_failed: Codex observer is unavailable")?
+        .verify_prompt_roots(process, roots)
+        .map_err(|error| error.to_string())?;
+    // File observation can take time. Check the live composer and owner again,
+    // followed by the caller's canonical revision fence before any input.
+    initial_prompt::require_ready(runner, record)
 }
 
-fn require_observed_prompt_readiness(
+fn require_provider_binding_ready(
     record: &crate::pane_state::PaneState,
     tracker: &crate::pane_state::CaptureTrackerSnapshot,
 ) -> Result<(), String> {
-    use crate::daemon::session_badge::BadgeState;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "system time is unavailable".to_string())?
-        .as_secs() as i64;
-    match crate::pane_state::resolve_presentation(record, tracker, now) {
-        BadgeState::Working | BadgeState::Blocked | BadgeState::Limited => {
-            Err("agent is busy or blocked".to_string())
-        }
-        BadgeState::Unknown => Err("agent readiness is unknown".to_string()),
-        _ if record.agent.as_str() == "codex"
-            && !tracker.hook_authoritative
-            && !tracker.codex_idle_verified_at.is_some_and(|at| {
-                (0..=crate::pane_state::resolver::SCREEN_EVIDENCE_TTL_SECONDS)
-                    .contains(&now.saturating_sub(at))
-            }) =>
-        {
-            Err("Codex lifecycle hooks are not verified for this daemon epoch".to_string())
-        }
-        _ => Ok(()),
+    if tracker
+        .codex_binding_rejected
+        .as_ref()
+        .is_some_and(|rejection| {
+            rejection.state_id == record.state_id
+                && rejection.agent_epoch == record.agent_epoch
+                && record.agent_process.as_ref() == Some(&rejection.process)
+        })
+    {
+        return Err("provider_binding_rejected: a foreign-session submit was rejected; a supported SessionStart must be accepted before another prompt".into());
     }
+    Ok(())
+}
+
+fn log_prompt_readiness_rejection(coordinator: &ProductionV2Coordinator, message: &str) {
+    let reason = message
+        .strip_prefix("readiness: ")
+        .unwrap_or(message)
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    let reason = match reason {
+        "agent_not_idle"
+        | "process_unavailable"
+        | "process_arguments_unavailable"
+        | "independent_invocation_required"
+        | "process_changed"
+        | "input_owner_unverified"
+        | "input_observation_failed"
+        | "input_not_ready"
+        | "root_observation_failed"
+        | "root_limit_exceeded"
+        | "duplicate_root_session"
+        | "root_not_quiescent"
+        | "root_history_unavailable" => reason,
+        "provider_binding_rejected" | "forked_conversation_unbound" => reason,
+        _ => "pane_precondition_changed",
+    };
+    coordinator.log_daemon_error(&format!("agent prompt readiness rejected: reason={reason}"));
 }
 
 pub(in crate::daemon::server) fn agent_prompt_precondition_matches(
@@ -817,7 +874,11 @@ fn agent_prompt_identity_matches(
         && record.version() == operation.expected_pane_version
         && record.current_run == operation.expected_current_run
         && record.agent == operation.binding.agent_kind
-        && record.agent_session_id == operation.binding.provider_session_id
+        && operation
+            .binding
+            .provider_session_id
+            .as_ref()
+            .is_none_or(|session| record.agent_session_id.as_ref() == Some(session))
         && record.agent_process.as_ref() == Some(&operation.binding.process)
         && record.run_seq.checked_add(1) == Some(operation.expected_run_seq)
 }
