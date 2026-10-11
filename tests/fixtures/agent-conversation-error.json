@@ -1,0 +1,15 @@
+{
+  "meta": {
+    "api_version": 9,
+    "started_at": 1791644963,
+    "emitted_at": 1791644963,
+    "diagnostic_count": 0
+  },
+  "error": {
+    "code": "conversation_unavailable",
+    "message": "Codex Stop has no matching task completion",
+    "stage": "observation",
+    "side_effect": "none",
+    "retry_action": "wait_then_retry"
+  }
+}

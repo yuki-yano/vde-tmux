@@ -507,6 +507,7 @@ fn v2_sidebar_command(command: crate::daemon::protocol::v2::SidebarCommand) -> C
 
 fn v2_pane_event(event: PaneEvent) -> ClientMessage {
     ClientMessage::SubmitPaneEvent {
+            conversation: None,
         proto: PROTOCOL_VERSION,
         envelope: PaneEventEnvelope {
             daemon_instance_id: v2_daemon_id(),

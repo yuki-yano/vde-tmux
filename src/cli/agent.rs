@@ -29,6 +29,18 @@ pub(super) enum AgentCommand {
     },
     /// Get one current agent by %pane_id or exact agent_ref.
     Get { target: String },
+    /// Read the exact provider conversation or wait for one cursor change.
+    Conversation {
+        target: String,
+        #[arg(long)]
+        include_tools: bool,
+        #[arg(long)]
+        since_revision: Option<String>,
+        #[arg(long)]
+        after_cursor: Option<String>,
+        #[arg(long, default_value_t = crate::api::DEFAULT_WAIT_TIMEOUT.as_millis() as u64)]
+        timeout_ms: u64,
+    },
     /// Submit one guarded prompt to an exact idle/done Codex occupant.
     Prompt {
         target: String,
@@ -451,6 +463,21 @@ pub(super) fn dispatch(
             },
         ),
         AgentCommand::Get { target } => crate::api::agent_get(runner, env, observed_at, &target),
+        AgentCommand::Conversation {
+            target,
+            include_tools,
+            since_revision,
+            after_cursor,
+            timeout_ms,
+        } => crate::api::agent_conversation(
+            runner,
+            env,
+            &target,
+            include_tools,
+            since_revision.as_deref(),
+            after_cursor.as_deref(),
+            Duration::from_millis(timeout_ms),
+        ),
         AgentCommand::Prompt {
             target,
             operation_id,

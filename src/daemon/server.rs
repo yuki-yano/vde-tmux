@@ -852,6 +852,15 @@ impl ProductionV2Coordinator {
                     .lookup(&request, Instant::now() + Duration::from_secs(2));
                 ServerMessage::QuestionProfileResult { request, profile }
             }
+            ClientMessage::QueryConversationBinding { pane_instance, .. } => {
+                let state = self.state.lock().expect("canonical state lock poisoned");
+                let Some(state) = state.as_ref() else {
+                    return ServerMessage::error(ErrorCode::NotReady, "daemon is hydrating", None);
+                };
+                ServerMessage::ConversationBindingResult {
+                    binding: state.conversation_bindings.get(&pane_instance).cloned(),
+                }
+            }
             ClientMessage::QueryResolvedSnapshot { .. } | ClientMessage::Subscribe { .. } => {
                 if self
                     .state
@@ -2413,21 +2422,32 @@ fn apply_production_mutation(
             mutations::question::probe_completed(coordinator, completion);
             return mutations::question::internal_ack(coordinator, accepted_seq);
         }
-        V2AcceptedMutation::External(ClientMessage::SubmitPaneEvent { envelope, .. }) => {
-            apply_external_pane_event(coordinator, accepted_seq, envelope)
+        V2AcceptedMutation::External(ClientMessage::SubmitPaneEvent {
+            envelope,
+            conversation,
+            ..
+        }) => {
+            let response = apply_external_pane_event(coordinator, accepted_seq, envelope.clone());
+            observe_conversation_binding(coordinator, &response, &envelope, conversation);
+            response
         }
         V2AcceptedMutation::External(ClientMessage::SubmitProviderEvent {
             envelope,
             observation,
             question_notice,
+            conversation,
             ..
-        }) => apply_external_provider_event(
-            coordinator,
-            accepted_seq,
-            envelope,
-            observation,
-            question_notice,
-        ),
+        }) => {
+            let response = apply_external_provider_event(
+                coordinator,
+                accepted_seq,
+                envelope.clone(),
+                observation,
+                question_notice,
+            );
+            observe_conversation_binding(coordinator, &response, &envelope, conversation);
+            response
+        }
         V2AcceptedMutation::External(ClientMessage::StartAgentPrompt {
             event_id,
             target_agent_ref,
@@ -2936,6 +2956,7 @@ fn apply_production_mutation(
         }
         V2AcceptedMutation::External(
             ClientMessage::Hello { .. }
+            | ClientMessage::QueryConversationBinding { .. }
             | ClientMessage::QueryResolvedSnapshot { .. }
             | ClientMessage::QueryStatusSnapshot { .. }
             | ClientMessage::QueryPane { .. }
@@ -3374,3 +3395,38 @@ include!("server/test_support.rs");
 
 #[cfg(test)]
 mod tests;
+
+fn observe_conversation_binding(
+    coordinator: &ProductionV2Coordinator,
+    response: &ServerMessage,
+    envelope: &PaneEventEnvelope,
+    hook: Option<crate::conversation::HookBinding>,
+) {
+    let response = match response {
+        ServerMessage::ProviderEventResult { lifecycle, .. } => lifecycle.as_ref(),
+        other => other,
+    };
+    if !matches!(
+        response,
+        ServerMessage::PaneEventResult { .. } | ServerMessage::SnapshotAck { .. }
+    ) {
+        return;
+    }
+    let mut guard = coordinator
+        .state
+        .lock()
+        .expect("canonical state lock poisoned");
+    if let Some(state) = guard.as_mut() {
+        let record = state
+            .leased
+            .runtime
+            .record(&envelope.pane_instance)
+            .cloned();
+        crate::conversation::observe_binding(
+            &mut state.conversation_bindings,
+            record.as_ref(),
+            envelope,
+            hook,
+        );
+    }
+}

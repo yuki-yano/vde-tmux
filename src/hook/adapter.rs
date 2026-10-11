@@ -362,7 +362,10 @@ fn parse_session_source(source: Option<&str>) -> Result<AgentSessionSource> {
         Some("startup") => Ok(AgentSessionSource::Startup),
         Some("resume") => Ok(AgentSessionSource::Resume),
         Some("clear") => Ok(AgentSessionSource::Clear),
-        _ => bail!("InvalidRequest: SessionStart requires startup, resume, or clear source"),
+        Some("compact") => Ok(AgentSessionSource::Compact),
+        _ => {
+            bail!("InvalidRequest: SessionStart requires startup, resume, clear, or compact source")
+        }
     }
 }
 

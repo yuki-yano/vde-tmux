@@ -22,7 +22,7 @@ use crate::pane_state::{
     ViewEvent,
 };
 
-pub const PROTOCOL_VERSION: u16 = 34;
+pub const PROTOCOL_VERSION: u16 = 35;
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -962,6 +962,10 @@ pub enum ClientMessage {
     Hello {
         proto: u16,
     },
+    QueryConversationBinding {
+        proto: u16,
+        pane_instance: PaneInstance,
+    },
     QueryResolvedSnapshot {
         proto: u16,
     },
@@ -1007,11 +1011,13 @@ pub enum ClientMessage {
     SubmitPaneEvent {
         proto: u16,
         envelope: PaneEventEnvelope,
+        conversation: Option<crate::conversation::HookBinding>,
     },
     SubmitProviderEvent {
         proto: u16,
         envelope: PaneEventEnvelope,
         observation: crate::hook::provider::ProviderObservation,
+        conversation: Option<crate::conversation::HookBinding>,
         question_notice: Option<crate::question_notice::QuestionNoticeInput>,
     },
     StartAgentPrompt {
@@ -1075,6 +1081,7 @@ impl ClientMessage {
             | Self::ReportQuestionJournalFailure { proto, .. }
             | Self::SubmitQuestionSession { proto, .. }
             | Self::QueryQuestionProfile { proto, .. }
+            | Self::QueryConversationBinding { proto, .. }
             | Self::QueryResolvedSnapshot { proto }
             | Self::QueryStatusSnapshot { proto, .. }
             | Self::QueryPane { proto, .. }
@@ -1158,6 +1165,7 @@ impl ClientMessage {
         matches!(
             self,
             Self::QueryResolvedSnapshot { .. }
+                | Self::QueryConversationBinding { .. }
                 | Self::QueryQuestionDiagnostics { .. }
                 | Self::QueryQuestionProfile { .. }
                 | Self::QueryStatusSnapshot { .. }
@@ -1277,6 +1285,9 @@ pub enum ServerMessage {
         server_identity: String,
         phase: DaemonPhase,
         hook_health: HookHealth,
+    },
+    ConversationBindingResult {
+        binding: Option<crate::conversation::BoundConversation>,
     },
     ResolvedSnapshotResult {
         snapshot_revision: u64,
@@ -1653,6 +1664,7 @@ mod tests {
 
     fn pane_event() -> ClientMessage {
         ClientMessage::SubmitPaneEvent {
+            conversation: None,
             proto: PROTOCOL_VERSION,
             envelope: PaneEventEnvelope {
                 daemon_instance_id: daemon_id(),
@@ -1784,7 +1796,7 @@ mod tests {
 
     #[test]
     fn every_client_message_roundtrips() {
-        assert_eq!(PROTOCOL_VERSION, 34);
+        assert_eq!(PROTOCOL_VERSION, 35);
         let state_id = StateId::parse("00112233445566778899aabbccddeeff").unwrap();
         let messages = vec![
             ClientMessage::Hello {

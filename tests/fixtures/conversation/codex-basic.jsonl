@@ -1,0 +1,30 @@
+{"type":"session_meta","payload":{"id":"codex-session","session_id":"codex-session","thread_source":"user","history_mode":"paginated","cwd":"/work","cli_version":"0.162.1"}}
+{"type":"event_msg","payload":{"turn_id":"t1","root_turn_id":"t1","turn_attribution":null,"type":"task_started"}}
+{"type":"turn_context","payload":{"turn_id":"t1","cwd":"/work","model":"synthetic"}}
+{"type":"world_state","payload":{"full":true,"state":{}}}
+{"type":"response_item","payload":{"role":"developer","content":[{"type":"input_text","text":"<collaboration_mode>synthetic developer context</collaboration_mode>"}],"type":"message"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /work\n\nsynthetic project rules"}],"type":"message"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"<environment_context>synthetic environment</environment_context>"}],"type":"message"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Fix the parser."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t1","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-1","client_id":null,"content":[{"type":"text","text":"Fix the parser.","text_elements":[]}]},"type":"item_completed"}}
+{"type":"response_item","payload":{"id":"rs-1","summary":[],"content":null,"encrypted_content":"opaque","type":"reasoning"}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-1","phase":"commentary","content":[{"type":"output_text","text":"Reading the parser."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t1","thread_id":"codex-session","item":{"type":"AgentMessage","id":"msg-1","phase":"commentary","content":[{"type":"Text","text":"Reading the parser."}],"delivery":null,"questions":null,"memory_citation":null},"type":"item_completed"}}
+{"type":"response_item","payload":{"id":"ct-1","call_id":"call-1","name":"exec","input":"cat parser.rs","status":"completed","type":"custom_tool_call"}}
+{"type":"response_item","payload":{"id":"cto-1","call_id":"call-1","name":"exec","output":"synthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\nsynthetic tool output line\n","type":"custom_tool_call_output"}}
+{"type":"event_msg","payload":{"turn_id":"t1","thread_id":"codex-session","item":{"type":"CommandExecution","id":"ce-1","command":"cat parser.rs","status":"completed"},"type":"item_completed"}}
+{"type":"response_item","payload":{"id":"fc-1","call_id":"call-2","name":"apply_patch","arguments":"{\"path\":\"parser.rs\"}","type":"function_call"}}
+{"type":"response_item","payload":{"id":"fco-1","call_id":"call-2","output":"patched","type":"function_call_output"}}
+{"type":"event_msg","payload":{"info":null,"rate_limits":null,"type":"token_count"}}
+{"type":"token_usage_record","payload":{"turn_id":"t1","session_id":"codex-session","usage":{}}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-2","phase":"final_answer","content":[{"type":"output_text","text":"Parser fixed."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t1","thread_id":"codex-session","item":{"type":"AgentMessage","id":"msg-2","phase":"final_answer","content":[{"type":"Text","text":"Parser fixed."}],"delivery":null,"questions":null,"memory_citation":null},"type":"item_completed"}}
+{"type":"event_msg","payload":{"turn_id":"t1","root_turn_id":"t1","last_agent_message":"Parser fixed.","error":null,"type":"task_complete"}}
+{"type":"event_msg","payload":{"turn_id":"t2","root_turn_id":"t2","turn_attribution":null,"type":"task_started"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"<image name=[Image #1]>"},{"type":"input_image","image_url":"data:image/png;base64,AA=="},{"type":"input_text","text":"</image>"},{"type":"input_text","text":"What is in this screenshot?"}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t2","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-2","client_id":null,"content":[{"type":"local_image","path":"/tmp/synthetic.png"},{"type":"text","text":"What is in this screenshot?","text_elements":[]}]},"type":"item_completed"}}
+{"type":"inter_agent_communication_metadata","payload":{"trigger_turn":false}}
+{"type":"response_item","payload":{"id":"am-1","author":"worker","recipient":"root","content":[],"type":"agent_message"}}
+{"type":"event_msg","payload":{"thread_id":"codex-session","thread_settings":{},"type":"thread_settings_applied"}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-3","phase":"final_answer","content":[{"type":"output_text","text":"A terminal window."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t2","root_turn_id":"t2","last_agent_message":"A terminal window.","error":null,"type":"task_complete"}}

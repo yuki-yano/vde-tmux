@@ -101,6 +101,8 @@ pub(crate) enum CanonicalSidebarEffect {
 
 pub(crate) struct CanonicalCoordinatorState {
     pub leased: LeasedCanonicalPaneStateRuntime,
+    pub conversation_file_stamps: BTreeMap<PaneInstance, Option<crate::conversation::FileStamp>>,
+    pub conversation_bindings: crate::conversation::ConversationBindings,
     pub question_notices: crate::question_notice::QuestionNotices,
     pub topology: TopologySnapshot,
     topology_observation_floor: u64,
@@ -131,6 +133,8 @@ impl CanonicalCoordinatorState {
     ) -> Self {
         Self {
             leased,
+            conversation_file_stamps: Default::default(),
+            conversation_bindings: Default::default(),
             question_notices: crate::question_notice::QuestionNotices::default(),
             topology,
             topology_observation_floor: 0,

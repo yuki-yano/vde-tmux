@@ -70,7 +70,7 @@ def tmux(*args):
 
 def query(*args):
     reply = json.loads(run([vt, *args, "--json"]).stdout)
-    assert reply["meta"]["api_version"] == 6, reply
+    assert reply["meta"]["api_version"] == 9, reply
     return reply["result"]
 
 

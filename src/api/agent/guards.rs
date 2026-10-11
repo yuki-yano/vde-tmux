@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 use super::super::connection::ApiConnection;
 use super::super::contract::{
     AgentSummary, AgentWaitTarget, ApiAgentStartCapability, ApiAgentSteerCapability,
-    ApiPromptConfirmationCapability, ApiPromptDispatchCapability, ApiProviderCapabilities,
-    ApiResponseCapability, MAX_PROMPT_BYTES,
+    ApiConversationCapability, ApiPromptConfirmationCapability, ApiPromptDispatchCapability,
+    ApiProviderCapabilities, ApiResponseCapability, MAX_PROMPT_BYTES,
 };
 use super::super::pane::{pane_ref, require_same_pane, resolve_pane, verify_live_pane};
 use super::projection::{agent_summary, canonical_state};
@@ -40,6 +40,7 @@ pub(crate) fn validate_prompt(prompt: &str) -> Result<()> {
 pub(in crate::api) fn provider_capabilities(agent: &str) -> Option<ApiProviderCapabilities> {
     match agent {
         "codex" => Some(ApiProviderCapabilities {
+            conversation: ApiConversationCapability::TranscriptReadOnly,
             prompt_dispatch: ApiPromptDispatchCapability::Durable,
             steer: ApiAgentSteerCapability::GuardedTerminalBestEffort,
             prompt_confirmation: ApiPromptConfirmationCapability::ProviderDigest,
@@ -48,6 +49,7 @@ pub(in crate::api) fn provider_capabilities(agent: &str) -> Option<ApiProviderCa
             start: ApiAgentStartCapability::DurableInitialPrompt,
         }),
         "claude" => Some(ApiProviderCapabilities {
+            conversation: ApiConversationCapability::TranscriptReadOnly,
             prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
             steer: ApiAgentSteerCapability::GuardedTerminalBestEffort,
             prompt_confirmation: ApiPromptConfirmationCapability::LifecycleCursor,
@@ -56,6 +58,7 @@ pub(in crate::api) fn provider_capabilities(agent: &str) -> Option<ApiProviderCa
             start: ApiAgentStartCapability::ProviderSession,
         }),
         "opencode" => Some(ApiProviderCapabilities {
+            conversation: ApiConversationCapability::Disabled,
             prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
             steer: ApiAgentSteerCapability::Disabled,
             prompt_confirmation: ApiPromptConfirmationCapability::None,

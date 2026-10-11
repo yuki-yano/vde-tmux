@@ -1,0 +1,25 @@
+{"type":"session_meta","payload":{"id":"codex-session","session_id":"codex-session","thread_source":"user","history_mode":"paginated","cwd":"/work","cli_version":"0.162.1"}}
+{"type":"event_msg","payload":{"turn_id":"t1","root_turn_id":"t1","turn_attribution":null,"type":"task_started"}}
+{"type":"response_item","payload":{"role":"developer","content":[{"type":"input_text","text":"<collaboration_mode>synthetic developer context</collaboration_mode>"}],"type":"message"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /work\n\n<INSTRUCTIONS>\nsynthetic project rules\n</INSTRUCTIONS>"}],"type":"message"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"<environment_context>synthetic environment</environment_context>"}],"type":"message"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"One."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t1","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-1","client_id":null,"content":[{"type":"text","text":"One.","text_elements":[]}]},"type":"item_completed"}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-1","phase":"final_answer","content":[{"type":"output_text","text":"One done."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t1","root_turn_id":"t1","last_agent_message":"One done.","error":null,"type":"task_complete"}}
+{"type":"event_msg","payload":{"turn_id":"t2","root_turn_id":"t2","turn_attribution":null,"type":"task_started"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Two."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t2","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-2","client_id":null,"content":[{"type":"text","text":"Two.","text_elements":[]}]},"type":"item_completed"}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-2","phase":"final_answer","content":[{"type":"output_text","text":"Two done."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t2","root_turn_id":"t2","last_agent_message":"Two done.","error":null,"type":"task_complete"}}
+{"type":"event_msg","payload":{"turn_id":"t3","root_turn_id":"t3","turn_attribution":null,"type":"task_started"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Three."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t3","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-3","client_id":null,"content":[{"type":"text","text":"Three.","text_elements":[]}]},"type":"item_completed"}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-3","phase":"final_answer","content":[{"type":"output_text","text":"Three done."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t3","root_turn_id":"t3","last_agent_message":"Three done.","error":null,"type":"task_complete"}}
+{"type":"event_msg","payload":{"num_turns":1,"type":"thread_rolled_back"}}
+{"type":"event_msg","payload":{"turn_id":"t4","root_turn_id":"t4","turn_attribution":null,"type":"task_started"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Three, revised."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t4","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-4","client_id":null,"content":[{"type":"text","text":"Three, revised.","text_elements":[]}]},"type":"item_completed"}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-4","phase":"final_answer","content":[{"type":"output_text","text":"Revised three done."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t4","root_turn_id":"t4","last_agent_message":"Revised three done.","error":null,"type":"task_complete"}}

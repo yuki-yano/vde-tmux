@@ -1,0 +1,85 @@
+{
+  "meta": {
+    "api_version": 9,
+    "server_identity": "3e34196b008c4fd9a443d1eafc7a7117cacca66940f1ee6994b800e1a0a04ca3",
+    "daemon_instance_id": "fb0731d6d6911c4e5b8b87441cf4ee50",
+    "snapshot_revision": 25,
+    "started_at": 1791644964,
+    "emitted_at": 1791644964,
+    "diagnostic_count": 0
+  },
+  "result": {
+    "type": "agent_conversation",
+    "conversation": {
+      "target": {
+        "agent_ref": "vta1:3e34196b008c4fd9a443d1eafc7a7117cacca66940f1ee6994b800e1a0a04ca3:2:75785:01366e637bbae79b3979cc75bd3297e8:1:75785:cec875c5eed225c6dec473e25745fc8d29ab6e57afea32263ec0813bca8caafd",
+        "pane_ref": "vtp1:3e34196b008c4fd9a443d1eafc7a7117cacca66940f1ee6994b800e1a0a04ca3:2:75785",
+        "pane_id": "%2",
+        "pane_pid": 75785,
+        "agent": "codex",
+        "state_id": "01366e637bbae79b3979cc75bd3297e8",
+        "agent_epoch": 1,
+        "process_pid": 75785
+      },
+      "session_id": "codex-conversation-session",
+      "run_seq": 1,
+      "completed_seq": 1,
+      "provider_turn_id": "turn-1",
+      "status": "done",
+      "lifecycle": {
+        "state": "idle"
+      },
+      "context_revision": "vtc1:1dcb87074537d7b601e89800c443a5ad8df7224409de155797d838ce46da25ae",
+      "cursor": "vtcc1:8b1c4d7fbde2d61c593c341aeab72460b8e890def4f47bf17f83dcefb2e21b96",
+      "update": "snapshot",
+      "read_bytes": 987,
+      "stop_boundary": true,
+      "history": {
+        "messages": [
+          {
+            "source_ref": "vtm1:106111e6fa815995d562a5fbeaf37104fa4c9cc1ca95d71b9378b2a97613de7d",
+            "order": 1,
+            "role": "user",
+            "kind": "instruction",
+            "original_role": "user",
+            "text": "Scoped instruction\nPreserve this exact second line.",
+            "text_complete": true,
+            "text_digest": "dc100439669d384dd758a4610a6b8bff58e0a23b58e3ae92c3288f405cf40653",
+            "provider_message_id": "u1",
+            "provider_turn_id": "turn-1",
+            "turn_index": 1,
+            "tool_call_id": null
+          },
+          {
+            "source_ref": "vtm1:814581fac20e1315a8f314fd79a65fa370ffe77d39dd3eda88e9b4523af8cf1b",
+            "order": 2,
+            "role": "assistant",
+            "kind": "final",
+            "original_role": "assistant",
+            "text": "Completed response\nFull second line.",
+            "text_complete": true,
+            "text_digest": "8c62b48bb425b4b802f19afe701e239f7da9ce1ee708bd600b8882a674819c88",
+            "provider_message_id": null,
+            "provider_turn_id": "turn-1",
+            "turn_index": 1,
+            "tool_call_id": null
+          }
+        ],
+        "turns": [
+          {
+            "turn_index": 1,
+            "provider_turn_id": "turn-1",
+            "user_source_refs": [
+              "vtm1:106111e6fa815995d562a5fbeaf37104fa4c9cc1ca95d71b9378b2a97613de7d"
+            ],
+            "final_source_ref": "vtm1:814581fac20e1315a8f314fd79a65fa370ffe77d39dd3eda88e9b4523af8cf1b",
+            "completed": true
+          }
+        ],
+        "omissions": [],
+        "compacted": false,
+        "partial_record": false
+      }
+    }
+  }
+}

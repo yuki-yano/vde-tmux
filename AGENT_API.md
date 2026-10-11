@@ -1,6 +1,6 @@
 # Agent JSON API
 
-This document defines the current API v8 contract (daemon protocol 34, Pane State schema 11,
+This document defines the current API v9 contract (daemon protocol 35, Pane State schema 11,
 Question sidecar schema 1). CLI, daemon, and sidebars must be installed together; there is no
 mixed-version fallback. The inherited v4 mutation boundary and rollout gates are maintained in
 [AGENT_API_V4.md](AGENT_API_V4.md). The durable state design inherited from v3 is recorded in
@@ -89,7 +89,7 @@ the conceptual request command, success envelope, and error envelope.
 ```json
 {
   "meta": {
-    "api_version": 6,
+    "api_version": 9,
     "server_identity": "...",
     "daemon_instance_id": "...",
     "snapshot_revision": 42,
@@ -519,6 +519,157 @@ mode, and symlink validation. It then clears only those four bounded regions and
 generation last. It refuses `--recover-uninitialized` when metadata is valid; use the generation-
 bound reset in that case.
 
+## Conversation context (API v9)
+
+`agent conversation` reads the provider's structured history for an **exact `agent_ref`**.
+It supports Codex and Claude; discover `providers.<kind>.capabilities.conversation =
+transcript_read_only` through `api schema`. It never submits prompts, calls an LLM, starts a
+provider, or writes to its transcript. `agent read` remains a bounded terminal read.
+
+```bash
+AGENT_REF="$(vt agent get %456 --json | jq -er '.result.agent.summary.agent_ref')"
+vt agent conversation "$AGENT_REF" --json > context.json
+REVISION="$(jq -er '.result.conversation.context_revision' context.json)"
+CURSOR="$(jq -er '.result.conversation.cursor' context.json)"
+
+# Check the revision without transferring the unchanged messages again.
+vt agent conversation "$AGENT_REF" --since-revision "$REVISION" --json
+
+# Wait for one context, session, turn, completion, or lifecycle change.
+vt agent conversation "$AGENT_REF" --after-cursor "$CURSOR" \
+  --since-revision "$REVISION" --timeout-ms 120000 --json
+
+# Request tool evidence explicitly; retain its role and source_ref.
+vt agent conversation "$AGENT_REF" --include-tools --json
+```
+
+The result type is `agent_conversation`, with `result.conversation`:
+
+| Field | Meaning |
+| --- | --- |
+| `target` | Exact agent/pane references, state ID, agent epoch, provider, and process PID |
+| `session_id` | Provider session bound by an accepted parent hook |
+| `run_seq`, `completed_seq` | Canonical turn/completion sequences; normal completion requires `status=done`, equal nonzero sequences, and verified Stop evidence |
+| `provider_turn_id` | Codex turn ID or Claude prompt ID when supplied; otherwise `null` |
+| `status`, `lifecycle` | Existing canonical agent status and lifecycle; waiting reasons remain distinct from completion |
+| `context_revision` | Opaque `vtc1:` digest of effective text, turn boundaries, compaction, and relevant evidence/omissions |
+| `cursor` | Opaque `vtcc1:` digest including exact identity, session, run/completion sequences, lifecycle, and context revision |
+| `update` | `snapshot` without a revision, `unchanged` for an equal revision, or `replace` for a different revision |
+| `history.messages` | Effective ordered messages; complete text is never silently abbreviated |
+| `history.turns` | User source references, final source reference, provider turn ID, and completion per provider turn |
+| `history.compacted` | Whether an effective compaction boundary is present |
+| `history.omissions` | Explicit reasons and optional source references for excluded/missing content |
+| `history.partial_record` | An unterminated last JSONL record was ignored |
+| `read_bytes`, `stop_boundary` | Bytes observed and whether a normal completed turn was checked against accepted Stop evidence |
+
+Every message has `source_ref`, `order`, `role`, `kind`, `original_role`, `text`,
+`text_complete`, `text_digest`, `provider_message_id`, `provider_turn_id`, `turn_index`, and `tool_call_id`.
+`text_digest` hashes the full normalized text before any explicit tool omission; tool text
+may be abbreviated with `text_complete=false` and a source-linked `tool_text_truncated`
+omission containing `omitted_text_digest`. User instructions and assistant text are complete. References are scoped
+to provider/session and source identity. Roles are `user`, `assistant`, `tool`, and `summary`;
+kinds are `instruction`, `commentary`, `final`, `tool_call`, `tool_result`, and
+`compaction_summary`. A provider compaction summary is not a verbatim user instruction.
+Claude tool results in provider `user` records are returned as `role=tool`,
+`kind=tool_result`, `original_role=user`; callers must not treat them as instructions.
+
+Tool calls/results are excluded by default and represented in omissions. `--include-tools`
+returns evidence for explicit source-reference use. Thinking/reasoning, notifications,
+subagent sidechains, injected metadata, and discarded branches are excluded. Unknown history
+formats, ambiguous turn attribution, conflicting duplicates, or unavailable mandatory latest
+text return `conversation_unavailable`; they are never reported as a complete empty history.
+The current parser targets Codex 0.162.1 and Claude Code 2.1.287. Codex fork/history-base,
+realtime history without reconstructible text, and rollback involving excluded/unpaired or untraced
+instruction boundaries are unavailable. Provider fixtures document each supported shape.
+Limits are 64 MiB of transcript input and 4 MiB of normalized context; exceeding a limit returns
+`resource_limit`. This endpoint explicitly exposes provider conversation bodies, including
+prompts submitted through the API. Those bodies remain excluded from ordinary snapshots and
+are not written to daemon diagnostics or new persistent caches.
+
+The reader pins the canonical identity/session/run, verifies the live process before and after
+acquisition, and checks the file identity and text again. A changed identity returns
+`stale_reference`; a concurrent canonical turn or text change returns `context_changed`
+(`observation`, `side_effect=none`, `retry_action=restart_observation`). Stop hook file size is
+an observed boundary, not proof that asynchronous provider output has flushed. A completed
+result requires the matching latest turn and full final text digest. Claude Stop proof
+uses the provider's LF-joined, trimmed text; the response preserves the complete transcript text. Before that output is
+available, acquisition returns `conversation_unavailable` (`retry_action=wait_then_retry`).
+A running turn requires the accepted Codex `turn_id` or Claude `prompt_id` to match the transcript;
+missing IDs are unavailable. Claude documents prompt IDs and asynchronous transcript output in
+its [hook input contract](https://code.claude.com/docs/en/hooks#common-input-fields). Claude's background-result Stop
+only becomes a completion boundary when the canonical lifecycle completes. Compaction stays
+in the same session/epoch; startup/resume/clear use the existing epoch rules.
+Conversation bindings are transient. After a daemon restart, a new accepted parent
+SessionStart/UserPromptSubmit must supply the transcript binding before this endpoint can read it.
+
+### Changes and cancellation
+
+`--after-cursor` uses the existing daemon revision subscription and returns **one** validated
+change. The initial subscription snapshot closes the subscribe/read race: a cursor already
+changed at invocation returns immediately. Transcript metadata changes are projected through
+the daemon observation cycle, so changes within a running turn and compaction also wake the
+subscription. Unrelated pane activity does not cause a result. Provider tool activity and
+unfinished JSONL tails do not change `context_revision`; new tool result evidence may change
+it. A lifecycle change can change `cursor` with the same `context_revision`.
+
+Continue by subscribing with the returned cursor. The consumer owns the process: terminate it
+when editprompt closes or the target changes, releasing its socket. Timeout is a typed
+`timeout` error (default 120 seconds, maximum 24 hours), not an unchanged or empty successful
+result. Daemon replacement, stream failure, and lost identity use existing typed errors.
+Subscription capacity remains the existing daemon limit. Only the requested conversation is
+parsed; unchanged transcript/state signatures avoid repeated body parsing on global events.
+
+Revision updates are **complete replacements**, rather than append-only deltas. This handles
+rollback, branch selection, and compaction without leaving removed source references in a
+consumer cache. An equal revision returns `update=unchanged` and an empty `messages` array;
+retain the prior body in that case. A different revision returns the full effective messages
+with `update=replace`; replace the cached body and discard obsolete references. Include the
+`include_tools` policy in the consumer cache key and fetch a full snapshot when changing it.
+Never order or increment digest revisions. Candidate admission must compare exact identity,
+session, run, cursor/revision, and its local draft before use.
+
+A synthetic response example is in
+[`tests/fixtures/agent-conversation-response.json`](tests/fixtures/agent-conversation-response.json);
+a typed failure example is in
+[`tests/fixtures/agent-conversation-error.json`](tests/fixtures/agent-conversation-error.json).
+Provider fixtures are in [`tests/fixtures/conversation/`](tests/fixtures/conversation/).
+Run `python3 scripts/test-agent-conversation-isolated.py` for exact CLI/hook/daemon acceptance.
+
+### Conversation delivery checklist
+
+Functional completion:
+
+- [x] Codex and Claude return full latest instruction/final text with distinct source references and roles.
+- [x] Exact identity, effective branch/compaction history, turn boundaries, and concurrent-read rejection are verified.
+- [x] Revision checks and one-change subscriptions invalidate stale context without mutating the provider.
+
+Test completion:
+
+- [x] Provider fixtures cover roles, duplicates, discarded branches, compaction, rollback, partial JSONL, and unsupported/missing content.
+- [x] `cargo test --lib`, CLI tests, and isolated conversation acceptance pass.
+- [x] `scripts/smoke-m6-runtime.sh` passes on an isolated tmux server.
+
+Verified locally on 2026-10-11: stable Rust `cargo test --locked` (1,231 library tests and
+three CLI tests; two existing physical redraw probes remain ignored), formatting, clippy,
+JSON Schema validation of request/success/error fixtures, isolated conversation acceptance for
+both providers, and the normal isolated runtime smoke. Provider sessions in this acceptance use
+native synthetic writers with real exact process identity and hooks. Authenticated provider
+execution and panepilot adoption/IME behavior remain operational integration work.
+
+Operational integration:
+
+- [x] CLI, daemon, hook callers, and sidebar are installed together with API 9 / protocol 35.
+- [ ] Panepilot discovers the conversation capability, uses replacement updates, and releases subscriptions on editprompt closure.
+- [ ] The consumer validates candidate identity/revision/draft at adoption and reports provider unavailability without terminal fallback.
+
+Installed locally on 2026-10-11 after staged Codex ownership and conversation acceptance passed.
+Both installed executable hashes match the staged binaries. The daemon is Serving / Healthy /
+Ready, and all ten sidebars use the new installed executable. The tmux server, sixty content
+panes and their geometry, storage generation, 112 Runs, 33 Operations, 110 response artifacts,
+and healthy Codex question-notice summaries are retained. Existing conversations require fresh
+accepted hook evidence after the daemon restart; authenticated provider and panepilot acceptance
+remain separate from this binary rollout.
+
 ## Terminal read
 
 `pane read` and `agent read` are the only API commands that execute `capture-pane`.
@@ -592,6 +743,7 @@ Every error contains a closed-enum `code`, human-readable `message`, `stage`, `s
   `event_history_lost`, `identity_verification_failed`, `control_unavailable`.
 - Contract/resource: `protocol_mismatch`, `invalid_daemon_response`, `resource_limit`,
   `capture_failed`, `daemon_error`, `internal_error`.
+- Conversation: `conversation_unavailable`, `context_changed`.
 - Durable state: `operation_conflict`, `operation_not_found`, `operation_store_full`,
   `operation_generation_replaced`, `request_state_busy`, `request_state_mismatch`,
   `request_state_invalid`, `run_not_found`, `run_generation_replaced`, `run_unresolved`,
@@ -894,5 +1046,5 @@ includes more work than the daemon-ingress bound; it excludes Codex's pre-hook d
 
 #### Operational rollout
 
-- [ ] CLI/daemon/sidebar are deployed together with API 8 / protocol 34 while retaining pane state via the offline schema 10 → 11 conversion in RELEASING.md.
+- [ ] CLI/daemon/sidebar are deployed together with API 9 / protocol 35 while retaining pane state via the offline schema 10 → 11 conversion in RELEASING.md.
 - [ ] Stock Codex version, Embedded mode, hook matcher, and post-restart notice behavior are verified in the deployment environment.

@@ -213,6 +213,17 @@ fn reduce_explicit(
         ReduceError::InvalidRequest("explicit event requires an agent session ID".to_string())
     })?;
 
+    if current.is_none()
+        && matches!(
+            envelope.event,
+            PaneEvent::AgentSessionStarted {
+                source: AgentSessionSource::Compact,
+                ..
+            }
+        )
+    {
+        return Err(ReduceError::StaleAgentEvent);
+    }
     let mut state = match current {
         Some(state) => state.clone(),
         None => {
@@ -236,6 +247,21 @@ fn reduce_explicit(
         }
     };
 
+    if matches!(
+        envelope.event,
+        PaneEvent::AgentSessionStarted {
+            source: AgentSessionSource::Compact,
+            ..
+        }
+    ) {
+        if state.agent != *agent
+            || state.agent_session_id.as_ref() != Some(session)
+            || !state.agent_present
+        {
+            return Err(ReduceError::StaleAgentEvent);
+        }
+        return Ok(Reduction::unchanged(current));
+    }
     if matches!(envelope.event, PaneEvent::AgentSessionStarted { .. }) {
         begin_agent_epoch(
             &mut state,
@@ -4547,5 +4573,47 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn compact_preserves_the_same_session_epoch_and_running_turn() {
+        let started = reduce_explicit_once(
+            None,
+            "claude",
+            "session-1",
+            PaneEvent::BeginRun {
+                started_at: 1,
+                prompt: None,
+            },
+            &CaptureTrackerSnapshot::default(),
+        )
+        .unwrap();
+        let compact = reduce_explicit_once(
+            started.record.as_ref(),
+            "claude",
+            "session-1",
+            PaneEvent::AgentSessionStarted {
+                observed_at: 2,
+                source: AgentSessionSource::Compact,
+                resumed_prompt: None,
+            },
+            &started.tracker_delta.as_ref().unwrap().next,
+        )
+        .unwrap();
+        assert_eq!(compact.record, started.record);
+        assert_eq!(compact.outcome, ReductionOutcome::Noop);
+        assert!(matches!(
+            reduce_explicit_once(
+                started.record.as_ref(),
+                "claude",
+                "other-session",
+                PaneEvent::AgentSessionStarted {
+                    observed_at: 2,
+                    source: AgentSessionSource::Compact,
+                    resumed_prompt: None
+                },
+                &started.tracker_delta.as_ref().unwrap().next
+            ),
+            Err(ReduceError::StaleAgentEvent)
+        ));
     }
 }

@@ -161,7 +161,7 @@ pub(crate) fn run_hook_command(
                 },
                 &context,
             )?;
-            send_typed_hook_event_observed(&mut client, event, None, env, &server_hash)
+            send_typed_hook_event_observed(&mut client, event, None, None, env, &server_hash)
         }
         HookCommand::Claude { event } => {
             let event_id = crate::pane_state::EventId::generate()?;
@@ -172,7 +172,14 @@ pub(crate) fn run_hook_command(
             // Claude's authenticated disposable-profile P0 contract is not frozen yet. Keep its
             // existing pane lifecycle hook healthy, but do not let unverified payloads create or
             // resolve durable v3 Runs.
-            send_typed_hook_event_observed(&mut client, event, None, env, &server_hash)
+            send_typed_hook_event_observed(
+                &mut client,
+                event,
+                None,
+                crate::conversation::HookBinding::capture(input),
+                env,
+                &server_hash,
+            )
         }
         HookCommand::Codex { arg } => {
             let Some(arg) = arg else {
@@ -298,6 +305,7 @@ pub(crate) fn run_hook_command(
                         crate::question_notice::ingress::SessionSource::Startup
                             | crate::question_notice::ingress::SessionSource::Resume
                             | crate::question_notice::ingress::SessionSource::Clear
+                            | crate::question_notice::ingress::SessionSource::Compact
                     )
                 {
                     let Some(observation) = observation else {
@@ -326,7 +334,7 @@ pub(crate) fn run_hook_command(
                 {
                     observation.question_resolver = Some(prepared.metadata.clone());
                 }
-                match send_typed_hook_event(&mut client, event, observation, question_notice.clone(), Some(&prepared)) {
+                match send_typed_hook_event(&mut client, event, observation, question_notice.clone(), Some(&prepared), crate::conversation::HookBinding::capture(input)) {
                     Ok(()) => return Ok(()),
                     Err(error)
                         if retry_before_write
@@ -398,10 +406,11 @@ fn send_typed_hook_event_observed(
     client: &mut crate::daemon::protocol::v2::V2Client,
     event: Option<PaneEventEnvelope>,
     observation: Option<crate::hook::provider::ProviderObservation>,
+    conversation: Option<crate::conversation::HookBinding>,
     env: &BTreeMap<String, String>,
     server_hash: &str,
 ) -> Result<()> {
-    match send_typed_hook_event(client, event, observation, None, None) {
+    match send_typed_hook_event(client, event, observation, None, None, conversation) {
         Ok(()) => Ok(()),
         Err(error) => {
             let error = anyhow::Error::new(error);
@@ -453,6 +462,7 @@ fn send_typed_hook_event(
     observation: Option<crate::hook::provider::ProviderObservation>,
     question_notice: Option<crate::question_notice::QuestionNoticeInput>,
     prepared: Option<&crate::question_notice::ingress::PreparedHook>,
+    conversation: Option<crate::conversation::HookBinding>,
 ) -> std::result::Result<(), crate::daemon::protocol::v2::V2RequestError> {
     let Some(envelope) = event else {
         return Ok(());
@@ -463,11 +473,13 @@ fn send_typed_hook_event(
             proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
             envelope,
             observation,
+            conversation,
             question_notice,
         },
         None => crate::daemon::protocol::v2::ClientMessage::SubmitPaneEvent {
             proto: crate::daemon::protocol::v2::PROTOCOL_VERSION,
             envelope,
+            conversation,
         },
     };
     let response = client.request_with_stage(&message)?;

@@ -207,6 +207,7 @@ pub(crate) use agent::run::{
     capture_visible_viewport_fingerprint, verify_recovery_foreground_owner,
 };
 pub use agent::{
+    conversation::agent_conversation,
     dispatch::{agent_prompt, agent_send, agent_send_keys, agent_start, agent_steer},
     operation::{agent_operation_abandon, agent_operation_get, agent_operation_wait},
     projection::{agent_get, agent_list},

@@ -7,6 +7,7 @@ pub mod category;
 pub mod cli;
 pub mod codex_capacity;
 pub mod config;
+pub mod conversation;
 pub mod daemon;
 pub mod detect;
 pub mod git;

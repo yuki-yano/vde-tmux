@@ -51,6 +51,18 @@ pub(in crate::daemon::server) fn apply_triage_projection(
     let state = state_guard
         .as_mut()
         .expect("state initialized before triage projection");
+    state.conversation_bindings.retain(|pane, binding| {
+        state.leased.runtime.record(pane).is_some_and(|record| {
+            record.agent_present
+                && record.state_id == binding.state_id
+                && record.agent_epoch == binding.agent_epoch
+        })
+    });
+    let stamps = crate::conversation::file_stamps(&state.conversation_bindings);
+    if state.conversation_file_stamps != stamps {
+        state.conversation_file_stamps = stamps;
+        state.leased.runtime.mark_projection_changed()?;
+    }
     state.leased.runtime.advance_poll_projection()?;
     state
         .leased

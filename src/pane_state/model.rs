@@ -1240,6 +1240,7 @@ pub enum AgentSessionSource {
     Startup,
     Resume,
     Clear,
+    Compact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -446,6 +446,20 @@ pub(super) fn validate_v2_origin(
             }
             Ok(())
         }
+        ClientMessage::SubmitPaneEvent {
+            envelope,
+            conversation: Some(binding),
+            ..
+        }
+        | ClientMessage::SubmitProviderEvent {
+            envelope,
+            conversation: Some(binding),
+            ..
+        } if !binding.valid() => Err(ServerMessage::error(
+            ErrorCode::InvalidRequest,
+            "invalid conversation locator",
+            Some(envelope.event_id.clone()),
+        )),
         ClientMessage::SubmitPaneEvent { envelope, .. } if !envelope.event.is_external() => {
             Err(ServerMessage::error(
                 ErrorCode::InvalidRequest,

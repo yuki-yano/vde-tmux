@@ -1,0 +1,30 @@
+{"type":"session_meta","payload":{"id":"codex-session","session_id":"codex-session","thread_source":"user","history_mode":"paginated","cwd":"/work","cli_version":"0.162.1"}}
+{"type":"event_msg","payload":{"turn_id":"t1","root_turn_id":"t1","turn_attribution":null,"type":"task_started"}}
+{"type":"response_item","payload":{"role":"developer","content":[{"type":"input_text","text":"<collaboration_mode>synthetic developer context</collaboration_mode>"}],"type":"message"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /work\n\nsynthetic project rules"}],"type":"message"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"<environment_context>synthetic environment</environment_context>"}],"type":"message"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Implement A."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t1","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-1","client_id":null,"content":[{"type":"text","text":"Implement A.","text_elements":[]}]},"type":"item_completed"}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-1","phase":"commentary","content":[{"type":"output_text","text":"Working on A."}],"type":"message"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Also implement B."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t1","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-2","client_id":null,"content":[{"type":"text","text":"Also implement B.","text_elements":[]}]},"type":"item_completed"}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-2","phase":"final_answer","content":[{"type":"output_text","text":"Done with A and B."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t1","root_turn_id":"t1","last_agent_message":"Done with A and B.","error":null,"type":"task_complete"}}
+{"type":"event_msg","payload":{"turn_id":"t2","root_turn_id":"t2","turn_attribution":null,"type":"task_started"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Start C."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t2","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-3","client_id":null,"content":[{"type":"text","text":"Start C.","text_elements":[]}]},"type":"item_completed"}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-3","phase":"commentary","content":[{"type":"output_text","text":"Starting C."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t2","root_turn_id":"t2","reason":"interrupted","type":"turn_aborted"}}
+{"type":"event_msg","payload":{"turn_id":"t3","root_turn_id":"t3","turn_attribution":null,"type":"task_started"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Summarize D."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t3","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-4","client_id":null,"content":[{"type":"text","text":"Summarize D.","text_elements":[]}]},"type":"item_completed"}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-4","phase":"final_answer","content":[{"type":"output_text","text":"D summary."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t3","root_turn_id":"t3","last_agent_message":"A different final text.","error":null,"type":"task_complete"}}
+{"type":"event_msg","payload":{"turn_id":"t4","root_turn_id":"t4","turn_attribution":null,"type":"task_started"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Try E."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t4","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-5","client_id":null,"content":[{"type":"text","text":"Try E.","text_elements":[]}]},"type":"item_completed"}}
+{"type":"event_msg","payload":{"turn_id":"t4","root_turn_id":"t4","last_agent_message":null,"error":{"message":"synthetic failure"},"type":"task_complete"}}
+{"type":"event_msg","payload":{"turn_id":"t5","root_turn_id":"t5","turn_attribution":null,"type":"task_started"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Finish F."}],"type":"message"}}
+{"type":"event_msg","payload":{"turn_id":"t5","thread_id":"codex-session","item":{"type":"UserMessage","id":"um-6","client_id":null,"content":[{"type":"text","text":"Finish F.","text_elements":[]}]},"type":"item_completed"}}
+{"type":"response_item","payload":{"role":"assistant","id":"msg-6","phase":"final_answer","content":[{"type":"output_text","text":"F is finished."}],"type":"message"}}

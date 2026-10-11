@@ -14,7 +14,7 @@ use crate::daemon::session_badge::BadgeState;
 
 use super::common::epoch_now;
 
-pub const API_VERSION: u16 = 8;
+pub const API_VERSION: u16 = 9;
 pub const DEFAULT_READ_LINES: usize = 120;
 pub const MAX_READ_LINES: usize = 2_000;
 pub const MAX_READ_BYTES: usize = 1024 * 1024;
@@ -124,6 +124,8 @@ pub enum ApiErrorCode {
     ResourceLimit,
     InvalidDaemonResponse,
     CaptureFailed,
+    ConversationUnavailable,
+    ContextChanged,
     AgentBusy,
     AgentNotReady,
     AgentBlocked,
@@ -184,6 +186,8 @@ impl ApiErrorCode {
             Self::ResourceLimit => "resource_limit",
             Self::InvalidDaemonResponse => "invalid_daemon_response",
             Self::CaptureFailed => "capture_failed",
+            Self::ConversationUnavailable => "conversation_unavailable",
+            Self::ContextChanged => "context_changed",
             Self::AgentBusy => "agent_busy",
             Self::AgentNotReady => "agent_not_ready",
             Self::AgentBlocked => "agent_blocked",
@@ -259,6 +263,7 @@ impl ApiErrorCode {
             | Self::TargetReplaced
             | Self::DispatchRejected => ApiRetryAction::RefreshTarget,
             Self::ExactIdentityUnavailable
+            | Self::ConversationUnavailable
             | Self::DaemonNotReady
             | Self::Timeout
             | Self::IdentityVerificationFailed
@@ -283,7 +288,8 @@ impl ApiErrorCode {
             | Self::StaleDaemon
             | Self::EventHistoryLost => ApiRetryAction::RestartObservation,
             Self::DeliveryUnknown => ApiRetryAction::InspectManually,
-            Self::StalePrecondition
+            Self::ContextChanged
+            | Self::StalePrecondition
             | Self::OperationGenerationReplaced
             | Self::RunGenerationReplaced => ApiRetryAction::RestartObservation,
             _ => ApiRetryAction::Never,
@@ -367,6 +373,18 @@ pub struct ApiSchemaContract {
     pub versions: ApiVersionContract,
     pub hard_limits: ApiHardLimitContract,
     pub providers: BTreeMap<String, ApiProviderContract>,
+    pub conversation: ApiConversationContract,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ApiConversationContract {
+    pub exact_agent_ref_required: bool,
+    pub read_only: bool,
+    pub transcript_max_bytes: u64,
+    pub context_max_bytes: u64,
+    pub subscription: String,
+    pub revision_update: String,
+    pub tools_default: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -422,6 +440,13 @@ pub struct ApiProviderContract {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum ApiConversationCapability {
+    TranscriptReadOnly,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ApiProviderStatus {
     Enabled,
     DisabledPendingAuthenticatedP0,
@@ -438,6 +463,7 @@ pub enum ApiProviderEvidenceBasis {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ApiProviderCapabilities {
+    pub conversation: ApiConversationCapability,
     pub prompt_dispatch: ApiPromptDispatchCapability,
     pub steer: ApiAgentSteerCapability,
     pub prompt_confirmation: ApiPromptConfirmationCapability,
@@ -558,6 +584,9 @@ pub enum ApiResult {
     },
     AgentGet {
         agent: AgentDetail,
+    },
+    AgentConversation {
+        conversation: super::agent::conversation::ConversationSnapshot,
     },
     AgentPrompt {
         operation_ref: String,
@@ -1180,6 +1209,16 @@ pub enum ApiRequest {
     AgentGet {
         target: String,
     },
+    AgentConversation {
+        target: String,
+        #[serde(default)]
+        include_tools: bool,
+        since_revision: Option<String>,
+        after_cursor: Option<String>,
+        #[serde(default = "default_wait_timeout_ms")]
+        #[schemars(range(min = 1, max = 86_400_000))]
+        timeout_ms: u64,
+    },
     AgentPrompt {
         target: String,
         operation_id: String,
@@ -1364,6 +1403,18 @@ pub fn schema_json(started_at: i64) -> Result<String> {
 
 fn api_schema_contract() -> ApiSchemaContract {
     ApiSchemaContract {
+        conversation: ApiConversationContract {
+            exact_agent_ref_required: true,
+            read_only: true,
+            transcript_max_bytes: crate::conversation::MAX_TRANSCRIPT_BYTES,
+            context_max_bytes: crate::conversation::MAX_CONTEXT_BYTES as u64,
+            subscription:
+                "agent conversation --after-cursor; one change per call; close process to cancel"
+                    .into(),
+            revision_update: "unchanged when equal; replace the effective history when different"
+                .into(),
+            tools_default: "excluded; request --include-tools for source_ref evidence".into(),
+        },
         versions: ApiVersionContract {
             public_agent_api: API_VERSION,
             daemon_protocol: PROTOCOL_VERSION,
@@ -1402,6 +1453,7 @@ fn api_schema_contract() -> ApiSchemaContract {
                     agent_kind: "codex".to_string(),
                     durable_adapter_status: ApiProviderStatus::Enabled,
                     capabilities: ApiProviderCapabilities {
+                        conversation: ApiConversationCapability::TranscriptReadOnly,
                         prompt_dispatch: ApiPromptDispatchCapability::Durable,
                         steer: ApiAgentSteerCapability::GuardedTerminalBestEffort,
                         prompt_confirmation: ApiPromptConfirmationCapability::ProviderDigest,
@@ -1434,6 +1486,7 @@ fn api_schema_contract() -> ApiSchemaContract {
                     agent_kind: "claude".to_string(),
                     durable_adapter_status: ApiProviderStatus::DisabledPendingAuthenticatedP0,
                     capabilities: ApiProviderCapabilities {
+                        conversation: ApiConversationCapability::TranscriptReadOnly,
                         prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
                         steer: ApiAgentSteerCapability::GuardedTerminalBestEffort,
                         prompt_confirmation: ApiPromptConfirmationCapability::LifecycleCursor,
@@ -1455,6 +1508,7 @@ fn api_schema_contract() -> ApiSchemaContract {
                     agent_kind: "opencode".to_string(),
                     durable_adapter_status: ApiProviderStatus::NotAvailable,
                     capabilities: ApiProviderCapabilities {
+                        conversation: ApiConversationCapability::Disabled,
                         prompt_dispatch: ApiPromptDispatchCapability::GuardedTerminal,
                         steer: ApiAgentSteerCapability::Disabled,
                         prompt_confirmation: ApiPromptConfirmationCapability::None,
@@ -1496,7 +1550,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            55
+            57
         );
         let error_codes = value["result"]["schemas"]["error"]["$defs"]["ApiErrorCode"]["enum"]
             .as_array()
